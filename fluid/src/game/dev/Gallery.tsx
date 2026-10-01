@@ -15,9 +15,8 @@
  * The session has no query client, so walking through a door says
  * `SIGNAL LOST` and leaves the player in the gallery, and F opens nothing:
  * the gallery is no engram. `?bloom=rgba8` forces the RGBA8 bloom path as
- * in the look demo, and `?look=` picks the look by any id in `LOOK_ORDER`
- * (`lookParam`; the game's own when absent), which the legend names: the
- * game has no key to switch it.
+ * in the look demo. An old link that still carries `?look=` opens as usual,
+ * the parameter ignored.
  *
  * Three more parameters are dev-only and not on the legend. `?hall=heroes`
  * shows `heroHallRoom()` (H15) instead of `galleryRoom()`: one of every hero
@@ -113,7 +112,6 @@ import { detectEnvironment, refusalReason, type Refusal } from "../device";
 import { hasWebGL2 } from "../gl/context";
 import { createSession, type PlaceLoader, type Session } from "../session";
 import { DeviceRefusal } from "../ui/DeviceRefusal";
-import type { LookId } from "../render/looks";
 import { CLASSIC_KEYS } from "../ui/keys";
 import { StationView } from "../ui/StationView";
 import { useHud } from "../ui/useHud";
@@ -134,12 +132,10 @@ import { consoleRoom } from "../world/consoleRoom";
 import { generateDeck } from "../world/deck";
 import { generateRoom } from "../world/generate";
 import { CONSOLE_VIEWS, consoleView } from "./consoleViews";
-import { lookLabel, lookParam } from "./lookParam";
 import { spotView } from "./spots";
 
-/** The look and the keys, along the top of the screen. */
-const legendFor = (look: LookId) =>
-  `MODEL GALLERY · ${lookLabel(look)} · ${CLASSIC_KEYS} · WASD MOUSE · I INVERT`;
+/** The keys, along the top of the screen. */
+const LEGEND = `MODEL GALLERY · ${CLASSIC_KEYS} · WASD MOUSE · I INVERT`;
 
 /** F goes nowhere from the gallery: there is no engram to open. */
 function openNothing() {}
@@ -152,10 +148,7 @@ function openNothing() {}
 export default function Gallery() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const sessionRef = useRef<Session | null>(null);
-  const [look] = useState<LookId>(() =>
-    lookParam(new URLSearchParams(window.location.search)),
-  );
-  const { sink, view, connector, reader } = useHud(look);
+  const { sink, view, connector, reader } = useHud();
   const [refusal] = useState<Refusal | null>(() =>
     refusalReason(detectEnvironment(hasWebGL2)),
   );
@@ -212,7 +205,6 @@ export default function Gallery() {
       navigate: openNothing,
       openFluid: openNothing,
       forceRgba8: params.get("bloom") === "rgba8",
-      initialLook: look,
       ...(load === undefined ? {} : { load }),
     });
     sessionRef.current = session;
@@ -235,7 +227,7 @@ export default function Gallery() {
       sessionRef.current = null;
       session.dispose();
     };
-  }, [refusal, sink, look]);
+  }, [refusal, sink]);
 
   const closeReader = useCallback(() => {
     sessionRef.current?.closeReader();
@@ -248,7 +240,7 @@ export default function Gallery() {
       view={view}
       connector={connector}
       reader={reader}
-      legend={legendFor(look)}
+      legend={LEGEND}
       onCloseReader={closeReader}
       onOpenFluid={openNothing}
     />

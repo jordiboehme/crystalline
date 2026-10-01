@@ -3,8 +3,8 @@ import { describe, expect, it } from "vitest";
 import { BLINK_CHANNELS, BLINK_GROUPS } from "./blink";
 import { ACCENT_MARK, FLAG, PROP_MARK } from "./geometry";
 import rendererSource from "./renderer.ts?raw";
-import { ACCENT_COUNT, LOOK_ORDER, LOOKS } from "./looks";
-import { SCENE_FS, SCENE_VS, SIGNAL_GAIN } from "./shaders";
+import { ACCENT_COUNT, LOOK } from "./looks";
+import { COMPOSITE_FS, SCENE_FS, SCENE_VS, SIGNAL_GAIN } from "./shaders";
 
 describe("the scene shader's blink and signal paths", () => {
   it("forwards the instance slot through a flat varying", () => {
@@ -127,8 +127,7 @@ it("swaps a prop's own mark for the look's accent at the instance's pick, the ro
   expect(PROP_MARK).toBeLessThan(-1.5);
   expect(SCENE_VS).toContain("uniform vec3 uAccents[5];");
   expect(ACCENT_COUNT).toBe(5);
-  for (const look of Object.values(LOOKS))
-    expect(look.accents.length, look.id).toBe(ACCENT_COUNT);
+  expect(LOOK.accents.length).toBe(ACCENT_COUNT);
   expect(SCENE_VS).toContain("int turnPick = int(aInstanceTurn.x + 0.5);");
   expect(SCENE_VS).toContain("mat2 turn = TURNS[turnPick & 3];");
   expect(SCENE_VS).toContain("int pick = turnPick >> 2;");
@@ -142,7 +141,7 @@ describe("the scene shader's decal branch", () => {
   it("alpha-tests a decal against the ordered threshold and never draws its edges (2.7 C20)", () => {
     // Mutation caught: no discard (every decal an opaque square), the test on
     // the tinted colour instead of the texel's alpha (the untextured 8-bit
-    // look would lose the shapes), or edge lines on decals in look 2.
+    // look would lose the shapes), or edge lines on decals.
     expect(FLAG.decal).toBe(14);
     expect(SCENE_FS).toContain("float bayer4(vec2 p)");
     expect(SCENE_FS).toMatch(
@@ -178,7 +177,7 @@ describe("the scene shader's decal branch", () => {
   });
 });
 
-describe("the scene shader's seams in look 2", () => {
+describe("the scene shader's seams", () => {
   it("draws the everywhere seams on the shell flag only, never on a plain lit surface", () => {
     // Mutation caught: the framed test back on `vFlag == 0` (every prop,
     // hero and fitting would glow again), or the shell's test dropped.
@@ -208,29 +207,25 @@ describe("the scene shader's seams in look 2", () => {
     expect(first).toBeGreaterThan(lit);
   });
 
-  it("uploads uEdgeEverywhere from the look, which only look 2 turns on", () => {
-    // Mutation caught: the day shift or the third look given seams
-    // everywhere, or the uniform fed a constant instead of the look.
+  it("uploads uEdgeEverywhere from the look, which turns it on", () => {
+    // Mutation caught: the look given no seams everywhere, or the uniform
+    // fed a constant instead of the look.
     expect(rendererSource).toMatch(
       /scene\.uniform\("uEdgeEverywhere"\),\s*look\.edge\.everywhere \? 1 : 0,/,
     );
-    for (const id of LOOK_ORDER)
-      expect(LOOKS[id].edge.everywhere, id).toBe(id === "aperture");
+    expect(LOOK.edge.everywhere).toBe(true);
   });
 });
 
-describe("the fade of look 2's seams with distance", () => {
-  it("keeps the fade distances in the look's edge settings: look 2 only, starting near 15 m and gone by 25 m", () => {
-    // Mutation caught: look 2's fade dropped (null, the far end washes out
-    // again), a fade starting in the near view, or one given to a look
-    // without seams everywhere.
-    const fade = LOOKS.aperture.edge.fade;
+describe("the fade of the look's seams with distance", () => {
+  it("keeps the fade distances in the look's edge settings, starting near 15 m and gone by 25 m", () => {
+    // Mutation caught: the fade dropped (null, the far end washes out
+    // again) or a fade starting in the near view.
+    const fade = LOOK.edge.fade;
     expect(fade).not.toBeNull();
     expect(fade?.from).toBeGreaterThanOrEqual(15);
     expect(fade?.to).toBeGreaterThan(fade?.from ?? Infinity);
     expect(fade?.to).toBeLessThanOrEqual(25);
-    for (const id of LOOK_ORDER.filter((id) => id !== "aperture"))
-      expect(LOOKS[id].edge.fade, id).toBeNull();
   });
 
   it("scales the shell's seam by the distance from the eye, and never a frame's line", () => {
@@ -258,7 +253,7 @@ describe("the fade of look 2's seams with distance", () => {
 it("darkens only the floor by the contact shadow, as far as the look says", () => {
   // Mutation caught: the shadow on walls or on the tops of props, applied
   // after the bands (it would add a band edge of its own), or a strength
-  // not taken from the look (looks 1 and 3 would get one).
+  // not taken from the look.
   expect(SCENE_FS).toContain(
     "if (vNormal.y > 0.9 && vWorld.y < 0.05) lit *= 1.0 - uContactShadow * textureLod(uShadow, vWorld.xz / uShadowSize, 0.0).r;\n  lit = floor(lit * uBands + 0.5) / uBands;",
   );
@@ -282,4 +277,20 @@ it("binds the contact shadow to a texture unit of its own", () => {
   expect(rendererSource).toMatch(
     /gl\.activeTexture\(gl\.TEXTURE2\);\s*gl\.bindTexture\(gl\.TEXTURE_2D, shadow\?\.texture \?\? null\);/,
   );
+});
+
+describe("the composite shader", () => {
+  it("has no dither or palette stage, and the scene shader keeps the decal test", () => {
+    // Mutation caught: a uniform left declared but never set (it would keep
+    // a dead branch), or `bayer4` removed together with the dither (the
+    // decals' alpha test needs it).
+    // The names are joined here so that no source line spells them whole.
+    const [dither, palette, mix] = ["Dither", "Palette", "TextureMix"].map(
+      (name) => `u${name}`,
+    );
+    expect(COMPOSITE_FS).not.toContain(dither);
+    expect(COMPOSITE_FS).not.toContain(palette);
+    expect(SCENE_FS).not.toContain(mix);
+    expect(SCENE_FS).toContain("float bayer4(vec2 p)");
+  });
 });

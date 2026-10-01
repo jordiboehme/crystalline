@@ -38,7 +38,7 @@ import {
   type Frame,
 } from "./kit";
 import { ASPECT, LAYER, TEXT_BASE, layerPlan } from "./layers";
-import { LOOKS } from "./looks";
+import { LOOK } from "./looks";
 import {
   add,
   cross,
@@ -155,7 +155,7 @@ function context(ceiling = CEILING): { ctx: ModelContext; keys: string[] } {
   return {
     keys,
     ctx: {
-      look: LOOKS.aperture,
+      look: LOOK,
       ceiling,
       hall: HALL,
       textLayer: (key) => {
@@ -930,7 +930,7 @@ describe("the exit's label (M3 C28)", () => {
     const asked: string[] = [];
     const builder = createBuilder();
     const movers = buildFixture((f) => createKit(builder, f), exit, index, {
-      look: LOOKS.aperture,
+      look: LOOK,
       ceiling: room.ceiling,
       hall: room.hall,
       textLayer: (key) => {
@@ -1304,7 +1304,7 @@ const overlapsPlan = (
 ) => b.lo[0] < r.a1 && b.hi[0] > r.a0 && b.lo[1] < r.d1 && b.hi[1] > r.d0;
 
 /** The machine body's tint in the test's look. */
-const BODY = LOOKS.aperture.palette.machine;
+const BODY = LOOK.palette.machine;
 const isBody = (b: LocalBox) => b.part.tint?.join() === BODY.join();
 const centreD = (b: LocalBox) => (b.lo[1] + b.hi[1]) / 2;
 
@@ -1852,7 +1852,7 @@ describe("model variants (2.7)", () => {
     // Mutation caught: an accent part left in its old colour, one painted
     // twice, a glowing part tinted in the accent, or the room's accent mark
     // used instead of the tag's colour.
-    const accent = LOOKS.aperture.accents[tagAccent("t")];
+    const accent = LOOK.accents[tagAccent("t")];
     if (!accent) throw new Error("no accent");
     expect(Object.keys(ACCENT_PARTS).length).toBe(MACHINE_KINDS.length);
     for (const machine of MACHINE_KINDS) {

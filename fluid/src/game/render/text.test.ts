@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { PROP_CATALOGUE } from "../world/props";
 import { LAYER_SIZE } from "./layers";
-import { LOOK_ORDER, LOOKS } from "./looks";
+import { LOOK } from "./looks";
 import { LIFT_LINES, SCREEN_LINES } from "../world/lifts";
 import { colours, flipRows, PICTOGRAM, ROWS, SIGN_PICTOGRAMS } from "./text";
 
@@ -67,16 +67,13 @@ describe("the key pictogram (M3 C20, C24)", () => {
 });
 
 describe("colours", () => {
-  it("answers a lift panel's colours in every look, ink apart from background", () => {
+  it("answers a lift panel's colours, ink apart from background", () => {
     // Mutation caught: the `panel` case missing from the switch, which has
     // no default, so it answers undefined.
-    expect(LOOK_ORDER.length).toBeGreaterThan(0);
-    for (const id of LOOK_ORDER) {
-      const { background, ink } = colours("panel", LOOKS[id]);
-      expect(background).toHaveLength(3);
-      expect(ink).toHaveLength(3);
-      expect(ink).not.toEqual(background);
-    }
+    const { background, ink } = colours("panel", LOOK);
+    expect(background).toHaveLength(3);
+    expect(ink).toHaveLength(3);
+    expect(ink).not.toEqual(background);
   });
 });
 
@@ -84,12 +81,7 @@ describe("the station screen's text (M3 C20, C24)", () => {
   it("shares the terminal screen's colours, so the glass matches the text", () => {
     // Mutation caught: the `station` case given colours of its own, so the
     // screen's glass (drawn in the screen background) drifts from its text.
-    expect(LOOK_ORDER.length).toBeGreaterThan(0);
-    for (const id of LOOK_ORDER) {
-      expect(colours("station", LOOKS[id])).toEqual(
-        colours("screen", LOOKS[id]),
-      );
-    }
+    expect(colours("station", LOOK)).toEqual(colours("screen", LOOK));
   });
 });
 

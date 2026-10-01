@@ -18,7 +18,7 @@ import {
   createBuilder,
   type V3,
 } from "../../geometry";
-import { LOOKS } from "../../looks";
+import { LOOK } from "../../looks";
 import {
   positions,
   recordingKitAt,
@@ -39,12 +39,7 @@ import {
 /** The console built at the origin with every kit call recorded. */
 function consoleParts(): Part[] {
   const parts: Part[] = [];
-  buildInterior(
-    recordingKitAt(createBuilder(), parts),
-    "console",
-    0,
-    LOOKS.aperture,
-  );
+  buildInterior(recordingKitAt(createBuilder(), parts), "console", 0, LOOK);
   return parts;
 }
 function boundsOf(p: Part): { lo: V3; hi: V3; mid: V3 } {
@@ -190,7 +185,7 @@ describe("the rotor (2.6e C8, C9)", () => {
     // sliding sideways, tied to a fixture's fault frame, or built for a
     // wall piece as well as the console.
     const { piece, index } = consolePiece();
-    const m = rotorMover(piece, index, LOOKS.aperture);
+    const m = rotorMover(piece, index, LOOK);
     expect(m.key).toBe(`rotor:${String(index)}`);
     expect(m.part).toBe("rotor");
     expect(m.fixture).toBe(-1);
@@ -199,19 +194,19 @@ describe("the rotor (2.6e C8, C9)", () => {
     expect(m.pivot).toBeNull();
     expect(m.rest).toBe(1);
     expect(m.swing).toBe(0);
-    expect(buildInteriorMovers(piece, index, LOOKS.aperture)).toHaveLength(1);
+    expect(buildInteriorMovers(piece, index, LOOK)).toHaveLength(1);
     const wall = (consoleRoom().interior ?? []).find(
       (p) => p.kind !== "console",
     );
     expect(wall).toBeDefined();
-    if (wall) expect(buildInteriorMovers(wall, 0, LOOKS.aperture)).toEqual([]);
+    if (wall) expect(buildInteriorMovers(wall, 0, LOOK)).toEqual([]);
   });
 
   it("stands at rest on the column's base ring, inside the column, glowing", () => {
     // Mutation caught: a rotor built at the origin instead of the
     // console's anchor, one out past the ribs, or discs that do not glow.
     const { piece, index } = consolePiece();
-    const m = rotorMover(piece, index, LOOKS.aperture);
+    const m = rotorMover(piece, index, LOOK);
     const pts = positions(m.mesh);
     expect(pts.length).toBeGreaterThan(0);
     const cx = piece.x * CELL;

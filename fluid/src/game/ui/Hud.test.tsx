@@ -31,12 +31,7 @@ function mountedPrompt(): HTMLElement {
     frame: () => undefined,
     notice: () => undefined,
   };
-  render(
-    <Hud
-      view={view}
-      connector={{ active: false, label: "", look: "aperture" }}
-    />,
-  );
+  render(<Hud view={view} connector={{ active: false, label: "" }} />);
   if (prompt === null) throw new Error("no prompt element");
   return prompt;
 }
@@ -84,12 +79,7 @@ describe("the HUD's frame line", () => {
       },
       notice: () => undefined,
     };
-    render(
-      <Hud
-        view={view}
-        connector={{ active: false, label: "", look: "aperture" }}
-      />,
-    );
+    render(<Hud view={view} connector={{ active: false, label: "" }} />);
     return frame;
   }
 

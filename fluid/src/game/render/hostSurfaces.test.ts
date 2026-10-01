@@ -47,7 +47,7 @@ import { CELL } from "../world/units";
 import { VARIANT_COUNTS } from "../world/variants";
 import { createBuilder, type MeshData } from "./geometry";
 import { createKit } from "./kit";
-import { LOOKS } from "./looks";
+import { LOOK } from "./looks";
 import { clearAboveBox, placeMesh, upwardFaceAt } from "./modelChecks";
 import { buildDecor, buildFixture, type ModelContext } from "./models";
 import { buildHeroMesh } from "./models/heroes";
@@ -73,7 +73,7 @@ const BASE: RoomSpec = {
 
 /** A model context like `models.test.ts`'s stub: every text on one layer. */
 const CTX: ModelContext = {
-  look: LOOKS.aperture,
+  look: LOOK,
   ceiling: 3.0,
   hall: BASE.hall,
   textLayer: () => ({ layer: 0, v0: 0, v1: 1 }),
@@ -247,7 +247,7 @@ describe("host surfaces on their hosts' meshes", () => {
             turn: t,
             seed: 1,
           };
-          const mesh = placeMesh(buildPropMesh(kind, v, LOOKS.aperture), t, [
+          const mesh = placeMesh(buildPropMesh(kind, v, LOOK), t, [
             p.x * CELL,
             0,
             p.y * CELL,
@@ -275,7 +275,7 @@ describe("host surfaces on their hosts' meshes", () => {
     for (const t of TURNS)
       it(`${kind} at turn ${String(t)}`, () => {
         const h = heroAt(kind, t);
-        const mesh = placeMesh(buildHeroMesh(kind, 0, LOOKS.aperture), t, [
+        const mesh = placeMesh(buildHeroMesh(kind, 0, LOOK), t, [
           h.x * CELL,
           0,
           h.y * CELL,

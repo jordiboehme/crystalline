@@ -13,8 +13,7 @@
  * vertically by the quad's aspect and the quad squeezes it back. Labels
  * share a layer six to a layer, each drawn into its own row with the same
  * squeeze per row, as `layerPlan` in `layers.ts` lays them out. Terminals
- * use the look's terminal style: green phosphor on dark glass in the manner
- * of MU/TH/UR, or the C64's light blue on blue with upper-case characters.
+ * are green phosphor on dark glass.
  *
  * A line that starts with `KEY_MARK` (M3 C20, C24) is drawn with the key
  * pictogram (`SIGNS.key`) in front of it, one glyph wide and as tall as the
@@ -34,7 +33,7 @@ import {
   type TextKind,
   type TextRequest,
 } from "./layers";
-import { C64_PALETTE, type Look, type Rgb } from "./looks";
+import type { Look, Rgb } from "./looks";
 
 /** A copy of RGBA rows in reverse order. */
 export function flipRows(
@@ -76,17 +75,12 @@ export function colours(
   kind: TextKind,
   look: Look,
 ): { background: Rgb; ink: Rgb } {
-  const petscii = look.terminal === "petscii";
   switch (kind) {
     case "screen":
     case "station":
       return {
-        background: petscii
-          ? (C64_PALETTE[6] ?? look.palette.screen)
-          : look.palette.screen,
-        ink: petscii
-          ? (C64_PALETTE[14] ?? look.palette.screenText)
-          : look.palette.screenText,
+        background: look.palette.screen,
+        ink: look.palette.screenText,
       };
     case "placard":
     case "poster":
@@ -98,7 +92,7 @@ export function colours(
       return { background: [0.05, 0.05, 0.06], ink: [1, 1, 1] };
     case "panel":
       // A lift's call panel: amber stop names on black, like a lit floor
-      // indicator, the same in every look.
+      // indicator.
       return { background: [0.03, 0.03, 0.035], ink: [1, 0.72, 0.28] };
   }
 }
@@ -171,10 +165,7 @@ function drawRequest(
 ) {
   const aspect = ASPECT[request.kind];
   const logicalHeight = size / aspect;
-  const petscii = look.terminal === "petscii";
-  const lines = petscii
-    ? request.lines.map((l) => l.toUpperCase())
-    : request.lines;
+  const lines = request.lines;
   const { background, ink } = colours(request.kind, look);
 
   ctx.save();

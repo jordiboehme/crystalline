@@ -33,7 +33,7 @@ import {
   stationOfPlace,
 } from "./paths";
 import { BLINK_CHANNELS, createBlink } from "./render/blink";
-import { LOOK_ORDER, LOOKS } from "./render/looks";
+import { LOOK } from "./render/looks";
 import type { Camera, Renderer } from "./render/renderer";
 import {
   INVERT_KEY,
@@ -447,22 +447,14 @@ describe("go", () => {
     serve();
     const session = start();
     session.go({ kind: "engram", domain: "eng", permalink: "alpha" });
-    expect(hud.connector).toHaveBeenLastCalledWith(
-      true,
-      "alpha",
-      expect.any(String),
-    );
+    expect(hud.connector).toHaveBeenLastCalledWith(true, "alpha");
     await vi.waitFor(() => {
       expect(navigate).toHaveBeenCalledTimes(1);
     });
     expect(navigate).toHaveBeenCalledWith("/%CF%80/d/eng/e/alpha");
     expect(roomsSet()).toEqual(["alpha"]);
     expect(session.current).toEqual(engramAt("eng", "alpha"));
-    expect(hud.connector).toHaveBeenLastCalledWith(
-      false,
-      "alpha",
-      expect.any(String),
-    );
+    expect(hud.connector).toHaveBeenLastCalledWith(false, "alpha");
   });
 
   it("lets a second go win over one still in flight", async () => {
@@ -505,22 +497,17 @@ describe("go", () => {
     const session = start();
     session.go({ kind: "engram", domain: "eng", permalink: "alpha" });
     session.dispose();
-    expect(hud.connector).toHaveBeenLastCalledWith(
-      false,
-      "alpha",
-      expect.any(String),
-    );
+    expect(hud.connector).toHaveBeenLastCalledWith(false, "alpha");
     expect(hud.reader).toHaveBeenLastCalledWith(null);
   });
 
-  it("keeps the connector in the game's look while loading, whatever digit is pressed", () => {
+  it("keeps the connector as it is while loading, whatever digit is pressed", () => {
     // Mutation caught: a look key read again while a place loads (the
-    // connector would be redrawn in the day shift's or the third look's
-    // colours).
+    // connector would be redrawn).
     serve({ "/domains/eng/engrams/alpha": () => new Promise(() => {}) });
     const session = start();
     session.go({ kind: "engram", domain: "eng", permalink: "alpha" });
-    expect(hud.connector).toHaveBeenLastCalledWith(true, "alpha", "aperture");
+    expect(hud.connector).toHaveBeenLastCalledWith(true, "alpha");
     const calls = hud.connector.mock.calls.length;
     for (const code of ["Digit1", "Digit2", "Digit3", "Digit4"]) {
       key("keydown", code);
@@ -528,7 +515,7 @@ describe("go", () => {
       key("keyup", code);
     }
     expect(hud.connector.mock.calls.length).toBe(calls);
-    expect(hud.connector).toHaveBeenLastCalledWith(true, "alpha", "aperture");
+    expect(hud.connector).toHaveBeenLastCalledWith(true, "alpha");
   });
 
   it("warms the cache once for the place behind a door the player walks up to", async () => {
@@ -694,21 +681,13 @@ describe("a load in flight", () => {
     key("keyup", "ArrowLeft");
     frames(5);
     expect(hud.prompt).toHaveBeenLastCalledWith("SPACE CRAWL Beta relates_to");
-    expect(hud.connector).toHaveBeenLastCalledWith(
-      false,
-      "alpha",
-      expect.any(String),
-    );
+    expect(hud.connector).toHaveBeenLastCalledWith(false, "alpha");
     expect(roomsSet()).toEqual(["alpha"]);
 
     // A fresh use in the new room still crawls back.
     key("keydown", "Space");
     frames(1);
-    expect(hud.connector).toHaveBeenLastCalledWith(
-      true,
-      "Beta",
-      expect.any(String),
-    );
+    expect(hud.connector).toHaveBeenLastCalledWith(true, "Beta");
   });
 
   it("forgets a use pressed while loading when the load fails", async () => {
@@ -771,10 +750,9 @@ describe("a room the renderer refuses", () => {
     expect(eyeAt()[1]).toBeLessThan(before[1] - 0.5);
   });
 
-  it("never switches the look from a key: the room stays in Aperture grid and the status names no look", () => {
+  it("never switches the look from a key: the room stays in the one look", () => {
     // Mutation caught: the digit keys mapped to looks again (the room would
-    // be handed to the renderer a second time, in another look), or the
-    // look's name put back on the status line.
+    // be handed to the renderer a second time).
     const session = start({ client: null });
     session.showCanned(CANNED_BRIDGE);
     frames(1);
@@ -788,13 +766,9 @@ describe("a room the renderer refuses", () => {
       frames(1);
     }
     expect(renderer.setRoom.mock.calls.length).toBe(rooms);
-    for (const [, look] of renderer.setRoom.mock.calls)
-      expect(look.id).toBe("aperture");
+    for (const [, look] of renderer.setRoom.mock.calls) expect(look).toBe(LOOK);
     expect(hud.notice).not.toHaveBeenCalled();
     expect(hud.status).toHaveBeenCalled();
-    for (const [text] of hud.status.mock.calls)
-      for (const id of LOOK_ORDER)
-        expect(text).not.toContain(LOOKS[id].name.toUpperCase());
     expect(session.current).toEqual(engramAt("station", "manifest"));
   });
 });
@@ -1033,7 +1007,6 @@ describe("the reader", () => {
       title: "Station Crystalline",
       content: CANNED_BRIDGE.content,
       section: { heading: "Scope", occurrence: 0 },
-      look: "aperture",
     });
     frames(10);
 
@@ -1510,13 +1483,8 @@ describe("the level cheat", () => {
     expect(openFluid).not.toHaveBeenCalled();
     expect(hud.reader).not.toHaveBeenCalled();
     expect(renderer.setRoom.mock.calls.length).toBe(rooms);
-    // No key switches the look, so Digit1 does nothing here either, and
-    // the status line names no look.
+    // No key switches the look, so Digit1 does nothing here either.
     expect(hud.status).toHaveBeenCalled();
-    for (const [text] of hud.status.mock.calls) {
-      for (const id of LOOK_ORDER)
-        expect(text).not.toContain(LOOKS[id].name.toUpperCase());
-    }
 
     // Closed: nothing typed inside comes back as a command or a step.
     session.closeLevels();
@@ -1582,11 +1550,7 @@ describe("the level cheat", () => {
     session.jump("eng");
     expect(levels).toHaveBeenLastCalledWith(false);
     // The connector names the domain, not the bridge's permalink (C10).
-    expect(hud.connector).toHaveBeenLastCalledWith(
-      true,
-      "eng",
-      expect.any(String),
-    );
+    expect(hud.connector).toHaveBeenLastCalledWith(true, "eng");
     await vi.waitFor(() => {
       expect(navigate).toHaveBeenCalledTimes(2);
     });
@@ -1595,11 +1559,7 @@ describe("the level cheat", () => {
     expect(roomsSet()).toEqual(["alpha", "manifest"]);
     // The connector's closing call names the domain too, not just the
     // opening one.
-    expect(hud.connector).toHaveBeenCalledWith(
-      false,
-      "eng",
-      expect.any(String),
-    );
+    expect(hud.connector).toHaveBeenCalledWith(false, "eng");
   });
 
   it("closes the select on a go from outside and on dispose", () => {
@@ -1823,11 +1783,7 @@ describe("malfunctions", () => {
     expect(lastDoors().get(`door:${String(door1)}`)).toBe(1);
     walkIn();
     await flush();
-    expect(hud.connector).toHaveBeenLastCalledWith(
-      false,
-      expect.any(String),
-      expect.any(String),
-    );
+    expect(hud.connector).toHaveBeenLastCalledWith(false, expect.any(String));
     expect(hud.notice).toHaveBeenCalledWith("ACCESS DENIED");
 
     const mark = renderer.draw.mock.calls.length;
@@ -2323,7 +2279,7 @@ describe("the console room", () => {
     walkIn();
     await flush();
     backOut();
-    expect(hud.connector).toHaveBeenCalledWith(true, "ops", expect.any(String));
+    expect(hud.connector).toHaveBeenCalledWith(true, "ops");
     await vi.waitFor(() => {
       expect(navigate).toHaveBeenCalledWith("/%CF%80/d/ops");
     });
@@ -2999,11 +2955,7 @@ describe("station addresses (M3)", () => {
     for (let t = 0; t < 80 && hud.connector.mock.calls.length === 0; t++)
       frames(1);
     key("keyup", "KeyW");
-    expect(hud.connector).toHaveBeenCalledWith(
-      true,
-      door.label,
-      expect.any(String),
-    );
+    expect(hud.connector).toHaveBeenCalledWith(true, door.label);
   });
 
   it("says where the player is, as the status line does (M4's pause screen)", async () => {
@@ -3305,11 +3257,7 @@ describe("the lifts and the exit (M3 C26 to C29)", () => {
     const t0 = now;
     session.ride(i);
     expect(onLift).toHaveBeenLastCalledWith(null);
-    expect(hud.connector).toHaveBeenLastCalledWith(
-      true,
-      stop.label,
-      expect.any(String),
-    );
+    expect(hud.connector).toHaveBeenLastCalledWith(true, stop.label);
     crank(200);
     settled.resolve(await stationLoad(stop.to, new AbortController().signal));
     await flush();
@@ -3321,11 +3269,7 @@ describe("the lifts and the exit (M3 C26 to C29)", () => {
     expect(landedAt).not.toBeNull();
     expect(landedAt ?? 0).toBeGreaterThanOrEqual(t0 + LIFT_RIDE_MS);
     expect(landedAt ?? 0).toBeLessThan(t0 + LIFT_RIDE_MS + 3 * TICK_MS);
-    expect(hud.connector).toHaveBeenLastCalledWith(
-      false,
-      stop.label,
-      expect.any(String),
-    );
+    expect(hud.connector).toHaveBeenLastCalledWith(false, stop.label);
     const bridge = lastRoom();
     if (bridge === undefined) throw new Error("no room");
     const lift = bridge.fixtures.findIndex((f) => f.kind === "lift");
@@ -3450,11 +3394,7 @@ describe("the lifts and the exit (M3 C26 to C29)", () => {
     const rooms = renderer.setRoom.mock.calls.length;
     session.ride(here);
     expect(onLift).toHaveBeenLastCalledWith(null);
-    expect(hud.connector).not.toHaveBeenCalledWith(
-      true,
-      stops[here]?.label,
-      expect.any(String),
-    );
+    expect(hud.connector).not.toHaveBeenCalledWith(true, stops[here]?.label);
     expect(renderer.setRoom.mock.calls.length).toBe(rooms);
     expect(session.current).toEqual(DECK_AT);
   });
@@ -3658,11 +3598,7 @@ describe("the pause (M4 C6 to C9)", () => {
     session.showCanned(CANNED_BRIDGE);
     frames(1);
     session.go({ kind: "airlock" });
-    expect(hud.connector).toHaveBeenLastCalledWith(
-      true,
-      expect.any(String),
-      expect.any(String),
-    );
+    expect(hud.connector).toHaveBeenLastCalledWith(true, expect.any(String));
     lock();
     unlock();
     expect(onPause).toHaveBeenLastCalledWith(true);
@@ -3702,11 +3638,7 @@ describe("the pause (M4 C6 to C9)", () => {
     frames(35);
     expect(lastCamera().eye).toEqual(eye);
     expect(lastDoors().get(`door:${String(i)}`) ?? 0).toBe(shut);
-    expect(hud.connector).not.toHaveBeenCalledWith(
-      true,
-      expect.any(String),
-      expect.any(String),
-    );
+    expect(hud.connector).not.toHaveBeenCalledWith(true, expect.any(String));
 
     session.resume();
     expect(onPause).toHaveBeenLastCalledWith(false);

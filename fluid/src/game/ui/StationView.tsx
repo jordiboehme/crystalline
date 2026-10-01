@@ -79,7 +79,6 @@ export function StationView({
           title={reader.title}
           markdown={reader.content}
           section={reader.section}
-          look={reader.look === "freescape" ? "petscii" : "phosphor"}
           onClose={onCloseReader}
           onOpenFluid={onOpenFluid}
         />

@@ -33,12 +33,11 @@
  * level, their slot their kind's blink bank. The group's family picks the
  * builder (`buildGroupMesh`). Each kind and variant the room
  * needs is built once as its own mesh in the look's colours and kept in a
- * cache keyed by the group's key; the cache is cleared when the look's id
- * changes and otherwise grows lazily, bounded by the prop, hero, curio and
+ * cache keyed by the group's key; the cache is cleared when the look
+ * object changes and otherwise grows lazily, bounded by the prop, hero, curio and
  * fitting catalogues. The condition does not enter the key: it changes only
  * grime and light scale, never the palette a mesh is coloured from (a look test
- * pins that). The look is fixed in play; only a dev page picks another,
- * at its start. The room's instance buffers depend only on the room, so a
+ * pins that). The room's instance buffers depend only on the room, so a
  * `setRoom` with the very same room object in a new look keeps them and
  * only rebuilds the small vertex arrays that bind them to the new look's
  * meshes.
@@ -77,14 +76,7 @@ import { buildRoomMesh, type MeshData, type V3 } from "./geometry";
 import { instanceGroups } from "./instances";
 import { LAYER, LAYER_SIZE, layerPlan } from "./layers";
 import { fillLightTexels, lightGrid, type LightGrid } from "./lightgrid";
-import {
-  C64_PALETTE,
-  accentFor,
-  applyCondition,
-  propLook,
-  type Look,
-  type LookId,
-} from "./looks";
+import { accentFor, applyCondition, propLook, type Look } from "./looks";
 import type { MoverPart } from "./models";
 import { buildCurioMesh } from "./models/curios";
 import { buildHeroMesh } from "./models/heroes";
@@ -293,7 +285,7 @@ export function createRenderer(
   let accents = new Float32Array(0);
   let room: RoomSpec | null = null;
   let look: Look | null = null;
-  let meshLook: LookId | null = null;
+  let meshLook: Look | null = null;
   const groupMeshes = new Map<string, VertexBuffer>();
   let groups: GpuGroup[] = [];
   let targets: Targets | null = null;
@@ -301,7 +293,6 @@ export function createRenderer(
   const projection = mat4();
   const view = mat4();
   const viewProjection = mat4();
-  const palette = new Float32Array(C64_PALETTE.flatMap((c) => [...c]));
   // The static room and the movers leave the instance attributes
   // disabled, so they read these generic values: offset 0 and turn 0.
   gl.vertexAttrib3f(INSTANCE_OFFSET_LOCATION, 0, 0, 0);
@@ -469,7 +460,7 @@ export function createRenderer(
       // again): its instance buffers stay. This is read before anything
       // is released.
       const sameRoom = nextRoom === room;
-      const lookChanged = nextLook.id !== meshLook;
+      const lookChanged = nextLook !== meshLook;
       const nextGroups = sameRoom ? null : instanceGroups(nextRoom);
       const needed: readonly GroupMesh[] =
         nextGroups ?? groups.map((g) => g.id);
@@ -487,7 +478,7 @@ export function createRenderer(
       releaseGroupMeshes();
       if (lookChanged) {
         releaseGroupCache();
-        meshLook = nextLook.id;
+        meshLook = nextLook;
       }
       if (nextGroups !== null) {
         releaseGroups();
@@ -650,7 +641,6 @@ export function createRenderer(
         shadow?.d ?? 1,
       );
       gl.uniform1f(scene.uniform("uContactShadow"), look.contactShadow ?? 0);
-      gl.uniform1f(scene.uniform("uTextureMix"), look.textureMix);
       gl.uniform3f(scene.uniform("uEdgeColour"), ...look.edge.colour);
       gl.uniform1f(scene.uniform("uEdgeStrength"), look.edge.strength);
       gl.uniform1f(scene.uniform("uEdgeWidth"), look.edge.width);
@@ -732,8 +722,6 @@ export function createRenderer(
         composite.uniform("uToneMap"),
         caps.color === "rgba16f" ? 1 : 0,
       );
-      gl.uniform1i(composite.uniform("uDither"), look.dither ? 1 : 0);
-      gl.uniform3fv(composite.uniform("uPalette"), palette);
       fullscreen.draw();
       // Unbind the bloom from unit 1 and the scene from unit 0: the next
       // frame renders into both.

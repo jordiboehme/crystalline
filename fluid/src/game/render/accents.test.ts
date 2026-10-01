@@ -27,7 +27,7 @@ import {
 } from "./geometry";
 import { createKit } from "./kit";
 import { layerPlan } from "./layers";
-import { LOOKS } from "./looks";
+import { LOOK, type Look } from "./looks";
 import { buildFixture, type ModelContext } from "./models";
 import { buildCurioMesh } from "./models/curios";
 import { buildHeroMesh } from "./models/heroes";
@@ -63,7 +63,7 @@ function tints(m: MeshData): [number, number, number][] {
 function contextFor(room: RoomSpec): ModelContext {
   const plan = layerPlan(room);
   return {
-    look: LOOKS.aperture,
+    look: LOOK,
     ceiling: room.ceiling,
     hall: room.hall,
     textLayer: (key) => plan.lookup(key),
@@ -74,18 +74,20 @@ function contextFor(room: RoomSpec): ModelContext {
 const marked = (m: MeshData) => tints(m).some((t) => t[0] === ACCENT_MARK);
 
 describe("the room's accent (2.7 C9)", () => {
-  it("puts the room's accent on the six kinds' small parts in every variant, and nowhere else in the set dressing, in every look without the props' own accents", () => {
+  it("puts the room's accent on the six kinds' small parts in every variant, and nowhere else in the set dressing, without the props' own accents", () => {
     // Mutation caught: an accented kind without its part, or the accent on
-    // a kind that should not carry it. Look 2 gives each prop its own
-    // accent instead (`propLook.test.ts`).
+    // a kind that should not carry it. The station's look gives each prop
+    // its own accent instead (`propLook.test.ts`), so this runs on a copy
+    // of it without that setting.
     expect(PROP_KINDS.length).toBeGreaterThan(0);
-    for (const look of [LOOKS.day, LOOKS.freescape])
-      for (const kind of PROP_KINDS)
-        for (let v = 0; v < PROP_CATALOGUE[kind].variants; v++)
-          expect(
-            marked(buildPropMesh(kind, v, look)),
-            `${look.id} ${kind} variant ${String(v)}`,
-          ).toBe((ACCENTED as readonly string[]).includes(kind));
+    const plain: Look = { ...LOOK };
+    delete plain.propAccents;
+    for (const kind of PROP_KINDS)
+      for (let v = 0; v < PROP_CATALOGUE[kind].variants; v++)
+        expect(
+          marked(buildPropMesh(kind, v, plain)),
+          `${kind} variant ${String(v)}`,
+        ).toBe((ACCENTED as readonly string[]).includes(kind));
   });
 
   it("never puts the room's accent on a hero, a curio, a fitting, a way, a poster, the placard or a tag strip", () => {
@@ -96,21 +98,21 @@ describe("the room's accent (2.7 C9)", () => {
     for (const kind of HERO_KINDS)
       for (let v = 0; v < HERO_CATALOGUE[kind].variants; v++)
         expect(
-          marked(buildHeroMesh(kind, v, LOOKS.aperture)),
+          marked(buildHeroMesh(kind, v, LOOK)),
           `${kind} variant ${String(v)}`,
         ).toBe(false);
     expect(CURIO_KINDS.length).toBeGreaterThan(0);
     for (const kind of CURIO_KINDS)
       for (let v = 0; v < CURIO_CATALOGUE[kind].sizes.length; v++)
         expect(
-          marked(buildCurioMesh(kind, v, LOOKS.aperture)),
+          marked(buildCurioMesh(kind, v, LOOK)),
           `${kind} variant ${String(v)}`,
         ).toBe(false);
     expect(INTERIOR_KINDS.length).toBeGreaterThan(0);
     for (const kind of INTERIOR_KINDS)
       for (let v = 0; v < INTERIOR_CATALOGUE[kind].variants; v++)
         expect(
-          marked(buildInteriorMesh(kind, v, LOOKS.aperture)),
+          marked(buildInteriorMesh(kind, v, LOOK)),
           `${kind} variant ${String(v)}`,
         ).toBe(false);
     const room = generateRoom(CANNED_HUB);

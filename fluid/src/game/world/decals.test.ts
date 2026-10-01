@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { LOOKS } from "../render/looks";
+import { LOOK } from "../render/looks";
 import { normals, positions } from "../render/modelChecks";
 import { HOUSING_DEPTH } from "../render/models/doors";
 import { buildPropMesh } from "../render/models/props";
@@ -615,7 +615,7 @@ describe("the decal hand tables against the meshes (2.7 Task 10 Step 3b)", () =>
       expect(bottoms.length).toBe(PROP_CATALOGUE[kind].variants);
       bottoms.forEach((h, v) => {
         const low = Math.min(
-          ...positions(buildPropMesh(kind, v, LOOKS.aperture)).map((p) => p[1]),
+          ...positions(buildPropMesh(kind, v, LOOK)).map((p) => p[1]),
         );
         expect(Math.abs(low - h), `${kind} ${String(v)}`).toBeLessThanOrEqual(
           TOL,
@@ -642,7 +642,7 @@ describe("the decal hand tables against the meshes (2.7 Task 10 Step 3b)", () =>
         expect(size).toBeDefined();
         // Built at turn 0 facing north: the front face looks along -z, at
         // z = -(depth / 2 - inset).
-        const mesh = buildPropMesh(kind, v, LOOKS.aperture);
+        const mesh = buildPropMesh(kind, v, LOOK);
         const pos = positions(mesh);
         const nor = normals(mesh);
         const plane = -(size!.depth / 2 - face.inset);

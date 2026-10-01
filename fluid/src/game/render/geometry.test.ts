@@ -52,7 +52,7 @@ import {
 } from "./geometry";
 import { DECAL_LIFT, createKit } from "./kit";
 import { LAYER, TEXT_BASE, layerPlan } from "./layers";
-import { LOOKS, accentFor, propLook, type Rgb } from "./looks";
+import { LOOK, accentFor, propLook, type Rgb } from "./looks";
 import { positions, worstWinding } from "./modelChecks";
 import { buildHeroMesh } from "./models/heroes";
 import { buildInteriorMesh } from "./models/interior";
@@ -105,7 +105,7 @@ const ROOMS: [string, PlaceInput][] = [
 for (const [name, place] of ROOMS) {
   describe(`buildRoomMesh: ${name}`, () => {
     const room = generateRoom(place);
-    const built = buildRoomMesh(room, LOOKS.day);
+    const built = buildRoomMesh(room, LOOK);
     const meshes = [built.static, ...built.movers.map((m) => m.mesh)];
     const plan = layerPlan(room);
 
@@ -218,7 +218,7 @@ for (const [name, place] of ROOMS) {
     });
 
     it("is the same every time", () => {
-      const again = buildRoomMesh(room, LOOKS.day).static.vertices;
+      const again = buildRoomMesh(room, LOOK).static.vertices;
       const first = built.static.vertices;
       expect(again.length).toBe(first.length);
       // A plain loop: toEqual on millions of floats is too slow for the hub.
@@ -236,7 +236,7 @@ describe("buildRoomMesh details", () => {
     // under its iris light, or a ring piece or shell face wound the wrong
     // way.
     const airlock = airlockRoom({ domains: CANNED_DOMAINS, here: null });
-    const mesh = buildRoomMesh(airlock, LOOKS.day).static;
+    const mesh = buildRoomMesh(airlock, LOOK).static;
     expect(mesh.count).toBeGreaterThan(0);
     expect(worstWinding(mesh)).toBeGreaterThan(0.999);
     expect(all(mesh).filter((v) => v.flag === FLAG.lamp)).toEqual([]);
@@ -244,7 +244,7 @@ describe("buildRoomMesh details", () => {
       expect(v.pos[1]).toBeLessThanOrEqual(airlock.ceiling + EPS);
     // The console room, whose light has no iris, still hangs its lamps.
     expect(
-      all(buildRoomMesh(consoleRoom(), LOOKS.day).static).some(
+      all(buildRoomMesh(consoleRoom(), LOOK).static).some(
         (v) => v.flag === FLAG.lamp,
       ),
     ).toBe(true);
@@ -252,14 +252,14 @@ describe("buildRoomMesh details", () => {
 
   it("keeps everything under a low ceiling", () => {
     const room: RoomSpec = { ...generateRoom(CANNED_BRIDGE), ceiling: 3 };
-    for (const v of all(buildRoomMesh(room, LOOKS.day).static)) {
+    for (const v of all(buildRoomMesh(room, LOOK).static)) {
       expect(v.pos[1]).toBeLessThanOrEqual(room.ceiling + EPS);
     }
   });
 
   it("has a portal surface, door frames and lamps", () => {
     // The portal surface is a mover (its disc), so the movers count too.
-    const built = buildRoomMesh(generateRoom(CANNED_BRIDGE), LOOKS.day);
+    const built = buildRoomMesh(generateRoom(CANNED_BRIDGE), LOOK);
     const flags = new Set(
       [built.static, ...built.movers.map((m) => m.mesh)].flatMap((m) =>
         all(m).map((v) => v.flag),
@@ -272,7 +272,7 @@ describe("buildRoomMesh details", () => {
 
   it("puts a lintel over every doorway between the hall and a bay or the corridor", () => {
     const room = generateRoom(CANNED_HUB);
-    const tris = triangles(buildRoomMesh(room, LOOKS.day).static);
+    const tris = triangles(buildRoomMesh(room, LOOK).static);
     // Lintel triangles: vertical, from LINTEL up to the ceiling.
     const lintels = tris.filter(([a, b, c]) => {
       const ys = [a.pos[1], b.pos[1], c.pos[1]];
@@ -332,7 +332,7 @@ describe("buildRoomMesh details", () => {
     };
     const boxes = room.scaffold;
     expect(boxes.length).toBeGreaterThan(0);
-    const vs = all(buildRoomMesh(room, LOOKS.day).static);
+    const vs = all(buildRoomMesh(room, LOOK).static);
     const metal = vs.filter((v) => v.layer === LAYER.metal);
     expect(metal.length).toBeGreaterThan(0);
     const inside = (v: Vertex) =>
@@ -374,7 +374,7 @@ describe("buildRoomMesh details", () => {
         decor: [],
       };
       expect(room.condition).not.toBe("construction");
-      const metal = all(buildRoomMesh(room, LOOKS.day).static).filter(
+      const metal = all(buildRoomMesh(room, LOOK).static).filter(
         (v) => v.layer === LAYER.metal,
       );
       expect(metal).toHaveLength(0);
@@ -382,9 +382,9 @@ describe("buildRoomMesh details", () => {
   });
 
   it("tints the cross-domain portal in the look's other portal colour", () => {
-    const alt = LOOKS.day.palette.portalAlt;
+    const alt = LOOK.palette.portalAlt;
     // The portal surface is its disc, a mover.
-    const built = buildRoomMesh(generateRoom(CANNED_BRIDGE), LOOKS.day);
+    const built = buildRoomMesh(generateRoom(CANNED_BRIDGE), LOOK);
     const portal = built.movers
       .filter((m) => m.part === "disc")
       .flatMap((m) => all(m.mesh))
@@ -405,7 +405,7 @@ describe("buildRoomMesh's hero movers", () => {
       h.kind === "police-box" ? [i] : [],
     );
     expect(boxes.length).toBeGreaterThan(0);
-    const { movers } = buildRoomMesh(room, LOOKS.aperture);
+    const { movers } = buildRoomMesh(room, LOOK);
     const wings = movers.filter((m) => m.part === "wing");
     expect(wings.length).toBe(2 * boxes.length);
     expect(new Set(wings.map((m) => m.key))).toEqual(
@@ -432,33 +432,31 @@ describe("the console room's shell (2.6e C4)", () => {
   it("draws the floor, the ceiling and the walls in the room's own tints in every look", () => {
     // Mutation caught: the shell of a room with fittings drawn in the
     // look's palette, so the console room's colours change with the look.
-    for (const look of Object.values(LOOKS)) {
-      const m = buildRoomMesh(consoleRoom(), look).static;
-      const floor = floorOf(m);
-      expect(floor.length).toBeGreaterThan(0);
-      for (const v of floor) expectTint(v.tint, CONSOLE_SHELL.floor);
-      const ceiling = all(m).filter((v) => v.layer === LAYER.ceiling);
-      const panels = ceiling.filter((v) => v.flag === FLAG.shell);
-      expect(panels.length).toBeGreaterThan(0);
-      for (const v of panels) expectTint(v.tint, CONSOLE_SHELL.ceiling);
-      const walls = all(m).filter(
-        (v) => v.layer === LAYER.panel && Math.abs(v.normal[1]) < EPS,
-      );
-      expect(walls.length).toBeGreaterThan(0);
-      for (const v of walls) expectTint(v.tint, CONSOLE_SHELL.wall);
-    }
+    const look = LOOK;
+    const m = buildRoomMesh(consoleRoom(), look).static;
+    const floor = floorOf(m);
+    expect(floor.length).toBeGreaterThan(0);
+    for (const v of floor) expectTint(v.tint, CONSOLE_SHELL.floor);
+    const ceiling = all(m).filter((v) => v.layer === LAYER.ceiling);
+    const panels = ceiling.filter((v) => v.flag === FLAG.shell);
+    expect(panels.length).toBeGreaterThan(0);
+    for (const v of panels) expectTint(v.tint, CONSOLE_SHELL.ceiling);
+    const walls = all(m).filter(
+      (v) => v.layer === LAYER.panel && Math.abs(v.normal[1]) < EPS,
+    );
+    expect(walls.length).toBeGreaterThan(0);
+    for (const v of walls) expectTint(v.tint, CONSOLE_SHELL.wall);
   });
 
   it("leaves a generated room's floor in the look's own colour", () => {
     // Mutation caught: every room's shell drawn in the console room's
     // tints.
-    for (const look of Object.values(LOOKS)) {
-      const floor = floorOf(
-        buildRoomMesh(generateRoom(CANNED_BRIDGE), look).static,
-      );
-      expect(floor.length).toBeGreaterThan(0);
-      for (const v of floor) expectTint(v.tint, look.palette.floor);
-    }
+    const look = LOOK;
+    const floor = floorOf(
+      buildRoomMesh(generateRoom(CANNED_BRIDGE), look).static,
+    );
+    expect(floor.length).toBeGreaterThan(0);
+    for (const v of floor) expectTint(v.tint, look.palette.floor);
   });
 });
 
@@ -466,7 +464,7 @@ describe("the console room's movers and size (2.6e C9, C19)", () => {
   it("gives the console room exactly one mover, the rotor, and it stays inside the column (2.6e C9)", () => {
     // Mutation caught: a second moving part (the doors, the scanner), or the
     // rotor travelling through the column's top ring.
-    const { movers } = buildRoomMesh(consoleRoom(), LOOKS.aperture);
+    const { movers } = buildRoomMesh(consoleRoom(), LOOK);
     expect(movers.map((m) => m.part)).toEqual(["rotor"]);
     const m = movers[0]!;
     const top = Math.max(...positions(m.mesh).map((p) => p[1])) + m.travel;
@@ -481,9 +479,9 @@ describe("the console room's movers and size (2.6e C9, C19)", () => {
     // Mutation caught: a fitting or the shell grown past the room's share
     // of the frame.
     const room = consoleRoom();
-    const { static: s, movers } = buildRoomMesh(room, LOOKS.aperture);
+    const { static: s, movers } = buildRoomMesh(room, LOOK);
     const pieces = (room.interior ?? []).reduce(
-      (n, p) => n + buildInteriorMesh(p.kind, p.variant, LOOKS.aperture).count,
+      (n, p) => n + buildInteriorMesh(p.kind, p.variant, LOOK).count,
       0,
     );
     const total =
@@ -564,7 +562,7 @@ describe("the accent stripe (2.7 C8, C9)", () => {
     // lintel, at the wrong height, or tinted with a real colour instead of
     // the accent mark.
     const room = generateRoom(CANNED_BRIDGE);
-    const stripes = stripeQuads(buildRoomMesh(room, LOOKS.aperture).static);
+    const stripes = stripeQuads(buildRoomMesh(room, LOOK).static);
     expect(stripes.length).toBeGreaterThan(0);
     const fixtureEdges = new Set(room.fixtures.map((f) => edgeKey(f.slot)));
     const entrance = edgeKey({ ...room.entrance, side: "s" });
@@ -586,17 +584,12 @@ describe("the accent stripe (2.7 C8, C9)", () => {
   it("uploads the look's accent at the room's index, and draws no stripe in the console room (Review Focus 5)", () => {
     // Mutation caught: the stripe drawn in a room with fittings, or the
     // accent read from another look.
-    expect(
-      stripeQuads(buildRoomMesh(consoleRoom(), LOOKS.aperture).static),
-    ).toEqual([]);
+    expect(stripeQuads(buildRoomMesh(consoleRoom(), LOOK).static)).toEqual([]);
     const room = {
       ...generateRoom(CANNED_BRIDGE),
       finish: { ...plainFinish(0), accent: 3 },
     };
-    expect(accentFor(room, LOOKS.freescape)).toEqual(
-      LOOKS.freescape.accents[3],
-    );
-    expect(accentFor(room, LOOKS.aperture)).toEqual(LOOKS.aperture.accents[3]);
+    expect(accentFor(room, LOOK)).toEqual(LOOK.accents[3]);
   });
 
   it("holds UNDER_STRIPE to exactly the wall props and wall heroes with a face under the stripe (2.7 C9)", () => {
@@ -607,15 +600,13 @@ describe("the accent stripe (2.7 C8, C9)", () => {
     for (const kind of PROP_KINDS) {
       if (PROP_CATALOGUE[kind].anchor !== "wall") continue;
       for (let v = 0; v < PROP_CATALOGUE[kind].variants; v++)
-        if (underStripe(buildPropMesh(kind, v, LOOKS.aperture)))
-          props.add(kind);
+        if (underStripe(buildPropMesh(kind, v, LOOK))) props.add(kind);
     }
     const heroes = new Set<string>();
     for (const kind of HERO_KINDS) {
       if (HERO_FOOTING[kind] === "free") continue;
       for (let v = 0; v < HERO_CATALOGUE[kind].variants; v++)
-        if (underStripe(buildHeroMesh(kind, v, LOOKS.aperture)))
-          heroes.add(kind);
+        if (underStripe(buildHeroMesh(kind, v, LOOK))) heroes.add(kind);
     }
     expect(props).toEqual(new Set(UNDER_STRIPE.props));
     expect(heroes).toEqual(new Set(UNDER_STRIPE.heroes));
@@ -640,7 +631,7 @@ describe("the accent stripe (2.7 C8, C9)", () => {
           .map((p) => edgeKey(edgeOf(p))),
       );
       covered += edges.size;
-      const stripes = stripeQuads(buildRoomMesh(room, LOOKS.aperture).static);
+      const stripes = stripeQuads(buildRoomMesh(room, LOOK).static);
       expect(stripes.length).toBeGreaterThan(0);
       // A single-edge wall prop lies inside its own edge, so a stripe on
       // any other edge cannot overlap it.
@@ -703,12 +694,12 @@ function wallQuads(m: MeshData): {
 describe("wall patterns (2.7 C11)", () => {
   it("gives each bay and the corridor a pattern of their own, on the built walls (Review Focus 1)", () => {
     // Mutation caught: every wall on the hall's layer, a bay's walls on the
-    // hall's pattern, or the pattern's uv scale left out (Aperture's seams
+    // hall's pattern, or the pattern's uv scale left out (the seams
     // would not move).
     const room = generateRoom(CANNED_HUB);
     expect(room.bays.length).toBeGreaterThan(0);
     expect(room.corridor).not.toBeNull();
-    const walls = wallQuads(buildRoomMesh(room, LOOKS.aperture).static);
+    const walls = wallQuads(buildRoomMesh(room, LOOK).static);
     expect(walls.length).toBeGreaterThan(0);
     for (const w of walls) {
       const want = WALL_PATTERN_LOOK[wallPatternOf(room, w.cx, w.cy)]!;
@@ -736,7 +727,7 @@ describe("the decals in the static mesh (2.7 C20, C21)", () => {
     // Mutation caught: `buildRoomMesh` never calling the decal recipe, or
     // the hand-built rooms drawing decals they do not have.
     const count = (room: RoomSpec) => {
-      const m = buildRoomMesh(room, LOOKS.aperture).static;
+      const m = buildRoomMesh(room, LOOK).static;
       let n = 0;
       for (let i = 0; i < m.count; i++)
         if (m.vertices[i * FLOATS_PER_VERTEX + 12] === FLAG.decal) n++;
@@ -796,7 +787,7 @@ describe("the construction baseboard (M3 C28)", () => {
     // hazard baseboard runs across the foot of its doors.
     const base = generateRoom(CANNED_WORKSHOP);
     expect(base.condition).toBe("construction");
-    const boards = baseboardEdges(buildRoomMesh(base, LOOKS.aperture).static);
+    const boards = baseboardEdges(buildRoomMesh(base, LOOK).static);
     const entrance: WallSlot = { ...base.entrance, side: "s" };
     const taken = new Set(base.fixtures.map((f) => edgeKey(f.slot)));
     const free = wallRuns(base.grid)
@@ -822,7 +813,7 @@ describe("the construction baseboard (M3 C28)", () => {
       },
     ];
     const room: RoomSpec = { ...base, fixtures: [...base.fixtures, ...fitted] };
-    const after = baseboardEdges(buildRoomMesh(room, LOOKS.aperture).static);
+    const after = baseboardEdges(buildRoomMesh(room, LOOK).static);
     expect(after.size).toBeGreaterThan(0);
     expect(after.has(edgeKey(entrance))).toBe(false);
     expect(after.has(edgeKey(free))).toBe(false);
@@ -842,7 +833,7 @@ describe("the hangar in the room mesh (M3 C15)", () => {
       ),
     ]);
     expect(skipped.size).toBe(14);
-    const stripes = stripeQuads(buildRoomMesh(room, LOOKS.aperture).static);
+    const stripes = stripeQuads(buildRoomMesh(room, LOOK).static);
     expect(stripes.length).toBeGreaterThan(0);
     for (const q of stripes) expect(skipped.has(q.edge), q.edge).toBe(false);
     // The rest of the north wall keeps its stripe.
@@ -858,7 +849,7 @@ describe("the hangar in the room mesh (M3 C15)", () => {
     const beams = gantryBeams(room);
     const h = room.hangar!.gantries[0]!.h;
     expect(beams.length).toBe(2);
-    const high = all(buildRoomMesh(room, LOOKS.aperture).static).filter(
+    const high = all(buildRoomMesh(room, LOOK).static).filter(
       (v) => v.pos[1] > h + 0.1 && v.pos[1] < room.ceiling - 0.1,
     );
     for (const bm of beams)
@@ -879,7 +870,7 @@ describe("the hangar in the room mesh (M3 C15)", () => {
     // c0799a87, the commit before the hangar was drawn.
     const room = generateDeck(CANNED_DECK, 1);
     expect(room.hangar).toBeUndefined();
-    const mesh = buildRoomMesh(room, LOOKS.aperture).static;
+    const mesh = buildRoomMesh(room, LOOK).static;
     for (const v of all(mesh))
       expect(v.pos[1]).toBeLessThanOrEqual(room.ceiling + EPS);
     expect(room.ceiling).toBe(4);
@@ -887,7 +878,7 @@ describe("the hangar in the room mesh (M3 C15)", () => {
   });
 });
 
-describe("look 2's seams on the room shell only", () => {
+describe("the look's seams on the room shell only", () => {
   /** The fixture kinds whose surfaces keep the seams, leaves included. */
   const SHELL_KINDS: readonly Fixture["kind"][] = [
     "door",
@@ -903,7 +894,7 @@ describe("look 2's seams on the room shell only", () => {
   const ctxOf = (room: RoomSpec): ModelContext => {
     const plan = layerPlan(room);
     return {
-      look: LOOKS.aperture,
+      look: LOOK,
       ceiling: room.ceiling,
       hall: room.hall,
       textLayer: (key) => plan.lookup(key),
@@ -945,12 +936,12 @@ describe("look 2's seams on the room shell only", () => {
 
   it("marks the floor, the ceiling and the full walls as shell, and leaves no lit vertex on them", () => {
     // Mutation caught: the shell never marked (b.markShell() dropped), so
-    // look 2 would draw no seams on the walls at all.
+    // the look would draw no seams on the walls at all.
     for (const [name, room] of [
       ["bridge", generateRoom(CANNED_BRIDGE)],
       ["airlock", airlock()],
     ] as const) {
-      const vs = all(buildRoomMesh(room, LOOKS.aperture).static);
+      const vs = all(buildRoomMesh(room, LOOK).static);
       const floor = vs.filter(
         (v) =>
           v.layer === LAYER.floor &&
@@ -995,9 +986,9 @@ describe("look 2's seams on the room shell only", () => {
     const hangar = generateDeck(CANNED_HANGAR, 0);
     expect(hangar.hangar).toBeDefined();
     const own = createBuilder();
-    buildHangar(own, hangar, LOOKS.aperture);
+    buildHangar(own, hangar, LOOK);
     const flags = asBuilt(
-      buildRoomMesh(hangar, LOOKS.aperture).static.vertices,
+      buildRoomMesh(hangar, LOOK).static.vertices,
       own.build(),
     );
     expect(flags.some((f) => f.own === FLAG.lit)).toBe(true);
@@ -1014,7 +1005,7 @@ describe("look 2's seams on the room shell only", () => {
       decor: [],
     };
     expect(building.scaffold.length).toBeGreaterThan(0);
-    const poles = all(buildRoomMesh(building, LOOKS.aperture).static).filter(
+    const poles = all(buildRoomMesh(building, LOOK).static).filter(
       (v) => v.layer === LAYER.metal,
     );
     expect(poles.length).toBeGreaterThan(0);
@@ -1029,7 +1020,7 @@ describe("look 2's seams on the room shell only", () => {
     // (the leaves would lose their seams as they slide).
     const seen = new Set<Fixture["kind"]>();
     for (const [name, room] of rooms()) {
-      const built = buildRoomMesh(room, LOOKS.aperture);
+      const built = buildRoomMesh(room, LOOK);
       const ctx = ctxOf(room);
       room.fixtures.forEach((fx, i) => {
         seen.add(fx.kind);
@@ -1062,8 +1053,8 @@ describe("look 2's seams on the room shell only", () => {
     for (const kind of [...SHELL_KINDS, "terminal", "machine"] as const)
       expect(seen.has(kind), kind).toBe(true);
     // A way's leaves are among the movers checked above.
-    const liftLeaves = buildRoomMesh(airlock(), LOOKS.aperture).movers.filter(
-      (m) => m.key.startsWith("door:"),
+    const liftLeaves = buildRoomMesh(airlock(), LOOK).movers.filter((m) =>
+      m.key.startsWith("door:"),
     );
     expect(liftLeaves.length).toBeGreaterThan(0);
     for (const m of liftLeaves) expect(flagsOf(m.mesh)).toContain(FLAG.shell);
@@ -1075,35 +1066,31 @@ describe("look 2's seams on the room shell only", () => {
     // or a fitting marked, or an instanced model flagged shell.
     for (const kind of PROP_KINDS)
       for (let v = 0; v < PROP_CATALOGUE[kind].variants; v++)
-        expect(flagsOf(buildPropMesh(kind, v, LOOKS.aperture))).not.toContain(
-          FLAG.shell,
-        );
+        expect(flagsOf(buildPropMesh(kind, v, LOOK))).not.toContain(FLAG.shell);
     for (const kind of HERO_KINDS)
-      expect(flagsOf(buildHeroMesh(kind, 0, LOOKS.aperture))).not.toContain(
-        FLAG.shell,
-      );
+      expect(flagsOf(buildHeroMesh(kind, 0, LOOK))).not.toContain(FLAG.shell);
     for (const kind of CURIO_KINDS)
       for (let v = 0; v < CURIO_CATALOGUE[kind].variants; v++)
-        expect(flagsOf(buildCurioMesh(kind, v, LOOKS.aperture))).not.toContain(
+        expect(flagsOf(buildCurioMesh(kind, v, LOOK))).not.toContain(
           FLAG.shell,
         );
     for (const kind of Object.keys(INTERIOR_CATALOGUE) as InteriorKind[])
-      expect(flagsOf(buildInteriorMesh(kind, 0, LOOKS.aperture))).not.toContain(
+      expect(flagsOf(buildInteriorMesh(kind, 0, LOOK))).not.toContain(
         FLAG.shell,
       );
-    const hatch = flagsOf(buildInteriorMesh("outer-hatch", 0, LOOKS.aperture));
+    const hatch = flagsOf(buildInteriorMesh("outer-hatch", 0, LOOK));
     expect(hatch).toContain(FLAG.lit);
 
     // The movers of heroes and fittings: a police box's leaves, the rotor.
     for (const room of [heroHallRoom(), consoleRoom(), airlock()]) {
-      const { movers } = buildRoomMesh(room, LOOKS.aperture);
+      const { movers } = buildRoomMesh(room, LOOK);
       const own = movers.filter(
         (m) => m.key.startsWith("box:") || m.part === "rotor",
       );
       for (const m of own) expect(flagsOf(m.mesh)).not.toContain(FLAG.shell);
     }
     expect(
-      buildRoomMesh(heroHallRoom(), LOOKS.aperture).movers.some((m) =>
+      buildRoomMesh(heroHallRoom(), LOOK).movers.some((m) =>
         m.key.startsWith("box:"),
       ),
     ).toBe(true);
@@ -1115,7 +1102,7 @@ describe("look 2's seams on the room shell only", () => {
       ["workshop", generateRoom(CANNED_WORKSHOP)] as const,
     ]) {
       if (room.decor.length === 0) continue;
-      const stat = buildRoomMesh(room, LOOKS.aperture).static.vertices;
+      const stat = buildRoomMesh(room, LOOK).static.vertices;
       const ctx = ctxOf(room);
       for (const d of room.decor) {
         const b = createBuilder();

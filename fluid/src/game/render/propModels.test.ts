@@ -24,7 +24,7 @@ import {
   type V3,
 } from "./geometry";
 import { frameAt, frameForSlot, type Frame } from "./kit";
-import { LOOKS, propLook, type Look } from "./looks";
+import { LOOK, propLook, type Look } from "./looks";
 import {
   GLOWING,
   floatingGlow,
@@ -71,14 +71,24 @@ function sideFor(t: number): Side {
 }
 
 /**
- * A prop built once at the origin, with every kit call recorded, in look 2
+ * The station's look without the props' own accents, so a prop's accent
+ * parts take the room's accent mark as they do when a look has none.
+ */
+const OWN_ACCENTLESS: Look = (() => {
+  const plain: Look = { ...LOOK };
+  delete plain.propAccents;
+  return plain;
+})();
+
+/**
+ * A prop built once at the origin, with every kit call recorded, in the look
  * (whose parts drawn only for the prop's own accent the envelope checks
  * then cover) unless `look` says otherwise.
  */
 function buildRecorded(
   kind: PropKind,
   variant: number,
-  look: Look = LOOKS.aperture,
+  look: Look = LOOK,
 ): { mesh: MeshData; parts: Part[] } {
   const builder = createBuilder();
   const parts: Part[] = [];
@@ -152,7 +162,7 @@ describe("prop models", () => {
       const { mesh, parts } = buildRecorded(kind, v);
 
       it(`${kind} variant ${String(v)} builds the same floats twice`, () => {
-        const again = buildPropMesh(kind, v, LOOKS.aperture);
+        const again = buildPropMesh(kind, v, LOOK);
         expect(again.count).toBe(mesh.count);
         expect(Array.from(again.vertices)).toEqual(Array.from(mesh.vertices));
       });
@@ -242,12 +252,8 @@ describe("prop models", () => {
   }
 
   it("refuses a variant the catalogue does not have", () => {
-    expect(() => buildPropMesh("crate", 3, LOOKS.aperture)).toThrow(
-      /no variant 3/,
-    );
-    expect(() => buildPropMesh("duct", -1, LOOKS.aperture)).toThrow(
-      /no variant -1/,
-    );
+    expect(() => buildPropMesh("crate", 3, LOOK)).toThrow(/no variant 3/);
+    expect(() => buildPropMesh("duct", -1, LOOK)).toThrow(/no variant -1/);
   });
 
   it("gives the world the wall band's depth", () => {
@@ -389,7 +395,7 @@ describe("prop models", () => {
       readonly number[],
     ][]) {
       counts.forEach((n, v) => {
-        const { parts } = buildRecorded(kind, v, LOOKS.day);
+        const { parts } = buildRecorded(kind, v, OWN_ACCENTLESS);
         const painted = parts.filter((p) => p.tint?.join() === mark);
         expect(painted.length, `${kind} variant ${String(v)}`).toBe(n);
         for (const p of painted) expect(GLOWING).not.toContain(p.flag);
@@ -397,7 +403,7 @@ describe("prop models", () => {
     }
   });
 
-  it("paints one part of each prop in its own accent in look 2, big enough to read but never a whole door, lid or body, and nothing in the room's", () => {
+  it("paints one part of each prop in its own accent in the look, big enough to read but never a whole door, lid or body, and nothing in the room's", () => {
     // Mutation caught: two parts marked (a stripe on two locker doors, a
     // band on every barrel of the cluster), a whole door or lid marked
     // (its surface passes the cap), a whole body marked (it fills the
@@ -405,7 +411,7 @@ describe("prop models", () => {
     // band), a kind that loses its coloured part, or a part that glows.
     // One part may be drawn in several strips that meet at their corners
     // (a rim, a band); strips that share no corner are two parts.
-    const look = propLook(LOOKS.aperture);
+    const look = propLook(LOOK);
     const OWN = [
       "barrel",
       "bench",
@@ -495,7 +501,7 @@ describe("prop models", () => {
     const f0 = frameAt([0, 0, 0], 0);
     for (let v = 0; v < PROP_CATALOGUE.trolley.variants; v++) {
       const at = `trolley variant ${String(v)}`;
-      const { parts } = buildRecorded("trolley", v, LOOKS.day);
+      const { parts } = buildRecorded("trolley", v, OWN_ACCENTLESS);
       const local = (p: (typeof parts)[number]) =>
         p.points.map((q) => toLocal(f0, q));
       const extent = (p: (typeof parts)[number], k: number) => {
@@ -532,7 +538,7 @@ describe("prop models", () => {
       readonly { a0: number; a1: number; depth: number }[],
     ][])
       sizes.forEach((size, v) => {
-        const bodies = buildRecorded(kind, v, LOOKS.day).parts.filter(
+        const bodies = buildRecorded(kind, v, OWN_ACCENTLESS).parts.filter(
           (p) => p.method === "bevelBox",
         );
         const local = bodies.flatMap((p) =>
@@ -555,7 +561,7 @@ describe("prop models", () => {
     // brief's own first depths did exactly this).
     const mark = accentTint(1).join();
     for (let v = 0; v < PROP_CATALOGUE["tool-cart"].variants; v++) {
-      const { parts } = buildRecorded("tool-cart", v, LOOKS.day);
+      const { parts } = buildRecorded("tool-cart", v, OWN_ACCENTLESS);
       const fronts = parts.filter((p) => p.tint?.join() === mark);
       const body = parts.find(
         (p) => p.method === "bevelBox" && p.tint?.join() !== mark,

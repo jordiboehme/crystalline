@@ -28,7 +28,7 @@
  * - `decal`: a decal (2.7 C20), lit as `lit` but with no edge lines, and
  *   first alpha-tested against an ordered threshold.
  * - `shell`: lit as `lit`, and the only surface that draws the look's
- *   seams when `edge.everywhere` is on (look 2). `buildRoomMesh` turns every
+ *   seams when `edge.everywhere` is on. `buildRoomMesh` turns every
  *   `lit` vertex of the shell (walls, floor, ceiling, lintels, stripe and
  *   baseboards), the scaffolding and the hangar into `shell`, and those
  *   of the fixtures in `SHELL_FIXTURES` with their movers; props, heroes,
@@ -666,7 +666,7 @@ function scaffold(b: Builder, box: Box, ceiling: number, s: Surface) {
  *
  * Seams: everything built up to the fixtures, and every fixture in
  * `SHELL_FIXTURES` with its movers, is marked `shell` (`markShell`);
- * nothing else is, so look 2 draws its seams on the room's structure,
+ * nothing else is, so the look draws its seams on the room's structure,
  * its ways through and its signs only.
  */
 export function buildRoomMesh(room: RoomSpec, look: Look): RoomMesh {

@@ -15,7 +15,7 @@ import { describe, expect, it } from "vitest";
 import type { PropKind } from "../../../world/types";
 import { blinkFlag, createBuilder, type V3 } from "../../geometry";
 import { frameAt } from "../../kit";
-import { LOOKS } from "../../looks";
+import { LOOK } from "../../looks";
 import { recordingKitAt, toLocal, type Part } from "../../modelChecks";
 import { pixelRuns, textRows } from "../heroes/pixels";
 import { MARK_BLUE, MARKS } from "../marks";
@@ -27,7 +27,7 @@ function recorded(kind: PropKind, variant: number): Part[] {
   const builder = createBuilder();
   const parts: Part[] = [];
   buildProp(recordingKitAt(builder, parts), kind, variant, {
-    look: LOOKS.aperture,
+    look: LOOK,
   });
   return parts;
 }

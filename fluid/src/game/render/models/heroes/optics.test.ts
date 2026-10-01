@@ -17,7 +17,7 @@ import { describe, expect, it } from "vitest";
 import { HERO_CATALOGUE } from "../../../world/heroes";
 import { blinkFlag, FLAG, type V3 } from "../../geometry";
 import { DECAL_LIFT, frameAt } from "../../kit";
-import { LOOKS } from "../../looks";
+import { LOOK } from "../../looks";
 import {
   inked,
   partsOf,
@@ -124,7 +124,7 @@ describe("optics hero models", () => {
 
   it("the slab is 1 : 4 : 9", () => {
     const ps = positions(
-      placeMesh(buildHeroMesh("black-slab", 0, LOOKS.aperture), 0, [0, 0, 0]),
+      placeMesh(buildHeroMesh("black-slab", 0, LOOK), 0, [0, 0, 0]),
     );
     const extent = (k: 0 | 1 | 2) =>
       Math.max(...ps.map((p) => p[k])) - Math.min(...ps.map((p) => p[k]));

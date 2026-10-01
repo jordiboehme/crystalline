@@ -26,7 +26,7 @@ import type { CurioKind } from "../../../world/types";
 import { FLAG, createBuilder, type V3 } from "../../geometry";
 import { DECAL_LIFT, frameAt } from "../../kit";
 import { TEXT_BASE } from "../../layers";
-import { LOOKS, type Rgb } from "../../looks";
+import { LOOK, type Rgb } from "../../looks";
 import {
   cellsOf,
   inked,
@@ -71,12 +71,7 @@ import {
  */
 function partsOf(kind: CurioKind, variant = 0): Part[] {
   const parts: Part[] = [];
-  buildCurio(
-    recordingKitAt(createBuilder(), parts),
-    kind,
-    variant,
-    LOOKS.aperture,
-  );
+  buildCurio(recordingKitAt(createBuilder(), parts), kind, variant, LOOK);
   const origin = frameAt([0, 0, 0], 0);
   return parts.map((p) => ({
     ...p,
@@ -471,9 +466,9 @@ describe("retro curio models", () => {
     const parts = partsOf("beige-laptop");
 
     it("stays under 900 triangles", () => {
-      expect(
-        buildCurioMesh("beige-laptop", 0, LOOKS.aperture).count / 3,
-      ).toBeLessThan(900);
+      expect(buildCurioMesh("beige-laptop", 0, LOOK).count / 3).toBeLessThan(
+        900,
+      );
     });
 
     it("lays the mark on the lid's back plane as exactly the font's runs of <=>", () => {

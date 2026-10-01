@@ -31,7 +31,7 @@ import {
 } from "../geometry";
 import { DECAL_LIFT, createKit } from "../kit";
 import { LAYER, TEXT_BASE } from "../layers";
-import { LOOKS } from "../looks";
+import { LOOK } from "../looks";
 import { DECAL_TILES } from "../textures";
 import { DECAL_BUDGET, DECAL_TINT, buildDecals } from "./decals";
 import { MARKS, stencilMarks } from "./marks";
@@ -210,7 +210,7 @@ describe("the decal recipe", () => {
     const room = generateRoom({ ...CANNED_WORKSHOP, status: "archived" });
     expect(room.decals.length).toBeGreaterThan(0);
     expect(room.decals.some((d) => d.on === "face")).toBe(true);
-    const quads = decalQuads(buildRoomMesh(room, LOOKS.aperture).static, room);
+    const quads = decalQuads(buildRoomMesh(room, LOOK).static, room);
     expect(quads.length).toBeGreaterThanOrEqual(room.decals.length);
     for (const q of quads) {
       expect(q.layer).toBe(LAYER.decal);
@@ -226,7 +226,7 @@ describe("the decal recipe", () => {
     const room = generateRoom(CANNED_HUB);
     const arrows = room.decals.filter((d) => d.kind === "arrow");
     expect(arrows.length).toBeGreaterThan(0);
-    const quads = decalQuads(buildRoomMesh(room, LOOKS.aperture).static).filter(
+    const quads = decalQuads(buildRoomMesh(room, LOOK).static).filter(
       (q) => q.tile === DECAL_TILES.arrow[0],
     );
     expect(quads.length).toBe(arrows.length);
@@ -257,7 +257,7 @@ describe("the decal recipe", () => {
     for (const status of ["stable", "draft", "deprecated", "archived"])
       for (const p of [CANNED_BRIDGE, CANNED_WORKSHOP, CANNED_HUB]) {
         const room = generateRoom({ ...p, status });
-        const mesh = buildRoomMesh(room, LOOKS.aperture).static;
+        const mesh = buildRoomMesh(room, LOOK).static;
         const text = textQuads(mesh); // layer >= TEXT_BASE, or emissive screens
         const decals = decalQuads(mesh).filter((q) => q.normal[1] < 0.99);
         expect(text.length).toBeGreaterThan(0);
@@ -287,7 +287,7 @@ describe("the decal recipe", () => {
     // arrow in a fixed colour instead of the room's accent, a wall stencil
     // light or a floor stencil dark, or a stencil off the solid tile.
     const room = generateRoom({ ...CANNED_HUB, status: "deprecated" });
-    const quads = decalQuads(buildRoomMesh(room, LOOKS.aperture).static);
+    const quads = decalQuads(buildRoomMesh(room, LOOK).static);
     const kinds = new Set<string>();
     const same = (p: V3, q: readonly number[]) =>
       p.every((x, i) => Math.abs(x - (q[i] ?? NaN)) < 1e-6);
@@ -346,7 +346,7 @@ describe("the decal recipe", () => {
             d.h < ACCENT_STRIPE.h1 &&
             d.h + d.length > ACCENT_STRIPE.h0,
         ).length;
-        const quads = decalQuads(buildRoomMesh(room, LOOKS.aperture).static);
+        const quads = decalQuads(buildRoomMesh(room, LOOK).static);
         for (const q of quads) {
           if (q.normal[1] > 0.99) continue;
           expect(
@@ -371,7 +371,7 @@ describe("the decal recipe", () => {
     ];
     expect(rooms.at(-1)!.decals.length).toBe(160);
     for (const room of rooms) {
-      const mesh = buildRoomMesh(room, LOOKS.aperture).static;
+      const mesh = buildRoomMesh(room, LOOK).static;
       let vertices = 0;
       for (let i = 0; i < mesh.count; i++)
         if (mesh.vertices[i * FLOATS_PER_VERTEX + 12] === FLAG.decal)
@@ -402,7 +402,7 @@ describe("the decal recipe", () => {
     let checked = 0;
     let low = 0;
     for (const room of rooms) {
-      const mesh = buildRoomMesh(room, LOOKS.aperture).static;
+      const mesh = buildRoomMesh(room, LOOK).static;
       const key = (n: V3, plane: number) =>
         `${n[0].toFixed(2)},${n[2].toFixed(2)},${String(Math.round(plane * 100))}`;
       const others = new Map<string, Flat[]>();

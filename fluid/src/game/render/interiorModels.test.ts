@@ -20,7 +20,7 @@ import type {
 import { CELL } from "../world/units";
 import { FLAG, createBuilder, type MeshData, type V3 } from "./geometry";
 import { frameAt, frameForSlot, type Frame } from "./kit";
-import { LOOKS, type Look } from "./looks";
+import { LOOK, type Look } from "./looks";
 import {
   floatingGlow,
   inBox,
@@ -91,7 +91,7 @@ function buildRecorded(
 ): { mesh: MeshData; parts: Part[] } {
   const builder = createBuilder();
   const parts: Part[] = [];
-  buildInterior(recordingKitAt(builder, parts), kind, variant, LOOKS.aperture);
+  buildInterior(recordingKitAt(builder, parts), kind, variant, LOOK);
   return { mesh: builder.build(), parts };
 }
 
@@ -157,7 +157,7 @@ describe("interior models (2.6e C2)", () => {
       it(`${kind} variant ${String(v)} builds the same floats as its instanced mesh`, () => {
         // Mutation caught: a recipe that reads anything but its kind,
         // variant and look, or an instanced mesh that is not the model.
-        const again = buildInteriorMesh(kind, v, LOOKS.aperture);
+        const again = buildInteriorMesh(kind, v, LOOK);
         expect(again.count).toBe(mesh.count);
         expect(Array.from(again.vertices)).toEqual(Array.from(mesh.vertices));
       });
@@ -254,28 +254,6 @@ describe("interior models (2.6e C2)", () => {
     expect([...(second ?? [])].every((g) => g >= 4)).toBe(true);
   });
 
-  it("keeps every fitting's colours in every look (C4)", () => {
-    // Mutation caught: a fitting painted with a look's colour (`s.body`,
-    // `s.panel`, `s.dark`), which would turn the room's white beige in one
-    // look and grey in another, or the console's panels with it.
-    expect(KINDS.length).toBe(8);
-    expect(Object.values(LOOKS).length).toBeGreaterThan(1);
-    for (const kind of KINDS)
-      for (let v = 0; v < INTERIOR_CATALOGUE[kind].variants; v++) {
-        const tintsIn = (look: Look) => {
-          const parts: Part[] = [];
-          buildInterior(recordingKitAt(createBuilder(), parts), kind, v, look);
-          return parts.map((p) => p.tint?.join() ?? "none");
-        };
-        const first = tintsIn(LOOKS.aperture);
-        expect(first.length).toBeGreaterThan(0);
-        for (const look of Object.values(LOOKS))
-          expect(tintsIn(look), `${kind} ${String(v)} ${look.id}`).toEqual(
-            first,
-          );
-      }
-  });
-
   describe("the rotor (C8, C19)", () => {
     const console0 = pieceAt("console", 0, 0).piece;
     const rotorIn = (look: Look) => {
@@ -288,7 +266,7 @@ describe("interior models (2.6e C2)", () => {
 
     it("stays under its triangle budget (C19)", () => {
       // Mutation caught: a rotor grown past its share of the room.
-      const mesh = rotorIn(LOOKS.aperture);
+      const mesh = rotorIn(LOOK);
       triangles.push(`rotor: ${String(mesh.count / 3)}`);
       expect(mesh.count).toBeGreaterThan(0);
       expect(mesh.count / 3).toBeLessThan(ROTOR_BUDGET);
@@ -297,7 +275,7 @@ describe("interior models (2.6e C2)", () => {
     it("winds every triangle with its normal", () => {
       // Mutation caught: a face of the rotor wound the wrong way, which
       // the renderer would cull.
-      const mesh = rotorIn(LOOKS.aperture);
+      const mesh = rotorIn(LOOK);
       expect(mesh.count).toBeGreaterThan(0);
       expect(worstWinding(mesh)).toBeGreaterThan(0.999);
     });
@@ -310,28 +288,18 @@ describe("interior models (2.6e C2)", () => {
       const at: V3 = [FREE_AT.x * CELL, 0, FREE_AT.y * CELL];
       buildRotor(
         recordingKitAt(createBuilder(), parts)(frameAt(at, 0)),
-        surfaces(LOOKS.aperture),
+        surfaces(LOOK),
       );
       expect(parts.length).toBeGreaterThan(0);
       expect(looseParts(parts, null, ROTOR.h0)).toEqual([]);
       expect(floatingGlow(parts, null)).toEqual([]);
     });
-
-    it("keeps its colours in every look (C4)", () => {
-      // Mutation caught: a rotor part painted with a look's colour.
-      const first = Array.from(rotorIn(LOOKS.aperture).vertices);
-      expect(first.length).toBeGreaterThan(0);
-      for (const look of Object.values(LOOKS))
-        expect(Array.from(rotorIn(look).vertices), look.id).toEqual(first);
-    });
   });
 
   it("refuses a variant the catalogue does not have", () => {
     // Mutation caught: the variant check dropped from `buildInterior`.
-    expect(() => buildInteriorMesh("console", 1, LOOKS.aperture)).toThrow(
-      /no variant 1/,
-    );
-    expect(() => buildInteriorMesh("roundel-wall", -1, LOOKS.aperture)).toThrow(
+    expect(() => buildInteriorMesh("console", 1, LOOK)).toThrow(/no variant 1/);
+    expect(() => buildInteriorMesh("roundel-wall", -1, LOOK)).toThrow(
       /no variant -1/,
     );
   });

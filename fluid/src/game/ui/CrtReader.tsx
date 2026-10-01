@@ -6,9 +6,8 @@
  * the 80 columns fit the viewport, and the screen shows as many whole lines
  * as fit under it; scrolling moves the first visible line, one line or one
  * screen at a time, never past the last full screen unless the section it
- * opened at lies in that screen. The two looks are the
- * phosphor green of a 70s terminal on near-black and the C64's light blue on
- * blue, where headings are uppercased as PETSCII would print them. Headings
+ * opened at lies in that screen. The screen is the
+ * phosphor green of a 70s terminal on near-black. Headings
  * are drawn in reverse video; the scanlines are a CSS repeating gradient and
  * the vignette a radial one, both laid over the text and ignoring the mouse.
  *
@@ -30,10 +29,11 @@ import { useEffect, useMemo, useRef, useState } from "react";
 
 import { CRT_COLUMNS, crtLines, type CrtLine } from "./crt";
 
-/** The screen's colours for each look the reader supports. */
-const PALETTES = {
-  phosphor: { fg: "#39ff7a", bg: "#050b07", glow: "0 0 4px #39ff7a88" },
-  petscii: { fg: "#6c5eb5", bg: "#352879", glow: "none" },
+/** The screen's colours. */
+const PALETTE = {
+  fg: "#39ff7a",
+  bg: "#050b07",
+  glow: "0 0 4px #39ff7a88",
 } as const;
 
 /** The footer every screen ends with. */
@@ -64,7 +64,7 @@ function screenMetrics(width: number, height: number) {
 /** How one kind of line is drawn beyond its text. */
 function lineStyle(
   kind: CrtLine["kind"],
-  palette: (typeof PALETTES)[keyof typeof PALETTES],
+  palette: typeof PALETTE,
 ): React.CSSProperties {
   switch (kind) {
     case "heading":
@@ -96,8 +96,6 @@ export interface CrtReaderProps {
   onOpenFluid: () => void;
   /** Called on Esc: leave the reader. */
   onClose: () => void;
-  /** The screen's look. */
-  look: "phosphor" | "petscii";
 }
 
 /**
@@ -111,7 +109,6 @@ export function CrtReader({
   section,
   onOpenFluid,
   onClose,
-  look,
 }: CrtReaderProps) {
   const layout = useMemo(() => crtLines(markdown), [markdown]);
   const [viewport, setViewport] = useState(() => ({
@@ -209,9 +206,7 @@ export function CrtReader({
     };
   }, [rows, maxTop, lineHeight, onOpenFluid, onClose]);
 
-  const palette = PALETTES[look];
-  const shout = (text: string) =>
-    look === "petscii" ? text.toUpperCase() : text;
+  const palette = PALETTE;
   const visible = layout.lines.slice(first, first + rows);
   const position =
     layout.lines.length === 0
@@ -239,7 +234,7 @@ export function CrtReader({
           className="flex justify-between gap-[1ch]"
           style={{ height: lineHeight }}
         >
-          <span className="min-w-0 truncate">{shout(title)}</span>
+          <span className="min-w-0 truncate">{title}</span>
           <span className="shrink-0">{position}</span>
         </div>
         <div data-testid="crt-lines" style={{ height: rows * lineHeight }}>
@@ -248,7 +243,7 @@ export function CrtReader({
               key={first + n}
               style={{ height: lineHeight, ...lineStyle(line.kind, palette) }}
             >
-              {line.kind === "heading" ? shout(line.text) : line.text}
+              {line.text}
             </div>
           ))}
         </div>

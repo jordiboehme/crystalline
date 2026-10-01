@@ -15,7 +15,6 @@
 
 import { useEffect, useState } from "react";
 
-import type { LookId } from "../render/looks";
 import type { HudSink, ReaderState } from "../session";
 import { CONNECTOR_MIN_MS, type ConnectorState } from "./Connector";
 
@@ -58,11 +57,10 @@ function write(el: HTMLElement | null, text: string | null) {
  * has been up for `CONNECTOR_MIN_MS`; a pending hide is dropped when the
  * host unmounts.
  */
-export function useHud(initialLook: LookId = "aperture"): HudBindings {
+export function useHud(): HudBindings {
   const [connector, setConnector] = useState<ConnectorState>({
     active: false,
     label: "",
-    look: initialLook,
   });
   const [reader, setReader] = useState<ReaderState | null>(null);
 
@@ -109,21 +107,21 @@ export function useHud(initialLook: LookId = "aperture"): HudBindings {
       notice: (text) => {
         set("notice", text);
       },
-      connector: (active, label, look) => {
+      connector: (active, label) => {
         cancelHide();
         if (active) {
           shownAt = performance.now();
-          setConnector({ active: true, label, look });
+          setConnector({ active: true, label });
           return;
         }
         const left = CONNECTOR_MIN_MS - (performance.now() - shownAt);
         if (left <= 0) {
-          setConnector({ active: false, label, look });
+          setConnector({ active: false, label });
           return;
         }
         hideTimer = setTimeout(() => {
           hideTimer = null;
-          setConnector({ active: false, label, look });
+          setConnector({ active: false, label });
         }, left);
       },
       reader: setReader,

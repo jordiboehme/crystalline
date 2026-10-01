@@ -1,24 +1,15 @@
 /**
- * The three looks the demo offers, as parameter sets over the same room.
+ * The station's look, as a parameter set over every room.
  *
  * A look changes nothing about what is in a room, only how it is drawn: the
  * palette, how bright the light is and how far it carries, how much grime,
- * how strong the neon edge lines are and where they appear, whether surfaces
- * are textured or flat, whether the picture is dithered down to the C64's
- * sixteen colours, and the five accents a room is picked out in (2.7 C7).
- * The renderer reads nothing else, so a look costs a few dozen numbers.
+ * how strong the neon edge lines are and where they appear, and the five
+ * accents a room is picked out in (2.7 C7). The renderer reads nothing else,
+ * so the look costs a few dozen numbers.
  *
- * - Day shift: beige and off-white panels in bright light, neon only on
- *   doors, portals and tag strips.
- * - Aperture grid: white panels with glowing seams on the room's shell and
- *   its ways through, doors in cyan and portals in orange. Props, heroes,
- *   fittings, decor, terminals and machines are plain shaded.
- * - Freescape 64: flat-shaded solid polygons, ordered dithering and the
- *   C64 palette: an 8-bit filled-polygon look.
- *
- * The game always runs in Aperture grid and has no key to switch looks;
- * the dev pages (the look demo and the model gallery) still start in any
- * of the three through their `?look=` parameter.
+ * White panels with glowing seams on the room's shell and its ways through,
+ * doors in cyan and portals in orange. Props, heroes, fittings, decor,
+ * terminals and machines are plain shaded.
  */
 
 import type { Condition, Finish } from "../world/types";
@@ -30,13 +21,8 @@ import type { Condition, Finish } from "../world/types";
  */
 export type Rgb = readonly [number, number, number];
 
-/** Which look. */
-export type LookId = "day" | "aperture" | "freescape";
-
 /** Every parameter the renderer reads from a look. */
 export interface Look {
-  id: LookId;
-  name: string;
   palette: {
     panel: Rgb;
     floor: Rgb;
@@ -97,19 +83,10 @@ export interface Look {
      */
     fade: { from: number; to: number } | null;
   };
-  /** 1 textured, 0 solid colours only. */
-  textureMix: number;
-  /** Face normals, no smooth light across a surface. */
-  flat: boolean;
-  /** Ordered dithering into `C64_PALETTE` in the final pass. */
-  dither: boolean;
   bloom: { threshold: number; strength: number };
-  /** The terminal screens' style. */
-  terminal: "phosphor" | "petscii";
   /**
-   * The look's accent set (2.7 C7): `ACCENT_COUNT` colours, index `i` in
-   * the same colour family in every look (0 yellow, 1 red, 2 green, 3 blue,
-   * cyan in the C64 palette, 4 teal), each at least 0.25 (RGB distance)
+   * The look's accent set (2.7 C7): `ACCENT_COUNT` colours (0 yellow, 1
+   * red, 2 green, 3 violet, 4 teal), each at least 0.25 (RGB distance)
    * from the look's `door`, `portal` and `portalAlt`, so an accent never
    * reads as a way. A room picks one by index (`Finish.accent`) and
    * `accentFor` reads it.
@@ -124,34 +101,6 @@ export interface Look {
   propAccents?: boolean;
 }
 
-const C64_RAW: readonly (readonly [number, number, number])[] = [
-  [0x00, 0x00, 0x00],
-  [0xff, 0xff, 0xff],
-  [0x68, 0x37, 0x2b],
-  [0x70, 0xa4, 0xb2],
-  [0x6f, 0x3d, 0x86],
-  [0x58, 0x8d, 0x43],
-  [0x35, 0x28, 0x79],
-  [0xb8, 0xc7, 0x6f],
-  [0x6f, 0x4f, 0x25],
-  [0x43, 0x39, 0x00],
-  [0x9a, 0x67, 0x59],
-  [0x44, 0x44, 0x44],
-  [0x6c, 0x6c, 0x6c],
-  [0x9a, 0xd2, 0x84],
-  [0x6c, 0x5e, 0xb5],
-  [0x95, 0x95, 0x95],
-];
-
-/** The C64's sixteen colours (the Pepto palette), in VIC-II order. */
-export const C64_PALETTE: readonly Rgb[] = C64_RAW.map(
-  ([r, g, b]) => [r / 255, g / 255, b / 255] as const,
-);
-
-function c64(index: number): Rgb {
-  return C64_PALETTE[index] ?? [0, 0, 0];
-}
-
 function hex(value: number): Rgb {
   return [
     ((value >> 16) & 255) / 255,
@@ -160,145 +109,54 @@ function hex(value: number): Rgb {
   ];
 }
 
-/** The three looks, keyed by `LookId`. */
-export const LOOKS: Record<LookId, Look> = {
-  day: {
-    id: "day",
-    name: "Day shift",
-    palette: {
-      panel: hex(0xe8e0cc),
-      floor: hex(0x9a9486),
-      ceiling: hex(0xf2eee4),
-      metal: hex(0xb8b2a4),
-      door: hex(0xd87a2c),
-      portal: hex(0x3cc8e8),
-      portalAlt: hex(0xe85cc8),
-      machine: hex(0xc9c1ad),
-      screen: hex(0x0c1a10),
-      screenText: hex(0x7cff9a),
-      lamp: hex(0xfff6e0),
-      fog: hex(0x1a1814),
-    },
-    lightScale: 1.1,
-    falloff: 0.045,
-    minLight: 0.12,
-    bands: 32,
-    grime: 0.08,
-    edge: {
-      colour: hex(0xffb050),
-      strength: 1.6,
-      everywhere: false,
-      width: 1.2,
-      fade: null,
-    },
-    textureMix: 1,
-    flat: false,
-    dither: false,
-    bloom: { threshold: 1, strength: 0.55 },
-    terminal: "phosphor",
-    // Mustard, rust red, olive, navy, teal green.
-    accents: [
-      hex(0xd8c040),
-      hex(0xa83d28),
-      hex(0x72803a),
-      hex(0x2e4276),
-      hex(0x338070),
-    ],
+/** The station's look. */
+export const LOOK: Look = {
+  palette: {
+    panel: hex(0xf4f6f8),
+    floor: hex(0x6c7074),
+    ceiling: hex(0xe4e8ec),
+    metal: hex(0x8c9094),
+    door: hex(0x28d8ff),
+    portal: hex(0xff8a1c),
+    portalAlt: hex(0x28d8ff),
+    machine: hex(0xd8dce0),
+    screen: hex(0x06121a),
+    screenText: hex(0x9ae8ff),
+    lamp: hex(0xf0f8ff),
+    fog: hex(0x0c1014),
   },
-  aperture: {
-    id: "aperture",
-    name: "Aperture grid",
-    palette: {
-      panel: hex(0xf4f6f8),
-      floor: hex(0x6c7074),
-      ceiling: hex(0xe4e8ec),
-      metal: hex(0x8c9094),
-      door: hex(0x28d8ff),
-      portal: hex(0xff8a1c),
-      portalAlt: hex(0x28d8ff),
-      machine: hex(0xd8dce0),
-      screen: hex(0x06121a),
-      screenText: hex(0x9ae8ff),
-      lamp: hex(0xf0f8ff),
-      fog: hex(0x0c1014),
-    },
-    propBody: { body: hex(0xb4b4ae), panel: hex(0xc3c3bd) },
-    lightScale: 1,
-    falloff: 0.05,
-    minLight: 0.1,
-    bands: 32,
-    grime: 0.04,
-    contactShadow: 0.85,
-    edge: {
-      colour: hex(0x9ae8ff),
-      strength: 2.2,
-      everywhere: true,
-      width: 1.4,
-      fade: { from: 15, to: 25 },
-    },
-    textureMix: 1,
-    flat: false,
-    dither: false,
-    bloom: { threshold: 0.9, strength: 0.8 },
-    terminal: "phosphor",
-    // Safety yellow, signal red, leaf green, violet, teal.
-    accents: [
-      hex(0xf0d830),
-      hex(0xd8382e),
-      hex(0x5a9a40),
-      hex(0x845cc8),
-      hex(0x1f9e8c),
-    ],
-    propAccents: true,
+  propBody: { body: hex(0xb4b4ae), panel: hex(0xc3c3bd) },
+  lightScale: 1,
+  falloff: 0.05,
+  minLight: 0.1,
+  bands: 32,
+  grime: 0.04,
+  contactShadow: 0.85,
+  edge: {
+    colour: hex(0x9ae8ff),
+    strength: 2.2,
+    everywhere: true,
+    width: 1.4,
+    fade: { from: 15, to: 25 },
   },
-  freescape: {
-    id: "freescape",
-    name: "Freescape 64",
-    palette: {
-      panel: c64(15),
-      floor: c64(11),
-      ceiling: c64(12),
-      metal: c64(12),
-      door: c64(8),
-      portal: c64(14),
-      portalAlt: c64(4),
-      machine: c64(3),
-      screen: c64(6),
-      screenText: c64(14),
-      lamp: c64(1),
-      fog: c64(0),
-    },
-    lightScale: 1,
-    falloff: 0.06,
-    minLight: 0.15,
-    bands: 8,
-    grime: 0,
-    edge: {
-      colour: c64(1),
-      strength: 0.6,
-      everywhere: false,
-      width: 1,
-      fade: null,
-    },
-    textureMix: 0,
-    flat: true,
-    dither: true,
-    bloom: { threshold: 1.2, strength: 0.2 },
-    terminal: "petscii",
-    // Yellow, light red, green, cyan, light green. The blue family takes
-    // cyan: the palette's blue (6) sits 0.247 from the cross-domain portal
-    // (4) and its light blue (14) is the portal itself.
-    accents: [c64(7), c64(10), c64(5), c64(3), c64(13)],
-  },
+  bloom: { threshold: 0.9, strength: 0.8 },
+  // Safety yellow, signal red, leaf green, violet, teal.
+  accents: [
+    hex(0xf0d830),
+    hex(0xd8382e),
+    hex(0x5a9a40),
+    hex(0x845cc8),
+    hex(0x1f9e8c),
+  ],
+  propAccents: true,
 };
 
 /**
  * The colour a room's accent takes in `look` (2.7 C8): the look's accent at
  * the room's index, `look.accents[room.finish.accent]`. The renderer
  * uploads it as `uAccent` on every draw, so a restored context, which
- * hands the same room back, keeps it, and a dev page that picks another
- * look (the look is fixed in play) gets that look's colour of the same
- * family. Black for an index past the set, which no finish holds.
+ * hands the same room back, keeps it. Black for an index past the set,
+ * which no finish holds.
  */
 export function accentFor(room: { finish: Finish }, look: Look): Rgb {
   return look.accents[room.finish.accent] ?? [0, 0, 0];
@@ -323,7 +181,7 @@ export function propLook(look: Look): Look {
 }
 
 /**
- * How many accents every look holds, and so how many a prop may pick from:
+ * How many accents the look holds, and so how many a prop may pick from:
  * the scene shader's `uAccents` array is this long.
  */
 export const ACCENT_COUNT = 5;
@@ -335,9 +193,6 @@ export const ACCENT_COUNT = 5;
 export function propAccentPick(seed: number): number {
   return (seed >>> 0) % ACCENT_COUNT;
 }
-
-/** The looks in order, the game's own (Aperture grid) second. */
-export const LOOK_ORDER: readonly LookId[] = ["day", "aperture", "freescape"];
 
 /**
  * A look adjusted for a room's condition: construction adds a little grime,

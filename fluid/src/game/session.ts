@@ -91,9 +91,8 @@
  * mouse's vertical look (remembered in `localStorage` under `INVERT_KEY`),
  * and M turns the sound off and on (with `sound`: its `toggleMute`, the
  * notice `SOUND OFF` or `SOUND ON`; without it M does nothing).
- * No key switches the look: the game always runs in Aperture grid (look
- * 2), and only the dev pages start in another (`initialLook`, their
- * `?look=`). Only the mouse looks up and down. The
+ * No key switches the look: the game always runs in the station's one look.
+ * Only the mouse looks up and down. The
  * browser's own meaning of Space, the arrows, comma, period and Alt is
  * cancelled while the session has the keys (`CLAIMED_KEYS`). While the CRT
  * reader is open it reads the keys itself: the session ignores its own
@@ -245,7 +244,7 @@ import {
 } from "./paths";
 import { createBlink } from "./render/blink";
 import { createLights, type LightState } from "./render/lights";
-import { LOOKS, type LookId } from "./render/looks";
+import { LOOK } from "./render/looks";
 import { createRenderer, type Renderer } from "./render/renderer";
 import {
   boxEntry,
@@ -316,15 +315,12 @@ export type { Arrival } from "./world/interact";
 /**
  * What the CRT reader is opened with: the engram's title and markdown, the
  * section the terminal stands for (its `##` heading and how many sections
- * of the same heading come before it, or null for the top), and the look
- * the station was drawn in when it opened, which picks the reader's screen
- * (the C64's blue for `freescape`, phosphor green otherwise).
+ * of the same heading come before it, or null for the top).
  */
 export interface ReaderState {
   title: string;
   content: string;
   section: { heading: string; occurrence: number } | null;
-  look: LookId;
 }
 
 /**
@@ -351,7 +347,7 @@ export interface HudSink {
   status(text: string): void;
   frame(text: string): void;
   notice(text: string | null): void;
-  connector(active: boolean, label: string, look: LookId): void;
+  connector(active: boolean, label: string): void;
   reader(state: ReaderState | null): void;
 }
 
@@ -378,8 +374,6 @@ export type RendererFactory = (
  * - `openFluid`: opens a Fluid path (the F key) outside the game.
  * - `forceRgba8`: take the RGBA8 bloom path whatever the GPU offers.
  * - `createRenderer`: see `RendererFactory`.
- * - `initialLook`: the look the session runs in, for good; `aperture`
- *   when not given. Only the dev pages pass another (their `?look=`).
  * - `clock`: the loop's clock; the browser's when not given. Tests crank it
  *   by hand.
  * - `load`: loads a place in place of the query client. The gallery's
@@ -405,7 +399,6 @@ export interface SessionOptions {
   openFluid(path: string): void;
   forceRgba8: boolean;
   createRenderer?: RendererFactory;
-  initialLook?: LookId;
   clock?: Clock;
   load?: PlaceLoader;
   /**
@@ -718,7 +711,6 @@ export function createSession(opts: SessionOptions): Session {
   const now = () => (opts.clock ?? performance).now();
 
   let disposed = false;
-  const lookId: LookId = opts.initialLook ?? "aperture";
   let inverted = readInverted();
   let place: PlaceInput | null = null;
   let current: StationAddress | null = null;
@@ -1046,11 +1038,11 @@ export function createSession(opts: SessionOptions): Session {
    * at all (no GPU yet, or a lost context) there is nothing to refuse, and
    * `boot` hands the room over when a renderer is made.
    */
-  const present = (next: RoomSpec, id: LookId): boolean => {
+  const present = (next: RoomSpec): boolean => {
     if (renderer === null) return true;
     const t0 = now();
     try {
-      renderer.setRoom(next, LOOKS[id]);
+      renderer.setRoom(next, LOOK);
       lastBuildMs = now() - t0;
       return true;
     } catch {
@@ -1093,7 +1085,7 @@ export function createSession(opts: SessionOptions): Session {
     landing: "box" | null = null,
     darkNow = false,
   ): boolean => {
-    if (!present(built, lookId)) {
+    if (!present(built)) {
       fail(LOAD_ERROR);
       return false;
     }
@@ -1200,7 +1192,7 @@ export function createSession(opts: SessionOptions): Session {
     ride = null;
     loading = false;
     controller = null;
-    hud.connector(false, label, lookId);
+    hud.connector(false, label);
     arrive();
     if (isFailure(loaded)) {
       fail(FAILED[loaded.kind]);
@@ -1320,7 +1312,7 @@ export function createSession(opts: SessionOptions): Session {
     }
     if (loading) {
       loading = false;
-      hud.connector(false, loadingLabel, lookId);
+      hud.connector(false, loadingLabel);
     }
     return gen;
   };
@@ -1354,7 +1346,7 @@ export function createSession(opts: SessionOptions): Session {
     const shown = label ?? labelFor(address);
     loading = true;
     loadingLabel = shown;
-    hud.connector(true, shown, lookId);
+    hud.connector(true, shown);
     const abort = new AbortController();
     controller = abort;
     loader(address, abort.signal).then(
@@ -1368,7 +1360,7 @@ export function createSession(opts: SessionOptions): Session {
         travelling = null;
         ride = null;
         arrive();
-        hud.connector(false, shown, lookId);
+        hud.connector(false, shown);
         if (!isAbort(error)) fail(LOAD_ERROR);
         retryCheck();
       },
@@ -1509,7 +1501,6 @@ export function createSession(opts: SessionOptions): Session {
       title: place.title,
       content: place.content,
       section: { heading: fixture.heading, occurrence: fixture.section },
-      look: lookId,
     });
   };
 
@@ -1951,7 +1942,7 @@ export function createSession(opts: SessionOptions): Session {
         renderer = made.renderer;
         if (room !== null) {
           const t0 = now();
-          renderer.setRoom(room, LOOKS[lookId]);
+          renderer.setRoom(room, LOOK);
           lastBuildMs = now() - t0;
         }
         sizeCanvas();
@@ -2364,7 +2355,7 @@ export function createSession(opts: SessionOptions): Session {
       opts.onLevels?.(false);
       opts.onLift?.(null);
       opts.onPause?.(false);
-      hud.connector(false, loadingLabel, lookId);
+      hud.connector(false, loadingLabel);
       disposed = true;
       generation++;
       controller?.abort();

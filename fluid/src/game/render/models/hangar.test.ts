@@ -25,7 +25,7 @@ import {
   type MeshData,
 } from "../geometry";
 import { DECAL_LIFT, createKit } from "../kit";
-import { LOOKS } from "../looks";
+import { LOOK } from "../looks";
 import { worstWinding } from "../modelChecks";
 import { FLUSH_DEPTH, HEADROOM, LAMP_TINT } from "./common";
 import { DECAL_TINT, buildDecals } from "./decals";
@@ -56,11 +56,11 @@ function vertices(m: MeshData): Vertex[] {
   });
 }
 
-/** The canned hangar and its structure alone, in the aperture look. */
+/** The canned hangar and its structure alone, in the station's look. */
 function hangarAlone(): { room: RoomSpec; mesh: MeshData } {
   const room = generateDeck(CANNED_HANGAR, 0);
   const b = createBuilder();
-  buildHangar(b, room, LOOKS.aperture);
+  buildHangar(b, room, LOOK);
   return { room, mesh: b.build() };
 }
 
@@ -244,7 +244,7 @@ describe("buildHangar (M3 C15)", () => {
     // still lie on the plate).
     const room = generateDeck(CANNED_HANGAR, 0);
     const pads = room.hangar!.pads.map(padBox);
-    const onPads = vertices(buildRoomMesh(room, LOOKS.aperture).static).filter(
+    const onPads = vertices(buildRoomMesh(room, LOOK).static).filter(
       (v) => v.flag === FLAG.decal && pads.some((p) => inPlan(p, v)),
     );
     const stencil = (v: Vertex) =>
@@ -292,24 +292,23 @@ describe("buildHangar (M3 C15)", () => {
     // walls in the flat look).
     const room = generateDeck(CANNED_HANGAR, 0);
     const boxes = [...gantryBeams(room), ...gantryLegs(room)];
-    for (const look of Object.values(LOOKS)) {
-      const b = createBuilder();
-      buildHangar(b, room, look);
-      const steel = vertices(b.build()).filter(
-        (v) =>
-          v.flag === FLAG.lit &&
-          v.tint[0] !== ACCENT_MARK &&
-          v.y > 0.5 &&
-          boxes.some((box) => inPlan(box, v)),
+    const look = LOOK;
+    const b = createBuilder();
+    buildHangar(b, room, look);
+    const steel = vertices(b.build()).filter(
+      (v) =>
+        v.flag === FLAG.lit &&
+        v.tint[0] !== ACCENT_MARK &&
+        v.y > 0.5 &&
+        boxes.some((box) => inPlan(box, v)),
+    );
+    expect(steel.length).toBeGreaterThan(0);
+    for (const v of steel)
+      v.tint.forEach((c, i) =>
+        expect(c).toBeLessThanOrEqual(
+          0.5 * (look.palette.panel[i] ?? NaN) + EPS,
+        ),
       );
-      expect(steel.length).toBeGreaterThan(0);
-      for (const v of steel)
-        v.tint.forEach((c, i) =>
-          expect(c).toBeLessThanOrEqual(
-            0.5 * (look.palette.panel[i] ?? NaN) + EPS,
-          ),
-        );
-    }
   });
 
   it("coats each pad in flat dark paint, with its white paint brighter than the floor, in every look", () => {
@@ -319,41 +318,40 @@ describe("buildHangar (M3 C15)", () => {
     const room = generateDeck(CANNED_HANGAR, 0);
     const pads = room.hangar!.pads.map(padBox);
     const mid = (p: Box) => ({ x: (p.x0 + p.x1) / 2, z: (p.z0 + p.z1) / 2 });
-    for (const look of Object.values(LOOKS)) {
-      const b = createBuilder();
-      buildHangar(b, room, look);
-      const vs = vertices(b.build());
-      const floor = look.palette.floor;
-      for (const p of pads) {
-        const coat = vs.filter(
-          (v) => Math.abs(v.y - PAD_TOP) < EPS && inPlan(p, v),
+    const look = LOOK;
+    const b = createBuilder();
+    buildHangar(b, room, look);
+    const vs = vertices(b.build());
+    const floor = look.palette.floor;
+    for (const p of pads) {
+      const coat = vs.filter(
+        (v) => Math.abs(v.y - PAD_TOP) < EPS && inPlan(p, v),
+      );
+      expect(coat.length).toBeGreaterThan(0);
+      // The coat covers the whole pad: all four of its corners are the
+      // pad's own, not a shrunk or offset patch (M3 fix wave, M11).
+      expect(Math.min(...coat.map((v) => v.x))).toBeCloseTo(p.x0, 6);
+      expect(Math.max(...coat.map((v) => v.x))).toBeCloseTo(p.x1, 6);
+      expect(Math.min(...coat.map((v) => v.z))).toBeCloseTo(p.z0, 6);
+      expect(Math.max(...coat.map((v) => v.z))).toBeCloseTo(p.z1, 6);
+      for (const v of coat) {
+        expect(v.flag).toBe(FLAG.decal);
+        v.tint.forEach((c, i) =>
+          expect(c).toBeLessThanOrEqual(0.6 * (floor[i] ?? NaN) + EPS),
         );
-        expect(coat.length).toBeGreaterThan(0);
-        // The coat covers the whole pad: all four of its corners are the
-        // pad's own, not a shrunk or offset patch (M3 fix wave, M11).
-        expect(Math.min(...coat.map((v) => v.x))).toBeCloseTo(p.x0, 6);
-        expect(Math.max(...coat.map((v) => v.x))).toBeCloseTo(p.x1, 6);
-        expect(Math.min(...coat.map((v) => v.z))).toBeCloseTo(p.z0, 6);
-        expect(Math.max(...coat.map((v) => v.z))).toBeCloseTo(p.z1, 6);
-        for (const v of coat) {
-          expect(v.flag).toBe(FLAG.decal);
-          v.tint.forEach((c, i) =>
-            expect(c).toBeLessThanOrEqual(0.6 * (floor[i] ?? NaN) + EPS),
-          );
-        }
-        // The cross at the pad's centre is white paint over the coat.
-        const c = mid(p);
-        const cross = vs.filter(
-          (v) =>
-            v.flag === FLAG.decal &&
-            v.y > PAD_TOP + EPS &&
-            Math.abs(v.x - c.x) < 3.1 &&
-            Math.abs(v.z - c.z) < 3.1,
-        );
-        expect(cross.length).toBeGreaterThan(0);
-        for (const v of cross)
-          v.tint.forEach((t, i) => expect(t).toBeGreaterThan(floor[i] ?? NaN));
       }
+      // The cross at the pad's centre is white paint over the coat.
+      const c = mid(p);
+      const cross = vs.filter(
+        (v) =>
+          v.flag === FLAG.decal &&
+          v.y > PAD_TOP + EPS &&
+          Math.abs(v.x - c.x) < 3.1 &&
+          Math.abs(v.z - c.z) < 3.1,
+      );
+      expect(cross.length).toBeGreaterThan(0);
+      for (const v of cross)
+        v.tint.forEach((t, i) => expect(t).toBeGreaterThan(floor[i] ?? NaN));
     }
   });
 });

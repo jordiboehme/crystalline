@@ -27,7 +27,7 @@ import { HERO_CATALOGUE, HERO_KINDS } from "../world/heroes";
 import { PROP_CATALOGUE, PROP_KINDS } from "../world/props";
 import { createBuilder } from "./geometry";
 import { createKit } from "./kit";
-import { LOOKS } from "./looks";
+import { LOOK } from "./looks";
 import type { KitAt } from "./models/common";
 import { buildCurio } from "./models/curios";
 import { buildHero } from "./models/heroes";
@@ -103,17 +103,16 @@ const fresh = (): KitAt => {
 
 /** Builds every kind and variant of the three families in every look. */
 function buildEverything(): void {
-  for (const look of Object.values(LOOKS)) {
-    for (const kind of HERO_KINDS)
-      for (let v = 0; v < HERO_CATALOGUE[kind].variants; v++)
-        buildHero(fresh(), kind, v, look);
-    for (const kind of CURIO_KINDS)
-      for (let v = 0; v < CURIO_CATALOGUE[kind].variants; v++)
-        buildCurio(fresh(), kind, v, look);
-    for (const kind of PROP_KINDS)
-      for (let v = 0; v < PROP_CATALOGUE[kind].variants; v++)
-        buildProp(fresh(), kind, v, { look });
-  }
+  const look = LOOK;
+  for (const kind of HERO_KINDS)
+    for (let v = 0; v < HERO_CATALOGUE[kind].variants; v++)
+      buildHero(fresh(), kind, v, look);
+  for (const kind of CURIO_KINDS)
+    for (let v = 0; v < CURIO_CATALOGUE[kind].variants; v++)
+      buildCurio(fresh(), kind, v, look);
+  for (const kind of PROP_KINDS)
+    for (let v = 0; v < PROP_CATALOGUE[kind].variants; v++)
+      buildProp(fresh(), kind, v, { look });
 }
 
 describe("readable text set while the recipes build", () => {
@@ -159,17 +158,15 @@ describe("no text on the fittings but the airlock's word (2.6e C20, M3 C24)", ()
       "scanner",
       "console",
     ];
-    expect(Object.values(LOOKS).length).toBeGreaterThan(1);
     const pieces = consoleRoom().interior ?? [];
     expect(pieces.some((p) => p.kind === "console")).toBe(true);
     recorded.length = 0;
     marked.length = 0;
-    for (const look of Object.values(LOOKS)) {
-      for (const kind of kinds)
-        for (let v = 0; v < INTERIOR_CATALOGUE[kind].variants; v++)
-          buildInterior(fresh(), kind, v, look);
-      pieces.forEach((p, i) => buildInteriorMovers(p, i, look));
-    }
+    const look = LOOK;
+    for (const kind of kinds)
+      for (let v = 0; v < INTERIOR_CATALOGUE[kind].variants; v++)
+        buildInterior(fresh(), kind, v, look);
+    pieces.forEach((p, i) => buildInteriorMovers(p, i, look));
     expect(recorded).toEqual([]);
     expect(marked).toEqual([]);
   });
@@ -180,19 +177,18 @@ describe("no text on the fittings but the airlock's word (2.6e C20, M3 C24)", ()
     // suit locker.
     const kinds = Object.keys(INTERIOR_CATALOGUE) as InteriorKind[];
     expect(kinds.length).toBe(8);
-    for (const look of Object.values(LOOKS))
-      for (const kind of kinds.slice(4))
-        for (let v = 0; v < INTERIOR_CATALOGUE[kind].variants; v++) {
-          recorded.length = 0;
-          marked.length = 0;
-          buildInterior(fresh(), kind, v, look);
-          expect(recorded, kind).toEqual(
-            kind === "outer-hatch" ? [MARKS.airlockWord] : [],
-          );
-          expect(marked, kind).toEqual(
-            kind === "outer-hatch" ? ["pixelPanel"] : [],
-          );
-        }
+    for (const kind of kinds.slice(4))
+      for (let v = 0; v < INTERIOR_CATALOGUE[kind].variants; v++) {
+        recorded.length = 0;
+        marked.length = 0;
+        buildInterior(fresh(), kind, v, LOOK);
+        expect(recorded, kind).toEqual(
+          kind === "outer-hatch" ? [MARKS.airlockWord] : [],
+        );
+        expect(marked, kind).toEqual(
+          kind === "outer-hatch" ? ["pixelPanel"] : [],
+        );
+      }
   });
 });
 
