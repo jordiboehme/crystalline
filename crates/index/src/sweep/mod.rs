@@ -138,8 +138,21 @@ pub const MAX_RELATED_PAIRS: usize = 2000;
 /// each side when both exceed eight, in document order.
 pub const MAX_LINE_PAIRS_PER_PAIR: usize = 64;
 
-/// A line pair is stored when the higher of its two reading orders is at or
-/// above this, so the finding line can move without a rescore.
+/// The most observation line pairs the NLI model reads per engram pair: the
+/// most similar ones at or above the embedding model's line-similarity floor
+/// (`crate::embed::line_similarity_floor`), every line of one engram against
+/// every line of the other. Measured: four kept 178 of 200 planted flips and
+/// cut the real domains from 2100 engram pairs to 73
+/// (research/2026-10-01-v302-line-filter-experiment.md).
+pub const MAX_LINE_PAIRS_PER_ENGRAM_PAIR: usize = 4;
+
+/// A line pair is stored when its first reading order (the lower-id engram's
+/// line as premise) is at or above this under `Min`, which is also the only
+/// case where the second order is read at all: below it the minimum of both
+/// orders can never reach a finding line (every model threshold is above 0.5,
+/// pinned in `nli/models.rs`). Under `Mean` both orders are read and either
+/// one at the floor stores the pair. The finding line can move without a
+/// rescore as long as it stays above this.
 pub const CONTRADICTION_STORE_FLOOR: f32 = 0.5;
 
 /// How the two reading orders of a line pair combine into its score. `Min`

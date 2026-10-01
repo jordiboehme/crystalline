@@ -28,7 +28,7 @@ pub enum Architecture {
 }
 
 /// One local model the provider knows how to run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LocalModel {
     /// The id `embeddings.model` names, and the id stored against every vector.
     pub id: &'static str,
@@ -63,6 +63,15 @@ pub struct LocalModel {
     /// The approximate first-use download, in megabytes, for the notice and
     /// for doctor.
     pub download_mb: u64,
+    /// The line cosine at or above which the contradiction check treats two
+    /// observation lines as being about the same subject and lets the NLI
+    /// model read them. Per model, because cosine distributions differ:
+    /// granite's line cosines are compressed (p10 0.72, p90 0.81 on Jordi's
+    /// domains) and "same subject" starts around 0.86
+    /// (research/2026-10-01-v302-line-filter-experiment.md). `None` for a
+    /// model nobody measured: V302 then does not run at all, so it cannot
+    /// flood on uncalibrated cosines.
+    pub line_similarity_floor: Option<f64>,
 }
 
 /// Every model the local provider can run. The first entry is the default.
@@ -82,6 +91,7 @@ pub const LOCAL_MODELS: [LocalModel; 2] = [
             "model.safetensors",
         ],
         download_mb: 220,
+        line_similarity_floor: Some(0.86),
     },
     LocalModel {
         id: "bge-small-en-v1.5",
@@ -92,6 +102,7 @@ pub const LOCAL_MODELS: [LocalModel; 2] = [
         query_prefix: "Represent this sentence for searching relevant passages: ",
         files: &["config.json", "tokenizer.json", "model.safetensors"],
         download_mb: 130,
+        line_similarity_floor: None,
     },
 ];
 
@@ -151,6 +162,14 @@ pub struct PinnedRepo<'a> {
 pub fn local_model(id: &str) -> Option<&'static LocalModel> {
     let id = id.trim();
     LOCAL_MODELS.iter().find(|m| m.id == id || m.repo == id)
+}
+
+/// The line-similarity floor of the embedding model `model_id` names, by id
+/// or repo; `None` for a model this table does not carry or carries without
+/// a measured floor. The daemon asks with the id its vectors are stored
+/// under, status and doctor with `configured_model_id`, so both say the same.
+pub fn line_similarity_floor(model_id: &str) -> Option<f64> {
+    local_model(model_id).and_then(|m| m.line_similarity_floor)
 }
 
 /// [`local_model`], refusing an id the table does not know.
@@ -1650,5 +1669,46 @@ mod tests {
                 "{file}"
             );
         }
+    }
+
+    /// The floor belongs to the embedding model: granite's was measured
+    /// (research/2026-10-01-v302-line-filter-experiment.md), bge's was not,
+    /// and a model this table does not know has none, so V302 cannot run on
+    /// cosines nobody calibrated.
+    #[test]
+    fn the_line_floor_belongs_to_the_model_entry() {
+        assert_eq!(
+            line_similarity_floor("granite-embedding-97m-multilingual-r2"),
+            Some(0.86)
+        );
+        assert_eq!(
+            line_similarity_floor("ibm-granite/granite-embedding-97m-multilingual-r2"),
+            Some(0.86),
+            "by repo too, as local_model resolves it"
+        );
+        assert_eq!(line_similarity_floor("bge-small-en-v1.5"), None);
+        assert_eq!(line_similarity_floor("text-embedding-3-small"), None);
+        // The direct-mode lookup goes through configured_model_id and lands on
+        // the same answer as the daemon's own model id.
+        let local = crystalline_core::config::EmbeddingsConfig {
+            provider: "local".to_string(),
+            model: String::new(),
+            endpoint: None,
+            api_key_env: None,
+        };
+        assert_eq!(
+            line_similarity_floor(&crate::embed::configured_model_id(Some(&local))),
+            Some(0.86)
+        );
+        let remote = crystalline_core::config::EmbeddingsConfig {
+            provider: "remote".to_string(),
+            model: "text-embedding-3-small".to_string(),
+            endpoint: Some("http://127.0.0.1:9".to_string()),
+            api_key_env: None,
+        };
+        assert_eq!(
+            line_similarity_floor(&crate::embed::configured_model_id(Some(&remote))),
+            None
+        );
     }
 }

@@ -15,9 +15,11 @@ pub mod period;
 mod stub;
 
 pub use candidates::{
-    CandidateFacts, CandidatePair, Candidates, LinePair, contradiction_candidates, eligible, fold,
-    line_pairs, max_related_pairs, observation_hash, observations_digest, pending_pairs,
-    related_threshold, score_rows, scorer_inputs, windows_overlap,
+    CandidateFacts, CandidatePair, Candidates, KeptLine, LinePair, LineRules,
+    contradiction_candidates, eligible, eligible_lines, first_order_inputs, fold, length_order,
+    line_pairs, line_rows, max_related_pairs, observation_hash, observations_digest, pending_pairs,
+    related_threshold, score_rows, scorer_inputs, scoring_checksum, second_order_input,
+    second_order_needed, similar_line_pairs, windows_overlap,
 };
 pub use models::{
     CONTRADICTION_SETTING_VALUES, NLI_MODELS, NliModel, NliProfile, RETIRED_NLI_REPOS,
@@ -32,12 +34,18 @@ use crate::error::Result;
 /// How many ordered pairs one scorer call takes.
 pub const NLI_BATCH_SIZE: usize = 16;
 
+/// How many kept line pairs one scoring group takes across engram pairs, so
+/// the length-sorted batches of [`NLI_BATCH_SIZE`] fill up even though one
+/// engram pair has at most four line pairs.
+pub const NLI_GROUP_LINE_PAIRS: usize = 128;
+
 /// Each line is cut to this many model tokens, so a pair and its separators
 /// fit the 512-token window.
 pub const MAX_LINE_TOKENS: usize = 254;
 
-/// The line pairs one daemon pass scores before it yields; each costs two
-/// forward passes, one per reading order.
+/// The kept line pairs one daemon pass scores before it yields. Each costs
+/// one forward pass in the first reading order, and a second only where the
+/// aggregation needs it ([`OrderAggregation::skips_second_order_below_floor`]).
 pub const MAX_INFERENCES_PER_PASS: usize = 2000;
 
 /// Whether this build carries the local NLI loader.
@@ -132,6 +140,15 @@ impl OrderAggregation {
             OrderAggregation::Min => ab.min(ba),
         }
     }
+
+    /// Whether a line pair whose first order is below the store floor can be
+    /// left unread in the second order. True under `Min`: the minimum of both
+    /// orders is at most the first, so it can never reach a finding line. A
+    /// switch to `Mean` reads both orders again, with nobody having to
+    /// remember this rule.
+    pub fn skips_second_order_below_floor(self) -> bool {
+        matches!(self, OrderAggregation::Min)
+    }
 }
 
 #[cfg(test)]
@@ -187,5 +204,13 @@ mod tests {
             assert!(how.combine(f32::NAN, 0.99).is_nan(), "{how:?}");
             assert!(how.combine(0.99, f32::NAN).is_nan(), "{how:?}");
         }
+    }
+
+    /// 11c: under Min a first order below the store floor can never fire, so
+    /// the second is skipped; Mean needs both.
+    #[test]
+    fn only_min_skips_the_second_order() {
+        assert!(OrderAggregation::Min.skips_second_order_below_floor());
+        assert!(!OrderAggregation::Mean.skips_second_order_below_floor());
     }
 }

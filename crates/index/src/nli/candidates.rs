@@ -2,12 +2,13 @@
 //! observation lines are paired. Pure: the engine assembles the facts from the
 //! base listing, the files and the stamps, and hands them in borrowed.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::OnceLock;
 
 use chrono::NaiveDate;
 use sha2::{Digest, Sha256};
 
+use super::OrderAggregation;
 use super::period::names_period;
 use crate::store::{ContradictionRow, EngramId, ScoredPair, is_current_status};
 use crate::sweep::twins::find_twins_where;
@@ -325,9 +326,268 @@ pub fn score_rows(
         .collect()
 }
 
+/// One kept line pair of an engram pair: indices into each engram's
+/// observations, both row hashes and the line cosine.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KeptLine {
+    /// The index of the line in the lower-id engram's observations.
+    pub ia: usize,
+    /// The index of the line in the higher-id engram's observations.
+    pub ib: usize,
+    /// [`observation_hash`] of `a`'s line.
+    pub hash_a: String,
+    /// [`observation_hash`] of `b`'s line.
+    pub hash_b: String,
+    /// The cosine of the two lines' vectors.
+    pub similarity: f32,
+}
+
+/// What decides which line pairs of an engram pair reach the model: the
+/// embedding model the vectors come from, its floor and the per-pair limit.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LineRules<'a> {
+    /// The embedding model id the line vectors are stored under.
+    pub embedding_model: &'a str,
+    /// That model's line-similarity floor.
+    pub floor: f64,
+    /// [`crate::sweep::MAX_LINE_PAIRS_PER_ENGRAM_PAIR`].
+    pub max_line_pairs: usize,
+}
+
+impl LineRules<'_> {
+    /// The rules as one stable text, folded into the per-engram checksum and
+    /// the walk digest, so a change of any of them rescores every pair once.
+    pub fn key(&self) -> String {
+        format!(
+            "{}\u{0}{}\u{0}{}",
+            self.embedding_model,
+            self.floor.to_bits(),
+            self.max_line_pairs
+        )
+    }
+}
+
+/// The per-engram checksum a scored pair is stored at: the observation digest
+/// under the line rules. A changed line, a changed floor, limit or embedding
+/// model each move it, so the pair is pending again and its rows are
+/// replaced; a frontmatter or prose edit does not.
+pub fn scoring_checksum(observations: &[FactObservation], rules: &LineRules<'_>) -> String {
+    let mut h = Sha256::new();
+    h.update(rules.key().as_bytes());
+    h.update([0]);
+    h.update(observations_digest(observations).as_bytes());
+    crate::hex_lower(&h.finalize())
+}
+
+/// Every distinct observation line, folded and keyed by its row hash, of the
+/// engrams that can take part in `V302`: current, not speculative, with
+/// observations (the candidate rule's eligibility, without the lead vector).
+/// These are the lines the walk keeps a vector for.
+pub fn eligible_lines(facts: &[CandidateFacts<'_>]) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for f in facts
+        .iter()
+        .filter(|f| eligible(f.status) && !f.observations.is_empty())
+    {
+        for o in f.observations {
+            let folded = fold(&o.text);
+            if folded.is_empty() {
+                continue;
+            }
+            out.entry(observation_hash(&o.text)).or_insert(folded);
+        }
+    }
+    out
+}
+
+/// The line pairs of one engram pair the model reads: every line of `a`
+/// against every line of `b` by the cosine of their vectors, those at or
+/// above `floor`, at most `limit`, the most similar first and document order
+/// among equals. A line with no words is skipped, a repeated line inside one
+/// engram counts once (its first occurrence), and two lines with the same
+/// text are never a pair: a line does not contradict itself, and a copied
+/// bullet would otherwise take a slot from two lines that differ.
+///
+/// `None` when a line of either side has no vector in `vectors` yet: the pair
+/// waits for it rather than reading as scored. Only the best `limit` are ever
+/// held, so a long engram costs time, never memory.
+pub fn similar_line_pairs(
+    a: &[FactObservation],
+    b: &[FactObservation],
+    vectors: &HashMap<String, Vec<f32>>,
+    floor: f64,
+    limit: usize,
+) -> Option<Vec<KeptLine>> {
+    let sa = embedded_side(a, vectors)?;
+    let sb = embedded_side(b, vectors)?;
+    // (similarity, index into sa, index into sb), the best `limit` so far.
+    let mut best: Vec<(f32, usize, usize)> = Vec::with_capacity(limit + 1);
+    let order = |x: &(f32, usize, usize), y: &(f32, usize, usize)| {
+        y.0.total_cmp(&x.0)
+            .then_with(|| (x.1, x.2).cmp(&(y.1, y.2)))
+    };
+    for (x, (_, ha, va)) in sa.iter().enumerate() {
+        for (y, (_, hb, vb)) in sb.iter().enumerate() {
+            if ha == hb {
+                continue;
+            }
+            let s = cosine(va, vb);
+            if s.is_nan() || f64::from(s) < floor {
+                continue;
+            }
+            best.push((s, x, y));
+            best.sort_by(order);
+            best.truncate(limit);
+        }
+    }
+    Some(
+        best.into_iter()
+            .map(|(similarity, x, y)| KeptLine {
+                ia: sa[x].0,
+                ib: sb[y].0,
+                hash_a: sa[x].1.clone(),
+                hash_b: sb[y].1.clone(),
+                similarity,
+            })
+            .collect(),
+    )
+}
+
+/// One side's lines with words, deduplicated by hash in document order, each
+/// with its index, hash and vector; `None` when one has no vector.
+fn embedded_side<'v>(
+    observations: &[FactObservation],
+    vectors: &'v HashMap<String, Vec<f32>>,
+) -> Option<Vec<(usize, String, &'v [f32])>> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out = Vec::with_capacity(observations.len());
+    for (i, o) in observations.iter().enumerate() {
+        if fold(&o.text).is_empty() {
+            continue;
+        }
+        let hash = observation_hash(&o.text);
+        if !seen.insert(hash.clone()) {
+            continue;
+        }
+        let vector = vectors.get(&hash)?;
+        out.push((i, hash, vector.as_slice()));
+    }
+    Some(out)
+}
+
+/// The cosine of two vectors; 0 for mismatched widths or a zero vector, so
+/// neither is ever kept.
+fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() {
+        return 0.0;
+    }
+    let (mut dot, mut na, mut nb) = (0f32, 0f32, 0f32);
+    for (x, y) in a.iter().zip(b) {
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    if na == 0.0 || nb == 0.0 {
+        return 0.0;
+    }
+    dot / (na.sqrt() * nb.sqrt())
+}
+
+/// The first reading order of each kept line pair, folded: `a`'s line as
+/// premise.
+pub fn first_order_inputs(
+    a: &[FactObservation],
+    b: &[FactObservation],
+    lines: &[KeptLine],
+) -> Vec<(String, String)> {
+    lines
+        .iter()
+        .map(|l| (fold(&a[l.ia].text), fold(&b[l.ib].text)))
+        .collect()
+}
+
+/// The second reading order of one kept line pair, folded: `b`'s line as
+/// premise.
+pub fn second_order_input(
+    a: &[FactObservation],
+    b: &[FactObservation],
+    line: &KeptLine,
+) -> (String, String) {
+    (fold(&b[line.ib].text), fold(&a[line.ia].text))
+}
+
+/// Which line pairs need the second order, given the first: all of them
+/// under `Mean`, those at or above [`CONTRADICTION_STORE_FLOOR`] under `Min`
+/// (a NaN never is).
+pub fn second_order_needed(first: &[f32], how: OrderAggregation) -> Vec<bool> {
+    first
+        .iter()
+        .map(|p| !how.skips_second_order_below_floor() || *p >= CONTRADICTION_STORE_FLOOR)
+        .collect()
+}
+
+/// The rows to store for one engram pair's kept line pairs, given both
+/// orders (`second` is `None` where it was not read). Under `Min` a line pair
+/// is stored when its first order reached [`CONTRADICTION_STORE_FLOOR`];
+/// under `Mean` when either order did. Both orders, the line similarity and
+/// the period hint are kept.
+#[allow(clippy::too_many_arguments)]
+pub fn line_rows(
+    a: EngramId,
+    b: EngramId,
+    obs_a: &[FactObservation],
+    obs_b: &[FactObservation],
+    lines: &[KeptLine],
+    first: &[f32],
+    second: &[Option<f32>],
+    how: OrderAggregation,
+) -> Vec<ContradictionRow> {
+    // One score per order per line pair; a short answer would zip away the
+    // tail silently and store the pair as scored.
+    debug_assert_eq!(first.len(), lines.len());
+    debug_assert_eq!(second.len(), lines.len());
+    lines
+        .iter()
+        .zip(first)
+        .zip(second)
+        .filter_map(|((l, &ab), ba)| {
+            let ba = (*ba)?;
+            let stored = if how.skips_second_order_below_floor() {
+                ab >= CONTRADICTION_STORE_FLOOR
+            } else {
+                ab >= CONTRADICTION_STORE_FLOOR || ba >= CONTRADICTION_STORE_FLOOR
+            };
+            stored.then(|| ContradictionRow {
+                a,
+                b,
+                line_a: obs_a[l.ia].line,
+                line_b: obs_b[l.ib].line,
+                hash_a: l.hash_a.clone(),
+                hash_b: l.hash_b.clone(),
+                score_ab: ab,
+                score_ba: ba,
+                similarity: l.similarity,
+                period: names_period(&obs_a[l.ia].text) || names_period(&obs_b[l.ib].text),
+            })
+        })
+        .collect()
+}
+
+/// The indices of `inputs` sorted by the byte length of premise plus
+/// hypothesis, ties in input order, so a batch pads to a near neighbour
+/// rather than to the longest line of the pass. Byte length is enough:
+/// the loader cuts every line to `MAX_LINE_TOKENS` anyway, which also bounds
+/// the last, longest batch (lesson 3 is about unbounded chunks).
+pub fn length_order(inputs: &[(String, String)]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..inputs.len()).collect();
+    order.sort_by_key(|&i| inputs[i].0.len() + inputs[i].1.len());
+    order
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sweep::MAX_LINE_PAIRS_PER_ENGRAM_PAIR;
 
     fn day(s: &str) -> NaiveDate {
         s.parse().unwrap()
@@ -696,5 +956,339 @@ mod tests {
         let one = contradiction_candidates(&views(&all), 0.80, 1);
         assert_eq!(one.pairs.len(), 1);
         assert!(one.full, "two overlapping pairs, one kept");
+    }
+
+    fn vectors_for(lines: &[(&str, &[f32])]) -> HashMap<String, Vec<f32>> {
+        lines
+            .iter()
+            .map(|(text, v)| (observation_hash(text), unit(v)))
+            .collect()
+    }
+
+    #[test]
+    fn only_lines_at_or_above_the_floor_are_kept_most_similar_first() {
+        let a = vec![
+            obs(3, "Staging deploys need a manual trigger"),
+            obs(4, "Logs go to Loki"),
+        ];
+        let b = vec![
+            obs(7, "Staging applies without manual approval"),
+            obs(8, "Grafana reads Loki"),
+            obs(9, "The cafeteria opens at eight"),
+        ];
+        let v = vectors_for(&[
+            ("Staging deploys need a manual trigger", &[1.0, 0.0, 0.0]),
+            ("Logs go to Loki", &[0.0, 1.0, 0.0]),
+            (
+                "Staging applies without manual approval",
+                &[0.95, 0.31, 0.0],
+            ),
+            ("Grafana reads Loki", &[0.1, 0.99, 0.0]),
+            ("The cafeteria opens at eight", &[0.0, 0.0, 1.0]),
+        ]);
+        let kept = similar_line_pairs(&a, &b, &v, 0.86, 4).expect("every line has a vector");
+        let at: Vec<(usize, usize)> = kept.iter().map(|k| (a[k.ia].line, b[k.ib].line)).collect();
+        assert_eq!(
+            at,
+            vec![(4, 8), (3, 7)],
+            "most similar first, the unrelated line never"
+        );
+        assert!(kept.windows(2).all(|w| w[0].similarity >= w[1].similarity));
+        assert!(kept.iter().all(|k| f64::from(k.similarity) >= 0.86));
+        assert_eq!(
+            kept[1].hash_a,
+            observation_hash("Staging deploys need a manual trigger")
+        );
+        assert!(
+            similar_line_pairs(&a, &b, &v, 0.999, 4).unwrap().is_empty(),
+            "nothing at the floor is a scored pair with no rows, not a missing one"
+        );
+    }
+
+    #[test]
+    fn at_most_the_limit_is_kept_and_ties_keep_document_order() {
+        let a: Vec<FactObservation> = (1..=3).map(|i| obs(i, &format!("a{i}"))).collect();
+        let b: Vec<FactObservation> = (1..=3).map(|i| obs(10 + i, &format!("b{i}"))).collect();
+        let same: Vec<(String, Vec<f32>)> = a
+            .iter()
+            .chain(&b)
+            .map(|o| (observation_hash(&o.text), vec![1.0, 0.0]))
+            .collect();
+        let v: HashMap<String, Vec<f32>> = same.into_iter().collect();
+        let kept = similar_line_pairs(&a, &b, &v, 0.86, MAX_LINE_PAIRS_PER_ENGRAM_PAIR).unwrap();
+        assert_eq!(kept.len(), 4, "nine pairs at 1.0, four kept");
+        let at: Vec<(usize, usize)> = kept.iter().map(|k| (k.ia, k.ib)).collect();
+        assert_eq!(at, vec![(0, 0), (0, 1), (0, 2), (1, 0)]);
+    }
+
+    /// Review focus 2: every line of a long engram takes part, the cut is the
+    /// limit and not a window of the first eight lines.
+    #[test]
+    fn a_long_engram_finds_its_match_beyond_the_old_window_and_keeps_four() {
+        let a: Vec<FactObservation> = (1..=150)
+            .map(|i| obs(i, &format!("filler line {i}")))
+            .collect();
+        let b = vec![obs(5, "The target subject line")];
+        let mut v: HashMap<String, Vec<f32>> = a
+            .iter()
+            .map(|o| (observation_hash(&o.text), unit(&[0.0, 1.0])))
+            .collect();
+        v.insert(observation_hash("filler line 120"), unit(&[1.0, 0.05]));
+        v.insert(
+            observation_hash("The target subject line"),
+            unit(&[1.0, 0.0]),
+        );
+        let kept = similar_line_pairs(&a, &b, &v, 0.86, 4).unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(a[kept[0].ia].line, 120);
+    }
+
+    /// Review focus 1: a line never contradicts itself, so the same text on
+    /// both sides takes no slot from two lines that differ.
+    #[test]
+    fn identical_lines_never_take_a_slot() {
+        // Each shared bullet on an axis of its own, so two different shared
+        // bullets are unrelated and only a bullet against its own copy (the
+        // same text) would sit at 1.0.
+        let axis = |i: usize| -> Vec<f32> {
+            let mut v = vec![0.0f32; 7];
+            v[i] = 1.0;
+            v
+        };
+        let shared: Vec<FactObservation> = (1..=5)
+            .map(|i| obs(i, &format!("shared bullet {i}")))
+            .collect();
+        let mut a = shared.clone();
+        a.push(obs(9, "The build uses Node 18"));
+        let mut b = shared.clone();
+        b.push(obs(9, "The build uses Node 20"));
+        let mut v: HashMap<String, Vec<f32>> = shared
+            .iter()
+            .enumerate()
+            .map(|(i, o)| (observation_hash(&o.text), axis(i)))
+            .collect();
+        v.insert(observation_hash("The build uses Node 18"), axis(5));
+        let mut node_20 = axis(5);
+        node_20[6] = 0.1;
+        v.insert(observation_hash("The build uses Node 20"), unit(&node_20));
+        let kept = similar_line_pairs(&a, &b, &v, 0.86, 4).unwrap();
+        assert!(kept.iter().all(|k| k.hash_a != k.hash_b), "{kept:?}");
+        assert!(
+            kept.iter().any(|k| a[k.ia].line == 9 && b[k.ib].line == 9),
+            "the two lines that differ are scored: {kept:?}"
+        );
+    }
+
+    /// A copied bullet inside one engram is one line: the pair keys would
+    /// collide on the primary key otherwise.
+    #[test]
+    fn a_repeated_line_inside_one_engram_is_paired_once() {
+        let a = vec![
+            obs(5, "The build uses Node 18"),
+            obs(9, "The  build uses Node 18"),
+        ];
+        let b = vec![obs(3, "The build uses Node 20")];
+        let v = vectors_for(&[
+            ("The build uses Node 18", &[1.0, 0.0]),
+            ("The build uses Node 20", &[0.99, 0.1]),
+        ]);
+        let kept = similar_line_pairs(&a, &b, &v, 0.86, 4).unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(
+            a[kept[0].ia].line, 5,
+            "the first occurrence in document order"
+        );
+        let blank = vec![obs(4, "   ")];
+        assert!(
+            similar_line_pairs(&blank, &b, &v, 0.86, 4)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A line with no vector yet makes the pair wait, never read as clean.
+    #[test]
+    fn a_missing_vector_makes_the_pair_wait() {
+        let a = vec![obs(1, "The build uses Node 18")];
+        let b = vec![obs(2, "The build uses Node 20"), obs(3, "Not embedded yet")];
+        let v = vectors_for(&[
+            ("The build uses Node 18", &[1.0, 0.0]),
+            ("The build uses Node 20", &[1.0, 0.0]),
+        ]);
+        assert_eq!(similar_line_pairs(&a, &b, &v, 0.86, 4), None);
+    }
+
+    #[test]
+    fn eligible_lines_are_the_distinct_folded_lines_of_engrams_that_can_take_part() {
+        let mut one = owned(1, &[1.0, 0.0]);
+        one.obs = vec![obs(3, "Node  18"), obs(4, " "), obs(5, "Shared")];
+        let mut two = owned(2, &[1.0, 0.0]);
+        two.obs = vec![obs(7, "Shared")];
+        let mut draft = owned(3, &[1.0, 0.0]);
+        draft.status = "draft".to_string();
+        draft.obs = vec![obs(1, "Speculative")];
+        let mut unembedded = owned(4, &[1.0, 0.0]);
+        unembedded.vector = None;
+        unembedded.obs = vec![obs(1, "No lead vector yet")];
+        let all = vec![one, two, draft, unembedded];
+        let lines = eligible_lines(&views(&all));
+        let texts: Vec<&str> = lines.values().map(String::as_str).collect();
+        assert_eq!(lines.len(), 3, "{texts:?}");
+        assert_eq!(lines[&observation_hash("Node 18")], "Node 18", "folded");
+        assert!(
+            lines.contains_key(&observation_hash("No lead vector yet")),
+            "eligibility is status and lines, not the lead vector"
+        );
+        assert!(!lines.contains_key(&observation_hash("Speculative")));
+    }
+
+    #[test]
+    fn the_scoring_checksum_moves_with_the_rules() {
+        let o = vec![obs(5, "Node 18")];
+        let rules = LineRules {
+            embedding_model: "granite",
+            floor: 0.86,
+            max_line_pairs: 4,
+        };
+        let base = scoring_checksum(&o, &rules);
+        assert_eq!(
+            base,
+            scoring_checksum(&[obs(9, "Node  18")], &rules),
+            "lines and spaces do not move it"
+        );
+        assert_ne!(
+            base,
+            scoring_checksum(
+                &o,
+                &LineRules {
+                    floor: 0.88,
+                    ..rules
+                }
+            )
+        );
+        assert_ne!(
+            base,
+            scoring_checksum(
+                &o,
+                &LineRules {
+                    max_line_pairs: 5,
+                    ..rules
+                }
+            )
+        );
+        assert_ne!(
+            base,
+            scoring_checksum(
+                &o,
+                &LineRules {
+                    embedding_model: "bge",
+                    ..rules
+                }
+            )
+        );
+        assert_ne!(base, scoring_checksum(&[obs(5, "Node 20")], &rules));
+        assert_ne!(
+            base,
+            observations_digest(&o),
+            "never the plain digest a pair stored before"
+        );
+    }
+
+    fn kept(
+        ia: usize,
+        ib: usize,
+        a: &[FactObservation],
+        b: &[FactObservation],
+        s: f32,
+    ) -> KeptLine {
+        KeptLine {
+            ia,
+            ib,
+            hash_a: observation_hash(&a[ia].text),
+            hash_b: observation_hash(&b[ib].text),
+            similarity: s,
+        }
+    }
+
+    #[test]
+    fn the_inputs_are_the_folded_lines_a_first_then_b_first() {
+        let a = vec![obs(1, "Node  18")];
+        let b = vec![obs(2, "Node 20")];
+        let lines = vec![kept(0, 0, &a, &b, 0.9)];
+        assert_eq!(
+            first_order_inputs(&a, &b, &lines),
+            vec![("Node 18".to_string(), "Node 20".to_string())]
+        );
+        assert_eq!(
+            second_order_input(&a, &b, &lines[0]),
+            ("Node 20".to_string(), "Node 18".to_string())
+        );
+    }
+
+    #[test]
+    fn the_second_order_follows_the_aggregation() {
+        let first = [0.2, 0.5, 0.93, f32::NAN];
+        assert_eq!(
+            second_order_needed(&first, OrderAggregation::Min),
+            vec![false, true, true, false],
+            "under Min only a first order at or above the store floor can fire"
+        );
+        assert_eq!(
+            second_order_needed(&first, OrderAggregation::Mean),
+            vec![true; 4]
+        );
+
+        let a = vec![
+            obs(1, "Since 2024 the build uses Node 18"),
+            obs(2, "Deploys run on Fridays"),
+        ];
+        let b = vec![obs(7, "The build uses Node 20")];
+        let lines = vec![kept(0, 0, &a, &b, 0.91), kept(1, 0, &a, &b, 0.87)];
+        // Min: the first order decides; the second line pair's first order
+        // is below the floor, so it was never read the other way.
+        let rows = line_rows(
+            EngramId(1),
+            EngramId(2),
+            &a,
+            &b,
+            &lines,
+            &[0.9, 0.3],
+            &[Some(0.4), None],
+            OrderAggregation::Min,
+        );
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        assert_eq!((r.line_a, r.line_b), (1, 7));
+        assert_eq!((r.score_ab, r.score_ba, r.similarity), (0.9, 0.4, 0.91));
+        assert!(r.period, "a line naming a year sets the hint");
+        // Mean: both orders were read, either one at the floor stores.
+        let rows = line_rows(
+            EngramId(1),
+            EngramId(2),
+            &a,
+            &b,
+            &lines,
+            &[0.3, 0.2],
+            &[Some(0.6), Some(0.1)],
+            OrderAggregation::Mean,
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].score_ab, rows[0].score_ba), (0.3, 0.6));
+    }
+
+    #[test]
+    fn length_order_sorts_by_length_and_keeps_ties_in_input_order() {
+        let inputs = vec![
+            (
+                "a much longer premise".to_string(),
+                "and hypothesis".to_string(),
+            ),
+            ("short".to_string(), "one".to_string()),
+            ("tie".to_string(), "abc".to_string()),
+            ("mid length".to_string(), "text".to_string()),
+            ("abc".to_string(), "tie".to_string()),
+        ];
+        assert_eq!(length_order(&inputs), vec![2, 4, 1, 3, 0]);
+        assert!(length_order(&[]).is_empty());
     }
 }

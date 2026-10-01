@@ -32,8 +32,8 @@ pub use chunk::{
 };
 pub use models::{
     Architecture, LOCAL_MODELS, LocalModel, SnapshotChoice, cached_model_dirs, choose_snapshot,
-    hub_dir_name, local_model, lookup_local_model, older_snapshot_warning, prune_model_cache,
-    retire_older_snapshots,
+    hub_dir_name, line_similarity_floor, local_model, lookup_local_model, older_snapshot_warning,
+    prune_model_cache, retire_older_snapshots,
 };
 
 /// How many chunks are embedded per provider call.
