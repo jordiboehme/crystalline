@@ -94,7 +94,9 @@ reporting partial numbers silently. The dump carries `similarity`; an index
 built before that column existed is refused with a clear message, so rebuild
 it. `evaluate.py --top N` prints the product's ranking per domain. The mean
 table is unreliable since the second order is skipped below the store floor
-under Min. The gate count is `flips_at_0_70`. Each profile gets its own model cache
+under Min. The probes gate is read at the product's finding line, 0.90 under
+Min: at least 150 of 200 planted flips (`flips_at_0_90`) and 0 planted
+negatives (`negatives_at_0_90`). Each profile gets its own model cache
 under `<out>`, seeded with a clone of the embedding model (and, with
 `NLI_SEED_MODELS` set, that profile's own checkpoint too).
 
