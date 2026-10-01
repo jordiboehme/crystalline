@@ -17,7 +17,7 @@
     "format:check": "prettier --check .",
     "test": "vitest run",
     "smoke": "bash e2e/run-smoke.sh",
-    "generate:api": "openapi-typescript ../crates/service/openapi/fluid-v1.json -o src/api/types.ts"
+    "generate:api": "openapi-ts"
   },
   "dependencies": {
     "@codemirror/autocomplete": "6.20.3",
@@ -52,6 +52,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
+    "@hey-api/openapi-ts": "0.99.0",
     "@playwright/test": "^1.63.0",
     "@tailwindcss/vite": "^4.3.3",
     "@testing-library/dom": "^10.4.2",
@@ -68,7 +69,6 @@
     "eslint-plugin-react-refresh": "^0.5.7",
     "globals": "^17.12.0",
     "jsdom": "30.0.1",
-    "openapi-typescript": "^7.13.0",
     "prettier": "^3.9.9",
     "tailwindcss": "^4.3.3",
     "typescript": "~6.0.3",

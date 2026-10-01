@@ -279,7 +279,7 @@ jobs:
           fi
           echo "version parity: $fluid_version"
 
-      # src/api/types.ts is generated from the OpenAPI snapshot the service
+      # src/api/gen is generated from the OpenAPI snapshot the service
       # crate emits, and is the only description of the API the UI has. A
       # regenerated file that differs means the snapshot moved and the UI is
       # typed against an API that no longer exists.
@@ -287,8 +287,9 @@ jobs:
         run: |
           set -euo pipefail
           pnpm generate:api
-          if ! git diff --exit-code src/api/types.ts; then
-            echo "::error file=fluid/src/api/types.ts::the generated types differ from the committed ones. Run 'pnpm generate:api' in fluid/ and commit the result."
+          git add -N src/api/gen
+          if ! git diff --exit-code src/api/gen; then
+            echo "::error file=fluid/src/api/gen::the generated types differ from the committed ones. Run 'pnpm generate:api' in fluid/ and commit the result."
             exit 1
           fi
 

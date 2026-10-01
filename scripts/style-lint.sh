@@ -19,7 +19,7 @@ fail=0
 #
 # Excluded: build output; vendored third-party files, which must stay
 # byte-identical to their upstream (see evals/skill-training/vendor/README.md);
-# the API types fluid/src/api/types.ts, generated from the OpenAPI snapshot by
+# the API types in fluid/src/api/gen, generated from the OpenAPI snapshot by
 # `pnpm generate:api` and never hand-written; and fluid/pnpm-lock.yaml, which
 # is generated too and is the one lockfile the patterns below can match.
 files=$(git ls-files -- '*.md' '*.rs' '*.ts' '*.tsx' '*.css' '*.html' \
@@ -28,7 +28,7 @@ files=$(git ls-files -- '*.md' '*.rs' '*.ts' '*.tsx' '*.css' '*.html' \
     | grep -v '^target/' \
     | grep -v '/node_modules/' \
     | grep -v '^evals/skill-training/vendor/' \
-    | grep -v '^fluid/src/api/types\.ts$' \
+    | grep -v '^fluid/src/api/gen/' \
     | grep -v '^fluid/pnpm-lock\.yaml$' || true)
 
 if [ -z "$files" ]; then
