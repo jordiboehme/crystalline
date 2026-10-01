@@ -254,6 +254,9 @@ impl Engine {
         // Delta 1: the files arrive in memory, already unpacked by the caller,
         // so there is no folder to walk and no source directory to validate.
         for (path, text) in files {
+            // Imported as LF, the one line ending anything is stored with.
+            let text = crystalline_core::to_lf(text);
+            let text: &str = &text;
             // Delta 4: a MANIFEST at any depth is ignored - defense in depth,
             // the REST layer screens these before the engine ever sees them.
             // Matched case-insensitively because the filesystem underneath is:
