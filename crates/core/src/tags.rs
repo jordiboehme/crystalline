@@ -36,16 +36,17 @@ pub fn is_lower_hyphen(s: &str) -> bool {
 }
 
 /// Fold a tag as an agent spelled it into the canonical lowercase-with-hyphens
-/// form: lowercased, every run of whitespace, underscores and hyphens turned
-/// into one hyphen, and hyphens trimmed from both ends. `None` when the result
-/// is not a tag [`is_lower_hyphen`] accepts (empty, or holding a character
-/// other than an ASCII letter, a digit or a separator), so the caller refuses
-/// it rather than writing a tag verify's E007 would flag.
+/// form: lowercased, every run of whitespace and underscores turned into one
+/// hyphen, and hyphens trimmed from both ends. A hyphen the caller wrote is
+/// kept as written, so a tag already in canonical form comes back unchanged.
+/// `None` when the result is not a tag [`is_lower_hyphen`] accepts (empty, or
+/// holding a character other than an ASCII letter, a digit or a hyphen), so
+/// the caller refuses it rather than writing a tag verify's E007 would flag.
 pub fn fold_tag(raw: &str) -> Option<String> {
     let mut out = String::with_capacity(raw.len());
     let mut pending_hyphen = false;
     for c in raw.chars().flat_map(char::to_lowercase) {
-        if c.is_whitespace() || c == '_' || c == '-' {
+        if c.is_whitespace() || c == '_' {
             pending_hyphen = true;
             continue;
         }
@@ -55,7 +56,8 @@ pub fn fold_tag(raw: &str) -> Option<String> {
         pending_hyphen = false;
         out.push(c);
     }
-    is_lower_hyphen(&out).then_some(out)
+    let out = out.trim_matches('-');
+    is_lower_hyphen(out).then(|| out.to_string())
 }
 
 /// Rewrite every occurrence of tag `old` to `new` in one Engram's markdown
@@ -590,8 +592,17 @@ mod tests {
         );
         assert_eq!(fold_tag("  API_v2  ").as_deref(), Some("api-v2"));
         assert_eq!(fold_tag("a \t_ b").as_deref(), Some("a-b"));
-        assert_eq!(fold_tag("a - b").as_deref(), Some("a-b"));
         assert_eq!(fold_tag("-edge-").as_deref(), Some("edge"));
+    }
+
+    #[test]
+    fn fold_tag_leaves_a_canonical_tag_unchanged() {
+        // An agent passes the engram's whole list back with one tag added, so
+        // a tag already in canonical form must come back byte for byte.
+        for tag in ["a--b", "api2", "multi-word", "x"] {
+            assert!(is_lower_hyphen(tag));
+            assert_eq!(fold_tag(tag).as_deref(), Some(tag), "{tag}");
+        }
     }
 
     #[test]
