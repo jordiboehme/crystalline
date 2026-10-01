@@ -488,6 +488,10 @@ impl Engine {
             "embeddings": {
                 "active_model": self.model_id,
                 "provider": self.provider().is_some(),
+                // The device the loaded local model runs on, with the reason
+                // when it is the CPU on a Mac that has a GPU; absent for a
+                // remote provider or none at all.
+                "device": self.provider().and_then(|p| p.device()).map(|d| d.to_string()),
                 "embedded_chunks": active_embedded,
                 "total_chunks": coverage.total_chunks,
                 "hybrid_available": coverage.has_active_embeddings(&self.model_id),

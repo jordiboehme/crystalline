@@ -19,7 +19,7 @@ Positioning follows the psychology concept of fluid vs crystallized intelligence
 Cargo workspace, Rust edition 2024, pinned toolchain in rust-toolchain.toml.
 
 - `crates/core` (crystalline-core) - format layer: parser, emitter, schema, verify, prompt. Must never depend on async runtimes, databases or ML crates
-- `crates/index` (crystalline-index) - Store trait, embedded database backend, sync engine, search, embeddings
+- `crates/index` (crystalline-index) - Store trait, embedded database backend, sync engine, search, embeddings. The local embedding model runs on Metal on Apple Silicon Macs (candle's `metal` feature, enabled for aarch64-apple-darwin only) with a CPU fallback, and on the CPU everywhere else (`src/device.rs`)
 - `crates/remote` (crystalline-remote) - GitHub-backed team collaboration plumbing: the forge-neutral Provider trait, the plain-text merge engine and the on-disk origin state. Git is never invoked; everything goes through the GitHub APIs
 - `crates/identity` (crystalline-identity) - accounts, roles, domain access, joins and scope
 - `crates/engine` (crystalline-engine) - the shared engine, review-mode overlay, origins, co-editing sessions

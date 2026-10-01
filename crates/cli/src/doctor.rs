@@ -838,6 +838,11 @@ pub struct DoctorReport {
     /// (plan correction 15: doctor never reads the index for this). Never a
     /// problem: `remaining_problems` is unchanged by it.
     pub contradictions: Option<serde_json::Value>,
+    /// The device a local embedding model would run on here, probed without
+    /// loading it (see `crystalline_index::device::probe`). `None` for a
+    /// remote provider and on a build without the local model stack.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_device: Option<String>,
     /// Onboarding trace for the Claude Code and Codex integrations
     /// `crystalline install` wires up. `None` when neither harness leaves
     /// any trace on disk at all: no settings/hooks file and no managed
@@ -1167,6 +1172,13 @@ pub async fn run(
         Some(store) => Some(embedding_summary(store, cfg).await?),
         None => None,
     };
+    let embedding_device = cfg
+        .embeddings
+        .as_ref()
+        .is_none_or(|e| e.provider.trim() == "local")
+        .then(crystalline_index::device::probe)
+        .flatten()
+        .map(|d| d.to_string());
 
     // Only when a daemon already answered this run's file stamps: reusing
     // that daemon's own numbers is one extra round trip on the route that
@@ -1199,6 +1211,7 @@ pub async fn run(
         github,
         embeddings,
         contradictions,
+        embedding_device,
         harnesses,
         provisioning,
         orphaned_rows,
@@ -3723,6 +3736,11 @@ pub fn render_human(report: &DoctorReport) -> String {
             }
         }
     }
+    // Probed, not loaded: a warm-up failure on the GPU shows only in
+    // `crystalline status`, which reports the running model's device.
+    if let Some(device) = &report.embedding_device {
+        let _ = writeln!(out, "  device: {device}");
+    }
 
     if let Some(c) = &report.contradictions {
         match c["model"].as_str() {
@@ -4474,6 +4492,30 @@ mod tests {
             !out.contains("ibm-granite/granite-embedding-97m-multilingual-r2 220 MB [stale]"),
             "the model in use is not marked stale: {out}"
         );
+    }
+
+    /// The probed device is one line under the embeddings, whichever way the
+    /// index was read, and a remote provider (no probe) prints none.
+    #[test]
+    fn the_embedding_device_is_a_line_under_the_embeddings() {
+        for (index, device) in [
+            (IndexAccess::Daemon, "metal"),
+            (IndexAccess::Absent, "cpu (off by CRYSTALLINE_ACCELERATION)"),
+            (
+                IndexAccess::Direct,
+                "cpu (fallback: no usable Metal device: none)",
+            ),
+        ] {
+            let report = DoctorReport {
+                index,
+                embedding_device: Some(device.to_string()),
+                ..DoctorReport::default()
+            };
+            let out = render_human(&report);
+            assert!(out.contains(&format!("\n  device: {device}\n")), "{out}");
+        }
+        let remote = render_human(&DoctorReport::default());
+        assert!(!remote.contains("device:"), "{remote}");
     }
 
     /// A start on an older cached snapshot is a warning line under the

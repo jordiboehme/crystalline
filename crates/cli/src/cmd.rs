@@ -2599,6 +2599,27 @@ pub(crate) fn contradictions_lines(data: &serde_json::Value) -> Vec<String> {
     lines
 }
 
+/// The status line about embeddings: coverage, model and default search, then
+/// the device the loaded local model runs on when the report carries one (a
+/// remote provider, no provider and an older daemon's report carry none).
+pub(crate) fn embeddings_line(emb: &serde_json::Value) -> String {
+    let mut line = format!(
+        "Embeddings: {}/{} chunks embedded with '{}', default search: {}",
+        emb["embedded_chunks"].as_u64().unwrap_or(0),
+        emb["total_chunks"].as_u64().unwrap_or(0),
+        emb["active_model"].as_str().unwrap_or(""),
+        if emb["hybrid_available"].as_bool().unwrap_or(false) {
+            "hybrid"
+        } else {
+            "text"
+        }
+    );
+    if let Some(device) = emb["device"].as_str() {
+        line.push_str(&format!(", device: {device}"));
+    }
+    line
+}
+
 /// Render a status report (the daemon's or the in-process one) as human
 /// text. `daemon_note` says where the numbers come from - the one line that
 /// keeps a fallback read from masquerading as the daemon's view.
@@ -2673,18 +2694,7 @@ pub fn render_status(data: &serde_json::Value, daemon_note: &str) {
         data["schema_version"].as_u64().unwrap_or(0),
         data["fts_mode"].as_str().unwrap_or("unknown")
     );
-    let emb = &data["embeddings"];
-    println!(
-        "Embeddings: {}/{} chunks embedded with '{}', default search: {}",
-        emb["embedded_chunks"].as_u64().unwrap_or(0),
-        emb["total_chunks"].as_u64().unwrap_or(0),
-        emb["active_model"].as_str().unwrap_or(""),
-        if emb["hybrid_available"].as_bool().unwrap_or(false) {
-            "hybrid"
-        } else {
-            "text"
-        }
-    );
+    println!("{}", embeddings_line(&data["embeddings"]));
 
     // The rebuild markers, printed directly under the coverage figure they
     // qualify: a number read as normal in the middle of a rebuild is the
@@ -4240,5 +4250,37 @@ mod contradictions_status_tests {
     #[test]
     fn an_older_daemon_without_the_block_prints_nothing() {
         assert!(contradictions_lines(&json!({})).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod embeddings_line_tests {
+    use super::embeddings_line;
+
+    #[test]
+    fn the_embeddings_line_names_the_device_when_the_report_has_one() {
+        let base = serde_json::json!({
+            "active_model": "granite-embedding-97m-multilingual-r2",
+            "embedded_chunks": 3, "total_chunks": 4, "hybrid_available": true,
+        });
+        assert_eq!(
+            embeddings_line(&base),
+            "Embeddings: 3/4 chunks embedded with 'granite-embedding-97m-multilingual-r2', default search: hybrid",
+            "an older daemon or a remote provider: no device, no guess"
+        );
+        for device in [
+            "metal",
+            "cpu",
+            "cpu (fallback: metal failed: out of memory)",
+            "cpu (off by CRYSTALLINE_ACCELERATION)",
+        ] {
+            let mut emb = base.clone();
+            emb["device"] = serde_json::json!(device);
+            assert!(
+                embeddings_line(&emb)
+                    .ends_with(&format!(", default search: hybrid, device: {device}")),
+                "{device}"
+            );
+        }
     }
 }

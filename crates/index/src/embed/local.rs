@@ -1,5 +1,5 @@
 //! The local embedding provider: one of the models in [`crate::embed::models`]
-//! on CPU via candle.
+//! via candle, on the Metal GPU of an Apple Silicon Mac or on the CPU.
 //!
 //! The model files are fetched with hf-hub into Crystalline's own model cache
 //! on first use (not hf-hub's default location). Which encoder the weights load
@@ -8,10 +8,11 @@
 //! in front of a query, granite runs through the vendored [`super::modernbert`]
 //! and wants nothing in front of anything. Both produce a sentence embedding
 //! from the `[CLS]` position followed by L2 normalization, and documents are
-//! embedded bare under either. Inference is CPU only (no metal or cuda
-//! features) so the release binaries stay portable, and both it and the weight
-//! load run on a blocking thread so neither stalls the async runtime; the
-//! download itself is async and is awaited before that thread starts. A load
+//! embedded bare under either. Inference runs on the device [`crate::device`]
+//! picks (Metal on an Apple Silicon Mac when usable, the CPU otherwise), and
+//! both it and the weight load run on a blocking thread so neither stalls the
+//! async runtime; the download itself is async and is awaited before that
+//! thread starts. A load
 //! failure of the pinned snapshot self-heals: that snapshot is removed and
 //! fetched once more before giving up.
 
@@ -32,6 +33,7 @@ use super::models::{
 };
 use super::modernbert::{Config as ModernBertConfig, ModernBert};
 use super::{DEFAULT_MODEL_ID, EmbeddingProvider};
+use crate::device::{DeviceReport, load_on_best_device};
 use crate::error::{IndexError, Result};
 use crate::hub::{HubFiles, HubRepo, cache_client, ensure_files, models_cache_dir, pad_id, read};
 
@@ -59,11 +61,12 @@ struct Encoder {
     loaded: Loaded,
     tokenizer: Tokenizer,
     device: Device,
+    report: DeviceReport,
 }
 
 /// The two encoders behind one seam. Both return `(batch, seq, hidden)`.
 enum Loaded {
-    Bert(BertModel),
+    Bert(Box<BertModel>),
     ModernBert(ModernBert),
 }
 
@@ -130,6 +133,10 @@ impl EmbeddingProvider for LocalProvider {
 
     fn max_input_tokens(&self) -> usize {
         MAX_INPUT_TOKENS
+    }
+
+    fn device(&self) -> Option<DeviceReport> {
+        Some(self.inner.report.clone())
     }
 }
 
@@ -337,13 +344,24 @@ async fn load_pinned(
 }
 
 /// [`build_encoder`] on a blocking thread: it mmaps and parses the weights.
+/// The device is the best one that builds the model and embeds a warm-up
+/// text; a GPU failure only falls back to the CPU, so the error this returns,
+/// and with it the self-heal in [`load_pinned`], is always the CPU's.
 async fn build_on_blocking(files: HubFiles, model: &'static LocalModel) -> Result<Encoder> {
-    tokio::task::spawn_blocking(move || build_encoder(&files, model))
-        .await
-        .map_err(|e| IndexError::Embedding(format!("model load task failed: {e}")))?
+    tokio::task::spawn_blocking(move || {
+        let (mut encoder, report) = load_on_best_device(
+            "embedding model",
+            |device| build_encoder(&files, model, device),
+            |encoder| embed_texts(encoder, &["warm-up".to_string()]).map(|_| ()),
+        )?;
+        encoder.report = report;
+        Ok(encoder)
+    })
+    .await
+    .map_err(|e| IndexError::Embedding(format!("model load task failed: {e}")))?
 }
 
-fn build_encoder(files: &HubFiles, model: &LocalModel) -> Result<Encoder> {
+fn build_encoder(files: &HubFiles, model: &LocalModel, device: &Device) -> Result<Encoder> {
     let config_text = read(files.config()?)?;
     // A cache holding another model's files fails here, by name, rather than
     // deep inside candle on a missing tensor.
@@ -368,7 +386,7 @@ fn build_encoder(files: &HubFiles, model: &LocalModel) -> Result<Encoder> {
         }))
         .map_err(|e| IndexError::Embedding(format!("configuring truncation: {e}")))?;
 
-    let device = Device::Cpu;
+    let device = device.clone();
     // Safety: the file is a snapshot from the model cache, either the pinned
     // download or an older snapshot of the same repository a person placed
     // there; mmap is the standard candle load path, and a file changed under
@@ -384,7 +402,7 @@ fn build_encoder(files: &HubFiles, model: &LocalModel) -> Result<Encoder> {
     let loaded = match model.architecture {
         Architecture::Bert => {
             let config: BertConfig = parse_config(&config_text)?;
-            Loaded::Bert(BertModel::load(vb, &config).map_err(build_error)?)
+            Loaded::Bert(Box::new(BertModel::load(vb, &config).map_err(build_error)?))
         }
         Architecture::ModernBert => {
             let config: ModernBertConfig = parse_config(&config_text)?;
@@ -396,6 +414,7 @@ fn build_encoder(files: &HubFiles, model: &LocalModel) -> Result<Encoder> {
         loaded,
         tokenizer,
         device,
+        report: DeviceReport::cpu(),
     })
 }
 
