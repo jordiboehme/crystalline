@@ -2224,7 +2224,7 @@ export interface components {
              *     that actor's own sessions and to nobody else.
              */
             draft_of?: string | null;
-            from?: null | components["schemas"]["MovedFrom"];
+            from?: components["schemas"]["MovedFrom"] | null;
             kind: components["schemas"]["ChangeKind"];
             /** @description Domain-relative, forward slashes, `.md`; after the change. */
             path: string;
@@ -2263,7 +2263,7 @@ export interface components {
              * @example octo
              */
             login?: string | null;
-            pending?: null | components["schemas"]["GithubPendingView"];
+            pending?: components["schemas"]["GithubPendingView"] | null;
             /**
              * @description keyring | file; null when disconnected. Never `environment`: the
              *     environment supplies the machine's credential and never a personal one.
@@ -2310,7 +2310,7 @@ export interface components {
              *     status read after the flow ends, then cleared.
              */
             error?: string | null;
-            pending?: null | components["schemas"]["GithubPendingView"];
+            pending?: components["schemas"]["GithubPendingView"] | null;
             /**
              * @description keyring | file | environment; null when disconnected.
              * @example keyring
@@ -2493,7 +2493,7 @@ export interface components {
              *     declares nothing.
              */
             policies: components["schemas"]["PolicyView"][];
-            provisioning?: null | components["schemas"]["ProvisioningView"];
+            provisioning?: components["schemas"]["ProvisioningView"] | null;
             /**
              * @description Which of the two an agent reads: `when_to_use`, or `scope` when When
              *     to Use is absent or empty, or `none` when both are.
@@ -2519,7 +2519,7 @@ export interface components {
              *     did not parse too, which is the one a reader most needs explained.
              */
             starters: components["schemas"]["StarterStanzaView"][];
-            tag_aliases?: null | components["schemas"]["TagAliasesView"];
+            tag_aliases?: components["schemas"]["TagAliasesView"] | null;
             /** @description The `When to Use` bullets; empty when the section is absent or empty. */
             when_to_use: string[];
         };
@@ -2626,7 +2626,7 @@ export interface components {
             oauth: boolean;
             /** @description Whether this instance refuses content mutations. */
             read_only: boolean;
-            user?: null | components["schemas"]["User"];
+            user?: components["schemas"]["User"] | null;
             /**
              * @description The server version, so a mismatched UI can say so.
              * @example 0.12.0
@@ -2856,7 +2856,7 @@ export interface components {
              *     like a login name: spaces and casing are kept as sent.
              */
             display?: string | null;
-            role?: null | components["schemas"]["Role"];
+            role?: components["schemas"]["Role"] | null;
         };
         /** @description One MANIFEST policy key: the registry row beside what this MANIFEST says. */
         PolicyView: {

@@ -186,7 +186,7 @@ rust-embed = { version = "8.12", features = [
 # are exactly the `macros` one the `#[utoipa::path]`, `ToSchema` and
 # `IntoParams` attributes need; `preserve_order` stays off, so nothing here can
 # switch serde_json's map type on the whole workspace.
-utoipa = "5.5.0"
+utoipa = "6.0.0"
 
 # The OpenID Connect relying party (crates/rest). `default-features = false`
 # is load bearing: the defaults are `reqwest` + `rustls-tls`, which reach

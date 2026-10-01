@@ -9532,11 +9532,11 @@
           "from": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/MovedFrom",
                 "description": "`moved` only."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -9605,11 +9605,11 @@
           "pending": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/GithubPendingView",
                 "description": "This account's device flow waiting for the browser side. Poll this\nroute until it goes null; the flow either connected or set `error`."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -9679,11 +9679,11 @@
           "pending": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/GithubPendingView",
                 "description": "A device flow waiting for the browser side. Poll this route until it\ngoes null; the flow either connected or set `error`."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -9950,11 +9950,11 @@
           "provisioning": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/ProvisioningView",
                 "description": "The `Provisioning` section, or `null` when the MANIFEST has none."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -9983,11 +9983,11 @@
           "tag_aliases": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/TagAliasesView",
                 "description": "The `Tag Aliases` section, or `null` when the MANIFEST has none."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -10074,11 +10074,11 @@
           "user": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/User",
                 "description": "The account behind this request, or null when there is none."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -10434,11 +10434,11 @@
           "role": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/Role",
                 "description": "The new role."
+              },
+              {
+                "type": "null"
               }
             ]
           }
