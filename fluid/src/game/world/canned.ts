@@ -644,10 +644,7 @@ export function galleryRoom(): RoomSpec {
 
   const terminals = [
     ["Scope", ["Every model the station draws.", "One of each."]],
-    [
-      "Keys",
-      ["The arrows or WASD walk.", "Space uses, ?look= picks the look."],
-    ],
+    ["Keys", ["The arrows or WASD walk.", "Space uses, M mutes."]],
   ] as const;
   for (const [heading, lines] of terminals) {
     fixtures.push({
