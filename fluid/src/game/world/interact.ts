@@ -20,8 +20,13 @@
  *   action, so neither is offered for Space.
  * - A sealed door or portal is offered only to say why it is sealed.
  * - A lift is offered for Space (`SPACE LIFT`, M3 C26), which opens its
- *   list of stops; a station screen is only looked at, and an exit opens
- *   on approach like a sliding door (M3 C28), so neither is offered.
+ *   list of stops; an exit opens on approach like a sliding door (M3 C28),
+ *   so it is not offered.
+ * - A machine, a poster, the placard and a screen are read with Space
+ *   (0.22 R12): `world/reading.ts` says what each reads. These reading
+ *   offers rank below every other offer (0.22 R13): `focusOf` takes one
+ *   only when no terminal, door, hatch, portal or lift is in focus, so a
+ *   placard beside a door never takes Space from the door.
  *
  * A way that failed on travel (the session's `failed` map) is treated as
  * sealed: it is offered only to say why, heads shut and carries no one.
@@ -118,10 +123,23 @@ const OPEN_ENOUGH = 0.9;
  * - `SPACE CRAWL <label>` at a hatch;
  * - `SEALED <sealedLabel>` at a sealed door or portal, which does nothing;
  * - `SEALED <label>` at a way in `failed`;
- * - `SPACE LIFT` at a lift.
+ * - `SPACE LIFT` at a lift;
+ * - `SPACE READ <room title>` at a machine;
+ * - `SPACE READ <category>` at a poster;
+ * - `SPACE READ PLACARD` at the placard;
+ * - `SPACE READ <first line>` at a screen.
  */
 export type Interactable = {
-  kind: "terminal" | "door" | "hatch" | "portal" | "lift";
+  kind:
+    | "terminal"
+    | "door"
+    | "hatch"
+    | "portal"
+    | "lift"
+    | "machine"
+    | "poster"
+    | "placard"
+    | "screen";
   index: number;
   prompt: string;
 };
@@ -250,15 +268,16 @@ export function approaches(slot: WallSlot, player: Player): boolean {
 /**
  * What the HUD offers for a fixture, or null when Space does nothing there and
  * nothing needs saying: an unsealed sliding door and an exit open on
- * approach and an unsealed portal on contact, and machines, posters, the
- * placard and screens are only looked at. A lift is always offered: Space
- * opens its stops.
+ * approach and an unsealed portal on contact. A lift is always offered:
+ * Space opens its stops. A machine, a poster, the placard and a screen are
+ * offered to be read; a machine names the room by `title`.
  */
 function offer(
   fixture: Fixture,
   index: number,
   doors: ReadonlyMap<number, DoorState>,
   failed: ReadonlyMap<number, string>,
+  title: string,
 ): Interactable | null {
   switch (fixture.kind) {
     case "terminal":
@@ -299,14 +318,34 @@ function offer(
       }
       return { kind: "lift", index, prompt: "SPACE LIFT" };
     }
-    case "exit":
     case "machine":
+      return { kind: "machine", index, prompt: `SPACE READ ${title}` };
     case "poster":
+      return {
+        kind: "poster",
+        index,
+        prompt: `SPACE READ ${fixture.category}`,
+      };
     case "placard":
+      return { kind: "placard", index, prompt: "SPACE READ PLACARD" };
     case "screen":
+      return {
+        kind: "screen",
+        index,
+        prompt: `SPACE READ ${fixture.lines[0] ?? ""}`,
+      };
+    case "exit":
       return null;
   }
 }
+
+/** The kinds `offer` offers to be read, which rank below every other kind. */
+const READING_KINDS: ReadonlySet<Interactable["kind"]> = new Set([
+  "machine",
+  "poster",
+  "placard",
+  "screen",
+]);
 
 /**
  * The fixture the player is facing and can use, or null.
@@ -314,8 +353,10 @@ function offer(
  * Of the fixtures `offer` has something to say about, the nearest one whose
  * wall point is within `REACH`, whose wall faces the player (the player
  * stands in front of it, not behind it) and which lies within `FACING` of
- * the view direction. `doors` decides whether a door is offered to open or
- * to close; without it every door is taken to be shut.
+ * the view direction. The nearest terminal, door, hatch, portal or lift
+ * wins; only when none of those is in focus does the nearest machine,
+ * poster, placard or screen (0.22 R13). `doors` decides whether a door is
+ * offered to open or to close; without it every door is taken to be shut.
  */
 export function focusOf(
   room: RoomSpec,
@@ -326,22 +367,32 @@ export function focusOf(
   const fx = -Math.sin(player.yaw);
   const fz = -Math.cos(player.yaw);
   const cosFacing = Math.cos(FACING);
+  // The nearest of each rank: the ways and terminals, and the readings.
   let best: Interactable | null = null;
   let bestDistance = Infinity;
+  let reading: Interactable | null = null;
+  let readingDistance = Infinity;
   for (const [index, fixture] of room.fixtures.entries()) {
     const w = wallPoint(fixture.slot);
     if (relative(w, player.x, player.z).depth <= 0) continue;
     const dx = w.x - player.x;
     const dz = w.z - player.z;
     const distance = Math.hypot(dx, dz);
-    if (distance > REACH || distance >= bestDistance) continue;
+    if (distance > REACH) continue;
     if (distance > 0 && (dx * fx + dz * fz) / distance < cosFacing) continue;
-    const candidate = offer(fixture, index, doors, failed);
+    const candidate = offer(fixture, index, doors, failed, room.title);
     if (candidate === null) continue;
-    best = candidate;
-    bestDistance = distance;
+    if (READING_KINDS.has(candidate.kind)) {
+      if (distance >= readingDistance) continue;
+      reading = candidate;
+      readingDistance = distance;
+    } else {
+      if (distance >= bestDistance) continue;
+      best = candidate;
+      bestDistance = distance;
+    }
   }
-  return best;
+  return best ?? reading;
 }
 
 /**

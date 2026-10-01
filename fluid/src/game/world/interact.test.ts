@@ -22,7 +22,12 @@ import {
   galleryRoom,
 } from "./canned";
 import { generateDeck } from "./deck";
-import { ACCESS_DENIED, NOT_FOUND, generateRoom } from "./generate";
+import {
+  ACCESS_DENIED,
+  MACHINE_KINDS,
+  NOT_FOUND,
+  generateRoom,
+} from "./generate";
 import { isFloor } from "./layout";
 import {
   AIRLOCK_START,
@@ -195,7 +200,7 @@ describe("focusOf at the station's fixtures (M3 C26, C28)", () => {
     seed: 3,
   });
 
-  it("offers the lift within reach, and nothing at a screen or an exit", () => {
+  it("offers the lift within reach, a screen to be read, and nothing at an exit", () => {
     // Mutation caught: the lift's case returning null, the exit offered as
     // a door.
     expect(focusOf(lift, inFront(lift, 0, 1.2))).toEqual({
@@ -204,8 +209,124 @@ describe("focusOf at the station's fixtures (M3 C26, C28)", () => {
       prompt: "SPACE LIFT",
     });
     expect(focusOf(lift, inFront(lift, 0, REACH + 0.3))).toBeNull();
-    expect(focusOf(screen, inFront(screen, 0, 1.2))).toBeNull();
+    expect(focusOf(screen, inFront(screen, 0, 1.2))).toEqual({
+      kind: "screen",
+      index: 0,
+      prompt: "SPACE READ S",
+    });
     expect(focusOf(exit, inFront(exit, 0, 1.2))).toBeNull();
+  });
+});
+
+describe("focusOf at the read fixtures (0.22 R12, R13)", () => {
+  const scope = bridge.fixtures[scopeIndex]!.slot;
+  /** The scope terminal's slot moved `dy` cells along the west wall. */
+  const beside = (dy: number): WallSlot => ({ ...scope, y: scope.y + dy });
+  /** The bridge with only `fixtures`. */
+  const only = (...fixtures: Fixture[]): RoomSpec => ({ ...bridge, fixtures });
+  const placard: Fixture = { kind: "placard", slot: scope, lines: ["P"] };
+  const poster: Fixture = {
+    kind: "poster",
+    slot: scope,
+    category: "warning",
+    lines: ["W"],
+    seed: 4,
+  };
+  const machine: Fixture = {
+    kind: "machine",
+    slot: scope,
+    machine: MACHINE_KINDS[0]!,
+    tag: "reactor",
+    hue: 0,
+    seed: 5,
+  };
+  const bulkhead: Fixture = {
+    kind: "door",
+    slot: beside(1),
+    style: "bulkhead",
+    relType: "depends_on",
+    label: "Reactor Core",
+    address: { domain: "station", permalink: "reactor-core" },
+    sealedLabel: null,
+    seed: 6,
+  };
+
+  it("offers a placard, a poster, a screen and a machine with their prompts", () => {
+    // Mutation caught: a reading kind left returning null, or a prompt
+    // naming the wrong thing (the poster's first line, not its category).
+    const cases: [Fixture, string][] = [
+      [placard, "SPACE READ PLACARD"],
+      [poster, "SPACE READ warning"],
+      [machine, `SPACE READ ${bridge.title}`],
+      [
+        {
+          kind: "screen",
+          slot: scope,
+          lines: ["DECK 3", "x"],
+          keys: [],
+          seed: 7,
+        },
+        "SPACE READ DECK 3",
+      ],
+    ];
+    expect(cases.length).toBeGreaterThan(0);
+    for (const [fixture, prompt] of cases) {
+      const room = only(fixture);
+      expect(focusOf(room, inFront(room, 0, 1.4))).toEqual({
+        kind: fixture.kind,
+        index: 0,
+        prompt,
+      });
+    }
+  });
+
+  /**
+   * A player 1.5 m out from the wall between slot 0 and slot 1, 1.2 m
+   * along it from slot 1's point towards slot 0's: slot 0 is nearer, and
+   * both are in reach and within FACING, looking straight at the wall.
+   */
+  const between = (room: RoomSpec): Player => {
+    const w0 = wallPoint(room.fixtures[0]!.slot);
+    const w1 = wallPoint(room.fixtures[1]!.slot);
+    const len = Math.hypot(w0.x - w1.x, w0.z - w1.z);
+    const t = 1.2 / len;
+    const x = w1.x + (w0.x - w1.x) * t + w1.inward[0] * 1.5;
+    const z = w1.z + (w0.z - w1.z) * t + w1.inward[1] * 1.5;
+    return at(x, z, yawAlong(-w1.inward[0], -w1.inward[1]));
+  };
+  const near = (room: RoomSpec, p: Player, i: number) => {
+    const w = wallPoint(room.fixtures[i]!.slot);
+    return Math.hypot(w.x - p.x, w.z - p.z);
+  };
+
+  it("keeps a bulkhead in focus with a placard nearer", () => {
+    // Mutation caught: one nearest-wins pass over every kind, so the nearer
+    // placard takes Space from the door.
+    const room = only(placard, bulkhead);
+    const p = between(room);
+    expect(near(room, p, 0)).toBeLessThan(near(room, p, 1));
+    // Each alone is in focus from the same spot.
+    expect(focusOf(only(placard), p)?.kind).toBe("placard");
+    expect(focusOf(only(bulkhead), p)?.kind).toBe("door");
+    expect(focusOf(room, p)).toEqual({
+      kind: "door",
+      index: 1,
+      prompt: "SPACE OPEN Reactor Core",
+    });
+  });
+
+  it("keeps the nearest-wins between a terminal and a door", () => {
+    // Mutation caught: the terminal ranked with the readings, so the
+    // farther door takes Space from the nearer terminal.
+    const terminal = bridge.fixtures[scopeIndex]!;
+    const room = only(terminal, bulkhead);
+    const p = between(room);
+    expect(near(room, p, 0)).toBeLessThan(near(room, p, 1));
+    expect(focusOf(room, p)).toEqual({
+      kind: "terminal",
+      index: 0,
+      prompt: "SPACE READ Scope",
+    });
   });
 });
 

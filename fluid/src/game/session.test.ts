@@ -106,7 +106,7 @@ vi.mock("../api/client", async (importOriginal) => {
  * which need a terminal or a door in reach without walking there.
  */
 const facing = vi.hoisted(() => ({
-  kind: null as "terminal" | "door" | null,
+  kind: null as "terminal" | "door" | "machine" | "poster" | null,
 }));
 
 vi.mock("./world/station", async (importOriginal) => {
@@ -1073,6 +1073,122 @@ describe("the reader", () => {
     );
     session.showCanned({ ...CANNED_BRIDGE, status: "archived" });
     expect(hud.reader).toHaveBeenLastCalledWith(null);
+  });
+});
+
+describe("reading the walls (0.22 spec 3b)", () => {
+  /** A loader that answers every engram with `place`. */
+  const engramLoad =
+    (place: PlaceInput): PlaceLoader =>
+    () =>
+      Promise.resolve({ kind: "engram", place, folder: "" });
+
+  /**
+   * A session standing in `place`'s room in front of its first fixture of
+   * the kind `facing.kind` names (the `roomFor` seam).
+   */
+  async function standInPlace(place: PlaceInput): Promise<Session> {
+    const session = start({ load: engramLoad(place) });
+    const at: StationAddress = {
+      kind: "engram",
+      domain: place.domain,
+      permalink: place.permalink,
+    };
+    session.go(at);
+    await flush();
+    frames(1);
+    expect(session.current).toEqual(at);
+    return session;
+  }
+
+  /** `room` shown by hand with the player in front of its first `kind`. */
+  function standAt(room: RoomSpec, kind: Fixture["kind"]): Fixture {
+    const fixture = room.fixtures.find((f) => f.kind === kind);
+    if (fixture === undefined) throw new Error(`no ${kind}`);
+    start({ client: null }).showRoom({
+      ...room,
+      spawn: wallFacingSpawn(fixture.slot),
+    });
+    frames(1);
+    return fixture;
+  }
+
+  /** Presses and releases Space over one tick. */
+  function use() {
+    key("keydown", "Space");
+    frames(1);
+    key("keyup", "Space");
+  }
+
+  it("opens the reader with the placard's reading at Space", () => {
+    // Mutation caught: the placard offered but left out of the use branch,
+    // so Space at it opens nothing.
+    const room = generateRoom(CANNED_WORKSHOP);
+    const placard = standAt(room, "placard");
+    if (placard.kind !== "placard") throw new Error("not a placard");
+    expect(hud.prompt).toHaveBeenLastCalledWith("SPACE READ PLACARD");
+    use();
+    expect(hud.reader).toHaveBeenLastCalledWith({
+      title: room.title,
+      content: placard.lines.join("\n\n"),
+      section: null,
+    });
+  });
+
+  it("opens the reader at the top of the engram at a machine", async () => {
+    // Mutation caught: a machine opened through the terminal's reading,
+    // which reads nothing for a fixture that is no terminal.
+    facing.kind = "machine";
+    const place = { ...CANNED_BRIDGE, permalink: "hall" };
+    await standInPlace(place);
+    expect(hud.prompt).toHaveBeenLastCalledWith(`SPACE READ ${place.title}`);
+    use();
+    expect(hud.reader).toHaveBeenLastCalledWith({
+      title: place.title,
+      content: place.content,
+      section: null,
+    });
+  });
+
+  it("opens the deck screen's reading at Space", () => {
+    // Mutation caught: the screen left out of the use branch.
+    const room = generateDeck(CANNED_DECK, 1);
+    const screen = standAt(room, "screen");
+    if (screen.kind !== "screen") throw new Error("not a screen");
+    use();
+    expect(hud.reader).toHaveBeenLastCalledWith({
+      title: screen.lines[0],
+      content: screen.lines.slice(1).join("\n\n"),
+      section: null,
+    });
+  });
+
+  it("closes a poster's reader on closeReader and gives the keys back", async () => {
+    // Mutation caught: a reading opened without going modal, so the W
+    // pressed while it is open walks.
+    facing.kind = "poster";
+    const session = await standInPlace(CANNED_WORKSHOP);
+    use();
+    expect(hud.reader).toHaveBeenLastCalledWith(
+      expect.objectContaining({ title: CANNED_WORKSHOP.title, section: null }),
+    );
+    frames(5);
+    const still = eyeAt();
+    key("keydown", "KeyS");
+    frames(5);
+    expect(eyeAt()[0]).toBeCloseTo(still[0], 6);
+    expect(eyeAt()[1]).toBeCloseTo(still[1], 6);
+    session.closeReader();
+    expect(hud.reader).toHaveBeenLastCalledWith(null);
+    // The S held from before is forgotten; a new press walks back.
+    key("keyup", "KeyS");
+    key("keydown", "KeyS");
+    frames(5);
+    key("keyup", "KeyS");
+    const moved = eyeAt();
+    expect(
+      Math.hypot(moved[0] - still[0], moved[1] - still[1]),
+    ).toBeGreaterThan(0.01);
   });
 });
 

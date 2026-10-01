@@ -97,7 +97,11 @@
  * No key switches the look: the game always runs in the station's one look.
  * Only the mouse looks up and down. The
  * browser's own meaning of Space, the arrows, comma, period and Alt is
- * cancelled while the session has the keys (`CLAIMED_KEYS`). While the CRT
+ * cancelled while the session has the keys (`CLAIMED_KEYS`). Space at a
+ * terminal, a machine, a poster, the placard or a screen opens the CRT
+ * reader with what that fixture reads (`fixtureReading` in
+ * `world/reading.ts`, through `openReading`); a terminal or a poster in a
+ * room with no place reads nothing and opens nothing. While the CRT
  * reader is open it reads the keys itself: the session ignores its own
  * commands and all movement until the host calls `closeReader`.
  *
@@ -307,6 +311,7 @@ import {
 import { LIFT_RIDE_MS } from "./timing";
 import { LIFT_WORDS, deckLabel } from "./world/lifts";
 import { readerBody } from "./ui/crt";
+import { fixtureReading, type Reading } from "./world/reading";
 import { roomFor } from "./world/station";
 import type {
   Box,
@@ -320,15 +325,12 @@ import type {
 export type { Arrival } from "./world/interact";
 
 /**
- * What the CRT reader is opened with: the engram's title and markdown, the
- * section the terminal stands for (its `##` heading and how many sections
- * of the same heading come before it, or null for the top).
+ * What the CRT reader is opened with: a `Reading` (`world/reading.ts`), a
+ * title and markdown and the section to open at: a terminal's `##` heading
+ * and how many sections of the same heading come before it, or null for
+ * the top.
  */
-export interface ReaderState {
-  title: string;
-  content: string;
-  section: { heading: string; occurrence: number } | null;
-}
+export type ReaderState = Reading;
 
 /**
  * Where the session writes what the player sees besides the room.
@@ -343,7 +345,7 @@ export interface ReaderState {
  *   hide it.
  * - `connector`: the travel overlay, shown while a place loads, with the
  *   destination's label and the look to draw it in.
- * - `reader`: the CRT reader's content while a terminal is read, null when
+ * - `reader`: the CRT reader's content while a fixture is read, null when
  *   it closes.
  *
  * Every writer may be called at any rate; the ones called every quarter
@@ -477,13 +479,13 @@ export type PlaceLoader = (
  *   they stand and the doors as they are.
  * - `showRoom` shows a room built by hand, with no place behind it (the
  *   dev-only model gallery): no load, no navigation, the player at the
- *   room's entrance and every door shut. Its terminals open no reader,
- *   since there is no engram to read. `current` stays null (M3 C5) unless
- *   `at` names the address the room stands for, a seam for the tests that
- *   stand a hand-built room (a police box forced into a deck, say) where
- *   the session would have entered it. `view`, when given, sets the
- *   player's pitch after entering, clamped to `MAX_PITCH` (C18, 2.6b): the
- *   dev seams' close curio framing (`spotView` in `dev/spots.ts`). It is
+ *   room's entrance and every door shut. Its terminals and posters open
+ *   no reader, since there is no engram to read. `current` stays null
+ *   (M3 C5) unless `at` names the address the room stands for, a seam
+ *   for the tests that stand a hand-built room (a police box forced into
+ *   a deck, say) where the session would have entered it. `view`, when
+ *   given, sets the player's pitch after entering, clamped to `MAX_PITCH`
+ *   (C18, 2.6b): the dev seams' close curio framing (`spotView` in `dev/spots.ts`). It is
  *   for those dev seams only; every other caller omits it and keeps the
  *   entrance's own pitch of 0.
  * - `go`, `showCanned` and `showRoom` close an open CRT reader, level
@@ -658,7 +660,10 @@ const CLAIMED_KEYS: ReadonlySet<string> = new Set([
   ...ALT_KEYS,
 ]);
 
-/** The use key: doors, terminals, the hatch, a police box's doors. */
+/**
+ * The use key: doors, the hatch, a lift, a police box's doors, and every
+ * fixture that is read.
+ */
 const USE_KEY = "Space";
 
 /** Every key that commands the session, drained while the reader is open. */
@@ -1063,11 +1068,11 @@ export function createSession(opts: SessionOptions): Session {
    * Enters a generated room: hands it to the renderer and resets everything
    * that belongs to the room before it. `next` is the place the room was
    * generated from, or null for a room with none (the airlock, a deck, the
-   * console room, a room built by hand), whose terminals then open no
-   * reader. `address` becomes `current`: the station address entered, as
-   * `roomFor` resolved it, never read back from `built` (M3 C5). `keep`
-   * keeps the player, the doors and
-   * this visit's failed ways and faults, for the same place shown again.
+   * console room, a room built by hand), whose terminals and posters then
+   * open no reader. `address` becomes `current`: the station address
+   * entered, as `roomFor` resolved it, never read back from `built` (M3
+   * C5). `keep` keeps the player, the doors and this visit's failed ways
+   * and faults, for the same place shown again.
    * `spawn`, when given, places the player there (in metres) in place of
    * `arrivalSpawn` (the arrival box's step out). Every entry ends a visit
    * of the console room: `inside` is cleared and its listing read aborted
@@ -1497,9 +1502,13 @@ export function createSession(opts: SessionOptions): Session {
     travel(bridgeAddress(picked), null, picked, "box");
   };
 
-  const openReader = (index: number) => {
-    const fixture = room?.fixtures[index];
-    if (fixture?.kind !== "terminal" || place === null) return;
+  /**
+   * Opens the CRT reader with `reading`, or does nothing for null: the
+   * session goes modal, forgets the keys held, releases the pointer lock,
+   * clears the prompt and beeps.
+   */
+  const openReading = (reading: Reading | null) => {
+    if (reading === null) return;
     readerOpen = true;
     input.clear();
     cheat?.reset();
@@ -1508,11 +1517,7 @@ export function createSession(opts: SessionOptions): Session {
     }
     setPrompt(null);
     cue({ kind: "terminal" });
-    hud.reader({
-      title: place.title,
-      content: place.content,
-      section: { heading: fixture.heading, occurrence: fixture.section },
-    });
+    hud.reader(reading);
   };
 
   const closeReader = () => {
@@ -2138,8 +2143,14 @@ export function createSession(opts: SessionOptions): Session {
     const used = !still && input.pressed(USE_KEY);
     if (used && focus !== null) {
       if (isBrokenWay(room, focus.index, failed)) pressedWay = focus.index;
-      if (focus.kind === "terminal") {
-        openReader(focus.index);
+      if (
+        focus.kind === "terminal" ||
+        focus.kind === "machine" ||
+        focus.kind === "poster" ||
+        focus.kind === "placard" ||
+        focus.kind === "screen"
+      ) {
+        openReading(fixtureReading(room, focus.index, place));
       } else if (focus.kind === "door") {
         pressedDoor = focus.index;
       } else if (focus.kind === "hatch") {
