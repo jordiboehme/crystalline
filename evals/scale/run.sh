@@ -562,9 +562,15 @@ PY
 import json, sqlite3, sys
 db, repo, profile, drained, out, fully_drained = sys.argv[1:7]
 con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+columns = {r[1] for r in con.execute("PRAGMA table_info(contradiction)")}
+if "similarity" not in columns:
+    sys.exit(
+        f"error: {db} has no contradiction.similarity column; it was built before the line filter "
+        "and is stale. Delete the index (or the whole out directory) and rerun the stages."
+    )
 rows = con.execute(
     """SELECT d.name, ea.permalink, eb.permalink, c.line_a, c.line_b, c.score_ab, c.score_ba,
-              c.period, p.cosine, oa.content, ob.content
+              c.period, p.cosine, c.similarity, oa.content, ob.content
        FROM contradiction c
        JOIN contradiction_pair p ON p.engram_a = c.engram_a AND p.engram_b = c.engram_b AND p.model = c.model
        JOIN engram ea ON ea.id = c.engram_a
@@ -581,7 +587,7 @@ pairs = con.execute(
        JOIN domain d ON d.id = p.domain_id WHERE p.model = ?""",
     (repo,),
 ).fetchall()
-keys = ["domain", "a", "b", "line_a", "line_b", "score_ab", "score_ba", "period", "cosine", "a_text", "b_text"]
+keys = ["domain", "a", "b", "line_a", "line_b", "score_ab", "score_ba", "period", "cosine", "similarity", "a_text", "b_text"]
 json.dump(
     {
         "profile": profile,

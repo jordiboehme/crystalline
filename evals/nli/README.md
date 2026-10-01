@@ -10,5 +10,8 @@ Two scripts for the contradiction check (V302).
 - `evaluate.py` reads a dump from `evals/scale/run.sh --stage nli` and the
   sidecar from `evals/scale/generate.py --contradictions`, and reports
   precision and recall per finding line, calibration, recall per flip type and
-  language, noise, speed and resident size. `--self-test` checks its own
+  language, noise, speed and resident size. The dump carries `similarity`, the line pair's
+  cosine. `--top N` prints the product's ranking per domain. The mean table is
+  unreliable since the second order is skipped below the store floor under Min.
+  The gate count is `flips_at_0_70`. `--self-test` checks its own
   arithmetic on a tiny synthetic case.

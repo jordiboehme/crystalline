@@ -90,7 +90,11 @@ corpus with the product's own caps (`--nli-lift no`), because the full corpus's
 lead cosines are degenerate and a lifted cap there means weeks of CPU. A
 pre-flight stops a stage whose projected drain exceeds `DRAIN_LIMIT`, and a
 drain that does not finish anyway marks the dump `"drained": false` rather than
-reporting partial numbers silently. Each profile gets its own model cache
+reporting partial numbers silently. The dump carries `similarity`; an index
+built before that column existed is refused with a clear message, so rebuild
+it. `evaluate.py --top N` prints the product's ranking per domain. The mean
+table is unreliable since the second order is skipped below the store floor
+under Min. The gate count is `flips_at_0_70`. Each profile gets its own model cache
 under `<out>`, seeded with a clone of the embedding model (and, with
 `NLI_SEED_MODELS` set, that profile's own checkpoint too).
 
