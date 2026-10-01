@@ -319,6 +319,7 @@ pub fn score_rows(
             hash_b: lp.hash_b.clone(),
             score_ab: ab,
             score_ba: ba,
+            similarity: 0.0,
             period: names_period(&lp.a.text) || names_period(&lp.b.text),
         })
         .collect()

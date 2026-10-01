@@ -14,7 +14,7 @@
 //! (see [`CURRENT_STATUS_CLASS`]), so a domain written before the vocabulary
 //! flip and a foreign OKF bundle both stay first-class.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use async_trait::async_trait;
@@ -456,6 +456,32 @@ pub(crate) fn rename_onto_taken_row(old: &str, new: &str) -> crate::IndexError {
         "cannot rename the index row of domain `{old}` to `{new}`: another domain row is \
          already named `{new}`; rename or remove domain `{new}` first, or pick another name"
     ))
+}
+
+/// How many hashes one `observation_vector` statement names at most. Every
+/// Store method that takes a hash list cuts it into runs of this many, so a
+/// domain of any size costs bounded statements and stays far below both
+/// backends' bind limits.
+pub const OBSERVATION_VECTOR_CHUNK: usize = 256;
+
+/// A vector as the raw little-endian f32 bytes both backends store it as.
+pub(crate) fn pack_f32_le(v: &[f32]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(v.len() * 4);
+    for f in v {
+        b.extend_from_slice(&f.to_le_bytes());
+    }
+    b
+}
+
+/// The bytes [`pack_f32_le`] wrote, back as floats. A length that is not a
+/// whole number of floats cannot come from that packing and decodes to
+/// nothing, so a caller's width check skips it rather than trusting a prefix.
+pub(crate) fn unpack_f32_le(bytes: &[u8]) -> Vec<f32> {
+    let (quads, partial) = bytes.as_chunks::<4>();
+    if !partial.is_empty() {
+        return Vec::new();
+    }
+    quads.iter().copied().map(f32::from_le_bytes).collect()
 }
 
 /// Run `body` inside one write transaction on `store`: commit when it
@@ -1576,9 +1602,24 @@ pub struct ContradictionRow {
     pub score_ab: f32,
     /// The same with the order reversed.
     pub score_ba: f32,
+    /// The cosine of the two lines' vectors under the embedding model the
+    /// pair was scored with: how much the two lines are about the same
+    /// subject, which is what let them reach the model at all.
+    pub similarity: f32,
     /// Whether either line names a period (a year, a date, a month, since or
     /// until): the finding then points at the validity window.
     pub period: bool,
+}
+
+/// One observation line's embedding as `observation_vector` keeps it: the
+/// row hash of its folded text ([`crate::nli::observation_hash`]) and the
+/// vector the embedding model gave it. Never the text (lessons 5 and 6).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObservationVector {
+    /// [`crate::nli::observation_hash`] of the line.
+    pub hash: String,
+    /// The embedding, unit-normalized as every provider returns it.
+    pub vector: Vec<f32>,
 }
 
 /// A freshly computed chunk to store against an engram. Produced by the chunker
@@ -2654,11 +2695,66 @@ pub trait Store: Send + Sync {
     /// status block's figure.
     async fn scored_pair_count(&self, model: &str) -> Result<u64>;
 
+    /// Which of `hashes` carry a line vector for `model`. The contradiction
+    /// walk's per-domain check before it embeds what is missing; narrow, the
+    /// hash column only. Read in runs of [`OBSERVATION_VECTOR_CHUNK`].
+    async fn observation_vectors_present(
+        &self,
+        model: &str,
+        hashes: &[String],
+    ) -> Result<HashSet<String>>;
+
+    /// The line vectors for `model` of those `hashes` that have one, by hash.
+    /// A row whose stored width disagrees with its `dims` is skipped with a
+    /// warning. Read in runs of [`OBSERVATION_VECTOR_CHUNK`].
+    async fn observation_vectors(
+        &self,
+        model: &str,
+        hashes: &[String],
+    ) -> Result<HashMap<String, Vec<f32>>>;
+
+    /// Store line vectors for `model`. A (model, hash) already stored keeps
+    /// its vector: the same text under the same model is the same vector. One
+    /// transaction per call; refuses inside an open `begin`.
+    async fn store_observation_vectors(
+        &self,
+        model: &str,
+        rows: &[ObservationVector],
+    ) -> Result<()>;
+
+    /// Every hash with a line vector for `model`, unordered. The pruning read:
+    /// narrow, one short column per row.
+    async fn observation_vector_hashes(&self, model: &str) -> Result<Vec<String>>;
+
+    /// Delete the line vectors of `hashes` under `model`, in runs of
+    /// [`OBSERVATION_VECTOR_CHUNK`]; returns how many went.
+    async fn delete_observation_vectors(&self, model: &str, hashes: &[String]) -> Result<u64>;
+
+    /// Delete every line vector of any embedding model but `model`, once a
+    /// daemon knows which model it runs. Not a hot statement: it runs once per
+    /// process.
+    async fn delete_observation_vectors_except(&self, model: &str) -> Result<u64>;
+
+    /// Delete every line vector. The contradiction check's off switch.
+    async fn clear_observation_vectors(&self) -> Result<u64>;
+
+    /// Delete the contradiction pair and line rows of `domains`, or of every
+    /// domain when `None`, in one transaction. The contradiction check's off
+    /// switch; a domain's own clear stays `clear_domain`.
+    async fn clear_contradictions(&self, domains: Option<&[DomainId]>) -> Result<()>;
+
+    /// Whether this database may be shared by several instances at once, so
+    /// per-instance housekeeping must not delete shared rows.
+    fn shares_database(&self) -> bool {
+        false
+    }
+
     /// Delete all indexed data, keeping the schema. The corruption-recovery
     /// path behind `crystalline reindex --wipe`, and nothing else: an ordinary
     /// rebuild (`--full`) never comes here, because destroying every embedding
     /// to re-read files that mostly did not change costs hours and buys
-    /// nothing. The contradiction tables go with everything else.
+    /// nothing. The contradiction tables and the line vectors go with
+    /// everything else.
     async fn wipe(&self) -> Result<()>;
 
     /// Best-effort WAL checkpoint in TRUNCATE mode, shrinking a local WAL file

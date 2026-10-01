@@ -1,6 +1,6 @@
 //! The hot statements and the plans they are entitled to.
 //!
-//! One place, thirty-one entries, each named by the function that issues it, so a
+//! One place, forty-two entries, each named by the function that issues it, so a
 //! rewrite that drops an index fails with the function's name rather than with
 //! a diff. Every entry obtains its SQL the way the code obtains it - a shared
 //! builder, a named constant or the same `format!` the method calls - because a
@@ -56,8 +56,8 @@
 
 use crystalline_index::SearchOrder;
 use crystalline_index::{
-    ContradictionRow, DomainId, DomainKind, EmbeddingRow, ScoredPair, Store, TursoStore,
-    sync_domain,
+    ContradictionRow, DomainId, DomainKind, EmbeddingRow, ObservationVector, ScoredPair, Store,
+    TursoStore, sync_domain,
 };
 
 // --- the registry ------------------------------------------------------------
@@ -136,6 +136,7 @@ pub const GUARDED_TABLES: &[&str] = &[
     "link",
     "contradiction",
     "contradiction_pair",
+    "observation_vector",
 ];
 
 /// Which table each alias in these statements stands for.
@@ -156,6 +157,7 @@ const ALIASES: &[(&str, &str)] = &[
     ("d", "domain"),
     ("cn", "contradiction"),
     ("cp", "contradiction_pair"),
+    ("ov", "observation_vector"),
 ];
 
 fn table_of(name: &str) -> &str {
@@ -722,6 +724,112 @@ pub fn registry() -> Vec<HotStatement> {
             turso_must_seek: &["idx_contradiction_pair_engram_b"],
             postgres_must_seek: &["idx_contradiction_pair_engram_b"],
         },
+        // The contradiction check's per-domain off switch: each delete seeks
+        // the domain index of its table, as `clear_domain`'s do.
+        HotStatement {
+            issued_by: "Store::clear_contradictions (contradiction)",
+            turso: || crystalline_index::turso::CLEAR_DOMAIN_CONTRADICTIONS_SQL.to_string(),
+            postgres: || crystalline_index::postgres::CLEAR_DOMAIN_CONTRADICTIONS_SQL.to_string(),
+            literals: &["1"],
+            literals_pg: None,
+            scan_expected: &[],
+            scan_expected_pg: None,
+            turso_must_seek: &["idx_contradiction_domain"],
+            postgres_must_seek: &["idx_contradiction_domain"],
+        },
+        HotStatement {
+            issued_by: "Store::clear_contradictions (contradiction_pair)",
+            turso: || crystalline_index::turso::CLEAR_DOMAIN_CONTRADICTION_PAIRS_SQL.to_string(),
+            postgres: || {
+                crystalline_index::postgres::CLEAR_DOMAIN_CONTRADICTION_PAIRS_SQL.to_string()
+            },
+            literals: &["1"],
+            literals_pg: None,
+            scan_expected: &[],
+            scan_expected_pg: None,
+            turso_must_seek: &["idx_contradiction_pair_domain"],
+            postgres_must_seek: &["idx_contradiction_pair_domain"],
+        },
+        // The line vectors: every read names the model and a hash list, so the
+        // primary key (model, hash) serves it. Turso names that key's
+        // autoindex, whose name turso picks, so the turso claim is the seek
+        // itself; postgres names the key.
+        HotStatement {
+            issued_by: "Store::observation_vectors_present",
+            turso: || crystalline_index::turso::observation_vectors_present_sql(3),
+            postgres: || crystalline_index::postgres::observation_vectors_present_sql(3),
+            literals: &["'fake'", "'h1'", "'h2'", "'h3'"],
+            literals_pg: None,
+            scan_expected: &[],
+            scan_expected_pg: None,
+            turso_must_seek: &[],
+            postgres_must_seek: &["observation_vector_pkey"],
+        },
+        HotStatement {
+            issued_by: "Store::observation_vectors",
+            turso: || crystalline_index::turso::observation_vectors_sql(3),
+            postgres: || crystalline_index::postgres::observation_vectors_sql(3),
+            literals: &["'fake'", "'h1'", "'h2'", "'h3'"],
+            literals_pg: None,
+            scan_expected: &[],
+            scan_expected_pg: None,
+            turso_must_seek: &[],
+            postgres_must_seek: &["observation_vector_pkey"],
+        },
+        HotStatement {
+            issued_by: "Store::observation_vector_hashes",
+            turso: || crystalline_index::turso::OBSERVATION_VECTOR_HASHES_SQL.to_string(),
+            postgres: || crystalline_index::postgres::OBSERVATION_VECTOR_HASHES_SQL.to_string(),
+            literals: &["'fake'"],
+            literals_pg: None,
+            scan_expected: &[],
+            scan_expected_pg: None,
+            turso_must_seek: &[],
+            postgres_must_seek: &["observation_vector_pkey"],
+        },
+        HotStatement {
+            issued_by: "Store::delete_observation_vectors",
+            turso: || crystalline_index::turso::delete_observation_vectors_sql(3),
+            postgres: || crystalline_index::postgres::delete_observation_vectors_sql(3),
+            literals: &["'fake'", "'h1'", "'h2'", "'h3'"],
+            literals_pg: None,
+            scan_expected: &[],
+            scan_expected_pg: None,
+            turso_must_seek: &[],
+            postgres_must_seek: &["observation_vector_pkey"],
+        },
+        // The two whole-table line vector deletes are full passes by design
+        // and not hot: registered so the claim is written down, not implied.
+        HotStatement {
+            issued_by: "Store::delete_observation_vectors_except",
+            turso: || crystalline_index::turso::DELETE_OBSERVATION_VECTORS_EXCEPT_SQL.to_string(),
+            postgres: || {
+                crystalline_index::postgres::DELETE_OBSERVATION_VECTORS_EXCEPT_SQL.to_string()
+            },
+            literals: &["'fake'"],
+            literals_pg: None,
+            scan_expected: &[(
+                "observation_vector",
+                "every other model's vectors, which `<>` cannot seek; runs once per process",
+            )],
+            scan_expected_pg: None,
+            turso_must_seek: &[],
+            postgres_must_seek: &[],
+        },
+        HotStatement {
+            issued_by: "Store::clear_observation_vectors",
+            turso: || crystalline_index::turso::CLEAR_OBSERVATION_VECTORS_SQL.to_string(),
+            postgres: || crystalline_index::postgres::CLEAR_OBSERVATION_VECTORS_SQL.to_string(),
+            literals: &[],
+            literals_pg: None,
+            scan_expected: &[(
+                "observation_vector",
+                "every row, the contradiction check's off switch",
+            )],
+            scan_expected_pg: None,
+            turso_must_seek: &[],
+            postgres_must_seek: &[],
+        },
     ]
 }
 
@@ -834,6 +942,7 @@ async fn seed(store: &dyn Store) -> DomainId {
                 hash_b: format!("h{}", b.0),
                 score_ab: 0.9,
                 score_ba: 0.6,
+                similarity: 0.0,
                 period: false,
             }];
             store
@@ -848,6 +957,18 @@ async fn seed(store: &dyn Store) -> DomainId {
                 .await
                 .unwrap();
         }
+    }
+
+    // Line vectors under two models, so the reads that name a model and a
+    // hash list are planned over real rows.
+    for model in ["fake", "other"] {
+        let rows: Vec<ObservationVector> = (0..FIXTURE_ENGRAMS * 2)
+            .map(|i| ObservationVector {
+                hash: format!("h{i}"),
+                vector: vec![0.5f32; FIXTURE_DIMS],
+            })
+            .collect();
+        store.store_observation_vectors(model, &rows).await.unwrap();
     }
 
     let domain = first.expect("two domains were seeded");

@@ -404,11 +404,7 @@ async fn filter_only(
 /// functions read. `vector_distance_cos` infers the dimensionality from the blob
 /// length, so the same call works for any provider width.
 fn pack_vector(v: &[f32]) -> Vec<u8> {
-    let mut b = Vec::with_capacity(v.len() * 4);
-    for f in v {
-        b.extend_from_slice(&f.to_le_bytes());
-    }
-    b
+    crate::store::pack_f32_le(v)
 }
 
 /// Semantic search over chunk embeddings. Requires the caller to have embedded

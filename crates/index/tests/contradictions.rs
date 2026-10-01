@@ -7,12 +7,13 @@
 //! and the `parity!` backend runner are mirrored from `tests/lead_vectors.rs`
 //! (Turso always, Postgres when `CRYSTALLINE_TEST_POSTGRES_URL` is set).
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use async_trait::async_trait;
 use crystalline_index::{
-    ChunkParams, ContradictionRow, DomainId, DomainKind, EmbeddingProvider, EngramId, Result,
-    ScoredPair, Store, TursoStore, run_embedding_pass, sync_domain_with,
+    ChunkParams, ContradictionRow, DomainId, DomainKind, EmbeddingProvider, EngramId,
+    ObservationVector, Result, ScoredPair, Store, TursoStore, run_embedding_pass, sync_domain_with,
 };
 
 // --- fake provider (mirrored from tests/lead_vectors.rs) ----------------------
@@ -188,6 +189,7 @@ fn row(
         hash_b: format!("h{lb}"),
         score_ab: ab,
         score_ba: ba,
+        similarity: 0.0,
         period,
     }
 }
@@ -565,3 +567,232 @@ parity!(
     upsert_keeps_contradictions_parity,
     an_upsert_keeps_the_scores_until_a_rescore_replaces_them
 );
+
+// --- the line vectors --------------------------------------------------------
+
+fn vector(hash: &str, x: f32) -> ObservationVector {
+    ObservationVector {
+        hash: hash.to_string(),
+        vector: vec![x, 1.0 - x, 0.5, 0.25],
+    }
+}
+
+fn hashes(list: &[&str]) -> Vec<String> {
+    list.iter().map(|h| h.to_string()).collect()
+}
+
+async fn line_vectors_round_trip_by_model_and_hash(store: &dyn Store) {
+    store
+        .store_observation_vectors("m1", &[vector("ha", 0.1), vector("hb", 0.2)])
+        .await
+        .unwrap();
+    store
+        .store_observation_vectors("m2", &[vector("ha", 0.9)])
+        .await
+        .unwrap();
+    let present = store
+        .observation_vectors_present("m1", &hashes(&["ha", "hb", "hc"]))
+        .await
+        .unwrap();
+    assert_eq!(present, HashSet::from(["ha".to_string(), "hb".to_string()]));
+    let got = store
+        .observation_vectors("m1", &hashes(&["ha", "hc"]))
+        .await
+        .unwrap();
+    assert_eq!(got.len(), 1, "an unknown hash is simply absent");
+    // Compared against the vector the helper built, bit for bit: `1.0 - x`
+    // in f32 is not the decimal literal.
+    assert_eq!(got["ha"], vector("ha", 0.1).vector);
+    let other = store
+        .observation_vectors("m2", &hashes(&["ha"]))
+        .await
+        .unwrap();
+    assert_eq!(other["ha"], vector("ha", 0.9).vector, "keyed by model too");
+    // A second store of a known (model, hash) keeps the first: the text is
+    // the same, so the vector is.
+    store
+        .store_observation_vectors("m1", &[vector("ha", 0.7)])
+        .await
+        .unwrap();
+    let again = store
+        .observation_vectors("m1", &hashes(&["ha"]))
+        .await
+        .unwrap();
+    assert_eq!(again["ha"], vector("ha", 0.1).vector);
+    let mut all = store.observation_vector_hashes("m1").await.unwrap();
+    all.sort();
+    assert_eq!(all, hashes(&["ha", "hb"]));
+}
+parity!(
+    line_vectors_round_trip_parity,
+    line_vectors_round_trip_by_model_and_hash
+);
+
+async fn a_long_hash_list_is_read_in_runs(store: &dyn Store) {
+    let rows: Vec<ObservationVector> = (0..600).map(|i| vector(&format!("h{i}"), 0.5)).collect();
+    store.store_observation_vectors("m", &rows).await.unwrap();
+    let asked: Vec<String> = (0..700).map(|i| format!("h{i}")).collect();
+    assert_eq!(
+        store
+            .observation_vectors_present("m", &asked)
+            .await
+            .unwrap()
+            .len(),
+        600,
+        "more hashes than one statement names, every present one found"
+    );
+    assert_eq!(
+        store.observation_vectors("m", &asked).await.unwrap().len(),
+        600
+    );
+    assert_eq!(
+        store
+            .delete_observation_vectors("m", &asked[..300])
+            .await
+            .unwrap(),
+        300
+    );
+    assert_eq!(
+        store.observation_vector_hashes("m").await.unwrap().len(),
+        300
+    );
+}
+parity!(long_hash_list_parity, a_long_hash_list_is_read_in_runs);
+
+async fn pruning_and_clearing_take_only_what_they_name(store: &dyn Store) {
+    store
+        .store_observation_vectors("keep", &[vector("a", 0.1), vector("b", 0.2)])
+        .await
+        .unwrap();
+    store
+        .store_observation_vectors("old", &[vector("a", 0.3)])
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .delete_observation_vectors("keep", &hashes(&["b", "zz"]))
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store
+            .delete_observation_vectors_except("keep")
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store.observation_vector_hashes("keep").await.unwrap(),
+        hashes(&["a"])
+    );
+    assert!(
+        store
+            .observation_vector_hashes("old")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(store.clear_observation_vectors().await.unwrap(), 1);
+    assert!(
+        store
+            .observation_vector_hashes("keep")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+parity!(
+    pruning_and_clearing_parity,
+    pruning_and_clearing_take_only_what_they_name
+);
+
+async fn clear_contradictions_by_domain_or_all(store: &dyn Store) {
+    let tmp = tempfile::tempdir().unwrap();
+    let one = two_in(store, &tmp.path().join("one"), "one").await;
+    let other = two_in(store, &tmp.path().join("other"), "other").await;
+    // `score` writes one pair row and one line row.
+    score(store, &one).await;
+    score(store, &other).await;
+    store
+        .clear_contradictions(Some(&[one.domain]))
+        .await
+        .unwrap();
+    assert_eq!(held(store, one.domain).await, (0, 0));
+    assert_eq!(
+        held(store, other.domain).await,
+        (1, 1),
+        "the other domain stays"
+    );
+    store.clear_contradictions(None).await.unwrap();
+    assert_eq!(held(store, other.domain).await, (0, 0));
+}
+parity!(
+    clear_contradictions_parity,
+    clear_contradictions_by_domain_or_all
+);
+
+async fn the_similarity_round_trips_and_wipe_clears_line_vectors(store: &dyn Store) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (domain, a, ca, b, cb) = two(store, tmp.path()).await;
+    let mut r = row(a, b, 5, 5, 0.91, 0.80, false);
+    r.similarity = 0.875;
+    store
+        .replace_contradictions(
+            domain,
+            &pair(a, b, &ca, &cb),
+            0.9,
+            "nli-x",
+            "t",
+            &[r.clone()],
+        )
+        .await
+        .unwrap();
+    let back = store.contradictions(domain, "nli-x", 0.5).await.unwrap();
+    assert_eq!(back, vec![r]);
+    store
+        .store_observation_vectors("m", &[vector("x", 0.5)])
+        .await
+        .unwrap();
+    store.wipe().await.unwrap();
+    assert!(
+        store
+            .observation_vector_hashes("m")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+parity!(
+    similarity_and_wipe_parity,
+    the_similarity_round_trips_and_wipe_clears_line_vectors
+);
+
+// --- the shared-database flag ------------------------------------------------
+
+/// A turso index is one instance's own file: per-instance housekeeping may
+/// delete its derived rows.
+#[tokio::test]
+async fn a_turso_store_does_not_share_its_database() {
+    let store = TursoStore::open_in_memory().await.unwrap();
+    assert!(!store.shares_database());
+}
+
+/// A postgres database may serve several instances at once, so per-instance
+/// housekeeping must leave the shared rows alone.
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn a_postgres_store_shares_its_database() {
+    let Some(url) = pg_url() else {
+        return;
+    };
+    let schema = unique_schema();
+    let store = crystalline_index::PostgresStore::open_in_schema(&url, &schema)
+        .await
+        .expect("open the postgres test schema");
+    assert!(store.shares_database());
+    store
+        .drop_schema()
+        .await
+        .expect("drop the postgres test schema");
+}

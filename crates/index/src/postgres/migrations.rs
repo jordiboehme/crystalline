@@ -529,6 +529,11 @@ WHERE to_domain IS NOT NULL AND to_id IS NOT NULL
 // primary keys that serve the first. `idx_contradiction_pair_model` serves
 // `Store::scored_pair_count`'s `WHERE model=$1`, which names no domain and so
 // cannot seek `idx_contradiction_pair_domain` - see the Turso twin's comment.
+// `observation_vector` caches the embedding of each observation line the
+// contradiction check pairs, keyed by the embedding model and the row hash of
+// the folded text; it holds no text and no engram id, and its primary key
+// serves every read - see the Turso twin's comment. A plain `BYTEA`, not a
+// `vector` column: nothing searches these vectors in SQL.
 const SCHEMA_V17: &str = r#"
 CREATE TABLE IF NOT EXISTS contradiction_pair (
     domain_id BIGINT NOT NULL REFERENCES domain(id) ON DELETE CASCADE,
@@ -555,12 +560,21 @@ CREATE TABLE IF NOT EXISTS contradiction (
     model TEXT NOT NULL,
     score_ab DOUBLE PRECISION NOT NULL,
     score_ba DOUBLE PRECISION NOT NULL,
+    similarity DOUBLE PRECISION NOT NULL DEFAULT 0,
     period BIGINT NOT NULL DEFAULT 0,
     PRIMARY KEY (engram_a, engram_b, hash_a, hash_b, model)
 );
 CREATE INDEX IF NOT EXISTS idx_contradiction_engram_b ON contradiction(engram_b);
 CREATE INDEX IF NOT EXISTS idx_contradiction_pair_engram_b ON contradiction_pair(engram_b);
 CREATE INDEX IF NOT EXISTS idx_contradiction_domain ON contradiction(domain_id, model);
+
+CREATE TABLE IF NOT EXISTS observation_vector (
+    model TEXT NOT NULL,
+    hash TEXT NOT NULL,
+    dims BIGINT NOT NULL,
+    vector BYTEA NOT NULL,
+    PRIMARY KEY (model, hash)
+);
 "#;
 
 const SCHEMA_V8: &str = r#"
@@ -588,8 +602,10 @@ CREATE TABLE attachment_blob (
 /// `domain`; `attachment_blob` references `attachment`, so it goes before it,
 /// and `engram_content` references `engram`, so it goes before that.
 /// `contradiction` and `contradiction_pair` reference `engram` and `domain`,
-/// so they go first.
+/// so they go first. `observation_vector` references nothing and leads the
+/// list.
 pub const WIPE_TABLES: &[&str] = &[
+    "observation_vector",
     "contradiction",
     "contradiction_pair",
     "observation_tag",

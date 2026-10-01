@@ -628,6 +628,16 @@ WHERE to_domain IS NOT NULL AND to_id IS NOT NULL
 // `delete_engram` deletes by `engram_a=?1 OR engram_b=?1` on both tables.
 // Each primary key leads with `engram_a` and serves one half of the OR; the
 // two `engram_b` indexes serve the other, so a delete never walks a table.
+//
+// `observation_vector` caches the embedding of each observation line the
+// contradiction check pairs, keyed by the embedding model and the row hash of
+// the folded text, so a text shared by many engrams is embedded once and an
+// edit embeds only the lines whose text changed. It holds no text at all
+// (hash, width and vector), and no engram id, so no per-engram statement ever
+// reads it: it is derived and disposable, pruned by the daemon when no current
+// line uses a hash, cleared when the check is switched off and by `wipe`, and
+// kept by `reindex --full` because a vector keyed by its text stays valid.
+// The primary key serves every read, which all name the model and a hash list.
 const SCHEMA_V18: &str = r#"
 CREATE TABLE contradiction_pair (
     domain_id INTEGER NOT NULL REFERENCES domain(id) ON DELETE CASCADE,
@@ -654,12 +664,21 @@ CREATE TABLE contradiction (
     model TEXT NOT NULL,
     score_ab REAL NOT NULL,
     score_ba REAL NOT NULL,
+    similarity REAL NOT NULL DEFAULT 0,
     period INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (engram_a, engram_b, hash_a, hash_b, model)
 );
 CREATE INDEX idx_contradiction_engram_b ON contradiction(engram_b);
 CREATE INDEX idx_contradiction_pair_engram_b ON contradiction_pair(engram_b);
 CREATE INDEX idx_contradiction_domain ON contradiction(domain_id, model);
+
+CREATE TABLE observation_vector (
+    model TEXT NOT NULL,
+    hash TEXT NOT NULL,
+    dims INTEGER NOT NULL,
+    vector BLOB NOT NULL,
+    PRIMARY KEY (model, hash)
+);
 "#;
 
 const SCHEMA_V9: &str = r#"
@@ -686,8 +705,10 @@ CREATE TABLE attachment_blob (
 /// cleared before `domain`; `attachment_blob` references `attachment`, so it
 /// goes before it, and `engram_content` references `engram`, so it goes
 /// before that. `contradiction` and `contradiction_pair` reference `engram`
-/// and `domain`, so they go first.
+/// and `domain`, so they go first. `observation_vector` references nothing
+/// and leads the list.
 pub const WIPE_TABLES: &[&str] = &[
+    "observation_vector",
     "contradiction",
     "contradiction_pair",
     "observation_tag",

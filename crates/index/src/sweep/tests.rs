@@ -3003,6 +3003,7 @@ fn stored(
         hash_b: observation_hash(tb),
         score_ab: ab,
         score_ba: ba,
+        similarity: 0.0,
         period: false,
     }
 }

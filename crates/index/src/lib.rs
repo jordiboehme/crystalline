@@ -48,11 +48,11 @@ pub use store::{
     DomainLookup, DomainStats, EdgeKind, EmbeddingCoverage, EmbeddingRow, EngramDescriptor,
     EngramId, EngramRecord, EngramSummary, FileStamp, FilterOp, FtsMode, GraphEdge, GraphNode,
     GraphSlice, HitKind, HostClaim, InboundHit, InboundPage, InboundQuery, InboundRef,
-    LEXICAL_CANDIDATE_CAP, LINKS_TO, LeadVector, MetadataFilter, NamedCount, NewChunk, OutboundRef,
-    Page, RETIRED_STATUSES, RebuildKind, RecentFilter, ScoredPair, SearchHit, SearchMode,
-    SearchOrder, SearchQuery, Store, StoreInfo, StoredEngram, TagAlias, TagCount, Vocabulary,
-    is_current_status, is_retired_status, lookup_in_domain, merge_vocabularies,
-    parse_metadata_filters, retired_factor, salience_prior,
+    LEXICAL_CANDIDATE_CAP, LINKS_TO, LeadVector, MetadataFilter, NamedCount, NewChunk,
+    OBSERVATION_VECTOR_CHUNK, ObservationVector, OutboundRef, Page, RETIRED_STATUSES, RebuildKind,
+    RecentFilter, ScoredPair, SearchHit, SearchMode, SearchOrder, SearchQuery, Store, StoreInfo,
+    StoredEngram, TagAlias, TagCount, Vocabulary, is_current_status, is_retired_status,
+    lookup_in_domain, merge_vocabularies, parse_metadata_filters, retired_factor, salience_prior,
 };
 /// The shared statement builders, reachable from `tests/plans.rs` and from
 /// nothing else.

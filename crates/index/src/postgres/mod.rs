@@ -91,7 +91,7 @@ pub use search::{
     semantic_hydrate_sql, semantic_phase1_sql,
 };
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -109,12 +109,13 @@ use crate::store::{
     DomainHost, DomainId, DomainKind, DomainStats, EdgeKind, EmbeddingCoverage, EmbeddingRow,
     EngramDescriptor, EngramId, EngramRecord, EngramSummary, FileStamp, FtsMode, GraphSlice,
     HostClaim, InboundHit, InboundPage, InboundQuery, InboundRef, LINKS_TO, LeadVector, NamedCount,
-    NewChunk, OutboundRef, Page, RebuildKind, RecentFilter, ReferenceCandidates, ScoredPair,
-    SearchHit, SearchMode, SearchQuery, SpellingPlan, Store, StoreInfo, StoredEngram, Vocabulary,
-    build_vocabulary, changed_spellings, count_references_to_sql, domain_url_needles, folder_slash,
-    in_transaction, names_a_domain_url, page_window, reference_match, referencing_domains_sql,
-    rename_onto_taken_row, reset_spelled_references_sql, resolve_references_to_sql,
-    resolve_spelled_references_sql, spelled_references_sql, spelling_plan,
+    NewChunk, OBSERVATION_VECTOR_CHUNK, ObservationVector, OutboundRef, Page, RebuildKind,
+    RecentFilter, ReferenceCandidates, ScoredPair, SearchHit, SearchMode, SearchQuery,
+    SpellingPlan, Store, StoreInfo, StoredEngram, Vocabulary, build_vocabulary, changed_spellings,
+    count_references_to_sql, domain_url_needles, folder_slash, in_transaction, names_a_domain_url,
+    page_window, reference_match, referencing_domains_sql, rename_onto_taken_row,
+    reset_spelled_references_sql, resolve_references_to_sql, resolve_spelled_references_sql,
+    spelled_references_sql, spelling_plan,
 };
 use crate::sweep::{SpelledRef, UnresolvedRef};
 
@@ -978,7 +979,7 @@ pub const CONTRADICTION_PAIRS_SCORED_SQL: &str = "SELECT cp.engram_a, cp.engram_
 /// `idx_contradiction_domain`. The floor applies to the higher reading order.
 #[doc(hidden)]
 pub const CONTRADICTIONS_SQL: &str = "SELECT cn.engram_a, cn.engram_b, cn.line_a, cn.line_b, cn.hash_a, cn.hash_b, \
-     cn.score_ab, cn.score_ba, cn.period FROM contradiction cn \
+     cn.score_ab, cn.score_ba, cn.similarity, cn.period FROM contradiction cn \
      WHERE cn.domain_id=$1 AND cn.model=$2 AND (cn.score_ab >= $3 OR cn.score_ba >= $3) \
      ORDER BY cn.engram_a, cn.engram_b, cn.line_a, cn.line_b";
 
@@ -1013,6 +1014,63 @@ pub const DELETE_ENGRAM_CONTRADICTION_PAIRS_SQL: &str =
 /// daemon-mode `doctor` run.
 #[doc(hidden)]
 pub const SCORED_PAIR_COUNT_SQL: &str = "SELECT COUNT(*) FROM contradiction_pair WHERE model=$1";
+
+/// One domain's line rows, deleted by [`Store::clear_contradictions`] through
+/// `idx_contradiction_domain`.
+#[doc(hidden)]
+pub const CLEAR_DOMAIN_CONTRADICTIONS_SQL: &str = "DELETE FROM contradiction WHERE domain_id=$1";
+
+/// One domain's pair rows, deleted by [`Store::clear_contradictions`] through
+/// `idx_contradiction_pair_domain`.
+#[doc(hidden)]
+pub const CLEAR_DOMAIN_CONTRADICTION_PAIRS_SQL: &str =
+    "DELETE FROM contradiction_pair WHERE domain_id=$1";
+
+/// The pruning read behind [`Store::observation_vector_hashes`]: the primary
+/// key `(model, hash)` serves `model=$1` as its leading column.
+#[doc(hidden)]
+pub const OBSERVATION_VECTOR_HASHES_SQL: &str =
+    "SELECT ov.hash FROM observation_vector ov WHERE ov.model=$1";
+
+/// The presence check behind [`Store::observation_vectors_present`] for `n`
+/// hashes, through the primary key.
+#[doc(hidden)]
+pub fn observation_vectors_present_sql(n: usize) -> String {
+    format!(
+        "SELECT ov.hash FROM observation_vector ov WHERE ov.model=$1 AND ov.hash IN ({})",
+        placeholders(2, n)
+    )
+}
+
+/// The read behind [`Store::observation_vectors`] for `n` hashes.
+#[doc(hidden)]
+pub fn observation_vectors_sql(n: usize) -> String {
+    format!(
+        "SELECT ov.hash, ov.dims, ov.vector FROM observation_vector ov \
+         WHERE ov.model=$1 AND ov.hash IN ({})",
+        placeholders(2, n)
+    )
+}
+
+/// The prune behind [`Store::delete_observation_vectors`] for `n` hashes.
+#[doc(hidden)]
+pub fn delete_observation_vectors_sql(n: usize) -> String {
+    format!(
+        "DELETE FROM observation_vector WHERE model=$1 AND hash IN ({})",
+        placeholders(2, n)
+    )
+}
+
+/// The delete behind [`Store::delete_observation_vectors_except`]: every
+/// other model's line vectors, a full pass by design, once per process.
+#[doc(hidden)]
+pub const DELETE_OBSERVATION_VECTORS_EXCEPT_SQL: &str =
+    "DELETE FROM observation_vector WHERE model <> $1";
+
+/// The delete behind [`Store::clear_observation_vectors`]: every line vector,
+/// the contradiction check's off switch.
+#[doc(hidden)]
+pub const CLEAR_OBSERVATION_VECTORS_SQL: &str = "DELETE FROM observation_vector";
 
 /// The address lookup behind [`Store::find_engram`].
 ///
@@ -2894,8 +2952,8 @@ impl Store for PostgresStore {
             }
             for row in rows {
                 sqlx::query(
-                    "INSERT INTO contradiction (domain_id, engram_a, engram_b, line_a, line_b, hash_a, hash_b, model, score_ab, score_ba, period) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                    "INSERT INTO contradiction (domain_id, engram_a, engram_b, line_a, line_b, hash_a, hash_b, model, score_ab, score_ba, similarity, period) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
                 )
                 .bind(domain.0)
                 .bind(row.a.0)
@@ -2907,6 +2965,7 @@ impl Store for PostgresStore {
                 .bind(model)
                 .bind(f64::from(row.score_ab))
                 .bind(f64::from(row.score_ba))
+                .bind(f64::from(row.similarity))
                 .bind(i64::from(row.period))
                 .execute(&mut *c)
                 .await
@@ -2943,7 +3002,8 @@ impl Store for PostgresStore {
                     hash_b: cell_text(r, 5)?,
                     score_ab: cell_real(r, 6)? as f32,
                     score_ba: cell_real(r, 7)? as f32,
-                    period: cell_i64(r, 8)? != 0,
+                    similarity: cell_real(r, 8)? as f32,
+                    period: cell_i64(r, 9)? != 0,
                 })
             })
             .collect())
@@ -2958,6 +3018,188 @@ impl Store for PostgresStore {
         )
         .await?;
         Ok(n.max(0) as u64)
+    }
+
+    async fn observation_vectors_present(
+        &self,
+        model: &str,
+        hashes: &[String],
+    ) -> Result<HashSet<String>> {
+        let mut conn = self.acquire().await?;
+        let mut out = HashSet::with_capacity(hashes.len());
+        for run in hashes.chunks(OBSERVATION_VECTOR_CHUNK) {
+            let sql = observation_vectors_present_sql(run.len());
+            let mut q = sqlx::query(AssertSqlSafe(sql.as_str())).bind(model);
+            for h in run {
+                q = q.bind(h);
+            }
+            for r in q.fetch_all(conn.as_mut()).await.map_err(IndexError::from)? {
+                if let Some(h) = cell_text(&r, 0) {
+                    out.insert(h);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    async fn observation_vectors(
+        &self,
+        model: &str,
+        hashes: &[String],
+    ) -> Result<HashMap<String, Vec<f32>>> {
+        let mut conn = self.acquire().await?;
+        let mut out = HashMap::with_capacity(hashes.len());
+        for run in hashes.chunks(OBSERVATION_VECTOR_CHUNK) {
+            let sql = observation_vectors_sql(run.len());
+            let mut q = sqlx::query(AssertSqlSafe(sql.as_str())).bind(model);
+            for h in run {
+                q = q.bind(h);
+            }
+            for r in q.fetch_all(conn.as_mut()).await.map_err(IndexError::from)? {
+                let (Some(hash), Some(dims)) = (cell_text(&r, 0), cell_i64(&r, 1)) else {
+                    continue;
+                };
+                let Ok(bytes) = r.try_get::<Vec<u8>, _>(2) else {
+                    continue;
+                };
+                let vector = crate::store::unpack_f32_le(&bytes);
+                if vector.len() as i64 != dims {
+                    tracing::warn!(
+                        hash = %hash,
+                        dims,
+                        stored = vector.len(),
+                        "skipping a line vector whose stored width disagrees with its dims column"
+                    );
+                    continue;
+                }
+                out.insert(hash, vector);
+            }
+        }
+        Ok(out)
+    }
+
+    async fn store_observation_vectors(
+        &self,
+        model: &str,
+        rows: &[ObservationVector],
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        in_transaction(self, async {
+            let mut conn = self.acquire().await?;
+            let c = conn.as_mut();
+            for row in rows {
+                sqlx::query(
+                    "INSERT INTO observation_vector (model, hash, dims, vector) \
+                     VALUES ($1, $2, $3, $4) ON CONFLICT (model, hash) DO NOTHING",
+                )
+                .bind(model)
+                .bind(&row.hash)
+                .bind(row.vector.len() as i64)
+                .bind(crate::store::pack_f32_le(&row.vector))
+                .execute(&mut *c)
+                .await
+                .map_err(IndexError::from)?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    async fn observation_vector_hashes(&self, model: &str) -> Result<Vec<String>> {
+        let mut conn = self.acquire().await?;
+        let rows = sqlx::query(OBSERVATION_VECTOR_HASHES_SQL)
+            .bind(model)
+            .fetch_all(conn.as_mut())
+            .await
+            .map_err(IndexError::from)?;
+        Ok(rows.iter().filter_map(|r| cell_text(r, 0)).collect())
+    }
+
+    async fn delete_observation_vectors(&self, model: &str, hashes: &[String]) -> Result<u64> {
+        if hashes.is_empty() {
+            return Ok(0);
+        }
+        in_transaction(self, async {
+            let mut conn = self.acquire().await?;
+            let c = conn.as_mut();
+            let mut gone = 0u64;
+            for run in hashes.chunks(OBSERVATION_VECTOR_CHUNK) {
+                let sql = delete_observation_vectors_sql(run.len());
+                let mut q = sqlx::query(AssertSqlSafe(sql.as_str())).bind(model);
+                for h in run {
+                    q = q.bind(h);
+                }
+                gone += q
+                    .execute(&mut *c)
+                    .await
+                    .map_err(IndexError::from)?
+                    .rows_affected();
+            }
+            Ok(gone)
+        })
+        .await
+    }
+
+    async fn delete_observation_vectors_except(&self, model: &str) -> Result<u64> {
+        let mut conn = self.acquire().await?;
+        Ok(sqlx::query(DELETE_OBSERVATION_VECTORS_EXCEPT_SQL)
+            .bind(model)
+            .execute(conn.as_mut())
+            .await
+            .map_err(IndexError::from)?
+            .rows_affected())
+    }
+
+    async fn clear_observation_vectors(&self) -> Result<u64> {
+        let mut conn = self.acquire().await?;
+        Ok(sqlx::query(CLEAR_OBSERVATION_VECTORS_SQL)
+            .execute(conn.as_mut())
+            .await
+            .map_err(IndexError::from)?
+            .rows_affected())
+    }
+
+    async fn clear_contradictions(&self, domains: Option<&[DomainId]>) -> Result<()> {
+        in_transaction(self, async {
+            let mut conn = self.acquire().await?;
+            let c = conn.as_mut();
+            match domains {
+                None => {
+                    for sql in [
+                        "DELETE FROM contradiction",
+                        "DELETE FROM contradiction_pair",
+                    ] {
+                        sqlx::query(sql)
+                            .execute(&mut *c)
+                            .await
+                            .map_err(IndexError::from)?;
+                    }
+                }
+                Some(ids) => {
+                    for id in ids {
+                        for sql in [
+                            CLEAR_DOMAIN_CONTRADICTIONS_SQL,
+                            CLEAR_DOMAIN_CONTRADICTION_PAIRS_SQL,
+                        ] {
+                            sqlx::query(sql)
+                                .bind(id.0)
+                                .execute(&mut *c)
+                                .await
+                                .map_err(IndexError::from)?;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// A postgres database may be shared by several instances at once.
+    fn shares_database(&self) -> bool {
+        true
     }
 
     async fn wipe(&self) -> Result<()> {
