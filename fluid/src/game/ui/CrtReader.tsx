@@ -1,5 +1,6 @@
 /**
- * The CRT reader: what a terminal shows when the player leans in with Space.
+ * The CRT reader: what a terminal, a machine, a poster, the placard or a
+ * screen shows when the player leans in with Space.
  *
  * A full-screen overlay laid out as an 80-column terminal, the engram's
  * markdown flattened by `crtLines` into screen lines. The font is sized so
@@ -11,9 +12,9 @@
  * are drawn in reverse video; the scanlines are a CSS repeating gradient and
  * the vignette a radial one, both laid over the text and ignoring the mouse.
  *
- * It opens at the terminal's own section: the `occurrence`-th line index the
- * layout records for the heading, or the top when the text no longer has
- * that section. The keys are read on `window` by `KeyboardEvent.code` while
+ * It opens at the reading's section (a terminal's own): the
+ * `occurrence`-th line index the layout records for the heading, or the
+ * top when there is none or the text no longer has that section. The keys are read on `window` by `KeyboardEvent.code` while
  * the reader is mounted, with the page's default action prevented so W, S
  * and the page keys do not also scroll the page: W/S or the arrows move one
  * line, Page Up/Down a screen, the wheel scrolls, F opens the engram in
@@ -86,10 +87,10 @@ export interface CrtReaderProps {
   /** The engram's markdown, frontmatter included or not. */
   markdown: string;
   /**
-   * The section the terminal stood for: its `##` heading as written and how
-   * many sections of the same heading come before it. Null opens at the top.
-   * It is read once, at mount: the parent mounts a fresh reader for each
-   * terminal (a new `key`), so a later change of this prop moves nothing.
+   * The section to open at (a terminal's): its `##` heading as written and
+   * how many sections of the same heading come before it. Null opens at the
+   * top. It is read once, at mount: the parent mounts a fresh reader for each
+   * reading (a new `key`), so a later change of this prop moves nothing.
    */
   section: { heading: string; occurrence: number } | null;
   /** Called on F: open the engram in Fluid. */
@@ -100,7 +101,7 @@ export interface CrtReaderProps {
 
 /**
  * The reader overlay. See the module doc for the layout and the keys; the
- * parent mounts it while a terminal is being read and unmounts it on
+ * parent mounts it while a fixture is being read and unmounts it on
  * `onClose`.
  */
 export function CrtReader({

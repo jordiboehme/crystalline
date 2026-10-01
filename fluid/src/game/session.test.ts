@@ -52,7 +52,7 @@ import {
   type Session,
   type SessionOptions,
 } from "./session";
-import { boxFront, type DomainRow } from "./world/box";
+import { boxFocus, boxFront, type DomainRow } from "./world/box";
 import { airlockRoom } from "./world/airlock";
 import { atConsoleExit, consoleRoom } from "./world/consoleRoom";
 import {
@@ -72,6 +72,7 @@ import { LIFT_WORDS } from "./world/lifts";
 import {
   ARRIVAL_DISTANCE,
   REACH,
+  focusOf,
   wallFacingSpawn,
   wallPoint,
 } from "./world/interact";
@@ -2288,6 +2289,61 @@ describe("the police box's doors", () => {
     key("keyup", "Space");
     frames(19);
     expect(lastDoors().get(`box:${String(i)}`)).toBe(0);
+  });
+
+  it("keeps Space at the box with a placard nearer in reach (0.22 R13)", () => {
+    // Mutation caught: the session taking any fixture focus before the box,
+    // so the nearer placard opens the reader and the box never opens.
+    const hall = heroHallRoom();
+    const index = hall.heroes.findIndex((h) => h.kind === "police-box");
+    expect(index).toBeGreaterThanOrEqual(0);
+    const front = boxFront(hall.heroes[index]!);
+    const dist = REACH - 0.4;
+    // The spot `standAtBox` stands the player on, looking at the box.
+    const player = {
+      x: front.x + front.inward[0] * dist,
+      z: front.z + front.inward[1] * dist,
+      vx: 0,
+      vz: 0,
+      yaw: Math.atan2(front.inward[0], front.inward[1]),
+      pitch: 0,
+      bob: 0,
+    };
+    // A placard on the first wall edge near the player that `focusOf`
+    // offers from there, nearer than the box's front.
+    const sides = ["n", "e", "s", "w"] as const;
+    let room: RoomSpec | null = null;
+    for (let y = 0; y < hall.depth && room === null; y++) {
+      for (let x = 0; x < hall.width && room === null; x++) {
+        for (const side of sides) {
+          const slot = { x, y, side };
+          const w = wallPoint(slot);
+          if (Math.hypot(w.x - player.x, w.z - player.z) >= dist) continue;
+          const candidate: RoomSpec = {
+            ...hall,
+            fixtures: [
+              ...hall.fixtures,
+              { kind: "placard", slot, lines: ["NEAR"] },
+            ],
+          };
+          if (focusOf(candidate, player)?.kind === "placard") {
+            room = candidate;
+            break;
+          }
+        }
+      }
+    }
+    if (room === null) throw new Error("no placard spot nearer than the box");
+    expect(boxFocus(room, player, new Map())).not.toBeNull();
+    const session = start();
+    const i = standAtBox(session, room);
+    expect(i).toBe(index);
+    expect(hud.prompt).toHaveBeenLastCalledWith("SPACE OPEN");
+    key("keydown", "Space");
+    key("keyup", "Space");
+    frames(19);
+    expect(hud.reader).not.toHaveBeenCalled();
+    expect(lastDoors().get(`box:${String(i)}`)).toBe(1);
   });
 
   it("never walks in without the console room option (2.6e C21)", () => {

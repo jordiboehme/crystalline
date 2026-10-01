@@ -1,6 +1,7 @@
 /**
  * The station's screen: the full-screen canvas a session draws on, the HUD
- * over it and, while a terminal is read, the CRT reader over both.
+ * over it and, while a fixture is read (a terminal, a machine, a poster,
+ * the placard or a screen), the CRT reader over both.
  *
  * The game route and the model gallery host a session the same way and
  * draw the same screen; only what they start the session with differs. So
@@ -37,11 +38,13 @@ export interface StationViewProps {
 }
 
 /**
- * The key a reader is mounted under: one per terminal opening. The reader
- * reads its section once, when it mounts, so a reader opened at another
- * terminal, or in another room, must be a new one rather than the old one
- * given new props. Closing a reader unmounts it, so reading the same
- * terminal twice mounts it afresh as well.
+ * The key a reader is mounted under: its reading's title and section. The
+ * reader reads its section once, when it mounts, so a reading with another
+ * title or section (another terminal, another room) must be a new reader
+ * rather than the old one given new props. Two readings with the same title
+ * and no section (the placard, then a machine) are never open one after
+ * the other without a close, and closing a reader unmounts it, so reading
+ * the same thing twice mounts it afresh as well.
  */
 function readerKey(reader: ReaderState): string {
   const section = reader.section;

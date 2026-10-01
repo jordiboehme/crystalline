@@ -26,7 +26,9 @@
  *   (0.22 R12): `world/reading.ts` says what each reads. These reading
  *   offers rank below every other offer (0.22 R13): `focusOf` takes one
  *   only when no terminal, door, hatch, portal or lift is in focus, so a
- *   placard beside a door never takes Space from the door.
+ *   placard beside a door never takes Space from the door. The session
+ *   consults a police box (`boxFocus`) before a reading offer as well
+ *   (`isReadingKind`).
  *
  * A way that failed on travel (the session's `failed` map) is treated as
  * sealed: it is offered only to say why, heads shut and carries no one.
@@ -348,6 +350,15 @@ const READING_KINDS: ReadonlySet<Interactable["kind"]> = new Set([
 ]);
 
 /**
+ * Whether `kind` is one of the reading offers (a machine, a poster, the
+ * placard, a screen), which rank below every other offer, a police box's
+ * included (0.22 R13).
+ */
+export function isReadingKind(kind: Interactable["kind"]): boolean {
+  return READING_KINDS.has(kind);
+}
+
+/**
  * The fixture the player is facing and can use, or null.
  *
  * Of the fixtures `offer` has something to say about, the nearest one whose
@@ -382,7 +393,7 @@ export function focusOf(
     if (distance > 0 && (dx * fx + dz * fz) / distance < cosFacing) continue;
     const candidate = offer(fixture, index, doors, failed, room.title);
     if (candidate === null) continue;
-    if (READING_KINDS.has(candidate.kind)) {
+    if (isReadingKind(candidate.kind)) {
       if (distance >= readingDistance) continue;
       reading = candidate;
       readingDistance = distance;

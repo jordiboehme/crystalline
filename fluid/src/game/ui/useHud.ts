@@ -9,7 +9,7 @@
  * `Hud` hands its elements over through callback refs (`HudView`), and the
  * sink writes each one's `textContent`, so a title or heading from an
  * engram is shown as the characters it is. The connector and the reader
- * change once per journey or terminal, so they are React state for the
+ * change once per journey or reading, so they are React state for the
  * host to render.
  */
 
@@ -37,7 +37,7 @@ export interface HudBindings {
   view: HudView;
   /** The connector as the sink last set it, held up for its minimum. */
   connector: ConnectorState;
-  /** The reader's content while a terminal is read, else null. */
+  /** The reader's content while a fixture is read, else null. */
   reader: ReaderState | null;
 }
 

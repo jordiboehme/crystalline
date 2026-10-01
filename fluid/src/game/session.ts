@@ -39,7 +39,9 @@
  *
  * Space at a police box's front opens or closes its doors too
  * (`world/box.ts`'s `boxFocus` and `stepBoxDoors`), like a bulkhead door: a
- * fixture in focus always wins over a box, since the two rarely compete. Its
+ * terminal, door, hatch, portal or lift in focus wins over a box, since the
+ * two rarely compete, and a box wins over a machine, a poster, the placard
+ * or a screen (0.22 R13), which are only read. Its
  * door state is kept under `boxKey(index)`, alongside the fixture doors'
  * `door:<index>` keys, in the same map the renderer draws every mover's
  * fraction from.
@@ -282,6 +284,7 @@ import {
   arrivalWay,
   doorKey,
   focusOf,
+  isReadingKind,
   hatchTravel,
   approaches,
   stepDoors,
@@ -2134,9 +2137,16 @@ export function createSession(opts: SessionOptions): Session {
       }
     }
 
-    const focus = modal() ? null : focusOf(room, player, doors, failed);
+    // Today's fixture offers first, then a police box, then the reading
+    // offers (0.22 R13): a placard, a poster, a machine or a screen never
+    // takes Space from a box the player faces.
+    const offered = modal() ? null : focusOf(room, player, doors, failed);
+    const reads = offered !== null && isReadingKind(offered.kind);
     const boxAt =
-      modal() || focus !== null ? null : boxFocus(room, player, boxes);
+      modal() || (offered !== null && !reads)
+        ? null
+        : boxFocus(room, player, boxes);
+    const focus = reads && boxAt !== null ? null : offered;
     let pressedDoor: number | null = null;
     let pressedWay: number | null = null;
     let pressedBox: number | null = null;
