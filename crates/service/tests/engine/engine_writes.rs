@@ -1545,6 +1545,82 @@ async fn split_refuses_a_stale_checksum_and_writes_nothing() {
     );
 }
 
+/// A bullet that wraps onto further lines is one observation: read_engram
+/// reports it once, at its first line and with the joined text, and a split
+/// by that line moves every line of it, never leaving a continuation behind.
+#[tokio::test]
+async fn split_moves_every_line_of_a_wrapped_bullet() {
+    let (tmp, engine) = engine_fixture().await;
+    let wrapped = BUNDLE.replace(
+        "- [fact] The loop needs a 40 minute purge before a mix swap\n",
+        "- [fact] The loop needs a 40 minute purge before a mix swap,\n  which is why the swap runs in the night shift\nand never during a docking #purge\n",
+    );
+    std::fs::write(tmp.path().join("eng/coolant-bundle.md"), &wrapped).unwrap();
+    engine.sync(None).await.unwrap();
+
+    let read = engine
+        .read_engram(
+            &ReadParams {
+                identifier: "coolant-bundle".to_string(),
+                domain: Some("eng".to_string()),
+                share_link: None,
+            },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    let purge: Vec<&serde_json::Value> = read["observations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|o| {
+            o["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("40 minute")
+        })
+        .collect();
+    assert_eq!(purge.len(), 1, "one observation: {purge:?}");
+    assert_eq!(
+        purge[0]["content"],
+        "The loop needs a 40 minute purge before a mix swap, which is why the swap runs in \
+         the night shift and never during a docking"
+    );
+    assert_eq!(purge[0]["tags"], serde_json::json!(["purge"]));
+    let first = wrapped
+        .lines()
+        .position(|l| l.contains("40 minute purge"))
+        .unwrap()
+        + 1;
+    assert_eq!(purge[0]["line"], first, "the bullet's own line");
+
+    engine
+        .split_engram(&SplitParams {
+            domain: "eng".to_string(),
+            identifier: "coolant-bundle".to_string(),
+            title: "Purge Procedure".to_string(),
+            folder: None,
+            observations: vec![first],
+            sections: Vec::new(),
+            expected_checksum: None,
+        })
+        .await
+        .unwrap();
+
+    let new = std::fs::read_to_string(tmp.path().join("eng/purge-procedure.md")).unwrap();
+    assert!(
+        new.contains(
+            "- [fact] The loop needs a 40 minute purge before a mix swap,\n  which is why the swap \
+             runs in the night shift\nand never during a docking #purge\n"
+        ),
+        "{new}"
+    );
+    let source = std::fs::read_to_string(tmp.path().join("eng/coolant-bundle.md")).unwrap();
+    assert!(!source.contains("night shift"), "{source}");
+    assert!(!source.contains("docking"), "{source}");
+    assert!(source.contains("- [fact] The purge pump is rated for 12 bar"));
+}
+
 #[tokio::test]
 async fn split_moves_a_section_by_heading_path() {
     let (tmp, engine, _) = bundle_fixture().await;

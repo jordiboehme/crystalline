@@ -1382,13 +1382,15 @@ impl Engine {
         let mut observations: BTreeSet<usize> = BTreeSet::new();
         let mut sections: BTreeSet<(usize, usize)> = BTreeSet::new();
         for line in &p.observations {
-            if !engram.observations.iter().any(|o| o.line == *line) {
+            let Some(obs) = engram.observations.iter().find(|o| o.line == *line) else {
                 return Err(EngineError::Invalid(format!(
                     "line {line} is not an observation bullet on '{permalink}'; \
                      read_engram reports the line of every observation it carries"
                 )));
-            }
-            moving.insert(*line);
+            };
+            // A bullet that wraps onto further lines moves whole: its first
+            // line is the one read_engram reports, its text runs to `end_line`.
+            moving.extend(obs.line..=obs.end_line.max(obs.line));
             observations.insert(*line);
         }
         for path in &p.sections {

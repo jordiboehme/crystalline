@@ -24,7 +24,7 @@ use crystalline_service::engine::{
     NLI_IDLE_DROP, ScorerLoader,
 };
 use crystalline_service::params::{
-    DeleteParams, EditParams, EvolveParams, MoveParams, WriteParams,
+    DeleteParams, EditParams, EvolveParams, MoveParams, ReadParams, WriteParams,
 };
 use tokio::sync::Mutex;
 
@@ -3559,4 +3559,73 @@ async fn the_walk_and_a_default_sweep_read_the_same_utc_date() {
         "counted under the same date: {value}"
     );
     assert!(!engine.contradictions_wanted());
+}
+
+// --- wrapped bullets ----------------------------------------------------------
+
+/// A bullet that wraps onto a second line is one observation to the check:
+/// its joined text is what is embedded and what the model reads, so the stub's
+/// "Node 18 against Node 20" pair is found although "Node 18" sits on the
+/// continuation line, and the stored row names the bullet's first line.
+#[tokio::test]
+async fn a_wrapped_bullet_is_embedded_and_scored_as_its_whole_text() {
+    let recording = Arc::new(Recording(std::sync::Mutex::new(Vec::new())));
+    let (_tmp, engine) = engine_on(recording.clone()).await;
+    let (s, loads) = (stub(), Arc::new(AtomicUsize::new(0)));
+    let engine = with_loader(engine, loader(s.clone(), loads));
+    set(&engine, "evolve.contradictions", "full").await;
+    engine
+        .write_engram(&write(
+            "Eighteen",
+            "The retry queue build runs on a pinned runtime.\n\n- [fact] The build uses\n  Node 18\n- [fact] Retries back off on the queue",
+        ))
+        .await
+        .unwrap();
+    engine
+        .write_engram(&write("Twenty", NODE_20))
+        .await
+        .unwrap();
+    engine.embed_pending().await.unwrap();
+
+    assert_eq!(
+        engine.score_contradictions().await.unwrap(),
+        scored(1, 1, 0),
+        "the wrapped Node 18 bullet against Node 20"
+    );
+    let stored = rows(&engine, full().repo).await;
+    assert_eq!(stored.len(), 1, "{stored:?}");
+    assert!((stored[0].score_ab - 0.93).abs() < 1e-6);
+
+    let read = engine
+        .read_engram(
+            &ReadParams {
+                identifier: "eighteen".to_string(),
+                domain: Some("notes".to_string()),
+                share_link: None,
+            },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    let node = read["observations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["content"] == "The build uses Node 18")
+        .unwrap_or_else(|| panic!("one joined observation: {read}"))
+        .clone();
+    let line = node["line"].as_u64().unwrap() as usize;
+    let eighteen = (stored[0].line_a, &stored[0].hash_a);
+    assert_eq!(eighteen.0, line, "the row names the bullet's first line");
+    assert_eq!(*eighteen.1, observation_hash("The build uses Node 18"));
+
+    let embedded = recording.0.lock().unwrap().clone();
+    assert!(
+        embedded.iter().any(|t| t == "The build uses Node 18"),
+        "the joined text was embedded: {embedded:?}"
+    );
+    assert!(
+        !embedded.iter().any(|t| t == "The build uses"),
+        "the first-line fragment never was: {embedded:?}"
+    );
 }

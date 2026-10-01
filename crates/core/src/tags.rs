@@ -20,7 +20,7 @@
 
 use std::ops::Range;
 
-use crate::parse::{fence_marker, is_hashtag, locate};
+use crate::parse::{body_lines, bullet_end, is_hashtag, locate};
 
 /// Whether a string is a canonical lowercase-with-hyphens tag: non-empty, no
 /// leading or trailing hyphen and only lowercase ASCII letters, digits and
@@ -393,6 +393,11 @@ fn rewrite_comma_items(inner: &str, old_f: &str, new: &str) -> (String, usize) {
 
 /// Rewrite trailing observation hashtags in the body, leaving the frontmatter
 /// and every non-observation line untouched.
+///
+/// The lines are read with the parser's own fence tracking and bullet extent
+/// (see `crate::parse::body_lines` and `crate::parse::bullet_end`), so a
+/// bullet that wraps onto further lines is rewritten as the one observation
+/// the parser reads: its trailing tags sit at the end of its last line.
 fn retag_body(source: &str, old_f: &str, new: &str) -> (String, usize) {
     let (_has_fm, _fm_span, body_start) = locate(source);
     let head = &source[..body_start];
@@ -401,53 +406,40 @@ fn retag_body(source: &str, old_f: &str, new: &str) -> (String, usize) {
     let mut out = String::with_capacity(source.len());
     out.push_str(head);
     let mut count = 0usize;
-    // Mirror the parser's stateful fence tracking exactly (see
-    // `crate::parse::body_lines`): a fence closes only on a marker of the same
-    // char, a count at least the opener's and nothing after it, so a shorter
-    // nested marker (``` inside ````) stays content and never toggles the fence.
-    let mut fence: Option<(char, usize)> = None;
-    for line in body.split_inclusive('\n') {
-        let (content, nl) = match line.strip_suffix('\n') {
-            Some(c) => (c, "\n"),
-            None => (line, ""),
-        };
-        let text = content.trim_end_matches('\r');
-        match fence {
-            None => {
-                if let Some((c, n, _)) = fence_marker(text) {
-                    // Opening fence line: emit verbatim, do not scan it.
-                    fence = Some((c, n));
-                    out.push_str(line);
-                    continue;
-                }
-                let (new_content, n) = retag_observation_line(content, old_f, new);
-                out.push_str(&new_content);
-                out.push_str(nl);
-                count += n;
-            }
-            Some((fc, fcount)) => {
-                // Inside a fence: emit verbatim and test the parser's close rule.
-                let mut closes = false;
-                if let Some((c, n, _)) = fence_marker(text)
-                    && c == fc
-                    && n >= fcount
-                    && text.trim_start()[n..].trim().is_empty()
-                {
-                    closes = true;
-                }
-                out.push_str(line);
-                if closes {
-                    fence = None;
-                }
-            }
+    // `split_inclusive` and the parser's `split` agree on every index this
+    // walk reads: the parser only adds an empty last line after a final
+    // newline, which has no counterpart here and holds no bullet.
+    let raw: Vec<&str> = body.split_inclusive('\n').collect();
+    let lines = body_lines(body, 1);
+    let mut i = 0;
+    while i < raw.len() {
+        let bl = &lines[i];
+        if bl.in_fence || !is_observation_bullet(bl.text) {
+            out.push_str(raw[i]);
+            i += 1;
+            continue;
         }
+        let end = bullet_end(&lines, i).min(raw.len() - 1);
+        let block: String = raw[i..=end].concat();
+        let (content, nl) = match block.strip_suffix('\n') {
+            Some(c) => (c, "\n"),
+            None => (block.as_str(), ""),
+        };
+        let (new_content, n) = retag_observation_line(content, old_f, new);
+        out.push_str(&new_content);
+        out.push_str(nl);
+        count += n;
+        i = end + 1;
     }
     (out, count)
 }
 
-/// Rewrite the trailing hashtag run of one line when it is a top-level
-/// observation bullet. Returns the (possibly unchanged) line content and how
-/// many hashtags were rewritten.
+/// Rewrite the trailing hashtag run of one observation bullet when it is a
+/// top-level observation bullet. `content` is the bullet's text from its `- `
+/// to the end of its last line, so a wrapped bullet arrives with the newlines
+/// between its lines, which the hashtag scan reads as whitespace like any
+/// other. Returns the (possibly unchanged) content and how many hashtags were
+/// rewritten.
 fn retag_observation_line(content: &str, old_f: &str, new: &str) -> (String, usize) {
     // The line, minus a trailing `\r`, must be a `- [category] ...` bullet.
     let cr = content.ends_with('\r');
@@ -785,6 +777,30 @@ mod tests {
         assert_eq!(
             out,
             "---\ntags:\n  - t\n---\n\n````\n```\n- [decision] fake #foo\n```\n````\n\n- [decision] real #bar\n"
+        );
+    }
+
+    #[test]
+    fn a_tag_on_a_wrapped_bullets_continuation_line_is_renamed() {
+        // The parser reads the bullet as one observation whose tags end its
+        // last line; the first line's `#foo` is mid-text and stays.
+        let src = "---\ntags:\n  - t\n---\n\n- [decision] chose #foo because\n  it was cheap #foo #keep\n- [decision] single #foo\n";
+        let (out, n) = retagged(src, "foo", "bar");
+        assert_eq!(n, 2);
+        assert_eq!(
+            out,
+            "---\ntags:\n  - t\n---\n\n- [decision] chose #foo because\n  it was cheap #bar #keep\n- [decision] single #bar\n"
+        );
+    }
+
+    #[test]
+    fn a_tag_run_split_over_continuation_lines_is_merged_whole_with_crlf() {
+        let src = "---\r\ntags:\r\n  - t\r\n---\r\n\r\n- [decision] chose it #bar\r\n  #foo\r\n\r\nprose\r\n";
+        let (out, n) = retagged(src, "foo", "bar");
+        assert_eq!(n, 1);
+        assert_eq!(
+            out,
+            "---\r\ntags:\r\n  - t\r\n---\r\n\r\n- [decision] chose it #bar\r\n\r\nprose\r\n"
         );
     }
 }
