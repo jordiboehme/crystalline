@@ -13,11 +13,19 @@ import { describe, expect, it } from "vitest";
 
 import { stationOfPlace } from "../paths";
 import { BLAST_HALF, BULK_HALF, SLIDE_HALF } from "../render/models/doors";
-import { CANNED_BRIDGE, CANNED_DECK, CANNED_HUB, galleryRoom } from "./canned";
+import { airlockRoom } from "./airlock";
+import {
+  CANNED_BRIDGE,
+  CANNED_DECK,
+  CANNED_DOMAINS,
+  CANNED_HUB,
+  galleryRoom,
+} from "./canned";
 import { generateDeck } from "./deck";
 import { ACCESS_DENIED, NOT_FOUND, generateRoom } from "./generate";
 import { isFloor } from "./layout";
 import {
+  AIRLOCK_START,
   APPROACH,
   ARRIVAL_DISTANCE,
   DOOR_HALF,
@@ -444,6 +452,51 @@ describe("arrivalSpawn", () => {
       }),
       entrance,
     );
+  });
+});
+
+describe("the airlock start (0.22 R2 to R4)", () => {
+  const airlock = airlockRoom({ domains: CANNED_DOMAINS, here: null });
+  const liftIndex = airlock.fixtures.findIndex((f) => f.kind === "lift");
+  const settled = (at: { x: number; z: number; yaw: number }): Player => ({
+    ...at,
+    vx: 0,
+    vz: 0,
+    pitch: 0,
+    bob: 0,
+  });
+  const from: StationAddress = { kind: "bridge", domain: "orbit" };
+
+  it("faces the lift within reach on the first tick", () => {
+    // Mutation caught: a yaw that faces the hatch, or a distance past REACH.
+    expect(liftIndex).toBeGreaterThanOrEqual(0);
+    const focus = focusOf(airlock, settled(arrivalSpawn(airlock, null)));
+    expect(focus?.kind).toBe("lift");
+    expect(focus?.prompt).toBe("SPACE LIFT");
+  });
+
+  it("stands AIRLOCK_START from the lift's wall point", () => {
+    // Mutation caught: the distance left at the cell's 1 m.
+    const w = wallPoint(airlock.fixtures[liftIndex]!.slot);
+    const at = arrivalSpawn(airlock, null);
+    expect(AIRLOCK_START).toBe(2.0);
+    expect(Math.hypot(at.x - w.x, at.z - w.z)).toBeCloseTo(AIRLOCK_START);
+  });
+
+  it("steps a lift ride out at the entrance facing the room", () => {
+    // Mutation caught: the ride turned to the lift too (R3).
+    const ride = arrivalSpawn(airlock, { via: "lift", from });
+    expect(ride.x).toBeCloseTo((airlock.spawn.x + 0.5) * CELL);
+    expect(ride.z).toBeCloseTo((airlock.spawn.y + 0.5) * CELL);
+    expect(ride.yaw).toBe(airlock.spawn.yaw);
+  });
+
+  it("leaves the canned bridge's start at its spawn", () => {
+    // Mutation caught: the rule widened to every room with no arrival.
+    const at = arrivalSpawn(bridge, null);
+    expect(at.x).toBeCloseTo((bridge.spawn.x + 0.5) * CELL);
+    expect(at.z).toBeCloseTo((bridge.spawn.y + 0.5) * CELL);
+    expect(at.yaw).toBe(bridge.spawn.yaw);
   });
 });
 

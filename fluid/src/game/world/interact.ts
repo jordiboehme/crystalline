@@ -97,6 +97,13 @@ export const PORTAL_HALF = 0.75;
 /** How far in front of the fixture the player arrives, in metres. */
 export const ARRIVAL_DISTANCE = 1.6;
 
+/**
+ * How far in front of the lift's wall point a start in the airlock stands,
+ * in metres (`arrivalSpawn`): the whole door is in view and `SPACE LIFT` is
+ * within `REACH` at once. 0.22 R4.
+ */
+export const AIRLOCK_START = 2.0;
+
 /** A door is open enough to walk through above this fraction. */
 const OPEN_ENOUGH = 0.9;
 
@@ -513,6 +520,9 @@ export function arrivalWay(
  *   door or portal that leads to A.
  * - Up through an exit from engram A (M3 C28), the player arrives in front
  *   of this deck's door that leads to A.
+ * - A start in the airlock (no arrival) stands `AIRLOCK_START` in front of
+ *   the lift, facing it (0.22 R2, R3). A ride into the airlock does not: it
+ *   steps out of the lift facing the room.
  * - Otherwise (no arrival, a lift ride, or no fixture matches) at the
  *   entrance, facing in (M3 C27: in front of the lift).
  *
@@ -531,6 +541,17 @@ export function arrivalSpawn(
 ): { x: number; z: number; yaw: number } {
   const index = arrivalMatch(room, arrival);
   const match = index === null ? undefined : room.fixtures[index];
+  if (arrival === null && room.space === "airlock") {
+    const lift = room.fixtures.find((f) => f.kind === "lift");
+    if (lift !== undefined) {
+      const w = wallPoint(lift.slot);
+      return {
+        x: w.x + w.inward[0] * AIRLOCK_START,
+        z: w.z + w.inward[1] * AIRLOCK_START,
+        yaw: yawFacing([-w.inward[0], -w.inward[1]]),
+      };
+    }
+  }
   if (match === undefined) {
     return {
       x: (room.spawn.x + 0.5) * CELL,

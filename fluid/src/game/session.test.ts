@@ -3004,6 +3004,18 @@ describe("station addresses (M3)", () => {
     });
     expect(hud.notice).not.toHaveBeenCalledWith("?LOAD ERROR");
   });
+
+  it("starts the airlock facing the lift, offering SPACE LIFT on the first tick (0.22 R2)", async () => {
+    // Mutation caught: the session placing the start through `spawnPlayer`
+    // (the room's spawn, facing the hatch) instead of `arrivalSpawn`.
+    const session = start({ load: stationLoad });
+    session.go({ kind: "airlock" });
+    await vi.waitFor(() => {
+      expect(session.current).toEqual({ kind: "airlock" });
+    });
+    frames(1);
+    expect(hud.prompt).toHaveBeenLastCalledWith("SPACE LIFT");
+  });
 });
 
 describe("the lifts and the exit (M3 C26 to C29)", () => {
