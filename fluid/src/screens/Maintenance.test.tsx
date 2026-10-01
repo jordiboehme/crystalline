@@ -287,15 +287,19 @@ function contradictionPayload() {
         title: "CI runtime",
         line: 7,
         finding:
-          '"The build uses Node 20" (CI runtime) against "The build uses Node 18" (Node version) read as a contradiction at probability 0.91',
+          'Possible contradiction: line 7 of "CI runtime" and line 5 of "Node version" read as contradicting at probability 0.91, line similarity 0.90, and 1 more line pair',
         evidence:
-          "eng/ci-runtime line 7; eng/node-version line 5; probability 0.91; model mdeberta-v3-base-xnli-2mil7",
+          "eng/ci-runtime line 7; eng/node-version line 5; probability 0.91; similarity 0.90; model mdeberta-v3-base-xnli-2mil7",
         fix: "read both then supersede or close a window or acknowledge V302",
         scope: "eng/ci-runtime, eng/node-version, aaaa, bbbb",
         counterpart: "node-version",
         counterpart_title: "Node version",
         counterpart_line: 5,
         probability: 0.91,
+        similarity: 0.9,
+        line_text: "The build uses Node 20",
+        counterpart_line_text: "The build uses Node 18",
+        more_line_pairs: 1,
       },
     ],
     actions: [
@@ -1237,15 +1241,25 @@ describe("acknowledging a finding", () => {
       rows(await section(/^Meaning/))[0],
       "the possible contradiction",
     );
-    expect(row).toHaveTextContent(
-      "read as a contradiction at probability 0.91",
+    expect(row).toHaveTextContent("read as contradicting at probability 0.91");
+    const lines = within(row).getByRole("list", { name: "The two lines" });
+    const items = within(lines).getAllByRole("listitem");
+    expect(items).toHaveLength(2);
+    expect(items[0]).toHaveTextContent(
+      'CI runtime line 7: "The build uses Node 20"',
+    );
+    expect(items[1]).toHaveTextContent(
+      'Node version line 5: "The build uses Node 18"',
     );
     expect(
-      within(row).getByRole("link", { name: "CI runtime" }),
+      within(items[0]!).getByRole("link", { name: "CI runtime" }),
     ).toHaveAttribute("href", "/d/eng/e/ci-runtime");
     expect(
-      within(row).getByRole("link", { name: "Node version" }),
+      within(items[1]!).getByRole("link", { name: "Node version" }),
     ).toHaveAttribute("href", "/d/eng/e/node-version");
+    expect(row).toHaveTextContent(
+      "Read as contradicting, line similarity 0.90, and 1 more line pair. A model's reading, never a verdict.",
+    );
     // The chip, named for a screen reader and drawn as the bare number.
     expect(within(row).getByText("Probability")).toBeInTheDocument();
     expect(within(row).getByText("0.91")).toBeInTheDocument();

@@ -170,9 +170,21 @@ export interface EvolveFinding {
   ackScope: string | null;
   /**
    * The other engram of a `V302` row: its permalink in the row's own domain,
-   * its title and the line of its observation. Null for every other rule.
+   * its title, the line of its observation and that line's text. Null for
+   * every other rule.
    */
-  counterpart: { permalink: string; title: string; line: number | null } | null;
+  counterpart: {
+    permalink: string;
+    title: string;
+    line: number | null;
+    lineText: string | null;
+  } | null;
+  /** A `V302` row's own line text, cut by the server. Null for every other rule. */
+  lineText: string | null;
+  /** How similar a `V302` row's two lines are, 0 to 1. Null for every other rule. */
+  similarity: number | null;
+  /** How many more line pairs of the same two engrams stand; 0 when none. */
+  moreLinePairs: number;
   /**
    * The model's contradiction probability for a `V302` row, 0 to 1, as the
    * finding text states it. Null for every other rule.
@@ -281,6 +293,7 @@ function counterpartOf(
     permalink,
     title: asString(record?.counterpart_title) ?? permalink,
     line: asNumber(record?.counterpart_line),
+    lineText: asString(record?.counterpart_line_text),
   };
 }
 
@@ -332,6 +345,9 @@ function readFinding(value: unknown): EvolveFinding | null {
     // link to nowhere.
     counterpart: counterpartOf(record),
     probability: asNumber(record?.probability),
+    lineText: asString(record?.line_text),
+    similarity: asNumber(record?.similarity),
+    moreLinePairs: asNumber(record?.more_line_pairs) ?? 0,
   };
 }
 

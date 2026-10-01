@@ -681,24 +681,47 @@ function FindingRow({
       </div>
       <p className="mt-1 text-sm">{finding.finding}</p>
       {finding.counterpart !== null && (
-        <p className="text-caption mt-0.5 text-slate-500 dark:text-slate-400">
-          {/*
-            "Read as", not "against": every visible V302 sentence says
-            "possible" or "read as" rather than stating the two engrams
-            contradict, and this is the one line here that names the other
-            engram.
-          */}
-          {"Read as contradicting "}
-          <Link
-            to={engramRoute(finding.domain, finding.counterpart.permalink)}
-            className="text-sky-700 underline underline-offset-2 hover:no-underline dark:text-sky-400"
-          >
-            {finding.counterpart.title}
-          </Link>
-          {finding.counterpart.line !== null &&
-            ` line ${String(finding.counterpart.line)}`}
-          {". A model's reading, never a verdict."}
-        </p>
+        <div className="mt-1">
+          <ul aria-label="The two lines" className="space-y-0.5 text-sm">
+            <li>
+              <Link
+                to={engramRoute(finding.domain, finding.permalink)}
+                className="text-sky-700 underline underline-offset-2 hover:no-underline dark:text-sky-400"
+              >
+                {finding.title}
+              </Link>
+              {finding.line !== null && ` line ${String(finding.line)}`}
+              {finding.lineText !== null && `: "${finding.lineText}"`}
+            </li>
+            <li>
+              <Link
+                to={engramRoute(finding.domain, finding.counterpart.permalink)}
+                className="text-sky-700 underline underline-offset-2 hover:no-underline dark:text-sky-400"
+              >
+                {finding.counterpart.title}
+              </Link>
+              {finding.counterpart.line !== null &&
+                ` line ${String(finding.counterpart.line)}`}
+              {finding.counterpart.lineText !== null &&
+                `: "${finding.counterpart.lineText}"`}
+            </li>
+          </ul>
+          <p className="text-caption mt-0.5 text-slate-500 dark:text-slate-400">
+            {/*
+              "Read as", never "contradicts": every visible V302 sentence says
+              "possible" or "read as" rather than stating the two engrams
+              contradict.
+            */}
+            {"Read as contradicting"}
+            {finding.similarity !== null &&
+              `, line similarity ${finding.similarity.toFixed(2)}`}
+            {finding.moreLinePairs > 0 &&
+              `, and ${String(finding.moreLinePairs)} more line ${
+                finding.moreLinePairs === 1 ? "pair" : "pairs"
+              }`}
+            {". A model's reading, never a verdict."}
+          </p>
+        </div>
       )}
       <p className="text-caption mt-0.5 font-mono break-words text-slate-500 dark:text-slate-400">
         {finding.evidence}

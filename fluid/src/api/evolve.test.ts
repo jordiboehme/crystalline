@@ -208,6 +208,9 @@ describe("the evolve payload", () => {
       // neither having one nor scoring anything.
       counterpart: null,
       probability: null,
+      lineText: null,
+      similarity: null,
+      moreLinePairs: 0,
     });
     expect(defined(queue.queue[1], "the second finding").line).toBe(12);
     expect(queue.actions).toContainEqual({
@@ -482,6 +485,10 @@ describe("the acknowledgment fields", () => {
           counterpart_title: "Node version",
           counterpart_line: 5,
           probability: 0.91,
+          similarity: 0.9,
+          line_text: "The build uses Node 20",
+          counterpart_line_text: "The build uses Node 18",
+          more_line_pairs: 2,
         },
         {
           n: 2,
@@ -503,7 +510,14 @@ describe("the acknowledgment fields", () => {
       permalink: "node-version",
       title: "Node version",
       line: 5,
+      lineText: "The build uses Node 18",
     });
+    expect(queue.queue[0]?.lineText).toBe("The build uses Node 20");
+    expect(queue.queue[0]?.similarity).toBe(0.9);
+    expect(queue.queue[0]?.moreLinePairs).toBe(2);
+    expect(queue.queue[1]?.lineText).toBeNull();
+    expect(queue.queue[1]?.similarity).toBeNull();
+    expect(queue.queue[1]?.moreLinePairs).toBe(0);
     expect(queue.queue[0]?.probability).toBe(0.91);
     expect(queue.queue[1]?.counterpart).toBeNull();
     expect(queue.queue[1]?.probability).toBeNull();
@@ -542,7 +556,12 @@ describe("the acknowledgment fields", () => {
           },
         ],
       }).queue[0]?.counterpart,
-    ).toEqual({ permalink: "b", title: "b", line: null });
+    ).toEqual({
+      permalink: "b",
+      title: "b",
+      line: null,
+      lineText: null,
+    });
   });
 });
 
