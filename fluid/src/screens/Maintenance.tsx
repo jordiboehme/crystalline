@@ -682,7 +682,10 @@ function FindingRow({
       <p className="mt-1 text-sm">{finding.finding}</p>
       {finding.counterpart !== null && (
         <div className="mt-1">
-          <ul aria-label="The two lines" className="space-y-0.5 text-sm">
+          <ul
+            aria-label="The two lines"
+            className="space-y-0.5 text-sm break-words"
+          >
             <li>
               <Link
                 to={engramRoute(finding.domain, finding.permalink)}
