@@ -26,6 +26,11 @@
  * A way that failed on travel (the session's `failed` map) is treated as
  * sealed: it is offered only to say why, heads shut and carries no one.
  *
+ * An arrival stands in front of the way back it came by (`arrivalSpawn`),
+ * and `arrivalWay` names that way when it is walked through, so the
+ * session latches it (0.22 R1): a latched way heads shut and carries no
+ * one, like a failed one, until the player has stepped clear.
+ *
  * A police box is not a fixture and leads nowhere the generator ever
  * built, so it is offered and stepped on its own: a police box's doors are
  * `world/box.ts`'s (`boxFocus`, `stepBoxDoors`), not this module's.
@@ -344,7 +349,7 @@ export function focusOf(
  * at this tick, names it, which turns it round. A lift's doors always head
  * shut: a ride has no car to open onto (C27). A sealed door always heads
  * shut, and so does a way in `failed` or in `shut` (the session's latched
- * exit), whatever the player does. Then each door moves `DOOR_STEP`
+ * way), whatever the player does. Then each door moves `DOOR_STEP`
  * towards where it is heading. Returns a new map; `doors` is left as it
  * was.
  */
@@ -401,7 +406,7 @@ export function stepDoors(
  * (`PORTAL_HALF`). An exit carries the player up by the sliding door's
  * rule (M3 C28). Nothing carries the player from behind a wall, where a
  * bay or the backlink corridor may lie. A way in `failed` or in `shut`
- * (the session's latched exit) carries no one, whatever its `DoorState`
+ * (the session's latched way) carries no one, whatever its `DoorState`
  * says. Hatches are crawled through on Space instead (`hatchTravel`).
  */
 export function travelOf(
@@ -456,6 +461,50 @@ export function hatchTravel(
 }
 
 /**
+ * The index in `room.fixtures` of the fixture `arrivalSpawn` places the
+ * player in front of, or null for none: the hatch back to `arrival.from`
+ * (through a door or portal), the door or portal back to it (through a
+ * hatch), the deck's door back to the engram (up through an exit). The
+ * first match in fixture order wins.
+ */
+function arrivalMatch(room: RoomSpec, arrival: Arrival | null): number | null {
+  if (arrival === null || arrival.via === "lift") return null;
+  const leadsBack = (to: PlaceAddress) =>
+    sameStation(stationOfPlace(to), arrival.from);
+  const index = room.fixtures.findIndex((f) => {
+    if (arrival.via === "exit") {
+      return f.kind === "door" && f.address !== null && leadsBack(f.address);
+    }
+    if (arrival.via === "hatch") {
+      return (
+        (f.kind === "door" || f.kind === "portal") &&
+        f.address !== null &&
+        leadsBack(f.address)
+      );
+    }
+    return f.kind === "hatch" && leadsBack(f.address);
+  });
+  return index < 0 ? null : index;
+}
+
+/**
+ * The walk-through way `arrivalSpawn` places the player in front of, by
+ * index in `room.fixtures`: the door or portal back to `arrival.from`
+ * (through a hatch), the deck's door back to the engram (up through an
+ * exit); null for no arrival, a lift ride, no match, or a matched hatch
+ * (which only Space uses). The session latches it on entry, so a player
+ * still walking backwards does not step straight back through it. 0.22 R1.
+ */
+export function arrivalWay(
+  room: RoomSpec,
+  arrival: Arrival | null,
+): number | null {
+  const index = arrivalMatch(room, arrival);
+  if (index === null) return null;
+  return room.fixtures[index]?.kind === "hatch" ? null : index;
+}
+
+/**
  * Where the player comes out in `room`, and facing where.
  *
  * - Through a door or portal from place A, the player arrives in front of
@@ -480,26 +529,8 @@ export function arrivalSpawn(
   room: RoomSpec,
   arrival: Arrival | null,
 ): { x: number; z: number; yaw: number } {
-  const leadsBack = (to: PlaceAddress) =>
-    arrival !== null && sameStation(stationOfPlace(to), arrival.from);
-  const match =
-    arrival === null || arrival.via === "lift"
-      ? undefined
-      : room.fixtures.find((f) => {
-          if (arrival.via === "exit") {
-            return (
-              f.kind === "door" && f.address !== null && leadsBack(f.address)
-            );
-          }
-          if (arrival.via === "hatch") {
-            return (
-              (f.kind === "door" || f.kind === "portal") &&
-              f.address !== null &&
-              leadsBack(f.address)
-            );
-          }
-          return f.kind === "hatch" && leadsBack(f.address);
-        });
+  const index = arrivalMatch(room, arrival);
+  const match = index === null ? undefined : room.fixtures[index];
   if (match === undefined) {
     return {
       x: (room.spawn.x + 0.5) * CELL,

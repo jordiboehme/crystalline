@@ -30,6 +30,7 @@ import {
   domainOf,
   fluidRouteOfStation,
   gameRouteOf,
+  sameStation,
   stationOfPlace,
 } from "./paths";
 import { BLINK_CHANNELS, createBlink } from "./render/blink";
@@ -68,7 +69,12 @@ import {
 import { generateDeck, type DeckRow } from "./world/deck";
 import { ACCESS_DENIED, NOT_FOUND, generateRoom } from "./world/generate";
 import { LIFT_WORDS } from "./world/lifts";
-import { REACH, wallFacingSpawn, wallPoint } from "./world/interact";
+import {
+  ARRIVAL_DISTANCE,
+  REACH,
+  wallFacingSpawn,
+  wallPoint,
+} from "./world/interact";
 import { faultSeed, planRun, type FaultFrame } from "./world/malfunction";
 import { MAX_PITCH, PLAYER_RADIUS, blockersFor } from "./world/move";
 import {
@@ -3465,6 +3471,136 @@ describe("the lifts and the exit (M3 C26 to C29)", () => {
       expect(session.current?.kind).toBe("deck");
     });
   });
+
+  it("walks backwards up through the exit and stays on the deck (0.22 R1)", async () => {
+    // Mutation caught: the latch not set on an exit arrival (the deck's
+    // door back, right behind the player, slides open and carries the
+    // player still walking backwards straight back into the room).
+    // `stationLoad` answers every engram in the root folder, whose deck
+    // holds `notes/n00`, so the deck has a door back to this room.
+    const from = engramAt("station", "notes/n00");
+    const session = start({ load: stationLoad, onLift: liftSpy() });
+    session.go(from);
+    await vi.waitFor(() => {
+      frames(1);
+      expect(session.current).toEqual(from);
+    });
+    frames(1);
+    // In past UP_LATCH_CLEAR, facing into the room with the exit behind.
+    holdUntil("ArrowUp", () => exitDepth() > UP_LATCH_CLEAR + 0.5);
+    expect(exitDepth()).toBeGreaterThan(UP_LATCH_CLEAR);
+    frames(10);
+    const ups = connectorUps();
+    // Backwards out through the exit, the back key held across the travel.
+    key("keydown", "ArrowDown");
+    for (let t = 0; t < 200 && session.current?.kind !== "deck"; t++) {
+      frames(1);
+      await flush();
+    }
+    expect(session.current?.kind).toBe("deck");
+    const deckNow = lastRoom();
+    const back = deckNow?.fixtures.findIndex(
+      (f) =>
+        f.kind === "door" &&
+        f.address !== null &&
+        sameStation(stationOfPlace(f.address), from),
+    );
+    if (deckNow === undefined || back === undefined || back < 0)
+      throw new Error("the deck has no door back");
+    // The arrival stands in front of that door (one tick of walking back
+    // on): the match placed it there.
+    const w = wallPoint(deckNow.fixtures[back]!.slot);
+    frames(1);
+    const eye = lastCamera().eye;
+    expect(
+      (eye[0] - w.x) * w.inward[0] + (eye[2] - w.z) * w.inward[1],
+    ).toBeLessThan(ARRIVAL_DISTANCE + 0.5);
+    // Three seconds more with the back key held.
+    for (let t = 0; t < 105; t++) {
+      frames(1);
+      await flush();
+    }
+    key("keyup", "ArrowDown");
+    expect(connectorUps()).toBe(ups + 1);
+    expect(session.current?.kind).toBe("deck");
+    expect(lastDoors().get(`door:${String(back)}`) ?? 0).toBe(0);
+  });
+
+  it("keeps the way behind a hatch crawl shut until the player stepped clear (0.22 R1)", async () => {
+    // Mutation caught: the latch cleared on the first tick, or the portal
+    // left out of `shut` (a step back from the arrival touches the portal
+    // and carries the player straight back).
+    const from = engramAt("logistics", "cargo-manifest");
+    const to = engramAt("station", "crew-handbook");
+    const start0 = roomFor(
+      {
+        kind: "engram",
+        place: {
+          ...CANNED_BRIDGE,
+          domain: "logistics",
+          permalink: "cargo-manifest",
+        },
+        folder: "",
+      },
+      null,
+      null,
+    ).room;
+    const hatch = start0.fixtures.find((f) => f.kind === "hatch");
+    if (hatch?.kind !== "hatch") throw new Error("no hatch");
+    expect(stationOfPlace(hatch.address)).toEqual(to);
+    const session = start({ load: stationLoad, onLift: liftSpy() });
+    session.showRoom(
+      { ...start0, spawn: wallFacingSpawn(hatch.slot) },
+      undefined,
+      from,
+    );
+    frames(1);
+    pressUse();
+    await vi.waitFor(() => {
+      frames(1);
+      expect(session.current).toEqual(to);
+    });
+    frames(1);
+    const room = lastRoom();
+    const portal =
+      room?.fixtures.findIndex(
+        (f) =>
+          f.kind === "portal" &&
+          f.address !== null &&
+          sameStation(stationOfPlace(f.address), from),
+      ) ?? -1;
+    expect(portal).toBeGreaterThanOrEqual(0);
+    /** How far in front of the portal's wall the eye is. */
+    const portalDepth = () => {
+      const w = wallPoint(room!.fixtures[portal]!.slot);
+      const eye = lastCamera().eye;
+      return (eye[0] - w.x) * w.inward[0] + (eye[2] - w.z) * w.inward[1];
+    };
+    // The crawl stands the player in front of the portal back, facing away.
+    expect(portalDepth()).toBeLessThan(ARRIVAL_DISTANCE + 0.1);
+    // A walk straight back reaches the portal and goes nowhere.
+    const ups = connectorUps();
+    let nearest = Infinity;
+    key("keydown", "ArrowDown");
+    for (let t = 0; t < 60; t++) {
+      frames(1);
+      nearest = Math.min(nearest, portalDepth());
+    }
+    key("keyup", "ArrowDown");
+    await flush();
+    expect(nearest).toBeLessThan(0.6);
+    expect(connectorUps()).toBe(ups);
+    expect(session.current).toEqual(to);
+    // Out past UP_LATCH_CLEAR and back in: through the portal.
+    holdUntil("ArrowUp", () => portalDepth() > UP_LATCH_CLEAR + 0.5);
+    expect(portalDepth()).toBeGreaterThan(UP_LATCH_CLEAR);
+    frames(10);
+    holdUntil("ArrowDown", () => connectorUps() > ups);
+    expect(connectorUps()).toBe(ups + 1);
+    await vi.waitFor(() => {
+      expect(session.current).toEqual(from);
+    });
+  });
 });
 
 describe("the pause (M4 C6 to C9)", () => {
@@ -4351,6 +4487,68 @@ describe("live changes (M4 C13 to C19)", () => {
     await run(1500);
     expect(shown()).toEqual(built(retexted()));
     expect(loadsOf(to)).toBe(1);
+  });
+
+  it("keeps the way latch through a text change (0.22 R1)", async () => {
+    // Mutation caught: `wayLatched` left out of `latches()` (the keep
+    // path's entry latches the way behind the arrival again, so a player
+    // who had stepped clear and walks back in is held at a shut way).
+    const cargo = engramAt("logistics", "cargo-manifest");
+    answers.set("hall", engramOf(placeOf()));
+    const session = start({ load: liveLoad });
+    session.go(ROOM_AT, { via: "hatch", from: cargo });
+    await micro();
+    frames(1);
+    expect(session.current).toEqual(ROOM_AT);
+    const room = shown();
+    const portal = room.fixtures.findIndex(
+      (f) =>
+        f.kind === "portal" &&
+        f.address !== null &&
+        sameStation(stationOfPlace(f.address), cargo),
+    );
+    expect(portal).toBeGreaterThanOrEqual(0);
+    /** How far in front of the portal's wall the eye is. */
+    const depth = () => {
+      const w = wallPoint(room.fixtures[portal]!.slot);
+      const eye = lastCamera().eye;
+      return (eye[0] - w.x) * w.inward[0] + (eye[2] - w.z) * w.inward[1];
+    };
+    expect(depth()).toBeLessThan(ARRIVAL_DISTANCE + 0.1);
+    // A text change while latched: a step back still goes nowhere.
+    answers.set("hall", engramOf(retexted()));
+    session.changed(frameOf());
+    await run(1500);
+    expect(shown()).toEqual(built(retexted()));
+    key("keydown", "ArrowDown");
+    for (let i = 0; i < 60; i++) await run(TICK_MS);
+    key("keyup", "ArrowDown");
+    expect(depth()).toBeLessThan(0.6);
+    expect(loadsOf("cargo-manifest")).toBe(0);
+    // Clear of the latch, a step back towards the portal, a text change
+    // there: the way stays open, and walking on goes through.
+    key("keydown", "ArrowUp");
+    for (let i = 0; i < 200 && depth() <= UP_LATCH_CLEAR + 0.5; i++)
+      await run(TICK_MS);
+    key("keyup", "ArrowUp");
+    expect(depth()).toBeGreaterThan(UP_LATCH_CLEAR);
+    await run(500);
+    key("keydown", "ArrowDown");
+    for (let i = 0; i < 200 && depth() > 1.4; i++) await run(TICK_MS);
+    key("keyup", "ArrowDown");
+    await run(500);
+    expect(depth()).toBeGreaterThan(0.6);
+    expect(depth()).toBeLessThan(UP_LATCH_CLEAR);
+    answers.set("hall", engramOf(retexted("newer")));
+    session.changed(frameOf({ checksum: "2" }));
+    await run(1500);
+    expect(shown()).toEqual(built(retexted("newer")));
+    expect(loadsOf("cargo-manifest")).toBe(0);
+    key("keydown", "ArrowDown");
+    for (let i = 0; i < 120 && loadsOf("cargo-manifest") === 0; i++)
+      await run(TICK_MS);
+    key("keyup", "ArrowDown");
+    expect(loadsOf("cargo-manifest")).toBe(1);
   });
 
   describe("reshapes behind the dip and keeps the player on free floor", () => {

@@ -27,6 +27,7 @@ import {
   REACH,
   approaches,
   arrivalSpawn,
+  arrivalWay,
   focusOf,
   hatchTravel,
   stepDoors,
@@ -446,6 +447,66 @@ describe("arrivalSpawn", () => {
   });
 });
 
+describe("arrivalWay (0.22 R1)", () => {
+  const handbook: StationAddress = {
+    kind: "engram",
+    domain: "station",
+    permalink: "crew-handbook",
+  };
+
+  it("names the door or portal a hatch crawl stands the player in front of", () => {
+    // Mutation caught: the hatch crawl's match not returned (no way to
+    // latch, so a step back walks through the way the player came by).
+    expect(
+      arrivalWay(bridge, {
+        via: "hatch",
+        from: { kind: "engram", domain: "station", permalink: "old-bridge" },
+      }),
+    ).toBe(slidingIndex);
+    expect(
+      arrivalWay(bridge, {
+        via: "hatch",
+        from: {
+          kind: "engram",
+          domain: "logistics",
+          permalink: "cargo-manifest",
+        },
+      }),
+    ).toBe(portalIndex);
+  });
+
+  it("is null for no arrival, a lift ride, no match and a matched hatch", () => {
+    // Mutation caught: a matched hatch returned (Space crawls a hatch, it
+    // carries no one on its own, and its latch would only hide its offer
+    // from nothing), or a lift ride matched like a crossing.
+    expect(arrivalWay(bridge, null)).toBeNull();
+    // A door arrival matches the hatch back: the hatch is no way to latch.
+    expect(
+      arrivalSpawn(bridge, { via: "door", from: handbook }).x,
+    ).not.toBeCloseTo((bridge.spawn.x + 0.5) * CELL);
+    expect(arrivalWay(bridge, { via: "door", from: handbook })).toBeNull();
+    expect(arrivalWay(bridge, { via: "portal", from: handbook })).toBeNull();
+    expect(
+      arrivalWay(bridge, {
+        via: "door",
+        from: { kind: "engram", domain: "station", permalink: "nowhere" },
+      }),
+    ).toBeNull();
+    // From cargo-manifest a hatch crawl matches the portal; a lift ride
+    // matches nothing (the deck case is in "the exit and the lift").
+    expect(
+      arrivalWay(bridge, {
+        via: "lift",
+        from: {
+          kind: "engram",
+          domain: "logistics",
+          permalink: "cargo-manifest",
+        },
+      }),
+    ).toBeNull();
+  });
+});
+
 /**
  * A point `metres` behind fixture `index`'s wall, on its axis: the far side
  * of the wall, where a bay or the corridor may be.
@@ -758,6 +819,27 @@ describe("the exit and the lift (M3 C27, C28)", () => {
       z: (deck.spawn.y + 0.5) * CELL,
       yaw: deck.spawn.yaw,
     });
+  });
+
+  it("names the deck's door back as the way behind an exit arrival, and nothing for a lift ride (0.22 R1)", () => {
+    // Mutation caught: the exit arrival's door not returned (the session
+    // would leave the way behind unlatched), or a lift ride matched like
+    // an exit (its latch would shut a door the player never came by).
+    const deck = roomFor(
+      { kind: "deck", input: CANNED_DECK, section: null },
+      { from: engram },
+      null,
+    ).room;
+    const back = indexOf(
+      deck,
+      (f) =>
+        f.kind === "door" &&
+        f.address !== null &&
+        f.address.permalink === row.permalink,
+    );
+    expect(arrivalWay(deck, { via: "exit", from: engram })).toBe(back);
+    expect(arrivalWay(deck, { via: "lift", from: engram })).toBeNull();
+    expect(arrivalWay(deck, null)).toBeNull();
   });
 
   it("holds a latched exit shut and carries no one through it", () => {

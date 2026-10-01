@@ -109,10 +109,13 @@
  * entrance, in front of the lift, its doors open and sliding shut. An
  * engram room's exit (C28) is walked through like a sliding door and
  * leads up to its deck, in front of the deck's door back to the room.
- * It is latched on every entry (`upLatched`): the entrance spawn stands
- * 1 m from it, so it stays shut and carries no one until the player has
- * once stood `UP_LATCH_CLEAR` from its wall. A failed stop or exit is a
- * notice only: neither marks a way (C29).
+ * Every arrival latches the way behind it by the exit's rule
+ * (`wayLatched`, 0.22 R1): the door or portal an arrival stands in front
+ * of (`arrivalWay`), else the room's exit, which the entrance spawn stands
+ * 1 m from. The latched way stays shut and carries no one until the
+ * player has once stood `UP_LATCH_CLEAR` from its wall, so a player still
+ * walking backwards after a crossing does not step straight back. A
+ * failed stop or exit is a notice only: neither marks a way (C29).
  *
  * Typed with no pause longer than a second, `idclev` opens the level select
  * when the host passed `onLevels` (the game route): the word's I toggle is
@@ -269,6 +272,7 @@ import {
 import { ACCESS_DENIED, NOT_FOUND, generateRoom } from "./world/generate";
 import {
   arrivalSpawn,
+  arrivalWay,
   doorKey,
   focusOf,
   hatchTravel,
@@ -575,9 +579,10 @@ export const LISTING_WAIT_MS = 5000;
 export { LIFT_RIDE_MS };
 
 /**
- * How far from its exit's wall point the player must once stand, in
- * metres, before the exit opens (M3 C28): the entrance spawn stands 1 m
- * from it, and a step back would otherwise go straight up again. Not the
+ * How far from a latched way's wall point the player must once stand, in
+ * metres, before it opens (M3 C28, 0.22 R1): the entrance spawn stands
+ * 1 m from the exit and an arrival `ARRIVAL_DISTANCE` from the way back,
+ * and a step back would otherwise go straight through again. Not the
  * console room's exit latch (`exitLatched`), which is its own.
  */
 export const UP_LATCH_CLEAR = 2.0;
@@ -747,11 +752,12 @@ export function createSession(opts: SessionOptions): Session {
    */
   let ride: { start: number; held: (() => void) | null } | null = null;
   /**
-   * The room's exit while it is latched (M3 C28), by fixture index: set
-   * on every entry, cleared once the player stands `UP_LATCH_CLEAR` from
-   * its wall point.
+   * The way behind the arrival while it is latched (M3 C28, 0.22 R1), by
+   * fixture index: on every entry the way `arrivalWay` names, else the
+   * room's exit; cleared once the player stands `UP_LATCH_CLEAR` from its
+   * wall point.
    */
-  let upLatched: number | null = null;
+  let wayLatched: number | null = null;
   /** The level cheat's word, read only when the host passed `onLevels`. */
   const cheat = opts.onLevels === undefined ? null : createCheatReader();
   /** Ticks run so far: the clock the word's gap is counted on (C2). */
@@ -1116,8 +1122,10 @@ export function createSession(opts: SessionOptions): Session {
     answering = null;
     answered = new Set();
     liftAt = null;
+    // The way behind the arrival, else the exit beside the entrance (0.22
+    // R1, M3 C28).
     const exit = room.fixtures.findIndex((f) => f.kind === "exit");
-    upLatched = exit < 0 ? null : exit;
+    wayLatched = arrivalWay(room, arrival) ?? (exit < 0 ? null : exit);
     inside = null;
     listing?.abort();
     listing = null;
@@ -1688,9 +1696,9 @@ export function createSession(opts: SessionOptions): Session {
   };
 
   /** The latches an entry resets, for the keep paths to put back. */
-  const latches = () => ({ latched, boxLatched, exitLatched, upLatched });
+  const latches = () => ({ latched, boxLatched, exitLatched, wayLatched });
   const restoreLatches = (saved: ReturnType<typeof latches>) => {
-    ({ latched, boxLatched, exitLatched, upLatched } = saved);
+    ({ latched, boxLatched, exitLatched, wayLatched } = saved);
   };
 
   /**
@@ -2136,19 +2144,19 @@ export function createSession(opts: SessionOptions): Session {
     } else if (used && boxAt !== null) {
       pressedBox = boxAt.index;
     }
-    // The exit's latch holds until the player has once stood
-    // `UP_LATCH_CLEAR` from its wall point (M3 C28).
-    if (upLatched !== null) {
-      const exit = room.fixtures[upLatched];
-      if (exit === undefined) {
-        upLatched = null;
+    // The way's latch holds until the player has once stood
+    // `UP_LATCH_CLEAR` from its wall point (M3 C28, 0.22 R1).
+    if (wayLatched !== null) {
+      const way = room.fixtures[wayLatched];
+      if (way === undefined) {
+        wayLatched = null;
       } else {
-        const w = wallPoint(exit.slot);
+        const w = wallPoint(way.slot);
         if (Math.hypot(player.x - w.x, player.z - w.z) > UP_LATCH_CLEAR)
-          upLatched = null;
+          wayLatched = null;
       }
     }
-    const shut = upLatched === null ? NONE_SHUT : new Set([upLatched]);
+    const shut = wayLatched === null ? NONE_SHUT : new Set([wayLatched]);
     const targetsBefore = doorTargets();
     const faultsBefore = faults;
     doors = stepDoors(room, player, doors, pressedDoor, failed, shut);
