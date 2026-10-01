@@ -458,10 +458,11 @@ pub(crate) fn rename_onto_taken_row(old: &str, new: &str) -> crate::IndexError {
     ))
 }
 
-/// How many hashes one `observation_vector` statement names at most. Every
-/// Store method that takes a hash list cuts it into runs of this many, so a
-/// domain of any size costs bounded statements and stays far below both
-/// backends' bind limits.
+/// How many hashes one `observation_vector` statement names at most. The
+/// postgres store cuts every hash list into runs of this many, so a domain of
+/// any size costs bounded statements and stays far below the bind limit. The
+/// turso store issues one point statement per hash instead, because turso
+/// seeks an `IN` list on the key's leading column only.
 pub const OBSERVATION_VECTOR_CHUNK: usize = 256;
 
 /// A vector as the raw little-endian f32 bytes both backends store it as.
@@ -2697,7 +2698,8 @@ pub trait Store: Send + Sync {
 
     /// Which of `hashes` carry a line vector for `model`. The contradiction
     /// walk's per-domain check before it embeds what is missing; narrow, the
-    /// hash column only. Read in runs of [`OBSERVATION_VECTOR_CHUNK`].
+    /// hash column only. Read on the full `(model, hash)` key: in runs of
+    /// [`OBSERVATION_VECTOR_CHUNK`] on postgres, one hash at a time on turso.
     async fn observation_vectors_present(
         &self,
         model: &str,
@@ -2706,7 +2708,7 @@ pub trait Store: Send + Sync {
 
     /// The line vectors for `model` of those `hashes` that have one, by hash.
     /// A row whose stored width disagrees with its `dims` is skipped with a
-    /// warning. Read in runs of [`OBSERVATION_VECTOR_CHUNK`].
+    /// warning. Read like [`Store::observation_vectors_present`].
     async fn observation_vectors(
         &self,
         model: &str,
@@ -2726,8 +2728,9 @@ pub trait Store: Send + Sync {
     /// narrow, one short column per row.
     async fn observation_vector_hashes(&self, model: &str) -> Result<Vec<String>>;
 
-    /// Delete the line vectors of `hashes` under `model`, in runs of
-    /// [`OBSERVATION_VECTOR_CHUNK`]; returns how many went.
+    /// Delete the line vectors of `hashes` under `model` in one transaction,
+    /// on the full key like [`Store::observation_vectors_present`]; returns
+    /// how many went.
     async fn delete_observation_vectors(&self, model: &str, hashes: &[String]) -> Result<u64>;
 
     /// Delete every line vector of any embedding model but `model`, once a

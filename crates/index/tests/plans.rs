@@ -80,8 +80,10 @@ pub struct HotStatement {
     /// seeded domain id, a permalink that exists, the model that embedded.
     pub literals: &'static [&'static str],
     /// A postgres override for `literals`, `None` where the two dialects spell
-    /// the same value the same way. Exactly one entry needs it: the semantic
-    /// query vector is a blob in turso and a `vector` literal in postgres.
+    /// the same value the same way, or where the two statements bind a
+    /// different number of values. The semantic query vector is a blob in
+    /// turso and a `vector` literal in postgres; the three line vector
+    /// statements name one hash on turso and a hash list on postgres.
     pub literals_pg: Option<&'static [&'static str]>,
     /// Tables whose full pass IS the intended plan on TURSO, each with the
     /// reason. Empty for all but one; a non-empty one is a claim a reviewer has
@@ -190,6 +192,13 @@ fn bind_literals(sql: &str, literals: &[&str]) -> String {
 /// The actor arm of a composed screen is bounded by one actor's own row count,
 /// which is what an overlay is; the base arm is the one that has to be a seek.
 const BASE_SCREEN: &str = "e.actor = ''";
+
+/// How turso spells a seek of `observation_vector` on its whole primary key.
+/// A plan that seeks `(model=?)` alone and filters the hash inside that range
+/// does not contain it, so the three line vector point statements go red on
+/// exactly that fallback. The autoindex name is turso's own, stable for a
+/// table's first unnamed key.
+const OV_FULL_KEY_SEEK: &str = "sqlite_autoindex_observation_vector_1 (model=? AND hash=?)";
 
 /// The semantic query vector, one spelling per dialect. Eight components, the
 /// width the fixture embeds at: a postgres `vector` literal of any other width
@@ -750,30 +759,33 @@ pub fn registry() -> Vec<HotStatement> {
             turso_must_seek: &["idx_contradiction_pair_domain"],
             postgres_must_seek: &["idx_contradiction_pair_domain"],
         },
-        // The line vectors: every read names the model and a hash list, so the
-        // primary key (model, hash) serves it. Turso names that key's
-        // autoindex, whose name turso picks, so the turso claim is the seek
-        // itself; postgres names the key.
+        // The line vectors: every read names the model and one hash (turso)
+        // or a hash list (postgres), so the primary key (model, hash) serves
+        // it. Turso seeks an `IN` list on `model` alone and filters the list
+        // inside that range, which is a seek to this guard but a walk over
+        // every vector of the model; so turso issues one point statement per
+        // hash, and the turso claim is the seek on BOTH key columns, spelled
+        // the way its plan spells it. Postgres names the key.
         HotStatement {
             issued_by: "Store::observation_vectors_present",
-            turso: || crystalline_index::turso::observation_vectors_present_sql(3),
+            turso: || crystalline_index::turso::OBSERVATION_VECTOR_PRESENT_SQL.to_string(),
             postgres: || crystalline_index::postgres::observation_vectors_present_sql(3),
-            literals: &["'fake'", "'h1'", "'h2'", "'h3'"],
-            literals_pg: None,
+            literals: &["'fake'", "'h1'"],
+            literals_pg: Some(&["'fake'", "'h1'", "'h2'", "'h3'"]),
             scan_expected: &[],
             scan_expected_pg: None,
-            turso_must_seek: &[],
+            turso_must_seek: &[OV_FULL_KEY_SEEK],
             postgres_must_seek: &["observation_vector_pkey"],
         },
         HotStatement {
             issued_by: "Store::observation_vectors",
-            turso: || crystalline_index::turso::observation_vectors_sql(3),
+            turso: || crystalline_index::turso::OBSERVATION_VECTOR_SQL.to_string(),
             postgres: || crystalline_index::postgres::observation_vectors_sql(3),
-            literals: &["'fake'", "'h1'", "'h2'", "'h3'"],
-            literals_pg: None,
+            literals: &["'fake'", "'h1'"],
+            literals_pg: Some(&["'fake'", "'h1'", "'h2'", "'h3'"]),
             scan_expected: &[],
             scan_expected_pg: None,
-            turso_must_seek: &[],
+            turso_must_seek: &[OV_FULL_KEY_SEEK],
             postgres_must_seek: &["observation_vector_pkey"],
         },
         HotStatement {
@@ -789,13 +801,13 @@ pub fn registry() -> Vec<HotStatement> {
         },
         HotStatement {
             issued_by: "Store::delete_observation_vectors",
-            turso: || crystalline_index::turso::delete_observation_vectors_sql(3),
+            turso: || crystalline_index::turso::DELETE_OBSERVATION_VECTOR_SQL.to_string(),
             postgres: || crystalline_index::postgres::delete_observation_vectors_sql(3),
-            literals: &["'fake'", "'h1'", "'h2'", "'h3'"],
-            literals_pg: None,
+            literals: &["'fake'", "'h1'"],
+            literals_pg: Some(&["'fake'", "'h1'", "'h2'", "'h3'"]),
             scan_expected: &[],
             scan_expected_pg: None,
-            turso_must_seek: &[],
+            turso_must_seek: &[OV_FULL_KEY_SEEK],
             postgres_must_seek: &["observation_vector_pkey"],
         },
         // The two whole-table line vector deletes are full passes by design

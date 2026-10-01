@@ -48,13 +48,13 @@ use crate::store::{
     DomainHost, DomainId, DomainKind, DomainStats, EdgeKind, EmbeddingCoverage, EmbeddingRow,
     EngramDescriptor, EngramId, EngramRecord, EngramSummary, FileStamp, FtsMode, GraphSlice,
     HostClaim, InboundHit, InboundPage, InboundQuery, InboundRef, LINKS_TO, LeadVector, NamedCount,
-    NewChunk, OBSERVATION_VECTOR_CHUNK, ObservationVector, OutboundRef, Page, RebuildKind,
-    RecentFilter, ReferenceCandidates, ScoredPair, SearchHit, SearchMode, SearchQuery,
-    SpellingPlan, Store, StoreInfo, StoredEngram, Vocabulary, build_vocabulary, changed_spellings,
-    count_references_to_sql, domain_url_needles, folder_slash, in_transaction, names_a_domain_url,
-    page_window, reference_match, referencing_domains_sql, rename_onto_taken_row,
-    reset_spelled_references_sql, resolve_references_to_sql, resolve_spelled_references_sql,
-    spelled_references_sql, spelling_plan,
+    NewChunk, ObservationVector, OutboundRef, Page, RebuildKind, RecentFilter, ReferenceCandidates,
+    ScoredPair, SearchHit, SearchMode, SearchQuery, SpellingPlan, Store, StoreInfo, StoredEngram,
+    Vocabulary, build_vocabulary, changed_spellings, count_references_to_sql, domain_url_needles,
+    folder_slash, in_transaction, names_a_domain_url, page_window, reference_match,
+    referencing_domains_sql, rename_onto_taken_row, reset_spelled_references_sql,
+    resolve_references_to_sql, resolve_spelled_references_sql, spelled_references_sql,
+    spelling_plan,
 };
 use crate::sweep::{SpelledRef, UnresolvedRef};
 
@@ -1041,34 +1041,26 @@ pub const CLEAR_DOMAIN_CONTRADICTION_PAIRS_SQL: &str =
 pub const OBSERVATION_VECTOR_HASHES_SQL: &str =
     "SELECT ov.hash FROM observation_vector ov WHERE ov.model=?1";
 
-/// The presence check behind [`Store::observation_vectors_present`] for `n`
-/// hashes, through the primary key.
+/// The presence check behind [`Store::observation_vectors_present`], one
+/// hash at a time. A point statement on purpose: turso seeks `model=? AND
+/// hash IN (...)` on `model` alone and filters the list inside that range, so
+/// with one embedding model every run would walk every stored vector. One
+/// prepared statement per hash seeks the full `(model, hash)` key.
 #[doc(hidden)]
-pub fn observation_vectors_present_sql(n: usize) -> String {
-    format!(
-        "SELECT ov.hash FROM observation_vector ov WHERE ov.model=?1 AND ov.hash IN ({})",
-        placeholders(2, n)
-    )
-}
+pub const OBSERVATION_VECTOR_PRESENT_SQL: &str =
+    "SELECT ov.hash FROM observation_vector ov WHERE ov.model=?1 AND ov.hash=?2";
 
-/// The read behind [`Store::observation_vectors`] for `n` hashes.
+/// The read behind [`Store::observation_vectors`], one hash at a time on the
+/// full key, for the reason [`OBSERVATION_VECTOR_PRESENT_SQL`] gives.
 #[doc(hidden)]
-pub fn observation_vectors_sql(n: usize) -> String {
-    format!(
-        "SELECT ov.hash, ov.dims, ov.vector FROM observation_vector ov \
-         WHERE ov.model=?1 AND ov.hash IN ({})",
-        placeholders(2, n)
-    )
-}
+pub const OBSERVATION_VECTOR_SQL: &str = "SELECT ov.hash, ov.dims, ov.vector FROM observation_vector ov \
+     WHERE ov.model=?1 AND ov.hash=?2";
 
-/// The prune behind [`Store::delete_observation_vectors`] for `n` hashes.
+/// The prune behind [`Store::delete_observation_vectors`], one hash at a time
+/// on the full key, for the reason [`OBSERVATION_VECTOR_PRESENT_SQL`] gives.
 #[doc(hidden)]
-pub fn delete_observation_vectors_sql(n: usize) -> String {
-    format!(
-        "DELETE FROM observation_vector WHERE model=?1 AND hash IN ({})",
-        placeholders(2, n)
-    )
-}
+pub const DELETE_OBSERVATION_VECTOR_SQL: &str =
+    "DELETE FROM observation_vector WHERE model=?1 AND hash=?2";
 
 /// The delete behind [`Store::delete_observation_vectors_except`]: every
 /// other model's line vectors, a full pass by design, once per process.
@@ -2967,16 +2959,19 @@ impl Store for TursoStore {
         hashes: &[String],
     ) -> Result<HashSet<String>> {
         let mut out = HashSet::with_capacity(hashes.len());
-        for run in hashes.chunks(OBSERVATION_VECTOR_CHUNK) {
-            let mut params = vec![Value::Text(model.to_string())];
-            params.extend(run.iter().map(|h| Value::Text(h.clone())));
-            for r in query_all(
-                &self.conn,
-                &observation_vectors_present_sql(run.len()),
-                params,
-            )
-            .await?
-            {
+        if hashes.is_empty() {
+            return Ok(out);
+        }
+        let mut stmt = self.conn.prepare(OBSERVATION_VECTOR_PRESENT_SQL).await?;
+        for hash in hashes {
+            let mut rows = stmt
+                .query(vec![
+                    Value::Text(model.to_string()),
+                    Value::Text(hash.clone()),
+                ])
+                .await?;
+            // Drained to the end so the statement completes before its reuse.
+            while let Some(r) = rows.next().await? {
                 if let Some(h) = cell_text(&r, 0) {
                     out.insert(h);
                 }
@@ -2991,10 +2986,23 @@ impl Store for TursoStore {
         hashes: &[String],
     ) -> Result<HashMap<String, Vec<f32>>> {
         let mut out = HashMap::with_capacity(hashes.len());
-        for run in hashes.chunks(OBSERVATION_VECTOR_CHUNK) {
-            let mut params = vec![Value::Text(model.to_string())];
-            params.extend(run.iter().map(|h| Value::Text(h.clone())));
-            for r in query_all(&self.conn, &observation_vectors_sql(run.len()), params).await? {
+        if hashes.is_empty() {
+            return Ok(out);
+        }
+        let mut stmt = self.conn.prepare(OBSERVATION_VECTOR_SQL).await?;
+        for wanted in hashes {
+            let mut rows = stmt
+                .query(vec![
+                    Value::Text(model.to_string()),
+                    Value::Text(wanted.clone()),
+                ])
+                .await?;
+            let mut found = Vec::new();
+            // Drained to the end so the statement completes before its reuse.
+            while let Some(r) = rows.next().await? {
+                found.push(r);
+            }
+            for r in found {
                 let (Some(hash), Some(dims), Some(blob)) =
                     (cell_text(&r, 0), cell_i64(&r, 1), cell_blob(&r, 2))
                 else {
@@ -3059,13 +3067,14 @@ impl Store for TursoStore {
             return Ok(0);
         }
         in_transaction(self, async {
+            let mut stmt = self.conn.prepare(DELETE_OBSERVATION_VECTOR_SQL).await?;
             let mut gone = 0u64;
-            for run in hashes.chunks(OBSERVATION_VECTOR_CHUNK) {
-                let mut params = vec![Value::Text(model.to_string())];
-                params.extend(run.iter().map(|h| Value::Text(h.clone())));
-                gone += self
-                    .conn
-                    .execute(&delete_observation_vectors_sql(run.len()), params)
+            for hash in hashes {
+                gone += stmt
+                    .execute(vec![
+                        Value::Text(model.to_string()),
+                        Value::Text(hash.clone()),
+                    ])
                     .await?;
             }
             Ok(gone)
