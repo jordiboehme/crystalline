@@ -92,6 +92,8 @@ export interface SoundSink {
   cue(cue: Cue): void;
   /** Toggles mute and answers the new state. */
   toggleMute(): boolean;
+  /** Toggles the ambience bus alone and answers the new state (true = off). */
+  toggleAmbience(): boolean;
 }
 
 /**

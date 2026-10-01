@@ -10,13 +10,13 @@
 export const CLASSIC_KEYS = "ARROWS MOVE · ALT STRAFE · SPACE USE · SHIFT RUN";
 
 /** The game route's legend: the classic keys, then the rest. */
-export const GAME_LEGEND = `${CLASSIC_KEYS} · WASD MOUSE · F FLUID · I INVERT · M SOUND`;
+export const GAME_LEGEND = `${CLASSIC_KEYS} · WASD MOUSE · F FLUID · I INVERT · M SOUND · N AMBIENCE`;
 
 /**
- * The pause screen's legend: the game's keys, and M, which turns the
- * sound off and on.
+ * The pause screen's legend: the game's keys, M, which turns the sound
+ * off and on, and N, which turns the ambience off and on on its own.
  */
-export const PAUSE_LEGEND = `${CLASSIC_KEYS} · WASD MOUSE · F FLUID · I INVERT · M SOUND`;
+export const PAUSE_LEGEND = `${CLASSIC_KEYS} · WASD MOUSE · F FLUID · I INVERT · M SOUND · N AMBIENCE`;
 
 /** Between two items of a legend, where a line may break. */
 export const LEGEND_GAP = " · ";

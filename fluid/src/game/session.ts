@@ -89,8 +89,11 @@
  * (`fluidRouteOfStation`: `/` in the airlock, the domain page on a bridge,
  * the folder on a deck, the engram in its room), I inverts the
  * mouse's vertical look (remembered in `localStorage` under `INVERT_KEY`),
- * and M turns the sound off and on (with `sound`: its `toggleMute`, the
- * notice `SOUND OFF` or `SOUND ON`; without it M does nothing).
+ * M turns the sound off and on (with `sound`: its `toggleMute`, the
+ * notice `SOUND OFF` or `SOUND ON`; without it M does nothing), and N
+ * turns the ambience (the room drones) off and on on its own (its
+ * `toggleAmbience`, the notice `AMBIENCE OFF` or `AMBIENCE ON`; without
+ * `sound` N does nothing).
  * No key switches the look: the game always runs in the station's one look.
  * Only the mouse looks up and down. The
  * browser's own meaning of Space, the arrows, comma, period and Alt is
@@ -659,7 +662,7 @@ const CLAIMED_KEYS: ReadonlySet<string> = new Set([
 const USE_KEY = "Space";
 
 /** Every key that commands the session, drained while the reader is open. */
-const COMMAND_KEYS = [USE_KEY, "KeyF", "KeyI", "KeyM"] as const;
+const COMMAND_KEYS = [USE_KEY, "KeyF", "KeyI", "KeyM", "KeyN"] as const;
 
 /** The renderer on a real WebGL2 context. */
 const defaultFactory: RendererFactory = (canvas, options) => {
@@ -2063,6 +2066,11 @@ export function createSession(opts: SessionOptions): Session {
         const muted = opts.sound?.toggleMute();
         if (muted !== undefined)
           flash(muted ? "SOUND OFF" : "SOUND ON", LOOK_NOTICE_MS);
+      }
+      if (input.pressed("KeyN")) {
+        const off = opts.sound?.toggleAmbience();
+        if (off !== undefined)
+          flash(off ? "AMBIENCE OFF" : "AMBIENCE ON", LOOK_NOTICE_MS);
       }
       const page = target ?? current;
       if (input.pressed("KeyF") && page !== null) {

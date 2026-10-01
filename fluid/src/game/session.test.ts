@@ -231,16 +231,24 @@ function stubHud() {
 
 /**
  * A sound sink that records every cue, and answers `toggleMute` from
- * `mutes` in turn (false once they run out).
+ * `mutes` in turn and `toggleAmbience` from `ambience` in turn (false once
+ * they run out).
  */
-function recordSound(mutes: readonly boolean[] = []) {
+function recordSound(
+  mutes: readonly boolean[] = [],
+  ambience: readonly boolean[] = [],
+) {
   const cues: Cue[] = [];
   let next = 0;
+  let nextAmbience = 0;
   const sink = {
     cue: vi.fn<SoundSink["cue"]>((c) => {
       cues.push(c);
     }),
     toggleMute: vi.fn<SoundSink["toggleMute"]>(() => mutes[next++] ?? false),
+    toggleAmbience: vi.fn<SoundSink["toggleAmbience"]>(
+      () => ambience[nextAmbience++] ?? false,
+    ),
   };
   return { cues, sink };
 }
@@ -5321,6 +5329,63 @@ describe("sound cues (M4 Task 7)", () => {
     frames(2);
     expect(
       hud.notice.mock.calls.some(([t]) => t !== null && t.startsWith("SOUND")),
+    ).toBe(false);
+  });
+
+  it("switches the ambience on N, on its own beside M", () => {
+    // Mutation caught: N unhandled or wired to the master, a notice
+    // missing, a sink-less N doing something, N handled while the reader
+    // is open or replayed when it closes, M and N sharing one toggle.
+    // (Dropping "KeyN" from COMMAND_KEYS alone survives: every way out of
+    // a modal state clears the input's presses, so the drain is belt and
+    // braces.)
+    const { cues, sink } = recordSound([true], [true, false]);
+    const session = start({ client: null, sound: sink });
+    session.showCanned(CANNED_BRIDGE);
+    frames(1);
+    const press = (code: string) => {
+      key("keydown", code);
+      frames(1);
+      key("keyup", code);
+    };
+    press("KeyN");
+    expect(sink.toggleAmbience).toHaveBeenCalledTimes(1);
+    expect(sink.toggleMute).not.toHaveBeenCalled();
+    expect(hud.notice).toHaveBeenLastCalledWith("AMBIENCE OFF");
+    press("KeyN");
+    expect(sink.toggleAmbience).toHaveBeenCalledTimes(2);
+    expect(hud.notice).toHaveBeenLastCalledWith("AMBIENCE ON");
+    press("KeyM");
+    expect(sink.toggleMute).toHaveBeenCalledTimes(1);
+    expect(sink.toggleAmbience).toHaveBeenCalledTimes(2);
+    expect(hud.notice).toHaveBeenLastCalledWith("SOUND OFF");
+
+    // With the reader open, N is the reader's, and not replayed after.
+    walkToScope();
+    key("keydown", "Space");
+    frames(1);
+    key("keyup", "Space");
+    expect(cues.at(-1)).toEqual({ kind: "terminal" });
+    const notices = hud.notice.mock.calls.length;
+    press("KeyN");
+    frames(2);
+    session.closeReader();
+    frames(3);
+    expect(sink.toggleAmbience).toHaveBeenCalledTimes(2);
+    expect(hud.notice.mock.calls.length).toBe(notices);
+    session.dispose();
+
+    // Without a sink, N is nothing at all.
+    hud.notice.mockClear();
+    const silent = start({ client: null });
+    silent.showCanned(CANNED_BRIDGE);
+    frames(1);
+    press("KeyN");
+    frames(2);
+    expect(
+      hud.notice.mock.calls.some(
+        ([t]) => t !== null && t.startsWith("AMBIENCE"),
+      ),
     ).toBe(false);
   });
 
