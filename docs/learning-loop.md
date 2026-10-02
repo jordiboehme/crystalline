@@ -161,4 +161,6 @@ crystalline provision deny engineering    # opt out, removing anything already s
 crystalline provision status              # every domain's decision, every harness's installed state
 ```
 
+`provision status` lists the allowed domains first, then the undecided ones, then the denied ones, each group by name, and `crystalline doctor` uses the same order. Domains that declare no provisioning and virtual domains fold into one summary line each; add `--all` to list every one of them. The JSON output (and the MCP `provision` tool's `status`) always lists every domain in that order.
+
 Bare `crystalline provision` reconciles every opted-in domain into every harness this machine has onboarded. It is idempotent and safe to rerun: installing what is missing, updating what changed and retiring what a domain no longer ships. A provisioned file you edited by hand is still brought current on the next reconcile, with your edited version kept beside it as a `.bak` copy rather than lost. A foreign file Crystalline never wrote is adopted when it already matches byte for byte and otherwise left untouched, never overwritten.

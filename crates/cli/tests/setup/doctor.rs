@@ -2263,6 +2263,83 @@ fn provisioning_section_reports_domain_counts_pending_line_and_harness_drift_edi
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// The provisioning section lists domains in the same order `provision
+/// status` does: allowed, undecided, denied, each by name, whatever order the
+/// config registers them in, and the awaiting list goes by name too.
+#[test]
+#[cfg(unix)]
+fn provisioning_section_lists_domains_and_pending_in_the_status_order() {
+    let (home, _state_dir) = isolated_home("provisioning-order");
+    let work = tempfile::tempdir().unwrap();
+
+    let mut yaml = String::from("domains:\n");
+    for (name, decision) in [
+        ("zulu", "provision: false\n"),
+        ("mike", ""),
+        ("Yankee", "provision: true\n"),
+        ("echo", ""),
+        ("alpha", "provision: true\n"),
+    ] {
+        let dir = work.path().join(format!("kb-{name}"));
+        write_provisioning_manifest(&dir, name, "- agents: agents\n");
+        write(&dir, "agents/scout.md", "# Scout\n");
+        yaml.push_str(&format!("  {name}:\n    path: {}\n", dir.display()));
+        if !decision.is_empty() {
+            yaml.push_str(&format!("    {decision}"));
+        }
+    }
+    let config = work.path().join("config.yaml");
+    std::fs::write(&config, yaml).unwrap();
+
+    let run = |json: bool| {
+        let mut cmd = bin();
+        apply_home(&mut cmd, &home);
+        if json {
+            cmd.arg("--json");
+        }
+        cmd.args(["doctor", "--config"])
+            .arg(&config)
+            .args(["--db"])
+            .arg(work.path().join("index.db"))
+            .output()
+            .unwrap()
+            .stdout
+    };
+
+    let report: Value = serde_json::from_slice(&run(true)).unwrap();
+    let names: Vec<&str> = report["provisioning"]["domains"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["alpha", "Yankee", "echo", "mike", "zulu"]);
+    let pending: Vec<&str> = report["provisioning"]["pending"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["domain"].as_str().unwrap())
+        .collect();
+    assert_eq!(pending, ["echo", "mike"]);
+
+    let human = String::from_utf8(run(false)).unwrap();
+    let at = |needle: &str| {
+        human
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle} missing: {human}"))
+    };
+    assert!(at("  alpha: allowed") < at("  Yankee: allowed"), "{human}");
+    assert!(at("  Yankee: allowed") < at("  echo: undecided"), "{human}");
+    assert!(at("  echo: undecided") < at("  mike: undecided"), "{human}");
+    assert!(at("  mike: undecided") < at("  zulu: denied"), "{human}");
+    assert!(
+        at("    echo: ") < at("    mike: "),
+        "the awaiting list is by name: {human}"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// No registered domain declares a `Provisioning` section at all: the
 /// section stays out of the report entirely, the same "omit rather than
 /// show empty" rule the environment and harnesses sections follow.

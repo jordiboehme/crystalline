@@ -1641,6 +1641,12 @@ enum ProvisionCommand {
     /// installed, edited and missing counts and any domain still awaiting a
     /// decision.
     Status {
+        /// List every domain on its own line, including the ones that
+        /// declare no provisioning and the virtual ones, which are folded
+        /// into a summary line otherwise. The JSON output always lists them
+        /// all.
+        #[arg(long)]
+        all: bool,
         /// Load the global config from this file instead of the default path.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -2529,15 +2535,15 @@ async fn provision_dispatch(
     config: Option<PathBuf>,
     json: bool,
 ) -> anyhow::Result<()> {
-    let (action, domain, config) = match command {
-        None => ("apply", None, config),
-        Some(ProvisionCommand::Status { config }) => ("status", None, config),
-        Some(ProvisionCommand::Allow { domain, config }) => ("allow", Some(domain), config),
-        Some(ProvisionCommand::Deny { domain, config }) => ("deny", Some(domain), config),
+    let (action, domain, config, all) = match command {
+        None => ("apply", None, config, false),
+        Some(ProvisionCommand::Status { all, config }) => ("status", None, config, all),
+        Some(ProvisionCommand::Allow { domain, config }) => ("allow", Some(domain), config, false),
+        Some(ProvisionCommand::Deny { domain, config }) => ("deny", Some(domain), config, false),
     };
     let data = crystalline_service::client::provision(action, domain.as_deref(), config.as_deref())
         .await?;
-    cmd::print_provision(action, &data, json);
+    cmd::print_provision(action, &data, json, all);
     Ok(())
 }
 

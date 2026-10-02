@@ -556,6 +556,24 @@ pub fn apply(
 
 // --- status -------------------------------------------------------------
 
+/// Where a domain sits in the status listing: allowed, undecided and denied
+/// domains that declare provisioning first, then the domains that declare
+/// none, then the virtual ones. Within a group the listing goes by name,
+/// case-insensitively, the same comparison `list_domains` uses.
+fn status_group(d: &DomainStatus) -> u8 {
+    if d.is_virtual {
+        return 4;
+    }
+    if !d.declares {
+        return 3;
+    }
+    match d.decision {
+        Decision::Allowed => 0,
+        Decision::Undecided => 1,
+        Decision::Denied => 2,
+    }
+}
+
 /// Which side of a provisioning decision a domain is on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
@@ -634,7 +652,11 @@ pub struct HarnessStatus {
 /// requested harness's installed state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusReport {
-    /// Every registered domain, in `global`'s own declaration order.
+    /// Every registered domain: allowed, undecided and denied domains that
+    /// declare provisioning, then those that declare none, then virtual
+    /// domains, each group by name (case-insensitive, exact name as the
+    /// tie-break). `pending` and `virtual_with_decision` go by the same name
+    /// key.
     pub domains: Vec<DomainStatus>,
     /// Every requested harness, in the order given.
     pub harnesses: Vec<HarnessStatus>,
@@ -727,7 +749,14 @@ pub fn status(
         });
     }
 
-    let pending = collect_pending(global, env_domains);
+    let mut pending = collect_pending(global, env_domains);
+
+    // The loop above walked the config's declaration order on purpose (it
+    // feeds `opted_artifacts`); only the finished lists are put in the
+    // reading order, so the report reads the same on every run.
+    domains.sort_by_cached_key(|d| (status_group(d), d.domain.to_lowercase(), d.domain.clone()));
+    pending.sort_by_cached_key(|p| (p.domain.to_lowercase(), p.domain.clone()));
+    virtual_with_decision.sort_by_cached_key(|name| (name.to_lowercase(), name.clone()));
 
     Ok(StatusReport {
         domains,
@@ -1776,5 +1805,161 @@ mod tests {
         assert!(stat_keys.contains("agents/top.md"));
         assert!(stat_keys.contains("agents/codex-reviewer.toml"));
         assert_eq!(stat_keys.len(), 6);
+    }
+
+    // --- status order ------------------------------------------------------------
+
+    /// A file domain whose MANIFEST declares `agents: agents` and ships one
+    /// agent file `<agent>.md` holding `content`.
+    fn shipping_domain(agent: &str, content: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        write_manifest(dir.path(), "## Provisioning\n\n- agents: agents\n");
+        std::fs::create_dir_all(dir.path().join("agents")).unwrap();
+        std::fs::write(
+            dir.path().join("agents").join(format!("{agent}.md")),
+            content,
+        )
+        .unwrap();
+        dir
+    }
+
+    fn with_decision(mut entry: DomainEntry, decision: Option<bool>) -> DomainEntry {
+        entry.provision = decision;
+        entry
+    }
+
+    #[test]
+    fn status_lists_domains_grouped_and_sorted_whatever_the_registration_order() {
+        let shipping = |agent: &str| shipping_domain(agent, "# Agent\n");
+        let (b_up, b_low, beta, alpha_up) = (
+            shipping("a1"),
+            shipping("a2"),
+            shipping("a3"),
+            shipping("a4"),
+        );
+        let (delta, charlie) = (shipping("a5"), shipping("a6"));
+        let (bravo, alpha_low) = (shipping("a7"), shipping("a8"));
+        let plain = tempfile::tempdir().unwrap();
+        write_manifest(plain.path(), "");
+
+        // Registered in an order that matches no group and no sort.
+        let mut global = GlobalConfig::default();
+        let d = &mut global.domains;
+        d.insert(
+            "zeta".into(),
+            with_decision(DomainEntry::virtual_domain(), Some(false)),
+        );
+        d.insert(
+            "Bravo".into(),
+            with_decision(DomainEntry::file(bravo.path()), Some(false)),
+        );
+        d.insert("alpha-plain".into(), DomainEntry::file(plain.path()));
+        d.insert("delta".into(), DomainEntry::file(delta.path()));
+        d.insert(
+            "b".into(),
+            with_decision(DomainEntry::file(b_low.path()), Some(true)),
+        );
+        d.insert("charlie".into(), DomainEntry::file(charlie.path()));
+        d.insert(
+            "beta".into(),
+            with_decision(DomainEntry::file(beta.path()), Some(true)),
+        );
+        d.insert(
+            "Echo".into(),
+            with_decision(DomainEntry::virtual_domain(), Some(true)),
+        );
+        d.insert(
+            "alpha".into(),
+            with_decision(DomainEntry::file(alpha_low.path()), Some(false)),
+        );
+        d.insert(
+            "B".into(),
+            with_decision(DomainEntry::file(b_up.path()), Some(true)),
+        );
+        d.insert(
+            "Alpha".into(),
+            with_decision(DomainEntry::file(alpha_up.path()), Some(true)),
+        );
+
+        let receipts = tempfile::tempdir().unwrap();
+        let report = status(
+            &global,
+            &receipts.path().join("receipt.json"),
+            &[],
+            &HashSet::new(),
+        )
+        .unwrap();
+
+        let names: Vec<&str> = report.domains.iter().map(|d| d.domain.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                // allowed
+                "Alpha",
+                "B",
+                "b",
+                "beta",
+                // undecided
+                "charlie",
+                "delta",
+                // denied
+                "alpha",
+                "Bravo",
+                // declares no provisioning
+                "alpha-plain",
+                // virtual
+                "Echo",
+                "zeta",
+            ]
+        );
+        let pending: Vec<&str> = report.pending.iter().map(|p| p.domain.as_str()).collect();
+        assert_eq!(pending, ["charlie", "delta"]);
+        assert_eq!(report.virtual_with_decision, ["Echo", "zeta"]);
+    }
+
+    #[test]
+    fn status_keeps_the_declaration_order_for_the_harness_projection() {
+        // Two allowed domains ship the same agent name with different bytes.
+        // The first-declared one ("zulu") must still win the collision, even
+        // though the report lists "alpha" before it: a receipt recording the
+        // first-declared bytes shows no drift.
+        let zulu = shipping_domain("shared", "# From zulu\n");
+        let alpha = shipping_domain("shared", "# From alpha\n");
+        let mut global = GlobalConfig::default();
+        global.domains.insert(
+            "zulu".into(),
+            with_decision(DomainEntry::file(zulu.path()), Some(true)),
+        );
+        global.domains.insert(
+            "alpha".into(),
+            with_decision(DomainEntry::file(alpha.path()), Some(true)),
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let receipt_path = dir.path().join("receipt.json");
+        let mut receipt = ProvisionReceipt::default();
+        let mut state = HarnessState::default();
+        state.files.insert(
+            "agents/shared.md".to_string(),
+            InstalledFile {
+                domain: "zulu".to_string(),
+                sha256: sha256_hex(b"# From zulu\n"),
+            },
+        );
+        receipt.harnesses.insert("claude-code".to_string(), state);
+        save(&receipt_path, &receipt).unwrap();
+
+        let report = status(
+            &global,
+            &receipt_path,
+            &[HarnessKind::ClaudeCode],
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert_eq!(report.domains[0].domain, "alpha");
+        assert_eq!(
+            report.harnesses[0].drift, 0,
+            "the first-declared domain wins"
+        );
     }
 }
