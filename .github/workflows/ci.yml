@@ -261,10 +261,19 @@ jobs:
 
       # On a push to main whose tree a pull request run already passed (see
       # `changes`), the checks below are skipped and the leg only compiles the
-      # tests, so the cache step above still saves what pull requests restore.
+      # tests and runs clippy, so the cache step above still saves what pull
+      # requests restore: the test build and clippy's check-mode metadata,
+      # which the compile alone never produces. Without clippy here, the first
+      # pull request after a lockfile or toolchain change rebuilt every
+      # dependency in check mode. A clippy failure turns main red, which is
+      # right: the pull request ran the same clippy on the same tree.
       - name: Compile the tests only (the pull request tested this tree)
         if: ${{ needs.changes.outputs.tested == 'true' }}
         run: cargo nextest run --workspace --no-run --locked
+
+      - name: cargo clippy (the pull request tested this tree)
+        if: ${{ needs.changes.outputs.tested == 'true' }}
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       # Formatting does not depend on the OS, so one leg checks it.
       - name: cargo fmt --check
