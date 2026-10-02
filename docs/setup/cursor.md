@@ -23,7 +23,9 @@ Cursor is a desktop app and may start with a short PATH. So the install writes t
 ## Known limits
 
 - Cursor also runs your Claude Code hooks. The Claude Code routing hook stays silent inside Cursor, so the routing block arrives once.
-- With Claude Code and Codex both installed, Cursor shows each skill twice, because it reads both folders.
+- With Claude Code installed together with Codex or Gemini CLI, Cursor shows each skill twice, because it reads both folders.
 - Until a live check confirms this harness, the skills also stay available over MCP.
+- Cursor starts the MCP server with only `HOME` and `PATH` in its environment. A Crystalline set up through `XDG_CONFIG_HOME`, `XDG_STATE_HOME` or `CRYSTALLINE_*` variables is not seen there, and Cursor talks to an empty instance instead. Use the default locations, or set those variables where Cursor gets its environment from.
+- The Windows paths are not verified.
 
 Run `crystalline uninstall cursor` before you downgrade Crystalline below 0.22.1.
