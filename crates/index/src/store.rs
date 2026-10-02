@@ -2228,7 +2228,11 @@ pub trait Store: Send + Sync {
     /// since it was read), [`crate::IndexError::StaleEdit`] when one stands
     /// there with other content. Never inserts, which is what the reparse
     /// after a parser change needs: it rewrites what it read, and a row that
-    /// vanished meanwhile must stay gone.
+    /// vanished meanwhile must stay gone. On Postgres the never-insert
+    /// guarantee holds only inside a transaction: the compare's row lock is
+    /// what keeps a concurrent delete out until the rewrite, and without a
+    /// transaction it is released when the compare statement ends, so a row
+    /// deleted between the compare and the rewrite would be inserted again.
     async fn update_engram_checked(
         &self,
         domain: DomainId,

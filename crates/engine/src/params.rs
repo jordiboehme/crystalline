@@ -286,7 +286,10 @@ pub struct SplitParams {
     pub sections: Vec<String>,
     /// The checksum from a prior read of the source, guarding the split
     /// against a change since that read: both writes are refused as a conflict
-    /// if the source changed. Omit for last-write-wins.
+    /// if the source changed. Without it the split still guards its own
+    /// rewrite of the source with the checksum it read, so it can be refused
+    /// as a conflict while another write to the same engram is in flight; try
+    /// it again then.
     #[serde(default)]
     pub expected_checksum: Option<String>,
 }

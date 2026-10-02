@@ -3976,16 +3976,6 @@ impl Store for PostgresStore {
 }
 
 impl PostgresStore {
-    /// Write one row of the `engram` table, in one actor's dimension.
-    ///
-    /// The single writer behind both [`Store::upsert_engram`] (the empty actor,
-    /// the base row) and [`Store::upsert_overlay`] (an actor key), for the
-    /// reason its Turso twin gives: a draft is a full engram row with the same
-    /// children and the same id-stable upsert, not a second shape.
-    ///
-    /// Everything here is scoped to `actor`, the duplicate-permalink probe
-    /// included: two actors may each hold `a` in their own dimension, and only
-    /// a clash inside one actor's own is a conflict.
     /// The compare of a compare-and-swap on the base row at `path`.
     ///
     /// A plain SELECT is not that under READ COMMITTED: it reads the last
@@ -4030,6 +4020,16 @@ impl PostgresStore {
         }
     }
 
+    /// Write one row of the `engram` table, in one actor's dimension.
+    ///
+    /// The single writer behind both [`Store::upsert_engram`] (the empty actor,
+    /// the base row) and [`Store::upsert_overlay`] (an actor key), for the
+    /// reason its Turso twin gives: a draft is a full engram row with the same
+    /// children and the same id-stable upsert, not a second shape.
+    ///
+    /// Everything here is scoped to `actor`, the duplicate-permalink probe
+    /// included: two actors may each hold `a` in their own dimension, and only
+    /// a clash inside one actor's own is a conflict.
     async fn upsert_row(
         &self,
         domain: DomainId,
