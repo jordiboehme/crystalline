@@ -2638,3 +2638,105 @@ fn a_bare_command_resolves_its_default_paths_under_the_test_home() {
         home.display()
     );
 }
+
+/// A sync with no daemon running reparses a virtual domain an older parser
+/// derived, from the content the database stores. The old parser is staged by
+/// hand: the observation is its first physical line and the generation is 0.
+/// A second sync of the now current domain writes nothing.
+#[test]
+fn a_sync_without_a_daemon_reparses_a_virtual_domain() {
+    use crystalline_core::{PARSE_GENERATION, parse_engram};
+    use crystalline_index::{DomainKind, EngramRecord, Store, TursoStore};
+
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+    let db = work.path().join("state/index.db");
+    let run = |args: &[&str]| {
+        bin()
+            .args(args)
+            .args(["--config"])
+            .arg(&config)
+            .args(["--db"])
+            .arg(&db)
+            .assert()
+            .success()
+    };
+    run(&["domain", "add", "notes", "--virtual"]);
+    run(&[
+        "write",
+        "notes",
+        "Wrapped",
+        "--content",
+        "The pump rules.\n\n- [fact] the purge runs before every mix swap,\n  which is why the swap waits for night #purge\n",
+    ]);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let purge_count = |store: &TursoStore| {
+        rt.block_on(async {
+            let vocab = store.vocabulary(Some("notes"), None).await.unwrap();
+            vocab
+                .tags
+                .iter()
+                .find(|t| t.name == "purge")
+                .map_or(0, |t| t.observations)
+        })
+    };
+    let stored = {
+        let store = rt.block_on(TursoStore::open(&db)).unwrap();
+        let domain = rt
+            .block_on(store.upsert_domain("notes", None, DomainKind::Virtual))
+            .unwrap();
+        let rows = rt.block_on(store.all_engram_contents(domain)).unwrap();
+        let row = rows.iter().find(|r| r.permalink == "wrapped").unwrap();
+        assert_eq!(purge_count(&store), 1, "written by the current parser");
+        let stamp = rt.block_on(store.file_stamps(domain)).unwrap()[&row.path].clone();
+        let mut record =
+            EngramRecord::from_engram(&parse_engram(&row.content).unwrap(), &row.path, stamp);
+        record.observations[0].content = "the purge runs before every mix swap,".to_string();
+        record.observations[0].tags.clear();
+        record.content = row.content.clone();
+        rt.block_on(store.upsert_engram(domain, &record)).unwrap();
+        rt.block_on(store.set_parse_generation(domain, 0)).unwrap();
+        assert_eq!(purge_count(&store), 0, "staged as fragments");
+        (row.content.clone(), row.sha256.clone())
+    };
+
+    let out = run(&["sync"]);
+    let text = String::from_utf8_lossy(&out.get_output().stdout).to_string()
+        + &String::from_utf8_lossy(&out.get_output().stderr);
+    assert!(
+        text.contains("engram(s) of 'notes' after a parser change"),
+        "the sync says what it did: {text}"
+    );
+
+    let store = rt.block_on(TursoStore::open(&db)).unwrap();
+    let domain = rt
+        .block_on(store.upsert_domain("notes", None, DomainKind::Virtual))
+        .unwrap();
+    assert_eq!(
+        rt.block_on(store.parse_generation(domain)).unwrap(),
+        PARSE_GENERATION
+    );
+    assert_eq!(purge_count(&store), 1, "the observation is joined again");
+    let rows = rt.block_on(store.all_engram_contents(domain)).unwrap();
+    let row = rows.iter().find(|r| r.permalink == "wrapped").unwrap();
+    assert_eq!(
+        (row.content.clone(), row.sha256.clone()),
+        stored,
+        "the stored content is byte for byte what it was"
+    );
+    drop(store);
+
+    // A current domain prints nothing new and writes nothing.
+    let out = run(&["sync"]);
+    let text = String::from_utf8_lossy(&out.get_output().stdout).to_string()
+        + &String::from_utf8_lossy(&out.get_output().stderr);
+    assert!(!text.contains("reparsed"), "nothing to reparse: {text}");
+    let store = rt.block_on(TursoStore::open(&db)).unwrap();
+    let rows = rt.block_on(store.all_engram_contents(domain)).unwrap();
+    let row = rows.iter().find(|r| r.permalink == "wrapped").unwrap();
+    assert_eq!(row.sha256, stored.1);
+}

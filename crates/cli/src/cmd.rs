@@ -2051,8 +2051,22 @@ pub async fn sync(
     // for the final cross-domain resolution pass below.
     let mut applied: Vec<(crystalline_index::DomainId, crystalline_index::SyncReport)> = Vec::new();
     for (name, entry) in targets {
-        // Virtual domains have no files to sync.
+        // Virtual domains have no files to sync, but a parser change leaves
+        // their stored rows behind, and the daemon's own reparse is not here
+        // to catch it up.
         let Some(path) = resolve_domain_path(&entry) else {
+            let store = store.lock().await;
+            let Some(domain) = store.domain_id(&name).await? else {
+                continue;
+            };
+            if crystalline_index::reparse_due(&*store, domain).await? {
+                let n = crystalline_index::reparse_stored_domain(&*store, &name, domain, &params)
+                    .await
+                    .map_err(|e| anyhow!("sync of '{name}' failed: {e}"))?;
+                if !json {
+                    println!("reparsed {n} engram(s) of '{name}' after a parser change");
+                }
+            }
             continue;
         };
         // A large domain's walk-and-hash pass can take a while with no
