@@ -2039,8 +2039,12 @@ impl McpServer {
         mut result: CallToolResult,
         ctx: &RequestContext<RoleServer>,
     ) -> CallToolResult {
-        let Some(trailer) =
-            crate::nudge::write_verb_trailer(&self.engine, mcp_account(ctx).as_deref()).await
+        let Some(trailer) = crate::nudge::write_verb_trailer(
+            &self.engine,
+            mcp_account(ctx).as_deref(),
+            &self.scope_of(ctx),
+        )
+        .await
         else {
             return result;
         };

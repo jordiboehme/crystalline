@@ -299,7 +299,33 @@ impl Engine {
                 {
                     let mut file_guard = self.file_config.write().unwrap();
                     let mut file = self.fresh_file_config(&file_guard);
-                    set_domain_provision_decision(&mut file, domain, allow)?;
+                    // Deciding about a domain is a way of asking whether it
+                    // exists, so a domain this caller may not see is refused
+                    // exactly as one nobody registered (the MCP verb asks the
+                    // same first; asking here keeps the engine safe on its
+                    // own). Either refusal lists the file's domains minus the
+                    // hidden ones: unfiltered, a typo would read back the name
+                    // of every private domain on the instance.
+                    let decided = if hidden.contains(domain.as_str()) {
+                        Err(EngineError::UnknownDomain {
+                            domain: domain.clone(),
+                            registered: file.domains.keys().cloned().collect(),
+                        })
+                    } else {
+                        set_domain_provision_decision(&mut file, domain, allow)
+                    };
+                    decided.map_err(|e| match e {
+                        EngineError::UnknownDomain { domain, registered } => {
+                            EngineError::UnknownDomain {
+                                domain,
+                                registered: registered
+                                    .into_iter()
+                                    .filter(|name| !hidden.contains(name))
+                                    .collect(),
+                            }
+                        }
+                        other => other,
+                    })?;
                     self.persist_config(&file)?;
                     let effective = self.overlay.apply(&file);
                     *file_guard = file;

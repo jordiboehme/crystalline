@@ -471,3 +471,109 @@ async fn an_apply_report_names_no_domain_the_caller_may_not_see() {
 
     restore_env(previous);
 }
+
+/// **A decision about a name nobody registered lists only the domains the
+/// caller may see.** The open tier (`auth.mcp` off) lets an anonymous agent
+/// reach `allow` and `deny`, and the refusal for an unknown name used to list
+/// every registered file domain, private ones included. That turned a typo
+/// into a way to read the names of domains this caller is not shown anywhere
+/// else. `harbor` is the control: it is visible and has to stay in the list.
+#[tokio::test]
+async fn an_unknown_domain_refusal_names_no_domain_the_caller_may_not_see() {
+    let _guard = HOME_LOCK.lock().await;
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let xdg_state_home = work.path().join("state");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&xdg_state_home).unwrap();
+    let previous = set_env(&home, &xdg_state_home);
+
+    let harbor_dir = work.path().join("kb-harbor");
+    write_harbor(&harbor_dir);
+    let vault_dir = work.path().join("kb-vault");
+    std::fs::create_dir_all(&vault_dir).unwrap();
+    let mut cfg = config_with_harbor(&harbor_dir);
+    cfg.domains
+        .insert("vault".to_string(), DomainEntry::file(&vault_dir));
+
+    let config_path = work.path().join("config.yaml");
+    let engine = engine_at(&config_path, cfg, false).await;
+
+    let auth = Arc::new(
+        AuthStore::open(&work.path().join("web-auth.db"))
+            .await
+            .unwrap(),
+    );
+    auth.add_user("keeper", "keeper", None, Role::Admin, "pw12345678")
+        .await
+        .unwrap();
+    auth.set_domain_visibility("vault", true, "keeper")
+        .await
+        .unwrap();
+    engine.set_domain_access(Arc::new(DomainAccess::new(auth)));
+
+    // Guard against a vacuous pass: this caller really has `vault` hidden.
+    assert_eq!(
+        engine.hidden_domains(&Scope::Anonymous).await.unwrap(),
+        Some(std::collections::HashSet::from(["vault".to_string()])),
+    );
+
+    for action in [
+        ProvisionAction::Allow {
+            domain: "does-not-exist".to_string(),
+        },
+        ProvisionAction::Deny {
+            domain: "does-not-exist".to_string(),
+        },
+    ] {
+        let err = engine
+            .provision(&action, &Scope::Anonymous)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EngineError::UnknownDomain { .. }), "{err}");
+        let message = err.to_string();
+        assert!(message.contains("does-not-exist"), "{message}");
+        assert!(message.contains("harbor"), "{message}");
+        assert!(
+            !message.contains("vault"),
+            "the refusal must not name a domain this caller may not see: {message}"
+        );
+    }
+
+    // Naming the hidden domain itself is refused in the same words, without a
+    // decision being recorded: the engine does not lean on the MCP gate alone.
+    let err = engine
+        .provision(
+            &ProvisionAction::Allow {
+                domain: "vault".to_string(),
+            },
+            &Scope::Anonymous,
+        )
+        .await
+        .unwrap_err();
+    match &err {
+        EngineError::UnknownDomain { registered, .. } => {
+            assert_eq!(registered, &vec!["harbor".to_string()], "{err}")
+        }
+        other => panic!("expected an unknown-domain refusal, got {other}"),
+    }
+
+    // The machine owner still gets the whole list.
+    let message = engine
+        .provision(
+            &ProvisionAction::Allow {
+                domain: "does-not-exist".to_string(),
+            },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        message.contains("harbor") && message.contains("vault"),
+        "{message}"
+    );
+
+    assert!(!config_path.exists());
+    restore_env(previous);
+}

@@ -25,7 +25,7 @@
 //! `crates/cli`, so the sentence is copied rather than imported, and a test in
 //! the CLI's own suite pins the copy against the original.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -214,6 +214,9 @@ fn count_walk(_key: &DomainKey) {}
 
 /// The one line a write receipt carries, or `None` when nothing is due.
 ///
+/// `scope` is the same caller as the access rules see it: the share ask leaves
+/// out every team domain [`Engine::hidden_for`] screens from it.
+///
 /// `identity` is the account the call authenticated as, `None` for a stdio
 /// session and for an instance with MCP authentication off. It answers two
 /// questions at once, and they are not the same question:
@@ -243,7 +246,11 @@ fn count_walk(_key: &DomainKey) {}
 /// tool calls, so the case is rare; the cost when it happens is one extra
 /// sentence; and the alternative is a lock on the path of every write, which is
 /// a real cost paid against a cosmetic one.
-pub async fn write_verb_trailer(engine: &Engine, identity: Option<&str>) -> Option<String> {
+pub async fn write_verb_trailer(
+    engine: &Engine,
+    identity: Option<&str>,
+    scope: &crate::scope::Scope,
+) -> Option<String> {
     let state_dir = engine.journal_state_dir().ok()?;
     let key = identity_key(identity);
     let now = Utc::now();
@@ -259,8 +266,21 @@ pub async fn write_verb_trailer(engine: &Engine, identity: Option<&str>) -> Opti
     let config = engine.config();
 
     if share_open {
-        let (count, domains) = unshared_team_work(engine, &config, identity).await;
-        if count > 0 && !domains.is_empty() {
+        // Resolved only once the ask is open, so a receipt with nothing due
+        // still reads nothing else. A scope that cannot be resolved skips the
+        // ask rather than widening it: a private team domain the caller may not
+        // see is never named or counted here.
+        let shared = match engine.hidden_for(scope).await {
+            Ok(hidden) => Some(unshared_team_work(engine, &config, identity, &hidden).await),
+            Err(e) => {
+                tracing::debug!("share ask skipped, the caller's scope is unreadable: {e}");
+                None
+            }
+        };
+        if let Some((count, domains)) = shared
+            && count > 0
+            && !domains.is_empty()
+        {
             record(&state_dir, NudgeKind::Share, key, now);
             return Some(share_nudge_line(count, &domains));
         }
@@ -305,16 +325,23 @@ fn record(state_dir: &std::path::Path, kind: NudgeKind, identity: &str, now: Dat
 /// install with no team domains from paying for this at all. A domain whose
 /// origin is mid-operation is skipped too, without waiting for it: an ask is
 /// worth no part of the latency of a write that has already landed.
+///
+/// A domain in `hidden` ([`Engine::hidden_for`] of the caller) is skipped the
+/// same way and before any walk: a private team domain the caller may not see
+/// is neither named in the ask nor counted in it. A folder walk counts
+/// everybody's work, so without this any account that writes anywhere would
+/// learn that the domain exists and how much it owes.
 async fn unshared_team_work(
     engine: &Engine,
     config: &GlobalConfig,
     identity: Option<&str>,
+    hidden: &HashSet<String>,
 ) -> (u64, Vec<String>) {
     let actor = identity.unwrap_or(crate::engine::OWNER_IDENTITY_NAME);
     let mut changes = 0u64;
     let mut names = Vec::new();
     for (name, entry) in &config.domains {
-        if entry.origin.is_none() {
+        if entry.origin.is_none() || hidden.contains(name) {
             continue;
         }
         let count = if entry.is_overlay() {
