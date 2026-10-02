@@ -1,5 +1,0 @@
-# Temporary, reverted with the ubuntu-26.04 trial commit: actionlint 1.7.12
-# predates the ubuntu-26.04 label and would reject it as unknown.
-self-hosted-runner:
-  labels:
-    - ubuntu-26.04

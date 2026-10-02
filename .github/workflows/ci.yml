@@ -63,7 +63,7 @@ jobs:
   changes:
     name: changes
     timeout-minutes: 10
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     # The artifact lookup needs actions: read. Naming one permission drops the
     # rest to none, so checkout's contents: read is named as well.
     permissions:
@@ -231,7 +231,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-26.04, ubuntu-24.04-arm, macos-latest, windows-latest]
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
         include:
           # candle-core pulls in gemm-f16, whose aarch64 NEON kernels emit
           # fullfp16 asm without gating it behind a target-feature check
@@ -277,7 +277,7 @@ jobs:
 
       # Formatting does not depend on the OS, so one leg checks it.
       - name: cargo fmt --check
-        if: ${{ matrix.os == 'ubuntu-26.04' && needs.changes.outputs.tested != 'true' }}
+        if: ${{ matrix.os == 'ubuntu-latest' && needs.changes.outputs.tested != 'true' }}
         run: cargo fmt --all --check
 
       - name: cargo clippy
@@ -288,9 +288,7 @@ jobs:
       # arm one): every test of the workspace run below that reads
       # CRYSTALLINE_TEST_POSTGRES_URL runs its postgres leg against this
       # container instead of skipping it, in the same build and the same
-      # cache entry (shared-key: test) as the rest of the leg. The leg is
-      # named twice so the condition holds for ubuntu-latest and for the
-      # ubuntu-26.04 label the image migration test runs under. Started with
+      # cache entry (shared-key: test) as the rest of the leg. Started with
       # docker run rather than as a job service because a service cannot be
       # limited to one matrix leg. The readiness probe goes over TCP inside
       # the container: the image's init phase runs a socket-only server, so
@@ -299,7 +297,7 @@ jobs:
       # CREATE EXTENSION is always a no-op and the parallel per-test schema
       # creation is race free.
       - name: Start postgres with pgvector
-        if: ${{ (matrix.os == 'ubuntu-latest' || matrix.os == 'ubuntu-26.04') && needs.changes.outputs.tested != 'true' }}
+        if: ${{ matrix.os == 'ubuntu-latest' && needs.changes.outputs.tested != 'true' }}
         run: |
           set -euo pipefail
           docker run -d --name pg \
@@ -342,7 +340,7 @@ jobs:
     timeout-minutes: 20
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && needs.changes.outputs.tested != 'true' }}
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     env:
       # Corepack fetches the pinned pnpm on first use, and the confirmation it
       # would otherwise ask for has nobody to answer it here. Set the same way
@@ -443,7 +441,7 @@ jobs:
     timeout-minutes: 20
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && needs.changes.outputs.tested != 'true' }}
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     env:
       # See the fluid job: corepack must not stop to ask before fetching pnpm.
       COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
@@ -527,7 +525,7 @@ jobs:
     timeout-minutes: 10
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && needs.changes.outputs.tested != 'true' }}
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -561,7 +559,7 @@ jobs:
   style:
     name: style
     timeout-minutes: 10
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -589,7 +587,7 @@ jobs:
   workflow-lint:
     name: workflow-lint
     timeout-minutes: 10
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -613,7 +611,7 @@ jobs:
   cargo-deny:
     name: cargo-deny
     timeout-minutes: 10
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -634,7 +632,7 @@ jobs:
   fluid-audit:
     name: fluid-audit
     timeout-minutes: 10
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     env:
       COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
     defaults:
@@ -689,7 +687,7 @@ jobs:
     timeout-minutes: 30
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && needs.changes.outputs.tested != 'true' }}
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -725,7 +723,7 @@ jobs:
     timeout-minutes: 10
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -763,7 +761,7 @@ jobs:
       - verify-action
       - workflow-lint
     if: ${{ github.event_name == 'pull_request' }}
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     steps:
       # The commit every job above checked out: refs/pull/N/merge at
       # github.sha.

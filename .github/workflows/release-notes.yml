@@ -17,7 +17,7 @@ permissions:
 jobs:
   sync:
     name: sync
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     # contents: write for `gh release edit`, which rewrites a release's notes.
     permissions:
       contents: write
