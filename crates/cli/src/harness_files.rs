@@ -10,7 +10,6 @@
 use std::path::{Path, PathBuf};
 
 use crystalline_core::HarnessKind;
-use crystalline_core::config;
 
 use crate::receipt;
 
@@ -49,8 +48,35 @@ pub(crate) fn backup_once(
     }
     let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
     let backup = dir.join(format!("{name}.{stamp}"));
-    config::save_bytes(&backup, bytes)?;
+    write_private(&backup, bytes)?;
     Ok(Some(backup))
+}
+
+/// Write a backup that only the user can read: the file is 0600 and every
+/// folder created on the way is 0700 on unix, whatever the mode of the file
+/// it copies, because an MCP file can hold tokens.
+fn write_private(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let io = |e: std::io::Error| anyhow::anyhow!("could not write {}: {e}", path.display());
+    if let Some(dir) = path.parent()
+        && !dir.as_os_str().is_empty()
+    {
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(dir).map_err(io)?;
+    }
+    #[cfg(unix)]
+    let permissions = {
+        use std::os::unix::fs::PermissionsExt;
+        Some(std::fs::Permissions::from_mode(0o600))
+    };
+    #[cfg(not(unix))]
+    let permissions = None;
+    replace_atomically(path, bytes, permissions).map_err(io)
 }
 
 /// The first twelve hex digits of the sha256 of the full path.
@@ -145,16 +171,26 @@ fn write_in_place(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
         std::fs::create_dir_all(parent).map_err(io)?;
     }
     let permissions = std::fs::metadata(&target).ok().map(|m| m.permissions());
+    replace_atomically(&target, bytes, permissions).map_err(io)
+}
+
+/// Write `bytes` to a temporary file beside `target` with `permissions`
+/// (when given), then rename it over `target`.
+fn replace_atomically(
+    target: &Path,
+    bytes: &[u8],
+    permissions: Option<std::fs::Permissions>,
+) -> std::io::Result<()> {
     let name = target
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     let tmp = target.with_file_name(format!(".{name}.crystalline-{}.tmp", std::process::id()));
-    let result = write_new(&tmp, bytes, permissions).and_then(|()| std::fs::rename(&tmp, &target));
+    let result = write_new(&tmp, bytes, permissions).and_then(|()| std::fs::rename(&tmp, target));
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
-    result.map_err(io)
+    result
 }
 
 /// Create `tmp` with `bytes`, private while it is written when it replaces
@@ -315,7 +351,9 @@ mod tests {
         let file = tmp.path().join(".cursor/mcp.json");
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(&file, "{}\n").unwrap();
-        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // Not 0600, which the temporary file starts with: only a copied mode
+        // can make this pass.
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o640)).unwrap();
         save_edited(
             None,
             HarnessKind::Cursor,
@@ -325,8 +363,35 @@ mod tests {
         )
         .unwrap();
         let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
+        assert_eq!(mode, 0o640);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "{\"a\": 1}\n");
+    }
+
+    /// An MCP file can hold tokens: its backup is private whatever the
+    /// file's own mode, in folders only the user can enter.
+    #[cfg(unix)]
+    #[test]
+    fn a_backup_is_private_and_so_are_its_folders() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        let file = tmp.path().join("h/.cursor/mcp.json");
+        let body = "{\"mcpServers\": {\"other\": {\"env\": {\"TOKEN\": \"x\"}}}}\n";
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, body).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let w = save_edited(Some(&state), HarnessKind::Cursor, &file, Some(body), "{}\n").unwrap();
+        let backup = w.backup.expect("backed up");
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&backup), 0o600, "the backup");
+        for dir in [
+            backup.parent().unwrap().to_path_buf(),
+            state.join("backups/cursor"),
+            state.join("backups"),
+        ] {
+            assert_eq!(mode(&dir), 0o700, "{}", dir.display());
+        }
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), body);
     }
 
     /// Two files with one name in two folders each get their own backup.
