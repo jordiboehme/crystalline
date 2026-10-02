@@ -1,11 +1,14 @@
 name: Dev channel
 
-# The Homebrew dev channel: every commit on main that CI passed becomes a
-# GitHub pre-release and the formula `crystalline-dev` in
-# jordiboehme/homebrew-tap, installed with
-# `brew install jordiboehme/tap/crystalline-dev`. The one exception is the
-# merge commit of a release PR, which the stable release builds (see the
-# release check in the `version` job).
+# The Homebrew dev channel: a commit on main that CI passed becomes a GitHub
+# pre-release and the formula `crystalline-dev` in jordiboehme/homebrew-tap,
+# installed with `brew install jordiboehme/tap/crystalline-dev`, but only when
+# it asks for a dev build (see the opt-in check in the `version` job). It asks
+# when its commit message contains `[dev-build]`, or when it came from a merged
+# pull request that has the label `dev-build` or `[dev-build]` in its title or
+# body. A manual dispatch on main always builds. Without an opt-in the run
+# ends green and builds nothing, so a release PR's merge commit, which the
+# stable release builds, carries no opt-in.
 #
 # The stable channel is untouched by this: a `v*` tag runs release.yml, which
 # publishes the latest release and Formula/crystalline.rb exactly as before.
@@ -60,6 +63,10 @@ jobs:
   version:
     name: compute the dev version
     runs-on: ubuntu-latest
+    # pull-requests: read for the opt-in check's pull request lookup.
+    permissions:
+      contents: read
+      pull-requests: read
     # Only a green CI run of a push to main in this repository, for the commit
     # that is still main's tip, ships. The branches filter above matches a
     # head branch by name, so a pull request from a fork's own `main` would
@@ -78,10 +85,64 @@ jobs:
       build: ${{ steps.plan.outputs.build }}
       formula: ${{ steps.plan.outputs.formula }}
     steps:
+      # The dev channel builds only on request. A manual dispatch is a
+      # request. A CI run asks when the head commit's message contains
+      # `[dev-build]`, or when the commit came from a merged pull request that
+      # has the label `dev-build` or `[dev-build]` in its title or body. This
+      # is opt-in, so every doubt (a failed pull request lookup, unreadable
+      # output) means no build, and the run still ends green. All later steps
+      # run only when a build was asked for, so a run without an opt-in needs
+      # neither the tap token nor a checkout.
+      - name: Is a dev build asked for
+        id: ask
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+          MESSAGE: ${{ github.event.workflow_run.head_commit.message }}
+        run: |
+          set -u
+          asked() {
+            echo "dev build asked for: $1"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+          not_asked() {
+            echo "$1"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            asked "manual dispatch"
+          fi
+          if printf '%s' "$MESSAGE" | grep -qF '[dev-build]'; then
+            asked "the commit message contains [dev-build]"
+          fi
+          if ! pulls="$(gh api "repos/$REPO/commits/$SHA/pulls" 2> "$RUNNER_TEMP/pulls.err")"; then
+            cat "$RUNNER_TEMP/pulls.err"
+            not_asked "the pull request lookup for $SHA failed, so no dev build"
+          fi
+          if ! match="$(jq -r '
+              [.[]
+               | select(.merged_at != null)
+               | select(any(.labels[]?; .name == "dev-build")
+                        or ((.title // "") | contains("[dev-build]"))
+                        or ((.body // "") | contains("[dev-build]")))
+               | .number]
+              | first // empty' <<<"$pulls")"; then
+            not_asked "the pull request lookup for $SHA returned unreadable output, so no dev build"
+          fi
+          if [ -n "$match" ]; then
+            asked "pull request #$match has the dev-build label or [dev-build] in its title or body"
+          fi
+          not_asked "no [dev-build] token or dev-build label, so no dev build"
+
       # Before anything is signed or published: without the tap token the run
       # would build, notarize and publish a release and then fail to point the
       # formula at it.
       - name: The tap token is configured
+        if: steps.ask.outputs.build == 'true'
         env:
           TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
         run: |
@@ -91,6 +152,7 @@ jobs:
           fi
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.ask.outputs.build == 'true'
         with:
           # The commit CI tested, which the guard above makes main's tip.
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
@@ -99,6 +161,7 @@ jobs:
 
       - name: Compute the version
         id: version
+        if: steps.ask.outputs.build == 'true'
         run: |
           set -euo pipefail
           sha="$(git rev-parse HEAD)"
@@ -106,63 +169,6 @@ jobs:
           echo "dev version $version from $sha"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
-
-      # The release PR adds release-notes/v<X.Y.Z>.md for the version it bumps
-      # to, so its merge commit is the commit the `v<X.Y.Z>` tag and
-      # release.yml build. A dev build of the same commit would only repeat
-      # that work. The commit counts as a release commit when the notes file
-      # for the workspace version is in this commit and not in its first
-      # parent, and the tag is either not there yet or points at this very
-      # commit (the tag usually follows the merge within minutes, before this
-      # run starts). Only that one commit is skipped: the next commit on main
-      # already has the file in its parent and builds as usual, tag or not.
-      # Every doubt (no parent, an unreadable version, a failed tag lookup)
-      # prints nothing, and the run builds as before. A manual dispatch asks
-      # for a build on purpose and skips the check.
-      - name: Is this the commit a stable release builds
-        id: release
-        if: github.event_name == 'workflow_run'
-        continue-on-error: true
-        run: |
-          set +e
-          set -u
-          build_as_usual() {
-            echo "release check: $1, so this is not a release commit."
-            exit 0
-          }
-          version="$(git show HEAD:Cargo.toml | sed -n 's/^version = "\(.*\)"$/\1/p' | head -1)"
-          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            build_as_usual "the workspace version '$version' is not X.Y.Z"
-          fi
-          tag="v$version"
-          notes="release-notes/$tag.md"
-          if ! git cat-file -e "HEAD:$notes" 2>/dev/null; then
-            build_as_usual "$notes is not in this commit"
-          fi
-          if ! git rev-parse --verify --quiet 'HEAD^1^{commit}' >/dev/null; then
-            build_as_usual "this commit has no parent to compare against"
-          fi
-          if git cat-file -e "HEAD^1:$notes" 2>/dev/null; then
-            build_as_usual "$notes was already in the parent commit"
-          fi
-          if ! refs="$(git ls-remote --tags origin)"; then
-            build_as_usual "the tag lookup failed"
-          fi
-          head="$(git rev-parse HEAD)"
-          # An annotated tag lists its own object and, as <tag>^{}, the commit.
-          target="$(awk -v t="refs/tags/$tag" '$2 == t "^{}" { print $1 }' <<<"$refs")"
-          if [ -z "$target" ]; then
-            target="$(awk -v t="refs/tags/$tag" '$2 == t { print $1 }' <<<"$refs")"
-          fi
-          if [ -n "$target" ] && [ "$target" != "$head" ]; then
-            build_as_usual "the tag $tag already points at another commit ($target)"
-          fi
-          where="not there yet"
-          if [ -n "$target" ]; then
-            where="at this commit"
-          fi
-          echo "release check: this commit adds $notes and the tag $tag is $where: release.yml builds it, so the dev channel skips it."
-          echo "release=$tag" >> "$GITHUB_OUTPUT"
 
       # What this run does, from the published dev releases and the tap's
       # current formula (scripts/dev-plan.sh has the rules): build and publish
@@ -172,11 +178,11 @@ jobs:
       # finishes the formula.
       - name: Plan the run
         id: plan
+        if: steps.ask.outputs.build == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
           VERSION: ${{ steps.version.outputs.version }}
-          RELEASE: ${{ steps.release.outputs.release }}
         run: |
           set -euo pipefail
           gh release list --repo "${{ github.repository }}" --limit 200 \
@@ -198,7 +204,7 @@ jobs:
             fi
           fi
 
-          bash scripts/dev-plan.sh "$VERSION" "$RUNNER_TEMP/releases.json" "$formula" "$RELEASE" | tee -a "$GITHUB_OUTPUT"
+          bash scripts/dev-plan.sh "$VERSION" "$RUNNER_TEMP/releases.json" "$formula" | tee -a "$GITHUB_OUTPUT"
 
   build:
     name: build

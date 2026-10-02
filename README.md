@@ -94,7 +94,7 @@ Via MSI: download `crystalline-<version>-windows-amd64.msi` (or `crystalline-<ve
 <details>
 <summary>Dev channel</summary>
 
-Every change on main that passes CI is built and published as a pre-release, installable with Homebrew (the merge of a release itself is skipped, because the stable release builds that commit):
+A change on main that passes CI is built and published as a pre-release, installable with Homebrew, when it asks for a dev build: put `[dev-build]` in the commit message, or merge it through a pull request that has the `dev-build` label or `[dev-build]` in its title or description. A maintainer can also run the Dev channel workflow by hand on main. Other changes, including the merge of a release, build no dev release:
 
 ```sh
 brew uninstall crystalline   # if you have the stable release

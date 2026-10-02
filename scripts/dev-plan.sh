@@ -19,26 +19,19 @@
 # dev.yml's publish job deletes a leftover draft of the same tag before it
 # creates the release, so a draft never blocks a version.
 #
-# - A commit the stable release builds (a release PR's merge commit, named by
-#   the optional <release-tag>, which dev.yml's release check sets) builds
-#   nothing and leaves the formula alone when it would otherwise be a new
-#   build: release.yml builds the same commit, and the next commit on main
-#   builds the dev channel as usual. A release that already exists is still
-#   finished as above.
+# dev.yml runs this only when a dev build was asked for (its opt-in check).
 #
-#   bash scripts/dev-plan.sh <version> <releases.json> <formula.rb> [<release-tag>]
+#   bash scripts/dev-plan.sh <version> <releases.json> <formula.rb>
 #
 # <releases.json> is `gh release list --json tagName,isPrerelease,isDraft`.
 # <formula.rb> is the tap's current Formula/crystalline-dev.rb; a missing or
-# empty file means there is none yet. <release-tag> is empty or missing for
-# every other commit. Prints build=... and formula=... for $GITHUB_OUTPUT, and
-# the reasoning on stderr.
+# empty file means there is none yet. Prints build=... and formula=... for
+# $GITHUB_OUTPUT, and the reasoning on stderr.
 set -euo pipefail
 
 version="${1:-}"
 releases="${2:-}"
 formula="${3:-}"
-release_tag="${4:-}"
 
 if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-dev\.([0-9]+)$ ]]; then
   echo "dev-plan: '$version' is not a dev version like 0.22.0-dev.4817" >&2
@@ -91,10 +84,6 @@ if [ "$exists" = "true" ]; then
     formula_update=false
     echo "dev-plan: released already and the formula is not behind: nothing to do" >&2
   fi
-elif [ "$n" -gt "$max" ] && [ -n "$release_tag" ]; then
-  build=false
-  formula_update=false
-  echo "dev-plan: newer than every published dev release, but this is the commit the stable release $release_tag builds: nothing to do" >&2
 elif [ "$n" -gt "$max" ]; then
   build=true
   formula_update=true
