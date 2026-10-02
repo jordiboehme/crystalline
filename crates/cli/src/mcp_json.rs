@@ -237,13 +237,13 @@ mod tests {
 
     #[test]
     fn harness_defaults_beside_our_entry_still_read_as_ours() {
-        let e = serde_json::json!({"command": "/x/crystalline", "args": ["mcp", "--harness", "kiro"], "env": {}, "disabled": false, "autoApprove": []});
+        let e = serde_json::json!({"command": TEST_PROGRAM, "args": ["mcp", "--harness", "kiro"], "env": {}, "disabled": false, "autoApprove": []});
         assert_eq!(classify(HarnessKind::Kiro, &e), EntryState::UpToDate);
         for customised in [
-            serde_json::json!({"command": "/x/crystalline", "args": ["mcp", "--harness", "kiro"], "env": {"RUST_LOG": "debug"}}),
-            serde_json::json!({"command": "/x/crystalline", "args": ["mcp", "--harness", "kiro", "--db", "/tmp/x"]}),
+            serde_json::json!({"command": TEST_PROGRAM, "args": ["mcp", "--harness", "kiro"], "env": {"RUST_LOG": "debug"}}),
+            serde_json::json!({"command": TEST_PROGRAM, "args": ["mcp", "--harness", "kiro", "--db", "/tmp/x"]}),
             serde_json::json!({"url": "https://team.example/mcp"}),
-            serde_json::json!({"command": "/x/crystalline", "args": ["mcp", "--harness", "kiro"], "timeout": 600000}),
+            serde_json::json!({"command": TEST_PROGRAM, "args": ["mcp", "--harness", "kiro"], "timeout": 600000}),
             serde_json::json!({"command": "other", "args": ["mcp", "--harness", "kiro"]}),
         ] {
             assert_eq!(
