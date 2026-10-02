@@ -16,7 +16,11 @@
 //! [`ModelSlot`] logs one warn line, reloads that model on the CPU once,
 //! retries the failed call there and keeps the model on the CPU for the rest
 //! of the process; the report then says `cpu (metal failed at runtime: ..)`.
-//! Each model has its own slot, so the other model keeps its device.
+//! Each model has its own slot, so the other model keeps its device. The
+//! process remembers the failure by model name, so a later load of the same
+//! model in this process (the contradiction model after its idle drop, the
+//! embedding provider after a config change) goes straight to the CPU with
+//! the same report and never opens the GPU again.
 //!
 //! `CRYSTALLINE_ACCELERATION=off` forces the CPU.
 //!
@@ -149,6 +153,16 @@ pub fn probe() -> Option<DeviceReport> {
 #[cfg(feature = "local-embeddings")]
 pub use slot::ModelSlot;
 
+/// The name the embedding model loads and logs under, and the key its runtime
+/// failure is remembered by.
+#[cfg(feature = "local-embeddings")]
+pub(crate) const EMBEDDING_MODEL: &str = "embedding model";
+
+/// The name the contradiction model loads and logs under, and the key its
+/// runtime failure is remembered by.
+#[cfg(feature = "local-embeddings")]
+pub(crate) const CONTRADICTION_MODEL: &str = "contradiction model";
+
 #[cfg(feature = "local-embeddings")]
 pub(crate) use loader::load_on_best_device;
 #[cfg(all(feature = "local-embeddings", test))]
@@ -161,6 +175,7 @@ mod loader {
 
     use candle_core::Device;
 
+    use super::slot::failed_at_runtime;
     use super::{ACCELERATION_BUILT_IN, CpuReason, DeviceKind, DeviceReport, acceleration_off};
     use crate::error::Result;
 
@@ -172,6 +187,9 @@ mod loader {
         Off,
         /// A GPU could not be opened: CPU, with the reason.
         Unusable(String),
+        /// This model already failed on the GPU at runtime in this process:
+        /// CPU, with that reason, and the GPU is not opened.
+        FailedAtRuntime(String),
         /// Try this device first.
         ///
         /// Only Apple Silicon builds construct it outside the tests; elsewhere
@@ -253,6 +271,10 @@ mod loader {
                 kind: DeviceKind::Cpu,
                 reason: Some(CpuReason::Fallback(reason)),
             },
+            Accelerator::FailedAtRuntime(reason) => DeviceReport {
+                kind: DeviceKind::Cpu,
+                reason: Some(CpuReason::Runtime(reason)),
+            },
             Accelerator::Device(_, kind) => DeviceReport { kind, reason: None },
         }
     }
@@ -260,13 +282,19 @@ mod loader {
     /// Build a model on the best device: the accelerator when one is usable
     /// and the model both builds and passes `warm` there, the CPU otherwise.
     /// Only a CPU failure is returned as an error, so a caller's recovery
-    /// (the corrupt-cache self-heal) never runs because of a GPU.
+    /// (the corrupt-cache self-heal) never runs because of a GPU. A model
+    /// that already failed on the GPU at runtime in this process loads on the
+    /// CPU without the GPU being opened.
     pub(crate) fn load_on_best_device<T>(
         what: &str,
         build: impl Fn(&Device) -> Result<T>,
         warm: impl Fn(&T) -> Result<()>,
     ) -> Result<(T, DeviceReport)> {
-        load_with(what, accelerator(acceleration_off()), build, warm)
+        let accelerator = match failed_at_runtime(what) {
+            Some(reason) => Accelerator::FailedAtRuntime(reason),
+            None => accelerator(acceleration_off()),
+        };
+        load_with(what, accelerator, build, warm)
     }
 
     /// [`load_on_best_device`] with the accelerator handed in: the seam the
@@ -277,10 +305,16 @@ mod loader {
         build: impl Fn(&Device) -> Result<T>,
         warm: impl Fn(&T) -> Result<()>,
     ) -> Result<(T, DeviceReport)> {
+        // The remembered runtime failure wins over any device handed in.
+        let accelerator = match failed_at_runtime(what) {
+            Some(reason) => Accelerator::FailedAtRuntime(reason),
+            None => accelerator,
+        };
         let reason = match accelerator {
             Accelerator::None => None,
             Accelerator::Off => Some(CpuReason::Off),
             Accelerator::Unusable(reason) => Some(CpuReason::Fallback(reason)),
+            Accelerator::FailedAtRuntime(reason) => Some(CpuReason::Runtime(reason)),
             Accelerator::Device(device, kind) => {
                 // A panic in candle's GPU code (it unwraps in places) is caught
                 // here, so it falls back like an error instead of unwinding
@@ -328,6 +362,7 @@ mod loader {
 
 #[cfg(feature = "local-embeddings")]
 mod slot {
+    use std::collections::BTreeMap;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -339,6 +374,27 @@ mod slot {
     /// Rebuilds a model on the CPU, with no warm-up and no self-heal.
     type Rebuild<T> = Box<dyn Fn() -> Result<T> + Send + Sync>;
 
+    /// The models that gave up the GPU at runtime in this process, by name,
+    /// with the reason. A slot writes here; the loader reads it, so a model
+    /// loaded again later in the process stays on the CPU.
+    static FAILED_AT_RUNTIME: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
+
+    /// The reason `what` gave up the GPU at runtime in this process, if it did.
+    pub(super) fn failed_at_runtime(what: &str) -> Option<String> {
+        FAILED_AT_RUNTIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(what)
+            .cloned()
+    }
+
+    fn remember_runtime_failure(what: &str, reason: &str) {
+        FAILED_AT_RUNTIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(what.to_string(), reason.to_string());
+    }
+
     /// One loaded model and the device it runs on, moved to the CPU when the
     /// GPU fails after a good load.
     ///
@@ -347,7 +403,9 @@ mod slot {
     /// when it errors or panics, the slot logs one warn line, rebuilds the
     /// model on the CPU, swaps it in with a [`CpuReason::Runtime`] report and
     /// retries the call once there. From then on nothing calls the GPU for
-    /// this model until the process restarts.
+    /// this model until the process restarts: the failure is remembered by
+    /// `what`, and a later load of the same model in this process goes to the
+    /// CPU without opening the GPU.
     ///
     /// Concurrency: the model sits behind an `Arc` that a call clones under a
     /// short read lock, so no lock is held across inference (a caught panic
@@ -476,6 +534,7 @@ mod slot {
                         "{}: {reason}; moving it to the cpu for the rest of this process",
                         self.what
                     );
+                    remember_runtime_failure(self.what, &reason);
                     live.model = None;
                     live.report = DeviceReport {
                         kind: DeviceKind::Cpu,
@@ -794,6 +853,9 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::{Arc, Barrier};
 
+        use candle_core::Device;
+
+        use super::super::loader::{Accelerator, load_with};
         use super::super::{CpuReason, DeviceKind, DeviceReport, ModelSlot};
         use crate::error::{IndexError, Result};
 
@@ -823,11 +885,13 @@ mod tests {
             }
         }
 
-        /// A slot holding the GPU instance, rebuilding a CPU one.
-        fn gpu_slot(counts: &Arc<Counts>) -> ModelSlot<Stub> {
+        /// A slot holding the GPU instance, rebuilding a CPU one. Each test
+        /// names its own model, because a runtime failure is remembered by
+        /// name for the whole process.
+        fn gpu_slot(what: &'static str, counts: &Arc<Counts>) -> ModelSlot<Stub> {
             let rebuild_counts = counts.clone();
             ModelSlot::new(
-                "test model",
+                what,
                 Stub {
                     gpu: true,
                     counts: counts.clone(),
@@ -859,7 +923,7 @@ mod tests {
         #[test]
         fn no_failure_means_no_change() {
             let counts = Arc::new(Counts::default());
-            let slot = gpu_slot(&counts);
+            let slot = gpu_slot("no failure means no change", &counts);
             for x in 0..5 {
                 assert_eq!(slot.run(|m| Ok(m.double(x))).unwrap(), x * 2);
             }
@@ -871,7 +935,10 @@ mod tests {
         #[test]
         fn a_gpu_error_moves_the_model_to_the_cpu_and_retries_there() {
             let counts = Arc::new(Counts::default());
-            let slot = gpu_slot(&counts);
+            let slot = gpu_slot(
+                "a gpu error moves the model to the cpu and retries there",
+                &counts,
+            );
             assert_eq!(slot.run(|m| gpu_breaks(m, 21)).unwrap(), 42, "retried");
             let report = slot.report();
             assert_eq!(report.kind, DeviceKind::Cpu);
@@ -897,7 +964,7 @@ mod tests {
         #[test]
         fn a_gpu_panic_moves_the_model_to_the_cpu() {
             let counts = Arc::new(Counts::default());
-            let slot = gpu_slot(&counts);
+            let slot = gpu_slot("a gpu panic moves the model to the cpu", &counts);
             let out = slot
                 .run(|m| {
                     if m.gpu {
@@ -919,7 +986,10 @@ mod tests {
         #[test]
         fn an_injected_failure_reaches_the_fallback_without_touching_the_model() {
             let counts = Arc::new(Counts::default());
-            let slot = gpu_slot(&counts);
+            let slot = gpu_slot(
+                "an injected failure reaches the fallback without touching the model",
+                &counts,
+            );
             slot.inject_runtime_failure(1);
             assert_eq!(slot.run(|m| Ok(m.double(3))).unwrap(), 6);
             assert_eq!(counts.gpu_calls.load(Ordering::SeqCst), 0);
@@ -934,7 +1004,7 @@ mod tests {
         fn a_model_on_the_cpu_returns_its_error_and_never_rebuilds() {
             let counts = Arc::new(Counts::default());
             let slot = ModelSlot::new(
-                "test model",
+                "cpu model",
                 Stub {
                     gpu: false,
                     counts: counts.clone(),
@@ -962,7 +1032,7 @@ mod tests {
             let attempts = Arc::new(AtomicUsize::new(0));
             let (rebuild_counts, rebuild_attempts) = (counts.clone(), attempts.clone());
             let slot = ModelSlot::new(
-                "test model",
+                "failing rebuild model",
                 Stub {
                     gpu: true,
                     counts: counts.clone(),
@@ -998,7 +1068,10 @@ mod tests {
         fn concurrent_failures_cause_exactly_one_rebuild() {
             const REQUESTS: usize = 8;
             let counts = Arc::new(Counts::default());
-            let slot = Arc::new(gpu_slot(&counts));
+            let slot = Arc::new(gpu_slot(
+                "concurrent failures cause exactly one rebuild",
+                &counts,
+            ));
             let barrier = Arc::new(Barrier::new(REQUESTS));
             let handles: Vec<_> = (0..REQUESTS as u32)
                 .map(|x| {
@@ -1026,6 +1099,48 @@ mod tests {
             assert_eq!(counts.gpu_calls.load(Ordering::SeqCst), REQUESTS);
             assert_eq!(counts.cpu_calls.load(Ordering::SeqCst), REQUESTS);
             assert_eq!(slot.report().kind, DeviceKind::Cpu);
+        }
+
+        /// A model dropped and loaded again later in the process (the
+        /// contradiction model after its idle drop) stays on the CPU with the
+        /// runtime reason; the GPU is never tried. Another model is not
+        /// affected.
+        #[test]
+        fn a_reload_after_a_runtime_failure_stays_on_the_cpu() {
+            const WHAT: &str = "reloaded model";
+            let counts = Arc::new(Counts::default());
+            let slot = gpu_slot(WHAT, &counts);
+            slot.run(|m| gpu_breaks(m, 1)).unwrap();
+            let failed = slot.report();
+            drop(slot);
+
+            let gpu = Accelerator::Device(Device::Cpu, DeviceKind::Metal);
+            let (model, report) = load_with(
+                WHAT,
+                gpu,
+                |device| {
+                    assert!(matches!(device, Device::Cpu));
+                    Ok(7u8)
+                },
+                |_| panic!("the GPU is never tried, so nothing is warmed up"),
+            )
+            .unwrap();
+            assert_eq!(model, 7);
+            assert_eq!(report, failed, "the same report after the reload");
+            assert!(report.runtime_failure().is_some(), "{report}");
+
+            let (_, other) = load_with(
+                "another model",
+                Accelerator::Device(Device::Cpu, DeviceKind::Metal),
+                |_| Ok(()),
+                |_| Ok(()),
+            )
+            .unwrap();
+            assert_eq!(
+                other,
+                DeviceReport::metal(),
+                "the other model keeps its device"
+            );
         }
     }
 }

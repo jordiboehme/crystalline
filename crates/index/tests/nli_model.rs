@@ -239,6 +239,12 @@ async fn a_runtime_gpu_failure_scores_the_batch_again_on_the_cpu() {
             "cpu (metal failed at runtime: contradiction model error: injected runtime failure)"
         );
         eprintln!("runtime fallback: {before:?} on metal, {after:?} on the cpu");
+        // A load later in the process (the daemon's reload after the idle
+        // drop) stays on the CPU. The failure is remembered for the whole
+        // process, which is why these tests run under nextest, one process
+        // per test.
+        let reloaded = LocalNli::load(model).await.unwrap();
+        assert_eq!(reloaded.device().unwrap(), now, "no second try on metal");
     } else {
         assert_eq!(now, device, "nothing to fall back from");
     }

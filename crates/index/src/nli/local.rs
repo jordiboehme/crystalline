@@ -40,7 +40,7 @@ use super::models::NliModel;
 #[cfg(test)]
 use super::models::{NliProfile, nli_model};
 use super::{ContradictionScorer, MAX_LINE_TOKENS, contradiction_index};
-use crate::device::{DeviceReport, ModelSlot, load_on_best_device};
+use crate::device::{CONTRADICTION_MODEL, DeviceReport, ModelSlot, load_on_best_device};
 use crate::embed::models::{note_loaded_snapshot, remove_failed_snapshot};
 use crate::error::{IndexError, Result};
 use crate::hub::{HubFiles, HubRepo, ensure_files, models_cache_dir, pad_id, read};
@@ -285,12 +285,12 @@ where
 async fn build_on_blocking(files: HubFiles, model: &'static NliModel) -> Result<LocalNli> {
     tokio::task::spawn_blocking(move || {
         let (loaded, report) = load_on_best_device(
-            "contradiction model",
+            CONTRADICTION_MODEL,
             |device| build(&files, model, device),
             warm_up,
         )?;
         let slot = ModelSlot::new(
-            "contradiction model",
+            CONTRADICTION_MODEL,
             loaded,
             report,
             IndexError::Nli,

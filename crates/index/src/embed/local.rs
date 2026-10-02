@@ -35,7 +35,7 @@ use super::models::{
 };
 use super::modernbert::{Config as ModernBertConfig, ModernBert};
 use super::{DEFAULT_MODEL_ID, EmbeddingProvider};
-use crate::device::{DeviceReport, ModelSlot, load_on_best_device};
+use crate::device::{DeviceReport, EMBEDDING_MODEL, ModelSlot, load_on_best_device};
 use crate::error::{IndexError, Result};
 use crate::hub::{HubFiles, HubRepo, cache_client, ensure_files, models_cache_dir, pad_id, read};
 
@@ -360,12 +360,12 @@ async fn build_on_blocking(
 ) -> Result<ModelSlot<Encoder>> {
     tokio::task::spawn_blocking(move || {
         let (encoder, report) = load_on_best_device(
-            "embedding model",
+            EMBEDDING_MODEL,
             |device| build_encoder(&files, model, device),
             |encoder| embed_texts(encoder, &["warm-up".to_string()]).map(|_| ()),
         )?;
         Ok(ModelSlot::new(
-            "embedding model",
+            EMBEDDING_MODEL,
             encoder,
             report,
             IndexError::Embedding,

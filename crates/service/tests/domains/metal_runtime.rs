@@ -208,7 +208,7 @@ async fn semantic(engine: &Engine, query: &str) -> serde_json::Value {
 async fn a_search_survives_a_gpu_failure_and_the_model_stays_on_the_cpu() {
     let counts = Arc::new(Counts::default());
     let provider = Arc::new(SlotEmbedder {
-        slot: slot("embedding model", &counts, IndexError::Embedding),
+        slot: slot("test embedding model", &counts, IndexError::Embedding),
     });
     let (_tmp, engine) = engine_on(provider).await;
     three(&engine).await;
@@ -262,7 +262,7 @@ async fn the_scoring_pass_completes_on_the_cpu_after_a_gpu_failure() {
     let counts = Arc::new(Counts::default());
     counts.gpu_broken.store(true, Ordering::SeqCst);
     let scorer: Arc<dyn ContradictionScorer> = Arc::new(SlotScorer {
-        slot: slot("contradiction model", &counts, IndexError::Nli),
+        slot: slot("test contradiction model", &counts, IndexError::Nli),
         stub: StubScorer::new(full().repo, 0.05).with(
             "The build uses Node 18",
             "The build uses Node 20",
