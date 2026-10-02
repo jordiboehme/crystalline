@@ -215,7 +215,7 @@ jobs:
             run_the_tests "no pull request run of this repository left an unexpired $name"
           fi
 
-          echo "tested: the pull request run(s) $runs passed every job on the tree $tree, so the test legs only compile and the other heavy jobs are skipped."
+          echo "tested: the pull request run(s) $runs passed every gated job on the tree $tree, so the test legs only compile and the other heavy jobs are skipped."
           echo "tested=true" >>"$GITHUB_OUTPUT"
 
   test:
@@ -647,11 +647,14 @@ jobs:
           comment: 'false'
 
   # The proof `changes` looks for on main: this pull request run passed every
-  # job on this tree. A job `if` without a status function means `success() &&
-  # ...`, and a skipped need skips this job, so a run with a failed, cancelled
-  # or skipped job uploads nothing. That includes a documentation-only pull
-  # request, whose heavy jobs were skipped; main's own classifier skips the
-  # same tree anyway.
+  # gated job on this tree. A job `if` without a status function means
+  # `success() && ...`, and a skipped need skips this job, so a run with a
+  # failed, cancelled or skipped gated job uploads nothing. That includes a
+  # documentation-only pull request, whose heavy jobs were skipped; main's own
+  # classifier skips the same tree anyway. The ungated jobs (style, cargo-deny,
+  # fluid-audit) are left out on purpose: they run again on every push to main,
+  # and the two audits can go red on a new advisory that has nothing to do with
+  # this tree.
   ci-passed:
     name: ci-passed
     timeout-minutes: 10
@@ -662,9 +665,6 @@ jobs:
       - fluid
       - fluid-smoke
       - fluid-image
-      - style
-      - cargo-deny
-      - fluid-audit
       - musl-spike
       - verify-action
     if: ${{ github.event_name == 'pull_request' }}
@@ -679,7 +679,7 @@ jobs:
         run: |
           set -euo pipefail
           tree=$(git rev-parse 'HEAD^{tree}')
-          echo "ci-passed: every job passed on the tree $tree (commit $GITHUB_SHA)"
+          echo "ci-passed: every gated job passed on the tree $tree (commit $GITHUB_SHA)"
           echo "tree=$tree" >>"$GITHUB_OUTPUT"
           mkdir -p "$RUNNER_TEMP/tested-tree"
           printf 'tree %s\ncommit %s\nrun %s\n' "$tree" "$GITHUB_SHA" "$GITHUB_RUN_ID" \
