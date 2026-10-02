@@ -589,10 +589,17 @@ fn harness_notes(harness: HarnessKind, book: &Receipt, hook_done: bool) -> Vec<S
                 );
             }
         }
+        HarnessKind::Kiro => {
+            if hook_done {
+                notes.push(
+                    "Kiro CLI 2.x and custom agents may not run hooks from ~/.kiro/hooks. The steering file ~/.kiro/steering/crystalline.md points the agent at the routing block either way."
+                        .to_string(),
+                );
+            }
+        }
         HarnessKind::ClaudeCode
         | HarnessKind::Codex
         | HarnessKind::Copilot
-        | HarnessKind::Kiro
         | HarnessKind::Gemini
         | HarnessKind::Qwen => {}
     }
