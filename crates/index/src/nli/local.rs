@@ -456,6 +456,24 @@ mod tests {
         .unwrap()
     }
 
+    /// M9 of the 0.22 review: a download that sent nothing for the stall
+    /// window comes out of `hub.rs` as an `Embedding` error and must reach
+    /// the engine as `NliFetch`, which the daemon tries again after its
+    /// backoff, never as a build error that blocks the model. The same holds
+    /// for the refusal while a dropped download may still be writing.
+    #[test]
+    fn a_stalled_download_is_a_fetch_error_the_daemon_retries() {
+        for message in [
+            "downloading model.safetensors for contradiction model a/b: no data arrived for 120 s",
+            "downloading model.safetensors for contradiction model a/b: a previous download of model.safetensors may still be running",
+        ] {
+            match as_fetch(IndexError::Embedding(message.to_string())) {
+                IndexError::NliFetch(m) => assert_eq!(m, message),
+                other => panic!("not a fetch error: {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn a_line_over_254_tokens_is_cut_on_a_token_boundary() {
         let t = words();

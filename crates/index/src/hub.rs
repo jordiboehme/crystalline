@@ -12,12 +12,12 @@
 
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crystalline_core::config;
-use hf_hub::progress::{DownloadEvent, ProgressEvent, ProgressHandler};
+use hf_hub::progress::{DownloadEvent, Progress, ProgressEvent, ProgressHandler};
 use hf_hub::{HFClient, HFError};
 use indexmap::IndexMap;
 use tokenizers::Tokenizer;
@@ -112,6 +112,66 @@ impl HubFiles {
     }
 }
 
+/// How long a download may go without a progress event before it is given
+/// up: a no-progress watchdog, not an overall timeout, because 558 MB on a
+/// slow link is a legitimate long download. See [`ensure_files_with`].
+pub(crate) const HUB_STALL_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The limits one fetch runs under. Production uses [`HubLimits::default`];
+/// a test passes a short stall window so it runs in well under a second.
+pub(crate) struct HubLimits {
+    /// How long one file's download may go without a progress event.
+    pub stall: Duration,
+}
+
+impl Default for HubLimits {
+    fn default() -> Self {
+        HubLimits {
+            stall: HUB_STALL_TIMEOUT,
+        }
+    }
+}
+
+/// The instant of the last download event of any kind, the clock the stall
+/// watchdog in [`ensure_files_with`] reads. It is attached to every download,
+/// alone or inside [`ByteProgress`], so the watchdog works whether or not a
+/// progress line is drawn. The first window starts at construction, which
+/// covers the HEAD and metadata requests that emit no event.
+pub(crate) struct StallClock {
+    origin: Instant,
+    /// Nanoseconds from `origin` to the last event.
+    last: AtomicU64,
+}
+
+impl StallClock {
+    pub(crate) fn new() -> Self {
+        StallClock {
+            origin: Instant::now(),
+            last: AtomicU64::new(0),
+        }
+    }
+
+    fn tick(&self) {
+        let nanos = u64::try_from(self.origin.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.last.fetch_max(nanos, Ordering::Relaxed);
+    }
+
+    /// How long it has been since the last event, or since construction.
+    fn quiet_for(&self) -> Duration {
+        self.origin
+            .elapsed()
+            .saturating_sub(Duration::from_nanos(self.last.load(Ordering::Relaxed)))
+    }
+}
+
+impl ProgressHandler for StallClock {
+    fn on_progress(&self, event: &ProgressEvent) {
+        if let ProgressEvent::Download(_) = event {
+            self.tick();
+        }
+    }
+}
+
 /// Adapts hf-hub's [`ProgressHandler`] events into a single carriage-return
 /// byte-progress line on stderr, throttled to about ten renders a second so a
 /// fast local connection does not flood the terminal with one write per event.
@@ -121,18 +181,21 @@ impl HubFiles {
 /// `on_progress` takes `&self` and may be called from any task, so the counters
 /// are interior-mutable. The file name is not carried by the events - a
 /// download's `Start` reports totals only - so it is set at construction, where
-/// the caller knows which file it asked for.
+/// the caller knows which file it asked for. Every download event also feeds
+/// the fetch's [`StallClock`], so one handler is attached per file.
 pub(crate) struct ByteProgress {
     filename: String,
+    clock: Arc<StallClock>,
     total: AtomicU64,
     downloaded: AtomicU64,
     last_render: Mutex<Option<Instant>>,
 }
 
 impl ByteProgress {
-    pub(crate) fn new(filename: &str) -> Self {
+    pub(crate) fn new(filename: &str, clock: Arc<StallClock>) -> Self {
         ByteProgress {
             filename: filename.to_string(),
+            clock,
             total: AtomicU64::new(0),
             downloaded: AtomicU64::new(0),
             last_render: Mutex::new(None),
@@ -170,6 +233,7 @@ impl ByteProgress {
 
 impl ProgressHandler for ByteProgress {
     fn on_progress(&self, event: &ProgressEvent) {
+        self.clock.on_progress(event);
         match event {
             ProgressEvent::Download(DownloadEvent::Start { total_bytes, .. }) => {
                 self.total.store(*total_bytes, Ordering::Relaxed);
@@ -220,13 +284,18 @@ impl ProgressHandler for ByteProgress {
 /// ([`HubRepo::revision`]), so a cache holding another commit counts as not
 /// cached here. `announce` false drops the notice and the progress line, for
 /// a daemon's quiet background fetch.
+///
+/// A download that sends nothing for [`HUB_STALL_TIMEOUT`] fails as a
+/// download error instead of hanging (see [`ensure_files_with`]). Both the
+/// embedding model's first-use download and the contradiction model's come
+/// through here, so the watchdog guards both.
 pub(crate) async fn ensure_files(
     cache_dir: &Path,
     repo: &HubRepo<'_>,
     announce: bool,
 ) -> Result<HubFiles> {
     let client = cache_client(cache_dir)?;
-    ensure_files_with(&client, cache_dir, repo, announce).await
+    ensure_files_with(&client, cache_dir, repo, announce, &HubLimits::default()).await
 }
 
 /// The hub client on a cache directory that exists.
@@ -240,11 +309,31 @@ pub(crate) fn cache_client(cache_dir: &Path) -> Result<HFClient> {
 
 /// [`ensure_files`] on a given client, so a test can point the network side
 /// at a listener it controls. Every request names `repo.revision`.
+///
+/// Each file's download runs under a no-progress watchdog: when no download
+/// event of any kind arrives for `limits.stall`, the download is dropped and
+/// the call fails with "no data arrived", an `Embedding` error the NLI loader
+/// relabels `NliFetch`, so the daemon's backoff runs and the pass is released.
+/// The first window starts with the request, so a server that accepts the
+/// connection and never answers the HEAD fails here. A xet-backed file (the
+/// weights are one) is covered up to the start of its data transfer: the
+/// HEAD, the token request and the download group setup. During the transfer
+/// hf-hub polls hf-xet ten times a second and emits an event each time, so
+/// the watchdog stays quiet there, and hf-xet's own read timeout (300 s by
+/// default) bounds a connection that stops sending.
+///
+/// A dropped xet download may leave `spawn_blocking` parts running on
+/// detached; the process still leaves through `std::process::exit`. Before a
+/// file goes to the network, a `<blob>.incomplete` in the repository's
+/// `blobs/` that was written to inside the stall window means such a download
+/// may still be writing, and the call refuses with a download error rather
+/// than start a second writer into the same blob.
 pub(crate) async fn ensure_files_with(
     client: &HFClient,
     cache_dir: &Path,
     repo: &HubRepo<'_>,
     announce: bool,
+    limits: &HubLimits,
 ) -> Result<HubFiles> {
     // The weights alone decide whether this is a first-use download: they are
     // the file worth a notice and a progress line.
@@ -266,26 +355,95 @@ pub(crate) async fn ensure_files_with(
     for file in repo.files {
         let path = match cached_path(client, repo, file).await? {
             Some(path) => path,
-            None => remote
-                .download_file()
-                .filename(*file)
-                .revision(repo.revision)
-                // Progress is opt in in hf-hub: leaving the handler off is the
-                // suppression, so exactly one progress mechanism is ever active
-                // and it is the one this module controls and TTY-gates itself.
-                .maybe_progress(show_progress.then(|| ByteProgress::new(file)))
-                .send()
-                .await
-                .map_err(|e| {
-                    IndexError::Embedding(format!(
-                        "downloading {file} for {} {} at commit {}: {e}",
-                        repo.what, repo.repo, repo.revision
-                    ))
-                })?,
+            None => {
+                if partial_download_running(cache_dir, repo, limits.stall) {
+                    return Err(IndexError::Embedding(format!(
+                        "downloading {file} for {} {}: a previous download of {file} may still be running",
+                        repo.what, repo.repo
+                    )));
+                }
+                let clock = Arc::new(StallClock::new());
+                // Progress is opt in in hf-hub, and the clock needs it, so a
+                // handler is always attached; the line is drawn only when
+                // `show_progress` says so, which keeps the one visible
+                // progress mechanism the one this module TTY-gates itself.
+                let handler: Progress = if show_progress {
+                    Arc::new(ByteProgress::new(file, clock.clone())).into()
+                } else {
+                    clock.clone().into()
+                };
+                let download = remote
+                    .download_file()
+                    .filename(*file)
+                    .revision(repo.revision)
+                    .progress(handler)
+                    .send();
+                match until_stalled(download, &clock, limits.stall).await {
+                    Some(fetched) => fetched.map_err(|e| {
+                        IndexError::Embedding(format!(
+                            "downloading {file} for {} {} at commit {}: {e}",
+                            repo.what, repo.repo, repo.revision
+                        ))
+                    })?,
+                    None => {
+                        return Err(IndexError::Embedding(format!(
+                            "downloading {file} for {} {}: no data arrived for {} s",
+                            repo.what,
+                            repo.repo,
+                            limits.stall.as_secs()
+                        )));
+                    }
+                }
+            }
         };
         paths.insert((*file).to_string(), path);
     }
     Ok(HubFiles { paths })
+}
+
+/// Runs `fetch` until it finishes, or answers `None` once `clock` has been
+/// quiet for `stall`; the unfinished future is dropped then.
+async fn until_stalled<F: std::future::Future>(
+    fetch: F,
+    clock: &StallClock,
+    stall: Duration,
+) -> Option<F::Output> {
+    let mut fetch = std::pin::pin!(fetch);
+    let period = (stall / 4).clamp(Duration::from_millis(10), Duration::from_secs(1));
+    let mut ticker = tokio::time::interval(period);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            biased;
+            out = &mut fetch => return Some(out),
+            _ = ticker.tick() => {
+                if clock.quiet_for() >= stall {
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+/// True when the repository's `blobs/` holds a `<blob>.incomplete` written to
+/// inside the last `stall`. hf-hub's plain HTTP path and its xet path both
+/// write there and rename on success, so a fresh one is a download that may
+/// still be running, perhaps one this process dropped on a stall. An older
+/// one is a leftover that a new download overwrites.
+fn partial_download_running(cache_dir: &Path, repo: &HubRepo<'_>, stall: Duration) -> bool {
+    let blobs = cache_dir.join(hub_dir_name(repo.repo)).join("blobs");
+    let Ok(entries) = std::fs::read_dir(&blobs) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        entry.file_name().to_string_lossy().ends_with(".incomplete")
+            && entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age < stall)
+    })
 }
 
 /// `("BAAI", "bge-small-en-v1.5")` from a table entry's repository id, which is
@@ -394,7 +552,104 @@ pub(crate) fn pad_id(
 
 #[cfg(test)]
 mod tests {
-    use super::pad_id;
+    use super::*;
+
+    /// A repository no Hub serves: the tests point the client at a listener.
+    const TEST_REPO: HubRepo<'static> = HubRepo {
+        repo: "test-owner/test-model",
+        revision: "0123456789abcdef0123456789abcdef01234567",
+        files: &["config.json", "model.safetensors"],
+        download_mb: 1,
+        what: "test model",
+    };
+
+    fn test_client(cache: &Path, endpoint: &str) -> HFClient {
+        HFClient::builder()
+            .endpoint(endpoint)
+            .cache_dir(cache.to_path_buf())
+            .build()
+            .unwrap()
+    }
+
+    /// M9 of the 0.22 review: a server that accepts the connection and never
+    /// answers must fail the fetch within the stall window, as a download
+    /// error the daemon retries later, not hang it.
+    #[tokio::test]
+    async fn a_download_that_sends_nothing_fails_as_a_fetch_error_and_is_retried_later() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Accept and hold every connection, never write a byte.
+        let _hold = tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                if let Ok((s, _)) = listener.accept().await {
+                    held.push(s);
+                }
+            }
+        });
+        let cache = tempfile::tempdir().unwrap();
+        let client = test_client(cache.path(), &format!("http://{addr}"));
+        let started = std::time::Instant::now();
+        let err = ensure_files_with(
+            &client,
+            cache.path(),
+            &TEST_REPO,
+            false,
+            &HubLimits {
+                stall: Duration::from_millis(300),
+            },
+        )
+        .await
+        .err()
+        .expect("a server that sends nothing cannot deliver the files");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(err.to_string().contains("no data arrived"), "{err}");
+        assert!(err.to_string().contains("config.json"), "{err}");
+    }
+
+    /// A `<blob>.incomplete` written to inside the stall window may be a
+    /// dropped download still writing, so the retry refuses instead of
+    /// starting a second writer into the same blob; an older one is a
+    /// leftover and does not stand in the way.
+    #[tokio::test]
+    async fn a_fresh_partial_download_holds_off_a_new_fetch_and_an_old_one_does_not() {
+        let cache = tempfile::tempdir().unwrap();
+        let blobs = cache
+            .path()
+            .join(hub_dir_name(TEST_REPO.repo))
+            .join("blobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+        let partial = blobs.join("abc123.incomplete");
+        std::fs::write(&partial, b"part").unwrap();
+        // Nothing listens on the discard port, so a fetch that dials out
+        // fails at once with a connection error.
+        let client = test_client(cache.path(), "http://127.0.0.1:9");
+        let limits = HubLimits {
+            stall: Duration::from_secs(60),
+        };
+
+        let err = ensure_files_with(&client, cache.path(), &TEST_REPO, false, &limits)
+            .await
+            .err()
+            .expect("a fresh partial download refuses the fetch");
+        assert!(err.to_string().contains("may still be running"), "{err}");
+
+        std::fs::File::options()
+            .write(true)
+            .open(&partial)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(120))
+            .unwrap();
+        let err = ensure_files_with(&client, cache.path(), &TEST_REPO, false, &limits)
+            .await
+            .err()
+            .expect("nothing serves the files");
+        assert!(!err.to_string().contains("may still be running"), "{err}");
+    }
 
     /// The pad id is what the tokenizer says the configured pad token is, and
     /// it has to agree with the model config; a disagreement means a mixed or
