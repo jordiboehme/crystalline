@@ -1467,6 +1467,7 @@ async fn an_unguarded_split_lands_on_a_concurrent_write_on_postgres() {
         tokio::spawn(async move { engine.split_engram(&p).await })
     };
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!split.is_finished(), "A waits for B's row lock");
     b.commit().await.unwrap();
     let receipt = split
         .await
@@ -1515,6 +1516,7 @@ async fn an_unguarded_split_whose_moved_lines_changed_is_refused_and_takes_its_e
         tokio::spawn(async move { engine.split_engram(&p).await })
     };
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!split.is_finished(), "A waits for B's row lock");
     b.commit().await.unwrap();
     let err = split
         .await
@@ -1555,6 +1557,7 @@ async fn a_guarded_split_is_still_refused_on_any_change() {
         tokio::spawn(async move { engine.split_engram(&p).await })
     };
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!split.is_finished(), "A waits for B's row lock");
     b.commit().await.unwrap();
     let err = split
         .await
@@ -1569,6 +1572,87 @@ async fn a_guarded_split_is_still_refused_on_any_change() {
 
     b.drop_schema().await.unwrap();
 }
+
+/// A CRLF source whose split moves a section followed by a blank line, the
+/// shape whose trailing blank line survives as a lone `\r` when the plan is
+/// made on the raw bytes. Both an unguarded and a guarded split land.
+async fn crlf_section_split(store: Arc<Mutex<dyn Store>>) {
+    let engine = virtual_engine(Arc::clone(&store));
+    engine
+        .write_engram(&write_params(
+            "Crlf Source",
+            "The crlf body.\n\n- [fact] keep one\n- [fact] keep two\n- [fact] keep three\n\n## Sec\n\n- [fact] sec one\n\n## Other\n\n- [fact] other one\n\n## Tail\n\n- [fact] tail one",
+        ))
+        .await
+        .unwrap();
+    let domain = store
+        .lock()
+        .await
+        .domain_id("notes")
+        .await
+        .unwrap()
+        .unwrap();
+    // Stores the source again as CRLF bytes and hands back their checksum.
+    let as_crlf = || async {
+        let store = store.lock().await;
+        let row = store
+            .all_engram_contents(domain)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.path == "crlf-source.md")
+            .unwrap();
+        let crlf = row.content.replace("\r\n", "\n").replace('\n', "\r\n");
+        store
+            .upsert_engram(domain, &rewritten(&row.path, &crlf))
+            .await
+            .unwrap();
+        sha_hex(&crlf)
+    };
+    let split = |section: &str, title: &str, expected_checksum: Option<String>| SplitParams {
+        domain: "notes".to_string(),
+        identifier: "crlf-source".to_string(),
+        title: title.to_string(),
+        folder: None,
+        observations: Vec::new(),
+        sections: vec![section.to_string()],
+        expected_checksum,
+    };
+
+    as_crlf().await;
+    engine
+        .split_engram(&split("## Sec", "Sec Moved", None))
+        .await
+        .expect("an unguarded split of a CRLF section lands");
+    let sum = as_crlf().await;
+    engine
+        .split_engram(&split("## Tail", "Tail Moved", Some(sum)))
+        .await
+        .expect("a guarded split of a CRLF section lands");
+
+    let store = store.lock().await;
+    let rows = store.all_engram_contents(domain).await.unwrap();
+    let text = |path: &str| {
+        rows.iter()
+            .find(|r| r.path == path)
+            .unwrap_or_else(|| panic!("no {path}"))
+            .content
+            .clone()
+    };
+    let source = text("crlf-source.md");
+    assert!(
+        !source.contains("sec one") && !source.contains("tail one"),
+        "{source}"
+    );
+    assert!(source.contains("- [fact] other one"), "{source}");
+    assert!(text("sec-moved.md").contains("- [fact] sec one"));
+    assert!(text("tail-moved.md").contains("- [fact] tail one"));
+}
+
+both_backends!(
+    a_crlf_section_split_lands_guarded_or_not,
+    crlf_section_split
+);
 
 /// Turso has no second writer to race with, so what applies there is the
 /// sequential half: an unguarded edit lands on whatever is stored, and a

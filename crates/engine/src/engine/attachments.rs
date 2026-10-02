@@ -1220,6 +1220,12 @@ impl Engine {
                 expected, &checksum,
             )));
         }
+        // Planned on the LF form, as every arm of the source edit hands its
+        // closure the LF form of what it read, so the re-plan there can
+        // compare the moved text as plain strings. `to_lf` keeps the line
+        // numbers, so the caller's lines still name the same bullets; the
+        // checksum above stays the one of the bytes a read handed out.
+        let content = crystalline_core::to_lf(&content);
         let engram = parse_engram(&content).map_err(|e| EngineError::Invalid(e.to_string()))?;
         let plan = Self::plan_split(&content, &engram, p, &desc.permalink)?;
 
@@ -1461,10 +1467,12 @@ impl Engine {
     /// The caller's line numbers alone would move the wrong bullets once
     /// another writer shifted lines, and the first plan's `moved` text already
     /// sits in the new engram. So the split lands only when the plan made now
-    /// moves exactly the text the first plan moved, compared with line endings
-    /// ignored because the first plan may have been made on CRLF bytes. Anything else, a re-plan
-    /// that fails included, is a conflict, and the caller's rollback takes the
-    /// new engram back out.
+    /// moves exactly the text the first plan moved. Both plans are made on LF
+    /// text: `split_engram_as` plans on the LF form of what it read, and every
+    /// arm hands the closure the LF form of what it is about to write over.
+    /// Anything else is a conflict, and so is a re-plan that fails because the
+    /// source changed under it; either way the caller's rollback takes the new
+    /// engram back out.
     pub(super) fn replanned_split_source(
         first: &SplitPlan,
         current: &str,
@@ -1472,26 +1480,22 @@ impl Engine {
         permalink: &str,
         back_link: &str,
     ) -> Result<String> {
-        let changed = || {
-            EngineError::Conflict(
+        // The first plan succeeded on this same request, so a re-plan that
+        // fails means the source changed; its own reason is passed through.
+        let gone = |e: String| {
+            EngineError::Conflict(format!(
+                "the source changed since this split read it: {e}; read it again and split again"
+            ))
+        };
+        let engram = parse_engram(current).map_err(|e| gone(e.to_string()))?;
+        let plan =
+            Self::plan_split(current, &engram, p, permalink).map_err(|e| gone(e.to_string()))?;
+        if plan.moved != first.moved {
+            return Err(EngineError::Conflict(
                 "the lines this split moves changed since it read the source; read it again and \
                  split again"
                     .to_string(),
-            )
-        };
-        let engram = parse_engram(current).map_err(|_| changed())?;
-        let plan = Self::plan_split(current, &engram, p, permalink).map_err(|_| changed())?;
-        // Line by line rather than through `to_lf` alone: a plan made on CRLF
-        // bytes ends its last moved line in a lone `\r`, since the plan splits
-        // on `\n` and trims only `\n`.
-        let lf = |text: &str| {
-            text.split('\n')
-                .map(|line| line.strip_suffix('\r').unwrap_or(line))
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        if lf(&plan.moved) != lf(&first.moved) {
-            return Err(changed());
+            ));
         }
         Ok(append_body(
             &plan.remaining,
@@ -1574,10 +1578,26 @@ mod tests {
     }
 
     #[test]
+    fn replanned_split_that_cannot_plan_any_more_names_its_own_reason() {
+        let p = params(SOURCE);
+        let first = first_plan(SOURCE, &p);
+        let newer = SOURCE.replace("- [fact] move two\n", "");
+        let err =
+            Engine::replanned_split_source(&first, &newer, &p, "source", "moved").unwrap_err();
+        assert!(
+            matches!(&err, EngineError::Conflict(m)
+                if m.starts_with("the source changed since this split read it:")
+                    && m.contains("is not an observation bullet")),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn replanned_split_lands_when_only_the_line_endings_differ() {
+        // As `split_engram_as` plans: on the LF form of the CRLF bytes it read.
         let crlf = SOURCE.replace('\n', "\r\n");
         let p = params(&crlf);
-        let first = first_plan(&crlf, &p);
+        let first = first_plan(&crystalline_core::to_lf(&crlf), &p);
         let out = Engine::replanned_split_source(&first, SOURCE, &p, "source", "moved").unwrap();
         assert!(out.contains("- split_into [[moved]]"), "{out}");
         assert!(out.contains("- [fact] keep three"), "{out}");
