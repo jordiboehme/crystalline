@@ -286,6 +286,106 @@ fn skills_records_misplaced(receipt: &ProvisionReceipt, installed: &[HarnessKind
         skills_owner(h, installed).is_some()
             && receipt.harnesses.get(h.id()).is_some_and(holds_skills)
     }) || !handover_sources(receipt, installed).is_empty()
+        || !stranded_skills(receipt, installed).is_empty()
+}
+
+/// Provisioned skills a departed harness left in a folder that no installed
+/// harness writes but an installed one still reads (Claude Code uninstalled,
+/// Cursor still reading `~/.claude/skills`), so they would keep loading with
+/// nobody to retire them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StrandedSkills {
+    /// The departed harness whose receipt row still records the files.
+    pub harness: HarnessKind,
+    /// The first installed harness, in [`HarnessKind::ALL`] order, that reads
+    /// the folder.
+    pub read_by: HarnessKind,
+    /// The folder the files sit in.
+    pub folder: PathBuf,
+    /// How many skills files the row records there.
+    pub files: usize,
+}
+
+/// Every departed harness's skills records that are stranded, in
+/// [`HarnessKind::ALL`] order. Read on a receipt the hand-over already ran
+/// on: a folder an installed harness writes has its records moved to that
+/// owner instead. A folder nobody installed reads is left as it was.
+fn stranded_skills(receipt: &ProvisionReceipt, installed: &[HarnessKind]) -> Vec<StrandedSkills> {
+    let mut out = Vec::new();
+    for gone in HarnessKind::ALL {
+        if installed.contains(&gone) {
+            continue;
+        }
+        let Some(state) = receipt.harnesses.get(gone.id()) else {
+            continue;
+        };
+        let files = state.files.keys().filter(|k| is_skills_key(k)).count();
+        if files == 0 {
+            continue;
+        }
+        let Some(folder) = skills_folder(gone) else {
+            continue;
+        };
+        if installed
+            .iter()
+            .any(|&h| skills_folder(h).as_ref() == Some(&folder))
+        {
+            continue;
+        }
+        let reader = HarnessKind::ALL.into_iter().find(|h| {
+            installed.contains(h)
+                && h.profile()
+                    .skills_reads
+                    .iter()
+                    .any(|r| r.resolve() == folder)
+        });
+        if let Some(read_by) = reader {
+            out.push(StrandedSkills {
+                harness: gone,
+                read_by,
+                folder,
+                files,
+            });
+        }
+    }
+    out
+}
+
+/// Retire every skills file `state` records for `harness` (reconcile against
+/// an empty desired set: a clean copy is removed, an edited one renamed to
+/// `.bak`), then drop those records. Commands, agents and MCP records stay.
+fn retire_skills_rows(
+    harness: HarnessKind,
+    state: &mut HarnessState,
+    notices: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) -> Vec<ArtifactAction> {
+    let mut actions = Vec::new();
+    if !holds_skills(state) {
+        return actions;
+    }
+    let mut skills_only = HarnessState {
+        files: state
+            .files
+            .iter()
+            .filter(|(k, _)| is_skills_key(k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        ..HarnessState::default()
+    };
+    if let Ok((acts, rec_notices)) = reconcile_harness(
+        harness,
+        &DesiredSet::default(),
+        &mut skills_only,
+        &mut DeferringMcpRunner,
+    ) {
+        actions = acts;
+        for notice in rec_notices {
+            push_notice(notices, seen, notice);
+        }
+    }
+    state.files.retain(|k, _| !is_skills_key(k));
+    actions
 }
 
 // --- shared manifest and artifact helpers ---------------------------------
@@ -528,6 +628,8 @@ pub struct ApplyReport {
     /// Each requested harness, in the order given, with the actions taken
     /// reconciling it. A harness whose own reconcile errored out gets an
     /// empty action list; the failure is recorded as a notice instead.
+    /// After them comes each departed harness whose stranded skills were
+    /// retired (see [`StrandedSkills`]), with those removals.
     pub harnesses: Vec<(HarnessKind, Vec<ArtifactAction>)>,
     /// Every scan, collision, skip, mcp and gate notice raised, deduplicated
     /// and in the stable order they were first raised.
@@ -659,30 +761,7 @@ pub fn apply(
         // writes (Cursor under Claude Code), retired like a dropped
         // artifact before the records go.
         if skills_owner(harness, harnesses).is_some() {
-            let mut actions = Vec::new();
-            if holds_skills(state) {
-                let mut skills_only = HarnessState {
-                    files: state
-                        .files
-                        .iter()
-                        .filter(|(k, _)| is_skills_key(k))
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect(),
-                    ..HarnessState::default()
-                };
-                if let Ok((acts, rec_notices)) = reconcile_harness(
-                    harness,
-                    &DesiredSet::default(),
-                    &mut skills_only,
-                    &mut DeferringMcpRunner,
-                ) {
-                    actions = acts;
-                    for notice in rec_notices {
-                        push_notice(&mut notices, &mut seen, notice);
-                    }
-                }
-                state.files.retain(|k, _| !is_skills_key(k));
-            }
+            let actions = retire_skills_rows(harness, state, &mut notices, &mut seen);
             harness_results.push((harness, actions));
             continue;
         }
@@ -705,6 +784,20 @@ pub fn apply(
                 harness_results.push((harness, Vec::new()));
             }
         }
+    }
+
+    // A departed harness's skills in a folder an installed one still reads
+    // and nobody writes: retired like a dropped artifact, so a deny reaches
+    // them, while the reader gets its own copy in its own folder above.
+    for stranded in stranded_skills(&receipt, harnesses) {
+        let Some(state) = receipt.harnesses.get_mut(stranded.harness.id()) else {
+            continue;
+        };
+        let actions = retire_skills_rows(stranded.harness, state, &mut notices, &mut seen);
+        if state.files.is_empty() && state.mcps.is_empty() {
+            receipt.harnesses.remove(stranded.harness.id());
+        }
+        harness_results.push((stranded.harness, actions));
     }
 
     let mut sources = BTreeMap::new();
@@ -839,6 +932,9 @@ pub struct StatusReport {
     pub domains: Vec<DomainStatus>,
     /// Every requested harness, in the order given.
     pub harnesses: Vec<HarnessStatus>,
+    /// Departed harnesses' skills an installed harness still reads and the
+    /// next `apply` retires.
+    pub stranded: Vec<StrandedSkills>,
     /// Undecided domains that declare a `Provisioning` section and ship at
     /// least one artifact, awaiting a decision.
     pub pending: Vec<PendingDomain>,
@@ -957,6 +1053,7 @@ pub fn status(
     Ok(StatusReport {
         domains,
         harnesses: harness_statuses,
+        stranded: stranded_skills(&receipt, harnesses),
         pending,
         virtual_with_decision,
     })
@@ -1123,7 +1220,11 @@ enum SessionWork {
 /// file added or removed, an opted-in domain the receipt never stamped (a fresh
 /// opt-in), a stamped domain no longer opted in (a fresh opt-out) or a harness
 /// with no receipt entry yet (freshly installed - stamps alone never prove a
-/// harness current, the same reason `apply`'s doc comment gives). MCP drift is
+/// harness current, the same reason `apply`'s doc comment gives) or skills
+/// records that sit under the wrong row: a folder's records under a harness
+/// that no longer owns it, or a departed harness's copies an installed one
+/// still reads ([`StrandedSkills`], the cover of a read-covered harness left).
+/// MCP drift is
 /// judged separately by [`mcp_drift`], since MCP configs carry no source stamp.
 fn prefilter(
     receipt: Option<&ProvisionReceipt>,
@@ -1911,6 +2012,40 @@ mod tests {
                 &[HarnessKind::ClaudeCode, HarnessKind::Codex]
             ),
             SessionWork::Work
+        );
+    }
+
+    #[test]
+    fn prefilter_work_when_a_departed_cover_left_skills_an_installed_harness_reads() {
+        // Claude Code covered Cursor and left: its copy in ~/.claude/skills is
+        // still read by Cursor and nobody writes that folder any more.
+        let mut receipt = steady_receipt();
+        receipt
+            .harnesses
+            .get_mut("claude-code")
+            .unwrap()
+            .files
+            .insert(
+                "skills/tide-tables/SKILL.md".to_string(),
+                InstalledFile {
+                    domain: "harbor".to_string(),
+                    sha256: String::new(),
+                },
+            );
+        receipt
+            .harnesses
+            .insert("cursor".to_string(), HarnessState::default());
+        receipt
+            .harnesses
+            .insert("codex".to_string(), HarnessState::default());
+        assert_eq!(
+            prefilter(Some(&receipt), &steady_walk(), &[HarnessKind::Cursor]),
+            SessionWork::Work
+        );
+        // Codex never reads ~/.claude/skills: nothing is stranded for it.
+        assert_eq!(
+            prefilter(Some(&receipt), &steady_walk(), &[HarnessKind::Codex]),
+            SessionWork::NoWork
         );
     }
 

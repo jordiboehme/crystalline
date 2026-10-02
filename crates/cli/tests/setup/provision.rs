@@ -1297,3 +1297,64 @@ fn doctor_prints_covered_by_for_a_harness_that_shares_the_folder() {
     assert!(human.contains("  gemini: covered by codex"), "{human}");
     assert!(human.contains("  codex: "), "{human}");
 }
+
+/// The number in doctor's closing "N problem(s) remaining" line.
+fn doctor_problems(human: &str) -> usize {
+    human
+        .lines()
+        .find_map(|l| l.strip_suffix(" problem(s) remaining"))
+        .and_then(|n| n.trim().parse().ok())
+        .unwrap_or_else(|| panic!("no problem count: {human}"))
+}
+
+#[test]
+fn an_uninstalled_covers_skill_is_a_doctor_problem_and_deny_retires_it() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home-stranded");
+    let bin_dir = work.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let harbor_dir = work.path().join("kb-harbor");
+    let db = work.path().join("index.db");
+    write_install_receipt_for(&home, &["claude-code", "cursor"]);
+    write_harbor(&harbor_dir);
+    write_shim(&bin_dir, "claude", &work.path().join("claude.log"));
+    register_and_allow(&home, &bin_dir, &harbor_dir);
+    let cover = home.join(".claude/skills/tide-tables/SKILL.md");
+    assert!(cover.is_file(), "Cursor is covered by Claude Code's copy");
+
+    // `crystalline uninstall claude-code`, as far as provisioning can tell.
+    write_install_receipt_for(&home, &["cursor"]);
+    let doctor = |json: bool| {
+        let mut cmd = provision_cmd(&home, &bin_dir);
+        if json {
+            cmd.arg("--json");
+        }
+        cmd.args(["doctor", "--db"]).arg(&db).output().unwrap()
+    };
+    let data: Value = serde_json::from_slice(&doctor(true).stdout).unwrap();
+    let stranded = &data["provisioning"]["stranded"];
+    assert_eq!(stranded.as_array().map(Vec::len), Some(1), "{data}");
+    assert_eq!(stranded[0]["harness"], "claude-code", "{data}");
+    assert_eq!(stranded[0]["read_by"], "cursor", "{data}");
+    let before = String::from_utf8_lossy(&doctor(false).stdout).into_owned();
+    assert!(
+        before.contains("[problem] claude-code: 2 provisioned skill file(s) left in"),
+        "{before}"
+    );
+
+    provision_cmd(&home, &bin_dir)
+        .args(["provision", "deny", "harbor"])
+        .assert()
+        .success();
+    assert!(!cover.exists(), "deny reaches the copy Cursor still reads");
+    assert!(!home.join(".agents/skills/tide-tables").exists());
+
+    let data: Value = serde_json::from_slice(&doctor(true).stdout).unwrap();
+    assert!(data["provisioning"]["stranded"].is_null(), "{data}");
+    let after = String::from_utf8_lossy(&doctor(false).stdout).into_owned();
+    assert_eq!(
+        doctor_problems(&after) + 1,
+        doctor_problems(&before),
+        "{before}\n---\n{after}"
+    );
+}

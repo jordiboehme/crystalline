@@ -629,6 +629,26 @@ pub struct ProvisioningDoctor {
     pub harnesses: Vec<ProvisioningHarnessDoctor>,
     /// Domains still awaiting a decision.
     pub pending: Vec<ProvisioningPendingDoctor>,
+    /// Skills an uninstalled harness left in a folder an installed harness
+    /// still reads. Each is a problem until the next reconcile retires it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub stranded: Vec<ProvisioningStrandedDoctor>,
+}
+
+/// Provisioned skills an uninstalled harness left behind in a folder that no
+/// installed harness writes and an installed one still reads, so they keep
+/// loading there even after a `deny`. The next `crystalline provision` (or
+/// session start) retires them.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProvisioningStrandedDoctor {
+    /// The uninstalled harness whose receipt row still records the files.
+    pub harness: String,
+    /// The installed harness that still reads the folder.
+    pub read_by: String,
+    /// The folder the files sit in.
+    pub folder: String,
+    /// How many skills files are recorded there.
+    pub files: usize,
 }
 
 /// One domain the index still holds rows for and nobody registers any more:
@@ -1039,6 +1059,12 @@ impl DoctorReport {
                         || h.mcp_entry.as_deref() == Some("ours-older")
                 })
                 .count();
+        }
+        // Skills an uninstalled harness left where an installed one still
+        // reads them keep loading, even after a deny, until a reconcile
+        // retires them.
+        if let Some(p) = &self.provisioning {
+            n += p.stranded.len();
         }
         // Rows whose domain is gone count only while something can be done
         // about them: a collectable set nobody has collected yet. A virtual
@@ -3013,10 +3039,22 @@ fn check_provisioning(
         })
         .collect();
 
+    let stranded = report
+        .stranded
+        .iter()
+        .map(|st| ProvisioningStrandedDoctor {
+            harness: st.harness.id().to_string(),
+            read_by: st.read_by.id().to_string(),
+            folder: st.folder.display().to_string(),
+            files: st.files,
+        })
+        .collect();
+
     Ok(Some(ProvisioningDoctor {
         domains,
         harnesses,
         pending,
+        stranded,
     }))
 }
 
@@ -4262,6 +4300,13 @@ pub fn render_human(report: &DoctorReport) -> String {
                 h.edited,
                 h.orphaned,
                 h.missing
+            );
+        }
+        for st in &p.stranded {
+            let _ = writeln!(
+                out,
+                "  [problem] {}: {} provisioned skill file(s) left in {}, which {} still reads - run `crystalline provision` to retire them.",
+                st.harness, st.files, st.folder, st.read_by
             );
         }
         if !p.pending.is_empty() {
