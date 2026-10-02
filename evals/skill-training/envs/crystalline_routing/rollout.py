@@ -46,6 +46,7 @@ def run_batch(
         max_turns=max_turns,
         exec_timeout=exec_timeout,
         score=_score,
+        builtin_tools=common.NO_BUILTIN_TOOLS,
         default_task_type="routing",
         sandbox_prefix="cst-routing-",
     )

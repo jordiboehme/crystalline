@@ -60,6 +60,7 @@ def run_batch(
         score=_score,
         prepare=_prepare,
         score_wants_conversation=True,
+        builtin_tools=common.NO_BUILTIN_TOOLS,
         default_task_type="evolve",
         sandbox_prefix="cst-evolve-",
     )

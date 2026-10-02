@@ -218,6 +218,7 @@ def run_batch(
         score=_score,
         setup=_setup,
         teardown=_teardown,
+        builtin_tools=common.NO_BUILTIN_TOOLS,
         default_task_type="collaboration",
         sandbox_prefix="cst-collab-",
     )

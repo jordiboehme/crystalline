@@ -302,6 +302,60 @@ def write_predictions(
     )
 
 
+# Built-in tools no env item needs: a session offered nothing but its MCP
+# server cannot message other sessions, schedule work or reach the web.
+NO_BUILTIN_TOOLS: list[str] = []
+
+# Built-in tools that reach outside the sandbox. No allow-list may name them.
+OUTSIDE_REACHING_TOOLS = [
+    "SendMessage", "ListAgents", "Agent", "Task", "Skill", "WebFetch",
+    "WebSearch", "Monitor", "PushNotification", "RemoteTrigger",
+    "CronCreate", "ScheduleWakeup", "TaskStop", "EnterWorktree",
+]
+
+
+def build_claude_command(
+    *,
+    claude_bin: str,
+    claude_model: str,
+    question: str,
+    mcp_config: Path | str,
+    max_turns: int,
+    skill_path: Path | str,
+    has_skill: bool,
+    allowed_tools: list[str] | None = None,
+    disallowed_tools: list[str] | None = None,
+    builtin_tools: list[str] | None = None,
+) -> list[str]:
+    """The ``claude -p`` command line of one eval session.
+
+    The built-in tool set is always restricted with ``--tools`` (an empty
+    list when the env passes none), never left at the default, so tools
+    that reach outside the sandbox are not offered at all.
+    ``--disallowedTools`` stays as a second fence.
+    """
+    builtin = NO_BUILTIN_TOOLS if builtin_tools is None else builtin_tools
+    cmd = [
+        claude_bin, "-p", question,
+        "--model", claude_model,
+        "--mcp-config", str(mcp_config),
+        "--strict-mcp-config",
+        "--setting-sources", "",
+        "--disallowedTools", *(
+            DISALLOWED_TOOLS if disallowed_tools is None else disallowed_tools
+        ),
+        "--allowedTools", *(
+            ["mcp__crystalline"] if allowed_tools is None else allowed_tools
+        ),
+        "--output-format", "stream-json", "--verbose",
+        "--max-turns", str(max_turns),
+        "--tools", ",".join(builtin),
+    ]
+    if has_skill:
+        cmd.extend(["--append-system-prompt-file", str(skill_path)])
+    return cmd
+
+
 def rollout_one(
     item: dict,
     skill_content: str,
@@ -362,28 +416,14 @@ def rollout_one(
         skill_path = sandbox / "skill.md"
         skill_path.write_text(skill_content or "", encoding="utf-8")
 
-        cmd = [
-            claude_bin, "-p", str(item["question"]),
-            "--model", claude_model,
-            "--mcp-config", str(mcp_config),
-            "--strict-mcp-config",
-            "--setting-sources", "",
-            "--disallowedTools", *(
-                DISALLOWED_TOOLS if disallowed_tools is None else disallowed_tools
-            ),
-            "--allowedTools", *(
-                ["mcp__crystalline"] if allowed_tools is None else allowed_tools
-            ),
-            "--output-format", "stream-json", "--verbose",
-            "--max-turns", str(max_turns),
-        ]
-        if builtin_tools is not None:
-            # Restrict the built-in tool set itself, so tools that reach
-            # outside the sandbox (messaging other sessions, scheduling,
-            # skills of the real install) are not offered at all.
-            cmd.extend(["--tools", ",".join(builtin_tools)])
-        if skill_content.strip():
-            cmd.extend(["--append-system-prompt-file", str(skill_path)])
+        cmd = build_claude_command(
+            claude_bin=claude_bin, claude_model=claude_model,
+            question=str(item["question"]), mcp_config=mcp_config,
+            max_turns=max_turns, skill_path=skill_path,
+            has_skill=bool(skill_content.strip()),
+            allowed_tools=allowed_tools, disallowed_tools=disallowed_tools,
+            builtin_tools=builtin_tools,
+        )
 
         claude_env = None
         if session_env is not None:
