@@ -817,15 +817,16 @@ enum PromptKind {
         /// config path.
         #[arg(long)]
         config: Option<PathBuf>,
-        /// Output format: text, json or copilot.
+        /// Output format: text, json, copilot, cursor or hook-specific.
         #[arg(long, value_enum)]
         format: Option<PromptFormat>,
         /// Which harness this routing prompt is being generated for, as
-        /// `crystalline install` wrote it into the harness's settings file
-        /// (claude-code, codex, copilot). Accepted so both managed hook
-        /// commands carry their harness in the same spelling; the routing
-        /// block itself does not vary by harness today. Omitted or
-        /// unrecognized is exactly today's behaviour.
+        /// `crystalline install` wrote it into the harness's hook file.
+        /// The routing block itself does not vary by harness. The id only
+        /// decides whether a hook another harness imported stays silent
+        /// because that harness runs a hook of its own (an imported Claude
+        /// Code hook inside Cursor). Omitted counts as claude-code; an
+        /// unrecognized id always prints.
         #[arg(long)]
         harness: Option<String>,
     },
@@ -854,6 +855,15 @@ enum PromptFormat {
     /// on a resumed session and wraps the routing prompt in
     /// `{"additionalContext": ...}` otherwise.
     Copilot,
+    /// One JSON line for a Cursor sessionStart hook: prints nothing on a
+    /// resumed session and wraps the routing prompt in
+    /// `{"additional_context": ...}` otherwise.
+    Cursor,
+    /// One JSON line for a Gemini CLI or Qwen Code SessionStart hook: prints
+    /// nothing on a resumed session and wraps the routing prompt in
+    /// `{"hookSpecificOutput": {"hookEventName": "SessionStart",
+    /// "additionalContext": ...}}` otherwise.
+    HookSpecific,
 }
 
 #[derive(Subcommand, Debug)]
@@ -4451,13 +4461,13 @@ fn run_prompt(
     db: Option<PathBuf>,
     json_flag: bool,
     format: Option<PromptFormat>,
-    // Accepted and deliberately unread: the routing block does not vary by
-    // harness today. The flag is on the command so both managed hook commands
-    // are spelled the same way, and never reading it is what makes an id this
-    // binary does not know inert - an older binary running a hook a newer one
-    // wrote must behave exactly as it always did, never fail. The day the
-    // block does vary, this is where the id gets resolved.
-    _harness: Option<String>,
+    // Read for one decision only: whether this hook was imported by another
+    // harness that runs a hook of its own (see `silenced_by_importer`).
+    // Reading it is safe for older binaries, because an older binary keeps
+    // not reading it, and an id this binary does not know resolves to "never
+    // silenced", so a hook a newer binary wrote still prints as it always did.
+    // The routing block itself does not vary by harness.
+    harness: Option<String>,
 ) -> anyhow::Result<()> {
     // An explicit --format wins; the global --json keeps selecting the JSON
     // shape it always has; the default is plain text.
@@ -4480,8 +4490,21 @@ fn run_prompt(
     // per-prompt recall hook's list of already-shown engrams is fair to
     // empty - the block that named them is gone from the agent's context too.
     let session_start = session_start_payload();
-    if format == PromptFormat::Copilot
-        && session_start.as_ref().and_then(|p| p.source.as_deref()) == Some("resume")
+    // One routing block per session (spec decision 13): Cursor runs the
+    // user's Claude Code hooks too, so with both installs it would get the
+    // block twice. The imported hook stays silent when the payload shows it
+    // runs inside a harness whose own hook is installed. Checked before the
+    // auto-update, so a silenced hook touches no file.
+    if silenced_by_importing_harness(harness.as_deref(), session_start.as_ref()) {
+        return Ok(());
+    }
+    // The JSON hook formats suppress a resumed session themselves, because
+    // their harnesses either have no matcher (Copilot, Cursor) or are not
+    // known to filter `resume` with it.
+    if matches!(
+        format,
+        PromptFormat::Copilot | PromptFormat::Cursor | PromptFormat::HookSpecific
+    ) && session_start.as_ref().and_then(|p| p.source.as_deref()) == Some("resume")
     {
         return Ok(());
     }
@@ -4609,6 +4632,28 @@ fn run_prompt(
                 }))?
             );
         }
+        // Cursor and the hook-specific envelope also read stdout as one JSON
+        // document (Gemini CLI requires it), so the notices stay on stderr
+        // here too.
+        PromptFormat::Cursor => {
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({
+                    "additional_context": crystalline_core::render_text(&output),
+                }))?
+            );
+        }
+        PromptFormat::HookSpecific => {
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "SessionStart",
+                        "additionalContext": crystalline_core::render_text(&output),
+                    },
+                }))?
+            );
+        }
     }
     for note in &reconcile_notices {
         eprintln!("{note}");
@@ -4616,7 +4661,42 @@ fn run_prompt(
     Ok(())
 }
 
-/// The two fields this command reads off a SessionStart payload. Both carry
+/// Whether this routing hook must stay silent because it was written for
+/// one harness and runs as an import inside another that has its own hook
+/// installed. `harness` is the `--harness` value: a missing flag counts as
+/// claude-code, the only harness that wrote the hook before the flag
+/// existed, and an id this binary does not know is never silenced. The
+/// evidence is the payload's fields and the environment; the installed
+/// hooks come from the install receipt.
+fn silenced_by_importing_harness(
+    harness: Option<&str>,
+    payload: Option<&SessionStartPayload>,
+) -> bool {
+    use crystalline_core::harness::profile::{HostEvidence, silenced_by_importer};
+    let written_for = match harness {
+        None => HarnessKind::ClaudeCode,
+        Some(id) => match HarnessKind::from_id(id) {
+            Some(kind) => kind,
+            None => return false,
+        },
+    };
+    let payload_fields: &[&str] = if payload.is_some_and(|p| p.cursor_version.is_some()) {
+        &["cursor_version"]
+    } else {
+        &[]
+    };
+    let env = |name: &str| std::env::var_os(name).is_some();
+    let evidence = HostEvidence {
+        payload_fields,
+        env: &env,
+    };
+    let hooked = crystalline_core::provision::install_receipt_path()
+        .map(|path| crystalline_core::provision::harnesses_with_hooks(&path))
+        .unwrap_or_default();
+    silenced_by_importer(written_for, &evidence, &hooked).is_some()
+}
+
+/// The fields this command reads off a SessionStart payload. Each carries
 /// a serde default, so a harness that omits one, sends `null` or adds fields
 /// nobody here knows about still parses.
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -4628,6 +4708,11 @@ struct SessionStartPayload {
     /// hook state file.
     #[serde(default)]
     session_id: Option<String>,
+    /// Cursor's version, which Cursor puts in the payload of the hooks it
+    /// runs: the signal that this hook runs inside Cursor. That an imported
+    /// Claude Code hook gets it too is documented but not yet observed.
+    #[serde(default)]
+    cursor_version: Option<String>,
 }
 
 /// The SessionStart payload on stdin, when there is one to read: `None` when

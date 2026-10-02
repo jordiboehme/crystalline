@@ -457,9 +457,90 @@ static QWEN: HarnessProfile = HarnessProfile {
     project: None,
 };
 
+/// What a hook can see of the process that runs it: the field names
+/// present in its JSON payload and a test for a set environment variable.
+pub struct HostEvidence<'a> {
+    /// The top-level field names the payload carries.
+    pub payload_fields: &'a [&'a str],
+    /// Whether the named environment variable is set.
+    pub env: &'a dyn Fn(&str) -> bool,
+}
+
+impl HostEvidence<'_> {
+    /// Whether `signal` shows in this evidence.
+    pub fn shows(&self, signal: HostSignal) -> bool {
+        match signal {
+            HostSignal::PayloadField(name) => self.payload_fields.contains(&name),
+            HostSignal::EnvVar(name) => (self.env)(name),
+        }
+    }
+}
+
+/// The harness that runs a hook written for `written_for` as an import and
+/// has a session hook of its own, so the imported hook must stay silent:
+/// the first kind in [`HarnessKind::ALL`] whose `imports_hooks_from` holds
+/// `written_for` with a signal `evidence` shows, and which is in `hooked`
+/// (the harnesses whose install has the hook part). `None` means the hook
+/// prints. A harness's own hook is never silenced by this, because no row
+/// imports its own hooks.
+pub fn silenced_by_importer(
+    written_for: HarnessKind,
+    evidence: &HostEvidence<'_>,
+    hooked: &[HarnessKind],
+) -> Option<HarnessKind> {
+    HarnessKind::ALL.into_iter().find(|importer| {
+        hooked.contains(importer)
+            && profile(*importer)
+                .imports_hooks_from
+                .iter()
+                .any(|&(from, signal)| from == written_for && evidence.shows(signal))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_imported_claude_hook_is_silenced_only_inside_cursor_with_cursors_own_hook() {
+        let no_env = |_: &str| false;
+        let in_cursor = HostEvidence {
+            payload_fields: &["cursor_version"],
+            env: &no_env,
+        };
+        let elsewhere = HostEvidence {
+            payload_fields: &[],
+            env: &no_env,
+        };
+        let both = [HarnessKind::ClaudeCode, HarnessKind::Cursor];
+        assert_eq!(
+            silenced_by_importer(HarnessKind::ClaudeCode, &in_cursor, &both),
+            Some(HarnessKind::Cursor)
+        );
+        assert_eq!(
+            silenced_by_importer(
+                HarnessKind::ClaudeCode,
+                &in_cursor,
+                &[HarnessKind::ClaudeCode]
+            ),
+            None,
+            "no Cursor hook: the import speaks"
+        );
+        assert_eq!(
+            silenced_by_importer(HarnessKind::ClaudeCode, &elsewhere, &both),
+            None,
+            "plain Claude Code"
+        );
+        assert_eq!(
+            silenced_by_importer(HarnessKind::Cursor, &in_cursor, &both),
+            None,
+            "Cursor's own hook always prints"
+        );
+        assert_eq!(
+            silenced_by_importer(HarnessKind::Codex, &in_cursor, &both),
+            None
+        );
+    }
 
     #[test]
     fn a_path_spec_resolves_against_the_given_roots() {
