@@ -840,9 +840,12 @@ pub struct DoctorReport {
     /// (plan correction 15: doctor never reads the index for this). Never a
     /// problem: `remaining_problems` is unchanged by it.
     pub contradictions: Option<serde_json::Value>,
-    /// The device a local embedding model would run on here, probed without
-    /// loading it (see `crystalline_index::device::probe`). `None` for a
-    /// remote provider and on a build without the local model stack.
+    /// The device the local embedding model runs on: the running daemon's
+    /// own answer when one served this run and has the model loaded (so a
+    /// load-time or runtime fallback to the CPU shows with its reason),
+    /// otherwise the device a load would pick here, probed without loading
+    /// it (see `crystalline_index::device::probe`). `None` for a remote
+    /// provider and on a build without the local model stack.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_device: Option<String>,
     /// Onboarding trace for the Claude Code and Codex integrations
@@ -1186,7 +1189,6 @@ pub async fn run(
         .then(crystalline_index::device::probe)
         .flatten()
         .map(|d| d.to_string());
-    let embedding_device = probed_device.clone().filter(|_| embedding_local);
 
     // Only when a daemon already answered this run's file stamps: reusing
     // that daemon's own numbers is one extra round trip on the route that
@@ -1201,6 +1203,13 @@ pub async fn run(
     } else {
         None
     };
+    // The daemon's loaded model wins over the probe: only it knows about a
+    // warm-up or runtime failure on the GPU.
+    let embedding_device = live_device(
+        daemon_status.as_ref().map(|d| &d["embeddings"]),
+        probed_device.clone(),
+    )
+    .filter(|_| embedding_local);
     let contradictions = Some(contradiction_summary(
         cfg,
         daemon_status.as_ref(),
@@ -2999,6 +3008,15 @@ fn is_embedding_listing(repo: &str) -> bool {
     !crystalline_index::nli::is_nli_checkpoint(repo)
 }
 
+/// The device a daemon's status block names for its loaded model, or
+/// `probed` when no daemon answered or it has no model loaded.
+fn live_device(block: Option<&serde_json::Value>, probed: Option<String>) -> Option<String> {
+    block
+        .and_then(|b| b["device"].as_str())
+        .map(str::to_string)
+        .or(probed)
+}
+
 /// The contradictions row: the profile and its model from config, whether the
 /// model's weights are in the cache (filesystem only, no index read - plan
 /// correction 15, so this runs the same under a running daemon as without
@@ -3013,7 +3031,8 @@ fn is_embedding_listing(repo: &str) -> bool {
 /// fields fall back to the config's embedding model, when no daemon answers
 /// or an older daemon omits them. `device` is the probed
 /// device a load of the model would pick here (as for the embedding model,
-/// probed, not loaded); it is reported only while a profile is on.
+/// probed, not loaded), unless the daemon has the model loaded and names its
+/// device, which wins; it is reported only while a profile is on.
 fn contradiction_summary(
     cfg: &GlobalConfig,
     daemon_status: Option<&serde_json::Value>,
@@ -3103,7 +3122,7 @@ fn contradiction_summary(
                 "last_error": last_error, "load_failed": load_failed,
                 "load_retry": load_retry, "read_only": read_only,
                 "embedding_pending": embedding_pending, "stale_checkpoints": stale,
-                "device": device, "embedding_model": embedding_model,
+                "device": live_device(live, device), "embedding_model": embedding_model,
                 "line_floor": line_floor, "line_floor_missing": line_floor_missing,
                 "lines_embedded": lines_embedded, "lines_eligible": lines_eligible,
             })
@@ -3779,8 +3798,8 @@ pub fn render_human(report: &DoctorReport) -> String {
             }
         }
     }
-    // Probed, not loaded: a warm-up failure on the GPU shows only in
-    // `crystalline status`, which reports the running model's device.
+    // The running daemon's device when it has the model loaded, probed
+    // otherwise (see `DoctorReport::embedding_device`).
     if let Some(device) = &report.embedding_device {
         let _ = writeln!(out, "  device: {device}");
     }
@@ -3824,7 +3843,8 @@ pub fn render_human(report: &DoctorReport) -> String {
                         let _ = writeln!(out, "{l}");
                     }
                 }
-                // Probed, not loaded, like the embedding model's device line.
+                // The daemon's loaded model or the probe, like the embedding
+                // model's device line.
                 if let Some(device) = c["device"].as_str() {
                     let _ = writeln!(out, "  device: {device}");
                 }
@@ -5631,6 +5651,39 @@ mod tests {
                 .any(|l| l == "  device: metal"),
             "{out}"
         );
+    }
+
+    /// A running daemon's loaded model knows what the probe cannot: a GPU
+    /// that failed after the load. Its device wins over the probe on both
+    /// rows; with no model loaded the probe stands.
+    #[test]
+    fn the_daemons_loaded_device_wins_over_the_probe() {
+        let runtime = "cpu (metal failed at runtime: inference: lost)";
+        let daemon = serde_json::json!({
+            "embeddings": { "device": runtime },
+            "contradictions": { "device": runtime },
+        });
+        assert_eq!(
+            live_device(Some(&daemon["embeddings"]), Some("metal".to_string())).as_deref(),
+            Some(runtime)
+        );
+        let idle = serde_json::json!({ "device": null });
+        assert_eq!(
+            live_device(Some(&idle), Some("metal".to_string())).as_deref(),
+            Some("metal"),
+            "no model loaded: the probe"
+        );
+        assert_eq!(live_device(None, None), None);
+
+        let _guard = MODELS_DIR_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = ModelsDirOverride::set(tmp.path());
+        let summary = contradiction_summary(
+            &cfg_with_profile("full"),
+            Some(&daemon),
+            Some("metal".to_string()),
+        );
+        assert_eq!(summary["device"], runtime, "{summary}");
     }
 
     /// Final review M1: the row takes `read_only` and `load_retry` from the

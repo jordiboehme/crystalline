@@ -10,8 +10,10 @@
 //! from the `[CLS]` position followed by L2 normalization, and documents are
 //! embedded bare under either. Inference runs on the device [`crate::device`]
 //! picks (Metal on an Apple Silicon Mac when usable, the CPU otherwise), and
-//! both it and the weight load run on a blocking thread so neither stalls the
-//! async runtime; the download itself is async and is awaited before that
+//! a GPU that fails after the load moves the model to the CPU for the rest of
+//! the process ([`ModelSlot`]), with the failed call retried there. Both
+//! inference and the weight load run on a blocking thread so neither stalls
+//! the async runtime; the download itself is async and is awaited before that
 //! thread starts. A load
 //! failure of the pinned snapshot self-heals: that snapshot is removed and
 //! fetched once more before giving up.
@@ -33,7 +35,7 @@ use super::models::{
 };
 use super::modernbert::{Config as ModernBertConfig, ModernBert};
 use super::{DEFAULT_MODEL_ID, EmbeddingProvider};
-use crate::device::{DeviceReport, load_on_best_device};
+use crate::device::{DeviceReport, ModelSlot, load_on_best_device};
 use crate::error::{IndexError, Result};
 use crate::hub::{HubFiles, HubRepo, cache_client, ensure_files, models_cache_dir, pad_id, read};
 
@@ -51,17 +53,16 @@ const MAX_INPUT_CHARS: usize = MAX_INPUT_TOKENS * 6;
 
 /// A locally hosted provider, running the model its configuration named.
 pub struct LocalProvider {
-    inner: Arc<Encoder>,
+    inner: Arc<ModelSlot<Encoder>>,
     model: &'static LocalModel,
 }
 
 /// The loaded model, tokenizer and device, shared into the blocking inference
-/// task.
+/// task through its [`ModelSlot`], which also holds the device report.
 struct Encoder {
     loaded: Loaded,
     tokenizer: Tokenizer,
     device: Device,
-    report: DeviceReport,
 }
 
 /// The two encoders behind one seam. Both return `(batch, seq, hidden)`.
@@ -93,7 +94,9 @@ impl LocalProvider {
             return Ok(Vec::new());
         }
         let inner = self.inner.clone();
-        tokio::task::spawn_blocking(move || embed_texts(&inner, &texts))
+        // A GPU failure here moves the model to the CPU and serves this same
+        // batch there, so a query embedding never fails a search because of it.
+        tokio::task::spawn_blocking(move || inner.run(|encoder| embed_texts(encoder, &texts)))
             .await
             .map_err(|e| IndexError::Embedding(format!("embedding task failed: {e}")))?
     }
@@ -136,7 +139,7 @@ impl EmbeddingProvider for LocalProvider {
     }
 
     fn device(&self) -> Option<DeviceReport> {
-        Some(self.inner.report.clone())
+        Some(self.inner.report())
     }
 }
 
@@ -251,7 +254,7 @@ async fn cached_path(
 
 /// Load the model, self-healing once from a corrupt cache. The fetch is awaited
 /// here; only the weight load goes to a blocking thread.
-async fn load_encoder(cache_dir: &Path, model: &'static LocalModel) -> Result<Encoder> {
+async fn load_encoder(cache_dir: &Path, model: &'static LocalModel) -> Result<ModelSlot<Encoder>> {
     let client = cache_client(cache_dir)?;
     load_encoder_with(&client, cache_dir, model).await
 }
@@ -271,7 +274,7 @@ async fn load_encoder_with(
     client: &HFClient,
     cache_dir: &Path,
     model: &'static LocalModel,
-) -> Result<Encoder> {
+) -> Result<ModelSlot<Encoder>> {
     let (files, choice) = load_files_with(client, cache_dir, model).await?;
     if let SnapshotChoice::Older {
         commit,
@@ -318,7 +321,7 @@ async fn load_pinned(
     cache_dir: &Path,
     model: &'static LocalModel,
     files: HubFiles,
-) -> Result<Encoder> {
+) -> Result<ModelSlot<Encoder>> {
     let snapshot = files.snapshot_dir()?;
     match build_on_blocking(files, model).await {
         Ok(encoder) => {
@@ -347,15 +350,27 @@ async fn load_pinned(
 /// The device is the best one that builds the model and embeds a warm-up
 /// text; a GPU failure only falls back to the CPU, so the error this returns,
 /// and with it the self-heal in [`load_pinned`], is always the CPU's.
-async fn build_on_blocking(files: HubFiles, model: &'static LocalModel) -> Result<Encoder> {
+///
+/// The slot keeps the files to build the model once more on the CPU when the
+/// GPU fails after this load. That rebuild runs no warm-up and never reaches
+/// the self-heal: its error is returned to the call that needed it.
+async fn build_on_blocking(
+    files: HubFiles,
+    model: &'static LocalModel,
+) -> Result<ModelSlot<Encoder>> {
     tokio::task::spawn_blocking(move || {
-        let (mut encoder, report) = load_on_best_device(
+        let (encoder, report) = load_on_best_device(
             "embedding model",
             |device| build_encoder(&files, model, device),
             |encoder| embed_texts(encoder, &["warm-up".to_string()]).map(|_| ()),
         )?;
-        encoder.report = report;
-        Ok(encoder)
+        Ok(ModelSlot::new(
+            "embedding model",
+            encoder,
+            report,
+            IndexError::Embedding,
+            move || build_encoder(&files, model, &Device::Cpu),
+        ))
     })
     .await
     .map_err(|e| IndexError::Embedding(format!("model load task failed: {e}")))?
@@ -414,7 +429,6 @@ fn build_encoder(files: &HubFiles, model: &LocalModel, device: &Device) -> Resul
         loaded,
         tokenizer,
         device,
-        report: DeviceReport::cpu(),
     })
 }
 

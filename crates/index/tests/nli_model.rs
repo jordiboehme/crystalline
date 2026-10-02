@@ -201,3 +201,46 @@ async fn the_profiles_separate_a_flipped_fact_from_an_unrelated_one() {
         );
     }
 }
+
+/// A GPU failure after a good load, injected into the real checkpoint: the
+/// same batch is scored again on the CPU, the scores agree with the GPU's to
+/// within 1e-4, the report names the runtime reason, and the next batch runs
+/// on the CPU. On a CPU-only machine (or with the override off) there is no
+/// GPU to fail, and the injection is ignored.
+#[tokio::test]
+async fn a_runtime_gpu_failure_scores_the_batch_again_on_the_cpu() {
+    if !enabled() {
+        return;
+    }
+    let model = nli_model(NliProfile::Full);
+    let nli = LocalNli::load(model).await.unwrap();
+    let device = expected_device(&nli);
+    let pairs = vec![
+        (
+            "The build uses Node 18".to_string(),
+            "The build uses Node 20".to_string(),
+        ),
+        (
+            "Der Build nutzt Node 18".to_string(),
+            "Deployments run on Fridays".to_string(),
+        ),
+    ];
+    let before = nli.score(&pairs).unwrap();
+    nli.inject_runtime_failure(1);
+    let after = nli.score(&pairs).unwrap();
+    for (b, a) in before.iter().zip(&after) {
+        assert!((b - a).abs() < 1e-4, "{before:?} against {after:?}");
+    }
+    let now = nli.device().unwrap();
+    if device.kind == DeviceKind::Metal {
+        assert_eq!(now.kind, DeviceKind::Cpu, "{now}");
+        assert_eq!(
+            now.to_string(),
+            "cpu (metal failed at runtime: contradiction model error: injected runtime failure)"
+        );
+        eprintln!("runtime fallback: {before:?} on metal, {after:?} on the cpu");
+    } else {
+        assert_eq!(now, device, "nothing to fall back from");
+    }
+    assert_eq!(nli.score(&pairs).unwrap().len(), 2);
+}

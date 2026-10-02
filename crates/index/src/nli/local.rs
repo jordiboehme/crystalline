@@ -9,7 +9,10 @@
 //! of an Apple Silicon Mac when the checkpoint builds there and scores a
 //! warm-up pair, the CPU otherwise. A GPU error or panic only falls back to
 //! the CPU, so the self-heal above runs on a CPU failure alone and never
-//! removes a good snapshot because of the GPU.
+//! removes a good snapshot because of the GPU. A GPU that fails after the
+//! load moves the checkpoint to the CPU for the rest of the process
+//! ([`ModelSlot`]): the failed batch is scored again there, so the pass
+//! completes instead of parking its pairs.
 //!
 //! candle's `DebertaV2SeqClassificationModel` reads `pooler.dense` and
 //! `classifier` through `vb.root()`, so it is handed `vb.pp("deberta")`. The
@@ -37,7 +40,7 @@ use super::models::NliModel;
 #[cfg(test)]
 use super::models::{NliProfile, nli_model};
 use super::{ContradictionScorer, MAX_LINE_TOKENS, contradiction_index};
-use crate::device::{DeviceReport, load_on_best_device};
+use crate::device::{DeviceReport, ModelSlot, load_on_best_device};
 use crate::embed::models::{note_loaded_snapshot, remove_failed_snapshot};
 use crate::error::{IndexError, Result};
 use crate::hub::{HubFiles, HubRepo, ensure_files, models_cache_dir, pad_id, read};
@@ -55,13 +58,17 @@ const MAX_PAIR_TOKENS: usize = 512;
 /// applies the same cut.
 const MAX_LINE_CHARS: usize = MAX_LINE_TOKENS * 16;
 
-/// A loaded NLI checkpoint.
+/// A loaded NLI checkpoint, on the device its [`ModelSlot`] holds it on.
 pub struct LocalNli {
     model: &'static NliModel,
+    slot: ModelSlot<Loaded>,
+}
+
+/// The checkpoint built on one device: what the slot holds and rebuilds.
+struct Loaded {
     head: Box<DebertaV2SeqClassificationModel>,
     tokenizer: Tokenizer,
     device: Device,
-    report: DeviceReport,
     contradiction: usize,
 }
 
@@ -135,6 +142,28 @@ impl LocalNli {
     /// compares these against Python before it compares logits, so a miss
     /// says whether the tokenizer or the model is at fault.
     pub fn pair_ids(&self, pairs: &[(String, String)]) -> Result<Vec<Vec<u32>>> {
+        self.slot.run(|loaded| loaded.pair_ids(pairs))
+    }
+
+    /// The raw classifier logits of each `(premise, hypothesis)` pair, as one
+    /// padded batch. What the parity test compares against Python; the scorer
+    /// takes the softmax of these. A GPU failure moves the checkpoint to the
+    /// CPU and runs the batch again there.
+    pub fn logits(&self, pairs: &[(String, String)]) -> Result<Vec<Vec<f32>>> {
+        self.slot.run(|loaded| loaded.logits(pairs))
+    }
+
+    /// Make the next `calls` scoring calls on the GPU fail as if the GPU had
+    /// ([`ModelSlot::inject_runtime_failure`]): the seam the real-model check
+    /// of the runtime fallback drives. A checkpoint on the CPU ignores it.
+    #[doc(hidden)]
+    pub fn inject_runtime_failure(&self, calls: usize) {
+        self.slot.inject_runtime_failure(calls);
+    }
+}
+
+impl Loaded {
+    fn pair_ids(&self, pairs: &[(String, String)]) -> Result<Vec<Vec<u32>>> {
         if pairs.is_empty() {
             return Ok(Vec::new());
         }
@@ -167,10 +196,8 @@ impl LocalNli {
             .map_err(|e| IndexError::Nli(format!("tokenizing: {e}")))
     }
 
-    /// The raw classifier logits of each `(premise, hypothesis)` pair, as one
-    /// padded batch. What the parity test compares against Python; the scorer
-    /// takes the softmax of these.
-    pub fn logits(&self, pairs: &[(String, String)]) -> Result<Vec<Vec<f32>>> {
+    /// The raw classifier logits of each pair on this device.
+    fn logits(&self, pairs: &[(String, String)]) -> Result<Vec<Vec<f32>>> {
         if pairs.is_empty() {
             return Ok(Vec::new());
         }
@@ -204,11 +231,13 @@ impl LocalNli {
 
 impl ContradictionScorer for LocalNli {
     fn score(&self, pairs: &[(String, String)]) -> Result<Vec<f32>> {
-        Ok(self
-            .logits(pairs)?
-            .iter()
-            .map(|row| softmax_at(row, self.contradiction))
-            .collect())
+        self.slot.run(|loaded| {
+            Ok(loaded
+                .logits(pairs)?
+                .iter()
+                .map(|row| softmax_at(row, loaded.contradiction))
+                .collect())
+        })
     }
 
     fn model_repo(&self) -> &str {
@@ -216,7 +245,7 @@ impl ContradictionScorer for LocalNli {
     }
 
     fn device(&self) -> Option<DeviceReport> {
-        Some(self.report.clone())
+        Some(self.slot.report())
     }
 }
 
@@ -249,15 +278,25 @@ where
 /// [`build`] on a blocking thread, on the device [`crate::device`] picks: the
 /// GPU when the checkpoint builds there and scores [`warm_up`], the CPU
 /// otherwise. The error this returns is always the CPU's.
+///
+/// The slot keeps the files to build the checkpoint once more on the CPU when
+/// the GPU fails after this load; that rebuild runs no warm-up and never
+/// reaches the self-heal.
 async fn build_on_blocking(files: HubFiles, model: &'static NliModel) -> Result<LocalNli> {
     tokio::task::spawn_blocking(move || {
-        let (mut nli, report) = load_on_best_device(
+        let (loaded, report) = load_on_best_device(
             "contradiction model",
             |device| build(&files, model, device),
             warm_up,
         )?;
-        nli.report = report;
-        Ok(nli)
+        let slot = ModelSlot::new(
+            "contradiction model",
+            loaded,
+            report,
+            IndexError::Nli,
+            move || build(&files, model, &Device::Cpu),
+        );
+        Ok(LocalNli { model, slot })
     })
     .await
     .map_err(|e| IndexError::Nli(format!("contradiction model load task failed: {e}")))?
@@ -266,12 +305,12 @@ async fn build_on_blocking(files: HubFiles, model: &'static NliModel) -> Result<
 /// One pair through the whole scoring path, logits read back to the host, so
 /// an op the GPU lacks (the I64 mask cast, a kernel) or an error it reports
 /// only at sync surfaces while the CPU is still there to fall back to.
-fn warm_up(nli: &LocalNli) -> Result<()> {
+fn warm_up(nli: &Loaded) -> Result<()> {
     nli.logits(&[("warm-up".to_string(), "warm-up".to_string())])
         .map(|_| ())
 }
 
-fn build(files: &HubFiles, model: &'static NliModel, device: &Device) -> Result<LocalNli> {
+fn build(files: &HubFiles, model: &'static NliModel, device: &Device) -> Result<Loaded> {
     let config_text = read(files.config()?)?;
     let raw: serde_json::Value = serde_json::from_str(&config_text)
         .map_err(|e| IndexError::Nli(format!("parsing config.json: {e}")))?;
@@ -319,12 +358,10 @@ fn build(files: &HubFiles, model: &'static NliModel, device: &Device) -> Result<
         DebertaV2SeqClassificationModel::load(vb.pp("deberta"), &config, None)
             .map_err(build_error)?,
     );
-    Ok(LocalNli {
-        model,
+    Ok(Loaded {
         head,
         tokenizer,
         device,
-        report: DeviceReport::cpu(),
         contradiction,
     })
 }
