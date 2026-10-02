@@ -571,9 +571,10 @@ enum Command {
         #[arg(long)]
         folder: Option<String>,
         /// The checksum from a prior read; the split is refused as a conflict if
-        /// the source changed since, whichever storage kind holds it. Without
-        /// it the split can still be refused while another write to the same
-        /// engram is in flight; try it again then.
+        /// the source changed since, whichever storage kind holds it. Omit for
+        /// last-write-wins: the split is applied to the newest text of the
+        /// source, and refused as a conflict only when the lines it moves
+        /// changed since it read them.
         #[arg(long)]
         expected_checksum: Option<String>,
         /// Load the global config from this file instead of the default path.
