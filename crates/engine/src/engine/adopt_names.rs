@@ -233,6 +233,24 @@ impl Engine {
         busy.contains(name) || self.overlay.env_domain(name).is_some()
     }
 
+    /// The configuration file an adoption edits: the file as it stands, like
+    /// [`Engine::fresh_file_config`], except that a file which is there and
+    /// does not parse is an error instead of a reason to fall back to the
+    /// snapshot. An adoption is bookkeeping nobody asked for, so it must not
+    /// write the snapshot over a file somebody is editing by hand, or over a
+    /// broken one `crystalline status` is about to report. The next sync
+    /// tries again.
+    fn adoption_file_config(&self, snapshot: &GlobalConfig) -> Result<GlobalConfig> {
+        match self.config_file_path() {
+            Some(path) if path.is_file() => overlay::load_file(&path).map_err(|e| {
+                EngineError::Invalid(format!(
+                    "{e}; the configuration file is left as it is until it parses again"
+                ))
+            }),
+            _ => Ok(snapshot.clone()),
+        }
+    }
+
     /// The catch-up half: infer and persist the name origin of every entry
     /// in the configuration file that has none. Answers each entry it
     /// inferred, in file order.
@@ -241,7 +259,7 @@ impl Engine {
         busy: &HashSet<String>,
     ) -> Result<Vec<(String, NameOrigin)>> {
         let mut file_guard = self.file_config.write().unwrap();
-        let mut file = self.fresh_file_config(&file_guard);
+        let mut file = self.adoption_file_config(&file_guard)?;
         let mut inferred = Vec::new();
         for (name, entry) in file.domains.iter_mut() {
             if entry.name_origin.is_some() || self.adoption_skips(name, busy) {
@@ -272,7 +290,7 @@ impl Engine {
     ) -> Result<Vec<(String, String)>> {
         let mut planned = Vec::new();
         let mut file_guard = self.file_config.write().unwrap();
-        let mut file = self.fresh_file_config(&file_guard);
+        let mut file = self.adoption_file_config(&file_guard)?;
         let mut changed = false;
         for (name, entry) in file.domains.iter_mut() {
             if self.adoption_skips(name, busy) {

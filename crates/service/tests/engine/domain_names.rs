@@ -1015,6 +1015,43 @@ async fn a_derived_name_follows_a_new_manifest_name() {
     );
 }
 
+/// An adoption never writes over a configuration file that does not parse.
+/// It used to fall back to the engine's snapshot and save that, which put a
+/// good file over one a person was editing by hand, and over the broken one
+/// `crystalline status` was about to report (one way the CI flake of
+/// `status_still_answers_over_a_config_it_cannot_parse` happened). It answers
+/// an error instead, and the pass after the file parses again lines the name
+/// up.
+#[tokio::test]
+async fn an_adoption_leaves_a_configuration_that_does_not_parse_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = bare_manifest_folder(tmp.path(), "eng", "Eng");
+    let engine = adopting_engine(
+        memory_store().await,
+        tmp.path(),
+        vec![(
+            "eng",
+            DomainEntry::file(root).with_name_origin(NameOrigin::Explicit),
+        )],
+    );
+    engine.sync(None).await.unwrap();
+    let path = tmp.path().join("config.yaml");
+    let good = std::fs::read_to_string(&path).unwrap();
+    let broken = "domains: [unclosed\n";
+    std::fs::write(&path, broken).unwrap();
+
+    let err = engine.adopt_domain_names().await.unwrap_err();
+    assert!(err.to_string().contains("left as it is"), "{err}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), broken);
+
+    std::fs::write(&path, good).unwrap();
+    engine.adopt_domain_names().await.unwrap();
+    assert_eq!(
+        saved(tmp.path()).domains["eng"].canonical_seen.as_deref(),
+        Some("eng")
+    );
+}
+
 /// An engine that does not hold this machine's state directory (a one-shot
 /// command while the daemon runs) adopts no name and renames nothing: an
 /// adoption moves the machine's state and configuration, which only the

@@ -192,6 +192,37 @@ impl Env {
         }
     }
 
+    /// Wait until the daemon's pass after its initial sync has written
+    /// `config.yaml`, or panic after ~8s.
+    ///
+    /// Readiness comes first and the initial sync runs behind it, so a daemon
+    /// that answers `ctl status` may still be about to line the domain names
+    /// up and record `canonical_seen` for every registered domain. A test that
+    /// snapshots the file, or edits it, right after [`Self::wait_ready`] races
+    /// that write; it waits here instead. Only for a configuration whose
+    /// domains the pass records, which is every domain `setup_domain`
+    /// registers.
+    fn wait_names_recorded(&self) {
+        let start = Instant::now();
+        loop {
+            let recorded =
+                config::load_yaml::<GlobalConfig>(&self.config_path()).is_ok_and(|cfg| {
+                    !cfg.domains.is_empty()
+                        && cfg.domains.values().all(|e| e.canonical_seen.is_some())
+                });
+            if recorded {
+                return;
+            }
+            if start.elapsed() > Duration::from_secs(8) {
+                panic!(
+                    "the daemon never recorded the domain names: {}",
+                    std::fs::read_to_string(self.config_path()).unwrap_or_default()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// The pid from the owner record. Reads `service.json`, never the lock
     /// file itself: the record moved there so a reader never has to touch a
     /// handle another process holds an exclusive lock on.
@@ -2449,6 +2480,9 @@ fn doctor_over_a_running_daemon_reports_instead_of_failing_on_the_index_lock() {
     let mut c1 = Mcp::spawn(&env);
     c1.initialize();
     env.wait_ready();
+    // The edits of `config.yaml` below load, change and save it, and the
+    // daemon's own write after its initial sync must not land in between.
+    env.wait_names_recorded();
 
     let docs = env.dir.join("kb-docs");
     std::fs::create_dir_all(&docs).unwrap();
@@ -2704,6 +2738,9 @@ fn explicit_overrides_bypass_a_running_daemon() {
     let mut c1 = Mcp::spawn(&env);
     c1.initialize();
     env.wait_ready();
+    // The snapshot below is compared byte for byte, so the daemon's own write
+    // after its initial sync has to have landed first.
+    env.wait_names_recorded();
 
     // Snapshot the daemon's own config before any overridden command runs.
     let daemon_config_before = std::fs::read_to_string(env.config_path()).unwrap();
@@ -4113,6 +4150,10 @@ fn status_still_answers_over_a_config_it_cannot_parse() {
     let mut client = Mcp::spawn(&env);
     client.initialize();
     env.wait_ready();
+    // The daemon's pass after its initial sync loads, changes and saves the
+    // file. Broken between its load and its save, the file was replaced with
+    // the good copy and `status` found nothing to report.
+    env.wait_names_recorded();
 
     // The daemon read a good config on the way up; this breaks the copy on
     // disk underneath it, which is exactly the state a person is in when they
@@ -4141,6 +4182,12 @@ fn status_still_answers_over_a_config_it_cannot_parse() {
             .as_str()
             .is_some_and(|e| !e.is_empty()),
         "--json carries the same note as a field: {value}"
+    );
+    // Nothing the daemon did since put a good file back.
+    assert_eq!(
+        std::fs::read_to_string(env.config_path()).unwrap(),
+        "domains: [unclosed\n",
+        "the daemon left the broken file as it is"
     );
 }
 
