@@ -1066,6 +1066,59 @@ fn session_start_retires_a_departed_covers_copy() {
 }
 
 #[test]
+fn a_departed_codex_copy_is_retired_when_the_only_writer_left_is_read_covered() {
+    // Claude Code, Codex and Cursor installed, Gemini not: Cursor writes
+    // ~/.agents/skills but is covered by Claude Code, so once Codex leaves
+    // nobody owns that folder and Codex's copy must not outlive a deny.
+    let _guard = HOME_LOCK.lock().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let (_dir, mut global) = skills_only_domain();
+    let receipt_dir = tempfile::tempdir().unwrap();
+    let receipt = receipt_dir.path().join("provisions.json");
+    let cover = home.path().join(".claude/skills/tide-tables/SKILL.md");
+    let shared = home.path().join(".agents/skills/tide-tables/SKILL.md");
+
+    let previous = set_home(home.path());
+    run_apply(&global, &receipt, &[ClaudeCode, Codex, Cursor]);
+    let both = (cover.is_file(), shared.is_file());
+    let before = provision::status(&global, &receipt, &[ClaudeCode, Cursor], &no_env()).unwrap();
+    // Codex is uninstalled.
+    let report = run_apply(&global, &receipt, &[ClaudeCode, Cursor]);
+    let after_uninstall = (cover.is_file(), shared.exists());
+    let codex_records = records_skills(&receipt, Codex);
+    let after = provision::status(&global, &receipt, &[ClaudeCode, Cursor], &no_env()).unwrap();
+    let again = run_apply(&global, &receipt, &[ClaudeCode, Cursor]);
+    deny(&mut global);
+    run_apply(&global, &receipt, &[ClaudeCode, Cursor]);
+    let denied = (cover.exists(), shared.exists());
+    restore_home(previous);
+
+    assert_eq!(both, (true, true));
+    assert_eq!(
+        before.stranded,
+        vec![provision::StrandedSkills {
+            harness: Codex,
+            read_by: Cursor,
+            folder: home.path().join(".agents/skills"),
+            files: 1,
+        }]
+    );
+    assert_eq!(statuses(&report, Codex), vec![ActionStatus::Removed]);
+    assert_eq!(
+        after_uninstall,
+        (true, false),
+        "Cursor keeps reading Claude Code's copy only"
+    );
+    assert!(!codex_records);
+    assert!(after.stranded.is_empty());
+    assert!(
+        again.harnesses.iter().all(|(_, a)| a.is_empty()),
+        "a second run changes nothing: {again:?}"
+    );
+    assert_eq!(denied, (false, false), "deny leaves nothing Cursor reads");
+}
+
+#[test]
 fn a_departed_harness_nobody_reads_keeps_its_records() {
     // Outside the ruling: no installed harness reads ~/.claude/skills, so the
     // departed row is left alone, as before.

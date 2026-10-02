@@ -290,9 +290,11 @@ fn skills_records_misplaced(receipt: &ProvisionReceipt, installed: &[HarnessKind
 }
 
 /// Provisioned skills a departed harness left in a folder that no installed
-/// harness writes but an installed one still reads (Claude Code uninstalled,
-/// Cursor still reading `~/.claude/skills`), so they would keep loading with
-/// nobody to retire them.
+/// owner writes but an installed harness still reads (Claude Code
+/// uninstalled, Cursor still reading `~/.claude/skills`; or Codex
+/// uninstalled while Cursor, covered by Claude Code, is the only writer of
+/// `~/.agents/skills`), so they would keep loading with nobody to retire
+/// them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StrandedSkills {
     /// The departed harness whose receipt row still records the files.
@@ -308,7 +310,7 @@ pub struct StrandedSkills {
 
 /// Every departed harness's skills records that are stranded, in
 /// [`HarnessKind::ALL`] order. Read on a receipt the hand-over already ran
-/// on: a folder an installed harness writes has its records moved to that
+/// on: a folder an installed owner writes has its records moved to that
 /// owner instead. A folder nobody installed reads is left as it was.
 fn stranded_skills(receipt: &ProvisionReceipt, installed: &[HarnessKind]) -> Vec<StrandedSkills> {
     let mut out = Vec::new();
@@ -326,10 +328,12 @@ fn stranded_skills(receipt: &ProvisionReceipt, installed: &[HarnessKind]) -> Vec
         let Some(folder) = skills_folder(gone) else {
             continue;
         };
-        if installed
-            .iter()
-            .any(|&h| skills_folder(h).as_ref() == Some(&folder))
-        {
+        // Only an installed owner takes the records over (the hand-over); a
+        // writer that is itself read-covered provisions nothing of its own
+        // (Cursor under Claude Code after Codex left ~/.agents/skills).
+        if installed.iter().any(|&h| {
+            skills_folder(h).as_ref() == Some(&folder) && skills_owner(h, installed).is_none()
+        }) {
             continue;
         }
         let reader = HarnessKind::ALL.into_iter().find(|h| {

@@ -1358,3 +1358,53 @@ fn an_uninstalled_covers_skill_is_a_doctor_problem_and_deny_retires_it() {
         "{before}\n---\n{after}"
     );
 }
+
+#[test]
+fn an_uninstalled_codex_copy_under_a_covered_cursor_is_a_doctor_problem_and_deny_retires_it() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home-stranded-codex");
+    let bin_dir = work.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let harbor_dir = work.path().join("kb-harbor");
+    let db = work.path().join("index.db");
+    write_install_receipt_for(&home, &["claude-code", "codex", "cursor"]);
+    write_harbor(&harbor_dir);
+    write_shim(&bin_dir, "claude", &work.path().join("claude.log"));
+    write_shim(&bin_dir, "codex", &work.path().join("codex.log"));
+    register_and_allow(&home, &bin_dir, &harbor_dir);
+    let shared = home.join(".agents/skills/tide-tables/SKILL.md");
+    assert!(shared.is_file(), "Codex owns the shared folder");
+
+    // `crystalline uninstall codex`: Cursor still writes ~/.agents/skills,
+    // but it is covered by Claude Code, so nobody owns that folder now.
+    write_install_receipt_for(&home, &["claude-code", "cursor"]);
+    let doctor = |json: bool| {
+        let mut cmd = provision_cmd(&home, &bin_dir);
+        if json {
+            cmd.arg("--json");
+        }
+        cmd.args(["doctor", "--db"]).arg(&db).output().unwrap()
+    };
+    let data: Value = serde_json::from_slice(&doctor(true).stdout).unwrap();
+    let stranded = &data["provisioning"]["stranded"];
+    assert_eq!(stranded.as_array().map(Vec::len), Some(1), "{data}");
+    assert_eq!(stranded[0]["harness"], "codex", "{data}");
+    assert_eq!(stranded[0]["read_by"], "cursor", "{data}");
+    let before = String::from_utf8_lossy(&doctor(false).stdout).into_owned();
+
+    provision_cmd(&home, &bin_dir)
+        .args(["provision", "deny", "harbor"])
+        .assert()
+        .success();
+    assert!(!home.join(".agents/skills/tide-tables").exists());
+    assert!(!home.join(".claude/skills/tide-tables").exists());
+
+    let data: Value = serde_json::from_slice(&doctor(true).stdout).unwrap();
+    assert!(data["provisioning"]["stranded"].is_null(), "{data}");
+    let after = String::from_utf8_lossy(&doctor(false).stdout).into_owned();
+    assert_eq!(
+        doctor_problems(&after) + 1,
+        doctor_problems(&before),
+        "{before}\n---\n{after}"
+    );
+}
