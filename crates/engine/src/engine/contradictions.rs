@@ -841,6 +841,10 @@ impl Engine {
                 remaining,
             });
         }
+        // What the walk found is published before the first pair is scored,
+        // so the status counts the pairs in flight instead of the previous
+        // walk's count. Only `publish_walk` settles a domain.
+        self.publish_progress(model, generation, &work, &pending);
         // The model is loaded only when some pair has a line pair to read. A
         // pair with none above the floor, the common case for a related
         // pair, is stored empty without it.
@@ -974,6 +978,7 @@ impl Engine {
                         }
                     }
                 }
+                self.publish_progress(model, generation, &work, &pending);
             }
             if out_of_budget {
                 break 'domains;
@@ -1154,6 +1159,26 @@ impl Engine {
             )
             .await?;
         Ok(true)
+    }
+
+    /// Publish the counts of a walk still scoring, under the guard
+    /// `publish_walk` uses. Nothing is settled or failed here: that is the
+    /// end of the walk's business, and its final counts overwrite these.
+    fn publish_progress(
+        &self,
+        model: &'static NliModel,
+        generation: u64,
+        work: &[DomainWork],
+        pending: &BTreeMap<String, usize>,
+    ) -> bool {
+        let current = self.contradiction_model().map(|m| m.repo);
+        let mut state = self.contradiction_state.lock().unwrap();
+        if state.generation != generation || current != Some(model.repo) {
+            return false;
+        }
+        record_counts(&mut state, work, pending);
+        state.pending = Some(pending.clone());
+        true
     }
 
     /// Record what a walk found, but only when the generation it started under

@@ -1504,6 +1504,55 @@ async fn a_setting_change_during_the_last_pair_is_not_lost() {
     );
 }
 
+/// Gate item 7: a write-triggered pass publishes the pairs it found before it
+/// scores them, so the status never reads 0 while a pair is still being read.
+#[tokio::test]
+async fn pending_pairs_counts_the_pairs_a_write_is_scoring() {
+    let entered = Arc::new(AtomicBool::new(false));
+    let (release, rx) = std::sync::mpsc::channel();
+    let blocking: Arc<dyn ContradictionScorer> = Arc::new(Blocking {
+        entered: entered.clone(),
+        release: std::sync::Mutex::new(rx),
+    });
+    let loader: ScorerLoader =
+        Arc::new(move |_model: &'static NliModel| ready(Ok(blocking.clone())));
+    let (_tmp, engine) = engine_with(loader).await;
+    set(&engine, "evolve.contradictions", "full").await;
+    three(&engine).await;
+    // The first pass settles the domain; its one batch is released ahead.
+    release.send(()).unwrap();
+    engine.score_contradictions().await.unwrap();
+    assert_eq!(
+        engine.contradictions_status().await.unwrap()["pending_pairs"],
+        0
+    );
+    entered.store(false, Ordering::SeqCst);
+    engine.edit_engram(&append_to_twenty()).await.unwrap();
+    engine.embed_pending().await.unwrap();
+    let pass = tokio::spawn({
+        let engine = engine.clone();
+        async move { engine.score_contradictions().await.unwrap() }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !entered.load(Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the pass reached the scorer");
+    let parked = engine.contradictions_status().await.unwrap()["pending_pairs"].clone();
+    release.send(()).unwrap();
+    pass.await.unwrap();
+    assert!(
+        parked.as_u64().is_some_and(|n| n >= 1),
+        "the pair being scored counts as pending, got {parked}"
+    );
+    assert_eq!(
+        engine.contradictions_status().await.unwrap()["pending_pairs"],
+        0
+    );
+}
+
 /// Review round 1, finding 7: turning the check off ends the walk in flight
 /// after the pair it is on, which is not stored, and lets go of the model.
 #[tokio::test]
