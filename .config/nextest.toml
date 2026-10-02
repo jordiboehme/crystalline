@@ -1,13 +1,15 @@
-# The root cause behind the two timeout overrides below, addressed rather than
-# survived: every suite in this group builds a reqwest client, and on macOS
-# each new client asks the system trust store for the root certificates. Under
-# full-workspace parallelism dozens of those land at once, the trust store
-# serializes them and the contention is not marginal - measured on 2026-08-26,
-# tests that run in milliseconds per-crate ran 100 to 10000 times slower under
-# full parallel load, close enough to the terminate-after ceiling to be killed
-# as hangs. Capping the group at four concurrent tests keeps the contention off
-# the critical path; everything else in the workspace runs at default
-# parallelism.
+# Why the suites in this group run at most four at a time: every one of them
+# builds reqwest clients. When the group was made (measured on 2026-08-26), the
+# reqwest of the day asked the macOS trust store for the root certificates on
+# every new client, and under full-workspace parallelism dozens of those landed
+# at once and were serialized there: tests that run in milliseconds per-crate
+# ran 100 to 10000 times slower, close enough to the terminate-after ceiling to
+# be killed as hangs. reqwest 0.13 with rustls no longer does that - building a
+# client does not touch the trust store, which is read only when an HTTPS
+# certificate is verified - so what a default client still costs on macOS is
+# the system proxy lookup (1 to 7 ms each), which the loopback test clients
+# skip with `no_proxy`. The cap stays as a cheap guard on the suites that build
+# many clients; everything else in the workspace runs at default parallelism.
 [test-groups.forge-wire]
 max-threads = 4
 

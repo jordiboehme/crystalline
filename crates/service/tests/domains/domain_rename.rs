@@ -2075,7 +2075,7 @@ async fn old_rest_paths_answer_the_renamed_domain() {
         .await
         .unwrap();
     });
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let mut bodies = Vec::new();
     for spelling in ["platform", "eng", "eng-team"] {
         let resp = client

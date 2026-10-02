@@ -407,7 +407,10 @@ async fn post_initialize(addr: &std::net::SocketAddr, bearer: Option<&str>) -> r
         },
     })
     .to_string();
-    let mut request = reqwest::Client::new()
+    let mut request = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
         .post(format!("http://{addr}/"))
         .header("content-type", "application/json")
         .header("accept", "application/json, text/event-stream")
@@ -469,7 +472,10 @@ async fn a_revoked_grant_is_refused_at_the_mcp_gate_at_once() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_probes_oauth_flag_follows_the_setting() {
     let (addr, _guard, _auth) = serve_with_mcp_oauth().await;
-    let body: serde_json::Value = reqwest::Client::new()
+    let body: serde_json::Value = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
         .get(format!("http://{addr}/api/v1/auth/me"))
         .send()
         .await

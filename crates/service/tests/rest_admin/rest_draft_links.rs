@@ -129,7 +129,7 @@ async fn serve() -> Fixture {
 }
 
 fn client() -> reqwest::Client {
-    reqwest::Client::builder().build().unwrap()
+    reqwest::Client::builder().no_proxy().build().unwrap()
 }
 
 /// One signed-in browser: its cookie and its CSRF token.

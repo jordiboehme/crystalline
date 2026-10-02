@@ -3136,7 +3136,10 @@ fn http_smoke_initialize_list_and_search() {
     // Give the router a moment after the port opens.
     std::thread::sleep(Duration::from_millis(300));
 
-    let client = reqwest::blocking::Client::new();
+    let client = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap();
     let url = format!("http://{addr}/");
 
     // /health answers without an MCP handshake: static liveness for load
@@ -4917,7 +4920,10 @@ fn health_and_status_say_how_the_daemon_started_and_what_it_bound() {
     wait_port(&addr);
     std::thread::sleep(Duration::from_millis(300));
 
-    let body: Value = reqwest::blocking::Client::new()
+    let body: Value = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
         .get(format!("http://{addr}/health"))
         .send()
         .unwrap()

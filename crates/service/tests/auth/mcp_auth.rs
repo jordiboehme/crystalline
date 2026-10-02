@@ -361,7 +361,7 @@ async fn post_initialize(
     addr: &std::net::SocketAddr,
     authorization: Option<&str>,
 ) -> reqwest::Response {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let mut request = client
         .post(format!("http://{addr}/"))
         .header("content-type", "application/json")
@@ -400,7 +400,10 @@ async fn post_stateless_tools_list(
         }
     })
     .to_string();
-    let mut request = reqwest::Client::new()
+    let mut request = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
         .post(format!("http://{addr}/"))
         .header("content-type", "application/json")
         .header("accept", "application/json, text/event-stream")
@@ -420,7 +423,10 @@ async fn post_on_session(
     session: &str,
     token: &str,
 ) -> reqwest::Response {
-    reqwest::Client::new()
+    reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
         .post(format!("http://{addr}/"))
         .header("content-type", "application/json")
         .header("accept", "application/json, text/event-stream")
@@ -711,7 +717,7 @@ async fn every_rejected_credential_gets_the_identical_refusal() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_health_probe_and_the_json_api_keep_their_own_rules() {
     let (addr, _guard, _store) = serve_with_mcp_auth(true).await;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let health = client
         .get(format!("http://{addr}/health"))
         .send()
@@ -777,7 +783,10 @@ async fn a_session_is_bound_to_the_identity_that_opened_it() {
     // never outlives the transport's own state. Ada's own DELETE is
     // authenticated and matches, so it goes through; what is left afterwards is
     // an id nothing stands behind, which the transport itself refuses.
-    let ended = reqwest::Client::new()
+    let ended = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
         .delete(format!("http://{addr}/"))
         .header("mcp-session-id", &session)
         .header("authorization", format!("Bearer {ada}"))
@@ -2533,7 +2542,10 @@ async fn the_aggregate_origin_verbs_hide_a_private_team_domain_from_the_open_tie
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn proxy_headers_are_no_way_past_the_mcp_gate() {
     let (addr, _tmp, _store) = serve_with_mcp_auth_and(true, true, Some(false)).await;
-    let refused = reqwest::Client::new()
+    let refused = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
         .post(format!("http://{addr}/"))
         .header("content-type", "application/json")
         .header("accept", "application/json, text/event-stream")
@@ -3054,7 +3066,11 @@ async fn get_with_accept(
     path: &str,
     accept: Option<&str>,
 ) -> reqwest::Response {
-    let mut request = reqwest::Client::new().get(format!("http://{addr}{path}"));
+    let mut request = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .get(format!("http://{addr}{path}"));
     if let Some(accept) = accept {
         request = request.header("accept", accept);
     }
