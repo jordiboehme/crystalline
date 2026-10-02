@@ -562,15 +562,22 @@ mod tests {
 
     #[test]
     fn stored_program_reads_the_absolute_spelling_back() {
+        // An absolute path with a space in it, on this platform: a Unix path
+        // is not absolute on Windows.
+        let spaced = if cfg!(windows) {
+            r"C:\a b\crystalline.exe"
+        } else {
+            "/a b/crystalline"
+        };
         let d = &HarnessKind::Cursor.profile().hooks;
         let with = run(
             d,
             Some(CURSOR),
-            &session_command(HarnessKind::Cursor, "/a b/crystalline"),
+            &session_command(HarnessKind::Cursor, spaced),
         );
         assert_eq!(
             stored_program(d, &parse_value(&with).unwrap()).as_deref(),
-            Some("/a b/crystalline")
+            Some(spaced)
         );
     }
 }
