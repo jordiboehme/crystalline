@@ -156,6 +156,7 @@ impl OauthCtx {
             auth,
             db,
             client: reqwest::Client::builder()
+                .no_proxy()
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .unwrap(),

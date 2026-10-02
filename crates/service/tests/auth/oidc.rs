@@ -743,6 +743,7 @@ impl RestCtx {
             // Redirects off: every hop of the flow is asserted here rather
             // than walked invisibly by the client.
             client: reqwest::Client::builder()
+                .no_proxy()
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .unwrap(),
