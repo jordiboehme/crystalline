@@ -561,8 +561,8 @@ fn program_notice(harness: HarnessKind, program: &str) -> Option<String> {
     }
 }
 
-/// The notes a harness adds after an install.
-fn harness_notes(harness: HarnessKind, book: &Receipt, hook_installed: bool) -> Vec<String> {
+/// The notes a harness adds after every install.
+fn harness_notes(harness: HarnessKind, book: &Receipt) -> Vec<String> {
     let mut notes = Vec::new();
     match harness {
         HarnessKind::Cursor => {
@@ -575,12 +575,10 @@ fn harness_notes(harness: HarnessKind, book: &Receipt, hook_installed: bool) -> 
                         .to_string(),
                 );
             }
-            if hook_installed {
-                notes.push(
-                    "Cursor reads ~/.cursor/hooks.json when it starts. Restart Cursor to load the hook."
-                        .to_string(),
-                );
-            }
+            notes.push(
+                "Cursor reads ~/.cursor/hooks.json when it starts. Restart Cursor to load the hook."
+                    .to_string(),
+            );
         }
         HarnessKind::ClaudeCode
         | HarnessKind::Codex
@@ -704,7 +702,7 @@ pub(crate) fn run_install(opts: &InstallOptions, json: bool) -> anyhow::Result<(
         );
     }
     notices.append(&mut run.notices);
-    notices.extend(harness_notes(harness, &book, hook_done));
+    notices.extend(harness_notes(harness, &book));
     notices.extend(rebalance_notices);
     let receipt_report = save_receipt(
         receipt_path.as_deref(),
