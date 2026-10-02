@@ -26,7 +26,6 @@ pub mod import;
 pub mod index;
 pub mod jsonc_edit;
 pub mod line_endings;
-pub mod managed_block;
 pub mod manifest;
 pub mod names;
 pub mod parse;
@@ -58,7 +57,7 @@ pub use engram::{
 };
 pub use harness::profile::{
     CommandSpelling, EntryShape, HookDialect, HostSignal, McpStyle, PathSpec, PointerStyle,
-    PointerWhen, SessionFormat, TimeoutUnit,
+    SessionFormat, TimeoutUnit,
 };
 pub use harness::{HarnessKind, HarnessPaths, HarnessProfile, artifact_base, harness_paths};
 pub use index::{

@@ -189,15 +189,6 @@ impl SessionFormat {
     }
 }
 
-/// When the always-on pointer is written.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum PointerWhen {
-    /// On every install.
-    Always,
-    /// Only while the session hook is not installed.
-    OnlyWithoutHook,
-}
-
 /// Where the always-on pointer to the routing prompt lives.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum PointerStyle {
@@ -209,11 +200,6 @@ pub enum PointerStyle {
         path: PathSpec,
         /// The frontmatter body written above the pointer.
         frontmatter: &'static str,
-    },
-    /// A marked block inside an instructions file the person owns.
-    ManagedBlock {
-        /// The instructions file.
-        path: PathSpec,
     },
 }
 
@@ -249,8 +235,6 @@ pub struct HarnessProfile {
     pub session_format: SessionFormat,
     /// Where the always-on pointer lives.
     pub pointer: PointerStyle,
-    /// When the pointer is written.
-    pub pointer_when: PointerWhen,
     /// The user folder install copies the skills into.
     pub skills_write: PathSpec,
     /// Every user skills folder the harness reads, `skills_write` included.
@@ -295,7 +279,6 @@ static CLAUDE_CODE: HarnessProfile = HarnessProfile {
     hooks: HookDialect::Legacy,
     session_format: SessionFormat::Text,
     pointer: PointerStyle::None,
-    pointer_when: PointerWhen::Always,
     skills_write: PathSpec::home(".claude/skills"),
     skills_reads: &[PathSpec::home(".claude/skills")],
     imports_hooks_from: &[],
@@ -311,7 +294,6 @@ static CODEX: HarnessProfile = HarnessProfile {
     hooks: HookDialect::Legacy,
     session_format: SessionFormat::Text,
     pointer: PointerStyle::None,
-    pointer_when: PointerWhen::Always,
     skills_write: PathSpec::home(".agents/skills"),
     skills_reads: &[PathSpec::home(".agents/skills")],
     imports_hooks_from: &[],
@@ -327,7 +309,6 @@ static COPILOT: HarnessProfile = HarnessProfile {
     hooks: HookDialect::Legacy,
     session_format: SessionFormat::Copilot,
     pointer: PointerStyle::None,
-    pointer_when: PointerWhen::Always,
     skills_write: PathSpec::copilot_home("skills"),
     skills_reads: &[PathSpec::copilot_home("skills")],
     imports_hooks_from: &[],
@@ -350,7 +331,6 @@ static CURSOR: HarnessProfile = HarnessProfile {
     },
     session_format: SessionFormat::Cursor,
     pointer: PointerStyle::None,
-    pointer_when: PointerWhen::Always,
     skills_write: PathSpec::home(".agents/skills"),
     skills_reads: &[
         PathSpec::home(".agents/skills"),
@@ -385,7 +365,6 @@ static KIRO: HarnessProfile = HarnessProfile {
         path: PathSpec::home(".kiro/steering/crystalline.md"),
         frontmatter: "inclusion: always",
     },
-    pointer_when: PointerWhen::Always,
     skills_write: PathSpec::home(".kiro/skills"),
     skills_reads: &[PathSpec::home(".kiro/skills")],
     imports_hooks_from: &[],
@@ -410,10 +389,7 @@ static GEMINI: HarnessProfile = HarnessProfile {
         matcher: "startup",
     },
     session_format: SessionFormat::HookSpecific,
-    pointer: PointerStyle::ManagedBlock {
-        path: PathSpec::home(".gemini/GEMINI.md"),
-    },
-    pointer_when: PointerWhen::OnlyWithoutHook,
+    pointer: PointerStyle::None,
     skills_write: PathSpec::home(".agents/skills"),
     skills_reads: &[
         PathSpec::home(".agents/skills"),
@@ -444,10 +420,7 @@ static QWEN: HarnessProfile = HarnessProfile {
         matcher: "startup",
     },
     session_format: SessionFormat::HookSpecific,
-    pointer: PointerStyle::ManagedBlock {
-        path: PathSpec::home(".qwen/QWEN.md"),
-    },
-    pointer_when: PointerWhen::OnlyWithoutHook,
+    pointer: PointerStyle::None,
     skills_write: PathSpec::home(".qwen/skills"),
     skills_reads: &[PathSpec::home(".qwen/skills")],
     imports_hooks_from: &[],
@@ -566,6 +539,17 @@ mod tests {
         for k in HarnessKind::ALL {
             let p = profile(k);
             assert!(p.skills_reads.contains(&p.skills_write), "{k:?}");
+        }
+    }
+
+    #[test]
+    fn no_harness_writes_an_instruction_file() {
+        const FORBIDDEN: [&str; 4] = ["claude.md", "agents.md", "gemini.md", "qwen.md"];
+        for k in HarnessKind::ALL {
+            if let PointerStyle::OwnedFile { path, .. } = profile(k).pointer {
+                let name = path.rel.rsplit('/').next().unwrap().to_ascii_lowercase();
+                assert!(!FORBIDDEN.contains(&name.as_str()), "{k:?} writes {name}");
+            }
         }
     }
 }

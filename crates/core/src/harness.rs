@@ -442,14 +442,13 @@ mod tests {
             "Gemini reads milliseconds: 10 would be a 10 ms timeout"
         );
         assert_eq!(g.session_format.flag(), Some("hook-specific"));
-        assert_eq!(g.pointer_when, PointerWhen::OnlyWithoutHook);
+        assert!(matches!(g.pointer, PointerStyle::None));
         assert_eq!(g.skills_write, PathSpec::home(".agents/skills"));
 
         let k = HarnessKind::Kiro.profile();
         assert!(
             matches!(k.pointer, PointerStyle::OwnedFile { path, .. } if path == PathSpec::home(".kiro/steering/crystalline.md"))
         );
-        assert_eq!(k.pointer_when, PointerWhen::Always);
         assert_eq!(
             HarnessKind::Qwen.profile().skills_write,
             PathSpec::home(".qwen/skills")

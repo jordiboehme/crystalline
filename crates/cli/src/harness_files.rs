@@ -1,8 +1,8 @@
 #![allow(dead_code)] // removed by Task 8, which wires the callers
 //! Reading, backing up and saving the harness files install edits.
 //!
-//! The text itself is edited by `crystalline_core::jsonc_edit` or
-//! `managed_block`; this module does the IO around it: read the file, keep
+//! The text itself is edited by `crystalline_core::jsonc_edit`; this
+//! module does the IO around it: read the file, keep
 //! one copy of a file the person had before the first change, and write the
 //! result atomically.
 
