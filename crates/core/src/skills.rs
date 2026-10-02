@@ -22,6 +22,11 @@
 //! the four topical skills - installing both would teach the same lessons twice.
 //! It is still served over MCP like any other: a remote client reading the
 //! skills should see everything this binary knows how to teach.
+//!
+//! [`SkillAsset::since`] names the release that first shipped a skill. The
+//! session-start upgrade otherwise reads a managed skill missing on disk as a
+//! deliberate deletion; `since` lets it tell "removed by the person" from
+//! "never offered to this install" and add a skill new in this release.
 
 /// One shipped agent skill: its folder name, its embedded `SKILL.md` and
 /// whether `crystalline install` copies it into a harness skills folder.
@@ -36,6 +41,11 @@ pub struct SkillAsset {
     /// skills folder. False for the consolidated Claude Desktop skill, which
     /// ships as its own zip; see the module docs.
     pub install_managed: bool,
+    /// The first release that ships this skill. An upgrade from an older
+    /// install adds the skill even though it is missing on disk; see
+    /// `reconcile_skill_set` in the CLI. Always a release triple, never a
+    /// pre-release.
+    pub since: &'static str,
 }
 
 impl SkillAsset {
@@ -61,26 +71,31 @@ pub const SKILL_ASSETS: &[SkillAsset] = &[
         name: "crystalline-routing",
         content: include_str!("../../../skills/crystalline-routing/SKILL.md"),
         install_managed: true,
+        since: "0.1.0",
     },
     SkillAsset {
         name: "crystalline-capture",
         content: include_str!("../../../skills/crystalline-capture/SKILL.md"),
         install_managed: true,
+        since: "0.1.0",
     },
     SkillAsset {
         name: "crystalline-schema",
         content: include_str!("../../../skills/crystalline-schema/SKILL.md"),
         install_managed: true,
+        since: "0.1.0",
     },
     SkillAsset {
         name: "crystalline-collaboration",
         content: include_str!("../../../skills/crystalline-collaboration/SKILL.md"),
         install_managed: true,
+        since: "0.1.0",
     },
     SkillAsset {
         name: "crystalline-intelligence",
         content: include_str!("../../../skills/crystalline-intelligence/SKILL.md"),
         install_managed: false,
+        since: "0.1.0",
     },
 ];
 
@@ -93,6 +108,18 @@ pub fn skill(name: &str) -> Option<&'static SkillAsset> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_skill_names_the_version_that_first_shipped_it() {
+        for s in SKILL_ASSETS {
+            assert!(!s.since.is_empty(), "{} has no since", s.name);
+            assert!(
+                s.since.split('.').count() == 3 && !s.since.contains('-'),
+                "{}: since is a release triple, never a pre-release",
+                s.name
+            );
+        }
+    }
 
     #[test]
     fn five_skills_ship_with_four_installed_into_harnesses() {

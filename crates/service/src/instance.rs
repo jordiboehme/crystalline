@@ -564,8 +564,10 @@ pub fn attach_policy(daemon_version: &str, own_version: &str) -> AttachPolicy {
 /// Whether `candidate` is a strictly newer release than `baseline`. Same
 /// precedence as [`attach_policy`]; an unparseable version on either side
 /// is never newer, so an odd record can only ever read as a conflict, never as
-/// an upgrade skew.
-pub(crate) fn strictly_newer(candidate: &str, baseline: &str) -> bool {
+/// an upgrade skew. The CLI uses it for skill upgrades too: a managed skill
+/// whose first release is newer than an install's recorded version is added
+/// even though it is missing on disk.
+pub fn strictly_newer(candidate: &str, baseline: &str) -> bool {
     match (Precedence::parse(candidate), Precedence::parse(baseline)) {
         (Some(candidate), Some(baseline)) => candidate > baseline,
         _ => false,

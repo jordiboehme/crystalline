@@ -527,7 +527,9 @@ fn install_skills(
             },
             vec![skills_placement::covered_marker(by)],
         )),
-        Placement::Write(dir) => install::reconcile_skills(&dir, prior, ReconcileMode::Install),
+        Placement::Write(dir) => {
+            install::reconcile_skills(&dir, prior, ReconcileMode::Install, None)
+        }
     }
 }
 
@@ -843,7 +845,12 @@ pub(crate) fn reconcile(harness: HarnessKind, entry: &mut InstallRecord) -> anyh
     // hand-over depends on.
     if entry.parts.skills && !skills_placement::is_covered(entry) {
         let dir = run.at(harness.profile().skills_write);
-        let (_, records) = install::reconcile_skills(&dir, &entry.skills, ReconcileMode::Auto)?;
+        let (_, records) = install::reconcile_skills(
+            &dir,
+            &entry.skills,
+            ReconcileMode::Auto,
+            Some(entry.version.as_str()),
+        )?;
         entry.skills = records;
     }
     Ok(())

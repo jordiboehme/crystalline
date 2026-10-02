@@ -199,6 +199,29 @@ pub(crate) fn managed_skills() -> Vec<(&'static str, &'static str)> {
         .collect()
 }
 
+/// One managed skill as the reconcile sees it: [`managed_skills`] plus the
+/// release that first shipped it ([`crystalline_core::SkillAsset::since`]),
+/// which decides whether an upgrade may add the skill when it is missing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ManagedSkill {
+    pub name: &'static str,
+    pub content: &'static str,
+    pub since: &'static str,
+}
+
+/// The managed skills with their first release, for [`reconcile_skills`].
+pub(crate) fn managed_skill_set() -> Vec<ManagedSkill> {
+    crystalline_core::SKILL_ASSETS
+        .iter()
+        .filter(|s| s.install_managed)
+        .map(|s| ManagedSkill {
+            name: s.name,
+            content: s.content,
+            since: s.since,
+        })
+        .collect()
+}
+
 /// Skill folder names shipped by past releases and no longer managed. When a
 /// release drops or renames a managed skill, its old folder name is appended
 /// here in the same change and never leaves the list, so install and the
@@ -1453,12 +1476,23 @@ fn uninstall_owned_hooks(path: &Path) -> anyhow::Result<HooksReport> {
 /// every current skill, retire leftovers named by the receipt or by
 /// [`RETIRED_SKILLS`] and return the per-skill report plus fresh receipt
 /// records for everything now on disk.
+///
+/// `row_version` is the version the receipt row last recorded. Only Auto mode
+/// reads it; every Install-mode caller passes `None`.
 pub(crate) fn reconcile_skills(
     dir: &Path,
     prior: &[receipt::RecordedSkill],
     mode: ReconcileMode,
+    row_version: Option<&str>,
 ) -> anyhow::Result<(SkillsReport, Vec<receipt::RecordedSkill>)> {
-    reconcile_skill_set(dir, &managed_skills(), RETIRED_SKILLS, prior, mode)
+    reconcile_skill_set(
+        dir,
+        &managed_skill_set(),
+        RETIRED_SKILLS,
+        prior,
+        mode,
+        row_version,
+    )
 }
 
 /// The engine behind [`reconcile_skills`], parameterized over the current
@@ -1470,21 +1504,35 @@ pub(crate) fn reconcile_skills(
 /// and is overwritten in place; anything else was edited by a person and is
 /// preserved as `SKILL.md.bak` first. With no receipt every mismatch takes
 /// the backup path, so losing the receipt never loses user content.
+///
+/// A skill missing on disk in Auto mode is read as removed by the person,
+/// with one exception: a skill new in this release (its `since` is strictly
+/// newer than `row_version`) that the row never recorded is installed as
+/// `installed-new`, because the person never had the chance to decline it.
+/// A covered row (any `covered:` or `covered-seed:` entry in `prior`) writes
+/// no files and never gets one, and a missing or unparseable `row_version`
+/// never reads as older.
 fn reconcile_skill_set(
     dir: &Path,
-    current: &[(&str, &str)],
+    current: &[ManagedSkill],
     retired: &[&str],
     prior: &[receipt::RecordedSkill],
     mode: ReconcileMode,
+    row_version: Option<&str>,
 ) -> anyhow::Result<(SkillsReport, Vec<receipt::RecordedSkill>)> {
     let prior_hash: std::collections::HashMap<&str, &str> = prior
         .iter()
         .map(|r| (r.name.as_str(), r.sha256.as_str()))
         .collect();
+    let covered = prior.iter().any(|r| {
+        r.name.starts_with(skills_placement::COVERED_PREFIX)
+            || r.name.starts_with(skills_placement::SEED_PREFIX)
+    });
     let mut skills = Vec::new();
     let mut records = Vec::new();
 
-    for &(name, content) in current {
+    for skill in current {
+        let (name, content) = (skill.name, skill.content);
         let path = dir.join(name).join("SKILL.md");
         let status = match std::fs::read(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => match mode {
@@ -1492,6 +1540,17 @@ fn reconcile_skill_set(
                     config::save_bytes(&path, content.as_bytes())?;
                     records.push(record_of(name, content));
                     "installed"
+                }
+                ReconcileMode::Auto
+                    if !covered
+                        && !prior_hash.contains_key(name)
+                        && row_version.is_some_and(|v| {
+                            crystalline_service::instance::strictly_newer(skill.since, v)
+                        }) =>
+                {
+                    config::save_bytes(&path, content.as_bytes())?;
+                    records.push(record_of(name, content));
+                    "installed-new"
                 }
                 ReconcileMode::Auto => "user-removed",
             },
@@ -1521,7 +1580,7 @@ fn reconcile_skill_set(
     // longer carries, then the static retired list for receipt-less
     // leftovers. `seen` keeps a name that appears in both from being retired
     // twice.
-    let current_names: std::collections::HashSet<&str> = current.iter().map(|&(n, _)| n).collect();
+    let current_names: std::collections::HashSet<&str> = current.iter().map(|s| s.name).collect();
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for r in prior {
         if current_names.contains(r.name.as_str()) || !seen.insert(r.name.as_str()) {
@@ -2003,6 +2062,7 @@ fn skill_label(status: &str) -> &str {
         "removed-retired" => "removed (retired in this version)",
         "retired-backup" => "retired (your copy kept as SKILL.md.bak)",
         "user-removed" => "not reinstalled (removed by you)",
+        "installed-new" => "installed (new in this version)",
         "kept-shared" => "kept (another harness still uses this folder)",
         "covered" => "nothing to remove (another harness's folder covered it)",
         other => other,
@@ -2155,8 +2215,12 @@ pub fn run_install(opts: InstallOptions, json: bool) -> anyhow::Result<()> {
         None
     } else {
         let prior_skills = prior.as_ref().map(|p| p.skills.as_slice()).unwrap_or(&[]);
-        let (report, records) =
-            reconcile_skills(&paths.skills_dir, prior_skills, ReconcileMode::Install)?;
+        let (report, records) = reconcile_skills(
+            &paths.skills_dir,
+            prior_skills,
+            ReconcileMode::Install,
+            None,
+        )?;
         new_records = Some(records);
         Some(report)
     };
@@ -2618,7 +2682,12 @@ fn reconcile_entry(
     // every skill missing and record an empty list, losing the marker the
     // hand-over depends on.
     if entry.parts.skills && !skills_placement::is_covered(entry) {
-        let (_, records) = reconcile_skills(&paths.skills_dir, &entry.skills, ReconcileMode::Auto)?;
+        let (_, records) = reconcile_skills(
+            &paths.skills_dir,
+            &entry.skills,
+            ReconcileMode::Auto,
+            Some(entry.version.as_str()),
+        )?;
         entry.skills = records;
     }
     Ok(())
@@ -3985,9 +4054,28 @@ mod tests {
     // --- skill reconcile ------------------------------------------------
 
     use crate::receipt::{RecordedSkill, sha256_hex};
+    use crate::skills_placement::{COVERED_PREFIX, SEED_PREFIX};
 
     /// The fake current set for reconcile tests: one skill, version 2 body.
-    const CUR: &[(&str, &str)] = &[("alpha", "alpha v2 body")];
+    const CUR: &[ManagedSkill] = &[ManagedSkill {
+        name: "alpha",
+        content: "alpha v2 body",
+        since: "0.1.0",
+    }];
+
+    /// The fake current set of a release that ships a new skill, `beta`.
+    const WITH_NEW: &[ManagedSkill] = &[
+        ManagedSkill {
+            name: "alpha",
+            content: "alpha v2 body",
+            since: "0.1.0",
+        },
+        ManagedSkill {
+            name: "beta",
+            content: "beta body",
+            since: "0.22.1",
+        },
+    ];
 
     fn rec(name: &str, body: &str) -> RecordedSkill {
         RecordedSkill {
@@ -4023,7 +4111,7 @@ mod tests {
     fn install_mode_installs_a_missing_skill_and_records_it() {
         let dir = tempfile::tempdir().unwrap();
         let (report, records) =
-            reconcile_skill_set(dir.path(), CUR, &[], &[], ReconcileMode::Install).unwrap();
+            reconcile_skill_set(dir.path(), CUR, &[], &[], ReconcileMode::Install, None).unwrap();
         assert_eq!(status_of(&report, "alpha"), "installed");
         assert_eq!(
             std::fs::read_to_string(skill_file(dir.path(), "alpha")).unwrap(),
@@ -4036,8 +4124,15 @@ mod tests {
     fn auto_mode_respects_a_user_deletion() {
         let dir = tempfile::tempdir().unwrap();
         let prior = [rec("alpha", "alpha v1 body")];
-        let (report, records) =
-            reconcile_skill_set(dir.path(), CUR, &[], &prior, ReconcileMode::Auto).unwrap();
+        let (report, records) = reconcile_skill_set(
+            dir.path(),
+            CUR,
+            &[],
+            &prior,
+            ReconcileMode::Auto,
+            Some("0.22.0"),
+        )
+        .unwrap();
         assert_eq!(status_of(&report, "alpha"), "user-removed");
         assert!(
             !skill_file(dir.path(), "alpha").exists(),
@@ -4047,12 +4142,162 @@ mod tests {
     }
 
     #[test]
+    fn an_older_row_gets_a_skill_that_is_new_in_this_version() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(dir.path(), "alpha", "alpha v2 body");
+        let prior = [rec("alpha", "alpha v2 body")];
+        let (report, records) = reconcile_skill_set(
+            dir.path(),
+            WITH_NEW,
+            &[],
+            &prior,
+            ReconcileMode::Auto,
+            Some("0.22.0"),
+        )
+        .unwrap();
+        assert_eq!(status_of(&report, "beta"), "installed-new");
+        assert_eq!(
+            std::fs::read_to_string(skill_file(dir.path(), "beta")).unwrap(),
+            "beta body"
+        );
+        assert!(records.contains(&rec("beta", "beta body")));
+    }
+
+    #[test]
+    fn a_dev_build_of_the_new_version_counts_as_older() {
+        let dir = tempfile::tempdir().unwrap();
+        let (report, _) = reconcile_skill_set(
+            dir.path(),
+            WITH_NEW,
+            &[],
+            &[rec("alpha", "alpha v2 body")],
+            ReconcileMode::Auto,
+            Some("0.22.1-dev.12"),
+        )
+        .unwrap();
+        assert_eq!(status_of(&report, "beta"), "installed-new");
+    }
+
+    #[test]
+    fn a_row_at_the_new_version_without_the_skill_keeps_it_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (report, records) = reconcile_skill_set(
+            dir.path(),
+            WITH_NEW,
+            &[],
+            &[rec("alpha", "alpha v2 body")],
+            ReconcileMode::Auto,
+            Some("0.22.1"),
+        )
+        .unwrap();
+        assert_eq!(status_of(&report, "beta"), "user-removed");
+        assert!(!skill_file(dir.path(), "beta").exists());
+        assert!(!records.iter().any(|r| r.name == "beta"));
+    }
+
+    #[test]
+    fn a_row_that_saw_the_skill_and_lost_it_keeps_it_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let prior = [rec("alpha", "alpha v2 body"), rec("beta", "beta body")];
+        let (report, _) = reconcile_skill_set(
+            dir.path(),
+            WITH_NEW,
+            &[],
+            &prior,
+            ReconcileMode::Auto,
+            Some("0.22.0"),
+        )
+        .unwrap();
+        assert_eq!(status_of(&report, "beta"), "user-removed");
+        assert!(!skill_file(dir.path(), "beta").exists());
+    }
+
+    #[test]
+    fn an_old_row_that_lost_every_skill_gets_only_the_new_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (report, records) = reconcile_skill_set(
+            dir.path(),
+            WITH_NEW,
+            &[],
+            &[],
+            ReconcileMode::Auto,
+            Some("0.22.0"),
+        )
+        .unwrap();
+        assert_eq!(status_of(&report, "alpha"), "user-removed");
+        assert!(
+            !skill_file(dir.path(), "alpha").exists(),
+            "never resurrected"
+        );
+        assert_eq!(status_of(&report, "beta"), "installed-new");
+        assert_eq!(records, vec![rec("beta", "beta body")]);
+    }
+
+    #[test]
+    fn a_covered_row_never_gets_a_new_skill() {
+        let dir = tempfile::tempdir().unwrap();
+        for marker in [
+            format!("{COVERED_PREFIX}claude-code"),
+            format!("{SEED_PREFIX}alpha"),
+        ] {
+            let marker = RecordedSkill {
+                name: marker,
+                sha256: String::new(),
+            };
+            let (report, _) = reconcile_skill_set(
+                dir.path(),
+                WITH_NEW,
+                &[],
+                std::slice::from_ref(&marker),
+                ReconcileMode::Auto,
+                Some("0.22.0"),
+            )
+            .unwrap();
+            assert_eq!(
+                status_of(&report, "beta"),
+                "user-removed",
+                "marker {:?}",
+                marker.name
+            );
+            assert!(!skill_file(dir.path(), "beta").exists());
+        }
+    }
+
+    #[test]
+    fn an_unparseable_row_version_installs_nothing_new() {
+        let dir = tempfile::tempdir().unwrap();
+        for v in [None, Some("garbage"), Some("")] {
+            let (report, _) = reconcile_skill_set(
+                dir.path(),
+                WITH_NEW,
+                &[],
+                &[rec("alpha", "alpha v2 body")],
+                ReconcileMode::Auto,
+                v,
+            )
+            .unwrap();
+            assert_eq!(
+                status_of(&report, "beta"),
+                "user-removed",
+                "row version {v:?}"
+            );
+        }
+    }
+
+    #[test]
     fn an_old_clean_copy_is_updated_without_a_backup() {
         let dir = tempfile::tempdir().unwrap();
         seed(dir.path(), "alpha", "alpha v1 body");
         let prior = [rec("alpha", "alpha v1 body")];
-        let (report, records) =
-            reconcile_skill_set(dir.path(), CUR, &[], &prior, ReconcileMode::Auto).unwrap();
+        let (report, records) = reconcile_skill_set(
+            dir.path(),
+            CUR,
+            &[],
+            &prior,
+            ReconcileMode::Auto,
+            Some("0.22.0"),
+        )
+        .unwrap();
         assert_eq!(status_of(&report, "alpha"), "updated");
         assert_eq!(
             std::fs::read_to_string(skill_file(dir.path(), "alpha")).unwrap(),
@@ -4071,7 +4316,8 @@ mod tests {
         seed(dir.path(), "alpha", "my customized alpha");
         let prior = [rec("alpha", "alpha v1 body")];
         let (report, _) =
-            reconcile_skill_set(dir.path(), CUR, &[], &prior, ReconcileMode::Install).unwrap();
+            reconcile_skill_set(dir.path(), CUR, &[], &prior, ReconcileMode::Install, None)
+                .unwrap();
         assert_eq!(status_of(&report, "alpha"), "updated-backup");
         assert_eq!(
             std::fs::read_to_string(skill_file(dir.path(), "alpha")).unwrap(),
@@ -4088,8 +4334,15 @@ mod tests {
         // No receipt at all: overwrite-with-backup is the safe fallback.
         let dir = tempfile::tempdir().unwrap();
         seed(dir.path(), "alpha", "who knows what this is");
-        let (report, _) =
-            reconcile_skill_set(dir.path(), CUR, &[], &[], ReconcileMode::Auto).unwrap();
+        let (report, _) = reconcile_skill_set(
+            dir.path(),
+            CUR,
+            &[],
+            &[],
+            ReconcileMode::Auto,
+            Some("0.22.0"),
+        )
+        .unwrap();
         assert_eq!(status_of(&report, "alpha"), "updated-backup");
         assert_eq!(
             std::fs::read_to_string(bak_file(dir.path(), "alpha")).unwrap(),
@@ -4102,7 +4355,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         seed(dir.path(), "alpha", "second edit");
         std::fs::write(bak_file(dir.path(), "alpha"), "first edit").unwrap();
-        let (_, _) = reconcile_skill_set(dir.path(), CUR, &[], &[], ReconcileMode::Auto).unwrap();
+        let (_, _) = reconcile_skill_set(
+            dir.path(),
+            CUR,
+            &[],
+            &[],
+            ReconcileMode::Auto,
+            Some("0.22.0"),
+        )
+        .unwrap();
         assert_eq!(
             std::fs::read_to_string(bak_file(dir.path(), "alpha")).unwrap(),
             "second edit",
@@ -4115,8 +4376,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         seed(dir.path(), "beta", "beta v1 body");
         let prior = [rec("beta", "beta v1 body")];
-        let (report, records) =
-            reconcile_skill_set(dir.path(), CUR, &[], &prior, ReconcileMode::Auto).unwrap();
+        let (report, records) = reconcile_skill_set(
+            dir.path(),
+            CUR,
+            &[],
+            &prior,
+            ReconcileMode::Auto,
+            Some("0.22.0"),
+        )
+        .unwrap();
         assert_eq!(status_of(&report, "beta"), "removed-retired");
         assert!(
             !dir.path().join("beta").exists(),
@@ -4130,8 +4398,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         seed(dir.path(), "beta", "my customized beta");
         let prior = [rec("beta", "beta v1 body")];
-        let (report, _) =
-            reconcile_skill_set(dir.path(), CUR, &[], &prior, ReconcileMode::Auto).unwrap();
+        let (report, _) = reconcile_skill_set(
+            dir.path(),
+            CUR,
+            &[],
+            &prior,
+            ReconcileMode::Auto,
+            Some("0.22.0"),
+        )
+        .unwrap();
         assert_eq!(status_of(&report, "beta"), "retired-backup");
         assert!(
             !skill_file(dir.path(), "beta").exists(),
@@ -4149,8 +4424,15 @@ mod tests {
         // copy cannot be proven ours, so it is preserved as the backup.
         let dir = tempfile::tempdir().unwrap();
         seed(dir.path(), "gamma", "gamma body");
-        let (report, _) =
-            reconcile_skill_set(dir.path(), CUR, &["gamma"], &[], ReconcileMode::Install).unwrap();
+        let (report, _) = reconcile_skill_set(
+            dir.path(),
+            CUR,
+            &["gamma"],
+            &[],
+            ReconcileMode::Install,
+            None,
+        )
+        .unwrap();
         assert_eq!(status_of(&report, "gamma"), "retired-backup");
         assert_eq!(
             std::fs::read_to_string(bak_file(dir.path(), "gamma")).unwrap(),
@@ -4163,8 +4445,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         seed(dir.path(), "gamma", "gamma body");
         let prior = [rec("gamma", "gamma body")];
-        let (report, _) =
-            reconcile_skill_set(dir.path(), CUR, &["gamma"], &prior, ReconcileMode::Auto).unwrap();
+        let (report, _) = reconcile_skill_set(
+            dir.path(),
+            CUR,
+            &["gamma"],
+            &prior,
+            ReconcileMode::Auto,
+            Some("0.22.0"),
+        )
+        .unwrap();
         assert_eq!(status_of(&report, "gamma"), "removed-retired");
         assert!(!dir.path().join("gamma").exists());
     }
@@ -4173,8 +4462,15 @@ mod tests {
     fn an_absent_retired_skill_reports_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let prior = [rec("beta", "beta v1 body")];
-        let (report, _) =
-            reconcile_skill_set(dir.path(), CUR, &["gamma"], &prior, ReconcileMode::Auto).unwrap();
+        let (report, _) = reconcile_skill_set(
+            dir.path(),
+            CUR,
+            &["gamma"],
+            &prior,
+            ReconcileMode::Auto,
+            Some("0.22.0"),
+        )
+        .unwrap();
         assert!(
             report
                 .skills
@@ -4187,8 +4483,15 @@ mod tests {
     fn an_already_current_skill_refreshes_its_record_untouched() {
         let dir = tempfile::tempdir().unwrap();
         seed(dir.path(), "alpha", "alpha v2 body");
-        let (report, records) =
-            reconcile_skill_set(dir.path(), CUR, &[], &[], ReconcileMode::Auto).unwrap();
+        let (report, records) = reconcile_skill_set(
+            dir.path(),
+            CUR,
+            &[],
+            &[],
+            ReconcileMode::Auto,
+            Some("0.22.0"),
+        )
+        .unwrap();
         assert_eq!(status_of(&report, "alpha"), "already-current");
         assert_eq!(records, vec![rec("alpha", "alpha v2 body")]);
     }
@@ -4245,7 +4548,8 @@ mod tests {
             rec("alpha", "alpha v1 body"),
         ];
         let (report, _records) =
-            reconcile_skill_set(&dir, CUR, &[], &prior, ReconcileMode::Auto).unwrap();
+            reconcile_skill_set(&dir, CUR, &[], &prior, ReconcileMode::Auto, Some("0.22.0"))
+                .unwrap();
 
         // The plain sibling name still reconciles normally.
         assert_eq!(status_of(&report, "alpha"), "updated");
