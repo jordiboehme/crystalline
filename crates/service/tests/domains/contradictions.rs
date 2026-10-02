@@ -3830,3 +3830,128 @@ async fn the_cap_reads_the_32_most_similar_and_says_it_bound() {
     assert!(!bound[0].contains("Relay note"), "no line text: {bound:?}");
     assert_eq!(v302(&sweep(&engine).await).len(), 1);
 }
+
+// --- two instances on one shared database ------------------------------------
+
+#[cfg(feature = "postgres")]
+fn pg_url() -> Option<String> {
+    use std::sync::Once;
+    static NOTE: Once = Once::new();
+    match std::env::var("CRYSTALLINE_TEST_POSTGRES_URL") {
+        Ok(u) if !u.is_empty() => Some(u),
+        _ => {
+            NOTE.call_once(|| {
+                eprintln!(
+                    "note: skipping the postgres contradiction leg (CRYSTALLINE_TEST_POSTGRES_URL is unset); turso only"
+                )
+            });
+            None
+        }
+    }
+}
+
+/// A recycled pid must never adopt a schema a panicking run left behind.
+#[cfg(feature = "postgres")]
+fn unique_schema() -> String {
+    use std::hash::{BuildHasher, RandomState};
+    use std::sync::atomic::AtomicU64;
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "ctx_{}_{}_{:x}",
+        std::process::id(),
+        n,
+        RandomState::new().hash_one(n)
+    )
+}
+
+/// The stub, slowed down: each batch takes long enough that two walks which
+/// start together both find their pairs pending before either one stores.
+#[cfg(feature = "postgres")]
+struct Slow(Arc<StubScorer>);
+
+#[cfg(feature = "postgres")]
+impl ContradictionScorer for Slow {
+    fn score(&self, pairs: &[(String, String)]) -> crystalline_index::Result<Vec<f32>> {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        self.0.score(pairs)
+    }
+    fn model_repo(&self) -> &str {
+        self.0.model_repo()
+    }
+}
+
+/// One instance on its own connection pool to the shared `schema`, with the
+/// `notes` virtual domain, an instance id and `scorer` behind its loader.
+#[cfg(feature = "postgres")]
+async fn instance_on(
+    url: &str,
+    schema: &str,
+    id: &str,
+    scorer: Arc<dyn ContradictionScorer>,
+) -> (tempfile::TempDir, Arc<Engine>) {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = GlobalConfig::default();
+    cfg.domains
+        .insert("notes".to_string(), DomainEntry::virtual_domain());
+    cfg.evolve = Some(EvolveConfig {
+        contradictions: Some("full".to_string()),
+    });
+    cfg.service = Some(ServiceConfig {
+        response_format: Some(ResponseFormat::Json),
+        ..ServiceConfig::default()
+    });
+    let config_path = tmp.path().join("config.yaml");
+    crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+    let store = crystalline_index::PostgresStore::open_in_schema(url, schema)
+        .await
+        .expect("open the postgres test schema");
+    let engine = Engine::new(
+        Arc::new(Mutex::new(store)),
+        cfg,
+        Some(Arc::new(crate::support::TopicEmbedder)),
+        Some(config_path),
+    )
+    .with_instance_id(id.to_string())
+    .with_scorer_loader(loader_of(scorer, Arc::new(AtomicUsize::new(0))));
+    (tmp, Arc::new(engine))
+}
+
+/// Lesson 31: two instances on one postgres both walk every virtual domain,
+/// but only one scores it at a time. Their passes run together; the related
+/// pair is read by the model once in total (one first order and the 0.97 pair
+/// read back, as on one instance), and a second walk on either finds nothing
+/// left.
+#[cfg(feature = "postgres")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_instances_score_a_virtual_domain_once() {
+    let Some(url) = pg_url() else {
+        return;
+    };
+    let schema = unique_schema();
+    let s = stub();
+    let slow: Arc<dyn ContradictionScorer> = Arc::new(Slow(s.clone()));
+    let (_ta, a) = instance_on(&url, &schema, "a", slow.clone()).await;
+    let (_tb, b) = instance_on(&url, &schema, "b", slow).await;
+    three(&a).await;
+    b.embed_pending().await.unwrap();
+
+    let (ra, rb) = tokio::join!(a.score_contradictions(), b.score_contradictions());
+    let (ra, rb) = (ra.unwrap(), rb.unwrap());
+    assert_eq!(
+        s.forwards(),
+        2,
+        "the pair is read once in total, not once per instance: {ra:?} {rb:?}"
+    );
+    assert_eq!(rows(&a, full().repo).await.len(), 1);
+
+    assert_eq!(a.score_contradictions().await.unwrap(), scored(0, 0, 0));
+    assert_eq!(b.score_contradictions().await.unwrap(), scored(0, 0, 0));
+    assert_eq!(s.forwards(), 2, "nothing is left to read");
+
+    drop((a, b));
+    let cleanup = crystalline_index::PostgresStore::open_in_schema(&url, &schema)
+        .await
+        .unwrap();
+    cleanup.drop_schema().await.unwrap();
+}

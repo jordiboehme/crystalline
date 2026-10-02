@@ -43,6 +43,7 @@ use turso::{Builder, Connection, Database, Row, Value};
 
 use crate::alias::{AliasMap, query_uses_tags};
 use crate::error::{IndexError, Result};
+use crate::store::WorkClaim;
 use crate::store::{
     AttachmentRow, BrowseLevel, ChunkJob, ChunkModelCount, ContentMention, ContradictionRow,
     DomainHost, DomainId, DomainKind, DomainStats, EdgeKind, EmbeddingCoverage, EmbeddingRow,
@@ -3195,6 +3196,11 @@ impl Store for TursoStore {
             Ok(())
         })
         .await
+    }
+
+    /// A turso index is this process's own file: nobody else works on it.
+    async fn try_work_claim(&self, _key: &str) -> Result<Option<WorkClaim>> {
+        Ok(Some(WorkClaim::unshared()))
     }
 
     async fn wipe(&self) -> Result<()> {

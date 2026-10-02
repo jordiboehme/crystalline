@@ -104,6 +104,7 @@ use tokio::sync::{Mutex as TokioMutex, MutexGuard};
 
 use crate::alias::{AliasMap, query_uses_tags};
 use crate::error::{IndexError, Result};
+use crate::store::WorkClaim;
 use crate::store::{
     AttachmentRow, BrowseLevel, ChunkJob, ChunkModelCount, ContentMention, ContradictionRow,
     DomainHost, DomainId, DomainKind, DomainStats, EdgeKind, EmbeddingCoverage, EmbeddingRow,
@@ -170,6 +171,45 @@ async fn take_spelling_for_rename(
         }
     }
     claim_own_spelling(conn, spelling, id).await
+}
+
+/// The advisory lock id of the work claim `key` in `schema`: FNV-1a 64 over
+/// the schema name, a NUL and the key, computed here so every instance and
+/// every build agrees on it. Advisory locks belong to the database, not to a
+/// schema, so the schema is part of the id: two schemas on one database
+/// (the test suites, or two separate teams) never shut each other out.
+fn work_claim_id(schema: Option<&str>, key: &str) -> i64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut h = FNV_OFFSET;
+    let schema = schema.unwrap_or_default().as_bytes();
+    for b in schema.iter().chain(&[0u8]).chain(key.as_bytes()) {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    h as i64
+}
+
+/// Unlock the work claim `id` on its own session and give the connection
+/// back to the pool. When the unlock fails or finds nothing held, the
+/// connection is closed instead, so a session that might still hold the lock
+/// never serves another statement.
+pub(crate) async fn release_work_claim(mut conn: PoolConnection<Postgres>, id: i64) {
+    let unlocked = sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock($1)")
+        .bind(id)
+        .fetch_one(&mut *conn)
+        .await;
+    match unlocked {
+        Ok(true) => drop(conn),
+        Ok(false) => {
+            tracing::warn!("a work claim was not held at its release; closing its session");
+            drop(conn.detach());
+        }
+        Err(e) => {
+            tracing::warn!("could not release a work claim, closing its session: {e}");
+            drop(conn.detach());
+        }
+    }
 }
 
 /// A PostgreSQL-backed store. Open one with [`PostgresStore::open`].
@@ -3253,6 +3293,20 @@ impl Store for PostgresStore {
         true
     }
 
+    /// A session-level advisory lock on a connection of its own, taken out of
+    /// the pool for as long as the claim lives. It never runs on the pinned
+    /// transaction connection: that one goes back to the pool at commit.
+    async fn try_work_claim(&self, key: &str) -> Result<Option<WorkClaim>> {
+        let id = work_claim_id(self.schema.as_deref(), key);
+        let mut conn = self.pool.acquire().await.map_err(IndexError::from)?;
+        let taken: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+            .bind(id)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(IndexError::from)?;
+        Ok(taken.then(|| WorkClaim::session(conn, id)))
+    }
+
     async fn wipe(&self) -> Result<()> {
         // Deletes every chunk, so the coverage snapshot is now stale.
         self.invalidate_coverage();
@@ -4222,6 +4276,30 @@ impl PostgresStore {
 
 #[cfg(test)]
 mod tests {
+    /// The work claim id is fixed: two instances of different builds on one
+    /// database must agree on it, so it never moves with a Rust release or a
+    /// process. The schema is part of it.
+    #[test]
+    fn the_work_claim_id_is_pinned_and_names_the_schema() {
+        use super::work_claim_id;
+        assert_eq!(
+            work_claim_id(None, "contradictions:1"),
+            8_733_647_130_574_241_276
+        );
+        assert_eq!(
+            work_claim_id(Some(""), "contradictions:1"),
+            work_claim_id(None, "contradictions:1")
+        );
+        assert_ne!(
+            work_claim_id(Some("a"), "contradictions:1"),
+            work_claim_id(Some("b"), "contradictions:1")
+        );
+        assert_ne!(
+            work_claim_id(Some("a"), "contradictions:1"),
+            work_claim_id(Some("a"), "contradictions:2")
+        );
+    }
+
     /// A line vector whose stored blob disagrees with its `dims` column is
     /// skipped, not returned: a blob of one float under `dims` 4, and a blob
     /// that is not a whole number of floats, beside one good row. Runs when

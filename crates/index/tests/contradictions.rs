@@ -874,3 +874,93 @@ async fn a_postgres_store_shares_its_database() {
         .await
         .expect("drop the postgres test schema");
 }
+
+// --- the work claim ------------------------------------------------------------
+
+/// The claim on two stores over one database. On postgres it is exclusive:
+/// the second claim is `None` while the first lives, a release frees it at
+/// once, and a guard dropped without a release frees it as soon as the server
+/// sees its session end. On turso there is nobody to exclude.
+async fn work_claims(first: &dyn Store, second: &dyn Store, exclusive: bool) {
+    let key = "contradictions:1";
+    let held = first.try_work_claim(key).await.unwrap();
+    assert!(held.is_some(), "the first claim is taken");
+    let other = second.try_work_claim(key).await.unwrap();
+    assert_eq!(other.is_none(), exclusive, "the second claim while held");
+    let same = first.try_work_claim(key).await.unwrap();
+    assert_eq!(
+        same.is_none(),
+        exclusive,
+        "the same store claiming again while held"
+    );
+    assert!(
+        second
+            .try_work_claim("contradictions:2")
+            .await
+            .unwrap()
+            .is_some(),
+        "another key is free"
+    );
+    drop((other, same));
+
+    held.unwrap().release().await;
+    let taken = second.try_work_claim(key).await.unwrap();
+    assert!(taken.is_some(), "free again after a release");
+
+    // Dropped without a release: the session ends and the lock with it.
+    drop(taken);
+    let mut freed = None;
+    for _ in 0..50 {
+        freed = first.try_work_claim(key).await.unwrap();
+        if freed.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(freed.is_some(), "free again after a drop");
+    freed.unwrap().release().await;
+}
+
+#[tokio::test]
+async fn a_work_claim_is_exclusive_on_postgres_and_free_on_turso() {
+    {
+        let store = TursoStore::open_in_memory().await.unwrap();
+        work_claims(&store, &store, false).await;
+    }
+    #[cfg(feature = "postgres")]
+    {
+        if let Some(url) = pg_url() {
+            let schema = unique_schema();
+            let first = crystalline_index::PostgresStore::open_in_schema(&url, &schema)
+                .await
+                .expect("open the postgres test schema");
+            let second = crystalline_index::PostgresStore::open_in_schema(&url, &schema)
+                .await
+                .expect("open the postgres test schema again");
+            // Advisory locks are the database's, not the schema's: another
+            // schema on the same database claims the same key on its own.
+            let elsewhere_schema = unique_schema();
+            let elsewhere =
+                crystalline_index::PostgresStore::open_in_schema(&url, &elsewhere_schema)
+                    .await
+                    .expect("open another postgres test schema");
+            let held = first.try_work_claim("contradictions:1").await.unwrap();
+            assert!(
+                elsewhere
+                    .try_work_claim("contradictions:1")
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "another schema is another set of claims"
+            );
+            held.unwrap().release().await;
+
+            work_claims(&first, &second, true).await;
+            elsewhere.drop_schema().await.unwrap();
+            first
+                .drop_schema()
+                .await
+                .expect("drop the postgres test schema");
+        }
+    }
+}

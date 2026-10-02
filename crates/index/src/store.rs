@@ -1622,6 +1622,63 @@ pub struct ScoredPair {
     pub checksum_b: String,
 }
 
+/// An exclusive work claim from [`Store::try_work_claim`], held for as long
+/// as the guard lives.
+///
+/// On Postgres it holds the connection whose session took the advisory lock.
+/// [`WorkClaim::release`] unlocks it and hands the connection back to the
+/// pool; a guard dropped without a release detaches its connection and drops
+/// it, which ends the session and so frees the lock. On a store this process
+/// owns alone the guard holds nothing.
+pub struct WorkClaim {
+    #[cfg(feature = "postgres")]
+    session: Option<(sqlx::pool::PoolConnection<sqlx::Postgres>, i64)>,
+}
+
+impl WorkClaim {
+    /// A claim with nobody to exclude, for a store this process owns alone.
+    pub(crate) fn unshared() -> WorkClaim {
+        WorkClaim {
+            #[cfg(feature = "postgres")]
+            session: None,
+        }
+    }
+
+    /// A claim held by the session of `conn` under the advisory lock `id`.
+    #[cfg(feature = "postgres")]
+    pub(crate) fn session(conn: sqlx::pool::PoolConnection<sqlx::Postgres>, id: i64) -> WorkClaim {
+        WorkClaim {
+            session: Some((conn, id)),
+        }
+    }
+
+    /// Let go of the claim now. A failed unlock closes the session instead,
+    /// so a connection that might still hold the lock never goes back to the
+    /// pool.
+    #[cfg_attr(not(feature = "postgres"), allow(unused_mut))]
+    pub async fn release(mut self) {
+        #[cfg(feature = "postgres")]
+        if let Some((conn, id)) = self.session.take() {
+            crate::postgres::release_work_claim(conn, id).await;
+        }
+    }
+}
+
+impl Drop for WorkClaim {
+    fn drop(&mut self) {
+        #[cfg(feature = "postgres")]
+        if let Some((conn, _)) = self.session.take() {
+            drop(conn.detach());
+        }
+    }
+}
+
+impl std::fmt::Debug for WorkClaim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkClaim").finish_non_exhaustive()
+    }
+}
+
 /// One scored observation-line pair as `contradiction` records it.
 ///
 /// `line_*` are the one-based lines `read_engram` reports; `hash_*` are the
@@ -2822,6 +2879,14 @@ pub trait Store: Send + Sync {
     fn shares_database(&self) -> bool {
         false
     }
+
+    /// Try to take an exclusive work claim named `key` for as long as the
+    /// returned guard lives. On Postgres a session-level advisory lock on a
+    /// connection the guard holds; the lock ends with the session, so a
+    /// crashed holder lets go by itself. On a store this process owns alone
+    /// there is nobody to exclude: always `Some`. `None` means another
+    /// session holds the claim right now.
+    async fn try_work_claim(&self, key: &str) -> Result<Option<WorkClaim>>;
 
     /// Delete all indexed data, keeping the schema. The corruption-recovery
     /// path behind `crystalline reindex --wipe`, and nothing else: an ordinary

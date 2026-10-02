@@ -27,7 +27,7 @@ use crystalline_index::nli::{
 };
 use crystalline_index::sweep::{MAX_LINE_PAIRS_PER_ENGRAM_PAIR, ORDER_AGGREGATION};
 use crystalline_index::{
-    ContradictionRow, OBSERVATION_VECTOR_CHUNK, ObservationVector, ScoredPair,
+    ContradictionRow, OBSERVATION_VECTOR_CHUNK, ObservationVector, ScoredPair, WorkClaim,
 };
 
 /// The key whose change lifts a failed load and makes pending unknown again.
@@ -124,6 +124,21 @@ struct DomainWork {
     count: Option<DomainCount>,
     /// What the walk's line step saw. `None` for a domain skipped as settled.
     lines: Option<LineCoverage>,
+    /// A virtual domain on a shared database: every instance walks it, so
+    /// its pairs are scored only under the domain's work claim
+    /// ([`Store::try_work_claim`]), by one instance at a time.
+    claimed: bool,
+}
+
+/// What [`Engine::claim_domain`] found.
+enum Claimed<'p> {
+    /// The claim is this instance's, with the pairs another instance stored
+    /// meanwhile.
+    Held(WorkClaim, Vec<&'p PairPlan>),
+    /// Another instance holds the claim.
+    Elsewhere,
+    /// The claim or the read under it failed.
+    Failed(String),
 }
 
 /// One pending engram pair and its kept line pairs; `lines` is `None` while
@@ -919,6 +934,7 @@ impl Engine {
             // nothing.
             let mut take: Vec<&PairPlan> = Vec::new();
             let mut out_of_budget = false;
+            let mut spent = 0usize;
             for plan in &w.pending {
                 let Some(lines) = &plan.lines else {
                     continue;
@@ -928,13 +944,54 @@ impl Engine {
                     break;
                 }
                 budget -= lines.len();
+                spent += lines.len();
                 take.push(plan);
             }
-            for group in groups_of(&take, NLI_GROUP_LINE_PAIRS) {
+            // A virtual domain on a shared database is scored by one
+            // instance at a time, under its work claim, taken right before
+            // the first group and let go after the last.
+            let claim = if w.claimed && !take.is_empty() {
+                match self.claim_domain(model, w, &mut take).await {
+                    Claimed::Held(claim, done) => {
+                        // Pairs another instance stored since this walk read
+                        // the domain: up to date, and not read again here.
+                        for plan in done {
+                            let (a, b) = (&w.facts[plan.pair.a], &w.facts[plan.pair.b]);
+                            if let Some(set) = failures.get_mut(&w.name) {
+                                set.remove(&failed_key(model, a, b));
+                            }
+                            if let Some(left) = pending.get_mut(&w.name) {
+                                *left = left.saturating_sub(1);
+                            }
+                            budget += plan.line_count();
+                        }
+                        Some(claim)
+                    }
+                    // Another instance is scoring this domain, or the claim
+                    // could not be asked for: skipped for this pass, its
+                    // pending left as walked, so it does not settle and the
+                    // next walk reads what the other instance stored. The
+                    // budget it would have used goes to the next domain.
+                    Claimed::Elsewhere => {
+                        budget += spent;
+                        continue;
+                    }
+                    Claimed::Failed(e) => {
+                        batch_error = Some(e);
+                        budget += spent;
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+            let mut stop = false;
+            'groups: for group in groups_of(&take, NLI_GROUP_LINE_PAIRS) {
                 // The profile is read between groups, so off, or another
                 // profile, ends this walk at once and lets go of the model.
                 if self.contradiction_model().map(|m| m.repo) != Some(model.repo) {
-                    break 'domains;
+                    stop = true;
+                    break 'groups;
                 }
                 let (results, n) = self
                     .score_and_store_group(model, w.id, &w.facts, group, scorer.as_ref())
@@ -958,7 +1015,10 @@ impl Engine {
                         }
                         // The profile moved before the write: nothing was
                         // stored, so nothing is counted, and the walk ends.
-                        Ok(false) => break 'domains,
+                        Ok(false) => {
+                            stop = true;
+                            break;
+                        }
                         Err(e) => {
                             if w.failures.contains(&key) {
                                 tracing::debug!(
@@ -978,9 +1038,15 @@ impl Engine {
                         }
                     }
                 }
+                if stop {
+                    break 'groups;
+                }
                 self.publish_progress(model, generation, &work, &pending);
             }
-            if out_of_budget {
+            if let Some(claim) = claim {
+                claim.release().await;
+            }
+            if stop || out_of_budget {
                 break 'domains;
             }
         }
@@ -1020,6 +1086,68 @@ impl Engine {
             line_pairs: lines_done,
             remaining,
         })
+    }
+
+    /// Take the work claim of `w`, a virtual domain on a shared database,
+    /// and once it is held read the domain's stored pairs again: another
+    /// instance may have stored some of `take` between this walk's read and
+    /// the claim. Those leave `take` and come back with the claim. The store
+    /// lock is held for the two calls only, never while the claim is.
+    async fn claim_domain<'p>(
+        &self,
+        model: &'static NliModel,
+        w: &DomainWork,
+        take: &mut Vec<&'p PairPlan>,
+    ) -> Claimed<'p> {
+        let key = format!("contradictions:{}", w.id.0);
+        let tried = self.store.lock().await.try_work_claim(&key).await;
+        let claim = match tried {
+            Ok(Some(claim)) => claim,
+            Ok(None) => {
+                tracing::debug!(
+                    domain = %w.name,
+                    "another instance is scoring this domain; it is left to that one this pass"
+                );
+                return Claimed::Elsewhere;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    domain = %w.name,
+                    "could not ask for the domain's contradiction work claim; it is skipped this pass: {e}"
+                );
+                return Claimed::Failed(e.to_string());
+            }
+        };
+        let scored = {
+            let store = self.store.lock().await;
+            store.contradiction_pairs_scored(w.id, model.repo).await
+        };
+        let scored = match scored {
+            Ok(scored) => scored,
+            Err(e) => {
+                claim.release().await;
+                tracing::warn!(
+                    domain = %w.name,
+                    "could not read the domain's scored pairs under its work claim; it is skipped this pass: {e}"
+                );
+                return Claimed::Failed(e.to_string());
+            }
+        };
+        let stored: HashSet<(i64, i64, &str, &str)> = scored
+            .iter()
+            .map(|s| (s.a.0, s.b.0, s.checksum_a.as_str(), s.checksum_b.as_str()))
+            .collect();
+        let mut done = Vec::new();
+        take.retain(|plan| {
+            let (a, b) = (&w.facts[plan.pair.a], &w.facts[plan.pair.b]);
+            let fresh =
+                !stored.contains(&(a.id.0, b.id.0, a.checksum.as_str(), b.checksum.as_str()));
+            if !fresh {
+                done.push(*plan);
+            }
+            fresh
+        });
+        Claimed::Held(claim, done)
     }
 
     /// Score a group of pending pairs and store each one. A scoring failure
@@ -1248,7 +1376,7 @@ impl Engine {
         retry: bool,
         today: NaiveDate,
     ) -> Result<(Vec<DomainWork>, bool)> {
-        let (scope, coverage) = {
+        let (scope, coverage, shared) = {
             let store = self.store.lock().await;
             let scope = self.embed_scope(&*store).await?;
             // The cached coverage snapshot, one cheap read per walk.
@@ -1256,7 +1384,7 @@ impl Engine {
                 .embedding_coverage()
                 .await?
                 .embedded_for(&self.model_id);
-            (scope, coverage)
+            (scope, coverage, store.shares_database())
         };
         let mut names = self.known_domain_names();
         names.sort();
@@ -1332,6 +1460,7 @@ impl Engine {
                     settle,
                     count: None,
                     lines: None,
+                    claimed: false,
                 });
                 continue;
             }
@@ -1430,6 +1559,7 @@ impl Engine {
                 settle,
                 count: Some(count),
                 lines: Some(lines),
+                claimed: shared && matches!(source, ContentSource::Virtual),
             });
         }
         Ok((out, complete))
