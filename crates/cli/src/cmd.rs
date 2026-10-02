@@ -1382,6 +1382,13 @@ pub(crate) fn print_provision_status(data: &serde_json::Value, json: bool, all: 
         }
     }
     for h in data["harnesses"].as_array().unwrap_or(&empty) {
+        if let Some(owner) = h["covered_by"].as_str() {
+            println!(
+                "{}: covered by {owner}",
+                h["harness"].as_str().unwrap_or("")
+            );
+            continue;
+        }
         println!(
             "{}: {} file(s) installed, {} mcp(s) installed, {} drifted, {} edited, {} orphaned, {} missing",
             h["harness"].as_str().unwrap_or(""),

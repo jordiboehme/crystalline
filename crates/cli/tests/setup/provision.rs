@@ -1221,6 +1221,16 @@ fn codex_and_gemini_share_one_provisioned_copy_and_one_drift_report() {
         "{data}"
     );
 
+    let text = provision_cmd(&home, &bin_dir)
+        .args(["provision", "status"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&text.stdout).contains("gemini: covered by codex"),
+        "{}",
+        String::from_utf8_lossy(&text.stdout)
+    );
+
     std::fs::write(&skill, "edited by hand\n").unwrap();
     let data = status_json(&home, &bin_dir);
     assert_eq!(status_of(&data, "codex")["edited"], 1, "{data}");

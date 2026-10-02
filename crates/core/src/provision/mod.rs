@@ -208,6 +208,86 @@ fn skills_owner(harness: HarnessKind, installed: &[HarnessKind]) -> Option<Harne
     None
 }
 
+/// Whether a receipt key names a skills file.
+fn is_skills_key(key: &str) -> bool {
+    key.starts_with("skills/")
+}
+
+/// Whether a receipt state records any skills file.
+fn holds_skills(state: &HarnessState) -> bool {
+    state.files.keys().any(|k| is_skills_key(k))
+}
+
+/// The ownership moves a receipt still owes, as `(owner, from)` pairs in
+/// `ALL` order: for each installed harness that owns its skills folder, every
+/// other harness whose row records skills in that same folder (a covered
+/// installed one, or one no longer installed) and still holds `skills/` rows.
+/// A folder's records belong to the folder, not the row.
+fn handover_sources(
+    receipt: &ProvisionReceipt,
+    installed: &[HarnessKind],
+) -> Vec<(HarnessKind, HarnessKind)> {
+    let mut moves = Vec::new();
+    for owner in HarnessKind::ALL {
+        if !installed.contains(&owner) || skills_owner(owner, installed).is_some() {
+            continue;
+        }
+        let Some(folder) = skills_folder(owner) else {
+            continue;
+        };
+        for from in HarnessKind::ALL {
+            if from == owner || skills_folder(from).as_ref() != Some(&folder) {
+                continue;
+            }
+            if installed.contains(&from) && skills_owner(from, installed).is_none() {
+                continue;
+            }
+            if receipt.harnesses.get(from.id()).is_some_and(holds_skills) {
+                moves.push((owner, from));
+            }
+        }
+    }
+    moves
+}
+
+/// Carry out [`handover_sources`]: the departed or covered row's skills rows
+/// replace the owner's older ones (it was the last writer), and only those
+/// rows leave it - commands, agents and MCP records stay where they are.
+fn hand_over_skills(receipt: &mut ProvisionReceipt, installed: &[HarnessKind]) {
+    let mut cleared: Vec<HarnessKind> = Vec::new();
+    for (owner, from) in handover_sources(receipt, installed) {
+        let Some(st) = receipt.harnesses.get_mut(from.id()) else {
+            continue;
+        };
+        let keys: Vec<String> = st
+            .files
+            .keys()
+            .filter(|k| is_skills_key(k))
+            .cloned()
+            .collect();
+        let moved: Vec<(String, InstalledFile)> = keys
+            .into_iter()
+            .filter_map(|k| st.files.remove(&k).map(|v| (k, v)))
+            .collect();
+        let state = receipt.harnesses.entry(owner.id().to_string()).or_default();
+        if !cleared.contains(&owner) {
+            cleared.push(owner);
+            state.files.retain(|k, _| !is_skills_key(k));
+        }
+        state.files.extend(moved);
+    }
+}
+
+/// Whether the receipt still holds skills rows that belong to somebody else
+/// now: an installed owner's folder recorded under another row, or an
+/// installed covered harness that still records skills.
+fn skills_records_misplaced(receipt: &ProvisionReceipt, installed: &[HarnessKind]) -> bool {
+    installed.iter().any(|&h| {
+        skills_owner(h, installed).is_some()
+            && receipt.harnesses.get(h.id()).is_some_and(holds_skills)
+    }) || !handover_sources(receipt, installed).is_empty()
+}
+
 // --- shared manifest and artifact helpers ---------------------------------
 
 /// Parse `entry`'s `MANIFEST.md` into a [`Manifest`], or `None` when the
@@ -515,6 +595,8 @@ pub fn apply(
         }
     };
 
+    hand_over_skills(&mut receipt, harnesses);
+
     let mut any_opted_in = false;
     let mut domain_artifacts: Vec<DomainArtifacts> = Vec::new();
     for (name, entry) in &global.domains {
@@ -572,11 +654,36 @@ pub fn apply(
             .entry(harness.id().to_string())
             .or_default();
         // A harness whose skills folder another installed harness owns
-        // reconciles nothing: it forgets what it recorded (the files now
-        // belong to the owner's row) and leaves them on disk.
+        // reconciles nothing of its own. Rows in the owner's folder were
+        // handed over above; what is left is a copy in a folder nobody else
+        // writes (Cursor under Claude Code), retired like a dropped
+        // artifact before the records go.
         if skills_owner(harness, harnesses).is_some() {
-            state.files.clear();
-            harness_results.push((harness, Vec::new()));
+            let mut actions = Vec::new();
+            if holds_skills(state) {
+                let mut skills_only = HarnessState {
+                    files: state
+                        .files
+                        .iter()
+                        .filter(|(k, _)| is_skills_key(k))
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                    ..HarnessState::default()
+                };
+                if let Ok((acts, rec_notices)) = reconcile_harness(
+                    harness,
+                    &DesiredSet::default(),
+                    &mut skills_only,
+                    &mut DeferringMcpRunner,
+                ) {
+                    actions = acts;
+                    for notice in rec_notices {
+                        push_notice(&mut notices, &mut seen, notice);
+                    }
+                }
+                state.files.retain(|k, _| !is_skills_key(k));
+            }
+            harness_results.push((harness, actions));
             continue;
         }
         match reconcile_harness(harness, &desired, state, mcp) {
@@ -757,7 +864,10 @@ pub fn status(
     harnesses: &[HarnessKind],
     env_domains: &HashSet<&str>,
 ) -> anyhow::Result<StatusReport> {
-    let receipt = load(receipt_path).unwrap_or_default();
+    let mut receipt = load(receipt_path).unwrap_or_default();
+    // Read as `apply` would leave it, without writing: the records of a
+    // folder already belong to its owner.
+    hand_over_skills(&mut receipt, harnesses);
 
     let mut domains = Vec::new();
     let mut virtual_with_decision = Vec::new();
@@ -1055,6 +1165,10 @@ fn prefilter(
         .iter()
         .any(|h| !receipt.harnesses.contains_key(h.id()))
     {
+        return SessionWork::Work;
+    }
+
+    if skills_records_misplaced(receipt, harnesses) {
         return SessionWork::Work;
     }
 

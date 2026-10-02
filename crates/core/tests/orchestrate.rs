@@ -740,11 +740,29 @@ fn when_the_owner_leaves_the_next_harness_adopts_the_identical_files() {
     assert_eq!(std::fs::read(&skill).unwrap(), before, "nothing rewritten");
     let (harness, actions) = &report.harnesses[0];
     assert_eq!(*harness, HarnessKind::Gemini);
-    assert_eq!(actions.len(), 1, "{actions:?}");
-    assert_eq!(actions[0].status, ActionStatus::Adopted);
+    assert!(
+        actions.is_empty(),
+        "records handed over, nothing to do: {actions:?}"
+    );
     let status = status.unwrap();
     assert_eq!(status.harnesses[0].covered_by, None);
     assert_eq!(status.harnesses[0].installed_files, 1);
+
+    // Without a record to hand over, the identical file is adopted.
+    std::fs::remove_file(&receipt_path).unwrap();
+    let previous = set_home(home.path());
+    let report = provision::apply(
+        &global,
+        &receipt_path,
+        &[HarnessKind::Gemini],
+        &mut NoMcp,
+        &no_env(),
+    )
+    .unwrap();
+    restore_home(previous);
+    assert_eq!(report.harnesses[0].1.len(), 1);
+    assert_eq!(report.harnesses[0].1[0].status, ActionStatus::Adopted);
+    assert_eq!(std::fs::read(&skill).unwrap(), before);
 }
 
 #[test]
@@ -773,6 +791,173 @@ fn cursor_is_covered_by_claude_code_and_apply_leaves_its_state_empty() {
         Some(HarnessKind::ClaudeCode)
     );
     assert_eq!(status.harnesses[1].installed_files, 0);
+}
+
+// --- shared skills folders: ownership moves ------------------------------------
+
+use HarnessKind::{ClaudeCode, Codex, Cursor, Gemini};
+
+fn run_apply(
+    global: &GlobalConfig,
+    receipt: &Path,
+    harnesses: &[HarnessKind],
+) -> provision::ApplyReport {
+    provision::apply(global, receipt, harnesses, &mut NoMcp, &no_env()).unwrap()
+}
+
+fn deny(global: &mut GlobalConfig) {
+    global.domains.get_mut("harbor").unwrap().provision = Some(false);
+}
+
+fn statuses(report: &provision::ApplyReport, h: HarnessKind) -> Vec<ActionStatus> {
+    report
+        .harnesses
+        .iter()
+        .filter(|(k, _)| *k == h)
+        .flat_map(|(_, a)| a.iter().map(|a| a.status))
+        .collect()
+}
+
+#[test]
+fn a_cursor_copy_is_retired_when_claude_code_starts_covering_it() {
+    let _guard = HOME_LOCK.lock().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let (_dir, mut global) = skills_only_domain();
+    let receipt_dir = tempfile::tempdir().unwrap();
+    let receipt = receipt_dir.path().join("provisions.json");
+    let own = home.path().join(".agents/skills/tide-tables/SKILL.md");
+    let cover = home.path().join(".claude/skills/tide-tables/SKILL.md");
+
+    let previous = set_home(home.path());
+    run_apply(&global, &receipt, &[Cursor]);
+    assert!(own.is_file());
+    let report = run_apply(&global, &receipt, &[ClaudeCode, Cursor]);
+    let (own_after, cover_after) = (own.exists(), cover.is_file());
+    assert_eq!(statuses(&report, Cursor), vec![ActionStatus::Removed]);
+    deny(&mut global);
+    run_apply(&global, &receipt, &[ClaudeCode, Cursor]);
+    let (own_denied, cover_denied) = (own.exists(), cover.exists());
+    restore_home(previous);
+
+    assert!(!own_after, "no duplicate copy in the folder Cursor writes");
+    assert!(cover_after);
+    assert!(!own_denied && !cover_denied, "deny leaves nothing behind");
+}
+
+#[test]
+fn deny_right_after_gemini_gets_a_new_owner_leaves_no_orphan() {
+    let _guard = HOME_LOCK.lock().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let (_dir, mut global) = skills_only_domain();
+    let receipt_dir = tempfile::tempdir().unwrap();
+    let receipt = receipt_dir.path().join("provisions.json");
+    let skill = home.path().join(".agents/skills/tide-tables/SKILL.md");
+
+    let previous = set_home(home.path());
+    run_apply(&global, &receipt, &[Gemini]);
+    assert!(skill.is_file());
+    deny(&mut global);
+    run_apply(&global, &receipt, &[Codex, Gemini]);
+    let left = skill.exists();
+    restore_home(previous);
+
+    assert!(!left, "the new owner retired what the covered one wrote");
+}
+
+#[test]
+fn deny_right_after_the_owner_leaves_removes_the_shared_copy() {
+    let _guard = HOME_LOCK.lock().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let (_dir, mut global) = skills_only_domain();
+    let receipt_dir = tempfile::tempdir().unwrap();
+    let receipt = receipt_dir.path().join("provisions.json");
+    let skill = home.path().join(".agents/skills/tide-tables/SKILL.md");
+
+    let previous = set_home(home.path());
+    run_apply(&global, &receipt, &[Codex, Gemini]);
+    deny(&mut global);
+    run_apply(&global, &receipt, &[Gemini]);
+    let left = skill.exists();
+    restore_home(previous);
+
+    assert!(!left);
+}
+
+#[test]
+fn a_returning_owner_reports_no_false_drift_and_writes_no_backup() {
+    let _guard = HOME_LOCK.lock().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let (dir, global) = skills_only_domain();
+    let receipt_dir = tempfile::tempdir().unwrap();
+    let receipt = receipt_dir.path().join("provisions.json");
+    let both = [Codex, Gemini];
+    let skill_dir = home.path().join(".agents/skills/tide-tables");
+
+    let previous = set_home(home.path());
+    run_apply(&global, &receipt, &both);
+    run_apply(&global, &receipt, &[Gemini]);
+    write(dir.path(), "skills/tide-tables/SKILL.md", "newer tides\n");
+    run_apply(&global, &receipt, &[Gemini]);
+    let status = provision::status(&global, &receipt, &both, &no_env()).unwrap();
+    let report = run_apply(&global, &receipt, &both);
+    let backup = skill_dir.join("SKILL.md.bak").exists();
+    let content = std::fs::read_to_string(skill_dir.join("SKILL.md")).unwrap();
+    restore_home(previous);
+
+    let codex = &status.harnesses[0];
+    assert_eq!((codex.edited, codex.drift, codex.orphaned), (0, 0, 0));
+    assert_eq!(codex.installed_files, 1);
+    assert!(statuses(&report, Codex).is_empty(), "{report:?}");
+    assert!(!backup);
+    assert_eq!(content, "newer tides\n");
+}
+
+#[test]
+fn a_stale_record_never_moves_a_persons_own_file_aside() {
+    let _guard = HOME_LOCK.lock().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let (_dir, mut global) = skills_only_domain();
+    let receipt_dir = tempfile::tempdir().unwrap();
+    let receipt = receipt_dir.path().join("provisions.json");
+    let skill_dir = home.path().join(".agents/skills/tide-tables");
+
+    let previous = set_home(home.path());
+    run_apply(&global, &receipt, &[Codex, Gemini]);
+    run_apply(&global, &receipt, &[Gemini]);
+    deny(&mut global);
+    run_apply(&global, &receipt, &[Gemini]);
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(skill_dir.join("SKILL.md"), "mine\n").unwrap();
+    run_apply(&global, &receipt, &[Codex, Gemini]);
+    let kept = std::fs::read_to_string(skill_dir.join("SKILL.md")).unwrap();
+    let backup = skill_dir.join("SKILL.md.bak").exists();
+    restore_home(previous);
+
+    assert_eq!(kept, "mine\n");
+    assert!(!backup);
+}
+
+#[test]
+fn session_start_runs_the_adoption_after_the_owner_leaves() {
+    let _guard = HOME_LOCK.lock().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let (_dir, global) = skills_only_domain();
+    let receipt_dir = tempfile::tempdir().unwrap();
+    let receipt = receipt_dir.path().join("provisions.json");
+
+    let previous = set_home(home.path());
+    run_apply(&global, &receipt, &[Codex, Gemini]);
+    provision::session_notices(&global, &receipt, &[Gemini], &no_env());
+    restore_home(previous);
+
+    let state = provision::load(&receipt).unwrap();
+    assert_eq!(state.harnesses["gemini"].files.len(), 1);
+    assert!(
+        state.harnesses["codex"]
+            .files
+            .keys()
+            .all(|k| !k.starts_with("skills/"))
+    );
 }
 
 // --- pending: env-defined domains never nag ---------------------------------
