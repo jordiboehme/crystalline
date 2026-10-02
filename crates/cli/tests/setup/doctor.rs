@@ -1799,7 +1799,10 @@ fn each_new_harness_reports_its_mcp_entry_hook_pointer_and_skills() {
             h["skills_folder"].as_str().unwrap().ends_with("skills"),
             "{id}: {h}"
         );
-        assert_eq!(h["skills_installed"], 4, "{id}: {h}");
+        let folder = PathBuf::from(h["skills_folder"].as_str().unwrap());
+        let shipped = skill_dirs(&folder);
+        assert!(shipped >= 4, "{id}: {folder:?}");
+        assert_eq!(h["skills_installed"], shipped, "{id}: {h}");
         let human = doctor_human(&home, work.path());
         assert!(
             !human.contains(&format!("partial setup - run: crystalline install {id}")),
@@ -1881,7 +1884,12 @@ fn skills_cursor_wrote_in_the_shared_folder_are_not_codex_skills() {
     let work = tempfile::tempdir().unwrap();
     run_in(&home, &["install", "cursor"]);
     let report = doctor_json(&home, work.path());
-    assert_eq!(harness_entry(&report, "cursor")["skills_installed"], 4);
+    let shipped = skill_dirs(&home.join(".agents/skills"));
+    assert!(shipped >= 4);
+    assert_eq!(
+        harness_entry(&report, "cursor")["skills_installed"],
+        shipped
+    );
     assert_eq!(
         harness_entry(&report, "codex")["skills_installed"],
         0,
@@ -1889,8 +1897,11 @@ fn skills_cursor_wrote_in_the_shared_folder_are_not_codex_skills() {
     );
     run_in(&home, &["install", "codex", "--skip-mcp"]);
     let report = doctor_json(&home, work.path());
-    assert_eq!(harness_entry(&report, "codex")["skills_installed"], 4);
-    assert_eq!(harness_entry(&report, "cursor")["skills_installed"], 4);
+    assert_eq!(harness_entry(&report, "codex")["skills_installed"], shipped);
+    assert_eq!(
+        harness_entry(&report, "cursor")["skills_installed"],
+        shipped
+    );
     let _ = std::fs::remove_dir_all(&home);
 }
 
@@ -2967,4 +2978,130 @@ fn a_read_only_instance_reports_the_rows_and_collects_none_of_them() {
         human.contains("nothing was collected: this instance is read-only"),
         "the render says it too: {human}"
     );
+}
+
+/// Rewind the receipt so it reads as written by an older release that did
+/// not know the newest managed skill: the row version goes to 0.0.1 and the
+/// skill's record is dropped. Returns the name of a skill whose `since` is
+/// newer than that, taken from the receipt's own list so the test follows
+/// the shipped set.
+#[cfg(unix)]
+fn age_receipt(state_dir: &Path, skill: &str) {
+    let path = state_dir.join("installs.json");
+    let mut receipt: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    for row in receipt["installs"].as_array_mut().unwrap() {
+        row["version"] = json!("0.0.1");
+        if let Some(skills) = row["skills"].as_array_mut() {
+            skills.retain(|s| s["name"] != skill);
+        }
+    }
+    std::fs::write(&path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+}
+
+/// A skill new in a release newer than the row's version is "not installed
+/// yet" for a row that installs skills, and nothing is promised to a row
+/// installed with `--skip-skills`.
+#[test]
+#[cfg(unix)]
+fn a_new_managed_skill_is_pending_only_for_a_row_that_installs_skills() {
+    let skill = "crystalline-provisioning";
+    for (flags, pending) in [
+        (&["--skip-mcp"][..], true),
+        (&["--skip-mcp", "--skip-skills"][..], false),
+    ] {
+        let (home, state) = isolated_home("harness-pending-skill");
+        let work = tempfile::tempdir().unwrap();
+        let mut args = vec!["install", "claude-code"];
+        args.extend_from_slice(flags);
+        run_in(&home, &args);
+        let _ = std::fs::remove_dir_all(home.join(".claude/skills").join(skill));
+        age_receipt(&state, skill);
+        let report = doctor_json(&home, work.path());
+        let claude = harness_entry(&report, "claude-code");
+        let listed = claude
+            .get("skills_pending")
+            .and_then(|p| p.as_array())
+            .is_some_and(|p| p.iter().any(|n| n == skill));
+        assert_eq!(listed, pending, "{flags:?}: {claude}");
+        let human = doctor_human(&home, work.path());
+        assert_eq!(
+            human.contains("next session start installs it"),
+            pending,
+            "{human}"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
+/// Doctor classifies the MCP entry with the planner install runs: a bare
+/// command where the profile wants the absolute path is a problem install
+/// repairs, not "up-to-date".
+#[test]
+#[cfg(unix)]
+fn a_bare_command_where_an_absolute_path_is_wanted_is_a_problem() {
+    let (home, _) = isolated_home("harness-cursor-bare");
+    let work = tempfile::tempdir().unwrap();
+    run_in(&home, &["install", "cursor"]);
+    let file = home.join(".cursor/mcp.json");
+    let text = std::fs::read_to_string(&file).unwrap();
+    let bin = shim_bin(&home).join("crystalline");
+    assert!(text.contains(bin.to_str().unwrap()), "{text}");
+    std::fs::write(&file, text.replace(bin.to_str().unwrap(), "crystalline")).unwrap();
+
+    let (config, db) = empty_config(work.path());
+    let mut cmd = bin_cmd(&home);
+    let out = cmd
+        .args(["--json", "doctor", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .code(1)
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(harness_entry(&report, "cursor")["mcp_entry"], "ours-older");
+    let human = doctor_human_code(&home, work.path(), 1);
+    assert!(human.contains("Run: crystalline install cursor"), "{human}");
+
+    // The repair the line names makes it green again.
+    run_in(&home, &["install", "cursor"]);
+    let report = doctor_json(&home, work.path());
+    assert_eq!(harness_entry(&report, "cursor")["mcp_entry"], "up-to-date");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[cfg(unix)]
+fn bin_cmd(home: &Path) -> Command {
+    let mut cmd = bin();
+    apply_home(&mut cmd, home);
+    cmd.env_remove("COPILOT_HOME").env("PATH", shim_bin(home));
+    cmd
+}
+
+#[cfg(unix)]
+fn doctor_human_code(home: &Path, work: &Path, code: i32) -> String {
+    let (config, db) = empty_config(work);
+    let out = bin_cmd(home)
+        .args(["doctor", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .code(code)
+        .get_output()
+        .stdout
+        .clone();
+    String::from_utf8(out).unwrap()
+}
+
+/// How many skill folders (each with a `SKILL.md`) a skills folder holds, so
+/// the tests follow the shipped set instead of a hard-coded count.
+#[cfg(unix)]
+fn skill_dirs(folder: &Path) -> usize {
+    std::fs::read_dir(folder)
+        .unwrap()
+        .filter(|e| e.as_ref().unwrap().path().join("SKILL.md").is_file())
+        .count()
 }

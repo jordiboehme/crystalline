@@ -152,6 +152,12 @@ fn stored_program(run: &Run) -> Option<String> {
     })
 }
 
+/// The program an explicit install would write for `harness` right now, the
+/// one doctor compares a stored MCP entry with.
+pub(crate) fn wanted_program(harness: HarnessKind) -> String {
+    program_for(&Run::new(harness), false).0
+}
+
 /// The program to write for `harness`, and the warning about it, if any.
 /// `keep` is for the session-start refresh only: it keeps a stored absolute
 /// path that still runs, because a GUI app's PATH there may lack crystalline

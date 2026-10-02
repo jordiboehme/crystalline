@@ -1024,8 +1024,8 @@ impl DoctorReport {
             }
         }
         // A harness that was never installed is not a problem; an
-        // unparseable settings/hooks file or MCP file for one that was is.
-        // A receipt
+        // unparseable settings/hooks file or MCP file for one that was is,
+        // and so is an MCP entry install would rewrite. A receipt
         // version skew and a retired leftover skill are never counted here:
         // both self-heal, the skew at the next session start and the
         // leftover at the next `crystalline install`, so neither should fail
@@ -1033,7 +1033,11 @@ impl DoctorReport {
         if let Some(harnesses) = &self.harnesses {
             n += harnesses
                 .iter()
-                .filter(|h| h.settings_parse_error.is_some() || h.mcp_parse_error.is_some())
+                .filter(|h| {
+                    h.settings_parse_error.is_some()
+                        || h.mcp_parse_error.is_some()
+                        || h.mcp_entry.as_deref() == Some("ours-older")
+                })
                 .count();
         }
         // Rows whose domain is gone count only while something can be done
@@ -2689,7 +2693,7 @@ fn read_profile_json(path: &Path) -> Result<Option<serde_json::Value>, String> {
 /// The MCP file of a profile harness: its path, the entry's state and the
 /// parse error, when there is one.
 fn check_profile_mcp(harness: HarnessKind) -> (Option<String>, Option<String>, Option<String>) {
-    let crystalline_core::McpStyle::JsonEntry { file, map_key, .. } = harness.profile().mcp else {
+    let crystalline_core::McpStyle::JsonEntry { file, .. } = harness.profile().mcp else {
         return (None, None, None);
     };
     let path = file.resolve();
@@ -2698,18 +2702,23 @@ fn check_profile_mcp(harness: HarnessKind) -> (Option<String>, Option<String>, O
         Err(e) => (shown, None, Some(e)),
         Ok(None) => (shown, Some("missing".to_string()), None),
         Ok(Some(root)) => {
-            let Some(top) = root.as_object() else {
+            if !root.is_object() {
                 let e = format!("{}: the file does not hold a JSON object", path.display());
                 return (shown, None, Some(e));
-            };
-            let state = match top.get(map_key).map(|servers| servers.get("crystalline")) {
-                None | Some(None) => "missing",
-                Some(Some(entry)) => match crate::mcp_json::classify(harness, entry) {
+            }
+            // The planner install itself runs, with the program install
+            // would write now, so the two cannot disagree: an entry install
+            // would rewrite (an older shape, a bare command where the
+            // absolute path is wanted, a stale path) is "ours-older".
+            let program = crate::install_profile::wanted_program(harness);
+            let state = match crate::mcp_json::plan_mcp_install(harness, Some(&root), &program) {
+                Ok((state, _)) => match state {
                     crate::mcp_json::EntryState::UpToDate => "up-to-date",
                     crate::mcp_json::EntryState::Ours => "ours-older",
                     crate::mcp_json::EntryState::Customised => "customised",
                     crate::mcp_json::EntryState::Missing => "missing",
                 },
+                Err(e) => return (shown, None, Some(format!("{}: {e}", path.display()))),
             };
             (shown, Some(state.to_string()), None)
         }
@@ -2727,14 +2736,16 @@ fn pending_new_skills(
     entry: Option<&receipt::InstallRecord>,
     on_disk: impl Fn(&str) -> bool,
 ) -> Vec<String> {
-    let Some(entry) = entry else {
+    // The refresh reconciles skills only for a row whose skills part is
+    // installed and that is not covered (a `covered:` or `covered-seed:`
+    // entry), so only such a row is promised an install.
+    let Some(entry) = entry.filter(|e| e.parts.skills) else {
         return Vec::new();
     };
-    if entry
-        .skills
-        .iter()
-        .any(|s| s.name.starts_with(skills_placement::COVERED_PREFIX))
-    {
+    if entry.skills.iter().any(|s| {
+        s.name.starts_with(skills_placement::COVERED_PREFIX)
+            || s.name.starts_with(skills_placement::SEED_PREFIX)
+    }) {
         return Vec::new();
     }
     set.iter()
@@ -4125,12 +4136,18 @@ pub fn render_human(report: &DoctorReport) -> String {
         for h in harnesses {
             let _ = writeln!(out, "  {} ({})", h.name, h.settings_path);
             if let Some(err) = &h.settings_parse_error {
-                let _ = writeln!(out, "    [problem] settings file is not valid JSON: {err}");
+                let _ = writeln!(
+                    out,
+                    "    [problem] settings file could not be read or is not valid JSON: {err}"
+                );
             }
             if let Some(err) = &h.mcp_parse_error
                 && h.settings_parse_error.as_ref() != Some(err)
             {
-                let _ = writeln!(out, "    [problem] MCP file is not valid JSON: {err}");
+                let _ = writeln!(
+                    out,
+                    "    [problem] MCP file could not be read or is not valid JSON: {err}"
+                );
             }
             if h.settings_parse_error.is_none() {
                 let other_trace = h.mcp_entry.as_deref().is_some_and(|e| e != "missing")
@@ -4148,6 +4165,13 @@ pub fn render_human(report: &DoctorReport) -> String {
                     .map(|p| format!(" ({p})"))
                     .unwrap_or_default();
                 let _ = writeln!(out, "    MCP entry: {state}{at}");
+                if state == "ours-older" {
+                    let _ = writeln!(
+                        out,
+                        "    [problem] the MCP entry differs from what install writes now (an older shape, a bare command or a stale path). Run: crystalline install {}",
+                        h.name
+                    );
+                }
             }
             if let (Some(path), Some(present)) = (&h.pointer_path, h.pointer_present) {
                 let _ = writeln!(
@@ -4647,6 +4671,19 @@ mod tests {
             .is_empty()
         );
         assert!(pending_new_skills(&set("0.22.1"), None, nothing_on_disk).is_empty());
+        // A row installed with --skip-skills is never promised an install.
+        let mut skipped = row("0.22.0", &[]);
+        skipped.parts.skills = false;
+        assert!(pending_new_skills(&set("0.22.1"), Some(&skipped), nothing_on_disk).is_empty());
+        // A hand-over seed marks a covered row as well.
+        assert!(
+            pending_new_skills(
+                &set("0.22.1"),
+                Some(&row("0.22.0", &["covered-seed:crystalline-capture"])),
+                nothing_on_disk
+            )
+            .is_empty()
+        );
     }
 
     /// A minimal harness fixture: only the fields [`hook_lines`] reads are
