@@ -1,4 +1,3 @@
-#![allow(dead_code)] // removed by Task 8, which wires the callers
 //! Where a harness gets its skills, and the rebalance between harnesses.
 //!
 //! Some harnesses read more than one user skills folder. Cursor reads

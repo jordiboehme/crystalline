@@ -64,6 +64,7 @@ use serde_json::{Map, Value, json};
 use crystalline_core::{HarnessKind, HarnessPaths, SessionFormat, config, harness_paths};
 use crystalline_service::{CliCapture, CliRun, run_harness_cli, run_harness_cli_capture};
 
+use crate::install_profile;
 use crate::receipt;
 use crate::skills_placement;
 
@@ -881,7 +882,7 @@ fn mcp_add_args(harness: HarnessKind, project: bool) -> Vec<String> {
 /// footgun, so a mismatch earns a notice. `None` when the PATH binary
 /// matches this one; a notice string otherwise (missing, unresponsive or a
 /// different version).
-fn path_binary_notice() -> Option<String> {
+pub(crate) fn path_binary_notice() -> Option<String> {
     let mine = env!("CARGO_PKG_VERSION");
     match std::process::Command::new("crystalline")
         .arg("--version")
@@ -1291,8 +1292,8 @@ fn install_hooks(harness: HarnessKind, path: &Path) -> anyhow::Result<HooksRepor
     match hooks_style(harness) {
         HooksStyle::Merged => install_merged_hooks(harness, path),
         HooksStyle::Owned => install_owned_hooks(harness, path),
-        // Unreachable behind the "not available yet" refusal.
-        HooksStyle::Profile => anyhow::bail!("internal: profile hooks are not wired yet"),
+        // The hook file comes from the profile row, not from `path`.
+        HooksStyle::Profile => install_profile::install_hook_report(harness),
     }
 }
 
@@ -1301,8 +1302,8 @@ fn uninstall_hooks(harness: HarnessKind, path: &Path) -> anyhow::Result<HooksRep
     match hooks_style(harness) {
         HooksStyle::Merged => uninstall_merged_hooks(path),
         HooksStyle::Owned => uninstall_owned_hooks(path),
-        // Unreachable behind the "not available yet" refusal.
-        HooksStyle::Profile => anyhow::bail!("internal: profile hooks are not wired yet"),
+        // The hook file comes from the profile row, not from `path`.
+        HooksStyle::Profile => install_profile::uninstall_hook_report(harness),
     }
 }
 
@@ -1327,7 +1328,7 @@ fn install_merged_hooks(harness: HarnessKind, path: &Path) -> anyhow::Result<Hoo
         } else {
             "added"
         },
-        stop: if had_stop { "already-present" } else { "added" },
+        stop: Some(if had_stop { "already-present" } else { "added" }),
         prompt: prompt_hook_command(harness).map(|_| {
             if had_prompt {
                 "already-present"
@@ -1357,7 +1358,7 @@ fn uninstall_merged_hooks(path: &Path) -> anyhow::Result<HooksReport> {
         } else {
             "absent"
         },
-        stop: if had_stop { "removed" } else { "absent" },
+        stop: Some(if had_stop { "removed" } else { "absent" }),
         // No harness argument here, but every merged-style harness (Claude
         // Code, Codex) supports the prompt hook today, so this is `Some`
         // whenever the merged path runs at all.
@@ -1387,7 +1388,7 @@ fn install_owned_hooks(harness: HarnessKind, path: &Path) -> anyhow::Result<Hook
         } else {
             "added"
         },
-        stop: if had_stop { "already-present" } else { "added" },
+        stop: Some(if had_stop { "already-present" } else { "added" }),
         prompt: prompt_hook_command(harness).map(|_| {
             if had_prompt {
                 "already-present"
@@ -1438,7 +1439,7 @@ fn uninstall_owned_hooks(path: &Path) -> anyhow::Result<HooksReport> {
         } else {
             "absent"
         },
-        stop: if had_stop { "removed" } else { "absent" },
+        stop: Some(if had_stop { "removed" } else { "absent" }),
         // The owned style is Copilot's alone, and it supports the prompt
         // hook (written, inert) like the other two, so this is always `Some`.
         prompt: Some(if had_prompt { "removed" } else { "absent" }),
@@ -1555,6 +1556,7 @@ fn reconcile_skill_set(
         SkillsReport {
             dir: dir.display().to_string(),
             skills,
+            covered_by: None,
         },
         records,
     ))
@@ -1723,6 +1725,7 @@ pub(crate) fn uninstall_skills(
     Ok(SkillsReport {
         dir: dir.display().to_string(),
         skills,
+        covered_by: None,
     })
 }
 
@@ -1735,7 +1738,7 @@ pub(crate) fn uninstall_skills(
 /// A project install run in the home folder aliases a user folder; that
 /// layout is not supported, and its files are not counted.
 #[allow(clippy::too_many_arguments)]
-fn skills_to_remove(
+pub(crate) fn skills_to_remove(
     harness: HarnessKind,
     user_scope: bool,
     dir: &Path,
@@ -1771,6 +1774,7 @@ fn skills_to_remove(
                     status,
                 })
                 .collect(),
+            covered_by: None,
         }),
     }
 }
@@ -1793,41 +1797,63 @@ fn remove_skill(path: &Path, skill_dir: &Path) -> anyhow::Result<()> {
 
 /// The MCP registration outcome. `manual_command` is present exactly when the
 /// automatic path did not complete, and carries the command to run by hand.
+///
+/// A profile harness's entry lives in a JSON file, so its report also names
+/// the file (`path`), a backup taken before the first change (`backup`) and
+/// why the file could not be edited (`error`). The legacy harnesses register
+/// through their CLI and leave all three out.
 #[derive(Serialize)]
-struct McpReport {
-    status: &'static str,
+pub(crate) struct McpReport {
+    pub(crate) status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    manual_command: Option<String>,
+    pub(crate) manual_command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) backup: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) error: Option<String>,
 }
 
 impl McpReport {
-    fn new(status: &'static str, manual_command: Option<String>) -> McpReport {
+    pub(crate) fn new(status: &'static str, manual_command: Option<String>) -> McpReport {
         McpReport {
             status,
             manual_command,
+            path: None,
+            backup: None,
+            error: None,
         }
     }
 }
 
 /// The hooks outcome: which file, what happened to each managed hook and
-/// whether the file was rewritten at all.
+/// whether the file was rewritten at all. A profile harness installs the
+/// session hook only, so its `stop` and `prompt` are `None` and left out of
+/// the JSON; the legacy harnesses always carry both (spec decision 15).
 #[derive(Serialize)]
-struct HooksReport {
-    path: String,
-    session_start: &'static str,
-    stop: &'static str,
+pub(crate) struct HooksReport {
+    pub(crate) path: String,
+    pub(crate) session_start: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) stop: Option<&'static str>,
     /// What happened to the `UserPromptSubmit` hook, `None` for a harness
-    /// [`prompt_hook_command`] answers `None` for (none today: every harness
-    /// gets an entry, Copilot's inert).
-    prompt: Option<&'static str>,
-    written: bool,
+    /// [`prompt_hook_command`] answers `None` for (none of the legacy three:
+    /// each gets an entry, Copilot's inert) and for the profile harnesses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) prompt: Option<&'static str>,
+    pub(crate) written: bool,
 }
 
-/// The skills outcome: the target folder and the per-skill result.
+/// The skills outcome: the target folder and the per-skill result. A
+/// profile harness covered by another harness's folder writes nothing and
+/// names that harness's id in `covered_by`.
 #[derive(Serialize)]
 pub(crate) struct SkillsReport {
-    dir: String,
-    skills: Vec<SkillReport>,
+    pub(crate) dir: String,
+    pub(crate) skills: Vec<SkillReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) covered_by: Option<&'static str>,
 }
 
 impl SkillsReport {
@@ -1842,50 +1868,71 @@ impl SkillsReport {
 
 /// One skill's result within a [`SkillsReport`].
 #[derive(Serialize)]
-struct SkillReport {
+pub(crate) struct SkillReport {
     name: String,
     status: &'static str,
 }
 
 /// The receipt outcome: where it lives and whether this run rewrote it.
 #[derive(Serialize)]
-struct ReceiptReport {
-    path: String,
-    written: bool,
+pub(crate) struct ReceiptReport {
+    pub(crate) path: String,
+    pub(crate) written: bool,
+}
+
+/// The always-on pointer outcome of a profile harness that has one: the
+/// file and what happened to it.
+#[derive(Serialize)]
+pub(crate) struct PointerReport {
+    pub(crate) path: String,
+    pub(crate) status: &'static str,
 }
 
 /// The full result of an `install`. A skipped part is `None`, omitted from the
 /// JSON entirely; `notices` carries harness-specific follow-up (Codex's trust
 /// step, for one).
+///
+/// `pointer` and `backups` belong to the profile harnesses: the pointer file
+/// a profile writes, and every backup this run took of a file it changed.
+/// Both are left out when there is nothing to say, so a legacy report is
+/// unchanged.
 #[derive(Serialize)]
-struct InstallReport {
-    harness: &'static str,
-    scope: &'static str,
+pub(crate) struct InstallReport {
+    pub(crate) harness: &'static str,
+    pub(crate) scope: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    mcp: Option<McpReport>,
+    pub(crate) mcp: Option<McpReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    hooks: Option<HooksReport>,
+    pub(crate) hooks: Option<HooksReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    skills: Option<SkillsReport>,
+    pub(crate) pointer: Option<PointerReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    receipt: Option<ReceiptReport>,
+    pub(crate) skills: Option<SkillsReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) receipt: Option<ReceiptReport>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    notices: Vec<String>,
+    pub(crate) backups: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) notices: Vec<String>,
 }
 
 /// The full result of an `uninstall`. Same shape as [`InstallReport`]; every
 /// part always runs, since `uninstall` has no skip options.
 #[derive(Serialize)]
-struct UninstallReport {
-    harness: &'static str,
-    scope: &'static str,
-    mcp: McpReport,
-    hooks: HooksReport,
-    skills: SkillsReport,
+pub(crate) struct UninstallReport {
+    pub(crate) harness: &'static str,
+    pub(crate) scope: &'static str,
+    pub(crate) mcp: McpReport,
+    pub(crate) hooks: HooksReport,
     #[serde(skip_serializing_if = "Option::is_none")]
-    receipt: Option<ReceiptReport>,
+    pub(crate) pointer: Option<PointerReport>,
+    pub(crate) skills: SkillsReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) receipt: Option<ReceiptReport>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    notices: Vec<String>,
+    pub(crate) backups: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) notices: Vec<String>,
 }
 
 // --- human rendering ---------------------------------------------------------
@@ -1893,6 +1940,9 @@ struct UninstallReport {
 /// The human-readable MCP line for a report status.
 fn mcp_line(m: &McpReport) -> String {
     let manual = m.manual_command.as_deref().unwrap_or("");
+    if m.path.is_some() {
+        return mcp_file_line(m, manual);
+    }
     match m.status {
         "already-present" => "already registered".to_string(),
         "already-present-customised" => format!(
@@ -1909,6 +1959,27 @@ fn mcp_line(m: &McpReport) -> String {
             format!("harness CLI not found. Register it yourself with: {manual}")
         }
         "failed" => format!("registration failed. Register it yourself with: {manual}"),
+        other => other.to_string(),
+    }
+}
+
+/// The human-readable MCP line for a profile harness, whose entry lives in
+/// the file the report names on the next line.
+fn mcp_file_line(m: &McpReport, manual: &str) -> String {
+    let error = m.error.as_deref().unwrap_or("");
+    match m.status {
+        "registered" => "registered".to_string(),
+        "repaired" => "updated to the entry this install writes".to_string(),
+        "already-present" => "already registered".to_string(),
+        "already-present-customised" => format!(
+            "already registered, and left as it is because it is not the entry this install writes. {manual}"
+        ),
+        "removed" => "removed".to_string(),
+        "removed-forced" => "removed (it was not the entry this install writes)".to_string(),
+        "kept-customised" => "kept, because it is not the entry this install writes. Run the uninstall with --force to remove it".to_string(),
+        "not-present" => "not registered (nothing to remove)".to_string(),
+        "failed" if manual.is_empty() => format!("the file could not be edited and is unchanged: {error}"),
+        "failed" => format!("the file could not be edited and is unchanged: {error}. {manual}"),
         other => other.to_string(),
     }
 }
@@ -1938,30 +2009,44 @@ fn skill_label(status: &str) -> &str {
     }
 }
 
+/// The parts of a report [`render_human`] prints.
+struct Parts<'a> {
+    mcp: Option<&'a McpReport>,
+    hooks: Option<&'a HooksReport>,
+    pointer: Option<&'a PointerReport>,
+    skills: Option<&'a SkillsReport>,
+    receipt: Option<&'a ReceiptReport>,
+    backups: &'a [String],
+    notices: &'a [String],
+}
+
 /// Render the shared body of an install or uninstall report under a header
 /// line. Skipped parts render as `skipped`; notices trail after a blank line.
-fn render_human(
-    header: String,
-    mcp: Option<&McpReport>,
-    hooks: Option<&HooksReport>,
-    skills: Option<&SkillsReport>,
-    receipt: Option<&ReceiptReport>,
-    notices: &[String],
-) -> String {
+/// Only the parts a report has are printed: a profile harness has no Stop
+/// or UserPromptSubmit hook, and only a profile harness names its MCP file,
+/// a pointer file and backups.
+fn render_human(header: String, parts: Parts<'_>) -> String {
     let mut out = header;
     out.push('\n');
-    match mcp {
+    match parts.mcp {
         None => out.push_str("  MCP server: skipped\n"),
-        Some(m) => out.push_str(&format!("  MCP server: {}\n", mcp_line(m))),
+        Some(m) => {
+            out.push_str(&format!("  MCP server: {}\n", mcp_line(m)));
+            if let Some(path) = &m.path {
+                out.push_str(&format!("  MCP file: {path}\n"));
+            }
+        }
     }
-    match hooks {
+    match parts.hooks {
         None => out.push_str("  Hooks: skipped\n"),
         Some(h) => {
             out.push_str(&format!(
                 "  SessionStart hook: {}\n",
                 hook_label(h.session_start)
             ));
-            out.push_str(&format!("  Stop hook: {}\n", hook_label(h.stop)));
+            if let Some(stop) = h.stop {
+                out.push_str(&format!("  Stop hook: {}\n", hook_label(stop)));
+            }
             if let Some(prompt) = h.prompt {
                 out.push_str(&format!(
                     "  UserPromptSubmit hook: {}\n",
@@ -1971,25 +2056,55 @@ fn render_human(
             out.push_str(&format!("  Settings file: {}\n", h.path));
         }
     }
-    match skills {
+    if let Some(p) = parts.pointer {
+        out.push_str(&format!(
+            "  Pointer file: {} ({})\n",
+            p.path,
+            pointer_label(p.status)
+        ));
+    }
+    match parts.skills {
         None => out.push_str("  Skills: skipped\n"),
         Some(s) => {
-            out.push_str(&format!("  Skills folder: {}\n", s.dir));
+            match s.covered_by.and_then(HarnessKind::from_id) {
+                Some(by) => out.push_str(&format!(
+                    "  Skills: covered by {}, which the {} install writes\n",
+                    s.dir,
+                    by.display_name()
+                )),
+                None => out.push_str(&format!("  Skills folder: {}\n", s.dir)),
+            }
             for sk in &s.skills {
                 out.push_str(&format!("    {}: {}\n", sk.name, skill_label(sk.status)));
             }
         }
     }
-    if let Some(r) = receipt {
+    if let Some(r) = parts.receipt {
         let state = if r.written { "" } else { " (not written)" };
         out.push_str(&format!("  Install receipt: {}{state}\n", r.path));
     }
-    for note in notices {
+    for backup in parts.backups {
+        out.push_str(&format!(
+            "  Backup of the file before this change: {backup}\n"
+        ));
+    }
+    for note in parts.notices {
         out.push('\n');
         out.push_str(note);
         out.push('\n');
     }
     out
+}
+
+/// The human-readable label for a pointer file status.
+fn pointer_label(status: &str) -> &str {
+    match status {
+        "already-present" => "already present",
+        "kept-modified" => "kept, because it has no Crystalline marker",
+        "removed-forced" => "removed (it had no Crystalline marker)",
+        "absent" => "not present",
+        other => other,
+    }
 }
 
 // --- entry points ------------------------------------------------------------
@@ -2014,6 +2129,9 @@ fn refuse_unready(harness: HarnessKind) -> anyhow::Result<()> {
 /// filesystem error writing a skill, does surface as an error.
 pub fn run_install(opts: InstallOptions, json: bool) -> anyhow::Result<()> {
     refuse_unready(opts.harness)?;
+    if !opts.harness.profile().is_legacy() {
+        return install_profile::run_install(&opts, json);
+    }
     let paths = harness_paths(opts.harness, opts.project);
     let scope = if opts.project { "project" } else { "user" };
 
@@ -2203,27 +2321,42 @@ pub fn run_install(opts: InstallOptions, json: bool) -> anyhow::Result<()> {
         scope,
         mcp,
         hooks,
+        pointer: None,
         skills,
         receipt: receipt_report,
+        backups: Vec::new(),
         notices,
     };
+    print_install(&report, opts.harness, json)
+}
 
+/// Print an install report: one JSON line, or the human summary.
+pub(crate) fn print_install(
+    report: &InstallReport,
+    harness: HarnessKind,
+    json: bool,
+) -> anyhow::Result<()> {
     if json {
-        println!("{}", serde_json::to_string(&report)?);
+        println!("{}", serde_json::to_string(report)?);
     } else {
         let header = format!(
-            "Installed Crystalline for {} ({scope} scope).",
-            opts.harness.display_name()
+            "Installed Crystalline for {} ({} scope).",
+            harness.display_name(),
+            report.scope
         );
         print!(
             "{}",
             render_human(
                 header,
-                report.mcp.as_ref(),
-                report.hooks.as_ref(),
-                report.skills.as_ref(),
-                report.receipt.as_ref(),
-                &report.notices,
+                Parts {
+                    mcp: report.mcp.as_ref(),
+                    hooks: report.hooks.as_ref(),
+                    pointer: report.pointer.as_ref(),
+                    skills: report.skills.as_ref(),
+                    receipt: report.receipt.as_ref(),
+                    backups: &report.backups,
+                    notices: &report.notices,
+                },
             )
         );
     }
@@ -2241,6 +2374,9 @@ pub fn run_uninstall(
     json: bool,
 ) -> anyhow::Result<()> {
     refuse_unready(harness)?;
+    if !harness.profile().is_legacy() {
+        return install_profile::run_uninstall(harness, project, force, json);
+    }
     let paths = harness_paths(harness, project);
     let scope = if project { "project" } else { "user" };
 
@@ -2337,27 +2473,42 @@ pub fn run_uninstall(
         scope,
         mcp,
         hooks,
+        pointer: None,
         skills,
         receipt: receipt_report,
+        backups: Vec::new(),
         notices,
     };
+    print_uninstall(&report, harness, json)
+}
 
+/// Print an uninstall report: one JSON line, or the human summary.
+pub(crate) fn print_uninstall(
+    report: &UninstallReport,
+    harness: HarnessKind,
+    json: bool,
+) -> anyhow::Result<()> {
     if json {
-        println!("{}", serde_json::to_string(&report)?);
+        println!("{}", serde_json::to_string(report)?);
     } else {
         let header = format!(
-            "Removed Crystalline from {} ({scope} scope).",
-            harness.display_name()
+            "Removed Crystalline from {} ({} scope).",
+            harness.display_name(),
+            report.scope
         );
         print!(
             "{}",
             render_human(
                 header,
-                Some(&report.mcp),
-                Some(&report.hooks),
-                Some(&report.skills),
-                report.receipt.as_ref(),
-                &report.notices,
+                Parts {
+                    mcp: Some(&report.mcp),
+                    hooks: Some(&report.hooks),
+                    pointer: report.pointer.as_ref(),
+                    skills: Some(&report.skills),
+                    receipt: report.receipt.as_ref(),
+                    backups: &report.backups,
+                    notices: &report.notices,
+                },
             )
         );
     }
@@ -2475,6 +2626,11 @@ fn reconcile_entry(
     entry: &mut receipt::InstallRecord,
     paths: &HarnessPaths,
 ) -> anyhow::Result<()> {
+    // A profile harness keeps a stored absolute program, may have a pointer
+    // file and writes the skills folder its profile names.
+    if !harness.profile().is_legacy() {
+        return install_profile::reconcile(harness, entry);
+    }
     if entry.parts.hooks {
         install_hooks(harness, &paths.settings)?;
     }

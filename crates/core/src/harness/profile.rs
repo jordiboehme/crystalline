@@ -346,7 +346,7 @@ static CURSOR: HarnessProfile = HarnessProfile {
     )],
     command_spelling: CommandSpelling::AbsolutePathEntry,
     onboarding_verified: false,
-    install_ready: false,
+    install_ready: true,
     project: None,
 };
 

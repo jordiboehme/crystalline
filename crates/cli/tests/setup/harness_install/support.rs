@@ -2,9 +2,6 @@
 //! a bin folder with a `crystalline` symlink to the binary under test, and
 //! the fixtures from crates/core/tests/fixtures/harness.
 
-// `write` and `receipt` have no caller until the first harness install lands.
-#![allow(dead_code)]
-
 use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;

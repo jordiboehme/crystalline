@@ -1,4 +1,3 @@
-#![allow(dead_code)] // removed by Task 8, which wires the callers
 //! The program spelling in a profile harness command and its ownership rule.
 //!
 //! Cursor and Kiro are GUI apps whose hooks may run with a PATH that lacks
@@ -29,8 +28,10 @@ pub(crate) struct ResolvedProgram {
 /// takes the first PATH entry that holds one, as the entry joined with
 /// `crystalline` and never canonicalized, so a link such as
 /// `/opt/homebrew/bin/crystalline` survives an upgrade. With nothing on PATH
-/// it falls back to this binary's own path. `path_env: None` means no PATH.
+/// it falls back to this binary's own path, with a warning that names
+/// `harness`. `path_env: None` means no PATH.
 pub(crate) fn resolve_program(
+    harness: HarnessKind,
     spelling: CommandSpelling,
     path_env: Option<&OsStr>,
     keep: Option<&str>,
@@ -64,7 +65,8 @@ pub(crate) fn resolve_program(
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "crystalline".to_string());
     let warning = Some(format!(
-        "crystalline is not on your PATH, so the harness gets this binary's own path ({program})"
+        "crystalline is not on your PATH, so {} gets this binary's own path ({program})",
+        harness.display_name()
     ));
     ResolvedProgram { program, warning }
 }
@@ -198,19 +200,45 @@ pub(crate) fn is_own_profile_spelling(command: &str) -> bool {
     }
 }
 
+/// An absolute program path for tests that holds on the platform they run
+/// on: a Unix path is not absolute on Windows, where a drive is needed.
+#[cfg(test)]
+pub(crate) const TEST_PROGRAM: &str = if cfg!(windows) {
+    r"C:\tools\crystalline.exe"
+} else {
+    "/opt/homebrew/bin/crystalline"
+};
+
+/// A second absolute program path for tests, in another folder.
+#[cfg(test)]
+pub(crate) const TEST_OTHER_PROGRAM: &str = if cfg!(windows) {
+    r"C:\Users\u\.cargo\bin\crystalline.exe"
+} else {
+    "/home/u/.cargo/bin/crystalline"
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    const ABS: &str = TEST_PROGRAM;
+
+    /// An absolute program path with a space in it, on this platform.
+    const SPACED: &str = if cfg!(windows) {
+        r"C:\Users\Jo Doe\bin\crystalline.exe"
+    } else {
+        "/Users/Jo Doe/.cargo/bin/crystalline"
+    };
+
     #[test]
     fn ownership_accepts_the_bare_and_the_absolute_spelling_and_nothing_else() {
         for ours in [
-            "crystalline prompt system --harness cursor",
-            "/opt/homebrew/bin/crystalline prompt system --format cursor --harness cursor",
-            "\"/Users/Jo Doe/.cargo/bin/crystalline\" prompt system --harness kiro",
-            "/opt/homebrew/bin/crystalline prompt system",
+            "crystalline prompt system --harness cursor".to_string(),
+            format!("{ABS} prompt system --format cursor --harness cursor"),
+            format!("\"{SPACED}\" prompt system --harness kiro"),
+            format!("{ABS} prompt system"),
         ] {
-            assert!(profile_command_kind(ours), "{ours}");
+            assert!(profile_command_kind(&ours), "{ours}");
         }
         for foreign in [
             "crystalline-foo prompt system",
@@ -220,6 +248,7 @@ mod tests {
             "/Users/someone/.othertool/hooks/cursor-hook.sh SessionStart",
             "crystalline prompt systemd",
             "crystalline hook stop --harness cursor",
+            r"C:\x\crystalline2.exe prompt system",
         ] {
             assert!(!profile_command_kind(foreign), "{foreign}");
         }
@@ -230,12 +259,12 @@ mod tests {
         assert!(is_own_profile_spelling(
             "crystalline prompt system --format cursor --harness cursor"
         ));
-        assert!(is_own_profile_spelling(
-            "/opt/homebrew/bin/crystalline prompt system --format hook-specific --harness gemini"
-        ));
-        assert!(is_own_profile_spelling(
-            "\"/Users/Jo Doe/bin/crystalline\" prompt system --harness kiro"
-        ));
+        assert!(is_own_profile_spelling(&format!(
+            "{ABS} prompt system --format hook-specific --harness gemini"
+        )));
+        assert!(is_own_profile_spelling(&format!(
+            "\"{SPACED}\" prompt system --harness kiro"
+        )));
         assert!(is_own_profile_spelling("crystalline prompt system"));
         assert!(!is_own_profile_spelling(
             "crystalline prompt system --format cursor --workspace /repo"
@@ -243,6 +272,36 @@ mod tests {
         assert!(!is_own_profile_spelling(
             "crystalline prompt system --format hook-specific --harness nextgen"
         ));
+    }
+
+    /// The Windows spellings of the binary: a drive path, quoted when it
+    /// holds a space, with the `.exe` suffix in any case.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_spelling_is_ours() {
+        for ours in [
+            r"C:\tools\crystalline.exe prompt system --format cursor --harness cursor",
+            r"C:\tools\CRYSTALLINE.EXE prompt system",
+            r"C:\tools\crystalline prompt system --harness kiro",
+            r#""C:\Program Files\Crystalline\crystalline.exe" prompt system --harness cursor"#,
+        ] {
+            assert!(profile_command_kind(ours), "{ours}");
+            assert!(is_own_profile_spelling(ours), "{ours}");
+        }
+        assert!(!profile_command_kind(
+            r"C:\tools\crystalline2.exe prompt system"
+        ));
+        assert!(!profile_command_kind(
+            r"tools\crystalline.exe prompt system"
+        ));
+        assert_eq!(
+            split_program(r#""C:\Program Files\crystalline.exe" prompt system"#),
+            Some((r"C:\Program Files\crystalline.exe", " prompt system"))
+        );
+        assert_eq!(
+            command_line(r"C:\Program Files\crystalline.exe", " prompt system"),
+            r#""C:\Program Files\crystalline.exe" prompt system"#
+        );
     }
 
     #[cfg(unix)]
@@ -263,15 +322,31 @@ mod tests {
         std::fs::create_dir_all(&bin).unwrap();
         std::os::unix::fs::symlink(&real, bin.join("crystalline")).unwrap();
         let path = std::env::join_paths([tmp.path().join("empty"), bin.clone()]).unwrap();
-        let got = resolve_program(CommandSpelling::AbsolutePathEntry, Some(&path), None);
+        let got = resolve_program(
+            HarnessKind::Cursor,
+            CommandSpelling::AbsolutePathEntry,
+            Some(&path),
+            None,
+        );
         assert_eq!(got.program, bin.join("crystalline").display().to_string());
         assert!(got.warning.is_none());
         let cellar = real.parent().unwrap().as_os_str().to_owned();
-        let got = resolve_program(CommandSpelling::AbsolutePathEntry, Some(&cellar), None);
+        let got = resolve_program(
+            HarnessKind::Cursor,
+            CommandSpelling::AbsolutePathEntry,
+            Some(&cellar),
+            None,
+        );
         assert_eq!(got.program, real.display().to_string());
         assert!(got.warning.unwrap().contains("versioned folder"));
         assert_eq!(
-            resolve_program(CommandSpelling::Bare, Some(&path), None).program,
+            resolve_program(
+                HarnessKind::Cursor,
+                CommandSpelling::Bare,
+                Some(&path),
+                None
+            )
+            .program,
             "crystalline"
         );
     }
@@ -284,6 +359,7 @@ mod tests {
         let kept = tmp.path().join("bin/crystalline");
         exe(&kept);
         let got = resolve_program(
+            HarnessKind::Kiro,
             CommandSpelling::AbsolutePathEntry,
             Some(std::ffi::OsStr::new("")),
             Some(kept.to_str().unwrap()),
@@ -291,6 +367,7 @@ mod tests {
         assert_eq!(got.program, kept.display().to_string());
         let gone = tmp.path().join("gone/crystalline");
         let got = resolve_program(
+            HarnessKind::Kiro,
             CommandSpelling::AbsolutePathEntry,
             Some(std::ffi::OsStr::new("")),
             Some(gone.to_str().unwrap()),
@@ -300,7 +377,11 @@ mod tests {
             gone.display().to_string(),
             "a dead path is re-resolved"
         );
-        assert!(got.warning.is_some());
+        let warning = got.warning.expect("the fallback is named");
+        assert!(
+            warning.contains("so Kiro gets this binary's own path"),
+            "{warning}"
+        );
     }
 
     #[test]
@@ -334,7 +415,12 @@ mod tests {
         let bin = tmp.path().join("bin");
         exe(&bin.join("crystalline"));
         let path = std::env::join_paths([plain, bin.clone()]).unwrap();
-        let got = resolve_program(CommandSpelling::AbsolutePathEntry, Some(&path), None);
+        let got = resolve_program(
+            HarnessKind::Cursor,
+            CommandSpelling::AbsolutePathEntry,
+            Some(&path),
+            None,
+        );
         assert_eq!(got.program, bin.join("crystalline").display().to_string());
     }
 }

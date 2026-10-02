@@ -1,4 +1,3 @@
-#![allow(dead_code)] // removed by Task 8, which wires the callers
 //! The session hook dialects of the profile harnesses.
 //!
 //! Each dialect is planned as a list of span-preserving edits
@@ -373,6 +372,7 @@ fn own_hooks(dialect: &HookDialect, root: &Value) -> Option<Vec<OwnHook>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::harness_command::TEST_PROGRAM;
     use crystalline_core::jsonc_edit::{apply_edits, parse_value};
 
     const GEMINI: &str = include_str!("../../core/tests/fixtures/harness/gemini-settings.json");
@@ -436,10 +436,10 @@ mod tests {
     #[test]
     fn the_cursor_entry_sits_in_the_shared_flat_map_and_leaves_it_as_found() {
         let d = &HarnessKind::Cursor.profile().hooks;
-        let cmd = session_command(HarnessKind::Cursor, "/opt/homebrew/bin/crystalline");
+        let cmd = session_command(HarnessKind::Cursor, TEST_PROGRAM);
         assert_eq!(
             cmd,
-            "/opt/homebrew/bin/crystalline prompt system --format cursor --harness cursor"
+            format!("{TEST_PROGRAM} prompt system --format cursor --harness cursor")
         );
         for original in [CURSOR, CURSOR_COMMENTED] {
             let with = run(d, Some(original), &cmd);
@@ -462,7 +462,7 @@ mod tests {
     fn an_older_spelling_of_ours_is_rewritten_in_place_and_a_hand_written_one_is_left() {
         let d = &HarnessKind::Cursor.profile().hooks;
         let old = "{\"version\": 1, \"hooks\": {\"sessionStart\": [{\"command\": \"crystalline prompt system --harness cursor\"}]}}";
-        let cmd = session_command(HarnessKind::Cursor, "/opt/homebrew/bin/crystalline");
+        let cmd = session_command(HarnessKind::Cursor, TEST_PROGRAM);
         let edits = plan_install(d, &parse_value(old).unwrap(), &cmd);
         assert_eq!(edits.len(), 1);
         assert!(matches!(&edits[0], Edit::Set { .. }));
@@ -473,7 +473,7 @@ mod tests {
     #[test]
     fn the_kiro_file_is_ours_and_empties_to_its_skeleton() {
         let d = &HarnessKind::Kiro.profile().hooks;
-        let cmd = session_command(HarnessKind::Kiro, "/opt/homebrew/bin/crystalline");
+        let cmd = session_command(HarnessKind::Kiro, TEST_PROGRAM);
         let fresh = run(d, None, &cmd);
         assert_eq!(
             parse_value(&fresh).unwrap(),

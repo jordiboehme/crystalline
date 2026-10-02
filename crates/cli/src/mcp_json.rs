@@ -1,4 +1,3 @@
-#![allow(dead_code)] // removed by Task 8, which wires the callers
 //! The MCP entry in a harness JSON file: what install writes, how an
 //! existing entry is read back, and the edits for install and uninstall.
 //! Pure functions; the caller reads and writes the file.
@@ -214,6 +213,7 @@ pub(crate) fn manual_hint(harness: HarnessKind, program: &str, path: &Path) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::harness_command::{TEST_OTHER_PROGRAM, TEST_PROGRAM};
     use crystalline_core::jsonc_edit::{apply_edits, parse_value};
     const CURSOR_MCP: &str = include_str!("../../core/tests/fixtures/harness/cursor-mcp.json");
     const KIRO_MCP: &str = include_str!("../../core/tests/fixtures/harness/kiro-mcp.json");
@@ -221,8 +221,8 @@ mod tests {
     #[test]
     fn each_harness_gets_its_documented_minimal_entry() {
         assert_eq!(
-            desired_entry(HarnessKind::Cursor, "/opt/homebrew/bin/crystalline").to_value(),
-            serde_json::json!({"type": "stdio", "command": "/opt/homebrew/bin/crystalline", "args": ["mcp", "--harness", "cursor"]})
+            desired_entry(HarnessKind::Cursor, TEST_PROGRAM).to_value(),
+            serde_json::json!({"type": "stdio", "command": TEST_PROGRAM, "args": ["mcp", "--harness", "cursor"]})
         );
         for (k, id) in [
             (HarnessKind::Kiro, "kiro"),
@@ -272,12 +272,8 @@ mod tests {
     #[test]
     fn install_then_uninstall_gives_the_users_file_back() {
         for (k, original, program) in [
-            (
-                HarnessKind::Cursor,
-                CURSOR_MCP,
-                "/opt/homebrew/bin/crystalline",
-            ),
-            (HarnessKind::Kiro, KIRO_MCP, "/opt/homebrew/bin/crystalline"),
+            (HarnessKind::Cursor, CURSOR_MCP, TEST_PROGRAM),
+            (HarnessKind::Kiro, KIRO_MCP, TEST_PROGRAM),
         ] {
             let (state, edits) =
                 plan_mcp_install(k, Some(&parse_value(original).unwrap()), program).unwrap();
@@ -324,7 +320,7 @@ mod tests {
         )
         .unwrap();
         let (state, edits) =
-            plan_mcp_install(HarnessKind::Cursor, Some(&bare), "/opt/bin/crystalline").unwrap();
+            plan_mcp_install(HarnessKind::Cursor, Some(&bare), TEST_PROGRAM).unwrap();
         assert_eq!((state, edits.len()), (EntryState::Ours, 1));
         assert_eq!(install_status(EntryState::UpToDate), "already-present");
         assert_eq!(
@@ -349,9 +345,9 @@ mod tests {
 
     #[test]
     fn a_command_that_differs_from_the_wanted_program_is_repaired() {
-        let wanted = "/opt/homebrew/bin/crystalline";
+        let wanted = TEST_PROGRAM;
         // A dead absolute path from another prefix, and a bare command.
-        for old in ["/home/u/.cargo/bin/crystalline", "crystalline"] {
+        for old in [TEST_OTHER_PROGRAM, "crystalline"] {
             let (state, edits) =
                 plan_mcp_install(HarnessKind::Cursor, Some(&cursor_root(old)), wanted).unwrap();
             assert_eq!((state, edits.len()), (EntryState::Ours, 1), "{old}");
@@ -363,7 +359,7 @@ mod tests {
         assert_eq!((state, edits.len()), (EntryState::UpToDate, 0));
         assert_eq!(install_status(state), "already-present");
         // A live stored path arrives as the wanted program, so it stays.
-        let live = "/home/u/.cargo/bin/crystalline";
+        let live = TEST_OTHER_PROGRAM;
         let (state, edits) =
             plan_mcp_install(HarnessKind::Cursor, Some(&cursor_root(live)), live).unwrap();
         assert_eq!((state, edits.len()), (EntryState::UpToDate, 0));
