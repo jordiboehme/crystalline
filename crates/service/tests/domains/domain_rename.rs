@@ -748,11 +748,17 @@ async fn a_rename_waits_for_a_write_already_running_body(store: Arc<Mutex<dyn St
                 .await
         })
     };
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(
-        engine.is_renaming("eng"),
-        "the rename has paused the domain"
-    );
+    // Waited for, not slept on: the renamer task may not have run at all yet
+    // on a loaded machine. The pause is set right before the drain, and the
+    // drain cannot end while the write above is held, so once the pause shows
+    // the rename is parked on that write.
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !engine.is_renaming("eng") {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the rename has paused the domain");
     assert!(
         !renamer.is_finished(),
         "the rename waits for the running write"
