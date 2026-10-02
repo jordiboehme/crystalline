@@ -148,7 +148,6 @@ mod tests {
     /// never runs for it and the real release later brings back a copy the
     /// person removed. The release bump has to come with the skill.
     #[test]
-    #[ignore = "fails until the workspace version is bumped to 0.22.1; remove this ignore in the bump commit"]
     fn no_skill_is_newer_than_the_binary_that_ships_it() {
         let binary = release_triple(env!("CARGO_PKG_VERSION"));
         for s in SKILL_ASSETS {
