@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "tide-tables": {
+      "type": "stdio",
+      "command": "tide-mcp",
+      "args": [
+        "--stdio"
+      ],
+      "env": {
+        "TIDE_TOKEN": "tok-FIXTURE-123"
+      }
+    }
+  }
+}

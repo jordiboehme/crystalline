@@ -18,6 +18,7 @@ SEEDS = {
     "crystalline-schema": HARNESS_ROOT / "outputs" / "seed_schema.md",
     "crystalline-intelligence": HARNESS_ROOT / "outputs" / "seed_memory.md",
     "crystalline-collaboration": HARNESS_ROOT / "outputs" / "seed_collaboration.md",
+    "crystalline-provisioning": HARNESS_ROOT / "outputs" / "seed_provisioning.md",
 }
 EMPTY_PATH = HARNESS_ROOT / "outputs" / "empty_skill.md"
 
