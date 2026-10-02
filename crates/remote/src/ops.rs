@@ -453,6 +453,7 @@ pub async fn subscribe(
     // existence test could consult it. That is a new function rather than a
     // new argument, which is why it is named rather than written.
     let mut files = BTreeMap::new();
+    let mut lf_digests = BTreeMap::new();
     let mut files_written = 0usize;
     for (rel, content) in &extracted {
         let wt_path = checked_working_path(state_dir, domain_root, rel)?;
@@ -462,6 +463,9 @@ pub async fn subscribe(
         }
         state::write_base_file(state_dir, rel, content)?;
         files.insert(rel.clone(), stamp(content));
+        if let Some(digest) = state::lf_digest(rel, content) {
+            lf_digests.insert(rel.clone(), digest);
+        }
     }
 
     let engrams = extracted.keys().filter(|p| p.ends_with(".md")).count();
@@ -476,6 +480,7 @@ pub async fn subscribe(
     origin_state.ref_etag = etag;
     origin_state.last_checked = Some(Utc::now());
     origin_state.files = files;
+    origin_state.lf_digests = lf_digests;
     origin_state.save(state_dir)?;
 
     Ok(SubscribeReport {
@@ -706,11 +711,26 @@ pub async fn pull_with(
             continue;
         }
 
-        match merge_file(base.as_deref(), local.as_deref(), upstream) {
+        // A markdown file the origin holds as CRLF is written locally as LF.
+        // When the local file is exactly that (the base as LF), it is the
+        // untouched base: merge it as the base itself, so upstream applies
+        // cleanly instead of running, and being reported as, a three-way merge.
+        let merge_base: Option<&[u8]> = match (base.as_deref(), local.as_deref()) {
+            (Some(b), Some(l))
+                if l != b
+                    && upstream != Some(b)
+                    && local_is_base_as_lf(state_dir, &state, rel, l) =>
+            {
+                Some(l)
+            }
+            _ => base.as_deref(),
+        };
+
+        match merge_file(merge_base, local.as_deref(), upstream) {
             FileMerge::Apply(bytes) => {
                 write_pulled_file(&wt_path, &bytes)?;
                 applied.push(rel.clone());
-                if is_three_way_merge(base.as_deref(), local.as_deref(), upstream) {
+                if is_three_way_merge(merge_base, local.as_deref(), upstream) {
                     merged.push(rel.clone());
                 }
             }
@@ -752,11 +772,11 @@ pub async fn pull_with(
         match &edit.content {
             Some(bytes) => {
                 state::write_base_file(state_dir, &edit.path, bytes)?;
-                state.files.insert(edit.path.clone(), stamp(bytes));
+                state.record_base(&edit.path, bytes);
             }
             None => {
                 state::remove_base_file(state_dir, &edit.path)?;
-                state.files.remove(&edit.path);
+                state.forget_base(&edit.path);
             }
         }
     }
@@ -3066,11 +3086,11 @@ fn advance_base_after_commit(
         .chain(&collected.entries.updated)
     {
         state::write_base_file(state_dir, path, bytes)?;
-        state.files.insert(path.clone(), stamp(bytes));
+        state.record_base(path, bytes);
     }
     for path in &collected.deleted {
         state::remove_base_file(state_dir, path)?;
-        state.files.remove(path);
+        state.forget_base(path);
     }
     state.base_commit = commit_sha.to_string();
     state.ref_etag = None;
@@ -5396,6 +5416,10 @@ async fn rebaseline(
         .iter()
         .map(|(rel, content)| (rel.clone(), stamp(content)))
         .collect();
+    state.lf_digests = extracted
+        .iter()
+        .filter_map(|(rel, content)| Some((rel.clone(), state::lf_digest(rel, content)?)))
+        .collect();
     state.base_commit = head;
     state.ref_etag = new_etag;
     state.last_checked = Some(Utc::now());
@@ -5667,6 +5691,21 @@ fn proposal_override_applies(merged: &[Proposal], rel: &str, local: Option<&[u8]
 /// both local and upstream present and both differing from the base (the
 /// add/add and edit/edit cases the merge engine runs through `diffy`). A plain
 /// take (local unchanged from base) fails this and is only "applied".
+/// Whether `local`, a markdown file differing from its base copy byte for
+/// byte, is that base as LF: the recorded LF digest says so, or, for a path
+/// the state records no digest for, the base copy read does.
+fn local_is_base_as_lf(state_dir: &Path, state: &OriginState, rel: &str, local: &[u8]) -> bool {
+    let Some(stamp) = state.files.get(rel) else {
+        return false;
+    };
+    let lf = state.lf_digests.get(rel).map(String::as_str);
+    let sha = state::sha256_hex(local);
+    if crate::changes::same_as_base(stamp, lf, local.len() as u64, &sha) {
+        return true;
+    }
+    lf.is_none() && crate::changes::matches_base_as_lf(state_dir, rel, stamp, local)
+}
+
 fn is_three_way_merge(base: Option<&[u8]>, local: Option<&[u8]>, upstream: Option<&[u8]>) -> bool {
     local.is_some() && upstream.is_some() && local != base && upstream != base
 }
