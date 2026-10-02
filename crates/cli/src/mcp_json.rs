@@ -366,9 +366,9 @@ mod tests {
 
     #[test]
     fn a_customised_entry_is_untouched_whatever_the_program() {
-        let root = serde_json::json!({"mcpServers": {"crystalline": {"command": "/old/crystalline", "args": ["mcp", "--harness", "kiro", "--db", "/x"], "env": {"A": "1"}}}});
+        let root = serde_json::json!({"mcpServers": {"crystalline": {"command": TEST_OTHER_PROGRAM, "args": ["mcp", "--harness", "kiro", "--db", "/x"], "env": {"A": "1"}}}});
         let (state, edits) =
-            plan_mcp_install(HarnessKind::Kiro, Some(&root), "/new/crystalline").unwrap();
+            plan_mcp_install(HarnessKind::Kiro, Some(&root), TEST_PROGRAM).unwrap();
         assert_eq!((state, edits.len()), (EntryState::Customised, 0));
     }
 

@@ -365,10 +365,18 @@ fn write_cursor_hook(home: &std::path::Path, command: &str) {
 /// The command install writes into Cursor's hooks file, pointing at this
 /// test build's binary, which exists and runs.
 fn live_cursor_command() -> String {
-    format!(
-        "{} prompt system --format cursor --harness cursor",
-        assert_cmd::cargo::cargo_bin("crystalline").display()
-    )
+    // Quoted when it holds a space, as install writes it: a checkout under
+    // such a folder (common on a Windows machine) would otherwise split the
+    // program at the space.
+    let program = assert_cmd::cargo::cargo_bin("crystalline")
+        .display()
+        .to_string();
+    let program = if program.contains(' ') {
+        format!("\"{program}\"")
+    } else {
+        program
+    };
+    format!("{program} prompt system --format cursor --harness cursor")
 }
 
 /// Decision 13: an imported Claude Code hook inside Cursor stays silent

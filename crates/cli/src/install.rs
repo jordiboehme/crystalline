@@ -2925,8 +2925,11 @@ mod tests {
     /// uninstall alike.
     #[test]
     fn a_legacy_install_leaves_an_absolute_spelled_hook_alone() {
+        // An absolute program on this platform: a Unix path is not absolute
+        // on Windows, where the test would then prove nothing.
+        let command = format!("{} prompt system", crate::harness_command::TEST_PROGRAM);
         let mut root: Map<String, Value> = serde_json::from_value(json!({
-            "hooks": { "SessionStart": [ { "hooks": [ { "type": "command", "command": "/opt/homebrew/bin/crystalline prompt system" } ] } ] }
+            "hooks": { "SessionStart": [ { "hooks": [ { "type": "command", "command": command } ] } ] }
         }))
         .unwrap();
         let before = root["hooks"]["SessionStart"][0].clone();
