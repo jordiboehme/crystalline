@@ -68,9 +68,9 @@ For a new section use `"operation": "append"` with `## Provisioning` and the bul
 
 For an existing section use `"operation": "replace_section"` with `"section": "## Provisioning"` and the bullets only, without the heading. Read `manifest_findings` on the receipt: fix every finding your edit caused before going on, and tell the person about the others.
 
-If the receipt marks the edit as a draft, the domain reviews changes first: the section counts, and `allow` works, only after the draft is shared and merged. Tell the person; if they want, share it with the `crystalline-collaboration` skill, and ask for the decision only once it is merged.
+If the receipt marks the edit as a draft, the domain reviews changes first: the section counts, and `allow` works, only after the draft is shared and merged. Tell the person, offer to share it with the `crystalline-collaboration` skill and ask for the decision only once it is merged.
 
-After every MANIFEST edit, call `provision` `status` and compare the domain's count for each declared kind with what you laid out. A wrong path raises no finding; a zero there means that kind's path is wrong, so fix it before the decision.
+After every MANIFEST edit that is not a draft, call `provision` `status` and compare the domain's count for each declared kind with what you laid out. A wrong path raises no finding; a zero there means that kind's path is wrong, so fix it before the decision.
 
 ## Ask for the decision
 
@@ -88,7 +88,8 @@ After every allow or deny, call `provision` `status` again. A harness row with `
 
 ## Change or update later
 
-Change artifacts in the tools repo: a hand edit in a harness folder is replaced on the next apply and kept only as a `.bak` file. After an edit, or after a `git pull` you proposed and the person confirmed, call `provision` with `action: "apply"` (or run `crystalline provision`) right away: MCP servers change only then, and the person sees the result now. Before a `deny`, say that it removes everything the domain shipped, adopted originals included.
+Change artifacts in the tools repo: a hand edit in a harness folder is replaced on the next apply and kept as a `.bak` file. After an edit, or after a `git pull` you proposed and the person confirmed, call `provision` with `action: "apply"` (or run `crystalline provision`) right away: MCP servers change only then. Before a `deny`, say that it removes everything the domain shipped, adopted originals included.
+
 ## Team domains
 
 Put the tools inside the domain folder (`skills: skills`, `mcps: mcps`): they travel with `share_changes` like any file and reach teammates with `update_domain`. After an `update_domain` that changed them, call `provision` `apply`.
