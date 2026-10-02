@@ -2064,8 +2064,9 @@ async fn discover_onboards_each_caller_with_the_domains_it_may_see() {
 /// `get_info` is synchronous and rmcp calls it with no request context, so this
 /// one channel cannot know who is connecting and cannot leave a private
 /// domain's bullets out of a per-caller block. It therefore carries every
-/// behavior rule, the count of registered domains and the pointer at
-/// `list_domains` - which does resolve a caller and does filter - and no name.
+/// behavior rule, the count of the domains that are not private and the
+/// pointer at `list_domains` - which does resolve a caller and does filter -
+/// and no name.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_http_handshake_carries_the_rules_and_no_domain_name() {
     let ctx = mcp_ctx(true).await;
@@ -2077,8 +2078,8 @@ async fn the_http_handshake_carries_the_rules_and_no_domain_name() {
         "the rules still arrive:\n{handshake}"
     );
     assert!(
-        handshake.contains("3 domains registered"),
-        "with the count line:\n{handshake}"
+        handshake.contains("2 domains registered"),
+        "with the count line, which leaves the private `lab` out:\n{handshake}"
     );
     assert!(
         !handshake.contains("confidential lab questions")

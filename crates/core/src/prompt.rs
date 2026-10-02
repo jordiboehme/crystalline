@@ -616,10 +616,12 @@ fn push_count_line(output: &PromptOutput, out: &mut String) {
 /// Stdio is unaffected and keeps the full block: a local session is the machine
 /// owner, which already has the files on disk.
 ///
-/// The count itself is deliberately the count of *registered* domains rather
-/// than of visible ones - there is nobody here to make it visible to - so this
-/// channel still says how many exist. That is the residue of the split, and it
-/// is one integer against the full index this used to hand out.
+/// The count is the length of `output.domains`, so it counts what the caller
+/// built `output` over. The HTTP handshake builds it over the domains that are
+/// not private (`Engine::routing_text_counted` takes the private ones out
+/// first): there is nobody here to make a private domain visible to, and
+/// counting it would tell any peer that it exists. A signed-in agent still
+/// finds the private domains it may see through `list_domains`.
 pub fn render_counted_instructions(output: &PromptOutput) -> String {
     let mut counted = instructions_head(output);
     push_count_line(output, &mut counted);

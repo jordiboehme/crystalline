@@ -56,9 +56,10 @@
 //! **Over HTTP that block names no domain.** `get_info` is synchronous and rmcp
 //! calls it with no request context, so the legacy handshake cannot know who is
 //! connecting and cannot leave a private domain out of a per-caller block;
-//! there it renders [`crate::engine::Engine::routing_text_counted`] instead -
-//! every behavior rule, the count of registered domains, and the pointer at
-//! `list_domains`, which does resolve a caller and does filter. Stdio keeps the
+//! there `initialize` renders [`crate::engine::Engine::routing_text_counted`]
+//! instead - every behavior rule, the count of the domains that are not
+//! private, and the pointer at `list_domains`, which does resolve a caller and
+//! does filter. Stdio keeps the
 //! whole block, because a local session is the machine owner. Every channel
 //! that *does* carry a request context is scoped per caller instead:
 //! `server/discover` through [`McpServer::arrival_info_scoped`], the
@@ -3877,22 +3878,27 @@ impl ServerHandler for McpServer {
         // `ServerConfig::default()` would leave rmcp's own `ProtocolVersion::
         // LATEST` here, which moves when the crate does.
         info.protocol_version = newest_legacy_handshake_version();
-        // **Which block, and why the transport decides it.** This method is
-        // synchronous and rmcp hands it no request context, so an HTTP server
-        // answering `initialize` has no caller to resolve and no way to leave a
-        // private domain's bullets out of a per-caller block. Naming every
-        // registered domain to whoever opened a session is what a private
-        // domain is not, so HTTP gets the countable half - every behavior rule,
-        // the number of domains, and the pointer at `list_domains`, which does
-        // resolve a caller and does filter. Stdio keeps the full block: that
-        // caller is the machine owner and has the files already.
+        // **Which block, and why the transport decides it.** Stdio keeps the
+        // full block, which names and counts every domain: that caller is the
+        // machine owner and has the files already.
+        //
+        // Over HTTP the `initialize` handshake has no caller to resolve, so it
+        // cannot leave a private domain's bullets out of a per-caller block. It
+        // gets the countable half instead - every behavior rule, the number of
+        // domains that are not private, and the pointer at `list_domains`,
+        // which does resolve a caller and does filter. Leaving the private
+        // domains out of the count needs the accounts database, which this
+        // synchronous method cannot read, so [`McpServer::initialize`] puts
+        // that block in. What stands here is the conditional pointer, which
+        // names and counts nothing: it is what an HTTP peer gets if the
+        // private set cannot be read, never a count that includes it.
         //
         // The era's own instructions channel does not go through here at all
         // ([`McpServer::discover`] carries a request context and is scoped);
         // this is the legacy lifecycle only.
         let mut instructions = match self.transport {
             Transport::Stdio => self.engine.routing_text(),
-            Transport::Http => self.engine.routing_text_counted(),
+            Transport::Http => crystalline_core::prompt::render_conditional_minimal_instructions(),
         };
         if self.engine.response_format() == ResponseFormat::Toon {
             instructions.push_str(TOON_INSTRUCTIONS_NOTE);
@@ -4025,6 +4031,27 @@ impl ServerHandler for McpServer {
         context.peer.set_peer_info(request);
 
         let mut info = self.arrival_info();
+        // The HTTP routing block, counted over the domains that are not
+        // private (see [`Engine::routing_text_counted`]). Only when the
+        // deployment's onboarding decision left the full block in place; a
+        // private set that cannot be read keeps `get_info`'s pointer, which
+        // names and counts nothing.
+        if self.transport == Transport::Http
+            && instructions_variant(self.engine.skills_serve(), self.gate)
+                == InstructionsVariant::Full
+        {
+            match self.engine.routing_text_counted().await {
+                Ok(mut instructions) => {
+                    if self.engine.response_format() == ResponseFormat::Toon {
+                        instructions.push_str(TOON_INSTRUCTIONS_NOTE);
+                    }
+                    info.instructions = Some(instructions);
+                }
+                Err(e) => tracing::warn!(
+                    "the handshake carries the short routing pointer, the private domains are unreadable: {e}"
+                ),
+            }
+        }
         // **We supply the downgrade target; rmcp decides the echo.** Whatever
         // this handler returns is post-processed by rmcp's
         // `negotiate_protocol_version` (`service/server.rs:480`) on every

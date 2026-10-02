@@ -520,7 +520,7 @@ async fn an_onboarded_harness_gets_the_minimal_block() {
 /// hands it no request context, so the legacy handshake cannot know who is
 /// connecting and cannot leave a private domain's bullets out of a per-caller
 /// block; over HTTP it therefore carries every behavior rule, the count of
-/// registered domains and the pointer at `list_domains` - which does resolve a
+/// the domains that are not private and the pointer at `list_domains` - which does resolve a
 /// caller and does filter - and no domain name at all. Stdio is the
 /// unchanged full block, pinned by every other test in this file.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -544,6 +544,63 @@ async fn an_http_session_gets_the_rules_and_no_domain_names() {
     assert!(
         !text.contains("- eng:") && !text.contains("Route here for eng questions"),
         "no domain is named to a caller this channel cannot resolve:\n{text}"
+    );
+}
+
+/// **The HTTP handshake counts only the domains that are not private.** It
+/// cannot know who is connecting, so a count of every registered domain would
+/// tell any peer that private domains exist. A signed-in agent still finds its
+/// own private domains through `list_domains`, which resolves the caller. Stdio
+/// is the machine owner and keeps naming every domain, `lab` included.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_http_handshake_counts_only_public_domains() {
+    let h = Harness::build(
+        &[
+            ("eng", &["Route here for eng questions"]),
+            ("lab", &["Route here for lab questions"]),
+        ],
+        &[],
+        false,
+    )
+    .await;
+    let auth = Arc::new(
+        crystalline_service::rest::AuthStore::open(&h.root.join("web-auth.db"))
+            .await
+            .unwrap(),
+    );
+    auth.add_user(
+        "keeper",
+        "keeper",
+        None,
+        crystalline_service::rest::Role::Admin,
+        "pw12345678",
+    )
+    .await
+    .unwrap();
+    auth.set_domain_visibility("lab", true, "keeper")
+        .await
+        .unwrap();
+    h.engine
+        .set_domain_access(Arc::new(crystalline_service::DomainAccess::new(auth)));
+
+    let (client, _server) = h.connect_as(true, ServedTransport::Http).await;
+    let text = instructions(&client);
+    assert!(
+        text.contains("1 domain registered; list_domains with include_routing=true"),
+        "the count leaves the private domain out:\n{text}"
+    );
+    assert!(
+        !text.contains("2 domains") && !text.contains("lab questions"),
+        "and nothing else says it exists:\n{text}"
+    );
+    drop(client);
+
+    let (client, _server) = h.connect_as(false, ServedTransport::Stdio).await;
+    let text = instructions(&client);
+    assert!(
+        text.contains("- eng: Route here for eng questions")
+            && text.contains("- lab: Route here for lab questions"),
+        "the machine owner keeps every domain line:\n{text}"
     );
 }
 
