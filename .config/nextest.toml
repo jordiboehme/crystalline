@@ -7,9 +7,10 @@
 # be killed as hangs. reqwest 0.13 with rustls no longer does that - building a
 # client does not touch the trust store, which is read only when an HTTPS
 # certificate is verified - so what a default client still costs on macOS is
-# the system proxy lookup (1 to 7 ms each), which the loopback test clients
-# skip with `no_proxy`. The cap stays as a cheap guard on the suites that build
-# many clients; everything else in the workspace runs at default parallelism.
+# the system proxy lookup (1 to 7 ms each), which most of the loopback test
+# clients skip with `no_proxy`. The cap, and the two timeout overrides below,
+# stay as a cheap guard on the suites that build many clients; everything
+# else in the workspace runs at default parallelism.
 [test-groups.forge-wire]
 max-threads = 4
 
