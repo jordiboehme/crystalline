@@ -100,14 +100,10 @@ pub fn installed_harnesses(path: &Path) -> Vec<HarnessKind> {
         }
     }
 
-    [
-        HarnessKind::ClaudeCode,
-        HarnessKind::Codex,
-        HarnessKind::Copilot,
-    ]
-    .into_iter()
-    .filter(|k| present.contains(k.id()))
-    .collect()
+    HarnessKind::ALL
+        .into_iter()
+        .filter(|k| present.contains(k.id()))
+        .collect()
 }
 
 /// Harnesses recorded in the install receipt at `path` whose install actually
@@ -150,14 +146,10 @@ pub fn harnesses_with_hooks(path: &Path) -> Vec<HarnessKind> {
         }
     }
 
-    [
-        HarnessKind::ClaudeCode,
-        HarnessKind::Codex,
-        HarnessKind::Copilot,
-    ]
-    .into_iter()
-    .filter(|k| present.contains(k.id()))
-    .collect()
+    HarnessKind::ALL
+        .into_iter()
+        .filter(|k| present.contains(k.id()))
+        .collect()
 }
 
 // --- shared manifest and artifact helpers ---------------------------------
@@ -1448,6 +1440,59 @@ mod tests {
         let path = dir.path().join("installs.json");
         std::fs::write(&path, r#"{ "format": 1, "installs": [] }"#).unwrap();
         assert!(harnesses_with_hooks(&path).is_empty());
+    }
+
+    /// Both lists follow `HarnessKind::ALL`, so the new harnesses are read
+    /// from the receipt and come out in declaration order, whatever row
+    /// order install left behind.
+    #[test]
+    fn the_new_harnesses_are_listed_in_declaration_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("installs.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "format": 1,
+                "installs": [
+                    {
+                        "harness": "qwen",
+                        "scope": "user",
+                        "version": "0.22.1",
+                        "parts": {"mcp": true, "hooks": true, "skills": true},
+                        "skills": []
+                    },
+                    {
+                        "harness": "claude-code",
+                        "scope": "user",
+                        "version": "0.22.1",
+                        "parts": {"mcp": true, "hooks": false, "skills": true},
+                        "skills": []
+                    },
+                    {
+                        "harness": "cursor",
+                        "scope": "user",
+                        "version": "0.22.1",
+                        "parts": {"mcp": true, "hooks": true, "skills": true},
+                        "skills": []
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            installed_harnesses(&path),
+            vec![
+                HarnessKind::ClaudeCode,
+                HarnessKind::Cursor,
+                HarnessKind::Qwen
+            ]
+        );
+        assert_eq!(
+            harnesses_with_hooks(&path),
+            vec![HarnessKind::Cursor, HarnessKind::Qwen],
+            "the same order, only the rows that wired hooks"
+        );
     }
 
     // --- any_domain_declares ---------------------------------------------------

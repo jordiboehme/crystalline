@@ -16,12 +16,18 @@ use crystalline_core::verify::{self, VerifyOptions};
 
 mod cmd;
 mod doctor;
+mod harness_command;
+mod harness_files;
 mod hook;
+mod hook_dialect;
 mod install;
+mod install_profile;
+mod mcp_json;
 mod members;
 mod recall;
 mod receipt;
 mod render;
+mod skills_placement;
 mod users;
 
 /// What `-V` and `--version` print. clap's `version` attribute feeds both as
@@ -1672,6 +1678,19 @@ enum HarnessArg {
     /// `crystalline.json` under Copilot's hooks folder, skills under
     /// `.copilot/skills` (user) or `.github/skills` (project).
     Copilot,
+    /// Cursor (editor and agent CLI): MCP in ~/.cursor/mcp.json, a
+    /// sessionStart hook in ~/.cursor/hooks.json, skills under
+    /// ~/.agents/skills.
+    Cursor,
+    /// Kiro (IDE and CLI): MCP in ~/.kiro/settings/mcp.json, a hook and a
+    /// steering file under ~/.kiro, skills under ~/.kiro/skills.
+    Kiro,
+    /// Gemini CLI: MCP and a SessionStart hook in ~/.gemini/settings.json,
+    /// skills under ~/.agents/skills.
+    Gemini,
+    /// Qwen Code: MCP and a SessionStart hook in ~/.qwen/settings.json,
+    /// skills under ~/.qwen/skills.
+    Qwen,
 }
 
 impl From<HarnessArg> for HarnessKind {
@@ -1680,6 +1699,10 @@ impl From<HarnessArg> for HarnessKind {
             HarnessArg::ClaudeCode => HarnessKind::ClaudeCode,
             HarnessArg::Codex => HarnessKind::Codex,
             HarnessArg::Copilot => HarnessKind::Copilot,
+            HarnessArg::Cursor => HarnessKind::Cursor,
+            HarnessArg::Kiro => HarnessKind::Kiro,
+            HarnessArg::Gemini => HarnessKind::Gemini,
+            HarnessArg::Qwen => HarnessKind::Qwen,
         }
     }
 }

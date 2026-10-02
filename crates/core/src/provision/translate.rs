@@ -24,7 +24,7 @@
 use crate::harness::HarnessKind;
 use crate::manifest::ArtifactType;
 use crate::parse::locate;
-use crate::provision::model::{ArtifactFile, DesiredPayload};
+use crate::provision::model::{ArtifactFile, DesiredPayload, harness_supports};
 use crate::provision::receipt::sha256_hex;
 use crate::yaml::YamlValue;
 use indexmap::IndexMap;
@@ -61,6 +61,8 @@ pub(crate) enum Translated {
 /// through the dialect logic above.
 pub(crate) fn translate_file(harness: HarnessKind, file: &ArtifactFile) -> Translated {
     match file.kind {
+        // The profile harnesses provision nothing yet, skills included.
+        ArtifactType::Skills if !harness_supports(harness, file.kind) => Translated::Unsupported,
         ArtifactType::Skills => passthrough(file),
         ArtifactType::Commands => translate_command(harness, file),
         ArtifactType::Agents => translate_agent(harness, file),
@@ -101,6 +103,10 @@ fn translate_command(harness: HarnessKind, file: &ArtifactFile) -> Translated {
             notices: Vec::new(),
         },
         HarnessKind::Copilot => Translated::Unsupported,
+        // Provisioning is not wired for the profile harnesses yet.
+        HarnessKind::Cursor | HarnessKind::Kiro | HarnessKind::Gemini | HarnessKind::Qwen => {
+            Translated::Unsupported
+        }
     }
 }
 
@@ -121,6 +127,10 @@ fn translate_agent(harness: HarnessKind, file: &ArtifactFile) -> Translated {
         // Codex TOML agent -> markdown, for Claude or Copilot.
         (true, HarnessKind::ClaudeCode) | (true, HarnessKind::Copilot) => {
             render_agent(file, &stem, harness, AgentTarget::Markdown)
+        }
+        // Provisioning is not wired for the profile harnesses yet.
+        (_, HarnessKind::Cursor | HarnessKind::Kiro | HarnessKind::Gemini | HarnessKind::Qwen) => {
+            Translated::Unsupported
         }
     }
 }

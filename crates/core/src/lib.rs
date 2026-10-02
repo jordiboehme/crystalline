@@ -24,7 +24,9 @@ pub mod frontmatter;
 pub mod harness;
 pub mod import;
 pub mod index;
+pub mod jsonc_edit;
 pub mod line_endings;
+pub mod managed_block;
 pub mod manifest;
 pub mod names;
 pub mod parse;
@@ -54,7 +56,11 @@ pub use engram::{
     EVOLVE_ACK_KEY, Engram, EvolveAck, Frontmatter, Generated, Heading, LinkTarget, Observation,
     RECOMMENDED_STATUSES, RECOMMENDED_TYPES, Relation, SchemaDef, Verification, Verified, WikiLink,
 };
-pub use harness::{HarnessKind, HarnessPaths, artifact_base, harness_paths};
+pub use harness::profile::{
+    CommandSpelling, EntryShape, HookDialect, HostSignal, McpStyle, PathSpec, PointerStyle,
+    PointerWhen, SessionFormat, TimeoutUnit,
+};
+pub use harness::{HarnessKind, HarnessPaths, HarnessProfile, artifact_base, harness_paths};
 pub use index::{
     INDEX_FILE, IndexEntry, LOG_FILE, OKF_VERSION, is_index_file, is_index_path, is_reserved_file,
     is_reserved_path, render_index,

@@ -552,11 +552,15 @@ pub struct DesiredSet {
 /// supported pair actually maps (passthrough versus a cross-dialect render)
 /// lives in [`crate::provision::translate`]; this gate answers only the coarse
 /// "at all" question the MCP path and the skip notices need.
+///
+/// The four profile harnesses (Cursor, Kiro, Gemini CLI, Qwen Code) take no
+/// kind yet: provisioning for them is not wired, so every pair is `false`.
 pub fn harness_supports(harness: HarnessKind, kind: ArtifactType) -> bool {
-    !matches!(
-        (harness, kind),
-        (HarnessKind::Copilot, ArtifactType::Commands)
-    )
+    match harness {
+        HarnessKind::ClaudeCode | HarnessKind::Codex => true,
+        HarnessKind::Copilot => kind != ArtifactType::Commands,
+        HarnessKind::Cursor | HarnessKind::Kiro | HarnessKind::Gemini | HarnessKind::Qwen => false,
+    }
 }
 
 /// Project every domain's scanned artifacts into one harness's desired set,
@@ -780,6 +784,51 @@ mod tests {
             HarnessKind::Copilot,
             ArtifactType::Commands
         ));
+    }
+
+    /// The four profile harnesses provision nothing yet: provisioning for
+    /// them lands with its own task, which flips skills first.
+    #[test]
+    fn the_profile_harnesses_support_no_kind_yet() {
+        for harness in [
+            HarnessKind::Cursor,
+            HarnessKind::Kiro,
+            HarnessKind::Gemini,
+            HarnessKind::Qwen,
+        ] {
+            for kind in [
+                ArtifactType::Skills,
+                ArtifactType::Commands,
+                ArtifactType::Agents,
+                ArtifactType::Mcps,
+            ] {
+                assert!(!harness_supports(harness, kind), "{harness:?} {kind:?}");
+            }
+        }
+    }
+
+    /// No file reaches a profile harness's desired set, skills included, so
+    /// a stray receipt row for one cannot make provisioning write anything.
+    #[test]
+    fn a_profile_harness_desired_set_holds_no_files() {
+        let harbor = DomainArtifacts {
+            domain: "harbor".to_string(),
+            files: vec![
+                file(ArtifactType::Skills, "tide-tables/SKILL.md", "harbor"),
+                file(ArtifactType::Commands, "charts/plot-route.md", "harbor"),
+                file(ArtifactType::Agents, "quartermaster.md", "harbor"),
+            ],
+            mcps: Vec::new(),
+        };
+        for harness in [
+            HarnessKind::Cursor,
+            HarnessKind::Kiro,
+            HarnessKind::Gemini,
+            HarnessKind::Qwen,
+        ] {
+            let (desired, _) = desired_set(harness, std::slice::from_ref(&harbor));
+            assert!(desired.files.is_empty(), "{harness:?}");
+        }
     }
 
     #[test]

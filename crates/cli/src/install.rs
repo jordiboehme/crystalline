@@ -61,7 +61,7 @@ use std::path::Path;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
-use crystalline_core::{HarnessKind, HarnessPaths, config, harness_paths};
+use crystalline_core::{HarnessKind, HarnessPaths, SessionFormat, config, harness_paths};
 use crystalline_service::{CliCapture, CliRun, run_harness_cli, run_harness_cli_capture};
 
 use crate::receipt;
@@ -85,14 +85,33 @@ pub(crate) const PROMPT_COMMAND: &str = "crystalline hook prompt";
 /// other harnesses get.
 pub(crate) const SESSION_START_COMMAND_COPILOT: &str = "crystalline prompt system --format copilot";
 
+/// The session-start command for Cursor, which reads an `additional_context`
+/// JSON reply.
+const SESSION_START_COMMAND_CURSOR: &str = "crystalline prompt system --format cursor";
+
+/// The session-start command for Gemini CLI and Qwen Code, which read the
+/// `hookSpecificOutput` envelope.
+const SESSION_START_COMMAND_HOOK_SPECIFIC: &str =
+    "crystalline prompt system --format hook-specific";
+
 /// The `SessionStart` command a harness's managed hook runs, without the
 /// harness flag: the base spelling every presence test asks for, so both an
 /// install written before `--harness` existed and one written after it read
 /// as present. `doctor` calls this for exactly that reason.
+///
+/// The profile harnesses take the format from their profile row.
 pub(crate) fn session_start_command(harness: HarnessKind) -> &'static str {
     match harness {
         HarnessKind::ClaudeCode | HarnessKind::Codex => SESSION_START_COMMAND,
         HarnessKind::Copilot => SESSION_START_COMMAND_COPILOT,
+        HarnessKind::Cursor | HarnessKind::Kiro | HarnessKind::Gemini | HarnessKind::Qwen => {
+            match harness.profile().session_format {
+                SessionFormat::Text => SESSION_START_COMMAND,
+                SessionFormat::Copilot => SESSION_START_COMMAND_COPILOT,
+                SessionFormat::Cursor => SESSION_START_COMMAND_CURSOR,
+                SessionFormat::HookSpecific => SESSION_START_COMMAND_HOOK_SPECIFIC,
+            }
+        }
     }
 }
 
@@ -199,19 +218,24 @@ pub(crate) enum ReconcileMode {
 }
 
 /// How a harness stores its hooks: merged into a shared settings file it
-/// does not own (the foreign-data-preserving group shape) or written into a
-/// dedicated file named for Crystalline (the flat Copilot entry shape).
+/// does not own (the foreign-data-preserving group shape), written into a
+/// dedicated file named for Crystalline (the flat Copilot entry shape), or
+/// described by the harness's profile row (the four profile harnesses).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum HooksStyle {
     Merged,
     Owned,
+    Profile,
 }
 
-/// Which of the two hook storage styles a harness uses.
+/// Which hook storage style a harness uses.
 pub(crate) fn hooks_style(harness: HarnessKind) -> HooksStyle {
     match harness {
         HarnessKind::ClaudeCode | HarnessKind::Codex => HooksStyle::Merged,
         HarnessKind::Copilot => HooksStyle::Owned,
+        HarnessKind::Cursor | HarnessKind::Kiro | HarnessKind::Gemini | HarnessKind::Qwen => {
+            HooksStyle::Profile
+        }
     }
 }
 
@@ -573,6 +597,8 @@ pub(crate) fn harness_hook_present(
     match hooks_style(harness) {
         HooksStyle::Merged => hook_present(root, event, command),
         HooksStyle::Owned => owned_hook_present(root, event, command),
+        // Profile hooks are not wired yet, so none can be present.
+        HooksStyle::Profile => false,
     }
 }
 
@@ -833,6 +859,15 @@ fn mcp_add_args(harness: HarnessKind, project: bool) -> Vec<String> {
             .into_iter()
             .map(String::from)
             .collect(),
+        // Never reached: the profile harnesses get their MCP entry written
+        // into a JSON file, never through `mcp add`. The plain stdio form
+        // stands in so the function stays total.
+        HarnessKind::Cursor | HarnessKind::Kiro | HarnessKind::Gemini | HarnessKind::Qwen => {
+            ["mcp", "add", "crystalline", "--"]
+                .into_iter()
+                .map(String::from)
+                .collect()
+        }
     };
     args.extend(mcp_server_command(harness));
     args
@@ -1074,6 +1109,8 @@ fn mcp_repair(stored: &StoredMcpEntry, harness: HarnessKind, project: bool) -> M
             stored.scope.starts_with(wanted)
         }
         HarnessKind::Codex | HarnessKind::Copilot => true,
+        // Never reached: `read_back_mcp` reads only Claude Code's entry.
+        HarnessKind::Cursor | HarnessKind::Kiro | HarnessKind::Gemini | HarnessKind::Qwen => true,
     };
     if !scope_ok
         || stored.transport != "stdio"
@@ -1207,6 +1244,11 @@ fn mcp_remove_args(harness: HarnessKind, project: bool) -> Vec<String> {
             vec!["mcp", "remove", "crystalline", "--scope", scope]
         }
         HarnessKind::Codex | HarnessKind::Copilot => vec!["mcp", "remove", "crystalline"],
+        // Never reached: the profile harnesses get their MCP entry removed
+        // from a JSON file, never through `mcp remove`.
+        HarnessKind::Cursor | HarnessKind::Kiro | HarnessKind::Gemini | HarnessKind::Qwen => {
+            vec!["mcp", "remove", "crystalline"]
+        }
     };
     args.into_iter().map(String::from).collect()
 }
@@ -1248,6 +1290,8 @@ fn install_hooks(harness: HarnessKind, path: &Path) -> anyhow::Result<HooksRepor
     match hooks_style(harness) {
         HooksStyle::Merged => install_merged_hooks(harness, path),
         HooksStyle::Owned => install_owned_hooks(harness, path),
+        // Unreachable behind the "not available yet" refusal.
+        HooksStyle::Profile => anyhow::bail!("internal: profile hooks are not wired yet"),
     }
 }
 
@@ -1256,6 +1300,8 @@ fn uninstall_hooks(harness: HarnessKind, path: &Path) -> anyhow::Result<HooksRep
     match hooks_style(harness) {
         HooksStyle::Merged => uninstall_merged_hooks(path),
         HooksStyle::Owned => uninstall_owned_hooks(path),
+        // Unreachable behind the "not available yet" refusal.
+        HooksStyle::Profile => anyhow::bail!("internal: profile hooks are not wired yet"),
     }
 }
 
@@ -1886,12 +1932,26 @@ fn render_human(
 
 // --- entry points ------------------------------------------------------------
 
+/// Refuse a harness whose install is not ready in this build, before
+/// anything is read or written. Both `install` and `uninstall` call this
+/// first, so a refused harness leaves no file and no receipt row behind.
+fn refuse_unready(harness: HarnessKind) -> anyhow::Result<()> {
+    if harness.profile().install_ready {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "crystalline install {} is not available in this build yet.",
+        harness.id()
+    )
+}
+
 /// Run `crystalline install`: register the MCP server, install the hooks and
 /// copy the skills for one harness, each part skippable. Never returns an
 /// error for a missing or failing harness CLI (that degrades to a printed
 /// manual command); a genuinely unreadable or unparseable settings file, or a
 /// filesystem error writing a skill, does surface as an error.
 pub fn run_install(opts: InstallOptions, json: bool) -> anyhow::Result<()> {
+    refuse_unready(opts.harness)?;
     let paths = harness_paths(opts.harness, opts.project);
     let scope = if opts.project { "project" } else { "user" };
 
@@ -2105,6 +2165,7 @@ pub fn run_uninstall(
     force: bool,
     json: bool,
 ) -> anyhow::Result<()> {
+    refuse_unready(harness)?;
     let paths = harness_paths(harness, project);
     let scope = if project { "project" } else { "user" };
 
@@ -2263,6 +2324,11 @@ pub(crate) fn auto_reconcile(current_version: &str, cwd: &Path) -> Vec<String> {
         let Some(harness) = HarnessKind::from_id(&entry.harness) else {
             continue;
         };
+        // A harness install refuses in this build is left alone here too,
+        // as an unknown id always was.
+        if !harness.profile().install_ready {
+            continue;
+        }
         let paths = harness_paths(harness, entry.scope == "project");
         match reconcile_entry(harness, entry, &paths) {
             Ok(()) => {

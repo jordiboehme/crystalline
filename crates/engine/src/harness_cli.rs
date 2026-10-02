@@ -252,6 +252,9 @@ fn mcp_add_argv(
         )),
         HarnessKind::Codex => codex_add_argv(name, parse_server_shape(server_json)?),
         HarnessKind::Copilot => copilot_add_argv(name, parse_server_shape(server_json)?),
+        // Provisioned MCP servers are not supported on the profile harnesses
+        // in 0.22.1: their MCP entries live in a JSON file, not behind a CLI.
+        HarnessKind::Cursor | HarnessKind::Kiro | HarnessKind::Gemini | HarnessKind::Qwen => None,
     }
 }
 
@@ -343,6 +346,9 @@ fn mcp_remove_argv(harness: HarnessKind, name: &str) -> Option<Vec<String>> {
                 .map(String::from)
                 .collect(),
         ),
+        // Provisioned MCP servers are not supported on the profile harnesses
+        // in 0.22.1, so there is never one to remove.
+        HarnessKind::Cursor | HarnessKind::Kiro | HarnessKind::Gemini | HarnessKind::Qwen => None,
     }
 }
 
@@ -400,6 +406,23 @@ impl McpRunner for SystemMcpRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_profile_harnesses_build_no_mcp_command_line() {
+        let server = r#"{"command":"buoy","args":["serve"]}"#;
+        for harness in [
+            HarnessKind::Cursor,
+            HarnessKind::Kiro,
+            HarnessKind::Gemini,
+            HarnessKind::Qwen,
+        ] {
+            assert!(
+                mcp_add_argv(harness, "buoy", server).is_none(),
+                "{harness:?}"
+            );
+            assert!(mcp_remove_argv(harness, "buoy").is_none(), "{harness:?}");
+        }
+    }
 
     #[test]
     fn claude_code_add_argv_is_user_scope_add_json() {
