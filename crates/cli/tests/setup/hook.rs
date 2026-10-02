@@ -1423,6 +1423,26 @@ impl DaemonEnv {
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("search json: {e}: {out}"))
     }
 
+    /// Search until the daemon's initial sync has indexed something: `serve`
+    /// returns once `ctl status` answers, and the first sync runs in the
+    /// background after that, so a search right after it can see nothing.
+    /// Returns the first answer with at least one hit; fails with the last
+    /// answer after 30 s.
+    fn wait_indexed(&self, query: &str) -> Value {
+        let start = Instant::now();
+        loop {
+            let search = self.search(query);
+            if search["total"].as_u64().unwrap_or(0) >= 1 {
+                return search;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(30),
+                "the daemon never indexed the engram: {search}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     /// Wait until every chunk is embedded for the active model, so a hybrid
     /// search really ranks against vectors rather than falling back to text.
     fn wait_embedded(&self) {
@@ -1586,12 +1606,8 @@ fn the_prompt_hook_is_silent_when_the_daemon_answers_in_text_mode() {
         json!(false),
         "{status}"
     );
-    let search = env.search(PLAIN_PROMPT);
+    let search = env.wait_indexed(PLAIN_PROMPT);
     assert_eq!(search["mode"], json!("text"), "{search}");
-    assert!(
-        search["total"].as_u64().unwrap_or(0) >= 1,
-        "the engram is there to be found: {search}"
-    );
 
     let (out, elapsed) = env.hook_prompt("session-text-mode", PLAIN_PROMPT);
     assert_silent(&out, "a daemon in text mode");
