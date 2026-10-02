@@ -38,8 +38,10 @@ impl Engine {
     ///
     /// Serialized with every other registration change through
     /// [`Engine::domain_admin`], which it releases before a rename takes it
-    /// again; so no caller may hold that lock. A rename that fails is logged
-    /// and reported, never returned: the sync this rides on has landed.
+    /// again; so no caller may hold that lock. Two adoptions run one after the
+    /// other, the second one waiting for the first one's renames. A rename
+    /// that fails is logged and reported, never returned: the sync this rides
+    /// on has landed.
     ///
     /// Answers the list of what it did, for logs and for the ctl `sync`
     /// reply's `names`: `{domain, action, ..}` with `action` one of
@@ -90,6 +92,15 @@ impl Engine {
                 return Ok(json!([]));
             }
         }
+        // One adoption at a time, from its plan to the end of its renames.
+        // `domain_admin` covers only the plan, because a rename takes it
+        // again. Without this, a second adoption (the watcher's and a ctl
+        // `sync` right after the same MANIFEST change) planned the same
+        // rename while the first one was about to run it, then found the
+        // rename slot taken and reported the rename as failed while it was
+        // landing. Waiting here instead, the second one plans from what the
+        // first one wrote and finds nothing left to do.
+        let _adopting = self.adoption_lock.lock().await;
         let mut report: Vec<Value> = Vec::new();
         let planned = {
             let _admin = self.domain_admin().await;
@@ -122,6 +133,13 @@ impl Engine {
             let table = self.name_table_now().await;
             self.record_canonicals(&table, &busy, &mut report)?
         };
+        #[cfg(any(test, feature = "testing"))]
+        {
+            let hold = self.adoption_hold.lock().unwrap().take();
+            if let Some(hold) = hold {
+                hold.hold().await;
+            }
+        }
 
         for (old, new) in planned {
             // An empty row an older version's `domain remove` left under the
@@ -219,6 +237,15 @@ impl Engine {
     pub async fn settle_after_initial_sync(&self) {
         self.adopt_domain_names_after("the initial sync").await;
         self.resolve_pending_after_startup().await;
+    }
+
+    /// Hold the next adoption after its plan, before its renames, until the
+    /// answered hold is released.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn hold_next_adoption_after_plan(&self) -> Arc<crate::rename::RenameHold> {
+        let hold = Arc::new(crate::rename::RenameHold::default());
+        *self.adoption_hold.lock().unwrap() = Some(hold.clone());
+        hold
     }
 
     /// How many times [`Engine::adopt_domain_names`] ran on this engine.

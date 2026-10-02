@@ -1015,6 +1015,84 @@ async fn a_derived_name_follows_a_new_manifest_name() {
     );
 }
 
+/// Two adoptions after one MANIFEST change (the watcher's and a ctl `sync`'s)
+/// run one after the other. The second one used to plan the same rename while
+/// the first one was about to run it, find the rename slot taken and report
+/// the rename as failed (and record the failure for `doctor`) while it was
+/// landing: the CI flake of `this_machines_own_daemon_still_lines_names_up`.
+/// Now it waits for the first one and finds nothing left to do.
+#[tokio::test]
+async fn a_second_adoption_waits_for_the_first_ones_rename() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = bare_manifest_folder(tmp.path(), "eng", "Eng");
+    let engine = Arc::new(adopting_engine(
+        memory_store().await,
+        tmp.path(),
+        vec![(
+            "eng",
+            DomainEntry::file(root.clone()).with_name_origin(NameOrigin::Derived),
+        )],
+    ));
+    sync_and_adopt(&engine).await;
+    declare(&root, "platform");
+    engine.sync(None).await.unwrap();
+
+    let limit = std::time::Duration::from_secs(20);
+    // The first adoption has planned the rename and not started it yet.
+    let first_planned = engine.hold_next_adoption_after_plan();
+    let first = {
+        let engine = engine.clone();
+        tokio::spawn(async move { engine.adopt_domain_names().await })
+    };
+    tokio::time::timeout(limit, first_planned.reached())
+        .await
+        .expect("the first adoption plans the rename");
+
+    let second_planned = engine.hold_next_adoption_after_plan();
+    let entered = engine.adoptions_run();
+    let second = {
+        let engine = engine.clone();
+        tokio::spawn(async move { engine.adopt_domain_names().await })
+    };
+    tokio::time::timeout(limit, async {
+        while engine.adoptions_run() == entered {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the second adoption starts");
+    // A negative check: a slow machine can only make it pass, never fail.
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            second_planned.reached()
+        )
+        .await
+        .is_err(),
+        "the second adoption does not plan while the first one is unfinished"
+    );
+
+    first_planned.release();
+    let first = first.await.unwrap().unwrap();
+    tokio::time::timeout(limit, second_planned.reached())
+        .await
+        .expect("the second adoption plans once the first one is done");
+    second_planned.release();
+    let second = second.await.unwrap().unwrap();
+    assert!(
+        first
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["action"] == "renamed"),
+        "{first}"
+    );
+    assert_eq!(second, serde_json::json!([]), "nothing is left to do");
+    let cfg = saved(tmp.path());
+    assert!(cfg.domains.contains_key("platform"), "{cfg:?}");
+    assert!(!cfg.domains.contains_key("eng"), "{cfg:?}");
+}
+
 /// An adoption never writes over a configuration file that does not parse.
 /// It used to fall back to the engine's snapshot and save that, which put a
 /// good file over one a person was editing by hand, and over the broken one

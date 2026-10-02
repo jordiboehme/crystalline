@@ -2279,8 +2279,18 @@ fn this_machines_own_daemon_still_lines_names_up() {
     env.wait_ready();
     let _ = dir;
     declare_manifest_name(&env, "eng", "platform");
+    // The watcher sees the same MANIFEST change and may be lining the name up
+    // already. The sync's own pass waits for that one instead of planning the
+    // same rename beside it and reporting it as failed while it lands.
     let (ok, out, err) = env.run_full(&["ctl", "sync"]);
     assert!(ok, "{out}{err}");
+    let reply: Value = serde_json::from_str(out.trim()).unwrap();
+    assert!(
+        !reply["names"]
+            .as_array()
+            .is_some_and(|names| names.iter().any(|n| n["action"] == "failed")),
+        "{reply}"
+    );
     let cfg: GlobalConfig = config::load_yaml(&env.config_path()).unwrap();
     assert!(
         cfg.domains.contains_key("platform") && !cfg.domains.contains_key("kb-eng"),

@@ -1067,6 +1067,9 @@ pub struct Engine {
     // keeps waiting: set when the rename after a sync fails, cleared when it
     // lands or waits for a known reason. `crystalline doctor` reads it.
     adoption_failures: std::sync::Mutex<HashMap<String, String>>,
+    // Held by `Engine::adopt_domain_names` from its plan to the end of its
+    // renames, so two adoptions never plan the same rename.
+    adoption_lock: tokio::sync::Mutex<()>,
     // Set while a rename is between its index row step and its config step:
     // a spelling push then would drop the alias the index row step left for
     // the old name, since the configuration does not list it yet. A refresh
@@ -1091,6 +1094,9 @@ pub struct Engine {
     // And a hold on the next write right after it is counted.
     #[cfg(any(test, feature = "testing"))]
     write_hold: std::sync::Mutex<Option<Arc<crate::rename::RenameHold>>>,
+    // And a hold on the next adoption between its plan and its renames.
+    #[cfg(any(test, feature = "testing"))]
+    adoption_hold: std::sync::Mutex<Option<Arc<crate::rename::RenameHold>>>,
     #[cfg(any(test, feature = "testing"))]
     rename_hold:
         std::sync::Mutex<Option<(crate::rename::RenameStep, Arc<crate::rename::RenameHold>)>>,
@@ -2097,6 +2103,7 @@ impl Engine {
             rename_pause: crate::rename::RenamePause::default(),
             rename_slot: std::sync::Mutex::new(None),
             adoption_failures: std::sync::Mutex::new(HashMap::new()),
+            adoption_lock: tokio::sync::Mutex::new(()),
             names_frozen: std::sync::atomic::AtomicBool::new(false),
             holds_state_dir: std::sync::atomic::AtomicBool::new(true),
             machine_owner: None,
@@ -2104,6 +2111,8 @@ impl Engine {
             rename_fail_after: std::sync::Mutex::new(None),
             #[cfg(any(test, feature = "testing"))]
             write_hold: std::sync::Mutex::new(None),
+            #[cfg(any(test, feature = "testing"))]
+            adoption_hold: std::sync::Mutex::new(None),
             #[cfg(any(test, feature = "testing"))]
             rename_hold: std::sync::Mutex::new(None),
             #[cfg(any(test, feature = "testing"))]
