@@ -546,9 +546,17 @@ jobs:
       # left empty in crates/cli/Cargo.toml's [package.metadata.deb] rather
       # than the "$auto" default that would try to resolve them via ldd). The
       # dev channel ships through Homebrew only, so it builds none.
+      # The install action fetches a prebuilt binary and checks it against
+      # the SHA-256 in its manifest. Its cargo-deb manifest has an x86_64
+      # Linux binary only, so the arm64 leg falls back to
+      # `cargo install --locked cargo-deb@3.7.0`: the same pinned build as
+      # before, never the unpinned cargo-binstall download.
       - name: Install cargo-deb
         if: matrix.musl && inputs.channel != 'dev'
-        run: cargo install cargo-deb --version 3.7.0 --locked
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-deb@3.7.0
+          fallback: cargo-install
 
       - name: Build .deb package
         if: matrix.musl && inputs.channel != 'dev'
@@ -606,6 +614,10 @@ jobs:
           "WiX candle $got at $candle"
           if ($got -ne $want) { throw "WiX candle is $got, expected $want" }
 
+      # Built from source on purpose: install-action has no cargo-wix
+      # manifest (checked at v2.87.22, the newest release on 2026-10-02), and
+      # its cargo-binstall fallback would download a binary no checksum pins.
+      # It is one step on the two Windows legs, under a minute.
       - name: Install cargo-wix
         if: matrix.msi
         run: cargo install cargo-wix --version 0.3.9 --locked

@@ -255,8 +255,14 @@ jobs:
             echo "version=v0.0.0-dev" >> "$GITHUB_OUTPUT"
           fi
 
+      # A prebuilt binary, checked against the SHA-256 in the install
+      # action's manifest; `fallback: none` fails the step rather than
+      # downloading an unpinned binary if the manifest ever lacks this host.
       - name: Install cargo-cyclonedx
-        run: cargo install cargo-cyclonedx --version 0.5.9 --locked
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-cyclonedx@0.5.9
+          fallback: none
 
       # cargo-cyclonedx writes a file next to every workspace member's
       # Cargo.toml whatever --manifest-path says, so the crates/cli one is
@@ -572,9 +578,9 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
-
+      # No QEMU: the Dockerfile has no RUN step (it only copies the files
+      # staged above and sets metadata), so the linux/arm64 build executes
+      # nothing emulated. Add QEMU back together with any RUN step.
       - name: Set up buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
@@ -752,7 +758,7 @@ jobs:
             org.opencontainers.image.description=The browser UI for a Crystalline instance. Crystalline stores what was learned; Fluid is where you think with it.
             org.opencontainers.image.licenses=AGPL-3.0-or-later
 
-      # No QEMU, unlike the crystalline images: the node stage is pinned to the
+      # No QEMU, as for the crystalline images: the node stage is pinned to the
       # build platform (see fluid/Dockerfile) because a static bundle is the
       # same bytes whatever the target is, so only the nginx stage is built per
       # platform and nothing runs emulated.
