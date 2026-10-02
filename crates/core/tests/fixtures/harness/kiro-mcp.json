@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "other": {
+      "command": "uvx",
+      "args": ["other-mcp@latest"],
+      "env": {},
+      "disabled": false,
+      "autoApprove": ["read_file"]
+    }
+  }
+}

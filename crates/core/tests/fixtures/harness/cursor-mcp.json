@@ -1,0 +1,12 @@
+{
+    // servers this person set up by hand
+    "mcpServers": {
+        "other": {
+            "command": "npx",
+            "args": ["-y", "other-mcp"],
+            "env": {
+                "TOKEN": "x"
+            }
+        }
+    }
+}
