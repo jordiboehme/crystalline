@@ -1369,6 +1369,55 @@ describe("the computers (0.22 spec 3a)", () => {
     expect(listing?.content).toContain("- ");
     expect(hud.reader).toHaveBeenLastCalledWith(listing);
   });
+
+  it("drops a deck's computer use points on a move to a room with none", () => {
+    // Mutation caught: the use points built only when there are none yet
+    // (`computers.length === 0`), or once per session, so the wall monitor
+    // of the deck left behind still answers Space at the same spot in the
+    // airlock, which has no computer and reads nothing.
+    // The airlock without its lift, so nothing else is offered where the
+    // player lands, and with the deck's spawn.
+    const airlock = airlockRoom({ domains: CANNED_DOMAINS, here: null });
+    const deck = generateDeck(CANNED_DECK, 1);
+    const spot = { x: deck.spawn.x, y: deck.spawn.y };
+    const there: RoomSpec = {
+      ...airlock,
+      fixtures: [],
+      spawn: { ...spot, yaw: 0 },
+    };
+    expect(roomReading(there, null)).toBeNull();
+    expect(computersOf(there, null)).toEqual([]);
+    expect(focusOf(there, spawnPlayer(there))).toBeNull();
+    // A deck whose wall monitor is in reach of the same spot.
+    const at = wallAnchor({ x: spot.x, y: spot.y, side: "n" });
+    const withMonitor: RoomSpec = {
+      ...deck,
+      spawn: there.spawn,
+      props: [
+        ...deck.props,
+        { kind: "wall-monitor", variant: 0, anchor: "wall", ...at, seed: 1 },
+      ],
+    };
+    expect(
+      computerFocus(
+        computersOf(withMonitor, null),
+        spawnPlayer(withMonitor),
+        withMonitor.title,
+      ),
+    ).not.toBeNull();
+    const session = start({ client: null });
+    session.showRoom(withMonitor);
+    frames(1);
+    expect(hud.prompt).toHaveBeenLastCalledWith(
+      `SPACE READ ${withMonitor.title}`,
+    );
+    session.showRoom(there);
+    frames(1);
+    expect(hud.prompt).toHaveBeenLastCalledWith(null);
+    hud.reader.mockClear();
+    use();
+    expect(hud.reader).not.toHaveBeenCalled();
+  });
 });
 
 describe("keys", () => {
