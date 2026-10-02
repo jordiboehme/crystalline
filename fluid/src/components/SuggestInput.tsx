@@ -272,7 +272,7 @@ export function SuggestInput({
         id={id}
         role="combobox"
         aria-expanded={expanded}
-        aria-controls={listId}
+        {...(expanded ? { "aria-controls": listId } : {})}
         aria-autocomplete="list"
         {...(hasActive ? { "aria-activedescendant": optionId(index) } : {})}
         {...(describedBy !== undefined
