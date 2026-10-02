@@ -73,6 +73,51 @@ impl ContradictionFact {
     }
 }
 
+/// One engram as the contradiction walk last read it: the content sha of
+/// that read and what the walk takes from the content alone. Kept per domain
+/// and path in [`Engine`]'s fact cache, so the next walk reads an engram
+/// again only when its stamp's sha moved. Nothing that depends on more than
+/// the content is kept: the id and the listing's status come from the
+/// listing, the scoring checksum from the line rules and the lead vector
+/// from the store, all again on every walk.
+pub(crate) struct CachedFact {
+    /// The lowercase hex SHA-256 of the content this entry was parsed from,
+    /// the same digest a [`FileStamp`] carries.
+    sha256: String,
+    /// The parse; `None` when that content does not parse, so a broken
+    /// engram is not read again until it changes.
+    parsed: Option<Arc<ParsedFact>>,
+}
+
+/// What [`CachedFact`] keeps of a parsed engram.
+struct ParsedFact {
+    /// The frontmatter status as written, untrimmed; absent falls back to
+    /// the listing's status, which is read afresh.
+    status: Option<String>,
+    valid_from: Option<NaiveDate>,
+    valid_to: Option<NaiveDate>,
+    observations: Vec<FactObservation>,
+}
+
+impl ParsedFact {
+    fn of(engram: &Engram) -> Self {
+        let fm = &engram.frontmatter;
+        ParsedFact {
+            status: fm.status.clone(),
+            valid_from: fm.valid_from,
+            valid_to: fm.valid_to,
+            observations: engram
+                .observations
+                .iter()
+                .map(|o| FactObservation {
+                    line: o.line,
+                    text: o.content.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
 /// What [`Engine::sweep_contradictions`] hands the sweep for one domain.
 /// Everything empty, zero and `false` when the check is off.
 #[derive(Default)]
@@ -332,9 +377,15 @@ impl Engine {
         state.failed.remove(name);
         state.pending = None;
         state.generation = state.generation.wrapping_add(1);
+        drop(state);
+        // The cache is keyed by domain id, which the name does not reach
+        // here; a removal is rare, so the whole cache goes.
+        self.contradiction_facts_cache.lock().unwrap().clear();
     }
 
     /// Forget everything the pass remembers and move the generation on.
+    /// The fact cache goes too: an off check keeps nothing of the engrams in
+    /// memory, and the walk after it reads every engram again.
     fn reset_contradiction_state(&self) {
         let mut state = self.contradiction_state.lock().unwrap();
         let generation = state.generation.wrapping_add(1);
@@ -342,6 +393,8 @@ impl Engine {
             generation,
             ..ContradictionState::default()
         };
+        drop(state);
+        self.contradiction_facts_cache.lock().unwrap().clear();
     }
 
     /// Ask the contradiction worker for a pass. `false` when no worker is
@@ -431,6 +484,16 @@ impl Engine {
     #[cfg(any(test, feature = "testing"))]
     pub fn contradiction_fact_walks(&self) -> u64 {
         self.contradiction_fact_walks
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// How many engrams [`Engine::contradiction_facts`] has read since this
+    /// engine was built: an engram whose content sha is in the fact cache
+    /// is not read, so a write to a parsed domain reads the one engram it
+    /// touched.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn contradiction_fact_loads(&self) -> u64 {
+        self.contradiction_fact_loads
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -1681,6 +1744,18 @@ impl Engine {
     /// ([`Engine::sweep_contradictions`]). An engram with no stamp or that no
     /// longer parses is left out, as the sweep leaves it out.
     ///
+    /// Only the engrams whose stamp moved are read. The parse of every other
+    /// one comes from the fact cache ([`CachedFact`]), keyed by the stamp's
+    /// content sha, the same stamp the walk digest is built from: one write
+    /// to a large domain reads one engram, and the walk after UTC midnight
+    /// reads none. A read is cached only when the text read hashes to the
+    /// stamp's sha, so a file that changed on disk before the sync stamped it
+    /// is read again once the stamp catches up. The entries of paths no
+    /// longer stamped are dropped with each walk. The cache lives in memory
+    /// only and is never written to the database. An embedding model change
+    /// needs no hook: the model is fixed for the life of an engine, and the
+    /// checksum is recomputed under `rules` here on every walk.
+    ///
     /// The lead-vector fetch is the whole domain's, unbounded (see
     /// [`Store::lead_vectors`]); a caller that only needs statuses, windows,
     /// checksums and lines passes `false` and pays nothing for it.
@@ -1711,41 +1786,104 @@ impl Engine {
             };
             (descs, vectors)
         };
+        // Taken out for the walk and put back rebuilt, so no lock is held
+        // across a read; one pass runs at a time, so nothing else wants it
+        // meanwhile. Put back only while the generation holds: a setting
+        // changed or a domain forgotten meanwhile cleared the cache, and a
+        // walk that started before must not fill it again.
+        let generation = self.contradiction_state.lock().unwrap().generation;
+        let mut cached = self
+            .contradiction_facts_cache
+            .lock()
+            .unwrap()
+            .remove(&domain_id)
+            .unwrap_or_default();
+        let mut kept: HashMap<String, CachedFact> = HashMap::with_capacity(descs.len());
         let mut facts = Vec::with_capacity(descs.len());
         for d in &descs {
-            if !stamps.contains_key(&d.path) {
-                continue;
-            }
-            let Some(engram) = self.load_engram(source, domain_id, &d.path).await else {
+            let Some(stamp) = stamps.get(&d.path) else {
                 continue;
             };
-            let fm = &engram.frontmatter;
-            let status = fm
+            let hit = cached.remove(&d.path).filter(|c| c.sha256 == stamp.sha256);
+            let parsed = match hit {
+                Some(hit) => {
+                    let parsed = hit.parsed.clone();
+                    kept.insert(d.path.clone(), hit);
+                    parsed
+                }
+                None => {
+                    #[cfg(any(test, feature = "testing"))]
+                    self.contradiction_fact_loads
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(text) = self.load_engram_text(source, domain_id, &d.path).await else {
+                        continue;
+                    };
+                    let parsed = parse_engram(&text)
+                        .ok()
+                        .map(|engram| Arc::new(ParsedFact::of(&engram)));
+                    if sha256_hex(text.as_bytes()) == stamp.sha256 {
+                        kept.insert(
+                            d.path.clone(),
+                            CachedFact {
+                                sha256: stamp.sha256.clone(),
+                                parsed: parsed.clone(),
+                            },
+                        );
+                    }
+                    parsed
+                }
+            };
+            let Some(parsed) = parsed else {
+                continue;
+            };
+            let status = parsed
                 .status
                 .as_deref()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| d.status.trim())
                 .to_lowercase();
-            let observations: Vec<FactObservation> = engram
-                .observations
-                .iter()
-                .map(|o| FactObservation {
-                    line: o.line,
-                    text: o.content.clone(),
-                })
-                .collect();
+            let observations = parsed.observations.clone();
             facts.push(ContradictionFact {
                 id: d.id,
                 status,
-                valid_from: fm.valid_from,
-                valid_to: fm.valid_to,
+                valid_from: parsed.valid_from,
+                valid_to: parsed.valid_to,
                 checksum: scoring_checksum(&observations, rules),
                 lead_vector: vectors.remove(&d.id.0),
                 observations,
             });
         }
+        // Checked and put back under the state lock: a reset moves the
+        // generation under it before it clears the cache, so it cannot fall
+        // between the check and the insert.
+        let state = self.contradiction_state.lock().unwrap();
+        if state.generation == generation {
+            self.contradiction_facts_cache
+                .lock()
+                .unwrap()
+                .insert(domain_id, kept);
+        }
+        drop(state);
         Ok(facts)
+    }
+
+    /// An engram's raw text through `source`, as [`Engine::load_engram`]
+    /// reads it before parsing: the file for a file domain, the stored
+    /// content for a virtual one. `None` when it cannot be read.
+    async fn load_engram_text(
+        &self,
+        source: &ContentSource,
+        domain_id: DomainId,
+        rel: &str,
+    ) -> Option<String> {
+        match source {
+            ContentSource::File { root } => std::fs::read_to_string(join_rel(root, rel)).ok(),
+            ContentSource::Virtual => {
+                let store = self.store.lock().await;
+                store.engram_content(domain_id, rel).await.ok().flatten()
+            }
+        }
     }
 
     /// `V302`'s input for one domain's sweep: the stored rows for the

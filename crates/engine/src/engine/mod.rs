@@ -798,6 +798,18 @@ pub struct Engine {
     // skip is invisible in the outcome. See `Engine::contradiction_fact_walks`.
     #[cfg(any(test, feature = "testing"))]
     contradiction_fact_walks: std::sync::atomic::AtomicU64,
+    // The same for the engrams such a parse read: an engram whose content
+    // sha is in the fact cache is not read. See
+    // `Engine::contradiction_fact_loads`.
+    #[cfg(any(test, feature = "testing"))]
+    contradiction_fact_loads: std::sync::atomic::AtomicU64,
+    // What the contradiction walk parsed of each engram, per domain and path,
+    // keyed by the content sha it was read at, so a walk reads only the
+    // engrams whose stamp moved. Memory only, never written to the database;
+    // cleared when the check is switched off or its setting changes. See
+    // `Engine::contradiction_facts`.
+    contradiction_facts_cache:
+        std::sync::Mutex<HashMap<DomainId, HashMap<String, contradictions::CachedFact>>>,
     // The same for walks of the contradiction pass, parsed or not, so a test
     // can see a worker that keeps asking.
     #[cfg(any(test, feature = "testing"))]
@@ -2043,6 +2055,9 @@ impl Engine {
             line_vectors_model_pruned: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "testing"))]
             contradiction_fact_walks: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(any(test, feature = "testing"))]
+            contradiction_fact_loads: std::sync::atomic::AtomicU64::new(0),
+            contradiction_facts_cache: std::sync::Mutex::default(),
             #[cfg(any(test, feature = "testing"))]
             contradiction_walks: std::sync::atomic::AtomicU64::new(0),
             #[cfg(any(test, feature = "testing"))]

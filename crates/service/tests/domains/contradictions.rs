@@ -3831,6 +3831,281 @@ async fn the_cap_reads_the_32_most_similar_and_says_it_bound() {
     assert_eq!(v302(&sweep(&engine).await).len(), 1);
 }
 
+// --- the fact cache: a walk reads only the engrams that changed ---------------
+
+/// Fifty engrams in `notes`, each with one observation line of its own. The
+/// topic provider puts them all on its "none" axis, so every pair is related
+/// and the stub scores them; the tests below count reads, not pairs.
+async fn fifty(engine: &Engine) {
+    for i in 0..50 {
+        engine
+            .write_engram(&write(
+                &format!("Ledger {i}"),
+                &format!("Ledger page {i} of the harbour books.\n\n- [fact] Ledger page {i} closes at {i} o'clock"),
+            ))
+            .await
+            .unwrap();
+    }
+    engine.embed_pending().await.unwrap();
+}
+
+/// How many engrams `notes` lists: the fifty and whatever else the domain
+/// holds of its own.
+async fn listed(engine: &Engine) -> u64 {
+    let store = engine.store();
+    let store = store.lock().await;
+    store.list_engrams("notes", None, None).await.unwrap().len() as u64
+}
+
+/// M11: the walk digest is over every path's stamp, so one write moves it,
+/// and the walk then used to read and parse the whole domain. With the fact
+/// cache it reads the one engram the write touched.
+#[tokio::test]
+async fn a_write_reparses_only_the_engram_it_touched() {
+    let (_tmp, engine) = engine_with(loader(stub(), Arc::new(AtomicUsize::new(0)))).await;
+    set(&engine, "evolve.contradictions", "full").await;
+    fifty(&engine).await;
+    let total = listed(&engine).await;
+    assert!(total >= 50, "{total}");
+    let loads = engine.contradiction_fact_loads();
+    engine.score_contradictions().await.unwrap();
+    assert_eq!(
+        engine.contradiction_fact_loads(),
+        loads + total,
+        "the first walk reads every engram"
+    );
+
+    engine
+        .edit_engram(&EditParams {
+            identifier: "ledger-7".to_string(),
+            domain: "notes".to_string(),
+            operation: "append".to_string(),
+            content: Some("\n- [fact] Ledger page 7 moved to the annex".to_string()),
+            ..EditParams::default()
+        })
+        .await
+        .unwrap();
+    engine.embed_pending().await.unwrap();
+    let eligible = engine.contradictions_status().await.unwrap()["lines_eligible"]
+        .as_u64()
+        .unwrap();
+    let (walks, loads) = (
+        engine.contradiction_fact_walks(),
+        engine.contradiction_fact_loads(),
+    );
+    let outcome = engine.score_contradictions().await.unwrap();
+    assert!(
+        matches!(
+            outcome,
+            ContradictionOutcome::Scored {
+                pairs: 49,
+                remaining: 0,
+                ..
+            }
+        ),
+        "the edited engram's pairs, at its new checksum: {outcome:?}"
+    );
+    assert_eq!(
+        engine.contradiction_fact_walks(),
+        walks + 1,
+        "the write moved the digest, so the domain is walked"
+    );
+    assert_eq!(
+        engine.contradiction_fact_loads(),
+        loads + 1,
+        "and only the engram the write touched is read"
+    );
+    let status = engine.contradictions_status().await.unwrap();
+    assert_eq!(
+        status["lines_eligible"].as_u64(),
+        Some(eligible + 1),
+        "the new line is seen: {status}"
+    );
+}
+
+/// A change that leaves an engram's observations alone moves its stamp, so
+/// it is read once, and its scoring checksum, so nothing is scored again. A
+/// walk whose digest moved with no stamp moving, the one after UTC midnight,
+/// reads nothing.
+#[tokio::test]
+async fn a_prose_edit_reads_one_engram_and_midnight_reads_none() {
+    let s = stub();
+    let (_tmp, engine) = engine_with(loader(s.clone(), Arc::new(AtomicUsize::new(0)))).await;
+    set(&engine, "evolve.contradictions", "full").await;
+    three(&engine).await;
+    assert_eq!(
+        engine.score_contradictions().await.unwrap(),
+        scored(1, 1, 0)
+    );
+    let forwards = s.forwards();
+
+    engine
+        .edit_engram(&EditParams {
+            identifier: "twenty".to_string(),
+            domain: "notes".to_string(),
+            operation: "append".to_string(),
+            content: Some("\nThe runtime is pinned in the build image.".to_string()),
+            ..EditParams::default()
+        })
+        .await
+        .unwrap();
+    engine.embed_pending().await.unwrap();
+    let (walks, loads) = (
+        engine.contradiction_fact_walks(),
+        engine.contradiction_fact_loads(),
+    );
+    assert_eq!(
+        engine.score_contradictions().await.unwrap(),
+        scored(0, 0, 0),
+        "the lines are the same, so the scored pair is up to date"
+    );
+    assert_eq!(engine.contradiction_fact_walks(), walks + 1);
+    assert_eq!(engine.contradiction_fact_loads(), loads + 1);
+    assert_eq!(s.forwards(), forwards, "nothing is scored again");
+
+    engine.set_contradiction_today(chrono::Utc::now().date_naive() + chrono::Days::new(1));
+    let (walks, loads) = (
+        engine.contradiction_fact_walks(),
+        engine.contradiction_fact_loads(),
+    );
+    assert_eq!(
+        engine.score_contradictions().await.unwrap(),
+        scored(0, 0, 0)
+    );
+    assert_eq!(
+        engine.contradiction_fact_walks(),
+        walks + 1,
+        "a new day walks the domain again"
+    );
+    assert_eq!(
+        engine.contradiction_fact_loads(),
+        loads,
+        "but reads none of its engrams"
+    );
+    assert_eq!(s.forwards(), forwards);
+    assert_eq!(v302(&sweep(&engine).await).len(), 1, "the finding stands");
+}
+
+/// The same on a file domain, where the stamp is the sha of the bytes on
+/// disk: an edit of one file reads that file and no other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_file_edit_reads_only_that_file() {
+    let (_tmp, dir, engine) = file_engine(loader(stub(), Arc::new(AtomicUsize::new(0)))).await;
+    set(&engine, "evolve.contradictions", "full").await;
+    assert_eq!(
+        engine.score_contradictions().await.unwrap(),
+        scored(1, 1, 0)
+    );
+    let path = dir.join("twenty.md");
+    let mut text = std::fs::read_to_string(&path).unwrap();
+    text.push_str("\nThe runtime is pinned in the build image.\n");
+    std::fs::write(&path, text).unwrap();
+    engine.sync(None).await.unwrap();
+    engine.embed_pending().await.unwrap();
+    let (walks, loads) = (
+        engine.contradiction_fact_walks(),
+        engine.contradiction_fact_loads(),
+    );
+    assert_eq!(
+        engine.score_contradictions().await.unwrap(),
+        scored(0, 0, 0)
+    );
+    assert_eq!(engine.contradiction_fact_walks(), walks + 1);
+    assert_eq!(
+        engine.contradiction_fact_loads(),
+        loads + 1,
+        "only the edited file is read"
+    );
+}
+
+/// A file whose bytes are written again unchanged gets a new mtime and the
+/// same sha: the digest does not move, so the domain is neither walked nor
+/// read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_touched_file_is_neither_walked_nor_read() {
+    let (_tmp, dir, engine) = file_engine(loader(stub(), Arc::new(AtomicUsize::new(0)))).await;
+    set(&engine, "evolve.contradictions", "full").await;
+    assert_eq!(
+        engine.score_contradictions().await.unwrap(),
+        scored(1, 1, 0)
+    );
+    let path = dir.join("twenty.md");
+    let text = std::fs::read(&path).unwrap();
+    std::fs::write(&path, &text).unwrap();
+    let file = std::fs::File::options().write(true).open(&path).unwrap();
+    file.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
+        .unwrap();
+    drop(file);
+    engine.sync(None).await.unwrap();
+    let (walks, loads) = (
+        engine.contradiction_fact_walks(),
+        engine.contradiction_fact_loads(),
+    );
+    assert_eq!(
+        engine.score_contradictions().await.unwrap(),
+        scored(0, 0, 0)
+    );
+    assert_eq!(engine.contradiction_fact_walks(), walks, "settled");
+    assert_eq!(engine.contradiction_fact_loads(), loads);
+}
+
+/// The off switch drops the fact cache with everything else the pass keeps,
+/// so the walk after it is switched on again reads every engram.
+#[tokio::test]
+async fn turning_the_check_off_and_on_reads_every_engram_again() {
+    let (_tmp, engine) = engine_with(loader(stub(), Arc::new(AtomicUsize::new(0)))).await;
+    set(&engine, "evolve.contradictions", "full").await;
+    fifty(&engine).await;
+    let total = listed(&engine).await;
+    engine.score_contradictions().await.unwrap();
+
+    set(&engine, "evolve.contradictions", "off").await;
+    assert_eq!(
+        engine.score_contradictions().await.unwrap(),
+        ContradictionOutcome::Off
+    );
+    set(&engine, "evolve.contradictions", "full").await;
+    engine.embed_pending().await.unwrap();
+    let loads = engine.contradiction_fact_loads();
+    // Off cleared the stored scores, so the pairs are scored again; only the
+    // reads are counted here.
+    engine.score_contradictions().await.unwrap();
+    assert_eq!(
+        engine.contradiction_fact_loads(),
+        loads + total,
+        "every engram is read again"
+    );
+}
+
+/// A deleted engram's entry leaves the cache with the walk that no longer
+/// sees its stamp, and the same content written back under the same path is
+/// read again rather than answered from a stale entry.
+#[tokio::test]
+async fn a_deleted_engram_written_back_is_read_again() {
+    let s = stub();
+    let (_tmp, engine) = engine_with(loader(s.clone(), Arc::new(AtomicUsize::new(0)))).await;
+    set(&engine, "evolve.contradictions", "full").await;
+    three(&engine).await;
+    assert_eq!(
+        engine.score_contradictions().await.unwrap(),
+        scored(1, 1, 0)
+    );
+    engine.delete_engram(&delete_fridays()).await.unwrap();
+    let loads = engine.contradiction_fact_loads();
+    engine.score_contradictions().await.unwrap();
+    assert_eq!(engine.contradiction_fact_loads(), loads, "nothing to read");
+
+    engine
+        .write_engram(&write("Fridays", FRIDAYS))
+        .await
+        .unwrap();
+    engine.embed_pending().await.unwrap();
+    let loads = engine.contradiction_fact_loads();
+    engine.score_contradictions().await.unwrap();
+    assert_eq!(engine.contradiction_fact_loads(), loads + 1);
+    assert_eq!(v302(&sweep(&engine).await).len(), 1);
+}
+
 // --- two instances on one shared database ------------------------------------
 
 #[cfg(feature = "postgres")]
@@ -4052,6 +4327,47 @@ async fn an_instance_with_the_check_off_leaves_shared_virtual_rows_alone() {
     let status = b.contradictions_status().await.unwrap();
     assert_eq!(status["scored_pairs"], 1, "{status}");
     assert_eq!(status["pending_pairs"], 0, "{status}");
+
+    drop((a, b));
+    let cleanup = crystalline_index::PostgresStore::open_in_schema(&url, &schema)
+        .await
+        .unwrap();
+    cleanup.drop_schema().await.unwrap();
+}
+
+/// The fact cache on a shared database: each instance keeps its own, keyed by
+/// the content sha the database stamps, so a write through one instance is
+/// read by the other on its next walk, and only that engram is.
+#[cfg(feature = "postgres")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn another_instances_write_is_the_one_engram_read_again() {
+    let Some(url) = pg_url() else {
+        return;
+    };
+    let schema = unique_schema();
+    let s = stub();
+    let (_ta, a) = instance_on(&url, &schema, "a", s.clone()).await;
+    let (_tb, b) = instance_on(&url, &schema, "b", s.clone()).await;
+    three(&a).await;
+    b.embed_pending().await.unwrap();
+    assert_eq!(a.score_contradictions().await.unwrap(), scored(1, 1, 0));
+    let (loads, total) = (b.contradiction_fact_loads(), listed(&b).await);
+    assert_eq!(b.score_contradictions().await.unwrap(), scored(0, 0, 0));
+    assert_eq!(
+        b.contradiction_fact_loads(),
+        loads + total,
+        "b reads every engram once"
+    );
+
+    a.edit_engram(&append_to_twenty()).await.unwrap();
+    a.embed_pending().await.unwrap();
+    let loads = b.contradiction_fact_loads();
+    b.score_contradictions().await.unwrap();
+    assert_eq!(
+        b.contradiction_fact_loads(),
+        loads + 1,
+        "b reads the engram a wrote, and only that one"
+    );
 
     drop((a, b));
     let cleanup = crystalline_index::PostgresStore::open_in_schema(&url, &schema)
