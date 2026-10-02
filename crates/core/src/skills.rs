@@ -129,6 +129,47 @@ mod tests {
         }
     }
 
+    /// `major.minor.patch` of a version string, any pre-release or build
+    /// suffix dropped, so a dev-channel build compares as its release.
+    fn release_triple(version: &str) -> (u64, u64, u64) {
+        let core = version.split(['-', '+']).next().unwrap_or_default();
+        let mut parts = core.split('.').map(|p| p.parse::<u64>().unwrap());
+        let triple = (
+            parts.next().unwrap(),
+            parts.next().unwrap(),
+            parts.next().unwrap(),
+        );
+        assert!(parts.next().is_none(), "{version} is not a triple");
+        triple
+    }
+
+    /// A skill whose `since` is newer than the binary that ships it is
+    /// recorded under the older version at install, so the upgrade rule
+    /// never runs for it and the real release later brings back a copy the
+    /// person removed. The release bump has to come with the skill.
+    #[test]
+    #[ignore = "fails until the workspace version is bumped to 0.22.1; remove this ignore in the bump commit"]
+    fn no_skill_is_newer_than_the_binary_that_ships_it() {
+        let binary = release_triple(env!("CARGO_PKG_VERSION"));
+        for s in SKILL_ASSETS {
+            assert!(
+                release_triple(s.since) <= binary,
+                "{} names since {} but this build is {}",
+                s.name,
+                s.since,
+                env!("CARGO_PKG_VERSION")
+            );
+        }
+    }
+
+    #[test]
+    fn release_triple_drops_a_pre_release_suffix() {
+        assert_eq!(release_triple("0.22.1-dev.20261002"), (0, 22, 1));
+        assert_eq!(release_triple("0.22.1"), (0, 22, 1));
+        assert!(release_triple("0.22.1") > release_triple("0.22.0"));
+        assert!(release_triple("0.10.0") > release_triple("0.9.9"));
+    }
+
     #[test]
     fn six_skills_ship_with_five_installed_into_harnesses() {
         let names: Vec<&str> = SKILL_ASSETS.iter().map(|s| s.name).collect();
