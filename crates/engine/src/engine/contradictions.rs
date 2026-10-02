@@ -562,9 +562,11 @@ impl Engine {
     /// runs before the startup sync claims any file domain, so a scope read
     /// then would hold the virtual domains only and leave the file domains'
     /// rows behind for good. On a shared database, only the scores of the
-    /// domains in this instance's scope, and no line vectors, which other
-    /// instances' domains may use. A failure leaves the flag unset, so the
-    /// next off pass tries again.
+    /// file domains this instance hosts, and no line vectors, which other
+    /// instances' domains may use. Never a virtual domain's rows: another
+    /// instance with the check on may have scored them, and an off feature
+    /// reads none of them, so they are not this instance's to drop. A
+    /// failure leaves the flag unset, so the next off pass tries again.
     async fn clear_contradiction_data_once(&self) -> Result<()> {
         use std::sync::atomic::Ordering;
         if self.contradiction_data_cleared.swap(true, Ordering::SeqCst) {
@@ -573,8 +575,10 @@ impl Engine {
         let done = async {
             let store = self.store.lock().await;
             if store.shares_database() {
-                let scope = self.embed_scope(&*store).await?;
-                store.clear_contradictions(scope.as_deref()).await?;
+                let mut hosted: Vec<DomainId> =
+                    self.hosted.read().unwrap().values().copied().collect();
+                hosted.sort_by_key(|d| d.0);
+                store.clear_contradictions(Some(&hosted)).await?;
             } else {
                 store.clear_contradictions(None).await?;
                 store.clear_observation_vectors().await?;

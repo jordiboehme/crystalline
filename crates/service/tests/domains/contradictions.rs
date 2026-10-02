@@ -4018,3 +4018,44 @@ async fn a_walk_that_went_stale_leaves_a_pair_another_instance_stored() {
         .unwrap();
     cleanup.drop_schema().await.unwrap();
 }
+
+/// Decision D2: the off switch on a shared database clears only the file
+/// domains this instance hosts. `b` has the check on and scored the shared
+/// virtual domain; `a` on the same schema turns the check off and runs its
+/// off pass. `b`'s rows are still there and its status still shows them.
+#[cfg(feature = "postgres")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_instance_with_the_check_off_leaves_shared_virtual_rows_alone() {
+    let Some(url) = pg_url() else {
+        return;
+    };
+    let schema = unique_schema();
+    let s = stub();
+    let scorer: Arc<dyn ContradictionScorer> = s.clone();
+    let (_ta, a) = instance_on(&url, &schema, "a", scorer.clone()).await;
+    let (_tb, b) = instance_on(&url, &schema, "b", scorer).await;
+    three(&b).await;
+    assert_eq!(b.score_contradictions().await.unwrap(), scored(1, 1, 0));
+    assert_eq!(rows(&b, full().repo).await.len(), 1);
+
+    set(&a, "evolve.contradictions", "off").await;
+    assert_eq!(
+        a.score_contradictions().await.unwrap(),
+        ContradictionOutcome::Off
+    );
+
+    assert_eq!(
+        rows(&b, full().repo).await.len(),
+        1,
+        "another instance's virtual rows are not this instance's to drop"
+    );
+    let status = b.contradictions_status().await.unwrap();
+    assert_eq!(status["scored_pairs"], 1, "{status}");
+    assert_eq!(status["pending_pairs"], 0, "{status}");
+
+    drop((a, b));
+    let cleanup = crystalline_index::PostgresStore::open_in_schema(&url, &schema)
+        .await
+        .unwrap();
+    cleanup.drop_schema().await.unwrap();
+}
