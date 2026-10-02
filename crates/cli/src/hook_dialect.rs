@@ -14,6 +14,9 @@
 //! `prompt system`, and only a spelling install wrote is rewritten. A
 //! hand-written variant counts as present and is left alone.
 
+use std::ffi::OsStr;
+use std::path::Path;
+
 use crystalline_core::jsonc_edit::{Edit, JsonIn, Prune, SegBuf};
 use crystalline_core::{HarnessKind, HookDialect};
 use serde_json::Value;
@@ -78,6 +81,11 @@ pub(crate) fn kiro_skeleton() -> JsonIn {
 /// one `Push` of our entry when there is none. A value of an unexpected
 /// type on the way is foreign data and plans nothing, and so does a
 /// `command` that is not one of ours.
+///
+/// A rewrite changes the command only. A Claude-style group copied in by
+/// hand with a seconds timeout (`10`) keeps it, which Gemini CLI reads as
+/// 10 ms. Install never writes such a group, so this is left as a known
+/// edge rather than a second edit.
 pub(crate) fn plan_install(dialect: &HookDialect, root: &Value, command: &str) -> Vec<Edit> {
     if !profile_command_kind(command) {
         return Vec::new();
@@ -143,6 +151,70 @@ pub(crate) fn stored_program(dialect: &HookDialect, root: &Value) -> Option<Stri
         .filter_map(|h| h.command)
         .find(|c| is_own_profile_spelling(c))
         .and_then(|c| split_program(&c).map(|(program, _)| program.to_string()))
+}
+
+/// Whether `root` holds a hook of ours whose program still exists as an
+/// executable file: an absolute program checked in place, the bare
+/// `crystalline` looked up in `path_env` (`None` means no PATH). A file
+/// system check only, never a subprocess, because the session-start dedupe
+/// asks it on every session.
+pub(crate) fn runnable_hook_present(
+    dialect: &HookDialect,
+    root: &Value,
+    path_env: Option<&OsStr>,
+) -> bool {
+    own_hooks(dialect, root)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|h| h.command)
+        .any(|command| {
+            split_program(&command).is_some_and(|(program, _)| {
+                let path = Path::new(program);
+                if path.is_absolute() {
+                    is_executable(path)
+                } else {
+                    path_env.is_some_and(|env| {
+                        std::env::split_paths(env)
+                            .filter(|dir| dir.is_absolute())
+                            .any(|dir| is_executable(&dir.join(program)))
+                    })
+                }
+            })
+        })
+}
+
+/// Whether the session hook `kind` installs is in its hooks file now and
+/// would run: the file under the home folder parses, holds a hook of ours
+/// and that hook's program exists. One small file read. Anything that
+/// cannot be read or parsed counts as not running.
+pub(crate) fn installed_hook_runs(kind: HarnessKind) -> bool {
+    let dialect = &kind.profile().hooks;
+    let Some(file) = dialect.file() else {
+        return false;
+    };
+    let Ok(text) = std::fs::read_to_string(file.resolve()) else {
+        return false;
+    };
+    let Ok(root) = crystalline_core::jsonc_edit::parse_value(&text) else {
+        return false;
+    };
+    runnable_hook_present(dialect, &root, std::env::var_os("PATH").as_deref())
+}
+
+/// An existing file (links followed) that may be run.
+fn is_executable(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.is_file() && meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        meta.is_file()
+    }
 }
 
 /// One hook of ours found in a parsed file.
@@ -413,6 +485,79 @@ mod tests {
             parse_value(&undo(d, &fresh)).unwrap(),
             serde_json::json!({"version": "v1", "hooks": []})
         );
+    }
+
+    /// A group that also holds a foreign hook loses only ours on uninstall.
+    #[test]
+    fn a_mixed_gemini_group_keeps_its_foreign_hook() {
+        let d = &HarnessKind::Gemini.profile().hooks;
+        let original = "{\"hooks\": {\"SessionStart\": [{\"matcher\": \"startup\", \"hooks\": [\n  {\"type\": \"command\", \"command\": \"/x/other.sh\"},\n  {\"type\": \"command\", \"command\": \"crystalline prompt system --format hook-specific --harness gemini\"}\n]}]}}";
+        let after = undo(d, original);
+        assert_eq!(
+            parse_value(&after).unwrap(),
+            serde_json::json!({"hooks": {"SessionStart": [{"matcher": "startup", "hooks": [
+                {"type": "command", "command": "/x/other.sh"}]}]}})
+        );
+    }
+
+    /// An older spelling inside a group is rewritten on its own command.
+    #[test]
+    fn an_older_spelling_inside_a_gemini_group_is_one_set() {
+        let d = &HarnessKind::Gemini.profile().hooks;
+        let old = "{\"hooks\": {\"SessionStart\": [{\"matcher\": \"startup\", \"hooks\": [{\"type\": \"command\", \"command\": \"crystalline prompt system --harness gemini\", \"timeout\": 10000}]}]}}";
+        let cmd = session_command(HarnessKind::Gemini, "crystalline");
+        let edits = plan_install(d, &parse_value(old).unwrap(), &cmd);
+        assert_eq!(
+            edits,
+            vec![Edit::Set {
+                path: vec![
+                    key("hooks"),
+                    key("SessionStart"),
+                    SegBuf::Index(0),
+                    key("hooks"),
+                    SegBuf::Index(0),
+                    key("command"),
+                ],
+                value: JsonIn::Str(cmd.clone()),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_hook_runs_only_while_its_program_exists() {
+        let d = &HarnessKind::Cursor.profile().hooks;
+        let tmp = tempfile::tempdir().unwrap();
+        let live = tmp.path().join("bin/crystalline");
+        std::fs::create_dir_all(live.parent().unwrap()).unwrap();
+        std::fs::write(&live, "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&live, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let doc = |program: &std::path::Path| {
+            serde_json::json!({"version": 1, "hooks": {"sessionStart": [
+                {"command": session_command(HarnessKind::Cursor, &program.display().to_string())}]}})
+        };
+        assert!(runnable_hook_present(d, &doc(&live), None));
+        assert!(!runnable_hook_present(
+            d,
+            &doc(&tmp.path().join("gone/crystalline")),
+            None
+        ));
+        let bare = serde_json::json!({"version": 1, "hooks": {"sessionStart": [
+            {"command": "crystalline prompt system --format cursor --harness cursor"}]}});
+        assert!(runnable_hook_present(
+            d,
+            &bare,
+            Some(live.parent().unwrap().as_os_str())
+        ));
+        assert!(!runnable_hook_present(d, &bare, None));
+        assert!(!runnable_hook_present(
+            d,
+            &serde_json::json!({"version": 1, "hooks": {}}),
+            None
+        ));
     }
 
     #[test]

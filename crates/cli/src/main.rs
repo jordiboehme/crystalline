@@ -4493,9 +4493,9 @@ fn run_prompt(
     // One routing block per session (spec decision 13): Cursor runs the
     // user's Claude Code hooks too, so with both installs it would get the
     // block twice. The imported hook stays silent when the payload shows it
-    // runs inside a harness whose own hook is installed. Checked before the
-    // auto-update, so a silenced hook touches no file.
-    if silenced_by_importing_harness(harness.as_deref(), session_start.as_ref()) {
+    // runs inside a harness whose own hook is installed and still runs.
+    // Checked before the auto-update, so a silenced hook touches no file.
+    if silenced_by_importing_harness(harness.as_deref(), format, session_start.as_ref()) {
         return Ok(());
     }
     // The JSON hook formats suppress a resumed session themselves, because
@@ -4663,18 +4663,28 @@ fn run_prompt(
 
 /// Whether this routing hook must stay silent because it was written for
 /// one harness and runs as an import inside another that has its own hook
-/// installed. `harness` is the `--harness` value: a missing flag counts as
-/// claude-code, the only harness that wrote the hook before the flag
-/// existed, and an id this binary does not know is never silenced. The
-/// evidence is the payload's fields and the environment; the installed
-/// hooks come from the install receipt.
+/// installed. `harness` is the `--harness` value. A missing flag counts as
+/// claude-code only for the text format: every hook written before the flag
+/// existed was a Claude Code text hook, while a flagless `--format cursor`
+/// (or any other JSON hook format) is a hand-written hook of the harness
+/// that reads that format, never an import. An id this binary does not know
+/// is never silenced. The evidence is the payload's fields and the
+/// environment.
+///
+/// The receipt alone does not silence: the importer's own hooks file must
+/// still hold a hook of ours whose program exists, or the importer may have
+/// no working route and the imported hook is the only one left. That costs
+/// one small file read and no subprocess, and only when every other
+/// condition already holds.
 fn silenced_by_importing_harness(
     harness: Option<&str>,
+    format: PromptFormat,
     payload: Option<&SessionStartPayload>,
 ) -> bool {
     use crystalline_core::harness::profile::{HostEvidence, silenced_by_importer};
     let written_for = match harness {
-        None => HarnessKind::ClaudeCode,
+        None if format == PromptFormat::Text => HarnessKind::ClaudeCode,
+        None => return false,
         Some(id) => match HarnessKind::from_id(id) {
             Some(kind) => kind,
             None => return false,
@@ -4693,7 +4703,8 @@ fn silenced_by_importing_harness(
     let hooked = crystalline_core::provision::install_receipt_path()
         .map(|path| crystalline_core::provision::harnesses_with_hooks(&path))
         .unwrap_or_default();
-    silenced_by_importer(written_for, &evidence, &hooked).is_some()
+    silenced_by_importer(written_for, &evidence, &hooked)
+        .is_some_and(hook_dialect::installed_hook_runs)
 }
 
 /// The fields this command reads off a SessionStart payload. Each carries
