@@ -649,6 +649,30 @@ describe("arrivalWay (0.22 R1)", () => {
     ).toBe(portalIndex);
   });
 
+  it("is null for a matched bulkhead or blast door, which only Space opens", () => {
+    // Mutation caught: the style check dropped or narrowed to one style (a
+    // latched bulkhead or blast door stays shut while it is offered, so the
+    // first Space at it does nothing).
+    const from: StationAddress = {
+      kind: "engram",
+      domain: "station",
+      permalink: "old-bridge",
+    };
+    const styles = ["sliding", "bulkhead", "blast"] as const;
+    const found = styles.map((style) =>
+      arrivalWay(
+        {
+          ...bridge,
+          fixtures: bridge.fixtures.map((f, i) =>
+            i === slidingIndex && f.kind === "door" ? { ...f, style } : f,
+          ),
+        },
+        { via: "hatch", from },
+      ),
+    );
+    expect(found).toEqual([slidingIndex, null, null]);
+  });
+
   it("is null for no arrival, a lift ride, no match and a matched hatch", () => {
     // Mutation caught: a matched hatch returned (Space crawls a hatch, it
     // carries no one on its own, and its latch would only hide its offer
