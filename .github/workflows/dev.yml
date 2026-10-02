@@ -34,11 +34,12 @@ on:
 # nothing would ship. The condition is the `version` job's guard.
 #
 # The tip check matters because CI runs on main can finish out of order
-# (ci.yml has no concurrency group and a docs-only fast path) and an old CI
-# run can be re-run. For workflow_run, github.sha is main's tip when this run
-# started, so `head_sha == github.sha` means CI tested the tip. It also keeps
-# `uses: ./.github/workflows/build.yml`, which resolves at github.sha, on the
-# same commit as the source the build checks out.
+# (ci.yml groups main runs per commit and never cancels them, and it has a
+# docs-only fast path) and an old CI run can be re-run. For workflow_run,
+# github.sha is main's tip when this run started, so `head_sha ==
+# github.sha` means CI tested the tip. It also keeps `uses:
+# ./.github/workflows/build.yml`, which resolves at github.sha, on the same
+# commit as the source the build checks out.
 concurrency:
   group: >-
     ${{ ((github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
