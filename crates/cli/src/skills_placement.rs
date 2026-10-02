@@ -25,8 +25,8 @@ use std::path::{Path, PathBuf};
 
 use crystalline_core::{HarnessKind, PathSpec, config};
 
-use crate::install::{self, ReconcileMode};
-use crate::receipt::{InstallRecord, Receipt, RecordedSkill};
+use crate::install;
+use crate::receipt::{self, InstallRecord, Receipt, RecordedSkill};
 
 /// The name prefix of the marker entry a covered row records in its skills
 /// list, followed by the id of the harness whose folder covers it. The colon
@@ -123,7 +123,8 @@ fn write_folder(harness: HarnessKind, folders: &Folders<'_>) -> PathBuf {
 }
 
 /// The user-scope rows with skills installed that write files, in
-/// `HarnessKind::ALL` order.
+/// `HarnessKind::ALL` order. The reference count: a folder's files belong to
+/// these rows.
 fn writers(book: &Receipt) -> impl Iterator<Item = (HarnessKind, &InstallRecord)> {
     HarnessKind::ALL.into_iter().filter_map(move |h| {
         book.find(h.id(), "user", None)
@@ -132,9 +133,24 @@ fn writers(book: &Receipt) -> impl Iterator<Item = (HarnessKind, &InstallRecord)
     })
 }
 
+/// The user-scope rows that can cover another harness, in
+/// `HarnessKind::ALL` order: every row with its skills part installed that
+/// is not itself covered, whatever its list holds. An emptied list means
+/// the person removed every skill, which a covered harness must respect
+/// too, so covering stops only when the row is uninstalled or its skills
+/// part removed.
+fn covers(book: &Receipt) -> impl Iterator<Item = (HarnessKind, &InstallRecord)> {
+    HarnessKind::ALL.into_iter().filter_map(move |h| {
+        book.find(h.id(), "user", None)
+            .filter(|r| r.parts.skills && !is_covered(r))
+            .map(|r| (h, r))
+    })
+}
+
 /// Where `harness` gets its skills given the rows in `book`: covered when a
 /// folder it reads, other than its own write folder, is the write folder of
-/// another user-scope row that writes files; its own folder otherwise.
+/// another user-scope row with skills installed that is not covered itself;
+/// its own folder otherwise.
 pub(crate) fn placement(harness: HarnessKind, book: &Receipt, folders: &Folders<'_>) -> Placement {
     let own = write_folder(harness, folders);
     if can_be_covered(harness) {
@@ -145,7 +161,7 @@ pub(crate) fn placement(harness: HarnessKind, book: &Receipt, folders: &Folders<
             .map(|r| r.resolve_in(folders.home, folders.copilot_home))
             .filter(|p| *p != own)
             .collect();
-        for (other, _) in writers(book) {
+        for (other, _) in covers(book) {
             if other == harness {
                 continue;
             }
@@ -179,6 +195,14 @@ pub(crate) fn folder_written_by_others(
 /// the earlier steps leave them, so two rows sharing a folder that both
 /// become covered do not each keep the files for the other.
 pub(crate) fn rebalance_plan(book: &Receipt, folders: &Folders<'_>) -> Vec<RebalanceStep> {
+    // The common case, every legacy-only machine: nothing can be covered,
+    // so nothing is copied or resolved.
+    if !HarnessKind::ALL
+        .into_iter()
+        .any(|h| can_be_covered(h) && book.find(h.id(), "user", None).is_some())
+    {
+        return Vec::new();
+    }
     let mut sim = book.clone();
     let mut steps = Vec::new();
     for harness in HarnessKind::ALL {
@@ -204,7 +228,12 @@ pub(crate) fn rebalance_plan(book: &Receipt, folders: &Folders<'_>) -> Vec<Rebal
                 });
                 next.skills = vec![covered_marker(by)];
             }
-            Placement::Write(to) if !writes_files(row) && is_covered(row) => {
+            // A marker naming a harness this binary does not know came from
+            // a newer binary; handing it over here would only fight that
+            // binary's next cover, so it is left alone.
+            Placement::Write(to)
+                if !writes_files(row) && row.skills.iter().any(|s| covered_by(s).is_some()) =>
+            {
                 steps.push(RebalanceStep::HandOver { harness, to });
                 // Stands in for the hashes the hand-over records.
                 next.skills = vec![RecordedSkill {
@@ -219,13 +248,92 @@ pub(crate) fn rebalance_plan(book: &Receipt, folders: &Folders<'_>) -> Vec<Rebal
     steps
 }
 
-/// Carry out planned steps on disk and in `book`. Returns whether any row
-/// changed and the notices to show; a step that fails becomes a notice and
-/// leaves its row as it was, so the rebalance never fails the run around it.
+/// The skill list a hand-over starts from: the list of the row that covered
+/// `row` as it was when the cover went away. That is `departed` when the
+/// cover was just uninstalled, or the cover's own row when it is still in
+/// the receipt with its skills part removed. `None` when neither is known
+/// (an older binary removed the cover's row).
+fn cover_list<'b>(
+    row: &InstallRecord,
+    book: &'b Receipt,
+    departed: Option<&'b InstallRecord>,
+) -> Option<&'b [RecordedSkill]> {
+    let by = row.skills.iter().find_map(covered_by)?;
+    if let Some(d) = departed.filter(|d| d.harness == by.id() && d.scope == "user") {
+        return Some(&d.skills);
+    }
+    book.find(by.id(), "user", None)
+        .map(|r| r.skills.as_slice())
+}
+
+/// Write a handed-over row's skills into `to`, its own folder.
+///
+/// Only names the cover still listed are written (`seed`; every managed
+/// skill when the cover's list is unknown), so a skill the person removed
+/// stays removed. When other rows write `to` too, a name none of them lists
+/// was removed from that shared folder and stays removed as well. A file
+/// already there that equals the managed copy is adopted; one whose hash
+/// matches a hash the cover or a co-writer recorded for that name is an old
+/// clean copy and is updated in place; any other file is a person's edit and
+/// is left alone, unrecorded, with a notice. No backup file is ever written
+/// here.
+fn hand_over(
+    to: &Path,
+    seed: Option<&[RecordedSkill]>,
+    co_writers: &[&InstallRecord],
+    notices: &mut Vec<String>,
+) -> anyhow::Result<Vec<RecordedSkill>> {
+    let wanted = |name: &str| {
+        seed.is_none_or(|s| s.iter().any(|r| r.name == name))
+            && (co_writers.is_empty()
+                || co_writers
+                    .iter()
+                    .any(|w| w.skills.iter().any(|r| r.name == name)))
+    };
+    let clean = |name: &str, hash: &str| {
+        seed.into_iter()
+            .flatten()
+            .chain(co_writers.iter().flat_map(|w| w.skills.iter()))
+            .any(|r| r.name == name && r.sha256 == hash)
+    };
+    let mut records = Vec::new();
+    for &(name, content) in install::managed_skills().iter() {
+        if !wanted(name) {
+            continue;
+        }
+        let path = to.join(name).join("SKILL.md");
+        match std::fs::read(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                config::save_bytes(&path, content.as_bytes())?;
+            }
+            Err(e) => return Err(anyhow::anyhow!("could not read {}: {e}", path.display())),
+            Ok(existing) if existing == content.as_bytes() => {}
+            Ok(existing) if clean(name, &receipt::sha256_hex(&existing)) => {
+                config::save_bytes(&path, content.as_bytes())?;
+            }
+            Ok(_) => {
+                notices.push(format!("kept {name} in {}: it was edited", to.display()));
+                continue;
+            }
+        }
+        records.push(RecordedSkill {
+            name: name.to_string(),
+            sha256: receipt::sha256_hex(content.as_bytes()),
+        });
+    }
+    Ok(records)
+}
+
+/// Carry out planned steps on disk and in `book`. `departed` is the row an
+/// uninstall just removed, whose skill list seeds a hand-over it causes.
+/// Returns whether any row changed and the notices to show; a step that
+/// fails becomes a notice and leaves its row as it was, so the rebalance
+/// never fails the run around it.
 pub(crate) fn apply_rebalance(
     book: &mut Receipt,
     steps: &[RebalanceStep],
     folders: &Folders<'_>,
+    departed: Option<&InstallRecord>,
 ) -> (bool, Vec<String>) {
     let mut changed = false;
     let mut notices = Vec::new();
@@ -266,8 +374,13 @@ pub(crate) fn apply_rebalance(
                 row.skills = vec![covered_marker(*by)];
             }
             RebalanceStep::HandOver { to, .. } => {
-                match install::reconcile_skills(to, &[], ReconcileMode::Install) {
-                    Ok((_, records)) => row.skills = records,
+                let seed = cover_list(&row, book, departed).map(<[RecordedSkill]>::to_vec);
+                let co_writers: Vec<&InstallRecord> = writers(book)
+                    .filter(|(h, _)| *h != harness && write_folder(*h, folders) == *to)
+                    .map(|(_, r)| r)
+                    .collect();
+                match hand_over(to, seed.as_deref(), &co_writers, &mut notices) {
+                    Ok(records) => row.skills = records,
                     Err(e) => {
                         notices.push(format!(
                             "Could not write the {} skills to {}: {e}",
@@ -286,13 +399,18 @@ pub(crate) fn apply_rebalance(
 }
 
 /// Plan and apply the rebalance in one call: what every install, uninstall
-/// and session-start refresh ends with.
-pub(crate) fn rebalance(book: &mut Receipt, folders: &Folders<'_>) -> (bool, Vec<String>) {
+/// and session-start refresh ends with. An uninstall passes the row it just
+/// removed as `departed`; everything else passes `None`.
+pub(crate) fn rebalance(
+    book: &mut Receipt,
+    folders: &Folders<'_>,
+    departed: Option<&InstallRecord>,
+) -> (bool, Vec<String>) {
     let steps = rebalance_plan(book, folders);
     if steps.is_empty() {
         return (false, Vec::new());
     }
-    apply_rebalance(book, &steps, folders)
+    apply_rebalance(book, &steps, folders, departed)
 }
 
 #[cfg(test)]
@@ -352,10 +470,28 @@ mod tests {
         assert!(
             matches!(placement(HarnessKind::Gemini, &b, &f), Placement::Write(ref p) if *p == home.join(".agents/skills"))
         );
+        // Ruling R2: an emptied list means the person removed every skill,
+        // which Cursor respects too, so the row still covers.
         let b = book(vec![row("claude-code", true, 0)]);
         assert!(
+            matches!(
+                placement(HarnessKind::Cursor, &b, &f),
+                Placement::Covered {
+                    by: HarnessKind::ClaudeCode,
+                    ..
+                }
+            ),
+            "a Claude Code row whose skills were all removed still covers"
+        );
+        let b = book(vec![row("claude-code", false, 4)]);
+        assert!(
             matches!(placement(HarnessKind::Cursor, &b, &f), Placement::Write(_)),
-            "a Claude Code row whose skills were all removed covers nothing"
+            "a row without its skills part covers nothing"
+        );
+        let b = book(vec![covered_row("claude-code", "cursor")]);
+        assert!(
+            matches!(placement(HarnessKind::Cursor, &b, &f), Placement::Write(_)),
+            "a covered row covers nothing"
         );
     }
 
@@ -469,6 +605,19 @@ mod tests {
             copilot_home: &cop,
         };
         assert!(rebalance_plan(&book(vec![row("cursor", true, 0)]), &f).is_empty());
+    }
+
+    /// Review M3: a marker from a newer binary names a harness this one does
+    /// not know; handing it over would fight that binary's next cover.
+    #[test]
+    fn a_marker_naming_an_unknown_harness_is_left_alone() {
+        let t = tempfile::tempdir().unwrap();
+        let (home, cop) = folders(t.path());
+        let f = Folders {
+            home: &home,
+            copilot_home: &cop,
+        };
+        assert!(rebalance_plan(&book(vec![covered_row("cursor", "zed")]), &f).is_empty());
     }
 
     #[test]

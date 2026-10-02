@@ -1732,6 +1732,8 @@ pub(crate) fn uninstall_skills(
 /// (`covered`). Otherwise this is [`uninstall_skills`]. Project folders
 /// belong to their row alone, so `user_scope = false` skips both checks.
 /// `book` still holds the row being uninstalled; the count excludes it.
+/// A project install run in the home folder aliases a user folder; that
+/// layout is not supported, and its files are not counted.
 #[allow(clippy::too_many_arguments)]
 fn skills_to_remove(
     harness: HarnessKind,
@@ -1756,12 +1758,16 @@ fn skills_to_remove(
     };
     match keep {
         None => uninstall_skills(dir, prior, force),
+        // Only the skills this row recorded and that are on disk are named,
+        // so a reader never gets a status for a file that is not there.
         Some(status) => Ok(SkillsReport {
             dir: dir.display().to_string(),
-            skills: managed_skills()
+            skills: prior
                 .iter()
-                .map(|&(name, _)| SkillReport {
-                    name: name.to_string(),
+                .filter(|r| is_plain_skill_name(&r.name))
+                .filter(|r| dir.join(&r.name).join("SKILL.md").is_file())
+                .map(|r| SkillReport {
+                    name: r.name.clone(),
                     status,
                 })
                 .collect(),
@@ -2164,6 +2170,7 @@ pub fn run_install(opts: InstallOptions, json: bool) -> anyhow::Result<()> {
             home: &home,
             copilot_home: &copilot_home,
         },
+        None,
     );
     notices.extend(rebalance_notices);
     let receipt_report = match &receipt_path {
@@ -2291,7 +2298,10 @@ pub fn run_uninstall(
     let removed = book.remove(harness.id(), scope, project_path.as_deref());
     // With this row gone, a harness it covered writes its own folder again
     // (the hand-over). A no-op, touching no file, on a legacy-only machine.
-    let (rebalanced, rebalance_notices) = skills_placement::rebalance(&mut book, &folders);
+    // The removed row's list seeds that hand-over, so a skill the person
+    // removed under the cover stays removed.
+    let (rebalanced, rebalance_notices) =
+        skills_placement::rebalance(&mut book, &folders, prior.as_ref());
     notices.extend(rebalance_notices);
     let receipt_report = if removed || rebalanced {
         match &receipt_path {
@@ -2440,6 +2450,7 @@ pub(crate) fn auto_reconcile(current_version: &str, cwd: &Path) -> Vec<String> {
             home: &home,
             copilot_home: &copilot_home,
         },
+        None,
     );
     notices.extend(
         rebalance_notices
@@ -4321,10 +4332,19 @@ mod tests {
         assert!(!paths.skills_dir.exists(), "nothing written");
     }
 
+    fn marker_of(by: &str) -> RecordedSkill {
+        RecordedSkill {
+            name: format!("{}{by}", crate::skills_placement::COVERED_PREFIX),
+            sha256: String::new(),
+        }
+    }
+
     /// The rebalance applied: Cursor installed first wrote `~/.agents/skills`;
     /// once Claude Code writes `~/.claude/skills`, which Cursor reads too,
     /// Cursor's clean copies go, an edited one stays with a notice, and the
-    /// row records the marker. Uninstalling Claude Code hands the skills back.
+    /// row records the marker. Uninstalling Claude Code hands the skills back,
+    /// and the edited copy is still the person's: left alone, unrecorded, no
+    /// backup file.
     #[test]
     fn the_rebalance_covers_and_hands_over_on_disk() {
         let work = tempfile::tempdir().unwrap();
@@ -4342,7 +4362,7 @@ mod tests {
         let mut book = receipt::Receipt::default();
         book.upsert(user_row("cursor", managed_records()));
         book.upsert(user_row("claude-code", managed_records()));
-        let (changed, notices) = crate::skills_placement::rebalance(&mut book, &f);
+        let (changed, notices) = crate::skills_placement::rebalance(&mut book, &f, None);
         assert!(changed);
         let cursor = book.find("cursor", "user", None).unwrap();
         assert_eq!(cursor.skills.len(), 1);
@@ -4366,20 +4386,190 @@ mod tests {
             "{notices:?}"
         );
 
+        let departed = book.find("claude-code", "user", None).cloned().unwrap();
         book.remove("claude-code", "user", None);
-        let (changed, _) = crate::skills_placement::rebalance(&mut book, &f);
+        let (changed, notices) = crate::skills_placement::rebalance(&mut book, &f, Some(&departed));
         assert!(changed);
+        assert_eq!(
+            notices,
+            vec![format!(
+                "kept {edited} in {}: it was edited",
+                agents.display()
+            )]
+        );
         let cursor = book.find("cursor", "user", None).unwrap();
-        assert_eq!(cursor.skills.len(), managed_skills().len());
+        assert_eq!(cursor.skills.len(), managed_skills().len() - 1);
+        assert!(cursor.skills.iter().all(|s| s.name != edited));
         for &(name, body) in managed_skills().iter() {
+            let expected = if name == edited { "my own words" } else { body };
             assert_eq!(
                 std::fs::read_to_string(skill_file(&agents, name)).unwrap(),
-                body
+                expected,
+                "{name}"
+            );
+            assert!(
+                !skill_file(&agents, name)
+                    .with_file_name("SKILL.md.bak")
+                    .exists(),
+                "a hand-over never writes a backup: {name}"
             );
         }
         assert!(
-            !crate::skills_placement::rebalance(&mut book, &f).0,
+            !crate::skills_placement::rebalance(&mut book, &f, None).0,
             "settled"
         );
+    }
+
+    /// Ruling R1: a hand-over writes only the skills the cover still listed,
+    /// so one the person removed under Claude Code does not come back in
+    /// Cursor. Ruling R3: a file the cover's hash proves an old clean copy
+    /// is updated in place, without a backup.
+    #[test]
+    fn a_hand_over_writes_only_the_skills_the_cover_still_listed() {
+        let work = tempfile::tempdir().unwrap();
+        let home = work.path().join("home");
+        let copilot = home.join(".copilot");
+        let f = crate::skills_placement::Folders {
+            home: &home,
+            copilot_home: &copilot,
+        };
+        let agents = home.join(".agents/skills");
+        let managed = managed_skills();
+        let removed = managed[0].0;
+        let stale = managed[1].0;
+        let old_body = "an older release's body";
+        seed(&agents, stale, old_body);
+
+        let mut cover: Vec<RecordedSkill> = managed_records()
+            .into_iter()
+            .filter(|r| r.name != removed)
+            .collect();
+        for r in &mut cover {
+            if r.name == stale {
+                *r = rec(stale, old_body);
+            }
+        }
+        let departed = user_row("claude-code", cover);
+        let mut book = receipt::Receipt::default();
+        book.upsert(user_row("cursor", vec![marker_of("claude-code")]));
+        let (changed, notices) = crate::skills_placement::rebalance(&mut book, &f, Some(&departed));
+        assert!(changed);
+        assert!(notices.is_empty(), "{notices:?}");
+        assert!(
+            !skill_file(&agents, removed).exists(),
+            "removed stays removed"
+        );
+        let cursor = book.find("cursor", "user", None).unwrap();
+        assert_eq!(cursor.skills.len(), managed.len() - 1);
+        assert!(cursor.skills.iter().all(|s| s.name != removed));
+        for &(name, body) in managed.iter().filter(|&&(n, _)| n != removed) {
+            assert_eq!(
+                std::fs::read_to_string(skill_file(&agents, name)).unwrap(),
+                body,
+                "{name}"
+            );
+        }
+        assert!(
+            !skill_file(&agents, stale)
+                .with_file_name("SKILL.md.bak")
+                .exists()
+        );
+    }
+
+    /// Ruling R1: when the cover's list was empty (the person removed every
+    /// skill), the hand-over writes nothing and records an empty list, never
+    /// the marker, so nothing is handed over again later.
+    #[test]
+    fn a_hand_over_from_an_emptied_cover_writes_nothing() {
+        let work = tempfile::tempdir().unwrap();
+        let home = work.path().join("home");
+        let copilot = home.join(".copilot");
+        let f = crate::skills_placement::Folders {
+            home: &home,
+            copilot_home: &copilot,
+        };
+        let departed = user_row("claude-code", Vec::new());
+        let mut book = receipt::Receipt::default();
+        book.upsert(user_row("cursor", vec![marker_of("claude-code")]));
+        let (changed, _) = crate::skills_placement::rebalance(&mut book, &f, Some(&departed));
+        assert!(changed);
+        assert!(book.find("cursor", "user", None).unwrap().skills.is_empty());
+        assert!(!home.join(".agents/skills").exists());
+        assert!(!crate::skills_placement::rebalance(&mut book, &f, None).0);
+    }
+
+    /// Ruling R2: a Claude Code row whose list Auto mode emptied still covers
+    /// Cursor; the session-start rebalance hands nothing over.
+    #[test]
+    fn an_emptied_cover_keeps_covering() {
+        let work = tempfile::tempdir().unwrap();
+        let home = work.path().join("home");
+        let copilot = home.join(".copilot");
+        let f = crate::skills_placement::Folders {
+            home: &home,
+            copilot_home: &copilot,
+        };
+        let mut book = receipt::Receipt::default();
+        book.upsert(user_row("claude-code", Vec::new()));
+        book.upsert(user_row("cursor", vec![marker_of("claude-code")]));
+        assert!(!crate::skills_placement::rebalance(&mut book, &f, None).0);
+        assert!(!home.join(".agents/skills").exists());
+        assert_eq!(
+            book.find("cursor", "user", None).unwrap().skills,
+            vec![marker_of("claude-code")]
+        );
+    }
+
+    /// A hand-over into a folder Codex still writes: a skill the person
+    /// removed there (missing from Codex's row) is not written again, and
+    /// Codex's edited copy is left alone with a notice and no backup.
+    #[test]
+    fn a_hand_over_into_a_shared_folder_respects_the_co_writer() {
+        let work = tempfile::tempdir().unwrap();
+        let home = work.path().join("home");
+        let copilot = home.join(".copilot");
+        let f = crate::skills_placement::Folders {
+            home: &home,
+            copilot_home: &copilot,
+        };
+        let agents = home.join(".agents/skills");
+        let managed = managed_skills();
+        let removed = managed[0].0;
+        let edited = managed[1].0;
+        seed_managed(&agents);
+        std::fs::remove_dir_all(agents.join(removed)).unwrap();
+        seed(&agents, edited, "codex user's words");
+
+        let mut book = receipt::Receipt::default();
+        book.upsert(user_row(
+            "codex",
+            managed_records()
+                .into_iter()
+                .filter(|r| r.name != removed)
+                .collect(),
+        ));
+        book.upsert(user_row("cursor", vec![marker_of("claude-code")]));
+        let departed = user_row("claude-code", managed_records());
+        let (changed, notices) = crate::skills_placement::rebalance(&mut book, &f, Some(&departed));
+        assert!(changed);
+        assert!(!skill_file(&agents, removed).exists(), "not resurrected");
+        assert_eq!(
+            std::fs::read_to_string(skill_file(&agents, edited)).unwrap(),
+            "codex user's words"
+        );
+        assert!(
+            !skill_file(&agents, edited)
+                .with_file_name("SKILL.md.bak")
+                .exists()
+        );
+        assert_eq!(
+            notices,
+            vec![format!(
+                "kept {edited} in {}: it was edited",
+                agents.display()
+            )]
+        );
+        let cursor = book.find("cursor", "user", None).unwrap();
+        assert_eq!(cursor.skills.len(), managed.len() - 2);
     }
 }

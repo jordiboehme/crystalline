@@ -2000,3 +2000,189 @@ fn prompt_system_reconciles_a_project_install_only_from_its_directory() {
         "the project install reconciles from its own directory"
     );
 }
+
+// --- skills placement across harnesses ---------------------------------------
+//
+// Cursor is not installable in this build, so these tests seed its receipt
+// row by hand (a Codex row renamed to `cursor` leaves exactly the files and
+// hashes a Cursor install writes to ~/.agents/skills) and drive the
+// rebalance through the installable harnesses.
+
+/// A shared home with shims for `claude` and `codex`.
+fn placement_home() -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let bin_dir = work.path().join("bin");
+    let log = work.path().join("calls.log");
+    write_shim(&bin_dir, "claude", &log);
+    write_shim(&bin_dir, "codex", &log);
+    (work, home, bin_dir)
+}
+
+fn agents_skill(home: &Path, name: &str) -> PathBuf {
+    home.join(".agents")
+        .join("skills")
+        .join(name)
+        .join("SKILL.md")
+}
+
+fn receipt_row(home: &Path, harness: &str) -> Option<Value> {
+    read_json(&receipt_file(home))["installs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["harness"] == harness)
+        .cloned()
+}
+
+fn skill_names(row: &Value) -> Vec<String> {
+    row["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// Install Codex, then rename its receipt row to `cursor`.
+fn seed_a_cursor_row_writing_agents_skills(home: &Path, bin_dir: &Path) {
+    install_cmd(home, bin_dir)
+        .args(["install", "codex"])
+        .assert()
+        .success();
+    tamper_receipt(home, |receipt| {
+        for row in receipt["installs"].as_array_mut().unwrap() {
+            if row["harness"] == "codex" {
+                row["harness"] = json!("cursor");
+            }
+        }
+    });
+}
+
+#[test]
+fn installing_claude_code_drops_a_covered_cursor_rows_clean_copies() {
+    let (_work, home, bin_dir) = placement_home();
+    seed_a_cursor_row_writing_agents_skills(&home, &bin_dir);
+    assert!(agents_skill(&home, "crystalline-routing").is_file());
+
+    install_cmd(&home, &bin_dir)
+        .args(["install", "claude-code"])
+        .assert()
+        .success();
+
+    assert!(
+        !agents_skill(&home, "crystalline-routing").exists(),
+        "Cursor reads ~/.claude/skills now, so its own copies go"
+    );
+    assert!(claude_skill(&home, "crystalline-routing").is_file());
+    let cursor = receipt_row(&home, "cursor").unwrap();
+    assert_eq!(skill_names(&cursor), vec!["covered:claude-code"]);
+}
+
+#[test]
+fn uninstalling_claude_code_hands_a_covered_cursor_row_its_own_folder() {
+    let (_work, home, bin_dir) = placement_home();
+    install_cmd(&home, &bin_dir)
+        .args(["install", "claude-code"])
+        .assert()
+        .success();
+    tamper_receipt(&home, |receipt| {
+        receipt["installs"].as_array_mut().unwrap().push(json!({
+            "harness": "cursor",
+            "scope": "user",
+            "version": env!("CARGO_PKG_VERSION"),
+            "parts": {"mcp": true, "hooks": true, "skills": true},
+            "skills": [{"name": "covered:claude-code", "sha256": ""}]
+        }));
+    });
+
+    install_cmd(&home, &bin_dir)
+        .args(["uninstall", "claude-code"])
+        .assert()
+        .success();
+
+    assert!(!claude_skill(&home, "crystalline-routing").exists());
+    assert_eq!(
+        std::fs::read_to_string(agents_skill(&home, "crystalline-routing")).unwrap(),
+        ROUTING_SKILL,
+        "the hand-over writes Cursor's own folder"
+    );
+    assert!(receipt_row(&home, "claude-code").is_none());
+    let cursor = receipt_row(&home, "cursor").unwrap();
+    assert!(
+        skill_names(&cursor).contains(&"crystalline-routing".to_string()),
+        "{cursor}"
+    );
+    assert!(
+        !skill_names(&cursor)
+            .iter()
+            .any(|n| n.starts_with("covered:")),
+        "{cursor}"
+    );
+}
+
+#[test]
+fn prompt_system_rebalances_even_when_no_version_differs() {
+    let (_work, home, bin_dir) = placement_home();
+    install_cmd(&home, &bin_dir)
+        .args(["install", "claude-code"])
+        .assert()
+        .success();
+    seed_a_cursor_row_writing_agents_skills(&home, &bin_dir);
+    std::fs::write(agents_skill(&home, "crystalline-capture"), "my edits").unwrap();
+
+    let out = install_cmd(&home, &bin_dir)
+        .args(["prompt", "system"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stderr.contains("[crystalline] kept crystalline-capture in "),
+        "the kept edit is a notice on stderr: {stderr}"
+    );
+    assert!(!stdout.contains("[crystalline]"), "{stdout}");
+    assert!(!agents_skill(&home, "crystalline-routing").exists());
+    assert_eq!(
+        std::fs::read_to_string(agents_skill(&home, "crystalline-capture")).unwrap(),
+        "my edits"
+    );
+    let cursor = receipt_row(&home, "cursor").unwrap();
+    assert_eq!(skill_names(&cursor), vec!["covered:claude-code"]);
+}
+
+#[test]
+fn uninstalling_codex_keeps_a_folder_cursor_still_writes() {
+    let (_work, home, bin_dir) = placement_home();
+    install_cmd(&home, &bin_dir)
+        .args(["install", "codex"])
+        .assert()
+        .success();
+    tamper_receipt(&home, |receipt| {
+        let installs = receipt["installs"].as_array_mut().unwrap();
+        let mut cursor = installs[0].clone();
+        cursor["harness"] = json!("cursor");
+        installs.push(cursor);
+    });
+
+    let out = install_cmd(&home, &bin_dir)
+        .args(["uninstall", "codex", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let statuses: Vec<&str> = report["skills"]["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["status"].as_str().unwrap())
+        .collect();
+    assert!(!statuses.is_empty());
+    assert!(statuses.iter().all(|s| *s == "kept-shared"), "{report}");
+    assert_eq!(
+        std::fs::read_to_string(agents_skill(&home, "crystalline-routing")).unwrap(),
+        ROUTING_SKILL,
+        "Cursor still writes ~/.agents/skills"
+    );
+}
