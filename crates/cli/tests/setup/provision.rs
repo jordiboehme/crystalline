@@ -58,23 +58,28 @@ fn read_log(log: &Path) -> String {
 /// directory, marking it onboarded at user scope, so `provision` treats it
 /// as an installed harness without a real `crystalline install` run.
 fn write_install_receipt(home: &Path) {
+    write_install_receipt_for(home, &["claude-code"]);
+}
+
+/// The same receipt with one user-scope row per id in `ids`.
+fn write_install_receipt_for(home: &Path, ids: &[&str]) {
     let path = home.join("state").join("crystalline").join("installs.json");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let rows: Vec<Value> = ids
+        .iter()
+        .map(|id| {
+            json!({
+                "harness": id,
+                "scope": "user",
+                "version": "0.0.0",
+                "parts": { "mcp": true, "hooks": true, "skills": true },
+                "skills": []
+            })
+        })
+        .collect();
     std::fs::write(
         &path,
-        serde_json::to_string_pretty(&json!({
-            "format": 1,
-            "installs": [
-                {
-                    "harness": "claude-code",
-                    "scope": "user",
-                    "version": "0.0.0",
-                    "parts": { "mcp": true, "hooks": true, "skills": true },
-                    "skills": []
-                }
-            ]
-        }))
-        .unwrap(),
+        serde_json::to_string_pretty(&json!({ "format": 1, "installs": rows })).unwrap(),
     )
     .unwrap();
 }
@@ -1169,4 +1174,116 @@ fn prompt_copilot_format_keeps_notices_out_of_the_context() {
         stderr.contains("Refreshed"),
         "and so does the reconcile summary: {stderr}"
     );
+}
+
+fn status_of<'a>(data: &'a Value, harness: &str) -> &'a Value {
+    data["harnesses"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["harness"] == harness)
+        .unwrap_or_else(|| panic!("{harness} status: {data}"))
+}
+
+fn status_json(home: &Path, bin_dir: &Path) -> Value {
+    let out = provision_cmd(home, bin_dir)
+        .args(["--json", "provision", "status"])
+        .output()
+        .unwrap();
+    serde_json::from_slice(&out.stdout).unwrap()
+}
+
+#[test]
+fn codex_and_gemini_share_one_provisioned_copy_and_one_drift_report() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home-shared");
+    let bin_dir = work.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let harbor_dir = work.path().join("kb-harbor");
+    write_install_receipt_for(&home, &["codex", "gemini"]);
+    write_harbor(&harbor_dir);
+    write_shim(&bin_dir, "codex", &work.path().join("codex.log"));
+    register_and_allow(&home, &bin_dir, &harbor_dir);
+
+    let skill = home.join(".agents/skills/tide-tables/SKILL.md");
+    assert!(
+        skill.is_file(),
+        "the harbor skill landed once in the shared folder"
+    );
+    let data = status_json(&home, &bin_dir);
+    assert_eq!(status_of(&data, "gemini")["covered_by"], "codex", "{data}");
+    assert_eq!(status_of(&data, "gemini")["installed_files"], 0, "{data}");
+    assert!(
+        status_of(&data, "codex")["installed_files"]
+            .as_u64()
+            .unwrap()
+            >= 1,
+        "{data}"
+    );
+
+    std::fs::write(&skill, "edited by hand\n").unwrap();
+    let data = status_json(&home, &bin_dir);
+    assert_eq!(status_of(&data, "codex")["edited"], 1, "{data}");
+    assert_eq!(
+        status_of(&data, "gemini")["edited"],
+        0,
+        "reported once, under the owner: {data}"
+    );
+}
+
+#[test]
+fn when_the_owner_leaves_the_next_harness_adopts_the_identical_files() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home-adopt");
+    let bin_dir = work.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let harbor_dir = work.path().join("kb-harbor");
+    write_install_receipt_for(&home, &["codex", "gemini"]);
+    write_harbor(&harbor_dir);
+    write_shim(&bin_dir, "codex", &work.path().join("codex.log"));
+    register_and_allow(&home, &bin_dir, &harbor_dir);
+    let skill = home.join(".agents/skills/tide-tables/SKILL.md");
+    let before = std::fs::read(&skill).unwrap();
+
+    write_install_receipt_for(&home, &["gemini"]);
+    provision_cmd(&home, &bin_dir)
+        .args(["provision", "allow", "harbor"])
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read(&skill).unwrap(),
+        before,
+        "adopted, not rewritten"
+    );
+    let data = status_json(&home, &bin_dir);
+    assert!(status_of(&data, "gemini")["covered_by"].is_null(), "{data}");
+    assert!(
+        status_of(&data, "gemini")["installed_files"]
+            .as_u64()
+            .unwrap()
+            >= 1,
+        "{data}"
+    );
+}
+
+#[test]
+fn doctor_prints_covered_by_for_a_harness_that_shares_the_folder() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home-doctor");
+    let bin_dir = work.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let harbor_dir = work.path().join("kb-harbor");
+    write_install_receipt_for(&home, &["codex", "gemini"]);
+    write_harbor(&harbor_dir);
+    write_shim(&bin_dir, "codex", &work.path().join("codex.log"));
+    register_and_allow(&home, &bin_dir, &harbor_dir);
+
+    let out = provision_cmd(&home, &bin_dir)
+        .args(["doctor", "--db"])
+        .arg(work.path().join("index.db"))
+        .output()
+        .unwrap();
+    let human = String::from_utf8_lossy(&out.stdout);
+    assert!(human.contains("  gemini: covered by codex"), "{human}");
+    assert!(human.contains("  codex: "), "{human}");
 }

@@ -635,6 +635,146 @@ fn status_reports_missing_files_and_virtual_decisions() {
     assert_eq!(report.virtual_with_decision, vec!["notes".to_string()]);
 }
 
+// --- shared skills folders: one owner ------------------------------------------
+
+fn skills_only_domain() -> (tempfile::TempDir, GlobalConfig) {
+    let domain_dir = tempfile::tempdir().unwrap();
+    write_manifest(domain_dir.path(), "- skills: skills\n");
+    write(
+        domain_dir.path(),
+        "skills/tide-tables/SKILL.md",
+        "---\nname: tide-tables\n---\n\nReads the tides.\n",
+    );
+    let mut entry = DomainEntry::file(domain_dir.path());
+    entry.provision = Some(true);
+    let global = config_with("harbor", entry);
+    (domain_dir, global)
+}
+
+#[test]
+fn codex_and_gemini_share_one_skills_folder_with_one_owner() {
+    let _guard = HOME_LOCK.lock().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let (_dir, global) = skills_only_domain();
+    let receipt_dir = tempfile::tempdir().unwrap();
+    let receipt_path = receipt_dir.path().join("provisions.json");
+    let both = [HarnessKind::Codex, HarnessKind::Gemini];
+
+    let previous = set_home(home.path());
+    let report = provision::apply(&global, &receipt_path, &both, &mut NoMcp, &no_env());
+    let status = provision::status(&global, &receipt_path, &both, &no_env());
+    restore_home(previous);
+    let report = report.unwrap();
+    let status = status.unwrap();
+
+    assert!(
+        home.path()
+            .join(".agents/skills/tide-tables/SKILL.md")
+            .is_file()
+    );
+    let installed: Vec<_> = report
+        .harnesses
+        .iter()
+        .map(|(h, a)| {
+            (
+                *h,
+                a.iter()
+                    .filter(|a| a.status == ActionStatus::Installed)
+                    .count(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        installed,
+        vec![(HarnessKind::Codex, 1), (HarnessKind::Gemini, 0)]
+    );
+
+    let codex = &status.harnesses[0];
+    assert_eq!(codex.covered_by, None);
+    assert_eq!(codex.installed_files, 1);
+    let gemini = &status.harnesses[1];
+    assert_eq!(gemini.covered_by, Some(HarnessKind::Codex));
+    assert_eq!(
+        (
+            gemini.installed_files,
+            gemini.installed_mcps,
+            gemini.edited,
+            gemini.missing,
+            gemini.drift,
+            gemini.orphaned
+        ),
+        (0, 0, 0, 0, 0, 0)
+    );
+}
+
+#[test]
+fn when_the_owner_leaves_the_next_harness_adopts_the_identical_files() {
+    let _guard = HOME_LOCK.lock().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let (_dir, global) = skills_only_domain();
+    let receipt_dir = tempfile::tempdir().unwrap();
+    let receipt_path = receipt_dir.path().join("provisions.json");
+    let skill = home.path().join(".agents/skills/tide-tables/SKILL.md");
+
+    let previous = set_home(home.path());
+    provision::apply(
+        &global,
+        &receipt_path,
+        &[HarnessKind::Codex, HarnessKind::Gemini],
+        &mut NoMcp,
+        &no_env(),
+    )
+    .unwrap();
+    let before = std::fs::read(&skill).unwrap();
+    let report = provision::apply(
+        &global,
+        &receipt_path,
+        &[HarnessKind::Gemini],
+        &mut NoMcp,
+        &no_env(),
+    );
+    let status = provision::status(&global, &receipt_path, &[HarnessKind::Gemini], &no_env());
+    restore_home(previous);
+    let report = report.unwrap();
+
+    assert_eq!(std::fs::read(&skill).unwrap(), before, "nothing rewritten");
+    let (harness, actions) = &report.harnesses[0];
+    assert_eq!(*harness, HarnessKind::Gemini);
+    assert_eq!(actions.len(), 1, "{actions:?}");
+    assert_eq!(actions[0].status, ActionStatus::Adopted);
+    let status = status.unwrap();
+    assert_eq!(status.harnesses[0].covered_by, None);
+    assert_eq!(status.harnesses[0].installed_files, 1);
+}
+
+#[test]
+fn cursor_is_covered_by_claude_code_and_apply_leaves_its_state_empty() {
+    let _guard = HOME_LOCK.lock().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let (_dir, global) = skills_only_domain();
+    let receipt_dir = tempfile::tempdir().unwrap();
+    let receipt_path = receipt_dir.path().join("provisions.json");
+    let both = [HarnessKind::ClaudeCode, HarnessKind::Cursor];
+
+    let previous = set_home(home.path());
+    provision::apply(&global, &receipt_path, &both, &mut NoMcp, &no_env()).unwrap();
+    let status = provision::status(&global, &receipt_path, &both, &no_env());
+    restore_home(previous);
+    let status = status.unwrap();
+
+    assert!(
+        home.path()
+            .join(".claude/skills/tide-tables/SKILL.md")
+            .is_file()
+    );
+    assert!(!home.path().join(".agents/skills").exists());
+    assert_eq!(
+        status.harnesses[1].covered_by,
+        Some(HarnessKind::ClaudeCode)
+    );
+    assert_eq!(status.harnesses[1].installed_files, 0);
+}
+
 // --- pending: env-defined domains never nag ---------------------------------
 
 /// An env-defined domain's `provision` field always reads back `None` (the

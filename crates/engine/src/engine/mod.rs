@@ -5573,6 +5573,7 @@ fn harness_status_json(status: &crystalline_core::provision::HarnessStatus) -> V
         "edited": status.edited,
         "orphaned": status.orphaned,
         "missing": status.missing,
+        "covered_by": status.covered_by.map(|h| h.id()),
     })
 }
 

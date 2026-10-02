@@ -152,6 +152,62 @@ pub fn harnesses_with_hooks(path: &Path) -> Vec<HarnessKind> {
         .collect()
 }
 
+// --- shared skills folders: one owner ---------------------------------------
+
+/// The user skills folder `harness` writes provisioned skills into.
+fn skills_folder(harness: HarnessKind) -> Option<PathBuf> {
+    artifact_base(harness, ArtifactType::Skills).ok().flatten()
+}
+
+/// The installed harness that covers `harness` because it reads a skills
+/// folder, other than its own write folder, that the other one writes (Cursor
+/// reads `~/.claude/skills`, which Claude Code writes). The first match in
+/// [`HarnessKind::ALL`] order wins.
+fn read_cover(harness: HarnessKind, installed: &[HarnessKind]) -> Option<HarnessKind> {
+    let own = skills_folder(harness)?;
+    let reads: Vec<PathBuf> = harness
+        .profile()
+        .skills_reads
+        .iter()
+        .map(|r| r.resolve())
+        .filter(|p| *p != own)
+        .collect();
+    if reads.is_empty() {
+        return None;
+    }
+    HarnessKind::ALL.into_iter().find(|&other| {
+        other != harness
+            && installed.contains(&other)
+            && skills_folder(other).is_some_and(|f| reads.contains(&f))
+    })
+}
+
+/// The harness that owns `harness`'s provisioned skills, or `None` when
+/// `harness` is the owner itself. Among `installed`, the owner of a skills
+/// folder is the first harness in [`HarnessKind::ALL`] order that writes it
+/// and is not covered by a read; every other installed harness that writes the
+/// folder, or reads it and so is covered, provisions nothing of its own and
+/// reports under the owner. Commands and agents never take part: the
+/// harnesses that can be covered keep none.
+fn skills_owner(harness: HarnessKind, installed: &[HarnessKind]) -> Option<HarnessKind> {
+    if let Some(by) = read_cover(harness, installed) {
+        return Some(by);
+    }
+    let own = skills_folder(harness)?;
+    for other in HarnessKind::ALL {
+        if !installed.contains(&other) {
+            continue;
+        }
+        if other == harness {
+            return None;
+        }
+        if skills_folder(other) == Some(own.clone()) && read_cover(other, installed).is_none() {
+            return Some(other);
+        }
+    }
+    None
+}
+
 // --- shared manifest and artifact helpers ---------------------------------
 
 /// Parse `entry`'s `MANIFEST.md` into a [`Manifest`], or `None` when the
@@ -515,6 +571,14 @@ pub fn apply(
             .harnesses
             .entry(harness.id().to_string())
             .or_default();
+        // A harness whose skills folder another installed harness owns
+        // reconciles nothing: it forgets what it recorded (the files now
+        // belong to the owner's row) and leaves them on disk.
+        if skills_owner(harness, harnesses).is_some() {
+            state.files.clear();
+            harness_results.push((harness, Vec::new()));
+            continue;
+        }
         match reconcile_harness(harness, &desired, state, mcp) {
             Ok((actions, rec_notices)) => {
                 for notice in rec_notices {
@@ -649,6 +713,11 @@ pub struct HarnessStatus {
     /// or its manifest stopped declaring the artifact. The next `apply`
     /// retires them.
     pub orphaned: usize,
+    /// The harness that owns the skills folder this one shares or reads,
+    /// when another installed harness does. Such a harness provisions
+    /// nothing of its own, so every count above is zero and drift, orphans
+    /// and edits are reported once, under the owner.
+    pub covered_by: Option<HarnessKind>,
 }
 
 /// A read-only snapshot of every domain's provisioning decision and every
@@ -736,6 +805,19 @@ pub fn status(
 
     let mut harness_statuses = Vec::new();
     for &harness in harnesses {
+        if let Some(owner) = skills_owner(harness, harnesses) {
+            harness_statuses.push(HarnessStatus {
+                harness,
+                installed_files: 0,
+                installed_mcps: 0,
+                edited: 0,
+                missing: 0,
+                drift: 0,
+                orphaned: 0,
+                covered_by: Some(owner),
+            });
+            continue;
+        }
         let empty = HarnessState::default();
         let state = receipt.harnesses.get(harness.id()).unwrap_or(&empty);
         let (edited, missing) = count_edited_and_missing(harness, state)?;
@@ -749,6 +831,7 @@ pub fn status(
             missing,
             drift,
             orphaned,
+            covered_by: None,
         });
     }
 

@@ -553,13 +553,16 @@ pub struct DesiredSet {
 /// lives in [`crate::provision::translate`]; this gate answers only the coarse
 /// "at all" question the MCP path and the skip notices need.
 ///
-/// The four profile harnesses (Cursor, Kiro, Gemini CLI, Qwen Code) take no
-/// kind yet: provisioning for them is not wired, so every pair is `false`.
+/// The four profile harnesses (Cursor, Kiro, Gemini CLI, Qwen Code) take
+/// skills only: they have no command or agent surface this crate speaks and
+/// register MCP servers by hand, so every other pair is `false`.
 pub fn harness_supports(harness: HarnessKind, kind: ArtifactType) -> bool {
     match harness {
         HarnessKind::ClaudeCode | HarnessKind::Codex => true,
         HarnessKind::Copilot => kind != ArtifactType::Commands,
-        HarnessKind::Cursor | HarnessKind::Kiro | HarnessKind::Gemini | HarnessKind::Qwen => false,
+        HarnessKind::Cursor | HarnessKind::Kiro | HarnessKind::Gemini | HarnessKind::Qwen => {
+            kind == ArtifactType::Skills
+        }
     }
 }
 
@@ -786,10 +789,9 @@ mod tests {
         ));
     }
 
-    /// The four profile harnesses provision nothing yet: provisioning for
-    /// them lands with its own task, which flips skills first.
+    /// The four profile harnesses provision skills and nothing else.
     #[test]
-    fn the_profile_harnesses_support_no_kind_yet() {
+    fn the_profile_harnesses_support_skills_only() {
         for harness in [
             HarnessKind::Cursor,
             HarnessKind::Kiro,
@@ -802,15 +804,19 @@ mod tests {
                 ArtifactType::Agents,
                 ArtifactType::Mcps,
             ] {
-                assert!(!harness_supports(harness, kind), "{harness:?} {kind:?}");
+                assert_eq!(
+                    harness_supports(harness, kind),
+                    kind == ArtifactType::Skills,
+                    "{harness:?} {kind:?}"
+                );
             }
         }
     }
 
-    /// No file reaches a profile harness's desired set, skills included, so
-    /// a stray receipt row for one cannot make provisioning write anything.
+    /// Only skills reach a profile harness's desired set, so a stray command
+    /// or agent row in the receipt cannot make provisioning write anything.
     #[test]
-    fn a_profile_harness_desired_set_holds_no_files() {
+    fn a_profile_harness_desired_set_holds_skills_only() {
         let harbor = DomainArtifacts {
             domain: "harbor".to_string(),
             files: vec![
@@ -827,7 +833,8 @@ mod tests {
             HarnessKind::Qwen,
         ] {
             let (desired, _) = desired_set(harness, std::slice::from_ref(&harbor));
-            assert!(desired.files.is_empty(), "{harness:?}");
+            let keys: Vec<&str> = desired.files.keys().map(String::as_str).collect();
+            assert_eq!(keys, ["skills/tide-tables/SKILL.md"], "{harness:?}");
         }
     }
 

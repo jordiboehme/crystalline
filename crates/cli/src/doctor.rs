@@ -556,6 +556,10 @@ pub struct ProvisioningHarnessDoctor {
     /// on disk at the harness - deleted by hand since the last reconcile,
     /// which reinstalls them.
     pub missing: usize,
+    /// The harness that owns the skills folder this one shares or reads;
+    /// every count above is zero then, since the owner's row carries them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub covered_by: Option<String>,
 }
 
 /// One domain still awaiting a provisioning decision, named with the counts
@@ -2752,6 +2756,7 @@ fn check_provisioning(
             edited: h.edited,
             orphaned: h.orphaned,
             missing: h.missing,
+            covered_by: h.covered_by.map(|o| o.id().to_string()),
         })
         .collect();
 
@@ -3927,6 +3932,10 @@ pub fn render_human(report: &DoctorReport) -> String {
             }
         }
         for h in &p.harnesses {
+            if let Some(owner) = &h.covered_by {
+                let _ = writeln!(out, "  {}: covered by {owner}", h.harness);
+                continue;
+            }
             let _ = writeln!(
                 out,
                 "  {}: {} file(s) installed, {} mcp(s) installed, {} drifted, {} edited, {} orphaned, {} missing",
