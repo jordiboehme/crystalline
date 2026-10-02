@@ -502,10 +502,49 @@ describe("computersOf (0.22 R14, R15)", () => {
     expect(at(2)?.x).toBeCloseTo((box.x0 + box.x1) / 2, 9);
     expect(at(2)?.z).toBeCloseTo(box.z1, 9);
     expect(at(2)?.z).toBeCloseTo(0.9, 9);
-    // The laser desk stands free at (8, 8) facing east, 3 m deep.
-    expect(at(3)?.x).toBeCloseTo(9.5, 9);
+    // The laser desk stands free at (8, 8) facing east, 3 m deep: its point
+    // is its footprint's centre, not its face.
+    expect(at(3)?.x).toBeCloseTo(8, 9);
     expect(at(3)?.z).toBeCloseTo(8, 9);
     expect(at(3)?.inward).toEqual([1, 0]);
+  });
+
+  it("uses the free laser desk from behind and a wall computer not through its wall", () => {
+    // Mutation caught: a free hero's point left on its front face (out of
+    // reach from behind a 3 m deep desk), or a wall hero given a free
+    // point (used through its wall).
+    const points = computersOf(room, CANNED_WORKSHOP);
+    const desk = points.filter((p) => p.list === "heroes" && p.index === 3);
+    expect(desk).toHaveLength(1);
+    expect(desk[0]?.wall).toBe(false);
+    // The desk faces east at (8, 8); the player stands west of it, behind
+    // it, looking east.
+    const behind = playerAt(8 - 1.85, 8, -Math.PI / 2);
+    expect(computerFocus(desk, behind, "LAB")?.point.index).toBe(3);
+    // The photo console is backed on the north wall; a player on the far
+    // side of that wall cannot use it.
+    const backed = points.filter((p) => p.list === "heroes" && p.index === 2);
+    expect(backed[0]?.wall).toBe(true);
+    const outside = playerAt(backed[0]?.point.x ?? 0, -1, Math.PI);
+    expect(computerFocus(backed, outside, "LAB")).toBeNull();
+  });
+
+  it("skips a hero whose variant it does not know", () => {
+    // Mutation caught: heroPoint throwing on a variant with no footprint.
+    const odd = {
+      ...room,
+      heroes: room.heroes.map((h) =>
+        h.kind === "laser-desk" ? { ...h, variant: 99 } : h,
+      ),
+    };
+    let points: ReturnType<typeof computersOf> = [];
+    expect(() => {
+      points = computersOf(odd, CANNED_WORKSHOP);
+    }).not.toThrow();
+    expect(points.some((p) => p.list === "heroes" && p.index === 3)).toBe(
+      false,
+    );
+    expect(points.some((p) => p.list === "heroes" && p.index === 2)).toBe(true);
   });
 });
 

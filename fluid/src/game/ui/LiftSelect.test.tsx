@@ -171,8 +171,8 @@ describe("LiftSelect", () => {
 
   it("shows the note under the list", () => {
     renderSelect([stop("a")], "a stop reads sealed");
-    const note = screen.getByRole("status");
-    expect(note).toHaveTextContent("a stop reads sealed");
+    const note = screen.getByText("a stop reads sealed");
+    expect(note).toHaveAttribute("role", "status");
     // "Under the list": the listbox must precede the note in document order.
     const listbox = screen.getByRole("listbox");
     expect(
@@ -182,7 +182,20 @@ describe("LiftSelect", () => {
 
   it("shows no note line when there is none", () => {
     renderSelect([stop("a")], null);
-    expect(screen.queryByRole("status")).toBeNull();
+    // Only the always-mounted status line is left, and it is empty.
+    expect(screen.getByRole("status")).toBeEmptyDOMElement();
+  });
+
+  // Mutation caught: the status line mounted together with its text, which
+  // a screen reader does not announce (a live region must exist before its
+  // content changes).
+  it("keeps the status element mounted, empty, before its text appears", () => {
+    const { field } = renderSelect([stop("A")]);
+    const status = screen.getByRole("status");
+    expect(status).toBeEmptyDOMElement();
+    fireEvent.change(field, { target: { value: "zzz" } });
+    expect(screen.getByRole("status")).toBe(status);
+    expect(status).toHaveTextContent(NO_SUCH_STOP);
   });
 
   it("draws a private stop with a key that has the accessible text 'private', before the label", () => {

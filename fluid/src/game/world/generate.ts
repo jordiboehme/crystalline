@@ -254,6 +254,16 @@ function wayOf(ref: PlaceReference): {
 }
 
 /**
+ * The category an observation's poster carries: its own, trimmed, or
+ * `NOTES` when it has none. `world/reading.ts` reads a poster by the same
+ * rule, so it imports this instead of copying it.
+ */
+export function posterCategory(category: string | null | undefined): string {
+  const trimmed = category?.trim() ?? "";
+  return trimmed === "" ? NOTES : trimmed;
+}
+
+/**
  * The observations as posters: one per category in order of first
  * appearance, with up to `POSTER_LINES` of its observations. An observation
  * without a category goes on the `NOTES` poster.
@@ -261,8 +271,7 @@ function wayOf(ref: PlaceReference): {
 function postersOf(place: PlaceInput): { category: string; lines: string[] }[] {
   const posters = new Map<string, string[]>();
   for (const o of place.observations) {
-    const trimmed = o.category?.trim() ?? "";
-    const category = trimmed === "" ? NOTES : trimmed;
+    const category = posterCategory(o.category);
     const lines = posters.get(category) ?? [];
     if (lines.length < POSTER_LINES) lines.push(o.content);
     posters.set(category, lines);

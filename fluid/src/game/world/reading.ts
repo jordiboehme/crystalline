@@ -39,7 +39,7 @@
  */
 
 import { FOOTPRINTS, HERO_FRONT, heroFootprint, heroTurn } from "./footprints";
-import { NOTES } from "./generate";
+import { posterCategory } from "./generate";
 import { HERO_CATALOGUE } from "./heroes";
 import { FACING, REACH, relative, type WallPoint } from "./interact";
 import type { Player } from "./move";
@@ -106,15 +106,6 @@ export function roomReading(
   }
   if (room.space === "airlock" || place === null) return null;
   return { title: place.title, content: place.content, section: null };
-}
-
-/**
- * The category an observation's poster carries: its own, trimmed, or
- * `NOTES` when it has none (the generator's poster rule).
- */
-function posterCategory(category: string | null): string {
-  const trimmed = category?.trim() ?? "";
-  return trimmed === "" ? NOTES : trimmed;
 }
 
 /** A screen's reading; see the module doc. */
@@ -230,23 +221,26 @@ function facingPoint(x: number, z: number, turn: number): WallPoint {
 }
 
 /**
- * A hero's front face: the centre of its footprint moved half its depth
- * along its front, so the point sits on the face whether the hero stands
- * free (centred on its anchor) or runs out from its wall point.
+ * A hero's use point. A hero on a wall (`wall` or `backed`) is used from
+ * its front only: the centre of its footprint moved half its depth along
+ * its front, so the point sits on the face it runs out from its wall with.
+ * A free one is used from any side (0.22 R16): the point is its footprint's
+ * centre, which every side reaches. Null for a variant with no footprint.
  */
-function heroPoint(h: Hero): WallPoint {
-  const turn = heroTurn(h);
-  const depth = FOOTPRINTS.hero[h.kind][h.variant]?.depth ?? 0;
+function heroPoint(h: Hero, wall: boolean): WallPoint | null {
+  const size = FOOTPRINTS.hero[h.kind][h.variant];
+  if (size === undefined) return null;
   const box = heroFootprint(h);
   const centre = facingPoint(
     (box.x0 + box.x1) / 2,
     (box.z0 + box.z1) / 2,
-    turn,
+    heroTurn(h),
   );
+  if (!wall) return centre;
   return {
     ...centre,
-    x: centre.x + centre.inward[0] * (depth / 2),
-    z: centre.z + centre.inward[1] * (depth / 2),
+    x: centre.x + centre.inward[0] * (size.depth / 2),
+    z: centre.z + centre.inward[1] * (size.depth / 2),
   };
 }
 
@@ -271,7 +265,9 @@ export function computersOf(
     if (!COMPUTER_HEROES.has(h.kind)) continue;
     const placement = HERO_CATALOGUE[h.kind].placement;
     const wall = placement === "wall" || placement === "backed";
-    points.push({ list: "heroes", index, point: heroPoint(h), wall });
+    const point = heroPoint(h, wall);
+    if (point === null) continue;
+    points.push({ list: "heroes", index, point, wall });
   }
   for (const [index, c] of room.curios.entries()) {
     if (!COMPUTER_CURIOS.has(c.kind)) continue;

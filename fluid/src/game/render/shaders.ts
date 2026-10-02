@@ -206,10 +206,10 @@ void main() {
  * A decal (`FLAG.decal`, 2.7 C20) takes the lit path with no edge lines,
  * after an alpha test: its texel's alpha, against the 4x4 ordered
  * threshold at its pixel (`bayer4`, each step offset half a step so no
- * threshold is 0). A texel below it is
- * discarded, so a hard-edged shape (a chevron, an arrow, a stencil's
- * pixel) stays crisp and a soft one (grime, a streak, rust) fades in a
- * stipple, the old ordered-dither look, with no blending and no sorting.
+ * threshold is 0). A texel below it is discarded, so a hard-edged shape (a
+ * chevron, an arrow, a stencil's pixel) stays crisp and a soft one (grime,
+ * a streak, rust) fades in an ordered stipple, with no blending and no
+ * sorting.
  * The test comes right after the texture reads (the texel, the portal's
  * swirl and the light grid's `cellLevel`), so a discarded fragment writes
  * nothing and every implicit-lod sample is taken while the whole 2x2 quad

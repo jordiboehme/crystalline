@@ -376,6 +376,19 @@ describe("LevelSelect's combobox pattern", () => {
     expect(screen.getByRole("status")).toHaveTextContent(NO_SUCH_LEVEL);
   });
 
+  // Mutation caught: the status line mounted together with its text, which
+  // a screen reader does not announce (a live region must exist before its
+  // content changes).
+  it("keeps the status element mounted, empty, before its text appears", async () => {
+    const { field } = renderSelect(() => listing(["a"]));
+    await screen.findAllByRole("option");
+    const status = screen.getByRole("status");
+    expect(status).toBeEmptyDOMElement();
+    fireEvent.change(field, { target: { value: "zzz" } });
+    expect(screen.getByRole("status")).toBe(status);
+    expect(status).toHaveTextContent(NO_SUCH_LEVEL);
+  });
+
   // Mutation caught: the window index used for posinset or setsize.
   it("numbers an option past the window by its place in the filtered list", async () => {
     const names = Array.from(

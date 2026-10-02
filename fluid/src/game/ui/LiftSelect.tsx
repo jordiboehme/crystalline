@@ -198,11 +198,10 @@ export function LiftSelect({ stops, note, onRide, onClose }: LiftSelectProps) {
           className="mt-2"
           style={{ minHeight: `${String(LEVEL_ROWS * 1.5)}rem` }}
         >
-          {status !== null ? (
-            <p role="status" className="py-1">
-              {status}
-            </p>
-          ) : (
+          <p role="status" className={status !== null ? "py-1" : undefined}>
+            {status ?? ""}
+          </p>
+          {status === null && (
             <ul id={listId} role="listbox" aria-label={LIFT_LIST}>
               {shown.slice(start, end).map((row, n) => {
                 const on = start + n === at;

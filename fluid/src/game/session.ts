@@ -2177,13 +2177,7 @@ export function createSession(opts: SessionOptions): Session {
     const used = !still && input.pressed(USE_KEY);
     if (used && focus !== null) {
       if (isBrokenWay(room, focus.index, failed)) pressedWay = focus.index;
-      if (
-        focus.kind === "terminal" ||
-        focus.kind === "machine" ||
-        focus.kind === "poster" ||
-        focus.kind === "placard" ||
-        focus.kind === "screen"
-      ) {
+      if (focus.kind === "terminal" || isReadingKind(focus.kind)) {
         openReading(fixtureReading(room, focus.index, place));
       } else if (focus.kind === "door") {
         pressedDoor = focus.index;
