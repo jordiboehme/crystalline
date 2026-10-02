@@ -343,6 +343,18 @@ pub async fn run_serve(
     // rest is read from the OS when the report is built. Recorded before the
     // lock for the same reason as the intent: `publish` reads it.
     crate::runs_in::record_start(breakaway_refused, exit_when_idle);
+    // How this daemon was started, for whoever displaces it after an upgrade:
+    // its successor is started the same way. Recorded before the lock, like
+    // the two above, because `publish` reads it.
+    crate::instance::record_start_options(crate::instance::StartOptions::capture(
+        db.as_deref(),
+        &loaded.path,
+        read_only,
+        http_flag.as_deref(),
+        &allowed_host_flag,
+        exit_when_idle,
+        &loaded.overlay,
+    ));
     if breakaway_refused {
         tracing::warn!("{}", crate::runs_in::BREAKAWAY_REFUSED_WARNING);
     }

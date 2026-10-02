@@ -3973,6 +3973,12 @@ const OLD_DAEMON_STATE_ENV: &str = "CRYSTALLINE_TEST_OLD_DAEMON_STATE";
 /// The version the stand-in claims: older than any real build, so every
 /// client displaces it.
 const OLD_DAEMON_VERSION: &str = "0.0.1";
+/// The start options the stand-in writes into its record, as raw JSON. Unset,
+/// the record carries none, which is the shape a 0.22.0 daemon wrote.
+const OLD_DAEMON_START_ENV: &str = "CRYSTALLINE_TEST_OLD_DAEMON_START";
+/// Set, the stand-in leaves on a `shutdown` without starting a successor:
+/// no bridge is connected, so the displacing command is the only spawner.
+const OLD_DAEMON_LEAVE_ENV: &str = "CRYSTALLINE_TEST_OLD_DAEMON_LEAVE";
 
 /// A daemon of an older version that, asked to shut down, leaves behind a
 /// successor already holding the index - the shape an in-place upgrade takes
@@ -3990,21 +3996,34 @@ struct OldDaemonStandIn {
 impl OldDaemonStandIn {
     /// Start the stand-in and wait until its record and socket are published.
     fn spawn(env: &Env) -> OldDaemonStandIn {
+        OldDaemonStandIn::spawn_with(env, None, false)
+    }
+
+    /// [`OldDaemonStandIn::spawn`] with `start` written into the record as its
+    /// start options, and with `leave` set, a stand-in that starts no
+    /// successor when it is asked to shut down.
+    fn spawn_with(env: &Env, start: Option<Value>, leave: bool) -> OldDaemonStandIn {
         std::fs::create_dir_all(env.state_dir()).unwrap();
         let log = std::fs::File::create(env.dir.join("old-daemon.log")).unwrap();
         let mut cmd = Command::new(std::env::current_exe().unwrap());
         env.apply(&mut cmd);
+        cmd.args([
+            "service::old_daemon_stand_in",
+            "--exact",
+            "--ignored",
+            "--test-threads=1",
+        ])
+        .env(OLD_DAEMON_ENV, "1")
+        .env(OLD_DAEMON_BIN_ENV, bin())
+        .env(OLD_DAEMON_CONFIG_ENV, env.config_path())
+        .env(OLD_DAEMON_STATE_ENV, env.state_dir());
+        if let Some(start) = start {
+            cmd.env(OLD_DAEMON_START_ENV, start.to_string());
+        }
+        if leave {
+            cmd.env(OLD_DAEMON_LEAVE_ENV, "1");
+        }
         let mut child = cmd
-            .args([
-                "service::old_daemon_stand_in",
-                "--exact",
-                "--ignored",
-                "--test-threads=1",
-            ])
-            .env(OLD_DAEMON_ENV, "1")
-            .env(OLD_DAEMON_BIN_ENV, bin())
-            .env(OLD_DAEMON_CONFIG_ENV, env.config_path())
-            .env(OLD_DAEMON_STATE_ENV, env.state_dir())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(log)
@@ -4081,20 +4100,20 @@ fn old_daemon_stand_in() {
     let sock = state.join("service.sock");
     let lock = state.join("service.lock");
     let me = std::process::id();
+    let leave = std::env::var_os(OLD_DAEMON_LEAVE_ENV).is_some();
 
     let _ = std::fs::remove_file(&sock);
     let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
-    std::fs::write(
-        &info,
-        serde_json::to_string(&json!({
-            "pid": me,
-            "socket_path": sock.display().to_string(),
-            "version": OLD_DAEMON_VERSION,
-            "started_at": "2026-01-01T00:00:00Z",
-        }))
-        .unwrap(),
-    )
-    .unwrap();
+    let mut record = json!({
+        "pid": me,
+        "socket_path": sock.display().to_string(),
+        "version": OLD_DAEMON_VERSION,
+        "started_at": "2026-01-01T00:00:00Z",
+    });
+    if let Ok(start) = std::env::var(OLD_DAEMON_START_ENV) {
+        record["start"] = serde_json::from_str(&start).unwrap();
+    }
+    std::fs::write(&info, serde_json::to_string(&record).unwrap()).unwrap();
 
     for stream in listener.incoming() {
         let Ok(mut stream) = stream else { break };
@@ -4115,6 +4134,9 @@ fn old_daemon_stand_in() {
         let _ = std::fs::remove_file(&info);
         let _ = std::fs::remove_file(&sock);
         let _ = std::fs::remove_file(&lock);
+        if leave {
+            std::process::exit(0);
+        }
         let successor = Command::new(&crystalline)
             .arg("serve")
             .arg("--config")
@@ -4173,6 +4195,118 @@ fn a_command_that_displaces_an_older_daemon_is_answered_by_its_successor() {
     assert_ne!(record["pid"], json!(old.pid), "{record}");
     assert_ne!(record["version"], json!(OLD_DAEMON_VERSION), "{record}");
     let _ = env.run(&["ctl", "shutdown"]);
+}
+
+/// The command line a process runs with, as `ps` prints it.
+fn process_args(pid: u64) -> String {
+    let out = Command::new("ps")
+        .args(["-o", "args=", "-p"])
+        .arg(pid.to_string())
+        .output()
+        .unwrap();
+    String::from_utf8_lossy_owned(out.stdout)
+}
+
+/// The I2 finding of 0.22.1, as a test: an older daemon started with `--db`
+/// and `--read-only`, displaced by a plain CLI command while no bridge is
+/// connected, comes back with exactly those options. Before the fix the
+/// command spawned a writable daemon on the default index, and the next
+/// read-only or `--db` bridge attached to it.
+#[test]
+fn a_displaced_daemon_comes_back_with_its_own_db_and_read_only() {
+    let env = Env::new("succ-opts");
+    env.setup_domain("eng");
+    let alt = env.dir.join("alt.db");
+    let old = OldDaemonStandIn::spawn_with(
+        &env,
+        Some(json!({
+            "db": alt.display().to_string(),
+            "config": env.config_path().display().to_string(),
+            "read_only": true,
+            "env": ["CRYSTALLINE_SERVICE_HTTP"],
+        })),
+        true,
+    );
+    let (ok, stdout, stderr) =
+        env.run_full(&["search", "token", "--search-type", "text", "--json"]);
+    assert!(ok, "answered: stdout={stdout} stderr={stderr}");
+
+    let record = env
+        .lock_record()
+        .unwrap_or_else(|| panic!("no successor under {}", env.state_dir().display()));
+    assert_ne!(record["pid"], json!(old.pid), "{record}");
+    assert_ne!(record["version"], json!(OLD_DAEMON_VERSION), "{record}");
+    let status = status_json(&env);
+    assert_eq!(
+        status["read_only"],
+        json!(true),
+        "the successor is read-only: {status}"
+    );
+    let args = process_args(record["pid"].as_u64().unwrap());
+    assert!(
+        args.contains(&format!("--db {}", alt.display())) && args.contains("--read-only"),
+        "the successor runs with the recorded options: {args}"
+    );
+    assert!(alt.exists(), "the successor opened the recorded index");
+    assert_eq!(
+        record["start"]["db"],
+        json!(alt.display().to_string()),
+        "and records them again for its own successor: {record}"
+    );
+    assert_eq!(record["start"]["read_only"], json!(true), "{record}");
+    let _ = env.run(&["ctl", "shutdown"]);
+}
+
+/// A record a 0.22.0 daemon wrote carries no start options, so nothing says
+/// how to start its successor: the displacing command keeps the behaviour
+/// 0.22.1 shipped with and starts one with the defaults.
+#[test]
+fn a_displaced_daemon_without_recorded_options_gets_a_default_successor() {
+    let env = Env::new("succ-legacy");
+    env.setup_domain("eng");
+    let old = OldDaemonStandIn::spawn_with(&env, None, true);
+    let (ok, stdout, stderr) =
+        env.run_full(&["search", "token", "--search-type", "text", "--json"]);
+    assert!(ok, "answered: stdout={stdout} stderr={stderr}");
+    let record = env
+        .lock_record()
+        .unwrap_or_else(|| panic!("no successor under {}", env.state_dir().display()));
+    assert_ne!(record["pid"], json!(old.pid), "{record}");
+    let status = status_json(&env);
+    assert_eq!(status["read_only"], json!(false), "{status}");
+    let args = process_args(record["pid"].as_u64().unwrap());
+    assert!(
+        !args.contains("--db") && !args.contains("--read-only"),
+        "a default successor: {args}"
+    );
+    let _ = env.run(&["ctl", "shutdown"]);
+}
+
+/// A daemon that read a setting from a variable this command does not have
+/// cannot be started again from here the way it ran: its database or its
+/// domains could come from that variable. The command starts no successor
+/// and answers on its own, as before 0.22.1.
+#[test]
+fn a_displaced_daemon_whose_environment_is_missing_here_is_not_restarted() {
+    let env = Env::new("succ-env");
+    env.setup_domain("eng");
+    let _old = OldDaemonStandIn::spawn_with(
+        &env,
+        Some(json!({
+            "config": env.config_path().display().to_string(),
+            "read_only": false,
+            "env": ["CRYSTALLINE_SERVICE_HTTP", "CRYSTALLINE_DATABASE_URL"],
+        })),
+        true,
+    );
+    let (ok, stdout, stderr) =
+        env.run_full(&["search", "token", "--search-type", "text", "--json"]);
+    assert!(ok, "answered on its own: stdout={stdout} stderr={stderr}");
+    assert!(
+        env.lock_record().is_none(),
+        "no successor was started: {:?}",
+        env.lock_record()
+    );
 }
 
 /// The daemon is reachable and its answer is not usable. `domain list` still

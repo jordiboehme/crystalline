@@ -2182,14 +2182,19 @@ fn decode<T: DeserializeOwned>(args: Value) -> anyhow::Result<T> {
 /// item 9 of 0.22). `None` stays the answer when no daemon was running, and
 /// when no daemon became ready after the displacement, so the caller falls
 /// back as before.
+///
+/// A successor this call starts runs with the displaced daemon's own start
+/// options from its record (its `--db`, config file and read-only mode among
+/// them), never with this command's: see
+/// [`crate::instance::attach_after_displacement`].
 pub async fn ctl_if_running(cmd: Value) -> anyhow::Result<Option<Value>> {
-    let conn = match crate::instance::try_attach_reporting().await {
+    let conn = match crate::instance::try_attach_displacing().await {
         (Some(conn), _) => conn,
-        (None, true) => match crate::instance::attach_after_displacement().await {
+        (None, Some(start)) => match crate::instance::attach_after_displacement(start).await {
             Some(conn) => conn,
             None => return Ok(None),
         },
-        (None, false) => return Ok(None),
+        (None, None) => return Ok(None),
     };
     Ok(Some(ctl_exchange(conn, cmd).await?))
 }
