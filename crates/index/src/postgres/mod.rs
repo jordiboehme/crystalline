@@ -4011,13 +4011,7 @@ impl PostgresStore {
                 .await
                 .map_err(IndexError::from)?
                 .and_then(|r| cell_text(&r, 0));
-        match stored {
-            Some(found) => Err(IndexError::StaleEdit {
-                expected: expected.to_string(),
-                found,
-            }),
-            None => Ok(false),
-        }
+        crate::store::compare_outcome(stored, expected)
     }
 
     /// Write one row of the `engram` table, in one actor's dimension.
