@@ -2651,8 +2651,10 @@ mod tests {
         ] {
             assert!(json.contains(name), "{name} is named: {json}");
         }
+        // The paths are made absolute, which adds a drive on Windows, so only
+        // the file names are checked.
         assert!(
-            json.contains("/srv/team.db") && json.contains("/srv/config.yaml"),
+            json.contains("team.db") && json.contains("config.yaml"),
             "{json}"
         );
         let back: LockInfo = serde_json::from_str(&json).unwrap();
