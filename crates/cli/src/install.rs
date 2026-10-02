@@ -319,7 +319,7 @@ enum ManagedCommand {
 /// `crystalline hook stopwatch` shares every character of the nudge command
 /// and is somebody else's hook, so a bare `starts_with` would claim it and
 /// uninstall would carry it off.
-fn extends_command(command: &str, base: &str) -> bool {
+pub(crate) fn extends_command(command: &str, base: &str) -> bool {
     command
         .strip_prefix(base)
         .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
@@ -2646,6 +2646,32 @@ mod tests {
     }
 
     // --- ownership recognition -----------------------------------------------
+
+    /// The profile harnesses accept an absolute program; the legacy three do
+    /// not, and must not start to: a hand-written absolute hook in a Claude
+    /// Code file is somebody else's, kept byte for byte by install and
+    /// uninstall alike.
+    #[test]
+    fn a_legacy_install_leaves_an_absolute_spelled_hook_alone() {
+        let mut root: Map<String, Value> = serde_json::from_value(json!({
+            "hooks": { "SessionStart": [ { "hooks": [ { "type": "command", "command": "/opt/homebrew/bin/crystalline prompt system" } ] } ] }
+        }))
+        .unwrap();
+        let before = root["hooks"]["SessionStart"][0].clone();
+        assert!(add_managed_hooks(&mut root, HarnessKind::ClaudeCode));
+        assert_eq!(root["hooks"]["SessionStart"][0], before, "not rewritten");
+        assert_eq!(
+            root["hooks"]["SessionStart"].as_array().unwrap().len(),
+            2,
+            "ours appended beside it"
+        );
+        assert!(remove_managed_hooks(&mut root));
+        assert_eq!(
+            root["hooks"]["SessionStart"],
+            json!([before]),
+            "and not removed"
+        );
+    }
 
     /// Ownership is decided on leading words, so every spelling any release
     /// has written is ours - and a longer word starting with one of them is
