@@ -2169,11 +2169,26 @@ fn decode<T: DeserializeOwned>(args: Value) -> anyhow::Result<T> {
 // --- ctl client --------------------------------------------------------------
 
 /// Send a ctl command if a daemon is running, else `None`.
+///
+/// A call that displaced an older daemon on the way does not answer `None`.
+/// A displacement means a daemon was running, so a daemon answers after it:
+/// either the successor a respawning MCP bridge has already started from the
+/// new binary, or one this call spawns. Going standalone there collides with
+/// that successor, which holds the index by the time the open runs, and the
+/// first command after an in-place upgrade failed on the index lock (gate
+/// item 9 of 0.22). `None` stays the answer when no daemon was running, and
+/// when no daemon became ready after the displacement, so the caller falls
+/// back as before.
 pub async fn ctl_if_running(cmd: Value) -> anyhow::Result<Option<Value>> {
-    match try_attach().await {
-        Some(conn) => Ok(Some(ctl_exchange(conn, cmd).await?)),
-        None => Ok(None),
-    }
+    let conn = match crate::instance::try_attach_reporting().await {
+        (Some(conn), _) => conn,
+        (None, true) => match crate::instance::attach_after_displacement().await {
+            Some(conn) => conn,
+            None => return Ok(None),
+        },
+        (None, false) => return Ok(None),
+    };
+    Ok(Some(ctl_exchange(conn, cmd).await?))
 }
 
 /// [`ctl_if_running`] over a passive attach: the answer of a daemon that is

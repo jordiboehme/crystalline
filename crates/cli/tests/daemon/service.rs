@@ -3962,6 +3962,219 @@ impl Drop for FakeDaemon {
     }
 }
 
+/// The variable that tells [`old_daemon_stand_in`] to act as an older daemon.
+const OLD_DAEMON_ENV: &str = "CRYSTALLINE_TEST_OLD_DAEMON_STAND_IN";
+/// The `crystalline` binary the stand-in starts as its successor.
+const OLD_DAEMON_BIN_ENV: &str = "CRYSTALLINE_TEST_OLD_DAEMON_BIN";
+/// The configuration file the successor serves.
+const OLD_DAEMON_CONFIG_ENV: &str = "CRYSTALLINE_TEST_OLD_DAEMON_CONFIG";
+/// The state directory the stand-in publishes its record in.
+const OLD_DAEMON_STATE_ENV: &str = "CRYSTALLINE_TEST_OLD_DAEMON_STATE";
+/// The version the stand-in claims: older than any real build, so every
+/// client displaces it.
+const OLD_DAEMON_VERSION: &str = "0.0.1";
+
+/// A daemon of an older version that, asked to shut down, leaves behind a
+/// successor already holding the index - the shape an in-place upgrade takes
+/// when a connected MCP bridge of the old version reconnects and spawns the
+/// new binary before the displacing command opens anything.
+///
+/// The stand-in is this test binary run again as [`old_daemon_stand_in`], the
+/// pattern of `displace_stand_in` in the service crate, so it inherits every
+/// variable [`Env::apply`] sets and so does the `serve` it starts.
+struct OldDaemonStandIn {
+    pid: u32,
+    reaper: Option<std::thread::JoinHandle<()>>,
+}
+
+impl OldDaemonStandIn {
+    /// Start the stand-in and wait until its record and socket are published.
+    fn spawn(env: &Env) -> OldDaemonStandIn {
+        std::fs::create_dir_all(env.state_dir()).unwrap();
+        let log = std::fs::File::create(env.dir.join("old-daemon.log")).unwrap();
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        env.apply(&mut cmd);
+        let mut child = cmd
+            .args([
+                "service::old_daemon_stand_in",
+                "--exact",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .env(OLD_DAEMON_ENV, "1")
+            .env(OLD_DAEMON_BIN_ENV, bin())
+            .env(OLD_DAEMON_CONFIG_ENV, env.config_path())
+            .env(OLD_DAEMON_STATE_ENV, env.state_dir())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(log)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        // Reaped the moment it exits, so a displacing client sees the pid
+        // really gone rather than a zombie of this process.
+        let reaper = std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        let start = Instant::now();
+        loop {
+            let published = env.lock_record().is_some_and(|r| {
+                r["pid"] == json!(pid) && r["version"] == json!(OLD_DAEMON_VERSION)
+            });
+            if published && env.sock_path().exists() {
+                break;
+            }
+            if start.elapsed() > Duration::from_secs(20) {
+                panic!(
+                    "the old daemon stand-in never published: {}",
+                    std::fs::read_to_string(env.dir.join("old-daemon.log")).unwrap_or_default()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        OldDaemonStandIn {
+            pid,
+            reaper: Some(reaper),
+        }
+    }
+}
+
+impl Drop for OldDaemonStandIn {
+    fn drop(&mut self) {
+        // Only a stand-in still running is signalled: once reaped, its pid
+        // may already belong to another process.
+        if let Some(reaper) = self.reaper.take() {
+            if !reaper.is_finished() {
+                let _ = Command::new("kill")
+                    .arg("-9")
+                    .arg(self.pid.to_string())
+                    .status();
+            }
+            let _ = reaper.join();
+        }
+    }
+}
+
+/// Not a test: the older daemon [`OldDaemonStandIn`] starts. It runs only
+/// with [`OLD_DAEMON_ENV`] set and returns at once any other way.
+///
+/// It publishes a record claiming [`OLD_DAEMON_VERSION`] and answers on the
+/// socket. A `shutdown` is acknowledged, then the record, socket and lock file
+/// are removed, the real `crystalline serve` is started detached, and the
+/// stand-in exits only once that successor has published a record of its
+/// own. The order is the point: the displacing command must find the index
+/// already held when it moves on, or it can win the race and pass without
+/// the fix.
+#[test]
+#[ignore = "a stand-in process for a daemon test, started by that test"]
+fn old_daemon_stand_in() {
+    use std::os::unix::process::CommandExt;
+
+    if std::env::var_os(OLD_DAEMON_ENV).is_none() {
+        return;
+    }
+    let var = |key: &str| PathBuf::from(std::env::var_os(key).unwrap());
+    let crystalline = var(OLD_DAEMON_BIN_ENV);
+    let config = var(OLD_DAEMON_CONFIG_ENV);
+    let state = var(OLD_DAEMON_STATE_ENV);
+    let info = state.join("service.json");
+    let sock = state.join("service.sock");
+    let lock = state.join("service.lock");
+    let me = std::process::id();
+
+    let _ = std::fs::remove_file(&sock);
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    std::fs::write(
+        &info,
+        serde_json::to_string(&json!({
+            "pid": me,
+            "socket_path": sock.display().to_string(),
+            "version": OLD_DAEMON_VERSION,
+            "started_at": "2026-01-01T00:00:00Z",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    for stream in listener.incoming() {
+        let Ok(mut stream) = stream else { break };
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        // The `ctl` handshake line, then the request line.
+        let mut line = String::new();
+        let _ = reader.read_line(&mut line);
+        line.clear();
+        let _ = reader.read_line(&mut line);
+        if !line.contains("\"shutdown\"") {
+            let _ =
+                stream.write_all(b"{\"v\":1,\"ok\":false,\"error\":\"an old daemon stand-in\"}\n");
+            continue;
+        }
+        let _ = stream.write_all(b"{\"v\":1,\"ok\":true,\"data\":null}\n");
+        let _ = stream.flush();
+        drop(stream);
+        let _ = std::fs::remove_file(&info);
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&lock);
+        let successor = Command::new(&crystalline)
+            .arg("serve")
+            .arg("--config")
+            .arg(&config)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let successor_pid = successor.id();
+        let start = Instant::now();
+        loop {
+            let published = std::fs::read_to_string(&info)
+                .ok()
+                .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+                .is_some_and(|r| r["pid"] == json!(successor_pid));
+            if published && sock.exists() {
+                break;
+            }
+            if start.elapsed() > Duration::from_secs(20) {
+                eprintln!("the successor (pid {successor_pid}) never published a record");
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::process::exit(0);
+    }
+}
+
+/// Gate item 9 of 0.22, as a test: the command that displaces an older
+/// daemon finds the index already held by a successor another client
+/// spawned, and must be answered by that successor rather than fail on
+/// the index lock.
+#[test]
+fn a_command_that_displaces_an_older_daemon_is_answered_by_its_successor() {
+    let env = Env::new("upgrade-race");
+    env.setup_domain("eng");
+    let old = OldDaemonStandIn::spawn(&env);
+    let (ok, stdout, stderr) =
+        env.run_full(&["search", "token", "--search-type", "text", "--json"]);
+    assert!(ok, "answered, not refused: stdout={stdout} stderr={stderr}");
+    assert!(
+        !stderr.contains("locked by another process") && !stderr.contains("did not answer"),
+        "{stderr}"
+    );
+    let status = status_json(&env);
+    assert_ne!(
+        status["version"],
+        json!(OLD_DAEMON_VERSION),
+        "the successor answered: {status}"
+    );
+    let record = env
+        .lock_record()
+        .unwrap_or_else(|| panic!("no successor record under {}", env.state_dir().display()));
+    assert_ne!(record["pid"], json!(old.pid), "{record}");
+    assert_ne!(record["version"], json!(OLD_DAEMON_VERSION), "{record}");
+    let _ = env.run(&["ctl", "shutdown"]);
+}
+
 /// The daemon is reachable and its answer is not usable. `domain list` still
 /// answers: the registrations come from configuration, and only the counts
 /// ride on the daemon. Letting the ctl error fail the command would have put

@@ -1391,6 +1391,28 @@ pub async fn dislodge_unresponsive() -> anyhow::Result<DislodgeOutcome> {
     }
 }
 
+/// Attach to whatever daemon follows one this call displaced: another
+/// client's respawn when one publishes inside the wait, else one this
+/// call spawns. Bounded by the same 15 s readiness budget `ensure_daemon`
+/// uses; `None` only when no daemon became ready, and the caller then
+/// falls back as before.
+///
+/// The spawn-and-poll part is [`ensure_daemon`] itself, so a successor
+/// another client already spawned wins the ownership race and this call's
+/// own spawn exits at once (the 2026-07-28 wedge logic there covers that).
+/// No `--db`, `--config` or `--read-only` is forwarded: an explicit override
+/// never reaches this path, and a read-only setting from the environment is
+/// inherited by the spawned daemon as it is by any other.
+pub async fn attach_after_displacement() -> Option<Connection> {
+    match ensure_daemon(true, None, None, false).await {
+        Ok(conn) => Some(conn),
+        Err(e) => {
+            tracing::warn!("no daemon became ready after displacing an older one: {e:#}");
+            None
+        }
+    }
+}
+
 /// Attach to a daemon, spawning one detached and polling for readiness (up to
 /// ~15s) when none is running and `spawn` is set. The window is generous on
 /// purpose: a cold start on modest hardware or a loaded machine can take well
