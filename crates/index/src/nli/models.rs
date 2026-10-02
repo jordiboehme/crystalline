@@ -19,7 +19,7 @@ use crate::embed::models::PinnedRepo;
 /// One value of `evolve.contradictions` other than `off`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NliProfile {
-    /// Multilingual, best quality, about 1.1 GB while scoring.
+    /// Multilingual, experimental, about 1.1 GB while scoring.
     Full,
 }
 
