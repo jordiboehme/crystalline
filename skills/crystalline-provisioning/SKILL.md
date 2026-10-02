@@ -9,11 +9,11 @@ A domain can ship the tools its knowledge depends on - skills, commands, agents 
 
 ## Before you start
 
-Call `list_domains` and take the domain's `path`. Stop and say why when the domain is virtual (it cannot ship tools) or when that path does not exist on the machine your shell sees: the server then runs elsewhere, and the person provisions with `crystalline provision` on their own machine. Call `provision` with `action: "status"`; if it lists no harness, the person runs `crystalline install <harness>` first. Call `origin_status`: if the domain has a team origin, choose the location from "Team domains" below. If `origin_status` is not among your tools, or refuses because collaboration is off, the domain is local; do not turn collaboration on for this.
+Call `list_domains` and take the domain's `path`. Stop and say why when the domain is virtual or when that path does not exist on the machine your shell sees: the server then runs elsewhere, and the person provisions with `crystalline provision` on their own machine. Call `provision` with `action: "status"`; if it lists no harness, the person runs `crystalline install <harness>` first. Call `origin_status`: if the domain has a team origin, choose the location from "Team domains" below. If `origin_status` is not among your tools, or refuses because collaboration is off, the domain is local; do not turn collaboration on.
 
 ## Choose where the tools live
 
-For a local domain the tools live in a git repo beside the domain folder, by default `<domain-folder>-tools`, declared from the MANIFEST as `../<domain-folder>-tools/<kind>`. If the person names an existing repo, propose `git clone <url> <path>` with that path; for a new one, propose `git init <path>`. Show the exact path and command and run it only after a yes.
+For a local domain the tools live in a git repo beside the domain folder, by default `<domain-folder>-tools`, declared from the MANIFEST as `../<domain-folder>-tools/<kind>`. If the person names an existing repo, propose `git clone <url> <path>`; for a new one, propose `git init <path>`. Show the exact path and command, then stop: end your turn and run it only after the person says yes.
 
 ## Lay out the folders
 
