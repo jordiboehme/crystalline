@@ -38,7 +38,7 @@ The generic harness recipe: run `crystalline prompt system` at session start and
 }
 ```
 
-Any harness with an equivalent session-start hook can run the same command the same way.
+Any harness with an equivalent session-start hook can run the same command the same way. `crystalline install` writes that hook for Cursor (`~/.cursor/hooks.json`, `--format cursor`), Kiro (`~/.kiro/hooks/crystalline.json`), Gemini CLI (`~/.gemini/settings.json`, `--format hook-specific`) and Qwen Code (`~/.qwen/settings.json`, `--format hook-specific`). It never edits an instruction file such as CLAUDE.md, AGENTS.md, GEMINI.md or QWEN.md.
 
 ## The learning loop
 
@@ -113,7 +113,7 @@ The `skills/` folder ships four harness-agnostic agent skills plus one consolida
 - **`crystalline-collaboration`** - working in a domain that has a team origin: checking status at session start, updating before deep work, sharing a coherent unit of knowledge as a proposal and relaying its review URL, conflict etiquette and connecting a new teammate end to end.
 - **`crystalline-intelligence`** - a single consolidated skill for Claude Desktop and other harnesses that install one skill at a time: recall, capture, read-only stand-down and team sharing essentials in one file.
 
-`crystalline install claude-code` (or `codex` or `copilot`) copies these same four skills into place automatically - `~/.claude/skills` for Claude Code, `~/.agents/skills` for Codex, `~/.copilot/skills` for the Copilot CLI - and leaves `crystalline-intelligence` alone, since it is Claude Desktop's own consolidated skill. Each is a plain folder with a `SKILL.md`; to do it by hand instead, copy the folder into wherever your harness looks for skills. For Claude Code, that is `.claude/skills/` in a project or `~/.claude/skills/` globally:
+`crystalline install claude-code` (or `codex` or `copilot`) copies these same four skills into place automatically - `~/.claude/skills` for Claude Code, `~/.agents/skills` for Codex, `~/.copilot/skills` for the Copilot CLI - and leaves `crystalline-intelligence` alone, since it is Claude Desktop's own consolidated skill. `crystalline install` also fills `~/.kiro/skills` for Kiro and `~/.qwen/skills` for Qwen Code. Gemini CLI, Cursor and Codex share `~/.agents/skills`: it holds one copy of each skill, and the folder is emptied only when no installed harness still writes it. Cursor also reads `~/.claude/skills`, so with Claude Code installed it writes no skills of its own. Each is a plain folder with a `SKILL.md`; to do it by hand instead, copy the folder into wherever your harness looks for skills. For Claude Code, that is `.claude/skills/` in a project or `~/.claude/skills/` globally:
 
 ```sh
 cp -r skills/crystalline-routing skills/crystalline-capture skills/crystalline-schema skills/crystalline-collaboration ~/.claude/skills/

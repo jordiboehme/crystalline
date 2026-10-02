@@ -113,6 +113,10 @@ Both formulae install the same `crystalline` binary, so your MCP registrations a
 | Claude Desktop | [A one-click extension, no terminal](docs/setup/claude-desktop.md) |
 | Codex CLI | [`crystalline install codex`](docs/setup/codex.md) |
 | GitHub Copilot CLI | [`crystalline install copilot`](docs/setup/copilot.md) |
+| Cursor | [`crystalline install cursor`](docs/setup/cursor.md) |
+| Kiro | [`crystalline install kiro`](docs/setup/kiro.md) |
+| Gemini CLI | [`crystalline install gemini`](docs/setup/gemini.md) |
+| Qwen Code | [`crystalline install qwen`](docs/setup/gemini.md#qwen-code) |
 | Any MCP harness | [`crystalline mcp` over stdio, wired by hand](docs/setup/mcp-harness.md) |
 | Remote clients | [A standing instruction for chat surfaces and the Messages API](docs/setup/remote-clients.md) |
 | From the terminal | [The CLI mirrors everything an agent can do](docs/setup/terminal.md) |
