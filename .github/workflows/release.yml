@@ -61,8 +61,7 @@ jobs:
   # The Fluid bundle and the six platform legs (build, sign, notarize,
   # package, plus the .deb and .msi packages) live in build.yml, which the dev
   # channel (dev.yml) shares. Its artifacts belong to this run, under the same
-  # names as before, so every job below downloads them unchanged. The
-  # secrets are passed through for the signing and notarization steps.
+  # names as before, so every job below downloads them unchanged.
   build:
     name: build
     needs: notes
@@ -73,7 +72,17 @@ jobs:
     uses: ./.github/workflows/build.yml # zizmor: ignore[self-repository]
     with:
       channel: stable
-    secrets: inherit
+    # Only the six Apple secrets, by name, never `inherit`. Once they live in
+    # the `release` environment, which build.yml's signing legs declare, the
+    # environment's copy wins and these resolve to nothing here; until then
+    # this is how the repository-level secrets reach the called workflow.
+    secrets:
+      APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+      APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+      APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
 
   mcpb:
     name: package MCP bundles
@@ -334,6 +343,10 @@ jobs:
     # Only a tag push produces a real GitHub Release; workflow_dispatch stops
     # after the build matrix above so it can be used as a dry run.
     if: github.ref_type == 'tag'
+    # The protected `release` environment (main and `v*` tags only).
+    environment:
+      name: release
+      deployment: false
     # id-token and attestations: keyless signing of the attestations below (Sigstore through GitHub's OIDC token), nothing else.
     permissions:
       contents: write
@@ -499,6 +512,10 @@ jobs:
     # Same tag guard as publish: workflow_dispatch is a build-matrix dry run
     # only, it never pushes an image.
     if: github.ref_type == 'tag'
+    # The protected `release` environment (main and `v*` tags only).
+    environment:
+      name: release
+      deployment: false
     # id-token and attestations: keyless signing of the attestations below (Sigstore through GitHub's OIDC token), nothing else.
     permissions:
       contents: read
@@ -692,6 +709,10 @@ jobs:
     # Same tag guard as publish and images: workflow_dispatch is a build-matrix
     # dry run only, it never pushes an image.
     if: github.ref_type == 'tag'
+    # The protected `release` environment (main and `v*` tags only).
+    environment:
+      name: release
+      deployment: false
     # id-token and attestations: keyless signing of the attestations below (Sigstore through GitHub's OIDC token), nothing else.
     permissions:
       contents: read
@@ -766,6 +787,10 @@ jobs:
     needs: publish
     runs-on: ubuntu-latest
     if: github.ref_type == 'tag'
+    # The protected `release` environment (main and `v*` tags only).
+    environment:
+      name: release
+      deployment: false
     permissions:
       contents: read
     steps:

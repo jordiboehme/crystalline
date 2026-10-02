@@ -28,6 +28,25 @@ on:
         description: 'The commit to check out. Empty checks out what triggered the caller.'
         type: string
         default: ''
+    # The signing secrets live in the `release` environment, which the build
+    # job below declares for its signing legs. A secret of that environment
+    # wins over one passed in here, so the callers' explicit pass only
+    # matters while the secrets still live at the repository level, which a
+    # called workflow cannot otherwise see. All optional: a dry run without
+    # them builds an unsigned binary.
+    secrets:
+      APPLE_CERTIFICATE_P12:
+        required: false
+      APPLE_CERTIFICATE_PASSWORD:
+        required: false
+      APPLE_TEAM_ID:
+        required: false
+      APPLE_API_KEY_P8:
+        required: false
+      APPLE_API_KEY_ID:
+        required: false
+      APPLE_API_ISSUER_ID:
+        required: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -173,6 +192,19 @@ jobs:
     name: build (${{ matrix.target }})
     needs: [fluid-dist, legs]
     runs-on: ${{ matrix.os }}
+    # The macOS legs sign and notarize, so they run in the protected
+    # `release` environment, which only `v*` tags and main may enter and
+    # which holds the Apple secrets. The other legs need no secret and stay
+    # outside it. So does a manual dry run from any other branch: the
+    # environment would refuse it, and once the Apple secrets live only in
+    # the environment they are empty outside it, so such a dry run builds an
+    # unsigned binary as designed (see "Decide whether to sign and
+    # notarize"). deployment: false uses the
+    # environment for its secrets and branch rule without recording a
+    # deployment for every build.
+    environment:
+      name: ${{ matrix.codesign && (startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main') && 'release' || '' }}
+      deployment: false
     strategy:
       fail-fast: false
       matrix:
@@ -204,7 +236,19 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y musl-tools
 
+      # The dev channel only. A stable build compiles cold, for two reasons.
+      # Trust: a tag run can restore only what main saved, and any job that
+      # runs on main (a test, a build script, a pnpm install) can write any
+      # cache key there, so a restored cache is input to the signed release
+      # that no review covers; a key prefix of its own would not change that.
+      # Cost: next to nothing today, since the stable legs already found no
+      # cache in the v0.21.3 cycle (the cache is over its 10 GB budget), and
+      # what a tag run saved was scoped to its tag, where nothing ever read
+      # it. A warm hit would save at most about 20 minutes on the Intel leg.
+      # The key stays release-<target>: ci.yml's musl-spike job reads the
+      # x86_64 musl entry the dev channel writes.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: inputs.channel == 'dev'
         with:
           key: release-${{ matrix.target }}
 

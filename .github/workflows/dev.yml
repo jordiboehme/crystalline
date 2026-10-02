@@ -72,6 +72,12 @@ jobs:
   version:
     name: compute the dev version
     runs-on: ubuntu-latest
+    # The tap token lives in the protected `release` environment (main and
+    # `v*` tags only). deployment: false, because this job runs for every
+    # green CI run on main and would otherwise record a deployment each time.
+    environment:
+      name: release
+      deployment: false
     # pull-requests: read for the opt-in check's pull request lookup.
     permissions:
       contents: read
@@ -156,7 +162,7 @@ jobs:
           TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
         run: |
           if [ -z "$TAP_GITHUB_TOKEN" ]; then
-            echo "::error::the TAP_GITHUB_TOKEN secret is empty or not visible to this workflow, so the crystalline-dev formula could not be updated. Set it as a repository secret."
+            echo "::error::the TAP_GITHUB_TOKEN secret is empty or not visible to this workflow, so the crystalline-dev formula could not be updated. Set it as a secret of the release environment."
             exit 1
           fi
 
@@ -229,13 +235,28 @@ jobs:
       channel: dev
       version: ${{ needs.version.outputs.version }}
       ref: ${{ needs.version.outputs.sha }}
-    secrets: inherit
+    # Only the six Apple secrets, by name, never `inherit`. Once they live in
+    # the `release` environment, which build.yml's signing legs declare, the
+    # environment's copy wins and these resolve to nothing here; until then
+    # this is how the repository-level secrets reach the called workflow.
+    secrets:
+      APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+      APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+      APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
 
   publish:
     name: publish the dev pre-release
     needs: [version, build]
     if: needs.version.outputs.build == 'true'
     runs-on: ubuntu-latest
+    # Publishes, so it runs in the protected environment like the rest of
+    # the release path, though it needs none of its secrets.
+    environment:
+      name: release
+      deployment: false
     permissions:
       contents: write
     env:
@@ -320,6 +341,10 @@ jobs:
       (needs.publish.result == 'success' ||
        (needs.publish.result == 'skipped' && needs.version.outputs.build != 'true'))
     runs-on: ubuntu-latest
+    # The tap token lives in the protected `release` environment.
+    environment:
+      name: release
+      deployment: false
     env:
       GH_TOKEN: ${{ github.token }}
       VERSION: ${{ needs.version.outputs.version }}
