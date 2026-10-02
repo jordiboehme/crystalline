@@ -142,10 +142,13 @@ pub(crate) fn plan_mcp_install(
         return Ok((EntryState::Missing, vec![set()]));
     };
     let mut state = classify(harness, entry);
-    // Bare `crystalline` where the profile now wants an absolute path.
+    // A command that is not the wanted program is rewritten: bare where an
+    // absolute path is wanted, or another path (maybe dead). A stored path
+    // that still runs arrives here as `program` already (spec decision 6).
+    // Task 8: with no hook to read a stored path from, pass this entry's
+    // own `command` as the path to keep when it still runs.
     if state == EntryState::UpToDate
-        && program != "crystalline"
-        && entry.get("command").and_then(Value::as_str) == Some("crystalline")
+        && entry.get("command").and_then(Value::as_str) != Some(program)
     {
         state = EntryState::Ours;
     }
@@ -163,9 +166,9 @@ pub(crate) fn plan_mcp_uninstall(
     harness: HarnessKind,
     root: &Value,
     force: bool,
-) -> (EntryState, Vec<Edit>) {
-    let Ok(Some(entry)) = existing_entry(Some(root)) else {
-        return (EntryState::Missing, Vec::new());
+) -> Result<(EntryState, Vec<Edit>), String> {
+    let Some(entry) = existing_entry(Some(root))? else {
+        return Ok((EntryState::Missing, Vec::new()));
     };
     let state = classify(harness, entry);
     let remove = state != EntryState::Customised || force;
@@ -177,7 +180,7 @@ pub(crate) fn plan_mcp_uninstall(
     } else {
         Vec::new()
     };
-    (state, edits)
+    Ok((state, edits))
 }
 
 /// The report status for an install that found this state.
@@ -283,7 +286,7 @@ mod tests {
             let (again, none) =
                 plan_mcp_install(k, Some(&parse_value(&with).unwrap()), program).unwrap();
             assert_eq!((again, none.len()), (EntryState::UpToDate, 0));
-            let (_, edits) = plan_mcp_uninstall(k, &parse_value(&with).unwrap(), false);
+            let (_, edits) = plan_mcp_uninstall(k, &parse_value(&with).unwrap(), false).unwrap();
             assert_eq!(apply_edits(Some(&with), &edits).unwrap().unwrap(), original);
         }
     }
@@ -292,9 +295,9 @@ mod tests {
     fn a_customised_entry_survives_uninstall_unless_forced() {
         let text = "{\"mcpServers\": {\"crystalline\": {\"command\": \"crystalline\", \"args\": [\"mcp\", \"--harness\", \"gemini\"], \"env\": {\"X\": \"1\"}}}}";
         let root = parse_value(text).unwrap();
-        let (state, edits) = plan_mcp_uninstall(HarnessKind::Gemini, &root, false);
+        let (state, edits) = plan_mcp_uninstall(HarnessKind::Gemini, &root, false).unwrap();
         assert_eq!((state, edits.len()), (EntryState::Customised, 0));
-        let (_, edits) = plan_mcp_uninstall(HarnessKind::Gemini, &root, true);
+        let (_, edits) = plan_mcp_uninstall(HarnessKind::Gemini, &root, true).unwrap();
         assert_eq!(edits.len(), 1);
     }
 
@@ -338,6 +341,47 @@ mod tests {
         );
         assert_eq!(uninstall_status(EntryState::Missing, false), "not-present");
         assert_eq!(uninstall_status(EntryState::Ours, false), "removed");
+    }
+
+    fn cursor_root(command: &str) -> serde_json::Value {
+        serde_json::json!({"mcpServers": {"crystalline": {"type": "stdio", "command": command, "args": ["mcp", "--harness", "cursor"]}}})
+    }
+
+    #[test]
+    fn a_command_that_differs_from_the_wanted_program_is_repaired() {
+        let wanted = "/opt/homebrew/bin/crystalline";
+        // A dead absolute path from another prefix, and a bare command.
+        for old in ["/home/u/.cargo/bin/crystalline", "crystalline"] {
+            let (state, edits) =
+                plan_mcp_install(HarnessKind::Cursor, Some(&cursor_root(old)), wanted).unwrap();
+            assert_eq!((state, edits.len()), (EntryState::Ours, 1), "{old}");
+            assert_eq!(install_status(state), "repaired");
+        }
+        // Already equal to the wanted program: nothing to do.
+        let (state, edits) =
+            plan_mcp_install(HarnessKind::Cursor, Some(&cursor_root(wanted)), wanted).unwrap();
+        assert_eq!((state, edits.len()), (EntryState::UpToDate, 0));
+        assert_eq!(install_status(state), "already-present");
+        // A live stored path arrives as the wanted program, so it stays.
+        let live = "/home/u/.cargo/bin/crystalline";
+        let (state, edits) =
+            plan_mcp_install(HarnessKind::Cursor, Some(&cursor_root(live)), live).unwrap();
+        assert_eq!((state, edits.len()), (EntryState::UpToDate, 0));
+    }
+
+    #[test]
+    fn a_customised_entry_is_untouched_whatever_the_program() {
+        let root = serde_json::json!({"mcpServers": {"crystalline": {"command": "/old/crystalline", "args": ["mcp", "--harness", "kiro", "--db", "/x"], "env": {"A": "1"}}}});
+        let (state, edits) =
+            plan_mcp_install(HarnessKind::Kiro, Some(&root), "/new/crystalline").unwrap();
+        assert_eq!((state, edits.len()), (EntryState::Customised, 0));
+    }
+
+    #[test]
+    fn uninstall_refuses_a_file_it_cannot_read_like_install_does() {
+        let root = parse_value("{\"mcpServers\": [1]}").unwrap();
+        let err = plan_mcp_uninstall(HarnessKind::Gemini, &root, false).unwrap_err();
+        assert!(err.contains("mcpServers"), "{err}");
     }
 
     #[test]
