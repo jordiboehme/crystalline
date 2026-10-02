@@ -108,6 +108,48 @@ pub use crate::serving::{
 /// bridge's bare `mcp` line already meant.
 pub(crate) const SKILLS_OFF_OPTION: &str = "skills=off";
 
+/// The option token that tells the daemon this stdio session's harness has
+/// Crystalline's session hook installed but its onboarding is not verified:
+/// the routing block is answered with the short conditional pointer and the
+/// skill surface stays served. A daemon older than the token ignores it
+/// (its check reads only [`SKILLS_OFF_OPTION`]) and serves everything, the
+/// safe direction.
+pub(crate) const ROUTING_CONDITIONAL_OPTION: &str = "routing=conditional";
+
+/// What the `crystalline mcp` process resolved about the harness that spawned
+/// it, from its `--harness` argument and this machine's install receipt,
+/// before the session started. Two facts, because they gate two things:
+///
+/// - `hook_installed`: the receipt lists this harness with Crystalline's
+///   session hook wired, so the routing block probably arrives at session
+///   start and the instructions can shrink to a pointer.
+/// - `onboarding_verified`: the hook part **and** the harness's profile flag,
+///   set once a live check confirmed that the harness loads the hook's block
+///   and the shipped skills as files. Only this hides the skill surface.
+///
+/// The default (both false) is "serve everything with the full instructions",
+/// which is what every uncertain input resolves to.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HarnessGate {
+    /// The receipt lists the harness with its session hook installed.
+    pub hook_installed: bool,
+    /// The hook is installed and the harness's onboarding is verified.
+    pub onboarding_verified: bool,
+}
+
+impl HarnessGate {
+    /// Whether the harness is fully onboarded by its own hook and skills on
+    /// disk: the hook is installed and its onboarding is verified.
+    pub fn verified(self) -> bool {
+        self.hook_installed && self.onboarding_verified
+    }
+
+    /// Whether the hook is installed but its onboarding is not verified.
+    pub fn conditional(self) -> bool {
+        self.hook_installed && !self.onboarding_verified
+    }
+}
+
 /// Whether the daemon this process is about to hand its handshake to has
 /// declared that it parses handshake options. A record that is missing,
 /// unreadable or written by a daemon that predates the field all read as
@@ -116,12 +158,19 @@ fn daemon_parses_mcp_line_options() -> bool {
     read_lock_info().is_some_and(|info| info.mcp_line_options)
 }
 
-/// The `mcp` handshake line for a resolved answer. Bare `mcp` unless there is
-/// something to say **and** the daemon has declared it can hear it. Pure so
+/// The `mcp` handshake line for a resolved gate. Bare `mcp` unless there is
+/// something to say **and** the daemon has declared it can hear it. A verified
+/// gate sends `skills=off`, byte-identical to what a 0.22.0 bridge sent, and a
+/// hook that is installed but unverified sends `routing=conditional`. Pure so
 /// the decision is testable without a daemon.
-fn mcp_mode_line(harness_onboarded: bool, daemon_parses_options: bool) -> String {
-    if harness_onboarded && daemon_parses_options {
+fn mcp_mode_line(gate: HarnessGate, daemon_parses_options: bool) -> String {
+    if !daemon_parses_options {
+        return "mcp\n".to_string();
+    }
+    if gate.verified() {
         format!("mcp {SKILLS_OFF_OPTION}\n")
+    } else if gate.conditional() {
+        format!("mcp {ROUTING_CONDITIONAL_OPTION}\n")
     } else {
         "mcp\n".to_string()
     }
@@ -136,7 +185,7 @@ impl Connection {
     /// Write the `mcp` handshake and hand back the stream for an rmcp session or
     /// a byte pump.
     ///
-    /// `harness_onboarded` is the answer the bridge process resolved at
+    /// `gate` is the answer the bridge process resolved at
     /// startup from its `--harness` argument and this machine's install
     /// receipt; the daemon builds its per-socket `McpServer` with it. It rides
     /// the handshake line rather than being re-derived daemon-side on purpose:
@@ -152,8 +201,8 @@ impl Connection {
     /// a daemon that would not shut down), so the fallback is the bare line,
     /// which resolves to "serve" - the safe direction, and exactly today's
     /// behaviour.
-    pub async fn into_mcp(self, harness_onboarded: bool) -> io::Result<IpcStream> {
-        let line = mcp_mode_line(harness_onboarded, daemon_parses_mcp_line_options());
+    pub async fn into_mcp(self, gate: HarnessGate) -> io::Result<IpcStream> {
+        let line = mcp_mode_line(gate, daemon_parses_mcp_line_options());
         self.handshake(line.as_bytes()).await
     }
 
@@ -2346,16 +2395,60 @@ mod tests {
     /// socket.
     #[test]
     fn the_extended_mode_line_is_only_sent_to_a_daemon_that_declared_it() {
-        assert_eq!(mcp_mode_line(true, true), "mcp skills=off\n");
+        assert_eq!(mcp_mode_line(VERIFIED_GATE, true), "mcp skills=off\n");
         assert_eq!(
-            mcp_mode_line(true, false),
+            mcp_mode_line(VERIFIED_GATE, false),
             "mcp\n",
             "a daemon that did not declare it gets the line it understands, and \
              serves the surface"
         );
         // Nothing to say, nothing added, whatever the daemon can parse.
-        assert_eq!(mcp_mode_line(false, true), "mcp\n");
-        assert_eq!(mcp_mode_line(false, false), "mcp\n");
+        assert_eq!(mcp_mode_line(HarnessGate::default(), true), "mcp\n");
+        assert_eq!(mcp_mode_line(HarnessGate::default(), false), "mcp\n");
+    }
+
+    /// The gate a verified harness with its hooks wired resolves to.
+    const VERIFIED_GATE: HarnessGate = HarnessGate {
+        hook_installed: true,
+        onboarding_verified: true,
+    };
+
+    /// A hook in the receipt without a verified profile asks for the short
+    /// conditional instructions and nothing else: it never sends the token
+    /// that hides the skills.
+    #[test]
+    fn an_installed_but_unverified_hook_sends_no_skills_off_token() {
+        let unverified = HarnessGate {
+            hook_installed: true,
+            onboarding_verified: false,
+        };
+        assert_eq!(mcp_mode_line(unverified, true), "mcp routing=conditional\n");
+        assert!(!mcp_mode_line(unverified, true).contains(SKILLS_OFF_OPTION));
+        assert_eq!(
+            mcp_mode_line(
+                HarnessGate {
+                    hook_installed: true,
+                    onboarding_verified: true
+                },
+                true
+            ),
+            "mcp skills=off\n"
+        );
+        assert_eq!(mcp_mode_line(unverified, false), "mcp\n");
+        assert_eq!(mcp_mode_line(HarnessGate::default(), true), "mcp\n");
+    }
+
+    /// What a 0.22.0 daemon does with the new token: its check reads only
+    /// `skills=off`, so the conditional token falls through to a full serve,
+    /// the safe direction.
+    #[test]
+    fn the_conditional_token_is_ignored_by_a_daemon_that_does_not_know_it() {
+        let (mode, options) = split_mode_line("mcp routing=conditional");
+        assert_eq!(mode, "mcp");
+        assert!(
+            !options.contains(&SKILLS_OFF_OPTION),
+            "the 0.22.0 check reads no skills=off: full serve"
+        );
     }
 
     /// The capability is read off the record, and a record written before the
@@ -2371,7 +2464,7 @@ mod tests {
             r#"{"pid":1,"socket_path":"s","version":"0.13.0","started_at":"2026-08-14T00:00:00Z"}"#;
         let info: LockInfo = serde_json::from_str(legacy).expect("an older record still parses");
         assert!(!info.mcp_line_options);
-        assert_eq!(mcp_mode_line(true, info.mcp_line_options), "mcp\n");
+        assert_eq!(mcp_mode_line(VERIFIED_GATE, info.mcp_line_options), "mcp\n");
 
         let current = serde_json::to_string(&LockInfo {
             pid: 1,

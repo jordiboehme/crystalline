@@ -919,6 +919,28 @@ async fn accept_loop(listener: interprocess::local_socket::tokio::Listener, shar
     }
 }
 
+/// The harness gate a bridge's `mcp` handshake options carry. `skills=off` is
+/// the verified gate and wins if both tokens ever arrive; `routing=conditional`
+/// is a hook that is installed but unverified; neither (a bare `mcp` from an
+/// older bridge, or an option this binary does not know) is the default gate,
+/// which serves everything.
+fn harness_gate_from_options(options: &[&str]) -> crate::instance::HarnessGate {
+    use crate::instance::{HarnessGate, ROUTING_CONDITIONAL_OPTION, SKILLS_OFF_OPTION};
+    if options.contains(&SKILLS_OFF_OPTION) {
+        HarnessGate {
+            hook_installed: true,
+            onboarding_verified: true,
+        }
+    } else if options.contains(&ROUTING_CONDITIONAL_OPTION) {
+        HarnessGate {
+            hook_installed: true,
+            onboarding_verified: false,
+        }
+    } else {
+        HarnessGate::default()
+    }
+}
+
 /// Dispatch one accepted connection by its `mcp` or `ctl` handshake.
 async fn handle_conn(mut stream: IpcStream, shared: Arc<Shared>) {
     let line = match read_mode_line(&mut stream).await {
@@ -942,8 +964,8 @@ async fn handle_conn(mut stream: IpcStream, shared: Arc<Shared>) {
             // never re-derives it: its own environment is whoever spawned it
             // first, and a value re-derived per accepted socket could change
             // the surface under a live client across a daemon restart.
-            let onboarded = options.contains(&crate::instance::SKILLS_OFF_OPTION);
-            let server = McpServer::new(shared.engine.clone()).with_onboarded_harness(onboarded);
+            let gate = harness_gate_from_options(&options);
+            let server = McpServer::new(shared.engine.clone()).with_harness_gate(gate);
             match rmcp::serve_server(server, stream).await {
                 Ok(running) => {
                     let _ = running.waiting().await;
@@ -3105,6 +3127,35 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both handshake tokens parse to their gate, the verified one wins when
+    /// both arrive, and a bare line or an unknown option serves everything.
+    #[test]
+    fn the_handshake_options_parse_to_the_harness_gate() {
+        use crate::instance::HarnessGate;
+        let verified = HarnessGate {
+            hook_installed: true,
+            onboarding_verified: true,
+        };
+        let conditional = HarnessGate {
+            hook_installed: true,
+            onboarding_verified: false,
+        };
+        assert_eq!(harness_gate_from_options(&["skills=off"]), verified);
+        assert_eq!(
+            harness_gate_from_options(&["routing=conditional"]),
+            conditional
+        );
+        assert_eq!(
+            harness_gate_from_options(&["routing=conditional", "skills=off"]),
+            verified
+        );
+        assert_eq!(harness_gate_from_options(&[]), HarnessGate::default());
+        assert_eq!(
+            harness_gate_from_options(&["future=1"]),
+            HarnessGate::default()
+        );
+    }
 
     /// The router `run_serve` builds ends an open event stream when the
     /// daemon's shutdown watch flips. Catches `http_service`

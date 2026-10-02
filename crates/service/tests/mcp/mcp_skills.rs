@@ -15,7 +15,7 @@ use std::sync::Arc;
 use crystalline_core::config::{DomainEntry, GlobalConfig, ResponseFormat, ServiceConfig};
 use crystalline_index::TursoStore;
 use crystalline_service::Engine;
-use crystalline_service::mcp::McpServer;
+use crystalline_service::mcp::{HarnessGate, McpServer};
 use rmcp::RoleClient;
 use rmcp::model::{CallToolRequestParams, GetPromptRequestParams, ReadResourceRequestParams};
 use rmcp::service::{Peer, RunningService};
@@ -138,6 +138,25 @@ impl Harness {
                 server_io,
             )
             .await
+        });
+        let client = rmcp::serve_client((), client_io).await.unwrap();
+        let server = server_task.await.unwrap().unwrap();
+        (client, server)
+    }
+
+    /// Open a stdio connection served with `gate`, the two facts the spawned
+    /// process resolved before the session started.
+    async fn connect_gated(
+        &self,
+        gate: HarnessGate,
+    ) -> (
+        RunningService<RoleClient, ()>,
+        RunningService<rmcp::RoleServer, McpServer>,
+    ) {
+        let (client_io, server_io) = tokio::io::duplex(1 << 16);
+        let engine = self.engine.clone();
+        let server_task = tokio::spawn(async move {
+            rmcp::serve_server(McpServer::new(engine).with_harness_gate(gate), server_io).await
         });
         let client = rmcp::serve_client((), client_io).await.unwrap();
         let server = server_task.await.unwrap().unwrap();
@@ -491,6 +510,43 @@ async fn an_onboarded_harness_is_served_none_of_the_three_lists() {
         .await
         .expect("a direct prompt read answers");
     assert_eq!(prompt_text(&connector), crystalline_core::CONNECTOR_SNIPPET);
+}
+
+/// A hook in the receipt is not enough to hide the skills: until a live check
+/// has confirmed that the harness loads them as files, an installed but
+/// unverified hook keeps the tool, the five resources and the two prompts
+/// listed, so nothing is lost if the harness turns out to drop them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_installed_but_unverified_hook_keeps_the_whole_surface() {
+    let h = Harness::new(&["eng"]).await;
+
+    let (client, _server) = h
+        .connect_gated(HarnessGate {
+            hook_installed: true,
+            onboarding_verified: false,
+        })
+        .await;
+    let peer = client.peer();
+
+    assert!(
+        tool_names(peer).await.contains(&"skills".to_string()),
+        "the skills tool stays listed"
+    );
+    let resources = peer.list_resources(Default::default()).await.unwrap();
+    let uris: Vec<&str> = resources.resources.iter().map(|r| r.uri.as_str()).collect();
+    let expected: Vec<String> = SKILL_NAMES
+        .iter()
+        .map(|n| format!("skill://{n}/SKILL.md"))
+        .collect();
+    assert_eq!(uris.len(), 5, "all five skill resources stay listed");
+    assert_eq!(
+        uris,
+        expected.iter().map(String::as_str).collect::<Vec<_>>()
+    );
+    let prompts = peer.list_prompts(Default::default()).await.unwrap();
+    let mut names: Vec<String> = prompts.prompts.iter().map(|p| p.name.clone()).collect();
+    names.sort();
+    assert_eq!(names, vec!["connector", "onboarding"]);
 }
 
 /// The other side of the same coin, and it is the default: every session

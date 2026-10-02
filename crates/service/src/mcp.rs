@@ -174,7 +174,7 @@
 //! `configure` flipping `github.enabled` moves the tool list, because the six
 //! GitHub-gated collaboration tools are listed only while it is on. That is
 //! the single mover on this server: `resources/list` and `prompts/list` read
-//! `skills.serve` and `harness_onboarded`, both fixed before the first request
+//! `skills.serve` and the harness gate, both fixed before the first request
 //! arrives, and the provisioning gate that `add_domain` and `update_domain`
 //! could once move became a call-time refusal instead.
 //!
@@ -857,12 +857,13 @@ const ATTACHMENT_TEMPLATE_DESCRIPTION: &str = "A file attachment a human added t
 ///
 /// - `true`: never hidden.
 /// - `false`: always hidden.
-/// - `auto`: served.
+/// - `auto`: served, unless the harness that spawned this process has its
+///   session hook installed **and** its onboarding verified.
 ///
 /// Both inputs are fixed before this server exists, which is what makes the
 /// gate legal on a listing at all. `skills_serve` is the effective setting
 /// snapshotted at engine construction ([`Engine::skills_serve`]);
-/// `harness_onboarded` is [`McpServer::with_onboarded_harness`], resolved by
+/// `gate` is [`McpServer::with_harness_gate`], resolved by
 /// the `crystalline mcp` process from its own `--harness` argument plus this
 /// machine's install receipt before the session starts.
 ///
@@ -875,38 +876,68 @@ const ATTACHMENT_TEMPLATE_DESCRIPTION: &str = "A file attachment a human added t
 /// the five skills on disk and is onboarded by its own session hook, so
 /// serving them again spends the tokens twice.
 ///
-/// An HTTP session never sets `harness_onboarded`: one daemon serves every
-/// HTTP client, a remote client never ran `crystalline install` here, and a
-/// remote client is exactly who the served surface exists for.
+/// **A hook in the receipt is not enough.** The surface is hidden only when
+/// the harness's onboarding is verified too: until a live check confirmed that
+/// the harness loads the shipped skills as files, hiding them could leave it
+/// with no way to reach them. A hook that is installed but unverified still
+/// shrinks the instructions (see [`instructions_variant`]); it never hides
+/// the surface.
+///
+/// An HTTP session never sets the gate: one daemon serves every HTTP client,
+/// a remote client never ran `crystalline install` here, and a remote client
+/// is exactly who the served surface exists for.
 ///
 /// Hidden means hidden, not disabled: the lists come back empty while the
 /// tool, the resources and the prompts all keep answering a direct call.
 /// Read-only mode is not part of it either: reading a skill is a read.
-fn hidden_skills_surface(skills_serve: SkillsServe, harness_onboarded: bool) -> bool {
+fn hidden_skills_surface(skills_serve: SkillsServe, gate: HarnessGate) -> bool {
     match skills_serve {
         SkillsServe::Always => false,
         SkillsServe::Never => true,
-        SkillsServe::Auto => harness_onboarded,
+        SkillsServe::Auto => gate.hook_installed && gate.onboarding_verified,
     }
 }
 
-/// Whether this server hands out the minimal `instructions` block instead of
-/// the full routing block: only under `auto`, and only when the harness that
-/// spawned this process is one whose own session hook has already delivered
-/// the full block.
+/// Which `instructions` block this server hands out on arrival.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstructionsVariant {
+    /// The whole routing block.
+    Full,
+    /// The header plus the pointer that says the session hook has already
+    /// delivered the block ([`crystalline_core::render_minimal_instructions`]).
+    Minimal,
+    /// The header plus the pointer that asks the agent to fetch the block when
+    /// it is not already in its context
+    /// ([`crystalline_core::prompt::render_conditional_minimal_instructions`]).
+    Conditional,
+}
+
+/// Which `instructions` block this server hands out: the short ones only
+/// under `auto`, and only when the harness that spawned this process has its
+/// session hook installed. A verified harness gets [`InstructionsVariant::Minimal`]
+/// (its hook is known to have delivered the full block); a hook that is
+/// installed but unverified gets [`InstructionsVariant::Conditional`], which
+/// does not claim what nobody has checked.
 ///
 /// The same two inputs as [`hidden_skills_surface`], deliberately: the surface
 /// and the instructions used to diverge (the surface keyed on the client's
 /// name, then stopped), and one input for both is what makes the two eras
 /// converge rather than split - a legacy peer reading `initialize` and a
-/// modern peer reading `server/discover` are told the same thing.
+/// modern peer reading `server/discover` are told the same thing. Under
+/// `auto` the surface is hidden exactly when the variant is `Minimal`.
 ///
 /// `skills.serve = false` deliberately does not shrink the instructions. That
 /// setting gates serving skills, not onboarding: an operator who turns the
 /// skill surface off still wants a connecting agent to learn which domains
 /// exist.
-fn minimal_instructions(skills_serve: SkillsServe, harness_onboarded: bool) -> bool {
-    skills_serve == SkillsServe::Auto && harness_onboarded
+fn instructions_variant(skills_serve: SkillsServe, gate: HarnessGate) -> InstructionsVariant {
+    if skills_serve != SkillsServe::Auto || !gate.hook_installed {
+        InstructionsVariant::Full
+    } else if gate.onboarding_verified {
+        InstructionsVariant::Minimal
+    } else {
+        InstructionsVariant::Conditional
+    }
 }
 
 /// Whether collaboration tool `name` is hidden, given the engine's `read_only`
@@ -976,6 +1007,9 @@ use crate::engine::{
     ACTOR_MAX_CHARS, AckIntent, ConfigureAction, Engine, EngineError, LiveWriteTarget,
     OVERLAY_NEEDS_IDENTITY, PreviewCredential, ProvisionAction, ShareActor, sanitize_actor,
 };
+/// The two facts the `crystalline mcp` process resolved about its harness,
+/// re-exported here because [`McpServer::with_harness_gate`] takes one.
+pub use crate::instance::HarnessGate;
 use crate::params::*;
 use crate::scope::member_level_word;
 use crate::scope::{DomainRight, Scope};
@@ -1339,7 +1373,7 @@ pub enum Transport {
 /// install-receipt match used to live here as an `AtomicBool` set from the
 /// client's own `initialize` name, which is the per-connection variation
 /// SEP-2567 forbids. What is here instead was decided before the connection
-/// existed: see `harness_onboarded`.
+/// existed: see `McpServer::gate`.
 /// The draft joins one MCP server object opened, and the thing that ends them.
 ///
 /// **A join belongs to a HOLDER, never to an account** (see [`crate::join`]),
@@ -1439,25 +1473,27 @@ static NEXT_SERVER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// install-receipt match used to live here as an `AtomicBool` set from the
 /// client's own `initialize` name, which is the per-connection variation
 /// SEP-2567 forbids. What is here instead was decided before the connection
-/// existed: see `harness_onboarded`.
+/// existed: see `McpServer::gate`.
 #[derive(Clone)]
 pub struct McpServer {
     engine: Arc<Engine>,
     transport: Transport,
-    /// Whether the harness that spawned the serving process already has the
-    /// shipped skills on disk and onboards itself at session start.
+    /// Whether the harness that spawned the serving process has Crystalline's
+    /// session hook installed, and whether its onboarding (the hook's routing
+    /// block and the shipped skills as files) is verified. See [`HarnessGate`].
     ///
     /// **Resolved before the session starts and constant for this server's
     /// life.** The `crystalline mcp` process reads its own `--harness`
     /// argument (written into the harness's MCP registration by `crystalline
-    /// install`) and asks this machine's install receipt whether that harness
-    /// has session hooks wired. Neither input is the client's identity: one is
-    /// deployment configuration, the other is machine state. False everywhere
-    /// it cannot be known - HTTP, a registration predating the flag, an
-    /// unrecognized harness id, a missing receipt - which serves the surface,
+    /// install`), asks this machine's install receipt whether that harness
+    /// has session hooks wired and reads the harness's profile flag. Neither
+    /// input is the client's identity: one is deployment configuration, the
+    /// other is machine state. It is the default gate everywhere it cannot be
+    /// known (HTTP, a registration predating the flag, an unrecognized harness
+    /// id, a missing receipt), which serves the surface and the full instructions,
     /// the safe direction (an over-served client pays duplicated context, an
     /// under-served one loses onboarding it cannot rediscover).
-    harness_onboarded: bool,
+    gate: HarnessGate,
     /// The drafts this server object joined by presenting a share-link, and
     /// the handle whose last clone ends them. See [`SessionJoins`].
     joins: Arc<SessionJoins>,
@@ -1489,7 +1525,7 @@ impl McpServer {
         McpServer {
             engine,
             transport,
-            harness_onboarded: false,
+            gate: HarnessGate::default(),
             joins,
             server: NEXT_SERVER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             sessions: None,
@@ -1737,14 +1773,24 @@ impl McpServer {
         None
     }
 
-    /// Record that the harness this process serves is already onboarded (see
-    /// the field). Set by the two stdio paths from the resolved answer the
-    /// `crystalline mcp` process computed at startup: the embedded stack
-    /// directly, the daemon relay from the value the bridge writes on its
+    /// Record what the harness this process serves already does for itself
+    /// (see the field). Set by the two stdio paths from the gate the
+    /// `crystalline mcp` process resolved at startup: the embedded stack
+    /// directly, the daemon relay from the token the bridge writes on its
     /// handshake line. Never set on the HTTP path.
-    pub fn with_onboarded_harness(mut self, onboarded: bool) -> McpServer {
-        self.harness_onboarded = onboarded;
+    pub fn with_harness_gate(mut self, gate: HarnessGate) -> McpServer {
+        self.gate = gate;
         self
+    }
+
+    /// [`McpServer::with_harness_gate`] for a fully onboarded harness or none:
+    /// `true` is the verified gate (hook installed and onboarding verified),
+    /// `false` the default gate.
+    pub fn with_onboarded_harness(self, onboarded: bool) -> McpServer {
+        self.with_harness_gate(HarnessGate {
+            hook_installed: onboarded,
+            onboarding_verified: onboarded,
+        })
     }
 
     /// Who this call is acting as, as the one value every scoped verb on this
@@ -3568,17 +3614,26 @@ impl McpServer {
     /// this, which is what the per-era arrival test in
     /// `tests/mcp/mcp_instructions.rs` pins.
     ///
-    /// When [`minimal_instructions`] says so, the full routing prose is
+    /// When [`instructions_variant`] says so, the full routing prose is
     /// replaced by the header plus a pointer: the harness that spawned this
     /// process delivers the block itself at session start, so repeating it
-    /// would spend the tokens twice. The TOON note is appended all the same -
-    /// no hook carries it, it describes this connection's wire format rather
-    /// than the knowledge, and a client that cannot read a tool result is
-    /// worse off than one that read the routing block twice.
+    /// would spend the tokens twice. A verified harness gets the minimal
+    /// pointer; a hook that is installed but unverified gets the conditional
+    /// one, which asks the agent to fetch the block when it is missing. The
+    /// TOON note is appended all the same - no hook carries it, it describes
+    /// this connection's wire format rather than the knowledge, and a client
+    /// that cannot read a tool result is worse off than one that read the
+    /// routing block twice.
     fn arrival_info(&self) -> ServerConfig {
         let mut info = self.get_info();
-        if minimal_instructions(self.engine.skills_serve(), self.harness_onboarded) {
-            let mut instructions = crystalline_core::render_minimal_instructions();
+        let short = match instructions_variant(self.engine.skills_serve(), self.gate) {
+            InstructionsVariant::Full => None,
+            InstructionsVariant::Minimal => Some(crystalline_core::render_minimal_instructions()),
+            InstructionsVariant::Conditional => {
+                Some(crystalline_core::prompt::render_conditional_minimal_instructions())
+            }
+        };
+        if let Some(mut instructions) = short {
             if self.engine.response_format() == ResponseFormat::Toon {
                 instructions.push_str(TOON_INSTRUCTIONS_NOTE);
             }
@@ -3602,7 +3657,8 @@ impl McpServer {
     /// what this exists to prevent, and a client that gets an error re-asks.
     async fn arrival_info_scoped(&self, scope: &Scope) -> Result<ServerConfig, ErrorData> {
         let mut info = self.arrival_info();
-        if minimal_instructions(self.engine.skills_serve(), self.harness_onboarded) {
+        if instructions_variant(self.engine.skills_serve(), self.gate) != InstructionsVariant::Full
+        {
             return Ok(info);
         }
         let mut instructions = self
@@ -3876,7 +3932,7 @@ impl ServerHandler for McpServer {
     /// only point at which the instructions could depend on the client, so the
     /// receipt match lived here; that is exactly what SEP-2567's
     /// per-connection prohibition forbids, and the decision moved to the
-    /// spawned process (see `McpServer::harness_onboarded`). What survives is
+    /// spawned process (see `McpServer::gate`). What survives is
     /// what rmcp's own default does: publishing the peer info, which is what
     /// `acting_actor` and every `generated.by` write read afterwards, and the
     /// version echo.
@@ -4076,7 +4132,7 @@ impl ServerHandler for McpServer {
     /// flip `github.enabled`, and six collaboration tools appear or disappear
     /// with it (see [`hidden_collab_tool`]). That is the only mover.
     /// `resources/list` and `prompts/list` read `skills.serve` and
-    /// `harness_onboarded`, both fixed before the first request arrives, so
+    /// the harness gate, both fixed before the first request arrives, so
     /// those two categories are accepted on a subscription and then never
     /// carry anything - accepting a category is a statement about what this
     /// server may deliver, not a promise that it will.
@@ -4172,8 +4228,7 @@ impl ServerHandler for McpServer {
     ) -> Result<ListToolsResult, ErrorData> {
         let read_only = self.engine.read_only();
         let github_enabled = self.engine.github_enabled();
-        let skills_hidden =
-            hidden_skills_surface(self.engine.skills_serve(), self.harness_onboarded);
+        let skills_hidden = hidden_skills_surface(self.engine.skills_serve(), self.gate);
         let mut tools = Self::tool_router().list_all();
         tools.retain(|t| {
             if is_write_tool(&t.name) && read_only {
@@ -4216,9 +4271,7 @@ impl ServerHandler for McpServer {
         if name == "provision" && hidden_provision_tool(read_only) {
             return None;
         }
-        if name == "skills"
-            && hidden_skills_surface(self.engine.skills_serve(), self.harness_onboarded)
-        {
+        if name == "skills" && hidden_skills_surface(self.engine.skills_serve(), self.gate) {
             return None;
         }
         let mut tool = Self::tool_router().get(name).cloned()?;
@@ -4237,7 +4290,7 @@ impl ServerHandler for McpServer {
         _request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, ErrorData> {
-        if hidden_skills_surface(self.engine.skills_serve(), self.harness_onboarded) {
+        if hidden_skills_surface(self.engine.skills_serve(), self.gate) {
             return Ok(ListResourcesResult::with_all_items(Vec::new()).with_cache_hints(&context));
         }
         let resources = SKILL_ASSETS
@@ -4356,7 +4409,7 @@ impl ServerHandler for McpServer {
         _request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListPromptsResult, ErrorData> {
-        let prompts = if hidden_skills_surface(self.engine.skills_serve(), self.harness_onboarded) {
+        let prompts = if hidden_skills_surface(self.engine.skills_serve(), self.gate) {
             Vec::new()
         } else {
             Self::prompt_router().list_all()
@@ -6793,40 +6846,71 @@ mod tests {
     /// second argument is never the connecting client: it is what the spawned
     /// process resolved from its `--harness` argument and this machine's
     /// receipt before the session started.
+    /// The three gates a spawned process can resolve to: the default (serve
+    /// everything), a hook installed but unverified, and a verified harness.
+    const GATES: [HarnessGate; 3] = [
+        HarnessGate {
+            hook_installed: false,
+            onboarding_verified: false,
+        },
+        HarnessGate {
+            hook_installed: true,
+            onboarding_verified: false,
+        },
+        HarnessGate {
+            hook_installed: true,
+            onboarding_verified: true,
+        },
+    ];
+
     #[test]
     fn hidden_skills_surface_matches_the_locked_matrix() {
-        for onboarded in [true, false] {
+        let [serve, conditional, verified] = GATES;
+        for gate in GATES {
             assert!(
-                !hidden_skills_surface(SkillsServe::Always, onboarded),
+                !hidden_skills_surface(SkillsServe::Always, gate),
                 "true always serves, whoever spawned us"
             );
             assert!(
-                hidden_skills_surface(SkillsServe::Never, onboarded),
+                hidden_skills_surface(SkillsServe::Never, gate),
                 "false never serves, whoever spawned us"
             );
         }
         assert!(
-            hidden_skills_surface(SkillsServe::Auto, true),
-            "auto plus an onboarded harness is the whole point of the feature"
+            hidden_skills_surface(SkillsServe::Auto, verified),
+            "auto plus a verified harness is the whole point of the feature"
         );
         assert!(
-            !hidden_skills_surface(SkillsServe::Auto, false),
+            !hidden_skills_surface(SkillsServe::Auto, conditional),
+            "a hook that is installed but unverified keeps the skills served"
+        );
+        assert!(
+            !hidden_skills_surface(SkillsServe::Auto, serve),
             "auto serves everyone else, which is every case we cannot resolve"
         );
     }
 
-    /// Only `auto` plus an onboarded harness shrinks the instructions: `false`
-    /// gates skill serving, never onboarding.
+    /// Only `auto` plus an installed hook shrinks the instructions, to the
+    /// minimal pointer for a verified harness and the conditional one for an
+    /// unverified hook: `false` gates skill serving, never onboarding.
     #[test]
-    fn minimal_instructions_are_auto_and_onboarded_only() {
-        assert!(minimal_instructions(SkillsServe::Auto, true));
-        assert!(!minimal_instructions(SkillsServe::Auto, false));
-        assert!(!minimal_instructions(SkillsServe::Always, true));
-        assert!(
-            !minimal_instructions(SkillsServe::Never, true),
-            "turning the skill surface off must not cost a client its routing block"
+    fn short_instructions_are_auto_and_an_installed_hook_only() {
+        use InstructionsVariant::{Conditional, Full, Minimal};
+        let [serve, conditional, verified] = GATES;
+        assert_eq!(instructions_variant(SkillsServe::Auto, verified), Minimal);
+        assert_eq!(
+            instructions_variant(SkillsServe::Auto, conditional),
+            Conditional
         );
-        assert!(!minimal_instructions(SkillsServe::Never, false));
+        assert_eq!(instructions_variant(SkillsServe::Auto, serve), Full);
+        for gate in GATES {
+            assert_eq!(instructions_variant(SkillsServe::Always, gate), Full);
+            assert_eq!(
+                instructions_variant(SkillsServe::Never, gate),
+                Full,
+                "turning the skill surface off must not cost a client its routing block"
+            );
+        }
     }
 
     /// The two gates take the same two inputs, so the surface and the
@@ -6834,18 +6918,20 @@ mod tests {
     /// already onboarded. They diverged once, when one keyed on the client's
     /// name and the other did not, and that divergence is what SEP-2567
     /// forbade.
+    ///
+    /// Since the gate became two facts the rule is no longer "hidden exactly
+    /// when the instructions are short": a hook that is installed but
+    /// unverified gets the short conditional instructions and keeps the
+    /// surface. Under `auto` the surface is hidden exactly when the variant
+    /// is `Minimal`, so `Conditional` never hides it.
     #[test]
     fn the_surface_and_the_instructions_read_the_same_answer() {
-        for serve in [SkillsServe::Auto, SkillsServe::Always, SkillsServe::Never] {
-            for onboarded in [true, false] {
-                if serve == SkillsServe::Auto {
-                    assert_eq!(
-                        hidden_skills_surface(serve, onboarded),
-                        minimal_instructions(serve, onboarded),
-                        "auto decides both together"
-                    );
-                }
-            }
+        for gate in GATES {
+            assert_eq!(
+                hidden_skills_surface(SkillsServe::Auto, gate),
+                instructions_variant(SkillsServe::Auto, gate) == InstructionsVariant::Minimal,
+                "auto decides both together for {gate:?}"
+            );
         }
     }
 
