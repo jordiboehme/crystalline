@@ -2109,26 +2109,12 @@ fn pointer_label(status: &str) -> &str {
 
 // --- entry points ------------------------------------------------------------
 
-/// Refuse a harness whose install is not ready in this build, before
-/// anything is read or written. Both `install` and `uninstall` call this
-/// first, so a refused harness leaves no file and no receipt row behind.
-fn refuse_unready(harness: HarnessKind) -> anyhow::Result<()> {
-    if harness.profile().install_ready {
-        return Ok(());
-    }
-    anyhow::bail!(
-        "crystalline install {} is not available in this build yet.",
-        harness.id()
-    )
-}
-
 /// Run `crystalline install`: register the MCP server, install the hooks and
 /// copy the skills for one harness, each part skippable. Never returns an
 /// error for a missing or failing harness CLI (that degrades to a printed
 /// manual command); a genuinely unreadable or unparseable settings file, or a
 /// filesystem error writing a skill, does surface as an error.
 pub fn run_install(opts: InstallOptions, json: bool) -> anyhow::Result<()> {
-    refuse_unready(opts.harness)?;
     if !opts.harness.profile().is_legacy() {
         return install_profile::run_install(&opts, json);
     }
@@ -2373,7 +2359,6 @@ pub fn run_uninstall(
     force: bool,
     json: bool,
 ) -> anyhow::Result<()> {
-    refuse_unready(harness)?;
     if !harness.profile().is_legacy() {
         return install_profile::run_uninstall(harness, project, force, json);
     }
@@ -2570,11 +2555,6 @@ pub(crate) fn auto_reconcile(current_version: &str, cwd: &Path) -> Vec<String> {
         let Some(harness) = HarnessKind::from_id(&entry.harness) else {
             continue;
         };
-        // A harness install refuses in this build is left alone here too,
-        // as an unknown id always was.
-        if !harness.profile().install_ready {
-            continue;
-        }
         let paths = harness_paths(harness, entry.scope == "project");
         match reconcile_entry(harness, entry, &paths) {
             Ok(()) => {

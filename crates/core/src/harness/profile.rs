@@ -247,8 +247,6 @@ pub struct HarnessProfile {
     /// Whether the session hook has been seen to deliver the routing prompt
     /// in a live session of this harness.
     pub onboarding_verified: bool,
-    /// Whether `crystalline install` accepts this harness in this build.
-    pub install_ready: bool,
     /// Project-scope install; `None` while only user scope is supported.
     pub project: Option<()>,
 }
@@ -284,7 +282,6 @@ static CLAUDE_CODE: HarnessProfile = HarnessProfile {
     imports_hooks_from: &[],
     command_spelling: CommandSpelling::Bare,
     onboarding_verified: true,
-    install_ready: true,
     project: None,
 };
 
@@ -299,7 +296,6 @@ static CODEX: HarnessProfile = HarnessProfile {
     imports_hooks_from: &[],
     command_spelling: CommandSpelling::Bare,
     onboarding_verified: true,
-    install_ready: true,
     project: None,
 };
 
@@ -314,7 +310,6 @@ static COPILOT: HarnessProfile = HarnessProfile {
     imports_hooks_from: &[],
     command_spelling: CommandSpelling::Bare,
     onboarding_verified: true,
-    install_ready: true,
     project: None,
 };
 
@@ -346,7 +341,6 @@ static CURSOR: HarnessProfile = HarnessProfile {
     )],
     command_spelling: CommandSpelling::AbsolutePathEntry,
     onboarding_verified: false,
-    install_ready: true,
     project: None,
 };
 
@@ -370,7 +364,6 @@ static KIRO: HarnessProfile = HarnessProfile {
     imports_hooks_from: &[],
     command_spelling: CommandSpelling::AbsolutePathEntry,
     onboarding_verified: false,
-    install_ready: true,
     project: None,
 };
 
@@ -398,7 +391,6 @@ static GEMINI: HarnessProfile = HarnessProfile {
     imports_hooks_from: &[],
     command_spelling: CommandSpelling::Bare,
     onboarding_verified: false,
-    install_ready: true,
     project: None,
 };
 
@@ -426,7 +418,6 @@ static QWEN: HarnessProfile = HarnessProfile {
     imports_hooks_from: &[],
     command_spelling: CommandSpelling::Bare,
     onboarding_verified: false,
-    install_ready: false,
     project: None,
 };
 

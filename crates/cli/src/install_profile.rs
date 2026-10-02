@@ -597,11 +597,21 @@ fn harness_notes(harness: HarnessKind, book: &Receipt, hook_done: bool) -> Vec<S
                 );
             }
         }
+        HarnessKind::Qwen => {
+            if book
+                .find(harness.id(), "user", None)
+                .is_some_and(|row| row.parts.skills)
+            {
+                notes.push(
+                    "Qwen Code may need skills enabled before it loads them. Until that is confirmed, the skills also stay available over MCP."
+                        .to_string(),
+                );
+            }
+        }
         HarnessKind::ClaudeCode
         | HarnessKind::Codex
         | HarnessKind::Copilot
-        | HarnessKind::Gemini
-        | HarnessKind::Qwen => {}
+        | HarnessKind::Gemini => {}
     }
     notes
 }
