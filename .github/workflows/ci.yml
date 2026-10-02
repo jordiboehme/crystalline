@@ -75,6 +75,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           # The classifier diffs against a base commit, which the default
           # shallow clone does not have. Only this job pays for the history,
           # and the pack is a few dozen megabytes.
@@ -126,15 +127,13 @@ jobs:
             *)              run_everything "the base commit is all zeros (a first push or a new branch)" ;;
           esac
 
-          git cat-file -e "${base}^{commit}" 2>/dev/null
-          if [ $? -ne 0 ]; then
+          if ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
             run_everything "the base commit $base is not in this clone"
           fi
 
           # --no-renames so a file that moves shows up on both sides: a rename
           # out of code into docs must not read as a documentation change.
-          files=$(git diff --name-only --no-renames "$range")
-          if [ $? -ne 0 ]; then
+          if ! files=$(git diff --name-only --no-renames "$range"); then
             run_everything "git diff $range failed"
           fi
           if [ -z "$files" ]; then
@@ -244,6 +243,8 @@ jobs:
       RUSTFLAGS: ${{ matrix.rustflags }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
         run: rustup show
@@ -308,6 +309,8 @@ jobs:
       CRYSTALLINE_TEST_POSTGRES_URL: postgres://postgres:crystalline@localhost:5432/crystalline_test
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
         run: rustup show
@@ -344,6 +347,8 @@ jobs:
         working-directory: fluid
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # Pinned to the same major fluid/Dockerfile:18 pins (node:26-alpine), so
       # CI, the image and a laptop are one fact. vitest 5 needs Node 22.12 or
@@ -357,9 +362,13 @@ jobs:
       # reads the "packageManager" pin in fluid/package.json, so the pnpm
       # version used here, in the Fluid image and on a laptop is one fact in one
       # place. It is no longer bundled with Node, hence the install, pinned to
-      # the same corepack release fluid/Dockerfile pins.
+      # the same corepack release fluid/Dockerfile pins. zizmor's
+      # adhoc-packages audit flags any install outside a lockfile; an exact
+      # version is as pinned as npm gets here, so that finding is ignored on
+      # this step and on the other corepack steps (fluid-smoke, fluid-audit,
+      # build.yml fluid-dist, release.yml sbom).
       - name: Enable corepack
-        run: |
+        run: | # zizmor: ignore[adhoc-packages]
           npm install --global corepack@0.35.0
           corepack enable pnpm
           pnpm --version
@@ -434,6 +443,8 @@ jobs:
       COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
         run: rustup show
@@ -452,8 +463,9 @@ jobs:
         with:
           node-version: '26'
 
+      # Pinned corepack; the fluid job explains the zizmor ignore.
       - name: Enable corepack
-        run: |
+        run: | # zizmor: ignore[adhoc-packages]
           npm install --global corepack@0.35.0
           corepack enable pnpm
         working-directory: fluid
@@ -512,6 +524,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # The build context is fluid/, exactly as the release job and the compose
       # file build it.
@@ -544,6 +558,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Run style lint
         run: bash scripts/style-lint.sh
@@ -555,6 +571,35 @@ jobs:
       - name: The docs' action pins match the workspace version
         run: bash scripts/version-pins.sh
 
+  # Static checks of the workflows and the bundled action. actionlint catches
+  # expression, type and shell errors; zizmor catches the security mistakes
+  # (template injection, over-wide tokens, persisted credentials, unpinned
+  # or impostor actions). Both tools run from images pinned by digest inside
+  # the SHA-pinned actions, at the versions named below. zizmor fails the job
+  # inline instead of uploading SARIF, so the job needs no write scope, and an
+  # accepted finding is ignored with a `# zizmor: ignore[...]` comment next to
+  # its line and a reason above it. Not gated on `changes`: it takes seconds,
+  # and a new zizmor audit can flag an unchanged workflow.
+  workflow-lint:
+    name: workflow-lint
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # actionlint 1.7.12 (the image digest is in the action's settings.json).
+      - name: actionlint
+        uses: devops-actions/actionlint@ec02b36684b2f574f1d219ad0a43b082e46bf3e4 # v0.1.13
+
+      - name: zizmor
+        uses: zizmorcore/zizmor-action@cc914d7f3750a2d13d75c7f184a1060aa0e9d482 # v0.6.4
+        with:
+          version: 1.30.1
+          advanced-security: false
+          annotations: true
+
   # Dependency audit for the Rust graph: advisories (RustSec), licenses (the
   # allowlist in deny.toml), sources (crates.io only) and bans (warnings).
   # Not gated on `changes`: a new advisory appears without any change here,
@@ -565,6 +610,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
@@ -589,13 +636,16 @@ jobs:
         working-directory: fluid
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '26'
 
+      # Pinned corepack; the fluid job explains the zizmor ignore.
       - name: Enable corepack
-        run: |
+        run: | # zizmor: ignore[adhoc-packages]
           npm install --global corepack@0.35.0
           corepack enable pnpm
           pnpm --version
@@ -611,6 +661,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
         run: rustup show
@@ -645,8 +697,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: ./action
+      # `./action` on purpose: the job tests the action as it is in this
+      # checkout, which is the same commit the self-repository syntax `$/`
+      # would resolve to. actionlint 1.7.12 does not parse `$/` yet, so
+      # zizmor's self-repository finding is ignored here.
+      - uses: ./action # zizmor: ignore[self-repository]
         with:
           paths: tests/fixtures/domain-good
           comment: 'false'
@@ -659,7 +717,8 @@ jobs:
   # classifier skips the same tree anyway. The ungated jobs (style, cargo-deny,
   # fluid-audit) are left out on purpose: they run again on every push to main,
   # and the two audits can go red on a new advisory that has nothing to do with
-  # this tree.
+  # this tree. workflow-lint is ungated too but waited for: a workflow that
+  # fails it should not count as tested.
   ci-passed:
     name: ci-passed
     timeout-minutes: 10
@@ -672,12 +731,15 @@ jobs:
       - fluid-image
       - musl-spike
       - verify-action
+      - workflow-lint
     if: ${{ github.event_name == 'pull_request' }}
     runs-on: ubuntu-latest
     steps:
       # The commit every job above checked out: refs/pull/N/merge at
       # github.sha.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Name the tested tree
         id: tree

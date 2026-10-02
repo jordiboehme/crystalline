@@ -51,12 +51,16 @@ runs:
         fi
         echo "version=$version" >> "$GITHUB_OUTPUT"
 
+    # Values reach the scripts below as environment variables and pass
+    # between steps as step outputs, never as `${{ }}` text pasted into a
+    # script and never through GITHUB_ENV, which would leak into the caller's
+    # later steps.
     - name: Resolve platform name
       id: platform
       shell: bash
       run: |
         set -euo pipefail
-        case "${{ runner.os }}-${{ runner.arch }}" in
+        case "${RUNNER_OS}-${RUNNER_ARCH}" in
           Linux-X64) platform="linux-amd64"; ext="tar.gz" ;;
           Linux-ARM64) platform="linux-arm64"; ext="tar.gz" ;;
           macOS-ARM64) platform="macos-arm64"; ext="tar.gz" ;;
@@ -64,7 +68,7 @@ runs:
           Windows-X64) platform="windows-amd64"; ext="zip" ;;
           Windows-ARM64) platform="windows-arm64"; ext="zip" ;;
           *)
-            echo "::error::unsupported runner os/arch combination: ${{ runner.os }}-${{ runner.arch }}"
+            echo "::error::unsupported runner os/arch combination: ${RUNNER_OS}-${RUNNER_ARCH}"
             exit 1
             ;;
         esac
@@ -72,57 +76,75 @@ runs:
         echo "ext=$ext" >> "$GITHUB_OUTPUT"
 
     - name: Download release artifact and checksums
+      id: download
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github-token }}
+        VERSION: ${{ steps.resolve.outputs.version }}
+        PLATFORM: ${{ steps.platform.outputs.platform }}
+        EXT: ${{ steps.platform.outputs.ext }}
       run: |
         set -euo pipefail
-        version="${{ steps.resolve.outputs.version }}"
-        platform="${{ steps.platform.outputs.platform }}"
-        archive="crystalline-${version}-${platform}.${{ steps.platform.outputs.ext }}"
+        archive="crystalline-${VERSION}-${PLATFORM}.${EXT}"
         workdir="$RUNNER_TEMP/crystalline-download"
         mkdir -p "$workdir"
         cd "$workdir"
-        gh release download "$version" \
+        gh release download "$VERSION" \
           --repo jordiboehme/crystalline \
           --pattern "$archive" --pattern "SHA256SUMS" --clobber
-        echo "archive=$archive" >> "$GITHUB_ENV"
-        echo "crystalline_workdir=$workdir" >> "$GITHUB_ENV"
+        echo "archive=$archive" >> "$GITHUB_OUTPUT"
+        echo "workdir=$workdir" >> "$GITHUB_OUTPUT"
 
     - name: Verify checksum
       shell: bash
+      env:
+        ARCHIVE: ${{ steps.download.outputs.archive }}
+        WORKDIR: ${{ steps.download.outputs.workdir }}
       run: |
         set -euo pipefail
-        cd "$crystalline_workdir"
-        grep -F "$archive" SHA256SUMS > archive.sha256sums
+        cd "$WORKDIR"
+        grep -F "$ARCHIVE" SHA256SUMS > archive.sha256sums
         sha256sum -c archive.sha256sums
 
     - name: Extract archive
+      id: extract
       shell: bash
+      env:
+        ARCHIVE: ${{ steps.download.outputs.archive }}
+        WORKDIR: ${{ steps.download.outputs.workdir }}
+        EXT: ${{ steps.platform.outputs.ext }}
       run: |
         set -euo pipefail
-        cd "$crystalline_workdir"
-        if [ "${{ steps.platform.outputs.ext }}" = "zip" ]; then
-          unzip -o "$archive"
+        cd "$WORKDIR"
+        if [ "$EXT" = "zip" ]; then
+          unzip -o "$ARCHIVE"
         else
-          tar -xzf "$archive"
+          tar -xzf "$ARCHIVE"
         fi
         bin=$(find . -maxdepth 2 -type f \( -name 'crystalline' -o -name 'crystalline.exe' \) | head -n1)
         chmod +x "$bin" 2>/dev/null || true
-        echo "crystalline_bin=$crystalline_workdir/${bin#./}" >> "$GITHUB_ENV"
+        echo "bin=$WORKDIR/${bin#./}" >> "$GITHUB_OUTPUT"
 
+    # `paths` is a space-separated list, so it is split into words here, the
+    # way the unquoted input used to be split, but never run as shell text.
     - name: Run crystalline verify
       id: verify
       shell: bash
+      env:
+        CRYSTALLINE_BIN: ${{ steps.extract.outputs.bin }}
+        WORKDIR: ${{ steps.download.outputs.workdir }}
+        STRICT: ${{ inputs.strict }}
+        PATHS: ${{ inputs.paths }}
       run: |
         set +e
-        strict_flag=""
-        if [ "${{ inputs.strict }}" = "true" ]; then
-          strict_flag="--strict"
+        read -r -d '' -a paths <<< "$PATHS"
+        strict_flag=()
+        if [ "$STRICT" = "true" ]; then
+          strict_flag=(--strict)
         fi
-        "$crystalline_bin" verify ${{ inputs.paths }} $strict_flag --format github
+        "$CRYSTALLINE_BIN" verify "${paths[@]}" "${strict_flag[@]}" --format github
         code=$?
-        "$crystalline_bin" verify ${{ inputs.paths }} $strict_flag --format json > "$crystalline_workdir/crystalline-verify.json"
+        "$CRYSTALLINE_BIN" verify "${paths[@]}" "${strict_flag[@]}" --format json > "$WORKDIR/crystalline-verify.json"
         echo "exit-code=$code" >> "$GITHUB_OUTPUT"
       continue-on-error: true
 
@@ -133,10 +155,11 @@ runs:
         GH_TOKEN: ${{ inputs.github-token }}
         REPO: ${{ github.repository }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
+        WORKDIR: ${{ steps.download.outputs.workdir }}
       run: |
         set -euo pipefail
         marker="<!-- crystalline-verify: managed comment, do not edit by hand -->"
-        report="$crystalline_workdir/crystalline-verify.json"
+        report="$WORKDIR/crystalline-verify.json"
 
         errors=$(jq '.summary.errors' "$report")
         warnings=$(jq '.summary.warnings' "$report")
@@ -178,8 +201,10 @@ runs:
 
     - name: Fail on verify errors
       shell: bash
+      env:
+        CODE: ${{ steps.verify.outputs.exit-code }}
       run: |
-        code="${{ steps.verify.outputs.exit-code }}"
+        code="$CODE"
         if [ "$code" != "0" ]; then
           echo "::error::crystalline verify exited with code $code (errors present)"
           exit 1

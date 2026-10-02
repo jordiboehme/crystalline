@@ -19,7 +19,16 @@ name: Dev channel
 #
 # The version is <X>.<Y+1>.0-dev.<N> (scripts/dev-version.sh): the next minor
 # after the workspace version, and the commit count of the built commit.
-on:
+#
+# zizmor flags workflow_run as a dangerous trigger, and the finding is ignored
+# below on purpose. The known attacks are code from a fork's pull request run
+# in a privileged context, and poisoned artifacts from the triggering run.
+# Neither applies here: the `version` job only ships for a green CI run of a
+# push to main in this repository whose head is still main's tip, so the
+# checked-out commit is one only someone with write access could create; the
+# build downloads artifacts only from its own run, never from the CI run; and
+# the commit message reaches the shell through `env:`, never as script text.
+on: # zizmor: ignore[dangerous-triggers]
   workflow_run:
     workflows: [CI]
     types: [completed]
@@ -154,6 +163,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: steps.ask.outputs.build == 'true'
         with:
+          persist-credentials: false
           # The commit CI tested, which the guard above makes main's tip.
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
           # The commit count is the version's last field, so the full history.
@@ -185,7 +195,7 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          gh release list --repo "${{ github.repository }}" --limit 200 \
+          gh release list --repo "${GITHUB_REPOSITORY}" --limit 200 \
             --json tagName,isPrerelease,isDraft > "$RUNNER_TEMP/releases.json"
 
           formula="$RUNNER_TEMP/crystalline-dev.rb"
@@ -210,7 +220,11 @@ jobs:
     name: build
     needs: version
     if: needs.version.outputs.build == 'true'
-    uses: ./.github/workflows/build.yml
+    # A local reusable workflow resolves at github.sha, the commit this run
+    # started on (see `concurrency` above), which is what the self-repository
+    # syntax `$/` would give too. actionlint 1.7.12 does not parse `$/` yet,
+    # so zizmor's self-repository finding is ignored here.
+    uses: ./.github/workflows/build.yml # zizmor: ignore[self-repository]
     with:
       channel: dev
       version: ${{ needs.version.outputs.version }}
@@ -260,11 +274,11 @@ jobs:
       - name: Delete a leftover draft of this tag
         run: |
           set -euo pipefail
-          ids="$(gh api --paginate "repos/${{ github.repository }}/releases" \
+          ids="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases" \
             --jq ".[] | select(.draft and .tag_name == \"$TAG\") | .id")"
           for id in $ids; do
             echo "deleting the leftover draft $id of $TAG"
-            gh api -X DELETE "repos/${{ github.repository }}/releases/$id"
+            gh api -X DELETE "repos/${GITHUB_REPOSITORY}/releases/$id"
           done
 
       # The notes list the commits since the previous dev pre-release. Without
@@ -274,7 +288,7 @@ jobs:
       - name: Create the pre-release
         run: |
           set -euo pipefail
-          previous="$(gh release list --repo "${{ github.repository }}" --limit 200 \
+          previous="$(gh release list --repo "${GITHUB_REPOSITORY}" --limit 200 \
             --json tagName,isPrerelease,isDraft,createdAt \
             --jq '[.[] | select(.isPrerelease and (.isDraft | not) and (.tagName | startswith("dev-")))] | sort_by(.createdAt) | reverse | .[0].tagName // empty')"
           start=()
@@ -283,7 +297,7 @@ jobs:
             start=(--notes-start-tag "$previous")
           fi
           gh release create "$TAG" release/* \
-            --repo "${{ github.repository }}" \
+            --repo "${GITHUB_REPOSITORY}" \
             --target "$SHA" \
             --title "crystalline $VERSION (dev)" \
             --prerelease \
@@ -313,6 +327,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           ref: ${{ needs.version.outputs.sha }}
 
       - name: Download the release checksums
@@ -320,7 +335,7 @@ jobs:
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/release"
           gh release download "$TAG" \
-            --repo "${{ github.repository }}" \
+            --repo "${GITHUB_REPOSITORY}" \
             --pattern SHA256SUMS --dir "$RUNNER_TEMP/release"
 
       # Only Formula/crystalline-dev.rb is written; Formula/crystalline.rb is
@@ -375,7 +390,7 @@ jobs:
       - name: Delete all but the newest dev pre-releases
         run: |
           set -euo pipefail
-          old="$(gh release list --repo "${{ github.repository }}" --limit 200 \
+          old="$(gh release list --repo "${GITHUB_REPOSITORY}" --limit 200 \
             --json tagName,isPrerelease,isDraft,createdAt \
             --jq "[.[] | select(.isPrerelease and (.isDraft | not) and (.tagName | startswith(\"dev-\")))] | sort_by(.createdAt) | reverse | .[$KEEP:] | .[].tagName")"
           if [ -z "$old" ]; then
@@ -391,5 +406,5 @@ jobs:
                 ;;
             esac
             echo "deleting $tag"
-            gh release delete "$tag" --repo "${{ github.repository }}" --cleanup-tag --yes
+            gh release delete "$tag" --repo "${GITHUB_REPOSITORY}" --cleanup-tag --yes
           done <<< "$old"

@@ -59,6 +59,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           ref: ${{ inputs.ref }}
 
       # The UI freezes its package.json version into the bundle and compares it
@@ -66,15 +67,18 @@ jobs:
       # every dev user sees a version-skew warning.
       - name: Set the dev version
         if: inputs.channel == 'dev'
-        run: bash ../scripts/set-build-version.sh "${{ inputs.version }}" fluid
+        env:
+          DEV_VERSION: ${{ inputs.version }}
+        run: bash ../scripts/set-build-version.sh "$DEV_VERSION" fluid
 
       # Corepack rather than a pnpm setup action, and for one reason: corepack
       # reads the "packageManager" pin in fluid/package.json, so the pnpm
       # version used here, in CI, in the Fluid image and on a laptop is one fact
       # in one place. It is no longer bundled with Node, hence the install,
-      # pinned to the same corepack release fluid/Dockerfile pins.
+      # pinned to the same corepack release fluid/Dockerfile pins. ci.yml's
+      # fluid job explains the zizmor ignore.
       - name: Enable corepack
-        run: |
+        run: | # zizmor: ignore[adhoc-packages]
           npm install --global corepack@0.35.0
           corepack enable pnpm
           pnpm --version
@@ -173,16 +177,26 @@ jobs:
       fail-fast: false
       matrix:
         include: ${{ fromJSON(needs.legs.outputs.include) }}
+    # The matrix and the inputs reach the shell steps as environment
+    # variables, never as `${{ }}` text pasted into a script.
+    env:
+      LEG_TARGET: ${{ matrix.target }}
+      LEG_PLATFORM: ${{ matrix.platform }}
+      LEG_DEB_ARCH: ${{ matrix.deb_arch }}
+      BUILD_CHANNEL: ${{ inputs.channel }}
+      DEV_VERSION: ${{ inputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           ref: ${{ inputs.ref }}
 
       - name: Install Rust toolchain
         run: rustup show
 
       - name: Add release target
-        run: rustup target add ${{ matrix.target }}
+        shell: bash
+        run: rustup target add "$LEG_TARGET"
 
       - name: Install musl-tools
         if: matrix.musl
@@ -199,10 +213,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [ "${{ inputs.channel }}" = "dev" ]; then
-            echo "version=v${{ inputs.version }}" >> "$GITHUB_OUTPUT"
-          elif [ "${{ github.ref_type }}" = "tag" ]; then
-            echo "version=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          if [ "$BUILD_CHANNEL" = "dev" ]; then
+            echo "version=v${DEV_VERSION}" >> "$GITHUB_OUTPUT"
+          elif [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
           else
             echo "version=v0.0.0-dev" >> "$GITHUB_OUTPUT"
           fi
@@ -214,7 +228,7 @@ jobs:
       - name: Set the dev version
         if: inputs.channel == 'dev'
         shell: bash
-        run: bash scripts/set-build-version.sh "${{ inputs.version }}" cargo
+        run: bash scripts/set-build-version.sh "$DEV_VERSION" cargo
 
       # The web UI, downloaded before cargo runs on purpose: the service crate's
       # build script copies fluid/dist into its OUT_DIR and the derive embeds
@@ -244,7 +258,8 @@ jobs:
       # runner. The dev channel's version rewrite above keeps the lockfile in
       # step with Cargo.toml for exactly this reason.
       - name: Build crystalline
-        run: cargo build --release --locked --target ${{ matrix.target }} -p crystalline
+        shell: bash
+        run: cargo build --release --locked --target "$LEG_TARGET" -p crystalline
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
 
@@ -253,9 +268,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          bin="target/${{ matrix.target }}/release/crystalline"
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            bin="target/${{ matrix.target }}/release/crystalline.exe"
+          bin="target/${LEG_TARGET}/release/crystalline"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            bin="target/${LEG_TARGET}/release/crystalline.exe"
           fi
           if [ ! -f "$bin" ]; then
             echo "::error::built binary not found at $bin"
@@ -265,10 +280,12 @@ jobs:
 
       - name: Smoke test the binary
         shell: bash
+        env:
+          BIN: ${{ steps.bin.outputs.path }}
         run: |
           set -euo pipefail
-          "${{ steps.bin.outputs.path }}" --version
-          "${{ steps.bin.outputs.path }}" verify --help
+          "$BIN" --version
+          "$BIN" verify --help
 
       # The formula's own test compares `crystalline --version` against the
       # formula version, so a rewrite that did not reach the binary fails here
@@ -276,10 +293,12 @@ jobs:
       - name: The binary carries the dev version
         if: inputs.channel == 'dev'
         shell: bash
+        env:
+          BIN: ${{ steps.bin.outputs.path }}
         run: |
           set -euo pipefail
-          got="$("${{ steps.bin.outputs.path }}" --version | head -1)"
-          want="crystalline ${{ inputs.version }}"
+          got="$("$BIN" --version | head -1)"
+          want="crystalline ${DEV_VERSION}"
           if [ "$got" != "$want" ]; then
             echo "::error::the binary says '$got', expected '$want'"
             exit 1
@@ -313,7 +332,7 @@ jobs:
           done
           if [ "${#missing[@]}" -eq 0 ]; then
             echo "sign=true" >> "$GITHUB_OUTPUT"
-          elif [ "${#missing[@]}" -eq 6 ] && [ "${{ github.ref_type }}" != "tag" ] && [ "${{ inputs.channel }}" != "dev" ]; then
+          elif [ "${#missing[@]}" -eq 6 ] && [ "$GITHUB_REF_TYPE" != "tag" ] && [ "$BUILD_CHANNEL" != "dev" ]; then
             echo "::notice::Apple signing secrets are not configured; this dry run produces an UNSIGNED macOS binary"
             echo "sign=false" >> "$GITHUB_OUTPUT"
           else
@@ -348,6 +367,7 @@ jobs:
         shell: bash
         env:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          BIN: ${{ steps.bin.outputs.path }}
         run: |
           set -euo pipefail
           keychain="$RUNNER_TEMP/signing.keychain-db"
@@ -361,9 +381,9 @@ jobs:
             --identifier io.github.jordiboehme.crystalline \
             --keychain "$keychain" \
             --sign "$identity" \
-            "${{ steps.bin.outputs.path }}"
-          codesign --verify --strict --verbose=2 "${{ steps.bin.outputs.path }}"
-          info="$(codesign --display --verbose=2 "${{ steps.bin.outputs.path }}" 2>&1)"
+            "$BIN"
+          codesign --verify --strict --verbose=2 "$BIN"
+          info="$(codesign --display --verbose=2 "$BIN" 2>&1)"
           echo "$info"
           grep -q "Identifier=io.github.jordiboehme.crystalline" <<< "$info"
           grep -q "TeamIdentifier=${APPLE_TEAM_ID}" <<< "$info"
@@ -376,12 +396,13 @@ jobs:
           APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          BIN: ${{ steps.bin.outputs.path }}
         run: |
           set -euo pipefail
           key="$RUNNER_TEMP/asc-key.p8"
           printf '%s\n' "$APPLE_API_KEY_P8" > "$key"
           zip="$RUNNER_TEMP/notarize.zip"
-          ditto -c -k "${{ steps.bin.outputs.path }}" "$zip"
+          ditto -c -k "$BIN" "$zip"
           result="$RUNNER_TEMP/notarize-result.json"
           set +e
           xcrun notarytool submit "$zip" \
@@ -407,10 +428,12 @@ jobs:
       - name: Smoke test the signed binary
         if: matrix.codesign && steps.signing.outputs.sign == 'true'
         shell: bash
+        env:
+          BIN: ${{ steps.bin.outputs.path }}
         run: |
           set -euo pipefail
-          "${{ steps.bin.outputs.path }}" --version
-          "${{ steps.bin.outputs.path }}" verify --help
+          "$BIN" --version
+          "$BIN" verify --help
 
       - name: Delete signing keychain
         if: always() && matrix.codesign
@@ -425,13 +448,15 @@ jobs:
       - name: Stage archive contents
         id: stage
         shell: bash
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+          BIN: ${{ steps.bin.outputs.path }}
         run: |
           set -euo pipefail
-          version="${{ steps.version.outputs.version }}"
-          name="crystalline-${version}-${{ matrix.platform }}"
+          name="crystalline-${RELEASE_VERSION}-${LEG_PLATFORM}"
           stage="dist/$name"
           mkdir -p "$stage"
-          cp "${{ steps.bin.outputs.path }}" "$stage/"
+          cp "$BIN" "$stage/"
           cp LICENSE "$stage/"
           cp README.md "$stage/"
           cp -r docs "$stage/docs"
@@ -441,13 +466,17 @@ jobs:
         if: matrix.archive_ext == 'tar.gz'
         shell: bash
         working-directory: dist
-        run: tar czf "${{ steps.stage.outputs.name }}.tar.gz" "${{ steps.stage.outputs.name }}"
+        env:
+          STAGE: ${{ steps.stage.outputs.name }}
+        run: tar czf "${STAGE}.tar.gz" "$STAGE"
 
       - name: Package archive (zip)
         if: matrix.archive_ext == 'zip'
         shell: pwsh
         working-directory: dist
-        run: Compress-Archive -Path "${{ steps.stage.outputs.name }}/*" -DestinationPath "${{ steps.stage.outputs.name }}.zip"
+        env:
+          STAGE: ${{ steps.stage.outputs.name }}
+        run: Compress-Archive -Path "${env:STAGE}/*" -DestinationPath "${env:STAGE}.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -468,15 +497,16 @@ jobs:
       - name: Build .deb package
         if: matrix.musl && inputs.channel != 'dev'
         shell: bash
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          version="${{ steps.version.outputs.version }}"
-          deb_version="${version#v}"
+          deb_version="${RELEASE_VERSION#v}"
           cargo deb -p crystalline \
-            --target ${{ matrix.target }} \
+            --target "$LEG_TARGET" \
             --no-build \
             --deb-version "$deb_version" \
-            --output "dist/crystalline_${deb_version}_${{ matrix.deb_arch }}.deb"
+            --output "dist/crystalline_${deb_version}_${LEG_DEB_ARCH}.deb"
 
       - name: Upload .deb artifact
         if: matrix.musl && inputs.channel != 'dev'
@@ -527,19 +557,20 @@ jobs:
       - name: Build .msi package
         if: matrix.msi
         shell: bash
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          version="${{ steps.version.outputs.version }}"
           # MSI ProductVersion is numeric major.minor.patch: strip the v
           # prefix and any prerelease suffix (a dry run's v0.0.0-dev becomes
           # the placeholder 0.0.0 and is never published).
-          msi_version="${version#v}"
+          msi_version="${RELEASE_VERSION#v}"
           msi_version="${msi_version%%-*}"
           cargo wix -p crystalline \
             --no-build --nocapture \
-            --target ${{ matrix.target }} \
+            --target "$LEG_TARGET" \
             --install-version "$msi_version" \
-            --output "dist/crystalline-${version}-${{ matrix.platform }}.msi"
+            --output "dist/crystalline-${RELEASE_VERSION}-${LEG_PLATFORM}.msi"
 
       # A real elevated install rather than an administrative extract: only an
       # actual install exercises the PATH Environment component, the upgrade
