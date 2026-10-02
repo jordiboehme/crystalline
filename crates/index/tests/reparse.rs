@@ -424,7 +424,9 @@ parity!(
 /// domain: the unreadable file keeps the rows an older parser derived, so the
 /// domain stays behind and the next sync reads everything again. Without
 /// this, a file unreadable during the upgrade sync would keep its old rows for
-/// good, since a permission fix moves neither its mtime nor its size.
+/// good, since a permission fix moves neither its mtime nor its size. Unix
+/// only: the test makes the file unreadable through its permission bits.
+#[cfg(unix)]
 async fn an_unreadable_file_leaves_the_domain_behind(store: Arc<Mutex<dyn Store>>) {
     use std::os::unix::fs::PermissionsExt;
     let store = store.lock().await;
@@ -547,6 +549,7 @@ async fn a_stale_compare_keeps_the_newer_content(store: Arc<Mutex<dyn Store>>) {
     );
 }
 
+#[cfg(unix)]
 parity!(
     unreadable_file_leaves_the_domain_behind,
     an_unreadable_file_leaves_the_domain_behind
