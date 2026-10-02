@@ -363,6 +363,21 @@ impl Engine {
         self.request_contradictions();
     }
 
+    /// Called by every full sync once its file domains are claimed: from
+    /// now on the off switch knows which file domains this instance hosts.
+    /// The first time, with the check off, it asks for the off pass, which
+    /// on a shared database has waited for this (see
+    /// [`Engine::clear_contradiction_data_once`]). A daemon's startup sync
+    /// is that first time.
+    pub(crate) fn file_hosting_claimed(&self) {
+        use std::sync::atomic::Ordering;
+        if !self.file_hosting_known.swap(true, Ordering::SeqCst)
+            && self.contradiction_model().is_none()
+        {
+            self.request_contradictions();
+        }
+    }
+
     /// Forget what the pass remembers about the domain `name`: called when
     /// it is unregistered or collected, which clears its rows. Without this a
     /// domain added back under the same name from the same files would match
@@ -375,6 +390,7 @@ impl Engine {
         state.settled.remove(name);
         state.counted.remove(name);
         state.failed.remove(name);
+        state.waiting.remove(name);
         state.pending = None;
         state.generation = state.generation.wrapping_add(1);
         drop(state);
@@ -458,11 +474,77 @@ impl Engine {
             None => true,
             // A new day: an engram may have expired with nothing written.
             Some(_) if state.walked_on != Some(self.contradiction_today()) => true,
+            // A domain left to another instance does not count: the tick
+            // checks its claim instead and asks once it is free.
             Some(pending) => {
-                let total = pending.values().sum::<usize>();
-                let failing = failed_count(&state, model.repo);
+                let mine = |name: &String| !state.waiting.contains_key(name);
+                let total = pending
+                    .iter()
+                    .filter(|(name, _)| mine(name))
+                    .map(|(_, n)| n)
+                    .sum::<usize>();
+                let failing = state
+                    .failed
+                    .iter()
+                    .filter(|(name, _)| mine(name))
+                    .map(|(_, set)| set.iter().filter(|f| f.repo == model.repo).count())
+                    .sum::<usize>();
                 total > failing || (failing > 0 && loaded)
             }
+        }
+    }
+
+    /// The tick's check of the domains the last walk left to another
+    /// instance (a shared virtual domain whose work claim was held): each
+    /// claim is taken and let go at once, and a domain whose claim is free
+    /// again stops waiting, so [`Engine::contradictions_wanted`] asks for the
+    /// pass that scores what is left of it. One claim per waiting domain and
+    /// no walk, so a domain another instance scores for an hour is not walked
+    /// again on every tick meanwhile. Returns whether a domain stopped
+    /// waiting.
+    pub async fn recheck_contradiction_claims(&self) -> bool {
+        let waiting: Vec<(String, DomainId)> = self
+            .contradiction_state
+            .lock()
+            .unwrap()
+            .waiting
+            .iter()
+            .map(|(name, id)| (name.clone(), *id))
+            .collect();
+        let mut freed = Vec::new();
+        for (name, id) in waiting {
+            if self.work_claim_free(id).await {
+                freed.push(name);
+            }
+        }
+        if freed.is_empty() {
+            return false;
+        }
+        let mut state = self.contradiction_state.lock().unwrap();
+        for name in &freed {
+            state.waiting.remove(name);
+        }
+        true
+    }
+
+    /// Whether the work claim of the shared virtual domain `id` is free: it
+    /// is taken and let go at once, so the probe never holds it. A claim
+    /// that cannot be asked for reads as free, and the claim taken for the
+    /// scoring then reports why.
+    async fn work_claim_free(&self, id: DomainId) -> bool {
+        let tried = self
+            .store
+            .lock()
+            .await
+            .try_work_claim(&work_claim_key(id))
+            .await;
+        match tried {
+            Ok(Some(claim)) => {
+                claim.release().await;
+                true
+            }
+            Ok(None) => false,
+            Err(_) => true,
         }
     }
 
@@ -628,16 +710,27 @@ impl Engine {
     /// file domains this instance hosts, and no line vectors, which other
     /// instances' domains may use. Never a virtual domain's rows: another
     /// instance with the check on may have scored them, and an off feature
-    /// reads none of them, so they are not this instance's to drop. A
-    /// failure leaves the flag unset, so the next off pass tries again.
+    /// reads none of them, so they are not this instance's to drop. Which
+    /// file domains it hosts is known only once a full sync has claimed
+    /// them, so before that the off pass clears nothing and leaves the flag
+    /// unset; the sync then asks for the pass again
+    /// ([`Engine::file_hosting_claimed`]). A failure leaves the flag unset
+    /// too, so the next off pass tries again.
     async fn clear_contradiction_data_once(&self) -> Result<()> {
         use std::sync::atomic::Ordering;
+        if self.contradiction_data_cleared.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let store = self.store.lock().await;
+        let shared = store.shares_database();
+        if shared && !self.file_hosting_known.load(Ordering::SeqCst) {
+            return Ok(());
+        }
         if self.contradiction_data_cleared.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
         let done = async {
-            let store = self.store.lock().await;
-            if store.shares_database() {
+            if shared {
                 let mut hosted: Vec<DomainId> =
                     self.hosted.read().unwrap().values().copied().collect();
                 hosted.sort_by_key(|d| d.0);
@@ -915,7 +1008,14 @@ impl Engine {
         {
             let remaining = pending.values().sum();
             self.publish_walk(
-                model, generation, today, &work, pending, failures, line_error,
+                model,
+                generation,
+                today,
+                &work,
+                pending,
+                failures,
+                BTreeMap::new(),
+                line_error,
             );
             return Ok(ContradictionOutcome::Scored {
                 pairs: 0,
@@ -927,11 +1027,30 @@ impl Engine {
         // so the status counts the pairs in flight instead of the previous
         // walk's count. Only `publish_walk` settles a domain.
         self.publish_progress(model, generation, &work, &pending);
+        // A shared virtual domain whose work claim another instance holds is
+        // left to that instance before the model is loaded, so this one
+        // neither loads the model for it nor scores it. The claim is only
+        // probed here, taken and let go at once, so it never spans the load;
+        // the scoring takes it again below.
+        let mut elsewhere: HashSet<DomainId> = HashSet::new();
+        for w in work
+            .iter()
+            .filter(|w| w.claimed && w.pending.iter().any(|p| p.lines.is_some()))
+        {
+            if !self.work_claim_free(w.id).await {
+                tracing::debug!(
+                    domain = %w.name,
+                    "another instance is scoring this domain; it is left to that one this pass"
+                );
+                elsewhere.insert(w.id);
+            }
+        }
         // The model is loaded only when some pair has a line pair to read. A
         // pair with none above the floor, the common case for a related
         // pair, is stored empty without it.
         let needs_model = work
             .iter()
+            .filter(|w| !elsewhere.contains(&w.id))
             .any(|w| w.pending.iter().any(|p| p.line_count() > 0));
         let scorer = if needs_model {
             match self.scorer_for(model).await {
@@ -996,6 +1115,10 @@ impl Engine {
         let (mut pairs_done, mut lines_done, mut batches) = (0usize, 0usize, 0usize);
         let mut batch_error: Option<String> = None;
         'domains: for w in &work {
+            // Left to another instance: its pending stays as walked.
+            if elsewhere.contains(&w.id) {
+                continue;
+            }
             // Whole pairs within the budget, in the order the walk found
             // them; a pair whose line vectors are missing waits and costs
             // nothing.
@@ -1040,6 +1163,7 @@ impl Engine {
                     // next walk reads what the other instance stored. The
                     // budget it would have used goes to the next domain.
                     Claimed::Elsewhere => {
+                        elsewhere.insert(w.id);
                         budget += spent;
                         continue;
                     }
@@ -1139,6 +1263,11 @@ impl Engine {
             );
         }
         let remaining = pending.values().sum();
+        let waiting = work
+            .iter()
+            .filter(|w| elsewhere.contains(&w.id))
+            .map(|w| (w.name.clone(), w.id))
+            .collect();
         self.publish_walk(
             model,
             generation,
@@ -1146,6 +1275,7 @@ impl Engine {
             &work,
             pending,
             failures,
+            waiting,
             batch_error.or(line_error),
         );
         Ok(ContradictionOutcome::Scored {
@@ -1166,8 +1296,12 @@ impl Engine {
         w: &DomainWork,
         take: &mut Vec<&'p PairPlan>,
     ) -> Claimed<'p> {
-        let key = format!("contradictions:{}", w.id.0);
-        let tried = self.store.lock().await.try_work_claim(&key).await;
+        let tried = self
+            .store
+            .lock()
+            .await
+            .try_work_claim(&work_claim_key(w.id))
+            .await;
         let claim = match tried {
             Ok(Some(claim)) => claim,
             Ok(None) => {
@@ -1379,7 +1513,8 @@ impl Engine {
     /// Record what a walk found, but only when the generation it started under
     /// is still current and the setting still names its model: a walk under
     /// a profile the setting has since left must not overwrite the unknown
-    /// pending the change asked for.
+    /// pending the change asked for. `waiting` names the domains this walk
+    /// left to another instance, replacing the last walk's.
     #[allow(clippy::too_many_arguments)]
     fn publish_walk(
         &self,
@@ -1389,6 +1524,7 @@ impl Engine {
         work: &[DomainWork],
         pending: BTreeMap<String, usize>,
         mut failures: HashMap<String, HashSet<FailedPair>>,
+        waiting: BTreeMap<String, DomainId>,
         batch_error: Option<String>,
     ) -> bool {
         let current = self.contradiction_model().map(|m| m.repo);
@@ -1421,6 +1557,7 @@ impl Engine {
         }
         record_counts(&mut state, work, &pending);
         state.pending = Some(pending);
+        state.waiting = waiting;
         state.walked_on = Some(today);
         match batch_error {
             Some(e) => state.last_error = Some(e),
@@ -2044,6 +2181,12 @@ fn record_counts(
             }
         }
     }
+}
+
+/// The name of the work claim one instance scores the shared virtual domain
+/// `id` under.
+fn work_claim_key(id: DomainId) -> String {
+    format!("contradictions:{}", id.0)
 }
 
 /// Whether a failed load is a download whose wait is over at `now`.

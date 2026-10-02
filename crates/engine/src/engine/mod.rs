@@ -790,6 +790,12 @@ pub struct Engine {
     // so the first off pass after a start clears what a setting changed while
     // the daemon was down left behind, and later off passes cost nothing.
     contradiction_data_cleared: std::sync::atomic::AtomicBool,
+    // Set once a full sync has claimed the file domains this instance hosts.
+    // On a shared database the off switch clears only those, so it waits for
+    // this: an off pass before it would clear none and latch the flag above.
+    // The sync that sets it asks for the off pass. See
+    // `Engine::clear_contradiction_data_once`.
+    file_hosting_known: std::sync::atomic::AtomicBool,
     // Set once the line vectors of every other embedding model were deleted
     // in this process; the model cannot change without a restart.
     line_vectors_model_pruned: std::sync::atomic::AtomicBool,
@@ -1964,6 +1970,11 @@ pub(crate) struct ContradictionState {
     /// by every further download failure up to [`NLI_FETCH_RETRY_MAX`], and
     /// forgotten by a setting change or a load that succeeds.
     pub(crate) load_backoff: Option<std::time::Duration>,
+    /// The shared virtual domains the last walk left to another instance,
+    /// whose work claim it found held. Their pending does not make the tick
+    /// ask for a pass; the tick checks their claims instead
+    /// ([`Engine::recheck_contradiction_claims`]) and asks once one is free.
+    pub(crate) waiting: BTreeMap<String, DomainId>,
 }
 
 /// The loaded scorer and when it last scored.
@@ -2052,6 +2063,7 @@ impl Engine {
             scorer: std::sync::Mutex::new(None),
             scorer_loader: default_scorer_loader(),
             contradiction_data_cleared: std::sync::atomic::AtomicBool::new(false),
+            file_hosting_known: std::sync::atomic::AtomicBool::new(false),
             line_vectors_model_pruned: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "testing"))]
             contradiction_fact_walks: std::sync::atomic::AtomicU64::new(0),

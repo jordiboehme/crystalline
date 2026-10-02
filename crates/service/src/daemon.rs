@@ -432,7 +432,10 @@ pub async fn run_serve(
     ));
     // Off at start: one pass clears what a setting changed while the daemon
     // was down left behind, even when no provider ever loads and so no embed
-    // pass hands over. On, the embed worker's handover asks as before.
+    // pass hands over. On, the embed worker's handover asks as before. On a
+    // shared database this pass clears nothing yet: the hosted file domains
+    // are known only after the startup sync, which asks for the off pass
+    // again once it has claimed them.
     if engine.contradiction_model().is_none() {
         engine.request_contradictions();
     }
@@ -2391,6 +2394,10 @@ pub async fn run_embed_tick(
                     // build error stays blocked until the setting is set
                     // again or the daemon restarts.
                     Ok(0) => {
+                        // A domain the last walk left to another instance
+                        // is not walked again until its claim is free; one
+                        // claim probe per such domain is all a tick costs.
+                        engine.recheck_contradiction_claims().await;
                         if engine.contradictions_wanted() {
                             engine.request_contradictions();
                         }

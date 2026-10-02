@@ -205,6 +205,11 @@ impl Engine {
             self.announce_report(name, &report, None);
             applied.push((domain, report));
         }
+        // A full run has claimed every file domain this instance can host,
+        // which the off switch of the contradiction check waits for.
+        if only.is_none() {
+            self.file_hosting_claimed();
+        }
         // Every domain of this run is in now, so the references that pointed
         // forward into a domain the loop had not reached yet can resolve. A
         // single-domain run is a no-op inside the pass.

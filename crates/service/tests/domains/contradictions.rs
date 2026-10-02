@@ -4049,6 +4049,42 @@ async fn a_touched_file_is_neither_walked_nor_read() {
     assert_eq!(engine.contradiction_fact_loads(), loads);
 }
 
+/// Review I1 of Task 15: a file read before the sync stamped it is never
+/// cached under the old stamp. The file changes on disk and a walk reads it
+/// before any sync; then it goes back to the stamped bytes, so the stamp
+/// never moves. The next walk reads the file again instead of answering it
+/// with the parse of bytes the file no longer has.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_file_read_before_its_stamp_caught_up_is_read_again() {
+    let (_tmp, dir, engine) = file_engine(loader(stub(), Arc::new(AtomicUsize::new(0)))).await;
+    set(&engine, "evolve.contradictions", "full").await;
+    assert_eq!(
+        engine.score_contradictions().await.unwrap(),
+        scored(1, 1, 0)
+    );
+    // Off and on again empties the fact cache, so the next walk reads.
+    set(&engine, "evolve.contradictions", "off").await;
+    engine.score_contradictions().await.unwrap();
+    set(&engine, "evolve.contradictions", "full").await;
+
+    let path = dir.join("twenty.md");
+    let stamped = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, stamped.replace("Node 20", "Node 22")).unwrap();
+    engine.set_contradiction_today(day("2030-01-01"));
+    engine.score_contradictions().await.unwrap();
+
+    std::fs::write(&path, &stamped).unwrap();
+    engine.sync(None).await.unwrap();
+    engine.set_contradiction_today(day("2030-01-02"));
+    let loads = engine.contradiction_fact_loads();
+    engine.score_contradictions().await.unwrap();
+    assert_eq!(
+        engine.contradiction_fact_loads(),
+        loads + 1,
+        "the file read ahead of its stamp is read again, the other one is not"
+    );
+}
+
 /// The off switch drops the fact cache with everything else the pass keeps,
 /// so the walk after it is switched on again reads every engram.
 #[tokio::test]
@@ -4249,10 +4285,11 @@ async fn two_instances_score_a_virtual_domain_once() {
 }
 
 /// A walk that went stale while it waited: `b` walks while the pair is still
-/// pending, then its model takes long to load, and by the time it holds the
-/// claim `a` has scored the pair, stored it and let go. Under the claim `b`
-/// reads the stored pairs again, leaves the pair alone and counts it as up to
-/// date, so nothing is pending afterwards.
+/// pending and finds the claim free, then its model takes long to load, and
+/// by the time it holds the claim `a` has scored the pair, stored it and let
+/// go. Under the claim `b` reads the stored pairs again, leaves the pair
+/// alone and counts it as up to date, so nothing is pending afterwards. The
+/// load is held until `a` is done, so the order is the same on every run.
 #[cfg(feature = "postgres")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_walk_that_went_stale_leaves_a_pair_another_instance_stored() {
@@ -4261,26 +4298,36 @@ async fn a_walk_that_went_stale_leaves_a_pair_another_instance_stored() {
     };
     let schema = unique_schema();
     let s = stub();
-    let slow: Arc<dyn ContradictionScorer> = Arc::new(Slow(s.clone()));
+    let scorer: Arc<dyn ContradictionScorer> = s.clone();
+    let (loading, go) = (
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(tokio::sync::Notify::new()),
+    );
     let late: ScorerLoader = {
-        let slow = slow.clone();
+        let (scorer, loading, go) = (scorer.clone(), loading.clone(), go.clone());
         Arc::new(move |_model: &'static NliModel| {
-            let slow = slow.clone();
+            let (scorer, loading, go) = (scorer.clone(), loading.clone(), go.clone());
             Box::pin(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-                Ok(slow)
+                loading.notify_one();
+                go.notified().await;
+                Ok(scorer)
             })
         })
     };
-    let (_ta, a) = instance_on(&url, &schema, "a", slow).await;
+    let (_ta, a) = instance_on(&url, &schema, "a", scorer).await;
     let (_tb, b) = instance_with(&url, &schema, "b", late).await;
     three(&a).await;
     b.embed_pending().await.unwrap();
 
-    let (ra, rb) = tokio::join!(a.score_contradictions(), b.score_contradictions());
-    assert_eq!(ra.unwrap(), scored(1, 1, 0));
+    let walking = {
+        let b = b.clone();
+        tokio::spawn(async move { b.score_contradictions().await })
+    };
+    loading.notified().await;
+    assert_eq!(a.score_contradictions().await.unwrap(), scored(1, 1, 0));
+    go.notify_one();
     assert_eq!(
-        rb.unwrap(),
+        walking.await.unwrap().unwrap(),
         scored(0, 0, 0),
         "the stored pair is up to date, not pending"
     );
@@ -4288,6 +4335,68 @@ async fn a_walk_that_went_stale_leaves_a_pair_another_instance_stored() {
     assert!(!b.contradictions_wanted(), "nothing left to ask for");
 
     drop((a, b));
+    let cleanup = crystalline_index::PostgresStore::open_in_schema(&url, &schema)
+        .await
+        .unwrap();
+    cleanup.drop_schema().await.unwrap();
+}
+
+/// Review I1 of Task 11: an instance that finds a shared virtual domain's
+/// claim held loads no model for it, and its tick does not walk the domain
+/// again while the claim stays held; it only checks the claim. Once the
+/// claim is free the tick asks for the pass that scores the pair.
+#[cfg(feature = "postgres")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_domain_another_instance_scores_loads_no_model_and_waits_for_its_claim() {
+    use crystalline_index::Store;
+    let Some(url) = pg_url() else {
+        return;
+    };
+    let schema = unique_schema();
+    let s = stub();
+    let loads = Arc::new(AtomicUsize::new(0));
+    let (_ta, a) = instance_on(&url, &schema, "a", s.clone()).await;
+    let (_tb, b) = instance_with(&url, &schema, "b", loader_of(s.clone(), loads.clone())).await;
+    three(&a).await;
+    b.embed_pending().await.unwrap();
+
+    // Another instance scoring `notes`, as a claim held on its own session.
+    let holder = crystalline_index::PostgresStore::open_in_schema(&url, &schema)
+        .await
+        .unwrap();
+    let id = holder.domain_id("notes").await.unwrap().expect("notes");
+    let claim = holder
+        .try_work_claim(&format!("contradictions:{}", id.0))
+        .await
+        .unwrap()
+        .expect("the claim is free");
+
+    assert_eq!(b.score_contradictions().await.unwrap(), scored(0, 0, 1));
+    assert_eq!(
+        loads.load(Ordering::SeqCst),
+        0,
+        "no model is loaded for a domain another instance scores"
+    );
+    assert!(
+        !b.contradictions_wanted(),
+        "the tick does not ask for a walk"
+    );
+    let walks = b.contradiction_fact_walks();
+    assert!(!b.recheck_contradiction_claims().await, "still held");
+    assert!(!b.contradictions_wanted());
+    assert_eq!(
+        b.contradiction_fact_walks(),
+        walks,
+        "a claim check walks nothing"
+    );
+
+    claim.release().await;
+    assert!(b.recheck_contradiction_claims().await, "free again");
+    assert!(b.contradictions_wanted(), "the tick asks for the pass now");
+    assert_eq!(b.score_contradictions().await.unwrap(), scored(1, 1, 0));
+    assert_eq!(loads.load(Ordering::SeqCst), 1);
+
+    drop((a, b, holder));
     let cleanup = crystalline_index::PostgresStore::open_in_schema(&url, &schema)
         .await
         .unwrap();
@@ -4329,6 +4438,220 @@ async fn an_instance_with_the_check_off_leaves_shared_virtual_rows_alone() {
     assert_eq!(status["pending_pairs"], 0, "{status}");
 
     drop((a, b));
+    let cleanup = crystalline_index::PostgresStore::open_in_schema(&url, &schema)
+        .await
+        .unwrap();
+    cleanup.drop_schema().await.unwrap();
+}
+
+/// A folder `files` under `root` with the 18/20 pair, for a file domain on
+/// a shared database.
+#[cfg(feature = "postgres")]
+fn files_folder(root: &std::path::Path) -> std::path::PathBuf {
+    let dir = root.join("files");
+    std::fs::create_dir_all(&dir).unwrap();
+    let engram = |title: &str, body: &str| {
+        format!(
+            "---\ntype: engram\ntitle: {title}\npermalink: {}\ntags:\n  - t\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n{body}\n",
+            title.to_lowercase()
+        )
+    };
+    std::fs::write(
+        dir.join("MANIFEST.md"),
+        "---\ntype: manifest\ntitle: files\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# files\n\n## Scope\n\n- Build notes\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("eighteen.md"), engram("Eighteen", NODE_18)).unwrap();
+    std::fs::write(dir.join("twenty.md"), engram("Twenty", NODE_20)).unwrap();
+    dir
+}
+
+/// One instance on the shared `schema` with the file domain `files` at
+/// `dir` and the virtual domain `notes`, the check set to `profile`.
+#[cfg(feature = "postgres")]
+async fn hosting_instance(
+    url: &str,
+    schema: &str,
+    id: &str,
+    dir: &std::path::Path,
+    profile: &str,
+) -> (tempfile::TempDir, Engine) {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = GlobalConfig {
+        domains_root: Some(tmp.path().join("domains-root")),
+        ..GlobalConfig::default()
+    };
+    cfg.domains
+        .insert("notes".to_string(), DomainEntry::virtual_domain());
+    cfg.domains
+        .insert("files".to_string(), DomainEntry::file(dir.to_path_buf()));
+    cfg.evolve = Some(EvolveConfig {
+        contradictions: Some(profile.to_string()),
+    });
+    cfg.service = Some(ServiceConfig {
+        response_format: Some(ResponseFormat::Json),
+        ..ServiceConfig::default()
+    });
+    let config_path = tmp.path().join("config.yaml");
+    crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+    let store = crystalline_index::PostgresStore::open_in_schema(url, schema)
+        .await
+        .expect("open the postgres test schema");
+    let engine = Engine::new(
+        Arc::new(Mutex::new(store)),
+        cfg,
+        Some(Arc::new(crate::support::TopicEmbedder)),
+        Some(config_path),
+    )
+    .with_state_dir(tmp.path().join("state"))
+    .with_instance_id(id.to_string())
+    .with_scorer_loader(loader(stub(), Arc::new(AtomicUsize::new(0))));
+    (tmp, engine)
+}
+
+/// The stored scores of `domain`: its rows and its scored pairs.
+#[cfg(feature = "postgres")]
+async fn scores_in(engine: &Engine, domain: &str) -> (usize, usize) {
+    let store = engine.store();
+    let store = store.lock().await;
+    let id = store.domain_id(domain).await.unwrap().expect("the domain");
+    (
+        store
+            .contradictions(id, full().repo, 0.0)
+            .await
+            .unwrap()
+            .len(),
+        store
+            .contradiction_pairs_scored(id, full().repo)
+            .await
+            .unwrap()
+            .len(),
+    )
+}
+
+/// `a` hosts `files` (claimed by its sync), with `notes` beside it, and has
+/// scored the pair in each.
+#[cfg(feature = "postgres")]
+async fn scored_hosting_instance(
+    url: &str,
+    schema: &str,
+    dir: &std::path::Path,
+) -> (tempfile::TempDir, Arc<Engine>) {
+    let (tmp, a) = hosting_instance(url, schema, "a", dir, "full").await;
+    let a = Arc::new(a);
+    a.sync(None).await.unwrap();
+    three(&a).await;
+    a.score_contradictions().await.unwrap();
+    assert_eq!(
+        scores_in(&a, "files").await,
+        (1, 1),
+        "the file domain is scored"
+    );
+    assert_eq!(
+        scores_in(&a, "notes").await,
+        (1, 1),
+        "the virtual domain is scored"
+    );
+    (tmp, a)
+}
+
+/// Review I2 of Task 12: on a shared database the off switch clears the
+/// file domains this instance hosts, never a virtual domain, and keeps the
+/// line vectors.
+#[cfg(feature = "postgres")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_off_switch_on_postgres_clears_the_hosted_file_domain_only() {
+    let Some(url) = pg_url() else {
+        return;
+    };
+    let schema = unique_schema();
+    let folder = tempfile::tempdir().unwrap();
+    let dir = files_folder(folder.path());
+    let (_ta, a) = scored_hosting_instance(&url, &schema, &dir).await;
+    let vectors = line_hashes(&a).await.len();
+    assert!(vectors > 0);
+
+    set(&a, "evolve.contradictions", "off").await;
+    assert_eq!(
+        a.score_contradictions().await.unwrap(),
+        ContradictionOutcome::Off
+    );
+    assert_eq!(
+        scores_in(&a, "files").await,
+        (0, 0),
+        "the hosted file domain is cleared"
+    );
+    assert_eq!(
+        scores_in(&a, "notes").await,
+        (1, 1),
+        "the virtual domain is not"
+    );
+    assert_eq!(
+        line_hashes(&a).await.len(),
+        vectors,
+        "the line vectors stay"
+    );
+
+    drop(a);
+    let cleanup = crystalline_index::PostgresStore::open_in_schema(&url, &schema)
+        .await
+        .unwrap();
+    cleanup.drop_schema().await.unwrap();
+}
+
+/// Review I1 of Task 12: a daemon on a shared database that starts with the
+/// check already off. Its first off pass runs before the startup sync claims
+/// the file domain and clears nothing; the sync asks for the pass again, and
+/// that one clears the hosted file domain and leaves the virtual one.
+#[cfg(feature = "postgres")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_off_restart_on_postgres_clears_the_hosted_file_domain_after_the_sync() {
+    let Some(url) = pg_url() else {
+        return;
+    };
+    let schema = unique_schema();
+    let folder = tempfile::tempdir().unwrap();
+    let dir = files_folder(folder.path());
+    let (_ta, a) = scored_hosting_instance(&url, &schema, &dir).await;
+    let vectors = line_hashes(&a).await.len();
+    drop(a);
+
+    let (_tr, restarted) = hosting_instance(&url, &schema, "a", &dir, "off").await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let restarted = Arc::new(restarted.with_contradiction_channel(tx));
+    assert_eq!(
+        restarted.score_contradictions().await.unwrap(),
+        ContradictionOutcome::Off
+    );
+    assert_eq!(
+        scores_in(&restarted, "files").await,
+        (1, 1),
+        "nothing is hosted before the startup sync, so nothing is cleared yet"
+    );
+
+    restarted.sync(None).await.unwrap();
+    assert!(rx.try_recv().is_ok(), "the sync asks for the off pass");
+    assert_eq!(
+        restarted.score_contradictions().await.unwrap(),
+        ContradictionOutcome::Off
+    );
+    assert_eq!(
+        scores_in(&restarted, "files").await,
+        (0, 0),
+        "the hosted file domain is cleared"
+    );
+    assert_eq!(
+        scores_in(&restarted, "notes").await,
+        (1, 1),
+        "the virtual domain is not"
+    );
+    assert_eq!(
+        line_hashes(&restarted).await.len(),
+        vectors,
+        "the line vectors stay"
+    );
+
+    drop(restarted);
     let cleanup = crystalline_index::PostgresStore::open_in_schema(&url, &schema)
         .await
         .unwrap();
