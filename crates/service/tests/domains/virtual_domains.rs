@@ -1708,3 +1708,102 @@ async fn unguarded_and_guarded_virtual_edits_on_turso() {
     );
     assert!(!stored.contains("guarded a"), "{stored}");
 }
+
+/// Stage a virtual domain as an older parser left it: the wrapped bullet's
+/// observation is a fragment without its tag, the stamp is generation 0 and
+/// the stored document is untouched.
+async fn stage_old_parse(store: &Arc<Mutex<dyn Store>>) -> crystalline_index::DomainId {
+    let store = store.lock().await;
+    let domain = store.domain_id("notes").await.unwrap().unwrap();
+    let rows = store.all_engram_contents(domain).await.unwrap();
+    let row = rows.iter().find(|r| r.content.contains("#purge")).unwrap();
+    let stamp = store.file_stamps(domain).await.unwrap()[&row.path].clone();
+    let engram = crystalline_core::parse_engram(&row.content).unwrap();
+    let mut record = crystalline_index::EngramRecord::from_engram(&engram, &row.path, stamp);
+    record.content = row.content.clone();
+    let obs = record
+        .observations
+        .iter_mut()
+        .find(|o| o.tags.contains(&"purge".to_string()))
+        .expect("the wrapped bullet carries #purge");
+    obs.content = "the purge runs before every mix swap,".to_string();
+    obs.tags.clear();
+    store.upsert_engram(domain, &record).await.unwrap();
+    store.set_parse_generation(domain, 0).await.unwrap();
+    domain
+}
+
+async fn purge_count(store: &Arc<Mutex<dyn Store>>) -> i64 {
+    store
+        .lock()
+        .await
+        .vocabulary(Some("notes"), None)
+        .await
+        .unwrap()
+        .tags
+        .iter()
+        .find(|t| t.name == "purge")
+        .map(|t| t.observations)
+        .unwrap_or(0)
+}
+
+/// Write the wrapped bullet through a writable engine, stage it as an older
+/// parser left it, then run the startup sync of a read-only engine over the
+/// same store. Returns the stamp and the purge count after it.
+async fn read_only_sync_over_old_parse(store: Arc<Mutex<dyn Store>>) -> (u32, i64) {
+    virtual_engine(store.clone())
+        .write_engram(&write_params(
+            "Purge",
+            "The purge rules.\n\n- [fact] the purge runs before every mix swap,\n  which is why the swap waits for night #purge\n",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(purge_count(&store).await, 1);
+    let domain = stage_old_parse(&store).await;
+    assert_eq!(purge_count(&store).await, 0);
+    virtual_engine(store.clone())
+        .with_read_only(true)
+        .sync(None)
+        .await
+        .unwrap();
+    let generation = store.lock().await.parse_generation(domain).await.unwrap();
+    (generation, purge_count(&store).await)
+}
+
+/// Decision D3: a read-only instance on a shared database leaves the reparse
+/// of a virtual domain to a writable instance, so the stamp and the rows stay.
+#[cfg(feature = "postgres")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_read_only_instance_on_a_shared_database_does_not_reparse_virtual_domains() {
+    let Some(url) = pg_url() else {
+        return;
+    };
+    let schema = unique_schema();
+    let pg = crystalline_index::PostgresStore::open_in_schema(&url, &schema)
+        .await
+        .unwrap();
+    let store: Arc<Mutex<dyn Store>> = Arc::new(Mutex::new(pg));
+    let (generation, purge) = read_only_sync_over_old_parse(store.clone()).await;
+    assert_eq!(generation, 0, "the generation stays where it was");
+    assert_eq!(purge, 0, "the rows are unchanged");
+
+    // A writable instance of the same database does the reparse.
+    virtual_engine(store.clone()).sync(None).await.unwrap();
+    assert_eq!(purge_count(&store).await, 1);
+
+    drop(store);
+    let cleanup = crystalline_index::PostgresStore::open_in_schema(&url, &schema)
+        .await
+        .unwrap();
+    cleanup.drop_schema().await.unwrap();
+}
+
+/// The twin: a read-only instance on its own index reparses as before.
+#[tokio::test]
+async fn a_read_only_instance_on_its_own_index_still_reparses() {
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let store: Arc<Mutex<dyn Store>> = Arc::new(Mutex::new(store));
+    let (generation, purge) = read_only_sync_over_old_parse(store).await;
+    assert_eq!(generation, crystalline_core::PARSE_GENERATION);
+    assert_eq!(purge, 1);
+}
