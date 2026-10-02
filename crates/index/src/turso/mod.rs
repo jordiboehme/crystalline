@@ -400,18 +400,6 @@ impl TursoStore {
         Ok(())
     }
 
-    /// Write one row of the `engram` table, in one actor's dimension.
-    ///
-    /// The single writer behind both [`Store::upsert_engram`] (which passes the
-    /// empty actor, the base row) and [`Store::upsert_overlay`] (which passes
-    /// an actor key). Keeping them one body is what makes a draft a full engram
-    /// row rather than a second shape: the same children, the same tags, the
-    /// same id-stable upsert, and no read downstream has to know which of the
-    /// two wrote it.
-    ///
-    /// Everything this statement touches is scoped to `actor`, including the
-    /// duplicate-permalink probe: two actors may each hold `a` at their own
-    /// path, and only a clash inside one actor's own dimension is a conflict.
     /// The compare of a compare-and-swap on the base row at `path`, as a
     /// guarded write: the same statement the Postgres twin needs to be safe
     /// against a second writer, a no-op UPDATE that only matches the row while
@@ -441,15 +429,21 @@ impl TursoStore {
         )
         .await?
         .and_then(|r| cell_text(&r, 0));
-        match stored {
-            Some(found) => Err(IndexError::StaleEdit {
-                expected: expected.to_string(),
-                found,
-            }),
-            None => Ok(false),
-        }
+        compare_outcome(stored, expected)
     }
 
+    /// Write one row of the `engram` table, in one actor's dimension.
+    ///
+    /// The single writer behind both [`Store::upsert_engram`] (which passes the
+    /// empty actor, the base row) and [`Store::upsert_overlay`] (which passes
+    /// an actor key). Keeping them one body is what makes a draft a full engram
+    /// row rather than a second shape: the same children, the same tags, the
+    /// same id-stable upsert, and no read downstream has to know which of the
+    /// two wrote it.
+    ///
+    /// Everything this statement touches is scoped to `actor`, including the
+    /// duplicate-permalink probe: two actors may each hold `a` at their own
+    /// path, and only a clash inside one actor's own dimension is a conflict.
     async fn upsert_row(
         &self,
         domain: DomainId,
@@ -3887,8 +3881,44 @@ impl Store for TursoStore {
     }
 }
 
+/// What [`TursoStore::guarded_compare`] answers when its no-op UPDATE
+/// reported no changed row, from the sha the fallback SELECT read: no row is
+/// `Ok(false)`, a row that moved on is [`IndexError::StaleEdit`], and a row
+/// that still carries the expected sha is `Ok(true)`. That last arm cannot
+/// happen while turso counts matched rows, but a release that counted only
+/// changed values would report zero changes for every no-op UPDATE, and this
+/// keeps such a release from refusing every guarded edit.
+fn compare_outcome(stored: Option<String>, expected: &str) -> Result<bool> {
+    match stored {
+        Some(found) if found == expected => Ok(true),
+        Some(found) => Err(IndexError::StaleEdit {
+            expected: expected.to_string(),
+            found,
+        }),
+        None => Ok(false),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    // Mutation caught: a matching row read back after an UPDATE that
+    // reported zero changes answered as a StaleEdit with two equal shas.
+    #[test]
+    fn a_guarded_compare_whose_row_still_matches_is_a_match_even_with_zero_changes() {
+        assert!(matches!(
+            compare_outcome(Some("abc".into()), "abc"),
+            Ok(true)
+        ));
+        assert!(matches!(compare_outcome(None, "abc"), Ok(false)));
+        match compare_outcome(Some("def".into()), "abc") {
+            Err(IndexError::StaleEdit { expected, found }) => {
+                assert_eq!(expected, "abc");
+                assert_eq!(found, "def");
+            }
+            other => panic!("expected a StaleEdit, got {other:?}"),
+        }
+    }
+
     use std::collections::BTreeMap;
 
     use super::*;
