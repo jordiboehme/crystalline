@@ -284,6 +284,45 @@ jobs:
         if: ${{ needs.changes.outputs.tested != 'true' }}
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      # The postgres backend's tests, on the x86_64 ubuntu leg only (not the
+      # arm one): every test of the workspace run below that reads
+      # CRYSTALLINE_TEST_POSTGRES_URL runs its postgres leg against this
+      # container instead of skipping it, in the same build and the same
+      # cache entry (shared-key: test) as the rest of the leg. The leg is
+      # named twice so the condition holds for ubuntu-latest and for the
+      # ubuntu-26.04 label the image migration test runs under. Started with
+      # docker run rather than as a job service because a service cannot be
+      # limited to one matrix leg. The readiness probe goes over TCP inside
+      # the container: the image's init phase runs a socket-only server, so
+      # a socket probe could answer before the real server is up. The
+      # extension is pre-created in public so the migration's defensive
+      # CREATE EXTENSION is always a no-op and the parallel per-test schema
+      # creation is race free.
+      - name: Start postgres with pgvector
+        if: ${{ (matrix.os == 'ubuntu-latest' || matrix.os == 'ubuntu-26.04') && needs.changes.outputs.tested != 'true' }}
+        run: |
+          set -euo pipefail
+          docker run -d --name pg \
+            -e POSTGRES_PASSWORD=crystalline \
+            -e POSTGRES_DB=crystalline_test \
+            -p 5432:5432 \
+            pgvector/pgvector:0.8.2-pg17-bookworm
+          for _ in $(seq 1 60); do
+            if docker exec pg pg_isready -h 127.0.0.1 -U postgres -d crystalline_test >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          if ! docker exec pg pg_isready -h 127.0.0.1 -U postgres -d crystalline_test; then
+            docker logs pg
+            echo "::error::postgres was not ready after 60 s"
+            exit 1
+          fi
+          docker exec -e PGPASSWORD=crystalline pg \
+            psql -h 127.0.0.1 -U postgres -d crystalline_test -v ON_ERROR_STOP=1 \
+            -c "CREATE EXTENSION IF NOT EXISTS vector;"
+          echo "CRYSTALLINE_TEST_POSTGRES_URL=postgres://postgres:crystalline@localhost:5432/crystalline_test" >>"$GITHUB_ENV"
+
       - name: cargo nextest run
         if: ${{ needs.changes.outputs.tested != 'true' }}
         # The `ci` profile is the default one plus a single retry, so an
@@ -294,48 +333,6 @@ jobs:
       - name: cargo test --doc
         if: ${{ needs.changes.outputs.tested != 'true' }}
         run: cargo test --workspace --doc --locked
-
-  postgres-parity:
-    name: postgres-parity
-    timeout-minutes: 15
-    needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && needs.changes.outputs.tested != 'true' }}
-    runs-on: ubuntu-26.04
-    services:
-      postgres:
-        image: pgvector/pgvector:0.8.2-pg17-bookworm
-        env:
-          POSTGRES_PASSWORD: crystalline
-          POSTGRES_DB: crystalline_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-    env:
-      CRYSTALLINE_TEST_POSTGRES_URL: postgres://postgres:crystalline@localhost:5432/crystalline_test
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Install Rust toolchain
-        run: rustup show
-
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-
-      - name: Create the pgvector extension
-        # Pre-create it in public so the migration's defensive CREATE EXTENSION
-        # is always a no-op and the parallel per-test schema creation is race
-        # free. psql ships on the ubuntu-26.04 runner image.
-        run: PGPASSWORD=crystalline psql -h localhost -U postgres -d crystalline_test -c "CREATE EXTENSION IF NOT EXISTS vector;"
-
-      - name: cargo test (parity suite on both backends)
-        run: cargo test -p crystalline-index --locked
 
   # Fluid, the browser UI. Nothing under fluid/ is part of the cargo workspace,
   # so its gates are a job of their own: they neither wait on the Rust matrix
@@ -734,7 +731,6 @@ jobs:
     needs:
       - changes
       - test
-      - postgres-parity
       - fluid
       - fluid-smoke
       - fluid-image
