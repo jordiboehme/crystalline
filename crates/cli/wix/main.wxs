@@ -99,9 +99,9 @@
 
     <UI>
       <UIRef Id='WixUI_FeatureTree'/>
-      <!-- No EULA dialog: cargo-wix ships no AGPL-3.0 RTF template, so the
-           LICENSE file installs beside the binary instead and the dialog
-           order skips straight from the welcome page to feature selection. -->
+      <!-- No EULA dialog: the LICENSE file (MPL-2.0) installs beside the
+           binary instead and the dialog order skips straight from the welcome
+           page to feature selection. -->
       <Publish Dialog='WelcomeDlg' Control='Next' Event='NewDialog' Value='CustomizeDlg' Order='99'>1</Publish>
       <Publish Dialog='CustomizeDlg' Control='Back' Event='NewDialog' Value='WelcomeDlg' Order='99'>1</Publish>
     </UI>

@@ -238,7 +238,14 @@ async fn ensure_files_with(
     model: &'static LocalModel,
     announce: bool,
 ) -> Result<HubFiles> {
-    crate::hub::ensure_files_with(client, cache_dir, &hub_repo(model), announce).await
+    crate::hub::ensure_files_with(
+        client,
+        cache_dir,
+        &hub_repo(model),
+        announce,
+        &crate::hub::HubLimits::default(),
+    )
+    .await
 }
 
 /// [`crate::hub::cached_path`] for one of an embedding model's files at its

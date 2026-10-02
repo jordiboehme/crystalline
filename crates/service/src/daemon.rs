@@ -65,9 +65,9 @@ const BANNER: &str = r"
 /// it too. (`--daemon` never reaches this branch at all: there is no
 /// terminal to print a banner to, and its own, separate startup output below
 /// is limited to the `tracing::info!` lines a backgrounded first-run wizard
-/// still needs.) AGPL section 13 is why it names the source: a
-/// network-served copy has to offer its users the source, so the link
-/// belongs where a user of a running instance can see it. Read from the
+/// still needs.) It names the source as a courtesy
+/// and for attribution, so the link sits where a user of a running instance
+/// can see it. Read from the
 /// environment rather than retyped, matching `crates/cli/src/main.rs`'s
 /// `VERSION_BLOCK`.
 const COPYRIGHT_LINE: &str = concat!(
@@ -343,6 +343,18 @@ pub async fn run_serve(
     // rest is read from the OS when the report is built. Recorded before the
     // lock for the same reason as the intent: `publish` reads it.
     crate::runs_in::record_start(breakaway_refused, exit_when_idle);
+    // How this daemon was started, for whoever displaces it after an upgrade:
+    // its successor is started the same way. Recorded before the lock, like
+    // the two above, because `publish` reads it.
+    crate::instance::record_start_options(crate::instance::StartOptions::capture(
+        db.as_deref(),
+        &loaded.path,
+        read_only,
+        http_flag.as_deref(),
+        &allowed_host_flag,
+        exit_when_idle,
+        &loaded.overlay,
+    ));
     if breakaway_refused {
         tracing::warn!("{}", crate::runs_in::BREAKAWAY_REFUSED_WARNING);
     }
@@ -432,7 +444,10 @@ pub async fn run_serve(
     ));
     // Off at start: one pass clears what a setting changed while the daemon
     // was down left behind, even when no provider ever loads and so no embed
-    // pass hands over. On, the embed worker's handover asks as before.
+    // pass hands over. On, the embed worker's handover asks as before. On a
+    // shared database this pass clears nothing yet: the hosted file domains
+    // are known only after the startup sync, which asks for the off pass
+    // again once it has claimed them.
     if engine.contradiction_model().is_none() {
         engine.request_contradictions();
     }
@@ -916,6 +931,28 @@ async fn accept_loop(listener: interprocess::local_socket::tokio::Listener, shar
     }
 }
 
+/// The harness gate a bridge's `mcp` handshake options carry. `skills=off` is
+/// the verified gate and wins if both tokens ever arrive; `routing=conditional`
+/// is a hook that is installed but unverified; neither (a bare `mcp` from an
+/// older bridge, or an option this binary does not know) is the default gate,
+/// which serves everything.
+fn harness_gate_from_options(options: &[&str]) -> crate::instance::HarnessGate {
+    use crate::instance::{HarnessGate, ROUTING_CONDITIONAL_OPTION, SKILLS_OFF_OPTION};
+    if options.contains(&SKILLS_OFF_OPTION) {
+        HarnessGate {
+            hook_installed: true,
+            onboarding_verified: true,
+        }
+    } else if options.contains(&ROUTING_CONDITIONAL_OPTION) {
+        HarnessGate {
+            hook_installed: true,
+            onboarding_verified: false,
+        }
+    } else {
+        HarnessGate::default()
+    }
+}
+
 /// Dispatch one accepted connection by its `mcp` or `ctl` handshake.
 async fn handle_conn(mut stream: IpcStream, shared: Arc<Shared>) {
     let line = match read_mode_line(&mut stream).await {
@@ -939,8 +976,8 @@ async fn handle_conn(mut stream: IpcStream, shared: Arc<Shared>) {
             // never re-derives it: its own environment is whoever spawned it
             // first, and a value re-derived per accepted socket could change
             // the surface under a live client across a daemon restart.
-            let onboarded = options.contains(&crate::instance::SKILLS_OFF_OPTION);
-            let server = McpServer::new(shared.engine.clone()).with_onboarded_harness(onboarded);
+            let gate = harness_gate_from_options(&options);
+            let server = McpServer::new(shared.engine.clone()).with_harness_gate(gate);
             match rmcp::serve_server(server, stream).await {
                 Ok(running) => {
                     let _ = running.waiting().await;
@@ -2391,6 +2428,10 @@ pub async fn run_embed_tick(
                     // build error stays blocked until the setting is set
                     // again or the daemon restarts.
                     Ok(0) => {
+                        // A domain the last walk left to another instance
+                        // is not walked again until its claim is free; one
+                        // claim probe per such domain is all a tick costs.
+                        engine.recheck_contradiction_claims().await;
                         if engine.contradictions_wanted() {
                             engine.request_contradictions();
                         }
@@ -3098,6 +3139,35 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both handshake tokens parse to their gate, the verified one wins when
+    /// both arrive, and a bare line or an unknown option serves everything.
+    #[test]
+    fn the_handshake_options_parse_to_the_harness_gate() {
+        use crate::instance::HarnessGate;
+        let verified = HarnessGate {
+            hook_installed: true,
+            onboarding_verified: true,
+        };
+        let conditional = HarnessGate {
+            hook_installed: true,
+            onboarding_verified: false,
+        };
+        assert_eq!(harness_gate_from_options(&["skills=off"]), verified);
+        assert_eq!(
+            harness_gate_from_options(&["routing=conditional"]),
+            conditional
+        );
+        assert_eq!(
+            harness_gate_from_options(&["routing=conditional", "skills=off"]),
+            verified
+        );
+        assert_eq!(harness_gate_from_options(&[]), HarnessGate::default());
+        assert_eq!(
+            harness_gate_from_options(&["future=1"]),
+            HarnessGate::default()
+        );
+    }
 
     /// The router `run_serve` builds ends an open event stream when the
     /// daemon's shutdown watch flips. Catches `http_service`

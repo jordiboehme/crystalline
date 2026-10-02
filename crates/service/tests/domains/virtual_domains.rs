@@ -1388,6 +1388,272 @@ async fn an_unguarded_virtual_edit_lands_on_a_concurrent_write_on_postgres() {
     b.drop_schema().await.unwrap();
 }
 
+/// The source the split race tests move two bullets out of, with enough left
+/// behind to pass the Q001 minimum.
+#[cfg(feature = "postgres")]
+const SPLIT_SOURCE: &str = "The split body.\n\n- [fact] keep one\n- [fact] keep two\n- [fact] keep three\n- [fact] move one\n- [fact] move two";
+
+/// The one-based line of `needle` in `text`, which is how read_engram reports
+/// an observation.
+#[cfg(feature = "postgres")]
+fn line_of(text: &str, needle: &str) -> usize {
+    text.split('\n').position(|l| l == needle).unwrap() + 1
+}
+
+#[cfg(feature = "postgres")]
+fn split_moving_two(stored: &str, expected_checksum: Option<String>) -> SplitParams {
+    SplitParams {
+        domain: "notes".to_string(),
+        identifier: "source".to_string(),
+        title: "Moved".to_string(),
+        folder: None,
+        observations: vec![
+            line_of(stored, "- [fact] move one"),
+            line_of(stored, "- [fact] move two"),
+        ],
+        sections: Vec::new(),
+        expected_checksum,
+    }
+}
+
+/// Two instances on one Postgres schema, an engine on A with the split source
+/// written, and B's handle on the stored row.
+#[cfg(feature = "postgres")]
+async fn split_race_setup(
+    url: &str,
+    schema: &str,
+) -> (
+    Arc<Engine>,
+    crystalline_index::PostgresStore,
+    crystalline_index::DomainId,
+    crystalline_index::StoredEngram,
+) {
+    let a = crystalline_index::PostgresStore::open_in_schema(url, schema)
+        .await
+        .unwrap();
+    let b = crystalline_index::PostgresStore::open_in_schema(url, schema)
+        .await
+        .unwrap();
+    let engine = Arc::new(virtual_engine(Arc::new(Mutex::new(a))));
+    engine
+        .write_engram(&write_params("Source", SPLIT_SOURCE))
+        .await
+        .unwrap();
+    let domain = b.domain_id("notes").await.unwrap().unwrap();
+    let row = b.all_engram_contents(domain).await.unwrap().remove(0);
+    (engine, b, domain, row)
+}
+
+/// B holds an uncommitted write that appends an unrelated line while A's
+/// split runs without a checksum: the split re-plans against B's text, finds
+/// the lines it moves unchanged and lands on top of it.
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn an_unguarded_split_lands_on_a_concurrent_write_on_postgres() {
+    let Some(url) = pg_url() else {
+        return;
+    };
+    let schema = unique_schema();
+    let (engine, b, domain, row) = split_race_setup(&url, &schema).await;
+
+    let from_b = format!("{}- [fact] from b\n", row.content);
+    b.begin().await.unwrap();
+    b.upsert_engram(domain, &rewritten(&row.path, &from_b))
+        .await
+        .unwrap();
+    let split = {
+        let engine = Arc::clone(&engine);
+        let p = split_moving_two(&row.content, None);
+        tokio::spawn(async move { engine.split_engram(&p).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!split.is_finished(), "A waits for B's row lock");
+    b.commit().await.unwrap();
+    let receipt = split
+        .await
+        .unwrap()
+        .expect("an unguarded split is last-write-wins");
+    let new_permalink = receipt["new"]["permalink"].as_str().unwrap().to_string();
+
+    let stored = b.engram_content(domain, &row.path).await.unwrap().unwrap();
+    assert!(stored.contains("- [fact] from b"), "{stored}");
+    assert!(
+        stored.contains(&format!("- split_into [[{new_permalink}]]")),
+        "{stored}"
+    );
+    assert!(!stored.contains("move one"), "{stored}");
+    let new_path = receipt["new"]["path"].as_str().unwrap();
+    let new = b.engram_content(domain, new_path).await.unwrap().unwrap();
+    assert!(
+        new.contains("- [fact] move one") && new.contains("- [fact] move two"),
+        "{new}"
+    );
+
+    b.drop_schema().await.unwrap();
+}
+
+/// B edits one of the bullets A's unguarded split moves: the split's re-plan
+/// sees the moved text changed, refuses, and takes its new engram back out.
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn an_unguarded_split_whose_moved_lines_changed_is_refused_and_takes_its_engram_back() {
+    let Some(url) = pg_url() else {
+        return;
+    };
+    let schema = unique_schema();
+    let (engine, b, domain, row) = split_race_setup(&url, &schema).await;
+
+    let from_b = row
+        .content
+        .replace("- [fact] move one", "- [fact] move one, changed by b");
+    b.begin().await.unwrap();
+    b.upsert_engram(domain, &rewritten(&row.path, &from_b))
+        .await
+        .unwrap();
+    let split = {
+        let engine = Arc::clone(&engine);
+        let p = split_moving_two(&row.content, None);
+        tokio::spawn(async move { engine.split_engram(&p).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!split.is_finished(), "A waits for B's row lock");
+    b.commit().await.unwrap();
+    let err = split
+        .await
+        .unwrap()
+        .expect_err("the moved lines changed under the split");
+    assert!(
+        matches!(&err, EngineError::Conflict(m) if m.contains("the lines this split moves changed")),
+        "{err}"
+    );
+
+    let rows = b.all_engram_contents(domain).await.unwrap();
+    assert_eq!(rows.len(), 1, "the new engram is taken back out");
+    let stored = b.engram_content(domain, &row.path).await.unwrap().unwrap();
+    assert_eq!(stored, from_b);
+
+    b.drop_schema().await.unwrap();
+}
+
+/// With the checksum of the text A read, B's unrelated append refuses A's
+/// split as a stale edit, as it always did.
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn a_guarded_split_is_still_refused_on_any_change() {
+    let Some(url) = pg_url() else {
+        return;
+    };
+    let schema = unique_schema();
+    let (engine, b, domain, row) = split_race_setup(&url, &schema).await;
+
+    let from_b = format!("{}- [fact] from b\n", row.content);
+    b.begin().await.unwrap();
+    b.upsert_engram(domain, &rewritten(&row.path, &from_b))
+        .await
+        .unwrap();
+    let split = {
+        let engine = Arc::clone(&engine);
+        let p = split_moving_two(&row.content, Some(sha_hex(&row.content)));
+        tokio::spawn(async move { engine.split_engram(&p).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!split.is_finished(), "A waits for B's row lock");
+    b.commit().await.unwrap();
+    let err = split
+        .await
+        .unwrap()
+        .expect_err("a guarded split refuses the race");
+    assert!(matches!(err, EngineError::Conflict(_)), "{err}");
+
+    let rows = b.all_engram_contents(domain).await.unwrap();
+    assert_eq!(rows.len(), 1, "the new engram is taken back out");
+    let stored = b.engram_content(domain, &row.path).await.unwrap().unwrap();
+    assert_eq!(stored, from_b);
+
+    b.drop_schema().await.unwrap();
+}
+
+/// A CRLF source whose split moves a section followed by a blank line, the
+/// shape whose trailing blank line survives as a lone `\r` when the plan is
+/// made on the raw bytes. Both an unguarded and a guarded split land.
+async fn crlf_section_split(store: Arc<Mutex<dyn Store>>) {
+    let engine = virtual_engine(Arc::clone(&store));
+    engine
+        .write_engram(&write_params(
+            "Crlf Source",
+            "The crlf body.\n\n- [fact] keep one\n- [fact] keep two\n- [fact] keep three\n\n## Sec\n\n- [fact] sec one\n\n## Other\n\n- [fact] other one\n\n## Tail\n\n- [fact] tail one",
+        ))
+        .await
+        .unwrap();
+    let domain = store
+        .lock()
+        .await
+        .domain_id("notes")
+        .await
+        .unwrap()
+        .unwrap();
+    // Stores the source again as CRLF bytes and hands back their checksum.
+    let as_crlf = || async {
+        let store = store.lock().await;
+        let row = store
+            .all_engram_contents(domain)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.path == "crlf-source.md")
+            .unwrap();
+        let crlf = row.content.replace("\r\n", "\n").replace('\n', "\r\n");
+        store
+            .upsert_engram(domain, &rewritten(&row.path, &crlf))
+            .await
+            .unwrap();
+        sha_hex(&crlf)
+    };
+    let split = |section: &str, title: &str, expected_checksum: Option<String>| SplitParams {
+        domain: "notes".to_string(),
+        identifier: "crlf-source".to_string(),
+        title: title.to_string(),
+        folder: None,
+        observations: Vec::new(),
+        sections: vec![section.to_string()],
+        expected_checksum,
+    };
+
+    as_crlf().await;
+    engine
+        .split_engram(&split("## Sec", "Sec Moved", None))
+        .await
+        .expect("an unguarded split of a CRLF section lands");
+    let sum = as_crlf().await;
+    engine
+        .split_engram(&split("## Tail", "Tail Moved", Some(sum)))
+        .await
+        .expect("a guarded split of a CRLF section lands");
+
+    let store = store.lock().await;
+    let rows = store.all_engram_contents(domain).await.unwrap();
+    let text = |path: &str| {
+        rows.iter()
+            .find(|r| r.path == path)
+            .unwrap_or_else(|| panic!("no {path}"))
+            .content
+            .clone()
+    };
+    let source = text("crlf-source.md");
+    assert!(
+        !source.contains("sec one") && !source.contains("tail one"),
+        "{source}"
+    );
+    assert!(source.contains("- [fact] other one"), "{source}");
+    assert!(text("sec-moved.md").contains("- [fact] sec one"));
+    assert!(text("tail-moved.md").contains("- [fact] tail one"));
+}
+
+both_backends!(
+    a_crlf_section_split_lands_guarded_or_not,
+    crlf_section_split
+);
+
 /// Turso has no second writer to race with, so what applies there is the
 /// sequential half: an unguarded edit lands on whatever is stored, and a
 /// guarded one against text that moved on is refused.
@@ -1441,4 +1707,103 @@ async fn unguarded_and_guarded_virtual_edits_on_turso() {
         "{stored}"
     );
     assert!(!stored.contains("guarded a"), "{stored}");
+}
+
+/// Stage a virtual domain as an older parser left it: the wrapped bullet's
+/// observation is a fragment without its tag, the stamp is generation 0 and
+/// the stored document is untouched.
+async fn stage_old_parse(store: &Arc<Mutex<dyn Store>>) -> crystalline_index::DomainId {
+    let store = store.lock().await;
+    let domain = store.domain_id("notes").await.unwrap().unwrap();
+    let rows = store.all_engram_contents(domain).await.unwrap();
+    let row = rows.iter().find(|r| r.content.contains("#purge")).unwrap();
+    let stamp = store.file_stamps(domain).await.unwrap()[&row.path].clone();
+    let engram = crystalline_core::parse_engram(&row.content).unwrap();
+    let mut record = crystalline_index::EngramRecord::from_engram(&engram, &row.path, stamp);
+    record.content = row.content.clone();
+    let obs = record
+        .observations
+        .iter_mut()
+        .find(|o| o.tags.contains(&"purge".to_string()))
+        .expect("the wrapped bullet carries #purge");
+    obs.content = "the purge runs before every mix swap,".to_string();
+    obs.tags.clear();
+    store.upsert_engram(domain, &record).await.unwrap();
+    store.set_parse_generation(domain, 0).await.unwrap();
+    domain
+}
+
+async fn purge_count(store: &Arc<Mutex<dyn Store>>) -> i64 {
+    store
+        .lock()
+        .await
+        .vocabulary(Some("notes"), None)
+        .await
+        .unwrap()
+        .tags
+        .iter()
+        .find(|t| t.name == "purge")
+        .map(|t| t.observations)
+        .unwrap_or(0)
+}
+
+/// Write the wrapped bullet through a writable engine, stage it as an older
+/// parser left it, then run the startup sync of a read-only engine over the
+/// same store. Returns the stamp and the purge count after it.
+async fn read_only_sync_over_old_parse(store: Arc<Mutex<dyn Store>>) -> (u32, i64) {
+    virtual_engine(store.clone())
+        .write_engram(&write_params(
+            "Purge",
+            "The purge rules.\n\n- [fact] the purge runs before every mix swap,\n  which is why the swap waits for night #purge\n",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(purge_count(&store).await, 1);
+    let domain = stage_old_parse(&store).await;
+    assert_eq!(purge_count(&store).await, 0);
+    virtual_engine(store.clone())
+        .with_read_only(true)
+        .sync(None)
+        .await
+        .unwrap();
+    let generation = store.lock().await.parse_generation(domain).await.unwrap();
+    (generation, purge_count(&store).await)
+}
+
+/// Decision D3: a read-only instance on a shared database leaves the reparse
+/// of a virtual domain to a writable instance, so the stamp and the rows stay.
+#[cfg(feature = "postgres")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_read_only_instance_on_a_shared_database_does_not_reparse_virtual_domains() {
+    let Some(url) = pg_url() else {
+        return;
+    };
+    let schema = unique_schema();
+    let pg = crystalline_index::PostgresStore::open_in_schema(&url, &schema)
+        .await
+        .unwrap();
+    let store: Arc<Mutex<dyn Store>> = Arc::new(Mutex::new(pg));
+    let (generation, purge) = read_only_sync_over_old_parse(store.clone()).await;
+    assert_eq!(generation, 0, "the generation stays where it was");
+    assert_eq!(purge, 0, "the rows are unchanged");
+
+    // A writable instance of the same database does the reparse.
+    virtual_engine(store.clone()).sync(None).await.unwrap();
+    assert_eq!(purge_count(&store).await, 1);
+
+    drop(store);
+    let cleanup = crystalline_index::PostgresStore::open_in_schema(&url, &schema)
+        .await
+        .unwrap();
+    cleanup.drop_schema().await.unwrap();
+}
+
+/// The twin: a read-only instance on its own index reparses as before.
+#[tokio::test]
+async fn a_read_only_instance_on_its_own_index_still_reparses() {
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let store: Arc<Mutex<dyn Store>> = Arc::new(Mutex::new(store));
+    let (generation, purge) = read_only_sync_over_old_parse(store).await;
+    assert_eq!(generation, crystalline_core::PARSE_GENERATION);
+    assert_eq!(purge, 1);
 }

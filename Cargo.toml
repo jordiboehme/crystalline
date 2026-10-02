@@ -12,10 +12,10 @@ members = [
 ]
 
 [workspace.package]
-version = "0.22.0"
+version = "0.22.1"
 authors = ["Jordi Böhme <jordi@boehme-lopez.de>"]
 edition = "2024"
-license = "AGPL-3.0-or-later"
+license = "MPL-2.0"
 rust-version = "1.99"
 repository = "https://github.com/jordiboehme/crystalline"
 
@@ -74,6 +74,11 @@ sha2 = "0.11.0"
 chrono = "0.4.45"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+# The span-preserving JSONC editor install uses on harness files it shares
+# with the person (crates/core/src/jsonc_edit.rs). `cst` gives the concrete
+# syntax tree that keeps comments and formatting; `preserve_order` stays off,
+# so nothing here can switch serde_json's map type on the whole workspace.
+jsonc-parser = { version = "0.34.0", default-features = false, features = ["cst", "serde_json"] }
 indexmap = "2.14.2"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "json"] }
 fs4 = "1.1.0"

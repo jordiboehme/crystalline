@@ -56,9 +56,10 @@
 //! **Over HTTP that block names no domain.** `get_info` is synchronous and rmcp
 //! calls it with no request context, so the legacy handshake cannot know who is
 //! connecting and cannot leave a private domain out of a per-caller block;
-//! there it renders [`crate::engine::Engine::routing_text_counted`] instead -
-//! every behavior rule, the count of registered domains, and the pointer at
-//! `list_domains`, which does resolve a caller and does filter. Stdio keeps the
+//! there `initialize` renders [`crate::engine::Engine::routing_text_counted`]
+//! instead - every behavior rule, the count of the domains that are not
+//! private, and the pointer at `list_domains`, which does resolve a caller and
+//! does filter. Stdio keeps the
 //! whole block, because a local session is the machine owner. Every channel
 //! that *does* carry a request context is scoped per caller instead:
 //! `server/discover` through [`McpServer::arrival_info_scoped`], the
@@ -174,7 +175,7 @@
 //! `configure` flipping `github.enabled` moves the tool list, because the six
 //! GitHub-gated collaboration tools are listed only while it is on. That is
 //! the single mover on this server: `resources/list` and `prompts/list` read
-//! `skills.serve` and `harness_onboarded`, both fixed before the first request
+//! `skills.serve` and the harness gate, both fixed before the first request
 //! arrives, and the provisioning gate that `add_domain` and `update_domain`
 //! could once move became a call-time refusal instead.
 //!
@@ -829,7 +830,7 @@ fn skill_names() -> String {
         .join(", ")
 }
 
-/// The five skill resource uris, comma separated, for the same reason.
+/// The six skill resource uris, comma separated, for the same reason.
 fn skill_uris() -> String {
     SKILL_ASSETS
         .iter()
@@ -857,12 +858,13 @@ const ATTACHMENT_TEMPLATE_DESCRIPTION: &str = "A file attachment a human added t
 ///
 /// - `true`: never hidden.
 /// - `false`: always hidden.
-/// - `auto`: served.
+/// - `auto`: served, unless the harness that spawned this process has its
+///   session hook installed **and** its onboarding verified.
 ///
 /// Both inputs are fixed before this server exists, which is what makes the
 /// gate legal on a listing at all. `skills_serve` is the effective setting
 /// snapshotted at engine construction ([`Engine::skills_serve`]);
-/// `harness_onboarded` is [`McpServer::with_onboarded_harness`], resolved by
+/// `gate` is [`McpServer::with_harness_gate`], resolved by
 /// the `crystalline mcp` process from its own `--harness` argument plus this
 /// machine's install receipt before the session starts.
 ///
@@ -875,38 +877,94 @@ const ATTACHMENT_TEMPLATE_DESCRIPTION: &str = "A file attachment a human added t
 /// the five skills on disk and is onboarded by its own session hook, so
 /// serving them again spends the tokens twice.
 ///
-/// An HTTP session never sets `harness_onboarded`: one daemon serves every
-/// HTTP client, a remote client never ran `crystalline install` here, and a
-/// remote client is exactly who the served surface exists for.
+/// **A hook in the receipt is not enough.** The surface is hidden only when
+/// the harness's onboarding is verified too: until a live check confirmed that
+/// the harness loads the shipped skills as files, hiding them could leave it
+/// with no way to reach them. A hook that is installed but unverified still
+/// shrinks the instructions (see [`instructions_variant`]); it never hides
+/// the surface.
+///
+/// An HTTP session never sets the gate: one daemon serves every HTTP client,
+/// a remote client never ran `crystalline install` here, and a remote client
+/// is exactly who the served surface exists for.
 ///
 /// Hidden means hidden, not disabled: the lists come back empty while the
 /// tool, the resources and the prompts all keep answering a direct call.
 /// Read-only mode is not part of it either: reading a skill is a read.
-fn hidden_skills_surface(skills_serve: SkillsServe, harness_onboarded: bool) -> bool {
+fn hidden_skills_surface(skills_serve: SkillsServe, gate: HarnessGate) -> bool {
     match skills_serve {
         SkillsServe::Always => false,
         SkillsServe::Never => true,
-        SkillsServe::Auto => harness_onboarded,
+        SkillsServe::Auto => gate.hook_installed && gate.onboarding_verified,
     }
 }
 
-/// Whether this server hands out the minimal `instructions` block instead of
-/// the full routing block: only under `auto`, and only when the harness that
-/// spawned this process is one whose own session hook has already delivered
-/// the full block.
+/// What one `resolve_conflict` resolution keeps: `mine` or `theirs` by name,
+/// or `merged` with the caller's content. Invalid params for `merged` without
+/// content and for any other word.
+fn resolution_parts<'a>(
+    resolution: &str,
+    content: Option<&'a str>,
+) -> Result<(Option<&'static str>, Option<&'a [u8]>), ErrorData> {
+    match resolution {
+        RESOLUTION_MINE => Ok((Some(RESOLUTION_MINE), None)),
+        RESOLUTION_THEIRS => Ok((Some(RESOLUTION_THEIRS), None)),
+        RESOLUTION_MERGED => match content {
+            Some(content) => Ok((None, Some(content.as_bytes()))),
+            None => Err(ErrorData::invalid_params(
+                format!("resolve_conflict requires content when resolution is {RESOLUTION_MERGED}"),
+                None,
+            )),
+        },
+        other => Err(ErrorData::invalid_params(
+            format!(
+                "resolve_conflict resolution must be {RESOLUTION_MINE}, {RESOLUTION_THEIRS} or {RESOLUTION_MERGED}, got '{other}'"
+            ),
+            None,
+        )),
+    }
+}
+
+/// Which `instructions` block this server hands out on arrival.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstructionsVariant {
+    /// The whole routing block.
+    Full,
+    /// The header plus the pointer that says the session hook has already
+    /// delivered the block ([`crystalline_core::render_minimal_instructions`]).
+    Minimal,
+    /// The header plus the pointer that asks the agent to fetch the block when
+    /// it is not already in its context
+    /// ([`crystalline_core::prompt::render_conditional_minimal_instructions`]).
+    Conditional,
+}
+
+/// Which `instructions` block this server hands out: the short ones only
+/// under `auto`, and only when the harness that spawned this process has its
+/// session hook installed. A verified harness gets [`InstructionsVariant::Minimal`]
+/// (its hook is known to have delivered the full block); a hook that is
+/// installed but unverified gets [`InstructionsVariant::Conditional`], which
+/// does not claim what nobody has checked.
 ///
 /// The same two inputs as [`hidden_skills_surface`], deliberately: the surface
 /// and the instructions used to diverge (the surface keyed on the client's
 /// name, then stopped), and one input for both is what makes the two eras
 /// converge rather than split - a legacy peer reading `initialize` and a
-/// modern peer reading `server/discover` are told the same thing.
+/// modern peer reading `server/discover` are told the same thing. Under
+/// `auto` the surface is hidden exactly when the variant is `Minimal`.
 ///
 /// `skills.serve = false` deliberately does not shrink the instructions. That
 /// setting gates serving skills, not onboarding: an operator who turns the
 /// skill surface off still wants a connecting agent to learn which domains
 /// exist.
-fn minimal_instructions(skills_serve: SkillsServe, harness_onboarded: bool) -> bool {
-    skills_serve == SkillsServe::Auto && harness_onboarded
+fn instructions_variant(skills_serve: SkillsServe, gate: HarnessGate) -> InstructionsVariant {
+    if skills_serve != SkillsServe::Auto || !gate.hook_installed {
+        InstructionsVariant::Full
+    } else if gate.onboarding_verified {
+        InstructionsVariant::Minimal
+    } else {
+        InstructionsVariant::Conditional
+    }
 }
 
 /// Whether collaboration tool `name` is hidden, given the engine's `read_only`
@@ -976,6 +1034,9 @@ use crate::engine::{
     ACTOR_MAX_CHARS, AckIntent, ConfigureAction, Engine, EngineError, LiveWriteTarget,
     OVERLAY_NEEDS_IDENTITY, PreviewCredential, ProvisionAction, ShareActor, sanitize_actor,
 };
+/// The two facts the `crystalline mcp` process resolved about its harness,
+/// re-exported here because [`McpServer::with_harness_gate`] takes one.
+pub use crate::instance::HarnessGate;
 use crate::params::*;
 use crate::scope::member_level_word;
 use crate::scope::{DomainRight, Scope};
@@ -1339,7 +1400,7 @@ pub enum Transport {
 /// install-receipt match used to live here as an `AtomicBool` set from the
 /// client's own `initialize` name, which is the per-connection variation
 /// SEP-2567 forbids. What is here instead was decided before the connection
-/// existed: see `harness_onboarded`.
+/// existed: see `McpServer::gate`.
 /// The draft joins one MCP server object opened, and the thing that ends them.
 ///
 /// **A join belongs to a HOLDER, never to an account** (see [`crate::join`]),
@@ -1439,25 +1500,27 @@ static NEXT_SERVER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// install-receipt match used to live here as an `AtomicBool` set from the
 /// client's own `initialize` name, which is the per-connection variation
 /// SEP-2567 forbids. What is here instead was decided before the connection
-/// existed: see `harness_onboarded`.
+/// existed: see `McpServer::gate`.
 #[derive(Clone)]
 pub struct McpServer {
     engine: Arc<Engine>,
     transport: Transport,
-    /// Whether the harness that spawned the serving process already has the
-    /// shipped skills on disk and onboards itself at session start.
+    /// Whether the harness that spawned the serving process has Crystalline's
+    /// session hook installed, and whether its onboarding (the hook's routing
+    /// block and the shipped skills as files) is verified. See [`HarnessGate`].
     ///
     /// **Resolved before the session starts and constant for this server's
     /// life.** The `crystalline mcp` process reads its own `--harness`
     /// argument (written into the harness's MCP registration by `crystalline
-    /// install`) and asks this machine's install receipt whether that harness
-    /// has session hooks wired. Neither input is the client's identity: one is
-    /// deployment configuration, the other is machine state. False everywhere
-    /// it cannot be known - HTTP, a registration predating the flag, an
-    /// unrecognized harness id, a missing receipt - which serves the surface,
+    /// install`), asks this machine's install receipt whether that harness
+    /// has session hooks wired and reads the harness's profile flag. Neither
+    /// input is the client's identity: one is deployment configuration, the
+    /// other is machine state. It is the default gate everywhere it cannot be
+    /// known (HTTP, a registration predating the flag, an unrecognized harness
+    /// id, a missing receipt), which serves the surface and the full instructions,
     /// the safe direction (an over-served client pays duplicated context, an
     /// under-served one loses onboarding it cannot rediscover).
-    harness_onboarded: bool,
+    gate: HarnessGate,
     /// The drafts this server object joined by presenting a share-link, and
     /// the handle whose last clone ends them. See [`SessionJoins`].
     joins: Arc<SessionJoins>,
@@ -1489,7 +1552,7 @@ impl McpServer {
         McpServer {
             engine,
             transport,
-            harness_onboarded: false,
+            gate: HarnessGate::default(),
             joins,
             server: NEXT_SERVER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             sessions: None,
@@ -1737,14 +1800,24 @@ impl McpServer {
         None
     }
 
-    /// Record that the harness this process serves is already onboarded (see
-    /// the field). Set by the two stdio paths from the resolved answer the
-    /// `crystalline mcp` process computed at startup: the embedded stack
-    /// directly, the daemon relay from the value the bridge writes on its
+    /// Record what the harness this process serves already does for itself
+    /// (see the field). Set by the two stdio paths from the gate the
+    /// `crystalline mcp` process resolved at startup: the embedded stack
+    /// directly, the daemon relay from the token the bridge writes on its
     /// handshake line. Never set on the HTTP path.
-    pub fn with_onboarded_harness(mut self, onboarded: bool) -> McpServer {
-        self.harness_onboarded = onboarded;
+    pub fn with_harness_gate(mut self, gate: HarnessGate) -> McpServer {
+        self.gate = gate;
         self
+    }
+
+    /// [`McpServer::with_harness_gate`] for a fully onboarded harness or none:
+    /// `true` is the verified gate (hook installed and onboarding verified),
+    /// `false` the default gate.
+    pub fn with_onboarded_harness(self, onboarded: bool) -> McpServer {
+        self.with_harness_gate(HarnessGate {
+            hook_installed: onboarded,
+            onboarding_verified: onboarded,
+        })
     }
 
     /// Who this call is acting as, as the one value every scoped verb on this
@@ -1993,8 +2066,12 @@ impl McpServer {
         mut result: CallToolResult,
         ctx: &RequestContext<RoleServer>,
     ) -> CallToolResult {
-        let Some(trailer) =
-            crate::nudge::write_verb_trailer(&self.engine, mcp_account(ctx).as_deref()).await
+        let Some(trailer) = crate::nudge::write_verb_trailer(
+            &self.engine,
+            mcp_account(ctx).as_deref(),
+            &self.scope_of(ctx),
+        )
+        .await
         else {
             return result;
         };
@@ -2995,13 +3072,20 @@ impl McpServer {
         if refused_collab_tool("share_changes", self.engine.github_enabled()) {
             return refuse(RemoteError::NotEnabled.to_string()).map(CallToolResponse::from);
         }
+        // Read-only first: it does not depend on the name, so it answers the
+        // same for every domain, and it comes before the name check below.
+        if self.engine.read_only() {
+            return Err(to_error(EngineError::ReadOnly));
+        }
         // A named domain this caller may not see is refused as an unregistered
-        // one, before the preview names a single file of it. A read gate rather
-        // than a write one: what may be shared is `github.share_identity`'s
-        // question and answered further in, and the narrow form so a domain
-        // that is merely unregistered keeps the answer it always had.
+        // one, before the preview names a single file of it, and an
+        // unregistered name is refused right here too, with the visible set:
+        // further in, an unscoped lookup would list every registered domain,
+        // private ones included. A read gate rather than a write one: what may
+        // be shared is `github.share_identity`'s question and answered further
+        // in.
         self.engine
-            .refuse_hidden_domain(&p.domain, &self.scope_of(&ctx))
+            .require_domain(&p.domain, &self.scope_of(&ctx))
             .await
             .map_err(to_error)?;
         if confirmation_supported(&ctx) {
@@ -3091,7 +3175,7 @@ impl McpServer {
         }
         if let Some(domain) = p.domain.as_deref() {
             self.engine
-                .refuse_hidden_domain(domain, &self.scope_of(&ctx))
+                .require_domain(domain, &self.scope_of(&ctx))
                 .await
                 .map_err(to_error)?;
         }
@@ -3122,7 +3206,7 @@ impl McpServer {
         }
         if let Some(domain) = p.domain.as_deref() {
             self.engine
-                .refuse_hidden_domain(domain, &self.scope_of(&ctx))
+                .require_domain(domain, &self.scope_of(&ctx))
                 .await
                 .map_err(to_error)?;
         }
@@ -3155,10 +3239,20 @@ impl McpServer {
         if refused_collab_tool("resolve_conflict", self.engine.github_enabled()) {
             return refuse(RemoteError::NotEnabled.to_string()).map(CallToolResponse::from);
         }
+        // Read-only first: it does not depend on the name, so it answers the
+        // same for every domain, and it comes before the name check below.
+        if self.engine.read_only() {
+            return Err(to_error(EngineError::ReadOnly));
+        }
+        // A malformed explicit resolution is refused first: that check does not
+        // depend on the name, so it answers the same for every domain.
+        if let Some(resolution) = p.resolution.as_deref() {
+            resolution_parts(resolution, p.content.as_deref())?;
+        }
         // Before the question, so a conflict preview never shows both sides of
         // an engram in a domain this caller may not see.
         self.engine
-            .refuse_hidden_domain(&p.domain, &self.scope_of(&ctx))
+            .require_domain(&p.domain, &self.scope_of(&ctx))
             .await
             .map_err(to_error)?;
         // Three ways to arrive at a resolution, and the arm order is the
@@ -3183,29 +3277,7 @@ impl McpServer {
             },
             None => return refuse(RESOLVE_NEEDS_RESOLUTION).map(CallToolResponse::from),
         };
-        let (keep, content): (Option<&str>, Option<&[u8]>) = match resolution.as_str() {
-            RESOLUTION_MINE => (Some(RESOLUTION_MINE), None),
-            RESOLUTION_THEIRS => (Some(RESOLUTION_THEIRS), None),
-            RESOLUTION_MERGED => {
-                let Some(content) = p.content.as_deref() else {
-                    return Err(ErrorData::invalid_params(
-                        format!(
-                            "resolve_conflict requires content when resolution is {RESOLUTION_MERGED}"
-                        ),
-                        None,
-                    ));
-                };
-                (None, Some(content.as_bytes()))
-            }
-            other => {
-                return Err(ErrorData::invalid_params(
-                    format!(
-                        "resolve_conflict resolution must be {RESOLUTION_MINE}, {RESOLUTION_THEIRS} or {RESOLUTION_MERGED}, got '{other}'"
-                    ),
-                    None,
-                ));
-            }
-        };
+        let (keep, content) = resolution_parts(&resolution, p.content.as_deref())?;
         // The same teaching refusal a share answers: settling a conflict in a
         // reviewing domain settles it in somebody's draft, so an agent with no
         // identity is told how to get one rather than handed a protocol error.
@@ -3240,9 +3312,14 @@ impl McpServer {
         if refused_collab_tool("withdraw_proposal", self.engine.github_enabled()) {
             return refuse(RemoteError::NotEnabled.to_string()).map(CallToolResponse::from);
         }
+        // Read-only first: it does not depend on the name, so it answers the
+        // same for every domain, and it comes before the name check below.
+        if self.engine.read_only() {
+            return Err(to_error(EngineError::ReadOnly));
+        }
         // Before the preview, for the reason `resolve_conflict` states.
         self.engine
-            .refuse_hidden_domain(&p.domain, &self.scope_of(&ctx))
+            .require_domain(&p.domain, &self.scope_of(&ctx))
             .await
             .map_err(to_error)?;
         let revert = p.revert.unwrap_or(false);
@@ -3317,7 +3394,7 @@ impl McpServer {
             return Err(to_error(EngineError::ReadOnly));
         }
         self.engine
-            .refuse_hidden_domain(&p.domain, &self.scope_of(&ctx))
+            .require_domain(&p.domain, &self.scope_of(&ctx))
             .await
             .map_err(to_error)?;
         let actor = self.share_actor(&ctx);
@@ -3409,13 +3486,6 @@ impl McpServer {
                         None,
                     ));
                 };
-                // Deciding about a domain is a way of asking whether it
-                // exists, so a domain this caller may not see is refused as an
-                // unregistered one first.
-                self.engine
-                    .refuse_hidden_domain(&domain, &self.scope_of(&ctx))
-                    .await
-                    .map_err(to_error)?;
                 if p.action == "allow" {
                     ProvisionAction::Allow { domain }
                 } else {
@@ -3458,6 +3528,16 @@ impl McpServer {
         if refused_provision_action(&action, self.engine.provisioning_declared()) {
             return refuse(PROVISION_NOT_DECLARED);
         }
+        // Only now the name. Deciding about a domain is a way of asking whether
+        // it exists, so every check above answers the same whatever name was
+        // passed, and here a domain this caller may not see is refused with
+        // exactly the bytes an unregistered name gets.
+        if let ProvisionAction::Allow { domain } | ProvisionAction::Deny { domain } = &action {
+            self.engine
+                .require_domain(domain, &self.scope_of(&ctx))
+                .await
+                .map_err(to_error)?;
+        }
         self.engine
             .provision(&action, &self.scope_of(&ctx))
             .await
@@ -3468,7 +3548,7 @@ impl McpServer {
     #[tool(
         name = "skills",
         title = "Skills",
-        description = "List the agent skills this server ships and read any skill's full SKILL.md playbook: how to route, capture, model schemas and collaborate well with Crystalline. Call with no arguments for the index of names and descriptions; pass name to read one skill before its kind of task.",
+        description = "List the agent skills this server ships and read any skill's full SKILL.md playbook: how to route, capture, model schemas, collaborate and provision tools well with Crystalline. Call with no arguments for the index of names and descriptions; pass name to read one skill before its kind of task.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -3568,17 +3648,26 @@ impl McpServer {
     /// this, which is what the per-era arrival test in
     /// `tests/mcp/mcp_instructions.rs` pins.
     ///
-    /// When [`minimal_instructions`] says so, the full routing prose is
+    /// When [`instructions_variant`] says so, the full routing prose is
     /// replaced by the header plus a pointer: the harness that spawned this
     /// process delivers the block itself at session start, so repeating it
-    /// would spend the tokens twice. The TOON note is appended all the same -
-    /// no hook carries it, it describes this connection's wire format rather
-    /// than the knowledge, and a client that cannot read a tool result is
-    /// worse off than one that read the routing block twice.
+    /// would spend the tokens twice. A verified harness gets the minimal
+    /// pointer; a hook that is installed but unverified gets the conditional
+    /// one, which asks the agent to fetch the block when it is missing. The
+    /// TOON note is appended all the same - no hook carries it, it describes
+    /// this connection's wire format rather than the knowledge, and a client
+    /// that cannot read a tool result is worse off than one that read the
+    /// routing block twice.
     fn arrival_info(&self) -> ServerConfig {
         let mut info = self.get_info();
-        if minimal_instructions(self.engine.skills_serve(), self.harness_onboarded) {
-            let mut instructions = crystalline_core::render_minimal_instructions();
+        let short = match instructions_variant(self.engine.skills_serve(), self.gate) {
+            InstructionsVariant::Full => None,
+            InstructionsVariant::Minimal => Some(crystalline_core::render_minimal_instructions()),
+            InstructionsVariant::Conditional => {
+                Some(crystalline_core::prompt::render_conditional_minimal_instructions())
+            }
+        };
+        if let Some(mut instructions) = short {
             if self.engine.response_format() == ResponseFormat::Toon {
                 instructions.push_str(TOON_INSTRUCTIONS_NOTE);
             }
@@ -3602,7 +3691,8 @@ impl McpServer {
     /// what this exists to prevent, and a client that gets an error re-asks.
     async fn arrival_info_scoped(&self, scope: &Scope) -> Result<ServerConfig, ErrorData> {
         let mut info = self.arrival_info();
-        if minimal_instructions(self.engine.skills_serve(), self.harness_onboarded) {
+        if instructions_variant(self.engine.skills_serve(), self.gate) != InstructionsVariant::Full
+        {
             return Ok(info);
         }
         let mut instructions = self
@@ -3817,22 +3907,27 @@ impl ServerHandler for McpServer {
         // `ServerConfig::default()` would leave rmcp's own `ProtocolVersion::
         // LATEST` here, which moves when the crate does.
         info.protocol_version = newest_legacy_handshake_version();
-        // **Which block, and why the transport decides it.** This method is
-        // synchronous and rmcp hands it no request context, so an HTTP server
-        // answering `initialize` has no caller to resolve and no way to leave a
-        // private domain's bullets out of a per-caller block. Naming every
-        // registered domain to whoever opened a session is what a private
-        // domain is not, so HTTP gets the countable half - every behavior rule,
-        // the number of domains, and the pointer at `list_domains`, which does
-        // resolve a caller and does filter. Stdio keeps the full block: that
-        // caller is the machine owner and has the files already.
+        // **Which block, and why the transport decides it.** Stdio keeps the
+        // full block, which names and counts every domain: that caller is the
+        // machine owner and has the files already.
+        //
+        // Over HTTP the `initialize` handshake has no caller to resolve, so it
+        // cannot leave a private domain's bullets out of a per-caller block. It
+        // gets the countable half instead - every behavior rule, the number of
+        // domains that are not private, and the pointer at `list_domains`,
+        // which does resolve a caller and does filter. Leaving the private
+        // domains out of the count needs the accounts database, which this
+        // synchronous method cannot read, so [`McpServer::initialize`] puts
+        // that block in. What stands here is the conditional pointer, which
+        // names and counts nothing: it is what an HTTP peer gets if the
+        // private set cannot be read, never a count that includes it.
         //
         // The era's own instructions channel does not go through here at all
         // ([`McpServer::discover`] carries a request context and is scoped);
         // this is the legacy lifecycle only.
         let mut instructions = match self.transport {
             Transport::Stdio => self.engine.routing_text(),
-            Transport::Http => self.engine.routing_text_counted(),
+            Transport::Http => crystalline_core::prompt::render_conditional_minimal_instructions(),
         };
         if self.engine.response_format() == ResponseFormat::Toon {
             instructions.push_str(TOON_INSTRUCTIONS_NOTE);
@@ -3876,7 +3971,7 @@ impl ServerHandler for McpServer {
     /// only point at which the instructions could depend on the client, so the
     /// receipt match lived here; that is exactly what SEP-2567's
     /// per-connection prohibition forbids, and the decision moved to the
-    /// spawned process (see `McpServer::harness_onboarded`). What survives is
+    /// spawned process (see `McpServer::gate`). What survives is
     /// what rmcp's own default does: publishing the peer info, which is what
     /// `acting_actor` and every `generated.by` write read afterwards, and the
     /// version echo.
@@ -3965,6 +4060,27 @@ impl ServerHandler for McpServer {
         context.peer.set_peer_info(request);
 
         let mut info = self.arrival_info();
+        // The HTTP routing block, counted over the domains that are not
+        // private (see [`Engine::routing_text_counted`]). Only when the
+        // deployment's onboarding decision left the full block in place; a
+        // private set that cannot be read keeps `get_info`'s pointer, which
+        // names and counts nothing.
+        if self.transport == Transport::Http
+            && instructions_variant(self.engine.skills_serve(), self.gate)
+                == InstructionsVariant::Full
+        {
+            match self.engine.routing_text_counted().await {
+                Ok(mut instructions) => {
+                    if self.engine.response_format() == ResponseFormat::Toon {
+                        instructions.push_str(TOON_INSTRUCTIONS_NOTE);
+                    }
+                    info.instructions = Some(instructions);
+                }
+                Err(e) => tracing::warn!(
+                    "the handshake carries the short routing pointer, the private domains are unreadable: {e}"
+                ),
+            }
+        }
         // **We supply the downgrade target; rmcp decides the echo.** Whatever
         // this handler returns is post-processed by rmcp's
         // `negotiate_protocol_version` (`service/server.rs:480`) on every
@@ -4076,7 +4192,7 @@ impl ServerHandler for McpServer {
     /// flip `github.enabled`, and six collaboration tools appear or disappear
     /// with it (see [`hidden_collab_tool`]). That is the only mover.
     /// `resources/list` and `prompts/list` read `skills.serve` and
-    /// `harness_onboarded`, both fixed before the first request arrives, so
+    /// the harness gate, both fixed before the first request arrives, so
     /// those two categories are accepted on a subscription and then never
     /// carry anything - accepting a category is a statement about what this
     /// server may deliver, not a promise that it will.
@@ -4172,8 +4288,7 @@ impl ServerHandler for McpServer {
     ) -> Result<ListToolsResult, ErrorData> {
         let read_only = self.engine.read_only();
         let github_enabled = self.engine.github_enabled();
-        let skills_hidden =
-            hidden_skills_surface(self.engine.skills_serve(), self.harness_onboarded);
+        let skills_hidden = hidden_skills_surface(self.engine.skills_serve(), self.gate);
         let mut tools = Self::tool_router().list_all();
         tools.retain(|t| {
             if is_write_tool(&t.name) && read_only {
@@ -4216,9 +4331,7 @@ impl ServerHandler for McpServer {
         if name == "provision" && hidden_provision_tool(read_only) {
             return None;
         }
-        if name == "skills"
-            && hidden_skills_surface(self.engine.skills_serve(), self.harness_onboarded)
-        {
+        if name == "skills" && hidden_skills_surface(self.engine.skills_serve(), self.gate) {
             return None;
         }
         let mut tool = Self::tool_router().get(name).cloned()?;
@@ -4237,7 +4350,7 @@ impl ServerHandler for McpServer {
         _request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, ErrorData> {
-        if hidden_skills_surface(self.engine.skills_serve(), self.harness_onboarded) {
+        if hidden_skills_surface(self.engine.skills_serve(), self.gate) {
             return Ok(ListResourcesResult::with_all_items(Vec::new()).with_cache_hints(&context));
         }
         let resources = SKILL_ASSETS
@@ -4356,7 +4469,7 @@ impl ServerHandler for McpServer {
         _request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListPromptsResult, ErrorData> {
-        let prompts = if hidden_skills_surface(self.engine.skills_serve(), self.harness_onboarded) {
+        let prompts = if hidden_skills_surface(self.engine.skills_serve(), self.gate) {
             Vec::new()
         } else {
             Self::prompt_router().list_all()
@@ -6793,40 +6906,71 @@ mod tests {
     /// second argument is never the connecting client: it is what the spawned
     /// process resolved from its `--harness` argument and this machine's
     /// receipt before the session started.
+    /// The three gates a spawned process can resolve to: the default (serve
+    /// everything), a hook installed but unverified, and a verified harness.
+    const GATES: [HarnessGate; 3] = [
+        HarnessGate {
+            hook_installed: false,
+            onboarding_verified: false,
+        },
+        HarnessGate {
+            hook_installed: true,
+            onboarding_verified: false,
+        },
+        HarnessGate {
+            hook_installed: true,
+            onboarding_verified: true,
+        },
+    ];
+
     #[test]
     fn hidden_skills_surface_matches_the_locked_matrix() {
-        for onboarded in [true, false] {
+        let [serve, conditional, verified] = GATES;
+        for gate in GATES {
             assert!(
-                !hidden_skills_surface(SkillsServe::Always, onboarded),
+                !hidden_skills_surface(SkillsServe::Always, gate),
                 "true always serves, whoever spawned us"
             );
             assert!(
-                hidden_skills_surface(SkillsServe::Never, onboarded),
+                hidden_skills_surface(SkillsServe::Never, gate),
                 "false never serves, whoever spawned us"
             );
         }
         assert!(
-            hidden_skills_surface(SkillsServe::Auto, true),
-            "auto plus an onboarded harness is the whole point of the feature"
+            hidden_skills_surface(SkillsServe::Auto, verified),
+            "auto plus a verified harness is the whole point of the feature"
         );
         assert!(
-            !hidden_skills_surface(SkillsServe::Auto, false),
+            !hidden_skills_surface(SkillsServe::Auto, conditional),
+            "a hook that is installed but unverified keeps the skills served"
+        );
+        assert!(
+            !hidden_skills_surface(SkillsServe::Auto, serve),
             "auto serves everyone else, which is every case we cannot resolve"
         );
     }
 
-    /// Only `auto` plus an onboarded harness shrinks the instructions: `false`
-    /// gates skill serving, never onboarding.
+    /// Only `auto` plus an installed hook shrinks the instructions, to the
+    /// minimal pointer for a verified harness and the conditional one for an
+    /// unverified hook: `false` gates skill serving, never onboarding.
     #[test]
-    fn minimal_instructions_are_auto_and_onboarded_only() {
-        assert!(minimal_instructions(SkillsServe::Auto, true));
-        assert!(!minimal_instructions(SkillsServe::Auto, false));
-        assert!(!minimal_instructions(SkillsServe::Always, true));
-        assert!(
-            !minimal_instructions(SkillsServe::Never, true),
-            "turning the skill surface off must not cost a client its routing block"
+    fn short_instructions_are_auto_and_an_installed_hook_only() {
+        use InstructionsVariant::{Conditional, Full, Minimal};
+        let [serve, conditional, verified] = GATES;
+        assert_eq!(instructions_variant(SkillsServe::Auto, verified), Minimal);
+        assert_eq!(
+            instructions_variant(SkillsServe::Auto, conditional),
+            Conditional
         );
-        assert!(!minimal_instructions(SkillsServe::Never, false));
+        assert_eq!(instructions_variant(SkillsServe::Auto, serve), Full);
+        for gate in GATES {
+            assert_eq!(instructions_variant(SkillsServe::Always, gate), Full);
+            assert_eq!(
+                instructions_variant(SkillsServe::Never, gate),
+                Full,
+                "turning the skill surface off must not cost a client its routing block"
+            );
+        }
     }
 
     /// The two gates take the same two inputs, so the surface and the
@@ -6834,18 +6978,20 @@ mod tests {
     /// already onboarded. They diverged once, when one keyed on the client's
     /// name and the other did not, and that divergence is what SEP-2567
     /// forbade.
+    ///
+    /// Since the gate became two facts the rule is no longer "hidden exactly
+    /// when the instructions are short": a hook that is installed but
+    /// unverified gets the short conditional instructions and keeps the
+    /// surface. Under `auto` the surface is hidden exactly when the variant
+    /// is `Minimal`, so `Conditional` never hides it.
     #[test]
     fn the_surface_and_the_instructions_read_the_same_answer() {
-        for serve in [SkillsServe::Auto, SkillsServe::Always, SkillsServe::Never] {
-            for onboarded in [true, false] {
-                if serve == SkillsServe::Auto {
-                    assert_eq!(
-                        hidden_skills_surface(serve, onboarded),
-                        minimal_instructions(serve, onboarded),
-                        "auto decides both together"
-                    );
-                }
-            }
+        for gate in GATES {
+            assert_eq!(
+                hidden_skills_surface(SkillsServe::Auto, gate),
+                instructions_variant(SkillsServe::Auto, gate) == InstructionsVariant::Minimal,
+                "auto decides both together for {gate:?}"
+            );
         }
     }
 

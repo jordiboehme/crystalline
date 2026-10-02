@@ -250,6 +250,252 @@ fn prompt_copilot_format_tolerates_missing_and_garbage_stdin() {
     }
 }
 
+/// Run `prompt system` in the prompt fixture with extra args and a stdin
+/// payload, under `home` when given (for a receipt), and return stdout.
+fn prompt_in_fixture(extra: &[&str], stdin: &str, home: Option<&std::path::Path>) -> String {
+    prompt_in_fixture_with_stderr(extra, stdin, home).0
+}
+
+/// [`prompt_in_fixture`], returning stdout and stderr.
+fn prompt_in_fixture_with_stderr(
+    extra: &[&str],
+    stdin: &str,
+    home: Option<&std::path::Path>,
+) -> (String, String) {
+    let mut cmd = crate::common::crystalline();
+    if let Some(home) = home {
+        crate::common::isolate(&mut cmd, home);
+    }
+    let mut args = vec![
+        "prompt",
+        "system",
+        "--workspace",
+        "workspace",
+        "--config",
+        "config.yaml",
+    ];
+    args.extend_from_slice(extra);
+    let assert = cmd
+        .current_dir(fixtures_dir().join("prompt-fixture"))
+        .args(&args)
+        .write_stdin(stdin.to_string())
+        .assert()
+        .success();
+    let out = assert.get_output();
+    (
+        String::from_utf8(out.stdout.clone()).unwrap(),
+        String::from_utf8(out.stderr.clone()).unwrap(),
+    )
+}
+
+/// The two new SessionStart shapes: Cursor's `additional_context` and the
+/// `hookSpecificOutput` envelope Gemini CLI and Qwen Code read. Both are one
+/// JSON document on stdout and nothing else.
+#[test]
+fn prompt_cursor_and_hook_specific_formats_match_snapshot() {
+    let cursor = prompt_in_fixture(&["--format", "cursor"], r#"{"source":"startup"}"#, None);
+    let v: serde_json::Value = serde_json::from_str(cursor.trim()).expect("one JSON document");
+    assert!(
+        v["additional_context"]
+            .as_str()
+            .unwrap()
+            .contains("astronomy")
+    );
+    assert_eq!(v.as_object().unwrap().len(), 1, "only additional_context");
+    insta::assert_snapshot!("prompt_cursor_format", cursor);
+
+    let hook = prompt_in_fixture(
+        &["--format", "hook-specific"],
+        r#"{"source":"startup"}"#,
+        None,
+    );
+    let v: serde_json::Value = serde_json::from_str(hook.trim()).expect("one JSON document");
+    assert_eq!(v["hookSpecificOutput"]["hookEventName"], "SessionStart");
+    assert!(
+        v["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap()
+            .contains("astronomy")
+    );
+    insta::assert_snapshot!("prompt_hook_specific_format", hook);
+}
+
+#[test]
+fn the_new_formats_print_nothing_on_resume() {
+    for format in ["cursor", "hook-specific"] {
+        let out = prompt_in_fixture(&["--format", format], r#"{"source":"resume"}"#, None);
+        assert!(out.is_empty(), "{format}: {out}");
+    }
+}
+
+const IN_CURSOR: &str = r#"{"source":"startup","session_id":"s1","cursor_version":"1.9.0","hook_event_name":"sessionStart"}"#;
+
+/// One receipt row with the hook part, at `version`.
+fn receipt_row(harness: &str, version: &str) -> String {
+    format!(
+        r#"{{"harness":"{harness}","scope":"user","version":"{version}","parts":{{"mcp":true,"hooks":true,"skills":true}},"skills":[]}}"#
+    )
+}
+
+/// Write the install receipt under `home` with these rows, at this
+/// binary's version so `auto_reconcile` has nothing to do.
+fn write_receipt(home: &std::path::Path, harnesses: &[&str]) -> std::path::PathBuf {
+    let receipt = crate::common::isolated_state_dir(home).join("installs.json");
+    std::fs::create_dir_all(receipt.parent().unwrap()).unwrap();
+    let rows: Vec<String> = harnesses
+        .iter()
+        .map(|h| receipt_row(h, env!("CARGO_PKG_VERSION")))
+        .collect();
+    std::fs::write(
+        &receipt,
+        format!(r#"{{"format":1,"installs":[{}]}}"#, rows.join(",")),
+    )
+    .unwrap();
+    receipt
+}
+
+/// Write `~/.cursor/hooks.json` under `home` with one sessionStart command.
+fn write_cursor_hook(home: &std::path::Path, command: &str) {
+    let dir = home.join(".cursor");
+    std::fs::create_dir_all(&dir).unwrap();
+    let doc = serde_json::json!({"version": 1, "hooks": {"sessionStart": [{"command": command}]}});
+    std::fs::write(dir.join("hooks.json"), doc.to_string()).unwrap();
+}
+
+/// The command install writes into Cursor's hooks file, pointing at this
+/// test build's binary, which exists and runs.
+fn live_cursor_command() -> String {
+    // Quoted when it holds a space, as install writes it: a checkout under
+    // such a folder (common on a Windows machine) would otherwise split the
+    // program at the space.
+    let program = assert_cmd::cargo::cargo_bin("crystalline")
+        .display()
+        .to_string();
+    let program = if program.contains(' ') {
+        format!("\"{program}\"")
+    } else {
+        program
+    };
+    format!("{program} prompt system --format cursor --harness cursor")
+}
+
+/// Decision 13: an imported Claude Code hook inside Cursor stays silent
+/// when Cursor's own hook is installed, and speaks otherwise.
+#[test]
+fn an_imported_claude_hook_inside_cursor_is_silent_when_cursor_has_its_own() {
+    let home = tempfile::tempdir().unwrap();
+    let in_cursor = IN_CURSOR;
+    let plain = r#"{"source":"startup","session_id":"s1"}"#;
+    let h = Some(home.path());
+
+    let receipt = write_receipt(home.path(), &["claude-code", "cursor"]);
+    write_cursor_hook(home.path(), &live_cursor_command());
+    assert_eq!(
+        prompt_in_fixture(&["--harness", "claude-code"], in_cursor, h),
+        "",
+        "silenced inside Cursor"
+    );
+    assert_eq!(
+        prompt_in_fixture(&[], in_cursor, h),
+        "",
+        "a hook written before --harness counts as claude-code"
+    );
+    assert!(
+        prompt_in_fixture(&["--format", "cursor", "--harness", "cursor"], in_cursor, h)
+            .contains("additional_context"),
+        "Cursor's own hook always prints"
+    );
+    assert!(
+        prompt_in_fixture(&["--harness", "claude-code"], plain, h).contains("astronomy"),
+        "plain Claude Code prints"
+    );
+    assert!(
+        prompt_in_fixture(&["--harness", "nextgen"], in_cursor, h).contains("astronomy"),
+        "an unknown id is never silenced"
+    );
+
+    // Decision 13's ordering: the silenced hook returns before the
+    // session-start auto-update, so a receipt from an older version is left
+    // as it is and nothing reaches stderr.
+    let old = format!(
+        r#"{{"format":1,"installs":[{},{}]}}"#,
+        receipt_row("claude-code", "0.0.1"),
+        receipt_row("cursor", "0.0.1")
+    );
+    std::fs::write(&receipt, &old).unwrap();
+    let (out, err) = prompt_in_fixture_with_stderr(&["--harness", "claude-code"], in_cursor, h);
+    assert_eq!(
+        (out.as_str(), err.as_str()),
+        ("", ""),
+        "silent on both streams"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&receipt).unwrap(),
+        old,
+        "no reconcile ran"
+    );
+
+    write_receipt(home.path(), &["claude-code"]);
+    assert!(
+        prompt_in_fixture(&["--harness", "claude-code"], in_cursor, h).contains("astronomy"),
+        "no Cursor hook installed: the imported hook is the only route and speaks"
+    );
+}
+
+/// A hand-written Cursor hook without `--harness` is Cursor's own hook, not
+/// an imported Claude Code one: a missing flag counts as claude-code only
+/// for the text format, the only one written before the flag existed.
+#[test]
+fn a_hand_written_cursor_hook_without_harness_always_prints() {
+    let home = tempfile::tempdir().unwrap();
+    write_receipt(home.path(), &["cursor"]);
+    write_cursor_hook(
+        home.path(),
+        "crystalline prompt system --format cursor --workspace /repo",
+    );
+    assert!(
+        prompt_in_fixture(&["--format", "cursor"], IN_CURSOR, Some(home.path()))
+            .contains("additional_context")
+    );
+}
+
+/// The receipt alone does not silence the imported hook: Cursor's hooks
+/// file must still hold our entry, and its program must still exist.
+#[test]
+fn the_imported_hook_speaks_when_cursors_entry_is_gone_or_dead() {
+    let home = tempfile::tempdir().unwrap();
+    let h = Some(home.path());
+    write_receipt(home.path(), &["claude-code", "cursor"]);
+
+    write_cursor_hook(
+        home.path(),
+        "/Users/someone/.othertool/hooks/cursor-hook.sh",
+    );
+    assert!(
+        prompt_in_fixture(&["--harness", "claude-code"], IN_CURSOR, h).contains("astronomy"),
+        "our entry was deleted from Cursor's hooks file"
+    );
+
+    let gone = home.path().join("gone/bin/crystalline");
+    write_cursor_hook(
+        home.path(),
+        &format!(
+            "{} prompt system --format cursor --harness cursor",
+            gone.display()
+        ),
+    );
+    assert!(
+        prompt_in_fixture(&["--harness", "claude-code"], IN_CURSOR, h).contains("astronomy"),
+        "our entry points at a program that no longer exists"
+    );
+
+    std::fs::remove_file(home.path().join(".cursor/hooks.json")).unwrap();
+    assert!(
+        prompt_in_fixture(&["--harness", "claude-code"], IN_CURSOR, h).contains("astronomy"),
+        "no hooks file at all"
+    );
+}
+
 /// Bare `crystalline prompt` (no kind) is a missing-subcommand error: clap
 /// prints its standard subcommand help and exits non-zero, never silently
 /// doing nothing.

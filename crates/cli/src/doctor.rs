@@ -22,7 +22,7 @@
 //! file parses and carries the `SessionStart`, `Stop` and `UserPromptSubmit`
 //! hooks (Copilot's `UserPromptSubmit` copy is reported present but noted
 //! inert - a config-file prompt hook's output is dropped there) and how
-//! many of the four managed skills are installed or locally modified (against the
+//! many of the five managed skills are installed or locally modified (against the
 //! install receipt when one exists) and whether a receipt version skew or
 //! retired leftovers await the next session-start refresh - filesystem
 //! only, with no shell-out to the harness's own CLI, so this check stays
@@ -79,8 +79,10 @@ use crystalline_service::instance;
 use serde::{Deserialize, Serialize};
 
 use crate::cmd;
+use crate::hook_dialect;
 use crate::install;
 use crate::receipt;
+use crate::skills_placement;
 
 /// How `doctor` read the index this run.
 ///
@@ -438,8 +440,10 @@ pub struct EnvironmentDoctor {
 }
 
 /// One coding harness's onboarding trace: whether its settings/hooks file
-/// exists, parses, carries our three managed hooks and how many of the four
-/// managed skills are installed at its skills folder. Checked purely from
+/// exists, parses, carries our managed hooks (three for the legacy harnesses,
+/// the session hook alone for a profile harness), what state its MCP entry
+/// is in (a profile harness) and how many of the five managed skills are
+/// installed at its skills folder. Checked purely from
 /// the filesystem, reusing `install`'s own presence predicate and skill
 /// list, with no shell-out to the harness's own CLI (`claude`, `codex` or
 /// `copilot`), so this stays fast and works offline; user scope only, since
@@ -447,8 +451,9 @@ pub struct EnvironmentDoctor {
 /// repository's `--project` setup.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct HarnessDoctor {
-    /// The harness's stable identifier, `"claude-code"`, `"codex"` or
-    /// `"copilot"` - the same spelling `crystalline install <name>` takes.
+    /// The harness's stable identifier, `"claude-code"`, `"codex"`,
+    /// `"copilot"`, `"cursor"`, `"kiro"`, `"gemini"` or `"qwen"` - the same
+    /// spelling `crystalline install <name>` takes.
     pub name: String,
     /// The settings/hooks file this harness reads (`settings.json` for
     /// Claude Code, `hooks.json` for Codex).
@@ -456,8 +461,8 @@ pub struct HarnessDoctor {
     /// Whether the settings file exists on disk.
     pub settings_present: bool,
     /// The parse error, when the file is present but is not valid JSON or
-    /// not a JSON object. `None` when the file is absent or parses cleanly -
-    /// the only field on this struct that
+    /// not a JSON object. `None` when the file is absent or parses cleanly.
+    /// With `mcp_parse_error`, the fields on this struct that
     /// [`DoctorReport::remaining_problems`] counts, since a harness that was
     /// simply never installed is not itself a problem.
     pub settings_parse_error: Option<String>,
@@ -479,7 +484,7 @@ pub struct HarnessDoctor {
     /// `None` - a corrupt file is "checked, found absent (we could not read
     /// it)", not "nothing to check here".
     pub prompt_hook: Option<bool>,
-    /// How many of the four managed skills have a `SKILL.md` at this
+    /// How many of the five managed skills have a `SKILL.md` at this
     /// harness's skills folder, whether or not its content still matches the
     /// embedded copy.
     pub skills_installed: usize,
@@ -495,6 +500,43 @@ pub struct HarnessDoctor {
     /// receipt or the retired list knows that still have a `SKILL.md` on
     /// disk. A re-run of `crystalline install` retires them.
     pub retired_leftovers: Vec<String>,
+    /// The file holding the MCP entry (a profile harness only; `None` for
+    /// the legacy three, which register through their own CLI).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_path: Option<String>,
+    /// The state of the MCP entry: `"up-to-date"`, `"ours-older"`,
+    /// `"customised"` or `"missing"`. `None` for the legacy three and when
+    /// the MCP file does not parse (see `mcp_parse_error`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_entry: Option<String>,
+    /// The parse error of the MCP file, when it is present but unreadable
+    /// or not shaped as expected. Counted by
+    /// [`DoctorReport::remaining_problems`], like `settings_parse_error`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_parse_error: Option<String>,
+    /// The owned pointer file (Kiro's steering file); `None` for a harness
+    /// without one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pointer_path: Option<String>,
+    /// Whether the pointer file exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pointer_present: Option<bool>,
+    /// The folder this harness's skills go to (a profile harness only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skills_folder: Option<String>,
+    /// The folder of the harness that covers this one's skills, when its
+    /// install receipt records a cover: this harness then writes no skill
+    /// files of its own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skills_covered_by: Option<String>,
+    /// A line worth reading beside the rest (Cursor beside Claude Code).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// Managed skills this binary ships that the install has not placed
+    /// yet: new in a release newer than the receipt row's version, so the
+    /// next session start installs them. Not a removal by the person.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skills_pending: Vec<String>,
 }
 
 /// One domain's provisioning diagnostics, straight off
@@ -556,6 +598,10 @@ pub struct ProvisioningHarnessDoctor {
     /// on disk at the harness - deleted by hand since the last reconcile,
     /// which reinstalls them.
     pub missing: usize,
+    /// The harness that owns the skills folder this one shares or reads;
+    /// every count above is zero then, since the owner's row carries them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub covered_by: Option<String>,
 }
 
 /// One domain still awaiting a provisioning decision, named with the counts
@@ -583,6 +629,26 @@ pub struct ProvisioningDoctor {
     pub harnesses: Vec<ProvisioningHarnessDoctor>,
     /// Domains still awaiting a decision.
     pub pending: Vec<ProvisioningPendingDoctor>,
+    /// Skills an uninstalled harness left in a folder an installed harness
+    /// still reads. Each is a problem until the next reconcile retires it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub stranded: Vec<ProvisioningStrandedDoctor>,
+}
+
+/// Provisioned skills an uninstalled harness left behind in a folder that no
+/// installed harness writes and an installed one still reads, so they keep
+/// loading there even after a `deny`. The next `crystalline provision` (or
+/// session start) retires them.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProvisioningStrandedDoctor {
+    /// The uninstalled harness whose receipt row still records the files.
+    pub harness: String,
+    /// The installed harness that still reads the folder.
+    pub read_by: String,
+    /// The folder the files sit in.
+    pub folder: String,
+    /// How many skills files are recorded there.
+    pub files: usize,
 }
 
 /// One domain the index still holds rows for and nobody registers any more:
@@ -978,7 +1044,8 @@ impl DoctorReport {
             }
         }
         // A harness that was never installed is not a problem; an
-        // unparseable settings/hooks file for one that was is. A receipt
+        // unparseable settings/hooks file or MCP file for one that was is,
+        // and so is an MCP entry install would rewrite. A receipt
         // version skew and a retired leftover skill are never counted here:
         // both self-heal, the skew at the next session start and the
         // leftover at the next `crystalline install`, so neither should fail
@@ -986,8 +1053,18 @@ impl DoctorReport {
         if let Some(harnesses) = &self.harnesses {
             n += harnesses
                 .iter()
-                .filter(|h| h.settings_parse_error.is_some())
+                .filter(|h| {
+                    h.settings_parse_error.is_some()
+                        || h.mcp_parse_error.is_some()
+                        || h.mcp_entry.as_deref() == Some("ours-older")
+                })
                 .count();
+        }
+        // Skills an uninstalled harness left where an installed one still
+        // reads them keep loading, even after a deny, until a reconcile
+        // retires them.
+        if let Some(p) = &self.provisioning {
+            n += p.stranded.len();
         }
         // Rows whose domain is gone count only while something can be done
         // about them: a collectable set nobody has collected yet. A virtual
@@ -2552,9 +2629,12 @@ fn render_origin(origin: &OriginConfig) -> String {
 }
 
 /// Filesystem-only diagnostics for each coding harness `crystalline
-/// install` wires up (`claude-code`, `codex` and `copilot`): whether a
-/// settings/hooks file exists, whether it parses, whether it carries our two
-/// managed hooks and how many of the four managed skills are present. No
+/// install` wires up (every [`HarnessKind::ALL`] entry, a profile harness
+/// only when it leaves a trace): whether a settings/hooks file exists,
+/// whether it parses, whether it carries our managed hooks, the state of the
+/// MCP entry and pointer file where the profile has them, and how many of
+/// the five managed skills are present (a folder several harnesses write is
+/// attributed to the rows that write it, a covered row shows its cover). No
 /// shell-out to any harness CLI, so this stays fast and works offline; user
 /// scope only, reusing `install`'s own presence predicate and skill list
 /// rather than duplicating either. `None` when no harness leaves any trace
@@ -2571,18 +2651,137 @@ fn check_harnesses() -> Option<Vec<HarnessDoctor>> {
         .ok()
         .and_then(|p| receipt::load(&p).ok())
         .unwrap_or_default();
-    let harnesses: Vec<HarnessDoctor> = [
-        HarnessKind::ClaudeCode,
-        HarnessKind::Codex,
-        HarnessKind::Copilot,
-    ]
-    .into_iter()
-    .map(|kind| check_one_harness(kind, book.find(kind.id(), "user", None)))
-    .collect();
-    let any_trace = harnesses
+    let mut harnesses: Vec<HarnessDoctor> = HarnessKind::ALL
+        .into_iter()
+        .map(|kind| check_one_harness(kind, &book))
+        .collect();
+    // Cursor also runs Claude Code's hooks, and the routing hook stays
+    // silent there. Doctor cannot read Cursor's import setting (it lives in
+    // the UI), so the note states the design and claims no state.
+    let claude_hooked = harnesses
         .iter()
-        .any(|h| h.settings_present || h.skills_installed > 0);
+        .any(|h| h.name == HarnessKind::ClaudeCode.id() && h.session_start_hook);
+    for h in &mut harnesses {
+        if claude_hooked && h.name == HarnessKind::Cursor.id() && h.session_start_hook {
+            h.note = Some(
+                "The Claude Code routing hook also runs inside Cursor and stays silent there."
+                    .to_string(),
+            );
+        }
+    }
+    // Decision 16: the legacy three are always listed once any harness
+    // leaves a trace; a profile harness is listed only when something of
+    // ours is on disk for it, so a machine without them reads as before.
+    let any_trace = harnesses.iter().any(harness_has_trace);
+    harnesses.retain(|h| {
+        HarnessKind::from_id(&h.name).is_some_and(|k| k.profile().is_legacy())
+            || harness_has_trace(h)
+    });
     any_trace.then_some(harnesses)
+}
+
+/// Whether a harness leaves any trace of ours: for the legacy three a
+/// settings file or an installed skill, for a profile harness one of our own
+/// artifacts (a file that merely exists may be another tool's; skills in a
+/// folder it shares with Codex may be Codex's), a receipt row or a file of
+/// its that does not parse.
+fn harness_has_trace(h: &HarnessDoctor) -> bool {
+    let legacy = HarnessKind::from_id(&h.name).is_none_or(|k| k.profile().is_legacy());
+    if legacy {
+        return h.settings_present || h.skills_installed > 0;
+    }
+    h.session_start_hook
+        || h.settings_parse_error.is_some()
+        || h.mcp_parse_error.is_some()
+        || h.mcp_entry.as_deref().is_some_and(|e| e != "missing")
+        || h.pointer_present == Some(true)
+        || h.skills_covered_by.is_some()
+        || h.receipt_version.is_some()
+}
+
+/// Read a profile harness's JSON (or JSONC) file: `Ok(None)` when it does
+/// not exist, `Err` with a sentence naming the path when it cannot be read
+/// or parsed.
+fn read_profile_json(path: &Path) -> Result<Option<serde_json::Value>, String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("could not read {}: {e}", path.display())),
+    };
+    if text.trim().is_empty() {
+        return Ok(None);
+    }
+    crystalline_core::jsonc_edit::parse_value(&text)
+        .map(Some)
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// The MCP file of a profile harness: its path, the entry's state and the
+/// parse error, when there is one.
+fn check_profile_mcp(harness: HarnessKind) -> (Option<String>, Option<String>, Option<String>) {
+    let crystalline_core::McpStyle::JsonEntry { file, .. } = harness.profile().mcp else {
+        return (None, None, None);
+    };
+    let path = file.resolve();
+    let shown = Some(path.display().to_string());
+    match read_profile_json(&path) {
+        Err(e) => (shown, None, Some(e)),
+        Ok(None) => (shown, Some("missing".to_string()), None),
+        Ok(Some(root)) => {
+            if !root.is_object() {
+                let e = format!("{}: the file does not hold a JSON object", path.display());
+                return (shown, None, Some(e));
+            }
+            // The planner install itself runs, with the program install
+            // would write now, so the two cannot disagree: an entry install
+            // would rewrite (an older shape, a bare command where the
+            // absolute path is wanted, a stale path) is "ours-older".
+            let program = crate::install_profile::wanted_program(harness);
+            let state = match crate::mcp_json::plan_mcp_install(harness, Some(&root), &program) {
+                Ok((state, _)) => match state {
+                    crate::mcp_json::EntryState::UpToDate => "up-to-date",
+                    crate::mcp_json::EntryState::Ours => "ours-older",
+                    crate::mcp_json::EntryState::Customised => "customised",
+                    crate::mcp_json::EntryState::Missing => "missing",
+                },
+                Err(e) => return (shown, None, Some(format!("{}: {e}", path.display()))),
+            };
+            (shown, Some(state.to_string()), None)
+        }
+    }
+}
+
+/// The managed skills missing on disk that the person never had the chance
+/// to decline: new in a release strictly newer than the receipt row's
+/// version and not recorded by it. The next session start installs them
+/// (`install::reconcile_skills` in Auto mode), so doctor must not read them
+/// as removed by the person. A row without a receipt, a covered row and a
+/// version that does not parse never have any.
+fn pending_new_skills(
+    set: &[install::ManagedSkill],
+    entry: Option<&receipt::InstallRecord>,
+    on_disk: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    // The refresh reconciles skills only for a row whose skills part is
+    // installed and that is not covered (a `covered:` or `covered-seed:`
+    // entry), so only such a row is promised an install.
+    let Some(entry) = entry.filter(|e| e.parts.skills) else {
+        return Vec::new();
+    };
+    if entry.skills.iter().any(|s| {
+        s.name.starts_with(skills_placement::COVERED_PREFIX)
+            || s.name.starts_with(skills_placement::SEED_PREFIX)
+    }) {
+        return Vec::new();
+    }
+    set.iter()
+        .filter(|skill| {
+            !on_disk(skill.name)
+                && !entry.skills.iter().any(|r| r.name == skill.name)
+                && crystalline_service::instance::strictly_newer(skill.since, &entry.version)
+        })
+        .map(|skill| skill.name.to_string())
+        .collect()
 }
 
 /// One harness's diagnostics: read its settings/hooks file read-only, check
@@ -2593,14 +2792,25 @@ fn check_harnesses() -> Option<Vec<HarnessDoctor>> {
 /// recorded hash) at its skills folder. `entry` is this harness's user-scope
 /// install receipt record, `None` when it was never installed or predates
 /// receipts.
-fn check_one_harness(
-    harness: HarnessKind,
-    entry: Option<&receipt::InstallRecord>,
-) -> HarnessDoctor {
+fn check_one_harness(harness: HarnessKind, book: &receipt::Receipt) -> HarnessDoctor {
+    let entry = book.find(harness.id(), "user", None);
+    let profile = harness.profile();
+    let is_profile = !profile.is_legacy();
     let paths = harness_paths(harness, false);
     let settings_present = paths.settings.is_file();
 
-    let (session_start_hook, stop_hook, prompt_hook, settings_parse_error) =
+    let (session_start_hook, stop_hook, prompt_hook, settings_parse_error) = if is_profile {
+        // The profile harnesses have a session hook and nothing else.
+        match read_profile_json(&paths.settings) {
+            Ok(root) => (
+                root.is_some_and(|r| hook_dialect::session_hook_present(&profile.hooks, &r)),
+                false,
+                None,
+                None,
+            ),
+            Err(e) => (false, false, None, Some(e)),
+        }
+    } else {
         match install::read_settings(&paths.settings) {
             Ok(root) => (
                 install::harness_hook_present(
@@ -2621,7 +2831,49 @@ fn check_one_harness(
                 None,
             ),
             Err(e) => (false, false, Some(false), Some(e.to_string())),
-        };
+        }
+    };
+
+    let (mcp_path, mcp_entry, mcp_parse_error) = if is_profile {
+        check_profile_mcp(harness)
+    } else {
+        (None, None, None)
+    };
+    let (pointer_path, pointer_present) = match profile.pointer {
+        crystalline_core::PointerStyle::OwnedFile { path, .. } => {
+            let path = path.resolve();
+            (Some(path.display().to_string()), Some(path.is_file()))
+        }
+        crystalline_core::PointerStyle::None => (None, None),
+    };
+
+    // Skills. A folder several harnesses write (Codex, Gemini CLI and
+    // Cursor share `~/.agents/skills`) belongs to every row that writes it
+    // and to no other: a row the install receipt shows as covered writes
+    // nothing, and a row that never installed there does not own what
+    // another harness put there. A machine with no receipt row for any of
+    // the sharers keeps counting the folder from disk.
+    let covered_by = entry.and_then(|e| e.skills.iter().find_map(skills_placement::covered_by));
+    let sharers = || {
+        HarnessKind::ALL
+            .into_iter()
+            .filter(move |o| *o != harness && o.profile().skills_write == profile.skills_write)
+    };
+    let counts_here = if covered_by.is_some() {
+        false
+    } else if sharers().next().is_none() {
+        true
+    } else {
+        match entry {
+            Some(e) => e
+                .skills
+                .iter()
+                .any(|s| install::is_plain_skill_name(&s.name)),
+            // A profile harness always leaves a receipt row, so without one
+            // the shared folder is another harness's.
+            None => !is_profile && !sharers().any(|o| book.find(o.id(), "user", None).is_some()),
+        }
+    };
 
     let recorded_hash: std::collections::HashMap<&str, &str> = entry
         .map(|e| {
@@ -2635,6 +2887,9 @@ fn check_one_harness(
     let mut skills_installed = 0;
     let mut skills_modified = 0;
     for &(name, content) in install::managed_skills().iter() {
+        if !counts_here {
+            break;
+        }
         let path = paths.skills_dir.join(name).join("SKILL.md");
         if let Ok(existing) = std::fs::read(&path) {
             skills_installed += 1;
@@ -2648,6 +2903,14 @@ fn check_one_harness(
             }
         }
     }
+
+    let skills_pending = if counts_here {
+        pending_new_skills(&install::managed_skill_set(), entry, |name| {
+            paths.skills_dir.join(name).join("SKILL.md").is_file()
+        })
+    } else {
+        Vec::new()
+    };
 
     // Leftovers: every name the receipt or the static retired list still
     // remembers, deduplicated, that is not a currently managed skill and
@@ -2671,7 +2934,7 @@ fn check_one_harness(
         if !install::is_plain_skill_name(name) {
             continue;
         }
-        if paths.skills_dir.join(name).join("SKILL.md").is_file() {
+        if counts_here && paths.skills_dir.join(name).join("SKILL.md").is_file() {
             retired_leftovers.push(name.to_string());
         }
     }
@@ -2688,6 +2951,16 @@ fn check_one_harness(
         skills_modified,
         receipt_version: entry.map(|e| e.version.clone()),
         retired_leftovers,
+        mcp_path,
+        mcp_entry,
+        mcp_parse_error,
+        pointer_path,
+        pointer_present,
+        skills_folder: is_profile.then(|| paths.skills_dir.display().to_string()),
+        skills_covered_by: covered_by
+            .map(|by| by.profile().skills_write.resolve().display().to_string()),
+        note: None,
+        skills_pending,
     }
 }
 
@@ -2752,6 +3025,7 @@ fn check_provisioning(
             edited: h.edited,
             orphaned: h.orphaned,
             missing: h.missing,
+            covered_by: h.covered_by.map(|o| o.id().to_string()),
         })
         .collect();
 
@@ -2765,10 +3039,22 @@ fn check_provisioning(
         })
         .collect();
 
+    let stranded = report
+        .stranded
+        .iter()
+        .map(|st| ProvisioningStrandedDoctor {
+            harness: st.harness.id().to_string(),
+            read_by: st.read_by.id().to_string(),
+            folder: st.folder.display().to_string(),
+            files: st.files,
+        })
+        .collect();
+
     Ok(Some(ProvisioningDoctor {
         domains,
         harnesses,
         pending,
+        stranded,
     }))
 }
 
@@ -3182,6 +3468,23 @@ fn hook_lines(h: &HarnessDoctor) -> String {
             "absent"
         }
     ));
+    // A profile harness has a session hook and no Stop or UserPromptSubmit
+    // one by design, so only the session hook, the MCP entry and (where the
+    // profile has one) the pointer file make up its setup.
+    if is_profile_harness(&h.name) {
+        let mcp = h.mcp_entry.as_deref().map(|e| e != "missing");
+        let parts: Vec<bool> = [Some(h.session_start_hook), mcp, h.pointer_present]
+            .into_iter()
+            .flatten()
+            .collect();
+        if parts.iter().any(|p| *p) && parts.iter().any(|p| !*p) {
+            out.push_str(&format!(
+                "    partial setup - run: crystalline install {}\n",
+                h.name
+            ));
+        }
+        return out;
+    }
     out.push_str(&format!(
         "    Stop hook: {}\n",
         if h.stop_hook { "present" } else { "absent" }
@@ -3233,6 +3536,12 @@ fn hook_lines(h: &HarnessDoctor) -> String {
         ));
     }
     out
+}
+
+/// Whether `name` is one of the profile harnesses (Cursor, Kiro, Gemini CLI,
+/// Qwen Code), the ones with an MCP file and no Stop or prompt hook.
+fn is_profile_harness(name: &str) -> bool {
+    HarnessKind::from_id(name).is_some_and(|k| !k.profile().is_legacy())
 }
 
 /// Render a report for a human.
@@ -3865,13 +4174,53 @@ pub fn render_human(report: &DoctorReport) -> String {
         for h in harnesses {
             let _ = writeln!(out, "  {} ({})", h.name, h.settings_path);
             if let Some(err) = &h.settings_parse_error {
-                let _ = writeln!(out, "    [problem] settings file is not valid JSON: {err}");
-            } else if !h.settings_present {
-                let _ = writeln!(out, "    not installed (no settings/hooks file yet)");
-            } else {
-                out.push_str(&hook_lines(h));
+                let _ = writeln!(
+                    out,
+                    "    [problem] settings file could not be read or is not valid JSON: {err}"
+                );
             }
-            if h.skills_installed > 0 {
+            if let Some(err) = &h.mcp_parse_error
+                && h.settings_parse_error.as_ref() != Some(err)
+            {
+                let _ = writeln!(
+                    out,
+                    "    [problem] MCP file could not be read or is not valid JSON: {err}"
+                );
+            }
+            if h.settings_parse_error.is_none() {
+                let other_trace = h.mcp_entry.as_deref().is_some_and(|e| e != "missing")
+                    || h.pointer_present == Some(true);
+                if !h.settings_present && !other_trace {
+                    let _ = writeln!(out, "    not installed (no settings/hooks file yet)");
+                } else {
+                    out.push_str(&hook_lines(h));
+                }
+            }
+            if let Some(state) = &h.mcp_entry {
+                let at = h
+                    .mcp_path
+                    .as_deref()
+                    .map(|p| format!(" ({p})"))
+                    .unwrap_or_default();
+                let _ = writeln!(out, "    MCP entry: {state}{at}");
+                if state == "ours-older" {
+                    let _ = writeln!(
+                        out,
+                        "    [problem] the MCP entry differs from what install writes now (an older shape, a bare command or a stale path). Run: crystalline install {}",
+                        h.name
+                    );
+                }
+            }
+            if let (Some(path), Some(present)) = (&h.pointer_path, h.pointer_present) {
+                let _ = writeln!(
+                    out,
+                    "    pointer file: {} ({path})",
+                    if present { "present" } else { "absent" }
+                );
+            }
+            if let Some(folder) = &h.skills_covered_by {
+                let _ = writeln!(out, "    skills: covered by {folder}");
+            } else if h.skills_installed > 0 {
                 let modified = if h.skills_modified > 0 {
                     format!(", {} locally modified", h.skills_modified)
                 } else {
@@ -3885,6 +4234,16 @@ pub fn render_human(report: &DoctorReport) -> String {
                 );
             } else {
                 let _ = writeln!(out, "    skills: none installed");
+            }
+            if !h.skills_pending.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "    not installed yet: {} (new in this version, the next session start installs it)",
+                    h.skills_pending.join(", ")
+                );
+            }
+            if let Some(note) = &h.note {
+                let _ = writeln!(out, "    {note}");
             }
             if let Some(v) = &h.receipt_version
                 && v != env!("CARGO_PKG_VERSION")
@@ -3927,6 +4286,10 @@ pub fn render_human(report: &DoctorReport) -> String {
             }
         }
         for h in &p.harnesses {
+            if let Some(owner) = &h.covered_by {
+                let _ = writeln!(out, "  {}: covered by {owner}", h.harness);
+                continue;
+            }
             let _ = writeln!(
                 out,
                 "  {}: {} file(s) installed, {} mcp(s) installed, {} drifted, {} edited, {} orphaned, {} missing",
@@ -3937,6 +4300,13 @@ pub fn render_human(report: &DoctorReport) -> String {
                 h.edited,
                 h.orphaned,
                 h.missing
+            );
+        }
+        for st in &p.stranded {
+            let _ = writeln!(
+                out,
+                "  [problem] {}: {} provisioned skill file(s) left in {}, which {} still reads - run `crystalline provision` to retire them.",
+                st.harness, st.files, st.folder, st.read_by
             );
         }
         if !p.pending.is_empty() {
@@ -4267,6 +4637,100 @@ mod tests {
         );
     }
 
+    /// A skill new in a release newer than the row's version, missing on
+    /// disk and never recorded, is "not installed yet" (the next session
+    /// start installs it), not removed by the person.
+    #[test]
+    fn a_skill_new_since_the_row_version_is_pending_not_removed() {
+        let set = |since: &'static str| {
+            vec![
+                install::ManagedSkill {
+                    name: "old-skill",
+                    content: "x",
+                    since: "0.1.0",
+                },
+                install::ManagedSkill {
+                    name: "new-skill",
+                    content: "x",
+                    since,
+                },
+            ]
+        };
+        let row = |version: &str, skills: &[&str]| receipt::InstallRecord {
+            harness: "claude-code".to_string(),
+            scope: "user".to_string(),
+            project_path: None,
+            version: version.to_string(),
+            parts: receipt::Parts {
+                mcp: false,
+                hooks: false,
+                skills: true,
+            },
+            skills: skills
+                .iter()
+                .map(|n| receipt::RecordedSkill {
+                    name: n.to_string(),
+                    sha256: String::new(),
+                })
+                .collect(),
+        };
+        let nothing_on_disk = |_: &str| false;
+        // Both missing, the row older than the new skill: only the new one
+        // is pending; the old one is the person's removal.
+        let pending = pending_new_skills(
+            &set("0.22.1"),
+            Some(&row("0.22.0", &["crystalline-capture"])),
+            nothing_on_disk,
+        );
+        assert_eq!(pending, ["new-skill"]);
+        // Already on disk, or already recorded: nothing pending.
+        assert!(
+            pending_new_skills(&set("0.22.1"), Some(&row("0.22.0", &[])), |n| n
+                == "new-skill")
+            .is_empty()
+        );
+        assert!(
+            pending_new_skills(
+                &set("0.22.1"),
+                Some(&row("0.22.0", &["new-skill"])),
+                nothing_on_disk
+            )
+            .is_empty()
+        );
+        // The row is as new as the skill, has no version that parses, is
+        // covered or does not exist: nothing pending.
+        assert!(
+            pending_new_skills(&set("0.22.1"), Some(&row("0.22.1", &[])), nothing_on_disk)
+                .is_empty()
+        );
+        assert!(
+            pending_new_skills(&set("0.22.1"), Some(&row("unknown", &[])), nothing_on_disk)
+                .is_empty()
+        );
+        assert!(
+            pending_new_skills(
+                &set("0.22.1"),
+                Some(&row("0.22.0", &["covered:claude-code"])),
+                nothing_on_disk
+            )
+            .is_empty()
+        );
+        assert!(pending_new_skills(&set("0.22.1"), None, nothing_on_disk).is_empty());
+        // A row installed with --skip-skills is never promised an install.
+        let mut skipped = row("0.22.0", &[]);
+        skipped.parts.skills = false;
+        assert!(pending_new_skills(&set("0.22.1"), Some(&skipped), nothing_on_disk).is_empty());
+        // A hand-over seed marks a covered row as well.
+        assert!(
+            pending_new_skills(
+                &set("0.22.1"),
+                Some(&row("0.22.0", &["covered-seed:crystalline-capture"])),
+                nothing_on_disk
+            )
+            .is_empty()
+        );
+    }
+
     /// A minimal harness fixture: only the fields [`hook_lines`] reads are
     /// worth setting, everything else keeps its `Default`.
     fn harness(
@@ -4342,6 +4806,40 @@ mod tests {
         // setup, whatever its prompt hook says.
         let copilot_missing_stop = harness("copilot", true, false, Some(true));
         assert!(hook_lines(&copilot_missing_stop).contains("partial setup"));
+    }
+
+    /// A profile harness has a session hook only: no Stop or prompt line, and
+    /// "partial setup" fires when the MCP entry, the hook or the pointer file
+    /// is missing while another part is present.
+    #[test]
+    fn a_profile_harness_prints_only_the_session_hook_and_judges_its_parts() {
+        let mut cursor = harness("cursor", true, false, None);
+        cursor.mcp_entry = Some("up-to-date".to_string());
+        let lines = hook_lines(&cursor);
+        assert!(lines.contains("SessionStart hook: present"), "{lines}");
+        assert!(!lines.contains("Stop hook"), "{lines}");
+        assert!(!lines.contains("UserPromptSubmit"), "{lines}");
+        assert!(!lines.contains("partial setup"), "{lines}");
+
+        cursor.mcp_entry = Some("missing".to_string());
+        assert!(hook_lines(&cursor).contains("partial setup - run: crystalline install cursor"));
+
+        // Kiro: the owned pointer file counts, Gemini has none to count.
+        let mut kiro = harness("kiro", true, false, None);
+        kiro.mcp_entry = Some("up-to-date".to_string());
+        kiro.pointer_present = Some(false);
+        assert!(hook_lines(&kiro).contains("partial setup"));
+        kiro.pointer_present = Some(true);
+        assert!(!hook_lines(&kiro).contains("partial setup"));
+        let mut gemini = harness("gemini", true, false, None);
+        gemini.mcp_entry = Some("up-to-date".to_string());
+        assert!(!hook_lines(&gemini).contains("partial setup"));
+        gemini.session_start_hook = false;
+        assert!(hook_lines(&gemini).contains("partial setup"));
+
+        // Nothing present at all is "not installed", not partial.
+        let none = harness("qwen", false, false, None);
+        assert!(!hook_lines(&none).contains("partial setup"));
     }
 
     /// Sync a temp file domain holding a MANIFEST (whose tail is `manifest_tail`,

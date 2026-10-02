@@ -43,7 +43,7 @@ FROM nginx:stable-alpine AS runtime
 LABEL org.opencontainers.image.title="Crystalline Fluid" \
       org.opencontainers.image.description="The browser UI for a Crystalline instance" \
       org.opencontainers.image.source="https://github.com/jordiboehme/crystalline" \
-      org.opencontainers.image.licenses="AGPL-3.0-or-later"
+      org.opencontainers.image.licenses="MPL-2.0"
 
 # Where the Crystalline daemon answers, as host:port. The nginx image's own
 # entrypoint runs envsubst over /etc/nginx/templates/*.template at every

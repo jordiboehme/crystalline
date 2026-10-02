@@ -1371,7 +1371,7 @@ dependencies = [
 
 [[package]]
 name = "crystalline"
-version = "0.22.0"
+version = "0.22.1"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1402,7 +1402,7 @@ dependencies = [
 
 [[package]]
 name = "crystalline-core"
-version = "0.22.0"
+version = "0.22.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1410,6 +1410,7 @@ dependencies = [
  "globset",
  "indexmap 2.14.2",
  "insta",
+ "jsonc-parser",
  "serde",
  "serde_json",
  "serde_yaml_ng",
@@ -1423,7 +1424,7 @@ dependencies = [
 
 [[package]]
 name = "crystalline-engine"
-version = "0.22.0"
+version = "0.22.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1456,7 +1457,7 @@ dependencies = [
 
 [[package]]
 name = "crystalline-identity"
-version = "0.22.0"
+version = "0.22.1"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1476,7 +1477,7 @@ dependencies = [
 
 [[package]]
 name = "crystalline-index"
-version = "0.22.0"
+version = "0.22.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -1505,7 +1506,7 @@ dependencies = [
 
 [[package]]
 name = "crystalline-remote"
-version = "0.22.0"
+version = "0.22.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -1531,7 +1532,7 @@ dependencies = [
 
 [[package]]
 name = "crystalline-rest"
-version = "0.22.0"
+version = "0.22.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -1566,7 +1567,7 @@ dependencies = [
 
 [[package]]
 name = "crystalline-service"
-version = "0.22.0"
+version = "0.22.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3737,6 +3738,15 @@ dependencies = [
  "cfg-if",
  "futures-util",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "jsonc-parser"
+version = "0.34.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ecded084f9b9a718d39668a42657c32253663d1f6afb3fbb9134f0305f73f48"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]

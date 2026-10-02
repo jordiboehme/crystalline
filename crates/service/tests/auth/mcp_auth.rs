@@ -1927,10 +1927,10 @@ async fn the_sweep_and_schema_verbs_answer_nothing_for_a_hidden_domain() {
         "and naming it directly finds nothing:\n{named}"
     );
 
-    // The same holds for every other verb that reaches a domain by name.
-    // `provision` is the one of those that needs no collaboration setting to
-    // reach its gate, so it stands for the set here; deciding about a domain is
-    // itself a way of asking whether it exists.
+    // Deciding about a domain is itself a way of asking whether it exists, so
+    // `provision` answers this non-admin with the role refusal, which does not
+    // depend on the name (see
+    // `provision_answers_a_hidden_and_an_unknown_domain_alike`).
     let decided = session
         .call_tool(
             "provision",
@@ -1938,8 +1938,124 @@ async fn the_sweep_and_schema_verbs_answer_nothing_for_a_hidden_domain() {
         )
         .await;
     assert!(
-        decided.contains("not registered"),
-        "provision refuses a hidden domain as an unregistered one:\n{decided}"
+        decided.contains("instance admin") && !decided.contains("not registered"),
+        "provision refuses before it looks at the name:\n{decided}"
+    );
+}
+
+/// The JSON-RPC answer inside one raw response (its `data:` line, without the
+/// transport framing around it, whose event id and length differ per call),
+/// with the quoted domain name taken out, so the answer for a hidden name and
+/// the answer for an unknown one can be compared byte for byte.
+fn without_name(raw: &str, name: &str) -> String {
+    let answer = raw
+        .lines()
+        .find(|line| line.starts_with("data: "))
+        .unwrap_or(raw);
+    answer.replace(&format!("'{name}'"), "'NAME'")
+}
+
+/// **Every collaboration verb answers a hidden domain and an unknown one with
+/// the same bytes, and neither lists a domain the caller may not see.**
+///
+/// The four verbs that take a domain by name and act on its origin used to let
+/// an unregistered name through to an unscoped lookup, whose refusal listed
+/// every registered domain, private ones included. So a typo read back the
+/// name of `lab`, which this caller is not shown anywhere else. `origin_status`
+/// and `update_domain` are pinned beside them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_collaboration_verbs_answer_a_hidden_and_an_unknown_domain_alike() {
+    let ctx = mcp_team_ctx().await;
+    let stranger = ctx.token_for("out").await;
+    let session = McpTestSession::open(&ctx.addr, Some(&stranger)).await;
+
+    for (tool, extra) in [
+        ("share_changes", serde_json::json!({})),
+        ("withdraw_proposal", serde_json::json!({})),
+        (
+            "resolve_conflict",
+            serde_json::json!({ "path": "lab-note.md" }),
+        ),
+        (
+            "discard_changes",
+            serde_json::json!({ "paths": ["lab-note.md"] }),
+        ),
+        ("origin_status", serde_json::json!({})),
+        ("update_domain", serde_json::json!({})),
+    ] {
+        let ask = |name: &str| {
+            let mut arguments = extra.clone();
+            arguments["domain"] = serde_json::json!(name);
+            arguments
+        };
+        let hidden = session.call_tool(tool, ask("lab")).await;
+        let unknown = session.call_tool(tool, ask("nope")).await;
+        assert!(
+            unknown.contains("not registered") && unknown.contains("[open, second]"),
+            "{tool} refuses an unknown name with the visible set:\n{unknown}"
+        );
+        assert!(
+            !unknown.contains("lab"),
+            "{tool} names no domain this caller may not see:\n{unknown}"
+        );
+        assert_eq!(
+            without_name(&hidden, "lab"),
+            without_name(&unknown, "nope"),
+            "{tool} answers a hidden name exactly like an unknown one"
+        );
+    }
+}
+
+/// **`provision` allow and deny never tell a hidden domain from an unknown
+/// one.** The checks that do not depend on the name (the instance admin gate,
+/// the nothing-declared gate) answer first and the same whatever name was
+/// passed; only then is the name checked, and a hidden name and an unknown one
+/// get the same bytes there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provision_answers_a_hidden_and_an_unknown_domain_alike() {
+    let decide = |name: &str| serde_json::json!({ "action": "allow", "domain": name });
+
+    // A signed-in non-admin: the role gate, for every name.
+    let ctx = mcp_ctx(true).await;
+    let stranger = ctx.token_for("out").await;
+    let session = McpTestSession::open(&ctx.addr, Some(&stranger)).await;
+    let hidden = session.call_tool("provision", decide("lab")).await;
+    let unknown = session.call_tool("provision", decide("nope")).await;
+    let visible = session.call_tool("provision", decide("open")).await;
+    assert!(hidden.contains("instance admin"), "{hidden}");
+    assert_eq!(
+        without_name(&hidden, "lab"),
+        without_name(&unknown, "nope"),
+        "hidden and unknown answer alike"
+    );
+    assert_eq!(
+        without_name(&hidden, "lab"),
+        without_name(&visible, "open"),
+        "and a visible name answers the same"
+    );
+
+    // An admin sees every domain, so its answers are the same too.
+    let boss = ctx.token_for("boss").await;
+    let session = McpTestSession::open(&ctx.addr, Some(&boss)).await;
+    let hidden = session.call_tool("provision", decide("lab")).await;
+    let unknown = session.call_tool("provision", decide("nope")).await;
+    assert_eq!(
+        without_name(&hidden, "lab"),
+        without_name(&unknown, "nope"),
+        "an admin is answered by the gate that does not depend on the name"
+    );
+
+    // The open tier: nothing declares provisioning here, so that gate answers
+    // for every name.
+    let ctx = mcp_ctx(false).await;
+    let session = McpTestSession::open(&ctx.addr, None).await;
+    let hidden = session.call_tool("provision", decide("lab")).await;
+    let unknown = session.call_tool("provision", decide("nope")).await;
+    assert!(hidden.contains("Provisioning"), "{hidden}");
+    assert_eq!(
+        without_name(&hidden, "lab"),
+        without_name(&unknown, "nope"),
+        "the open tier answers alike too"
     );
 }
 
@@ -2064,8 +2180,9 @@ async fn discover_onboards_each_caller_with_the_domains_it_may_see() {
 /// `get_info` is synchronous and rmcp calls it with no request context, so this
 /// one channel cannot know who is connecting and cannot leave a private
 /// domain's bullets out of a per-caller block. It therefore carries every
-/// behavior rule, the count of registered domains and the pointer at
-/// `list_domains` - which does resolve a caller and does filter - and no name.
+/// behavior rule, the count of the domains that are not private and the
+/// pointer at `list_domains` - which does resolve a caller and does filter -
+/// and no name.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_http_handshake_carries_the_rules_and_no_domain_name() {
     let ctx = mcp_ctx(true).await;
@@ -2077,8 +2194,8 @@ async fn the_http_handshake_carries_the_rules_and_no_domain_name() {
         "the rules still arrive:\n{handshake}"
     );
     assert!(
-        handshake.contains("3 domains registered"),
-        "with the count line:\n{handshake}"
+        handshake.contains("2 domains registered"),
+        "with the count line, which leaves the private `lab` out:\n{handshake}"
     );
     assert!(
         !handshake.contains("confidential lab questions")

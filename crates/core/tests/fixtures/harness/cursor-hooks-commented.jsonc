@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "hooks": {
+    // the other tool sends every session start to its own script
+    "sessionStart": [
+      {
+        /* written by the other tool */
+        "command": "/Users/someone/.othertool/hooks/cursor-hook.sh SessionStart"
+      }
+    ],
+    "sessionEnd": [
+      {
+        "command": "/Users/someone/.othertool/hooks/cursor-hook.sh SessionEnd"
+      }
+    ],
+    "beforeSubmitPrompt": [
+      {
+        "command": "/Users/someone/.othertool/hooks/cursor-hook.sh Start"
+      }
+    ],
+    "stop": [
+      {
+        "command": "/Users/someone/.othertool/hooks/cursor-hook.sh Stop"
+      }
+    ],
+    "beforeShellExecution": [
+      {
+        "command": "/Users/someone/.othertool/hooks/cursor-hook.sh PermissionRequest"
+      }
+    ],
+    "beforeMCPExecution": [
+      {
+        "command": "/Users/someone/.othertool/hooks/cursor-hook.sh PermissionRequest"
+      }
+    ],
+  }
+}

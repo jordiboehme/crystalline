@@ -1287,9 +1287,9 @@ pub(crate) fn read_resolve_content(path: &Path) -> Result<Vec<u8>> {
 /// Render a `provision` result: `status`'s report through
 /// [`print_provision_status`], every other action (bare `provision`,
 /// `allow`, `deny`) through [`print_provision_apply`].
-pub(crate) fn print_provision(action: &str, data: &serde_json::Value, json: bool) {
+pub(crate) fn print_provision(action: &str, data: &serde_json::Value, json: bool, all: bool) {
     if action == "status" {
-        print_provision_status(data, json);
+        print_provision_status(data, json, all);
     } else {
         print_provision_apply(data, json);
     }
@@ -1338,26 +1338,57 @@ pub(crate) fn print_provision_apply(data: &serde_json::Value, json: bool) {
 /// counts, then domains still awaiting a decision. The harness line matches
 /// `crystalline doctor`'s provisioning section wording exactly, so the two
 /// surfaces never drift apart on what they report.
-pub(crate) fn print_provision_status(data: &serde_json::Value, json: bool) {
+///
+/// The domains arrive in the report's own order (allowed, undecided, denied,
+/// then the quiet ones). The quiet domains - those declaring no provisioning
+/// and the virtual ones - fold into one summary line per group unless `all`
+/// asks for every one of them on its own line. `--json` always carries every
+/// domain.
+pub(crate) fn print_provision_status(data: &serde_json::Value, json: bool, all: bool) {
     if json {
         println!("{data}");
         return;
     }
     let empty = Vec::new();
+    let mut no_provisioning = 0usize;
+    let mut virtual_domains = 0usize;
     for d in data["domains"].as_array().unwrap_or(&empty) {
         let name = d["domain"].as_str().unwrap_or("");
         if d["is_virtual"].as_bool().unwrap_or(false) {
-            println!("{name}: virtual, never provisions artifacts");
+            if all {
+                println!("{name}: virtual, never provisions artifacts");
+            }
+            virtual_domains += 1;
             continue;
         }
         if !d["declares"].as_bool().unwrap_or(false) {
-            println!("{name}: declares no provisioning");
+            if all {
+                println!("{name}: declares no provisioning");
+            }
+            no_provisioning += 1;
             continue;
         }
         let decision = d["decision"].as_str().unwrap_or("undecided");
         println!("{name}: {decision}, {}", format_counts(&d["counts"]));
     }
+    if !all {
+        if no_provisioning > 0 {
+            println!(
+                "{no_provisioning} domain(s) declare no provisioning (run `crystalline provision status --all` to list them)"
+            );
+        }
+        if virtual_domains > 0 {
+            println!("{virtual_domains} virtual domain(s), which never provision artifacts");
+        }
+    }
     for h in data["harnesses"].as_array().unwrap_or(&empty) {
+        if let Some(owner) = h["covered_by"].as_str() {
+            println!(
+                "{}: covered by {owner}",
+                h["harness"].as_str().unwrap_or("")
+            );
+            continue;
+        }
         println!(
             "{}: {} file(s) installed, {} mcp(s) installed, {} drifted, {} edited, {} orphaned, {} missing",
             h["harness"].as_str().unwrap_or(""),
@@ -2051,8 +2082,22 @@ pub async fn sync(
     // for the final cross-domain resolution pass below.
     let mut applied: Vec<(crystalline_index::DomainId, crystalline_index::SyncReport)> = Vec::new();
     for (name, entry) in targets {
-        // Virtual domains have no files to sync.
+        // Virtual domains have no files to sync, but a parser change leaves
+        // their stored rows behind, and the daemon's own reparse is not here
+        // to catch it up.
         let Some(path) = resolve_domain_path(&entry) else {
+            let store = store.lock().await;
+            let Some(domain) = store.domain_id(&name).await? else {
+                continue;
+            };
+            if crystalline_index::reparse_due(&*store, domain).await? {
+                let n = crystalline_index::reparse_stored_domain(&*store, &name, domain, &params)
+                    .await
+                    .map_err(|e| anyhow!("sync of '{name}' failed: {e}"))?;
+                if !json {
+                    println!("reparsed {n} engram(s) of '{name}' after a parser change");
+                }
+            }
             continue;
         };
         // A large domain's walk-and-hash pass can take a while with no

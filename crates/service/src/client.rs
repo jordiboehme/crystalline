@@ -18,7 +18,8 @@ use crystalline_remote::ops::DiscardTarget;
 use crate::daemon::{Departure, SHUTDOWN_DEADLINE, open_store, resolve_db};
 use crate::engine::{CLI_ACTOR, Engine, ShareActor, open_standalone};
 use crate::instance::{
-    Connection, acquire_ownership, acquire_standalone_ownership, ensure_daemon, try_attach,
+    Connection, HarnessGate, acquire_ownership, acquire_standalone_ownership, ensure_daemon,
+    try_attach,
 };
 use crate::mcp::McpServer;
 use crate::overlay;
@@ -121,9 +122,13 @@ where
     Ok(Some(buf.trim_end_matches(['\r', '\n']).to_string()))
 }
 
-/// Whether the harness that spawned this process already has the shipped
-/// skills on disk and onboards itself at session start, from the `--harness`
-/// argument its MCP registration carries plus this machine's install receipt.
+/// What the harness that spawned this process already does for itself, from
+/// the `--harness` argument its MCP registration carries plus this machine's
+/// install receipt: whether its session hook is installed (the routing block
+/// probably arrives at session start) and whether its onboarding is verified
+/// (the hook is installed **and** the harness's profile says a live check
+/// confirmed that it loads the hook's block and the shipped skills as files).
+/// See [`HarnessGate`].
 ///
 /// Neither input is the connecting client: one is the deployment's own
 /// configuration, the other is machine state. That is what makes the answer
@@ -137,24 +142,25 @@ where
 /// can be overridden by the environment, which this process inherits from the
 /// harness and the daemon does not.
 ///
-/// Every uncertain input resolves to `false`, meaning serve: no argument (a
-/// registration predating the flag), an id this binary does not know, a
-/// missing or corrupt receipt, or a harness the receipt does not list with
-/// hooks. An over-served client pays duplicated context; an under-served one
-/// loses onboarding it cannot rediscover.
-fn resolve_harness_onboarded(harness: Option<&str>) -> bool {
+/// Every uncertain input resolves to [`HarnessGate::default`], meaning serve
+/// everything with the full instructions: no argument (a registration
+/// predating the flag), an id this binary does not know, a missing or corrupt
+/// receipt, or a harness the receipt does not list with hooks. An over-served
+/// client pays duplicated context; an under-served one loses onboarding it
+/// cannot rediscover.
+fn resolve_harness_gate(harness: Option<&str>) -> HarnessGate {
     let Ok(receipt) = crystalline_core::provision::install_receipt_path() else {
-        return false;
+        return HarnessGate::default();
     };
-    resolve_harness_onboarded_at(harness, &receipt)
+    resolve_harness_gate_at(harness, &receipt)
 }
 
-/// [`resolve_harness_onboarded`] against an explicit receipt path, so the
-/// decision table can be tested without touching this machine's real state
-/// directory or its environment.
-fn resolve_harness_onboarded_at(harness: Option<&str>, receipt: &Path) -> bool {
+/// [`resolve_harness_gate`] against an explicit receipt path, so the decision
+/// table can be tested without touching this machine's real state directory
+/// or its environment.
+fn resolve_harness_gate_at(harness: Option<&str>, receipt: &Path) -> HarnessGate {
     let Some(id) = harness else {
-        return false;
+        return HarnessGate::default();
     };
     // Parsed permissively rather than as a clap value enum: a downgraded
     // binary meeting a newer registration, or a harness id rolled out ahead of
@@ -166,15 +172,20 @@ fn resolve_harness_onboarded_at(harness: Option<&str>, receipt: &Path) -> bool {
             "unknown --harness value; serving the full skill surface. \
              Upgrade crystalline if this harness is newer than this binary."
         );
-        return false;
+        return HarnessGate::default();
     };
-    let onboarded = crystalline_core::harnesses_with_hooks(receipt).contains(&kind);
+    let hook_installed = crystalline_core::harnesses_with_hooks(receipt).contains(&kind);
+    let gate = HarnessGate {
+        hook_installed,
+        onboarding_verified: hook_installed && kind.profile().onboarding_verified,
+    };
     tracing::debug!(
         harness = %id,
-        onboarded,
+        hook_installed = gate.hook_installed,
+        onboarding_verified = gate.onboarding_verified,
         "resolved the skill surface for this session from the install receipt"
     );
-    onboarded
+    gate
 }
 
 /// The `crystalline mcp` stdio entry: attach to (or spawn) a daemon and relay
@@ -200,7 +211,7 @@ pub async fn run_mcp(
     // fixed at startup is invariant for every connection it can ever serve,
     // which is what SEP-2567 needs of a gate that stays on a listing. It is
     // re-sent on each daemon reconnect and never re-derived daemon-side.
-    let harness_onboarded = resolve_harness_onboarded(harness);
+    let harness_gate = resolve_harness_gate(harness);
 
     // Read the client's first line concurrently with daemon acquisition, so a
     // cold daemon spawns while the client is still composing its opener rather
@@ -230,7 +241,7 @@ pub async fn run_mcp(
         // as a client while the client is still composing its first request.
         let (opened, daemon) = tokio::join!(read_session_opener(&mut reader), async {
             let conn = ensure_daemon(true, db, config_path, read_only).await?;
-            conn.into_mcp(harness_onboarded)
+            conn.into_mcp(harness_gate)
                 .await
                 .map_err(|e| anyhow::anyhow!("daemon MCP handshake failed ({e})"))
         });
@@ -254,15 +265,7 @@ pub async fn run_mcp(
     if let Some(daemon) = daemon {
         match daemon {
             Ok(stream) => {
-                return pump_stdio(
-                    stream,
-                    primed,
-                    db,
-                    config_path,
-                    read_only,
-                    harness_onboarded,
-                )
-                .await;
+                return pump_stdio(stream, primed, db, config_path, read_only, harness_gate).await;
             }
             Err(e) => tracing::warn!("no daemon available ({e}); running embedded"),
         }
@@ -279,7 +282,7 @@ pub async fn run_mcp(
     // still intact for the stub. Only if the stub itself fails to serve do we
     // fall back to the old `-32000` reply and a non-zero exit (stderr carries
     // the chain for the Desktop log).
-    match build_embedded(db, config_path, read_only, harness_onboarded).await {
+    match build_embedded(db, config_path, read_only, harness_gate).await {
         Ok(stack) => run_embedded_stdio(stack, primed).await,
         Err(e) => {
             tracing::error!(
@@ -532,7 +535,7 @@ async fn pump_stdio<R>(
     db: Option<&Path>,
     config_path: Option<&Path>,
     read_only: bool,
-    harness_onboarded: bool,
+    harness_gate: HarnessGate,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -572,7 +575,7 @@ where
             // `McpServer` per accepted socket (`daemon.rs`), so a restart
             // would otherwise flip an onboarded harness back to served in the
             // middle of a live session.
-            let Ok(stream) = conn.into_mcp(harness_onboarded).await else {
+            let Ok(stream) = conn.into_mcp(harness_gate).await else {
                 continue;
             };
             session = Session::new(stream);
@@ -610,7 +613,7 @@ async fn build_embedded(
     db: Option<&Path>,
     config_path: Option<&Path>,
     read_only: bool,
-    harness_onboarded: bool,
+    harness_gate: HarnessGate,
 ) -> anyhow::Result<EmbeddedStack> {
     let ownership = acquire_ownership()
         .map_err(|e| anyhow::anyhow!("cannot run an embedded MCP server: {e}"))?;
@@ -670,7 +673,7 @@ async fn build_embedded(
     engine.refresh_routing_cache().await;
 
     Ok(EmbeddedStack {
-        server: McpServer::new(engine.clone()).with_onboarded_harness(harness_onboarded),
+        server: McpServer::new(engine.clone()).with_harness_gate(harness_gate),
         engine,
         ownership,
     })
@@ -2169,11 +2172,31 @@ fn decode<T: DeserializeOwned>(args: Value) -> anyhow::Result<T> {
 // --- ctl client --------------------------------------------------------------
 
 /// Send a ctl command if a daemon is running, else `None`.
+///
+/// A call that displaced an older daemon on the way does not answer `None`.
+/// A displacement means a daemon was running, so a daemon answers after it:
+/// either the successor a respawning MCP bridge has already started from the
+/// new binary, or one this call spawns. Going standalone there collides with
+/// that successor, which holds the index by the time the open runs, and the
+/// first command after an in-place upgrade failed on the index lock (gate
+/// item 9 of 0.22). `None` stays the answer when no daemon was running, and
+/// when no daemon became ready after the displacement, so the caller falls
+/// back as before.
+///
+/// A successor this call starts runs with the displaced daemon's own start
+/// options from its record (its `--db`, config file and read-only mode among
+/// them), never with this command's: see
+/// [`crate::instance::attach_after_displacement`].
 pub async fn ctl_if_running(cmd: Value) -> anyhow::Result<Option<Value>> {
-    match try_attach().await {
-        Some(conn) => Ok(Some(ctl_exchange(conn, cmd).await?)),
-        None => Ok(None),
-    }
+    let conn = match crate::instance::try_attach_displacing().await {
+        (Some(conn), _) => conn,
+        (None, Some(start)) => match crate::instance::attach_after_displacement(start).await {
+            Some(conn) => conn,
+            None => return Ok(None),
+        },
+        (None, None) => return Ok(None),
+    };
+    Ok(Some(ctl_exchange(conn, cmd).await?))
 }
 
 /// [`ctl_if_running`] over a passive attach: the answer of a daemon that is
@@ -2276,7 +2299,8 @@ mod tests {
     //
     // The whole decision table for `--harness`, against a receipt written by
     // hand in the shape `crystalline install` writes. Every uncertain row
-    // resolves to false, meaning "serve the surface": an over-served client
+    // resolves to the default gate, meaning "serve the surface and the full
+    // instructions": an over-served client
     // pays some duplicated context, an under-served one loses onboarding it
     // has no way to rediscover.
 
@@ -2292,6 +2316,12 @@ mod tests {
         .unwrap();
     }
 
+    /// The gate a verified harness with its hooks wired resolves to.
+    const VERIFIED: HarnessGate = HarnessGate {
+        hook_installed: true,
+        onboarding_verified: true,
+    };
+
     #[test]
     fn the_resolved_answer_is_the_named_harness_plus_this_machines_receipt() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2299,17 +2329,69 @@ mod tests {
 
         // The row the feature exists for.
         write_receipt(&receipt, "claude-code", true);
-        assert!(resolve_harness_onboarded_at(Some("claude-code"), &receipt));
+        assert_eq!(
+            resolve_harness_gate_at(Some("claude-code"), &receipt),
+            VERIFIED
+        );
 
         // Per harness, not per machine: the receipt knows claude-code, and a
         // codex-spawned process still gets the surface. This is the whole
         // reason the argument exists rather than the receipt alone.
-        assert!(!resolve_harness_onboarded_at(Some("codex"), &receipt));
+        assert_eq!(
+            resolve_harness_gate_at(Some("codex"), &receipt),
+            HarnessGate::default()
+        );
 
         // Hooks skipped: nothing onboards that session, so the block and the
         // surface both have to come from here.
         write_receipt(&receipt, "claude-code", false);
-        assert!(!resolve_harness_onboarded_at(Some("claude-code"), &receipt));
+        assert_eq!(
+            resolve_harness_gate_at(Some("claude-code"), &receipt),
+            HarnessGate::default()
+        );
+    }
+
+    /// The gate is two facts. A hook in the receipt is enough for the short
+    /// instructions with a conditional pointer, but the skills stay served
+    /// until the harness's profile says a live check confirmed that it loads
+    /// the hook's routing block and the skills as files.
+    #[test]
+    fn the_gate_is_two_facts_and_only_a_verified_profile_hides_the_skills() {
+        let tmp = tempfile::tempdir().unwrap();
+        let receipt = tmp.path().join("installs.json");
+        write_receipt(&receipt, "claude-code", true);
+        assert_eq!(
+            resolve_harness_gate_at(Some("claude-code"), &receipt),
+            HarnessGate {
+                hook_installed: true,
+                onboarding_verified: true
+            }
+        );
+        for id in ["codex", "copilot"] {
+            write_receipt(&receipt, id, true);
+            assert_eq!(
+                resolve_harness_gate_at(Some(id), &receipt),
+                VERIFIED,
+                "{id} is verified"
+            );
+        }
+        for id in ["cursor", "kiro", "gemini", "qwen"] {
+            write_receipt(&receipt, id, true);
+            assert_eq!(
+                resolve_harness_gate_at(Some(id), &receipt),
+                HarnessGate {
+                    hook_installed: true,
+                    onboarding_verified: false
+                },
+                "{id} is unverified"
+            );
+            write_receipt(&receipt, id, false);
+            assert_eq!(
+                resolve_harness_gate_at(Some(id), &receipt),
+                HarnessGate::default(),
+                "{id} with --skip-hooks"
+            );
+        }
     }
 
     #[test]
@@ -2317,28 +2399,35 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let receipt = tmp.path().join("installs.json");
         write_receipt(&receipt, "claude-code", true);
+        let serve = HarnessGate::default();
 
         // No argument at all: a registration written before `--harness`
         // existed. This is the pre-existing-install case and it must behave
         // exactly as it did before the flag.
-        assert!(!resolve_harness_onboarded_at(None, &receipt));
+        assert_eq!(resolve_harness_gate_at(None, &receipt), serve);
 
         // An id this binary does not know: a downgrade meeting a newer
         // registration, or a harness rolled out ahead of the binaries. Warns
         // and serves; it must never be a usage error, which would leave the
         // harness with a server that will not start.
-        assert!(!resolve_harness_onboarded_at(
-            Some("nextgen-harness"),
-            &receipt
-        ));
-        assert!(!resolve_harness_onboarded_at(Some(""), &receipt));
+        assert_eq!(
+            resolve_harness_gate_at(Some("nextgen-harness"), &receipt),
+            serve
+        );
+        assert_eq!(resolve_harness_gate_at(Some(""), &receipt), serve);
 
         // A missing receipt and a corrupt one both read as "nothing onboarded"
         // through the tolerant shallow reader, never as an error.
         let missing = tmp.path().join("nope.json");
-        assert!(!resolve_harness_onboarded_at(Some("claude-code"), &missing));
+        assert_eq!(
+            resolve_harness_gate_at(Some("claude-code"), &missing),
+            serve
+        );
         std::fs::write(&receipt, "not json at all").unwrap();
-        assert!(!resolve_harness_onboarded_at(Some("claude-code"), &receipt));
+        assert_eq!(
+            resolve_harness_gate_at(Some("claude-code"), &receipt),
+            serve
+        );
     }
 
     #[test]

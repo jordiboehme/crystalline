@@ -458,6 +458,49 @@ pub(crate) fn rename_onto_taken_row(old: &str, new: &str) -> crate::IndexError {
     ))
 }
 
+/// What a store's `guarded_compare` answers when its no-op UPDATE reported no
+/// changed row, from the sha the fallback SELECT read: no row is `Ok(false)`,
+/// a row that moved on is [`crate::IndexError::StaleEdit`], and a row that
+/// still carries the expected sha is `Ok(true)`. That last arm cannot happen
+/// while the database counts matched rows, but a release that counted only
+/// changed values would report zero changes for every no-op UPDATE, and this
+/// keeps such a release from refusing every guarded edit. Both backends call
+/// it, so they agree.
+pub(crate) fn compare_outcome(stored: Option<String>, expected: &str) -> Result<bool> {
+    match stored {
+        Some(found) if found == expected => Ok(true),
+        Some(found) => Err(crate::IndexError::StaleEdit {
+            expected: expected.to_string(),
+            found,
+        }),
+        None => Ok(false),
+    }
+}
+
+#[cfg(test)]
+mod compare_outcome_tests {
+    use super::compare_outcome;
+    use crate::IndexError;
+
+    // Mutation caught: a matching row read back after an UPDATE that
+    // reported zero changes answered as a StaleEdit with two equal shas.
+    #[test]
+    fn a_guarded_compare_whose_row_still_matches_is_a_match_even_with_zero_changes() {
+        assert!(matches!(
+            compare_outcome(Some("abc".into()), "abc"),
+            Ok(true)
+        ));
+        assert!(matches!(compare_outcome(None, "abc"), Ok(false)));
+        match compare_outcome(Some("def".into()), "abc") {
+            Err(IndexError::StaleEdit { expected, found }) => {
+                assert_eq!(expected, "abc");
+                assert_eq!(found, "def");
+            }
+            other => panic!("expected a StaleEdit, got {other:?}"),
+        }
+    }
+}
+
 /// How many hashes one `observation_vector` statement names at most. The
 /// postgres store cuts every hash list into runs of this many, so a domain of
 /// any size costs bounded statements and stays far below the bind limit. The
@@ -1577,6 +1620,63 @@ pub struct ScoredPair {
     pub checksum_a: String,
     /// `b`'s scoring checksum at scoring time.
     pub checksum_b: String,
+}
+
+/// An exclusive work claim from [`Store::try_work_claim`], held for as long
+/// as the guard lives.
+///
+/// On Postgres it holds the connection whose session took the advisory lock.
+/// [`WorkClaim::release`] unlocks it and hands the connection back to the
+/// pool; a guard dropped without a release detaches its connection and drops
+/// it, which ends the session and so frees the lock. On a store this process
+/// owns alone the guard holds nothing.
+pub struct WorkClaim {
+    #[cfg(feature = "postgres")]
+    session: Option<(sqlx::pool::PoolConnection<sqlx::Postgres>, i64)>,
+}
+
+impl WorkClaim {
+    /// A claim with nobody to exclude, for a store this process owns alone.
+    pub(crate) fn unshared() -> WorkClaim {
+        WorkClaim {
+            #[cfg(feature = "postgres")]
+            session: None,
+        }
+    }
+
+    /// A claim held by the session of `conn` under the advisory lock `id`.
+    #[cfg(feature = "postgres")]
+    pub(crate) fn session(conn: sqlx::pool::PoolConnection<sqlx::Postgres>, id: i64) -> WorkClaim {
+        WorkClaim {
+            session: Some((conn, id)),
+        }
+    }
+
+    /// Let go of the claim now. A failed unlock closes the session instead,
+    /// so a connection that might still hold the lock never goes back to the
+    /// pool.
+    #[cfg_attr(not(feature = "postgres"), allow(unused_mut))]
+    pub async fn release(mut self) {
+        #[cfg(feature = "postgres")]
+        if let Some((conn, id)) = self.session.take() {
+            crate::postgres::release_work_claim(conn, id).await;
+        }
+    }
+}
+
+impl Drop for WorkClaim {
+    fn drop(&mut self) {
+        #[cfg(feature = "postgres")]
+        if let Some((conn, _)) = self.session.take() {
+            drop(conn.detach());
+        }
+    }
+}
+
+impl std::fmt::Debug for WorkClaim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkClaim").finish_non_exhaustive()
+    }
 }
 
 /// One scored observation-line pair as `contradiction` records it.
@@ -2779,6 +2879,14 @@ pub trait Store: Send + Sync {
     fn shares_database(&self) -> bool {
         false
     }
+
+    /// Try to take an exclusive work claim named `key` for as long as the
+    /// returned guard lives. On Postgres a session-level advisory lock on a
+    /// connection the guard holds; the lock ends with the session, so a
+    /// crashed holder lets go by itself. On a store this process owns alone
+    /// there is nobody to exclude: always `Some`. `None` means another
+    /// session holds the claim right now.
+    async fn try_work_claim(&self, key: &str) -> Result<Option<WorkClaim>>;
 
     /// Delete all indexed data, keeping the schema. The corruption-recovery
     /// path behind `crystalline reindex --wipe`, and nothing else: an ordinary

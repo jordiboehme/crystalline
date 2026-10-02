@@ -6,7 +6,7 @@ One command wires Claude Code to Crystalline; this page says what it wired and h
 crystalline install claude-code
 ```
 
-One command wires the whole integration: MCP registration, the `SessionStart` onboarding hook, the `Stop` capture nudge, the `UserPromptSubmit` recall hook (see [The learning loop](../learning-loop.md#the-learning-loop)) and the four topical skills. It is idempotent - rerun it any time and whatever is already correct is left untouched - and each part is skippable with `--skip-mcp`, `--skip-hooks` or `--skip-skills`; `--project` writes into the current repository's config instead of your global one, and `crystalline uninstall claude-code` reverses everything `install` did, leaving any hook, key or locally edited skill that is not Crystalline's own in place.
+One command wires the whole integration: MCP registration, the `SessionStart` onboarding hook, the `Stop` capture nudge, the `UserPromptSubmit` recall hook (see [The learning loop](../learning-loop.md#the-learning-loop)) and the five topical skills. It is idempotent - rerun it any time and whatever is already correct is left untouched - and each part is skippable with `--skip-mcp`, `--skip-hooks` or `--skip-skills`; `--project` writes into the current repository's config instead of your global one, and `crystalline uninstall claude-code` reverses everything `install` did, leaving any hook, key or locally edited skill that is not Crystalline's own in place.
 
 The README's [Get started](../../README.md#get-started) is exactly this path end to end.
 

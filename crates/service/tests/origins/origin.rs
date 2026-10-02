@@ -6031,25 +6031,115 @@ async fn unshared_team_work_puts_the_share_ask_on_a_write_receipt() {
     )
     .unwrap();
 
-    let first = crystalline_service::nudge::write_verb_trailer(&eng, Some("ada"))
-        .await
-        .expect("a receipt with work to share carries the sharing ask");
+    let first =
+        crystalline_service::nudge::write_verb_trailer(&eng, Some("ada"), &Scope::Unrestricted)
+            .await
+            .expect("a receipt with work to share carries the sharing ask");
     assert_eq!(
         first,
         crystalline_service::nudge::share_nudge_line(1, &["brand".to_string()]),
         "the sharing ask names the one domain and counts the one change"
     );
 
-    let second = crystalline_service::nudge::write_verb_trailer(&eng, Some("ada"))
-        .await
-        .expect("the maintenance ask was not spent by the sharing one");
+    let second =
+        crystalline_service::nudge::write_verb_trailer(&eng, Some("ada"), &Scope::Unrestricted)
+            .await
+            .expect("the maintenance ask was not spent by the sharing one");
     assert_eq!(second, crystalline_service::nudge::MCP_EVOLVE_NUDGE);
 
     assert!(
-        crystalline_service::nudge::write_verb_trailer(&eng, Some("ada"))
+        crystalline_service::nudge::write_verb_trailer(&eng, Some("ada"), &Scope::Unrestricted)
             .await
             .is_none(),
         "both asks are inside their cooldown now"
+    );
+}
+
+/// **The sharing ask on a write receipt never names or counts a private team
+/// domain the caller may not see.**
+///
+/// A direct-mode team domain's unshared count is a walk of its folder, which
+/// holds everybody's work, so without a screen any account writing anywhere
+/// would be told that `vault` exists and how much it owes. `brand` is the
+/// control: it is visible and its one change is the whole of the stranger's
+/// ask. The machine owner sees both, on its own cooldown key.
+#[tokio::test]
+async fn the_share_ask_names_no_team_domain_the_caller_may_not_see() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest_sharing_indexes())]));
+    mock.set_branch("main", &commit);
+
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let brand_root = tmp.path().join("brand-knowledge");
+    let vault_root = tmp.path().join("vault-knowledge");
+    let eng = engine_with(&config_path, &origins_dir, mock.clone(), true, false).await;
+    for (repo, name, root) in [
+        ("acme/brand-knowledge", "brand", &brand_root),
+        ("acme/vault-knowledge", "vault", &vault_root),
+    ] {
+        eng.origin_add(repo, Some(name), None, None, Some(root.to_str().unwrap()))
+            .await
+            .unwrap();
+    }
+    std::fs::write(
+        brand_root.join("added.md"),
+        engram("Added", "added", "written here, never shared"),
+    )
+    .unwrap();
+    for slug in ["secret-one", "secret-two"] {
+        std::fs::write(
+            vault_root.join(format!("{slug}.md")),
+            engram(slug, slug, "private work, never shared"),
+        )
+        .unwrap();
+    }
+
+    let auth = Arc::new(
+        AuthStore::open(&tmp.path().join("web-auth.db"))
+            .await
+            .unwrap(),
+    );
+    auth.add_user("keeper", "keeper", None, Role::Admin, "pw12345678")
+        .await
+        .unwrap();
+    auth.add_user("ada", "ada", None, Role::Editor, "pw12345678")
+        .await
+        .unwrap();
+    auth.set_domain_visibility("vault", true, "keeper")
+        .await
+        .unwrap();
+    eng.set_domain_access(Arc::new(DomainAccess::new(auth)));
+    let ada = Scope::User {
+        account: "ada".to_string(),
+        admin: false,
+    };
+    // Guard against a vacuous pass: ada really has `vault` hidden.
+    assert_eq!(
+        eng.hidden_domains(&ada).await.unwrap(),
+        Some(std::collections::HashSet::from(["vault".to_string()])),
+    );
+
+    let hers = crystalline_service::nudge::write_verb_trailer(&eng, Some("ada"), &ada)
+        .await
+        .expect("brand's change is hers to be asked about");
+    assert_eq!(
+        hers,
+        crystalline_service::nudge::share_nudge_line(1, &["brand".to_string()]),
+        "the ask names and counts only the domain ada may see"
+    );
+
+    let mine = crystalline_service::nudge::write_verb_trailer(&eng, None, &Scope::Unrestricted)
+        .await
+        .expect("the machine owner is asked about both");
+    assert_eq!(
+        mine,
+        crystalline_service::nudge::share_nudge_line(
+            3,
+            &["brand".to_string(), "vault".to_string()]
+        ),
+        "the screen is about the caller, not the domain"
     );
 }
 
@@ -6090,7 +6180,7 @@ async fn two_receipts_inside_the_memo_window_walk_the_tree_once() {
     // sibling test in this binary walks its own team domain, and `cargo test`
     // runs the two as threads in one process.
     assert!(
-        crystalline_service::nudge::write_verb_trailer(&eng, Some("ada"))
+        crystalline_service::nudge::write_verb_trailer(&eng, Some("ada"), &Scope::Unrestricted)
             .await
             .is_none(),
         "a domain that owes nothing has nothing to ask about"
@@ -6108,7 +6198,7 @@ async fn two_receipts_inside_the_memo_window_walk_the_tree_once() {
     .unwrap();
 
     assert!(
-        crystalline_service::nudge::write_verb_trailer(&eng, Some("ada"))
+        crystalline_service::nudge::write_verb_trailer(&eng, Some("ada"), &Scope::Unrestricted)
             .await
             .is_none(),
         "the second receipt answers from the memo, which has not seen the new file"

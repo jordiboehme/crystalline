@@ -310,7 +310,7 @@ impl Engine {
         let started = std::time::Instant::now();
         let work = async {
             // This writer's own view of the domain they just wrote in. The
-            // write itself already screened the domain (`refuse_hidden_domain`
+            // write itself already screened the domain (`require_domain`
             // on the way in), so there is nothing left for this pass to screen.
             let view = DomainView::for_read(self, &domain, &HashSet::new(), scope)?;
             let text = match probe {

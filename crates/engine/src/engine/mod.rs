@@ -790,6 +790,12 @@ pub struct Engine {
     // so the first off pass after a start clears what a setting changed while
     // the daemon was down left behind, and later off passes cost nothing.
     contradiction_data_cleared: std::sync::atomic::AtomicBool,
+    // Set once a full sync has claimed the file domains this instance hosts.
+    // On a shared database the off switch clears only those, so it waits for
+    // this: an off pass before it would clear none and latch the flag above.
+    // The sync that sets it asks for the off pass. See
+    // `Engine::clear_contradiction_data_once`.
+    file_hosting_known: std::sync::atomic::AtomicBool,
     // Set once the line vectors of every other embedding model were deleted
     // in this process; the model cannot change without a restart.
     line_vectors_model_pruned: std::sync::atomic::AtomicBool,
@@ -798,6 +804,18 @@ pub struct Engine {
     // skip is invisible in the outcome. See `Engine::contradiction_fact_walks`.
     #[cfg(any(test, feature = "testing"))]
     contradiction_fact_walks: std::sync::atomic::AtomicU64,
+    // The same for the engrams such a parse read: an engram whose content
+    // sha is in the fact cache is not read. See
+    // `Engine::contradiction_fact_loads`.
+    #[cfg(any(test, feature = "testing"))]
+    contradiction_fact_loads: std::sync::atomic::AtomicU64,
+    // What the contradiction walk parsed of each engram, per domain and path,
+    // keyed by the content sha it was read at, so a walk reads only the
+    // engrams whose stamp moved. Memory only, never written to the database;
+    // cleared when the check is switched off or its setting changes. See
+    // `Engine::contradiction_facts`.
+    contradiction_facts_cache:
+        std::sync::Mutex<HashMap<DomainId, HashMap<String, contradictions::CachedFact>>>,
     // The same for walks of the contradiction pass, parsed or not, so a test
     // can see a worker that keeps asking.
     #[cfg(any(test, feature = "testing"))]
@@ -1952,6 +1970,11 @@ pub(crate) struct ContradictionState {
     /// by every further download failure up to [`NLI_FETCH_RETRY_MAX`], and
     /// forgotten by a setting change or a load that succeeds.
     pub(crate) load_backoff: Option<std::time::Duration>,
+    /// The shared virtual domains the last walk left to another instance,
+    /// whose work claim it found held. Their pending does not make the tick
+    /// ask for a pass; the tick checks their claims instead
+    /// ([`Engine::recheck_contradiction_claims`]) and asks once one is free.
+    pub(crate) waiting: BTreeMap<String, DomainId>,
 }
 
 /// The loaded scorer and when it last scored.
@@ -2040,9 +2063,13 @@ impl Engine {
             scorer: std::sync::Mutex::new(None),
             scorer_loader: default_scorer_loader(),
             contradiction_data_cleared: std::sync::atomic::AtomicBool::new(false),
+            file_hosting_known: std::sync::atomic::AtomicBool::new(false),
             line_vectors_model_pruned: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "testing"))]
             contradiction_fact_walks: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(any(test, feature = "testing"))]
+            contradiction_fact_loads: std::sync::atomic::AtomicU64::new(0),
+            contradiction_facts_cache: std::sync::Mutex::default(),
             #[cfg(any(test, feature = "testing"))]
             contradiction_walks: std::sync::atomic::AtomicU64::new(0),
             #[cfg(any(test, feature = "testing"))]
@@ -2395,33 +2422,6 @@ impl Engine {
         access.write_right(scope, domain).await.map_err(|e| {
             EngineError::Internal(format!("this domain's membership is unreadable: {e:#}"))
         })
-    }
-
-    /// Refuse a domain this caller must not be answered from, and say nothing
-    /// about a name the index has never heard of.
-    ///
-    /// The narrow half of [`Engine::require_domain`], for a verb that already
-    /// has its own words for a domain nobody registered and its own order for
-    /// saying them. A screened domain is refused here with exactly the bytes an
-    /// unregistered one gets, which is the whole point; anything else falls
-    /// through untouched, so adding this gate to a verb cannot change what that
-    /// verb answered before on any input the index holds rows for.
-    ///
-    /// [`Engine::hidden_for`] screens two things and both are refused here: a
-    /// private domain, and a domain whose rows outlived their registration. The
-    /// second is a name the verb behind this gate would have refused for itself
-    /// a line later, since nothing unregistered resolves to a content source -
-    /// so this is one line earlier, not one refusal more.
-    pub async fn refuse_hidden_domain(
-        &self,
-        name: &str,
-        scope: &crate::scope::Scope,
-    ) -> Result<()> {
-        let hidden = self.hidden_for(scope).await?;
-        if hidden.contains(name) {
-            self.domain_entry_scoped(name, &hidden)?;
-        }
-        Ok(())
     }
 
     /// Every domain name a read must answer as though it were not there: the
@@ -3276,6 +3276,11 @@ impl Engine {
     /// for a domain that does not exist the name of every private domain on the
     /// instance. A domain the caller may not see is refused as an unregistered
     /// one, and the set the refusal lists is the visible set.
+    ///
+    /// The one gate every surface puts in front of a verb that takes a domain
+    /// by name. A hidden name and a name nobody registered get the same bytes,
+    /// and both are refused here rather than further in, where an unscoped
+    /// lookup would list every registered domain, private ones included.
     pub async fn require_domain(&self, name: &str, scope: &crate::scope::Scope) -> Result<()> {
         let hidden = self.hidden_for(scope).await?;
         self.domain_entry_scoped(name, &hidden)?;
@@ -5568,6 +5573,7 @@ fn harness_status_json(status: &crystalline_core::provision::HarnessStatus) -> V
         "edited": status.edited,
         "orphaned": status.orphaned,
         "missing": status.missing,
+        "covered_by": status.covered_by.map(|h| h.id()),
     })
 }
 

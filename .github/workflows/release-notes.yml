@@ -12,15 +12,19 @@ on:
   workflow_dispatch: {}
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   sync:
     name: sync
     runs-on: ubuntu-latest
+    # contents: write for `gh release edit`, which rewrites a release's notes.
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           # scripts/sync-release-notes.sh diffs github.event.before against
           # the pushed commit below, which the default shallow clone does not
           # have. Same reasoning as the `changes` job in ci.yml.
@@ -29,15 +33,16 @@ jobs:
       - name: Sync
         env:
           GH_TOKEN: ${{ github.token }}
+          BEFORE: ${{ github.event.before }}
         run: |
           set -euo pipefail
 
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
             bash scripts/sync-release-notes.sh
             exit 0
           fi
 
-          before="${{ github.event.before }}"
+          before="$BEFORE"
           case "$before" in
             ''|0000000000000000000000000000000000000000)
               # A first push to main, or one git has no usable base for:
@@ -52,7 +57,7 @@ jobs:
           # --diff-filter=d drops deletions: a removed notes file has nothing
           # left to sync and scripts/sync-release-notes.sh would skip a
           # missing path anyway, but there is no reason to even pass it one.
-          mapfile -t files < <(git diff --name-only --diff-filter=d "$before" "${{ github.sha }}" -- 'release-notes/v*.md')
+          mapfile -t files < <(git diff --name-only --diff-filter=d "$before" "${GITHUB_SHA}" -- 'release-notes/v*.md')
 
           if [ "${#files[@]}" -eq 0 ]; then
             echo "no release-notes files changed"

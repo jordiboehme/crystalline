@@ -206,6 +206,7 @@ pub fn detect_local_changes(
         base,
         crystalline_core::generated_indexes_at(domain_root),
         None,
+        None,
     )
 }
 
@@ -224,16 +225,41 @@ pub fn detect_local_changes_against(
     base: &BTreeMap<String, BaseStamp>,
     state_dir: &Path,
 ) -> Result<LocalChanges, RemoteError> {
+    // The LF digests recorded beside the stamps, read once for the whole walk.
+    // A digest describes the stamp recorded next to it, so it is trusted only
+    // for a path whose stamp in `base` is that very stamp: a caller passing a
+    // tip that differs from the recorded base gets the base-copy fallback.
+    let digests: Option<BTreeMap<String, String>> = crate::state::OriginState::load(state_dir)
+        .ok()
+        .flatten()
+        .map(|state| {
+            state
+                .lf_digests
+                .into_iter()
+                .filter(|(rel, _)| {
+                    base.get(rel)
+                        .is_some_and(|b| state.files.get(rel) == Some(b))
+                })
+                .collect()
+        });
     detect_local_changes_with(
         domain_root,
         base,
         crystalline_core::generated_indexes_at(domain_root),
         Some(state_dir),
+        digests.as_ref(),
     )
 }
 
 fn same_text_as_base(state_dir: Option<&Path>, rel: &str, stamp: &BaseStamp, disk: &[u8]) -> bool {
     state_dir.is_some_and(|dir| matches_base_as_lf(dir, rel, stamp, disk))
+}
+
+/// Whether a file of `size` bytes and digest `sha` is the base entry `stamp`
+/// describes: the same bytes, or (for a CRLF origin file) the same text as LF,
+/// which `lf` carries as the digest of the base copy's LF form.
+pub(crate) fn same_as_base(stamp: &BaseStamp, lf: Option<&str>, size: u64, sha: &str) -> bool {
+    (stamp.size == size && stamp.sha256 == sha) || lf == Some(sha)
 }
 
 /// Whether `disk`, a markdown file whose bytes differ from `stamp`, is the
@@ -268,6 +294,7 @@ pub(crate) fn detect_local_changes_with(
     base: &BTreeMap<String, BaseStamp>,
     indexes: GeneratedIndexes,
     base_copies: Option<&Path>,
+    lf_digests: Option<&BTreeMap<String, String>>,
 ) -> Result<LocalChanges, RemoteError> {
     let mut changes = Vec::new();
     let mut skipped_large = Vec::new();
@@ -335,8 +362,12 @@ pub(crate) fn detect_local_changes_with(
             Some(stamp) => {
                 let bytes = std::fs::read(entry.path())?;
                 let sha256 = sha256_hex(&bytes);
-                if (stamp.size != size || stamp.sha256 != sha256)
-                    && !same_text_as_base(base_copies, &rel, stamp, &bytes)
+                let lf = lf_digests.and_then(|m| m.get(&rel)).map(String::as_str);
+                // A path the map covers is decided by its digest; only one it
+                // does not cover (a state from 0.22.0) reads the base copy.
+                let covered = lf.is_some();
+                if !same_as_base(stamp, lf, size, &sha256)
+                    && (covered || !same_text_as_base(base_copies, &rel, stamp, &bytes))
                 {
                     changes.push(LocalChange::Modified { path: rel, sha256 });
                 }
@@ -452,7 +483,17 @@ pub(crate) fn detect_local_changes_with(
                 // that exists while the proposal writes the name the
                 // repository knows.
                 let stamp = base[key];
-                if stamp.size != *size || stamp.sha256 != *sha256 {
+                let lf = lf_digests.and_then(|m| m.get(key)).map(String::as_str);
+                let unchanged = same_as_base(stamp, lf, *size, sha256)
+                    || (lf.is_none()
+                        && base_copies.is_some()
+                        && disk_paths
+                            .get(key)
+                            .and_then(|disk| std::fs::read(domain_root.join(disk)).ok())
+                            .is_some_and(|bytes| {
+                                same_text_as_base(base_copies, key, stamp, &bytes)
+                            }));
+                if !unchanged {
                     changes.push(LocalChange::Modified {
                         path: key.to_string(),
                         sha256: sha256.clone(),
@@ -528,6 +569,17 @@ pub fn pair_renames(
     changes: &LocalChanges,
     base: &BTreeMap<String, BaseStamp>,
 ) -> Vec<(String, String)> {
+    pair_renames_with(changes, base, &BTreeMap::new())
+}
+
+/// [`pair_renames`], also indexing each deleted path by its LF digest (the
+/// origin state's `lf_digests`), so the rename of a CRLF origin file, which
+/// Crystalline wrote as LF, pairs with its `Added` LF hash.
+pub fn pair_renames_with(
+    changes: &LocalChanges,
+    base: &BTreeMap<String, BaseStamp>,
+    lf_digests: &BTreeMap<String, String>,
+) -> Vec<(String, String)> {
     let mut deleted_by_hash: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for change in &changes.changes {
         if let LocalChange::Deleted { path } = change
@@ -537,6 +589,12 @@ pub fn pair_renames(
                 .entry(stamp.sha256.as_str())
                 .or_default()
                 .push(path.as_str());
+            if let Some(lf) = lf_digests.get(path) {
+                deleted_by_hash
+                    .entry(lf.as_str())
+                    .or_default()
+                    .push(path.as_str());
+            }
         }
     }
 
@@ -697,12 +755,12 @@ mod tests {
     /// Detection for a domain that keeps its generated indexes local: the
     /// default, and what every MANIFEST that declares nothing gets.
     fn local(dir: &Path, base: &BTreeMap<String, BaseStamp>) -> LocalChanges {
-        detect_local_changes_with(dir, base, GeneratedIndexes::Local, None).unwrap()
+        detect_local_changes_with(dir, base, GeneratedIndexes::Local, None, None).unwrap()
     }
 
     /// Detection for a domain that lets them travel.
     fn shared(dir: &Path, base: &BTreeMap<String, BaseStamp>) -> LocalChanges {
-        detect_local_changes_with(dir, base, GeneratedIndexes::Shared, None).unwrap()
+        detect_local_changes_with(dir, base, GeneratedIndexes::Shared, None, None).unwrap()
     }
 
     /// A write the daemon was killed in the middle of leaves its temp file
@@ -943,6 +1001,129 @@ mod tests {
             "{:?}",
             result.changes
         );
+    }
+
+    const CRLF_DOC: &[u8] = b"---\r\ntitle: One\r\n---\r\n\r\nBody.\r\n";
+    const LF_DOC: &[u8] = b"---\ntitle: One\n---\n\nBody.\n";
+
+    #[test]
+    fn a_case_only_rename_of_a_crlf_origin_file_is_no_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        crate::state::write_base_file(state.path(), "Notes/A.md", CRLF_DOC).unwrap();
+        let mut base = BTreeMap::new();
+        base.insert("Notes/A.md".to_string(), stamp_for(CRLF_DOC));
+        write(dir.path(), "notes/A.md", LF_DOC);
+
+        let result = detect_local_changes_with(
+            dir.path(),
+            &base,
+            GeneratedIndexes::Local,
+            Some(state.path()),
+            None,
+        )
+        .unwrap();
+        assert!(result.changes.is_empty(), "{:?}", result.changes);
+        assert_eq!(
+            result.disk_paths.get("Notes/A.md").map(String::as_str),
+            Some("notes/A.md"),
+            "the base key was adopted"
+        );
+
+        // With the digest recorded no base copy is needed.
+        let digests = BTreeMap::from([(
+            "Notes/A.md".to_string(),
+            crate::state::lf_digest("Notes/A.md", CRLF_DOC).unwrap(),
+        )]);
+        let result = detect_local_changes_with(
+            dir.path(),
+            &base,
+            GeneratedIndexes::Local,
+            None,
+            Some(&digests),
+        )
+        .unwrap();
+        assert!(result.changes.is_empty(), "{:?}", result.changes);
+
+        // A real edit under the new case is still a modification.
+        write(
+            dir.path(),
+            "notes/A.md",
+            b"---\ntitle: One\n---\n\nEdited.\n",
+        );
+        let result = detect_local_changes_with(
+            dir.path(),
+            &base,
+            GeneratedIndexes::Local,
+            Some(state.path()),
+            Some(&digests),
+        )
+        .unwrap();
+        assert!(
+            matches!(&result.changes[..], [LocalChange::Modified { path, .. }] if path == "Notes/A.md"),
+            "{:?}",
+            result.changes
+        );
+    }
+
+    #[test]
+    fn a_renamed_crlf_origin_file_pairs_as_a_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut base = BTreeMap::new();
+        base.insert("a.md".to_string(), stamp_for(CRLF_DOC));
+        write(dir.path(), "b.md", LF_DOC);
+        let digests = BTreeMap::from([(
+            "a.md".to_string(),
+            crate::state::lf_digest("a.md", CRLF_DOC).unwrap(),
+        )]);
+
+        let result = local(dir.path(), &base);
+        assert!(pair_renames(&result, &base).is_empty());
+        assert_eq!(
+            pair_renames_with(&result, &base, &digests),
+            vec![("a.md".to_string(), "b.md".to_string())]
+        );
+    }
+
+    #[test]
+    fn an_untouched_crlf_origin_file_is_read_once_per_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let rel = "notes/one.md";
+        crate::state::write_base_file(state.path(), rel, CRLF_DOC).unwrap();
+        let mut base = BTreeMap::new();
+        base.insert(rel.to_string(), stamp_for(CRLF_DOC));
+        write(dir.path(), rel, LF_DOC);
+        let digests = BTreeMap::from([(
+            rel.to_string(),
+            crate::state::lf_digest(rel, CRLF_DOC).unwrap(),
+        )]);
+        let reads = || crate::state::BASE_READS.with(|c| c.get());
+
+        let before = reads();
+        let result = detect_local_changes_with(
+            dir.path(),
+            &base,
+            GeneratedIndexes::Local,
+            Some(state.path()),
+            Some(&digests),
+        )
+        .unwrap();
+        assert!(result.changes.is_empty());
+        assert_eq!(reads() - before, 0, "the recorded digest needs no read");
+
+        let before = reads();
+        let empty = BTreeMap::new();
+        let result = detect_local_changes_with(
+            dir.path(),
+            &base,
+            GeneratedIndexes::Local,
+            Some(state.path()),
+            Some(&empty),
+        )
+        .unwrap();
+        assert!(result.changes.is_empty());
+        assert_eq!(reads() - before, 1, "no digest: one base copy read");
     }
 
     #[test]

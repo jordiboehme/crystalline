@@ -15,10 +15,15 @@ use std::path::PathBuf;
 use crate::config;
 use crate::manifest::ArtifactType;
 
+pub mod pointer;
+pub mod profile;
+
+pub use profile::HarnessProfile;
+
 /// Which coding harness is being targeted. [`HarnessKind::id`] produces the
-/// stable spellings `claude-code`, `codex` and `copilot`, mirrored by the
-/// cli crate's `clap::ValueEnum` wrapper for identical CLI spellings and
-/// help text.
+/// stable spellings `claude-code`, `codex`, `copilot`, `cursor`, `kiro`,
+/// `gemini` and `qwen`, mirrored by the cli crate's `clap::ValueEnum`
+/// wrapper for identical CLI spellings.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum HarnessKind {
     /// Anthropic's Claude Code CLI: hooks in `settings.json`, skills in a
@@ -31,9 +36,40 @@ pub enum HarnessKind {
     /// `crystalline.json` under Copilot's hooks folder, skills under
     /// `.copilot/skills` (user) or `.github/skills` (project).
     Copilot,
+    /// Cursor (editor and agent CLI): MCP in ~/.cursor/mcp.json, a
+    /// sessionStart hook in ~/.cursor/hooks.json, skills under
+    /// ~/.agents/skills.
+    Cursor,
+    /// Kiro (IDE and CLI): MCP in ~/.kiro/settings/mcp.json, a hook and a
+    /// steering file under ~/.kiro, skills under ~/.kiro/skills.
+    Kiro,
+    /// Gemini CLI: MCP and a SessionStart hook in ~/.gemini/settings.json,
+    /// skills under ~/.agents/skills.
+    Gemini,
+    /// Qwen Code: MCP and a SessionStart hook in ~/.qwen/settings.json,
+    /// skills under ~/.qwen/skills.
+    Qwen,
 }
 
 impl HarnessKind {
+    /// Every harness, in declaration order. Lists that walk all harnesses
+    /// (provisioning, doctor) iterate this, so a new variant cannot be
+    /// forgotten in one of them; a test pins that it is complete.
+    pub const ALL: [HarnessKind; 7] = [
+        HarnessKind::ClaudeCode,
+        HarnessKind::Codex,
+        HarnessKind::Copilot,
+        HarnessKind::Cursor,
+        HarnessKind::Kiro,
+        HarnessKind::Gemini,
+        HarnessKind::Qwen,
+    ];
+
+    /// This harness's row in the profile table.
+    pub fn profile(self) -> &'static HarnessProfile {
+        profile::profile(self)
+    }
+
     /// The stable identifier used in machine-readable output, and reused by
     /// `doctor` to label its harnesses section with the same spelling
     /// `crystalline install <name>` takes.
@@ -42,6 +78,10 @@ impl HarnessKind {
             HarnessKind::ClaudeCode => "claude-code",
             HarnessKind::Codex => "codex",
             HarnessKind::Copilot => "copilot",
+            HarnessKind::Cursor => "cursor",
+            HarnessKind::Kiro => "kiro",
+            HarnessKind::Gemini => "gemini",
+            HarnessKind::Qwen => "qwen",
         }
     }
 
@@ -53,6 +93,10 @@ impl HarnessKind {
             "claude-code" => Some(HarnessKind::ClaudeCode),
             "codex" => Some(HarnessKind::Codex),
             "copilot" => Some(HarnessKind::Copilot),
+            "cursor" => Some(HarnessKind::Cursor),
+            "kiro" => Some(HarnessKind::Kiro),
+            "gemini" => Some(HarnessKind::Gemini),
+            "qwen" => Some(HarnessKind::Qwen),
             _ => None,
         }
     }
@@ -105,15 +149,25 @@ impl HarnessKind {
             HarnessKind::ClaudeCode => "Claude Code",
             HarnessKind::Codex => "Codex",
             HarnessKind::Copilot => "GitHub Copilot CLI",
+            HarnessKind::Cursor => "Cursor",
+            HarnessKind::Kiro => "Kiro",
+            HarnessKind::Gemini => "Gemini CLI",
+            HarnessKind::Qwen => "Qwen Code",
         }
     }
 
-    /// The CLI binary that owns this harness's MCP registration.
+    /// The CLI binary that owns this harness's MCP registration. For the
+    /// four profile harnesses, whose MCP entry install writes into a file,
+    /// it is the harness's own CLI and appears only in manual hints.
     pub fn cli(self) -> &'static str {
         match self {
             HarnessKind::ClaudeCode => "claude",
             HarnessKind::Codex => "codex",
             HarnessKind::Copilot => "copilot",
+            HarnessKind::Cursor => "cursor-agent",
+            HarnessKind::Kiro => "kiro-cli",
+            HarnessKind::Gemini => "gemini",
+            HarnessKind::Qwen => "qwen",
         }
     }
 
@@ -129,6 +183,10 @@ impl HarnessKind {
             HarnessKind::ClaudeCode => &[&["claude"]],
             HarnessKind::Codex => &[&["codex"]],
             HarnessKind::Copilot => &[&["copilot"], &["gh", "copilot", "--"]],
+            HarnessKind::Cursor => &[&["cursor-agent"]],
+            HarnessKind::Kiro => &[&["kiro-cli"]],
+            HarnessKind::Gemini => &[&["gemini"]],
+            HarnessKind::Qwen => &[&["qwen"]],
         }
     }
 }
@@ -174,19 +232,32 @@ pub fn harness_paths(harness: HarnessKind, project: bool) -> HarnessPaths {
             settings: PathBuf::from(".github/hooks/crystalline.json"),
             skills_dir: PathBuf::from(".github/skills"),
         },
+        // The profile harnesses: the hook file and the skills folder from
+        // their profile row, the same for both scopes. The project arm is
+        // never reached, because install and uninstall refuse `--project`
+        // for these four.
+        (HarnessKind::Cursor | HarnessKind::Kiro | HarnessKind::Gemini | HarnessKind::Qwen, _) => {
+            let profile = harness.profile();
+            HarnessPaths {
+                settings: profile
+                    .hooks
+                    .file()
+                    .unwrap_or(profile.config_root)
+                    .resolve(),
+                skills_dir: user_skills_dir(harness),
+            }
+        }
     }
 }
 
 /// The user-scope skills folder for a harness. The single source of truth for
 /// that path, shared by [`harness_paths`] (which surfaces it as
 /// `skills_dir`) and [`artifact_base`] (which returns it for
-/// [`ArtifactType::Skills`]) so the two can never drift.
+/// [`ArtifactType::Skills`]) so the two can never drift. It reads the
+/// profile row's `skills_write`, so the table and the path helpers are one
+/// statement.
 fn user_skills_dir(harness: HarnessKind) -> PathBuf {
-    match harness {
-        HarnessKind::ClaudeCode => config::expand_tilde("~/.claude/skills"),
-        HarnessKind::Codex => config::expand_tilde("~/.agents/skills"),
-        HarnessKind::Copilot => copilot_home().join("skills"),
-    }
+    harness.profile().skills_write.resolve()
 }
 
 /// The user-scope directory a harness stores artifacts of `kind` under, or
@@ -225,6 +296,12 @@ pub fn artifact_base(harness: HarnessKind, kind: ArtifactType) -> anyhow::Result
         // The Copilot CLI declined a prompt-file surface (skills replace it),
         // and every harness registers MCP servers through its own CLI.
         (HarnessKind::Copilot, ArtifactType::Commands) | (_, ArtifactType::Mcps) => None,
+        // The profile harnesses provision no commands or agents yet
+        // (`harness_supports` is false for them), so they have no base.
+        (
+            HarnessKind::Cursor | HarnessKind::Kiro | HarnessKind::Gemini | HarnessKind::Qwen,
+            ArtifactType::Commands | ArtifactType::Agents,
+        ) => None,
     };
     Ok(base)
 }
@@ -232,7 +309,7 @@ pub fn artifact_base(harness: HarnessKind, kind: ArtifactType) -> anyhow::Result
 /// Copilot's home folder: `$COPILOT_HOME` when it is set and non-empty,
 /// `~/.copilot` otherwise, matching how the Copilot CLI itself resolves its
 /// hooks and skills locations.
-fn copilot_home() -> PathBuf {
+pub(crate) fn copilot_home() -> PathBuf {
     match std::env::var_os("COPILOT_HOME") {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir),
         _ => config::expand_tilde("~/.copilot"),
@@ -287,6 +364,136 @@ mod tests {
         }
     }
 
+    /// `ALL` is complete. The successor ring is an exhaustive match, so a new
+    /// variant does not compile until it gets an arm here; put it into the
+    /// ring, and the walk below then demands it in `ALL` as well.
+    #[test]
+    fn all_lists_every_variant_once_in_declaration_order() {
+        fn next(k: HarnessKind) -> HarnessKind {
+            match k {
+                HarnessKind::ClaudeCode => HarnessKind::Codex,
+                HarnessKind::Codex => HarnessKind::Copilot,
+                HarnessKind::Copilot => HarnessKind::Cursor,
+                HarnessKind::Cursor => HarnessKind::Kiro,
+                HarnessKind::Kiro => HarnessKind::Gemini,
+                HarnessKind::Gemini => HarnessKind::Qwen,
+                HarnessKind::Qwen => HarnessKind::ClaudeCode,
+            }
+        }
+        let mut walked = vec![HarnessKind::ClaudeCode];
+        let mut k = next(HarnessKind::ClaudeCode);
+        while k != HarnessKind::ClaudeCode {
+            walked.push(k);
+            k = next(k);
+        }
+        assert_eq!(walked, HarnessKind::ALL);
+        let ids: Vec<&str> = HarnessKind::ALL.iter().map(|k| k.id()).collect();
+        assert_eq!(
+            ids,
+            [
+                "claude-code",
+                "codex",
+                "copilot",
+                "cursor",
+                "kiro",
+                "gemini",
+                "qwen"
+            ]
+        );
+        for k in HarnessKind::ALL {
+            assert_eq!(HarnessKind::from_id(k.id()), Some(k), "{k:?} round-trips");
+        }
+    }
+
+    /// The four new rows carry the landscape's facts; the gate and the
+    /// install flag start closed.
+    #[test]
+    fn the_new_profiles_hold_the_landscape_facts() {
+        use profile::*;
+        let c = HarnessKind::Cursor.profile();
+        assert!(
+            matches!(c.mcp, McpStyle::JsonEntry { file, map_key: "mcpServers", shape: EntryShape::CursorStdio } if file == PathSpec::home(".cursor/mcp.json"))
+        );
+        assert!(
+            matches!(c.hooks, HookDialect::FlatEventMap { file, event: "sessionStart" } if file == PathSpec::home(".cursor/hooks.json"))
+        );
+        assert_eq!(c.session_format.flag(), Some("cursor"));
+        assert_eq!(c.command_spelling, CommandSpelling::AbsolutePathEntry);
+        assert_eq!(
+            c.imports_hooks_from,
+            &[(
+                HarnessKind::ClaudeCode,
+                HostSignal::PayloadField("cursor_version")
+            )]
+        );
+        assert!(c.skills_reads.contains(&PathSpec::home(".claude/skills")));
+
+        let g = HarnessKind::Gemini.profile();
+        assert!(
+            matches!(
+                g.hooks,
+                HookDialect::ClaudeGroups {
+                    timeout: 10000,
+                    unit: TimeoutUnit::Millis,
+                    matcher: "startup",
+                    ..
+                }
+            ),
+            "Gemini reads milliseconds: 10 would be a 10 ms timeout"
+        );
+        assert_eq!(g.session_format.flag(), Some("hook-specific"));
+        assert!(matches!(g.pointer, PointerStyle::None));
+        assert_eq!(g.skills_write, PathSpec::home(".agents/skills"));
+
+        let k = HarnessKind::Kiro.profile();
+        assert!(
+            matches!(k.pointer, PointerStyle::OwnedFile { path, .. } if path == PathSpec::home(".kiro/steering/crystalline.md"))
+        );
+        assert_eq!(
+            HarnessKind::Qwen.profile().skills_write,
+            PathSpec::home(".qwen/skills")
+        );
+
+        for k in [
+            HarnessKind::Cursor,
+            HarnessKind::Kiro,
+            HarnessKind::Gemini,
+            HarnessKind::Qwen,
+        ] {
+            assert!(
+                !k.profile().onboarding_verified,
+                "{k:?} is unverified in 0.22.1"
+            );
+            assert!(!k.profile().is_legacy());
+            assert!(k.profile().project.is_none());
+        }
+        for k in [
+            HarnessKind::ClaudeCode,
+            HarnessKind::Codex,
+            HarnessKind::Copilot,
+        ] {
+            assert!(k.profile().is_legacy() && k.profile().onboarding_verified);
+        }
+    }
+
+    /// The profile's skills folder and the existing path helpers agree for
+    /// every harness, so the table cannot drift from `artifact_base`.
+    #[test]
+    fn the_profile_skills_folder_never_drifts_from_harness_paths() {
+        for k in HarnessKind::ALL {
+            assert_eq!(
+                k.profile().skills_write.resolve(),
+                harness_paths(k, false).skills_dir,
+                "{k:?}"
+            );
+            assert_eq!(
+                k.profile().skills_write.resolve(),
+                user_skills_dir(k),
+                "{k:?}"
+            );
+        }
+    }
+
     #[test]
     fn harness_paths_resolve_user_and_project_scopes() {
         for harness in [
@@ -324,6 +531,46 @@ mod tests {
                     );
                     assert_eq!(project.skills_dir, PathBuf::from(".github/skills"));
                 }
+                _ => unreachable!("only the three legacy harnesses are walked here"),
+            }
+        }
+    }
+
+    /// The profile harnesses take their hook file and skills folder from the
+    /// profile row, at both scopes (the project arm is never reached).
+    #[test]
+    fn harness_paths_of_the_profile_harnesses_come_from_the_profile() {
+        let cases = [
+            (
+                HarnessKind::Cursor,
+                "~/.cursor/hooks.json",
+                "~/.agents/skills",
+            ),
+            (
+                HarnessKind::Kiro,
+                "~/.kiro/hooks/crystalline.json",
+                "~/.kiro/skills",
+            ),
+            (
+                HarnessKind::Gemini,
+                "~/.gemini/settings.json",
+                "~/.agents/skills",
+            ),
+            (HarnessKind::Qwen, "~/.qwen/settings.json", "~/.qwen/skills"),
+        ];
+        for (harness, settings, skills) in cases {
+            for project in [false, true] {
+                let paths = harness_paths(harness, project);
+                assert_eq!(
+                    paths.settings,
+                    config::expand_tilde(settings),
+                    "{harness:?}"
+                );
+                assert_eq!(
+                    paths.skills_dir,
+                    config::expand_tilde(skills),
+                    "{harness:?}"
+                );
             }
         }
     }
@@ -355,11 +602,7 @@ mod tests {
     fn artifact_base_skills_folder_never_drifts_from_harness_paths() {
         // The skills base and `harness_paths`' `skills_dir` share one helper,
         // so every harness must agree on where skills land.
-        for harness in [
-            HarnessKind::ClaudeCode,
-            HarnessKind::Codex,
-            HarnessKind::Copilot,
-        ] {
+        for harness in HarnessKind::ALL {
             assert_eq!(
                 artifact_base(harness, ArtifactType::Skills).unwrap(),
                 Some(harness_paths(harness, false).skills_dir)

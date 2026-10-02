@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "command": "/Users/someone/.othertool/hooks/cursor-hook.sh SessionStart"
+      }
+    ],
+    "sessionEnd": [
+      {
+        "command": "/Users/someone/.othertool/hooks/cursor-hook.sh SessionEnd"
+      }
+    ],
+    "beforeSubmitPrompt": [
+      {
+        "command": "/Users/someone/.othertool/hooks/cursor-hook.sh Start"
+      }
+    ],
+    "stop": [
+      {
+        "command": "/Users/someone/.othertool/hooks/cursor-hook.sh Stop"
+      }
+    ],
+    "beforeShellExecution": [
+      {
+        "command": "/Users/someone/.othertool/hooks/cursor-hook.sh PermissionRequest"
+      }
+    ],
+    "beforeMCPExecution": [
+      {
+        "command": "/Users/someone/.othertool/hooks/cursor-hook.sh PermissionRequest"
+      }
+    ]
+  }
+}

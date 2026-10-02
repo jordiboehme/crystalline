@@ -1,3 +1,6 @@
 # Golden-file tests assert byte-identical round trips, so every text file
 # must check out with LF endings on every platform including Windows.
 * text=auto eol=lf
+# The one exception: a fixture whose point is its CRLF line endings, so git
+# keeps its bytes as they are.
+crates/core/tests/fixtures/harness/qwen-settings-crlf.json -text

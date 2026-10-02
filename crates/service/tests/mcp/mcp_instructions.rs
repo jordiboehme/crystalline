@@ -22,7 +22,7 @@ use std::sync::Arc;
 use crystalline_core::config::{DomainEntry, GlobalConfig};
 use crystalline_index::TursoStore;
 use crystalline_service::Engine;
-use crystalline_service::mcp::{McpServer, newest_legacy_handshake_version};
+use crystalline_service::mcp::{HarnessGate, McpServer, newest_legacy_handshake_version};
 use rmcp::RoleClient;
 use rmcp::model::{ClientConfig, Implementation, ProtocolVersion};
 use rmcp::service::RunningService;
@@ -155,6 +155,27 @@ impl Harness {
                 ServedTransport::Http => McpServer::new_http(engine),
             };
             rmcp::serve_server(server, server_io).await
+        });
+        let mut info = ClientConfig::default();
+        info.client_info = Implementation::new("mcp-test-client", "1.2.3");
+        let client = rmcp::serve_client(info, client_io).await.unwrap();
+        let server = server_task.await.unwrap().unwrap();
+        (client, server)
+    }
+
+    /// Open one stdio connection served with `gate`, the two facts the
+    /// spawned process resolved before the session started.
+    async fn connect_gated(
+        &self,
+        gate: HarnessGate,
+    ) -> (
+        RunningService<RoleClient, ClientConfig>,
+        RunningService<rmcp::RoleServer, McpServer>,
+    ) {
+        let (client_io, server_io) = tokio::io::duplex(1 << 16);
+        let engine = self.engine.clone();
+        let server_task = tokio::spawn(async move {
+            rmcp::serve_server(McpServer::new(engine).with_harness_gate(gate), server_io).await
         });
         let mut info = ClientConfig::default();
         info.client_info = Implementation::new("mcp-test-client", "1.2.3");
@@ -499,7 +520,7 @@ async fn an_onboarded_harness_gets_the_minimal_block() {
 /// hands it no request context, so the legacy handshake cannot know who is
 /// connecting and cannot leave a private domain's bullets out of a per-caller
 /// block; over HTTP it therefore carries every behavior rule, the count of
-/// registered domains and the pointer at `list_domains` - which does resolve a
+/// the domains that are not private and the pointer at `list_domains` - which does resolve a
 /// caller and does filter - and no domain name at all. Stdio is the
 /// unchanged full block, pinned by every other test in this file.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -523,6 +544,63 @@ async fn an_http_session_gets_the_rules_and_no_domain_names() {
     assert!(
         !text.contains("- eng:") && !text.contains("Route here for eng questions"),
         "no domain is named to a caller this channel cannot resolve:\n{text}"
+    );
+}
+
+/// **The HTTP handshake counts only the domains that are not private.** It
+/// cannot know who is connecting, so a count of every registered domain would
+/// tell any peer that private domains exist. A signed-in agent still finds its
+/// own private domains through `list_domains`, which resolves the caller. Stdio
+/// is the machine owner and keeps naming every domain, `lab` included.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_http_handshake_counts_only_public_domains() {
+    let h = Harness::build(
+        &[
+            ("eng", &["Route here for eng questions"]),
+            ("lab", &["Route here for lab questions"]),
+        ],
+        &[],
+        false,
+    )
+    .await;
+    let auth = Arc::new(
+        crystalline_service::rest::AuthStore::open(&h.root.join("web-auth.db"))
+            .await
+            .unwrap(),
+    );
+    auth.add_user(
+        "keeper",
+        "keeper",
+        None,
+        crystalline_service::rest::Role::Admin,
+        "pw12345678",
+    )
+    .await
+    .unwrap();
+    auth.set_domain_visibility("lab", true, "keeper")
+        .await
+        .unwrap();
+    h.engine
+        .set_domain_access(Arc::new(crystalline_service::DomainAccess::new(auth)));
+
+    let (client, _server) = h.connect_as(true, ServedTransport::Http).await;
+    let text = instructions(&client);
+    assert!(
+        text.contains("1 domain registered; list_domains with include_routing=true"),
+        "the count leaves the private domain out:\n{text}"
+    );
+    assert!(
+        !text.contains("2 domains") && !text.contains("lab questions"),
+        "and nothing else says it exists:\n{text}"
+    );
+    drop(client);
+
+    let (client, _server) = h.connect_as(false, ServedTransport::Stdio).await;
+    let text = instructions(&client);
+    assert!(
+        text.contains("- eng: Route here for eng questions")
+            && text.contains("- lab: Route here for lab questions"),
+        "the machine owner keeps every domain line:\n{text}"
     );
 }
 
@@ -554,6 +632,63 @@ async fn an_unresolved_session_gets_the_full_block() {
     assert!(
         text.contains("Behavior:") && text.contains("- eng: Route here for eng questions"),
         "nothing onboards this session, so the block stays:\n{text}"
+    );
+}
+
+/// A harness whose hook is installed but whose onboarding is not verified yet
+/// gets the short block with a conditional pointer: the hook may have
+/// delivered the routing block, but nothing has confirmed that this harness
+/// loads it, so the sentence tells the agent what to do when it is missing.
+/// The TOON note rides along exactly as it does on the minimal block, and a
+/// modern peer reading `server/discover` is told the same bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_installed_but_unverified_hook_gets_the_conditional_block() {
+    let h = Harness::build(&[("eng", &["Route here for eng questions"])], &[], false).await;
+    let unverified = HarnessGate {
+        hook_installed: true,
+        onboarding_verified: false,
+    };
+    let verified = HarnessGate {
+        hook_installed: true,
+        onboarding_verified: true,
+    };
+
+    let (client, _server) = h.connect_gated(unverified).await;
+    let conditional = instructions(&client);
+    let (client, _server) = h.connect_gated(verified).await;
+    let minimal = instructions(&client);
+
+    let conditional_tail = conditional
+        .strip_prefix(&crystalline_core::prompt::render_conditional_minimal_instructions())
+        .unwrap_or_else(|| panic!("the conditional block leads:\n{conditional}"));
+    let minimal_tail = minimal
+        .strip_prefix(&crystalline_core::render_minimal_instructions())
+        .unwrap_or_else(|| panic!("a verified harness keeps the minimal block:\n{minimal}"));
+    assert_eq!(
+        conditional_tail, minimal_tail,
+        "the same TOON note follows both short blocks"
+    );
+    assert!(
+        conditional.contains("TOON"),
+        "the wire-format note stays:\n{conditional}"
+    );
+    assert!(
+        !conditional.contains("Behavior:") && !conditional.contains("- eng:"),
+        "the routing block is not repeated:\n{conditional}"
+    );
+    assert_ne!(
+        conditional, minimal,
+        "the two short blocks say different things"
+    );
+
+    let newest = crystalline_service::mcp::SERVED_PROTOCOL_VERSIONS
+        .last()
+        .unwrap()
+        .clone();
+    let by_discover = instructions_via_discover_gated(&h, newest, unverified).await;
+    assert_eq!(
+        by_discover, conditional,
+        "server/discover hands a modern peer the same conditional block"
     );
 }
 
@@ -777,12 +912,22 @@ async fn instructions_via_initialize(h: &Harness, version: ProtocolVersion) -> S
 /// request, so the `_meta` the era requires (`protocolVersion` plus
 /// `clientCapabilities`) is exactly what a real client would send.
 async fn instructions_via_discover(h: &Harness, version: ProtocolVersion) -> String {
+    instructions_via_discover_gated(h, version, HarnessGate::default()).await
+}
+
+/// [`instructions_via_discover`] against a server built with `gate`.
+async fn instructions_via_discover_gated(
+    h: &Harness,
+    version: ProtocolVersion,
+    gate: HarnessGate,
+) -> String {
     use rmcp::service::{ClientLifecycleMode, ClientServiceExt};
 
     let (client_io, server_io) = tokio::io::duplex(1 << 16);
     let engine = h.engine.clone();
-    let server_task =
-        tokio::spawn(async move { rmcp::serve_server(McpServer::new(engine), server_io).await });
+    let server_task = tokio::spawn(async move {
+        rmcp::serve_server(McpServer::new(engine).with_harness_gate(gate), server_io).await
+    });
     let client = ClientConfig::default()
         .serve_with_lifecycle(
             client_io,

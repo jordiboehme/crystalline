@@ -13,6 +13,8 @@ mod configure;
 mod doctor;
 mod doctor_names;
 #[cfg(unix)]
+mod harness_install;
+#[cfg(unix)]
 mod hook;
 #[cfg(unix)]
 mod install;

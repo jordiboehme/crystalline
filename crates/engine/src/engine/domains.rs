@@ -689,17 +689,31 @@ impl Engine {
     }
 
     /// [`Engine::routing_text`] with the domain lines replaced by the count
-    /// line: every behavior rule, no domain named.
+    /// line: every behavior rule, no domain named, and only the domains that
+    /// are not private counted.
     ///
-    /// What the legacy `initialize` handshake serves over HTTP. `get_info` is
-    /// synchronous and rmcp calls it with no request context, so that one
-    /// channel has no caller to resolve and cannot leave a private domain's
-    /// bullets out of a per-caller block; it hands out the countable half
-    /// instead and points at `list_domains`, which does resolve a caller. See
-    /// [`crystalline_core::render_counted_instructions`] for the residue that
-    /// leaves. Stdio never calls this: a local session is the machine owner.
-    pub fn routing_text_counted(&self) -> String {
-        crystalline_core::render_counted_instructions(&self.routing_output(&HashSet::new()))
+    /// What the legacy `initialize` handshake serves over HTTP. That handshake
+    /// has no caller to resolve (the instructions are built before any request
+    /// names one), so it cannot leave a private domain's bullets out of a
+    /// per-caller block; it hands out the countable half instead and points at
+    /// `list_domains`, which does resolve a caller. The count leaves out every
+    /// private domain, whoever connects: counting them would tell any peer that
+    /// private domains exist. A signed-in agent still finds the private domains
+    /// it may see through `list_domains`. See
+    /// [`crystalline_core::render_counted_instructions`].
+    ///
+    /// Stdio never calls this: a local session is the machine owner and gets
+    /// [`Engine::routing_text`], which names and counts every domain.
+    ///
+    /// Async because the private set lives in the accounts database. A set
+    /// that cannot be read is an error rather than the unfiltered count.
+    pub async fn routing_text_counted(&self) -> Result<String> {
+        let (private, _) = self
+            .visibility_for(&crate::scope::Scope::Unrestricted)
+            .await?;
+        Ok(crystalline_core::render_counted_instructions(
+            &self.routing_output(&private),
+        ))
     }
 
     /// The routing block's model over every registered domain except the named
@@ -769,7 +783,8 @@ impl Engine {
     /// context) is the one channel that is neither - an HTTP peer whose
     /// initialize instructions this server cannot key on anybody - and it is
     /// answered by [`Engine::routing_text_counted`] rather than by this: no
-    /// caller to resolve means no bullets at all rather than everybody's. The
+    /// caller to resolve means no bullets at all rather than everybody's, and a
+    /// count of the domains that are not private. The
     /// era's own instructions channel (`server/discover`) does carry a request
     /// context, and the `onboarding` prompt carries one too, so both are
     /// scoped through here.

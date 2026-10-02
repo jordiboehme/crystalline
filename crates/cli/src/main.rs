@@ -16,12 +16,18 @@ use crystalline_core::verify::{self, VerifyOptions};
 
 mod cmd;
 mod doctor;
+mod harness_command;
+mod harness_files;
 mod hook;
+mod hook_dialect;
 mod install;
+mod install_profile;
+mod mcp_json;
 mod members;
 mod recall;
 mod receipt;
 mod render;
+mod skills_placement;
 mod users;
 
 /// What `-V` and `--version` print. clap's `version` attribute feeds both as
@@ -30,9 +36,9 @@ mod users;
 ///
 /// Three lines, no blank line: this is Jordi's own compact form (decided
 /// 2026-09-08), not the fuller GNU disclaimer block - no warranty
-/// paragraph, no "this is free software" line. AGPL section 13 is why the
-/// source link is here at all: a network-served copy has to offer its users
-/// the source.
+/// paragraph, no "this is free software" line. The source link is here as a
+/// courtesy and for attribution: a user of a running copy can see where the
+/// source is.
 ///
 /// Read from the environment rather than retyped, so a change to
 /// Cargo.toml's `version`, `license` or `repository` carries here too.
@@ -122,7 +128,7 @@ enum Command {
     /// Wire a coding harness up to Crystalline in one idempotent step:
     /// register the MCP server, install the SessionStart routing hook, the
     /// Stop capture-nudge hook and the UserPromptSubmit recall hook, and
-    /// copy the four topical skills into place. Safe to re-run; a second run
+    /// copy the five topical skills into place. Safe to re-run; a second run
     /// that finds everything already in place writes nothing and reports it
     /// as already present. Static like `verify` and `prompt`: no database,
     /// service or network connection. A missing or failing harness CLI is
@@ -571,9 +577,10 @@ enum Command {
         #[arg(long)]
         folder: Option<String>,
         /// The checksum from a prior read; the split is refused as a conflict if
-        /// the source changed since, whichever storage kind holds it. Without
-        /// it the split can still be refused while another write to the same
-        /// engram is in flight; try it again then.
+        /// the source changed since, whichever storage kind holds it. Omit for
+        /// last-write-wins: the split is applied to the newest text of the
+        /// source, and refused as a conflict only when the lines it moves
+        /// changed since it read them.
         #[arg(long)]
         expected_checksum: Option<String>,
         /// Load the global config from this file instead of the default path.
@@ -810,15 +817,16 @@ enum PromptKind {
         /// config path.
         #[arg(long)]
         config: Option<PathBuf>,
-        /// Output format: text, json or copilot.
+        /// Output format: text, json, copilot, cursor or hook-specific.
         #[arg(long, value_enum)]
         format: Option<PromptFormat>,
         /// Which harness this routing prompt is being generated for, as
-        /// `crystalline install` wrote it into the harness's settings file
-        /// (claude-code, codex, copilot). Accepted so both managed hook
-        /// commands carry their harness in the same spelling; the routing
-        /// block itself does not vary by harness today. Omitted or
-        /// unrecognized is exactly today's behaviour.
+        /// `crystalline install` wrote it into the harness's hook file.
+        /// The routing block itself does not vary by harness. The id only
+        /// decides whether a hook another harness imported stays silent
+        /// because that harness runs a hook of its own (an imported Claude
+        /// Code hook inside Cursor). Omitted counts as claude-code; an
+        /// unrecognized id always prints.
         #[arg(long)]
         harness: Option<String>,
     },
@@ -847,6 +855,15 @@ enum PromptFormat {
     /// on a resumed session and wraps the routing prompt in
     /// `{"additionalContext": ...}` otherwise.
     Copilot,
+    /// One JSON line for a Cursor sessionStart hook: prints nothing on a
+    /// resumed session and wraps the routing prompt in
+    /// `{"additional_context": ...}` otherwise.
+    Cursor,
+    /// One JSON line for a Gemini CLI or Qwen Code SessionStart hook: prints
+    /// nothing on a resumed session and wraps the routing prompt in
+    /// `{"hookSpecificOutput": {"hookEventName": "SessionStart",
+    /// "additionalContext": ...}}` otherwise.
+    HookSpecific,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1624,6 +1641,12 @@ enum ProvisionCommand {
     /// installed, edited and missing counts and any domain still awaiting a
     /// decision.
     Status {
+        /// List every domain on its own line, including the ones that
+        /// declare no provisioning and the virtual ones, which are folded
+        /// into a summary line otherwise. The JSON output always lists them
+        /// all.
+        #[arg(long)]
+        all: bool,
         /// Load the global config from this file instead of the default path.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -1671,6 +1694,19 @@ enum HarnessArg {
     /// `crystalline.json` under Copilot's hooks folder, skills under
     /// `.copilot/skills` (user) or `.github/skills` (project).
     Copilot,
+    /// Cursor (editor and agent CLI): MCP in ~/.cursor/mcp.json, a
+    /// sessionStart hook in ~/.cursor/hooks.json, skills under
+    /// ~/.agents/skills.
+    Cursor,
+    /// Kiro (IDE and CLI): MCP in ~/.kiro/settings/mcp.json, a hook and a
+    /// steering file under ~/.kiro, skills under ~/.kiro/skills.
+    Kiro,
+    /// Gemini CLI: MCP and a SessionStart hook in ~/.gemini/settings.json,
+    /// skills under ~/.agents/skills.
+    Gemini,
+    /// Qwen Code: MCP and a SessionStart hook in ~/.qwen/settings.json,
+    /// skills under ~/.qwen/skills.
+    Qwen,
 }
 
 impl From<HarnessArg> for HarnessKind {
@@ -1679,6 +1715,10 @@ impl From<HarnessArg> for HarnessKind {
             HarnessArg::ClaudeCode => HarnessKind::ClaudeCode,
             HarnessArg::Codex => HarnessKind::Codex,
             HarnessArg::Copilot => HarnessKind::Copilot,
+            HarnessArg::Cursor => HarnessKind::Cursor,
+            HarnessArg::Kiro => HarnessKind::Kiro,
+            HarnessArg::Gemini => HarnessKind::Gemini,
+            HarnessArg::Qwen => HarnessKind::Qwen,
         }
     }
 }
@@ -2495,15 +2535,15 @@ async fn provision_dispatch(
     config: Option<PathBuf>,
     json: bool,
 ) -> anyhow::Result<()> {
-    let (action, domain, config) = match command {
-        None => ("apply", None, config),
-        Some(ProvisionCommand::Status { config }) => ("status", None, config),
-        Some(ProvisionCommand::Allow { domain, config }) => ("allow", Some(domain), config),
-        Some(ProvisionCommand::Deny { domain, config }) => ("deny", Some(domain), config),
+    let (action, domain, config, all) = match command {
+        None => ("apply", None, config, false),
+        Some(ProvisionCommand::Status { all, config }) => ("status", None, config, all),
+        Some(ProvisionCommand::Allow { domain, config }) => ("allow", Some(domain), config, false),
+        Some(ProvisionCommand::Deny { domain, config }) => ("deny", Some(domain), config, false),
     };
     let data = crystalline_service::client::provision(action, domain.as_deref(), config.as_deref())
         .await?;
-    cmd::print_provision(action, &data, json);
+    cmd::print_provision(action, &data, json, all);
     Ok(())
 }
 
@@ -4427,13 +4467,13 @@ fn run_prompt(
     db: Option<PathBuf>,
     json_flag: bool,
     format: Option<PromptFormat>,
-    // Accepted and deliberately unread: the routing block does not vary by
-    // harness today. The flag is on the command so both managed hook commands
-    // are spelled the same way, and never reading it is what makes an id this
-    // binary does not know inert - an older binary running a hook a newer one
-    // wrote must behave exactly as it always did, never fail. The day the
-    // block does vary, this is where the id gets resolved.
-    _harness: Option<String>,
+    // Read for one decision only: whether this hook was imported by another
+    // harness that runs a hook of its own (see `silenced_by_importer`).
+    // Reading it is safe for older binaries, because an older binary keeps
+    // not reading it, and an id this binary does not know resolves to "never
+    // silenced", so a hook a newer binary wrote still prints as it always did.
+    // The routing block itself does not vary by harness.
+    harness: Option<String>,
 ) -> anyhow::Result<()> {
     // An explicit --format wins; the global --json keeps selecting the JSON
     // shape it always has; the default is plain text.
@@ -4456,8 +4496,21 @@ fn run_prompt(
     // per-prompt recall hook's list of already-shown engrams is fair to
     // empty - the block that named them is gone from the agent's context too.
     let session_start = session_start_payload();
-    if format == PromptFormat::Copilot
-        && session_start.as_ref().and_then(|p| p.source.as_deref()) == Some("resume")
+    // One routing block per session (spec decision 13): Cursor runs the
+    // user's Claude Code hooks too, so with both installs it would get the
+    // block twice. The imported hook stays silent when the payload shows it
+    // runs inside a harness whose own hook is installed and still runs.
+    // Checked before the auto-update, so a silenced hook touches no file.
+    if silenced_by_importing_harness(harness.as_deref(), format, session_start.as_ref()) {
+        return Ok(());
+    }
+    // The JSON hook formats suppress a resumed session themselves, because
+    // their harnesses either have no matcher (Copilot, Cursor) or are not
+    // known to filter `resume` with it.
+    if matches!(
+        format,
+        PromptFormat::Copilot | PromptFormat::Cursor | PromptFormat::HookSpecific
+    ) && session_start.as_ref().and_then(|p| p.source.as_deref()) == Some("resume")
     {
         return Ok(());
     }
@@ -4585,6 +4638,28 @@ fn run_prompt(
                 }))?
             );
         }
+        // Cursor and the hook-specific envelope also read stdout as one JSON
+        // document (Gemini CLI requires it), so the notices stay on stderr
+        // here too.
+        PromptFormat::Cursor => {
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({
+                    "additional_context": crystalline_core::render_text(&output),
+                }))?
+            );
+        }
+        PromptFormat::HookSpecific => {
+            println!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "SessionStart",
+                        "additionalContext": crystalline_core::render_text(&output),
+                    },
+                }))?
+            );
+        }
     }
     for note in &reconcile_notices {
         eprintln!("{note}");
@@ -4592,7 +4667,53 @@ fn run_prompt(
     Ok(())
 }
 
-/// The two fields this command reads off a SessionStart payload. Both carry
+/// Whether this routing hook must stay silent because it was written for
+/// one harness and runs as an import inside another that has its own hook
+/// installed. `harness` is the `--harness` value. A missing flag counts as
+/// claude-code only for the text format: every hook written before the flag
+/// existed was a Claude Code text hook, while a flagless `--format cursor`
+/// (or any other JSON hook format) is a hand-written hook of the harness
+/// that reads that format, never an import. An id this binary does not know
+/// is never silenced. The evidence is the payload's fields and the
+/// environment.
+///
+/// The receipt alone does not silence: the importer's own hooks file must
+/// still hold a hook of ours whose program exists, or the importer may have
+/// no working route and the imported hook is the only one left. That costs
+/// one small file read and no subprocess, and only when every other
+/// condition already holds.
+fn silenced_by_importing_harness(
+    harness: Option<&str>,
+    format: PromptFormat,
+    payload: Option<&SessionStartPayload>,
+) -> bool {
+    use crystalline_core::harness::profile::{HostEvidence, silenced_by_importer};
+    let written_for = match harness {
+        None if format == PromptFormat::Text => HarnessKind::ClaudeCode,
+        None => return false,
+        Some(id) => match HarnessKind::from_id(id) {
+            Some(kind) => kind,
+            None => return false,
+        },
+    };
+    let payload_fields: &[&str] = if payload.is_some_and(|p| p.cursor_version.is_some()) {
+        &["cursor_version"]
+    } else {
+        &[]
+    };
+    let env = |name: &str| std::env::var_os(name).is_some();
+    let evidence = HostEvidence {
+        payload_fields,
+        env: &env,
+    };
+    let hooked = crystalline_core::provision::install_receipt_path()
+        .map(|path| crystalline_core::provision::harnesses_with_hooks(&path))
+        .unwrap_or_default();
+    silenced_by_importer(written_for, &evidence, &hooked)
+        .is_some_and(hook_dialect::installed_hook_runs)
+}
+
+/// The fields this command reads off a SessionStart payload. Each carries
 /// a serde default, so a harness that omits one, sends `null` or adds fields
 /// nobody here knows about still parses.
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -4604,6 +4725,11 @@ struct SessionStartPayload {
     /// hook state file.
     #[serde(default)]
     session_id: Option<String>,
+    /// Cursor's version, which Cursor puts in the payload of the hooks it
+    /// runs: the signal that this hook runs inside Cursor. That an imported
+    /// Claude Code hook gets it too is documented but not yet observed.
+    #[serde(default)]
+    cursor_version: Option<String>,
 }
 
 /// The SessionStart payload on stdin, when there is one to read: `None` when

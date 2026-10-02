@@ -2,7 +2,8 @@
 //!
 //! A skill is a folder under `skills/` with a `SKILL.md` playbook teaching one
 //! kind of Crystalline work: routing to a domain, capturing what was learned,
-//! modelling a schema, collaborating with a team. `include_str!` bakes each one
+//! modelling a schema, collaborating with a team, provisioning what a domain
+//! ships. `include_str!` bakes each one
 //! into the binary, so an install from a downloaded release carries exactly the
 //! skills a clone would.
 //!
@@ -19,9 +20,14 @@
 //! `crystalline-intelligence` is the single consolidated skill for Claude
 //! Desktop, which has no hooks and installs one skill at a time, so it ships
 //! only as its own zip and is never copied into a harness skills folder beside
-//! the four topical skills - installing both would teach the same lessons twice.
+//! the five topical skills - installing both would teach the same lessons twice.
 //! It is still served over MCP like any other: a remote client reading the
 //! skills should see everything this binary knows how to teach.
+//!
+//! [`SkillAsset::since`] names the release that first shipped a skill. The
+//! session-start upgrade otherwise reads a managed skill missing on disk as a
+//! deliberate deletion; `since` lets it tell "removed by the person" from
+//! "never offered to this install" and add a skill new in this release.
 
 /// One shipped agent skill: its folder name, its embedded `SKILL.md` and
 /// whether `crystalline install` copies it into a harness skills folder.
@@ -36,6 +42,11 @@ pub struct SkillAsset {
     /// skills folder. False for the consolidated Claude Desktop skill, which
     /// ships as its own zip; see the module docs.
     pub install_managed: bool,
+    /// The first release that ships this skill. An upgrade from an older
+    /// install adds the skill even though it is missing on disk; see
+    /// `reconcile_skill_set` in the CLI. Always a release triple, never a
+    /// pre-release.
+    pub since: &'static str,
 }
 
 impl SkillAsset {
@@ -55,32 +66,44 @@ impl SkillAsset {
 
 /// Every skill this binary ships, in the order a reader should meet them:
 /// route to a domain, capture what was learned, model a schema, collaborate
-/// with a team, and the consolidated Claude Desktop skill last.
+/// with a team, provision what a domain ships, and the consolidated Claude
+/// Desktop skill last.
 pub const SKILL_ASSETS: &[SkillAsset] = &[
     SkillAsset {
         name: "crystalline-routing",
         content: include_str!("../../../skills/crystalline-routing/SKILL.md"),
         install_managed: true,
+        since: "0.1.0",
     },
     SkillAsset {
         name: "crystalline-capture",
         content: include_str!("../../../skills/crystalline-capture/SKILL.md"),
         install_managed: true,
+        since: "0.1.0",
     },
     SkillAsset {
         name: "crystalline-schema",
         content: include_str!("../../../skills/crystalline-schema/SKILL.md"),
         install_managed: true,
+        since: "0.1.0",
     },
     SkillAsset {
         name: "crystalline-collaboration",
         content: include_str!("../../../skills/crystalline-collaboration/SKILL.md"),
         install_managed: true,
+        since: "0.1.0",
+    },
+    SkillAsset {
+        name: "crystalline-provisioning",
+        content: include_str!("../../../skills/crystalline-provisioning/SKILL.md"),
+        install_managed: true,
+        since: "0.22.1",
     },
     SkillAsset {
         name: "crystalline-intelligence",
         content: include_str!("../../../skills/crystalline-intelligence/SKILL.md"),
         install_managed: false,
+        since: "0.1.0",
     },
 ];
 
@@ -95,8 +118,71 @@ mod tests {
     use super::*;
 
     #[test]
-    fn five_skills_ship_with_four_installed_into_harnesses() {
-        assert_eq!(SKILL_ASSETS.len(), 5);
+    fn every_skill_names_the_version_that_first_shipped_it() {
+        for s in SKILL_ASSETS {
+            assert!(!s.since.is_empty(), "{} has no since", s.name);
+            assert!(
+                s.since.split('.').count() == 3 && !s.since.contains('-'),
+                "{}: since is a release triple, never a pre-release",
+                s.name
+            );
+        }
+    }
+
+    /// `major.minor.patch` of a version string, any pre-release or build
+    /// suffix dropped, so a dev-channel build compares as its release.
+    fn release_triple(version: &str) -> (u64, u64, u64) {
+        let core = version.split(['-', '+']).next().unwrap_or_default();
+        let mut parts = core.split('.').map(|p| p.parse::<u64>().unwrap());
+        let triple = (
+            parts.next().unwrap(),
+            parts.next().unwrap(),
+            parts.next().unwrap(),
+        );
+        assert!(parts.next().is_none(), "{version} is not a triple");
+        triple
+    }
+
+    /// A skill whose `since` is newer than the binary that ships it is
+    /// recorded under the older version at install, so the upgrade rule
+    /// never runs for it and the real release later brings back a copy the
+    /// person removed. The release bump has to come with the skill.
+    #[test]
+    fn no_skill_is_newer_than_the_binary_that_ships_it() {
+        let binary = release_triple(env!("CARGO_PKG_VERSION"));
+        for s in SKILL_ASSETS {
+            assert!(
+                release_triple(s.since) <= binary,
+                "{} names since {} but this build is {}",
+                s.name,
+                s.since,
+                env!("CARGO_PKG_VERSION")
+            );
+        }
+    }
+
+    #[test]
+    fn release_triple_drops_a_pre_release_suffix() {
+        assert_eq!(release_triple("0.22.1-dev.20261002"), (0, 22, 1));
+        assert_eq!(release_triple("0.22.1"), (0, 22, 1));
+        assert!(release_triple("0.22.1") > release_triple("0.22.0"));
+        assert!(release_triple("0.10.0") > release_triple("0.9.9"));
+    }
+
+    #[test]
+    fn six_skills_ship_with_five_installed_into_harnesses() {
+        let names: Vec<&str> = SKILL_ASSETS.iter().map(|s| s.name).collect();
+        assert_eq!(
+            names,
+            vec![
+                "crystalline-routing",
+                "crystalline-capture",
+                "crystalline-schema",
+                "crystalline-collaboration",
+                "crystalline-provisioning",
+                "crystalline-intelligence",
+            ]
+        );
         let managed: Vec<&str> = SKILL_ASSETS
             .iter()
             .filter(|s| s.install_managed)
@@ -109,6 +195,7 @@ mod tests {
                 "crystalline-capture",
                 "crystalline-schema",
                 "crystalline-collaboration",
+                "crystalline-provisioning",
             ]
         );
         assert_eq!(
@@ -230,5 +317,49 @@ mod tests {
                 "consolidated skill lacks {needle}"
             );
         }
+    }
+
+    #[test]
+    fn the_provisioning_skill_keeps_its_guardrails() {
+        let s = skill("crystalline-provisioning").expect("ships").content;
+        for (needle, why) in [
+            (
+                "\"identifier\": \"manifest\"",
+                "the MANIFEST is edited over MCP by its permalink",
+            ),
+            (
+                "\"operation\": \"append\"",
+                "a new Provisioning section is appended",
+            ),
+            (
+                "replace_section",
+                "an existing section is replaced, body only",
+            ),
+            (
+                "expected_checksum",
+                "the edit is guarded against a concurrent change",
+            ),
+            (
+                "manifest_findings",
+                "the agent fixes every finding before going on",
+            ),
+            ("Copy, never move", "a moved skill disappears on deny"),
+            (
+                "only after the person answers",
+                "allow or deny is the person's decision",
+            ),
+            ("secret", "no secret value in an mcps file"),
+            (
+                "repository root",
+                "a team ../ path never climbs above the repo root",
+            ),
+            (
+                "crystalline-",
+                "the reserved prefix is named so the agent avoids it",
+            ),
+        ] {
+            assert!(s.contains(needle), "{why}: missing {needle:?}");
+        }
+        assert_eq!(skill("crystalline-provisioning").unwrap().since, "0.22.1");
     }
 }

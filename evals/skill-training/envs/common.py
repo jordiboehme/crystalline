@@ -38,6 +38,19 @@ which appends the parsed conversation - assistant text and tool calls
 interleaved in the order they happened - as a sixth argument to
 ``score``. Every other env keeps the five-argument signature.
 
+An env whose subject writes into the person's home (the provisioning
+benchmark: ``provision`` installs skills under ``~/.claude/skills`` and
+registers MCP servers through ``claude mcp add-json``) isolates HOME:
+``setup_sandbox(..., isolate_home=True)`` points ``HOME``,
+``COPILOT_HOME`` and ``CODEX_HOME`` of the registration commands and of
+the MCP server into ``<sandbox>/home``. The Claude Code session itself
+keeps the real HOME, because its login lives there; such an env also
+passes ``session_env`` (extra variables for the ``claude`` process, for
+example a ``CLAUDE_ENV_FILE`` that moves HOME for the Bash tool only)
+and its own ``allowed_tools`` / ``disallowed_tools``, plus
+``builtin_tools`` to cut the built-in tool set down to what the env
+needs.
+
 Results are resume-aware per out_root: a task whose result.json already
 exists is loaded, not re-run, matching the built-in envs' behavior.
 """
@@ -70,6 +83,7 @@ PrepareFn = Callable[[dict, Path], Any]
 ScoreFn = Callable[..., tuple[int, float, list[str]]]
 SetupFn = Callable[[dict, Path], tuple[Path, Any]]
 TeardownFn = Callable[[Any], None]
+SessionEnvFn = Callable[[Path], dict]
 
 
 class TransientRolloutError(RuntimeError):
@@ -110,18 +124,43 @@ def sandbox_env(sandbox: Path) -> dict:
     )
 
 
+def home_env(sandbox: Path) -> dict:
+    """HOME and the harness homes that hang off it, all inside the sandbox.
+
+    Refuses to run when CLAUDE_CONFIG_DIR is set: the ``claude`` CLI that
+    provisioning calls to register MCP servers would then write into that
+    folder instead of the sandboxed HOME.
+    """
+    if os.environ.get("CLAUDE_CONFIG_DIR"):
+        raise RuntimeError(
+            "CLAUDE_CONFIG_DIR is set; unset it so HOME isolation covers "
+            "every write the claude CLI makes"
+        )
+    home = sandbox / "home"
+    return {
+        "HOME": str(home),
+        "COPILOT_HOME": str(home / ".copilot"),
+        "CODEX_HOME": str(home / ".codex"),
+    }
+
+
 def setup_sandbox(
     sandbox: Path,
     fixture_dir: Path,
     crystalline_bin: str,
     extra_env: dict | None = None,
+    isolate_home: bool = False,
 ) -> Path:
     """Copy fixture domains in and register them; return the mcp config path.
 
     ``extra_env`` is merged into both the registration commands and the
     MCP server's environment in mcp.json (the collaboration benchmark
-    routes GitHub calls to its fake server this way).
+    routes GitHub calls to its fake server this way). ``isolate_home``
+    adds ``home_env`` to both, creating ``<sandbox>/home`` if needed.
     """
+    if isolate_home:
+        (sandbox / "home").mkdir(exist_ok=True)
+        extra_env = {**home_env(sandbox), **(extra_env or {})}
     domains_src = fixture_dir / "domains"
     domains_dst = sandbox / "domains"
     shutil.copytree(domains_src, domains_dst)
@@ -263,6 +302,60 @@ def write_predictions(
     )
 
 
+# Built-in tools no env item needs: a session offered nothing but its MCP
+# server cannot message other sessions, schedule work or reach the web.
+NO_BUILTIN_TOOLS: list[str] = []
+
+# Built-in tools that reach outside the sandbox. No allow-list may name them.
+OUTSIDE_REACHING_TOOLS = [
+    "SendMessage", "ListAgents", "Agent", "Task", "Skill", "WebFetch",
+    "WebSearch", "Monitor", "PushNotification", "RemoteTrigger",
+    "CronCreate", "ScheduleWakeup", "TaskStop", "EnterWorktree",
+]
+
+
+def build_claude_command(
+    *,
+    claude_bin: str,
+    claude_model: str,
+    question: str,
+    mcp_config: Path | str,
+    max_turns: int,
+    skill_path: Path | str,
+    has_skill: bool,
+    allowed_tools: list[str] | None = None,
+    disallowed_tools: list[str] | None = None,
+    builtin_tools: list[str] | None = None,
+) -> list[str]:
+    """The ``claude -p`` command line of one eval session.
+
+    The built-in tool set is always restricted with ``--tools`` (an empty
+    list when the env passes none), never left at the default, so tools
+    that reach outside the sandbox are not offered at all.
+    ``--disallowedTools`` stays as a second fence.
+    """
+    builtin = NO_BUILTIN_TOOLS if builtin_tools is None else builtin_tools
+    cmd = [
+        claude_bin, "-p", question,
+        "--model", claude_model,
+        "--mcp-config", str(mcp_config),
+        "--strict-mcp-config",
+        "--setting-sources", "",
+        "--disallowedTools", *(
+            DISALLOWED_TOOLS if disallowed_tools is None else disallowed_tools
+        ),
+        "--allowedTools", *(
+            ["mcp__crystalline"] if allowed_tools is None else allowed_tools
+        ),
+        "--output-format", "stream-json", "--verbose",
+        "--max-turns", str(max_turns),
+        "--tools", ",".join(builtin),
+    ]
+    if has_skill:
+        cmd.extend(["--append-system-prompt-file", str(skill_path)])
+    return cmd
+
+
 def rollout_one(
     item: dict,
     skill_content: str,
@@ -280,6 +373,10 @@ def rollout_one(
     setup: SetupFn | None = None,
     teardown: TeardownFn | None = None,
     score_wants_conversation: bool = False,
+    session_env: SessionEnvFn | None = None,
+    allowed_tools: list[str] | None = None,
+    disallowed_tools: list[str] | None = None,
+    builtin_tools: list[str] | None = None,
     default_task_type: str,
     sandbox_prefix: str,
 ) -> dict:
@@ -319,25 +416,24 @@ def rollout_one(
         skill_path = sandbox / "skill.md"
         skill_path.write_text(skill_content or "", encoding="utf-8")
 
-        cmd = [
-            claude_bin, "-p", str(item["question"]),
-            "--model", claude_model,
-            "--mcp-config", str(mcp_config),
-            "--strict-mcp-config",
-            "--setting-sources", "",
-            "--disallowedTools", *DISALLOWED_TOOLS,
-            "--allowedTools", "mcp__crystalline",
-            "--output-format", "stream-json", "--verbose",
-            "--max-turns", str(max_turns),
-        ]
-        if skill_content.strip():
-            cmd.extend(["--append-system-prompt-file", str(skill_path)])
+        cmd = build_claude_command(
+            claude_bin=claude_bin, claude_model=claude_model,
+            question=str(item["question"]), mcp_config=mcp_config,
+            max_turns=max_turns, skill_path=skill_path,
+            has_skill=bool(skill_content.strip()),
+            allowed_tools=allowed_tools, disallowed_tools=disallowed_tools,
+            builtin_tools=builtin_tools,
+        )
 
+        claude_env = None
+        if session_env is not None:
+            claude_env = dict(os.environ, **session_env(sandbox))
         try:
             proc = subprocess.run(
                 cmd, capture_output=True, text=True, encoding="utf-8",
                 errors="replace", timeout=exec_timeout,
                 cwd=str(sandbox / "work"), stdin=subprocess.DEVNULL,
+                env=claude_env,
             )
             raw = proc.stdout or ""
             if proc.returncode != 0:
@@ -416,6 +512,10 @@ def run_batch(
     setup: SetupFn | None = None,
     teardown: TeardownFn | None = None,
     score_wants_conversation: bool = False,
+    session_env: SessionEnvFn | None = None,
+    allowed_tools: list[str] | None = None,
+    disallowed_tools: list[str] | None = None,
+    builtin_tools: list[str] | None = None,
     default_task_type: str,
     sandbox_prefix: str,
 ) -> list[dict]:
@@ -438,6 +538,10 @@ def run_batch(
             setup=setup,
             teardown=teardown,
             score_wants_conversation=score_wants_conversation,
+            session_env=session_env,
+            allowed_tools=allowed_tools,
+            disallowed_tools=disallowed_tools,
+            builtin_tools=builtin_tools,
             default_task_type=default_task_type,
             sandbox_prefix=sandbox_prefix,
         )

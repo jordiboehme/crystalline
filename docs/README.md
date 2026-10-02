@@ -8,6 +8,9 @@ The [Crystalline Handbook](https://jordiboehme.github.io/crystalline/) is the lo
 | [Claude Desktop](setup/claude-desktop.md) | The one-click extension and the companion skill |
 | [Codex CLI](setup/codex.md) | `crystalline install codex` and what to do after an upgrade |
 | [GitHub Copilot CLI](setup/copilot.md) | `crystalline install copilot`, where its hooks and skills land, and what to do after an upgrade |
+| [Cursor](setup/cursor.md) | `crystalline install cursor`, the files it writes and its limits |
+| [Kiro](setup/kiro.md) | `crystalline install kiro`, including the steering file Crystalline owns |
+| [Gemini CLI and Qwen Code](setup/gemini.md) | `crystalline install gemini` and `crystalline install qwen` |
 | [Any MCP harness](setup/mcp-harness.md) | `crystalline mcp` over stdio, wired by hand, and the daemon behind it |
 | [Remote clients](setup/remote-clients.md) | A standing instruction for chat surfaces and the Messages API connector |
 | [From the terminal](setup/terminal.md) | The CLI walkthrough: a domain, an engram, a search |

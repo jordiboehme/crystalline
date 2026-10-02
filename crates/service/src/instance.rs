@@ -96,6 +96,158 @@ pub struct LockInfo {
     /// than 0.21.1 and on one from a holder that never served.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runs_in: Option<crate::runs_in::RunsIn>,
+    /// The options the owning daemon was started with, so whoever displaces
+    /// it after an upgrade starts the successor the same way. `None` on a
+    /// record from a daemon older than 0.22.1 and on one from a holder that
+    /// never served; see [`StartOptions`] for what a displacement does then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<StartOptions>,
+}
+
+/// The options a daemon was started with that decide what it serves and
+/// where: written into its record so a client that displaces it after an
+/// upgrade starts the successor with exactly these, not with the defaults
+/// (the I2 finding of 0.22.1: a plain CLI command displaced a daemon a
+/// read-only or `--db` bridge had started, spawned a writable one on the
+/// default index, and the next bridge attached to that).
+///
+/// What is recorded, and what is not:
+///
+/// - `db` is the global `--db` as given, made absolute. It is a file path:
+///   no flag of this CLI takes a database URL, so the record never holds one.
+///   `None` means the state directory's own `index.db`, which is the same
+///   file for every reader of this record (the record lives in that
+///   directory).
+/// - `config` is the config file the daemon resolved (the `--config` flag,
+///   else `CRYSTALLINE_CONFIG`, else the default path), absolute and always
+///   set by a daemon that served. Recording the default too means the
+///   successor never picks up a different file from a `CRYSTALLINE_CONFIG`
+///   the displacing shell happens to carry. A `database.url` in that file,
+///   password included, stays in that file and is reached through it.
+/// - `read_only` is the effective mode (the flag, `service.read_only` in the
+///   file or the environment), so a read-only daemon never comes back
+///   writable, even when its mode came from a harness's `env` block that a
+///   shell never has.
+/// - `http` and `allowed_hosts` are the `--http` and `--allowed-host` flags
+///   as given, not the bindings they resolved to, so the successor resolves
+///   the file and the environment the way its predecessor did.
+/// - `exit_when_idle` is the extension's bounded life: a daemon started with
+///   it is replaced by one that also ends when idle.
+/// - `env` lists the names, never the values, of the `CRYSTALLINE_*`
+///   variables the daemon applied over its config file. A database URL or a
+///   token read from the environment is a secret, so only the fact that it
+///   came from that variable is kept. Whoever displaces the daemon must have
+///   every one of them set, or it starts no successor at all (see
+///   [`attach_after_displacement`]); a variable it has that is not listed is
+///   removed from the successor's environment. Known limit: variables are
+///   compared by name only, so a displacing process that sets a listed
+///   variable to another value (a `CRYSTALLINE_DATABASE_URL` naming another
+///   database, say) hands the successor its own value. Read-only cannot be
+///   relaxed that way, since it is replayed as a flag.
+/// - `partial` says one of the paths could not be written down (it is not
+///   UTF-8); such a record is treated like a missing variable.
+///
+/// The environment outside the overlay is not recorded either and passes from
+/// the displacing process as it is: `CRYSTALLINE_CONFIG` (harmless, the
+/// recorded `--config` wins), the cache directories the model is kept in,
+/// `RUST_LOG` and proxy variables among it. A successor started with another
+/// cache directory downloads the model again; nothing it serves changes.
+///
+/// Not recorded: `--take-over` (a one-time migration of host locks the
+/// predecessor already made; the successor claims the locks its predecessor
+/// released under the same instance id), `--autostarted` and `--daemon`
+/// (every successor is an autostarted daemon), and `--breakaway-refused`
+/// (a fact about the spawner, decided anew at each spawn).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartOptions {
+    /// The global `--db` as given, absolute. Never a URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub db: Option<String>,
+    /// The config file the daemon resolved, absolute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<String>,
+    /// The effective read-only mode.
+    #[serde(default)]
+    pub read_only: bool,
+    /// The `--http` flag as given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http: Option<String>,
+    /// The `--allowed-host` flags as given.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_hosts: Vec<String>,
+    /// Started with `--exit-when-idle`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub exit_when_idle: bool,
+    /// The names of the environment variables the daemon applied over its
+    /// config file. Names only, never values.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<String>,
+    /// A path could not be recorded.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub partial: bool,
+}
+
+impl StartOptions {
+    /// What `run_serve` records, from its flags and the config it loaded.
+    /// The paths are made absolute against this process's directory, which
+    /// for a hand-started `serve` is where the person ran it.
+    pub fn capture(
+        db: Option<&Path>,
+        config: &Path,
+        read_only: bool,
+        http: Option<&str>,
+        allowed_hosts: &[String],
+        exit_when_idle: bool,
+        overlay: &crate::overlay::EnvOverlay,
+    ) -> StartOptions {
+        let mut partial = false;
+        let mut text = |path: &Path| -> Option<String> {
+            let path = absolute_for_daemon(path);
+            match path.to_str() {
+                Some(text) => Some(text.to_string()),
+                None => {
+                    partial = true;
+                    None
+                }
+            }
+        };
+        let db = db.and_then(&mut text);
+        let config = text(config);
+        StartOptions {
+            db,
+            config,
+            read_only,
+            http: http.map(str::to_string),
+            allowed_hosts: allowed_hosts.to_vec(),
+            exit_when_idle,
+            env: overlay_variable_names(overlay),
+            partial,
+        }
+    }
+}
+
+/// The names of the variables `overlay` applies, sorted and without
+/// repeats. Only the first column of [`EnvOverlay::active_overrides`] is
+/// read; its values (masked or not) never leave this function.
+///
+/// [`EnvOverlay::active_overrides`]: crate::overlay::EnvOverlay::active_overrides
+fn overlay_variable_names(overlay: &crate::overlay::EnvOverlay) -> Vec<String> {
+    let mut names: Vec<String> = overlay
+        .active_overrides()
+        .into_iter()
+        .map(|(var, _, _)| var)
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+static START_OPTIONS: std::sync::OnceLock<StartOptions> = std::sync::OnceLock::new();
+
+/// Record this daemon's start options for [`Ownership::publish`]. The first
+/// call wins, like `record_serve_intent`.
+pub fn record_start_options(options: StartOptions) {
+    let _ = START_OPTIONS.set(options);
 }
 
 pub use crate::serving::{
@@ -108,6 +260,48 @@ pub use crate::serving::{
 /// bridge's bare `mcp` line already meant.
 pub(crate) const SKILLS_OFF_OPTION: &str = "skills=off";
 
+/// The option token that tells the daemon this stdio session's harness has
+/// Crystalline's session hook installed but its onboarding is not verified:
+/// the routing block is answered with the short conditional pointer and the
+/// skill surface stays served. A daemon older than the token ignores it
+/// (its check reads only [`SKILLS_OFF_OPTION`]) and serves everything, the
+/// safe direction.
+pub(crate) const ROUTING_CONDITIONAL_OPTION: &str = "routing=conditional";
+
+/// What the `crystalline mcp` process resolved about the harness that spawned
+/// it, from its `--harness` argument and this machine's install receipt,
+/// before the session started. Two facts, because they gate two things:
+///
+/// - `hook_installed`: the receipt lists this harness with Crystalline's
+///   session hook wired, so the routing block probably arrives at session
+///   start and the instructions can shrink to a pointer.
+/// - `onboarding_verified`: the hook part **and** the harness's profile flag,
+///   set once a live check confirmed that the harness loads the hook's block
+///   and the shipped skills as files. Only this hides the skill surface.
+///
+/// The default (both false) is "serve everything with the full instructions",
+/// which is what every uncertain input resolves to.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HarnessGate {
+    /// The receipt lists the harness with its session hook installed.
+    pub hook_installed: bool,
+    /// The hook is installed and the harness's onboarding is verified.
+    pub onboarding_verified: bool,
+}
+
+impl HarnessGate {
+    /// Whether the harness is fully onboarded by its own hook and skills on
+    /// disk: the hook is installed and its onboarding is verified.
+    pub fn verified(self) -> bool {
+        self.hook_installed && self.onboarding_verified
+    }
+
+    /// Whether the hook is installed but its onboarding is not verified.
+    pub fn conditional(self) -> bool {
+        self.hook_installed && !self.onboarding_verified
+    }
+}
+
 /// Whether the daemon this process is about to hand its handshake to has
 /// declared that it parses handshake options. A record that is missing,
 /// unreadable or written by a daemon that predates the field all read as
@@ -116,12 +310,19 @@ fn daemon_parses_mcp_line_options() -> bool {
     read_lock_info().is_some_and(|info| info.mcp_line_options)
 }
 
-/// The `mcp` handshake line for a resolved answer. Bare `mcp` unless there is
-/// something to say **and** the daemon has declared it can hear it. Pure so
+/// The `mcp` handshake line for a resolved gate. Bare `mcp` unless there is
+/// something to say **and** the daemon has declared it can hear it. A verified
+/// gate sends `skills=off`, byte-identical to what a 0.22.0 bridge sent, and a
+/// hook that is installed but unverified sends `routing=conditional`. Pure so
 /// the decision is testable without a daemon.
-fn mcp_mode_line(harness_onboarded: bool, daemon_parses_options: bool) -> String {
-    if harness_onboarded && daemon_parses_options {
+fn mcp_mode_line(gate: HarnessGate, daemon_parses_options: bool) -> String {
+    if !daemon_parses_options {
+        return "mcp\n".to_string();
+    }
+    if gate.verified() {
         format!("mcp {SKILLS_OFF_OPTION}\n")
+    } else if gate.conditional() {
+        format!("mcp {ROUTING_CONDITIONAL_OPTION}\n")
     } else {
         "mcp\n".to_string()
     }
@@ -136,7 +337,7 @@ impl Connection {
     /// Write the `mcp` handshake and hand back the stream for an rmcp session or
     /// a byte pump.
     ///
-    /// `harness_onboarded` is the answer the bridge process resolved at
+    /// `gate` is the answer the bridge process resolved at
     /// startup from its `--harness` argument and this machine's install
     /// receipt; the daemon builds its per-socket `McpServer` with it. It rides
     /// the handshake line rather than being re-derived daemon-side on purpose:
@@ -152,8 +353,8 @@ impl Connection {
     /// a daemon that would not shut down), so the fallback is the bare line,
     /// which resolves to "serve" - the safe direction, and exactly today's
     /// behaviour.
-    pub async fn into_mcp(self, harness_onboarded: bool) -> io::Result<IpcStream> {
-        let line = mcp_mode_line(harness_onboarded, daemon_parses_mcp_line_options());
+    pub async fn into_mcp(self, gate: HarnessGate) -> io::Result<IpcStream> {
+        let line = mcp_mode_line(gate, daemon_parses_mcp_line_options());
         self.handshake(line.as_bytes()).await
     }
 
@@ -253,6 +454,8 @@ impl Ownership {
             // Only a process that went through `run_serve` has start facts;
             // `hold-lock` records none, as it records no intent.
             runs_in: intent.map(|_| crate::runs_in::RunsIn::here()),
+            // Recorded by `run_serve` only; `hold-lock` records none.
+            start: START_OPTIONS.get().cloned(),
         };
         self.write_record(&info)
     }
@@ -273,6 +476,7 @@ impl Ownership {
             allowed_hosts: Vec::new(),
             standalone: Some(command.to_string()),
             runs_in: None,
+            start: None,
         };
         self.write_record(&info)
     }
@@ -417,17 +621,27 @@ pub async fn try_attach() -> Option<Connection> {
 /// still starting" apart from "no daemon because this very poll iteration
 /// just tore one down", which calls for a re-spawn rather than another wait.
 pub async fn try_attach_reporting() -> (Option<Connection>, bool) {
+    let (conn, displaced) = try_attach_displacing().await;
+    (conn, displaced.is_some())
+}
+
+/// As [`try_attach_reporting`], but a displacement hands back what the
+/// displaced daemon's record said about how it was started (the outer
+/// `Some`; the inner value is `None` for a record older than 0.22.1). The
+/// record is gone once the old daemon has left, so this first read is the
+/// only chance to see it.
+pub async fn try_attach_displacing() -> (Option<Connection>, Option<Option<StartOptions>>) {
     let Some(info) = read_lock_info() else {
-        return (None, false);
+        return (None, None);
     };
     // A one-shot command holding the state directory is no daemon: nothing
     // to attach to and, whatever its version, nothing to displace.
     if !process_alive(info.pid) || info.standalone.is_some() {
-        return (None, false);
+        return (None, None);
     }
     if attach_policy(&info.version, crystalline_core::VERSION) == AttachPolicy::Displace {
         let Some(sock) = config::service_sock_path().ok() else {
-            return (None, false);
+            return (None, None);
         };
         tracing::info!(
             "displacing crystalline daemon v{} (pid {}) in favor of v{}",
@@ -436,7 +650,7 @@ pub async fn try_attach_reporting() -> (Option<Connection>, bool) {
             crystalline_core::VERSION
         );
         if displace(&sock, info.pid).await {
-            return (None, true);
+            return (None, Some(info.start));
         }
         // The old daemon is still running: `displace` either could not verify
         // it as a Crystalline process and so never signalled it, or not even
@@ -457,7 +671,7 @@ pub async fn try_attach_reporting() -> (Option<Connection>, bool) {
             }
         }
     }
-    (connect_socket().await, false)
+    (connect_socket().await, None)
 }
 
 /// Attach to a running daemon exactly as it is: read the lock record, check
@@ -515,8 +729,10 @@ pub fn attach_policy(daemon_version: &str, own_version: &str) -> AttachPolicy {
 /// Whether `candidate` is a strictly newer release than `baseline`. Same
 /// precedence as [`attach_policy`]; an unparseable version on either side
 /// is never newer, so an odd record can only ever read as a conflict, never as
-/// an upgrade skew.
-pub(crate) fn strictly_newer(candidate: &str, baseline: &str) -> bool {
+/// an upgrade skew. The CLI uses it for skill upgrades too: a managed skill
+/// whose first release is newer than an install's recorded version is added
+/// even though it is missing on disk.
+pub fn strictly_newer(candidate: &str, baseline: &str) -> bool {
     match (Precedence::parse(candidate), Precedence::parse(baseline)) {
         (Some(candidate), Some(baseline)) => candidate > baseline,
         _ => false,
@@ -1391,6 +1607,175 @@ pub async fn dislodge_unresponsive() -> anyhow::Result<DislodgeOutcome> {
     }
 }
 
+/// Attach to whatever daemon follows one this call displaced: another
+/// client's respawn when one publishes inside the wait, else one this
+/// call spawns. Bounded by the same 15 s readiness budget `ensure_daemon`
+/// uses (a shorter one when the record says nothing, see
+/// [`successor_plan`]); `None` only when no daemon became ready, and the
+/// caller then falls back as before.
+///
+/// `displaced` is what the displaced daemon's record said about how it was
+/// started, and the successor is started with exactly that (see
+/// [`successor_plan`]): its `--db`, its config file, its read-only mode, its
+/// HTTP flags and its environment variable names. Nothing of the displacing
+/// command itself reaches the successor: an explicit `--db` or `--config`
+/// never reaches this path (`use_daemon` sends such a command to the index
+/// directly), and a `CRYSTALLINE_*` variable the predecessor did not apply is
+/// removed from the successor's environment. A daemon whose start cannot be
+/// reproduced here, or whose record does not say how it was started, gets no
+/// successor from this call; the wait still attaches to one another client
+/// starts.
+///
+/// The spawn-and-poll part is [`ensure_daemon_with`] itself, so a successor
+/// another client already spawned wins the ownership race and this call's
+/// own spawn exits at once (the 2026-07-28 wedge logic there covers that).
+pub async fn attach_after_displacement(displaced: Option<StartOptions>) -> Option<Connection> {
+    let current = crate::overlay::EnvOverlay::from_process_env()
+        .map(|overlay| overlay_variable_names(&overlay));
+    let plan = successor_plan(
+        displaced.as_ref(),
+        current.as_ref().map(Vec::as_slice),
+        |name| std::env::var_os(name).is_some_and(|value| !value.is_empty()),
+    );
+    let options = match plan {
+        SuccessorPlan::Spawn(options) => options,
+        SuccessorPlan::Wait { why, budget } => {
+            tracing::warn!(
+                "not starting a successor for the displaced daemon: {why}; waiting for another client to start one"
+            );
+            return wait_for_successor(budget).await;
+        }
+    };
+    match ensure_daemon_with(true, &options).await {
+        Ok(conn) => Some(conn),
+        Err(e) => {
+            tracing::warn!("no daemon became ready after displacing an older one: {e:#}");
+            None
+        }
+    }
+}
+
+/// What a displacing client does about the successor.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SuccessorPlan {
+    /// Start one with these options.
+    Spawn(SpawnOptions),
+    /// Start none and only wait up to `budget` for another client's, for
+    /// the reason `why`.
+    Wait { why: String, budget: Duration },
+}
+
+/// How long a displacing client waits for another client's successor when it
+/// starts none itself because the record could not be reproduced here: the
+/// same window [`ensure_daemon_with`] gives its own spawn.
+const SUCCESSOR_WAIT: Duration = Duration::from_secs(15);
+
+/// How long it waits when the displaced daemon's record says nothing about
+/// how it was started (a daemon older than 0.22.1). Long enough for a
+/// connected bridge, which reconnects the moment its socket closes
+/// (`pump_stdio` in the client), to start the successor with its own flags;
+/// short, because with no bridge connected nobody will, and the command then
+/// answers on its own.
+const UNRECORDED_SUCCESSOR_WAIT: Duration = Duration::from_secs(3);
+
+/// Decide how to start the successor of a displaced daemon whose record
+/// said `displaced`. `current` is the list of overlay variables this process
+/// applies itself (an error when its environment does not parse, which the
+/// successor would fail on too), and `has_var` asks whether a variable is set
+/// here.
+///
+/// - No recorded options (a record from 0.22.0 or older): no successor, and
+///   only a short wait ([`UNRECORDED_SUCCESSOR_WAIT`]). Nobody can tell from
+///   such a record whether the daemon ran read-only or on another index, so a
+///   successor with the defaults could hand the next bridge a writable daemon
+///   on the wrong index (the I2 finding of 0.22.1). A connected bridge starts
+///   the successor itself with its own flags inside the wait, the existing
+///   "first spawner decides" rule; with none connected the command answers on
+///   its own, as before 0.22.1.
+/// - A recorded variable this process does not have, a path the record could
+///   not hold, or an environment that does not parse: no successor. The
+///   database, a domain or the read-only switch may have come from that
+///   variable, and a successor without it would serve something else.
+/// - Otherwise the recorded options, with every overlay variable of this
+///   process that the predecessor did not apply removed.
+pub(crate) fn successor_plan(
+    displaced: Option<&StartOptions>,
+    current: Result<&[String], &crate::overlay::OverlayError>,
+    has_var: impl Fn(&str) -> bool,
+) -> SuccessorPlan {
+    let wait = |why: String| SuccessorPlan::Wait {
+        why,
+        budget: SUCCESSOR_WAIT,
+    };
+    let Some(start) = displaced else {
+        return SuccessorPlan::Wait {
+            why: "its record does not say how it was started".to_string(),
+            budget: UNRECORDED_SUCCESSOR_WAIT,
+        };
+    };
+    if start.partial {
+        return wait("its record could not hold one of its paths".to_string());
+    }
+    if let Some(missing) = start.env.iter().find(|name| !has_var(name)) {
+        return wait(format!(
+            "it read {missing} from its environment and that variable is not set here"
+        ));
+    }
+    let current = match current {
+        Ok(current) => current,
+        Err(e) => return wait(format!("this environment does not parse ({e})")),
+    };
+    SuccessorPlan::Spawn(SpawnOptions {
+        db: start.db.as_ref().map(PathBuf::from),
+        config: start.config.as_ref().map(PathBuf::from),
+        read_only: start.read_only,
+        http: start.http.clone(),
+        allowed_hosts: start.allowed_hosts.clone(),
+        exit_when_idle: start.exit_when_idle,
+        env_remove: current
+            .iter()
+            .filter(|name| !start.env.contains(name))
+            .cloned()
+            .collect(),
+    })
+}
+
+/// Poll for a daemon another client starts, for up to `budget`, without
+/// spawning one.
+async fn wait_for_successor(budget: Duration) -> Option<Connection> {
+    let deadline = Instant::now() + budget;
+    loop {
+        if let Some(conn) = try_attach().await {
+            return Some(conn);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// How [`spawn_daemon`] starts a daemon. `ensure_daemon` fills the first
+/// three from a client's own flags; a displacement fills all of them from
+/// the displaced daemon's [`StartOptions`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SpawnOptions {
+    /// The global `--db`.
+    pub db: Option<PathBuf>,
+    /// `--config`.
+    pub config: Option<PathBuf>,
+    /// `--read-only`.
+    pub read_only: bool,
+    /// `--http`.
+    pub http: Option<String>,
+    /// `--allowed-host`, once per value.
+    pub allowed_hosts: Vec<String>,
+    /// `--exit-when-idle`, on top of the extension's own.
+    pub exit_when_idle: bool,
+    /// Variables removed from the daemon's environment.
+    pub env_remove: Vec<String>,
+}
+
 /// Attach to a daemon, spawning one detached and polling for readiness (up to
 /// ~15s) when none is running and `spawn` is set. The window is generous on
 /// purpose: a cold start on modest hardware or a loaded machine can take well
@@ -1403,6 +1788,20 @@ pub async fn ensure_daemon(
     db: Option<&Path>,
     config_path: Option<&Path>,
     read_only: bool,
+) -> anyhow::Result<Connection> {
+    let options = SpawnOptions {
+        db: db.map(Path::to_path_buf),
+        config: config_path.map(Path::to_path_buf),
+        read_only,
+        ..SpawnOptions::default()
+    };
+    ensure_daemon_with(spawn, &options).await
+}
+
+/// [`ensure_daemon`] with every option a spawned daemon can be given.
+pub(crate) async fn ensure_daemon_with(
+    spawn: bool,
+    options: &SpawnOptions,
 ) -> anyhow::Result<Connection> {
     if let Some(conn) = try_attach().await {
         return Ok(conn);
@@ -1458,7 +1857,7 @@ pub async fn ensure_daemon(
         HolderState::Free => {}
     }
 
-    spawn_daemon(db, config_path, read_only)?;
+    spawn_daemon(options)?;
     // Poll readiness: lock record present and socket connectable. Another
     // client's lingering old-binary bridge can be reconnecting during this
     // same takeover window: it reads the empty lock this call's displacement
@@ -1477,7 +1876,7 @@ pub async fn ensure_daemon(
         }
         if displaced && respawns < 3 {
             respawns += 1;
-            spawn_daemon(db, config_path, read_only)?;
+            spawn_daemon(options)?;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -1542,7 +1941,9 @@ fn daemon_log_sink() -> Option<std::process::Stdio> {
 /// it, and carries `--exit-when-idle`, which ends it on its own once its last
 /// client is gone even when that teardown never comes.
 ///
-/// No `--http off` is passed and none ever should be: a daemon started this way
+/// No `--http off` is passed of this call's own accord and none ever should be
+/// (the one `--http` it passes is a displaced daemon's own flag, replayed for
+/// its successor, see [`attach_after_displacement`]): a daemon started this way
 /// (an agent's `crystalline mcp` connection, the Desktop extension) serves the
 /// HTTP endpoint on 127.0.0.1:7411 by exactly the same default a hand-started
 /// `crystalline serve` does. The daemon is a singleton, so an autostarted one
@@ -1558,24 +1959,21 @@ fn daemon_log_sink() -> Option<std::process::Stdio> {
 /// program's folder made the daemon hold that folder). `--db`, `--config` and
 /// a relative `CRYSTALLINE_CONFIG` are made absolute first, so they still name
 /// the files the client meant.
-fn spawn_daemon(
-    db: Option<&Path>,
-    config_path: Option<&Path>,
-    read_only: bool,
-) -> anyhow::Result<()> {
+fn spawn_daemon(options: &SpawnOptions) -> anyhow::Result<()> {
     let exe = std::env::current_exe()?;
     let extension = crate::stub::is_mcpb_channel();
     // The daemon works in the state directory (below), so every path it is
     // handed has to name the same file from there as it does here.
-    let db = db.map(absolute_for_daemon);
-    let config_path = config_path.map(absolute_for_daemon);
+    let options = SpawnOptions {
+        db: options.db.as_deref().map(absolute_for_daemon),
+        config: options.config.as_deref().map(absolute_for_daemon),
+        ..options.clone()
+    };
     let mut cmd = std::process::Command::new(exe);
-    cmd.args(daemon_args(
-        db.as_deref(),
-        config_path.as_deref(),
-        read_only,
-        extension,
-    ));
+    cmd.args(daemon_args(&options, extension));
+    for name in &options.env_remove {
+        cmd.env_remove(name);
+    }
     if let Some(value) = std::env::var_os(crate::overlay::CONFIG_PATH_ENV)
         && let Some(absolute) = config_env_for_daemon(&value)
     {
@@ -1661,28 +2059,33 @@ fn spawn_daemon(
 /// (a hidden flag, not `--daemon`, which an operator passes by hand too, and
 /// not an environment variable, which a shell could leave set and mislabel a
 /// daemon somebody started deliberately). `--exit-when-idle` is the extension's
-/// bounded lifetime; see [`spawn_daemon`].
-fn daemon_args(
-    db: Option<&Path>,
-    config_path: Option<&Path>,
-    read_only: bool,
-    exit_when_idle: bool,
-) -> Vec<std::ffi::OsString> {
+/// bounded lifetime, see [`spawn_daemon`], and also the successor's of a
+/// displaced daemon that had it. `--http` and `--allowed-host` are passed only
+/// when a displaced daemon's record says it was started with them.
+fn daemon_args(options: &SpawnOptions, extension: bool) -> Vec<std::ffi::OsString> {
     let mut args: Vec<std::ffi::OsString> = Vec::new();
-    if let Some(db) = db {
+    if let Some(db) = &options.db {
         args.push("--db".into());
         args.push(db.into());
     }
     args.push("serve".into());
     args.push("--daemon".into());
     args.push("--autostarted".into());
-    if exit_when_idle {
+    if extension || options.exit_when_idle {
         args.push("--exit-when-idle".into());
     }
-    if read_only {
+    if options.read_only {
         args.push("--read-only".into());
     }
-    if let Some(cfg) = config_path {
+    if let Some(http) = &options.http {
+        args.push("--http".into());
+        args.push(http.into());
+    }
+    for host in &options.allowed_hosts {
+        args.push("--allowed-host".into());
+        args.push(host.into());
+    }
+    if let Some(cfg) = &options.config {
         args.push("--config".into());
         args.push(cfg.into());
     }
@@ -2133,19 +2536,22 @@ mod tests {
     /// outlive Claude Desktop.
     #[test]
     fn daemon_args_add_exit_when_idle_only_for_the_extension() {
-        let plain = daemon_args(None, None, false, false);
+        let plain = daemon_args(&SpawnOptions::default(), false);
         assert_eq!(plain, ["serve", "--daemon", "--autostarted"]);
 
-        let idle = daemon_args(None, None, false, true);
+        let idle = daemon_args(&SpawnOptions::default(), true);
         assert_eq!(
             idle,
             ["serve", "--daemon", "--autostarted", "--exit-when-idle"]
         );
 
         let full = daemon_args(
-            Some(Path::new("/x/index.db")),
-            Some(Path::new("/x/config.yaml")),
-            true,
+            &SpawnOptions {
+                db: Some(PathBuf::from("/x/index.db")),
+                config: Some(PathBuf::from("/x/config.yaml")),
+                read_only: true,
+                ..SpawnOptions::default()
+            },
             true,
         );
         assert_eq!(
@@ -2160,6 +2566,169 @@ mod tests {
                 "--read-only",
                 "--config",
                 "/x/config.yaml",
+            ]
+        );
+    }
+
+    /// A record a 0.22.0 daemon wrote has no start options. It still parses,
+    /// and a displacing command starts no successor for it: it only waits a
+    /// moment for a connected bridge to start one with its own flags.
+    #[test]
+    fn a_record_without_start_options_parses_and_gets_no_successor_from_a_command() {
+        let record = r#"{"pid":4242,"socket_path":"/s/service.sock","version":"0.22.0",
+            "started_at":"2026-09-30T10:00:00Z","mcp_line_options":true,
+            "started_by":"autostart","http":"127.0.0.1:7411","allowed_hosts":[],
+            "runs_in":{"working_dir":"/s","breakaway_refused":false,"exits_when_idle":false}}"#;
+        let info: LockInfo = serde_json::from_str(record).expect("a 0.22.0 record parses");
+        assert_eq!(info.start, None);
+        match successor_plan(info.start.as_ref(), Ok(&[]), |_| true) {
+            SuccessorPlan::Wait { budget, .. } => {
+                assert_eq!(budget, UNRECORDED_SUCCESSOR_WAIT);
+                assert!(budget <= Duration::from_secs(3), "{budget:?}");
+            }
+            other => panic!("no successor for a 0.22.0 record: {other:?}"),
+        }
+    }
+
+    /// What a daemon records about its start carries no secret: a database
+    /// URL with a password, a single sign-on client secret and a GitHub
+    /// token read from the environment leave only their variable names.
+    #[test]
+    fn start_options_record_variable_names_and_never_their_values() {
+        let overlay = crate::overlay::EnvOverlay::from_vars(
+            [
+                ("CRYSTALLINE_DATABASE_BACKEND", "postgres"),
+                (
+                    "CRYSTALLINE_DATABASE_URL",
+                    "postgres://team:hunter2@db.internal/crystalline",
+                ),
+                ("CRYSTALLINE_AUTH_OIDC_CLIENT_ID", "app-1234"),
+                ("CRYSTALLINE_AUTH_OIDC_CLIENT_SECRET", "oidc-s3cret"),
+                ("CRYSTALLINE_GITHUB_TOKEN", "ghp_tokenvalue"),
+            ]
+            .map(|(k, v)| (k.to_string(), v.to_string())),
+        )
+        .unwrap();
+        let start = StartOptions::capture(
+            Some(Path::new("/srv/team.db")),
+            Path::new("/srv/config.yaml"),
+            true,
+            None,
+            &[],
+            false,
+            &overlay,
+        );
+        let info = LockInfo {
+            pid: 1,
+            socket_path: "/s".to_string(),
+            version: "0.22.1".to_string(),
+            started_at: "2026-10-02T00:00:00Z".to_string(),
+            mcp_line_options: true,
+            started_by: None,
+            http: HttpBinding::Unrecorded,
+            allowed_hosts: Vec::new(),
+            standalone: None,
+            runs_in: None,
+            start: Some(start),
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        for secret in [
+            "hunter2",
+            "team:",
+            "db.internal",
+            "oidc-s3cret",
+            "ghp_tokenvalue",
+            "app-1234",
+            "postgres://",
+        ] {
+            assert!(!json.contains(secret), "{secret} leaked into {json}");
+        }
+        for name in [
+            "CRYSTALLINE_DATABASE_URL",
+            "CRYSTALLINE_DATABASE_BACKEND",
+            "CRYSTALLINE_AUTH_OIDC_CLIENT_SECRET",
+            "CRYSTALLINE_GITHUB_TOKEN",
+        ] {
+            assert!(json.contains(name), "{name} is named: {json}");
+        }
+        // The paths are made absolute, which adds a drive on Windows, so only
+        // the file names are checked.
+        assert!(
+            json.contains("team.db") && json.contains("config.yaml"),
+            "{json}"
+        );
+        let back: LockInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.start, info.start, "the record reads back as written");
+    }
+
+    /// The successor runs with the displaced daemon's options; a variable it
+    /// read that is missing here means no successor at all, and a variable
+    /// set here that it never read is kept out of the successor.
+    #[test]
+    fn the_successor_plan_follows_the_record_and_its_environment() {
+        let start = StartOptions {
+            db: Some("/srv/team.db".to_string()),
+            config: Some("/srv/config.yaml".to_string()),
+            read_only: true,
+            http: Some("127.0.0.1:7499".to_string()),
+            allowed_hosts: vec!["kb.example".to_string()],
+            exit_when_idle: false,
+            env: vec!["CRYSTALLINE_DATABASE_URL".to_string()],
+            partial: false,
+        };
+        let here = vec![
+            "CRYSTALLINE_DATABASE_URL".to_string(),
+            "CRYSTALLINE_SERVICE_HTTP".to_string(),
+        ];
+        assert_eq!(
+            successor_plan(Some(&start), Ok(&here), |name| here
+                .iter()
+                .any(|h| h == name)),
+            SuccessorPlan::Spawn(SpawnOptions {
+                db: Some(PathBuf::from("/srv/team.db")),
+                config: Some(PathBuf::from("/srv/config.yaml")),
+                read_only: true,
+                http: Some("127.0.0.1:7499".to_string()),
+                allowed_hosts: vec!["kb.example".to_string()],
+                exit_when_idle: false,
+                env_remove: vec!["CRYSTALLINE_SERVICE_HTTP".to_string()],
+            })
+        );
+        match successor_plan(Some(&start), Ok(&[]), |_| false) {
+            SuccessorPlan::Wait { why, budget } => {
+                assert!(why.contains("CRYSTALLINE_DATABASE_URL"), "{why}");
+                assert_eq!(budget, SUCCESSOR_WAIT);
+            }
+            other => panic!("a missing variable starts no successor: {other:?}"),
+        }
+        let partial = StartOptions {
+            partial: true,
+            env: Vec::new(),
+            ..start.clone()
+        };
+        assert!(matches!(
+            successor_plan(Some(&partial), Ok(&[]), |_| true),
+            SuccessorPlan::Wait { .. }
+        ));
+        let args = match successor_plan(Some(&start), Ok(&here), |_| true) {
+            SuccessorPlan::Spawn(options) => daemon_args(&options, false),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            args,
+            [
+                "--db",
+                "/srv/team.db",
+                "serve",
+                "--daemon",
+                "--autostarted",
+                "--read-only",
+                "--http",
+                "127.0.0.1:7499",
+                "--allowed-host",
+                "kb.example",
+                "--config",
+                "/srv/config.yaml",
             ]
         );
     }
@@ -2324,16 +2893,60 @@ mod tests {
     /// socket.
     #[test]
     fn the_extended_mode_line_is_only_sent_to_a_daemon_that_declared_it() {
-        assert_eq!(mcp_mode_line(true, true), "mcp skills=off\n");
+        assert_eq!(mcp_mode_line(VERIFIED_GATE, true), "mcp skills=off\n");
         assert_eq!(
-            mcp_mode_line(true, false),
+            mcp_mode_line(VERIFIED_GATE, false),
             "mcp\n",
             "a daemon that did not declare it gets the line it understands, and \
              serves the surface"
         );
         // Nothing to say, nothing added, whatever the daemon can parse.
-        assert_eq!(mcp_mode_line(false, true), "mcp\n");
-        assert_eq!(mcp_mode_line(false, false), "mcp\n");
+        assert_eq!(mcp_mode_line(HarnessGate::default(), true), "mcp\n");
+        assert_eq!(mcp_mode_line(HarnessGate::default(), false), "mcp\n");
+    }
+
+    /// The gate a verified harness with its hooks wired resolves to.
+    const VERIFIED_GATE: HarnessGate = HarnessGate {
+        hook_installed: true,
+        onboarding_verified: true,
+    };
+
+    /// A hook in the receipt without a verified profile asks for the short
+    /// conditional instructions and nothing else: it never sends the token
+    /// that hides the skills.
+    #[test]
+    fn an_installed_but_unverified_hook_sends_no_skills_off_token() {
+        let unverified = HarnessGate {
+            hook_installed: true,
+            onboarding_verified: false,
+        };
+        assert_eq!(mcp_mode_line(unverified, true), "mcp routing=conditional\n");
+        assert!(!mcp_mode_line(unverified, true).contains(SKILLS_OFF_OPTION));
+        assert_eq!(
+            mcp_mode_line(
+                HarnessGate {
+                    hook_installed: true,
+                    onboarding_verified: true
+                },
+                true
+            ),
+            "mcp skills=off\n"
+        );
+        assert_eq!(mcp_mode_line(unverified, false), "mcp\n");
+        assert_eq!(mcp_mode_line(HarnessGate::default(), true), "mcp\n");
+    }
+
+    /// What a 0.22.0 daemon does with the new token: its check reads only
+    /// `skills=off`, so the conditional token falls through to a full serve,
+    /// the safe direction.
+    #[test]
+    fn the_conditional_token_is_ignored_by_a_daemon_that_does_not_know_it() {
+        let (mode, options) = split_mode_line("mcp routing=conditional");
+        assert_eq!(mode, "mcp");
+        assert!(
+            !options.contains(&SKILLS_OFF_OPTION),
+            "the 0.22.0 check reads no skills=off: full serve"
+        );
     }
 
     /// The capability is read off the record, and a record written before the
@@ -2349,7 +2962,7 @@ mod tests {
             r#"{"pid":1,"socket_path":"s","version":"0.13.0","started_at":"2026-08-14T00:00:00Z"}"#;
         let info: LockInfo = serde_json::from_str(legacy).expect("an older record still parses");
         assert!(!info.mcp_line_options);
-        assert_eq!(mcp_mode_line(true, info.mcp_line_options), "mcp\n");
+        assert_eq!(mcp_mode_line(VERIFIED_GATE, info.mcp_line_options), "mcp\n");
 
         let current = serde_json::to_string(&LockInfo {
             pid: 1,
@@ -2362,6 +2975,7 @@ mod tests {
             allowed_hosts: Vec::new(),
             standalone: None,
             runs_in: None,
+            start: None,
         })
         .unwrap();
         let info: LockInfo = serde_json::from_str(&current).unwrap();
@@ -2963,6 +3577,7 @@ mod tests {
             allowed_hosts: Vec::new(),
             standalone: None,
             runs_in: None,
+            start: None,
         };
         std::fs::write(&info_path, serde_json::to_string(&info).unwrap()).unwrap();
 
@@ -3016,6 +3631,7 @@ mod tests {
             allowed_hosts: Vec::new(),
             standalone: None,
             runs_in: None,
+            start: None,
         };
         std::fs::write(&info_path, serde_json::to_string(&info).unwrap()).unwrap();
 
@@ -3089,6 +3705,7 @@ mod tests {
             allowed_hosts: Vec::new(),
             standalone: None,
             runs_in: None,
+            start: None,
         };
         std::fs::write(
             config::service_lock_path().unwrap(),
@@ -3436,6 +4053,7 @@ mod tests {
             allowed_hosts: Vec::new(),
             standalone: None,
             runs_in: None,
+            start: None,
         };
         std::fs::write(
             config::service_info_path().unwrap(),
@@ -3576,6 +4194,7 @@ mod tests {
             allowed_hosts: vec![],
             standalone: None,
             runs_in: None,
+            start: None,
         }
     }
 

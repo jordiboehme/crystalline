@@ -43,6 +43,7 @@ use turso::{Builder, Connection, Database, Row, Value};
 
 use crate::alias::{AliasMap, query_uses_tags};
 use crate::error::{IndexError, Result};
+use crate::store::WorkClaim;
 use crate::store::{
     AttachmentRow, BrowseLevel, ChunkJob, ChunkModelCount, ContentMention, ContradictionRow,
     DomainHost, DomainId, DomainKind, DomainStats, EdgeKind, EmbeddingCoverage, EmbeddingRow,
@@ -429,7 +430,7 @@ impl TursoStore {
         )
         .await?
         .and_then(|r| cell_text(&r, 0));
-        compare_outcome(stored, expected)
+        crate::store::compare_outcome(stored, expected)
     }
 
     /// Write one row of the `engram` table, in one actor's dimension.
@@ -3197,6 +3198,11 @@ impl Store for TursoStore {
         .await
     }
 
+    /// A turso index is this process's own file: nobody else works on it.
+    async fn try_work_claim(&self, _key: &str) -> Result<Option<WorkClaim>> {
+        Ok(Some(WorkClaim::unshared()))
+    }
+
     async fn wipe(&self) -> Result<()> {
         // Deletes every chunk, so the coverage snapshot is now stale.
         self.invalidate_coverage();
@@ -3881,44 +3887,8 @@ impl Store for TursoStore {
     }
 }
 
-/// What [`TursoStore::guarded_compare`] answers when its no-op UPDATE
-/// reported no changed row, from the sha the fallback SELECT read: no row is
-/// `Ok(false)`, a row that moved on is [`IndexError::StaleEdit`], and a row
-/// that still carries the expected sha is `Ok(true)`. That last arm cannot
-/// happen while turso counts matched rows, but a release that counted only
-/// changed values would report zero changes for every no-op UPDATE, and this
-/// keeps such a release from refusing every guarded edit.
-fn compare_outcome(stored: Option<String>, expected: &str) -> Result<bool> {
-    match stored {
-        Some(found) if found == expected => Ok(true),
-        Some(found) => Err(IndexError::StaleEdit {
-            expected: expected.to_string(),
-            found,
-        }),
-        None => Ok(false),
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    // Mutation caught: a matching row read back after an UPDATE that
-    // reported zero changes answered as a StaleEdit with two equal shas.
-    #[test]
-    fn a_guarded_compare_whose_row_still_matches_is_a_match_even_with_zero_changes() {
-        assert!(matches!(
-            compare_outcome(Some("abc".into()), "abc"),
-            Ok(true)
-        ));
-        assert!(matches!(compare_outcome(None, "abc"), Ok(false)));
-        match compare_outcome(Some("def".into()), "abc") {
-            Err(IndexError::StaleEdit { expected, found }) => {
-                assert_eq!(expected, "abc");
-                assert_eq!(found, "def");
-            }
-            other => panic!("expected a StaleEdit, got {other:?}"),
-        }
-    }
-
     use std::collections::BTreeMap;
 
     use super::*;

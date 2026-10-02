@@ -27,7 +27,7 @@ use crystalline_index::nli::{
 };
 use crystalline_index::sweep::{MAX_LINE_PAIRS_PER_ENGRAM_PAIR, ORDER_AGGREGATION};
 use crystalline_index::{
-    ContradictionRow, OBSERVATION_VECTOR_CHUNK, ObservationVector, ScoredPair,
+    ContradictionRow, OBSERVATION_VECTOR_CHUNK, ObservationVector, ScoredPair, WorkClaim,
 };
 
 /// The key whose change lifts a failed load and makes pending unknown again.
@@ -69,6 +69,51 @@ impl ContradictionFact {
             checksum: &self.checksum,
             lead_vector: self.lead_vector.as_deref(),
             observations: &self.observations,
+        }
+    }
+}
+
+/// One engram as the contradiction walk last read it: the content sha of
+/// that read and what the walk takes from the content alone. Kept per domain
+/// and path in [`Engine`]'s fact cache, so the next walk reads an engram
+/// again only when its stamp's sha moved. Nothing that depends on more than
+/// the content is kept: the id and the listing's status come from the
+/// listing, the scoring checksum from the line rules and the lead vector
+/// from the store, all again on every walk.
+pub(crate) struct CachedFact {
+    /// The lowercase hex SHA-256 of the content this entry was parsed from,
+    /// the same digest a [`FileStamp`] carries.
+    sha256: String,
+    /// The parse; `None` when that content does not parse, so a broken
+    /// engram is not read again until it changes.
+    parsed: Option<Arc<ParsedFact>>,
+}
+
+/// What [`CachedFact`] keeps of a parsed engram.
+struct ParsedFact {
+    /// The frontmatter status as written, untrimmed; absent falls back to
+    /// the listing's status, which is read afresh.
+    status: Option<String>,
+    valid_from: Option<NaiveDate>,
+    valid_to: Option<NaiveDate>,
+    observations: Vec<FactObservation>,
+}
+
+impl ParsedFact {
+    fn of(engram: &Engram) -> Self {
+        let fm = &engram.frontmatter;
+        ParsedFact {
+            status: fm.status.clone(),
+            valid_from: fm.valid_from,
+            valid_to: fm.valid_to,
+            observations: engram
+                .observations
+                .iter()
+                .map(|o| FactObservation {
+                    line: o.line,
+                    text: o.content.clone(),
+                })
+                .collect(),
         }
     }
 }
@@ -124,6 +169,21 @@ struct DomainWork {
     count: Option<DomainCount>,
     /// What the walk's line step saw. `None` for a domain skipped as settled.
     lines: Option<LineCoverage>,
+    /// A virtual domain on a shared database: every instance walks it, so
+    /// its pairs are scored only under the domain's work claim
+    /// ([`Store::try_work_claim`]), by one instance at a time.
+    claimed: bool,
+}
+
+/// What [`Engine::claim_domain`] found.
+enum Claimed<'p> {
+    /// The claim is this instance's, with the pairs another instance stored
+    /// meanwhile.
+    Held(WorkClaim, Vec<&'p PairPlan>),
+    /// Another instance holds the claim.
+    Elsewhere,
+    /// The claim or the read under it failed.
+    Failed(String),
 }
 
 /// One pending engram pair and its kept line pairs; `lines` is `None` while
@@ -303,6 +363,21 @@ impl Engine {
         self.request_contradictions();
     }
 
+    /// Called by every full sync once its file domains are claimed: from
+    /// now on the off switch knows which file domains this instance hosts.
+    /// The first time, with the check off, it asks for the off pass, which
+    /// on a shared database has waited for this (see
+    /// [`Engine::clear_contradiction_data_once`]). A daemon's startup sync
+    /// is that first time.
+    pub(crate) fn file_hosting_claimed(&self) {
+        use std::sync::atomic::Ordering;
+        if !self.file_hosting_known.swap(true, Ordering::SeqCst)
+            && self.contradiction_model().is_none()
+        {
+            self.request_contradictions();
+        }
+    }
+
     /// Forget what the pass remembers about the domain `name`: called when
     /// it is unregistered or collected, which clears its rows. Without this a
     /// domain added back under the same name from the same files would match
@@ -315,11 +390,18 @@ impl Engine {
         state.settled.remove(name);
         state.counted.remove(name);
         state.failed.remove(name);
+        state.waiting.remove(name);
         state.pending = None;
         state.generation = state.generation.wrapping_add(1);
+        drop(state);
+        // The cache is keyed by domain id, which the name does not reach
+        // here; a removal is rare, so the whole cache goes.
+        self.contradiction_facts_cache.lock().unwrap().clear();
     }
 
     /// Forget everything the pass remembers and move the generation on.
+    /// The fact cache goes too: an off check keeps nothing of the engrams in
+    /// memory, and the walk after it reads every engram again.
     fn reset_contradiction_state(&self) {
         let mut state = self.contradiction_state.lock().unwrap();
         let generation = state.generation.wrapping_add(1);
@@ -327,6 +409,8 @@ impl Engine {
             generation,
             ..ContradictionState::default()
         };
+        drop(state);
+        self.contradiction_facts_cache.lock().unwrap().clear();
     }
 
     /// Ask the contradiction worker for a pass. `false` when no worker is
@@ -390,11 +474,77 @@ impl Engine {
             None => true,
             // A new day: an engram may have expired with nothing written.
             Some(_) if state.walked_on != Some(self.contradiction_today()) => true,
+            // A domain left to another instance does not count: the tick
+            // checks its claim instead and asks once it is free.
             Some(pending) => {
-                let total = pending.values().sum::<usize>();
-                let failing = failed_count(&state, model.repo);
+                let mine = |name: &String| !state.waiting.contains_key(name);
+                let total = pending
+                    .iter()
+                    .filter(|(name, _)| mine(name))
+                    .map(|(_, n)| n)
+                    .sum::<usize>();
+                let failing = state
+                    .failed
+                    .iter()
+                    .filter(|(name, _)| mine(name))
+                    .map(|(_, set)| set.iter().filter(|f| f.repo == model.repo).count())
+                    .sum::<usize>();
                 total > failing || (failing > 0 && loaded)
             }
+        }
+    }
+
+    /// The tick's check of the domains the last walk left to another
+    /// instance (a shared virtual domain whose work claim was held): each
+    /// claim is taken and let go at once, and a domain whose claim is free
+    /// again stops waiting, so [`Engine::contradictions_wanted`] asks for the
+    /// pass that scores what is left of it. One claim per waiting domain and
+    /// no walk, so a domain another instance scores for an hour is not walked
+    /// again on every tick meanwhile. Returns whether a domain stopped
+    /// waiting.
+    pub async fn recheck_contradiction_claims(&self) -> bool {
+        let waiting: Vec<(String, DomainId)> = self
+            .contradiction_state
+            .lock()
+            .unwrap()
+            .waiting
+            .iter()
+            .map(|(name, id)| (name.clone(), *id))
+            .collect();
+        let mut freed = Vec::new();
+        for (name, id) in waiting {
+            if self.work_claim_free(id).await {
+                freed.push(name);
+            }
+        }
+        if freed.is_empty() {
+            return false;
+        }
+        let mut state = self.contradiction_state.lock().unwrap();
+        for name in &freed {
+            state.waiting.remove(name);
+        }
+        true
+    }
+
+    /// Whether the work claim of the shared virtual domain `id` is free: it
+    /// is taken and let go at once, so the probe never holds it. A claim
+    /// that cannot be asked for reads as free, and the claim taken for the
+    /// scoring then reports why.
+    async fn work_claim_free(&self, id: DomainId) -> bool {
+        let tried = self
+            .store
+            .lock()
+            .await
+            .try_work_claim(&work_claim_key(id))
+            .await;
+        match tried {
+            Ok(Some(claim)) => {
+                claim.release().await;
+                true
+            }
+            Ok(None) => false,
+            Err(_) => true,
         }
     }
 
@@ -416,6 +566,16 @@ impl Engine {
     #[cfg(any(test, feature = "testing"))]
     pub fn contradiction_fact_walks(&self) -> u64 {
         self.contradiction_fact_walks
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// How many engrams [`Engine::contradiction_facts`] has read since this
+    /// engine was built: an engram whose content sha is in the fact cache
+    /// is not read, so a write to a parsed domain reads the one engram it
+    /// touched.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn contradiction_fact_loads(&self) -> u64 {
+        self.contradiction_fact_loads
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -547,19 +707,34 @@ impl Engine {
     /// runs before the startup sync claims any file domain, so a scope read
     /// then would hold the virtual domains only and leave the file domains'
     /// rows behind for good. On a shared database, only the scores of the
-    /// domains in this instance's scope, and no line vectors, which other
-    /// instances' domains may use. A failure leaves the flag unset, so the
-    /// next off pass tries again.
+    /// file domains this instance hosts, and no line vectors, which other
+    /// instances' domains may use. Never a virtual domain's rows: another
+    /// instance with the check on may have scored them, and an off feature
+    /// reads none of them, so they are not this instance's to drop. Which
+    /// file domains it hosts is known only once a full sync has claimed
+    /// them, so before that the off pass clears nothing and leaves the flag
+    /// unset; the sync then asks for the pass again
+    /// ([`Engine::file_hosting_claimed`]). A failure leaves the flag unset
+    /// too, so the next off pass tries again.
     async fn clear_contradiction_data_once(&self) -> Result<()> {
         use std::sync::atomic::Ordering;
+        if self.contradiction_data_cleared.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let store = self.store.lock().await;
+        let shared = store.shares_database();
+        if shared && !self.file_hosting_known.load(Ordering::SeqCst) {
+            return Ok(());
+        }
         if self.contradiction_data_cleared.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
         let done = async {
-            let store = self.store.lock().await;
-            if store.shares_database() {
-                let scope = self.embed_scope(&*store).await?;
-                store.clear_contradictions(scope.as_deref()).await?;
+            if shared {
+                let mut hosted: Vec<DomainId> =
+                    self.hosted.read().unwrap().values().copied().collect();
+                hosted.sort_by_key(|d| d.0);
+                store.clear_contradictions(Some(&hosted)).await?;
             } else {
                 store.clear_contradictions(None).await?;
                 store.clear_observation_vectors().await?;
@@ -833,7 +1008,14 @@ impl Engine {
         {
             let remaining = pending.values().sum();
             self.publish_walk(
-                model, generation, today, &work, pending, failures, line_error,
+                model,
+                generation,
+                today,
+                &work,
+                pending,
+                failures,
+                BTreeMap::new(),
+                line_error,
             );
             return Ok(ContradictionOutcome::Scored {
                 pairs: 0,
@@ -841,11 +1023,34 @@ impl Engine {
                 remaining,
             });
         }
+        // What the walk found is published before the first pair is scored,
+        // so the status counts the pairs in flight instead of the previous
+        // walk's count. Only `publish_walk` settles a domain.
+        self.publish_progress(model, generation, &work, &pending);
+        // A shared virtual domain whose work claim another instance holds is
+        // left to that instance before the model is loaded, so this one
+        // neither loads the model for it nor scores it. The claim is only
+        // probed here, taken and let go at once, so it never spans the load;
+        // the scoring takes it again below.
+        let mut elsewhere: HashSet<DomainId> = HashSet::new();
+        for w in work
+            .iter()
+            .filter(|w| w.claimed && w.pending.iter().any(|p| p.lines.is_some()))
+        {
+            if !self.work_claim_free(w.id).await {
+                tracing::debug!(
+                    domain = %w.name,
+                    "another instance is scoring this domain; it is left to that one this pass"
+                );
+                elsewhere.insert(w.id);
+            }
+        }
         // The model is loaded only when some pair has a line pair to read. A
         // pair with none above the floor, the common case for a related
         // pair, is stored empty without it.
         let needs_model = work
             .iter()
+            .filter(|w| !elsewhere.contains(&w.id))
             .any(|w| w.pending.iter().any(|p| p.line_count() > 0));
         let scorer = if needs_model {
             match self.scorer_for(model).await {
@@ -910,11 +1115,16 @@ impl Engine {
         let (mut pairs_done, mut lines_done, mut batches) = (0usize, 0usize, 0usize);
         let mut batch_error: Option<String> = None;
         'domains: for w in &work {
+            // Left to another instance: its pending stays as walked.
+            if elsewhere.contains(&w.id) {
+                continue;
+            }
             // Whole pairs within the budget, in the order the walk found
             // them; a pair whose line vectors are missing waits and costs
             // nothing.
             let mut take: Vec<&PairPlan> = Vec::new();
             let mut out_of_budget = false;
+            let mut spent = 0usize;
             for plan in &w.pending {
                 let Some(lines) = &plan.lines else {
                     continue;
@@ -924,13 +1134,55 @@ impl Engine {
                     break;
                 }
                 budget -= lines.len();
+                spent += lines.len();
                 take.push(plan);
             }
-            for group in groups_of(&take, NLI_GROUP_LINE_PAIRS) {
+            // A virtual domain on a shared database is scored by one
+            // instance at a time, under its work claim, taken right before
+            // the first group and let go after the last.
+            let claim = if w.claimed && !take.is_empty() {
+                match self.claim_domain(model, w, &mut take).await {
+                    Claimed::Held(claim, done) => {
+                        // Pairs another instance stored since this walk read
+                        // the domain: up to date, and not read again here.
+                        for plan in done {
+                            let (a, b) = (&w.facts[plan.pair.a], &w.facts[plan.pair.b]);
+                            if let Some(set) = failures.get_mut(&w.name) {
+                                set.remove(&failed_key(model, a, b));
+                            }
+                            if let Some(left) = pending.get_mut(&w.name) {
+                                *left = left.saturating_sub(1);
+                            }
+                            budget += plan.line_count();
+                        }
+                        Some(claim)
+                    }
+                    // Another instance is scoring this domain, or the claim
+                    // could not be asked for: skipped for this pass, its
+                    // pending left as walked, so it does not settle and the
+                    // next walk reads what the other instance stored. The
+                    // budget it would have used goes to the next domain.
+                    Claimed::Elsewhere => {
+                        elsewhere.insert(w.id);
+                        budget += spent;
+                        continue;
+                    }
+                    Claimed::Failed(e) => {
+                        batch_error = Some(e);
+                        budget += spent;
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+            let mut stop = false;
+            'groups: for group in groups_of(&take, NLI_GROUP_LINE_PAIRS) {
                 // The profile is read between groups, so off, or another
                 // profile, ends this walk at once and lets go of the model.
                 if self.contradiction_model().map(|m| m.repo) != Some(model.repo) {
-                    break 'domains;
+                    stop = true;
+                    break 'groups;
                 }
                 let (results, n) = self
                     .score_and_store_group(model, w.id, &w.facts, group, scorer.as_ref())
@@ -954,7 +1206,10 @@ impl Engine {
                         }
                         // The profile moved before the write: nothing was
                         // stored, so nothing is counted, and the walk ends.
-                        Ok(false) => break 'domains,
+                        Ok(false) => {
+                            stop = true;
+                            break;
+                        }
                         Err(e) => {
                             if w.failures.contains(&key) {
                                 tracing::debug!(
@@ -974,8 +1229,15 @@ impl Engine {
                         }
                     }
                 }
+                if stop {
+                    break 'groups;
+                }
+                self.publish_progress(model, generation, &work, &pending);
             }
-            if out_of_budget {
+            if let Some(claim) = claim {
+                claim.release().await;
+            }
+            if stop || out_of_budget {
                 break 'domains;
             }
         }
@@ -1001,6 +1263,11 @@ impl Engine {
             );
         }
         let remaining = pending.values().sum();
+        let waiting = work
+            .iter()
+            .filter(|w| elsewhere.contains(&w.id))
+            .map(|w| (w.name.clone(), w.id))
+            .collect();
         self.publish_walk(
             model,
             generation,
@@ -1008,6 +1275,7 @@ impl Engine {
             &work,
             pending,
             failures,
+            waiting,
             batch_error.or(line_error),
         );
         Ok(ContradictionOutcome::Scored {
@@ -1015,6 +1283,72 @@ impl Engine {
             line_pairs: lines_done,
             remaining,
         })
+    }
+
+    /// Take the work claim of `w`, a virtual domain on a shared database,
+    /// and once it is held read the domain's stored pairs again: another
+    /// instance may have stored some of `take` between this walk's read and
+    /// the claim. Those leave `take` and come back with the claim. The store
+    /// lock is held for the two calls only, never while the claim is.
+    async fn claim_domain<'p>(
+        &self,
+        model: &'static NliModel,
+        w: &DomainWork,
+        take: &mut Vec<&'p PairPlan>,
+    ) -> Claimed<'p> {
+        let tried = self
+            .store
+            .lock()
+            .await
+            .try_work_claim(&work_claim_key(w.id))
+            .await;
+        let claim = match tried {
+            Ok(Some(claim)) => claim,
+            Ok(None) => {
+                tracing::debug!(
+                    domain = %w.name,
+                    "another instance is scoring this domain; it is left to that one this pass"
+                );
+                return Claimed::Elsewhere;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    domain = %w.name,
+                    "could not ask for the domain's contradiction work claim; it is skipped this pass: {e}"
+                );
+                return Claimed::Failed(e.to_string());
+            }
+        };
+        let scored = {
+            let store = self.store.lock().await;
+            store.contradiction_pairs_scored(w.id, model.repo).await
+        };
+        let scored = match scored {
+            Ok(scored) => scored,
+            Err(e) => {
+                claim.release().await;
+                tracing::warn!(
+                    domain = %w.name,
+                    "could not read the domain's scored pairs under its work claim; it is skipped this pass: {e}"
+                );
+                return Claimed::Failed(e.to_string());
+            }
+        };
+        let stored: HashSet<(i64, i64, &str, &str)> = scored
+            .iter()
+            .map(|s| (s.a.0, s.b.0, s.checksum_a.as_str(), s.checksum_b.as_str()))
+            .collect();
+        let mut done = Vec::new();
+        take.retain(|plan| {
+            let (a, b) = (&w.facts[plan.pair.a], &w.facts[plan.pair.b]);
+            let fresh =
+                !stored.contains(&(a.id.0, b.id.0, a.checksum.as_str(), b.checksum.as_str()));
+            if !fresh {
+                done.push(*plan);
+            }
+            fresh
+        });
+        Claimed::Held(claim, done)
     }
 
     /// Score a group of pending pairs and store each one. A scoring failure
@@ -1156,10 +1490,31 @@ impl Engine {
         Ok(true)
     }
 
+    /// Publish the counts of a walk still scoring, under the guard
+    /// `publish_walk` uses. Nothing is settled or failed here: that is the
+    /// end of the walk's business, and its final counts overwrite these.
+    fn publish_progress(
+        &self,
+        model: &'static NliModel,
+        generation: u64,
+        work: &[DomainWork],
+        pending: &BTreeMap<String, usize>,
+    ) -> bool {
+        let current = self.contradiction_model().map(|m| m.repo);
+        let mut state = self.contradiction_state.lock().unwrap();
+        if state.generation != generation || current != Some(model.repo) {
+            return false;
+        }
+        record_counts(&mut state, work, pending);
+        state.pending = Some(pending.clone());
+        true
+    }
+
     /// Record what a walk found, but only when the generation it started under
     /// is still current and the setting still names its model: a walk under
     /// a profile the setting has since left must not overwrite the unknown
-    /// pending the change asked for.
+    /// pending the change asked for. `waiting` names the domains this walk
+    /// left to another instance, replacing the last walk's.
     #[allow(clippy::too_many_arguments)]
     fn publish_walk(
         &self,
@@ -1169,6 +1524,7 @@ impl Engine {
         work: &[DomainWork],
         pending: BTreeMap<String, usize>,
         mut failures: HashMap<String, HashSet<FailedPair>>,
+        waiting: BTreeMap<String, DomainId>,
         batch_error: Option<String>,
     ) -> bool {
         let current = self.contradiction_model().map(|m| m.repo);
@@ -1201,6 +1557,7 @@ impl Engine {
         }
         record_counts(&mut state, work, &pending);
         state.pending = Some(pending);
+        state.waiting = waiting;
         state.walked_on = Some(today);
         match batch_error {
             Some(e) => state.last_error = Some(e),
@@ -1223,7 +1580,7 @@ impl Engine {
         retry: bool,
         today: NaiveDate,
     ) -> Result<(Vec<DomainWork>, bool)> {
-        let (scope, coverage) = {
+        let (scope, coverage, shared) = {
             let store = self.store.lock().await;
             let scope = self.embed_scope(&*store).await?;
             // The cached coverage snapshot, one cheap read per walk.
@@ -1231,7 +1588,7 @@ impl Engine {
                 .embedding_coverage()
                 .await?
                 .embedded_for(&self.model_id);
-            (scope, coverage)
+            (scope, coverage, store.shares_database())
         };
         let mut names = self.known_domain_names();
         names.sort();
@@ -1307,6 +1664,7 @@ impl Engine {
                     settle,
                     count: None,
                     lines: None,
+                    claimed: false,
                 });
                 continue;
             }
@@ -1405,6 +1763,7 @@ impl Engine {
                 settle,
                 count: Some(count),
                 lines: Some(lines),
+                claimed: shared && matches!(source, ContentSource::Virtual),
             });
         }
         Ok((out, complete))
@@ -1522,6 +1881,18 @@ impl Engine {
     /// ([`Engine::sweep_contradictions`]). An engram with no stamp or that no
     /// longer parses is left out, as the sweep leaves it out.
     ///
+    /// Only the engrams whose stamp moved are read. The parse of every other
+    /// one comes from the fact cache ([`CachedFact`]), keyed by the stamp's
+    /// content sha, the same stamp the walk digest is built from: one write
+    /// to a large domain reads one engram, and the walk after UTC midnight
+    /// reads none. A read is cached only when the text read hashes to the
+    /// stamp's sha, so a file that changed on disk before the sync stamped it
+    /// is read again once the stamp catches up. The entries of paths no
+    /// longer stamped are dropped with each walk. The cache lives in memory
+    /// only and is never written to the database. An embedding model change
+    /// needs no hook: the model is fixed for the life of an engine, and the
+    /// checksum is recomputed under `rules` here on every walk.
+    ///
     /// The lead-vector fetch is the whole domain's, unbounded (see
     /// [`Store::lead_vectors`]); a caller that only needs statuses, windows,
     /// checksums and lines passes `false` and pays nothing for it.
@@ -1552,41 +1923,104 @@ impl Engine {
             };
             (descs, vectors)
         };
+        // Taken out for the walk and put back rebuilt, so no lock is held
+        // across a read; one pass runs at a time, so nothing else wants it
+        // meanwhile. Put back only while the generation holds: a setting
+        // changed or a domain forgotten meanwhile cleared the cache, and a
+        // walk that started before must not fill it again.
+        let generation = self.contradiction_state.lock().unwrap().generation;
+        let mut cached = self
+            .contradiction_facts_cache
+            .lock()
+            .unwrap()
+            .remove(&domain_id)
+            .unwrap_or_default();
+        let mut kept: HashMap<String, CachedFact> = HashMap::with_capacity(descs.len());
         let mut facts = Vec::with_capacity(descs.len());
         for d in &descs {
-            if !stamps.contains_key(&d.path) {
-                continue;
-            }
-            let Some(engram) = self.load_engram(source, domain_id, &d.path).await else {
+            let Some(stamp) = stamps.get(&d.path) else {
                 continue;
             };
-            let fm = &engram.frontmatter;
-            let status = fm
+            let hit = cached.remove(&d.path).filter(|c| c.sha256 == stamp.sha256);
+            let parsed = match hit {
+                Some(hit) => {
+                    let parsed = hit.parsed.clone();
+                    kept.insert(d.path.clone(), hit);
+                    parsed
+                }
+                None => {
+                    #[cfg(any(test, feature = "testing"))]
+                    self.contradiction_fact_loads
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(text) = self.load_engram_text(source, domain_id, &d.path).await else {
+                        continue;
+                    };
+                    let parsed = parse_engram(&text)
+                        .ok()
+                        .map(|engram| Arc::new(ParsedFact::of(&engram)));
+                    if sha256_hex(text.as_bytes()) == stamp.sha256 {
+                        kept.insert(
+                            d.path.clone(),
+                            CachedFact {
+                                sha256: stamp.sha256.clone(),
+                                parsed: parsed.clone(),
+                            },
+                        );
+                    }
+                    parsed
+                }
+            };
+            let Some(parsed) = parsed else {
+                continue;
+            };
+            let status = parsed
                 .status
                 .as_deref()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| d.status.trim())
                 .to_lowercase();
-            let observations: Vec<FactObservation> = engram
-                .observations
-                .iter()
-                .map(|o| FactObservation {
-                    line: o.line,
-                    text: o.content.clone(),
-                })
-                .collect();
+            let observations = parsed.observations.clone();
             facts.push(ContradictionFact {
                 id: d.id,
                 status,
-                valid_from: fm.valid_from,
-                valid_to: fm.valid_to,
+                valid_from: parsed.valid_from,
+                valid_to: parsed.valid_to,
                 checksum: scoring_checksum(&observations, rules),
                 lead_vector: vectors.remove(&d.id.0),
                 observations,
             });
         }
+        // Checked and put back under the state lock: a reset moves the
+        // generation under it before it clears the cache, so it cannot fall
+        // between the check and the insert.
+        let state = self.contradiction_state.lock().unwrap();
+        if state.generation == generation {
+            self.contradiction_facts_cache
+                .lock()
+                .unwrap()
+                .insert(domain_id, kept);
+        }
+        drop(state);
         Ok(facts)
+    }
+
+    /// An engram's raw text through `source`, as [`Engine::load_engram`]
+    /// reads it before parsing: the file for a file domain, the stored
+    /// content for a virtual one. `None` when it cannot be read.
+    async fn load_engram_text(
+        &self,
+        source: &ContentSource,
+        domain_id: DomainId,
+        rel: &str,
+    ) -> Option<String> {
+        match source {
+            ContentSource::File { root } => std::fs::read_to_string(join_rel(root, rel)).ok(),
+            ContentSource::Virtual => {
+                let store = self.store.lock().await;
+                store.engram_content(domain_id, rel).await.ok().flatten()
+            }
+        }
     }
 
     /// `V302`'s input for one domain's sweep: the stored rows for the
@@ -1747,6 +2181,12 @@ fn record_counts(
             }
         }
     }
+}
+
+/// The name of the work claim one instance scores the shared virtual domain
+/// `id` under.
+fn work_claim_key(id: DomainId) -> String {
+    format!("contradictions:{}", id.0)
 }
 
 /// Whether a failed load is a download whose wait is over at `now`.

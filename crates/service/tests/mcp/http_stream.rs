@@ -555,8 +555,8 @@ async fn the_wire_format_baseline_the_conformance_tasks_measure_against() {
     let resources = list(3, "resources/list").await;
     assert_eq!(
         resources["result"]["resources"].as_array().unwrap().len(),
-        5,
-        "the five served skills"
+        6,
+        "the six served skills"
     );
     let templates = list(4, "resources/templates/list").await;
     let listed = templates["result"]["resourceTemplates"].as_array().unwrap();

@@ -57,6 +57,7 @@ def run_batch(
         exec_timeout=exec_timeout,
         score=_score,
         prepare=_prepare,
+        builtin_tools=common.NO_BUILTIN_TOOLS,
         default_task_type="schema",
         sandbox_prefix="cst-schema-",
     )

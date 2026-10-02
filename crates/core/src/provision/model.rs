@@ -552,11 +552,18 @@ pub struct DesiredSet {
 /// supported pair actually maps (passthrough versus a cross-dialect render)
 /// lives in [`crate::provision::translate`]; this gate answers only the coarse
 /// "at all" question the MCP path and the skip notices need.
+///
+/// The four profile harnesses (Cursor, Kiro, Gemini CLI, Qwen Code) take
+/// skills only: they have no command or agent surface this crate speaks and
+/// register MCP servers by hand, so every other pair is `false`.
 pub fn harness_supports(harness: HarnessKind, kind: ArtifactType) -> bool {
-    !matches!(
-        (harness, kind),
-        (HarnessKind::Copilot, ArtifactType::Commands)
-    )
+    match harness {
+        HarnessKind::ClaudeCode | HarnessKind::Codex => true,
+        HarnessKind::Copilot => kind != ArtifactType::Commands,
+        HarnessKind::Cursor | HarnessKind::Kiro | HarnessKind::Gemini | HarnessKind::Qwen => {
+            kind == ArtifactType::Skills
+        }
+    }
 }
 
 /// Project every domain's scanned artifacts into one harness's desired set,
@@ -638,9 +645,10 @@ pub fn desired_set(harness: HarnessKind, all: &[DomainArtifacts]) -> (DesiredSet
             }
         }
 
-        // Every harness registers MCP servers through its own CLI -
-        // [`harness_supports`] is always true for mcps - so the servers
-        // project unconditionally.
+        // The servers project unconditionally, whatever [`harness_supports`]
+        // says: it is false for mcps on the four profile harnesses (skills
+        // only), and the engine reports the registration as unsupported there
+        // instead of dropping the server from the desired set.
         for mcp in &domain_artifacts.mcps {
             match mcps.get(&mcp.name) {
                 Some(existing) => {
@@ -780,6 +788,55 @@ mod tests {
             HarnessKind::Copilot,
             ArtifactType::Commands
         ));
+    }
+
+    /// The four profile harnesses provision skills and nothing else.
+    #[test]
+    fn the_profile_harnesses_support_skills_only() {
+        for harness in [
+            HarnessKind::Cursor,
+            HarnessKind::Kiro,
+            HarnessKind::Gemini,
+            HarnessKind::Qwen,
+        ] {
+            for kind in [
+                ArtifactType::Skills,
+                ArtifactType::Commands,
+                ArtifactType::Agents,
+                ArtifactType::Mcps,
+            ] {
+                assert_eq!(
+                    harness_supports(harness, kind),
+                    kind == ArtifactType::Skills,
+                    "{harness:?} {kind:?}"
+                );
+            }
+        }
+    }
+
+    /// Only skills reach a profile harness's desired set, so a stray command
+    /// or agent row in the receipt cannot make provisioning write anything.
+    #[test]
+    fn a_profile_harness_desired_set_holds_skills_only() {
+        let harbor = DomainArtifacts {
+            domain: "harbor".to_string(),
+            files: vec![
+                file(ArtifactType::Skills, "tide-tables/SKILL.md", "harbor"),
+                file(ArtifactType::Commands, "charts/plot-route.md", "harbor"),
+                file(ArtifactType::Agents, "quartermaster.md", "harbor"),
+            ],
+            mcps: Vec::new(),
+        };
+        for harness in [
+            HarnessKind::Cursor,
+            HarnessKind::Kiro,
+            HarnessKind::Gemini,
+            HarnessKind::Qwen,
+        ] {
+            let (desired, _) = desired_set(harness, std::slice::from_ref(&harbor));
+            let keys: Vec<&str> = desired.files.keys().map(String::as_str).collect();
+            assert_eq!(keys, ["skills/tide-tables/SKILL.md"], "{harness:?}");
+        }
     }
 
     #[test]

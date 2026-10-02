@@ -50,7 +50,7 @@ cat << FORMULA
 class CrystallineDev < Formula
   desc "Local-first knowledge management for humans and AI agents (dev builds)"
   homepage "https://github.com/jordiboehme/crystalline"
-  license "AGPL-3.0-or-later"
+  license "MPL-2.0"
   version "${version}"
 
   conflicts_with "crystalline", because: "both install the crystalline binary"

@@ -205,6 +205,11 @@ impl Engine {
             self.announce_report(name, &report, None);
             applied.push((domain, report));
         }
+        // A full run has claimed every file domain this instance can host,
+        // which the off switch of the contradiction check waits for.
+        if only.is_none() {
+            self.file_hosting_claimed();
+        }
         // Every domain of this run is in now, so the references that pointed
         // forward into a domain the loop had not reached yet can resolve. A
         // single-domain run is a no-op inside the pass.
@@ -374,6 +379,11 @@ impl Engine {
     /// current generation costs one read of its stamp, and a domain the index
     /// holds no row for yet has nothing to reparse.
     ///
+    /// A read-only instance on a database other instances share returns at
+    /// once: the reparse writes rows, and a writable instance of that
+    /// database (or a `crystalline sync`) does it. A read-only instance on
+    /// its own index reparses as any other.
+    ///
     /// A reparse that fails rolls back and leaves the domain's generation
     /// where it was, so the next sync tries again; it is logged and answered
     /// as a `failed` entry of the sync, never as the sync's error, so one
@@ -394,6 +404,15 @@ impl Engine {
                     .collect()
             }
         };
+        if self.read_only && !names.is_empty() && self.store.lock().await.shares_database() {
+            static NOTED: std::sync::Once = std::sync::Once::new();
+            NOTED.call_once(|| {
+                tracing::info!(
+                    "reparse of the virtual domains after a parser change is left to a writable instance of this database"
+                )
+            });
+            return Ok(Vec::new());
+        }
         let mut failed = Vec::new();
         for name in names {
             let store = self.store.lock().await;

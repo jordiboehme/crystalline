@@ -81,6 +81,14 @@ pub struct OriginState {
     /// [`crate::changes::detect_local_changes`] uses to skip hashing files
     /// that plainly have not changed.
     pub files: BTreeMap<String, BaseStamp>,
+    /// For a markdown base copy that is valid UTF-8 and whose LF form differs
+    /// from its bytes (an origin file held as CRLF), the SHA-256 of that LF
+    /// form, keyed like `files`. Crystalline writes LF, so a local file equals
+    /// its base copy as LF; this digest says so without reading the base
+    /// copy. Written only by [`OriginState::record_base`]. An entry missing
+    /// here (a state from 0.22.0) is covered by reading the base copy instead.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub lf_digests: BTreeMap<String, String>,
     /// Share proposals still open for review.
     pub proposals: Vec<Proposal>,
     /// Merged or withdrawn proposals kept for status display, newest first,
@@ -454,6 +462,32 @@ impl QueuedBranch {
 }
 
 impl OriginState {
+    /// Records `bytes` as the base content of `rel`: its stamp in `files`, and
+    /// its LF digest in `lf_digests` when it has one (removed otherwise).
+    pub fn record_base(&mut self, rel: &str, bytes: &[u8]) {
+        self.files.insert(
+            rel.to_string(),
+            BaseStamp {
+                sha256: sha256_hex(bytes),
+                size: bytes.len() as u64,
+            },
+        );
+        match lf_digest(rel, bytes) {
+            Some(digest) => {
+                self.lf_digests.insert(rel.to_string(), digest);
+            }
+            None => {
+                self.lf_digests.remove(rel);
+            }
+        }
+    }
+
+    /// Forgets `rel`'s base stamp and its LF digest.
+    pub fn forget_base(&mut self, rel: &str) {
+        self.files.remove(rel);
+        self.lf_digests.remove(rel);
+    }
+
     /// A fresh, empty state for a domain that has never pulled from `repo`
     /// yet: `base_commit` empty, every collection empty, at
     /// [`CURRENT_VERSION`].
@@ -466,6 +500,7 @@ impl OriginState {
             ref_etag: None,
             last_checked: None,
             files: BTreeMap::new(),
+            lf_digests: BTreeMap::new(),
             proposals: Vec::new(),
             history: Vec::new(),
             direct_shares: Vec::new(),
@@ -570,6 +605,26 @@ pub fn write_base_file(dir: &Path, rel: &str, bytes: &[u8]) -> Result<(), Remote
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test seam: how many times [`read_base_file`] ran on this thread.
+    pub(crate) static BASE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The SHA-256 of `bytes` read as LF, for a markdown file that is valid UTF-8
+/// and whose LF form differs from its bytes; `None` for anything else.
+pub(crate) fn lf_digest(rel: &str, bytes: &[u8]) -> Option<String> {
+    let is_markdown = Path::new(rel)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("md"));
+    if !is_markdown {
+        return None;
+    }
+    let text = std::str::from_utf8(bytes).ok()?;
+    let lf = crystalline_core::to_lf(text);
+    (lf.as_bytes() != bytes).then(|| sha256_hex(lf.as_bytes()))
+}
+
 /// Reads `rel`'s base snapshot copy under `dir`, or `None` if it has never
 /// been written.
 ///
@@ -577,6 +632,8 @@ pub fn write_base_file(dir: &Path, rel: &str, bytes: &[u8]) -> Result<(), Remote
 /// absolute path or a Windows drive-prefix attempt is rejected with
 /// [`RemoteError::State`] naming the offending path rather than read.
 pub fn read_base_file(dir: &Path, rel: &str) -> Result<Option<Vec<u8>>, RemoteError> {
+    #[cfg(test)]
+    BASE_READS.with(|c| c.set(c.get() + 1));
     match std::fs::read(base_path(dir, rel)?) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -1040,6 +1097,54 @@ mod tests {
             read_base_file(dir.path(), "notes/example.md").unwrap(),
             None
         );
+    }
+
+    /// The 0.22.0 shape of the state: no `lf_digests`, and no
+    /// `deny_unknown_fields`, so it reads a newer file and drops the map.
+    #[derive(Deserialize)]
+    #[allow(dead_code)]
+    struct OriginStateV0220 {
+        version: u32,
+        repo: String,
+        files: BTreeMap<String, BaseStamp>,
+    }
+
+    #[test]
+    fn lf_digests_round_trip_and_a_0_22_0_reader_still_loads_the_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = OriginState::new("o/r", "main");
+        state.record_base("notes/a.md", b"a\r\nb\r\n");
+        state.record_base("notes/lf.md", b"a\nb\n");
+        state.record_base("data.csv", b"a\r\nb\r\n");
+        assert_eq!(
+            state.lf_digests.keys().collect::<Vec<_>>(),
+            vec!["notes/a.md"],
+            "only a CRLF markdown file carries a digest"
+        );
+        state.save(dir.path()).unwrap();
+        let raw = std::fs::read_to_string(dir.path().join(STATE_FILE_NAME)).unwrap();
+        assert!(raw.contains("lf_digests"));
+        let old: OriginStateV0220 = serde_json::from_str(&raw).unwrap();
+        assert_eq!(old.files.len(), 3);
+
+        let loaded = OriginState::load(dir.path()).unwrap().unwrap();
+        assert_eq!(loaded.lf_digests, state.lf_digests);
+
+        // A re-record as LF drops the digest; forget drops both.
+        state.record_base("notes/a.md", b"a\nb\n");
+        assert!(state.lf_digests.is_empty());
+        state.record_base("notes/a.md", b"a\r\n");
+        state.forget_base("notes/a.md");
+        assert!(state.lf_digests.is_empty() && !state.files.contains_key("notes/a.md"));
+
+        // A 0.22.0-shaped file without the field loads with an empty map.
+        let mut value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        value.as_object_mut().unwrap().remove("lf_digests");
+        std::fs::write(dir.path().join(STATE_FILE_NAME), value.to_string()).unwrap();
+        let loaded = OriginState::load(dir.path()).unwrap().unwrap();
+        assert!(loaded.lf_digests.is_empty());
+        let reserialized = serde_json::to_string(&loaded).unwrap();
+        assert!(!reserialized.contains("lf_digests"));
     }
 
     #[test]

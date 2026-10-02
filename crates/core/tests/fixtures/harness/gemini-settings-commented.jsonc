@@ -1,0 +1,11 @@
+{
+	// the look of the terminal UI
+	"theme": "Default",
+	/* servers set up by hand */
+	"mcpServers": {
+		"other": {
+			"command": "other-mcp", // on PATH
+			"args": ["--stdio",],
+		},
+	},
+}

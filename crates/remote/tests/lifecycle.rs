@@ -642,6 +642,48 @@ async fn scenario_03_upstream_edit_of_untouched_file_applies() {
     );
 }
 
+/// A markdown file the origin holds as CRLF is LF on disk. Untouched, it takes
+/// an upstream change as a plain apply, not as a three-way merge.
+#[tokio::test]
+async fn an_untouched_lf_file_over_a_crlf_base_takes_upstream_without_a_merge() {
+    let mock = MockProvider::new();
+    let c1 = mock.add_commit(
+        commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("notes/a.md", b"alpha\r\nbeta\r\n"),
+        ]),
+        None,
+    );
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+    assert_eq!(read(&sub.domain_root.join("notes/a.md")), b"alpha\nbeta\n");
+    assert!(
+        load_state(&sub.state_dir)
+            .lf_digests
+            .contains_key("notes/a.md"),
+        "the LF digest is recorded beside the stamp"
+    );
+
+    let c2 = mock.add_commit(
+        commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("notes/a.md", b"alpha\r\nrevised\r\n"),
+        ]),
+        Some(&c1),
+    );
+    mock.set_branch("main", &c2);
+
+    let report = pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+    assert_eq!(report.applied, vec!["notes/a.md".to_string()]);
+    assert!(report.merged.is_empty(), "{:?}", report.merged);
+    assert!(report.conflicts.is_empty());
+    assert_eq!(
+        read(&sub.domain_root.join("notes/a.md")),
+        b"alpha\nrevised\n"
+    );
+}
+
 // Scenario 4: disjoint edits merge cleanly. A file only the working tree
 // touched is left alone, a file only upstream touched is taken plainly and a
 // file both sides touched in different regions is three-way merged; only the

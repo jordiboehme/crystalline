@@ -58,23 +58,28 @@ fn read_log(log: &Path) -> String {
 /// directory, marking it onboarded at user scope, so `provision` treats it
 /// as an installed harness without a real `crystalline install` run.
 fn write_install_receipt(home: &Path) {
+    write_install_receipt_for(home, &["claude-code"]);
+}
+
+/// The same receipt with one user-scope row per id in `ids`.
+fn write_install_receipt_for(home: &Path, ids: &[&str]) {
     let path = home.join("state").join("crystalline").join("installs.json");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let rows: Vec<Value> = ids
+        .iter()
+        .map(|id| {
+            json!({
+                "harness": id,
+                "scope": "user",
+                "version": "0.0.0",
+                "parts": { "mcp": true, "hooks": true, "skills": true },
+                "skills": []
+            })
+        })
+        .collect();
     std::fs::write(
         &path,
-        serde_json::to_string_pretty(&json!({
-            "format": 1,
-            "installs": [
-                {
-                    "harness": "claude-code",
-                    "scope": "user",
-                    "version": "0.0.0",
-                    "parts": { "mcp": true, "hooks": true, "skills": true },
-                    "skills": []
-                }
-            ]
-        }))
-        .unwrap(),
+        serde_json::to_string_pretty(&json!({ "format": 1, "installs": rows })).unwrap(),
     )
     .unwrap();
 }
@@ -480,6 +485,162 @@ fn status_reports_pending_and_counts() {
         ),
         "{stdout}"
     );
+}
+
+/// A config registering domains in an order that matches no group and no
+/// sort: two allowed, two undecided, two denied, one that declares no
+/// provisioning and two virtual ones. Returns the config path.
+fn write_mixed_config(work: &Path) -> PathBuf {
+    let mut yaml = String::from("domains:\n");
+    let mut file_domain = |name: &str, decision: &str, declares: bool| {
+        let dir = work.join(format!("kb-{name}"));
+        if declares {
+            write_manifest(&dir, "- agents: agents\n");
+            write(&dir, "agents/scout.md", "# Scout\n\nWatches the coast.\n");
+        } else {
+            write(
+                &dir,
+                "MANIFEST.md",
+                "---\ntype: manifest\ntitle: quiet\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# quiet\n\n## Scope\n\n- Nothing shipped\n\n## When to Use\n\n- Never\n",
+            );
+        }
+        yaml.push_str(&format!("  {name}:\n    path: {}\n", dir.display()));
+        if !decision.is_empty() {
+            yaml.push_str(&format!("    provision: {decision}\n"));
+        }
+    };
+    file_domain("Bravo", "false", true);
+    file_domain("quiet", "", false);
+    file_domain("delta", "", true);
+    file_domain("beta", "true", true);
+    file_domain("charlie", "", true);
+    file_domain("alpha", "false", true);
+    file_domain("Alpha", "true", true);
+    yaml.push_str("  zeta:\n    kind: virtual\n  Echo:\n    kind: virtual\n");
+    let config = work.join("mixed.yaml");
+    std::fs::write(&config, yaml).unwrap();
+    config
+}
+
+#[test]
+fn status_text_folds_the_quiet_domains_and_all_lists_them_in_order() {
+    let (work, home, bin_dir, _harbor_dir) = setup("status-fold");
+    let config = write_mixed_config(work.path());
+
+    let run = |all: bool| {
+        let mut cmd = provision_cmd(&home, &bin_dir);
+        cmd.args(["provision", "status", "--config"]).arg(&config);
+        if all {
+            cmd.arg("--all");
+        }
+        let out = cmd.output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let lines_of = |text: &str| -> Vec<String> {
+        text.lines()
+            .filter(|l| !l.starts_with("Domains awaiting") && !l.starts_with("  "))
+            .map(|l| l.to_string())
+            .collect()
+    };
+
+    // Default: the loud domains one per line, the quiet ones folded.
+    let folded = run(false);
+    let lines = lines_of(&folded);
+    let starts: Vec<&str> = lines.iter().map(|l| l.as_str()).collect();
+    assert!(starts[0].starts_with("Alpha: allowed"), "{folded}");
+    assert!(starts[1].starts_with("beta: allowed"), "{folded}");
+    assert!(starts[2].starts_with("charlie: undecided"), "{folded}");
+    assert!(starts[3].starts_with("delta: undecided"), "{folded}");
+    assert!(starts[4].starts_with("alpha: denied"), "{folded}");
+    assert!(starts[5].starts_with("Bravo: denied"), "{folded}");
+    assert_eq!(
+        starts[6],
+        "1 domain(s) declare no provisioning (run `crystalline provision status --all` to list them)",
+        "{folded}"
+    );
+    assert_eq!(
+        starts[7], "2 virtual domain(s), which never provision artifacts",
+        "{folded}"
+    );
+    assert!(!folded.contains("quiet:"), "{folded}");
+    assert!(!folded.contains("Echo:"), "{folded}");
+    assert!(!folded.contains("zeta:"), "{folded}");
+
+    // With --all every domain has its own line, in the group order, and no
+    // summary line is left.
+    let all = run(true);
+    let lines = lines_of(&all);
+    let names: Vec<&str> = lines
+        .iter()
+        .take(9)
+        .map(|l| l.split(':').next().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "Alpha", "beta", "charlie", "delta", "alpha", "Bravo", "quiet", "Echo", "zeta"
+        ],
+        "{all}"
+    );
+    assert!(all.contains("quiet: declares no provisioning"), "{all}");
+    assert!(
+        all.contains("Echo: virtual, never provisions artifacts"),
+        "{all}"
+    );
+    assert!(!all.contains("domain(s)"), "{all}");
+
+    // The awaiting list is in name order too.
+    let tail: Vec<&str> = all
+        .lines()
+        .skip_while(|l| !l.starts_with("Domains awaiting"))
+        .skip(1)
+        .map(|l| l.trim().split(':').next().unwrap())
+        .collect();
+    assert_eq!(tail, ["charlie", "delta"], "{all}");
+}
+
+#[test]
+fn status_json_lists_every_domain_in_the_group_order() {
+    let (work, home, bin_dir, _harbor_dir) = setup("status-json-order");
+    let config = write_mixed_config(work.path());
+
+    // `--json` ignores `--all` and always carries every domain.
+    let out = provision_cmd(&home, &bin_dir)
+        .args(["--json", "provision", "status", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let data: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let names: Vec<&str> = data["domains"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["domain"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "Alpha", "beta", "charlie", "delta", "alpha", "Bravo", "quiet", "Echo", "zeta"
+        ],
+        "{data}"
+    );
+    let pending: Vec<&str> = data["pending"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["domain"].as_str().unwrap())
+        .collect();
+    assert_eq!(pending, ["charlie", "delta"], "{data}");
 }
 
 #[test]
@@ -1012,5 +1173,238 @@ fn prompt_copilot_format_keeps_notices_out_of_the_context() {
     assert!(
         stderr.contains("Refreshed"),
         "and so does the reconcile summary: {stderr}"
+    );
+}
+
+fn status_of<'a>(data: &'a Value, harness: &str) -> &'a Value {
+    data["harnesses"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["harness"] == harness)
+        .unwrap_or_else(|| panic!("{harness} status: {data}"))
+}
+
+fn status_json(home: &Path, bin_dir: &Path) -> Value {
+    let out = provision_cmd(home, bin_dir)
+        .args(["--json", "provision", "status"])
+        .output()
+        .unwrap();
+    serde_json::from_slice(&out.stdout).unwrap()
+}
+
+#[test]
+fn codex_and_gemini_share_one_provisioned_copy_and_one_drift_report() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home-shared");
+    let bin_dir = work.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let harbor_dir = work.path().join("kb-harbor");
+    write_install_receipt_for(&home, &["codex", "gemini"]);
+    write_harbor(&harbor_dir);
+    write_shim(&bin_dir, "codex", &work.path().join("codex.log"));
+    register_and_allow(&home, &bin_dir, &harbor_dir);
+
+    let skill = home.join(".agents/skills/tide-tables/SKILL.md");
+    assert!(
+        skill.is_file(),
+        "the harbor skill landed once in the shared folder"
+    );
+    let data = status_json(&home, &bin_dir);
+    assert_eq!(status_of(&data, "gemini")["covered_by"], "codex", "{data}");
+    assert_eq!(status_of(&data, "gemini")["installed_files"], 0, "{data}");
+    assert!(
+        status_of(&data, "codex")["installed_files"]
+            .as_u64()
+            .unwrap()
+            >= 1,
+        "{data}"
+    );
+
+    let text = provision_cmd(&home, &bin_dir)
+        .args(["provision", "status"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&text.stdout).contains("gemini: covered by codex"),
+        "{}",
+        String::from_utf8_lossy(&text.stdout)
+    );
+
+    std::fs::write(&skill, "edited by hand\n").unwrap();
+    let data = status_json(&home, &bin_dir);
+    assert_eq!(status_of(&data, "codex")["edited"], 1, "{data}");
+    assert_eq!(
+        status_of(&data, "gemini")["edited"],
+        0,
+        "reported once, under the owner: {data}"
+    );
+}
+
+#[test]
+fn when_the_owner_leaves_the_next_harness_adopts_the_identical_files() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home-adopt");
+    let bin_dir = work.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let harbor_dir = work.path().join("kb-harbor");
+    write_install_receipt_for(&home, &["codex", "gemini"]);
+    write_harbor(&harbor_dir);
+    write_shim(&bin_dir, "codex", &work.path().join("codex.log"));
+    register_and_allow(&home, &bin_dir, &harbor_dir);
+    let skill = home.join(".agents/skills/tide-tables/SKILL.md");
+    let before = std::fs::read(&skill).unwrap();
+
+    write_install_receipt_for(&home, &["gemini"]);
+    provision_cmd(&home, &bin_dir)
+        .args(["provision", "allow", "harbor"])
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read(&skill).unwrap(),
+        before,
+        "adopted, not rewritten"
+    );
+    let data = status_json(&home, &bin_dir);
+    assert!(status_of(&data, "gemini")["covered_by"].is_null(), "{data}");
+    assert!(
+        status_of(&data, "gemini")["installed_files"]
+            .as_u64()
+            .unwrap()
+            >= 1,
+        "{data}"
+    );
+}
+
+#[test]
+fn doctor_prints_covered_by_for_a_harness_that_shares_the_folder() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home-doctor");
+    let bin_dir = work.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let harbor_dir = work.path().join("kb-harbor");
+    write_install_receipt_for(&home, &["codex", "gemini"]);
+    write_harbor(&harbor_dir);
+    write_shim(&bin_dir, "codex", &work.path().join("codex.log"));
+    register_and_allow(&home, &bin_dir, &harbor_dir);
+
+    let out = provision_cmd(&home, &bin_dir)
+        .args(["doctor", "--db"])
+        .arg(work.path().join("index.db"))
+        .output()
+        .unwrap();
+    let human = String::from_utf8_lossy(&out.stdout);
+    assert!(human.contains("  gemini: covered by codex"), "{human}");
+    assert!(human.contains("  codex: "), "{human}");
+}
+
+/// The number in doctor's closing "N problem(s) remaining" line.
+fn doctor_problems(human: &str) -> usize {
+    human
+        .lines()
+        .find_map(|l| l.strip_suffix(" problem(s) remaining"))
+        .and_then(|n| n.trim().parse().ok())
+        .unwrap_or_else(|| panic!("no problem count: {human}"))
+}
+
+#[test]
+fn an_uninstalled_covers_skill_is_a_doctor_problem_and_deny_retires_it() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home-stranded");
+    let bin_dir = work.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let harbor_dir = work.path().join("kb-harbor");
+    let db = work.path().join("index.db");
+    write_install_receipt_for(&home, &["claude-code", "cursor"]);
+    write_harbor(&harbor_dir);
+    write_shim(&bin_dir, "claude", &work.path().join("claude.log"));
+    register_and_allow(&home, &bin_dir, &harbor_dir);
+    let cover = home.join(".claude/skills/tide-tables/SKILL.md");
+    assert!(cover.is_file(), "Cursor is covered by Claude Code's copy");
+
+    // `crystalline uninstall claude-code`, as far as provisioning can tell.
+    write_install_receipt_for(&home, &["cursor"]);
+    let doctor = |json: bool| {
+        let mut cmd = provision_cmd(&home, &bin_dir);
+        if json {
+            cmd.arg("--json");
+        }
+        cmd.args(["doctor", "--db"]).arg(&db).output().unwrap()
+    };
+    let data: Value = serde_json::from_slice(&doctor(true).stdout).unwrap();
+    let stranded = &data["provisioning"]["stranded"];
+    assert_eq!(stranded.as_array().map(Vec::len), Some(1), "{data}");
+    assert_eq!(stranded[0]["harness"], "claude-code", "{data}");
+    assert_eq!(stranded[0]["read_by"], "cursor", "{data}");
+    let before = String::from_utf8_lossy(&doctor(false).stdout).into_owned();
+    assert!(
+        before.contains("[problem] claude-code: 2 provisioned skill file(s) left in"),
+        "{before}"
+    );
+
+    provision_cmd(&home, &bin_dir)
+        .args(["provision", "deny", "harbor"])
+        .assert()
+        .success();
+    assert!(!cover.exists(), "deny reaches the copy Cursor still reads");
+    assert!(!home.join(".agents/skills/tide-tables").exists());
+
+    let data: Value = serde_json::from_slice(&doctor(true).stdout).unwrap();
+    assert!(data["provisioning"]["stranded"].is_null(), "{data}");
+    let after = String::from_utf8_lossy(&doctor(false).stdout).into_owned();
+    assert_eq!(
+        doctor_problems(&after) + 1,
+        doctor_problems(&before),
+        "{before}\n---\n{after}"
+    );
+}
+
+#[test]
+fn an_uninstalled_codex_copy_under_a_covered_cursor_is_a_doctor_problem_and_deny_retires_it() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home-stranded-codex");
+    let bin_dir = work.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let harbor_dir = work.path().join("kb-harbor");
+    let db = work.path().join("index.db");
+    write_install_receipt_for(&home, &["claude-code", "codex", "cursor"]);
+    write_harbor(&harbor_dir);
+    write_shim(&bin_dir, "claude", &work.path().join("claude.log"));
+    write_shim(&bin_dir, "codex", &work.path().join("codex.log"));
+    register_and_allow(&home, &bin_dir, &harbor_dir);
+    let shared = home.join(".agents/skills/tide-tables/SKILL.md");
+    assert!(shared.is_file(), "Codex owns the shared folder");
+
+    // `crystalline uninstall codex`: Cursor still writes ~/.agents/skills,
+    // but it is covered by Claude Code, so nobody owns that folder now.
+    write_install_receipt_for(&home, &["claude-code", "cursor"]);
+    let doctor = |json: bool| {
+        let mut cmd = provision_cmd(&home, &bin_dir);
+        if json {
+            cmd.arg("--json");
+        }
+        cmd.args(["doctor", "--db"]).arg(&db).output().unwrap()
+    };
+    let data: Value = serde_json::from_slice(&doctor(true).stdout).unwrap();
+    let stranded = &data["provisioning"]["stranded"];
+    assert_eq!(stranded.as_array().map(Vec::len), Some(1), "{data}");
+    assert_eq!(stranded[0]["harness"], "codex", "{data}");
+    assert_eq!(stranded[0]["read_by"], "cursor", "{data}");
+    let before = String::from_utf8_lossy(&doctor(false).stdout).into_owned();
+
+    provision_cmd(&home, &bin_dir)
+        .args(["provision", "deny", "harbor"])
+        .assert()
+        .success();
+    assert!(!home.join(".agents/skills/tide-tables").exists());
+    assert!(!home.join(".claude/skills/tide-tables").exists());
+
+    let data: Value = serde_json::from_slice(&doctor(true).stdout).unwrap();
+    assert!(data["provisioning"]["stranded"].is_null(), "{data}");
+    let after = String::from_utf8_lossy(&doctor(false).stdout).into_owned();
+    assert_eq!(
+        doctor_problems(&after) + 1,
+        doctor_problems(&before),
+        "{before}\n---\n{after}"
     );
 }

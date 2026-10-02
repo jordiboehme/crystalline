@@ -12,6 +12,12 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Read only by default. The jobs that publish (publish, images, fluid-image)
+# name the scopes they need in their own `permissions:` block, so the build
+# legs, which run every crate's build script, never hold a token that writes.
+permissions:
+  contents: read
+
 jobs:
   # Guards the whole build against a tag with no notes to publish. A tag push
   # with a missing, empty or motto-less release-notes/<tag>.md would otherwise
@@ -30,16 +36,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: The release notes file exists, is not empty and opens with an H1
         shell: bash
         run: |
           set -euo pipefail
-          if [ "${{ github.ref_type }}" != "tag" ]; then
+          if [ "${GITHUB_REF_TYPE}" != "tag" ]; then
             echo "not a tag push, nothing to verify"
             exit 0
           fi
-          file="release-notes/${{ github.ref_name }}.md"
+          file="release-notes/${GITHUB_REF_NAME}.md"
           if [ ! -s "$file" ]; then
             echo "::error file=$file::$file is missing or empty. Add it and push the tag again (or, if the release PR already merged without it, add the file to main first)."
             exit 1
@@ -53,15 +61,28 @@ jobs:
   # The Fluid bundle and the six platform legs (build, sign, notarize,
   # package, plus the .deb and .msi packages) live in build.yml, which the dev
   # channel (dev.yml) shares. Its artifacts belong to this run, under the same
-  # names as before, so every job below downloads them unchanged. The
-  # secrets are passed through for the signing and notarization steps.
+  # names as before, so every job below downloads them unchanged.
   build:
     name: build
     needs: notes
-    uses: ./.github/workflows/build.yml
+    # A local reusable workflow resolves at the commit this run started on,
+    # which is what the self-repository syntax `$/` would give too.
+    # actionlint 1.7.12 does not parse `$/` yet, so zizmor's self-repository
+    # finding is ignored here.
+    uses: ./.github/workflows/build.yml # zizmor: ignore[self-repository]
     with:
       channel: stable
-    secrets: inherit
+    # Only the six Apple secrets, by name, never `inherit`. Once they live in
+    # the `release` environment, which build.yml's signing legs declare, the
+    # environment's copy wins and these resolve to nothing here; until then
+    # this is how the repository-level secrets reach the called workflow.
+    secrets:
+      APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+      APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+      APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
 
   mcpb:
     name: package MCP bundles
@@ -72,14 +93,16 @@ jobs:
     # plus the universal one), it just has nowhere to upload them.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Resolve release version
         id: version
         shell: bash
         run: |
           set -euo pipefail
-          if [ "${{ github.ref_type }}" = "tag" ]; then
-            tag="${{ github.ref_name }}"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            tag="${GITHUB_REF_NAME}"
             echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
           else
             version=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
@@ -117,9 +140,11 @@ jobs:
       # extracted.
       - name: Stage bundles, generate manifests and pack
         shell: bash
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          version="${{ steps.version.outputs.version }}"
+          version="$RELEASE_VERSION"
           mkdir -p mcpb-out
           for platform in macos-arm64 macos-intel windows-amd64 windows-arm64; do
             download_dir="downloads/$platform"
@@ -166,22 +191,24 @@ jobs:
       # Skill zips: crystalline-claude-desktop-skill carries the consolidated
       # crystalline-intelligence skill Claude Desktop users upload as-is (the skill
       # FOLDER must sit at the zip root, hence zipping from inside skills/);
-      # crystalline-agent-skills carries the four topical skills for harnesses
+      # crystalline-agent-skills carries the five topical skills for harnesses
       # that install skill folders directly.
       - name: Package skill zips
         shell: bash
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          version="${{ steps.version.outputs.version }}"
+          version="$RELEASE_VERSION"
           mkdir -p skill-out
           (cd skills && zip -qr "../skill-out/crystalline-claude-desktop-skill-v${version}.zip" crystalline-intelligence)
           (cd skills && zip -qr "../skill-out/crystalline-agent-skills-v${version}.zip" \
-            crystalline-routing crystalline-capture crystalline-schema crystalline-collaboration)
+            crystalline-routing crystalline-capture crystalline-schema crystalline-collaboration crystalline-provisioning)
           # Exact-path assertions: each skill folder must sit at the zip ROOT
           # (an unanchored grep would also match a wrong skills/<name> layout)
           # and every topical skill must be present in the bundle zip.
           unzip -Z1 "skill-out/crystalline-claude-desktop-skill-v${version}.zip" | grep -qx 'crystalline-intelligence/SKILL.md'
-          for s in crystalline-routing crystalline-capture crystalline-schema crystalline-collaboration; do
+          for s in crystalline-routing crystalline-capture crystalline-schema crystalline-collaboration crystalline-provisioning; do
             unzip -Z1 "skill-out/crystalline-agent-skills-v${version}.zip" | grep -qx "$s/SKILL.md"
           done
 
@@ -209,6 +236,8 @@ jobs:
       COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
         run: rustup show
@@ -220,14 +249,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [ "${{ github.ref_type }}" = "tag" ]; then
-            echo "version=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
           else
             echo "version=v0.0.0-dev" >> "$GITHUB_OUTPUT"
           fi
 
+      # A prebuilt binary, checked against the SHA-256 in the install
+      # action's manifest; `fallback: none` fails the step rather than
+      # downloading an unpinned binary if the manifest ever lacks this host.
       - name: Install cargo-cyclonedx
-        run: cargo install cargo-cyclonedx --version 0.5.9 --locked
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-cyclonedx@0.5.9
+          fallback: none
 
       # cargo-cyclonedx writes a file next to every workspace member's
       # Cargo.toml whatever --manifest-path says, so the crates/cli one is
@@ -235,9 +270,11 @@ jobs:
       # the end proves it did not touch the lockfile.
       - name: Generate the Rust SBOMs
         shell: bash
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          version="${{ steps.version.outputs.version }}"
+          version="$RELEASE_VERSION"
           mkdir -p sbom
           while read -r target platform; do
             [ -n "$target" ] || continue
@@ -257,9 +294,10 @@ jobs:
           TARGETS
           git diff --exit-code Cargo.lock
 
+      # Pinned corepack; ci.yml's fluid job explains the zizmor ignore.
       - name: Enable corepack
         working-directory: fluid
-        run: |
+        run: | # zizmor: ignore[adhoc-packages]
           npm install --global corepack@0.35.0
           corepack enable pnpm
           pnpm --version
@@ -269,12 +307,14 @@ jobs:
       # service crate embeds everything in that folder into the binary.
       - name: Generate the Fluid SBOM
         working-directory: fluid
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
           pnpm install --frozen-lockfile
           pnpm sbom --sbom-format cyclonedx --sbom-type application \
             --sbom-spec-version 1.5 --prod \
-            --out "../sbom/crystalline-fluid-${{ steps.version.outputs.version }}.cdx.json"
+            --out "../sbom/crystalline-fluid-${RELEASE_VERSION}.cdx.json"
 
       # Cheap guards against an SBOM that is empty or describes the wrong
       # platform.
@@ -309,6 +349,10 @@ jobs:
     # Only a tag push produces a real GitHub Release; workflow_dispatch stops
     # after the build matrix above so it can be used as a dry run.
     if: github.ref_type == 'tag'
+    # The protected `release` environment (main and `v*` tags only).
+    environment:
+      name: release
+      deployment: false
     # id-token and attestations: keyless signing of the attestations below (Sigstore through GitHub's OIDC token), nothing else.
     permissions:
       contents: write
@@ -316,6 +360,8 @@ jobs:
       attestations: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Download all archives
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -335,7 +381,7 @@ jobs:
           # SHA256SUMS like everything else.
           find downloads -type f -not -path 'downloads/fluid-dist/*' \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.deb' -o -name '*.mcpb' -o -name '*.msi' -o -name '*.cdx.json' \) -exec cp {} release/ \;
           cd release
-          sha256sum * > SHA256SUMS
+          sha256sum -- * > SHA256SUMS
           ls -la
 
       # actions/attest fails only when a whole subject list matches nothing,
@@ -460,9 +506,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh release create "${{ github.ref_name }}" release/* \
-            --title "${{ github.ref_name }}" \
-            --notes-file "release-notes/${{ github.ref_name }}.md"
+          gh release create "${GITHUB_REF_NAME}" release/* \
+            --title "${GITHUB_REF_NAME}" \
+            --notes-file "release-notes/${GITHUB_REF_NAME}.md"
 
   images:
     name: publish container images
@@ -472,6 +518,10 @@ jobs:
     # Same tag guard as publish: workflow_dispatch is a build-matrix dry run
     # only, it never pushes an image.
     if: github.ref_type == 'tag'
+    # The protected `release` environment (main and `v*` tags only).
+    environment:
+      name: release
+      deployment: false
     # id-token and attestations: keyless signing of the attestations below (Sigstore through GitHub's OIDC token), nothing else.
     permissions:
       contents: read
@@ -480,6 +530,8 @@ jobs:
       attestations: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Download x86_64 musl artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -526,9 +578,9 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
-
+      # No QEMU: the Dockerfile has no RUN step (it only copies the files
+      # staged above and sets metadata), so the linux/arm64 build executes
+      # nothing emulated. Add QEMU back together with any RUN step.
       - name: Set up buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
@@ -549,7 +601,7 @@ jobs:
           labels: |
             org.opencontainers.image.title=Crystalline
             org.opencontainers.image.description=Local-first knowledge management for humans and AI agents.
-            org.opencontainers.image.licenses=AGPL-3.0-or-later
+            org.opencontainers.image.licenses=MPL-2.0
 
       - name: Build and push
         id: push
@@ -595,7 +647,7 @@ jobs:
           labels: |
             org.opencontainers.image.title=Crystalline (with model)
             org.opencontainers.image.description=Local-first knowledge management for humans and AI agents, with the ibm-granite/granite-embedding-97m-multilingual-r2 embedding model (Apache-2.0 licensed) baked in so semantic search is ready immediately with no runtime download.
-            org.opencontainers.image.licenses=AGPL-3.0-or-later
+            org.opencontainers.image.licenses=MPL-2.0
 
       # Builds the variant for one platform and loads it into the local
       # docker daemon (buildx --load does not support a multi-platform
@@ -618,9 +670,11 @@ jobs:
       # COPY intact), the same offline path a real air-gapped deployment
       # depends on.
       - name: Verify the with-model image works fully offline
+        env:
+          IMAGE_TAGS: ${{ steps.meta_with_model.outputs.tags }}
         run: |
           set -euo pipefail
-          image="$(head -n1 <<< "${{ steps.meta_with_model.outputs.tags }}")"
+          image="$(head -n1 <<< "$IMAGE_TAGS")"
           output="$(docker run --rm --network none "$image" model download)"
           echo "$output"
           grep -q "Model ready" <<< "$output"
@@ -661,6 +715,10 @@ jobs:
     # Same tag guard as publish and images: workflow_dispatch is a build-matrix
     # dry run only, it never pushes an image.
     if: github.ref_type == 'tag'
+    # The protected `release` environment (main and `v*` tags only).
+    environment:
+      name: release
+      deployment: false
     # id-token and attestations: keyless signing of the attestations below (Sigstore through GitHub's OIDC token), nothing else.
     permissions:
       contents: read
@@ -669,6 +727,8 @@ jobs:
       attestations: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Log in to GHCR
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
@@ -696,9 +756,9 @@ jobs:
           labels: |
             org.opencontainers.image.title=Crystalline Fluid
             org.opencontainers.image.description=The browser UI for a Crystalline instance. Crystalline stores what was learned; Fluid is where you think with it.
-            org.opencontainers.image.licenses=AGPL-3.0-or-later
+            org.opencontainers.image.licenses=MPL-2.0
 
-      # No QEMU, unlike the crystalline images: the node stage is pinned to the
+      # No QEMU, as for the crystalline images: the node stage is pinned to the
       # build platform (see fluid/Dockerfile) because a static bundle is the
       # same bytes whatever the target is, so only the nginx stage is built per
       # platform and nothing runs emulated.
@@ -733,6 +793,10 @@ jobs:
     needs: publish
     runs-on: ubuntu-latest
     if: github.ref_type == 'tag'
+    # The protected `release` environment (main and `v*` tags only).
+    environment:
+      name: release
+      deployment: false
     permissions:
       contents: read
     steps:
@@ -742,8 +806,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p /tmp/release
-          gh release download "${{ github.ref_name }}" \
-            --repo "${{ github.repository }}" \
+          gh release download "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
             --pattern SHA256SUMS --dir /tmp/release
 
       - name: Regenerate and push the formula
@@ -751,7 +815,7 @@ jobs:
           TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          TAG="${{ github.ref_name }}"
+          TAG="${GITHUB_REF_NAME}"
           VERSION="${TAG#v}"
           sums="/tmp/release/SHA256SUMS"
 
@@ -761,15 +825,15 @@ jobs:
           sha_linux_arm64=$(grep "crystalline-${TAG}-linux-arm64.tar.gz" "$sums" | awk '{print $1}')
 
           git clone "https://x-access-token:${TAP_GITHUB_TOKEN}@github.com/jordiboehme/homebrew-tap.git" \
-            "${{ runner.temp }}/homebrew-tap"
+            "${RUNNER_TEMP}/homebrew-tap"
 
-          mkdir -p "${{ runner.temp }}/homebrew-tap/Formula"
+          mkdir -p "${RUNNER_TEMP}/homebrew-tap/Formula"
 
-          cat > "${{ runner.temp }}/homebrew-tap/Formula/crystalline.rb" << FORMULA
+          cat > "${RUNNER_TEMP}/homebrew-tap/Formula/crystalline.rb" << FORMULA
           class Crystalline < Formula
             desc "Local-first knowledge management for humans and AI agents"
             homepage "https://github.com/jordiboehme/crystalline"
-            license "AGPL-3.0-or-later"
+            license "MPL-2.0"
             version "${VERSION}"
 
             on_macos do
@@ -806,7 +870,7 @@ jobs:
           end
           FORMULA
 
-          cd "${{ runner.temp }}/homebrew-tap"
+          cd "${RUNNER_TEMP}/homebrew-tap"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Formula/crystalline.rb

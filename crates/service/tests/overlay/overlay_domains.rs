@@ -7452,18 +7452,26 @@ async fn the_share_ask_counts_only_the_acting_identitys_drafts() {
     let f = reviewed_origin_fixture().await;
     f.draft("team", "alice", "plan.md", ALICE_DRAFT).await;
 
-    let hers = crystalline_service::nudge::write_verb_trailer(&f.engine, Some("alice"))
-        .await
-        .expect("alice holds a draft nobody has reviewed");
+    let hers = crystalline_service::nudge::write_verb_trailer(
+        &f.engine,
+        Some("alice"),
+        &Scope::Unrestricted,
+    )
+    .await
+    .expect("alice holds a draft nobody has reviewed");
     assert_eq!(
         hers,
         crystalline_service::nudge::share_nudge_line(1, &["team".to_string()]),
         "her one draft is the one change the ask counts"
     );
     assert!(
-        crystalline_service::nudge::write_verb_trailer(&f.engine, Some("bob"))
-            .await
-            .is_none(),
+        crystalline_service::nudge::write_verb_trailer(
+            &f.engine,
+            Some("bob"),
+            &Scope::Unrestricted
+        )
+        .await
+        .is_none(),
         "bob holds nothing, and alice's draft is not his to share"
     );
 }

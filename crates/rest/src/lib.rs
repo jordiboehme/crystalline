@@ -117,7 +117,7 @@ use crate::scope::{DomainAccess, DomainRight};
                        through unchanged so this API and the MCP tools stay one \
                        source of truth; each carries an example of the shape it \
                        answers with.",
-        license(name = "AGPL-3.0-or-later"),
+        license(name = "MPL-2.0"),
     ),
     tags(
         (name = "meta", description = "The API's description of itself."),

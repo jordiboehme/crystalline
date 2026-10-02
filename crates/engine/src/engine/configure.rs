@@ -279,6 +279,14 @@ impl Engine {
                 if self.read_only {
                     return Err(EngineError::ReadOnly);
                 }
+                // Deciding about a domain is a way of asking whether it exists,
+                // so the name is checked before anything can describe the
+                // domain: a domain this caller may not see is refused with
+                // exactly the bytes a name nobody registered gets, from the one
+                // helper every scoped refusal uses, ahead of the env check that
+                // would name the domain's variable. The MCP verb asks the same
+                // first; asking here keeps the engine safe on its own.
+                self.domain_entry_scoped(domain, &hidden)?;
                 // An env-defined domain's source of truth is its variable: the
                 // overlay re-inserts a fresh entry (provision unset) on every
                 // effective-config recompute, so a decision written to the
@@ -299,7 +307,17 @@ impl Engine {
                 {
                     let mut file_guard = self.file_config.write().unwrap();
                     let mut file = self.fresh_file_config(&file_guard);
-                    set_domain_provision_decision(&mut file, domain, allow)?;
+                    // The name was resolved above; a domain removed from the
+                    // file since is refused through the same helper, so even
+                    // that race lists only what this caller may see.
+                    set_domain_provision_decision(&mut file, domain, allow).map_err(
+                        |e| match e {
+                            EngineError::UnknownDomain { domain, .. } => {
+                                self.unknown_domain(&domain, &hidden)
+                            }
+                            other => other,
+                        },
+                    )?;
                     self.persist_config(&file)?;
                     let effective = self.overlay.apply(&file);
                     *file_guard = file;

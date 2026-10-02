@@ -3,7 +3,7 @@
 //! This file is `candle-transformers` 0.11.0's `src/models/modernbert.rs`
 //! (504 lines), copied whole on 2026-09-21 and keeping its own upstream
 //! licence: `MIT OR Apache-2.0`, copyright the candle authors. The rest of this
-//! crate is AGPL-3.0-or-later; both upstream licences permit the inclusion and
+//! crate is MPL-2.0; both upstream licences permit the inclusion and
 //! this file stays under its own terms.
 //!
 //! It is vendored because candle 0.11.0's own module cannot run

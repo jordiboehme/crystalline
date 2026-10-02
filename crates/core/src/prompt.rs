@@ -616,10 +616,12 @@ fn push_count_line(output: &PromptOutput, out: &mut String) {
 /// Stdio is unaffected and keeps the full block: a local session is the machine
 /// owner, which already has the files on disk.
 ///
-/// The count itself is deliberately the count of *registered* domains rather
-/// than of visible ones - there is nobody here to make it visible to - so this
-/// channel still says how many exist. That is the residue of the split, and it
-/// is one integer against the full index this used to hand out.
+/// The count is the length of `output.domains`, so it counts what the caller
+/// built `output` over. The HTTP handshake builds it over the domains that are
+/// not private (`Engine::routing_text_counted` takes the private ones out
+/// first): there is nobody here to make a private domain visible to, and
+/// counting it would tell any peer that it exists. A signed-in agent still
+/// finds the private domains it may see through `list_domains`.
 pub fn render_counted_instructions(output: &PromptOutput) -> String {
     let mut counted = instructions_head(output);
     push_count_line(output, &mut counted);
@@ -646,11 +648,32 @@ pub fn render_minimal_instructions() -> String {
     format!("{ROUTING_HEADER}{MINIMAL_INSTRUCTIONS_POINTER}\n")
 }
 
-/// The header both instruction variants open with, so the two can never drift.
+/// Render the conditional minimal `instructions` variant: the same header
+/// plus one sentence that tells the agent to fetch the routing block when it
+/// is not already in its context.
+///
+/// This is what a server hands a harness whose session hook is installed but
+/// whose onboarding has not been verified by a live check. The hook probably
+/// delivered the full block, so repeating it would spend the tokens twice, but
+/// nothing has confirmed that this harness loads hook output, so the sentence
+/// [`render_minimal_instructions`] carries ("your session hook has already
+/// delivered its full routing block") would claim what is not known. The
+/// conditional sentence keeps the block one tool call away either way.
+///
+/// Like the minimal variant it takes no arguments and reads nothing.
+pub fn render_conditional_minimal_instructions() -> String {
+    format!("{ROUTING_HEADER}{CONDITIONAL_INSTRUCTIONS_POINTER}\n")
+}
+
+/// The header every instruction variant opens with, so they can never drift.
 const ROUTING_HEADER: &str = "CRYSTALLINE KNOWLEDGE ROUTING\n\n";
 
 /// The one sentence [`render_minimal_instructions`] carries under the header.
 const MINIMAL_INSTRUCTIONS_POINTER: &str = "Crystalline is your crystallized intelligence across sessions and your session hook has already delivered its full routing block; call list_domains with include_routing=true to fetch the domain index and its behavior rules again at any time.";
+
+/// The one sentence [`render_conditional_minimal_instructions`] carries under
+/// the header.
+const CONDITIONAL_INSTRUCTIONS_POINTER: &str = "Crystalline is your crystallized intelligence across sessions. If the Crystalline knowledge routing block is not already in your context, call list_domains with include_routing=true to fetch the domain index and its behavior rules.";
 
 /// The paste-able custom-instructions snippet for remote clients whose harness
 /// runs no session hooks and never shows the model a server's initialize
@@ -1265,6 +1288,27 @@ mod tests {
             render_minimal_instructions(),
             text,
             "deterministic, like every other renderer here"
+        );
+    }
+
+    /// The conditional variant is the same header plus a pointer that does not
+    /// claim the hook delivered anything: it is what a harness gets whose hook
+    /// is installed but whose onboarding nobody has verified yet.
+    #[test]
+    fn conditional_instructions_are_the_header_and_the_conditional_pointer() {
+        let text = render_conditional_minimal_instructions();
+        assert_eq!(
+            text,
+            "CRYSTALLINE KNOWLEDGE ROUTING\n\nCrystalline is your crystallized intelligence across sessions. If the Crystalline knowledge routing block is not already in your context, call list_domains with include_routing=true to fetch the domain index and its behavior rules.\n"
+        );
+        assert_ne!(
+            text,
+            render_minimal_instructions(),
+            "the verified variant keeps its own sentence"
+        );
+        assert!(
+            !text.contains("has already delivered"),
+            "nothing is claimed that is not known:\n{text}"
         );
     }
 

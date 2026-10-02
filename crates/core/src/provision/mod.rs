@@ -100,14 +100,10 @@ pub fn installed_harnesses(path: &Path) -> Vec<HarnessKind> {
         }
     }
 
-    [
-        HarnessKind::ClaudeCode,
-        HarnessKind::Codex,
-        HarnessKind::Copilot,
-    ]
-    .into_iter()
-    .filter(|k| present.contains(k.id()))
-    .collect()
+    HarnessKind::ALL
+        .into_iter()
+        .filter(|k| present.contains(k.id()))
+        .collect()
 }
 
 /// Harnesses recorded in the install receipt at `path` whose install actually
@@ -150,14 +146,250 @@ pub fn harnesses_with_hooks(path: &Path) -> Vec<HarnessKind> {
         }
     }
 
-    [
-        HarnessKind::ClaudeCode,
-        HarnessKind::Codex,
-        HarnessKind::Copilot,
-    ]
-    .into_iter()
-    .filter(|k| present.contains(k.id()))
-    .collect()
+    HarnessKind::ALL
+        .into_iter()
+        .filter(|k| present.contains(k.id()))
+        .collect()
+}
+
+// --- shared skills folders: one owner ---------------------------------------
+
+/// The user skills folder `harness` writes provisioned skills into.
+fn skills_folder(harness: HarnessKind) -> Option<PathBuf> {
+    artifact_base(harness, ArtifactType::Skills).ok().flatten()
+}
+
+/// The installed harness that covers `harness` because it reads a skills
+/// folder, other than its own write folder, that the other one writes (Cursor
+/// reads `~/.claude/skills`, which Claude Code writes). The first match in
+/// [`HarnessKind::ALL`] order wins.
+fn read_cover(harness: HarnessKind, installed: &[HarnessKind]) -> Option<HarnessKind> {
+    let own = skills_folder(harness)?;
+    let reads: Vec<PathBuf> = harness
+        .profile()
+        .skills_reads
+        .iter()
+        .map(|r| r.resolve())
+        .filter(|p| *p != own)
+        .collect();
+    if reads.is_empty() {
+        return None;
+    }
+    HarnessKind::ALL.into_iter().find(|&other| {
+        other != harness
+            && installed.contains(&other)
+            && skills_folder(other).is_some_and(|f| reads.contains(&f))
+    })
+}
+
+/// The harness that owns `harness`'s provisioned skills, or `None` when
+/// `harness` is the owner itself. Among `installed`, the owner of a skills
+/// folder is the first harness in [`HarnessKind::ALL`] order that writes it
+/// and is not covered by a read; every other installed harness that writes the
+/// folder, or reads it and so is covered, provisions nothing of its own and
+/// reports under the owner. Commands and agents never take part: the
+/// harnesses that can be covered keep none.
+fn skills_owner(harness: HarnessKind, installed: &[HarnessKind]) -> Option<HarnessKind> {
+    if let Some(by) = read_cover(harness, installed) {
+        return Some(by);
+    }
+    let own = skills_folder(harness)?;
+    for other in HarnessKind::ALL {
+        if !installed.contains(&other) {
+            continue;
+        }
+        if other == harness {
+            return None;
+        }
+        if skills_folder(other) == Some(own.clone()) && read_cover(other, installed).is_none() {
+            return Some(other);
+        }
+    }
+    None
+}
+
+/// Whether a receipt key names a skills file.
+fn is_skills_key(key: &str) -> bool {
+    key.starts_with("skills/")
+}
+
+/// Whether a receipt state records any skills file.
+fn holds_skills(state: &HarnessState) -> bool {
+    state.files.keys().any(|k| is_skills_key(k))
+}
+
+/// The ownership moves a receipt still owes, as `(owner, from)` pairs in
+/// `ALL` order: for each installed harness that owns its skills folder, every
+/// other harness whose row records skills in that same folder (a covered
+/// installed one, or one no longer installed) and still holds `skills/` rows.
+/// A folder's records belong to the folder, not the row.
+fn handover_sources(
+    receipt: &ProvisionReceipt,
+    installed: &[HarnessKind],
+) -> Vec<(HarnessKind, HarnessKind)> {
+    let mut moves = Vec::new();
+    for owner in HarnessKind::ALL {
+        if !installed.contains(&owner) || skills_owner(owner, installed).is_some() {
+            continue;
+        }
+        let Some(folder) = skills_folder(owner) else {
+            continue;
+        };
+        for from in HarnessKind::ALL {
+            if from == owner || skills_folder(from).as_ref() != Some(&folder) {
+                continue;
+            }
+            if installed.contains(&from) && skills_owner(from, installed).is_none() {
+                continue;
+            }
+            if receipt.harnesses.get(from.id()).is_some_and(holds_skills) {
+                moves.push((owner, from));
+            }
+        }
+    }
+    moves
+}
+
+/// Carry out [`handover_sources`]: the departed or covered row's skills rows
+/// replace the owner's older ones (it was the last writer), and only those
+/// rows leave it - commands, agents and MCP records stay where they are.
+fn hand_over_skills(receipt: &mut ProvisionReceipt, installed: &[HarnessKind]) {
+    let mut cleared: Vec<HarnessKind> = Vec::new();
+    for (owner, from) in handover_sources(receipt, installed) {
+        let Some(st) = receipt.harnesses.get_mut(from.id()) else {
+            continue;
+        };
+        let keys: Vec<String> = st
+            .files
+            .keys()
+            .filter(|k| is_skills_key(k))
+            .cloned()
+            .collect();
+        let moved: Vec<(String, InstalledFile)> = keys
+            .into_iter()
+            .filter_map(|k| st.files.remove(&k).map(|v| (k, v)))
+            .collect();
+        let state = receipt.harnesses.entry(owner.id().to_string()).or_default();
+        if !cleared.contains(&owner) {
+            cleared.push(owner);
+            state.files.retain(|k, _| !is_skills_key(k));
+        }
+        state.files.extend(moved);
+    }
+}
+
+/// Whether the receipt still holds skills rows that belong to somebody else
+/// now: an installed owner's folder recorded under another row, or an
+/// installed covered harness that still records skills.
+fn skills_records_misplaced(receipt: &ProvisionReceipt, installed: &[HarnessKind]) -> bool {
+    installed.iter().any(|&h| {
+        skills_owner(h, installed).is_some()
+            && receipt.harnesses.get(h.id()).is_some_and(holds_skills)
+    }) || !handover_sources(receipt, installed).is_empty()
+        || !stranded_skills(receipt, installed).is_empty()
+}
+
+/// Provisioned skills a departed harness left in a folder that no installed
+/// owner writes but an installed harness still reads (Claude Code
+/// uninstalled, Cursor still reading `~/.claude/skills`; or Codex
+/// uninstalled while Cursor, covered by Claude Code, is the only writer of
+/// `~/.agents/skills`), so they would keep loading with nobody to retire
+/// them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StrandedSkills {
+    /// The departed harness whose receipt row still records the files.
+    pub harness: HarnessKind,
+    /// The first installed harness, in [`HarnessKind::ALL`] order, that reads
+    /// the folder.
+    pub read_by: HarnessKind,
+    /// The folder the files sit in.
+    pub folder: PathBuf,
+    /// How many skills files the row records there.
+    pub files: usize,
+}
+
+/// Every departed harness's skills records that are stranded, in
+/// [`HarnessKind::ALL`] order. Read on a receipt the hand-over already ran
+/// on: a folder an installed owner writes has its records moved to that
+/// owner instead. A folder nobody installed reads is left as it was.
+fn stranded_skills(receipt: &ProvisionReceipt, installed: &[HarnessKind]) -> Vec<StrandedSkills> {
+    let mut out = Vec::new();
+    for gone in HarnessKind::ALL {
+        if installed.contains(&gone) {
+            continue;
+        }
+        let Some(state) = receipt.harnesses.get(gone.id()) else {
+            continue;
+        };
+        let files = state.files.keys().filter(|k| is_skills_key(k)).count();
+        if files == 0 {
+            continue;
+        }
+        let Some(folder) = skills_folder(gone) else {
+            continue;
+        };
+        // Only an installed owner takes the records over (the hand-over); a
+        // writer that is itself read-covered provisions nothing of its own
+        // (Cursor under Claude Code after Codex left ~/.agents/skills).
+        if installed.iter().any(|&h| {
+            skills_folder(h).as_ref() == Some(&folder) && skills_owner(h, installed).is_none()
+        }) {
+            continue;
+        }
+        let reader = HarnessKind::ALL.into_iter().find(|h| {
+            installed.contains(h)
+                && h.profile()
+                    .skills_reads
+                    .iter()
+                    .any(|r| r.resolve() == folder)
+        });
+        if let Some(read_by) = reader {
+            out.push(StrandedSkills {
+                harness: gone,
+                read_by,
+                folder,
+                files,
+            });
+        }
+    }
+    out
+}
+
+/// Retire every skills file `state` records for `harness` (reconcile against
+/// an empty desired set: a clean copy is removed, an edited one renamed to
+/// `.bak`), then drop those records. Commands, agents and MCP records stay.
+fn retire_skills_rows(
+    harness: HarnessKind,
+    state: &mut HarnessState,
+    notices: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) -> Vec<ArtifactAction> {
+    let mut actions = Vec::new();
+    if !holds_skills(state) {
+        return actions;
+    }
+    let mut skills_only = HarnessState {
+        files: state
+            .files
+            .iter()
+            .filter(|(k, _)| is_skills_key(k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        ..HarnessState::default()
+    };
+    if let Ok((acts, rec_notices)) = reconcile_harness(
+        harness,
+        &DesiredSet::default(),
+        &mut skills_only,
+        &mut DeferringMcpRunner,
+    ) {
+        actions = acts;
+        for notice in rec_notices {
+            push_notice(notices, seen, notice);
+        }
+    }
+    state.files.retain(|k, _| !is_skills_key(k));
+    actions
 }
 
 // --- shared manifest and artifact helpers ---------------------------------
@@ -400,6 +632,8 @@ pub struct ApplyReport {
     /// Each requested harness, in the order given, with the actions taken
     /// reconciling it. A harness whose own reconcile errored out gets an
     /// empty action list; the failure is recorded as a notice instead.
+    /// After them comes each departed harness whose stranded skills were
+    /// retired (see [`StrandedSkills`]), with those removals.
     pub harnesses: Vec<(HarnessKind, Vec<ArtifactAction>)>,
     /// Every scan, collision, skip, mcp and gate notice raised, deduplicated
     /// and in the stable order they were first raised.
@@ -467,6 +701,8 @@ pub fn apply(
         }
     };
 
+    hand_over_skills(&mut receipt, harnesses);
+
     let mut any_opted_in = false;
     let mut domain_artifacts: Vec<DomainArtifacts> = Vec::new();
     for (name, entry) in &global.domains {
@@ -492,7 +728,10 @@ pub fn apply(
         domain_artifacts.push(artifacts);
     }
 
-    let pending = collect_pending(global, env_domains);
+    // Display order only: the reconcile above and below keeps the config's
+    // declaration order for its collision precedence.
+    let mut pending = collect_pending(global, env_domains);
+    pending.sort_by_cached_key(|p| (p.domain.to_lowercase(), p.domain.clone()));
 
     if harnesses.is_empty() {
         if any_opted_in {
@@ -520,6 +759,16 @@ pub fn apply(
             .harnesses
             .entry(harness.id().to_string())
             .or_default();
+        // A harness whose skills folder another installed harness owns
+        // reconciles nothing of its own. Rows in the owner's folder were
+        // handed over above; what is left is a copy in a folder nobody else
+        // writes (Cursor under Claude Code), retired like a dropped
+        // artifact before the records go.
+        if skills_owner(harness, harnesses).is_some() {
+            let actions = retire_skills_rows(harness, state, &mut notices, &mut seen);
+            harness_results.push((harness, actions));
+            continue;
+        }
         match reconcile_harness(harness, &desired, state, mcp) {
             Ok((actions, rec_notices)) => {
                 for notice in rec_notices {
@@ -539,6 +788,20 @@ pub fn apply(
                 harness_results.push((harness, Vec::new()));
             }
         }
+    }
+
+    // A departed harness's skills in a folder an installed one still reads
+    // and nobody writes: retired like a dropped artifact, so a deny reaches
+    // them, while the reader gets its own copy in its own folder above.
+    for stranded in stranded_skills(&receipt, harnesses) {
+        let Some(state) = receipt.harnesses.get_mut(stranded.harness.id()) else {
+            continue;
+        };
+        let actions = retire_skills_rows(stranded.harness, state, &mut notices, &mut seen);
+        if state.files.is_empty() && state.mcps.is_empty() {
+            receipt.harnesses.remove(stranded.harness.id());
+        }
+        harness_results.push((stranded.harness, actions));
     }
 
     let mut sources = BTreeMap::new();
@@ -563,6 +826,24 @@ pub fn apply(
 }
 
 // --- status -------------------------------------------------------------
+
+/// Where a domain sits in the status listing: allowed, undecided and denied
+/// domains that declare provisioning first, then the domains that declare
+/// none, then the virtual ones. Within a group the listing goes by name,
+/// case-insensitively, the same comparison `list_domains` uses.
+fn status_group(d: &DomainStatus) -> u8 {
+    if d.is_virtual {
+        return 4;
+    }
+    if !d.declares {
+        return 3;
+    }
+    match d.decision {
+        Decision::Allowed => 0,
+        Decision::Undecided => 1,
+        Decision::Denied => 2,
+    }
+}
 
 /// Which side of a provisioning decision a domain is on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -636,16 +917,28 @@ pub struct HarnessStatus {
     /// or its manifest stopped declaring the artifact. The next `apply`
     /// retires them.
     pub orphaned: usize,
+    /// The harness that owns the skills folder this one shares or reads,
+    /// when another installed harness does. Such a harness provisions
+    /// nothing of its own, so every count above is zero and drift, orphans
+    /// and edits are reported once, under the owner.
+    pub covered_by: Option<HarnessKind>,
 }
 
 /// A read-only snapshot of every domain's provisioning decision and every
 /// requested harness's installed state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusReport {
-    /// Every registered domain, in `global`'s own declaration order.
+    /// Every registered domain: allowed, undecided and denied domains that
+    /// declare provisioning, then those that declare none, then virtual
+    /// domains, each group by name (case-insensitive, exact name as the
+    /// tie-break). `pending` and `virtual_with_decision` go by the same name
+    /// key.
     pub domains: Vec<DomainStatus>,
     /// Every requested harness, in the order given.
     pub harnesses: Vec<HarnessStatus>,
+    /// Departed harnesses' skills an installed harness still reads and the
+    /// next `apply` retires.
+    pub stranded: Vec<StrandedSkills>,
     /// Undecided domains that declare a `Provisioning` section and ship at
     /// least one artifact, awaiting a decision.
     pub pending: Vec<PendingDomain>,
@@ -671,7 +964,10 @@ pub fn status(
     harnesses: &[HarnessKind],
     env_domains: &HashSet<&str>,
 ) -> anyhow::Result<StatusReport> {
-    let receipt = load(receipt_path).unwrap_or_default();
+    let mut receipt = load(receipt_path).unwrap_or_default();
+    // Read as `apply` would leave it, without writing: the records of a
+    // folder already belong to its owner.
+    hand_over_skills(&mut receipt, harnesses);
 
     let mut domains = Vec::new();
     let mut virtual_with_decision = Vec::new();
@@ -719,6 +1015,19 @@ pub fn status(
 
     let mut harness_statuses = Vec::new();
     for &harness in harnesses {
+        if let Some(owner) = skills_owner(harness, harnesses) {
+            harness_statuses.push(HarnessStatus {
+                harness,
+                installed_files: 0,
+                installed_mcps: 0,
+                edited: 0,
+                missing: 0,
+                drift: 0,
+                orphaned: 0,
+                covered_by: Some(owner),
+            });
+            continue;
+        }
         let empty = HarnessState::default();
         let state = receipt.harnesses.get(harness.id()).unwrap_or(&empty);
         let (edited, missing) = count_edited_and_missing(harness, state)?;
@@ -732,14 +1041,23 @@ pub fn status(
             missing,
             drift,
             orphaned,
+            covered_by: None,
         });
     }
 
-    let pending = collect_pending(global, env_domains);
+    let mut pending = collect_pending(global, env_domains);
+
+    // The loop above walked the config's declaration order on purpose (it
+    // feeds `opted_artifacts`); only the finished lists are put in the
+    // reading order, so the report reads the same on every run.
+    domains.sort_by_cached_key(|d| (status_group(d), d.domain.to_lowercase(), d.domain.clone()));
+    pending.sort_by_cached_key(|p| (p.domain.to_lowercase(), p.domain.clone()));
+    virtual_with_decision.sort_by_cached_key(|name| (name.to_lowercase(), name.clone()));
 
     Ok(StatusReport {
         domains,
         harnesses: harness_statuses,
+        stranded: stranded_skills(&receipt, harnesses),
         pending,
         virtual_with_decision,
     })
@@ -906,7 +1224,11 @@ enum SessionWork {
 /// file added or removed, an opted-in domain the receipt never stamped (a fresh
 /// opt-in), a stamped domain no longer opted in (a fresh opt-out) or a harness
 /// with no receipt entry yet (freshly installed - stamps alone never prove a
-/// harness current, the same reason `apply`'s doc comment gives). MCP drift is
+/// harness current, the same reason `apply`'s doc comment gives) or skills
+/// records that sit under the wrong row: a folder's records under a harness
+/// that no longer owns it, or a departed harness's copies an installed one
+/// still reads ([`StrandedSkills`], the cover of a read-covered harness left).
+/// MCP drift is
 /// judged separately by [`mcp_drift`], since MCP configs carry no source stamp.
 fn prefilter(
     receipt: Option<&ProvisionReceipt>,
@@ -948,6 +1270,10 @@ fn prefilter(
         .iter()
         .any(|h| !receipt.harnesses.contains_key(h.id()))
     {
+        return SessionWork::Work;
+    }
+
+    if skills_records_misplaced(receipt, harnesses) {
         return SessionWork::Work;
     }
 
@@ -1450,6 +1776,59 @@ mod tests {
         assert!(harnesses_with_hooks(&path).is_empty());
     }
 
+    /// Both lists follow `HarnessKind::ALL`, so the new harnesses are read
+    /// from the receipt and come out in declaration order, whatever row
+    /// order install left behind.
+    #[test]
+    fn the_new_harnesses_are_listed_in_declaration_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("installs.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "format": 1,
+                "installs": [
+                    {
+                        "harness": "qwen",
+                        "scope": "user",
+                        "version": "0.22.1",
+                        "parts": {"mcp": true, "hooks": true, "skills": true},
+                        "skills": []
+                    },
+                    {
+                        "harness": "claude-code",
+                        "scope": "user",
+                        "version": "0.22.1",
+                        "parts": {"mcp": true, "hooks": false, "skills": true},
+                        "skills": []
+                    },
+                    {
+                        "harness": "cursor",
+                        "scope": "user",
+                        "version": "0.22.1",
+                        "parts": {"mcp": true, "hooks": true, "skills": true},
+                        "skills": []
+                    }
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            installed_harnesses(&path),
+            vec![
+                HarnessKind::ClaudeCode,
+                HarnessKind::Cursor,
+                HarnessKind::Qwen
+            ]
+        );
+        assert_eq!(
+            harnesses_with_hooks(&path),
+            vec![HarnessKind::Cursor, HarnessKind::Qwen],
+            "the same order, only the rows that wired hooks"
+        );
+    }
+
     // --- any_domain_declares ---------------------------------------------------
 
     fn write_manifest(dir: &Path, bullets: &str) {
@@ -1641,6 +2020,40 @@ mod tests {
     }
 
     #[test]
+    fn prefilter_work_when_a_departed_cover_left_skills_an_installed_harness_reads() {
+        // Claude Code covered Cursor and left: its copy in ~/.claude/skills is
+        // still read by Cursor and nobody writes that folder any more.
+        let mut receipt = steady_receipt();
+        receipt
+            .harnesses
+            .get_mut("claude-code")
+            .unwrap()
+            .files
+            .insert(
+                "skills/tide-tables/SKILL.md".to_string(),
+                InstalledFile {
+                    domain: "harbor".to_string(),
+                    sha256: String::new(),
+                },
+            );
+        receipt
+            .harnesses
+            .insert("cursor".to_string(), HarnessState::default());
+        receipt
+            .harnesses
+            .insert("codex".to_string(), HarnessState::default());
+        assert_eq!(
+            prefilter(Some(&receipt), &steady_walk(), &[HarnessKind::Cursor]),
+            SessionWork::Work
+        );
+        // Codex never reads ~/.claude/skills: nothing is stranded for it.
+        assert_eq!(
+            prefilter(Some(&receipt), &steady_walk(), &[HarnessKind::Codex]),
+            SessionWork::NoWork
+        );
+    }
+
+    #[test]
     fn prefilter_advisory_when_the_receipt_would_not_load() {
         assert_eq!(
             prefilter(None, &steady_walk(), &[HarnessKind::ClaudeCode]),
@@ -1731,5 +2144,192 @@ mod tests {
         assert!(stat_keys.contains("agents/top.md"));
         assert!(stat_keys.contains("agents/codex-reviewer.toml"));
         assert_eq!(stat_keys.len(), 6);
+    }
+
+    // --- status order ------------------------------------------------------------
+
+    /// A file domain whose MANIFEST declares `agents: agents` and ships one
+    /// agent file `<agent>.md` holding `content`.
+    fn shipping_domain(agent: &str, content: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        write_manifest(dir.path(), "## Provisioning\n\n- agents: agents\n");
+        std::fs::create_dir_all(dir.path().join("agents")).unwrap();
+        std::fs::write(
+            dir.path().join("agents").join(format!("{agent}.md")),
+            content,
+        )
+        .unwrap();
+        dir
+    }
+
+    fn with_decision(mut entry: DomainEntry, decision: Option<bool>) -> DomainEntry {
+        entry.provision = decision;
+        entry
+    }
+
+    #[test]
+    fn status_lists_domains_grouped_and_sorted_whatever_the_registration_order() {
+        let shipping = |agent: &str| shipping_domain(agent, "# Agent\n");
+        let (b_up, b_low, beta, alpha_up) = (
+            shipping("a1"),
+            shipping("a2"),
+            shipping("a3"),
+            shipping("a4"),
+        );
+        let (delta, charlie) = (shipping("a5"), shipping("a6"));
+        let (bravo, alpha_low) = (shipping("a7"), shipping("a8"));
+        let plain = tempfile::tempdir().unwrap();
+        write_manifest(plain.path(), "");
+
+        // Registered in an order that matches no group and no sort.
+        let mut global = GlobalConfig::default();
+        let d = &mut global.domains;
+        d.insert(
+            "zeta".into(),
+            with_decision(DomainEntry::virtual_domain(), Some(false)),
+        );
+        d.insert(
+            "Bravo".into(),
+            with_decision(DomainEntry::file(bravo.path()), Some(false)),
+        );
+        d.insert("alpha-plain".into(), DomainEntry::file(plain.path()));
+        d.insert("delta".into(), DomainEntry::file(delta.path()));
+        d.insert(
+            "b".into(),
+            with_decision(DomainEntry::file(b_low.path()), Some(true)),
+        );
+        d.insert("charlie".into(), DomainEntry::file(charlie.path()));
+        d.insert(
+            "beta".into(),
+            with_decision(DomainEntry::file(beta.path()), Some(true)),
+        );
+        d.insert(
+            "Echo".into(),
+            with_decision(DomainEntry::virtual_domain(), Some(true)),
+        );
+        d.insert(
+            "alpha".into(),
+            with_decision(DomainEntry::file(alpha_low.path()), Some(false)),
+        );
+        d.insert(
+            "B".into(),
+            with_decision(DomainEntry::file(b_up.path()), Some(true)),
+        );
+        d.insert(
+            "Alpha".into(),
+            with_decision(DomainEntry::file(alpha_up.path()), Some(true)),
+        );
+
+        let receipts = tempfile::tempdir().unwrap();
+        let report = status(
+            &global,
+            &receipts.path().join("receipt.json"),
+            &[],
+            &HashSet::new(),
+        )
+        .unwrap();
+
+        let names: Vec<&str> = report.domains.iter().map(|d| d.domain.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                // allowed
+                "Alpha",
+                "B",
+                "b",
+                "beta",
+                // undecided
+                "charlie",
+                "delta",
+                // denied
+                "alpha",
+                "Bravo",
+                // declares no provisioning
+                "alpha-plain",
+                // virtual
+                "Echo",
+                "zeta",
+            ]
+        );
+        let pending: Vec<&str> = report.pending.iter().map(|p| p.domain.as_str()).collect();
+        assert_eq!(pending, ["charlie", "delta"]);
+        assert_eq!(report.virtual_with_decision, ["Echo", "zeta"]);
+    }
+
+    #[test]
+    fn apply_lists_the_domains_awaiting_a_decision_in_name_order() {
+        let (zulu, mike, echo) = (
+            shipping_domain("a1", "# A\n"),
+            shipping_domain("a2", "# A\n"),
+            shipping_domain("a3", "# A\n"),
+        );
+        let mut global = GlobalConfig::default();
+        global
+            .domains
+            .insert("zulu".into(), DomainEntry::file(zulu.path()));
+        global
+            .domains
+            .insert("mike".into(), DomainEntry::file(mike.path()));
+        global
+            .domains
+            .insert("Echo".into(), DomainEntry::file(echo.path()));
+
+        let dir = tempfile::tempdir().unwrap();
+        let report = apply(
+            &global,
+            &dir.path().join("receipt.json"),
+            &[],
+            &mut DeferringMcpRunner,
+            &HashSet::new(),
+        )
+        .unwrap();
+        let pending: Vec<&str> = report.pending.iter().map(|p| p.domain.as_str()).collect();
+        assert_eq!(pending, ["Echo", "mike", "zulu"]);
+    }
+
+    #[test]
+    fn status_keeps_the_declaration_order_for_the_harness_projection() {
+        // Two allowed domains ship the same agent name with different bytes.
+        // The first-declared one ("zulu") must still win the collision, even
+        // though the report lists "alpha" before it: a receipt recording the
+        // first-declared bytes shows no drift.
+        let zulu = shipping_domain("shared", "# From zulu\n");
+        let alpha = shipping_domain("shared", "# From alpha\n");
+        let mut global = GlobalConfig::default();
+        global.domains.insert(
+            "zulu".into(),
+            with_decision(DomainEntry::file(zulu.path()), Some(true)),
+        );
+        global.domains.insert(
+            "alpha".into(),
+            with_decision(DomainEntry::file(alpha.path()), Some(true)),
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let receipt_path = dir.path().join("receipt.json");
+        let mut receipt = ProvisionReceipt::default();
+        let mut state = HarnessState::default();
+        state.files.insert(
+            "agents/shared.md".to_string(),
+            InstalledFile {
+                domain: "zulu".to_string(),
+                sha256: sha256_hex(b"# From zulu\n"),
+            },
+        );
+        receipt.harnesses.insert("claude-code".to_string(), state);
+        save(&receipt_path, &receipt).unwrap();
+
+        let report = status(
+            &global,
+            &receipt_path,
+            &[HarnessKind::ClaudeCode],
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert_eq!(report.domains[0].domain, "alpha");
+        assert_eq!(
+            report.harnesses[0].drift, 0,
+            "the first-declared domain wins"
+        );
     }
 }
