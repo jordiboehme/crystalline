@@ -899,6 +899,32 @@ fn hidden_skills_surface(skills_serve: SkillsServe, gate: HarnessGate) -> bool {
     }
 }
 
+/// What one `resolve_conflict` resolution keeps: `mine` or `theirs` by name,
+/// or `merged` with the caller's content. Invalid params for `merged` without
+/// content and for any other word.
+fn resolution_parts<'a>(
+    resolution: &str,
+    content: Option<&'a str>,
+) -> Result<(Option<&'static str>, Option<&'a [u8]>), ErrorData> {
+    match resolution {
+        RESOLUTION_MINE => Ok((Some(RESOLUTION_MINE), None)),
+        RESOLUTION_THEIRS => Ok((Some(RESOLUTION_THEIRS), None)),
+        RESOLUTION_MERGED => match content {
+            Some(content) => Ok((None, Some(content.as_bytes()))),
+            None => Err(ErrorData::invalid_params(
+                format!("resolve_conflict requires content when resolution is {RESOLUTION_MERGED}"),
+                None,
+            )),
+        },
+        other => Err(ErrorData::invalid_params(
+            format!(
+                "resolve_conflict resolution must be {RESOLUTION_MINE}, {RESOLUTION_THEIRS} or {RESOLUTION_MERGED}, got '{other}'"
+            ),
+            None,
+        )),
+    }
+}
+
 /// Which `instructions` block this server hands out on arrival.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InstructionsVariant {
@@ -3046,13 +3072,20 @@ impl McpServer {
         if refused_collab_tool("share_changes", self.engine.github_enabled()) {
             return refuse(RemoteError::NotEnabled.to_string()).map(CallToolResponse::from);
         }
+        // Read-only first: it does not depend on the name, so it answers the
+        // same for every domain, and it comes before the name check below.
+        if self.engine.read_only() {
+            return Err(to_error(EngineError::ReadOnly));
+        }
         // A named domain this caller may not see is refused as an unregistered
-        // one, before the preview names a single file of it. A read gate rather
-        // than a write one: what may be shared is `github.share_identity`'s
-        // question and answered further in, and the narrow form so a domain
-        // that is merely unregistered keeps the answer it always had.
+        // one, before the preview names a single file of it, and an
+        // unregistered name is refused right here too, with the visible set:
+        // further in, an unscoped lookup would list every registered domain,
+        // private ones included. A read gate rather than a write one: what may
+        // be shared is `github.share_identity`'s question and answered further
+        // in.
         self.engine
-            .refuse_hidden_domain(&p.domain, &self.scope_of(&ctx))
+            .require_domain(&p.domain, &self.scope_of(&ctx))
             .await
             .map_err(to_error)?;
         if confirmation_supported(&ctx) {
@@ -3142,7 +3175,7 @@ impl McpServer {
         }
         if let Some(domain) = p.domain.as_deref() {
             self.engine
-                .refuse_hidden_domain(domain, &self.scope_of(&ctx))
+                .require_domain(domain, &self.scope_of(&ctx))
                 .await
                 .map_err(to_error)?;
         }
@@ -3173,7 +3206,7 @@ impl McpServer {
         }
         if let Some(domain) = p.domain.as_deref() {
             self.engine
-                .refuse_hidden_domain(domain, &self.scope_of(&ctx))
+                .require_domain(domain, &self.scope_of(&ctx))
                 .await
                 .map_err(to_error)?;
         }
@@ -3206,10 +3239,20 @@ impl McpServer {
         if refused_collab_tool("resolve_conflict", self.engine.github_enabled()) {
             return refuse(RemoteError::NotEnabled.to_string()).map(CallToolResponse::from);
         }
+        // Read-only first: it does not depend on the name, so it answers the
+        // same for every domain, and it comes before the name check below.
+        if self.engine.read_only() {
+            return Err(to_error(EngineError::ReadOnly));
+        }
+        // A malformed explicit resolution is refused first: that check does not
+        // depend on the name, so it answers the same for every domain.
+        if let Some(resolution) = p.resolution.as_deref() {
+            resolution_parts(resolution, p.content.as_deref())?;
+        }
         // Before the question, so a conflict preview never shows both sides of
         // an engram in a domain this caller may not see.
         self.engine
-            .refuse_hidden_domain(&p.domain, &self.scope_of(&ctx))
+            .require_domain(&p.domain, &self.scope_of(&ctx))
             .await
             .map_err(to_error)?;
         // Three ways to arrive at a resolution, and the arm order is the
@@ -3234,29 +3277,7 @@ impl McpServer {
             },
             None => return refuse(RESOLVE_NEEDS_RESOLUTION).map(CallToolResponse::from),
         };
-        let (keep, content): (Option<&str>, Option<&[u8]>) = match resolution.as_str() {
-            RESOLUTION_MINE => (Some(RESOLUTION_MINE), None),
-            RESOLUTION_THEIRS => (Some(RESOLUTION_THEIRS), None),
-            RESOLUTION_MERGED => {
-                let Some(content) = p.content.as_deref() else {
-                    return Err(ErrorData::invalid_params(
-                        format!(
-                            "resolve_conflict requires content when resolution is {RESOLUTION_MERGED}"
-                        ),
-                        None,
-                    ));
-                };
-                (None, Some(content.as_bytes()))
-            }
-            other => {
-                return Err(ErrorData::invalid_params(
-                    format!(
-                        "resolve_conflict resolution must be {RESOLUTION_MINE}, {RESOLUTION_THEIRS} or {RESOLUTION_MERGED}, got '{other}'"
-                    ),
-                    None,
-                ));
-            }
-        };
+        let (keep, content) = resolution_parts(&resolution, p.content.as_deref())?;
         // The same teaching refusal a share answers: settling a conflict in a
         // reviewing domain settles it in somebody's draft, so an agent with no
         // identity is told how to get one rather than handed a protocol error.
@@ -3291,9 +3312,14 @@ impl McpServer {
         if refused_collab_tool("withdraw_proposal", self.engine.github_enabled()) {
             return refuse(RemoteError::NotEnabled.to_string()).map(CallToolResponse::from);
         }
+        // Read-only first: it does not depend on the name, so it answers the
+        // same for every domain, and it comes before the name check below.
+        if self.engine.read_only() {
+            return Err(to_error(EngineError::ReadOnly));
+        }
         // Before the preview, for the reason `resolve_conflict` states.
         self.engine
-            .refuse_hidden_domain(&p.domain, &self.scope_of(&ctx))
+            .require_domain(&p.domain, &self.scope_of(&ctx))
             .await
             .map_err(to_error)?;
         let revert = p.revert.unwrap_or(false);
@@ -3368,7 +3394,7 @@ impl McpServer {
             return Err(to_error(EngineError::ReadOnly));
         }
         self.engine
-            .refuse_hidden_domain(&p.domain, &self.scope_of(&ctx))
+            .require_domain(&p.domain, &self.scope_of(&ctx))
             .await
             .map_err(to_error)?;
         let actor = self.share_actor(&ctx);
@@ -3460,13 +3486,6 @@ impl McpServer {
                         None,
                     ));
                 };
-                // Deciding about a domain is a way of asking whether it
-                // exists, so a domain this caller may not see is refused as an
-                // unregistered one first.
-                self.engine
-                    .refuse_hidden_domain(&domain, &self.scope_of(&ctx))
-                    .await
-                    .map_err(to_error)?;
                 if p.action == "allow" {
                     ProvisionAction::Allow { domain }
                 } else {
@@ -3508,6 +3527,16 @@ impl McpServer {
         // how a caller learns there is nothing to decide.
         if refused_provision_action(&action, self.engine.provisioning_declared()) {
             return refuse(PROVISION_NOT_DECLARED);
+        }
+        // Only now the name. Deciding about a domain is a way of asking whether
+        // it exists, so every check above answers the same whatever name was
+        // passed, and here a domain this caller may not see is refused with
+        // exactly the bytes an unregistered name gets.
+        if let ProvisionAction::Allow { domain } | ProvisionAction::Deny { domain } = &action {
+            self.engine
+                .require_domain(domain, &self.scope_of(&ctx))
+                .await
+                .map_err(to_error)?;
         }
         self.engine
             .provision(&action, &self.scope_of(&ctx))

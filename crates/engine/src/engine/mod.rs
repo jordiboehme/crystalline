@@ -2424,33 +2424,6 @@ impl Engine {
         })
     }
 
-    /// Refuse a domain this caller must not be answered from, and say nothing
-    /// about a name the index has never heard of.
-    ///
-    /// The narrow half of [`Engine::require_domain`], for a verb that already
-    /// has its own words for a domain nobody registered and its own order for
-    /// saying them. A screened domain is refused here with exactly the bytes an
-    /// unregistered one gets, which is the whole point; anything else falls
-    /// through untouched, so adding this gate to a verb cannot change what that
-    /// verb answered before on any input the index holds rows for.
-    ///
-    /// [`Engine::hidden_for`] screens two things and both are refused here: a
-    /// private domain, and a domain whose rows outlived their registration. The
-    /// second is a name the verb behind this gate would have refused for itself
-    /// a line later, since nothing unregistered resolves to a content source -
-    /// so this is one line earlier, not one refusal more.
-    pub async fn refuse_hidden_domain(
-        &self,
-        name: &str,
-        scope: &crate::scope::Scope,
-    ) -> Result<()> {
-        let hidden = self.hidden_for(scope).await?;
-        if hidden.contains(name) {
-            self.domain_entry_scoped(name, &hidden)?;
-        }
-        Ok(())
-    }
-
     /// Every domain name a read must answer as though it were not there: the
     /// private domains this caller may not see, plus every domain the index
     /// still holds that nobody has registered here.
@@ -3303,6 +3276,11 @@ impl Engine {
     /// for a domain that does not exist the name of every private domain on the
     /// instance. A domain the caller may not see is refused as an unregistered
     /// one, and the set the refusal lists is the visible set.
+    ///
+    /// The one gate every surface puts in front of a verb that takes a domain
+    /// by name. A hidden name and a name nobody registered get the same bytes,
+    /// and both are refused here rather than further in, where an unscoped
+    /// lookup would list every registered domain, private ones included.
     pub async fn require_domain(&self, name: &str, scope: &crate::scope::Scope) -> Result<()> {
         let hidden = self.hidden_for(scope).await?;
         self.domain_entry_scoped(name, &hidden)?;

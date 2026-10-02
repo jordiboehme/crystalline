@@ -24,7 +24,7 @@
 //! **The registered-set screen composes ahead of the actor dimension, never
 //! behind it**, and here that is a constructor argument rather than a doc
 //! comment: every constructor takes the screen its caller already computed (the
-//! `hidden` set from [`Engine::hidden_for`] for a read, [`Engine::refuse_hidden_domain`]
+//! `hidden` set from [`Engine::hidden_for`] for a read, [`Engine::require_domain`]
 //! for a write), so a view cannot be built without the screen having run. A
 //! draft in a domain this reader may not see, and a draft in a domain this
 //! instance has no registration for, are both absent before whose-draft-is-it
@@ -315,7 +315,7 @@ impl<'a> DomainView<'a> {
     /// the refusal itself says "this domain reviews changes before they land",
     /// which is a fact about a domain they must not learn exists. So a domain
     /// [`Engine::hidden_for`] hides is answered here exactly as a domain nobody
-    /// registered, by the same [`Engine::refuse_hidden_domain`] every read
+    /// registered, by the same [`Engine::require_domain`] every read
     /// goes through, before either answer below can be reached.
     ///
     /// **A direct domain never reaches that screen**, and that is deliberate
@@ -345,7 +345,7 @@ impl<'a> DomainView<'a> {
         if !engine.reviews_changes(name) {
             return Ok(seen(None));
         }
-        engine.refuse_hidden_domain(name, scope).await?;
+        engine.require_domain(name, scope).await?;
         match crate::scope::overlay_actor(scope) {
             Some(actor) => Ok(seen(Some(actor))),
             None => Err(EngineError::Refused(OVERLAY_NEEDS_IDENTITY.to_string())),
@@ -391,7 +391,7 @@ impl<'a> DomainView<'a> {
             return DomainView::for_write(engine, name, scope).await;
         };
         let ticket = engine.enter_write(name).await?;
-        engine.refuse_hidden_domain(name, scope).await?;
+        engine.require_domain(name, scope).await?;
         let mut view = DomainView::for_actor(engine, name, &HashSet::new(), &join.owner)?;
         view.joined = Some(join.owner.clone());
         view.writer = crate::scope::overlay_actor(scope);

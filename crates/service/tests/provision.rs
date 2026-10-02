@@ -577,3 +577,92 @@ async fn an_unknown_domain_refusal_names_no_domain_the_caller_may_not_see() {
     assert!(!config_path.exists());
     restore_env(previous);
 }
+
+/// **A private domain defined by the environment is refused like an unknown
+/// name, before the environment check can name it or its variable.** The two
+/// refusals also come from one helper, so a hidden name and a typo read back
+/// the same visible set, env domains included.
+#[tokio::test]
+async fn a_hidden_env_domain_is_refused_like_an_unknown_name() {
+    let _guard = HOME_LOCK.lock().await;
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let xdg_state_home = work.path().join("state");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&xdg_state_home).unwrap();
+    let previous = set_env(&home, &xdg_state_home);
+
+    let harbor_dir = work.path().join("kb-harbor");
+    write_harbor(&harbor_dir);
+    let overlay = EnvOverlay::from_vars(vec![
+        (
+            "CRYSTALLINE_DOMAIN_COVE".to_string(),
+            work.path().join("kb-cove").display().to_string(),
+        ),
+        (
+            "CRYSTALLINE_DOMAIN_REEF".to_string(),
+            work.path().join("kb-reef").display().to_string(),
+        ),
+    ])
+    .unwrap();
+    let config_path = work.path().join("config.yaml");
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let engine = Engine::new(
+        Arc::new(TokioMutex::new(store)),
+        config_with_harbor(&harbor_dir),
+        None,
+        Some(config_path.clone()),
+    )
+    .with_env_overlay(overlay);
+
+    let auth = Arc::new(
+        AuthStore::open(&work.path().join("web-auth.db"))
+            .await
+            .unwrap(),
+    );
+    auth.add_user("keeper", "keeper", None, Role::Admin, "pw12345678")
+        .await
+        .unwrap();
+    auth.set_domain_visibility("cove", true, "keeper")
+        .await
+        .unwrap();
+    engine.set_domain_access(Arc::new(DomainAccess::new(auth)));
+    assert_eq!(
+        engine.hidden_domains(&Scope::Anonymous).await.unwrap(),
+        Some(std::collections::HashSet::from(["cove".to_string()])),
+    );
+
+    let decide = |name: &str| ProvisionAction::Allow {
+        domain: name.to_string(),
+    };
+    let hidden = engine
+        .provision(&decide("cove"), &Scope::Anonymous)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(hidden, EngineError::UnknownDomain { .. }),
+        "a hidden env domain is refused as unknown, not with the env message: {hidden}"
+    );
+    let unknown = engine
+        .provision(&decide("typo"), &Scope::Anonymous)
+        .await
+        .unwrap_err();
+    let hidden = hidden.to_string();
+    let unknown = unknown.to_string();
+    assert!(
+        !hidden.contains("CRYSTALLINE_DOMAIN_COVE") && !unknown.contains("cove"),
+        "{hidden}\n{unknown}"
+    );
+    assert!(
+        unknown.contains("reef"),
+        "the visible env domain is listed: {unknown}"
+    );
+    assert_eq!(
+        hidden.replace("'cove'", "'NAME'"),
+        unknown.replace("'typo'", "'NAME'"),
+        "a hidden name and a typo read back the same bytes"
+    );
+
+    assert!(!config_path.exists());
+    restore_env(previous);
+}
