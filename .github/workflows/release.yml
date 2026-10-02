@@ -191,7 +191,7 @@ jobs:
       # Skill zips: crystalline-claude-desktop-skill carries the consolidated
       # crystalline-intelligence skill Claude Desktop users upload as-is (the skill
       # FOLDER must sit at the zip root, hence zipping from inside skills/);
-      # crystalline-agent-skills carries the four topical skills for harnesses
+      # crystalline-agent-skills carries the five topical skills for harnesses
       # that install skill folders directly.
       - name: Package skill zips
         shell: bash
@@ -203,12 +203,12 @@ jobs:
           mkdir -p skill-out
           (cd skills && zip -qr "../skill-out/crystalline-claude-desktop-skill-v${version}.zip" crystalline-intelligence)
           (cd skills && zip -qr "../skill-out/crystalline-agent-skills-v${version}.zip" \
-            crystalline-routing crystalline-capture crystalline-schema crystalline-collaboration)
+            crystalline-routing crystalline-capture crystalline-schema crystalline-collaboration crystalline-provisioning)
           # Exact-path assertions: each skill folder must sit at the zip ROOT
           # (an unanchored grep would also match a wrong skills/<name> layout)
           # and every topical skill must be present in the bundle zip.
           unzip -Z1 "skill-out/crystalline-claude-desktop-skill-v${version}.zip" | grep -qx 'crystalline-intelligence/SKILL.md'
-          for s in crystalline-routing crystalline-capture crystalline-schema crystalline-collaboration; do
+          for s in crystalline-routing crystalline-capture crystalline-schema crystalline-collaboration crystalline-provisioning; do
             unzip -Z1 "skill-out/crystalline-agent-skills-v${version}.zip" | grep -qx "$s/SKILL.md"
           done
 

@@ -645,9 +645,10 @@ pub fn desired_set(harness: HarnessKind, all: &[DomainArtifacts]) -> (DesiredSet
             }
         }
 
-        // Every harness registers MCP servers through its own CLI -
-        // [`harness_supports`] is always true for mcps - so the servers
-        // project unconditionally.
+        // The servers project unconditionally, whatever [`harness_supports`]
+        // says: it is false for mcps on the four profile harnesses (skills
+        // only), and the engine reports the registration as unsupported there
+        // instead of dropping the server from the desired set.
         for mcp in &domain_artifacts.mcps {
             match mcps.get(&mcp.name) {
                 Some(existing) => {

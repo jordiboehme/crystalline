@@ -110,7 +110,7 @@ On macOS and Linux the `XDG_*` variables move these folders. On Windows, config 
 
 Nothing is encrypted at rest. Use disk encryption.
 
-`crystalline install claude-code` registers the MCP server with the `claude` CLI, adds three hooks to `~/.claude/settings.json` (`SessionStart`, `Stop` and `UserPromptSubmit`) and copies four skills into `~/.claude/skills`. With `--project` it writes the hooks and skills into the project's `.claude/` folder and registers the MCP server with project scope instead. Hook entries of other tools are kept. `crystalline uninstall claude-code` removes what install added.
+`crystalline install claude-code` registers the MCP server with the `claude` CLI, adds three hooks to `~/.claude/settings.json` (`SessionStart`, `Stop` and `UserPromptSubmit`) and copies five skills into `~/.claude/skills`. With `--project` it writes the hooks and skills into the project's `.claude/` folder and registers the MCP server with project scope instead. Hook entries of other tools are kept. `crystalline uninstall claude-code` removes what install added.
 
 ## Verify a release
 

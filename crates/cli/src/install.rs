@@ -3,7 +3,7 @@
 //!
 //! A full setup is three parts: register the MCP server, install the
 //! `SessionStart` routing hook, the `Stop` capture-nudge hook and the
-//! `UserPromptSubmit` recall hook, and copy the four topical skills into the
+//! `UserPromptSubmit` recall hook, and copy the five topical skills into the
 //! harness's skill folder. `install` does all three (each skippable with
 //! `--skip-mcp`/`--skip-hooks`/`--skip-skills`);
 //! `uninstall` takes them back out. Both are static: no database, service or
@@ -189,7 +189,7 @@ const PROMPT_HOOK_TIMEOUT_SECS: u64 = 5;
 /// an install from a downloaded release carries the same skills a clone would.
 /// `crystalline-intelligence` is deliberately not managed: it is the single
 /// consolidated skill for Claude Desktop, which has no hooks and installs one
-/// skill at a time. The MCP server serves all five regardless (see
+/// skill at a time. The MCP server serves all six regardless (see
 /// [`crystalline_core::skills`]); only installation is filtered here.
 pub(crate) fn managed_skills() -> Vec<(&'static str, &'static str)> {
     crystalline_core::SKILL_ASSETS

@@ -22,7 +22,7 @@
 //! file parses and carries the `SessionStart`, `Stop` and `UserPromptSubmit`
 //! hooks (Copilot's `UserPromptSubmit` copy is reported present but noted
 //! inert - a config-file prompt hook's output is dropped there) and how
-//! many of the four managed skills are installed or locally modified (against the
+//! many of the five managed skills are installed or locally modified (against the
 //! install receipt when one exists) and whether a receipt version skew or
 //! retired leftovers await the next session-start refresh - filesystem
 //! only, with no shell-out to the harness's own CLI, so this check stays
@@ -442,7 +442,7 @@ pub struct EnvironmentDoctor {
 /// One coding harness's onboarding trace: whether its settings/hooks file
 /// exists, parses, carries our managed hooks (three for the legacy harnesses,
 /// the session hook alone for a profile harness), what state its MCP entry
-/// is in (a profile harness) and how many of the four managed skills are
+/// is in (a profile harness) and how many of the five managed skills are
 /// installed at its skills folder. Checked purely from
 /// the filesystem, reusing `install`'s own presence predicate and skill
 /// list, with no shell-out to the harness's own CLI (`claude`, `codex` or
@@ -484,7 +484,7 @@ pub struct HarnessDoctor {
     /// `None` - a corrupt file is "checked, found absent (we could not read
     /// it)", not "nothing to check here".
     pub prompt_hook: Option<bool>,
-    /// How many of the four managed skills have a `SKILL.md` at this
+    /// How many of the five managed skills have a `SKILL.md` at this
     /// harness's skills folder, whether or not its content still matches the
     /// embedded copy.
     pub skills_installed: usize,
@@ -2607,7 +2607,7 @@ fn render_origin(origin: &OriginConfig) -> String {
 /// only when it leaves a trace): whether a settings/hooks file exists,
 /// whether it parses, whether it carries our managed hooks, the state of the
 /// MCP entry and pointer file where the profile has them, and how many of
-/// the four managed skills are present (a folder several harnesses write is
+/// the five managed skills are present (a folder several harnesses write is
 /// attributed to the rows that write it, a covered row shows its cover). No
 /// shell-out to any harness CLI, so this stays fast and works offline; user
 /// scope only, reusing `install`'s own presence predicate and skill list

@@ -128,7 +128,7 @@ enum Command {
     /// Wire a coding harness up to Crystalline in one idempotent step:
     /// register the MCP server, install the SessionStart routing hook, the
     /// Stop capture-nudge hook and the UserPromptSubmit recall hook, and
-    /// copy the four topical skills into place. Safe to re-run; a second run
+    /// copy the five topical skills into place. Safe to re-run; a second run
     /// that finds everything already in place writes nothing and reports it
     /// as already present. Static like `verify` and `prompt`: no database,
     /// service or network connection. A missing or failing harness CLI is

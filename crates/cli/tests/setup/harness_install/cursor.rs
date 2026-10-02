@@ -34,6 +34,7 @@ fn a_fresh_install_writes_the_mcp_entry_the_hook_and_the_skills() {
         "crystalline-capture",
         "crystalline-schema",
         "crystalline-collaboration",
+        "crystalline-provisioning",
     ] {
         assert!(
             b.home

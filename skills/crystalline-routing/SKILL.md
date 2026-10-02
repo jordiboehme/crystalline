@@ -115,7 +115,7 @@ Otherwise, search first. Reading every MANIFEST up front burns context for no be
 
 ## A domain can ship its own tools
 
-A MANIFEST can carry an optional `## Provisioning` section: bullets shaped `type: path`, one of four kinds - `skills`, `commands`, `agents` and `mcps` - naming a folder relative to the MANIFEST itself (a `../` path is allowed, pointing at a folder that lives beside the domain root). This is how a domain ships the working tools its knowledge depends on, not just the knowledge itself - authored once and provisioned into every harness whose format allows it. The scaffolded starter MANIFEST never includes this section; it is added by hand once a domain has something to ship. Nothing ships until a person decides to - see the note above on the routing block for what to do when a domain is still awaiting that decision.
+A MANIFEST can carry an optional `## Provisioning` section: bullets shaped `type: path`, one of four kinds - `skills`, `commands`, `agents` and `mcps` - naming a folder relative to the MANIFEST itself (a `../` path is allowed, pointing at a folder that lives beside the domain root). This is how a domain ships the working tools its knowledge depends on, not just the knowledge itself - authored once and provisioned into every harness whose format allows it. The scaffolded starter MANIFEST never includes this section; it is added by hand once a domain has something to ship. Nothing ships until a person decides to - see the note above on the routing block for what to do when a domain is still awaiting that decision. To set up or change what a domain ships, switch to the `crystalline-provisioning` skill.
 
 ## Knowledge questions are not codebase questions
 
@@ -155,3 +155,4 @@ Folders are not a navigation tree - search and the routing lines stay primary. A
 - `read_engram` reports an `inbound` summary or a `related` hint -> more linked knowledge; follow the named `build_context` anchor.
 - Before writing anything, switch to the `crystalline-capture` skill.
 - Domain has a team origin (`origin_status` says so) -> switch to the `crystalline-collaboration` skill for status, sharing and conflicts.
+- Set up or change what a domain ships -> the `crystalline-provisioning` skill.

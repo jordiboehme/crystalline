@@ -830,7 +830,7 @@ fn skill_names() -> String {
         .join(", ")
 }
 
-/// The five skill resource uris, comma separated, for the same reason.
+/// The six skill resource uris, comma separated, for the same reason.
 fn skill_uris() -> String {
     SKILL_ASSETS
         .iter()
@@ -3548,7 +3548,7 @@ impl McpServer {
     #[tool(
         name = "skills",
         title = "Skills",
-        description = "List the agent skills this server ships and read any skill's full SKILL.md playbook: how to route, capture, model schemas and collaborate well with Crystalline. Call with no arguments for the index of names and descriptions; pass name to read one skill before its kind of task.",
+        description = "List the agent skills this server ships and read any skill's full SKILL.md playbook: how to route, capture, model schemas, collaborate and provision tools well with Crystalline. Call with no arguments for the index of names and descriptions; pass name to read one skill before its kind of task.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,

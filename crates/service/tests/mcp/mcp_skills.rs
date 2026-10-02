@@ -23,11 +23,12 @@ use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
 /// Every skill this binary ships, in served order.
-const SKILL_NAMES: [&str; 5] = [
+const SKILL_NAMES: [&str; 6] = [
     "crystalline-routing",
     "crystalline-capture",
     "crystalline-schema",
     "crystalline-collaboration",
+    "crystalline-provisioning",
     "crystalline-intelligence",
 ];
 
@@ -514,7 +515,7 @@ async fn an_onboarded_harness_is_served_none_of_the_three_lists() {
 
 /// A hook in the receipt is not enough to hide the skills: until a live check
 /// has confirmed that the harness loads them as files, an installed but
-/// unverified hook keeps the tool, the five resources and the two prompts
+/// unverified hook keeps the tool, the six resources and the two prompts
 /// listed, so nothing is lost if the harness turns out to drop them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_installed_but_unverified_hook_keeps_the_whole_surface() {
@@ -538,7 +539,7 @@ async fn an_installed_but_unverified_hook_keeps_the_whole_surface() {
         .iter()
         .map(|n| format!("skill://{n}/SKILL.md"))
         .collect();
-    assert_eq!(uris.len(), 5, "all five skill resources stay listed");
+    assert_eq!(uris.len(), 6, "all six skill resources stay listed");
     assert_eq!(
         uris,
         expected.iter().map(String::as_str).collect::<Vec<_>>()

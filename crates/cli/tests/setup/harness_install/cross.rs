@@ -37,7 +37,7 @@ fn claude_code_then_cursor_covers_cursor_and_writes_nothing_twice() {
         "{out}"
     );
     assert_eq!(skills_in(&b, ".agents/skills"), 0);
-    assert_eq!(skills_in(&b, ".claude/skills"), 4);
+    assert_eq!(skills_in(&b, ".claude/skills"), 5);
     let out = cmd(&b)
         .args(["--json", "uninstall", "cursor"])
         .assert()
@@ -52,7 +52,7 @@ fn claude_code_then_cursor_covers_cursor_and_writes_nothing_twice() {
     );
     assert_eq!(
         skills_in(&b, ".claude/skills"),
-        4,
+        5,
         "the cover keeps its files"
     );
 }
@@ -72,7 +72,7 @@ fn uninstalling_claude_code_hands_cursors_skills_to_agents_skills() {
     assert_eq!(skills_in(&b, ".claude/skills"), 0);
     assert_eq!(
         skills_in(&b, ".agents/skills"),
-        4,
+        5,
         "handed over in the same run"
     );
 }
@@ -139,7 +139,7 @@ fn a_session_start_refresh_keeps_cursors_cover_for_the_hand_over() {
         .args(["uninstall", "claude-code"])
         .assert()
         .success();
-    assert_eq!(skills_in(&b, ".agents/skills"), 4);
+    assert_eq!(skills_in(&b, ".agents/skills"), 5);
 }
 
 /// Decision 3 and review focus 3.
@@ -147,7 +147,7 @@ fn a_session_start_refresh_keeps_cursors_cover_for_the_hand_over() {
 fn cursor_first_then_claude_code_leaves_one_copy_of_each_skill() {
     let b = sandbox();
     cmd(&b).args(["install", "cursor"]).assert().success();
-    assert_eq!(skills_in(&b, ".agents/skills"), 4);
+    assert_eq!(skills_in(&b, ".agents/skills"), 5);
     cmd(&b)
         .args(["install", "claude-code", "--skip-mcp"])
         .assert()
@@ -157,7 +157,7 @@ fn cursor_first_then_claude_code_leaves_one_copy_of_each_skill() {
         0,
         "Cursor's copies dropped: it reads ~/.claude/skills now"
     );
-    assert_eq!(skills_in(&b, ".claude/skills"), 4);
+    assert_eq!(skills_in(&b, ".claude/skills"), 5);
 }
 
 #[test]
@@ -213,7 +213,7 @@ fn uninstalling_gemini_keeps_the_skills_codex_still_needs() {
         .assert()
         .success();
     cmd(&b).args(["uninstall", "gemini"]).assert().success();
-    assert_eq!(skills_in(&b, ".agents/skills"), 4);
+    assert_eq!(skills_in(&b, ".agents/skills"), 5);
     cmd(&b).args(["uninstall", "codex"]).assert().success();
     assert_eq!(
         skills_in(&b, ".agents/skills"),
@@ -234,5 +234,5 @@ fn uninstalling_codex_keeps_the_skills_gemini_still_needs() {
         .assert()
         .success();
     cmd(&b).args(["uninstall", "codex"]).assert().success();
-    assert_eq!(skills_in(&b, ".agents/skills"), 4);
+    assert_eq!(skills_in(&b, ".agents/skills"), 5);
 }
