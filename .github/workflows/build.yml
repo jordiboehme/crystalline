@@ -301,9 +301,21 @@ jobs:
       # need an update fails the build instead of being re-resolved on the
       # runner. The dev channel's version rewrite above keeps the lockfile in
       # step with Cargo.toml for exactly this reason.
+      # cargo-auditable embeds the resolved dependency list in a section of
+      # the binary (a few kB), so `cargo audit bin`, Trivy, Grype and
+      # osv-scanner can name the crates inside a shipped binary or container
+      # image long after the release. The install action fetches a prebuilt
+      # binary and checks it against the SHA-256 in its manifest.
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-auditable@0.7.6
+
+      # The build itself is unchanged; `cargo auditable build` takes the same
+      # arguments as `cargo build` and the packagers below (.deb, .msi) wrap
+      # this binary with --no-build.
       - name: Build crystalline
         shell: bash
-        run: cargo build --release --locked --target "$LEG_TARGET" -p crystalline
+        run: cargo auditable build --release --locked --target "$LEG_TARGET" -p crystalline
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
 
