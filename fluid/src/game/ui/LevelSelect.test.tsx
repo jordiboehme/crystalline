@@ -376,6 +376,18 @@ describe("LevelSelect's combobox pattern", () => {
     expect(screen.getByRole("status")).toHaveTextContent(NO_SUCH_LEVEL);
   });
 
+  // Mutation caught: aria-controls kept after the listbox left the DOM, so
+  // the field names an element that does not exist.
+  it("names no missing element when the filter matches nothing", async () => {
+    const { field } = renderSelect(() => listing(["a"]));
+    await screen.findAllByRole("option");
+    fireEvent.change(field, { target: { value: "zzz" } });
+    expect(screen.queryByRole("listbox")).toBeNull();
+    expect(field).not.toHaveAttribute("aria-controls");
+    expect(field).toHaveAttribute("aria-expanded", "false");
+    expect(field).not.toHaveAttribute("aria-activedescendant");
+  });
+
   // Mutation caught: the status line mounted together with its text, which
   // a screen reader does not announce (a live region must exist before its
   // content changes).

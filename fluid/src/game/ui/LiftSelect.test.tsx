@@ -294,6 +294,17 @@ describe("LiftSelect's combobox pattern", () => {
     expect(screen.getByRole("status")).toHaveTextContent(NO_SUCH_STOP);
   });
 
+  // Mutation caught: aria-controls kept after the listbox left the DOM, so
+  // the field names an element that does not exist.
+  it("names no missing element when the filter matches nothing", () => {
+    const { field } = renderSelect([stop("A")]);
+    fireEvent.change(field, { target: { value: "zzz" } });
+    expect(screen.queryByRole("listbox")).toBeNull();
+    expect(field).not.toHaveAttribute("aria-controls");
+    expect(field).toHaveAttribute("aria-expanded", "false");
+    expect(field).not.toHaveAttribute("aria-activedescendant");
+  });
+
   // Mutation caught: the window index used for posinset or setsize.
   it("numbers an option past the window by its place in the filtered list", () => {
     const stops = Array.from({ length: 25 }, (_, i) => stop(`s${String(i)}`));

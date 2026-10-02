@@ -25,7 +25,8 @@
  *
  * The field is a combobox over the listbox: `aria-expanded` while rows show,
  * `aria-controls` naming the list, and `aria-activedescendant` on the selected
- * option while it shows (absent when a status line stands in for the list).
+ * option, both only while the list is mounted (absent when a status line
+ * stands in for it, so neither names an element that is not there).
  * Each option carries its place in the filtered list (`aria-setsize`,
  * `aria-posinset`), the status line is a `status`, and a key pressed during
  * an IME composition does nothing.
@@ -173,7 +174,7 @@ export function LiftSelect({ stops, note, onRide, onClose }: LiftSelectProps) {
           aria-label={LIFT_FIELD}
           role="combobox"
           aria-expanded={status === null}
-          aria-controls={listId}
+          {...(status === null ? { "aria-controls": listId } : {})}
           aria-autocomplete="list"
           aria-describedby={footerId}
           {...(status === null
