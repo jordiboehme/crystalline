@@ -34,7 +34,6 @@ import {
   stationOfPlace,
 } from "./paths";
 import { BLINK_CHANNELS, createBlink } from "./render/blink";
-import { LOOK } from "./render/looks";
 import type { Camera, Renderer } from "./render/renderer";
 import {
   INVERT_KEY,
@@ -350,7 +349,7 @@ function start(
 
 /** The rooms `setRoom` was handed, by permalink. */
 function roomsSet(): string[] {
-  return renderer.setRoom.mock.calls.map(([room]: [RoomSpec, unknown]) => {
+  return renderer.setRoom.mock.calls.map(([room]: [RoomSpec]) => {
     return room.permalink;
   });
 }
@@ -783,7 +782,8 @@ describe("a room the renderer refuses", () => {
 
   it("never switches the look from a key: the room stays in the one look", () => {
     // Mutation caught: the digit keys mapped to looks again (the room would
-    // be handed to the renderer a second time).
+    // be handed to the renderer a second time), or the session handing the
+    // renderer a look again.
     const session = start({ client: null });
     session.showCanned(CANNED_BRIDGE);
     frames(1);
@@ -797,7 +797,9 @@ describe("a room the renderer refuses", () => {
       frames(1);
     }
     expect(renderer.setRoom.mock.calls.length).toBe(rooms);
-    for (const [, look] of renderer.setRoom.mock.calls) expect(look).toBe(LOOK);
+    // The renderer reads `LOOK` itself: no call hands it a look.
+    for (const call of renderer.setRoom.mock.calls)
+      expect(call).toHaveLength(1);
     expect(hud.notice).not.toHaveBeenCalled();
     expect(hud.status).toHaveBeenCalled();
     expect(session.current).toEqual(engramAt("station", "manifest"));
@@ -3968,6 +3970,66 @@ describe("the lifts and the exit (M3 C26 to C29)", () => {
     await vi.waitFor(() => {
       expect(session.current).toEqual(from);
     });
+  });
+
+  it("opens a blast door behind a hatch crawl on the first Space (0.22 R1)", async () => {
+    // Mutation caught: `arrivalWay` latching a door that does not slide.
+    // A bulkhead or blast door only opens on Space, so the latch kept it
+    // shut while the HUD still offered it, and the press did nothing.
+    const from = engramAt("station", "reactor-core");
+    const to = engramAt("station", "crew-handbook");
+    const start0 = roomFor(
+      {
+        kind: "engram",
+        place: {
+          ...CANNED_BRIDGE,
+          domain: "station",
+          permalink: "reactor-core",
+        },
+        folder: "",
+      },
+      null,
+      null,
+    ).room;
+    const hatch = start0.fixtures.find((f) => f.kind === "hatch");
+    if (hatch?.kind !== "hatch") throw new Error("no hatch");
+    expect(stationOfPlace(hatch.address)).toEqual(to);
+    const session = start({ load: stationLoad, onLift: liftSpy() });
+    session.showRoom(
+      { ...start0, spawn: wallFacingSpawn(hatch.slot) },
+      undefined,
+      from,
+    );
+    frames(1);
+    pressUse();
+    await vi.waitFor(() => {
+      frames(1);
+      expect(session.current).toEqual(to);
+    });
+    frames(1);
+    const room = lastRoom();
+    const back =
+      room?.fixtures.findIndex(
+        (f) =>
+          f.kind === "door" &&
+          f.address !== null &&
+          sameStation(stationOfPlace(f.address), from),
+      ) ?? -1;
+    expect(back).toBeGreaterThanOrEqual(0);
+    const door = room!.fixtures[back]!;
+    expect(door.kind === "door" ? door.style : null).toBe("blast");
+    // Turn round on the spot until the door is offered, then press Space.
+    holdUntil(
+      "ArrowLeft",
+      () =>
+        hud.prompt.mock.calls.at(-1)?.[0]?.startsWith("SPACE OPEN") === true,
+    );
+    expect(hud.prompt.mock.calls.at(-1)?.[0]).toMatch(
+      /^SPACE OPEN depends_on /,
+    );
+    pressUse();
+    frames(10);
+    expect(lastDoors().get(`door:${String(back)}`) ?? 0).toBeGreaterThan(0);
   });
 });
 

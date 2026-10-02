@@ -124,8 +124,9 @@
  * engram room's exit (C28) is walked through like a sliding door and
  * leads up to its deck, in front of the deck's door back to the room.
  * Every arrival latches the way behind it by the exit's rule
- * (`wayLatched`, 0.22 R1): the door or portal an arrival stands in front
- * of (`arrivalWay`), else the room's exit, which the entrance spawn stands
+ * (`wayLatched`, 0.22 R1): the sliding door or portal an arrival stands in
+ * front of (`arrivalWay`; a bulkhead or blast door opens only on Space and
+ * is never latched), else the room's exit, which the entrance spawn stands
  * 1 m from. The latched way stays shut and carries no one until the
  * player has once stood `UP_LATCH_CLEAR` from its wall, so a player still
  * walking backwards after a crossing does not step straight back. A
@@ -261,7 +262,6 @@ import {
 } from "./paths";
 import { createBlink } from "./render/blink";
 import { createLights, type LightState } from "./render/lights";
-import { LOOK } from "./render/looks";
 import { createRenderer, type Renderer } from "./render/renderer";
 import {
   boxEntry,
@@ -359,7 +359,7 @@ export type ReaderState = Reading;
  * - `notice`: a centred message over the canvas (`ACCESS DENIED`), null to
  *   hide it.
  * - `connector`: the travel overlay, shown while a place loads, with the
- *   destination's label and the look to draw it in.
+ *   destination's label.
  * - `reader`: the CRT reader's content while a fixture is read, null when
  *   it closes.
  *
@@ -1076,7 +1076,7 @@ export function createSession(opts: SessionOptions): Session {
     if (renderer === null) return true;
     const t0 = now();
     try {
-      renderer.setRoom(next, LOOK);
+      renderer.setRoom(next);
       lastBuildMs = now() - t0;
       return true;
     } catch {
@@ -1979,7 +1979,7 @@ export function createSession(opts: SessionOptions): Session {
         renderer = made.renderer;
         if (room !== null) {
           const t0 = now();
-          renderer.setRoom(room, LOOK);
+          renderer.setRoom(room);
           lastBuildMs = now() - t0;
         }
         sizeCanvas();

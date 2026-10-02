@@ -13,7 +13,7 @@
  * a template built from allowed parts.
  *
  * The console room's fittings set no text at all (2.6e C20): every
- * interior kind and variant is built in every look with the records
+ * interior kind and variant is built in `LOOK` with the records
  * cleared first, with the console room's moving parts (the rotor), and
  * neither `textRows` nor a pixel-mark helper may be called. Their recipes take
  * no model context, so `label` and
@@ -101,7 +101,7 @@ const fresh = (): KitAt => {
   return (f) => createKit(b, f);
 };
 
-/** Builds every kind and variant of the three families in every look. */
+/** Builds every kind and variant of the three families in `LOOK`. */
 function buildEverything(): void {
   const look = LOOK;
   for (const kind of HERO_KINDS)

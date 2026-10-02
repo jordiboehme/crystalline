@@ -560,9 +560,11 @@ function arrivalMatch(room: RoomSpec, arrival: Arrival | null): number | null {
  * The walk-through way `arrivalSpawn` places the player in front of, by
  * index in `room.fixtures`: the door or portal back to `arrival.from`
  * (through a hatch), the deck's door back to the engram (up through an
- * exit); null for no arrival, a lift ride, no match, or a matched hatch
- * (which only Space uses). The session latches it on entry, so a player
- * still walking backwards does not step straight back through it. 0.22 R1.
+ * exit); null for no arrival, a lift ride, no match, a matched hatch, or
+ * a matched bulkhead or blast door (which only Space uses, so walking
+ * backwards never carries the player through them, and a latch would only
+ * eat the press). The session latches it on entry, so a player still
+ * walking backwards does not step straight back through it. 0.22 R1.
  */
 export function arrivalWay(
   room: RoomSpec,
@@ -570,7 +572,9 @@ export function arrivalWay(
 ): number | null {
   const index = arrivalMatch(room, arrival);
   if (index === null) return null;
-  return room.fixtures[index]?.kind === "hatch" ? null : index;
+  const way = room.fixtures[index];
+  if (way?.kind === "hatch") return null;
+  return way?.kind === "door" && way.style !== "sliding" ? null : index;
 }
 
 /**
