@@ -94,7 +94,7 @@ Via MSI: download `crystalline-<version>-windows-amd64.msi` (or `crystalline-<ve
 <details>
 <summary>Dev channel</summary>
 
-Every change on main that passes CI is built and published as a pre-release, installable with Homebrew:
+Every change on main that passes CI is built and published as a pre-release, installable with Homebrew (the merge of a release itself is skipped, because the stable release builds that commit):
 
 ```sh
 brew uninstall crystalline   # if you have the stable release

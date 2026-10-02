@@ -3,7 +3,9 @@ name: Dev channel
 # The Homebrew dev channel: every commit on main that CI passed becomes a
 # GitHub pre-release and the formula `crystalline-dev` in
 # jordiboehme/homebrew-tap, installed with
-# `brew install jordiboehme/tap/crystalline-dev`.
+# `brew install jordiboehme/tap/crystalline-dev`. The one exception is the
+# merge commit of a release PR, which the stable release builds (see the
+# release check in the `version` job).
 #
 # The stable channel is untouched by this: a `v*` tag runs release.yml, which
 # publishes the latest release and Formula/crystalline.rb exactly as before.
@@ -105,6 +107,63 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
+      # The release PR adds release-notes/v<X.Y.Z>.md for the version it bumps
+      # to, so its merge commit is the commit the `v<X.Y.Z>` tag and
+      # release.yml build. A dev build of the same commit would only repeat
+      # that work. The commit counts as a release commit when the notes file
+      # for the workspace version is in this commit and not in its first
+      # parent, and the tag is either not there yet or points at this very
+      # commit (the tag usually follows the merge within minutes, before this
+      # run starts). Only that one commit is skipped: the next commit on main
+      # already has the file in its parent and builds as usual, tag or not.
+      # Every doubt (no parent, an unreadable version, a failed tag lookup)
+      # prints nothing, and the run builds as before. A manual dispatch asks
+      # for a build on purpose and skips the check.
+      - name: Is this the commit a stable release builds
+        id: release
+        if: github.event_name == 'workflow_run'
+        continue-on-error: true
+        run: |
+          set +e
+          set -u
+          build_as_usual() {
+            echo "release check: $1, so this is not a release commit."
+            exit 0
+          }
+          version="$(git show HEAD:Cargo.toml | sed -n 's/^version = "\(.*\)"$/\1/p' | head -1)"
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            build_as_usual "the workspace version '$version' is not X.Y.Z"
+          fi
+          tag="v$version"
+          notes="release-notes/$tag.md"
+          if ! git cat-file -e "HEAD:$notes" 2>/dev/null; then
+            build_as_usual "$notes is not in this commit"
+          fi
+          if ! git rev-parse --verify --quiet 'HEAD^1^{commit}' >/dev/null; then
+            build_as_usual "this commit has no parent to compare against"
+          fi
+          if git cat-file -e "HEAD^1:$notes" 2>/dev/null; then
+            build_as_usual "$notes was already in the parent commit"
+          fi
+          if ! refs="$(git ls-remote --tags origin)"; then
+            build_as_usual "the tag lookup failed"
+          fi
+          head="$(git rev-parse HEAD)"
+          # An annotated tag lists its own object and, as <tag>^{}, the commit.
+          target="$(awk -v t="refs/tags/$tag" '$2 == t "^{}" { print $1 }' <<<"$refs")"
+          if [ -z "$target" ]; then
+            target="$(awk -v t="refs/tags/$tag" '$2 == t { print $1 }' <<<"$refs")"
+          fi
+          if [ -n "$target" ] && [ "$target" != "$head" ]; then
+            build_as_usual "the tag $tag already points at another commit ($target)"
+          fi
+          where="not there yet"
+          if [ -n "$target" ]; then
+            where="at this commit"
+          fi
+          echo "release check: this commit adds $notes and the tag $tag is $where: release.yml builds it, so the dev channel skips it."
+          echo "release=$tag" >> "$GITHUB_OUTPUT"
+
       # What this run does, from the published dev releases and the tap's
       # current formula (scripts/dev-plan.sh has the rules): build and publish
       # only a version newer than every published one, and update the formula
@@ -117,6 +176,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
           VERSION: ${{ steps.version.outputs.version }}
+          RELEASE: ${{ steps.release.outputs.release }}
         run: |
           set -euo pipefail
           gh release list --repo "${{ github.repository }}" --limit 200 \
@@ -138,7 +198,7 @@ jobs:
             fi
           fi
 
-          bash scripts/dev-plan.sh "$VERSION" "$RUNNER_TEMP/releases.json" "$formula" | tee -a "$GITHUB_OUTPUT"
+          bash scripts/dev-plan.sh "$VERSION" "$RUNNER_TEMP/releases.json" "$formula" "$RELEASE" | tee -a "$GITHUB_OUTPUT"
 
   build:
     name: build
