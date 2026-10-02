@@ -12,6 +12,12 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Read only by default. The jobs that publish (publish, images, fluid-image)
+# name the scopes they need in their own `permissions:` block, so the build
+# legs, which run every crate's build script, never hold a token that writes.
+permissions:
+  contents: read
+
 jobs:
   # Guards the whole build against a tag with no notes to publish. A tag push
   # with a missing, empty or motto-less release-notes/<tag>.md would otherwise

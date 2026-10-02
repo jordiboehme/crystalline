@@ -32,6 +32,12 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# A called workflow can only narrow the caller's token, never widen it. Both
+# callers grant contents: read to the calling job, and that is all any job
+# here needs: a checkout, and artifacts, which use the runtime token.
+permissions:
+  contents: read
+
 jobs:
   # The Fluid bundle, built once for the whole release. It is JavaScript, so it
   # is the same bytes on every platform and there is no reason for six build

@@ -8,6 +8,11 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Read only by default: every job can check out the tree and nothing more. A
+# job that needs another scope names it in its own `permissions:` block.
+permissions:
+  contents: read
+
 # A newer push to a pull request cancels the run it supersedes. A push to main
 # keeps one group per commit and never cancels, so dev.yml sees every main run.
 concurrency:
