@@ -225,17 +225,22 @@ for (const share of [false, true]) {
         await page.route("**/api/v1/settings/github", (route) =>
           route.fulfill({ json: { enabled: true, connected: false } }),
         );
-        // A long display name, to squeeze the account button.
-        await page.route("**/api/v1/auth/me", async (route) => {
-          const response = await route.fetch();
-          const body = (await response.json()) as {
-            user?: { display: string } | null;
-          };
-          if (body.user) {
-            body.user.display = "Bartholomew Featherstonehaugh-Smythe";
-          }
-          await route.fulfill({ response, json: body });
-        });
+        // A long display name, to squeeze the account button. The real answer
+        // is read once, up front, through the page's own cookies, and every
+        // `/auth/me` after that gets the edited copy. Fetching it inside the
+        // handler raced the reload below: a request the old page still had
+        // in flight was disposed with the page, and reading its body threw
+        // "Response has been disposed".
+        const me = await page.request.get("/api/v1/auth/me");
+        expect(me.ok()).toBe(true);
+        const body = (await me.json()) as {
+          user?: { display: string } | null;
+        };
+        expect(body.user).toBeTruthy();
+        body.user!.display = "Bartholomew Featherstonehaugh-Smythe";
+        await page.route("**/api/v1/auth/me", (route) =>
+          route.fulfill({ json: body }),
+        );
         await page.reload();
         await expect(
           page.getByRole("button", { name: "Share changes" }),
@@ -249,6 +254,11 @@ for (const share of [false, true]) {
       // The room left to type in: the box minus its padding. 40 px is about
       // five characters, the least that still reads as a field.
       expect(boxes.typing).toBeGreaterThanOrEqual(40);
+      if (share) {
+        // A refetch the app starts while the page closes must not fail the
+        // test from a canned handler that has nothing left to answer.
+        await page.unrouteAll({ behavior: "ignoreErrors" });
+      }
     });
   }
 }
