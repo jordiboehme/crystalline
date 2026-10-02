@@ -34,6 +34,12 @@ use crate::receipt::{self, InstallRecord, Receipt, RecordedSkill};
 /// the filesystem skips it.
 pub(crate) const COVERED_PREFIX: &str = "covered:";
 
+/// The name prefix of the entries a failed hand-over keeps beside the
+/// marker: the departed cover's skill list, so the retry at the next session
+/// start writes only those skills. Like the marker, the colon keeps these
+/// names away from every path that reaches the filesystem.
+pub(crate) const SEED_PREFIX: &str = "covered-seed:";
+
 /// The two roots every user skills folder resolves under. Production builds
 /// them once per run with [`real_roots`]; tests pass temporary folders.
 pub(crate) struct Folders<'a> {
@@ -250,20 +256,33 @@ pub(crate) fn rebalance_plan(book: &Receipt, folders: &Folders<'_>) -> Vec<Rebal
 
 /// The skill list a hand-over starts from: the list of the row that covered
 /// `row` as it was when the cover went away. That is `departed` when the
-/// cover was just uninstalled, or the cover's own row when it is still in
-/// the receipt with its skills part removed. `None` when neither is known
-/// (an older binary removed the cover's row).
-fn cover_list<'b>(
+/// cover was just uninstalled; else the copy a failed hand-over kept in the
+/// row itself ([`SEED_PREFIX`] entries); else the cover's own row when it is
+/// still in the receipt with its skills part removed. `None` when none is
+/// known (an older binary removed the cover's row).
+fn cover_list(
     row: &InstallRecord,
-    book: &'b Receipt,
-    departed: Option<&'b InstallRecord>,
-) -> Option<&'b [RecordedSkill]> {
+    book: &Receipt,
+    departed: Option<&InstallRecord>,
+) -> Option<Vec<RecordedSkill>> {
     let by = row.skills.iter().find_map(covered_by)?;
     if let Some(d) = departed.filter(|d| d.harness == by.id() && d.scope == "user") {
-        return Some(&d.skills);
+        return Some(d.skills.clone());
     }
-    book.find(by.id(), "user", None)
-        .map(|r| r.skills.as_slice())
+    let kept: Vec<RecordedSkill> = row
+        .skills
+        .iter()
+        .filter_map(|s| {
+            s.name.strip_prefix(SEED_PREFIX).map(|name| RecordedSkill {
+                name: name.to_string(),
+                sha256: s.sha256.clone(),
+            })
+        })
+        .collect();
+    if !kept.is_empty() {
+        return Some(kept);
+    }
+    book.find(by.id(), "user", None).map(|r| r.skills.clone())
 }
 
 /// Write a handed-over row's skills into `to`, its own folder.
@@ -374,8 +393,11 @@ pub(crate) fn apply_rebalance(
                 row.skills = vec![covered_marker(*by)];
             }
             RebalanceStep::HandOver { to, .. } => {
-                let seed = cover_list(&row, book, departed).map(<[RecordedSkill]>::to_vec);
-                let co_writers: Vec<&InstallRecord> = writers(book)
+                let seed = cover_list(&row, book, departed);
+                // Every row with its skills part that shares the folder, its
+                // list emptied or not: an emptied co-writer means the person
+                // removed those skills from this folder, and they stay removed.
+                let co_writers: Vec<&InstallRecord> = covers(book)
                     .filter(|(h, _)| *h != harness && write_folder(*h, folders) == *to)
                     .map(|(_, r)| r)
                     .collect();
@@ -387,7 +409,17 @@ pub(crate) fn apply_rebalance(
                             harness.display_name(),
                             to.display()
                         ));
-                        continue;
+                        // Keep the marker, so the next session start retries,
+                        // and the cover's list beside it, so the retry writes
+                        // only those skills and never the full set.
+                        let Some(seed) = seed else {
+                            continue;
+                        };
+                        row.skills.retain(|s| s.name.starts_with(COVERED_PREFIX));
+                        row.skills.extend(seed.into_iter().map(|s| RecordedSkill {
+                            name: format!("{SEED_PREFIX}{}", s.name),
+                            sha256: s.sha256,
+                        }));
                     }
                 }
             }

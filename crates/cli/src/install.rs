@@ -4572,4 +4572,86 @@ mod tests {
         let cursor = book.find("cursor", "user", None).unwrap();
         assert_eq!(cursor.skills.len(), managed.len() - 2);
     }
+
+    /// Re-review probe D: Codex's list is empty because the person removed
+    /// every skill from `~/.agents/skills`. Codex still shares that folder,
+    /// so a hand-over into it writes nothing back.
+    #[test]
+    fn a_hand_over_into_a_folder_an_emptied_co_writer_shares_writes_nothing() {
+        let work = tempfile::tempdir().unwrap();
+        let home = work.path().join("home");
+        let copilot = home.join(".copilot");
+        let f = crate::skills_placement::Folders {
+            home: &home,
+            copilot_home: &copilot,
+        };
+        let agents = home.join(".agents/skills");
+        for co_writer in ["codex", "gemini"] {
+            let mut book = receipt::Receipt::default();
+            book.upsert(user_row(co_writer, Vec::new()));
+            book.upsert(user_row("cursor", vec![marker_of("claude-code")]));
+            let departed = user_row("claude-code", managed_records());
+            let (changed, _) = crate::skills_placement::rebalance(&mut book, &f, Some(&departed));
+            assert!(changed, "{co_writer}");
+            assert!(!agents.exists(), "{co_writer}: nothing written back");
+            assert!(
+                book.find("cursor", "user", None).unwrap().skills.is_empty(),
+                "{co_writer}"
+            );
+        }
+    }
+
+    /// Re-review N1: a hand-over that fails keeps the departed cover's list
+    /// in the row, so the session-start retry writes only those skills and
+    /// never falls back to the full set.
+    #[test]
+    fn a_failed_hand_over_keeps_the_cover_list_for_the_retry() {
+        let work = tempfile::tempdir().unwrap();
+        let home = work.path().join("home");
+        let copilot = home.join(".copilot");
+        let f = crate::skills_placement::Folders {
+            home: &home,
+            copilot_home: &copilot,
+        };
+        let managed = managed_skills();
+        let removed = managed[0].0;
+        // A file where the ~/.agents folder belongs makes every write fail.
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join(".agents"), "in the way").unwrap();
+
+        let departed = user_row(
+            "claude-code",
+            managed_records()
+                .into_iter()
+                .filter(|r| r.name != removed)
+                .collect(),
+        );
+        let mut book = receipt::Receipt::default();
+        book.upsert(user_row("cursor", vec![marker_of("claude-code")]));
+        let (_, notices) = crate::skills_placement::rebalance(&mut book, &f, Some(&departed));
+        assert!(
+            notices.iter().any(|n| n.starts_with("Could not write")),
+            "{notices:?}"
+        );
+        let cursor = book.find("cursor", "user", None).unwrap().clone();
+        assert!(crate::skills_placement::is_covered(&cursor), "{cursor:?}");
+
+        // The next session start: no departed row, no Claude Code row.
+        std::fs::remove_file(home.join(".agents")).unwrap();
+        let (changed, notices) = crate::skills_placement::rebalance(&mut book, &f, None);
+        assert!(changed, "{notices:?}");
+        let agents = home.join(".agents/skills");
+        assert!(
+            !skill_file(&agents, removed).exists(),
+            "removed stays removed"
+        );
+        let cursor = book.find("cursor", "user", None).unwrap();
+        assert_eq!(cursor.skills.len(), managed.len() - 1, "{cursor:?}");
+        for &(name, body) in managed.iter().filter(|&&(n, _)| n != removed) {
+            assert_eq!(
+                std::fs::read_to_string(skill_file(&agents, name)).unwrap(),
+                body
+            );
+        }
+    }
 }

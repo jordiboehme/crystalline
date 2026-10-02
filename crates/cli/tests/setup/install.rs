@@ -2121,6 +2121,48 @@ fn uninstalling_claude_code_hands_a_covered_cursor_row_its_own_folder() {
     );
 }
 
+/// The uninstall hands the removed row's own list to the hand-over: a skill
+/// the person removed under Claude Code does not appear in Cursor's folder.
+#[test]
+fn uninstalling_claude_code_hands_over_only_the_skills_it_still_listed() {
+    let (_work, home, bin_dir) = placement_home();
+    install_cmd(&home, &bin_dir)
+        .args(["install", "claude-code"])
+        .assert()
+        .success();
+    std::fs::remove_dir_all(claude_skill(&home, "crystalline-schema").parent().unwrap()).unwrap();
+    tamper_receipt(&home, |receipt| {
+        let installs = receipt["installs"].as_array_mut().unwrap();
+        installs[0]["skills"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|s| s["name"] != "crystalline-schema");
+        installs.push(json!({
+            "harness": "cursor",
+            "scope": "user",
+            "version": env!("CARGO_PKG_VERSION"),
+            "parts": {"mcp": true, "hooks": true, "skills": true},
+            "skills": [{"name": "covered:claude-code", "sha256": ""}]
+        }));
+    });
+
+    install_cmd(&home, &bin_dir)
+        .args(["uninstall", "claude-code"])
+        .assert()
+        .success();
+
+    assert!(agents_skill(&home, "crystalline-routing").is_file());
+    assert!(
+        !agents_skill(&home, "crystalline-schema").exists(),
+        "a skill removed under Claude Code stays removed in Cursor"
+    );
+    let cursor = receipt_row(&home, "cursor").unwrap();
+    assert!(
+        !skill_names(&cursor).contains(&"crystalline-schema".to_string()),
+        "{cursor}"
+    );
+}
+
 #[test]
 fn prompt_system_rebalances_even_when_no_version_differs() {
     let (_work, home, bin_dir) = placement_home();
