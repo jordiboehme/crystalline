@@ -65,6 +65,7 @@ use crystalline_core::{HarnessKind, HarnessPaths, SessionFormat, config, harness
 use crystalline_service::{CliCapture, CliRun, run_harness_cli, run_harness_cli_capture};
 
 use crate::receipt;
+use crate::skills_placement;
 
 /// The command the `SessionStart` hook runs: re-inject the knowledge routing
 /// prompt at session start.
@@ -1640,7 +1641,7 @@ fn retire(
 /// hash is untouched by the user and is dropped; a genuinely edited file is
 /// kept (`kept-modified`) unless `force` is set. The receipt hash is what
 /// keeps an old-but-clean skill from being mistaken for an edited one.
-fn uninstall_skills(
+pub(crate) fn uninstall_skills(
     dir: &Path,
     prior: &[receipt::RecordedSkill],
     force: bool,
@@ -1725,6 +1726,49 @@ fn uninstall_skills(
     })
 }
 
+/// Uninstall one row's skills from `dir`, honouring the reference count: at
+/// user scope, a folder another receipt row still writes keeps every file
+/// (`kept-shared`), and a covered row, which wrote nothing, removes nothing
+/// (`covered`). Otherwise this is [`uninstall_skills`]. Project folders
+/// belong to their row alone, so `user_scope = false` skips both checks.
+/// `book` still holds the row being uninstalled; the count excludes it.
+#[allow(clippy::too_many_arguments)]
+fn skills_to_remove(
+    harness: HarnessKind,
+    user_scope: bool,
+    dir: &Path,
+    prior: &[receipt::RecordedSkill],
+    force: bool,
+    book: &receipt::Receipt,
+    folders: &skills_placement::Folders<'_>,
+) -> anyhow::Result<SkillsReport> {
+    let keep = if !user_scope {
+        None
+    } else if prior
+        .iter()
+        .any(|s| s.name.starts_with(skills_placement::COVERED_PREFIX))
+    {
+        Some("covered")
+    } else if skills_placement::folder_written_by_others(dir, book, harness, folders) {
+        Some("kept-shared")
+    } else {
+        None
+    };
+    match keep {
+        None => uninstall_skills(dir, prior, force),
+        Some(status) => Ok(SkillsReport {
+            dir: dir.display().to_string(),
+            skills: managed_skills()
+                .iter()
+                .map(|&(name, _)| SkillReport {
+                    name: name.to_string(),
+                    status,
+                })
+                .collect(),
+        }),
+    }
+}
+
 /// Delete a skill's `SKILL.md`, then remove its folder when that leaves it
 /// empty. The folder removal is best-effort and only ever runs on an empty
 /// managed-skill folder, so nothing a person added alongside is disturbed.
@@ -1778,6 +1822,16 @@ struct HooksReport {
 pub(crate) struct SkillsReport {
     dir: String,
     skills: Vec<SkillReport>,
+}
+
+impl SkillsReport {
+    /// The skills an uninstall kept because a person edited them.
+    pub(crate) fn kept_modified(&self) -> impl Iterator<Item = &str> {
+        self.skills
+            .iter()
+            .filter(|s| s.status == "kept-modified")
+            .map(|s| s.name.as_str())
+    }
 }
 
 /// One skill's result within a [`SkillsReport`].
@@ -1872,6 +1926,8 @@ fn skill_label(status: &str) -> &str {
         "removed-retired" => "removed (retired in this version)",
         "retired-backup" => "retired (your copy kept as SKILL.md.bak)",
         "user-removed" => "not reinstalled (removed by you)",
+        "kept-shared" => "kept (another harness still uses this folder)",
+        "covered" => "nothing to remove (another harness's folder covered it)",
         other => other,
     }
 }
@@ -2098,6 +2154,18 @@ pub fn run_install(opts: InstallOptions, json: bool) -> anyhow::Result<()> {
             None => prior.map(|p| p.skills).unwrap_or_default(),
         },
     });
+    // A harness that reads another row's folder may now be covered by this
+    // install, or a covered one handed back its own folder. Nothing to do,
+    // and no file touched, on a machine with only the legacy harnesses.
+    let (home, copilot_home) = skills_placement::real_roots();
+    let (_, rebalance_notices) = skills_placement::rebalance(
+        &mut book,
+        &skills_placement::Folders {
+            home: &home,
+            copilot_home: &copilot_home,
+        },
+    );
+    notices.extend(rebalance_notices);
     let receipt_report = match &receipt_path {
         Some(path) => match receipt::save(path, &book) {
             Ok(()) => Some(ReceiptReport {
@@ -2194,7 +2262,20 @@ pub fn run_uninstall(
     let mcp = uninstall_mcp(harness, project);
     let hooks = uninstall_hooks(harness, &paths.settings)?;
     let prior_skills = prior.as_ref().map(|p| p.skills.as_slice()).unwrap_or(&[]);
-    let skills = uninstall_skills(&paths.skills_dir, prior_skills, force)?;
+    let (home, copilot_home) = skills_placement::real_roots();
+    let folders = skills_placement::Folders {
+        home: &home,
+        copilot_home: &copilot_home,
+    };
+    let skills = skills_to_remove(
+        harness,
+        !project,
+        &paths.skills_dir,
+        prior_skills,
+        force,
+        &book,
+        &folders,
+    )?;
 
     let mut notices = Vec::new();
     if harness == HarnessKind::Codex {
@@ -2208,7 +2289,11 @@ pub fn run_uninstall(
     // was actually there to remove: an uninstall of a target the receipt
     // never knew about must never touch the file.
     let removed = book.remove(harness.id(), scope, project_path.as_deref());
-    let receipt_report = if removed {
+    // With this row gone, a harness it covered writes its own folder again
+    // (the hand-over). A no-op, touching no file, on a legacy-only machine.
+    let (rebalanced, rebalance_notices) = skills_placement::rebalance(&mut book, &folders);
+    notices.extend(rebalance_notices);
+    let receipt_report = if removed || rebalanced {
         match &receipt_path {
             Some(path) => match receipt::save(path, &book) {
                 Ok(()) => Some(ReceiptReport {
@@ -2345,6 +2430,23 @@ pub(crate) fn auto_reconcile(current_version: &str, cwd: &Path) -> Vec<String> {
             )),
         }
     }
+    // The rebalance runs even when no version differs, so a hand-over an
+    // older binary missed heals here. It only looks at rows and paths, so the
+    // no-op path stays the one receipt read above.
+    let (home, copilot_home) = skills_placement::real_roots();
+    let (rebalanced, rebalance_notices) = skills_placement::rebalance(
+        &mut book,
+        &skills_placement::Folders {
+            home: &home,
+            copilot_home: &copilot_home,
+        },
+    );
+    notices.extend(
+        rebalance_notices
+            .into_iter()
+            .map(|n| format!("[crystalline] {n}")),
+    );
+    changed |= rebalanced;
     if changed && receipt::save(&path, &book).is_err() {
         notices.push(
             "[crystalline] Could not rewrite the install receipt; the refresh may re-run next session."
@@ -2365,7 +2467,10 @@ fn reconcile_entry(
     if entry.parts.hooks {
         install_hooks(harness, &paths.settings)?;
     }
-    if entry.parts.skills {
+    // A covered row wrote no files: Auto mode on its marker alone would see
+    // every skill missing and record an empty list, losing the marker the
+    // hand-over depends on.
+    if entry.parts.skills && !skills_placement::is_covered(entry) {
         let (_, records) = reconcile_skills(&paths.skills_dir, &entry.skills, ReconcileMode::Auto)?;
         entry.skills = records;
     }
@@ -4054,6 +4159,227 @@ mod tests {
             std::fs::read_to_string(escape_target.join("SKILL.md")).unwrap(),
             "escape canary",
             "the relative escape was never followed"
+        );
+    }
+
+    // --- shared skills folders --------------------------------------------
+
+    fn user_row(harness: &str, skills: Vec<RecordedSkill>) -> receipt::InstallRecord {
+        receipt::InstallRecord {
+            harness: harness.to_string(),
+            scope: "user".to_string(),
+            project_path: None,
+            version: "0.22.1".to_string(),
+            parts: receipt::Parts {
+                mcp: true,
+                hooks: true,
+                skills: true,
+            },
+            skills,
+        }
+    }
+
+    fn managed_records() -> Vec<RecordedSkill> {
+        managed_skills()
+            .iter()
+            .map(|&(name, body)| rec(name, body))
+            .collect()
+    }
+
+    fn seed_managed(dir: &Path) {
+        for &(name, body) in managed_skills().iter() {
+            seed(dir, name, body);
+        }
+    }
+
+    /// The reference count on uninstall: Codex and Cursor both write
+    /// `~/.agents/skills`, so uninstalling one of them leaves every file the
+    /// other still needs; once it is the last writer, the clean copies go.
+    #[test]
+    fn uninstall_keeps_a_skills_folder_another_row_still_writes() {
+        let work = tempfile::tempdir().unwrap();
+        let home = work.path().join("home");
+        let copilot = home.join(".copilot");
+        let f = crate::skills_placement::Folders {
+            home: &home,
+            copilot_home: &copilot,
+        };
+        let dir = home.join(".agents/skills");
+        seed_managed(&dir);
+
+        let mut book = receipt::Receipt::default();
+        book.upsert(user_row("codex", managed_records()));
+        book.upsert(user_row("cursor", managed_records()));
+        let report = skills_to_remove(
+            HarnessKind::Codex,
+            true,
+            &dir,
+            &managed_records(),
+            false,
+            &book,
+            &f,
+        )
+        .unwrap();
+        for &(name, _) in managed_skills().iter() {
+            assert!(skill_file(&dir, name).is_file(), "{name} stays for Cursor");
+            assert_eq!(status_of(&report, name), "kept-shared");
+        }
+
+        book.remove("codex", "user", None);
+        let report = skills_to_remove(
+            HarnessKind::Cursor,
+            true,
+            &dir,
+            &managed_records(),
+            false,
+            &book,
+            &f,
+        )
+        .unwrap();
+        for &(name, _) in managed_skills().iter() {
+            assert!(
+                !skill_file(&dir, name).exists(),
+                "{name} goes with the last writer"
+            );
+            assert_eq!(status_of(&report, name), "removed");
+        }
+    }
+
+    /// A covered row wrote nothing, so its uninstall removes nothing, even
+    /// clean copies another harness's receipt row may have lost track of.
+    #[test]
+    fn uninstalling_a_covered_row_removes_nothing() {
+        let work = tempfile::tempdir().unwrap();
+        let home = work.path().join("home");
+        let copilot = home.join(".copilot");
+        let f = crate::skills_placement::Folders {
+            home: &home,
+            copilot_home: &copilot,
+        };
+        let dir = home.join(".agents/skills");
+        seed_managed(&dir);
+        let marker = vec![RecordedSkill {
+            name: format!("{}claude-code", crate::skills_placement::COVERED_PREFIX),
+            sha256: String::new(),
+        }];
+        let mut book = receipt::Receipt::default();
+        book.upsert(user_row("cursor", marker.clone()));
+        skills_to_remove(HarnessKind::Cursor, true, &dir, &marker, false, &book, &f).unwrap();
+        for &(name, _) in managed_skills().iter() {
+            assert!(skill_file(&dir, name).is_file(), "{name}");
+        }
+    }
+
+    /// A project-scope uninstall is never reference counted: project folders
+    /// are the row's own, even when run from the home folder.
+    #[test]
+    fn a_project_uninstall_ignores_the_user_rows() {
+        let work = tempfile::tempdir().unwrap();
+        let home = work.path().join("home");
+        let copilot = home.join(".copilot");
+        let f = crate::skills_placement::Folders {
+            home: &home,
+            copilot_home: &copilot,
+        };
+        let dir = home.join(".agents/skills");
+        seed_managed(&dir);
+        let mut book = receipt::Receipt::default();
+        book.upsert(user_row("cursor", managed_records()));
+        skills_to_remove(
+            HarnessKind::Codex,
+            false,
+            &dir,
+            &managed_records(),
+            false,
+            &book,
+            &f,
+        )
+        .unwrap();
+        for &(name, _) in managed_skills().iter() {
+            assert!(!skill_file(&dir, name).exists(), "{name}");
+        }
+    }
+
+    /// The session-start refresh keeps a covered row's marker: Auto mode on
+    /// the marker alone would see every skill missing, record an empty list
+    /// and so lose the hand-over for good.
+    #[test]
+    fn the_session_start_refresh_keeps_a_covered_rows_marker() {
+        let work = tempfile::tempdir().unwrap();
+        let paths = HarnessPaths {
+            settings: work.path().join("hooks.json"),
+            skills_dir: work.path().join("skills"),
+        };
+        let marker = RecordedSkill {
+            name: format!("{}claude-code", crate::skills_placement::COVERED_PREFIX),
+            sha256: String::new(),
+        };
+        let mut entry = user_row("cursor", vec![marker.clone()]);
+        entry.parts.hooks = false;
+        reconcile_entry(HarnessKind::Cursor, &mut entry, &paths).unwrap();
+        assert_eq!(entry.skills, vec![marker]);
+        assert!(!paths.skills_dir.exists(), "nothing written");
+    }
+
+    /// The rebalance applied: Cursor installed first wrote `~/.agents/skills`;
+    /// once Claude Code writes `~/.claude/skills`, which Cursor reads too,
+    /// Cursor's clean copies go, an edited one stays with a notice, and the
+    /// row records the marker. Uninstalling Claude Code hands the skills back.
+    #[test]
+    fn the_rebalance_covers_and_hands_over_on_disk() {
+        let work = tempfile::tempdir().unwrap();
+        let home = work.path().join("home");
+        let copilot = home.join(".copilot");
+        let f = crate::skills_placement::Folders {
+            home: &home,
+            copilot_home: &copilot,
+        };
+        let agents = home.join(".agents/skills");
+        seed_managed(&agents);
+        let edited = managed_skills()[0].0;
+        seed(&agents, edited, "my own words");
+
+        let mut book = receipt::Receipt::default();
+        book.upsert(user_row("cursor", managed_records()));
+        book.upsert(user_row("claude-code", managed_records()));
+        let (changed, notices) = crate::skills_placement::rebalance(&mut book, &f);
+        assert!(changed);
+        let cursor = book.find("cursor", "user", None).unwrap();
+        assert_eq!(cursor.skills.len(), 1);
+        assert_eq!(
+            crate::skills_placement::covered_by(&cursor.skills[0]),
+            Some(HarnessKind::ClaudeCode)
+        );
+        for &(name, _) in managed_skills().iter() {
+            assert_eq!(
+                skill_file(&agents, name).is_file(),
+                name == edited,
+                "{name}"
+            );
+        }
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(
+            notices[0].starts_with(&format!(
+                "kept {edited} in {}: it was edited;",
+                agents.display()
+            )),
+            "{notices:?}"
+        );
+
+        book.remove("claude-code", "user", None);
+        let (changed, _) = crate::skills_placement::rebalance(&mut book, &f);
+        assert!(changed);
+        let cursor = book.find("cursor", "user", None).unwrap();
+        assert_eq!(cursor.skills.len(), managed_skills().len());
+        for &(name, body) in managed_skills().iter() {
+            assert_eq!(
+                std::fs::read_to_string(skill_file(&agents, name)).unwrap(),
+                body
+            );
+        }
+        assert!(
+            !crate::skills_placement::rebalance(&mut book, &f).0,
+            "settled"
         );
     }
 }
