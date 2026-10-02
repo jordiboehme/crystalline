@@ -2,7 +2,8 @@
 //!
 //! A skill is a folder under `skills/` with a `SKILL.md` playbook teaching one
 //! kind of Crystalline work: routing to a domain, capturing what was learned,
-//! modelling a schema, collaborating with a team. `include_str!` bakes each one
+//! modelling a schema, collaborating with a team, provisioning what a domain
+//! ships. `include_str!` bakes each one
 //! into the binary, so an install from a downloaded release carries exactly the
 //! skills a clone would.
 //!
@@ -19,7 +20,7 @@
 //! `crystalline-intelligence` is the single consolidated skill for Claude
 //! Desktop, which has no hooks and installs one skill at a time, so it ships
 //! only as its own zip and is never copied into a harness skills folder beside
-//! the four topical skills - installing both would teach the same lessons twice.
+//! the five topical skills - installing both would teach the same lessons twice.
 //! It is still served over MCP like any other: a remote client reading the
 //! skills should see everything this binary knows how to teach.
 //!
@@ -65,7 +66,8 @@ impl SkillAsset {
 
 /// Every skill this binary ships, in the order a reader should meet them:
 /// route to a domain, capture what was learned, model a schema, collaborate
-/// with a team, and the consolidated Claude Desktop skill last.
+/// with a team, provision what a domain ships, and the consolidated Claude
+/// Desktop skill last.
 pub const SKILL_ASSETS: &[SkillAsset] = &[
     SkillAsset {
         name: "crystalline-routing",
@@ -90,6 +92,12 @@ pub const SKILL_ASSETS: &[SkillAsset] = &[
         content: include_str!("../../../skills/crystalline-collaboration/SKILL.md"),
         install_managed: true,
         since: "0.1.0",
+    },
+    SkillAsset {
+        name: "crystalline-provisioning",
+        content: include_str!("../../../skills/crystalline-provisioning/SKILL.md"),
+        install_managed: true,
+        since: "0.22.1",
     },
     SkillAsset {
         name: "crystalline-intelligence",
@@ -122,8 +130,19 @@ mod tests {
     }
 
     #[test]
-    fn five_skills_ship_with_four_installed_into_harnesses() {
-        assert_eq!(SKILL_ASSETS.len(), 5);
+    fn six_skills_ship_with_five_installed_into_harnesses() {
+        let names: Vec<&str> = SKILL_ASSETS.iter().map(|s| s.name).collect();
+        assert_eq!(
+            names,
+            vec![
+                "crystalline-routing",
+                "crystalline-capture",
+                "crystalline-schema",
+                "crystalline-collaboration",
+                "crystalline-provisioning",
+                "crystalline-intelligence",
+            ]
+        );
         let managed: Vec<&str> = SKILL_ASSETS
             .iter()
             .filter(|s| s.install_managed)
@@ -136,6 +155,7 @@ mod tests {
                 "crystalline-capture",
                 "crystalline-schema",
                 "crystalline-collaboration",
+                "crystalline-provisioning",
             ]
         );
         assert_eq!(
@@ -257,5 +277,49 @@ mod tests {
                 "consolidated skill lacks {needle}"
             );
         }
+    }
+
+    #[test]
+    fn the_provisioning_skill_keeps_its_guardrails() {
+        let s = skill("crystalline-provisioning").expect("ships").content;
+        for (needle, why) in [
+            (
+                "\"identifier\": \"manifest\"",
+                "the MANIFEST is edited over MCP by its permalink",
+            ),
+            (
+                "\"operation\": \"append\"",
+                "a new Provisioning section is appended",
+            ),
+            (
+                "replace_section",
+                "an existing section is replaced, body only",
+            ),
+            (
+                "expected_checksum",
+                "the edit is guarded against a concurrent change",
+            ),
+            (
+                "manifest_findings",
+                "the agent fixes every finding before going on",
+            ),
+            ("Copy, never move", "a moved skill disappears on deny"),
+            (
+                "only after the person answers",
+                "allow or deny is the person's decision",
+            ),
+            ("secret", "no secret value in an mcps file"),
+            (
+                "repository root",
+                "a team ../ path never climbs above the repo root",
+            ),
+            (
+                "crystalline-",
+                "the reserved prefix is named so the agent avoids it",
+            ),
+        ] {
+            assert!(s.contains(needle), "{why}: missing {needle:?}");
+        }
+        assert_eq!(skill("crystalline-provisioning").unwrap().since, "0.22.1");
     }
 }
