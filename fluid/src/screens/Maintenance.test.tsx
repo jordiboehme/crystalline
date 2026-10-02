@@ -1228,7 +1228,7 @@ describe("acknowledging a finding", () => {
     });
   });
 
-  it("draws a V302 row with both engrams linked and the probability, and acknowledges the pair of lines", async () => {
+  it("draws a V302 row with the counterpart linked and the probability, and acknowledges the pair of lines", async () => {
     const acks: (RequestInit | undefined)[] = [];
     await open({
       "/evolve": contradictionPayload,
@@ -1251,8 +1251,15 @@ describe("acknowledging a finding", () => {
     expect(items[1]).toHaveTextContent(
       'Node version line 5: "The build uses Node 18"',
     );
+    // Mutation caught: the row's own engram linked a second time in the
+    // list. The row header already links it, and two links of one name in
+    // one row are noise for a screen reader.
+    expect(within(items[0]!).queryByRole("link")).toBeNull();
     expect(
-      within(items[0]!).getByRole("link", { name: "CI runtime" }),
+      within(row).getAllByRole("link", { name: "CI runtime" }),
+    ).toHaveLength(1);
+    expect(
+      within(row).getByRole("link", { name: "CI runtime" }),
     ).toHaveAttribute("href", "/d/eng/e/ci-runtime");
     expect(
       within(items[1]!).getByRole("link", { name: "Node version" }),

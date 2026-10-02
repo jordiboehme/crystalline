@@ -686,13 +686,13 @@ function FindingRow({
             aria-label="The two lines"
             className="space-y-0.5 text-sm break-words"
           >
+            {/*
+              The row's own engram is plain text here: the row header above
+              already links it, and a second link of the same name in one row
+              is noise for a screen reader. The counterpart is the link.
+            */}
             <li>
-              <Link
-                to={engramRoute(finding.domain, finding.permalink)}
-                className="text-sky-700 underline underline-offset-2 hover:no-underline dark:text-sky-400"
-              >
-                {finding.title}
-              </Link>
+              {finding.title}
               {finding.line !== null && ` line ${String(finding.line)}`}
               {finding.lineText !== null && `: "${finding.lineText}"`}
             </li>
