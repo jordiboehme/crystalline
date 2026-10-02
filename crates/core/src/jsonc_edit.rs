@@ -90,6 +90,10 @@ pub enum JsoncError {
     NotAnArray { at: String },
     /// The array at this dotted path has no element at the index.
     IndexOutOfRange { at: String },
+    /// The file is valid, but the edit at this dotted path (or these paths,
+    /// joined by ", ") could not be applied without changing something
+    /// else in it, so nothing is written. Never the person's fault.
+    Unsafe { at: String },
 }
 
 impl fmt::Display for JsoncError {
@@ -118,6 +122,10 @@ impl fmt::Display for JsoncError {
             JsoncError::IndexOutOfRange { at } => write!(
                 f,
                 "\"{at}\" does not exist. Check the file and run the command again"
+            ),
+            JsoncError::Unsafe { at } => write!(
+                f,
+                "Crystalline could not change \"{at}\" without touching other parts of this file's layout, so nothing was written. The file is unchanged; make this change by hand"
             ),
         }
     }
@@ -149,7 +157,7 @@ pub enum Edit {
 /// Parse JSON or JSONC (comments and trailing commas allowed) into a value.
 /// Blank text reads as an empty object, the same as a missing file.
 pub fn parse_value(text: &str) -> Result<serde_json::Value, JsoncError> {
-    Ok(parse(text)?
+    Ok(parse(without_bom(text).1)?
         .map(serde_json::Value::from)
         .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new())))
 }
@@ -177,6 +185,13 @@ pub fn get(text: &str, path: &[Seg<'_>]) -> Result<Option<serde_json::Value>, Js
 /// the edits then build a new document, printed by [`render_new`]. Returns
 /// `None` when the result equals the input, so the caller writes nothing.
 pub fn apply_edits(text: Option<&str>, edits: &[Edit]) -> Result<Option<String>, JsoncError> {
+    let (bom, text) = match text {
+        Some(t) => {
+            let (bom, rest) = without_bom(t);
+            (bom, Some(rest))
+        }
+        None => ("", None),
+    };
     let Some(original) = text.filter(|t| !t.trim().is_empty()) else {
         let mut root = JsonIn::Object(Vec::new());
         let mut changed = false;
@@ -186,13 +201,120 @@ pub fn apply_edits(text: Option<&str>, edits: &[Edit]) -> Result<Option<String>,
         let empty = matches!(&root, JsonIn::Object(m) if m.is_empty());
         return Ok((changed && !empty).then(|| render_new(&root)));
     };
+    // A parse error here is the person's file; past this point the file is
+    // known to be valid, so a parse error can only come from a splice.
+    parse(original)?;
     let mut current = original.to_string();
     for edit in edits {
-        if let Some(next) = splice::apply(&current, edit)? {
+        let next = splice::apply(&current, edit).map_err(|e| match e {
+            JsoncError::Parse { .. } => JsoncError::Unsafe {
+                at: dotted(edit_path(edit)),
+            },
+            other => other,
+        })?;
+        if let Some(next) = next {
             current = next;
         }
     }
-    Ok((current != original).then_some(current))
+    if current == original {
+        return Ok(None);
+    }
+    verify(original, &current, edits)?;
+    Ok(Some(format!("{bom}{current}")))
+}
+
+/// Split off a leading UTF-8 byte order mark, which some editors write.
+fn without_bom(text: &str) -> (&str, &str) {
+    match text.strip_prefix('\u{feff}') {
+        Some(rest) => ("\u{feff}", rest),
+        None => ("", text),
+    }
+}
+
+fn edit_path(edit: &Edit) -> &[SegBuf] {
+    match edit {
+        Edit::Set { path, .. } | Edit::Push { path, .. } | Edit::Remove { path, .. } => path,
+    }
+}
+
+/// The post-condition of the splice editor (spec 3.3): the result parses to
+/// an object, and once the edited paths are taken out of both documents
+/// (with the containers an edit created or pruned, when they are empty on
+/// one side and missing on the other), both are equal. Anything else means
+/// a splice rule went wrong, and the edit is refused.
+fn verify(original: &str, result: &str, edits: &[Edit]) -> Result<(), JsoncError> {
+    let refuse = || JsoncError::Unsafe {
+        at: edits
+            .iter()
+            .map(|e| dotted(edit_path(e)))
+            .collect::<Vec<_>>()
+            .join(", "),
+    };
+    let mut before = parse_value(original).map_err(|_| refuse())?;
+    let mut after = match parse(result) {
+        Ok(Some(root @ ast::Value::Object(_))) => serde_json::Value::from(root),
+        _ => return Err(refuse()),
+    };
+    for edit in edits {
+        // An index shifts its siblings, so the whole array is the scope.
+        let path: Vec<&str> = edit_path(edit)
+            .iter()
+            .map_while(|seg| match seg {
+                SegBuf::Key(k) => Some(k.as_str()),
+                SegBuf::Index(_) => None,
+            })
+            .collect();
+        if path.is_empty() {
+            continue;
+        }
+        strip(&mut before, &path);
+        strip(&mut after, &path);
+        for depth in (1..path.len()).rev() {
+            let ancestor = &path[..depth];
+            let empty_here_missing_there = |a: &serde_json::Value, b: &serde_json::Value| {
+                lookup_value(a, ancestor).is_some_and(is_empty_container)
+                    && lookup_value(b, ancestor).is_none()
+            };
+            if empty_here_missing_there(&before, &after) {
+                strip(&mut before, ancestor);
+            } else if empty_here_missing_there(&after, &before) {
+                strip(&mut after, ancestor);
+            }
+        }
+    }
+    if before == after {
+        Ok(())
+    } else {
+        Err(refuse())
+    }
+}
+
+fn lookup_value<'a>(value: &'a serde_json::Value, path: &[&str]) -> Option<&'a serde_json::Value> {
+    path.iter().try_fold(value, |node, key| node.get(*key))
+}
+
+fn strip(value: &mut serde_json::Value, path: &[&str]) {
+    let Some((last, parents)) = path.split_last() else {
+        return;
+    };
+    let mut node = value;
+    for key in parents {
+        match node.get_mut(*key) {
+            Some(next) => node = next,
+            None => return,
+        }
+    }
+    if let serde_json::Value::Object(map) = node {
+        map.remove(*last);
+    }
+}
+
+fn is_empty_container(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(map) => map.is_empty(),
+        serde_json::Value::Array(items) => items.is_empty(),
+        _ => false,
+    }
 }
 
 /// Print a value as a new file: 2-space indent, arrays of scalars on one
@@ -562,9 +684,12 @@ mod splice {
         let after = remove_item(text, parent, index);
         if prune == Prune::Emptied && !parent_path.is_empty() {
             let root = root_object(&after)?;
+            // A container that still holds the person's comments is not
+            // empty: it stays, comments and all.
             if let Ok((d, node)) = descend(&root, parent_path)
                 && d == parent_path.len()
                 && items(node).is_empty()
+                && !scan_gap(&after, node.start() + 1, node.end() - 1).has_comment
             {
                 return Ok(Some(
                     remove(&after, parent_path, prune)?.unwrap_or(after.clone()),
@@ -693,36 +818,56 @@ mod splice {
         let (start, end) = present[index];
         let bound = present.get(index + 1).map(|n| n.0).unwrap_or(close);
         let own_comma = scan_gap(text, end, bound).comma;
+        let prev_bound = match index {
+            0 => container.start() + 1,
+            i => present[i - 1].1,
+        };
+        let gap_before = scan_gap(text, prev_bound, start);
+        let before = ws_back(text, start);
+        // The item sits right after a comment. The line break after that
+        // comment is the comment's own (a `//` comment ends there), so it is
+        // never deleted; the item's line goes with the break after it.
+        let after_comment = gap_before.last_comment_end == Some(before);
+        let first_break_after = |from: usize| text[from..start].find('\n').map(|i| from + i + 1);
         let deletions: Vec<(usize, usize)> = if present.len() == 1 {
             // The only item: the whitespace before it from its first line
             // break, and after it one line break when more than one follows
             // (the container was split over lines before), else all of it.
             let end = own_comma.map(|c| c + 1).unwrap_or(end);
-            let before = ws_back(text, start);
-            let from = match text[before..start].find('\n') {
-                Some(i) if i > 0 && text.as_bytes()[before + i - 1] == b'\r' => before + i - 1,
-                Some(i) => before + i,
-                None => before,
-            };
             let ws_end = ws_forward(text, end);
             let run = &text[end..ws_end];
-            let to = if run.matches('\n').count() >= 2 {
-                end + run.find('\n').expect("counted") + 1
-            } else {
-                ws_end
-            };
-            vec![(from, to)]
+            let through_first_break = run.find('\n').map(|i| end + i + 1);
+            match first_break_after(before) {
+                Some(from) if after_comment => vec![(from, through_first_break.unwrap_or(ws_end))],
+                _ => {
+                    let from = match text[before..start].find('\n') {
+                        Some(i) if i > 0 && text.as_bytes()[before + i - 1] == b'\r' => {
+                            before + i - 1
+                        }
+                        Some(i) => before + i,
+                        None => before,
+                    };
+                    let to = if run.matches('\n').count() >= 2 {
+                        through_first_break.expect("counted")
+                    } else {
+                        ws_end
+                    };
+                    vec![(from, to)]
+                }
+            }
         } else if index + 1 == present.len() {
             let prev_end = present[index - 1].1;
-            let gap = scan_gap(text, prev_end, start);
-            if !gap.has_comment {
+            if !gap_before.has_comment {
                 vec![(prev_end, end)]
             } else {
-                let run = ws_back(text, start);
-                match (own_comma, gap.comma) {
-                    (Some(own), _) => vec![(run, own + 1)],
-                    (None, Some(comma)) => vec![(comma, comma + 1), (run, end)],
-                    (None, None) => vec![(run, end)],
+                let item_end = own_comma.map(|c| c + 1).unwrap_or(end);
+                let (from, to) = match first_break_after(before) {
+                    Some(from) if after_comment => (from, past_blank_line_end(text, item_end)),
+                    _ => (before, item_end),
+                };
+                match (own_comma, gap_before.comma) {
+                    (None, Some(comma)) => vec![(comma, comma + 1), (from, to)],
+                    _ => vec![(from, to)],
                 }
             }
         } else {
@@ -752,6 +897,25 @@ mod splice {
     struct Gap {
         comma: Option<usize>,
         has_comment: bool,
+        /// Where the last comment in the gap ends, when nothing but
+        /// whitespace follows it: a `//` comment ends before its line
+        /// break (before the `\r` of a CRLF), a block comment after `*/`.
+        last_comment_end: Option<usize>,
+    }
+
+    /// Past the blanks and the line break that end the line at `at`, when
+    /// nothing else follows on that line; else `at` itself.
+    fn past_blank_line_end(text: &str, at: usize) -> usize {
+        let rest = &text[at..];
+        let blank = rest.len() - rest.trim_start_matches([' ', '\t']).len();
+        let after = &rest[blank..];
+        if after.starts_with("\r\n") {
+            at + blank + 2
+        } else if after.starts_with('\n') {
+            at + blank + 1
+        } else {
+            at
+        }
     }
 
     /// Scan text between two values, which holds only whitespace, comments
@@ -761,17 +925,25 @@ mod splice {
         let mut gap = Gap {
             comma: None,
             has_comment: false,
+            last_comment_end: None,
         };
         let mut i = from;
         while i < to {
             match bytes[i] {
                 b',' => {
                     gap.comma.get_or_insert(i);
+                    gap.last_comment_end = None;
                     i += 1;
                 }
                 b'/' if bytes.get(i + 1) == Some(&b'/') => {
                     gap.has_comment = true;
                     i = text[i..].find('\n').map(|n| i + n).unwrap_or(text.len());
+                    let end = if i > 0 && bytes[i - 1] == b'\r' {
+                        i - 1
+                    } else {
+                        i
+                    };
+                    gap.last_comment_end = Some(end);
                 }
                 b'/' if bytes.get(i + 1) == Some(&b'*') => {
                     gap.has_comment = true;
@@ -779,8 +951,13 @@ mod splice {
                         .find("*/")
                         .map(|n| i + 2 + n + 2)
                         .unwrap_or(text.len());
+                    gap.last_comment_end = Some(i);
                 }
-                _ => i += 1,
+                b if is_ws(b) => i += 1,
+                _ => {
+                    gap.last_comment_end = None;
+                    i += 1;
+                }
             }
         }
         gap
@@ -1258,5 +1435,405 @@ mod tests {
             apply_edits(Some("{\"hooks\": {\"SessionStart\": {}}}"), &push).unwrap_err(),
             JsoncError::NotAnArray { at } if at == "hooks.SessionStart"
         ));
+    }
+
+    fn remove_never(text: &str, path: Vec<SegBuf>) -> String {
+        apply_edits(
+            Some(text),
+            &[Edit::Remove {
+                path,
+                prune: Prune::Never,
+            }],
+        )
+        .unwrap()
+        .expect("a change")
+    }
+
+    fn key(k: &str) -> SegBuf {
+        SegBuf::Key(k.into())
+    }
+
+    /// Review t2, critical 1: the person deletes the other server, and
+    /// uninstall must not pull the closing brace into the comment above.
+    #[test]
+    fn the_reviews_cursor_repro_uninstalls_to_valid_json() {
+        let installed = install(Some(include_str!(
+            "../tests/fixtures/harness/cursor-mcp.json"
+        )));
+        let edited = remove_never(&installed, vec![key("mcpServers"), key("other")]);
+        assert!(
+            edited.starts_with(
+                "{\n    // servers this person set up by hand\n    \"mcpServers\": {\n        \"crystalline\": {"
+            ),
+            "{edited:?}"
+        );
+        let back = uninstall(&edited);
+        assert_eq!(back, "{\n    // servers this person set up by hand\n}\n");
+        assert_eq!(parse_value(&back).unwrap(), serde_json::json!({}));
+    }
+
+    /// The only item and the last item after a line or a block comment, in
+    /// LF and in CRLF: the comment keeps its line and the result parses.
+    #[test]
+    fn a_removal_after_a_comment_keeps_the_comment_on_its_own_line() {
+        let cases: &[(&str, Vec<SegBuf>, &str)] = &[
+            (
+                "{\n  // c\n  \"crystalline\": {}\n}\n",
+                vec![key("crystalline")],
+                "{\n  // c\n}\n",
+            ),
+            (
+                "{\r\n  // c\r\n  \"crystalline\": {}\r\n}\r\n",
+                vec![key("crystalline")],
+                "{\r\n  // c\r\n}\r\n",
+            ),
+            (
+                "{\n  /* c */\n  \"crystalline\": {}\n}\n",
+                vec![key("crystalline")],
+                "{\n  /* c */\n}\n",
+            ),
+            (
+                "{\r\n  /* c */\r\n  \"crystalline\": {}\r\n}\r\n",
+                vec![key("crystalline")],
+                "{\r\n  /* c */\r\n}\r\n",
+            ),
+            (
+                "{\n  \"m\": {\n    // c\n    \"crystalline\": {}\n  }\n}\n",
+                vec![key("m"), key("crystalline")],
+                "{\n  \"m\": {\n    // c\n  }\n}\n",
+            ),
+            (
+                "{\"h\": [\n  // mine\n  {}\n]}",
+                vec![key("h"), SegBuf::Index(0)],
+                "{\"h\": [\n  // mine\n]}",
+            ),
+            (
+                "{\"a\": 1, // note\n    \"crystalline\": {} }",
+                vec![key("crystalline")],
+                "{\"a\": 1 // note\n }",
+            ),
+            (
+                "{\"a\": 1, // note\r\n    \"crystalline\": {} }",
+                vec![key("crystalline")],
+                "{\"a\": 1 // note\r\n }",
+            ),
+            (
+                "{\"a\": 1, /* note */\n    \"crystalline\": {} }",
+                vec![key("crystalline")],
+                "{\"a\": 1 /* note */\n }",
+            ),
+            (
+                "{\n  \"a\": 1, // note\n  \"crystalline\": {},\n}\n",
+                vec![key("crystalline")],
+                "{\n  \"a\": 1, // note\n}\n",
+            ),
+        ];
+        for (text, path, want) in cases {
+            let got = remove_never(text, path.clone());
+            assert_eq!(&got, want, "{text:?}");
+            parse_value(&got).unwrap_or_else(|e| panic!("{got:?}: {e}"));
+        }
+    }
+
+    /// The documented exception with a comment beside the empty container:
+    /// the container goes, the comment and valid JSON stay.
+    #[test]
+    fn the_exception_under_a_comment_leaves_the_comment_and_valid_json() {
+        for (original, want) in [
+            (
+                "{\n  // MCP servers for Cursor\n  \"mcpServers\": {}\n}\n",
+                "{\n  // MCP servers for Cursor\n}\n",
+            ),
+            (
+                "{\r\n  // MCP servers for Cursor\r\n  \"mcpServers\": {}\r\n}\r\n",
+                "{\r\n  // MCP servers for Cursor\r\n}\r\n",
+            ),
+        ] {
+            assert_eq!(uninstall(&install(Some(original))), want);
+        }
+    }
+
+    /// Review t2, important 1: a container that holds the person's comments
+    /// is not empty, so the prune keeps it and the file comes back.
+    #[test]
+    fn a_container_with_only_comments_is_not_pruned() {
+        for original in [
+            "{\n  \"mcpServers\": {\n    // mine go here\n  }\n}\n",
+            "{\r\n  \"mcpServers\": {\r\n    // mine go here\r\n  }\r\n}\r\n",
+            "{\n  \"mcpServers\": { /* mine */ }\n}\n",
+            "{\n  \"theme\": 1,\n  \"mcpServers\": {\n    /* later */\n  }\n}",
+        ] {
+            assert_eq!(
+                uninstall(&install(Some(original))),
+                original,
+                "{original:?}"
+            );
+        }
+    }
+
+    /// Spec 3.3: the result is parsed again and every key outside the edit
+    /// must be unchanged, or nothing is written.
+    #[test]
+    fn a_result_that_changes_anything_outside_the_edit_is_refused() {
+        let set = [Edit::Set {
+            path: key_path(),
+            value: ours("gemini"),
+        }];
+        let original = "{\n  \"theme\": \"Default\"\n}\n";
+        let good = install(Some(original));
+        assert_eq!(verify(original, &good, &set), Ok(()));
+        for bad in [
+            good.replace("Default", "Dracula"),
+            good.replace("\"theme\": \"Default\",\n", ""),
+            good.replace("}\n}\n", "}\n"),
+        ] {
+            assert!(
+                matches!(verify(original, &bad, &set), Err(JsoncError::Unsafe { .. })),
+                "{bad:?}"
+            );
+        }
+        let message = JsoncError::Unsafe {
+            at: "mcpServers.crystalline".into(),
+        }
+        .to_string();
+        assert!(message.contains("nothing was written"), "{message}");
+        assert!(!message.contains("column"), "{message}");
+    }
+
+    /// Review t2, minor 1: a leading byte order mark is kept and is not
+    /// reported as broken JSON.
+    #[test]
+    fn a_byte_order_mark_is_kept_and_not_read_as_broken_json() {
+        let original = "\u{feff}{\n  \"theme\": \"Default\"\n}\n";
+        let installed = install(Some(original));
+        assert!(
+            installed.starts_with("\u{feff}{\n  \"theme\""),
+            "{installed:?}"
+        );
+        assert_eq!(
+            get(&installed, &[Seg::Key("theme")]).unwrap(),
+            Some(serde_json::json!("Default"))
+        );
+        assert_eq!(uninstall(&installed), original);
+    }
+
+    /// Every node's raw text by dotted path.
+    fn raw_nodes(text: &str) -> std::collections::BTreeMap<String, String> {
+        fn walk(
+            text: &str,
+            node: &ast::Value<'_>,
+            at: &str,
+            out: &mut std::collections::BTreeMap<String, String>,
+        ) {
+            let join = |seg: &str| {
+                if at.is_empty() {
+                    seg.to_string()
+                } else {
+                    format!("{at}.{seg}")
+                }
+            };
+            match node {
+                ast::Value::Object(obj) => {
+                    for p in &obj.properties {
+                        let path = join(p.name.as_str());
+                        out.insert(
+                            path.clone(),
+                            text[p.value.start()..p.value.end()].to_string(),
+                        );
+                        walk(text, &p.value, &path, out);
+                    }
+                }
+                ast::Value::Array(arr) => {
+                    for (i, e) in arr.elements.iter().enumerate() {
+                        let path = join(&i.to_string());
+                        out.insert(path.clone(), text[e.start()..e.end()].to_string());
+                        walk(text, e, &path, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = std::collections::BTreeMap::new();
+        let root = parse(text).unwrap().expect("a value");
+        walk(text, &root, "", &mut out);
+        out
+    }
+
+    /// Every node of `original` that is not on the way to a touched path and
+    /// not under one has the same bytes in `output`.
+    fn assert_foreign_kept(name: &str, original: &str, output: &str, touched: &[String]) {
+        let after = raw_nodes(output);
+        for (path, raw) in raw_nodes(original) {
+            let related = touched.iter().any(|t| {
+                t == &path
+                    || t.starts_with(&format!("{path}."))
+                    || path.starts_with(&format!("{t}."))
+            });
+            if !related {
+                assert_eq!(after.get(&path), Some(&raw), "{name}: {path}");
+            }
+        }
+    }
+
+    /// Property-style: for every fixture and every install and uninstall
+    /// sequence, the output parses and every node outside our entries keeps
+    /// its bytes; the person deleting their own entries in between still
+    /// leaves an uninstall that parses.
+    #[test]
+    fn every_fixture_survives_every_install_sequence() {
+        let fixtures: &[(&str, &str, &str)] = &[
+            (
+                "cursor hooks",
+                include_str!("../tests/fixtures/harness/cursor-hooks.json"),
+                "sessionStart",
+            ),
+            (
+                "cursor hooks commented",
+                include_str!("../tests/fixtures/harness/cursor-hooks-commented.jsonc"),
+                "sessionStart",
+            ),
+            (
+                "cursor mcp",
+                include_str!("../tests/fixtures/harness/cursor-mcp.json"),
+                "sessionStart",
+            ),
+            (
+                "gemini",
+                include_str!("../tests/fixtures/harness/gemini-settings.json"),
+                "SessionStart",
+            ),
+            (
+                "gemini commented",
+                include_str!("../tests/fixtures/harness/gemini-settings-commented.jsonc"),
+                "SessionStart",
+            ),
+            (
+                "kiro mcp",
+                include_str!("../tests/fixtures/harness/kiro-mcp.json"),
+                "SessionStart",
+            ),
+            (
+                "qwen crlf",
+                include_str!("../tests/fixtures/harness/qwen-settings-crlf.json"),
+                "SessionStart",
+            ),
+            (
+                "comments everywhere",
+                "{\n  // a\n  \"theme\": 1, // b\n  /* c */\n  \"mcpServers\": { // d\n    \"other\": {} /* e */\n  },\n  \"hooks\": {\n    // f\n  }\n}\n",
+                "SessionStart",
+            ),
+        ];
+        let mcp = key_path();
+        for (name, original, event) in fixtures {
+            let hook_path = vec![key("hooks"), key(event)];
+            let existing = parse_value(original).unwrap()["hooks"][event]
+                .as_array()
+                .map_or(0, Vec::len);
+            let mut hook_item = hook_path.clone();
+            hook_item.push(SegBuf::Index(existing));
+            let hook_touched = format!("hooks.{event}.{existing}");
+            let group = JsonIn::Object(vec![("command".into(), JsonIn::Str("crystalline".into()))]);
+            let set_mcp = Edit::Set {
+                path: mcp.clone(),
+                value: ours("gemini"),
+            };
+            let push_hook = Edit::Push {
+                path: hook_path.clone(),
+                value: group,
+            };
+            let remove_mcp = Edit::Remove {
+                path: mcp.clone(),
+                prune: Prune::Emptied,
+            };
+            let remove_hook = Edit::Remove {
+                path: hook_item.clone(),
+                prune: Prune::Emptied,
+            };
+            let touched = vec!["mcpServers.crystalline".to_string(), hook_touched];
+
+            for installs in [
+                vec![set_mcp.clone()],
+                vec![push_hook.clone()],
+                vec![set_mcp.clone(), push_hook.clone()],
+                vec![push_hook.clone(), set_mcp.clone()],
+            ] {
+                let installed = apply_edits(Some(original), &installs)
+                    .unwrap_or_else(|e| panic!("{name}: {e}"))
+                    .expect("a change");
+                parse_value(&installed).unwrap();
+                assert_foreign_kept(name, original, &installed, &touched);
+                if installs.contains(&set_mcp) {
+                    assert_eq!(
+                        apply_edits(Some(&installed), std::slice::from_ref(&set_mcp)).unwrap(),
+                        None,
+                        "{name}: a second install is no change"
+                    );
+                }
+                for uninstalls in [
+                    vec![remove_mcp.clone(), remove_hook.clone()],
+                    vec![remove_hook.clone(), remove_mcp.clone()],
+                ] {
+                    let back = apply_edits(Some(&installed), &uninstalls)
+                        .unwrap_or_else(|e| panic!("{name}: {e}"))
+                        .expect("a change");
+                    assert_eq!(&back, original, "{name}: {installs:?} then {uninstalls:?}");
+                }
+            }
+
+            // The person deletes their own entries while ours stay, then
+            // uninstall runs: whatever is left must still parse.
+            let installed = apply_edits(Some(original), &[set_mcp.clone(), push_hook.clone()])
+                .unwrap()
+                .unwrap();
+            let value = parse_value(&installed).unwrap();
+            let mut theirs: Vec<Vec<SegBuf>> = Vec::new();
+            for (k, v) in value.as_object().unwrap() {
+                if k == "mcpServers" || k == "hooks" {
+                    for inner in v
+                        .as_object()
+                        .map(|m| m.keys().cloned().collect::<Vec<_>>())
+                        .unwrap_or_default()
+                    {
+                        if inner != "crystalline" && inner != *event {
+                            theirs.push(vec![key(k), key(&inner)]);
+                        }
+                    }
+                    if k == "hooks" {
+                        for i in (0..existing).rev() {
+                            let mut p = hook_path.clone();
+                            p.push(SegBuf::Index(i));
+                            theirs.push(p);
+                        }
+                    }
+                } else {
+                    theirs.push(vec![key(k)]);
+                }
+            }
+            let mut text = installed;
+            for path in theirs {
+                if let Some(next) = apply_edits(
+                    Some(&text),
+                    &[Edit::Remove {
+                        path,
+                        prune: Prune::Never,
+                    }],
+                )
+                .unwrap_or_else(|e| panic!("{name}: {e}"))
+                {
+                    text = next;
+                }
+            }
+            parse_value(&text).unwrap_or_else(|e| panic!("{name}: {text:?}: {e}"));
+            let back = apply_edits(Some(&text), &[remove_hook.clone(), remove_mcp.clone()])
+                .unwrap_or_else(|e| panic!("{name}: {text:?}: {e}"));
+            let back = back.unwrap_or(text);
+            let value = parse_value(&back).unwrap_or_else(|e| panic!("{name}: {back:?}: {e}"));
+            assert!(
+                value
+                    .get("mcpServers")
+                    .is_none_or(|m| m.get("crystalline").is_none()),
+                "{name}"
+            );
+        }
     }
 }
