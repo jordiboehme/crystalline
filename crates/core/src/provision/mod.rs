@@ -484,7 +484,10 @@ pub fn apply(
         domain_artifacts.push(artifacts);
     }
 
-    let pending = collect_pending(global, env_domains);
+    // Display order only: the reconcile above and below keeps the config's
+    // declaration order for its collision precedence.
+    let mut pending = collect_pending(global, env_domains);
+    pending.sort_by_cached_key(|p| (p.domain.to_lowercase(), p.domain.clone()));
 
     if harnesses.is_empty() {
         if any_opted_in {
@@ -1915,6 +1918,37 @@ mod tests {
         let pending: Vec<&str> = report.pending.iter().map(|p| p.domain.as_str()).collect();
         assert_eq!(pending, ["charlie", "delta"]);
         assert_eq!(report.virtual_with_decision, ["Echo", "zeta"]);
+    }
+
+    #[test]
+    fn apply_lists_the_domains_awaiting_a_decision_in_name_order() {
+        let (zulu, mike, echo) = (
+            shipping_domain("a1", "# A\n"),
+            shipping_domain("a2", "# A\n"),
+            shipping_domain("a3", "# A\n"),
+        );
+        let mut global = GlobalConfig::default();
+        global
+            .domains
+            .insert("zulu".into(), DomainEntry::file(zulu.path()));
+        global
+            .domains
+            .insert("mike".into(), DomainEntry::file(mike.path()));
+        global
+            .domains
+            .insert("Echo".into(), DomainEntry::file(echo.path()));
+
+        let dir = tempfile::tempdir().unwrap();
+        let report = apply(
+            &global,
+            &dir.path().join("receipt.json"),
+            &[],
+            &mut DeferringMcpRunner,
+            &HashSet::new(),
+        )
+        .unwrap();
+        let pending: Vec<&str> = report.pending.iter().map(|p| p.domain.as_str()).collect();
+        assert_eq!(pending, ["Echo", "mike", "zulu"]);
     }
 
     #[test]
