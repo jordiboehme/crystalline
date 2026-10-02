@@ -656,8 +656,33 @@ jobs:
           corepack enable pnpm
           pnpm --version
 
+      # A pull request fails on an advisory. On a push to main the step may
+      # fail without failing the job (continue-on-error), because a new
+      # advisory has nothing to do with the merged tree and would only turn
+      # main red; the report step below turns it into a warning instead.
       - name: pnpm audit --prod
+        id: audit
+        continue-on-error: ${{ github.event_name == 'push' }}
         run: pnpm audit --prod
+
+      # Runs on both: failure() on a pull request (the step failed the job),
+      # the outcome on main (continue-on-error left the job green). Writes the
+      # advisories to the run summary and names the packages in a warning.
+      - name: Report the advisories
+        if: ${{ failure() || steps.audit.outcome == 'failure' }}
+        run: |
+          set -uo pipefail
+          json="$RUNNER_TEMP/pnpm-audit.json"
+          pnpm audit --prod --json >"$json" || true
+          {
+            echo "## pnpm audit --prod"
+            echo
+            echo "| package | severity | advisory |"
+            echo "| --- | --- | --- |"
+            jq -r '.advisories[] | "| \(.module_name) | \(.severity) | [\(.title)](\(.url)) |"' "$json" || echo "| (the audit output could not be read) | | |"
+          } >>"$GITHUB_STEP_SUMMARY"
+          packages=$(jq -r '[.advisories[].module_name] | unique | join(", ")' "$json" 2>/dev/null || true)
+          echo "::warning title=pnpm audit::advisories for ${packages:-packages the audit output did not name}; see the run summary"
 
   musl-spike:
     name: musl-spike
