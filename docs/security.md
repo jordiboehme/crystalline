@@ -158,7 +158,7 @@ The Windows binaries and the MSI are not Authenticode signed yet. SmartScreen wa
 
 ## License
 
-Crystalline is licensed under the GNU AGPL v3.0 or later (see [LICENSE](../LICENSE)). The third-party licenses the binary may contain are the allowlist in [`deny.toml`](../deny.toml). The SBOMs list the dependencies that ship, with their versions and, where a package declares one, its license. The Rust SBOMs also name the build-time crates and mark them as excluded, because they are not part of the binary.
+Crystalline is licensed under the Mozilla Public License 2.0 (see [LICENSE](../LICENSE)). The third-party licenses the binary may contain are the allowlist in [`deny.toml`](../deny.toml). The SBOMs list the dependencies that ship, with their versions and, where a package declares one, its license. The Rust SBOMs also name the build-time crates and mark them as excluded, because they are not part of the binary.
 
 ## Known gaps
 

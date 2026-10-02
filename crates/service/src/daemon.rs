@@ -65,9 +65,9 @@ const BANNER: &str = r"
 /// it too. (`--daemon` never reaches this branch at all: there is no
 /// terminal to print a banner to, and its own, separate startup output below
 /// is limited to the `tracing::info!` lines a backgrounded first-run wizard
-/// still needs.) AGPL section 13 is why it names the source: a
-/// network-served copy has to offer its users the source, so the link
-/// belongs where a user of a running instance can see it. Read from the
+/// still needs.) It names the source as a courtesy
+/// and for attribution, so the link sits where a user of a running instance
+/// can see it. Read from the
 /// environment rather than retyped, matching `crates/cli/src/main.rs`'s
 /// `VERSION_BLOCK`.
 const COPYRIGHT_LINE: &str = concat!(

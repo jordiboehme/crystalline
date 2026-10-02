@@ -39,19 +39,8 @@ allow = [
     "Zlib",
 ]
 confidence-threshold = 0.8
-# The workspace crates carry Crystalline's own license. It is allowed for
-# them by name only, so a third-party AGPL dependency still fails. A new
-# workspace crate needs an entry here.
-exceptions = [
-    { crate = "crystalline", allow = ["AGPL-3.0-or-later"] },
-    { crate = "crystalline-core", allow = ["AGPL-3.0-or-later"] },
-    { crate = "crystalline-engine", allow = ["AGPL-3.0-or-later"] },
-    { crate = "crystalline-identity", allow = ["AGPL-3.0-or-later"] },
-    { crate = "crystalline-index", allow = ["AGPL-3.0-or-later"] },
-    { crate = "crystalline-remote", allow = ["AGPL-3.0-or-later"] },
-    { crate = "crystalline-rest", allow = ["AGPL-3.0-or-later"] },
-    { crate = "crystalline-service", allow = ["AGPL-3.0-or-later"] },
-]
+# The workspace crates carry Crystalline's own license, MPL-2.0, which is in
+# the global allow list above, so they need no per-crate exception.
 
 # cfg_block has no license field, only a LICENSE file (Apache-2.0). The
 # clarification makes the result independent of cargo-deny's license-file

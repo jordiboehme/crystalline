@@ -3353,8 +3353,8 @@ fn an_occupied_http_address_is_not_fatal_and_says_so() {
 }
 
 /// A foreground `serve` prints the copyright line even when stderr is
-/// redirected, because AGPL section 13 means a user of a running instance has
-/// to be able to see where the source is. The line sits after the
+/// redirected, because a user of a running instance should be
+/// able to see where the source is. The line sits after the
 /// `is_terminal()` guard that owns the ASCII banner and inside `if
 /// !daemon_flag`, and only running it proves that placement.
 ///

@@ -36,9 +36,9 @@ mod users;
 ///
 /// Three lines, no blank line: this is Jordi's own compact form (decided
 /// 2026-09-08), not the fuller GNU disclaimer block - no warranty
-/// paragraph, no "this is free software" line. AGPL section 13 is why the
-/// source link is here at all: a network-served copy has to offer its users
-/// the source.
+/// paragraph, no "this is free software" line. The source link is here as a
+/// courtesy and for attribution: a user of a running copy can see where the
+/// source is.
 ///
 /// Read from the environment rather than retyped, so a change to
 /// Cargo.toml's `version`, `license` or `repository` carries here too.

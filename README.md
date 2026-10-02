@@ -26,7 +26,7 @@
 ```
 
 [![CI](https://github.com/jordiboehme/crystalline/actions/workflows/ci.yml/badge.svg)](https://github.com/jordiboehme/crystalline/actions/workflows/ci.yml)
-[![License: AGPL-3.0](https://img.shields.io/github/license/jordiboehme/crystalline)](LICENSE)
+[![License: MPL-2.0](https://img.shields.io/github/license/jordiboehme/crystalline)](LICENSE)
 [![Latest release](https://img.shields.io/github/v/release/jordiboehme/crystalline)](https://github.com/jordiboehme/crystalline/releases/latest)
 [![OKF BundleDex](https://bundledex.net/static-badge.svg)](https://bundledex.net)
 
@@ -206,4 +206,4 @@ Questions: jordi@boehme-lopez.de.
 
 ## License
 
-GNU Affero General Public License v3.0 - see [LICENSE](LICENSE).
+Mozilla Public License 2.0 - see [LICENSE](LICENSE).

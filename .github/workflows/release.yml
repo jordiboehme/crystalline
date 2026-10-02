@@ -601,7 +601,7 @@ jobs:
           labels: |
             org.opencontainers.image.title=Crystalline
             org.opencontainers.image.description=Local-first knowledge management for humans and AI agents.
-            org.opencontainers.image.licenses=AGPL-3.0-or-later
+            org.opencontainers.image.licenses=MPL-2.0
 
       - name: Build and push
         id: push
@@ -647,7 +647,7 @@ jobs:
           labels: |
             org.opencontainers.image.title=Crystalline (with model)
             org.opencontainers.image.description=Local-first knowledge management for humans and AI agents, with the ibm-granite/granite-embedding-97m-multilingual-r2 embedding model (Apache-2.0 licensed) baked in so semantic search is ready immediately with no runtime download.
-            org.opencontainers.image.licenses=AGPL-3.0-or-later
+            org.opencontainers.image.licenses=MPL-2.0
 
       # Builds the variant for one platform and loads it into the local
       # docker daemon (buildx --load does not support a multi-platform
@@ -756,7 +756,7 @@ jobs:
           labels: |
             org.opencontainers.image.title=Crystalline Fluid
             org.opencontainers.image.description=The browser UI for a Crystalline instance. Crystalline stores what was learned; Fluid is where you think with it.
-            org.opencontainers.image.licenses=AGPL-3.0-or-later
+            org.opencontainers.image.licenses=MPL-2.0
 
       # No QEMU, as for the crystalline images: the node stage is pinned to the
       # build platform (see fluid/Dockerfile) because a static bundle is the
@@ -833,7 +833,7 @@ jobs:
           class Crystalline < Formula
             desc "Local-first knowledge management for humans and AI agents"
             homepage "https://github.com/jordiboehme/crystalline"
-            license "AGPL-3.0-or-later"
+            license "MPL-2.0"
             version "${VERSION}"
 
             on_macos do

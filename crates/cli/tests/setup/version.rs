@@ -1,7 +1,6 @@
 //! `crystalline --version` / `-V`: names the copyright, the license and the
-//! source, per AGPL section 13 (a network-served copy has to offer its users
-//! the source, so the link belongs where a user of a running instance can
-//! see it). Three lines, no blank line, both flags byte-identical.
+//! source (a courtesy and attribution: the link sits where a user of a
+//! running instance can see it). Three lines, no blank line, both flags byte-identical.
 
 use assert_cmd::Command;
 

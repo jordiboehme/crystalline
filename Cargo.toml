@@ -15,7 +15,7 @@ members = [
 version = "0.22.0"
 authors = ["Jordi Böhme <jordi@boehme-lopez.de>"]
 edition = "2024"
-license = "AGPL-3.0-or-later"
+license = "MPL-2.0"
 rust-version = "1.99"
 repository = "https://github.com/jordiboehme/crystalline"
 
