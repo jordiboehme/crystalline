@@ -1126,12 +1126,16 @@ impl Engine {
     /// **The new engram goes first, and a failed source edit takes it back out
     /// only while the source is untouched.** First because the failure that
     /// leaves the knowledge in two places is survivable and the one that leaves
-    /// it in none is not. The source edit carries the checksum of the text this
-    /// call planned against, so a concurrent edit refuses it rather than
-    /// dropping somebody's work; a refusal before the source's bytes change -
-    /// that conflict, a read that fails, a write the filesystem refuses -
-    /// deletes the new engram again and hands the caller the failure with the
-    /// archive exactly as it was.
+    /// it in none is not. With an `expected_checksum` the source edit carries
+    /// the checksum of the text this call planned against, so any concurrent
+    /// edit refuses it. Without one the split is last-write-wins: the source
+    /// edit plans the split again against the text it is about to write over
+    /// (see [`Engine::replanned_split_source`]) and lands on top of another
+    /// writer's change, refusing only when the lines it moves changed, since
+    /// those are already in the new engram. A refusal before the source's
+    /// bytes change - either conflict, a read that fails, a write the
+    /// filesystem refuses - deletes the new engram again and hands the caller
+    /// the failure with the archive exactly as it was.
     ///
     /// **Once the source has been rewritten, nothing is undone**, and that is
     /// the invariant rather than an omission: the source no longer holds the
@@ -1147,7 +1151,9 @@ impl Engine {
     /// inside one store transaction that rolls back on any error, so a failure
     /// there is always the untouched case: a concurrent edit comes back as the
     /// `Conflict` it is and the new engram is taken back out, with the stored
-    /// bytes exactly as they were.
+    /// bytes exactly as they were. An unguarded split that loses the row to
+    /// another instance takes the virtual arm's bounded retry first and
+    /// re-plans against the newer text.
     ///
     /// **A moved section takes its relation bullets with it**, since a section
     /// moves as text. That can leave a relation the source declared one-sided;
@@ -1271,20 +1277,28 @@ impl Engine {
         let back_link = new_permalink
             .clone()
             .unwrap_or_else(|| crystalline_core::slugify(&title));
-        let remaining = append_body(&plan.remaining, &format!("- split_into [[{back_link}]]"));
+        // A caller who presented a checksum gets it compared against the text
+        // this call planned against, on every arm. Without one the edit is
+        // last-write-wins: the virtual arm's bounded retry runs, and the
+        // closure re-plans against whatever text the arm is about to write
+        // over, landing only when the lines it moves are the ones already in
+        // the new engram.
+        let guard = p.expected_checksum.as_ref().map(|_| checksum.as_str());
         let edited = self
             .apply_source_edit_staged(
                 &desc,
                 &source,
                 &view,
-                Some(&checksum),
+                guard,
                 &actor,
                 // A split moves words it did not write, so its tail records
                 // the agent without a model, exactly as it records the actor.
                 None,
                 scope,
                 None,
-                move |_| Ok(remaining.clone()),
+                |current| {
+                    Self::replanned_split_source(&plan, current, p, &desc.permalink, &back_link)
+                },
             )
             .await;
         let source_warning = match edited {
@@ -1438,5 +1452,136 @@ impl Engine {
             observations: observations.len(),
             sections: sections.len(),
         })
+    }
+
+    /// The source a split writes, planned again against `current`, the text
+    /// the edit is about to write over: the room's text, the draft, the file
+    /// read inside the write lock or the stored row of this attempt.
+    ///
+    /// The caller's line numbers alone would move the wrong bullets once
+    /// another writer shifted lines, and the first plan's `moved` text already
+    /// sits in the new engram. So the split lands only when the plan made now
+    /// moves exactly the text the first plan moved, compared with line endings
+    /// ignored because the first plan may have been made on CRLF bytes. Anything else, a re-plan
+    /// that fails included, is a conflict, and the caller's rollback takes the
+    /// new engram back out.
+    pub(super) fn replanned_split_source(
+        first: &SplitPlan,
+        current: &str,
+        p: &SplitParams,
+        permalink: &str,
+        back_link: &str,
+    ) -> Result<String> {
+        let changed = || {
+            EngineError::Conflict(
+                "the lines this split moves changed since it read the source; read it again and \
+                 split again"
+                    .to_string(),
+            )
+        };
+        let engram = parse_engram(current).map_err(|_| changed())?;
+        let plan = Self::plan_split(current, &engram, p, permalink).map_err(|_| changed())?;
+        // Line by line rather than through `to_lf` alone: a plan made on CRLF
+        // bytes ends its last moved line in a lone `\r`, since the plan splits
+        // on `\n` and trims only `\n`.
+        let lf = |text: &str| {
+            text.split('\n')
+                .map(|line| line.strip_suffix('\r').unwrap_or(line))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        if lf(&plan.moved) != lf(&first.moved) {
+            return Err(changed());
+        }
+        Ok(append_body(
+            &plan.remaining,
+            &format!("- split_into [[{back_link}]]"),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SOURCE: &str = "---\ntitle: Source\ntype: note\nstatus: stable\npermalink: source\n---\n\n# Source\n\nThe source body.\n\n- [fact] keep one\n- [fact] keep two\n- [fact] keep three\n- [fact] move one\n- [fact] move two\n";
+
+    /// The one-based line of `needle` in `text`, which is how read_engram
+    /// reports an observation.
+    fn line_of(text: &str, needle: &str) -> usize {
+        text.split('\n')
+            .position(|l| l.trim_end_matches('\r') == needle)
+            .unwrap()
+            + 1
+    }
+
+    fn params(text: &str) -> SplitParams {
+        SplitParams {
+            domain: "notes".to_string(),
+            identifier: "source".to_string(),
+            title: "Moved".to_string(),
+            observations: vec![
+                line_of(text, "- [fact] move one"),
+                line_of(text, "- [fact] move two"),
+            ],
+            ..SplitParams::default()
+        }
+    }
+
+    fn first_plan(text: &str, p: &SplitParams) -> SplitPlan {
+        let engram = parse_engram(text).unwrap();
+        Engine::plan_split(text, &engram, p, "source").unwrap()
+    }
+
+    fn is_moved_lines_conflict(err: &EngineError) -> bool {
+        matches!(err, EngineError::Conflict(m) if m.contains("the lines this split moves changed"))
+    }
+
+    #[test]
+    fn replanned_split_lands_on_newer_text_with_an_unrelated_line_appended() {
+        let p = params(SOURCE);
+        let first = first_plan(SOURCE, &p);
+        let newer = format!("{SOURCE}- [fact] from another writer\n");
+        let out = Engine::replanned_split_source(&first, &newer, &p, "source", "moved").unwrap();
+        assert!(out.contains("- [fact] from another writer"), "{out}");
+        assert!(out.contains("- split_into [[moved]]"), "{out}");
+        assert!(out.contains("- [fact] keep one"), "{out}");
+        assert!(!out.contains("move one"), "{out}");
+        assert!(!out.contains("move two"), "{out}");
+    }
+
+    #[test]
+    fn replanned_split_refuses_a_line_inserted_above_the_moved_bullets() {
+        let p = params(SOURCE);
+        let first = first_plan(SOURCE, &p);
+        let newer = SOURCE.replace(
+            "- [fact] keep one\n",
+            "- [fact] inserted above\n- [fact] keep one\n",
+        );
+        let err =
+            Engine::replanned_split_source(&first, &newer, &p, "source", "moved").unwrap_err();
+        assert!(is_moved_lines_conflict(&err), "{err}");
+    }
+
+    #[test]
+    fn replanned_split_refuses_an_edited_moved_bullet() {
+        let p = params(SOURCE);
+        let first = first_plan(SOURCE, &p);
+        let newer = SOURCE.replace("- [fact] move one\n", "- [fact] move one, edited\n");
+        let err =
+            Engine::replanned_split_source(&first, &newer, &p, "source", "moved").unwrap_err();
+        assert!(is_moved_lines_conflict(&err), "{err}");
+    }
+
+    #[test]
+    fn replanned_split_lands_when_only_the_line_endings_differ() {
+        let crlf = SOURCE.replace('\n', "\r\n");
+        let p = params(&crlf);
+        let first = first_plan(&crlf, &p);
+        let out = Engine::replanned_split_source(&first, SOURCE, &p, "source", "moved").unwrap();
+        assert!(out.contains("- split_into [[moved]]"), "{out}");
+        assert!(out.contains("- [fact] keep three"), "{out}");
+        assert!(!out.contains("move one"), "{out}");
+        assert!(!out.contains('\r'), "{out:?}");
     }
 }

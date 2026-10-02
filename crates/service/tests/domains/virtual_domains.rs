@@ -1388,6 +1388,188 @@ async fn an_unguarded_virtual_edit_lands_on_a_concurrent_write_on_postgres() {
     b.drop_schema().await.unwrap();
 }
 
+/// The source the split race tests move two bullets out of, with enough left
+/// behind to pass the Q001 minimum.
+#[cfg(feature = "postgres")]
+const SPLIT_SOURCE: &str = "The split body.\n\n- [fact] keep one\n- [fact] keep two\n- [fact] keep three\n- [fact] move one\n- [fact] move two";
+
+/// The one-based line of `needle` in `text`, which is how read_engram reports
+/// an observation.
+#[cfg(feature = "postgres")]
+fn line_of(text: &str, needle: &str) -> usize {
+    text.split('\n').position(|l| l == needle).unwrap() + 1
+}
+
+#[cfg(feature = "postgres")]
+fn split_moving_two(stored: &str, expected_checksum: Option<String>) -> SplitParams {
+    SplitParams {
+        domain: "notes".to_string(),
+        identifier: "source".to_string(),
+        title: "Moved".to_string(),
+        folder: None,
+        observations: vec![
+            line_of(stored, "- [fact] move one"),
+            line_of(stored, "- [fact] move two"),
+        ],
+        sections: Vec::new(),
+        expected_checksum,
+    }
+}
+
+/// Two instances on one Postgres schema, an engine on A with the split source
+/// written, and B's handle on the stored row.
+#[cfg(feature = "postgres")]
+async fn split_race_setup(
+    url: &str,
+    schema: &str,
+) -> (
+    Arc<Engine>,
+    crystalline_index::PostgresStore,
+    crystalline_index::DomainId,
+    crystalline_index::StoredEngram,
+) {
+    let a = crystalline_index::PostgresStore::open_in_schema(url, schema)
+        .await
+        .unwrap();
+    let b = crystalline_index::PostgresStore::open_in_schema(url, schema)
+        .await
+        .unwrap();
+    let engine = Arc::new(virtual_engine(Arc::new(Mutex::new(a))));
+    engine
+        .write_engram(&write_params("Source", SPLIT_SOURCE))
+        .await
+        .unwrap();
+    let domain = b.domain_id("notes").await.unwrap().unwrap();
+    let row = b.all_engram_contents(domain).await.unwrap().remove(0);
+    (engine, b, domain, row)
+}
+
+/// B holds an uncommitted write that appends an unrelated line while A's
+/// split runs without a checksum: the split re-plans against B's text, finds
+/// the lines it moves unchanged and lands on top of it.
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn an_unguarded_split_lands_on_a_concurrent_write_on_postgres() {
+    let Some(url) = pg_url() else {
+        return;
+    };
+    let schema = unique_schema();
+    let (engine, b, domain, row) = split_race_setup(&url, &schema).await;
+
+    let from_b = format!("{}- [fact] from b\n", row.content);
+    b.begin().await.unwrap();
+    b.upsert_engram(domain, &rewritten(&row.path, &from_b))
+        .await
+        .unwrap();
+    let split = {
+        let engine = Arc::clone(&engine);
+        let p = split_moving_two(&row.content, None);
+        tokio::spawn(async move { engine.split_engram(&p).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    b.commit().await.unwrap();
+    let receipt = split
+        .await
+        .unwrap()
+        .expect("an unguarded split is last-write-wins");
+    let new_permalink = receipt["new"]["permalink"].as_str().unwrap().to_string();
+
+    let stored = b.engram_content(domain, &row.path).await.unwrap().unwrap();
+    assert!(stored.contains("- [fact] from b"), "{stored}");
+    assert!(
+        stored.contains(&format!("- split_into [[{new_permalink}]]")),
+        "{stored}"
+    );
+    assert!(!stored.contains("move one"), "{stored}");
+    let new_path = receipt["new"]["path"].as_str().unwrap();
+    let new = b.engram_content(domain, new_path).await.unwrap().unwrap();
+    assert!(
+        new.contains("- [fact] move one") && new.contains("- [fact] move two"),
+        "{new}"
+    );
+
+    b.drop_schema().await.unwrap();
+}
+
+/// B edits one of the bullets A's unguarded split moves: the split's re-plan
+/// sees the moved text changed, refuses, and takes its new engram back out.
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn an_unguarded_split_whose_moved_lines_changed_is_refused_and_takes_its_engram_back() {
+    let Some(url) = pg_url() else {
+        return;
+    };
+    let schema = unique_schema();
+    let (engine, b, domain, row) = split_race_setup(&url, &schema).await;
+
+    let from_b = row
+        .content
+        .replace("- [fact] move one", "- [fact] move one, changed by b");
+    b.begin().await.unwrap();
+    b.upsert_engram(domain, &rewritten(&row.path, &from_b))
+        .await
+        .unwrap();
+    let split = {
+        let engine = Arc::clone(&engine);
+        let p = split_moving_two(&row.content, None);
+        tokio::spawn(async move { engine.split_engram(&p).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    b.commit().await.unwrap();
+    let err = split
+        .await
+        .unwrap()
+        .expect_err("the moved lines changed under the split");
+    assert!(
+        matches!(&err, EngineError::Conflict(m) if m.contains("the lines this split moves changed")),
+        "{err}"
+    );
+
+    let rows = b.all_engram_contents(domain).await.unwrap();
+    assert_eq!(rows.len(), 1, "the new engram is taken back out");
+    let stored = b.engram_content(domain, &row.path).await.unwrap().unwrap();
+    assert_eq!(stored, from_b);
+
+    b.drop_schema().await.unwrap();
+}
+
+/// With the checksum of the text A read, B's unrelated append refuses A's
+/// split as a stale edit, as it always did.
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn a_guarded_split_is_still_refused_on_any_change() {
+    let Some(url) = pg_url() else {
+        return;
+    };
+    let schema = unique_schema();
+    let (engine, b, domain, row) = split_race_setup(&url, &schema).await;
+
+    let from_b = format!("{}- [fact] from b\n", row.content);
+    b.begin().await.unwrap();
+    b.upsert_engram(domain, &rewritten(&row.path, &from_b))
+        .await
+        .unwrap();
+    let split = {
+        let engine = Arc::clone(&engine);
+        let p = split_moving_two(&row.content, Some(sha_hex(&row.content)));
+        tokio::spawn(async move { engine.split_engram(&p).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    b.commit().await.unwrap();
+    let err = split
+        .await
+        .unwrap()
+        .expect_err("a guarded split refuses the race");
+    assert!(matches!(err, EngineError::Conflict(_)), "{err}");
+
+    let rows = b.all_engram_contents(domain).await.unwrap();
+    assert_eq!(rows.len(), 1, "the new engram is taken back out");
+    let stored = b.engram_content(domain, &row.path).await.unwrap().unwrap();
+    assert_eq!(stored, from_b);
+
+    b.drop_schema().await.unwrap();
+}
+
 /// Turso has no second writer to race with, so what applies there is the
 /// sequential half: an unguarded edit lands on whatever is stored, and a
 /// guarded one against text that moved on is refused.
