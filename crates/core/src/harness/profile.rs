@@ -398,7 +398,7 @@ static GEMINI: HarnessProfile = HarnessProfile {
     imports_hooks_from: &[],
     command_spelling: CommandSpelling::Bare,
     onboarding_verified: false,
-    install_ready: false,
+    install_ready: true,
     project: None,
 };
 

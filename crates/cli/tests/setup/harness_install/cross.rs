@@ -198,3 +198,41 @@ fn inside_cursor_only_cursors_own_hook_prints() {
         .clone();
     assert!(String::from_utf8_lossy(&cursor).contains("additional_context"));
 }
+
+/// Gemini CLI and Codex share `~/.agents/skills`; the last one to leave
+/// takes the files.
+#[test]
+fn uninstalling_gemini_keeps_the_skills_codex_still_needs() {
+    let b = sandbox();
+    cmd(&b)
+        .args(["install", "codex", "--skip-mcp"])
+        .assert()
+        .success();
+    cmd(&b)
+        .args(["install", "gemini", "--skip-mcp"])
+        .assert()
+        .success();
+    cmd(&b).args(["uninstall", "gemini"]).assert().success();
+    assert_eq!(skills_in(&b, ".agents/skills"), 4);
+    cmd(&b).args(["uninstall", "codex"]).assert().success();
+    assert_eq!(
+        skills_in(&b, ".agents/skills"),
+        0,
+        "the last writer takes them"
+    );
+}
+
+#[test]
+fn uninstalling_codex_keeps_the_skills_gemini_still_needs() {
+    let b = sandbox();
+    cmd(&b)
+        .args(["install", "codex", "--skip-mcp"])
+        .assert()
+        .success();
+    cmd(&b)
+        .args(["install", "gemini", "--skip-mcp"])
+        .assert()
+        .success();
+    cmd(&b).args(["uninstall", "codex"]).assert().success();
+    assert_eq!(skills_in(&b, ".agents/skills"), 4);
+}
