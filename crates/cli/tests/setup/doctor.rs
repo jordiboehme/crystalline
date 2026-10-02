@@ -1677,6 +1677,244 @@ fn harness_entry<'a>(report: &'a Value, name: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("no {name} entry in harnesses: {report}"))
 }
 
+/// A bin folder holding only a `crystalline` symlink to the binary under
+/// test, so the absolute spelling Cursor and Kiro get is deterministic.
+#[cfg(unix)]
+fn shim_bin(home: &Path) -> PathBuf {
+    let bin = home.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let link = bin.join("crystalline");
+    if !link.exists() {
+        std::os::unix::fs::symlink(assert_cmd::cargo::cargo_bin("crystalline"), &link).unwrap();
+    }
+    bin
+}
+
+#[cfg(unix)]
+fn run_in(home: &Path, args: &[&str]) -> Vec<u8> {
+    let mut cmd = bin();
+    apply_home(&mut cmd, home);
+    cmd.env_remove("COPILOT_HOME").env("PATH", shim_bin(home));
+    cmd.args(args)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone()
+}
+
+#[cfg(unix)]
+fn doctor_json(home: &Path, work: &Path) -> Value {
+    let (config, db) = empty_config(work);
+    let out = run_in(
+        home,
+        &[
+            "--json",
+            "doctor",
+            "--config",
+            config.to_str().unwrap(),
+            "--db",
+            db.to_str().unwrap(),
+        ],
+    );
+    serde_json::from_slice(&out).unwrap()
+}
+
+#[cfg(unix)]
+fn doctor_human(home: &Path, work: &Path) -> String {
+    let (config, db) = empty_config(work);
+    let out = run_in(
+        home,
+        &[
+            "doctor",
+            "--config",
+            config.to_str().unwrap(),
+            "--db",
+            db.to_str().unwrap(),
+        ],
+    );
+    String::from_utf8(out).unwrap()
+}
+
+/// Decision 16.
+#[test]
+#[cfg(unix)]
+fn a_machine_without_the_new_harnesses_shows_the_same_three_entries() {
+    let (home, _) = isolated_home("harness-legacy-only");
+    let work = tempfile::tempdir().unwrap();
+    run_in(&home, &["install", "claude-code", "--skip-mcp"]);
+    let report = doctor_json(&home, work.path());
+    let names: Vec<&str> = report["harnesses"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["claude-code", "codex", "copilot"]);
+    assert!(
+        harness_entry(&report, "claude-code")
+            .get("mcp_entry")
+            .is_none(),
+        "legacy JSON unchanged: {report}"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+#[cfg(unix)]
+fn each_new_harness_reports_its_mcp_entry_hook_pointer_and_skills() {
+    // Only Kiro owns a pointer file; Gemini and Qwen never get one
+    // (install does not edit instruction files).
+    for (id, pointer) in [
+        ("cursor", false),
+        ("kiro", true),
+        ("gemini", false),
+        ("qwen", false),
+    ] {
+        let (home, _) = isolated_home(&format!("harness-{id}"));
+        let work = tempfile::tempdir().unwrap();
+        run_in(&home, &["install", id]);
+        let report = doctor_json(&home, work.path());
+        let h = harness_entry(&report, id);
+        assert_eq!(h["mcp_entry"], "up-to-date", "{id}: {h}");
+        assert_eq!(h["session_start_hook"], true, "{id}: {h}");
+        assert_eq!(h["stop_hook"], false, "{id}: {h}");
+        assert!(h["prompt_hook"].is_null(), "{id}: {h}");
+        if pointer {
+            assert_eq!(h["pointer_present"], true, "{id}: {h}");
+            assert!(
+                h["pointer_path"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with("crystalline.md")
+            );
+        } else {
+            assert!(
+                h.get("pointer_present").is_none(),
+                "{id} has no pointer: {h}"
+            );
+            assert!(h.get("pointer_path").is_none(), "{id} has no pointer: {h}");
+        }
+        assert!(
+            h["skills_folder"].as_str().unwrap().ends_with("skills"),
+            "{id}: {h}"
+        );
+        assert_eq!(h["skills_installed"], 4, "{id}: {h}");
+        let human = doctor_human(&home, work.path());
+        assert!(
+            !human.contains(&format!("partial setup - run: crystalline install {id}")),
+            "{id}: {human}"
+        );
+        assert!(
+            !human.contains("UserPromptSubmit hook: not available"),
+            "{id}: {human}"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn a_malformed_mcp_json_is_a_problem_doctor_counts() {
+    let (home, _) = isolated_home("harness-cursor-broken");
+    let work = tempfile::tempdir().unwrap();
+    run_in(&home, &["install", "cursor"]);
+    std::fs::write(home.join(".cursor/mcp.json"), "{").unwrap();
+    let (config, db) = empty_config(work.path());
+    let mut cmd = bin();
+    apply_home(&mut cmd, &home);
+    let out = cmd
+        .env("PATH", shim_bin(&home))
+        .args(["--json", "doctor", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .code(1)
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&out).unwrap();
+    let err = harness_entry(&report, "cursor")["mcp_parse_error"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(err.contains("mcp.json") && err.contains("line"), "{err}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+#[cfg(unix)]
+fn cursor_beside_claude_code_carries_the_dedupe_note_and_the_cover() {
+    let (home, _) = isolated_home("harness-cursor-claude");
+    let work = tempfile::tempdir().unwrap();
+    run_in(&home, &["install", "claude-code", "--skip-mcp"]);
+    run_in(&home, &["install", "cursor"]);
+    let report = doctor_json(&home, work.path());
+    let c = harness_entry(&report, "cursor");
+    assert!(
+        c["note"].as_str().unwrap().contains("stays silent there"),
+        "{c}"
+    );
+    assert!(
+        c["skills_covered_by"]
+            .as_str()
+            .unwrap()
+            .ends_with(".claude/skills"),
+        "{c}"
+    );
+    assert_eq!(
+        c["skills_installed"], 0,
+        "a covered row writes nothing: {c}"
+    );
+    let human = doctor_human(&home, work.path());
+    assert!(human.contains("covered by"), "{human}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A folder several harnesses write is attributed to the rows that write it,
+/// never to a harness that did not install anything there.
+#[test]
+#[cfg(unix)]
+fn skills_cursor_wrote_in_the_shared_folder_are_not_codex_skills() {
+    let (home, _) = isolated_home("harness-shared-folder");
+    let work = tempfile::tempdir().unwrap();
+    run_in(&home, &["install", "cursor"]);
+    let report = doctor_json(&home, work.path());
+    assert_eq!(harness_entry(&report, "cursor")["skills_installed"], 4);
+    assert_eq!(
+        harness_entry(&report, "codex")["skills_installed"],
+        0,
+        "{report}"
+    );
+    run_in(&home, &["install", "codex", "--skip-mcp"]);
+    let report = doctor_json(&home, work.path());
+    assert_eq!(harness_entry(&report, "codex")["skills_installed"], 4);
+    assert_eq!(harness_entry(&report, "cursor")["skills_installed"], 4);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Without a hook install writes the MCP entry and the skills only, and
+/// doctor names the missing part. Gemini has no pointer either way.
+#[test]
+#[cfg(unix)]
+fn gemini_without_its_hook_is_a_partial_setup_and_no_instruction_file_appears() {
+    let (home, _) = isolated_home("harness-gemini-nohook");
+    let work = tempfile::tempdir().unwrap();
+    run_in(&home, &["install", "gemini", "--skip-hooks"]);
+    assert!(!home.join(".gemini/GEMINI.md").exists());
+    let human = doctor_human(&home, work.path());
+    assert!(
+        human.contains("partial setup - run: crystalline install gemini"),
+        "{human}"
+    );
+    let report = doctor_json(&home, work.path());
+    let g = harness_entry(&report, "gemini");
+    assert_eq!(g["session_start_hook"], false);
+    assert_eq!(g["mcp_entry"], "up-to-date");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 #[test]
 #[cfg(unix)]
 fn harnesses_section_reports_both_hooks_present_after_install() {

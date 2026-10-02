@@ -676,12 +676,21 @@ pub(crate) fn run_install(opts: &InstallOptions, json: bool) -> anyhow::Result<(
     let pointer = install_pointer(&mut run);
 
     let prior_skills = prior.as_ref().map(|p| p.skills.as_slice()).unwrap_or(&[]);
+    // Like a failed hook, a skills error fails that part with its reason and
+    // lets the other parts stand: the receipt then keeps what it recorded.
     let (skills, new_records) = if opts.skip_skills {
         (None, None)
     } else {
-        let (report, records) = install_skills(harness, &book, prior_skills, &run.folders())?;
-        (Some(report), Some(records))
+        match install_skills(harness, &book, prior_skills, &run.folders()) {
+            Ok((report, records)) => (Some(report), Some(records)),
+            Err(e) => {
+                run.notices
+                    .push(format!("The skills were not installed: {e}."));
+                (None, None)
+            }
+        }
     };
+    let skills_left_alone = opts.skip_skills || new_records.is_none();
 
     let mcp_done = mcp.as_ref().is_some_and(|m| m.status != "failed");
     let hook_done = hook.as_ref().is_some_and(|h| h.installed);
@@ -693,12 +702,12 @@ pub(crate) fn run_install(opts: &InstallOptions, json: bool) -> anyhow::Result<(
     let parts = receipt::Parts {
         mcp: prior_parts.mcp || mcp_done,
         hooks: prior_parts.hooks || hook_done,
-        skills: prior_parts.skills || !opts.skip_skills,
+        skills: prior_parts.skills || !skills_left_alone,
     };
     // As in the legacy install: a recorded hooks or skills part this run did
     // not bring up to date keeps the earlier version, so the session-start
     // refresh still sees the difference and catches up.
-    let stale = (!hook_done && parts.hooks) || (opts.skip_skills && parts.skills);
+    let stale = (!hook_done && parts.hooks) || (skills_left_alone && parts.skills);
     let version = match (&prior, stale) {
         (Some(p), true) => p.version.clone(),
         _ => env!("CARGO_PKG_VERSION").to_string(),

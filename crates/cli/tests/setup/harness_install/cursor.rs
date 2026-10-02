@@ -164,6 +164,43 @@ fn a_malformed_file_is_refused_and_the_other_parts_still_install() {
     );
 }
 
+/// A skills error fails the skills part with a message and leaves the other
+/// parts standing, as a hooks error does; it does not abort the install.
+#[test]
+fn a_skills_error_fails_the_skills_part_only() {
+    let b = sandbox();
+    // A plain file where the skills folder would go.
+    write(&b.home.join(".agents/skills"), b"in the way\n");
+    let out = cmd(&b)
+        .args(["--json", "install", "cursor"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(report["mcp"]["status"], "registered");
+    assert_eq!(report["hooks"]["session_start"], "added");
+    assert!(report.get("skills").is_none_or(|v| v.is_null()), "{report}");
+    let notices = report["notices"].to_string();
+    assert!(
+        notices.contains("The skills were not installed"),
+        "{notices}"
+    );
+    let r = receipt(&b);
+    let row = r["installs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["harness"] == "cursor")
+        .unwrap();
+    assert_eq!(
+        row["parts"],
+        json!({"mcp": true, "hooks": true, "skills": false}),
+        "the failed part is not recorded"
+    );
+}
+
 /// A hooks file whose `hooks` is not an object holds nothing of ours and
 /// gets nothing: the hook part fails, the file stays, and the receipt does
 /// not claim a hook the MCP gate would then trust.
