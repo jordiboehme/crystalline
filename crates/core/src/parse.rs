@@ -757,18 +757,28 @@ fn top_level_bullet(line: &str) -> Option<&str> {
     line.strip_prefix("- ")
 }
 
-fn parse_observation_head(content: &str) -> Option<(String, String)> {
-    if !content.starts_with('[') {
-        return None;
-    }
-    let rest = &content[1..];
+/// The leading `[category]` of a bullet's content and the text after it, or
+/// `None` when the content does not start with one. A bracket directly
+/// followed by `(` is a markdown inline link and one directly followed by `[`
+/// a reference link, so neither is a category. The one place that decides it:
+/// the parser and the tag rewriter both ask here.
+pub(crate) fn split_category(content: &str) -> Option<(&str, &str)> {
+    let rest = content.strip_prefix('[')?;
     let close = rest.find(']')?;
     let category = &rest[..close];
     if category.is_empty() || category.contains('[') {
         return None;
     }
-    let body = rest[close + 1..].trim_start();
-    Some((category.trim().to_string(), body.to_string()))
+    let after = &rest[close + 1..];
+    if after.starts_with(['(', '[']) {
+        return None;
+    }
+    Some((category, after))
+}
+
+fn parse_observation_head(content: &str) -> Option<(String, String)> {
+    let (category, after) = split_category(content)?;
+    Some((category.trim().to_string(), after.trim_start().to_string()))
 }
 
 fn split_observation(body: &str) -> (String, Vec<String>, Option<String>) {
@@ -1127,6 +1137,31 @@ mod tests {
             contents,
             vec!["see [[Done]] and more", "code `[[x` here wraps"]
         );
+    }
+
+    #[test]
+    fn a_bullet_that_starts_with_a_link_is_not_a_category() {
+        let obs = observations_of("- [label](https://x) - text\n");
+        assert!(obs.is_empty(), "{obs:?}");
+        let obs = observations_of("- [label][ref] text\n- [fact](x)\n");
+        assert!(obs.is_empty(), "{obs:?}");
+        let obs = observations_of("- [fact] x\n- [fact]y\n");
+        let got: Vec<(&str, &str)> = obs
+            .iter()
+            .map(|o| (o.category.as_str(), o.content.as_str()))
+            .collect();
+        assert_eq!(got, vec![("fact", "x"), ("fact", "y")]);
+    }
+
+    #[test]
+    fn a_wrapped_bullet_that_starts_with_a_link_is_not_a_category() {
+        let (obs, relations, _, _) = scan_body(
+            "- [label](https://x) - text that\n  wraps here\n- [fact] next\n",
+            1,
+        );
+        assert!(relations.is_empty(), "{relations:?}");
+        let contents: Vec<&str> = obs.iter().map(|o| o.content.as_str()).collect();
+        assert_eq!(contents, vec!["next"]);
     }
 
     #[test]

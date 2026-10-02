@@ -501,15 +501,7 @@ fn is_observation_bullet(line: &str) -> bool {
     let Some(content) = line.strip_prefix("- ") else {
         return false;
     };
-    if !content.starts_with('[') {
-        return false;
-    }
-    let rest = &content[1..];
-    let Some(close) = rest.find(']') else {
-        return false;
-    };
-    let category = &rest[..close];
-    !category.is_empty() && !category.contains('[')
+    crate::parse::split_category(content).is_some()
 }
 
 /// Rewrite the hashtag tokens inside the trailing region `#a #b #c`, preserving
@@ -572,6 +564,13 @@ mod tests {
 
     fn retagged(source: &str, old: &str, new: &str) -> (String, usize) {
         retag(source, old, new).expect("retag changed the source")
+    }
+
+    #[test]
+    fn a_link_bullet_is_not_an_observation_bullet() {
+        assert!(is_observation_bullet("- [fact] x #a"));
+        assert!(!is_observation_bullet("- [label](https://x) #a"));
+        assert!(!is_observation_bullet("- [label][ref] #a"));
     }
 
     #[test]
