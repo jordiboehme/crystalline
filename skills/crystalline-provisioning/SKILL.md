@@ -9,7 +9,7 @@ A domain can ship the tools its knowledge depends on - skills, commands, agents 
 
 ## Before you start
 
-Call `provision` with `action: "status"` first. Stop and say why when the Crystalline server does not run on the person's own machine (hand them the `crystalline provision` commands to run there instead), when `status` lists no harness (they run `crystalline install <harness>` first) or when the domain is virtual (it cannot ship tools). Call `origin_status`: if the domain has a team origin, choose the location from "Team domains" below.
+Call `provision` with `action: "status"` first. Stop and say why when the Crystalline server does not run on the person's own machine (hand them the `crystalline provision` commands to run there instead), when `status` lists no harness (they run `crystalline install <harness>` first) or when the domain is virtual (it cannot ship tools). Call `origin_status`: if the domain has a team origin, choose the location from "Team domains" below. If it refuses because collaboration is off, the domain is local; do not turn collaboration on for this.
 
 ## Choose where the tools live
 
@@ -78,7 +78,7 @@ A request to set up provisioning is not consent to allow it.
 
 ## Check the result
 
-Call `provision` `status` and compare each declared kind's count with what you laid out; a zero for a declared kind means its path is wrong. Relay every notice from the apply to the person: skipped artifacts, dropped fields, an MCP name already registered outside Crystalline (they remove it first) and any command they must run by hand. With a shell, also run `crystalline doctor`.
+Call `provision` `status` and compare the domain's count for each declared kind with what you laid out; a zero there means that kind's path is wrong. A harness that cannot carry a kind shows zero for it, which says nothing about the path. Relay every notice from the apply to the person: skipped artifacts, dropped fields, an MCP name already registered outside Crystalline (they remove it first) and any command they must run by hand. With a shell, also run `crystalline doctor`.
 
 ## Change or update later
 
