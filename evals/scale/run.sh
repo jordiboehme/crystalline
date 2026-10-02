@@ -12,6 +12,7 @@
 #   bash evals/scale/run.sh --stage base
 #   bash evals/scale/run.sh --stage embed
 #   bash evals/scale/run.sh --stage daemon
+#   bash evals/scale/run.sh --stage nli --nli-profile full [--nli-lift no]
 #
 # The stages are separate because the embedding pass takes over an hour on a
 # laptop, and they run in that order: `base` builds the index from scratch and
@@ -23,14 +24,32 @@
 # stage embeds nothing at all. It refuses rather than reporting that nothing
 # took no time.
 #
+# `nli` sets `evolve.contradictions` to one profile, starts the daemon, waits
+# until nothing is pending, samples the resident size until the model is
+# dropped, and dumps every stored row. By default (`--nli-lift yes`) it lowers
+# the related line to 0.70 and lifts the pair cap, so higher lines are
+# evaluated off the stored cosine without rescoring: run that on a probes
+# corpus (`generate.py --domains 1 --engrams-per-domain 200 --contradictions
+# 400`), because on the ten-thousand-engram corpus a lifted cap means weeks of
+# CPU (its lead cosines are degenerate, see `TWIN_THRESHOLD`). `--nli-lift no`
+# keeps the product's own caps: that is the drain time and resident size of
+# the full corpus. A pre-flight projects the drain from the first pass and
+# aborts when it would exceed `DRAIN_LIMIT`. Each profile runs with its own
+# model cache, because a daemon prunes every NLI checkpoint but its own at
+# start.
+#
 set -euo pipefail
 
 BIN="target/release/crystalline"
 CORPUS="evals/scale/corpus"
 OUT="evals/scale/out"
 STAGE="all"
-DRAIN_LIMIT=1800   # seconds to wait for the daemon's embedding backlog
+DRAIN_LIMIT="${DRAIN_LIMIT:-1800}"   # seconds to wait for the daemon's embedding backlog
 SAMPLE_EVERY=10    # seconds between resident-size samples
+NLI_PROFILE="full"
+NLI_LIFT="yes"
+NLI_UNLOAD_WAIT="${NLI_UNLOAD_WAIT:-960}"   # seconds to keep sampling after the drain, for the idle drop
+NLI_SEED_MODELS="${NLI_SEED_MODELS:-}"   # a directory already holding this profile's checkpoint, hf-hub cache shape
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -38,6 +57,8 @@ while [ $# -gt 0 ]; do
     --corpus) CORPUS="$2"; shift 2 ;;
     --out) OUT="$2"; shift 2 ;;
     --stage) STAGE="$2"; shift 2 ;;
+    --nli-profile) NLI_PROFILE="$2"; shift 2 ;;
+    --nli-lift) NLI_LIFT="$2"; shift 2 ;;
     # The header block above, which ends at the line before `set -euo
     # pipefail`, so --help never truncates mid-sentence when it is edited.
     -h|--help) sed -n '2,/^set -euo pipefail$/p' "$0" | sed '$d'; exit 0 ;;
@@ -46,8 +67,8 @@ while [ $# -gt 0 ]; do
 done
 
 case "$STAGE" in
-  all|base|embed|daemon) ;;
-  *) echo "--stage must be all, base, embed or daemon" >&2; exit 2 ;;
+  all|base|embed|daemon|nli) ;;
+  *) echo "--stage must be all, base, embed, daemon or nli" >&2; exit 2 ;;
 esac
 
 command -v "$BIN" >/dev/null 2>&1 || [ -x "$BIN" ] || {
@@ -74,6 +95,10 @@ OUT="$(cd "$OUT" && pwd)"
 # measures embedding rather than a 128 MB download.
 REAL_HOME="$HOME"
 export CRYSTALLINE_MODELS_DIR="${CRYSTALLINE_MODELS_DIR:-$REAL_HOME/.cache/crystalline/models}"
+# tracing-subscriber writes ANSI color codes into daemon.log unless told not
+# to, and both log parsers below (the nli pre-flight and evaluate.py's
+# speed()) have to read those lines back out.
+export NO_COLOR=1
 export HOME="$OUT/home"
 export XDG_CONFIG_HOME="$HOME/.config"
 export XDG_DATA_HOME="$HOME/.local/share"
@@ -92,7 +117,9 @@ LOGS="$OUT/logs"
 CSV="$OUT/results.csv"
 mkdir -p "$LOGS"
 
-DOMAINS="platform observatory harbor meridian atelier"
+# Every corpus directory with a MANIFEST.md: the five generated domains, and
+# `probes` when the corpus was generated with --contradictions.
+DOMAINS="$(cd "$CORPUS" && for d in */; do [ -f "$d/MANIFEST.md" ] && printf '%s ' "${d%/}"; done)"
 
 # Ten fixed queries, every term drawn from the generated vocabulary.
 QUERIES=(
@@ -220,9 +247,11 @@ stage_base() {
   for d in $DOMAINS; do
     run_step "verify-$d" "$BIN" verify "$CORPUS/$d"
   done
-  run_step "verify-all" "$BIN" verify \
-    "$CORPUS/platform" "$CORPUS/observatory" "$CORPUS/harbor" \
-    "$CORPUS/meridian" "$CORPUS/atelier"
+  local verify_args=()
+  for d in $DOMAINS; do
+    verify_args+=("$CORPUS/$d")
+  done
+  run_step "verify-all" "$BIN" verify ${verify_args[@]+"${verify_args[@]}"}
   search_battery "search" "text hybrid semantic"
   run_step "evolve" "$BIN" evolve --limit 10 --config "$CFG" --db "$DB"
   run_step "evolve-temporal" \
@@ -342,10 +371,248 @@ stage_daemon() {
   printf '  %-34s exit %-3s %8ss %9s MB\n' "daemon-peak-sampled" 0 "$elapsed" "$peak"
 }
 
+stage_nli() {
+  local profile="$NLI_PROFILE" repo
+  case "$profile" in
+    full) repo="MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7" ;;
+    *) echo "--nli-profile must be full" >&2; return 2 ;;
+  esac
+  if [ "$NLI_LIFT" = "yes" ] && [ ! -f "$CORPUS/contradictions.json" ]; then
+    echo "--nli-lift yes measures precision on planted pairs; generate a probes corpus with --contradictions" >&2
+    return 2
+  fi
+  # The lifted pair cap is 20 times the planted pair count rather than a huge
+  # constant, so a probes corpus with many engrams cannot still blow up into a
+  # quadratic scan; the cap only ever needs to clear "every planted pair plus
+  # some slack", not "everything".
+  local lift=()
+  case "$NLI_LIFT" in
+    yes)
+      local planted cap
+      planted="$(python3 -c 'import json,sys
+print(len(json.load(open(sys.argv[1]))))' "$CORPUS/contradictions.json")"
+      cap=$((planted * 20))
+      lift=(CRYSTALLINE_NLI_RELATED=0.70 "CRYSTALLINE_NLI_MAX_PAIRS=$cap")
+      ;;
+    no) ;;
+    *) echo "--nli-lift must be yes or no" >&2; return 2 ;;
+  esac
+  echo "== nli ($profile, lift $NLI_LIFT) =="
+
+  # A direct `serve --daemon` never forks: the process invoked below is the
+  # daemon itself, running until `ctl shutdown`, and its tracing output goes
+  # wherever its own stderr points (the state directory's conventional
+  # daemon.log is only ever written by the internal auto-spawn path, which
+  # this is not). So this stage owns that path explicitly and starts it fresh,
+  # rather than searching for a file a direct invocation never creates.
+  local daemon_log="$XDG_STATE_HOME/crystalline/daemon.log"
+  mkdir -p "$(dirname "$daemon_log")"
+  rm -f "$daemon_log"
+
+  # A model cache of this profile's own, seeded with a clone of the embedding
+  # model so the stage measures scoring rather than a download. Checked (and
+  # seeded) per checkpoint, not only when the whole directory is missing, so a
+  # rerun that reuses an existing $models still gets the NLI checkpoint copied
+  # in the first time it is needed. NLI_SEED_MODELS, when set, points at a
+  # directory already holding this profile's own checkpoint (the hf-hub cache
+  # shape, `models--<org>--<name>`) - without it a first run of a given
+  # profile still downloads that one checkpoint, exactly like a real install.
+  local models="$OUT/models-$profile"
+  mkdir -p "$models"
+  local granite_dir
+  for granite_dir in "$CRYSTALLINE_MODELS_DIR"/models--ibm-granite--*; do
+    [ -d "$granite_dir" ] || continue
+    [ -d "$models/$(basename "$granite_dir")" ] || {
+      cp -Rc "$granite_dir" "$models/" 2> /dev/null || cp -R "$granite_dir" "$models/"
+    }
+  done
+  if [ -n "$NLI_SEED_MODELS" ]; then
+    local hub_name="models--${repo//\//--}"
+    if [ -d "$NLI_SEED_MODELS/$hub_name" ] && [ ! -d "$models/$hub_name" ]; then
+      cp -Rc "$NLI_SEED_MODELS/$hub_name" "$models/" 2> /dev/null \
+        || cp -R "$NLI_SEED_MODELS/$hub_name" "$models/"
+    fi
+  fi
+
+  local rss="$OUT/nli-$profile-rss.csv" stop="$OUT/.nli-sampler-stop"
+  rm -f "$stop"
+  echo "seconds,rss_mb,pending,loaded" > "$rss"
+  run_step "config-contradictions-$profile" "$BIN" config set evolve.contradictions "$profile" --config "$CFG"
+
+  { env CRYSTALLINE_MODELS_DIR="$models" ${lift[@]+"${lift[@]}"} \
+      /usr/bin/time -l "$BIN" serve --daemon --http off --config "$CFG" --db "$DB" \
+      > "$LOGS/serve-daemon-nli-$profile.log"; } 2> "$daemon_log" &
+  local job=$! waited=0 pid=""
+  while [ "$waited" -lt 180 ]; do
+    pid="$(status_field pid)"
+    [ -n "$pid" ] && break
+    kill -0 "$job" 2> /dev/null || break
+    sleep 2
+    waited=$((waited + 2))
+  done
+  if [ -z "$pid" ]; then
+    echo "the daemon never answered ctl status; see $daemon_log" >&2
+    kill "$job" 2> /dev/null || true
+    wait "$job" 2> /dev/null || true
+    return 1
+  fi
+
+  (
+    local_elapsed=0
+    while [ ! -f "$stop" ]; do
+      kill -0 "$pid" 2> /dev/null || break
+      size="$(ps -o rss= -p "$pid" 2> /dev/null | tr -d ' ')"
+      now_json="$("$BIN" ctl status --json 2> /dev/null || true)"
+      pending="$(printf '%s' "$now_json" | json_field contradictions.pending_pairs)"
+      loaded="$(printf '%s' "$now_json" | python3 -c 'import json,sys
+try: d = json.load(sys.stdin)
+except Exception: sys.exit(0)
+print("true" if any(a.get("kind") == "contradictions" for a in d.get("activity", {}).get("now", [])) else "false")')"
+      printf '%s,%s,%s,%s\n' "$local_elapsed" \
+        "$(awk -v k="${size:-0}" 'BEGIN { printf "%.1f", k / 1024 }')" "$pending" "$loaded" >> "$rss"
+      sleep "$SAMPLE_EVERY"
+      local_elapsed=$((local_elapsed + SAMPLE_EVERY))
+    done
+  ) &
+  local sampler=$!
+
+  # Drained when the daemon reports zero pending after it has reported a
+  # number at all (null means no pass ran yet). Once the first pass has logged
+  # its speed, project the whole drain from the average cost per pair scored
+  # so far (cumulative over every pass logged, not just the first) and stop
+  # early when it cannot finish inside DRAIN_LIMIT: that projection is a
+  # result too, and a night is not. Measured, not assumed worst-case: an
+  # earlier version of this projection assumed every pending pair needed the
+  # full 64 line pairs both orders (8 batches/pair); a probes corpus (2
+  # observation bullets per engram, so 4 line pairs and about 1 batch per
+  # pair) made that overestimate the remaining time by about 8x, which was
+  # large enough to trip DRAIN_LIMIT on a run that would actually finish
+  # comfortably. The corpus this harness generates - probes or the standard
+  # 10k one - always writes exactly two observation bullets per engram
+  # (`generate.py`'s `engram_text`), so the average from whatever has already
+  # been scored this run is a sound estimate for what is left, not a guess
+  # tuned to one corpus shape.
+  local elapsed=0 pending checked="" estimate drained_ok=""
+  while [ "$elapsed" -lt "$DRAIN_LIMIT" ]; do
+    kill -0 "$pid" 2> /dev/null || { echo "the daemon died after ${elapsed}s" >&2; break; }
+    pending="$(status_field contradictions.pending_pairs)"
+    if [ "$pending" = "0" ]; then
+      echo "contradiction backlog drained after about ${elapsed}s"
+      drained_ok=1
+      break
+    fi
+    if [ -z "$checked" ] && [ -f "$daemon_log" ] && [ -n "$pending" ] && [ "$pending" != "None" ]; then
+      estimate="$(python3 - "$daemon_log" "$pending" <<'PY'
+import re, sys
+log, pending = sys.argv[1], int(sys.argv[2])
+ansi = re.compile(r"\x1b\[[0-9;]*m")
+ms = pairs = 0
+for raw in open(log, encoding="utf-8", errors="replace"):
+    line = ansi.sub("", raw)
+    if "scored related pairs for possible contradictions" not in line:
+        continue
+    m_ms = re.search(r"\bms=(\d+)", line)
+    m_pairs = re.search(r"\bpairs=(\d+)", line)
+    if not (m_ms and m_pairs):
+        continue
+    ms += int(m_ms.group(1))
+    pairs += int(m_pairs.group(1))
+if pairs:
+    print(int(pending * ms / pairs / 1000))
+PY
+)"
+      if [ -n "$estimate" ]; then
+        checked=1
+        echo "projected drain: about ${estimate}s for $pending pending pairs"
+        if [ "$estimate" -gt "$DRAIN_LIMIT" ]; then
+          echo "the projection exceeds DRAIN_LIMIT=${DRAIN_LIMIT}s; stopping. Measure precision on a probes corpus, time the full corpus with --nli-lift no" >&2
+          "$BIN" ctl shutdown || true
+          touch "$stop"
+          wait "$sampler" 2> /dev/null || true
+          wait "$job" || true
+          return 1
+        fi
+      fi
+    fi
+    sleep "$SAMPLE_EVERY"
+    elapsed=$((elapsed + SAMPLE_EVERY))
+  done
+  local drained="$elapsed" fully_drained="false"
+  if [ -n "$drained_ok" ]; then
+    fully_drained="true"
+  else
+    echo "the contradiction backlog did not drain (daemon died, or ${DRAIN_LIMIT}s ran out); the dump below is partial" >&2
+  fi
+  run_step "ctl-status-nli-$profile" "$BIN" ctl status
+  if kill -0 "$pid" 2> /dev/null; then
+    echo "sampling ${NLI_UNLOAD_WAIT}s more for the idle drop"
+    sleep "$NLI_UNLOAD_WAIT"
+  else
+    echo "the daemon is already gone; skipping the ${NLI_UNLOAD_WAIT}s idle-drop sample"
+  fi
+  touch "$stop"
+  wait "$sampler" 2> /dev/null || true
+  run_step "ctl-shutdown-nli-$profile" "$BIN" ctl shutdown
+  wait "$job" || true
+  [ -f "$daemon_log" ] && cp "$daemon_log" "$LOGS/daemon-nli-$profile.log"
+
+  # Every stored row and every scored pair, with texts and cosines, read
+  # straight off the index file once the daemon has let go of it.
+  python3 - "$DB" "$repo" "$profile" "$drained" "$OUT/nli-$profile.json" "$fully_drained" <<'PY'
+import json, sqlite3, sys
+db, repo, profile, drained, out, fully_drained = sys.argv[1:7]
+con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+columns = {r[1] for r in con.execute("PRAGMA table_info(contradiction)")}
+if "similarity" not in columns:
+    sys.exit(
+        f"error: {db} has no contradiction.similarity column; it was built before the line filter "
+        "and is stale. Delete the index (or the whole out directory) and rerun the stages."
+    )
+rows = con.execute(
+    """SELECT d.name, ea.permalink, eb.permalink, c.line_a, c.line_b, c.score_ab, c.score_ba,
+              c.period, p.cosine, c.similarity, oa.content, ob.content
+       FROM contradiction c
+       JOIN contradiction_pair p ON p.engram_a = c.engram_a AND p.engram_b = c.engram_b AND p.model = c.model
+       JOIN engram ea ON ea.id = c.engram_a
+       JOIN engram eb ON eb.id = c.engram_b
+       JOIN domain d ON d.id = c.domain_id
+       LEFT JOIN observation oa ON oa.engram_id = c.engram_a AND oa.line = c.line_a
+       LEFT JOIN observation ob ON ob.engram_id = c.engram_b AND ob.line = c.line_b
+       WHERE c.model = ?""",
+    (repo,),
+).fetchall()
+pairs = con.execute(
+    """SELECT d.name, ea.permalink, eb.permalink, p.cosine FROM contradiction_pair p
+       JOIN engram ea ON ea.id = p.engram_a JOIN engram eb ON eb.id = p.engram_b
+       JOIN domain d ON d.id = p.domain_id WHERE p.model = ?""",
+    (repo,),
+).fetchall()
+keys = ["domain", "a", "b", "line_a", "line_b", "score_ab", "score_ba", "period", "cosine", "similarity", "a_text", "b_text"]
+json.dump(
+    {
+        "profile": profile,
+        "model": repo,
+        "wall_seconds": int(drained),
+        "drained": fully_drained == "true",
+        "rows": [dict(zip(keys, r)) for r in rows],
+        "pairs": [dict(zip(["domain", "a", "b", "cosine"], p)) for p in pairs],
+    },
+    open(out, "w", encoding="utf-8"),
+    ensure_ascii=False,
+    indent=1,
+)
+note = "" if fully_drained == "true" else " (PARTIAL: the backlog had not drained)"
+print(f"dumped {len(rows)} rows over {len(pairs)} scored pairs to {out}{note}")
+PY
+  printf '%s,%s,%s,%s,%s\n' "$STAGE" "nli-$profile-drain" 0 "$drained" \
+    "$(awk -F, 'NR > 1 && $2 != "" && $2 + 0 > m { m = $2 + 0 } END { printf "%.1f", m }' "$rss")" >> "$CSV"
+}
+
 case "$STAGE" in
   base) stage_base ;;
   embed) stage_embed ;;
   daemon) stage_daemon ;;
+  nli) stage_nli ;;
   all) stage_base; stage_embed; stage_daemon ;;
 esac
 

@@ -594,7 +594,7 @@ async fn unknown_domain_family_and_rule_error_with_the_valid_set() {
         .to_string();
     assert_eq!(
         e,
-        "unknown family 'lifecycle'; valid families: temporal, structure, redundancy"
+        "unknown family 'lifecycle'; valid families: temporal, structure, redundancy, meaning"
     );
 
     let e = engine
@@ -613,7 +613,7 @@ async fn unknown_domain_family_and_rule_error_with_the_valid_set() {
         "{e}"
     );
     // The catalog's last id, so the error names the whole of it.
-    assert!(e.ends_with("V301"), "{e}");
+    assert!(e.ends_with("V302"), "{e}");
 
     let e = engine
         .evolve_engrams(
@@ -2725,6 +2725,7 @@ async fn a_reference_dropped_only_in_a_draft_still_never_orphans_a_shared_file()
                 content: Some("the deck is elsewhere now".to_string()),
                 key: None,
                 value: None,
+                values: None,
                 expected_replacements: None,
                 section: None,
                 include_subsections: false,

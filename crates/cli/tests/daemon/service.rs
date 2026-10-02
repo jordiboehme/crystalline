@@ -160,7 +160,7 @@ impl Env {
         let out = cmd.args(args).output().unwrap();
         (
             out.status.success(),
-            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy_owned(out.stdout),
         )
     }
 
@@ -172,8 +172,8 @@ impl Env {
         let out = cmd.args(args).output().unwrap();
         (
             out.status.success(),
-            String::from_utf8_lossy(&out.stdout).into_owned(),
-            String::from_utf8_lossy(&out.stderr).into_owned(),
+            String::from_utf8_lossy_owned(out.stdout),
+            String::from_utf8_lossy_owned(out.stderr),
         )
     }
 
@@ -189,6 +189,37 @@ impl Env {
                 panic!("daemon did not become ready");
             }
             std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// Wait until the daemon's pass after its initial sync has written
+    /// `config.yaml`, or panic after ~8s.
+    ///
+    /// Readiness comes first and the initial sync runs behind it, so a daemon
+    /// that answers `ctl status` may still be about to line the domain names
+    /// up and record `canonical_seen` for every registered domain. A test that
+    /// snapshots the file, or edits it, right after [`Self::wait_ready`] races
+    /// that write; it waits here instead. Only for a configuration whose
+    /// domains the pass records, which is every domain `setup_domain`
+    /// registers.
+    fn wait_names_recorded(&self) {
+        let start = Instant::now();
+        loop {
+            let recorded =
+                config::load_yaml::<GlobalConfig>(&self.config_path()).is_ok_and(|cfg| {
+                    !cfg.domains.is_empty()
+                        && cfg.domains.values().all(|e| e.canonical_seen.is_some())
+                });
+            if recorded {
+                return;
+            }
+            if start.elapsed() > Duration::from_secs(8) {
+                panic!(
+                    "the daemon never recorded the domain names: {}",
+                    std::fs::read_to_string(self.config_path()).unwrap_or_default()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 
@@ -758,6 +789,173 @@ fn a_stopping_daemon_does_not_wait_for_a_blocking_task() {
     assert!(!env.lock_path().exists(), "lock file removed");
 
     // The index lock went with the process: a direct read opens it at once.
+    let db = env.state_dir().join("index.db");
+    let (ok, stdout, stderr) = env.run_full(&["search", "seed", "--db", db.to_str().unwrap()]);
+    assert!(
+        ok,
+        "the index opens right after the daemon left: {stdout}\n{stderr}"
+    );
+}
+
+/// A minimal OpenAI-compatible embeddings endpoint on a loopback port: every
+/// input gets the same unit vector, so every pair of engrams is related. One
+/// request per connection, answered with `Connection: close`. The thread
+/// lives as long as the test process.
+fn serve_flat_embeddings() -> String {
+    use std::io::Read as _;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                if stream.read(&mut byte).unwrap_or(0) == 0 {
+                    break;
+                }
+                head.push(byte[0]);
+            }
+            let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
+            let length: usize = head
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+            let mut body = vec![0u8; length];
+            if stream.read_exact(&mut body).is_err() {
+                continue;
+            }
+            let request: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            let inputs = match &request["input"] {
+                Value::Array(items) => items.len(),
+                Value::String(_) => 1,
+                _ => 0,
+            };
+            let data: Vec<Value> = (0..inputs)
+                .map(|i| json!({ "embedding": [1.0, 0.0, 0.0], "index": i }))
+                .collect();
+            let reply = json!({ "data": data }).to_string();
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                reply.len()
+            );
+        }
+    });
+    format!("http://{addr}/v1")
+}
+
+/// Lesson 10 for the contradiction check: a daemon asked to stop while the
+/// contradiction pass is loading its model (held on a blocking thread by the
+/// test hook, where a real run downloads about 550 MB) is gone within the
+/// shutdown deadline, and the index opens from another process straight
+/// after. The embeddings come from a loopback endpoint, so the pass has lead
+/// vectors and a pending pair, which is what makes it ask for the model.
+#[test]
+fn a_stopping_daemon_does_not_wait_for_a_contradiction_model_load() {
+    let env = Env::new("nli");
+    let endpoint = serve_flat_embeddings();
+    std::fs::create_dir_all(env.config_path().parent().unwrap()).unwrap();
+    let cfg = GlobalConfig {
+        service: Some(ServiceConfig {
+            response_format: Some(ResponseFormat::Json),
+            ..ServiceConfig::default()
+        }),
+        embeddings: Some(config::EmbeddingsConfig {
+            provider: "openai-compatible".to_string(),
+            // Named after the default model only for its line-similarity
+            // floor: a model without one runs no contradiction pass at all.
+            // The loopback endpoint answers the same flat vector whatever
+            // the name.
+            model: "granite-embedding-97m-multilingual-r2".to_string(),
+            endpoint: Some(endpoint),
+            api_key_env: None,
+        }),
+        evolve: Some(config::EvolveConfig {
+            contradictions: Some("full".to_string()),
+        }),
+        ..GlobalConfig::default()
+    };
+    config::save_yaml(&env.config_path(), &cfg).unwrap();
+    env.setup_domain("eng");
+    let root = env.dir.join("kb-eng");
+    for (slug, node) in [("eighteen", "18"), ("twenty", "20")] {
+        std::fs::write(
+            root.join(format!("{slug}.md")),
+            format!(
+                "---\ntype: engram\ntitle: {slug}\npermalink: {slug}\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nThe build runs on a pinned runtime.\n\n- [fact] The build uses Node {node}\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    let stderr_path = env.dir.join("serve.stderr");
+    let mut cmd = Command::new(bin());
+    env.apply(&mut cmd);
+    cmd.env("CRYSTALLINE_TEST_NLI_LOAD_HOLD_SECS", "60");
+    let mut daemon = cmd
+        .arg("serve")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(&stderr_path).unwrap())
+        .spawn()
+        .unwrap();
+    // The sync, the embed pass and the handover run in the background; the
+    // pass reaches the loader once both lead vectors exist. No `wait_ready`
+    // first: `ctl status` reads the store, and a pass that wrongly held the
+    // store lock across the load would park it there until the load ended,
+    // which would hide exactly the fault this test is for. The hook's line
+    // comes after the socket is up.
+    let started = Instant::now();
+    loop {
+        let log = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+        if log.contains("test hook: holding the contradiction model load for 60s") {
+            break;
+        }
+        if started.elapsed() > Duration::from_secs(30) {
+            let _ = daemon.kill();
+            let _ = daemon.wait();
+            panic!("the contradiction pass never asked for its model; stderr:\n{log}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Timed from before the request: a pass that held the store lock across
+    // the load would stall the ctl answer itself, not only the exit.
+    let asked = Instant::now();
+    let (ok, out) = env.run(&["ctl", "shutdown"]);
+    assert!(ok, "ctl shutdown: {out}");
+    let status = loop {
+        if let Some(status) = daemon.try_wait().unwrap() {
+            break Some(status);
+        }
+        if asked.elapsed() > Duration::from_secs(12) {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let gone_after = asked.elapsed();
+    let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+    let Some(status) = status else {
+        let _ = daemon.kill();
+        let _ = daemon.wait();
+        panic!(
+            "the daemon was still running {gone_after:?} after ctl shutdown; its stderr:\n{stderr}"
+        );
+    };
+    assert!(
+        gone_after < Duration::from_secs(12),
+        "gone inside the shutdown deadline, not after the held load: {gone_after:?}\n{stderr}"
+    );
+    assert!(status.success(), "a clean exit: {status:?}\n{stderr}");
+    assert!(
+        !stderr.contains("did not finish in"),
+        "the steps finished on their own; the watchdog never fired:\n{stderr}"
+    );
+    assert!(!env.lock_path().exists(), "lock file removed");
+
+    // A successor opens the index at once.
     let db = env.state_dir().join("index.db");
     let (ok, stdout, stderr) = env.run_full(&["search", "seed", "--db", db.to_str().unwrap()]);
     assert!(
@@ -2081,8 +2279,18 @@ fn this_machines_own_daemon_still_lines_names_up() {
     env.wait_ready();
     let _ = dir;
     declare_manifest_name(&env, "eng", "platform");
+    // The watcher sees the same MANIFEST change and may be lining the name up
+    // already. The sync's own pass waits for that one instead of planning the
+    // same rename beside it and reporting it as failed while it lands.
     let (ok, out, err) = env.run_full(&["ctl", "sync"]);
     assert!(ok, "{out}{err}");
+    let reply: Value = serde_json::from_str(out.trim()).unwrap();
+    assert!(
+        !reply["names"]
+            .as_array()
+            .is_some_and(|names| names.iter().any(|n| n["action"] == "failed")),
+        "{reply}"
+    );
     let cfg: GlobalConfig = config::load_yaml(&env.config_path()).unwrap();
     assert!(
         cfg.domains.contains_key("platform") && !cfg.domains.contains_key("kb-eng"),
@@ -2282,6 +2490,9 @@ fn doctor_over_a_running_daemon_reports_instead_of_failing_on_the_index_lock() {
     let mut c1 = Mcp::spawn(&env);
     c1.initialize();
     env.wait_ready();
+    // The edits of `config.yaml` below load, change and save it, and the
+    // daemon's own write after its initial sync must not land in between.
+    env.wait_names_recorded();
 
     let docs = env.dir.join("kb-docs");
     std::fs::create_dir_all(&docs).unwrap();
@@ -2537,6 +2748,9 @@ fn explicit_overrides_bypass_a_running_daemon() {
     let mut c1 = Mcp::spawn(&env);
     c1.initialize();
     env.wait_ready();
+    // The snapshot below is compared byte for byte, so the daemon's own write
+    // after its initial sync has to have landed first.
+    env.wait_names_recorded();
 
     // Snapshot the daemon's own config before any overridden command runs.
     let daemon_config_before = std::fs::read_to_string(env.config_path()).unwrap();
@@ -2825,6 +3039,50 @@ fn edit_set_frontmatter_assigns_a_field_without_reading_stdin() {
     let _ = env.run(&["ctl", "shutdown"]);
 }
 
+/// `crystalline edit ... set_frontmatter --key tags --values a,b` replaces the
+/// tag list with the folded, comma-separated one.
+#[test]
+fn edit_set_frontmatter_sets_tags_from_a_comma_list() {
+    let env = Env::new("set-fm-tags");
+    env.setup_domain("eng");
+
+    let (ok, out) = env.run(&[
+        "edit",
+        "seed",
+        "eng",
+        "set_frontmatter",
+        "--key",
+        "tags",
+        "--values",
+        "api,Retry Policy",
+        "--json",
+    ]);
+    assert!(ok, "edit set_frontmatter tags: {out}");
+    let text = std::fs::read_to_string(env.dir.join("kb-eng/seed.md")).unwrap();
+    assert!(
+        text.contains("tags:\n  - api\n  - retry-policy\n"),
+        "{text}"
+    );
+
+    // --values with nothing after it is the empty list: every tag goes.
+    let (ok, out) = env.run(&[
+        "edit",
+        "seed",
+        "eng",
+        "set_frontmatter",
+        "--key",
+        "tags",
+        "--values",
+        "--json",
+    ]);
+    assert!(ok, "edit set_frontmatter empty tags: {out}");
+    let text = std::fs::read_to_string(env.dir.join("kb-eng/seed.md")).unwrap();
+    assert!(!text.contains("tags:"), "{text}");
+    assert!(!text.contains("retry-policy"), "{text}");
+
+    let _ = env.run(&["ctl", "shutdown"]);
+}
+
 /// The CLI-daemon seam must stay format-independent. A daemon on the TOON
 /// response-format default still answers a CLI data command with structured
 /// engine JSON, because the command routes over the ctl `tool` command rather
@@ -2878,7 +3136,10 @@ fn http_smoke_initialize_list_and_search() {
     // Give the router a moment after the port opens.
     std::thread::sleep(Duration::from_millis(300));
 
-    let client = reqwest::blocking::Client::new();
+    let client = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap();
     let url = format!("http://{addr}/");
 
     // /health answers without an MCP handshake: static liveness for load
@@ -3902,6 +4163,10 @@ fn status_still_answers_over_a_config_it_cannot_parse() {
     let mut client = Mcp::spawn(&env);
     client.initialize();
     env.wait_ready();
+    // The daemon's pass after its initial sync loads, changes and saves the
+    // file. Broken between its load and its save, the file was replaced with
+    // the good copy and `status` found nothing to report.
+    env.wait_names_recorded();
 
     // The daemon read a good config on the way up; this breaks the copy on
     // disk underneath it, which is exactly the state a person is in when they
@@ -3930,6 +4195,12 @@ fn status_still_answers_over_a_config_it_cannot_parse() {
             .as_str()
             .is_some_and(|e| !e.is_empty()),
         "--json carries the same note as a field: {value}"
+    );
+    // Nothing the daemon did since put a good file back.
+    assert_eq!(
+        std::fs::read_to_string(env.config_path()).unwrap(),
+        "domains: [unclosed\n",
+        "the daemon left the broken file as it is"
     );
 }
 
@@ -4247,7 +4518,7 @@ fn a_responsive_daemon_survives_doctor_fix() {
         .output()
         .unwrap();
     let ok = raw.status.success();
-    let out = String::from_utf8_lossy(&raw.stdout).into_owned();
+    let out = String::from_utf8_lossy_owned(raw.stdout);
     assert!(
         ok,
         "a healthy service is not a problem: {out}{}",
@@ -4649,7 +4920,10 @@ fn health_and_status_say_how_the_daemon_started_and_what_it_bound() {
     wait_port(&addr);
     std::thread::sleep(Duration::from_millis(300));
 
-    let body: Value = reqwest::blocking::Client::new()
+    let body: Value = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
         .get(format!("http://{addr}/health"))
         .send()
         .unwrap()

@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  AMBIENCE_KEY,
   BUS_LEVELS,
   MASTER_LEVEL,
   MUTE_KEY,
@@ -42,6 +43,7 @@ describe("createMixer", () => {
       none.suspend();
       none.resume();
       none.toggleMute();
+      none.toggleAmbience();
       none.close();
     }).not.toThrow();
 
@@ -190,6 +192,75 @@ describe("createMixer", () => {
     expect(blocked.muted).toBe(false);
     expect(blocked.toggleMute()).toBe(true);
     expect(blocked.toggleMute()).toBe(false);
+  });
+
+  // Mutation caught: the master ramped instead of the ambience bus, another
+  // bus ramped with it, the choice not written, or the ramp a hard set.
+  it("switches the ambience bus alone with a short ramp and remembers", () => {
+    const ctx = new FakeAudioContext();
+    ctx.currentTime = 2;
+    const mixer = createMixer({ borrow: () => ctx });
+    const master = masterOf(ctx);
+    const masterEvents = master.gain.events.length;
+    const others = BUSES.filter((b) => b !== "ambience");
+    expect(others).toHaveLength(3);
+    const otherEvents = others.map(
+      (b) => (mixer.bus(b) as FakeGain).gain.events.length,
+    );
+    expect(mixer.ambienceOff).toBe(false);
+    expect(mixer.toggleAmbience()).toBe(true);
+    expect(mixer.ambienceOff).toBe(true);
+    expect(mixer.muted).toBe(false);
+    const ambience = mixer.bus("ambience") as FakeGain;
+    const ramp = ambience.gain.events.at(-1)!;
+    expect(ramp[0]).toBe("linearRampToValueAtTime");
+    expect(ramp[1]).toBe(0);
+    expect(ramp[2]).toBeGreaterThan(2);
+    expect(ramp[2]).toBeLessThanOrEqual(2.03 + 1e-9);
+    expect(master.gain.events).toHaveLength(masterEvents);
+    others.forEach((b, i) =>
+      expect((mixer.bus(b) as FakeGain).gain.events).toHaveLength(
+        otherEvents[i]!,
+      ),
+    );
+    expect(window.localStorage.getItem(AMBIENCE_KEY)).toBe("1");
+    expect(window.localStorage.getItem(MUTE_KEY)).toBeNull();
+
+    expect(mixer.toggleAmbience()).toBe(false);
+    expect(ambience.gain.events.at(-1)?.[1]).toBe(BUS_LEVELS.ambience);
+    expect(window.localStorage.getItem(AMBIENCE_KEY)).toBe("0");
+  });
+
+  // Mutation caught: the bus built at its level while the choice says off
+  // (a reload would play the drones), or the other buses built at zero.
+  it("builds the ambience bus at 0 from the remembered state", () => {
+    window.localStorage.setItem(AMBIENCE_KEY, "1");
+    const ctx = new FakeAudioContext();
+    const mixer = createMixer({ borrow: () => ctx });
+    expect(mixer.ambienceOff).toBe(true);
+    expect((mixer.bus("ambience") as FakeGain).gain.value).toBe(0);
+    for (const b of BUSES.filter((n) => n !== "ambience"))
+      expect((mixer.bus(b) as FakeGain).gain.value).toBe(BUS_LEVELS[b]);
+    expect(masterOf(ctx).gain.value).toBe(MASTER_LEVEL);
+
+    const later = new FakeAudioContext();
+    const made = createMixer({ make: () => later });
+    made.unlock();
+    expect((made.bus("ambience") as FakeGain).gain.value).toBe(0);
+  });
+
+  // Mutation caught: a storage error escaping the toggle.
+  it("toggles the ambience when the storage refuses", () => {
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new Error("blocked");
+    });
+    vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
+      throw new Error("blocked");
+    });
+    const blocked = createMixer();
+    expect(blocked.ambienceOff).toBe(false);
+    expect(blocked.toggleAmbience()).toBe(true);
+    expect(blocked.toggleAmbience()).toBe(false);
   });
 
   // Mutation caught: the remembered mute applied only to a borrowed

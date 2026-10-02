@@ -43,7 +43,7 @@ import {
   type V3,
 } from "./geometry";
 import { createKit, turnPoint, type Frame, type Kit } from "./kit";
-import { LOOKS, type Rgb } from "./looks";
+import { LOOK, type Rgb } from "./looks";
 import type { KitAt } from "./models";
 import { buildHero } from "./models/heroes";
 import { pixelRuns, textRows } from "./models/heroes/pixels";
@@ -513,12 +513,7 @@ export const anchorOf = (h: Hero): V3 => [h.x * CELL, 0, h.y * CELL];
 /** A hero's recorded parts, built at the origin at turn 0. */
 export function partsOf(kind: HeroKind, variant = 0): Part[] {
   const parts: Part[] = [];
-  buildHero(
-    recordingKitAt(createBuilder(), parts),
-    kind,
-    variant,
-    LOOKS.aperture,
-  );
+  buildHero(recordingKitAt(createBuilder(), parts), kind, variant, LOOK);
   return parts;
 }
 

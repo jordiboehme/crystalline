@@ -13,7 +13,7 @@ import { heroFootprint } from "../../../world/footprints";
 import type { Hero } from "../../../world/types";
 import { FLAG, blinkFlag, createBuilder, type V3 } from "../../geometry";
 import { createKit, frameAt } from "../../kit";
-import { LOOKS } from "../../looks";
+import { LOOK } from "../../looks";
 import {
   inked,
   partsOf,
@@ -225,16 +225,12 @@ describe("street hero models", () => {
       recordingKitAt(createBuilder(), bodyParts),
       "police-box",
       0,
-      LOOKS.aperture,
+      LOOK,
       false,
     );
     expect(inked(bodyParts, NOTICE_INK, "panel")).toHaveLength(0);
     const leafParts: Part[] = [];
-    boxDoor(
-      recordingKitAt(createBuilder(), leafParts),
-      surfaces(LOOKS.aperture),
-      "left",
-    );
+    boxDoor(recordingKitAt(createBuilder(), leafParts), surfaces(LOOK), "left");
     expect(inked(leafParts, NOTICE_INK, "panel")).toHaveLength(
       runsOfLines(MARKS.boxNotice),
     );
@@ -255,15 +251,9 @@ describe("the police box's doors (2.6e C10, C16)", () => {
     // Mutation caught: buildHeroMesh still building the leaves (they would
     // be drawn twice, one copy never opening), or a leaf mover missing.
     const whole = createBuilder();
-    buildHero(
-      (f) => createKit(whole, f),
-      "police-box",
-      0,
-      LOOKS.aperture,
-      true,
-    );
-    const body = buildHeroMesh("police-box", 0, LOOKS.aperture);
-    const wings = boxLeafMovers(hero, 7, LOOKS.aperture);
+    buildHero((f) => createKit(whole, f), "police-box", 0, LOOK, true);
+    const body = buildHeroMesh("police-box", 0, LOOK);
+    const wings = boxLeafMovers(hero, 7, LOOK);
     expect(wings.map((m) => m.part)).toEqual(["wing", "wing"]);
     expect(new Set(wings.map((m) => m.key))).toEqual(new Set(["box:7"]));
     expect(wings.every((m) => m.fixture === -1)).toBe(true);
@@ -275,7 +265,7 @@ describe("the police box's doors (2.6e C10, C16)", () => {
   it("swings each leaf's inner edge deep into the box, never out of its front", () => {
     // Mutation caught: a swing sign that opens a leaf outward, both leaves
     // turning the same way, or a swing of 0 (the doors never open).
-    const wings = boxLeafMovers(hero, 0, LOOKS.aperture);
+    const wings = boxLeafMovers(hero, 0, LOOK);
     expect(wings.length).toBe(2);
     expect((wings[0]?.swing ?? 0) * (wings[1]?.swing ?? 0)).toBeLessThan(0);
     const box = heroFootprint(hero);
@@ -311,7 +301,7 @@ describe("the police box's doors (2.6e C10, C16)", () => {
       const front = boxFront(h);
       const depth = (q: V3) =>
         (q[0] - front.x) * front.inward[0] + (q[2] - front.z) * front.inward[1];
-      const wings = boxLeafMovers(h, 0, LOOKS.aperture);
+      const wings = boxLeafMovers(h, 0, LOOK);
       expect(wings.length).toBe(2);
       for (const m of wings) {
         const pivot = m.pivot ?? [0, 0, 0];

@@ -38,8 +38,10 @@ impl Engine {
     ///
     /// Serialized with every other registration change through
     /// [`Engine::domain_admin`], which it releases before a rename takes it
-    /// again; so no caller may hold that lock. A rename that fails is logged
-    /// and reported, never returned: the sync this rides on has landed.
+    /// again; so no caller may hold that lock. Two adoptions run one after the
+    /// other, the second one waiting for the first one's renames. A rename
+    /// that fails is logged and reported, never returned: the sync this rides
+    /// on has landed.
     ///
     /// Answers the list of what it did, for logs and for the ctl `sync`
     /// reply's `names`: `{domain, action, ..}` with `action` one of
@@ -90,6 +92,15 @@ impl Engine {
                 return Ok(json!([]));
             }
         }
+        // One adoption at a time, from its plan to the end of its renames.
+        // `domain_admin` covers only the plan, because a rename takes it
+        // again. Without this, a second adoption (the watcher's and a ctl
+        // `sync` right after the same MANIFEST change) planned the same
+        // rename while the first one was about to run it, then found the
+        // rename slot taken and reported the rename as failed while it was
+        // landing. Waiting here instead, the second one plans from what the
+        // first one wrote and finds nothing left to do.
+        let _adopting = self.adoption_lock.lock().await;
         let mut report: Vec<Value> = Vec::new();
         let planned = {
             let _admin = self.domain_admin().await;
@@ -122,6 +133,13 @@ impl Engine {
             let table = self.name_table_now().await;
             self.record_canonicals(&table, &busy, &mut report)?
         };
+        #[cfg(any(test, feature = "testing"))]
+        {
+            let hold = self.adoption_hold.lock().unwrap().take();
+            if let Some(hold) = hold {
+                hold.hold().await;
+            }
+        }
 
         for (old, new) in planned {
             // An empty row an older version's `domain remove` left under the
@@ -221,6 +239,15 @@ impl Engine {
         self.resolve_pending_after_startup().await;
     }
 
+    /// Hold the next adoption after its plan, before its renames, until the
+    /// answered hold is released.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn hold_next_adoption_after_plan(&self) -> Arc<crate::rename::RenameHold> {
+        let hold = Arc::new(crate::rename::RenameHold::default());
+        *self.adoption_hold.lock().unwrap() = Some(hold.clone());
+        hold
+    }
+
     /// How many times [`Engine::adopt_domain_names`] ran on this engine.
     #[cfg(any(test, feature = "testing"))]
     pub fn adoptions_run(&self) -> u64 {
@@ -233,6 +260,24 @@ impl Engine {
         busy.contains(name) || self.overlay.env_domain(name).is_some()
     }
 
+    /// The configuration file an adoption edits: the file as it stands, like
+    /// [`Engine::fresh_file_config`], except that a file which is there and
+    /// does not parse is an error instead of a reason to fall back to the
+    /// snapshot. An adoption is bookkeeping nobody asked for, so it must not
+    /// write the snapshot over a file somebody is editing by hand, or over a
+    /// broken one `crystalline status` is about to report. The next sync
+    /// tries again.
+    fn adoption_file_config(&self, snapshot: &GlobalConfig) -> Result<GlobalConfig> {
+        match self.config_file_path() {
+            Some(path) if path.is_file() => overlay::load_file(&path).map_err(|e| {
+                EngineError::Invalid(format!(
+                    "{e}; the configuration file is left as it is until it parses again"
+                ))
+            }),
+            _ => Ok(snapshot.clone()),
+        }
+    }
+
     /// The catch-up half: infer and persist the name origin of every entry
     /// in the configuration file that has none. Answers each entry it
     /// inferred, in file order.
@@ -241,7 +286,7 @@ impl Engine {
         busy: &HashSet<String>,
     ) -> Result<Vec<(String, NameOrigin)>> {
         let mut file_guard = self.file_config.write().unwrap();
-        let mut file = self.fresh_file_config(&file_guard);
+        let mut file = self.adoption_file_config(&file_guard)?;
         let mut inferred = Vec::new();
         for (name, entry) in file.domains.iter_mut() {
             if entry.name_origin.is_some() || self.adoption_skips(name, busy) {
@@ -272,7 +317,7 @@ impl Engine {
     ) -> Result<Vec<(String, String)>> {
         let mut planned = Vec::new();
         let mut file_guard = self.file_config.write().unwrap();
-        let mut file = self.fresh_file_config(&file_guard);
+        let mut file = self.adoption_file_config(&file_guard)?;
         let mut changed = false;
         for (name, entry) in file.domains.iter_mut() {
             if self.adoption_skips(name, busy) {

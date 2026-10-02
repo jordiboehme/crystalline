@@ -41,7 +41,6 @@ function renderReader(
       section={null}
       onOpenFluid={onOpenFluid}
       onClose={onClose}
-      look="phosphor"
       {...overrides}
     />,
   );
@@ -84,17 +83,6 @@ describe("CrtReader", () => {
   it("opens at the top when the section is not in the text", () => {
     renderReader({ section: { heading: "Gone", occurrence: 0 } });
     expect(visibleLines()[0]).toBe("Station log");
-  });
-
-  it("uppercases headings for the PETSCII look", () => {
-    renderReader({
-      look: "petscii",
-      section: { heading: "Scope", occurrence: 0 },
-    });
-    expect(visibleLines().slice(0, 2)).toEqual([
-      "SCOPE",
-      "What the scope covers.",
-    ]);
   });
 
   it("scrolls by line and by screen, and stops at the top", () => {
@@ -173,7 +161,6 @@ describe("CrtReader", () => {
         section={null}
         onOpenFluid={() => undefined}
         onClose={onClose}
-        look="phosphor"
       />,
     );
     unmount();

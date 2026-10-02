@@ -3,9 +3,10 @@
 //!
 //! Checks: (a) DB orphans, an indexed file whose path no longer exists on
 //! disk; (b) files on disk that are not yet indexed; (c) encoding problems
-//! (BOM or null bytes), which reuses `verify`'s `E006` rule rather than
-//! re-implementing the check; (d) stale service artifacts, a lock file with a
-//! dead pid or a socket file left behind by a killed daemon; (e) config
+//! (a BOM, a null byte or bytes that are not UTF-8), which reuses `verify`'s
+//! `E006` rule rather than re-implementing the check; (d) stale service
+//! artifacts, a lock file with a dead pid or a socket file left behind by a
+//! killed daemon; (e) config
 //! sanity, a registered domain whose path is missing or lacks a
 //! `MANIFEST.md`; (f) an embedding staleness summary, the stored model
 //! against the configured one, plus the cached model directories with sizes,
@@ -154,7 +155,8 @@ pub struct DomainDoctor {
     /// frontmatter fails to parse (`verify` rule `E001`). Running `sync`
     /// again never resolves these; the frontmatter itself needs a fix.
     pub unsyncable: Vec<UnsyncableFile>,
-    /// Encoding problems, sourced from `verify`'s `E006` rule.
+    /// Encoding problems (a BOM, a null byte or bytes that are not UTF-8),
+    /// sourced from `verify`'s `E006` rule.
     pub encoding_issues: Vec<EncodingIssue>,
     /// Files whose frontmatter holds a key more than once (`verify` rule
     /// `E010`). Kept apart from `unsyncable`, since `--fix` can repair them.
@@ -830,9 +832,20 @@ pub struct DoctorReport {
     pub github: Option<GithubDoctor>,
     /// Embedding staleness summary, `None` when there is no index yet.
     pub embeddings: Option<serde_json::Value>,
-    /// The device a local embedding model would run on here, probed without
-    /// loading it (see `crystalline_index::device::probe`). `None` for a
-    /// remote provider and on a build without the local model stack.
+    /// The contradiction check: the configured profile, its model, whether
+    /// the model is downloaded, pending and failing pairs and a load failure
+    /// when a running daemon answered `status`, and NLI checkpoints no
+    /// profile uses now. Read from config and the model cache alone, so it is
+    /// there whatever route the index took, even under a running daemon
+    /// (plan correction 15: doctor never reads the index for this). Never a
+    /// problem: `remaining_problems` is unchanged by it.
+    pub contradictions: Option<serde_json::Value>,
+    /// The device the local embedding model runs on: the running daemon's
+    /// own answer when one served this run and has the model loaded (so a
+    /// load-time or runtime fallback to the CPU shows with its reason),
+    /// otherwise the device a load would pick here, probed without loading
+    /// it (see `crystalline_index::device::probe`). `None` for a remote
+    /// provider and on a build without the local model stack.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_device: Option<String>,
     /// Onboarding trace for the Claude Code and Codex integrations
@@ -1164,13 +1177,44 @@ pub async fn run(
         Some(store) => Some(embedding_summary(store, cfg).await?),
         None => None,
     };
-    let embedding_device = cfg
+    // One probe for both local models: each opens a Metal device, and the
+    // contradiction model runs on the same pick as the embedding model.
+    let embedding_local = cfg
         .embeddings
         .as_ref()
-        .is_none_or(|e| e.provider.trim() == "local")
+        .is_none_or(|e| e.provider.trim() == "local");
+    let contradictions_on =
+        crystalline_index::nli::NliProfile::from_setting(cfg.evolve_contradictions()).is_some();
+    let probed_device = (embedding_local || contradictions_on)
         .then(crystalline_index::device::probe)
         .flatten()
         .map(|d| d.to_string());
+
+    // Only when a daemon already answered this run's file stamps: reusing
+    // that daemon's own numbers is one extra round trip on the route that
+    // already has one, never a second blind probe on the direct or absent
+    // routes, and the contradictions row never opens the index itself (plan
+    // correction 15).
+    let daemon_status = if matches!(index, IndexAccess::Daemon) {
+        crystalline_service::ctl_if_running(serde_json::json!({ "v": 1, "cmd": "status" }))
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+    // The daemon's loaded model wins over the probe: only it knows about a
+    // warm-up or runtime failure on the GPU.
+    let embedding_device = live_device(
+        daemon_status.as_ref().map(|d| &d["embeddings"]),
+        probed_device.clone(),
+    )
+    .filter(|_| embedding_local);
+    let contradictions = Some(contradiction_summary(
+        cfg,
+        daemon_status.as_ref(),
+        probed_device.filter(|_| contradictions_on),
+    ));
 
     let harnesses = check_harnesses();
 
@@ -1187,6 +1231,7 @@ pub async fn run(
         environment,
         github,
         embeddings,
+        contradictions,
         embedding_device,
         harnesses,
         provisioning,
@@ -1972,7 +2017,9 @@ async fn check_domain_checks(
 /// dropped and the newer text stays. The error is the note the report shows.
 fn write_fix(file: &Path, source: &str, text: &str) -> Result<(), String> {
     let tmp = fix_temp_path(file);
-    let written = std::fs::write(&tmp, text).and_then(|()| {
+    // Every domain file is stored as LF, whatever the text it came from held.
+    let text = crystalline_core::to_lf(text);
+    let written = std::fs::write(&tmp, text.as_bytes()).and_then(|()| {
         let permissions = std::fs::metadata(file)?.permissions();
         std::fs::set_permissions(&tmp, permissions)
     });
@@ -2902,9 +2949,16 @@ async fn embedding_summary(store: &dyn Store, cfg: &GlobalConfig) -> Result<serd
     // resolves here; an id the table has never heard of leaves both absent
     // rather than wrong.
     let entry = local_model(&configured);
-    let cached = config::models_dir()
+    // NLI checkpoints share the model cache but are not embedding models: the
+    // contradictions row lists them and marks them stale on its own terms, so
+    // they are filtered out here rather than shown twice with two different
+    // verdicts (plan correction 14).
+    let cached: Vec<(String, u64)> = config::models_dir()
         .map(|dir| cached_model_dirs(&dir))
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(repo, _)| is_embedding_listing(repo))
+        .collect();
     let configured_repo = entry.map(|m| m.repo);
     let configured_model_bytes =
         configured_repo.and_then(|repo| cached.iter().find(|(r, _)| r == repo).map(|(_, b)| *b));
@@ -2944,6 +2998,136 @@ async fn embedding_summary(store: &dyn Store, cfg: &GlobalConfig) -> Result<serd
         "models": coverage.models,
         "cached_models": cached_models,
     }))
+}
+
+/// Whether a cached repository belongs in the embedding listing: anything but
+/// a checkpoint of the contradiction check's model table or a retired one
+/// (plan correction 14). The contradictions row lists NLI checkpoints on its own terms, so a
+/// checkpoint would otherwise show up twice with two different verdicts.
+fn is_embedding_listing(repo: &str) -> bool {
+    !crystalline_index::nli::is_nli_checkpoint(repo)
+}
+
+/// The device a daemon's status block names for its loaded model, or
+/// `probed` when no daemon answered or it has no model loaded.
+fn live_device(block: Option<&serde_json::Value>, probed: Option<String>) -> Option<String> {
+    block
+        .and_then(|b| b["device"].as_str())
+        .map(str::to_string)
+        .or(probed)
+}
+
+/// The contradictions row: the profile and its model from config, whether the
+/// model's weights are in the cache (filesystem only, no index read - plan
+/// correction 15, so this runs the same under a running daemon as without
+/// one), and NLI checkpoints no profile uses now. `daemon_status` is `ctl
+/// status`'s answer when a daemon served this run's file stamps; its
+/// `pending_pairs`, `failing_pairs`, `last_error`, `load_failed`,
+/// `load_retry`, `read_only`, `embedding_pending`, `embedding_model`,
+/// `line_floor`, `line_floor_missing`, `lines_embedded` and `lines_eligible`
+/// are read from there and never recomputed (lesson 36) - a direct read has
+/// no worker, so the counts and flags stay null/false, the same shape
+/// `crystalline status`'s standalone fallback reports. Only the three floor
+/// fields fall back to the config's embedding model, when no daemon answers
+/// or an older daemon omits them. `device` is the probed
+/// device a load of the model would pick here (as for the embedding model,
+/// probed, not loaded), unless the daemon has the model loaded and names its
+/// device, which wins; it is reported only while a profile is on.
+fn contradiction_summary(
+    cfg: &GlobalConfig,
+    daemon_status: Option<&serde_json::Value>,
+    device: Option<String>,
+) -> serde_json::Value {
+    use crystalline_index::nli::{
+        LOCAL_NLI_AVAILABLE, NLI_FEATURE_MISSING, NLI_MODELS, NliProfile, RETIRED_NLI_REPOS,
+        nli_model, repo_weights_cached, weights_cached,
+    };
+    let setting = cfg.evolve_contradictions();
+    let model = NliProfile::from_setting(setting).map(nli_model);
+    let models_dir = config::models_dir().ok();
+    let cached = |repo: &str| {
+        models_dir
+            .as_deref()
+            .is_some_and(|dir| repo_weights_cached(dir, repo))
+    };
+    // The retired checkpoints of a development build count too: they are on
+    // disk, no profile runs them, and the next daemon start prunes them.
+    let stale: Vec<&str> = NLI_MODELS
+        .iter()
+        .map(|m| m.repo)
+        .chain(RETIRED_NLI_REPOS)
+        .filter(|repo| Some(*repo) != model.map(|m| m.repo) && cached(repo))
+        .collect();
+    let live = daemon_status.map(|d| &d["contradictions"]);
+    let pending = live.and_then(|c| c["pending_pairs"].as_u64());
+    let failing = live.and_then(|c| c["failing_pairs"].as_u64());
+    let load_failed = live.is_some_and(|c| c["load_failed"].as_bool().unwrap_or(false));
+    let load_retry = live.is_some_and(|c| c["load_retry"].as_bool().unwrap_or(false));
+    let read_only = live.is_some_and(|c| c["read_only"].as_bool().unwrap_or(false));
+    let embedding_pending = live.is_some_and(|c| c["embedding_pending"].as_bool().unwrap_or(false));
+    let lines_embedded = live.and_then(|c| c["lines_embedded"].as_u64());
+    let lines_eligible = live.and_then(|c| c["lines_eligible"].as_u64());
+    // The daemon's own answer wins (lesson 36); the config is the fallback
+    // when no daemon answers or an older daemon omits the key.
+    let config_model = crystalline_index::embed::configured_model_id(cfg.embeddings.as_ref());
+    let config_floor = crystalline_index::embed::line_similarity_floor(&config_model);
+    let embedding_model = live
+        .and_then(|c| c["embedding_model"].as_str())
+        .map_or(config_model, str::to_string);
+    // The daemon's flag decides which side the floor comes from: an older
+    // daemon without the key falls back to the config as a whole.
+    let daemon_flag = live.and_then(|c| c["line_floor_missing"].as_bool());
+    let line_floor = match daemon_flag {
+        Some(_) => live.and_then(|c| c["line_floor"].as_f64()),
+        None => config_floor,
+    };
+    let line_floor_missing = daemon_flag.unwrap_or(config_floor.is_none());
+    let last_error = live
+        .and_then(|c| c["last_error"].as_str())
+        .map(str::to_string);
+    match model {
+        None => serde_json::json!({
+            "profile": setting, "model": null, "repo": null, "downloaded": null,
+            "reason": null, "pending_pairs": null, "failing_pairs": null,
+            "last_error": null, "load_failed": false, "load_retry": false,
+            "read_only": read_only, "embedding_pending": false,
+            "embedding_model": embedding_model, "line_floor": line_floor,
+            "line_floor_missing": false, "lines_embedded": null,
+            "lines_eligible": null, "stale_checkpoints": stale,
+        }),
+        Some(m) => {
+            // The pinned commit only: the loader fetches it whatever other
+            // snapshot of the repository is cached, so another commit on disk
+            // is not a download the daemon will use.
+            let downloaded = models_dir
+                .as_deref()
+                .is_some_and(|dir| weights_cached(dir, m));
+            // A load failure already gets its own line from
+            // `contradiction_wait_reason` (the model could not be loaded:
+            // <error>); repeating `last_error` here too would print it twice.
+            // "Not downloaded" alone is still correct: the weights are not on
+            // disk, whatever the reason the load never finished.
+            let reason = (!downloaded && !load_failed).then(|| {
+                last_error.clone().unwrap_or_else(|| {
+                    if LOCAL_NLI_AVAILABLE {
+                        "the daemon downloads it on its first pass".to_string()
+                    } else {
+                        NLI_FEATURE_MISSING.to_string()
+                    }
+                })
+            });
+            serde_json::json!({
+                "profile": setting, "model": m.id, "repo": m.repo, "downloaded": downloaded,
+                "reason": reason, "pending_pairs": pending, "failing_pairs": failing,
+                "last_error": last_error, "load_failed": load_failed,
+                "load_retry": load_retry, "read_only": read_only,
+                "embedding_pending": embedding_pending, "stale_checkpoints": stale,
+                "device": live_device(live, device), "embedding_model": embedding_model,
+                "line_floor": line_floor, "line_floor_missing": line_floor_missing,
+                "lines_embedded": lines_embedded, "lines_eligible": lines_eligible,
+            })
+        }
+    }
 }
 
 /// The cached snapshot the local model starts on, when it is not the pinned
@@ -3614,10 +3798,66 @@ pub fn render_human(report: &DoctorReport) -> String {
             }
         }
     }
-    // Probed, not loaded: a warm-up failure on the GPU shows only in
-    // `crystalline status`, which reports the running model's device.
+    // The running daemon's device when it has the model loaded, probed
+    // otherwise (see `DoctorReport::embedding_device`).
     if let Some(device) = &report.embedding_device {
         let _ = writeln!(out, "  device: {device}");
+    }
+
+    if let Some(c) = &report.contradictions {
+        match c["model"].as_str() {
+            None => {
+                let unknown = c["profile"]
+                    .as_str()
+                    .and_then(crystalline_index::nli::unknown_setting_note);
+                match unknown {
+                    Some(note) => {
+                        let _ = writeln!(out, "contradictions: off ({note})");
+                    }
+                    None => {
+                        let _ = writeln!(out, "contradictions: off");
+                    }
+                }
+            }
+            Some(model) => {
+                let state = match (c["downloaded"].as_bool(), c["reason"].as_str()) {
+                    (Some(true), _) => "downloaded".to_string(),
+                    (_, Some(reason)) => format!("not downloaded: {reason}"),
+                    _ => "not downloaded".to_string(),
+                };
+                let pending = match c["pending_pairs"].as_u64() {
+                    Some(n) => format!("{n} {} pending", crate::cmd::pair_word(n)),
+                    None => "not counted yet".to_string(),
+                };
+                let mut line = format!(
+                    "contradictions: {}, {model} ({state}), {pending}",
+                    c["profile"].as_str().unwrap_or_default()
+                );
+                line.push_str(&crate::cmd::lines_embedded_suffix(c));
+                if let Some(reason) = crate::cmd::contradiction_wait_reason(c) {
+                    line.push_str(&format!(", {reason}"));
+                }
+                let _ = writeln!(out, "{line}");
+                if let Some(remedy) = crate::cmd::contradiction_reload_remedy(c) {
+                    for l in remedy {
+                        let _ = writeln!(out, "{l}");
+                    }
+                }
+                // The daemon's loaded model or the probe, like the embedding
+                // model's device line.
+                if let Some(device) = c["device"].as_str() {
+                    let _ = writeln!(out, "  device: {device}");
+                }
+            }
+        }
+        if let Some(stale) = c["stale_checkpoints"].as_array().filter(|s| !s.is_empty()) {
+            let names: Vec<&str> = stale.iter().filter_map(|v| v.as_str()).collect();
+            let _ = writeln!(
+                out,
+                "  stale NLI checkpoint(s) no profile uses now, still on disk: {}",
+                names.join(", ")
+            );
+        }
     }
 
     if let Some(harnesses) = &report.harnesses {
@@ -3963,6 +4203,7 @@ fn render_provision_counts(counts: &BTreeMap<String, usize>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crystalline_core::config::EvolveConfig;
     use crystalline_index::{TursoStore, sync_domain};
 
     fn owner(index: &str, config: &str, state_dir: &str) -> crystalline_service::RenameOwner {
@@ -5078,6 +5319,663 @@ mod tests {
         assert!(!out.contains("[problem]"), "{out}");
     }
 
+    /// Task 7: the contradictions row - off, or the model with its download
+    /// state and pending count - never counts toward the exit code, and its
+    /// stale-checkpoint line is separate from the embedding row's.
+    #[test]
+    fn the_contradictions_row_says_off_or_names_the_model_and_never_counts_as_a_problem() {
+        let mut report = report_with_orphans(IndexAccess::Direct, &[]);
+        report.contradictions = Some(serde_json::json!({
+            "profile": "off", "model": null, "repo": null, "downloaded": null,
+            "reason": null, "pending_pairs": null, "failing_pairs": null,
+            "last_error": null, "load_failed": false, "embedding_pending": false,
+            "stale_checkpoints": [],
+        }));
+        assert!(render_human(&report).contains("contradictions: off"));
+
+        report.contradictions = Some(serde_json::json!({
+            "profile": "full", "model": "mdeberta-v3-base-xnli-2mil7",
+            "repo": "MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7",
+            "downloaded": false, "reason": "the daemon downloads it on its first pass",
+            "pending_pairs": 3, "failing_pairs": 0, "last_error": null,
+            "load_failed": false, "embedding_pending": false,
+            "stale_checkpoints": ["MoritzLaurer/multilingual-MiniLMv2-L12-mnli-xnli"],
+        }));
+        let out = render_human(&report);
+        assert!(
+            out.contains("contradictions: full, mdeberta-v3-base-xnli-2mil7 (not downloaded: the daemon downloads it on its first pass), 3 pairs pending"),
+            "{out}"
+        );
+        assert!(
+            out.contains("  stale NLI checkpoint(s) no profile uses now, still on disk: MoritzLaurer/multilingual-MiniLMv2-L12-mnli-xnli"),
+            "{out}"
+        );
+        assert_eq!(
+            report.remaining_problems(),
+            0,
+            "the row never changes the exit code"
+        );
+    }
+
+    /// L1, shared with `crystalline status` through `contradiction_wait_reason`
+    /// (lesson 36: doctor never recomputes its own diagnosis): a load failure
+    /// and a parked batch failure render differently even though both carry
+    /// `last_error`, and a pending count of zero says so when coverage is
+    /// still incomplete.
+    #[test]
+    fn the_contradictions_row_names_the_daemons_wait_reason_like_status_does() {
+        let mut report = report_with_orphans(IndexAccess::Daemon, &[]);
+        report.contradictions = Some(serde_json::json!({
+            "profile": "full", "model": "mdeberta-v3-base-xnli-2mil7",
+            "repo": "MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7",
+            "downloaded": true, "reason": null, "pending_pairs": 1,
+            "failing_pairs": 0, "last_error": "contradiction model error: offline",
+            "load_failed": true, "embedding_pending": false,
+            "stale_checkpoints": [],
+        }));
+        let out = render_human(&report);
+        assert!(
+            out.contains(
+                "1 pair pending, the model could not be loaded: contradiction model error: offline"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "not retried until evolve.contradictions is set again or the daemon restarts"
+            ),
+            "the remedy is on its own line: {out}"
+        );
+        assert!(
+            out.contains("crystalline config set evolve.contradictions full"),
+            "{out}"
+        );
+
+        report.contradictions = Some(serde_json::json!({
+            "profile": "full", "model": "mdeberta-v3-base-xnli-2mil7",
+            "repo": "MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7",
+            "downloaded": true, "reason": null, "pending_pairs": 0,
+            "failing_pairs": 0, "last_error": null, "load_failed": false,
+            "embedding_pending": true, "stale_checkpoints": [],
+        }));
+        let out = render_human(&report);
+        assert!(
+            out.contains("0 pairs pending, embedding not finished for some candidates"),
+            "{out}"
+        );
+    }
+
+    /// The common offline-first-use shape: the model is not downloaded AND
+    /// the load failed, so `contradiction_summary` must not also parrot
+    /// `last_error` into the "not downloaded" parenthetical - the wait
+    /// reason already carries it once.
+    #[test]
+    fn a_failed_load_that_never_downloaded_names_the_error_exactly_once() {
+        let mut report = report_with_orphans(IndexAccess::Daemon, &[]);
+        report.contradictions = Some(serde_json::json!({
+            "profile": "full", "model": "mdeberta-v3-base-xnli-2mil7",
+            "repo": "MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7",
+            "downloaded": false, "reason": null, "pending_pairs": 1,
+            "failing_pairs": 0, "last_error": "contradiction model error: offline",
+            "load_failed": true, "embedding_pending": false,
+            "stale_checkpoints": [],
+        }));
+        let out = render_human(&report);
+        assert_eq!(
+            out.matches("contradiction model error: offline").count(),
+            1,
+            "{out}"
+        );
+        assert!(
+            out.contains("(not downloaded), 1 pair pending, the model could not be loaded: contradiction model error: offline"),
+            "{out}"
+        );
+    }
+
+    /// A direct read (no daemon answered) never claims to know the pending
+    /// count.
+    #[test]
+    fn the_contradictions_row_says_pending_is_not_counted_without_a_daemon() {
+        let mut report = report_with_orphans(IndexAccess::Direct, &[]);
+        report.contradictions = Some(serde_json::json!({
+            "profile": "full", "model": "mdeberta-v3-base-xnli-2mil7",
+            "repo": "MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7",
+            "downloaded": true, "reason": null, "pending_pairs": null,
+            "failing_pairs": null, "last_error": null, "load_failed": false,
+            "embedding_pending": false, "stale_checkpoints": [],
+        }));
+        let out = render_human(&report);
+        assert!(out.contains("not counted yet"), "{out}");
+    }
+
+    /// Plan correction 14: the embedding row's cached-model listing must not
+    /// mark an NLI checkpoint stale - the contradictions row lists those.
+    #[test]
+    fn nli_checkpoints_are_not_listed_as_stale_embedding_models() {
+        assert!(!is_embedding_listing(
+            crystalline_index::nli::NLI_MODELS[0].repo
+        ));
+        for retired in crystalline_index::nli::RETIRED_NLI_REPOS {
+            assert!(
+                !is_embedding_listing(retired),
+                "a retired NLI checkpoint is not an embedding model either: {retired}"
+            );
+        }
+        assert!(is_embedding_listing("BAAI/bge-small-en-v1.5"));
+    }
+
+    /// A config file that still says `light` or `english-only` (a development
+    /// build's) reads as off, and doctor says the value is not known and what
+    /// is accepted. The summary is built by the real `contradiction_summary`,
+    /// so this is the path a stale file takes.
+    #[test]
+    fn doctor_names_a_removed_profile_as_not_known_and_lists_the_accepted_values() {
+        let _guard = MODELS_DIR_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = ModelsDirOverride::set(tmp.path());
+        for removed in ["light", "english-only"] {
+            let summary = contradiction_summary(&cfg_with_profile(removed), None, None);
+            assert_eq!(summary["model"], serde_json::Value::Null, "{summary}");
+            assert_eq!(summary["profile"], removed);
+            let mut report = report_with_orphans(IndexAccess::Direct, &[]);
+            report.contradictions = Some(summary);
+            let out = render_human(&report);
+            assert!(out.contains("contradictions: off ("), "{out}");
+            assert!(out.contains(&format!("'{removed}'")), "{out}");
+            assert!(out.contains("not a known value"), "{out}");
+            assert!(out.contains("off or full"), "{out}");
+        }
+    }
+
+    // --- contradiction_summary, driven directly ------------------------
+    //
+    // Every test above builds the JSON `report.contradictions` by hand and
+    // only exercises `render_human`; that let two of the bugs the review
+    // round caught (the doubled load-failure error, and a reason string
+    // that should have been suppressed) through with every other test
+    // green. These drive `contradiction_summary` itself, the function that
+    // actually assembles the row.
+
+    /// Guards every test below: `contradiction_summary` reads
+    /// `CRYSTALLINE_MODELS_DIR` through `config::models_dir()`, env vars are
+    /// process-global, and `cargo test --workspace` runs this file's tests
+    /// on multiple threads (nextest gives each test its own process, but the
+    /// canonical fallback does not) - the same convention as
+    /// `crystalline-core`'s `MODELS_DIR_ENV_LOCK`.
+    static MODELS_DIR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Points `CRYSTALLINE_MODELS_DIR` at a directory for its lifetime and
+    /// restores whatever the environment had on drop, even on panic.
+    struct ModelsDirOverride {
+        previous: Option<String>,
+    }
+
+    impl ModelsDirOverride {
+        fn set(dir: &Path) -> ModelsDirOverride {
+            let previous = std::env::var("CRYSTALLINE_MODELS_DIR").ok();
+            unsafe {
+                std::env::set_var("CRYSTALLINE_MODELS_DIR", dir);
+            }
+            ModelsDirOverride { previous }
+        }
+    }
+
+    impl Drop for ModelsDirOverride {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(v) => unsafe { std::env::set_var("CRYSTALLINE_MODELS_DIR", v) },
+                None => unsafe { std::env::remove_var("CRYSTALLINE_MODELS_DIR") },
+            }
+        }
+    }
+
+    /// A `GlobalConfig` with `evolve.contradictions` set to `profile`.
+    fn cfg_with_profile(profile: &str) -> GlobalConfig {
+        GlobalConfig {
+            evolve: Some(EvolveConfig {
+                contradictions: Some(profile.to_string()),
+            }),
+            ..GlobalConfig::default()
+        }
+    }
+
+    /// Fabricates a cached NLI checkpoint at
+    /// `<dir>/<hub name>/snapshots/<commit>/model.safetensors`, the shape
+    /// `weights_cached` reads (a config alone is not a download): the pinned
+    /// commit for a checkpoint this build runs, any commit for a retired one.
+    fn seed_nli_checkpoint(dir: &Path, repo: &str) {
+        let commit = crystalline_index::nli::nli_model_by_repo(repo).map_or("abc", |m| m.revision);
+        seed_nli_snapshot(dir, repo, commit);
+    }
+
+    fn seed_nli_snapshot(dir: &Path, repo: &str, commit: &str) {
+        let snap = dir
+            .join(crystalline_index::hub_dir_name(repo))
+            .join("snapshots")
+            .join(commit);
+        std::fs::create_dir_all(&snap).unwrap();
+        std::fs::write(snap.join("model.safetensors"), b"w").unwrap();
+    }
+
+    #[test]
+    fn contradiction_summary_off_names_no_model_and_no_pending() {
+        let _guard = MODELS_DIR_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = ModelsDirOverride::set(tmp.path());
+        let summary = contradiction_summary(&GlobalConfig::default(), None, None);
+        assert_eq!(summary["profile"], "off");
+        assert_eq!(summary["model"], serde_json::Value::Null);
+        assert_eq!(summary["repo"], serde_json::Value::Null);
+        assert_eq!(summary["downloaded"], serde_json::Value::Null);
+        assert_eq!(summary["reason"], serde_json::Value::Null);
+        assert_eq!(summary["pending_pairs"], serde_json::Value::Null);
+        assert_eq!(summary["failing_pairs"], serde_json::Value::Null);
+        assert_eq!(summary["load_failed"], false);
+        assert_eq!(summary["embedding_pending"], false);
+        assert_eq!(summary["stale_checkpoints"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn contradiction_summary_full_with_pending_from_a_running_daemon() {
+        use crystalline_index::nli::{NliProfile, nli_model};
+        let _guard = MODELS_DIR_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        seed_nli_checkpoint(tmp.path(), nli_model(NliProfile::Full).repo);
+        let _env = ModelsDirOverride::set(tmp.path());
+        let daemon = serde_json::json!({ "contradictions": {
+            "pending_pairs": 12, "failing_pairs": 0, "last_error": null,
+            "load_failed": false, "embedding_pending": false,
+        }});
+        let summary = contradiction_summary(&cfg_with_profile("full"), Some(&daemon), None);
+        assert_eq!(summary["profile"], "full");
+        assert_eq!(summary["model"], nli_model(NliProfile::Full).id);
+        assert_eq!(summary["repo"], nli_model(NliProfile::Full).repo);
+        assert_eq!(summary["downloaded"], true);
+        assert_eq!(summary["reason"], serde_json::Value::Null);
+        assert_eq!(summary["pending_pairs"], 12);
+        assert_eq!(summary["stale_checkpoints"], serde_json::json!([]));
+    }
+
+    /// The contradiction model is fetched at a pinned commit, so another
+    /// commit of the same repository on disk is not the download the daemon
+    /// uses: the row says not downloaded, and never lists the live model's
+    /// repository as a stale checkpoint.
+    #[test]
+    fn another_commit_of_the_live_nli_model_is_not_a_download() {
+        use crystalline_index::nli::{NliProfile, nli_model};
+        let _guard = MODELS_DIR_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let full = nli_model(NliProfile::Full);
+        seed_nli_snapshot(
+            tmp.path(),
+            full.repo,
+            "0123456789abcdef0123456789abcdef01234567",
+        );
+        let _env = ModelsDirOverride::set(tmp.path());
+        let summary = contradiction_summary(&cfg_with_profile("full"), None, None);
+        assert_eq!(summary["downloaded"], false);
+        assert!(summary["reason"].is_string(), "{summary}");
+        assert_eq!(summary["stale_checkpoints"], serde_json::json!([]));
+        seed_nli_snapshot(tmp.path(), full.repo, full.revision);
+        let summary = contradiction_summary(&cfg_with_profile("full"), None, None);
+        assert_eq!(summary["downloaded"], true);
+    }
+
+    /// The contradiction model runs on the embedding model's device pick, so
+    /// doctor prints the probed device under its row the way it does under
+    /// the embeddings block; off prints none.
+    #[test]
+    fn the_contradictions_row_names_the_probed_device() {
+        let _guard = MODELS_DIR_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = ModelsDirOverride::set(tmp.path());
+        let summary =
+            contradiction_summary(&cfg_with_profile("full"), None, Some("metal".to_string()));
+        assert_eq!(summary["device"], "metal");
+        let mut report = report_with_orphans(IndexAccess::Direct, &[]);
+        report.contradictions = Some(summary);
+        let out = render_human(&report);
+        let row = out
+            .lines()
+            .position(|l| l.starts_with("contradictions: full"))
+            .unwrap_or_else(|| panic!("{out}"));
+        assert_eq!(out.lines().nth(row + 1), Some("  device: metal"), "{out}");
+
+        let off = contradiction_summary(&GlobalConfig::default(), None, None);
+        assert!(off.get("device").is_none(), "{off}");
+        report.contradictions = Some(off);
+        let out = render_human(&report);
+        assert!(
+            !out.lines()
+                .skip_while(|l| !l.starts_with("contradictions:"))
+                .any(|l| l == "  device: metal"),
+            "{out}"
+        );
+    }
+
+    /// A running daemon's loaded model knows what the probe cannot: a GPU
+    /// that failed after the load. Its device wins over the probe on both
+    /// rows; with no model loaded the probe stands.
+    #[test]
+    fn the_daemons_loaded_device_wins_over_the_probe() {
+        let runtime = "cpu (metal failed at runtime: inference: lost)";
+        let daemon = serde_json::json!({
+            "embeddings": { "device": runtime },
+            "contradictions": { "device": runtime },
+        });
+        assert_eq!(
+            live_device(Some(&daemon["embeddings"]), Some("metal".to_string())).as_deref(),
+            Some(runtime)
+        );
+        let idle = serde_json::json!({ "device": null });
+        assert_eq!(
+            live_device(Some(&idle), Some("metal".to_string())).as_deref(),
+            Some("metal"),
+            "no model loaded: the probe"
+        );
+        assert_eq!(live_device(None, None), None);
+
+        let _guard = MODELS_DIR_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = ModelsDirOverride::set(tmp.path());
+        let summary = contradiction_summary(
+            &cfg_with_profile("full"),
+            Some(&daemon),
+            Some("metal".to_string()),
+        );
+        assert_eq!(summary["device"], runtime, "{summary}");
+    }
+
+    /// Final review M1: the row takes `read_only` and `load_retry` from the
+    /// daemon, so its remedy on a read-only daemon is a restart, never the
+    /// `config set` that daemon would refuse.
+    #[test]
+    fn a_read_only_daemons_load_failure_names_a_restart() {
+        let _guard = MODELS_DIR_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = ModelsDirOverride::set(tmp.path());
+        let daemon = serde_json::json!({ "contradictions": {
+            "pending_pairs": 1, "failing_pairs": 0,
+            "last_error": "contradiction model error: bad weights",
+            "load_failed": true, "load_retry": false, "read_only": true,
+            "embedding_pending": false,
+        }});
+        let summary = contradiction_summary(&cfg_with_profile("full"), Some(&daemon), None);
+        assert_eq!(summary["read_only"], true);
+        assert_eq!(summary["load_retry"], false);
+        let mut report = report_with_orphans(IndexAccess::Daemon, &[]);
+        report.contradictions = Some(summary);
+        let out = render_human(&report);
+        assert!(
+            out.contains("not retried until the daemon restarts (it serves read-only and refuses the setting); restart the daemon"),
+            "{out}"
+        );
+        assert!(!out.contains("crystalline config set"), "{out}");
+    }
+
+    /// V302: a remote embedding model has no measured line floor, so doctor
+    /// names the reason from the config (a daemon's answer is not needed) and
+    /// the row says the check does not run.
+    #[test]
+    fn contradiction_summary_names_a_missing_line_floor_from_the_config() {
+        let _guard = MODELS_DIR_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = ModelsDirOverride::set(tmp.path());
+        let mut cfg = cfg_with_profile("full");
+        cfg.embeddings = Some(crate::config::EmbeddingsConfig {
+            provider: "openai-compatible".to_string(),
+            model: "text-embedding-3-small".to_string(),
+            endpoint: None,
+            api_key_env: None,
+        });
+        let summary = contradiction_summary(&cfg, None, None);
+        assert_eq!(summary["line_floor_missing"], true, "{summary}");
+        assert_eq!(summary["line_floor"], serde_json::Value::Null);
+        assert_eq!(summary["embedding_model"], "text-embedding-3-small");
+        let report = DoctorReport {
+            contradictions: Some(summary),
+            ..DoctorReport::default()
+        };
+        let out = render_human(&report);
+        assert!(
+            out.contains(
+                "not run: the embedding model 'text-embedding-3-small' has no measured line-similarity floor"
+            ),
+            "{out}"
+        );
+    }
+
+    /// V302: line coverage comes from the daemon's answer and is shown after
+    /// the pending count; the floor is the configured model's.
+    #[test]
+    fn contradiction_summary_carries_line_coverage_from_a_running_daemon() {
+        let _guard = MODELS_DIR_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = ModelsDirOverride::set(tmp.path());
+        let daemon = serde_json::json!({ "contradictions": {
+            "pending_pairs": 3, "failing_pairs": 0, "last_error": null,
+            "load_failed": false, "embedding_pending": false,
+            "lines_embedded": 812, "lines_eligible": 830,
+        }});
+        let summary = contradiction_summary(&cfg_with_profile("full"), Some(&daemon), None);
+        assert_eq!(summary["lines_embedded"], 812);
+        assert_eq!(summary["lines_eligible"], 830);
+        assert_eq!(summary["line_floor_missing"], false);
+        assert!(summary["line_floor"].as_f64().is_some(), "{summary}");
+        let report = DoctorReport {
+            contradictions: Some(summary),
+            ..DoctorReport::default()
+        };
+        let out = render_human(&report);
+        assert!(
+            out.contains("3 pairs pending, lines 812/830 embedded"),
+            "{out}"
+        );
+    }
+
+    /// A daemon's own floor answer wins over the config's model.
+    #[test]
+    fn contradiction_summary_takes_the_line_floor_from_the_daemon() {
+        let _guard = MODELS_DIR_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = ModelsDirOverride::set(tmp.path());
+        // Config: default local model (has a floor). Daemon: a remote one without.
+        let daemon = serde_json::json!({ "contradictions": {
+            "pending_pairs": 2, "failing_pairs": 0, "last_error": null,
+            "load_failed": false, "embedding_pending": false,
+            "embedding_model": "text-embedding-3-small",
+            "line_floor": null, "line_floor_missing": true,
+            "lines_embedded": 5, "lines_eligible": 9,
+        }});
+        let summary = contradiction_summary(&cfg_with_profile("full"), Some(&daemon), None);
+        assert_eq!(summary["line_floor_missing"], true, "{summary}");
+        assert_eq!(summary["embedding_model"], "text-embedding-3-small");
+        assert_eq!(summary["line_floor"], serde_json::Value::Null);
+        let report = DoctorReport {
+            contradictions: Some(summary),
+            ..DoctorReport::default()
+        };
+        let out = render_human(&report);
+        assert!(
+            out.contains("2 pairs pending, lines 5/9 embedded, not run: the embedding model 'text-embedding-3-small' has no measured line-similarity floor"),
+            "{out}"
+        );
+        // The other way round: the daemon has a floor, the config does not.
+        let mut cfg = cfg_with_profile("full");
+        cfg.embeddings = Some(crate::config::EmbeddingsConfig {
+            provider: "openai-compatible".to_string(),
+            model: "text-embedding-3-small".to_string(),
+            endpoint: None,
+            api_key_env: None,
+        });
+        let daemon = serde_json::json!({ "contradictions": {
+            "pending_pairs": 0, "embedding_model": "granite-x",
+            "line_floor": 0.86, "line_floor_missing": false,
+        }});
+        let summary = contradiction_summary(&cfg, Some(&daemon), None);
+        assert_eq!(summary["line_floor_missing"], false, "{summary}");
+        assert_eq!(summary["line_floor"], 0.86);
+        assert_eq!(summary["embedding_model"], "granite-x");
+    }
+
+    /// An older daemon that omits the floor keys leaves the config's answer.
+    #[test]
+    fn contradiction_summary_falls_back_to_the_config_for_an_older_daemon() {
+        let _guard = MODELS_DIR_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = ModelsDirOverride::set(tmp.path());
+        let mut cfg = cfg_with_profile("full");
+        cfg.embeddings = Some(crate::config::EmbeddingsConfig {
+            provider: "openai-compatible".to_string(),
+            model: "text-embedding-3-small".to_string(),
+            endpoint: None,
+            api_key_env: None,
+        });
+        let daemon = serde_json::json!({ "contradictions": {
+            "pending_pairs": 1, "failing_pairs": 0, "last_error": null,
+            "load_failed": false, "embedding_pending": false,
+        }});
+        let summary = contradiction_summary(&cfg, Some(&daemon), None);
+        assert_eq!(summary["line_floor_missing"], true, "{summary}");
+        assert_eq!(summary["embedding_model"], "text-embedding-3-small");
+    }
+
+    /// Off prints no coverage and no floor reason, even with a remote model.
+    #[test]
+    fn contradiction_summary_off_has_no_floor_reason_with_a_remote_model() {
+        let _guard = MODELS_DIR_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = ModelsDirOverride::set(tmp.path());
+        let cfg = GlobalConfig {
+            embeddings: Some(crate::config::EmbeddingsConfig {
+                provider: "openai-compatible".to_string(),
+                model: "text-embedding-3-small".to_string(),
+                endpoint: None,
+                api_key_env: None,
+            }),
+            ..GlobalConfig::default()
+        };
+        let summary = contradiction_summary(&cfg, None, None);
+        assert_eq!(summary["line_floor_missing"], false);
+        assert_eq!(summary["lines_embedded"], serde_json::Value::Null);
+    }
+
+    /// L7/lesson 62: no daemon answered (a direct read, or one that has not
+    /// walked yet), so the pending count is unknown - `null`, never `0`.
+    #[test]
+    fn contradiction_summary_with_no_daemon_answer_leaves_the_count_unknown_not_zero() {
+        let _guard = MODELS_DIR_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = ModelsDirOverride::set(tmp.path());
+        let summary = contradiction_summary(&cfg_with_profile("full"), None, None);
+        assert_eq!(summary["pending_pairs"], serde_json::Value::Null);
+        assert_ne!(summary["pending_pairs"], serde_json::json!(0), "{summary}");
+        assert_eq!(summary["failing_pairs"], serde_json::Value::Null);
+        assert_eq!(summary["load_failed"], false);
+        assert_eq!(summary["embedding_pending"], false);
+        assert_eq!(summary["downloaded"], false);
+        assert_eq!(
+            summary["reason"],
+            serde_json::json!("the daemon downloads it on its first pass")
+        );
+    }
+
+    /// The bug the review round caught: a load failure must not also set the
+    /// "not downloaded" reason to `last_error`, since `contradiction_wait_reason`
+    /// already renders that error on its own line.
+    #[test]
+    fn contradiction_summary_a_failed_load_suppresses_the_download_reason() {
+        let _guard = MODELS_DIR_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = ModelsDirOverride::set(tmp.path());
+        let daemon = serde_json::json!({ "contradictions": {
+            "pending_pairs": 1, "failing_pairs": 0,
+            "last_error": "contradiction model error: offline",
+            "load_failed": true, "embedding_pending": false,
+        }});
+        let summary = contradiction_summary(&cfg_with_profile("full"), Some(&daemon), None);
+        assert_eq!(summary["downloaded"], false);
+        assert_eq!(summary["load_failed"], true);
+        assert_eq!(summary["last_error"], "contradiction model error: offline");
+        assert_eq!(
+            summary["reason"],
+            serde_json::Value::Null,
+            "the wait reason already carries the error; the download reason must not repeat it: {summary}"
+        );
+    }
+
+    /// A parked batch failure (the model loaded fine; some pairs failed
+    /// scoring) is carried through untouched, with no download reason since
+    /// a batch failure only happens once the model is downloaded.
+    #[test]
+    fn contradiction_summary_carries_failing_pairs_through() {
+        use crystalline_index::nli::{NliProfile, nli_model};
+        let _guard = MODELS_DIR_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        seed_nli_checkpoint(tmp.path(), nli_model(NliProfile::Full).repo);
+        let _env = ModelsDirOverride::set(tmp.path());
+        let daemon = serde_json::json!({ "contradictions": {
+            "pending_pairs": 2, "failing_pairs": 2,
+            "last_error": "the batch failed", "load_failed": false,
+            "embedding_pending": false,
+        }});
+        let summary = contradiction_summary(&cfg_with_profile("full"), Some(&daemon), None);
+        assert_eq!(summary["failing_pairs"], 2);
+        assert_eq!(summary["last_error"], "the batch failed");
+        assert_eq!(summary["load_failed"], false);
+        assert_eq!(summary["downloaded"], true);
+        assert_eq!(summary["reason"], serde_json::Value::Null);
+    }
+
+    /// The exact combination that produced the doubled-error bug:
+    /// `load_failed` must win over a nonzero `failing_pairs` for the download
+    /// reason too (it stays suppressed), even though both are set at once -
+    /// a stale failing-pairs count left over from before the load broke.
+    #[test]
+    fn contradiction_summary_load_failed_suppresses_the_reason_even_with_failing_pairs_set() {
+        let _guard = MODELS_DIR_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = ModelsDirOverride::set(tmp.path());
+        let daemon = serde_json::json!({ "contradictions": {
+            "pending_pairs": 3, "failing_pairs": 2,
+            "last_error": "contradiction model error: offline",
+            "load_failed": true, "embedding_pending": false,
+        }});
+        let summary = contradiction_summary(&cfg_with_profile("full"), Some(&daemon), None);
+        assert_eq!(summary["load_failed"], true);
+        assert_eq!(summary["failing_pairs"], 2);
+        assert_eq!(
+            summary["reason"],
+            serde_json::Value::Null,
+            "load_failed suppresses the download reason even with failing pairs parked too: {summary}"
+        );
+        assert_eq!(summary["last_error"], "contradiction model error: offline");
+    }
+
+    /// Plan correction 14, from `contradiction_summary`'s own side: a
+    /// checkpoint cached for a model the config does not run (here a retired
+    /// one, left by a development build) is listed as stale, and the configured model's own (uncached) state is unaffected.
+    #[test]
+    fn contradiction_summary_lists_an_unused_cached_checkpoint_as_stale() {
+        let _guard = MODELS_DIR_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let retired = crystalline_index::nli::RETIRED_NLI_REPOS[0];
+        seed_nli_checkpoint(tmp.path(), retired);
+        let _env = ModelsDirOverride::set(tmp.path());
+        let summary = contradiction_summary(&cfg_with_profile("full"), None, None);
+        let stale: Vec<&str> = summary["stale_checkpoints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(stale, vec![retired]);
+        assert_eq!(
+            summary["downloaded"], false,
+            "the configured (full) model itself is not the one that is cached: {summary}"
+        );
+    }
+
     /// The temporary file is hidden, so a sync or remote change detection,
     /// which walk every file that is not hidden, never takes a leftover one
     /// for an engram or a change to propose.
@@ -5090,6 +5988,17 @@ mod tests {
             name.starts_with(&format!(".dup.md.doctor-fix.{}.", std::process::id())),
             "{name}"
         );
+    }
+
+    /// `--fix` stores LF only: a CRLF file it rewrites leaves no `\r`.
+    #[test]
+    fn write_fix_writes_lf_over_a_crlf_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("dup.md");
+        std::fs::write(&file, "old\r\nline\r\n").unwrap();
+        write_fix(&file, "old\r\nline\r\n", "new\r\nline\r\n").unwrap();
+        let bytes = std::fs::read(&file).unwrap();
+        assert_eq!(bytes, b"new\nline\n");
     }
 
     /// The fixed file keeps the original's permissions.

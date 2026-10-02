@@ -656,7 +656,7 @@ async fn post(addr: std::net::SocketAddr, id: u32, method: &str, mut params: Val
             _ => break,
         }
     }
-    String::from_utf8_lossy(&buf).into_owned()
+    String::from_utf8_lossy_owned(buf)
 }
 
 /// The first JSON-RPC payload in an SSE-framed or plain-JSON response.

@@ -776,3 +776,27 @@ fn a_verified_actor_with_a_newline_stays_one_line() {
         "{out}"
     );
 }
+
+/// A bullet inserted under a heading that prose follows directly is kept
+/// apart from that prose by a blank line, so the parser reads the bullet and
+/// the paragraph as two things rather than one wrapped observation.
+#[test]
+fn insert_after_section_keeps_an_inserted_bullet_off_the_prose_below() {
+    let source = "---\ntype: engram\ntitle: T\n---\n\n# T\n\n## S\nSome prose here.\n";
+    let out = insert_after_section(source, "## S", "- [fact] new one").unwrap();
+    assert!(
+        out.contains("## S\n\n- [fact] new one\n\nSome prose here.\n"),
+        "{out}"
+    );
+    let engram = crystalline_core::parse_engram(&out).unwrap();
+    assert_eq!(engram.observations.len(), 1);
+    assert_eq!(engram.observations[0].content, "new one");
+
+    // Above another bullet nothing is added: the list stays tight.
+    let listed = "---\ntype: engram\ntitle: T\n---\n\n# T\n\n## S\n- [fact] old one\n";
+    let out = insert_after_section(listed, "## S", "- [fact] new one").unwrap();
+    assert!(
+        out.contains("## S\n\n- [fact] new one\n- [fact] old one\n"),
+        "{out}"
+    );
+}

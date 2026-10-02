@@ -680,6 +680,103 @@ async fn a_stale_checksum_against_the_live_text_refuses() {
     );
 }
 
+/// A CRLF engram read before anybody opened it hands out the checksum of
+/// its CRLF bytes. A room then opened over it with nothing typed stands for
+/// those same bytes, so the guarded edit is not refused.
+#[tokio::test]
+async fn a_guard_taken_before_a_clean_room_opened_over_a_crlf_file_still_holds() {
+    let (tmp, engine, _scratch) = engine_fixture(false).await;
+    std::fs::write(tmp.path().join("eng/alpha.md"), ALPHA.replace('\n', "\r\n")).unwrap();
+    engine.sync(None).await.unwrap();
+    let sessions = CollabSessions::new(engine.clone());
+    engine.set_collab_sessions(&sessions);
+    let read = |engine: Arc<Engine>| async move {
+        engine
+            .read_engram(
+                &ReadParams {
+                    identifier: "alpha".to_string(),
+                    domain: Some("eng".to_string()),
+                    ..ReadParams::default()
+                },
+                &crystalline_service::Scope::Unrestricted,
+            )
+            .await
+            .unwrap()
+    };
+    let before = read(engine.clone()).await["checksum"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let joined = sessions.join("eng", "alpha", None).await.unwrap();
+    let _doc = sync_client(&joined).await;
+    let in_room = read(engine.clone()).await;
+    assert_eq!(in_room["live"].as_bool(), Some(true));
+    assert_eq!(
+        in_room["checksum"].as_str().unwrap(),
+        before,
+        "a clean room hands out the stored bytes' checksum"
+    );
+
+    let edited = engine
+        .edit_engram_as(
+            &append_edit("guarded across the open", Some(&before)),
+            None,
+            &crystalline_service::Scope::Unrestricted,
+        )
+        .await
+        .expect("the guard taken before the room opened holds");
+    assert_eq!(edited["landed"], "live");
+}
+
+/// The other way round: a checksum read while a clean room was open over a
+/// CRLF engram still guards an edit after the room closed without a save.
+#[tokio::test]
+async fn a_guard_taken_in_a_clean_room_over_a_crlf_file_holds_after_it_closes() {
+    let (tmp, engine, _scratch) = engine_fixture(false).await;
+    let path = tmp.path().join("eng/alpha.md");
+    std::fs::write(&path, ALPHA.replace('\n', "\r\n")).unwrap();
+    engine.sync(None).await.unwrap();
+    let sessions = CollabSessions::new(engine.clone());
+    engine.set_collab_sessions(&sessions);
+    let joined = sessions.join("eng", "alpha", None).await.unwrap();
+    let _doc = sync_client(&joined).await;
+    let checksum = engine
+        .read_engram(
+            &ReadParams {
+                identifier: "alpha".to_string(),
+                domain: Some("eng".to_string()),
+                ..ReadParams::default()
+            },
+            &crystalline_service::Scope::Unrestricted,
+        )
+        .await
+        .unwrap()["checksum"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    assert!(joined.session.remove_conn(joined.conn).await);
+    joined.session.final_save().await;
+    sessions.dispose_if_empty(&joined.session).await;
+    assert!(
+        std::fs::read(&path).unwrap().contains(&b'\r'),
+        "a room that only read the file left it as it was"
+    );
+
+    engine
+        .edit_engram_as(
+            &append_edit("guarded after the close", Some(&checksum)),
+            None,
+            &crystalline_service::Scope::Unrestricted,
+        )
+        .await
+        .expect("the guard taken in the clean room holds against the file");
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    assert!(!on_disk.contains('\r'), "{on_disk:?}");
+    assert!(on_disk.contains("guarded after the close"), "{on_disk:?}");
+}
+
 /// **Ruling 1.** In a domain that reviews changes, the live document an agent
 /// composes into is the room over ITS OWN overlay document - never another
 /// actor's, and with no join anywhere in it.

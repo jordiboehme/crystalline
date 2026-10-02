@@ -156,6 +156,22 @@ describe("the suggesting input", () => {
     expect(onCommit).not.toHaveBeenCalled();
   });
 
+  // Mutation caught: aria-controls set while the listbox is not rendered, so
+  // the field names an element that does not exist.
+  it("names the list in aria-controls only while the list is shown", async () => {
+    render(<Harness />);
+    expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
+    expect(field()).not.toHaveAttribute("aria-controls");
+
+    await userEvent.click(field());
+    const list = screen.getByRole("listbox");
+    expect(field()).toHaveAttribute("aria-controls", list.id);
+
+    await userEvent.keyboard("{Escape}");
+    expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
+    expect(field()).not.toHaveAttribute("aria-controls");
+  });
+
   it("walks the list with the arrow keys, saying which row is active", async () => {
     render(<Harness />);
     await userEvent.click(field());

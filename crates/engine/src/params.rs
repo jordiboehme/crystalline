@@ -137,13 +137,20 @@ pub struct EditParams {
     /// set_frontmatter, which takes key and value instead.
     #[serde(default)]
     pub content: Option<String>,
-    /// The frontmatter field to assign, for set_frontmatter. One of status,
-    /// valid_from, valid_to, stale_after, source_date, resource, source_version,
-    /// salience, verified or evolve_ack. No other key is settable here: type,
-    /// title, permalink, tags, recorded_at and the generated provenance block
-    /// carry identity and provenance and are owned by their own tools.
+    /// The frontmatter field to assign, for set_frontmatter. tags takes values
+    /// (a list); status, valid_from, valid_to, stale_after, source_date,
+    /// resource, source_version, salience, verified and evolve_ack take value.
+    /// No other key is settable here: type, title, permalink, recorded_at and
+    /// the generated provenance block carry identity and provenance.
     #[serde(default)]
     pub key: Option<String>,
+    /// The whole new list, for set_frontmatter on tags (add a tag, remove a
+    /// tag, set tags): read the engram, then pass every tag it should carry.
+    /// Each is folded to lowercase-with-hyphens and deduplicated, and a tag
+    /// that cannot be folded is refused by name; an empty list removes the
+    /// key.
+    #[serde(default)]
+    pub values: Option<Vec<String>>,
     /// The value to assign, for set_frontmatter. Omit it (or pass null) to
     /// remove the field, which is how a valid_to that should never have been
     /// set is cleared; status cannot be removed, since every engram needs one.
@@ -218,7 +225,8 @@ pub struct SaveParams {
     /// A file path is not an identifier: a miss names the permalink it
     /// probably meant.
     pub identifier: String,
-    /// The complete markdown text, frontmatter included, written verbatim.
+    /// The complete markdown text, frontmatter included, written as sent
+    /// apart from its line endings, which are stored as LF.
     pub content: String,
     /// The checksum from the read this save is based on. The save is refused
     /// as a conflict when the stored version no longer matches, on file and
@@ -278,7 +286,10 @@ pub struct SplitParams {
     pub sections: Vec<String>,
     /// The checksum from a prior read of the source, guarding the split
     /// against a change since that read: both writes are refused as a conflict
-    /// if the source changed. Omit for last-write-wins.
+    /// if the source changed. Without it the split still guards its own
+    /// rewrite of the source with the checksum it read, so it can be refused
+    /// as a conflict while another write to the same engram is in flight; try
+    /// it again then.
     #[serde(default)]
     pub expected_checksum: Option<String>,
 }
@@ -491,8 +502,9 @@ pub struct EvolveParams {
     pub domains: Vec<String>,
     /// Restrict the sweep to these detector families: temporal (validity
     /// windows, staleness and the supersede lifecycle), structure (references,
-    /// reciprocity, orphans, stubs and size) or redundancy (duplicate content,
-    /// colliding titles and tag drift). Omit for all three.
+    /// reciprocity, orphans, stubs and size), redundancy (duplicate content,
+    /// colliding titles and tag drift) or meaning (semantic twins and possible
+    /// contradictions). Omit for all four.
     #[serde(default, deserialize_with = "null_as_default")]
     pub families: Vec<String>,
     /// Restrict the sweep to these rule ids, for example V001 or V201. Omit for
@@ -842,6 +854,54 @@ domain_args!(OriginStatusParams { opt domain });
 domain_args!(ResolveConflictParams { one domain });
 domain_args!(WithdrawProposalParams { one domain });
 domain_args!(ProvisionParams { opt domain });
+
+// Every text a tool parameter carries may arrive with CRLF line endings, and is
+// taken as the LF text it means: what Crystalline stores is LF only, and a
+// find_text or a section heading sent with CRLF has to match that LF text. The
+// conversion is `crystalline_core::to_lf`, applied once where each write verb
+// takes its parameters.
+
+fn lf(text: &mut String) {
+    if let std::borrow::Cow::Owned(converted) = crystalline_core::to_lf(text) {
+        *text = converted;
+    }
+}
+
+fn lf_opt(text: &mut Option<String>) {
+    if let Some(text) = text {
+        lf(text);
+    }
+}
+
+impl WriteParams {
+    /// These parameters with every text in them as LF.
+    pub(crate) fn lf_only(mut self) -> Self {
+        lf(&mut self.content);
+        self
+    }
+}
+
+impl EditParams {
+    /// These parameters with every text in them as LF.
+    pub(crate) fn lf_only(mut self) -> Self {
+        lf_opt(&mut self.content);
+        lf_opt(&mut self.value);
+        lf_opt(&mut self.section);
+        lf_opt(&mut self.find_text);
+        if let Some(values) = &mut self.values {
+            values.iter_mut().for_each(lf);
+        }
+        self
+    }
+}
+
+impl SaveParams {
+    /// These parameters with the document as LF.
+    pub(crate) fn lf_only(mut self) -> Self {
+        lf(&mut self.content);
+        self
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -12,7 +12,7 @@ import { describe, expect, it } from "vitest";
 
 import { FLAG, blinkFlag, createBuilder, type V3 } from "../../geometry";
 import { frameAt } from "../../kit";
-import { LOOKS } from "../../looks";
+import { LOOK } from "../../looks";
 import { partsOf, recordingKitAt, toLocal, type Part } from "../../modelChecks";
 import { surfaces } from "../common";
 import { BIRD_A, sleepPod } from "./living";
@@ -87,7 +87,7 @@ describe("living hero models", () => {
     // Build one pod at a time, so a lid built over the opposite pod cannot
     // be matched to a neighbour: all six pods look alike, but each is
     // checked on its own parts only.
-    const look = surfaces(LOOKS.aperture);
+    const look = surfaces(LOOK);
     const f = frameAt([0, 0, 0], 0);
     const centre = (p: Part) => {
       const pts = local(p);

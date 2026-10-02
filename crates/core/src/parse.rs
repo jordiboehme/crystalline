@@ -21,6 +21,23 @@ use crate::engram::{
 };
 use crate::yaml::YamlValue;
 
+/// The generation of what the parser extracts from an engram: its
+/// observations, relations, links, headings and tags.
+///
+/// **Bump it in the same change whenever the parser starts extracting
+/// something different from the same text.** The index records the
+/// generation each domain was last parsed with, and a sync that finds an
+/// older one reparses every engram of that domain once - a file domain from
+/// its files, a virtual domain from the content the database stores -
+/// without rewriting a byte of either, and then records this value. Without
+/// the bump, an engram nobody edits keeps the rows an older parser derived
+/// until its next write.
+///
+/// - 0: every index before the generation was recorded.
+/// - 1: a bullet that wraps onto further lines is one observation or
+///   relation (0.22).
+pub const PARSE_GENERATION: u32 = 1;
+
 /// An error encountered while parsing an Engram.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ParseError {
@@ -44,6 +61,13 @@ pub enum ParseError {
     /// The frontmatter parsed to something other than a mapping.
     #[error("frontmatter is not a mapping")]
     FrontmatterNotMapping,
+    /// The file's bytes are not UTF-8 text. Raised by whoever reads the
+    /// bytes, since a `&str` can never hold such a file.
+    #[error("file is not valid UTF-8 (first bad byte on line {line})")]
+    NotUtf8 {
+        /// One-based line holding the first invalid sequence.
+        line: usize,
+    },
 }
 
 /// A parsed Engram plus enough of the original source to edit it losslessly.
@@ -467,12 +491,20 @@ fn scan_body(
     let mut links = Vec::new();
     let mut headings = Vec::new();
 
-    for bl in body_lines(body, body_line_start) {
+    let lines = body_lines(body, body_line_start);
+    // A wrapped relation's target may sit on a continuation line, so the
+    // exclusion of that target from the prose links lasts for the whole
+    // bullet: the index of its last line, and the target still to exclude.
+    let mut relation_target: Option<(usize, LinkTarget)> = None;
+    for (idx, bl) in lines.iter().enumerate() {
         if bl.in_fence {
             continue;
         }
         let line = bl.text;
         let line_no = bl.line_no;
+        if relation_target.as_ref().is_some_and(|(end, _)| idx > *end) {
+            relation_target = None;
+        }
 
         if let Some((level, text)) = parse_heading(line) {
             headings.push(Heading {
@@ -483,22 +515,27 @@ fn scan_body(
             continue;
         }
 
-        // Top-level bullets (zero indent) can be observations or relations.
-        let mut relation_target: Option<LinkTarget> = None;
-        if let Some(content) = top_level_bullet(line) {
-            if let Some((category, rest)) = parse_observation_head(content) {
+        // Top-level bullets (zero indent) can be observations or relations,
+        // read over the bullet's first line and every line that continues it.
+        if let Some(first) = top_level_bullet(line) {
+            let end = bullet_end(&lines, idx);
+            let end_line = lines[end].line_no;
+            let content = bullet_text(first, &lines[idx + 1..=end]);
+            if let Some((category, rest)) = parse_observation_head(&content) {
                 let (obs_content, tags, context) = split_observation(&rest);
                 observations.push(Observation {
                     line: line_no,
+                    end_line,
                     category,
                     content: obs_content,
                     tags,
                     context,
                 });
-            } else if let Some((rel_type, target)) = parse_relation(content) {
-                relation_target = Some(target.clone());
+            } else if let Some((rel_type, target)) = parse_relation(&content) {
+                relation_target = Some((end, target.clone()));
                 relations.push(Relation {
                     line: line_no,
+                    end_line,
                     rel_type,
                     target,
                 });
@@ -515,14 +552,15 @@ fn scan_body(
                 Cow::Borrowed(line)
             };
             let mut seen: Vec<LinkTarget> = Vec::new();
-            let mut excluded = relation_target.is_none();
             for inner in find_wikilinks(&masked) {
                 let target = LinkTarget::parse(&inner);
-                if !excluded
-                    && let Some(rt) = &relation_target
-                    && &target == rt
+                if relation_target
+                    .as_ref()
+                    .is_some_and(|(_, rt)| &target == rt)
                 {
-                    excluded = true;
+                    // Excluded once: a second link to the same target in the
+                    // bullet is prose like any other.
+                    relation_target = None;
                     continue;
                 }
                 if !seen.contains(&target) {
@@ -537,6 +575,129 @@ fn scan_body(
     }
 
     (observations, relations, links, headings)
+}
+
+/// The index of the last line of the top-level bullet that starts at
+/// `lines[start]`: the bullet's own line plus every line that continues its
+/// first paragraph, the way CommonMark reads a list item. A continuation line
+/// is indented under the bullet or, as a lazy continuation, not indented at
+/// all. The first of these ends the bullet's text: a blank line, a code fence,
+/// a heading, another list item (a nested `  - ...` is its own bullet), a
+/// block quote, a thematic break, an HTML block start (`<`) or a table row
+/// (`|`). Returns `start` for a bullet on one line.
+///
+/// A line that ends inside an unclosed `[[` link, or a bullet's first line
+/// whose `[category` bracket is still open, is not joined with the next one:
+/// the wikilink rename and the near-miss check read one line at a time, so a
+/// link or a category split over two lines stays the per-line typo it always
+/// was rather than becoming a relation or an observation they cannot see.
+pub(crate) fn bullet_end(lines: &[BodyLine<'_>], start: usize) -> usize {
+    if unclosed_category(lines[start].text) {
+        return start;
+    }
+    let mut end = start;
+    for (offset, bl) in lines.iter().enumerate().skip(start + 1) {
+        if bl.in_fence || !continues_bullet(bl.text) || ends_inside_link(lines[end].text) {
+            break;
+        }
+        end = offset;
+    }
+    end
+}
+
+/// Whether a line that follows a bullet's text continues it rather than
+/// ending it. See [`bullet_end`] for the rule. Also what the section editors
+/// ask before they put a block directly above an existing line, so an
+/// inserted bullet never swallows the prose under it.
+pub(crate) fn continues_bullet(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || parse_heading(line).is_some() {
+        return false;
+    }
+    // A fence indented deeper than a top-level fence (one inside the item)
+    // ends the text too, though the fence tracking does not see it.
+    if fence_marker(trimmed).is_some() {
+        return false;
+    }
+    !(starts_list_item(trimmed)
+        || trimmed.starts_with('>')
+        || trimmed.starts_with('<')
+        || trimmed.starts_with('|')
+        || is_thematic_break(trimmed))
+}
+
+/// Whether the line's last `[[` (outside inline code) has no `]]` after it.
+fn ends_inside_link(line: &str) -> bool {
+    let masked: Cow<'_, str> = if line.contains('`') {
+        Cow::Owned(mask_inline_code(line))
+    } else {
+        Cow::Borrowed(line)
+    };
+    match masked.rfind("[[") {
+        Some(open) => !masked[open + 2..].contains("]]"),
+        None => false,
+    }
+}
+
+/// Whether a top-level bullet line opens a `[category` bracket it never
+/// closes on that line.
+fn unclosed_category(line: &str) -> bool {
+    line.strip_prefix("- [")
+        .is_some_and(|rest| !rest.contains(']'))
+}
+
+/// Whether trimmed line text opens a list item that may interrupt a
+/// paragraph: a `-`, `*` or `+` marker followed by a space, a tab or nothing,
+/// or an ordered marker numbered 1 (`1.` or `1)`), the only number CommonMark
+/// lets interrupt a paragraph. Any other number is paragraph text, so
+/// `2024. was the year` continues the bullet.
+fn starts_list_item(trimmed: &str) -> bool {
+    let marker_then_gap = |rest: &str| rest.is_empty() || rest.starts_with([' ', '\t']);
+    if let Some(rest) = trimmed.strip_prefix(['-', '*', '+']) {
+        return marker_then_gap(rest);
+    }
+    let digits = trimmed.chars().take_while(char::is_ascii_digit).count();
+    if (1..=9).contains(&digits)
+        && trimmed[..digits].parse::<u32>() == Ok(1)
+        && let Some(rest) = trimmed[digits..].strip_prefix(['.', ')'])
+    {
+        return marker_then_gap(rest);
+    }
+    false
+}
+
+/// Whether trimmed line text is a thematic break: three or more of one of
+/// `-`, `*` or `_`, with nothing else but spaces and tabs.
+fn is_thematic_break(trimmed: &str) -> bool {
+    let Some(first) = trimmed.chars().next() else {
+        return false;
+    };
+    if !matches!(first, '-' | '*' | '_') {
+        return false;
+    }
+    let mut count = 0;
+    for c in trimmed.chars() {
+        if c == first {
+            count += 1;
+        } else if c != ' ' && c != '\t' {
+            return false;
+        }
+    }
+    count >= 3
+}
+
+/// The text of a wrapped bullet: the content after `- ` on its first line
+/// and every continuation line, each trimmed, joined with single spaces.
+fn bullet_text<'a>(first: &'a str, continuation: &[BodyLine<'_>]) -> Cow<'a, str> {
+    if continuation.is_empty() {
+        return Cow::Borrowed(first);
+    }
+    let mut text = first.trim_end().to_string();
+    for bl in continuation {
+        text.push(' ');
+        text.push_str(bl.text.trim());
+    }
+    Cow::Owned(text)
 }
 
 /// Parse an ATX heading, returning `(level, text)`.
@@ -596,18 +757,28 @@ fn top_level_bullet(line: &str) -> Option<&str> {
     line.strip_prefix("- ")
 }
 
-fn parse_observation_head(content: &str) -> Option<(String, String)> {
-    if !content.starts_with('[') {
-        return None;
-    }
-    let rest = &content[1..];
+/// The leading `[category]` of a bullet's content and the text after it, or
+/// `None` when the content does not start with one. A bracket directly
+/// followed by `(` is a markdown inline link and one directly followed by `[`
+/// a reference link, so neither is a category. The one place that decides it:
+/// the parser and the tag rewriter both ask here.
+pub(crate) fn split_category(content: &str) -> Option<(&str, &str)> {
+    let rest = content.strip_prefix('[')?;
     let close = rest.find(']')?;
     let category = &rest[..close];
     if category.is_empty() || category.contains('[') {
         return None;
     }
-    let body = rest[close + 1..].trim_start();
-    Some((category.trim().to_string(), body.to_string()))
+    let after = &rest[close + 1..];
+    if after.starts_with(['(', '[']) {
+        return None;
+    }
+    Some((category, after))
+}
+
+fn parse_observation_head(content: &str) -> Option<(String, String)> {
+    let (category, after) = split_category(content)?;
+    Some((category.trim().to_string(), after.trim_start().to_string()))
 }
 
 fn split_observation(body: &str) -> (String, Vec<String>, Option<String>) {
@@ -806,5 +977,213 @@ mod tests {
         let body = "just `code` here, nothing to link";
         let (_, _, links, _) = scan_body(body, 1);
         assert!(links.is_empty());
+    }
+
+    // --- wrapped bullets ---------------------------------------------------
+
+    fn observations_of(body: &str) -> Vec<Observation> {
+        scan_body(body, 1).0
+    }
+
+    #[test]
+    fn a_bullet_indented_over_two_lines_is_one_observation() {
+        let obs = observations_of(
+            "- [fact] targets are all repo-kind, which is why\n  they run with the default runner\n",
+        );
+        assert_eq!(obs.len(), 1);
+        assert_eq!(
+            obs[0].content,
+            "targets are all repo-kind, which is why they run with the default runner"
+        );
+        assert_eq!(obs[0].line, 1);
+        assert_eq!(obs[0].end_line, 2);
+    }
+
+    #[test]
+    fn a_bullet_wrapped_over_three_lines_joins_every_line() {
+        let body = "intro\n\n- [decision] one\n    two\n  three\nafter a blank\n";
+        let obs = observations_of(body);
+        // `after a blank` is a lazy continuation too: no blank line comes first.
+        assert_eq!(obs.len(), 1);
+        assert_eq!(obs[0].content, "one two three after a blank");
+        assert_eq!(obs[0].line, 3);
+        assert_eq!(obs[0].end_line, 6);
+    }
+
+    #[test]
+    fn a_lazy_continuation_line_belongs_to_the_bullet() {
+        let obs = observations_of("- [fact] the first half\nand the second half\n");
+        assert_eq!(obs.len(), 1);
+        assert_eq!(obs[0].content, "the first half and the second half");
+        assert_eq!((obs[0].line, obs[0].end_line), (1, 2));
+    }
+
+    #[test]
+    fn a_wrapped_category_bullet_reads_a_tag_on_its_continuation_line() {
+        let obs = observations_of(
+            "- [risk] the cache can serve a stale row\n  after a failover #cache #ops (seen in 0.21)\n",
+        );
+        assert_eq!(obs.len(), 1);
+        assert_eq!(obs[0].category, "risk");
+        assert_eq!(
+            obs[0].content,
+            "the cache can serve a stale row after a failover"
+        );
+        assert_eq!(obs[0].tags, vec!["cache", "ops"]);
+        assert_eq!(obs[0].context.as_deref(), Some("seen in 0.21"));
+    }
+
+    #[test]
+    fn a_hashtag_on_the_first_line_of_a_wrapped_bullet_is_mid_text() {
+        // Joined, `#ops` no longer ends the bullet, so it is text, not a tag:
+        // only a tag run at the end of the whole bullet is the bullet's tags.
+        let obs = observations_of("- [fact] restart the node #ops\n  before the upgrade\n");
+        assert_eq!(obs[0].content, "restart the node #ops before the upgrade");
+        assert!(obs[0].tags.is_empty());
+    }
+
+    #[test]
+    fn a_blank_line_ends_the_bullet_and_the_paragraph_is_not_joined() {
+        let obs = observations_of("- [fact] one line only\n\nA paragraph after it.\n");
+        assert_eq!(obs.len(), 1);
+        assert_eq!(obs[0].content, "one line only");
+        assert_eq!(obs[0].end_line, 1);
+    }
+
+    #[test]
+    fn a_nested_list_item_is_not_joined_into_its_parent() {
+        let body = "- [fact] the parent\n  wraps here\n  - a nested item\n    that wraps\n- [fact] the sibling\n";
+        let obs = observations_of(body);
+        assert_eq!(obs.len(), 2);
+        assert_eq!(obs[0].content, "the parent wraps here");
+        assert_eq!(obs[0].end_line, 2);
+        assert_eq!(obs[1].content, "the sibling");
+        assert_eq!(obs[1].line, 5);
+    }
+
+    #[test]
+    fn the_next_bullet_heading_quote_or_rule_ends_a_bullet() {
+        let body = "- [a] one\n* star item\n- [b] two\n## Heading\n- [c] three\n> quoted\n- [d] four\n---\n- [e] five\n1. ordered\n- [f] six\n2024. was the year\n";
+        let obs = observations_of(body);
+        let contents: Vec<&str> = obs.iter().map(|o| o.content.as_str()).collect();
+        assert_eq!(
+            contents,
+            vec![
+                "one",
+                "two",
+                "three",
+                "four",
+                "five",
+                "six 2024. was the year"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_code_fence_inside_a_bullet_ends_the_observation_text() {
+        let body = "- [howto] run it like this\n  ```sh\n  crystalline sync\n  ```\n- [howto] or deeper\n    ```\n    code\n    ```\n";
+        let obs = observations_of(body);
+        assert_eq!(obs.len(), 2);
+        assert_eq!(obs[0].content, "run it like this");
+        assert_eq!(obs[0].end_line, 1);
+        assert_eq!(obs[1].content, "or deeper");
+        assert_eq!(obs[1].end_line, 5);
+    }
+
+    #[test]
+    fn a_wrapped_relation_is_one_relation_and_its_target_is_not_a_prose_link() {
+        let body = "- relates_to\n  [[Target Engram]]\n- depends_on [[Other]] for the\n  reasons in [[Notes]]\n";
+        let (_, relations, links, _) = scan_body(body, 1);
+        assert_eq!(relations.len(), 2);
+        assert_eq!(relations[0].rel_type, "relates_to");
+        assert_eq!(relations[0].target.target, "Target Engram");
+        assert_eq!((relations[0].line, relations[0].end_line), (1, 2));
+        assert_eq!(relations[1].rel_type, "depends_on");
+        assert_eq!(relations[1].target.target, "Other");
+        assert_eq!(relations[1].end_line, 4);
+        let prose: Vec<(&str, usize)> = links
+            .iter()
+            .map(|l| (l.target.target.as_str(), l.line))
+            .collect();
+        assert_eq!(prose, vec![("Notes", 4)]);
+    }
+
+    #[test]
+    fn a_crlf_wrapped_bullet_is_joined_without_carriage_returns() {
+        let obs = observations_of("- [fact] first half\r\n  second half #tag\r\n\r\nprose\r\n");
+        assert_eq!(obs.len(), 1);
+        assert_eq!(obs[0].content, "first half second half");
+        assert_eq!(obs[0].tags, vec!["tag"]);
+        assert!(!obs[0].content.contains('\r'));
+        assert_eq!((obs[0].line, obs[0].end_line), (1, 2));
+    }
+
+    #[test]
+    fn a_line_ending_inside_an_open_link_or_category_is_not_joined() {
+        // Read per line, as the rename and the near-miss check read it: no
+        // relation to `Long Name` and no observation of category `cat egory`.
+        let (obs, relations, links, _) =
+            scan_body("- relates_to [[Long\n  Name]]\n- [cat\n  egory] text\n", 1);
+        assert!(relations.is_empty(), "{relations:?}");
+        assert!(links.is_empty(), "{links:?}");
+        assert!(obs.is_empty(), "{obs:?}");
+        // A link closed on its own line still lets the bullet wrap, and one
+        // inside inline code is not a link at all.
+        let obs = observations_of(
+            "- [fact] see [[Done]] and\n  more\n- [fact] code `[[x` here\n  wraps\n",
+        );
+        let contents: Vec<&str> = obs.iter().map(|o| o.content.as_str()).collect();
+        assert_eq!(
+            contents,
+            vec!["see [[Done]] and more", "code `[[x` here wraps"]
+        );
+    }
+
+    #[test]
+    fn a_bullet_that_starts_with_a_link_is_not_a_category() {
+        let obs = observations_of("- [label](https://x) - text\n");
+        assert!(obs.is_empty(), "{obs:?}");
+        let obs = observations_of("- [label][ref] text\n- [fact](x)\n");
+        assert!(obs.is_empty(), "{obs:?}");
+        let obs = observations_of("- [fact] x\n- [fact]y\n");
+        let got: Vec<(&str, &str)> = obs
+            .iter()
+            .map(|o| (o.category.as_str(), o.content.as_str()))
+            .collect();
+        assert_eq!(got, vec![("fact", "x"), ("fact", "y")]);
+    }
+
+    #[test]
+    fn a_wrapped_bullet_that_starts_with_a_link_is_not_a_category() {
+        let (obs, relations, _, _) = scan_body(
+            "- [label](https://x) - text that\n  wraps here\n- [fact] next\n",
+            1,
+        );
+        assert!(relations.is_empty(), "{relations:?}");
+        let contents: Vec<&str> = obs.iter().map(|o| o.content.as_str()).collect();
+        assert_eq!(contents, vec!["next"]);
+    }
+
+    #[test]
+    fn an_html_block_or_a_table_row_ends_a_bullet() {
+        let obs = observations_of(
+            "- [fact] one\n<!-- note -->\n- [fact] two\n| a | b |\n|---|---|\n- [fact] three\n  <b>inline</b> is html too\n",
+        );
+        let contents: Vec<&str> = obs.iter().map(|o| o.content.as_str()).collect();
+        assert_eq!(contents, vec!["one", "two", "three"]);
+    }
+
+    #[test]
+    fn a_wrapped_bullet_reports_its_first_line_in_a_whole_file() {
+        let source =
+            "---\ntype: engram\ntitle: T\n---\n# T\n\n- [fact] one\n  continued\n- [fact] two\n";
+        let engram = parse_engram(source).unwrap();
+        let lines: Vec<(usize, usize)> = engram
+            .observations
+            .iter()
+            .map(|o| (o.line, o.end_line))
+            .collect();
+        assert_eq!(lines, vec![(7, 8), (9, 9)]);
+        assert_eq!(engram.observations[0].content, "one continued");
     }
 }

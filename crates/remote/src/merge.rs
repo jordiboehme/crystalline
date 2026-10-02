@@ -518,4 +518,40 @@ mod tests {
             FileMerge::Apply(local.into_bytes())
         );
     }
+
+    /// A base the origin holds as CRLF against two LF sides is the same
+    /// document: the pull merges as LF and writes LF, and never conflicts on
+    /// the line endings alone.
+    #[test]
+    fn a_crlf_base_with_lf_sides_merges_clean_as_lf() {
+        let base = String::from_utf8(BASE_TWO_SECTIONS.to_vec())
+            .unwrap()
+            .replace('\n', "\r\n");
+        assert_eq!(
+            merge_file(
+                Some(base.as_bytes()),
+                Some(LOCAL_EDITS_A),
+                Some(UPSTREAM_EDITS_B)
+            ),
+            FileMerge::Apply(MERGED_BOTH_EDITS.to_vec())
+        );
+    }
+
+    /// The file this machine turned to LF on a write, against an origin that
+    /// still holds the CRLF base and now changed it: no conflict, the origin's
+    /// change lands as LF.
+    #[test]
+    fn a_local_lf_rewrite_of_a_crlf_base_takes_the_upstream_change_as_lf() {
+        let crlf = |b: &[u8]| String::from_utf8(b.to_vec()).unwrap().replace('\n', "\r\n");
+        let base = crlf(BASE_TWO_SECTIONS);
+        let upstream = crlf(UPSTREAM_EDITS_B);
+        assert_eq!(
+            merge_file(
+                Some(base.as_bytes()),
+                Some(BASE_TWO_SECTIONS),
+                Some(upstream.as_bytes())
+            ),
+            FileMerge::Apply(UPSTREAM_EDITS_B.to_vec())
+        );
+    }
 }

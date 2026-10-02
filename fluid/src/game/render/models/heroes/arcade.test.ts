@@ -20,7 +20,7 @@ import {
   type V3,
 } from "../../geometry";
 import { DECAL_LIFT, frameAt } from "../../kit";
-import { LOOKS } from "../../looks";
+import { LOOK } from "../../looks";
 import {
   cross,
   dot,
@@ -48,12 +48,7 @@ const CABINETS = ["arcade-cabinet", "recruit-cabinet"] as const;
 /** A hero's recorded parts, built at the origin at turn 0. */
 function partsOf(kind: HeroKind, variant: number): Part[] {
   const parts: Part[] = [];
-  buildHero(
-    recordingKitAt(createBuilder(), parts),
-    kind,
-    variant,
-    LOOKS.aperture,
-  );
+  buildHero(recordingKitAt(createBuilder(), parts), kind, variant, LOOK);
   return parts;
 }
 
@@ -217,7 +212,7 @@ describe("arcade hero models", () => {
 
   it("the recruitment cabinet is wider and deeper than the arcade cabinet and its side panels glow", () => {
     const extents = (kind: HeroKind) => {
-      const ps = positions(buildHeroMesh(kind, 0, LOOKS.aperture));
+      const ps = positions(buildHeroMesh(kind, 0, LOOK));
       const span = (i: 0 | 2) =>
         Math.max(...ps.map((p) => p[i])) - Math.min(...ps.map((p) => p[i]));
       return { width: span(0), depth: span(2) };
@@ -261,7 +256,7 @@ describe("arcade hero models", () => {
   it("stacks no two same-facing overlapping faces closer than the decal spacing", () => {
     for (const kind of CABINETS)
       for (let v = 0; v < HERO_CATALOGUE[kind].variants; v++) {
-        const ts = triangles(buildHeroMesh(kind, v, LOOKS.aperture));
+        const ts = triangles(buildHeroMesh(kind, v, LOOK));
         const close: string[] = [];
         for (let i = 0; i < ts.length; i++)
           for (let j = i + 1; j < ts.length; j++) {

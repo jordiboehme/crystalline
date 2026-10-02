@@ -69,7 +69,7 @@ async fn sweep(engine: &Engine) -> Value {
         .evolve_engrams(
             &EvolveParams {
                 domains: vec!["notes".to_string()],
-                families: vec!["redundancy".to_string()],
+                families: vec!["redundancy".to_string(), "meaning".to_string()],
                 rules: Vec::new(),
                 min_priority: None,
                 limit: Some(50),
@@ -194,6 +194,7 @@ fn ack(permalink: &str) -> EditParams {
         operation: "set_frontmatter".to_string(),
         key: Some("evolve_ack".to_string()),
         value: Some("V301 distinct, linked".to_string()),
+        values: None,
         content: None,
         section: None,
         find_text: None,
@@ -255,10 +256,7 @@ async fn acknowledging_one_pair_leaves_the_other_standing() {
     // test does, or the pair would vanish for the wrong reason.
     engine.embed_pending().await.unwrap();
     let after = sweep(&engine).await;
-    assert_eq!(
-        after["acknowledged"]["by_family"]["redundancy"], 1,
-        "{after}"
-    );
+    assert_eq!(after["acknowledged"]["by_family"]["meaning"], 1, "{after}");
     assert_eq!(
         rules_of(&after).iter().filter(|(r, _)| r == "V301").count(),
         twins_before - 1
@@ -314,10 +312,7 @@ async fn two_pairs_on_one_hub_are_acknowledged_side_by_side() {
     );
 
     let after = sweep(&engine).await;
-    assert_eq!(
-        after["acknowledged"]["by_family"]["redundancy"], 2,
-        "{after}"
-    );
+    assert_eq!(after["acknowledged"]["by_family"]["meaning"], 2, "{after}");
     let rows: Vec<&Value> = after["queue"]
         .as_array()
         .unwrap()
@@ -562,13 +557,13 @@ fn account(name: &str) -> Scope {
     }
 }
 
-/// The redundancy sweep of `team`, asked as somebody in particular.
+/// The redundancy and meaning sweep of `team`, asked as somebody in particular.
 async fn sweep_team(engine: &Engine, scope: &Scope) -> Value {
     engine
         .evolve_engrams(
             &EvolveParams {
                 domains: vec!["team".to_string()],
-                families: vec!["redundancy".to_string()],
+                families: vec!["redundancy".to_string(), "meaning".to_string()],
                 rules: Vec::new(),
                 min_priority: None,
                 limit: Some(50),
@@ -637,6 +632,7 @@ async fn a_draft_is_never_its_base_rows_twin() {
                 content: Some("- [decision] and a retry that exhausts its backoff goes to the dead-letter queue #t".to_string()),
                 key: None,
                 value: None,
+                values: None,
                 find_text: None,
                 expected_replacements: None,
                 section: None,
@@ -661,6 +657,7 @@ async fn a_draft_is_never_its_base_rows_twin() {
                 operation: "set_frontmatter".to_string(),
                 key: Some("salience".to_string()),
                 value: Some("5".to_string()),
+                values: None,
                 content: None,
                 find_text: None,
                 expected_replacements: None,

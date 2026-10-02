@@ -68,7 +68,7 @@ export const ROUNDEL = {
  * A glowing roundel's face: a warm cream (C5, C26). A blinking light
  * shines at its tint times `SIGNAL_GAIN` (1.4) times its bank's gain. Its
  * bank (`soft`) runs from `SOFT_FLOOR` to 1, so its peak (0.896) stays under
- * the aperture grid's bloom threshold (0.9) and its lowest point stays
+ * the bloom threshold (0.9) and its lowest point stays
  * above an unlit roundel's face: the roundels breathe softly instead of
  * flaring, and read lit by their warmth against the neutral white wall.
  */

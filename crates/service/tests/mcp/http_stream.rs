@@ -132,7 +132,7 @@ async fn post(addr: std::net::SocketAddr, body: &str, session_id: Option<&str>) 
             Err(_) => break,
         }
     }
-    String::from_utf8_lossy(&buf).into_owned()
+    String::from_utf8_lossy_owned(buf)
 }
 
 /// Pull the `mcp-session-id` response header out of a raw HTTP response's
@@ -448,7 +448,7 @@ async fn post_with_named_headers(
             _ => break,
         }
     }
-    String::from_utf8_lossy(&buf).into_owned()
+    String::from_utf8_lossy_owned(buf)
 }
 
 /// Pull the JSON-RPC payload out of an SSE-framed or plain-JSON response and

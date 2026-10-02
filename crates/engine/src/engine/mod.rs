@@ -186,19 +186,20 @@ pub const EVOLVE_GUIDANCE: &str = "This queue changes nothing by itself. Present
      Items marked mechanical complete intent the archive already records - fix those directly and summarize once. \
      Items marked judgment change what the archive claims - read the engram, propose and wait for a yes, one at a time. \
      A lifecycle finding never knows whether a change is a correction or a replacement; read and decide with the edit-versus-supersede test. \
-     Act only on the evidence stated: this sweep detects by dates, links, graph shape and embedding similarity, and similarity is not a contradiction - it cannot confirm that two engrams disagree. \
+     Act only on the evidence stated: this sweep detects by dates, links, graph shape, embedding similarity and stored model scores; similarity is not a contradiction, and a V302 row is a possible contradiction a local model read, a question and never proof that two engrams disagree. \
      Re-run the same scope when done.";
 
 /// The frontmatter keys `edit_engram`'s `set_frontmatter` operation may write:
-/// the lifecycle surface an agent tends while keeping knowledge honest.
-/// `resource` and `source_version` are the source a piece of knowledge was
-/// taken from and the version of it that was read; a re-ingest moves both.
-/// Every other key is refused there, because identity (`permalink`, `title`,
-/// `type`), classification (`tags`), the record of when knowledge was
-/// captured (`recorded_at`) and the write provenance (`generated`) are owned
-/// by the tools that maintain them and a blind assignment would corrupt an
-/// address, a history or the index.
+/// the lifecycle surface an agent tends while keeping knowledge honest, plus
+/// one engram's `tags`. `resource` and `source_version` are the source a piece
+/// of knowledge was taken from and the version of it that was read; a
+/// re-ingest moves both. Every other key is refused there, because identity
+/// (`permalink`, `title`, `type`), the record of when knowledge was captured
+/// (`recorded_at`) and the write provenance (`generated`) are owned by the
+/// tools that maintain them and a blind assignment would corrupt an address or
+/// a history. Bulk tag hygiene across a domain stays with `crystalline tags`.
 pub const SETTABLE_FRONTMATTER_KEYS: &[&str] = &[
+    "tags",
     "status",
     "valid_from",
     "valid_to",
@@ -210,6 +211,11 @@ pub const SETTABLE_FRONTMATTER_KEYS: &[&str] = &[
     "verified",
     "evolve_ack",
 ];
+
+/// The settable keys whose value is a list: `set_frontmatter` takes the whole
+/// new list as `values` and writes it as a block list, where every other key
+/// takes one `value`.
+pub const LIST_FRONTMATTER_KEYS: &[&str] = &["tags"];
 
 /// [`SETTABLE_FRONTMATTER_KEYS`] rendered for an error message.
 fn settable_keys() -> String {
@@ -768,6 +774,39 @@ pub struct Engine {
     // One embedding pass at a time, whoever asks: the worker, a verb that just
     // wrote, the daemon's startup task or the self-heal tick. See [`EmbedGate`].
     embed_gate: Arc<std::sync::Mutex<EmbedGate>>,
+    // The channel the contradiction worker listens on. `None` outside the
+    // daemon, where nothing scores.
+    contradiction_tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+    // One contradiction pass at a time. See [`ContradictionGate`].
+    contradiction_gate: Arc<std::sync::Mutex<ContradictionGate>>,
+    // Pending per domain, the settled digests and the last error.
+    contradiction_state: std::sync::Mutex<ContradictionState>,
+    // The NLI model, loaded lazily and dropped after ten idle minutes.
+    scorer: std::sync::Mutex<Option<LoadedScorer>>,
+    // How a scorer is built; a test seam, the real loader otherwise.
+    scorer_loader: ScorerLoader,
+    // Set once the off switch has cleared the stored scores and line vectors
+    // in this process, and unset by every change of `evolve.contradictions`:
+    // so the first off pass after a start clears what a setting changed while
+    // the daemon was down left behind, and later off passes cost nothing.
+    contradiction_data_cleared: std::sync::atomic::AtomicBool,
+    // Set once the line vectors of every other embedding model were deleted
+    // in this process; the model cannot change without a restart.
+    line_vectors_model_pruned: std::sync::atomic::AtomicBool,
+    // A test seam like `detection_walks`: how many times the contradiction
+    // pass has parsed a domain's engrams. A settled domain is skipped, and a
+    // skip is invisible in the outcome. See `Engine::contradiction_fact_walks`.
+    #[cfg(any(test, feature = "testing"))]
+    contradiction_fact_walks: std::sync::atomic::AtomicU64,
+    // The same for walks of the contradiction pass, parsed or not, so a test
+    // can see a worker that keeps asking.
+    #[cfg(any(test, feature = "testing"))]
+    contradiction_walks: std::sync::atomic::AtomicU64,
+    // The date the contradiction check reads validity against, set by a
+    // test to move a day on without waiting for one. See
+    // `Engine::set_contradiction_today`.
+    #[cfg(any(test, feature = "testing"))]
+    contradiction_today_override: std::sync::Mutex<Option<NaiveDate>>,
     // What the last successful embedding-model load pruned from the model
     // cache, so `ctl status` after a start says what that start freed. Empty on
     // every install that had nothing to prune, which is every install that
@@ -1028,6 +1067,9 @@ pub struct Engine {
     // keeps waiting: set when the rename after a sync fails, cleared when it
     // lands or waits for a known reason. `crystalline doctor` reads it.
     adoption_failures: std::sync::Mutex<HashMap<String, String>>,
+    // Held by `Engine::adopt_domain_names` from its plan to the end of its
+    // renames, so two adoptions never plan the same rename.
+    adoption_lock: tokio::sync::Mutex<()>,
     // Set while a rename is between its index row step and its config step:
     // a spelling push then would drop the alias the index row step left for
     // the old name, since the configuration does not list it yet. A refresh
@@ -1052,6 +1094,9 @@ pub struct Engine {
     // And a hold on the next write right after it is counted.
     #[cfg(any(test, feature = "testing"))]
     write_hold: std::sync::Mutex<Option<Arc<crate::rename::RenameHold>>>,
+    // And a hold on the next adoption between its plan and its renames.
+    #[cfg(any(test, feature = "testing"))]
+    adoption_hold: std::sync::Mutex<Option<Arc<crate::rename::RenameHold>>>,
     #[cfg(any(test, feature = "testing"))]
     rename_hold:
         std::sync::Mutex<Option<(crate::rename::RenameStep, Arc<crate::rename::RenameHold>)>>,
@@ -1098,7 +1143,9 @@ pub struct GrantedDraft {
 /// `draft` and `draft_owner`, which are what keep a draft standing where the
 /// team's page stands from being mistaken for it.
 fn granted_draft_json(domain: &str, owner: &str, draft: &GrantedDraft) -> Result<Value> {
-    let engram = parse_engram(&draft.content).map_err(|e| EngineError::Invalid(e.to_string()))?;
+    // Handed back as LF, with the checksum of the row as it is held.
+    let content = crystalline_core::to_lf(&draft.content);
+    let engram = parse_engram(&content).map_err(|e| EngineError::Invalid(e.to_string()))?;
     let relations: Vec<Value> = engram
         .relations
         .iter()
@@ -1129,7 +1176,7 @@ fn granted_draft_json(domain: &str, owner: &str, draft: &GrantedDraft) -> Result
         "status": engram.frontmatter.status.clone().unwrap_or_default(),
         "path": draft.path,
         "url": format!("crystalline://{domain}/{}", draft.permalink),
-        "content": draft.content,
+        "content": content,
         "checksum": draft.checksum,
         "frontmatter": engram.frontmatter,
         "observations": engram.observations,
@@ -1692,6 +1739,272 @@ impl Drop for EmbedPass {
     }
 }
 
+/// The single-flight state of the contradiction pass, the shape of
+/// [`EmbedGate`] for the same reason: two passes over one pending set would
+/// score the same pairs twice.
+#[derive(Default)]
+pub(crate) struct ContradictionGate {
+    running: bool,
+    again: bool,
+}
+
+/// Holds the claim on the contradiction pass, releasing it on drop.
+pub(crate) struct ContradictionPass {
+    gate: Arc<std::sync::Mutex<ContradictionGate>>,
+    released: bool,
+}
+
+impl ContradictionPass {
+    /// Claim the pass, or `None` when one is already running, which is then
+    /// told to walk once more.
+    fn claim(gate: &Arc<std::sync::Mutex<ContradictionGate>>) -> Option<ContradictionPass> {
+        let mut state = gate.lock().unwrap();
+        if state.running {
+            state.again = true;
+            return None;
+        }
+        state.running = true;
+        state.again = false;
+        drop(state);
+        Some(ContradictionPass {
+            gate: Arc::clone(gate),
+            released: false,
+        })
+    }
+
+    /// `true` to walk again because a request arrived during the walk just
+    /// finished; `false` ends the pass and releases the claim.
+    fn walk_again(&mut self) -> bool {
+        let mut state = self.gate.lock().unwrap();
+        if state.again {
+            state.again = false;
+            true
+        } else {
+            state.running = false;
+            self.released = true;
+            false
+        }
+    }
+}
+
+impl Drop for ContradictionPass {
+    fn drop(&mut self) {
+        if !self.released {
+            self.gate.lock().unwrap().running = false;
+        }
+    }
+}
+
+/// What a request for a contradiction pass did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContradictionOutcome {
+    /// `evolve.contradictions` is off: nothing was read, loaded or scored.
+    Off,
+    /// A pass was already running; it walks once more for this request.
+    AlreadyRunning,
+    /// Pairs were pending and the model could not be loaded. Logged once and
+    /// reported by status; the load is tried again only once the setting is
+    /// set again or the daemon starts again.
+    ModelUnavailable,
+    /// The embedding model has no measured line-similarity floor, so `V302`
+    /// does not run: nothing is embedded, loaded or scored, and status and
+    /// doctor say why.
+    NoLineFloor,
+    /// This call scored `pairs` engram pairs over `line_pairs` line pairs and
+    /// left `remaining` pending for the next pass.
+    Scored {
+        pairs: usize,
+        line_pairs: usize,
+        remaining: usize,
+    },
+}
+
+/// How long the loaded NLI model may sit unused before the tick drops it.
+pub const NLI_IDLE_DROP: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// The first wait before a contradiction model whose download failed is
+/// tried again. Each further failure doubles it, up to
+/// [`NLI_FETCH_RETRY_MAX`].
+pub const NLI_FETCH_RETRY_FIRST: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The longest wait between two tries of a contradiction model download.
+pub const NLI_FETCH_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Builds the scorer for a model. The daemon's is
+/// [`crystalline_index::nli::load_scorer`]; a test hands in a stub.
+pub type ScorerLoader = Arc<
+    dyn Fn(
+            &'static crystalline_index::nli::NliModel,
+        ) -> futures::future::BoxFuture<
+            'static,
+            crystalline_index::Result<Arc<dyn crystalline_index::nli::ContradictionScorer>>,
+        > + Send
+        + Sync,
+>;
+
+/// What a walk that left a domain with nothing pending saw of it, so the next
+/// walk can skip the domain without parsing it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SettledDomain {
+    /// The digest of the NLI model, the related line, the embedding model and
+    /// every path with its checksum.
+    pub(crate) digest: String,
+    /// The active model's embedded-chunk count at that walk, kept only when a
+    /// possible candidate (current, with observations) had no lead vector
+    /// yet: then a later embedding can add a pair without moving a stamp, so
+    /// a moved count walks the domain again. `None` when every possible
+    /// candidate had its vector, where only a stamp can change the pairs.
+    pub(crate) coverage: Option<usize>,
+    /// Whether the domain settled with pairs a failed batch left: a walk the
+    /// tick marked as a retry walks it again, any other walk skips it.
+    pub(crate) failing: bool,
+    /// The row hashes of the domain's eligible observation lines at that
+    /// walk. The digest pins the files, so they are still the lines in use
+    /// while the domain is skipped, and a walk that skips it can still prune
+    /// the line vectors no domain uses. Shared, so a skip copies no set.
+    pub(crate) line_hashes: Arc<HashSet<String>>,
+}
+
+/// What a walk counted for one domain it parsed, kept for the sweep. The
+/// digest and coverage are the walk's own, so the sweep can tell whether the
+/// domain still looks the way it did when it was counted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DomainCount {
+    /// The walk digest at that walk (see [`SettledDomain::digest`]).
+    pub(crate) digest: String,
+    /// The embedded-chunk count, kept only when an engram that could take
+    /// part had no lead vector yet (see [`SettledDomain::coverage`]).
+    pub(crate) coverage: Option<usize>,
+    /// Related pairs left unscored after that walk, known failures included.
+    pub(crate) pending: usize,
+    /// More related pairs cleared the line than the per-domain cap.
+    pub(crate) capped: bool,
+    /// The lead vectors met when the scope was over the vector cap.
+    pub(crate) vectors_capped: Option<usize>,
+    /// Current engrams with observations and no lead vector yet.
+    pub(crate) unembedded: usize,
+    /// Distinct observation lines of engrams that can take part.
+    pub(crate) lines_eligible: usize,
+    /// How many of those carry a vector for the embedding model.
+    pub(crate) lines_embedded: usize,
+}
+
+/// One engram pair the scorer or the store failed on, at the checksums and
+/// under the model it failed with. A pair that fails the same way twice is
+/// not worth a walk on every write: it is retried once per tick at most, and
+/// an edit that moves a checksum makes it a new pair.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct FailedPair {
+    pub(crate) repo: &'static str,
+    pub(crate) a: i64,
+    pub(crate) b: i64,
+    pub(crate) checksum_a: String,
+    pub(crate) checksum_b: String,
+}
+
+/// What the contradiction pass remembers between walks.
+#[derive(Default)]
+pub(crate) struct ContradictionState {
+    /// Bumped by every change of `evolve.contradictions` (and by off). A walk
+    /// publishes what it found only when the generation it started under is
+    /// still current, so a walk under the old profile cannot overwrite the
+    /// unknown pending a setting change just asked for.
+    pub(crate) generation: u64,
+    /// Related pairs left unscored per domain after the last walk, the pairs
+    /// a failed batch left included. `None` until a walk has run, and again
+    /// once the setting changes: unknown, which is what makes the tick ask.
+    pub(crate) pending: Option<BTreeMap<String, usize>>,
+    /// The date the last published walk read validity against. A new day
+    /// asks for a walk with nothing written, since an engram can expire
+    /// overnight.
+    pub(crate) walked_on: Option<NaiveDate>,
+    /// Per domain, the pairs the scorer or the store failed on. Skipped by
+    /// every walk but a retry walk, which the tick asks for at most once per
+    /// tick and only while the model is loaded anyway.
+    pub(crate) failed: HashMap<String, HashSet<FailedPair>>,
+    /// Set by the tick: the next walk retries the failed pairs once.
+    pub(crate) retry_due: bool,
+    /// Per domain, what the last walk that left it at zero saw, so a walk
+    /// skips a domain nothing changed in.
+    pub(crate) settled: HashMap<String, SettledDomain>,
+    /// Per domain, what the last walk that parsed it counted, which is what
+    /// the sweep's `V302` truncation lines read instead of walking the
+    /// candidates again. Read only while its digest and coverage still
+    /// match: a stale record is "not counted", never a quiet domain.
+    pub(crate) counted: HashMap<String, DomainCount>,
+    /// Why the model could not be loaded or a batch could not be scored.
+    /// A load failure stays until the setting is set again; a batch failure
+    /// until the next walk that loads nothing new and fails nothing.
+    pub(crate) last_error: Option<String>,
+    /// Whether that failure has been logged, so it is logged once.
+    pub(crate) error_logged: bool,
+    /// The model repo whose load failed. The loader wipes the checkpoint and
+    /// downloads it again on a build error, so after a build error the pass
+    /// never asks for that model again by itself: only a set
+    /// `evolve.contradictions`, another profile or a daemon start does. A
+    /// failed download is different, see `load_retry_at`.
+    pub(crate) load_failed: Option<&'static str>,
+    /// When a load that failed to download may be tried again: the tick asks
+    /// for a pass once this has passed. `None` after a build error, which is
+    /// never retried by itself.
+    pub(crate) load_retry_at: Option<tokio::time::Instant>,
+    /// The wait that set `load_retry_at`: [`NLI_FETCH_RETRY_FIRST`], doubled
+    /// by every further download failure up to [`NLI_FETCH_RETRY_MAX`], and
+    /// forgotten by a setting change or a load that succeeds.
+    pub(crate) load_backoff: Option<std::time::Duration>,
+}
+
+/// The loaded scorer and when it last scored.
+pub(crate) struct LoadedScorer {
+    pub(crate) repo: &'static str,
+    pub(crate) scorer: Arc<dyn crystalline_index::nli::ContradictionScorer>,
+    pub(crate) last_used: tokio::time::Instant,
+}
+
+fn default_scorer_loader() -> ScorerLoader {
+    Arc::new(
+        |model: &'static crystalline_index::nli::NliModel| -> futures::future::BoxFuture<
+            'static,
+            crystalline_index::Result<Arc<dyn crystalline_index::nli::ContradictionScorer>>,
+        > {
+            if let Some(hold) = held_nli_load() {
+                return Box::pin(hold_the_load(hold));
+            }
+            Box::pin(crystalline_index::nli::load_scorer(model))
+        },
+    )
+}
+
+/// How long the daemon's NLI loader holds a load, from
+/// [`crate::overlay::NLI_LOAD_HOLD_ENV`], or `None`. A test-only seam in the
+/// same spirit as the daemon's parked blocking task: the shutdown test needs
+/// a load that is still running on a blocking thread when the daemon is asked
+/// to stop, and a real download is neither hermetic nor slow on demand. An
+/// unset, empty, zero or unparsable value holds nothing.
+fn held_nli_load() -> Option<std::time::Duration> {
+    std::env::var(crate::overlay::NLI_LOAD_HOLD_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map(std::time::Duration::from_secs)
+}
+
+/// The held load: a blocking thread asleep for `hold`, then a failure, so it
+/// never downloads anything.
+async fn hold_the_load(
+    hold: std::time::Duration,
+) -> crystalline_index::Result<Arc<dyn crystalline_index::nli::ContradictionScorer>> {
+    // Said out loud, so the test that sets it can tell the load is held.
+    tracing::info!(
+        "test hook: holding the contradiction model load for {}s",
+        hold.as_secs()
+    );
+    let _ = tokio::task::spawn_blocking(move || std::thread::sleep(hold)).await;
+    Err(IndexError::Nli(
+        "test hook: the held contradiction model load ended".to_string(),
+    ))
+}
+
 impl Engine {
     /// Build an engine around an already-open store, an optional provider and a
     /// config. A `None` provider can be installed later with [`Engine::set_provider`].
@@ -1721,6 +2034,19 @@ impl Engine {
             watch_tx: None,
             embed_tx: None,
             embed_gate: Arc::default(),
+            contradiction_tx: None,
+            contradiction_gate: Arc::default(),
+            contradiction_state: std::sync::Mutex::default(),
+            scorer: std::sync::Mutex::new(None),
+            scorer_loader: default_scorer_loader(),
+            contradiction_data_cleared: std::sync::atomic::AtomicBool::new(false),
+            line_vectors_model_pruned: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(any(test, feature = "testing"))]
+            contradiction_fact_walks: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(any(test, feature = "testing"))]
+            contradiction_walks: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(any(test, feature = "testing"))]
+            contradiction_today_override: std::sync::Mutex::new(None),
             model_cache_pruned: std::sync::RwLock::new(Vec::new()),
             provider: std::sync::RwLock::new(provider),
             model_id,
@@ -1777,6 +2103,7 @@ impl Engine {
             rename_pause: crate::rename::RenamePause::default(),
             rename_slot: std::sync::Mutex::new(None),
             adoption_failures: std::sync::Mutex::new(HashMap::new()),
+            adoption_lock: tokio::sync::Mutex::new(()),
             names_frozen: std::sync::atomic::AtomicBool::new(false),
             holds_state_dir: std::sync::atomic::AtomicBool::new(true),
             machine_owner: None,
@@ -1784,6 +2111,8 @@ impl Engine {
             rename_fail_after: std::sync::Mutex::new(None),
             #[cfg(any(test, feature = "testing"))]
             write_hold: std::sync::Mutex::new(None),
+            #[cfg(any(test, feature = "testing"))]
+            adoption_hold: std::sync::Mutex::new(None),
             #[cfg(any(test, feature = "testing"))]
             rename_hold: std::sync::Mutex::new(None),
             #[cfg(any(test, feature = "testing"))]
@@ -2366,6 +2695,24 @@ impl Engine {
     /// inline, so a connect request returns without waiting on the model.
     pub fn with_embed_channel(mut self, tx: tokio::sync::mpsc::UnboundedSender<()>) -> Engine {
         self.embed_tx = Some(tx);
+        self
+    }
+
+    /// Wire the contradiction worker's channel. The daemon's builder does
+    /// this; nothing else scores.
+    pub fn with_contradiction_channel(
+        mut self,
+        tx: tokio::sync::mpsc::UnboundedSender<()>,
+    ) -> Engine {
+        self.contradiction_tx = Some(tx);
+        self
+    }
+
+    /// Replace how the NLI scorer is built, for tests: a stub, a counting
+    /// loader or a failing one, so no test downloads a model.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_scorer_loader(mut self, loader: ScorerLoader) -> Engine {
+        self.scorer_loader = loader;
         self
     }
 
@@ -3057,7 +3404,11 @@ impl Engine {
     /// `no_engine_function_composes_into_a_room_under_a_file_write_lock` scans
     /// for exactly that and names `.live_text(` among its needles, so a caller
     /// that gets this wrong fails the suite rather than the field.
-    async fn live_text_at(&self, desc: &EngramDescriptor, view: &DomainView<'_>) -> Option<String> {
+    async fn live_text_at(
+        &self,
+        desc: &EngramDescriptor,
+        view: &DomainView<'_>,
+    ) -> Option<crate::collab::session::LiveText> {
         let rooms = self.collab_rooms()?;
         rooms
             .live_text(&desc.domain, &desc.permalink, view.actor())
@@ -3094,6 +3445,9 @@ impl Engine {
     /// `content` column, and the permalink the row will answer to - the
     /// frontmatter's when it carries one, the path's slug when it does not.
     pub(crate) fn overlay_record(path: &str, text: &str) -> Result<EngramRecord> {
+        // A draft row holds LF only, and its stamp describes what it holds.
+        let text = crystalline_core::to_lf(text);
+        let text = text.as_ref();
         let engram = parse_engram(text).map_err(|e| EngineError::Invalid(e.to_string()))?;
         let mut record = EngramRecord::from_engram(&engram, path, virtual_stamp(text));
         record.content = text.to_string();
@@ -4181,6 +4535,7 @@ impl Engine {
     /// inherited them) are the orphan collector's, which ages them out on the
     /// daemon's sweep. A reindex is never the remedy for a row.
     pub fn forget_domain(&self, name: &str) {
+        self.forget_contradiction_domain(name);
         self.discovered_domains.write().unwrap().remove(name);
         self.mark_names_stale();
         if let Some(tx) = &self.watch_tx {
@@ -4449,6 +4804,17 @@ impl Engine {
         expected_sha: Option<&str>,
         store_full: bool,
     ) -> Result<EngramId> {
+        // The index holds LF only, whatever line endings the text came with: a
+        // file domain's CRLF file is indexed as LF (its stamp stays the one of
+        // the bytes on disk, which a read never rewrites), and a virtual row
+        // stores the LF text with a stamp that describes it.
+        let text = crystalline_core::to_lf(text);
+        let mut stamp = stamp;
+        if store_full && let std::borrow::Cow::Owned(lf) = &text {
+            stamp.size = lf.len() as u64;
+            stamp.sha256 = sha256_hex(lf.as_bytes());
+        }
+        let text = text.as_ref();
         let engram = parse_engram(text).map_err(|e| EngineError::Invalid(e.to_string()))?;
         let mut record = EngramRecord::from_engram(&engram, rel, stamp);
         if store_full {
@@ -4517,8 +4883,8 @@ impl Engine {
             size: meta.len(),
             sha256: sha256_hex(&bytes),
         };
-        let text = String::from_utf8(bytes)
-            .map_err(|_| EngineError::Invalid(format!("{} is not valid UTF-8", abs.display())))?;
+        let text =
+            String::from_utf8(bytes).map_err(|_| EngineError::Invalid(not_utf8_message(&abs)))?;
         // A file domain stores the body only; its source of truth is the file.
         self.index_markdown(store, domain_id, rel, &text, stamp, None, false)
             .await
@@ -4554,8 +4920,16 @@ impl Engine {
     ) -> Result<String> {
         if let ContentSource::File { root } = source {
             let abs = join_rel(root, &desc.path);
-            if let Ok(text) = std::fs::read_to_string(&abs) {
-                return Ok(text);
+            match std::fs::read_to_string(&abs) {
+                Ok(text) => return Ok(text),
+                // A file that is there but not UTF-8 is refused, never
+                // answered from the row: a file domain's row holds the body
+                // only, so the answer would lose the frontmatter, and an edit
+                // built on it would write the document without it.
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                    return Err(text_read_error(&abs, e));
+                }
+                Err(_) => {}
             }
         }
         let store = self.store.lock().await;
@@ -4626,6 +5000,8 @@ mod adopt_names;
 mod attachments;
 mod configure;
 mod context;
+mod contradictions;
+pub use contradictions::run_contradiction_worker;
 mod delete;
 mod domain_add;
 mod domains;
@@ -5297,20 +5673,32 @@ pub async fn run_embed_worker(
 ) {
     while rx.recv().await.is_some() {
         while rx.try_recv().is_ok() {}
-        match engine.embed_pending().await {
-            Ok(0) => {}
-            Ok(n) => {
-                // The count the daemon's startup pass used to log itself. It
-                // belongs here now that every pass comes through the worker,
-                // and stays at info: the worker coalesces a burst of requests
-                // into one pass, so a large first index is one line, not
-                // thousands.
-                tracing::info!("embedded {n} chunk(s)");
-                // The engine passive-checkpoints on its own past a hardcoded
-                // un-backfilled-frame threshold, so this is disk reclamation
-                // of the post-bulk-embed high-water mark, not growth control.
-                engine.checkpoint_wal().await;
+        match engine.embed_pending_outcome().await {
+            Ok(EmbedOutcome::Embedded { chunks, .. }) => {
+                if chunks > 0 {
+                    // The count the daemon's startup pass used to log itself.
+                    // It belongs here now that every pass comes through the
+                    // worker, and stays at info: the worker coalesces a burst
+                    // of requests into one pass, so a large first index is
+                    // one line, not thousands.
+                    tracing::info!("embedded {chunks} chunk(s)");
+                    // The engine passive-checkpoints on its own past a
+                    // hardcoded un-backfilled-frame threshold, so this is disk
+                    // reclamation of the post-bulk-embed high-water mark, not
+                    // growth control.
+                    engine.checkpoint_wal().await;
+                }
+                // The contradiction pass follows every completed embed pass:
+                // a pair is a candidate only once both lead vectors exist, and
+                // a status or window edit that embedded nothing can still add
+                // or retire one. A pass whose batches were all rejected hands
+                // over too, since on an install whose backlog never drains
+                // this is the only way in. A domain nothing changed in is
+                // skipped by its settled digest, so asking after every pass
+                // stays cheap.
+                engine.request_contradictions();
             }
+            Ok(EmbedOutcome::AlreadyRunning) => {}
             Err(e) => tracing::warn!("background embed failed: {e}"),
         }
     }
@@ -5843,8 +6231,33 @@ fn normalize_md(dest: &str) -> String {
     }
 }
 
+/// The one line a write path answers with when the file it would rewrite is
+/// not UTF-8 text: nothing is written, and the person is told how to fix it.
+pub(crate) fn not_utf8_message(abs: &Path) -> String {
+    format!(
+        "{} is not valid UTF-8, so it cannot be read or written as text; save it as UTF-8 and try again",
+        abs.display()
+    )
+}
+
+/// An io error from reading a text file, with the not-UTF-8 case said in the
+/// words [`not_utf8_message`] uses rather than as a bare io error.
+pub(crate) fn text_read_error(abs: &Path, source: std::io::Error) -> EngineError {
+    if source.kind() == std::io::ErrorKind::InvalidData {
+        return EngineError::Invalid(not_utf8_message(abs));
+    }
+    EngineError::Io {
+        path: abs.display().to_string(),
+        source,
+    }
+}
+
+/// Write an engram, a MANIFEST or any other domain text file: always as UTF-8
+/// with LF line endings, the whole file, whatever the text it was given held.
+/// Attachments, whose bytes are never text to convert, go through
+/// [`write_bytes`] instead.
 fn write_file(abs: &Path, contents: &str) -> Result<()> {
-    write_bytes(abs, contents.as_bytes())
+    write_bytes(abs, crystalline_core::to_lf(contents).as_bytes())
 }
 
 fn write_bytes(abs: &Path, contents: &[u8]) -> Result<()> {
@@ -6325,8 +6738,9 @@ fn without_ack(source: &str, rule: &str, scope: Option<&str>) -> String {
 /// reads. The replacement keeps the original position, which keeps a
 /// hand-ordered list hand-ordered.
 ///
-/// The exception is [`crystalline_index::is_pair_scoped`] - `V301` - and it
-/// exists because a twin finding is about a pair rather than about the engram:
+/// The exception is [`crystalline_index::is_pair_scoped`] - `V301` and `V302` -
+/// and it exists because a twin finding, like a possible contradiction, is
+/// about a pair rather than about the engram:
 /// an engram that twins two others carries two twin findings and neither is the
 /// engram's answer about the rule. Keying those by rule alone made the second
 /// acknowledgment overwrite the first, which silenced one pair and left the

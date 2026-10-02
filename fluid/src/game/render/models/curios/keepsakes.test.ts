@@ -16,7 +16,7 @@ import type { CurioKind } from "../../../world/types";
 import { createBuilder, type V3 } from "../../geometry";
 import { frameAt, type Frame } from "../../kit";
 import { LAYER } from "../../layers";
-import { LOOKS } from "../../looks";
+import { LOOK } from "../../looks";
 import {
   cellsOf,
   inked,
@@ -46,7 +46,7 @@ const ORIGIN: Frame = frameAt([0, 0, 0], 0);
 /** A keepsake kind's recorded parts, built once at the origin. */
 function partsOf(kind: CurioKind): Part[] {
   const parts: Part[] = [];
-  buildCurio(recordingKitAt(createBuilder(), parts), kind, 0, LOOKS.aperture);
+  buildCurio(recordingKitAt(createBuilder(), parts), kind, 0, LOOK);
   return parts;
 }
 

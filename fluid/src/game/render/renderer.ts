@@ -1,7 +1,7 @@
 /**
  * Frames from a room: the scene pass, the bloom and the final composite.
  *
- * `setRoom` does the expensive work once per room or look - it builds the
+ * `setRoom` does the expensive work once per room - it builds the
  * static room mesh and one small mesh per moving part of a way, fills the
  * texture array (the procedural layers up to `LAYER.decal` - panels, floor,
  * ceiling, metal, hazard, the portal swirl, grime, the ribbed and plated
@@ -32,16 +32,14 @@
  * fittings are the fourth (`interior:<kind>:<variant>`), placed at floor
  * level, their slot their kind's blink bank. The group's family picks the
  * builder (`buildGroupMesh`). Each kind and variant the room
- * needs is built once as its own mesh in the look's colours and kept in a
- * cache keyed by the group's key; the cache is cleared when the look's id
- * changes and otherwise grows lazily, bounded by the prop, hero, curio and
- * fitting catalogues. The condition does not enter the key: it changes only
- * grime and light scale, never the palette a mesh is coloured from (a look test
- * pins that). The look is fixed in play; only a dev page picks another,
- * at its start. The room's instance buffers depend only on the room, so a
- * `setRoom` with the very same room object in a new look keeps them and
- * only rebuilds the small vertex arrays that bind them to the new look's
- * meshes.
+ * needs is built once as its own mesh in `LOOK`'s colours and kept in a
+ * cache keyed by the group's key; the cache grows lazily, bounded by the
+ * prop, hero, curio and fitting catalogues. The condition does not enter
+ * the key: it changes only grime and light scale, never the palette a mesh
+ * is coloured from (a look test pins that). The room's instance buffers
+ * depend only on the room, so a `setRoom` with the very same room object
+ * keeps them and only rebuilds the small vertex arrays that bind them to
+ * the cached meshes.
  *
  * Every GPU object is owned here and released in `dispose`, which the demo
  * calls on unmount. After a lost context the demo does not call it: the
@@ -77,14 +75,7 @@ import { buildRoomMesh, type MeshData, type V3 } from "./geometry";
 import { instanceGroups } from "./instances";
 import { LAYER, LAYER_SIZE, layerPlan } from "./layers";
 import { fillLightTexels, lightGrid, type LightGrid } from "./lightgrid";
-import {
-  C64_PALETTE,
-  accentFor,
-  applyCondition,
-  propLook,
-  type Look,
-  type LookId,
-} from "./looks";
+import { accentFor, applyCondition, LOOK, propLook, type Look } from "./looks";
 import type { MoverPart } from "./models";
 import { buildCurioMesh } from "./models/curios";
 import { buildHeroMesh } from "./models/heroes";
@@ -121,7 +112,7 @@ export interface Camera {
  * The station's renderer.
  *
  * - `setRoom` builds the meshes, the texture array and the light grid for a
- *   room in a look; call it again when either changes. It throws when the
+ *   room in `LOOK`; call it again when the room changes. It throws when the
  *   room needs more texture layers than the GPU holds (`caps.maxLayers`,
  *   at least 256 in WebGL2), a limit error like a failed shader: a shorter
  *   array would make the shader clamp the missing layers to the last one
@@ -149,7 +140,7 @@ export interface Camera {
  * `draw` before `setRoom` or after `dispose` draws nothing.
  */
 export interface Renderer {
-  setRoom(room: RoomSpec, look: Look): void;
+  setRoom(room: RoomSpec): void;
   resize(width: number, height: number): void;
   draw(
     camera: Camera,
@@ -216,8 +207,8 @@ export function buildGroupMesh(g: GroupMesh, look: Look): MeshData {
 /**
  * One prop, hero, curio or fitting kind and variant of the room on the GPU:
  * which mesh it draws (`id`), its instance buffer, kept while the room stays
- * the same, and the vertex array that binds it to the cached mesh of the
- * current look, remade on every `setRoom`.
+ * the same, and the vertex array that binds it to the cached mesh, remade
+ * on every `setRoom`.
  */
 interface GpuGroup {
   id: GroupMesh;
@@ -293,7 +284,6 @@ export function createRenderer(
   let accents = new Float32Array(0);
   let room: RoomSpec | null = null;
   let look: Look | null = null;
-  let meshLook: LookId | null = null;
   const groupMeshes = new Map<string, VertexBuffer>();
   let groups: GpuGroup[] = [];
   let targets: Targets | null = null;
@@ -301,7 +291,6 @@ export function createRenderer(
   const projection = mat4();
   const view = mat4();
   const viewProjection = mat4();
-  const palette = new Float32Array(C64_PALETTE.flatMap((c) => [...c]));
   // The static room and the movers leave the instance attributes
   // disabled, so they read these generic values: offset 0 and turn 0.
   gl.vertexAttrib3f(INSTANCE_OFFSET_LOCATION, 0, 0, 0);
@@ -348,7 +337,6 @@ export function createRenderer(
   const releaseGroupCache = () => {
     for (const v of groupMeshes.values()) v.dispose();
     groupMeshes.clear();
-    meshLook = null;
   };
 
   const makeTarget = (w: number, h: number, depth: boolean): Target => {
@@ -453,7 +441,7 @@ export function createRenderer(
   };
 
   return {
-    setRoom(nextRoom, nextLook) {
+    setRoom(nextRoom) {
       if (disposed) return;
       const plan = layerPlan(nextRoom);
       if (plan.count > caps.maxLayers) {
@@ -463,32 +451,27 @@ export function createRenderer(
       }
       // The meshes are built before the old room is let go, so a room that
       // cannot be built leaves the old one on the GPU and drawn.
-      const nextLookApplied = applyCondition(nextLook, nextRoom.condition);
+      const nextLookApplied = applyCondition(LOOK, nextRoom.condition);
       const built = buildRoomMesh(nextRoom, nextLookApplied);
       // The same room object handed back (`enter` showing the same place
       // again): its instance buffers stay. This is read before anything
       // is released.
       const sameRoom = nextRoom === room;
-      const lookChanged = nextLook.id !== meshLook;
       const nextGroups = sameRoom ? null : instanceGroups(nextRoom);
       const needed: readonly GroupMesh[] =
         nextGroups ?? groups.map((g) => g.id);
-      // The prop, hero, curio and fitting meshes this room lacks in this look
+      // The prop, hero, curio and fitting meshes this room lacks
       // are built on the CPU before the old room is let go, like the room mesh,
       // so one that cannot be built leaves the old room drawn too.
       const fresh = new Map<string, MeshData>();
       for (const g of needed) {
-        if (!lookChanged && groupMeshes.has(g.key)) continue;
-        fresh.set(g.key, buildGroupMesh(g, nextLook));
+        if (groupMeshes.has(g.key)) continue;
+        fresh.set(g.key, buildGroupMesh(g, LOOK));
       }
       // The contact shadow is painted on the CPU before the release too.
       const nextShadow = contactShadows(nextRoom);
       releaseRoom();
       releaseGroupMeshes();
-      if (lookChanged) {
-        releaseGroupCache();
-        meshLook = nextLook.id;
-      }
       if (nextGroups !== null) {
         releaseGroups();
         // An instance group is a `GroupMesh` as it stands (its count and
@@ -538,11 +521,7 @@ export function createRenderer(
         if (i !== LAYER.pictogram) array.setLayer(i, pixels);
       });
       array.setLayer(LAYER.pictogram, pictogram);
-      for (const { layer, pixels } of drawTextLayers(
-        plan,
-        nextLook,
-        LAYER_SIZE,
-      )) {
+      for (const { layer, pixels } of drawTextLayers(plan, LOOK, LAYER_SIZE)) {
         array.setLayer(layer, pixels);
       }
       array.finish();
@@ -650,7 +629,6 @@ export function createRenderer(
         shadow?.d ?? 1,
       );
       gl.uniform1f(scene.uniform("uContactShadow"), look.contactShadow ?? 0);
-      gl.uniform1f(scene.uniform("uTextureMix"), look.textureMix);
       gl.uniform3f(scene.uniform("uEdgeColour"), ...look.edge.colour);
       gl.uniform1f(scene.uniform("uEdgeStrength"), look.edge.strength);
       gl.uniform1f(scene.uniform("uEdgeWidth"), look.edge.width);
@@ -732,8 +710,6 @@ export function createRenderer(
         composite.uniform("uToneMap"),
         caps.color === "rgba16f" ? 1 : 0,
       );
-      gl.uniform1i(composite.uniform("uDither"), look.dither ? 1 : 0);
-      gl.uniform3fv(composite.uniform("uPalette"), palette);
       fullscreen.draw();
       // Unbind the bloom from unit 1 and the scene from unit 0: the next
       // frame renders into both.

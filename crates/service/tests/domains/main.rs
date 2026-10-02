@@ -12,11 +12,13 @@ mod support;
 
 mod collaboration;
 mod configure;
+mod contradictions;
 mod domain_access;
 mod domain_admin;
 mod domain_rename;
 mod evolve;
 mod evolve_twins;
+mod metal_runtime;
 mod toon_measurement;
 mod virtual_domains;
 mod visibility;

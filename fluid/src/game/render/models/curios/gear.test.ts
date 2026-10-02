@@ -15,7 +15,7 @@ import { describe, expect, it } from "vitest";
 
 import { createBuilder, FLAG, type V3 } from "../../geometry";
 import { frameAt } from "../../kit";
-import { LOOKS } from "../../looks";
+import { LOOK } from "../../looks";
 import {
   recordingKitAt,
   shape,
@@ -33,12 +33,7 @@ function partsOf(
   variant: number,
 ): Part[] {
   const parts: Part[] = [];
-  buildCurio(
-    recordingKitAt(createBuilder(), parts),
-    kind,
-    variant,
-    LOOKS.aperture,
-  );
+  buildCurio(recordingKitAt(createBuilder(), parts), kind, variant, LOOK);
   return parts;
 }
 
@@ -164,8 +159,8 @@ describe("gear curio models", () => {
     expect(strip(partsOf("light-sword", 2))).toEqual(
       strip(partsOf("light-sword", 1)),
     );
-    const blue = buildCurioMesh("light-sword", 1, LOOKS.aperture);
-    const green = buildCurioMesh("light-sword", 2, LOOKS.aperture);
+    const blue = buildCurioMesh("light-sword", 1, LOOK);
+    const green = buildCurioMesh("light-sword", 2, LOOK);
     expect(green.count).toBe(blue.count);
     expect(Array.from(green.vertices)).not.toEqual(Array.from(blue.vertices));
   });

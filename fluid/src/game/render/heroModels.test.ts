@@ -13,7 +13,7 @@ import type { Hero, HeroKind, Side, WallSlot } from "../world/types";
 import { CELL } from "../world/units";
 import { FLAG, createBuilder, type MeshData, type V3 } from "./geometry";
 import { createKit, frameAt, frameForSlot, type Frame } from "./kit";
-import { LOOKS } from "./looks";
+import { LOOK } from "./looks";
 import {
   clearAbove,
   floatingGlow,
@@ -66,7 +66,7 @@ function buildRecorded(
 ): { mesh: MeshData; parts: Part[] } {
   const builder = createBuilder();
   const parts: Part[] = [];
-  buildHero(recordingKitAt(builder, parts), kind, variant, LOOKS.aperture);
+  buildHero(recordingKitAt(builder, parts), kind, variant, LOOK);
   return { mesh: builder.build(), parts };
 }
 
@@ -109,7 +109,7 @@ describe("hero models", () => {
       it(`${kind} variant ${String(v)} builds the same floats twice`, () => {
         // Built as the checks build it, moving parts in place.
         const b = createBuilder();
-        buildHero((f) => createKit(b, f), kind, v, LOOKS.aperture);
+        buildHero((f) => createKit(b, f), kind, v, LOOK);
         const again = b.build();
         expect(again.count).toBe(mesh.count);
         expect(Array.from(again.vertices)).toEqual(Array.from(mesh.vertices));
@@ -220,18 +220,12 @@ describe("hero models", () => {
     // winding, glow contact, float and budget and never the leaves'.
     const { mesh } = buildRecorded("police-box", 0);
     const explicit = createBuilder();
-    buildHero(
-      recordingKitAt(explicit, []),
-      "police-box",
-      0,
-      LOOKS.aperture,
-      true,
-    );
-    const body = buildHeroMesh("police-box", 0, LOOKS.aperture);
+    buildHero(recordingKitAt(explicit, []), "police-box", 0, LOOK, true);
+    const body = buildHeroMesh("police-box", 0, LOOK);
     const wings = boxLeafMovers(
       { kind: "police-box", variant: 0, x: 3, y: 4, turn: 0, seed: 0 },
       0,
-      LOOKS.aperture,
+      LOOK,
     );
     expect(mesh.count).toBe(explicit.build().count);
     expect(mesh.count).toBe(
@@ -242,10 +236,8 @@ describe("hero models", () => {
   });
 
   it("refuses a variant the catalogue does not have", () => {
-    expect(() => buildHeroMesh("turret", 1, LOOKS.aperture)).toThrow(
-      /no variant 1/,
-    );
-    expect(() => buildHeroMesh("arcade-cabinet", -1, LOOKS.aperture)).toThrow(
+    expect(() => buildHeroMesh("turret", 1, LOOK)).toThrow(/no variant 1/);
+    expect(() => buildHeroMesh("arcade-cabinet", -1, LOOK)).toThrow(
       /no variant -1/,
     );
   });

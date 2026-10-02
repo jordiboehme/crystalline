@@ -109,7 +109,7 @@ const TURN_TABLE = [0, 1, 2, 3]
  * two surfaces. The flag is rounded to an int once here, so the fragment
  * shader compares whole numbers. The fragment shader is unchanged by
  * instancing, so the light grid, the bands, the grime, the edge lines and
- * the dither apply to props as to everything else.
+ * the tone map apply to props as to everything else.
  *
  * The tint may carry the accent mark (`ACCENT_MARK` and `accentTint` in
  * `geometry.ts`, 2.7 C8): a negative first channel, which no real colour
@@ -204,23 +204,22 @@ void main() {
  * turns towards its floor cell. A texel of 0 is legal: a dark cell.
  *
  * A decal (`FLAG.decal`, 2.7 C20) takes the lit path with no edge lines,
- * after an alpha test: its texel's alpha, read whatever `uTextureMix` is,
- * against the 4x4 ordered threshold at its pixel (`bayer4`, each step
- * offset half a step so no threshold is 0). A texel below it is
- * discarded, so a hard-edged shape (a chevron, an arrow, a stencil's
- * pixel) stays crisp and a soft one (grime, a streak, rust) fades in a
- * stipple, the old ordered-dither look, with no blending and no sorting.
+ * after an alpha test: its texel's alpha, against the 4x4 ordered
+ * threshold at its pixel (`bayer4`, each step offset half a step so no
+ * threshold is 0). A texel below it is discarded, so a hard-edged shape (a
+ * chevron, an arrow, a stencil's pixel) stays crisp and a soft one (grime,
+ * a streak, rust) fades in an ordered stipple, with no blending and no
+ * sorting.
  * The test comes right after the texture reads (the texel, the portal's
  * swirl and the light grid's `cellLevel`), so a discarded fragment writes
  * nothing and every implicit-lod sample is taken while the whole 2x2 quad
  * still runs: a discard is not uniform across a quad, and a sample after
  * it would read undefined derivatives. Everything after the test reads
  * the derivatives taken at the top (`textureGrad` for the grime). The
- * atlas's colour is white, so a decal's colour is its tint in every look,
- * and the shapes survive Freescape 64, whose texture mix is 0.
+ * atlas's colour is white, so a decal's colour is its tint.
  *
  * Edge lines: a frame (`FLAG.frame`) always draws them, in its own tint.
- * With `uEdgeEverywhere` (look 2) the room's shell (`FLAG.shell`) draws
+ * With `uEdgeEverywhere` the room's shell (`FLAG.shell`) draws
  * them too, in the look's edge colour; a plain `lit` surface (a prop, a
  * hero, a fitting, a terminal) never does. The shell is lit exactly as
  * `lit`: no early return tests its flag. The shell's seams fade with the
@@ -259,7 +258,6 @@ uniform float uFalloff;
 uniform float uMinLight;
 uniform float uBands;
 uniform float uGrime;
-uniform float uTextureMix;
 uniform vec3 uEdgeColour;
 uniform float uEdgeStrength;
 uniform float uEdgeWidth;
@@ -315,7 +313,7 @@ void main() {
   float swirl = texture(uTextures, vec3(swirlUv, vLayer)).r;
   float level = cellLevel(vWorld, vNormal);
   if (vFlag == ${String(FLAG.decal)} && texel4.a < bayer4(gl_FragCoord.xy)) discard;
-  vec3 base = vTint * mix(vec3(1.0), texel, uTextureMix);
+  vec3 base = vTint * texel;
 
   if (vFlag == 1) {
     outColour = vec4(vTint * texel * 1.4 * uGain, 1.0);
@@ -450,8 +448,7 @@ void main() {
  * Reinhard tone map on the half-float path (scaled by 1.6, so a value of
  * 0.6 maps to itself, darker values are lifted a little, 1 comes out at 0.8
  * and full white is only reached at about 1.67, which leaves the bloom
- * headroom above 1), and for Freescape 64 an ordered 4x4 Bayer dither on
- * 2x2 pixel blocks into the sixteen colours of `uPalette`, the C64 palette.
+ * headroom above 1).
  */
 export const COMPOSITE_FS = `#version 300 es
 precision highp float;
@@ -460,35 +457,11 @@ uniform sampler2D uScene;
 uniform sampler2D uBloom;
 uniform float uBloomStrength;
 uniform bool uToneMap;
-uniform bool uDither;
-uniform vec3 uPalette[16];
 out vec4 outColour;
-
-const float BAYER[16] = float[16](
-  0.0, 8.0, 2.0, 10.0,
-  12.0, 4.0, 14.0, 6.0,
-  3.0, 11.0, 1.0, 9.0,
-  15.0, 7.0, 13.0, 5.0);
-
-vec3 nearest(vec3 c) {
-  vec3 best = uPalette[0];
-  float bestD = 1e9;
-  for (int i = 0; i < 16; i++) {
-    vec3 d = c - uPalette[i];
-    float dd = dot(d, d);
-    if (dd < bestD) { bestD = dd; best = uPalette[i]; }
-  }
-  return best;
-}
 
 void main() {
   vec3 c = texture(uScene, vUv).rgb + texture(uBloom, vUv).rgb * uBloomStrength;
   if (uToneMap) c = c * 1.6 / (1.0 + c);
-  if (uDither) {
-    ivec2 p = ivec2(gl_FragCoord.xy) / 2 % 4;
-    float t = BAYER[p.y * 4 + p.x] / 16.0 - 0.5;
-    c = nearest(clamp(c + t * 0.22, 0.0, 1.0));
-  }
   outColour = vec4(clamp(c, 0.0, 1.0), 1.0);
 }
 `;

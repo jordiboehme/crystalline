@@ -163,3 +163,12 @@ export function stepSelection(
   if (count === 0) return 0;
   return Math.min(Math.max(0, selected + by), count - 1);
 }
+
+/**
+ * The id of the option at `index` of the filtered list, under the listbox
+ * id `listId`. The field's `aria-activedescendant` and the option's `id`
+ * both come from here, so they cannot drift apart.
+ */
+export function optionId(listId: string, index: number): string {
+  return `${listId}-option-${String(index)}`;
+}

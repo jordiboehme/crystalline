@@ -106,6 +106,11 @@ pub const MIGRATIONS: &[Migration] = &[
         label: "unbind references an unknown prefix bound at home",
         sql: SCHEMA_V16,
     },
+    Migration {
+        version: 17,
+        label: "contradiction scores",
+        sql: SCHEMA_V17,
+    },
 ];
 
 // The whole current schema in one step. The temporal columns stay TEXT ISO
@@ -514,6 +519,74 @@ WHERE to_domain IS NOT NULL AND to_id IS NOT NULL
                   AND (e.permalink = link.to_raw OR lower(e.title) = lower(link.to_raw)));
 "#;
 
+// The Turso v18 tables, same meaning. Foreign keys are enforced here, so the
+// declared cascades do the work on a delete; `delete_engram` and
+// `clear_domain` still delete by hand for symmetry with Turso. Written to
+// replay (`IF NOT EXISTS`), because the ledger stamp is a separate statement.
+// `idx_contradiction_pair_domain` carries the order columns as its Turso twin
+// does, so the two schemas stay the same, and the two `engram_b` indexes serve
+// the second half of `delete_engram`'s `engram_a=$1 OR engram_b=$1` beside the
+// primary keys that serve the first. `idx_contradiction_pair_model` serves
+// `Store::scored_pair_count`'s `WHERE model=$1`, which names no domain and so
+// cannot seek `idx_contradiction_pair_domain` - see the Turso twin's comment.
+// `observation_vector` caches the embedding of each observation line the
+// contradiction check pairs, keyed by the embedding model and the row hash of
+// the folded text; it holds no text and no engram id, and its primary key
+// serves every read - see the Turso twin's comment. A plain `BYTEA`, not a
+// `vector` column: nothing searches these vectors in SQL.
+//
+// `domain.parse_generation` is the parser generation
+// (`crystalline_core::PARSE_GENERATION`) the domain's rows were last derived
+// with. An index this migration (the Turso v18 twin) upgrades has every row at 0, older than any
+// parser that records one, so the first sync after the upgrade reparses each
+// domain once and stamps it; a domain row created later is stamped with the
+// current generation on insert, so a fresh index reparses nothing. Unreleased
+// when it joined this migration (the Turso v18 twin), so it rides here rather than in one of its own.
+const SCHEMA_V17: &str = r#"
+CREATE TABLE IF NOT EXISTS contradiction_pair (
+    domain_id BIGINT NOT NULL REFERENCES domain(id) ON DELETE CASCADE,
+    engram_a BIGINT NOT NULL REFERENCES engram(id) ON DELETE CASCADE,
+    engram_b BIGINT NOT NULL REFERENCES engram(id) ON DELETE CASCADE,
+    checksum_a TEXT NOT NULL,
+    checksum_b TEXT NOT NULL,
+    cosine DOUBLE PRECISION NOT NULL,
+    model TEXT NOT NULL,
+    scored_at TEXT NOT NULL,
+    PRIMARY KEY (engram_a, engram_b, model)
+);
+CREATE INDEX IF NOT EXISTS idx_contradiction_pair_domain ON contradiction_pair(domain_id, model, engram_a, engram_b);
+CREATE INDEX IF NOT EXISTS idx_contradiction_pair_model ON contradiction_pair(model);
+
+CREATE TABLE IF NOT EXISTS contradiction (
+    domain_id BIGINT NOT NULL REFERENCES domain(id) ON DELETE CASCADE,
+    engram_a BIGINT NOT NULL REFERENCES engram(id) ON DELETE CASCADE,
+    engram_b BIGINT NOT NULL REFERENCES engram(id) ON DELETE CASCADE,
+    line_a BIGINT NOT NULL,
+    line_b BIGINT NOT NULL,
+    hash_a TEXT NOT NULL,
+    hash_b TEXT NOT NULL,
+    model TEXT NOT NULL,
+    score_ab DOUBLE PRECISION NOT NULL,
+    score_ba DOUBLE PRECISION NOT NULL,
+    similarity DOUBLE PRECISION NOT NULL DEFAULT 0,
+    period BIGINT NOT NULL DEFAULT 0,
+    PRIMARY KEY (engram_a, engram_b, hash_a, hash_b, model)
+);
+CREATE INDEX IF NOT EXISTS idx_contradiction_engram_b ON contradiction(engram_b);
+CREATE INDEX IF NOT EXISTS idx_contradiction_pair_engram_b ON contradiction_pair(engram_b);
+CREATE INDEX IF NOT EXISTS idx_contradiction_domain ON contradiction(domain_id, model);
+
+CREATE TABLE IF NOT EXISTS observation_vector (
+    model TEXT NOT NULL,
+    hash TEXT NOT NULL,
+    dims BIGINT NOT NULL,
+    vector BYTEA NOT NULL,
+    PRIMARY KEY (model, hash)
+);
+
+ALTER TABLE domain ADD COLUMN IF NOT EXISTS parse_generation BIGINT NOT NULL DEFAULT 0;
+"#;
+
 const SCHEMA_V8: &str = r#"
 CREATE TABLE attachment (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -538,7 +611,13 @@ CREATE TABLE attachment_blob (
 /// and `domain_spelling` all reference `domain(id)`, so they are cleared before
 /// `domain`; `attachment_blob` references `attachment`, so it goes before it,
 /// and `engram_content` references `engram`, so it goes before that.
+/// `contradiction` and `contradiction_pair` reference `engram` and `domain`,
+/// so they go first. `observation_vector` references nothing and leads the
+/// list.
 pub const WIPE_TABLES: &[&str] = &[
+    "observation_vector",
+    "contradiction",
+    "contradiction_pair",
     "observation_tag",
     "engram_tag",
     "chunk",
@@ -640,8 +719,8 @@ mod tests {
         .await
         .unwrap();
 
-        let (v16, before) = MIGRATIONS.split_last().unwrap();
-        assert_eq!(v16.version, 16, "the last migration is v16");
+        let (before, v16) = (&MIGRATIONS[..15], &MIGRATIONS[15]);
+        assert_eq!(v16.version, 16, "the sixteenth migration is v16");
         for m in before {
             sqlx::raw_sql(m.sql).execute(&mut conn).await.unwrap();
         }
@@ -1256,5 +1335,59 @@ mod tests {
             .execute(&mut conn)
             .await
             .unwrap();
+    }
+
+    /// The Turso v18 upgrade test's twin: a schema at v16 with a domain row
+    /// in it, built and stamped migration by migration as `apply` would have,
+    /// then opened by the store (which runs v17) and synced once.
+    #[tokio::test]
+    async fn a_schema_from_before_v17_reparses_on_its_first_sync() {
+        let Ok(url) = std::env::var("CRYSTALLINE_TEST_POSTGRES_URL") else {
+            return;
+        };
+        if url.is_empty() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("d");
+        let schema = format!("mig_reparse_{}", std::process::id());
+        let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}; SET search_path TO {schema}, public"
+        )))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE IF NOT EXISTS schema_migration (version BIGINT PRIMARY KEY, applied_at TEXT NOT NULL)",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(
+            MIGRATIONS[16].version, 17,
+            "the seventeenth migration is v17"
+        );
+        for m in &MIGRATIONS[..16] {
+            sqlx::raw_sql(m.sql).execute(&mut conn).await.unwrap();
+            sqlx::query("INSERT INTO schema_migration (version, applied_at) VALUES ($1, $2)")
+                .bind(m.version)
+                .bind(chrono::Utc::now().to_rfc3339())
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+        sqlx::query("INSERT INTO domain(name, path, kind) VALUES ('d', $1, 'file')")
+            .bind(root.to_string_lossy().into_owned())
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        drop(conn);
+
+        let store = crate::PostgresStore::open_in_schema(&url, &schema)
+            .await
+            .unwrap();
+        crate::sync::upgrade_fixture::first_sync_after_the_upgrade_reparses(&store, &root).await;
+        store.drop_schema().await.unwrap();
     }
 }

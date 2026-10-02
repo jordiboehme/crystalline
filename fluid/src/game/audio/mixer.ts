@@ -6,7 +6,10 @@
  * one master gain into the context's destination (M4 C21). Muting ramps
  * the master to zero in 30 ms (no click) and remembers the choice in
  * `localStorage` under `MUTE_KEY`, as the inverted look remembers its own;
- * a storage that refuses still toggles for the session.
+ * a storage that refuses still toggles for the session. The ambience bus
+ * has its own switch (`toggleAmbience`, remembered under `AMBIENCE_KEY`):
+ * it ramps that bus alone to zero, the effects, signature and modem buses
+ * and the master untouched.
  *
  * **Where the context comes from (`ContextSource`).** Browsers start a
  * context only inside a user gesture, and the game's code runs after its
@@ -60,6 +63,9 @@ export const MASTER_LEVEL = 0.7;
 /** Where the mute choice is remembered: `"1"` muted, anything else not. */
 export const MUTE_KEY = "station.muted";
 
+/** Where the ambience choice is remembered: `"1"` off, anything else on (0.22 R6). */
+export const AMBIENCE_KEY = "station.ambienceOff";
+
 /** How long the master takes to fall silent or come back on a mute. */
 export const MUTE_RAMP_S = 0.03;
 
@@ -92,6 +98,10 @@ export interface Mixer {
   readonly muted: boolean;
   /** Toggles and remembers; returns the new state. */
   toggleMute(): boolean;
+  /** Whether the ambience bus is switched off. */
+  readonly ambienceOff: boolean;
+  /** Toggles the ambience bus and remembers it; returns the new state (true = off). */
+  toggleAmbience(): boolean;
   /** Disconnects the graph; closes an owned context, suspends a borrowed one. */
   close(): void;
 }
@@ -108,10 +118,12 @@ interface Graph {
  */
 export function createMixer(source: ContextSource = {}): Mixer {
   let muted = readMuted();
+  let ambienceOff = readAmbienceOff();
   let closed = false;
   let owned = false;
   let ctx: AudioContextLike | null = attempt(source.borrow);
-  let graph: Graph | null = ctx === null ? null : build(ctx, muted);
+  let graph: Graph | null =
+    ctx === null ? null : build(ctx, muted, ambienceOff);
 
   const quietly = (run: (c: AudioContextLike) => Promise<void>): void => {
     if (ctx === null || ctx.state === "closed") return;
@@ -138,7 +150,7 @@ export function createMixer(source: ContextSource = {}): Mixer {
         ctx = attempt(source.make);
         if (ctx === null) return;
         owned = true;
-        graph = build(ctx, muted);
+        graph = build(ctx, muted, ambienceOff);
       }
       quietly((c) => c.resume());
     },
@@ -158,6 +170,21 @@ export function createMixer(source: ContextSource = {}): Mixer {
         rampTo(graph.master.gain, muted ? 0 : MASTER_LEVEL, ctx.currentTime);
       }
       return muted;
+    },
+    get ambienceOff() {
+      return ambienceOff;
+    },
+    toggleAmbience() {
+      ambienceOff = !ambienceOff;
+      writeAmbienceOff(ambienceOff);
+      if (ctx !== null && graph !== null) {
+        rampTo(
+          graph.buses.ambience.gain,
+          ambienceOff ? 0 : BUS_LEVELS.ambience,
+          ctx.currentTime,
+        );
+      }
+      return ambienceOff;
     },
     close() {
       if (closed) return;
@@ -185,14 +212,21 @@ export function makeAudioContext(): AudioContext | null {
   return Ctor === undefined ? null : new Ctor();
 }
 
-/** The master and the four buses on `ctx`, the master at the mute state. */
-function build(ctx: AudioContextLike, muted: boolean): Graph {
+/**
+ * The master and the four buses on `ctx`, the master at the mute state and
+ * the ambience bus at its own switch.
+ */
+function build(
+  ctx: AudioContextLike,
+  muted: boolean,
+  ambienceOff: boolean,
+): Graph {
   const master = ctx.createGain();
   master.gain.value = muted ? 0 : MASTER_LEVEL;
   master.connect(ctx.destination);
   const bus = (name: Bus): GainLike => {
     const gain = ctx.createGain();
-    gain.gain.value = BUS_LEVELS[name];
+    gain.gain.value = name === "ambience" && ambienceOff ? 0 : BUS_LEVELS[name];
     gain.connect(master);
     return gain;
   };
@@ -238,6 +272,24 @@ function readMuted(): boolean {
 function writeMuted(muted: boolean): void {
   try {
     window.localStorage.setItem(MUTE_KEY, muted ? "1" : "0");
+  } catch {
+    // A private window or blocked storage: the choice lasts this session.
+  }
+}
+
+/** Reads the ambience choice; anything but a readable "1" is ambience on. */
+function readAmbienceOff(): boolean {
+  try {
+    return window.localStorage.getItem(AMBIENCE_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+/** Remembers the ambience choice, when the storage lets it. */
+function writeAmbienceOff(off: boolean): void {
+  try {
+    window.localStorage.setItem(AMBIENCE_KEY, off ? "1" : "0");
   } catch {
     // A private window or blocked storage: the choice lasts this session.
   }

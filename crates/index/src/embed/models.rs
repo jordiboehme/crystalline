@@ -28,7 +28,7 @@ pub enum Architecture {
 }
 
 /// One local model the provider knows how to run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LocalModel {
     /// The id `embeddings.model` names, and the id stored against every vector.
     pub id: &'static str,
@@ -63,6 +63,15 @@ pub struct LocalModel {
     /// The approximate first-use download, in megabytes, for the notice and
     /// for doctor.
     pub download_mb: u64,
+    /// The line cosine at or above which the contradiction check treats two
+    /// observation lines as being about the same subject and lets the NLI
+    /// model read them. Per model, because cosine distributions differ:
+    /// granite's line cosines are compressed (p10 0.72, p90 0.81 on Jordi's
+    /// domains) and "same subject" starts around 0.86
+    /// (research/2026-10-01-v302-line-filter-experiment.md). `None` for a
+    /// model nobody measured: V302 then does not run at all, so it cannot
+    /// flood on uncalibrated cosines.
+    pub line_similarity_floor: Option<f64>,
 }
 
 /// Every model the local provider can run. The first entry is the default.
@@ -82,6 +91,7 @@ pub const LOCAL_MODELS: [LocalModel; 2] = [
             "model.safetensors",
         ],
         download_mb: 220,
+        line_similarity_floor: Some(0.86),
     },
     LocalModel {
         id: "bge-small-en-v1.5",
@@ -92,6 +102,7 @@ pub const LOCAL_MODELS: [LocalModel; 2] = [
         query_prefix: "Represent this sentence for searching relevant passages: ",
         files: &["config.json", "tokenizer.json", "model.safetensors"],
         download_mb: 130,
+        line_similarity_floor: None,
     },
 ];
 
@@ -113,6 +124,37 @@ impl LocalModel {
             Architecture::ModernBert => "modernbert",
         }
     }
+
+    /// This model as the snapshot cleanup sees it.
+    pub fn pinned(&self) -> PinnedRepo<'static> {
+        PinnedRepo {
+            id: self.id,
+            repo: self.repo,
+            revision: self.revision,
+            files: self.files,
+            what: "embedding model",
+        }
+    }
+}
+
+/// One repository fetched at a pinned commit, as the snapshot cleanup sees
+/// it. The embedding models of [`LOCAL_MODELS`] and the contradiction
+/// check's NLI checkpoint share the model cache and follow the same rules:
+/// nothing removes a snapshot this process loaded or another complete one,
+/// and in a folder the user provides only the snapshot that failed to build
+/// may go.
+#[derive(Debug, Clone, Copy)]
+pub struct PinnedRepo<'a> {
+    /// The short id the logs name it by.
+    pub id: &'a str,
+    /// The Hugging Face repository id, `<owner>/<name>`.
+    pub repo: &'a str,
+    /// The pinned commit, a full 40-character hash.
+    pub revision: &'a str,
+    /// The files the loader needs, all of which a complete snapshot holds.
+    pub files: &'a [&'a str],
+    /// What the logs call it: "embedding model" or "contradiction model".
+    pub what: &'a str,
 }
 
 /// The table entry for an id, by the short id or by the full repository id.
@@ -120,6 +162,14 @@ impl LocalModel {
 pub fn local_model(id: &str) -> Option<&'static LocalModel> {
     let id = id.trim();
     LOCAL_MODELS.iter().find(|m| m.id == id || m.repo == id)
+}
+
+/// The line-similarity floor of the embedding model `model_id` names, by id
+/// or repo; `None` for a model this table does not carry or carries without
+/// a measured floor. The daemon asks with the id its vectors are stored
+/// under, status and doctor with `configured_model_id`, so both say the same.
+pub fn line_similarity_floor(model_id: &str) -> Option<f64> {
+    local_model(model_id).and_then(|m| m.line_similarity_floor)
 }
 
 /// [`local_model`], refusing an id the table does not know.
@@ -203,7 +253,7 @@ pub fn choose_snapshot(models_dir: &Path, model: &LocalModel) -> SnapshotChoice 
         .filter(|c| c != model.revision)
         .collect();
     others.sort();
-    let pinned_complete = snapshot_complete(&snapshots.join(model.revision), model);
+    let pinned_complete = snapshot_complete(&snapshots.join(model.revision), model.files);
     let older = older_snapshot(&repo_dir, &others, model);
     match (pinned_complete, older) {
         (true, None) => SnapshotChoice::Pinned { others },
@@ -244,8 +294,8 @@ fn snapshot_commits(snapshots: &Path) -> Vec<String> {
 
 /// Every file the loader needs is present (a symlink counts when its blob is
 /// there, which `is_file` follows).
-fn snapshot_complete(dir: &Path, model: &LocalModel) -> bool {
-    model.files.iter().all(|f| dir.join(f).is_file())
+fn snapshot_complete(dir: &Path, files: &[&str]) -> bool {
+    files.iter().all(|f| dir.join(f).is_file())
 }
 
 /// The older complete snapshot a start would use: the one `refs/main` names,
@@ -254,7 +304,7 @@ fn older_snapshot(repo_dir: &Path, others: &[String], model: &LocalModel) -> Opt
     let snapshots = repo_dir.join("snapshots");
     let complete: Vec<&String> = others
         .iter()
-        .filter(|c| snapshot_complete(&snapshots.join(c), model))
+        .filter(|c| snapshot_complete(&snapshots.join(c), model.files))
         .collect();
     if let Ok(main) = std::fs::read_to_string(repo_dir.join("refs").join("main")) {
         let main = main.trim();
@@ -421,7 +471,7 @@ pub fn retire_older_snapshots(models_dir: &Path, model: &LocalModel) -> Vec<Stri
         .into_iter()
         .filter(|c| !is_loaded_snapshot(&snapshots.join(c)))
         .collect();
-    let removed = remove_snapshots(&repo_dir, model, &candidates, true);
+    let removed = remove_snapshots(&repo_dir, &model.pinned(), &candidates, true);
     if !removed.is_empty() {
         tracing::info!(
             model = model.id,
@@ -451,7 +501,14 @@ pub fn retire_older_snapshots(models_dir: &Path, model: &LocalModel) -> Vec<Stri
 ///   blobs cannot be told apart and stay; that is logged, because the fetch
 ///   may reuse them.
 pub fn remove_failed_pinned_snapshot(models_dir: &Path, model: &LocalModel, user_dir: bool) {
-    let repo_dir = models_dir.join(model.cache_dir_name());
+    remove_failed_snapshot(models_dir, &model.pinned(), user_dir);
+}
+
+/// [`remove_failed_pinned_snapshot`] for any pinned repository in the model
+/// cache, the contradiction check's NLI checkpoint included: the same three
+/// cases, the same guarantees.
+pub fn remove_failed_snapshot(models_dir: &Path, model: &PinnedRepo<'_>, user_dir: bool) {
+    let repo_dir = models_dir.join(hub_dir_name(model.repo));
     let snapshots = repo_dir.join("snapshots");
     let pinned = [model.revision.to_string()];
     if user_dir {
@@ -460,7 +517,7 @@ pub fn remove_failed_pinned_snapshot(models_dir: &Path, model: &LocalModel, user
     }
     let other_complete = snapshot_commits(&snapshots)
         .iter()
-        .any(|c| c != model.revision && snapshot_complete(&snapshots.join(c), model));
+        .any(|c| c != model.revision && snapshot_complete(&snapshots.join(c), model.files));
     if !other_complete {
         if let Err(e) = std::fs::remove_dir_all(&repo_dir)
             && e.kind() != std::io::ErrorKind::NotFound
@@ -468,7 +525,8 @@ pub fn remove_failed_pinned_snapshot(models_dir: &Path, model: &LocalModel, user
             tracing::warn!(
                 model = model.id,
                 path = %repo_dir.display(),
-                "could not clear the embedding model's cache directory: {e}"
+                "could not clear the {}'s cache directory: {e}",
+                model.what
             );
         }
         return;
@@ -485,8 +543,9 @@ pub fn remove_failed_pinned_snapshot(models_dir: &Path, model: &LocalModel, user
         tracing::warn!(
             model = model.id,
             path = %repo_dir.join("blobs").display(),
-            "removed the pinned snapshot of the embedding model that failed to load, but its \
-             files were copies, so the blobs they came from stay and the next fetch may reuse them"
+            "removed the pinned snapshot of the {} that failed to load, but its \
+             files were copies, so the blobs they came from stay and the next fetch may reuse them",
+            model.what
         );
     }
 }
@@ -497,7 +556,7 @@ pub fn remove_failed_pinned_snapshot(models_dir: &Path, model: &LocalModel, user
 /// to is shared and stays. A removal that fails is logged and skipped.
 fn remove_snapshots(
     repo_dir: &Path,
-    model: &LocalModel,
+    model: &PinnedRepo<'_>,
     commits: &[String],
     own_cache: bool,
 ) -> Vec<String> {
@@ -526,7 +585,8 @@ fn remove_snapshots(
                 model = model.id,
                 commit = %commit,
                 path = %dir.display(),
-                "leaving a snapshot of the embedding model in place: {e}"
+                "leaving a snapshot of the {} in place: {e}",
+                model.what
             ),
         }
     }
@@ -604,13 +664,14 @@ pub fn cached_model_dirs(models_dir: &Path) -> Vec<(String, u64)> {
     found
 }
 
-/// Remove every cached directory for a repository `LOCAL_MODELS` lists whose
+/// Remove every cached directory for a repository `LOCAL_MODELS`, `NLI_MODELS` or
+/// `RETIRED_NLI_REPOS` lists whose
 /// id is not in `keep`, returning what went and how many bytes it freed,
 /// sorted by repo id.
 ///
-/// Only a repository the table knows is ever a candidate: `CRYSTALLINE_MODELS_DIR`
-/// may point at a cache other Hugging Face tools share, and a directory that
-/// table does not list - another tool's model, or one this build used to know
+/// Only a repository one of the two tables knows is ever a candidate: `CRYSTALLINE_MODELS_DIR`
+/// may point at a cache other Hugging Face tools share, and a directory neither
+/// table lists - another tool's model, or one this build used to know
 /// and has since dropped - is never touched, whatever `keep` says. `keep`
 /// itself holds repository ids, not table ids, so a caller that cannot
 /// resolve its configured model through the table must decline to prune
@@ -626,7 +687,9 @@ pub fn prune_model_cache(models_dir: &Path, keep: &[&str]) -> Result<Vec<(String
     let mut removed = Vec::new();
     let mut candidates: Vec<(String, PathBuf)> = hub_dirs(models_dir)
         .into_iter()
-        .filter(|(repo, _)| LOCAL_MODELS.iter().any(|m| m.repo == repo))
+        .filter(|(repo, _)| {
+            LOCAL_MODELS.iter().any(|m| m.repo == repo) || crate::nli::is_nli_checkpoint(repo)
+        })
         .collect();
     candidates.sort();
     for (repo, path) in candidates {
@@ -639,7 +702,7 @@ pub fn prune_model_cache(models_dir: &Path, keep: &[&str]) -> Result<Vec<(String
                 tracing::info!(
                     repo = %repo,
                     bytes,
-                    "removed the cached weights of an embedding model this install no longer uses"
+                    "removed the cached weights of a model this install no longer uses"
                 );
                 removed.push((repo, bytes));
             }
@@ -1000,6 +1063,30 @@ mod tests {
             "the bigger model measures bigger: {cached:?}"
         );
         assert_eq!(cached_model_dirs(&root.join("missing")), Vec::new());
+    }
+
+    #[test]
+    fn an_nli_checkpoint_is_pruned_unless_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let granite = "ibm-granite/granite-embedding-97m-multilingual-r2";
+        let full = crate::nli::NLI_MODELS[0].repo;
+        let [retired_a, retired_b] = crate::nli::RETIRED_NLI_REPOS;
+        hub_dir(root, granite, &[7u8; 64]);
+        hub_dir(root, full, &[1u8; 16]);
+        hub_dir(root, retired_a, &[2u8; 16]);
+        hub_dir(root, retired_b, &[3u8; 16]);
+        let removed = prune_model_cache(root, &[granite, full]).unwrap();
+        let mut repos: Vec<&str> = removed.iter().map(|(r, _)| r.as_str()).collect();
+        repos.sort();
+        let mut want = vec![retired_a, retired_b];
+        want.sort();
+        assert_eq!(
+            repos, want,
+            "the retired NLI checkpoints of a development build go, the kept one stays"
+        );
+        assert!(root.join(hub_dir_name(full)).is_dir());
+        assert!(root.join(hub_dir_name(granite)).is_dir());
     }
 
     /// Every model is fetched at a fixed commit, never at a branch: a full
@@ -1489,5 +1576,139 @@ mod tests {
             );
         }
         assert!(repo.join("blobs").join("kept").is_file());
+    }
+
+    /// A snapshot of `pinned`'s files, each a relative symlink into
+    /// `blobs/<etag>` on unix the way hf-hub writes one, with `refs/main`
+    /// naming it: the contradiction model's shape, which no
+    /// [`LocalModel`] helper can seed.
+    #[cfg(unix)]
+    fn linked_pinned(root: &Path, pinned: &PinnedRepo<'_>, commit: &str, tag: &str) {
+        let repo = root.join(hub_dir_name(pinned.repo));
+        let blobs = repo.join("blobs");
+        let snap = repo.join("snapshots").join(commit);
+        std::fs::create_dir_all(&blobs).unwrap();
+        std::fs::create_dir_all(&snap).unwrap();
+        for file in pinned.files {
+            let etag = etag(tag, file);
+            std::fs::write(blobs.join(&etag), tag.as_bytes()).unwrap();
+            std::os::unix::fs::symlink(format!("../../blobs/{etag}"), snap.join(file)).unwrap();
+        }
+        std::fs::create_dir_all(repo.join("refs")).unwrap();
+        std::fs::write(repo.join("refs").join("main"), commit).unwrap();
+    }
+
+    /// The contradiction model's self-heal follows the embedding model's
+    /// rules. In a folder the user provides, only the failed pinned snapshot
+    /// directory goes, even when it is the only snapshot there: its blobs,
+    /// its ref and the repository directory stay, where the loader before
+    /// the pin wiped the whole repository.
+    #[cfg(unix)]
+    #[test]
+    fn the_nli_self_heal_removes_only_the_failed_snapshot_in_a_user_folder() {
+        let nli = crate::nli::NLI_MODELS[0].pinned();
+        for other in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            if other {
+                linked_pinned(root, &nli, OLD_A, "old");
+            }
+            linked_pinned(root, &nli, nli.revision, "new");
+
+            remove_failed_snapshot(root, &nli, true);
+            let repo = root.join(hub_dir_name(nli.repo));
+            assert!(!repo.join("snapshots").join(nli.revision).exists());
+            for file in nli.files {
+                assert!(
+                    repo.join("blobs").join(etag("new", file)).is_file(),
+                    "{file}"
+                );
+                if other {
+                    assert!(
+                        repo.join("snapshots").join(OLD_A).join(file).is_file(),
+                        "{file}"
+                    );
+                }
+            }
+            assert!(repo.join("refs").join("main").is_file());
+        }
+    }
+
+    /// In Crystalline's own cache the contradiction model's self-heal is the
+    /// embedding model's too: alone, the repository directory is cleared;
+    /// beside another complete snapshot, that snapshot and its blobs stay and
+    /// only the failed one with the blobs only it used goes.
+    #[cfg(unix)]
+    #[test]
+    fn the_nli_self_heal_in_the_own_cache_never_removes_another_snapshot() {
+        let nli = crate::nli::NLI_MODELS[0].pinned();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        linked_pinned(root, &nli, nli.revision, "new");
+        remove_failed_snapshot(root, &nli, false);
+        assert!(!root.join(hub_dir_name(nli.repo)).exists());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        linked_pinned(root, &nli, OLD_A, "old");
+        linked_pinned(root, &nli, nli.revision, "new");
+        remove_failed_snapshot(root, &nli, false);
+        let repo = root.join(hub_dir_name(nli.repo));
+        assert!(!repo.join("snapshots").join(nli.revision).exists());
+        for file in nli.files {
+            assert!(
+                repo.join("snapshots").join(OLD_A).join(file).is_file(),
+                "{file}"
+            );
+            assert!(
+                repo.join("blobs").join(etag("old", file)).is_file(),
+                "{file}"
+            );
+            assert!(
+                !repo.join("blobs").join(etag("new", file)).exists(),
+                "{file}"
+            );
+        }
+    }
+
+    /// The floor belongs to the embedding model: granite's was measured
+    /// (research/2026-10-01-v302-line-filter-experiment.md), bge's was not,
+    /// and a model this table does not know has none, so V302 cannot run on
+    /// cosines nobody calibrated.
+    #[test]
+    fn the_line_floor_belongs_to_the_model_entry() {
+        assert_eq!(
+            line_similarity_floor("granite-embedding-97m-multilingual-r2"),
+            Some(0.86)
+        );
+        assert_eq!(
+            line_similarity_floor("ibm-granite/granite-embedding-97m-multilingual-r2"),
+            Some(0.86),
+            "by repo too, as local_model resolves it"
+        );
+        assert_eq!(line_similarity_floor("bge-small-en-v1.5"), None);
+        assert_eq!(line_similarity_floor("text-embedding-3-small"), None);
+        // The direct-mode lookup goes through configured_model_id and lands on
+        // the same answer as the daemon's own model id.
+        let local = crystalline_core::config::EmbeddingsConfig {
+            provider: "local".to_string(),
+            model: String::new(),
+            endpoint: None,
+            api_key_env: None,
+        };
+        assert_eq!(
+            line_similarity_floor(&crate::embed::configured_model_id(Some(&local))),
+            Some(0.86)
+        );
+        let remote = crystalline_core::config::EmbeddingsConfig {
+            provider: "remote".to_string(),
+            model: "text-embedding-3-small".to_string(),
+            endpoint: Some("http://127.0.0.1:9".to_string()),
+            api_key_env: None,
+        };
+        assert_eq!(
+            line_similarity_floor(&crate::embed::configured_model_id(Some(&remote))),
+            None
+        );
     }
 }

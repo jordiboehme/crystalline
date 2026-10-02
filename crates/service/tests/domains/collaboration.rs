@@ -121,6 +121,7 @@ fn edit_params(
         content: Some(content.to_string()),
         key: None,
         value: None,
+        values: None,
         section: None,
         find_text: None,
         expected_replacements: None,

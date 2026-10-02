@@ -98,7 +98,7 @@ impl Engine {
         // open document where there is one, and in review mode their own draft
         // where they hold one.
         let visible = match &live {
-            Some(live) => Some(live.clone()),
+            Some(live) => Some(live.text.clone()),
             None => match overlay {
                 Some(_) => view.text_at(&source, &desc).await?,
                 None => Some(self.load_content(&source, &desc).await?),
@@ -112,7 +112,10 @@ impl Engine {
                 ))
             })?;
             let found = sha256_hex(current.as_bytes());
-            if &found != expected {
+            // A clean room also accepts the stored bytes' checksum it hands
+            // out (see `LiveText`).
+            let room_token = live.as_ref().map(|live| live.checksum.as_str());
+            if &found != expected && room_token != Some(expected.as_str()) {
                 return Err(EngineError::Conflict(stale_edit_message(expected, &found)));
             }
         }

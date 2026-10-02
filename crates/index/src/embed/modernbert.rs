@@ -29,12 +29,16 @@
 //! candle release carries them: huggingface/candle#3991 for the activation and
 //! huggingface/candle#3992 for the prefix (local branches
 //! `modernbert-hidden-activation` and `modernbert-bare-checkpoint` until they
-//! merge). Three mechanical differences come on top of the two patches: the
+//! merge). Four mechanical differences come on top of the two patches: the
 //! file was run through this workspace's rustfmt (style edition 2024), which
 //! reorders the two `use` lists and nothing else; `ClassifierPooling` carries an
 //! `#[allow(clippy::upper_case_acronyms)]` because this workspace's clippy pin
-//! rejects upstream's variant names under `-D warnings`; and the granite config
-//! test at the bottom is ours rather than the pull request's.
+//! rejects upstream's variant names under `-D warnings`; upstream's
+//! `use core::f32;` is dropped, because Rust 1.99 deprecates the legacy
+//! `f32::MIN` and `f32::NEG_INFINITY` module constants it made the two mask
+//! helpers resolve to (without it they name the identical associated
+//! constants); and the granite config test at the bottom is ours rather than
+//! the pull request's.
 //!
 //! The trap, from the spike that produced this file: never add
 //! `#[serde(alias = "norm_eps")]` to `Config::layer_norm_eps`. Granite's
@@ -67,7 +71,6 @@ use candle_nn::{
 };
 use serde::Deserialize;
 
-use core::f32;
 use std::collections::HashMap;
 use std::sync::Arc;
 

@@ -20,6 +20,9 @@ pub mod device;
 pub mod embed;
 mod error;
 mod factory;
+#[cfg(feature = "local-embeddings")]
+mod hub;
+pub mod nli;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 mod store;
@@ -40,15 +43,16 @@ pub use embed::{
 pub use error::{IndexError, Result, SCHEMA_TOO_NEW_OPENING, is_schema_too_new_text};
 pub use factory::{open_store, store_location};
 pub use store::{
-    AttachmentRow, BrowseLevel, ChunkJob, ChunkModelCount, ContentMention, DEFAULT_RETIRED_WEIGHT,
-    DEFAULT_SALIENCE_WEIGHT, DomainHost, DomainId, DomainKind, DomainLookup, DomainStats, EdgeKind,
-    EmbeddingCoverage, EmbeddingRow, EngramDescriptor, EngramId, EngramRecord, EngramSummary,
-    FileStamp, FilterOp, FtsMode, GraphEdge, GraphNode, GraphSlice, HitKind, HostClaim, InboundHit,
-    InboundPage, InboundQuery, InboundRef, LEXICAL_CANDIDATE_CAP, LINKS_TO, LeadVector,
-    MetadataFilter, NamedCount, NewChunk, OutboundRef, Page, RETIRED_STATUSES, RebuildKind,
-    RecentFilter, SearchHit, SearchMode, SearchOrder, SearchQuery, Store, StoreInfo, StoredEngram,
-    TagAlias, TagCount, Vocabulary, is_current_status, is_retired_status, lookup_in_domain,
-    merge_vocabularies, parse_metadata_filters, retired_factor, salience_prior,
+    AttachmentRow, BrowseLevel, ChunkJob, ChunkModelCount, ContentMention, ContradictionRow,
+    DEFAULT_RETIRED_WEIGHT, DEFAULT_SALIENCE_WEIGHT, DomainHost, DomainId, DomainKind,
+    DomainLookup, DomainStats, EdgeKind, EmbeddingCoverage, EmbeddingRow, EngramDescriptor,
+    EngramId, EngramRecord, EngramSummary, FileStamp, FilterOp, FtsMode, GraphEdge, GraphNode,
+    GraphSlice, HitKind, HostClaim, InboundHit, InboundPage, InboundQuery, InboundRef,
+    LEXICAL_CANDIDATE_CAP, LINKS_TO, LeadVector, MetadataFilter, NamedCount, NewChunk,
+    OBSERVATION_VECTOR_CHUNK, ObservationVector, OutboundRef, Page, RETIRED_STATUSES, RebuildKind,
+    RecentFilter, ScoredPair, SearchHit, SearchMode, SearchOrder, SearchQuery, Store, StoreInfo,
+    StoredEngram, TagAlias, TagCount, Vocabulary, is_current_status, is_retired_status,
+    lookup_in_domain, merge_vocabularies, parse_metadata_filters, retired_factor, salience_prior,
 };
 /// The shared statement builders, reachable from `tests/plans.rs` and from
 /// nothing else.
@@ -75,9 +79,10 @@ pub use sweep::{
     SweepReport, UnresolvedRef, content_line_count, detect, is_pair_scoped, rank, rule_info,
 };
 pub use sync::{
-    DomainScan, NoReindexHooks, PathChange, PathChangeKind, ReindexHooks, SyncReport, apply_scan,
-    apply_scan_with_slab, refresh_tag_aliases, reindex_domains, resolve_forward_refs, scan_domain,
-    scan_paths, sync_domain, sync_domain_with,
+    DomainScan, NoReindexHooks, PathChange, PathChangeKind, ReindexHooks, ReparseSeam, ReparseStep,
+    SyncReport, apply_scan, apply_scan_with_slab, refresh_tag_aliases, reindex_domains,
+    reparse_due, reparse_stored_domain, reparse_stored_domain_with, resolve_forward_refs,
+    scan_domain, scan_paths, sync_domain, sync_domain_with,
 };
 pub use turso::TursoStore;
 pub use vocab::{TagCluster, tag_clusters, tag_clusters_with_aliases};

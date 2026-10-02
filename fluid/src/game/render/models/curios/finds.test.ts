@@ -17,7 +17,7 @@ import type { CurioKind } from "../../../world/types";
 import type { Rgb } from "../../looks";
 import { blinkFlag, createBuilder, FLAG, type V3 } from "../../geometry";
 import { frameAt } from "../../kit";
-import { LOOKS } from "../../looks";
+import { LOOK } from "../../looks";
 import { BLINK_LOW } from "../../blink";
 import { recordingKitAt, toLocal, type Part } from "../../modelChecks";
 import { pixelRuns, textRows } from "../heroes/pixels";
@@ -30,7 +30,7 @@ import { buildCurio } from "./index";
 function recorded(kind: CurioKind, variant = 0): Part[] {
   const builder = createBuilder();
   const parts: Part[] = [];
-  buildCurio(recordingKitAt(builder, parts), kind, variant, LOOKS.aperture);
+  buildCurio(recordingKitAt(builder, parts), kind, variant, LOOK);
   return parts;
 }
 

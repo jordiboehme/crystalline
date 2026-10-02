@@ -206,7 +206,7 @@ async fn sweep(engine: &Engine) -> Value {
         .evolve_engrams(
             &EvolveParams {
                 domains: vec!["notes".to_string()],
-                families: vec!["redundancy".to_string()],
+                families: vec!["redundancy".to_string(), "meaning".to_string()],
                 rules: Vec::new(),
                 min_priority: None,
                 limit: Some(50),

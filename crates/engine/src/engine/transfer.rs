@@ -254,6 +254,9 @@ impl Engine {
         // Delta 1: the files arrive in memory, already unpacked by the caller,
         // so there is no folder to walk and no source directory to validate.
         for (path, text) in files {
+            // Imported as LF, the one line ending anything is stored with.
+            let text = crystalline_core::to_lf(text);
+            let text: &str = &text;
             // Delta 4: a MANIFEST at any depth is ignored - defense in depth,
             // the REST layer screens these before the engine ever sees them.
             // Matched case-insensitively because the filesystem underneath is:
@@ -527,7 +530,18 @@ impl Engine {
                         continue;
                     }
                     match std::fs::read(&abs) {
-                        Ok(bytes) => files.push((rel, bytes)),
+                        // Handed over as LF, like every other read: markdown
+                        // that is UTF-8 text is converted, anything else is
+                        // passed on as its bytes.
+                        Ok(bytes) => files.push((
+                            rel,
+                            match String::from_utf8(bytes) {
+                                Ok(text) => {
+                                    crystalline_core::to_lf(&text).into_owned().into_bytes()
+                                }
+                                Err(e) => e.into_bytes(),
+                            },
+                        )),
                         // One unreadable file must not deny the operator the
                         // rest of the backup: it is skipped and logged rather
                         // than failing the whole archive.
@@ -546,7 +560,14 @@ impl Engine {
                 let all = store.all_engram_contents(domain_id).await?;
                 drop(store);
                 all.into_iter()
-                    .map(|e| (e.path, e.content.into_bytes()))
+                    .map(|e| {
+                        (
+                            e.path,
+                            crystalline_core::to_lf(&e.content)
+                                .into_owned()
+                                .into_bytes(),
+                        )
+                    })
                     .collect()
             }
         };
@@ -567,8 +588,8 @@ impl Engine {
     ///
     /// The read half is [`Engine::domain_files`], the same one the archive
     /// download uses, so an export is a copy of the domain rather than a
-    /// re-serialization of the index: a file domain hands over its exact disk
-    /// bytes (frontmatter included, MANIFEST included), a virtual domain the
+    /// re-serialization of the index: a file domain hands over its disk bytes
+    /// (frontmatter included, MANIFEST included, markdown as LF), a virtual domain the
     /// full text of every row, both hand over their attachments under
     /// `assets/`, and the OKF reserved names are excluded from both. Reading
     /// the store directly instead - the shape this verb had - wrote

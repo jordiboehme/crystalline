@@ -1995,7 +1995,7 @@ pub async fn raw_post(
             Err(_) => break,
         }
     }
-    String::from_utf8_lossy(&buf).into_owned()
+    String::from_utf8_lossy_owned(buf)
 }
 
 /// The `mcp-session-id` header out of a raw response head, case-insensitively.

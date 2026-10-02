@@ -47,7 +47,10 @@ use crystalline_core::manifest::Manifest;
 use crystalline_core::parse_engram;
 
 use crate::archive::{extract_repo_subtree, extract_tarball};
-use crate::changes::{LocalChange, LocalChanges, MAX_SHARED_FILE_BYTES, detect_local_changes};
+use crate::changes::{
+    LocalChange, LocalChanges, MAX_SHARED_FILE_BYTES, detect_local_changes,
+    detect_local_changes_against,
+};
 use crate::error::RemoteError;
 use crate::merge::{FileMerge, merge_file};
 use crate::provider::{
@@ -454,7 +457,7 @@ pub async fn subscribe(
     for (rel, content) in &extracted {
         let wt_path = checked_working_path(state_dir, domain_root, rel)?;
         if !wt_path.exists() {
-            write_working_file(&wt_path, content)?;
+            write_pulled_file(&wt_path, content)?;
             files_written += 1;
         }
         state::write_base_file(state_dir, rel, content)?;
@@ -463,7 +466,7 @@ pub async fn subscribe(
 
     let engrams = extracted.keys().filter(|p| p.ends_with(".md")).count();
     let local_changes = if adopted {
-        detect_local_changes(domain_root, &files)?.substantive_count()
+        detect_local_changes_against(domain_root, &files, state_dir)?.substantive_count()
     } else {
         0
     };
@@ -696,7 +699,7 @@ pub async fn pull_with(
         // who edited after sharing (hashes differ) falls through to merge.
         if proposal_override_applies(&merged_to_consume, rel, local.as_deref()) {
             match &edit.content {
-                Some(bytes) => write_working_file(&wt_path, bytes)?,
+                Some(bytes) => write_pulled_file(&wt_path, bytes)?,
                 None => remove_working_file(&wt_path)?,
             }
             applied.push(rel.clone());
@@ -705,7 +708,7 @@ pub async fn pull_with(
 
         match merge_file(base.as_deref(), local.as_deref(), upstream) {
             FileMerge::Apply(bytes) => {
-                write_working_file(&wt_path, &bytes)?;
+                write_pulled_file(&wt_path, &bytes)?;
                 applied.push(rel.clone());
                 if is_three_way_merge(base.as_deref(), local.as_deref(), upstream) {
                     merged.push(rel.clone());
@@ -1444,7 +1447,7 @@ pub async fn status(
 
     // After the probe, not before: a layer the forge just reported declined
     // hands its files back to this count.
-    let local = detect_local_changes(domain_root, &unshared_base(&state))?;
+    let local = detect_local_changes_against(domain_root, &unshared_base(&state), state_dir)?;
 
     let open_proposals = state
         .proposals
@@ -2233,7 +2236,10 @@ pub async fn propose(
             Some(_) => effective_tip_files(&state),
             None => state.files.clone(),
         };
-        let local = select_share_files(detect_local_changes(domain_root, &base)?, options.files)?;
+        let local = select_share_files(
+            detect_local_changes_against(domain_root, &base, state_dir)?,
+            options.files,
+        )?;
         if local.changes.is_empty() {
             return Ok(ProposeOutcome::NothingToShare {
                 skipped_large: local.skipped_large,
@@ -2566,7 +2572,7 @@ pub async fn propose_preview(
     // the same reason the share does: nothing below this line is about a
     // commit onto the connected branch.
     if options.sharing == Sharing::Direct {
-        return preview_direct(spec, domain_root, domain_name, &state, options);
+        return preview_direct(spec, domain_root, domain_name, state_dir, &state, options);
     }
     // The same capability question a real share asks, and the same cached
     // answer: a preview that guessed would name an action the share then
@@ -2593,7 +2599,10 @@ pub async fn propose_preview(
         } else {
             state.files.clone()
         };
-        let local = select_share_files(detect_local_changes(domain_root, &base)?, options.files)?;
+        let local = select_share_files(
+            detect_local_changes_against(domain_root, &base, state_dir)?,
+            options.files,
+        )?;
         if !state.conflicts.is_empty() {
             return Ok(SharePlan {
                 action: PlannedAction::ConflictsPending {
@@ -2708,7 +2717,10 @@ pub async fn propose_preview(
     } else {
         state.files.clone()
     };
-    let local = select_share_files(detect_local_changes(domain_root, &base)?, options.files)?;
+    let local = select_share_files(
+        detect_local_changes_against(domain_root, &base, state_dir)?,
+        options.files,
+    )?;
 
     if !state.conflicts.is_empty() {
         return Ok(SharePlan {
@@ -2843,6 +2855,7 @@ fn preview_direct(
     spec: &OriginSpec,
     domain_root: &Path,
     domain_name: &str,
+    state_dir: &Path,
     state: &OriginState,
     options: ShareOptions<'_>,
 ) -> Result<SharePlan, RemoteError> {
@@ -2850,7 +2863,7 @@ fn preview_direct(
         return Err(RemoteError::Refused(DIRECT_NO_AMEND.to_string()));
     }
     let local = select_share_files(
-        detect_local_changes(domain_root, &state.files)?,
+        detect_local_changes_against(domain_root, &state.files, state_dir)?,
         options.files,
     )?;
     let plan = |action: PlannedAction, effective_title: String| SharePlan {
@@ -2922,7 +2935,7 @@ async fn commit_direct(
         });
     }
     let mut local = select_share_files(
-        detect_local_changes(domain_root, &state.files)?,
+        detect_local_changes_against(domain_root, &state.files, state_dir)?,
         options.files,
     )?;
     if local.changes.is_empty() {
@@ -3011,7 +3024,7 @@ async fn commit_direct(
                     });
                 }
                 local = select_share_files(
-                    detect_local_changes(domain_root, &state.files)?,
+                    detect_local_changes_against(domain_root, &state.files, state_dir)?,
                     options.files,
                 )?;
                 if local.changes.is_empty() {
@@ -3841,7 +3854,7 @@ async fn amend_layer(
     // This share's own work is what stands against the chain tip; the layer's
     // recorded files are already proposed and are not it.
     let fresh = select_share_files(
-        detect_local_changes(domain_root, &effective_tip_files(&state))?,
+        detect_local_changes_against(domain_root, &effective_tip_files(&state), state_dir)?,
         files,
     )?;
     if fresh.changes.is_empty() {
@@ -5232,14 +5245,14 @@ pub fn resolve(
             let local = detect_local_changes(domain_root, &state.files)?;
             let wt_path = checked_working_path(state_dir, domain_root, local.disk_path(path))?;
             match upstream {
-                Some(bytes) => write_working_file(&wt_path, &bytes)?,
+                Some(bytes) => write_pulled_file(&wt_path, &bytes)?,
                 None => remove_working_file(&wt_path)?,
             }
         }
         Resolution::Merged(content) => {
             let local = detect_local_changes(domain_root, &state.files)?;
             let wt_path = checked_working_path(state_dir, domain_root, local.disk_path(path))?;
-            write_working_file(&wt_path, content)?;
+            write_pulled_file(&wt_path, content)?;
         }
     }
 
@@ -5373,7 +5386,7 @@ async fn rebaseline(
     for (rel, content) in &extracted {
         let wt_path = checked_working_path(state_dir, domain_root, local.disk_path(rel))?;
         if !wt_path.exists() {
-            write_working_file(&wt_path, content)?;
+            write_pulled_file(&wt_path, content)?;
             applied.push(rel.clone());
         }
     }
@@ -5862,6 +5875,31 @@ fn write_working_file(path: &Path, content: &[u8]) -> Result<(), RemoteError> {
     }
     std::fs::write(path, content)?;
     Ok(())
+}
+
+/// Writes a file a pull, a subscribe or a resolution brings in from the
+/// origin. A markdown file that is UTF-8 text lands with LF line endings, the
+/// one line ending Crystalline writes, whatever the origin holds; every other
+/// file lands byte for byte. So does a `.md` file the origin holds as bytes
+/// that are not UTF-8: it is mirrored as it is, never repaired or refused
+/// here, and `validate` reports it under `E006`. The base snapshot
+/// keeps the origin's own bytes, which is what tells the next pull what the
+/// origin changed.
+///
+/// The paths that put a recorded version back (a discard, a layer revert, a
+/// base materialisation) write through [`write_working_file`] instead: their
+/// whole point is to leave the file holding exactly the bytes its stamp
+/// records.
+fn write_pulled_file(path: &Path, content: &[u8]) -> Result<(), RemoteError> {
+    let is_markdown = path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("md"));
+    match std::str::from_utf8(content) {
+        Ok(text) if is_markdown => {
+            write_working_file(path, crystalline_core::to_lf(text).as_bytes())
+        }
+        _ => write_working_file(path, content),
+    }
 }
 
 /// Removes a working-tree file; removing one already gone is not an error.

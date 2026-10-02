@@ -399,6 +399,10 @@ pub async fn run_serve(
     // running it inline, so the triggering request returns without waiting
     // on the model.
     let (embed_tx, embed_rx) = tokio::sync::mpsc::unbounded_channel();
+    // The contradiction worker's channel: the embed worker asks for a pass
+    // after every completed embed pass, and the embed tick asks while pending
+    // is unknown or non-zero.
+    let (contradiction_tx, contradiction_rx) = tokio::sync::mpsc::unbounded_channel();
     // The provider is built in the background (see below); text search and the
     // socket never wait on the model download. The engine holds the file config
     // and the overlay separately (persist and refresh hit the resolved file even
@@ -406,6 +410,7 @@ pub async fn run_serve(
     let mut engine = Engine::new(store, loaded.file.clone(), None, Some(loaded.path.clone()))
         .with_watch_channel(watch_tx)
         .with_embed_channel(embed_tx)
+        .with_contradiction_channel(contradiction_tx)
         .with_read_only(read_only)
         .with_instance_id(instance_id)
         .with_env_overlay(loaded.overlay.clone())
@@ -419,6 +424,18 @@ pub async fn run_serve(
     }
     let engine = Arc::new(engine);
     tokio::spawn(crate::engine::run_embed_worker(engine.clone(), embed_rx));
+    // Its own task, never a shutdown step: a model download or a scoring
+    // batch in flight is abandoned by `Departure`'s exit, not waited for.
+    tokio::spawn(crate::engine::run_contradiction_worker(
+        engine.clone(),
+        contradiction_rx,
+    ));
+    // Off at start: one pass clears what a setting changed while the daemon
+    // was down left behind, even when no provider ever loads and so no embed
+    // pass hands over. On, the embed worker's handover asks as before.
+    if engine.contradiction_model().is_none() {
+        engine.request_contradictions();
+    }
     if let Some(park) = parked_blocking_task() {
         // Said out loud, so the test that sets it can tell its own parked
         // task from any other blocking work that happens to be running.
@@ -2333,6 +2350,16 @@ const EMBED_TICK: Duration = Duration::from_secs(300);
 /// checked first, and only an outstanding backlog nobody is walking fires the
 /// worker. The interval's first tick is immediate and is consumed, so the first
 /// live tick lands one cadence in rather than the moment the daemon starts.
+///
+/// The same tick drives the contradiction pass: it drops an idle NLI model
+/// and, when nothing is left to embed, asks for a contradiction pass while
+/// that pass's pending count is unknown or non-zero, which is how a daemon
+/// that starts fully embedded still scores and how a pair a failed batch left
+/// is retried once per tick rather than in a loop. A failed model load is not
+/// retried here: the loader downloads the model again on a failure, so only a
+/// set `evolve.contradictions` or a daemon start asks for it again. On an
+/// install whose backlog never drains, the embed worker's handover after each
+/// pass is what runs the contradiction pass.
 pub async fn run_embed_tick(
     engine: Arc<Engine>,
     cadence: Duration,
@@ -2344,11 +2371,30 @@ pub async fn run_embed_tick(
         tokio::select! {
             _ = wait_true(&mut shutdown) => break,
             _ = ticker.tick() => {
+                // Every tick, whatever the backlog: a model nobody used for
+                // ten minutes, or one the setting no longer names, goes.
+                engine.drop_idle_scorer();
+                // Once per tick, the next walk (this tick's, or the one the
+                // embed worker hands over to) retries the pairs a failed
+                // batch left, and only while the model is loaded anyway.
+                engine.mark_contradiction_retry();
                 if engine.embed_in_flight() {
                     continue;
                 }
                 match engine.embedding_backlog().await {
-                    Ok(0) => {}
+                    // Nothing left to embed is when the contradiction pass
+                    // sees every lead vector: asked while its pending count is
+                    // unknown (a fresh start, a changed setting) or non-zero.
+                    // Off asks for nothing. A model whose load failed asks for
+                    // nothing either until its retry is due: a failed download
+                    // waits out its backoff and is then asked for again, a
+                    // build error stays blocked until the setting is set
+                    // again or the daemon restarts.
+                    Ok(0) => {
+                        if engine.contradictions_wanted() {
+                            engine.request_contradictions();
+                        }
+                    }
                     Ok(_) => {
                         engine.request_embed();
                     }

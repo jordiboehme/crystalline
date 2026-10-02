@@ -134,7 +134,7 @@ fn run(env: &Env, args: &[&str]) -> (bool, String) {
     let out = cmd.args(args).stdin(Stdio::null()).output().unwrap();
     (
         out.status.success(),
-        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy_owned(out.stdout),
     )
 }
 

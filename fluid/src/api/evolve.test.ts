@@ -204,6 +204,13 @@ describe("the evolve payload", () => {
       // named by its engram and its rule, and sends neither.
       scope: null,
       ackScope: null,
+      // Both are `V302`'s alone: a row that fires on no counterpart reads as
+      // neither having one nor scoring anything.
+      counterpart: null,
+      probability: null,
+      lineText: null,
+      similarity: null,
+      moreLinePairs: 0,
     });
     expect(defined(queue.queue[1], "the second finding").line).toBe(12);
     expect(queue.actions).toContainEqual({
@@ -457,12 +464,111 @@ describe("the acknowledgment fields", () => {
     expect(finding.ackStale).toBe(true);
     expect(finding.ackNote).toBe("lineage citation, keep");
   });
+
+  it("reads a V302 row's counterpart and probability, and nulls them elsewhere", () => {
+    const queue = readEvolveQueue({
+      queue: [
+        {
+          n: 1,
+          priority: 85,
+          rule: "V302",
+          class: "judgment",
+          domain: "eng",
+          permalink: "ci-runtime",
+          title: "CI runtime",
+          line: 7,
+          finding: "a possible contradiction",
+          evidence: "e",
+          fix: "f",
+          scope: "eng/ci-runtime, eng/node-version, aaaa, bbbb",
+          counterpart: "node-version",
+          counterpart_title: "Node version",
+          counterpart_line: 5,
+          probability: 0.91,
+          similarity: 0.9,
+          line_text: "The build uses Node 20",
+          counterpart_line_text: "The build uses Node 18",
+          more_line_pairs: 2,
+        },
+        {
+          n: 2,
+          priority: 50,
+          rule: "V006",
+          class: "judgment",
+          domain: "eng",
+          permalink: "p",
+          title: "P",
+          line: null,
+          finding: "f",
+          evidence: "e",
+          fix: "x",
+        },
+      ],
+    });
+
+    expect(queue.queue[0]?.counterpart).toEqual({
+      permalink: "node-version",
+      title: "Node version",
+      line: 5,
+      lineText: "The build uses Node 18",
+    });
+    expect(queue.queue[0]?.lineText).toBe("The build uses Node 20");
+    expect(queue.queue[0]?.similarity).toBe(0.9);
+    expect(queue.queue[0]?.moreLinePairs).toBe(2);
+    expect(queue.queue[1]?.lineText).toBeNull();
+    expect(queue.queue[1]?.similarity).toBeNull();
+    expect(queue.queue[1]?.moreLinePairs).toBe(0);
+    expect(queue.queue[0]?.probability).toBe(0.91);
+    expect(queue.queue[1]?.counterpart).toBeNull();
+    expect(queue.queue[1]?.probability).toBeNull();
+  });
+
+  it("falls back to the permalink for a counterpart with no title, and drops one with no permalink", () => {
+    // A counterpart without its permalink would be a link to nowhere, so it
+    // is read as no counterpart at all rather than half of one.
+    expect(
+      readEvolveQueue({
+        queue: [
+          {
+            n: 1,
+            priority: 1,
+            rule: "V302",
+            domain: "eng",
+            permalink: "a",
+            counterpart_title: "Untitled",
+            probability: 0.5,
+          },
+        ],
+      }).queue[0]?.counterpart,
+    ).toBeNull();
+
+    expect(
+      readEvolveQueue({
+        queue: [
+          {
+            n: 1,
+            priority: 1,
+            rule: "V302",
+            domain: "eng",
+            permalink: "a",
+            counterpart: "b",
+            probability: 0.5,
+          },
+        ],
+      }).queue[0]?.counterpart,
+    ).toEqual({
+      permalink: "b",
+      title: "b",
+      line: null,
+      lineText: null,
+    });
+  });
 });
 
 /**
  * Which section a finding is drawn under. The rule id says it - the catalog
- * numbers temporal rules `V0xx`, structure `V1xx` and redundancy `V2xx` - and
- * a row carries no family of its own to read instead.
+ * numbers temporal rules `V0xx`, structure `V1xx`, redundancy `V2xx` and
+ * meaning `V3xx` - and a row carries no family of its own to read instead.
  */
 describe("the family of a rule", () => {
   it("reads the family off the rule id", () => {
@@ -470,10 +576,10 @@ describe("the family of a rule", () => {
     expect(evolveFamily("V006")).toBe("temporal");
     expect(evolveFamily("V105")).toBe("structure");
     expect(evolveFamily("V203")).toBe("redundancy");
-    // The meaning series shares the redundancy heading, as the catalog does:
-    // a twin found by embedding is the same kind of work as a duplicate found
-    // by wording, and a section of its own would say otherwise.
-    expect(evolveFamily("V301")).toBe("redundancy");
+    // The meaning series is its own section: a twin and a possible
+    // contradiction are both questions about what two engrams say.
+    expect(evolveFamily("V301")).toBe("meaning");
+    expect(evolveFamily("V302")).toBe("meaning");
   });
 
   it("puts a rule from a newer catalog under no section at all", () => {
@@ -485,7 +591,12 @@ describe("the family of a rule", () => {
   });
 
   it("lists the families in the catalog's own order", () => {
-    expect(EVOLVE_FAMILIES).toEqual(["temporal", "structure", "redundancy"]);
+    expect(EVOLVE_FAMILIES).toEqual([
+      "temporal",
+      "structure",
+      "redundancy",
+      "meaning",
+    ]);
   });
 });
 

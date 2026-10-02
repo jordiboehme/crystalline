@@ -112,11 +112,28 @@ where
             if rel_path == Path::new("MANIFEST.md") {
                 manifest_index = Some(i);
             }
-            let source = std::fs::read_to_string(&path).map_err(|e| ScanError::Io {
+            let bytes = std::fs::read(&path).map_err(|e| ScanError::Io {
                 path: path.clone(),
                 source: e,
             })?;
-            let parsed = parse::parse_engram(&source);
+            // A file that is not UTF-8 is a finding (`E006`), not a reason to
+            // stop verifying the domain: it is kept with a lossy copy of its
+            // text, which no rule reads, since it never parses.
+            let (source, parsed) = match String::from_utf8(bytes) {
+                Ok(source) => {
+                    let parsed = parse::parse_engram(&source);
+                    (source, parsed)
+                }
+                Err(e) => {
+                    let valid = e.utf8_error().valid_up_to();
+                    let bytes = e.into_bytes();
+                    let line = bytes[..valid].iter().filter(|b| **b == b'\n').count() + 1;
+                    (
+                        String::from_utf8_lossy_owned(bytes),
+                        Err(parse::ParseError::NotUtf8 { line }),
+                    )
+                }
+            };
             scanned.push(ScannedFile {
                 path,
                 rel_path,

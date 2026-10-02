@@ -20,11 +20,23 @@
  *   action, so neither is offered for Space.
  * - A sealed door or portal is offered only to say why it is sealed.
  * - A lift is offered for Space (`SPACE LIFT`, M3 C26), which opens its
- *   list of stops; a station screen is only looked at, and an exit opens
- *   on approach like a sliding door (M3 C28), so neither is offered.
+ *   list of stops; an exit opens on approach like a sliding door (M3 C28),
+ *   so it is not offered.
+ * - A machine, a poster, the placard and a screen are read with Space
+ *   (0.22 R12): `world/reading.ts` says what each reads. These reading
+ *   offers rank below every other offer (0.22 R13): `focusOf` takes one
+ *   only when no terminal, door, hatch, portal or lift is in focus, so a
+ *   placard beside a door never takes Space from the door. The session
+ *   consults a police box (`boxFocus`) before a reading offer as well
+ *   (`isReadingKind`).
  *
  * A way that failed on travel (the session's `failed` map) is treated as
  * sealed: it is offered only to say why, heads shut and carries no one.
+ *
+ * An arrival stands in front of the way back it came by (`arrivalSpawn`),
+ * and `arrivalWay` names that way when it is walked through, so the
+ * session latches it (0.22 R1): a latched way heads shut and carries no
+ * one, like a failed one, until the player has stepped clear.
  *
  * A police box is not a fixture and leads nowhere the generator ever
  * built, so it is offered and stepped on its own: a police box's doors are
@@ -92,6 +104,13 @@ export const PORTAL_HALF = 0.75;
 /** How far in front of the fixture the player arrives, in metres. */
 export const ARRIVAL_DISTANCE = 1.6;
 
+/**
+ * How far in front of the lift's wall point a start in the airlock stands,
+ * in metres (`arrivalSpawn`): the whole door is in view and `SPACE LIFT` is
+ * within `REACH` at once. 0.22 R4.
+ */
+export const AIRLOCK_START = 2.0;
+
 /** A door is open enough to walk through above this fraction. */
 const OPEN_ENOUGH = 0.9;
 
@@ -106,10 +125,23 @@ const OPEN_ENOUGH = 0.9;
  * - `SPACE CRAWL <label>` at a hatch;
  * - `SEALED <sealedLabel>` at a sealed door or portal, which does nothing;
  * - `SEALED <label>` at a way in `failed`;
- * - `SPACE LIFT` at a lift.
+ * - `SPACE LIFT` at a lift;
+ * - `SPACE READ <room title>` at a machine;
+ * - `SPACE READ <category>` at a poster;
+ * - `SPACE READ PLACARD` at the placard;
+ * - `SPACE READ <first line>` at a screen.
  */
 export type Interactable = {
-  kind: "terminal" | "door" | "hatch" | "portal" | "lift";
+  kind:
+    | "terminal"
+    | "door"
+    | "hatch"
+    | "portal"
+    | "lift"
+    | "machine"
+    | "poster"
+    | "placard"
+    | "screen";
   index: number;
   prompt: string;
 };
@@ -238,15 +270,16 @@ export function approaches(slot: WallSlot, player: Player): boolean {
 /**
  * What the HUD offers for a fixture, or null when Space does nothing there and
  * nothing needs saying: an unsealed sliding door and an exit open on
- * approach and an unsealed portal on contact, and machines, posters, the
- * placard and screens are only looked at. A lift is always offered: Space
- * opens its stops.
+ * approach and an unsealed portal on contact. A lift is always offered:
+ * Space opens its stops. A machine, a poster, the placard and a screen are
+ * offered to be read; a machine names the room by `title`.
  */
 function offer(
   fixture: Fixture,
   index: number,
   doors: ReadonlyMap<number, DoorState>,
   failed: ReadonlyMap<number, string>,
+  title: string,
 ): Interactable | null {
   switch (fixture.kind) {
     case "terminal":
@@ -287,13 +320,42 @@ function offer(
       }
       return { kind: "lift", index, prompt: "SPACE LIFT" };
     }
-    case "exit":
     case "machine":
+      return { kind: "machine", index, prompt: `SPACE READ ${title}` };
     case "poster":
+      return {
+        kind: "poster",
+        index,
+        prompt: `SPACE READ ${fixture.category}`,
+      };
     case "placard":
+      return { kind: "placard", index, prompt: "SPACE READ PLACARD" };
     case "screen":
+      return {
+        kind: "screen",
+        index,
+        prompt: `SPACE READ ${fixture.lines[0] ?? ""}`,
+      };
+    case "exit":
       return null;
   }
+}
+
+/** The kinds `offer` offers to be read, which rank below every other kind. */
+const READING_KINDS: ReadonlySet<Interactable["kind"]> = new Set([
+  "machine",
+  "poster",
+  "placard",
+  "screen",
+]);
+
+/**
+ * Whether `kind` is one of the reading offers (a machine, a poster, the
+ * placard, a screen), which rank below every other offer, a police box's
+ * included (0.22 R13).
+ */
+export function isReadingKind(kind: Interactable["kind"]): boolean {
+  return READING_KINDS.has(kind);
 }
 
 /**
@@ -302,8 +364,10 @@ function offer(
  * Of the fixtures `offer` has something to say about, the nearest one whose
  * wall point is within `REACH`, whose wall faces the player (the player
  * stands in front of it, not behind it) and which lies within `FACING` of
- * the view direction. `doors` decides whether a door is offered to open or
- * to close; without it every door is taken to be shut.
+ * the view direction. The nearest terminal, door, hatch, portal or lift
+ * wins; only when none of those is in focus does the nearest machine,
+ * poster, placard or screen (0.22 R13). `doors` decides whether a door is
+ * offered to open or to close; without it every door is taken to be shut.
  */
 export function focusOf(
   room: RoomSpec,
@@ -314,22 +378,32 @@ export function focusOf(
   const fx = -Math.sin(player.yaw);
   const fz = -Math.cos(player.yaw);
   const cosFacing = Math.cos(FACING);
+  // The nearest of each rank: the ways and terminals, and the readings.
   let best: Interactable | null = null;
   let bestDistance = Infinity;
+  let reading: Interactable | null = null;
+  let readingDistance = Infinity;
   for (const [index, fixture] of room.fixtures.entries()) {
     const w = wallPoint(fixture.slot);
     if (relative(w, player.x, player.z).depth <= 0) continue;
     const dx = w.x - player.x;
     const dz = w.z - player.z;
     const distance = Math.hypot(dx, dz);
-    if (distance > REACH || distance >= bestDistance) continue;
+    if (distance > REACH) continue;
     if (distance > 0 && (dx * fx + dz * fz) / distance < cosFacing) continue;
-    const candidate = offer(fixture, index, doors, failed);
+    const candidate = offer(fixture, index, doors, failed, room.title);
     if (candidate === null) continue;
-    best = candidate;
-    bestDistance = distance;
+    if (isReadingKind(candidate.kind)) {
+      if (distance >= readingDistance) continue;
+      reading = candidate;
+      readingDistance = distance;
+    } else {
+      if (distance >= bestDistance) continue;
+      best = candidate;
+      bestDistance = distance;
+    }
   }
-  return best;
+  return best ?? reading;
 }
 
 /**
@@ -344,7 +418,7 @@ export function focusOf(
  * at this tick, names it, which turns it round. A lift's doors always head
  * shut: a ride has no car to open onto (C27). A sealed door always heads
  * shut, and so does a way in `failed` or in `shut` (the session's latched
- * exit), whatever the player does. Then each door moves `DOOR_STEP`
+ * way), whatever the player does. Then each door moves `DOOR_STEP`
  * towards where it is heading. Returns a new map; `doors` is left as it
  * was.
  */
@@ -401,7 +475,7 @@ export function stepDoors(
  * (`PORTAL_HALF`). An exit carries the player up by the sliding door's
  * rule (M3 C28). Nothing carries the player from behind a wall, where a
  * bay or the backlink corridor may lie. A way in `failed` or in `shut`
- * (the session's latched exit) carries no one, whatever its `DoorState`
+ * (the session's latched way) carries no one, whatever its `DoorState`
  * says. Hatches are crawled through on Space instead (`hatchTravel`).
  */
 export function travelOf(
@@ -456,6 +530,54 @@ export function hatchTravel(
 }
 
 /**
+ * The index in `room.fixtures` of the fixture `arrivalSpawn` places the
+ * player in front of, or null for none: the hatch back to `arrival.from`
+ * (through a door or portal), the door or portal back to it (through a
+ * hatch), the deck's door back to the engram (up through an exit). The
+ * first match in fixture order wins.
+ */
+function arrivalMatch(room: RoomSpec, arrival: Arrival | null): number | null {
+  if (arrival === null || arrival.via === "lift") return null;
+  const leadsBack = (to: PlaceAddress) =>
+    sameStation(stationOfPlace(to), arrival.from);
+  const index = room.fixtures.findIndex((f) => {
+    if (arrival.via === "exit") {
+      return f.kind === "door" && f.address !== null && leadsBack(f.address);
+    }
+    if (arrival.via === "hatch") {
+      return (
+        (f.kind === "door" || f.kind === "portal") &&
+        f.address !== null &&
+        leadsBack(f.address)
+      );
+    }
+    return f.kind === "hatch" && leadsBack(f.address);
+  });
+  return index < 0 ? null : index;
+}
+
+/**
+ * The walk-through way `arrivalSpawn` places the player in front of, by
+ * index in `room.fixtures`: the door or portal back to `arrival.from`
+ * (through a hatch), the deck's door back to the engram (up through an
+ * exit); null for no arrival, a lift ride, no match, a matched hatch, or
+ * a matched bulkhead or blast door (which only Space uses, so walking
+ * backwards never carries the player through them, and a latch would only
+ * eat the press). The session latches it on entry, so a player still
+ * walking backwards does not step straight back through it. 0.22 R1.
+ */
+export function arrivalWay(
+  room: RoomSpec,
+  arrival: Arrival | null,
+): number | null {
+  const index = arrivalMatch(room, arrival);
+  if (index === null) return null;
+  const way = room.fixtures[index];
+  if (way?.kind === "hatch") return null;
+  return way?.kind === "door" && way.style !== "sliding" ? null : index;
+}
+
+/**
  * Where the player comes out in `room`, and facing where.
  *
  * - Through a door or portal from place A, the player arrives in front of
@@ -464,6 +586,9 @@ export function hatchTravel(
  *   door or portal that leads to A.
  * - Up through an exit from engram A (M3 C28), the player arrives in front
  *   of this deck's door that leads to A.
+ * - A start in the airlock (no arrival) stands `AIRLOCK_START` in front of
+ *   the lift, facing it (0.22 R2, R3). A ride into the airlock does not: it
+ *   steps out of the lift facing the room.
  * - Otherwise (no arrival, a lift ride, or no fixture matches) at the
  *   entrance, facing in (M3 C27: in front of the lift).
  *
@@ -480,26 +605,19 @@ export function arrivalSpawn(
   room: RoomSpec,
   arrival: Arrival | null,
 ): { x: number; z: number; yaw: number } {
-  const leadsBack = (to: PlaceAddress) =>
-    arrival !== null && sameStation(stationOfPlace(to), arrival.from);
-  const match =
-    arrival === null || arrival.via === "lift"
-      ? undefined
-      : room.fixtures.find((f) => {
-          if (arrival.via === "exit") {
-            return (
-              f.kind === "door" && f.address !== null && leadsBack(f.address)
-            );
-          }
-          if (arrival.via === "hatch") {
-            return (
-              (f.kind === "door" || f.kind === "portal") &&
-              f.address !== null &&
-              leadsBack(f.address)
-            );
-          }
-          return f.kind === "hatch" && leadsBack(f.address);
-        });
+  const index = arrivalMatch(room, arrival);
+  const match = index === null ? undefined : room.fixtures[index];
+  if (arrival === null && room.space === "airlock") {
+    const lift = room.fixtures.find((f) => f.kind === "lift");
+    if (lift !== undefined) {
+      const w = wallPoint(lift.slot);
+      return {
+        x: w.x + w.inward[0] * AIRLOCK_START,
+        z: w.z + w.inward[1] * AIRLOCK_START,
+        yaw: yawFacing([-w.inward[0], -w.inward[1]]),
+      };
+    }
+  }
   if (match === undefined) {
     return {
       x: (room.spawn.x + 0.5) * CELL,

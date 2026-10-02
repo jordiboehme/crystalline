@@ -6,9 +6,10 @@ name: Build
 # - stable: release.yml calls this for a `v*` tag push (and for its manual dry
 #   run). All six platform legs build, the musl legs also make .deb packages
 #   and the Windows legs .msi packages, exactly as before this was split out.
-# - dev: dev.yml calls this for every commit on main that passed CI. Only the
-#   four legs Homebrew installs from build (macOS and Linux, arm64 and x86_64),
-#   with no .deb, and the dev version is written into the checkout first.
+# - dev: dev.yml calls this for a commit on main that passed CI and asked for
+#   a dev build. Only the four legs Homebrew installs from build (macOS and
+#   Linux, arm64 and x86_64), with no .deb, and the dev version is written
+#   into the checkout first.
 #
 # Artifacts uploaded here belong to the calling run, so the caller's publish
 # jobs download them by the same names as before.
@@ -50,7 +51,7 @@ jobs:
       run:
         working-directory: fluid
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref }}
 
@@ -167,7 +168,7 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.legs.outputs.include) }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref }}
 
@@ -183,7 +184,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y musl-tools
 
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: release-${{ matrix.target }}
 

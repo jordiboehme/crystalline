@@ -13,7 +13,7 @@ import { describe, expect, it } from "vitest";
 import type { InteriorKind } from "../../../world/types";
 import { FLAG, createBuilder } from "../../geometry";
 import { frameAt } from "../../kit";
-import { LOOKS } from "../../looks";
+import { LOOK } from "../../looks";
 import { recordingKitAt, toLocal, type Part } from "../../modelChecks";
 import { SOFT_FLOOR } from "../../blink";
 import { LAYER, LAYER_SIZE } from "../../layers";
@@ -39,12 +39,7 @@ function wallParts(
   variant: number,
 ): Part[] {
   const parts: Part[] = [];
-  buildInterior(
-    recordingKitAt(createBuilder(), parts),
-    kind,
-    variant,
-    LOOKS.aperture,
-  );
+  buildInterior(recordingKitAt(createBuilder(), parts), kind, variant, LOOK);
   return parts;
 }
 
@@ -393,7 +388,7 @@ describe("the console room's colours (2.6e C25 to C27)", () => {
     // so bright that the walls or the console's top bloom in the aperture
     // grid, a warm or cool cast, or discs that read as dark holes (the old
     // shade of 0.82) or not recessed at all.
-    const threshold = LOOKS.aperture.bloom.threshold;
+    const threshold = LOOK.bloom.threshold;
     expect(litLevel(CONSOLE_WALL, WALL_N)).toBeGreaterThanOrEqual(0.8);
     expect(litLevel(CONSOLE_WALL, UP_N)).toBeLessThan(threshold);
     expect(
@@ -413,7 +408,7 @@ describe("the console room's colours (2.6e C25 to C27)", () => {
     // or a glow no warmer than the wall.
     expect(INTERIOR_BANK["roundel-wall"]).toBe("soft");
     const peak = Math.max(...ROUNDEL_GLOW) * SIGNAL_GAIN;
-    expect(peak).toBeLessThan(LOOKS.aperture.bloom.threshold);
+    expect(peak).toBeLessThan(LOOK.bloom.threshold);
     const lowest = ROUNDEL_GLOW.map((c) => c * SIGNAL_GAIN * SOFT_FLOOR);
     const unlit = ROUNDEL_FACE.map((c) => c * PANEL_MEAN * facing(WALL_N));
     expect(luma(lowest)).toBeGreaterThanOrEqual(luma(unlit));

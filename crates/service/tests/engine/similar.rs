@@ -872,6 +872,7 @@ async fn a_drafts_receipt_never_lists_its_own_base_row() {
                 content: Some(format!("- [decision] {appended} #team")),
                 key: None,
                 value: None,
+                values: None,
                 find_text: None,
                 expected_replacements: None,
                 section: None,

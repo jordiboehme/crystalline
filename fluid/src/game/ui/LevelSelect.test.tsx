@@ -55,7 +55,7 @@ function renderSelect(answer: Answer, current = "eng") {
       <LevelSelect current={current} onJump={onJump} onClose={onClose} />
     </QueryClientProvider>,
   );
-  const field = screen.getByRole("textbox", { name: "Domain name" });
+  const field = screen.getByRole("combobox", { name: "Domain name" });
   return { onJump, onClose, field, client };
 }
 
@@ -340,5 +340,93 @@ describe("LevelSelect's first key", () => {
       unmount();
       client.clear();
     }
+  });
+});
+
+describe("LevelSelect's combobox pattern", () => {
+  // Mutation caught: the active descendant computed from the window position
+  // instead of the filtered index, or a missing aria-controls link.
+  it("is a combobox over its listbox, the active descendant following the selection", async () => {
+    const { field } = renderSelect(() => listing(["a", "b", "c"]));
+    await screen.findAllByRole("option");
+    expect(field).toHaveAttribute("aria-expanded", "true");
+    expect(field).toHaveAttribute("aria-autocomplete", "list");
+    const list = screen.getByRole("listbox", { name: "Domains" });
+    expect(field).toHaveAttribute("aria-controls", list.id);
+    const options = screen.getAllByRole("option");
+    expect(field).toHaveAttribute("aria-activedescendant", options[0]!.id);
+    fireEvent.keyDown(field, { key: "ArrowDown" });
+    expect(field).toHaveAttribute("aria-activedescendant", options[1]!.id);
+    expect(new Set(options.map((o) => o.id)).size).toBe(3);
+    // The footer describes the field.
+    const footer = document.getElementById(
+      field.getAttribute("aria-describedby") ?? "",
+    );
+    expect(footer?.textContent).toBe(LEVELS_FOOTER);
+  });
+
+  // Mutation caught: aria-expanded or aria-activedescendant kept while a
+  // status line stands in for the list, or the status line not a status.
+  it("collapses and drops the active descendant while a status line shows", async () => {
+    const { field } = renderSelect(() => listing(["a"]));
+    await screen.findAllByRole("option");
+    fireEvent.change(field, { target: { value: "zzz" } });
+    expect(field).toHaveAttribute("aria-expanded", "false");
+    expect(field).not.toHaveAttribute("aria-activedescendant");
+    expect(screen.getByRole("status")).toHaveTextContent(NO_SUCH_LEVEL);
+  });
+
+  // Mutation caught: aria-controls kept after the listbox left the DOM, so
+  // the field names an element that does not exist.
+  it("names no missing element when the filter matches nothing", async () => {
+    const { field } = renderSelect(() => listing(["a"]));
+    await screen.findAllByRole("option");
+    fireEvent.change(field, { target: { value: "zzz" } });
+    expect(screen.queryByRole("listbox")).toBeNull();
+    expect(field).not.toHaveAttribute("aria-controls");
+    expect(field).toHaveAttribute("aria-expanded", "false");
+    expect(field).not.toHaveAttribute("aria-activedescendant");
+  });
+
+  // Mutation caught: the status line mounted together with its text, which
+  // a screen reader does not announce (a live region must exist before its
+  // content changes).
+  it("keeps the status element mounted, empty, before its text appears", async () => {
+    const { field } = renderSelect(() => listing(["a"]));
+    await screen.findAllByRole("option");
+    const status = screen.getByRole("status");
+    expect(status).toBeEmptyDOMElement();
+    fireEvent.change(field, { target: { value: "zzz" } });
+    expect(screen.getByRole("status")).toBe(status);
+    expect(status).toHaveTextContent(NO_SUCH_LEVEL);
+  });
+
+  // Mutation caught: the window index used for posinset or setsize.
+  it("numbers an option past the window by its place in the filtered list", async () => {
+    const names = Array.from(
+      { length: 25 },
+      (_, i) => `d${String(i).padStart(2, "0")}`,
+    );
+    const { field } = renderSelect(() => listing(names), "d00");
+    await screen.findAllByRole("option");
+    expect(names.length).toBeGreaterThan(LEVEL_ROWS);
+    for (let i = 0; i < 24; i++) fireEvent.keyDown(field, { key: "ArrowDown" });
+    const on = screen.getByRole("option", { selected: true });
+    expect(on).toHaveAttribute("aria-posinset", "25");
+    expect(on).toHaveAttribute("aria-setsize", "25");
+    expect(field).toHaveAttribute("aria-activedescendant", on.id);
+  });
+
+  // Mutation caught: the composition guard missing from the key handler.
+  it("does nothing on Enter or an arrow during an IME composition", async () => {
+    const { field, onJump, onClose } = renderSelect(() => listing(["a", "b"]));
+    await screen.findAllByRole("option");
+    fireEvent.keyDown(field, { key: "ArrowDown", isComposing: true });
+    expect(selected()).toBe("a");
+    fireEvent.keyDown(field, { key: "Enter", isComposing: true });
+    fireEvent.keyDown(field, { key: "Enter", keyCode: 229 });
+    fireEvent.keyDown(field, { key: "Escape", isComposing: true });
+    expect(onJump).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
   });
 });

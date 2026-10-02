@@ -1,20 +1,20 @@
 /**
- * The CRT reader: what a terminal shows when the player leans in with Space.
+ * The CRT reader: what a terminal, a machine, a poster, the placard or a
+ * screen shows when the player leans in with Space.
  *
  * A full-screen overlay laid out as an 80-column terminal, the engram's
  * markdown flattened by `crtLines` into screen lines. The font is sized so
  * the 80 columns fit the viewport, and the screen shows as many whole lines
  * as fit under it; scrolling moves the first visible line, one line or one
  * screen at a time, never past the last full screen unless the section it
- * opened at lies in that screen. The two looks are the
- * phosphor green of a 70s terminal on near-black and the C64's light blue on
- * blue, where headings are uppercased as PETSCII would print them. Headings
+ * opened at lies in that screen. The screen is the
+ * phosphor green of a 70s terminal on near-black. Headings
  * are drawn in reverse video; the scanlines are a CSS repeating gradient and
  * the vignette a radial one, both laid over the text and ignoring the mouse.
  *
- * It opens at the terminal's own section: the `occurrence`-th line index the
- * layout records for the heading, or the top when the text no longer has
- * that section. The keys are read on `window` by `KeyboardEvent.code` while
+ * It opens at the reading's section (a terminal's own): the
+ * `occurrence`-th line index the layout records for the heading, or the
+ * top when there is none or the text no longer has that section. The keys are read on `window` by `KeyboardEvent.code` while
  * the reader is mounted, with the page's default action prevented so W, S
  * and the page keys do not also scroll the page: W/S or the arrows move one
  * line, Page Up/Down a screen, the wheel scrolls, F opens the engram in
@@ -30,10 +30,11 @@ import { useEffect, useMemo, useRef, useState } from "react";
 
 import { CRT_COLUMNS, crtLines, type CrtLine } from "./crt";
 
-/** The screen's colours for each look the reader supports. */
-const PALETTES = {
-  phosphor: { fg: "#39ff7a", bg: "#050b07", glow: "0 0 4px #39ff7a88" },
-  petscii: { fg: "#6c5eb5", bg: "#352879", glow: "none" },
+/** The screen's colours. */
+const PALETTE = {
+  fg: "#39ff7a",
+  bg: "#050b07",
+  glow: "0 0 4px #39ff7a88",
 } as const;
 
 /** The footer every screen ends with. */
@@ -64,7 +65,7 @@ function screenMetrics(width: number, height: number) {
 /** How one kind of line is drawn beyond its text. */
 function lineStyle(
   kind: CrtLine["kind"],
-  palette: (typeof PALETTES)[keyof typeof PALETTES],
+  palette: typeof PALETTE,
 ): React.CSSProperties {
   switch (kind) {
     case "heading":
@@ -86,23 +87,21 @@ export interface CrtReaderProps {
   /** The engram's markdown, frontmatter included or not. */
   markdown: string;
   /**
-   * The section the terminal stood for: its `##` heading as written and how
-   * many sections of the same heading come before it. Null opens at the top.
-   * It is read once, at mount: the parent mounts a fresh reader for each
-   * terminal (a new `key`), so a later change of this prop moves nothing.
+   * The section to open at (a terminal's): its `##` heading as written and
+   * how many sections of the same heading come before it. Null opens at the
+   * top. It is read once, at mount: the parent mounts a fresh reader for each
+   * reading (a new `key`), so a later change of this prop moves nothing.
    */
   section: { heading: string; occurrence: number } | null;
   /** Called on F: open the engram in Fluid. */
   onOpenFluid: () => void;
   /** Called on Esc: leave the reader. */
   onClose: () => void;
-  /** The screen's look. */
-  look: "phosphor" | "petscii";
 }
 
 /**
  * The reader overlay. See the module doc for the layout and the keys; the
- * parent mounts it while a terminal is being read and unmounts it on
+ * parent mounts it while a fixture is being read and unmounts it on
  * `onClose`.
  */
 export function CrtReader({
@@ -111,7 +110,6 @@ export function CrtReader({
   section,
   onOpenFluid,
   onClose,
-  look,
 }: CrtReaderProps) {
   const layout = useMemo(() => crtLines(markdown), [markdown]);
   const [viewport, setViewport] = useState(() => ({
@@ -209,9 +207,7 @@ export function CrtReader({
     };
   }, [rows, maxTop, lineHeight, onOpenFluid, onClose]);
 
-  const palette = PALETTES[look];
-  const shout = (text: string) =>
-    look === "petscii" ? text.toUpperCase() : text;
+  const palette = PALETTE;
   const visible = layout.lines.slice(first, first + rows);
   const position =
     layout.lines.length === 0
@@ -239,7 +235,7 @@ export function CrtReader({
           className="flex justify-between gap-[1ch]"
           style={{ height: lineHeight }}
         >
-          <span className="min-w-0 truncate">{shout(title)}</span>
+          <span className="min-w-0 truncate">{title}</span>
           <span className="shrink-0">{position}</span>
         </div>
         <div data-testid="crt-lines" style={{ height: rows * lineHeight }}>
@@ -248,7 +244,7 @@ export function CrtReader({
               key={first + n}
               style={{ height: lineHeight, ...lineStyle(line.kind, palette) }}
             >
-              {line.kind === "heading" ? shout(line.text) : line.text}
+              {line.text}
             </div>
           ))}
         </div>

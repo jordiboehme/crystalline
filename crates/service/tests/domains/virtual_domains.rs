@@ -145,6 +145,7 @@ async fn virtual_crud(store: Arc<Mutex<dyn Store>>) {
             content: Some("an appended line".to_string()),
             key: None,
             value: None,
+            values: None,
             section: None,
             find_text: None,
             expected_replacements: None,
@@ -258,6 +259,7 @@ async fn stale_edit_conflict(store: Arc<Mutex<dyn Store>>) {
             content: Some("someone else's change".to_string()),
             key: None,
             value: None,
+            values: None,
             section: None,
             find_text: None,
             expected_replacements: None,
@@ -279,6 +281,7 @@ async fn stale_edit_conflict(store: Arc<Mutex<dyn Store>>) {
             content: Some("my stale change".to_string()),
             key: None,
             value: None,
+            values: None,
             section: None,
             find_text: None,
             expected_replacements: None,
@@ -320,6 +323,7 @@ async fn stale_edit_conflict(store: Arc<Mutex<dyn Store>>) {
             content: Some("my retried change".to_string()),
             key: None,
             value: None,
+            values: None,
             section: None,
             find_text: None,
             expected_replacements: None,
@@ -351,6 +355,7 @@ async fn virtual_edit_drop_is_cas_consistent(store: Arc<Mutex<dyn Store>>) {
             content: Some("status: stable\nvalid_to: 9999-12-30\n".to_string()),
             key: None,
             value: None,
+            values: None,
             section: None,
             find_text: Some("status: stable\n".to_string()),
             expected_replacements: None,
@@ -394,6 +399,7 @@ async fn virtual_edit_drop_is_cas_consistent(store: Arc<Mutex<dyn Store>>) {
             content: Some("a follow-up line".to_string()),
             key: None,
             value: None,
+            values: None,
             section: None,
             find_text: None,
             expected_replacements: None,
@@ -440,6 +446,7 @@ async fn virtual_edit_rejects_malformed_temporal_date(store: Arc<Mutex<dyn Store
             content: Some("status: stable\nvalid_to: 2026-07-15T10:30:00Z\n".to_string()),
             key: None,
             value: None,
+            values: None,
             section: None,
             find_text: Some("status: stable\n".to_string()),
             expected_replacements: None,
@@ -481,6 +488,7 @@ async fn virtual_edit_rejects_malformed_temporal_date(store: Arc<Mutex<dyn Store
             content: Some("a normal follow-up".to_string()),
             key: None,
             value: None,
+            values: None,
             section: None,
             find_text: None,
             expected_replacements: None,
@@ -1262,3 +1270,175 @@ both_backends!(
     a_virtual_overwrite_replaces_the_owning_row,
     virtual_overwrite_in_place
 );
+
+// --- an unguarded edit stays last-write-wins against a concurrent write ------
+
+fn sha_hex(text: &str) -> String {
+    use sha2::Digest;
+    crystalline_index::hex_lower(&sha2::Sha256::digest(text.as_bytes()))
+}
+
+fn append(identifier: &str, line: &str, expected_checksum: Option<String>) -> EditParams {
+    EditParams {
+        identifier: identifier.to_string(),
+        domain: "notes".to_string(),
+        operation: "append".to_string(),
+        content: Some(line.to_string()),
+        expected_checksum,
+        ..EditParams::default()
+    }
+}
+
+/// The record another instance writes: the stored document with one more
+/// line, under the stamp that describes it.
+fn rewritten(path: &str, text: &str) -> crystalline_index::EngramRecord {
+    let engram = crystalline_core::parse_engram(text).unwrap();
+    let mut record = crystalline_index::EngramRecord::from_engram(
+        &engram,
+        path,
+        crystalline_index::FileStamp {
+            mtime: 1_700_000_000,
+            size: text.len() as u64,
+            sha256: sha_hex(text),
+        },
+    );
+    record.content = text.to_string();
+    record
+}
+
+/// Two instances on one Postgres schema. B holds an uncommitted write of a
+/// virtual engram while A's engine edits the same engram:
+///
+/// - without an `expected_checksum`, A's edit waits for B, finds the text it
+///   read gone, applies itself again to B's text and lands on top of it, so
+///   both changes stand, as last-write-wins promises;
+/// - with the checksum of the text A read, the same race is refused as the
+///   stale edit it is, and B's text stays alone.
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn an_unguarded_virtual_edit_lands_on_a_concurrent_write_on_postgres() {
+    let Some(url) = pg_url() else {
+        return;
+    };
+    let schema = unique_schema();
+    let a = crystalline_index::PostgresStore::open_in_schema(&url, &schema)
+        .await
+        .unwrap();
+    let b = crystalline_index::PostgresStore::open_in_schema(&url, &schema)
+        .await
+        .unwrap();
+    let engine = Arc::new(virtual_engine(Arc::new(Mutex::new(a))));
+    engine
+        .write_engram(&write_params("Race", "The race body.\n\n- [fact] first"))
+        .await
+        .unwrap();
+    let domain = b.domain_id("notes").await.unwrap().unwrap();
+    let row = b.all_engram_contents(domain).await.unwrap().remove(0);
+
+    // B's write, held open while A's unguarded edit runs.
+    let from_b = format!("{}- [fact] from b\n", row.content);
+    b.begin().await.unwrap();
+    b.upsert_engram(domain, &rewritten(&row.path, &from_b))
+        .await
+        .unwrap();
+    let edit = {
+        let engine = Arc::clone(&engine);
+        tokio::spawn(async move {
+            engine
+                .edit_engram(&append("race", "- [fact] from a", None))
+                .await
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!edit.is_finished(), "A waits for B's row lock");
+    b.commit().await.unwrap();
+    edit.await
+        .unwrap()
+        .expect("an unguarded edit is last-write-wins");
+    let stored = b.engram_content(domain, &row.path).await.unwrap().unwrap();
+    assert!(stored.contains("- [fact] from b"), "{stored}");
+    assert!(stored.contains("- [fact] from a"), "{stored}");
+
+    // The same race with a checksum: refused, and B's text is what stands.
+    let read_sha = sha_hex(&stored);
+    let from_b_again = format!("{stored}- [fact] from b again\n");
+    b.begin().await.unwrap();
+    b.upsert_engram(domain, &rewritten(&row.path, &from_b_again))
+        .await
+        .unwrap();
+    let guarded = {
+        let engine = Arc::clone(&engine);
+        tokio::spawn(async move {
+            engine
+                .edit_engram(&append("race", "- [fact] guarded a", Some(read_sha)))
+                .await
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    b.commit().await.unwrap();
+    let err = guarded
+        .await
+        .unwrap()
+        .expect_err("a guarded edit refuses the race");
+    assert!(matches!(err, EngineError::Conflict(_)), "{err}");
+    let stored = b.engram_content(domain, &row.path).await.unwrap().unwrap();
+    assert!(stored.contains("- [fact] from b again"), "{stored}");
+    assert!(!stored.contains("guarded a"), "{stored}");
+
+    b.drop_schema().await.unwrap();
+}
+
+/// Turso has no second writer to race with, so what applies there is the
+/// sequential half: an unguarded edit lands on whatever is stored, and a
+/// guarded one against text that moved on is refused.
+#[tokio::test]
+async fn unguarded_and_guarded_virtual_edits_on_turso() {
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let store: Arc<Mutex<dyn Store>> = Arc::new(Mutex::new(store));
+    let engine = virtual_engine(Arc::clone(&store));
+    engine
+        .write_engram(&write_params("Race", "The race body.\n\n- [fact] first"))
+        .await
+        .unwrap();
+    let (domain, row) = {
+        let store = store.lock().await;
+        let domain = store.domain_id("notes").await.unwrap().unwrap();
+        (
+            domain,
+            store.all_engram_contents(domain).await.unwrap().remove(0),
+        )
+    };
+    let read_sha = row.sha256.clone();
+    {
+        let store = store.lock().await;
+        store
+            .upsert_engram(
+                domain,
+                &rewritten(&row.path, &format!("{}- [fact] from b\n", row.content)),
+            )
+            .await
+            .unwrap();
+    }
+    engine
+        .edit_engram(&append("race", "- [fact] from a", None))
+        .await
+        .unwrap();
+    let err = engine
+        .edit_engram(&append("race", "- [fact] guarded a", Some(read_sha)))
+        .await
+        .expect_err("stale");
+    assert!(matches!(err, EngineError::Conflict(_)), "{err}");
+    let stored = {
+        let store = store.lock().await;
+        store
+            .engram_content(domain, &row.path)
+            .await
+            .unwrap()
+            .unwrap()
+    };
+    assert!(
+        stored.contains("from b") && stored.contains("from a"),
+        "{stored}"
+    );
+    assert!(!stored.contains("guarded a"), "{stored}");
+}

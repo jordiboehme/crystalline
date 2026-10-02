@@ -13,8 +13,9 @@
  * - `boxFront` gives a police box's front wall, in the same terms
  *   `interact.ts`'s `wallPoint` gives a fixture's wall.
  * - `boxFocus` is the box version of `focusOf`: Space at the front toggles
- *   the doors, like a bulkhead or blast door. A fixture in focus always
- *   wins over a box (the session tries `focusOf` first).
+ *   the doors, like a bulkhead or blast door. A terminal, door, hatch,
+ *   portal or lift in focus wins over a box (the session tries `focusOf`
+ *   first); a box wins over a reading offer (`isReadingKind`, 0.22 R13).
  * - `stepBoxDoors` is the box version of `stepDoors`: the doors keep
  *   heading where they were sent until pressed again: they never close by
  *   themselves.

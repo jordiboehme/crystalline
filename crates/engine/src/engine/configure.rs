@@ -48,6 +48,7 @@ impl Engine {
                     *self.config.write().unwrap() = effective;
                     view
                 };
+                self.contradiction_setting_touched(key);
                 self.announce_a_moved_tool_list(github_before).await;
                 Ok(view)
             }
@@ -68,6 +69,7 @@ impl Engine {
                     *self.config.write().unwrap() = effective;
                     view
                 };
+                self.contradiction_setting_touched(key);
                 self.announce_a_moved_tool_list(github_before).await;
                 Ok(view)
             }

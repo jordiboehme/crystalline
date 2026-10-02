@@ -189,7 +189,7 @@ async fn next_control(rx: &mut tokio::sync::broadcast::Receiver<Frame>) -> Contr
 }
 
 #[tokio::test]
-async fn a_pause_lands_the_save_with_the_separator_reapplied() {
+async fn a_pause_lands_the_save_as_lf() {
     let (tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine.clone());
     let mut joined = sessions.join("eng", "crlf", None).await.unwrap();
@@ -202,15 +202,14 @@ async fn a_pause_lands_the_save_with_the_separator_reapplied() {
         .tick_save(Instant::now() + Duration::from_millis(SAVE_DEBOUNCE_MS + 100))
         .await;
 
+    // The whole file lands as LF, the CRLF lines the session never touched
+    // included: Crystalline writes LF only.
     let on_disk = std::fs::read_to_string(tmp.path().join("eng/crlf.md")).unwrap();
     assert!(
-        on_disk.ends_with("windows body\r\nhello from the session\r\n"),
-        "saved with CRLF back: {on_disk:?}"
+        on_disk.ends_with("windows body\nhello from the session\n"),
+        "saved as LF: {on_disk:?}"
     );
-    assert!(
-        !on_disk.replace("\r\n", "").contains('\n'),
-        "no stray LF was minted"
-    );
+    assert!(!on_disk.contains('\r'), "no CR is left: {on_disk:?}");
     let saved = next_control(&mut joined.rx).await;
     assert!(matches!(saved, Control::Saved { .. }));
 
@@ -262,6 +261,67 @@ async fn a_room_save_announces_once() {
         .tick_save(Instant::now() + Duration::from_secs(60))
         .await;
     assert!(rx.try_recv().is_err(), "a quiet tick announces nothing");
+}
+
+/// A file that mixes CRLF and LF hosts a room like any other, and the
+/// room's save writes the whole file as LF.
+#[tokio::test]
+async fn a_mixed_endings_file_hosts_a_room_and_saves_as_lf() {
+    let (tmp, engine, _scratch) = engine_fixture().await;
+    std::fs::write(
+        tmp.path().join("eng/mixed.md"),
+        "---\r\ntitle: Mixed\r\npermalink: mixed\r\ntags:\r\n  - eng\r\nstatus: stable\r\ntype: engram\r\n---\r\n\r\na CRLF file\nwith a lone LF\r\n",
+    )
+    .unwrap();
+    engine.sync(None).await.unwrap();
+    let sessions = CollabSessions::new(engine.clone());
+    let mut joined = sessions.join("eng", "mixed", None).await.unwrap();
+    let doc = sync_client(&joined).await;
+    append_line(&joined, &doc, "typed in the room").await;
+    joined
+        .session
+        .tick_save(Instant::now() + Duration::from_millis(SAVE_DEBOUNCE_MS + 100))
+        .await;
+    let saved = next_control(&mut joined.rx).await;
+    assert!(matches!(saved, Control::Saved { .. }), "{saved:?}");
+    let on_disk = std::fs::read_to_string(tmp.path().join("eng/mixed.md")).unwrap();
+    assert!(!on_disk.contains('\r'), "{on_disk:?}");
+    assert!(
+        on_disk.ends_with("a CRLF file\nwith a lone LF\ntyped in the room\n"),
+        "{on_disk:?}"
+    );
+}
+
+/// A lone `\r` is line content, not a line ending: it rides through a room
+/// over a CRLF file and its save untouched, while every CRLF pair turns LF.
+#[tokio::test]
+async fn a_lone_cr_survives_a_room_and_its_save() {
+    let (tmp, engine, _scratch) = engine_fixture().await;
+    std::fs::write(
+        tmp.path().join("eng/cr.md"),
+        "---\r\ntitle: Cr\r\npermalink: cr\r\ntags:\r\n  - eng\r\nstatus: stable\r\ntype: engram\r\n---\r\n\r\nbefore\rafter\r\n",
+    )
+    .unwrap();
+    engine.sync(None).await.unwrap();
+    let sessions = CollabSessions::new(engine.clone());
+    let mut joined = sessions.join("eng", "cr", None).await.unwrap();
+    let doc = sync_client(&joined).await;
+    let synced = doc
+        .get_or_insert_text("content")
+        .get_string(&doc.transact());
+    assert!(synced.contains("before\rafter\n"), "{synced:?}");
+    append_line(&joined, &doc, "typed").await;
+    joined
+        .session
+        .tick_save(Instant::now() + Duration::from_millis(SAVE_DEBOUNCE_MS + 100))
+        .await;
+    assert!(matches!(
+        next_control(&mut joined.rx).await,
+        Control::Saved { .. }
+    ));
+    let on_disk = std::fs::read_to_string(tmp.path().join("eng/cr.md")).unwrap();
+    assert!(on_disk.ends_with("before\rafter\ntyped\n"), "{on_disk:?}");
+    assert!(!on_disk.contains("\r\n"), "{on_disk:?}");
 }
 
 #[tokio::test]

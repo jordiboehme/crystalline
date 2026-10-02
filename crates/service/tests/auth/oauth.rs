@@ -694,7 +694,7 @@ async fn mcp_post(
             Err(_) => break,
         }
     }
-    String::from_utf8_lossy(&buf).into_owned()
+    String::from_utf8_lossy_owned(buf)
 }
 
 /// Whether the MCP gate served a handshake presenting `token`, which is the

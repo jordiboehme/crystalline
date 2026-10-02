@@ -20,7 +20,7 @@
 
 use std::ops::Range;
 
-use crate::parse::{fence_marker, is_hashtag, locate};
+use crate::parse::{body_lines, bullet_end, is_hashtag, locate};
 
 /// Whether a string is a canonical lowercase-with-hyphens tag: non-empty, no
 /// leading or trailing hyphen and only lowercase ASCII letters, digits and
@@ -33,6 +33,45 @@ pub fn is_lower_hyphen(s: &str) -> bool {
         && !s.ends_with('-')
         && s.chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// Fold a tag as an agent spelled it into the canonical lowercase-with-hyphens
+/// form: lowercased, every run of separators (whitespace, underscores and
+/// hyphens) that holds at least one whitespace or underscore turned into one
+/// hyphen, and hyphens trimmed from both ends. A run of hyphens alone is kept
+/// as written, so a tag already in canonical form (`a--b` included) comes
+/// back unchanged. `None` when the result is not a tag [`is_lower_hyphen`]
+/// accepts (empty, or holding a character other than an ASCII letter, a digit
+/// or a hyphen), so the caller refuses it rather than writing a tag verify's
+/// E007 would flag.
+pub fn fold_tag(raw: &str) -> Option<String> {
+    let mut out = String::with_capacity(raw.len());
+    // The separator run being read: its length in hyphens, and whether it
+    // held anything other than hyphens.
+    let mut hyphens = 0usize;
+    let mut folds = false;
+    let flush = |out: &mut String, hyphens: &mut usize, folds: &mut bool| {
+        if *folds {
+            out.push('-');
+        } else {
+            out.extend(std::iter::repeat_n('-', *hyphens));
+        }
+        *hyphens = 0;
+        *folds = false;
+    };
+    for c in raw.chars().flat_map(char::to_lowercase) {
+        match c {
+            '-' => hyphens += 1,
+            '_' => folds = true,
+            c if c.is_whitespace() => folds = true,
+            c => {
+                flush(&mut out, &mut hyphens, &mut folds);
+                out.push(c);
+            }
+        }
+    }
+    let out = out.trim_matches('-');
+    is_lower_hyphen(out).then(|| out.to_string())
 }
 
 /// Rewrite every occurrence of tag `old` to `new` in one Engram's markdown
@@ -354,6 +393,11 @@ fn rewrite_comma_items(inner: &str, old_f: &str, new: &str) -> (String, usize) {
 
 /// Rewrite trailing observation hashtags in the body, leaving the frontmatter
 /// and every non-observation line untouched.
+///
+/// The lines are read with the parser's own fence tracking and bullet extent
+/// (see `crate::parse::body_lines` and `crate::parse::bullet_end`), so a
+/// bullet that wraps onto further lines is rewritten as the one observation
+/// the parser reads: its trailing tags sit at the end of its last line.
 fn retag_body(source: &str, old_f: &str, new: &str) -> (String, usize) {
     let (_has_fm, _fm_span, body_start) = locate(source);
     let head = &source[..body_start];
@@ -362,53 +406,40 @@ fn retag_body(source: &str, old_f: &str, new: &str) -> (String, usize) {
     let mut out = String::with_capacity(source.len());
     out.push_str(head);
     let mut count = 0usize;
-    // Mirror the parser's stateful fence tracking exactly (see
-    // `crate::parse::body_lines`): a fence closes only on a marker of the same
-    // char, a count at least the opener's and nothing after it, so a shorter
-    // nested marker (``` inside ````) stays content and never toggles the fence.
-    let mut fence: Option<(char, usize)> = None;
-    for line in body.split_inclusive('\n') {
-        let (content, nl) = match line.strip_suffix('\n') {
-            Some(c) => (c, "\n"),
-            None => (line, ""),
-        };
-        let text = content.trim_end_matches('\r');
-        match fence {
-            None => {
-                if let Some((c, n, _)) = fence_marker(text) {
-                    // Opening fence line: emit verbatim, do not scan it.
-                    fence = Some((c, n));
-                    out.push_str(line);
-                    continue;
-                }
-                let (new_content, n) = retag_observation_line(content, old_f, new);
-                out.push_str(&new_content);
-                out.push_str(nl);
-                count += n;
-            }
-            Some((fc, fcount)) => {
-                // Inside a fence: emit verbatim and test the parser's close rule.
-                let mut closes = false;
-                if let Some((c, n, _)) = fence_marker(text)
-                    && c == fc
-                    && n >= fcount
-                    && text.trim_start()[n..].trim().is_empty()
-                {
-                    closes = true;
-                }
-                out.push_str(line);
-                if closes {
-                    fence = None;
-                }
-            }
+    // `split_inclusive` and the parser's `split` agree on every index this
+    // walk reads: the parser only adds an empty last line after a final
+    // newline, which has no counterpart here and holds no bullet.
+    let raw: Vec<&str> = body.split_inclusive('\n').collect();
+    let lines = body_lines(body, 1);
+    let mut i = 0;
+    while i < raw.len() {
+        let bl = &lines[i];
+        if bl.in_fence || !is_observation_bullet(bl.text) {
+            out.push_str(raw[i]);
+            i += 1;
+            continue;
         }
+        let end = bullet_end(&lines, i).min(raw.len() - 1);
+        let block: String = raw[i..=end].concat();
+        let (content, nl) = match block.strip_suffix('\n') {
+            Some(c) => (c, "\n"),
+            None => (block.as_str(), ""),
+        };
+        let (new_content, n) = retag_observation_line(content, old_f, new);
+        out.push_str(&new_content);
+        out.push_str(nl);
+        count += n;
+        i = end + 1;
     }
     (out, count)
 }
 
-/// Rewrite the trailing hashtag run of one line when it is a top-level
-/// observation bullet. Returns the (possibly unchanged) line content and how
-/// many hashtags were rewritten.
+/// Rewrite the trailing hashtag run of one observation bullet when it is a
+/// top-level observation bullet. `content` is the bullet's text from its `- `
+/// to the end of its last line, so a wrapped bullet arrives with the newlines
+/// between its lines, which the hashtag scan reads as whitespace like any
+/// other. Returns the (possibly unchanged) content and how many hashtags were
+/// rewritten.
 fn retag_observation_line(content: &str, old_f: &str, new: &str) -> (String, usize) {
     // The line, minus a trailing `\r`, must be a `- [category] ...` bullet.
     let cr = content.ends_with('\r');
@@ -470,15 +501,7 @@ fn is_observation_bullet(line: &str) -> bool {
     let Some(content) = line.strip_prefix("- ") else {
         return false;
     };
-    if !content.starts_with('[') {
-        return false;
-    }
-    let rest = &content[1..];
-    let Some(close) = rest.find(']') else {
-        return false;
-    };
-    let category = &rest[..close];
-    !category.is_empty() && !category.contains('[')
+    crate::parse::split_category(content).is_some()
 }
 
 /// Rewrite the hashtag tokens inside the trailing region `#a #b #c`, preserving
@@ -544,6 +567,13 @@ mod tests {
     }
 
     #[test]
+    fn a_link_bullet_is_not_an_observation_bullet() {
+        assert!(is_observation_bullet("- [fact] x #a"));
+        assert!(!is_observation_bullet("- [label](https://x) #a"));
+        assert!(!is_observation_bullet("- [label][ref] #a"));
+    }
+
+    #[test]
     fn is_lower_hyphen_accepts_canonical_and_rejects_the_rest() {
         assert!(is_lower_hyphen("multi-word"));
         assert!(is_lower_hyphen("api2"));
@@ -553,6 +583,43 @@ mod tests {
         assert!(!is_lower_hyphen("Foo"));
         assert!(!is_lower_hyphen("a_b"));
         assert!(!is_lower_hyphen("a b"));
+    }
+
+    #[test]
+    fn fold_tag_lowercases_and_turns_separator_runs_into_one_hyphen() {
+        assert_eq!(
+            fold_tag("Confluence Source").as_deref(),
+            Some("confluence-source")
+        );
+        assert_eq!(
+            fold_tag("confluence-source").as_deref(),
+            Some("confluence-source")
+        );
+        assert_eq!(fold_tag("  API_v2  ").as_deref(), Some("api-v2"));
+        assert_eq!(fold_tag("a \t_ b").as_deref(), Some("a-b"));
+        assert_eq!(fold_tag("-edge-").as_deref(), Some("edge"));
+        // A run mixing hyphens with whitespace or underscores is one hyphen.
+        assert_eq!(fold_tag("a - b").as_deref(), Some("a-b"));
+        assert_eq!(fold_tag("a_-_b").as_deref(), Some("a-b"));
+        assert_eq!(fold_tag("a -b").as_deref(), Some("a-b"));
+        assert_eq!(fold_tag("a- b").as_deref(), Some("a-b"));
+    }
+
+    #[test]
+    fn fold_tag_leaves_a_canonical_tag_unchanged() {
+        // An agent passes the engram's whole list back with one tag added, so
+        // a tag already in canonical form must come back byte for byte.
+        for tag in ["a--b", "api2", "multi-word", "x"] {
+            assert!(is_lower_hyphen(tag));
+            assert_eq!(fold_tag(tag).as_deref(), Some(tag), "{tag}");
+        }
+    }
+
+    #[test]
+    fn fold_tag_refuses_what_cannot_become_a_canonical_tag() {
+        for raw in ["", "   ", "_-_", "c++", "caf\u{e9}", "a/b", "#tag"] {
+            assert_eq!(fold_tag(raw), None, "{raw:?}");
+        }
     }
 
     #[test]
@@ -709,6 +776,30 @@ mod tests {
         assert_eq!(
             out,
             "---\ntags:\n  - t\n---\n\n````\n```\n- [decision] fake #foo\n```\n````\n\n- [decision] real #bar\n"
+        );
+    }
+
+    #[test]
+    fn a_tag_on_a_wrapped_bullets_continuation_line_is_renamed() {
+        // The parser reads the bullet as one observation whose tags end its
+        // last line; the first line's `#foo` is mid-text and stays.
+        let src = "---\ntags:\n  - t\n---\n\n- [decision] chose #foo because\n  it was cheap #foo #keep\n- [decision] single #foo\n";
+        let (out, n) = retagged(src, "foo", "bar");
+        assert_eq!(n, 2);
+        assert_eq!(
+            out,
+            "---\ntags:\n  - t\n---\n\n- [decision] chose #foo because\n  it was cheap #bar #keep\n- [decision] single #bar\n"
+        );
+    }
+
+    #[test]
+    fn a_tag_run_split_over_continuation_lines_is_merged_whole_with_crlf() {
+        let src = "---\r\ntags:\r\n  - t\r\n---\r\n\r\n- [decision] chose it #bar\r\n  #foo\r\n\r\nprose\r\n";
+        let (out, n) = retagged(src, "foo", "bar");
+        assert_eq!(n, 1);
+        assert_eq!(
+            out,
+            "---\r\ntags:\r\n  - t\r\n---\r\n\r\n- [decision] chose it #bar\r\n\r\nprose\r\n"
         );
     }
 }

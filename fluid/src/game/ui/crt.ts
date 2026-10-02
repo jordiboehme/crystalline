@@ -14,7 +14,7 @@
  *   line `[DIAGRAM: <tag>]` instead, since a diagram's source is no use on a
  *   terminal.
  * - `#` to `######` headings become one `heading` line with the text, wrapped
- *   when long. The case is kept; the PETSCII look uppercases in the reader.
+ *   when long. The case is kept.
  * - List items (`-`, `*`, `+`, `1.`) keep their marker; a wrapped item hangs
  *   its continuation lines under the text after the marker. Nested lists are
  *   indented 2 spaces per level, whatever indent the source used, and a
@@ -25,11 +25,11 @@
  *   paragraph around it.
  * - Everything else is a paragraph: its lines are joined and word-wrapped to
  *   `columns`, and a word longer than `columns` is hard-broken.
- * - Inline, `[text](url)` keeps the text, `[[Target]]` and
- *   `[[domain:Target|label]]` keep the label or else the target, and
- *   backticks are stripped. `**`, `__`, `*` and `_` are stripped only as
- *   emphasis markers around text (`**x**`, `__x__`, `*x*`, `_x_`), so a lone
- *   `*` as in `2*3` stays, and so does a `_` inside a word (`snake_case`).
+ * - Inline, the rules of `plainInline` in `textFlow.ts` apply: `[text](url)`
+ *   keeps the text, `[[Target]]` and `[[domain:Target|label]]` keep the label
+ *   or else the target, backticks are stripped, and `**`, `__`, `*` and `_`
+ *   are stripped only as emphasis markers around text, so a lone `*` as in
+ *   `2*3` stays, and so does a `_` inside a word (`snake_case`).
  * - Runs of blank lines collapse to one `blank`; none leads or trails.
  *
  * `sections` maps the text of each `##` heading, exactly as written after the
@@ -39,7 +39,7 @@
  * find their place here.
  */
 
-import { parseWikiTarget } from "../../wikilinks";
+import { IMAGE, hardWrap, imageNote, plainInline, wordWrap } from "../textFlow";
 
 /** The width of the reader's screen, in characters. */
 export const CRT_COLUMNS = 80;
@@ -60,81 +60,7 @@ const HEADING = /^(#{1,6})\s+(.*?)\s*#*\s*$/;
 const SECTION = /^##\s+(.+?)\s*#*\s*$/;
 const LIST_ITEM = /^(\s*)([-*+]|\d+[.)])\s+(.*)$/;
 const QUOTE = /^\s*>\s?(.*)$/;
-const IMAGE = /!\[([^\]]*)\]\(\s*([^)\s]*)[^)]*\)/g;
 const DIAGRAM_TAGS = new Set(["mermaid", "plantuml"]);
-
-/** The note an image turns into: its alt text, or its source without one. */
-function imageNote(alt: string, src: string): string {
-  const label = alt.trim() === "" ? src : alt.trim();
-  return `[IMAGE: ${label}]`;
-}
-
-/**
- * Inline markdown reduced to its text: images to their note, links and
- * wikilinks to their visible words, emphasis and code markers dropped.
- */
-function plain(text: string): string {
-  return text
-    .replace(IMAGE, (_m, alt: string, src: string) => imageNote(alt, src))
-    .replace(/\[\[([^[\]]+)\]\]/g, (_m, inner: string) => {
-      const bar = inner.indexOf("|");
-      if (bar >= 0) {
-        const label = inner.slice(bar + 1).trim();
-        if (label !== "") return label;
-      }
-      return parseWikiTarget(bar >= 0 ? inner.slice(0, bar) : inner).target;
-    })
-    .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1")
-    .replace(/`/g, "")
-    .replace(/\*\*(?=\S)(.+?)(?<=\S)\*\*/g, "$1")
-    .replace(
-      /(?<![\p{L}\p{N}_])__(?=\S)(.+?)(?<=\S)__(?![\p{L}\p{N}_])/gu,
-      "$1",
-    )
-    .replace(/(?<![\p{L}\p{N}])\*(?=\S)(.+?)(?<=\S)\*(?![\p{L}\p{N}])/gu, "$1")
-    .replace(/(?<![\p{L}\p{N}_])_(?=\S)(.+?)(?<=\S)_(?![\p{L}\p{N}_])/gu, "$1");
-}
-
-/** A string cut into pieces of at most `width` characters. */
-function hardWrap(text: string, width: number): string[] {
-  if (text.length <= width) return [text];
-  const pieces: string[] = [];
-  for (let i = 0; i < text.length; i += width) {
-    pieces.push(text.slice(i, i + width));
-  }
-  return pieces;
-}
-
-/**
- * Words laid into lines of at most `width` characters, one space between
- * words. A word wider than a line is cut; its last piece can share a line
- * with the words after it. No words gives no lines.
- */
-function wordWrap(text: string, width: number): string[] {
-  const out: string[] = [];
-  let line = "";
-  for (const word of text.split(/\s+/)) {
-    if (word === "") continue;
-    const pieces = hardWrap(word, width);
-    for (const [n, piece] of pieces.entries()) {
-      const last = n === pieces.length - 1;
-      if (line === "") {
-        line = piece;
-      } else if (line.length + 1 + piece.length <= width) {
-        line = `${line} ${piece}`;
-      } else {
-        out.push(line);
-        line = piece;
-      }
-      if (!last) {
-        out.push(line);
-        line = "";
-      }
-    }
-  }
-  if (line !== "") out.push(line);
-  return out;
-}
 
 /** What the lines of a paragraph or list item are gathered into before layout. */
 type OpenBlock =
@@ -192,7 +118,10 @@ export function crtLines(
       IMAGE.lastIndex = 0;
       const image = IMAGE.exec(rest);
       if (image === null) break;
-      for (const line of wordWrap(plain(rest.slice(0, image.index)), width)) {
+      for (const line of wordWrap(
+        plainInline(rest.slice(0, image.index)),
+        width,
+      )) {
         push("text", line);
       }
       for (const line of hardWrap(
@@ -203,7 +132,7 @@ export function crtLines(
       }
       rest = rest.slice(image.index + image[0].length);
     }
-    for (const line of wordWrap(plain(rest), width)) push("text", line);
+    for (const line of wordWrap(plainInline(rest), width)) push("text", line);
   };
   const flush = () => {
     if (open === null) return;
@@ -213,7 +142,7 @@ export function crtLines(
     } else {
       const hang = " ".repeat(open.prefix.length);
       const wrapped = wordWrap(
-        plain(text),
+        plainInline(text),
         Math.max(1, width - open.prefix.length),
       );
       if (wrapped.length === 0) wrapped.push("");
@@ -270,7 +199,7 @@ export function crtLines(
         if (at === undefined) sections.set(key, [lines.length]);
         else at.push(lines.length);
       }
-      const text = wordWrap(plain(heading[2] ?? ""), width);
+      const text = wordWrap(plainInline(heading[2] ?? ""), width);
       if (text.length === 0) text.push("");
       for (const row of text) push("heading", row);
       continue;
@@ -297,7 +226,10 @@ export function crtLines(
     if (quote !== null) {
       flush();
       listIndents = [];
-      const text = wordWrap(plain(quote[1] ?? ""), Math.max(1, width - 2));
+      const text = wordWrap(
+        plainInline(quote[1] ?? ""),
+        Math.max(1, width - 2),
+      );
       if (text.length === 0) text.push("");
       for (const row of text) push("quote", `> ${row}`.trimEnd());
       continue;
@@ -306,7 +238,7 @@ export function crtLines(
     if (line.trim().startsWith("|")) {
       flush();
       listIndents = [];
-      for (const piece of hardWrap(plain(line.trim()), width)) {
+      for (const piece of hardWrap(plainInline(line.trim()), width)) {
         push("text", piece);
       }
       continue;

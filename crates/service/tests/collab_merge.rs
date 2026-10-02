@@ -477,13 +477,16 @@ async fn a_deleted_conflict_never_restores_over_a_file_that_came_back() {
     assert_eq!(std::fs::read_to_string(&path).unwrap(), external);
 }
 
+/// An external write that mixes line endings is no longer the room's
+/// decision: it merges as LF like any other edit. The room only read it, so
+/// the file keeps the bytes it was written with until the next save.
+///
+/// This replaces a test that used a mixed theirs to raise a conflict with
+/// nothing typed in the room. That shape cannot happen any more: a room that
+/// typed nothing holds the base text, and a merge against an unchanged side
+/// always takes the other side cleanly.
 #[tokio::test]
-async fn resolving_mine_adopts_their_text_as_the_base_so_the_choice_lands() {
-    // A theirs the session cannot merge at all: mixed line endings. Nobody in
-    // the room typed, so "mine" is the base text - and a resolve that adopted
-    // only their CHECKSUM would leave the save comparing my text against the
-    // stale base, finding nothing to write, and telling the room its choice
-    // landed when the file still held theirs.
+async fn a_mixed_endings_external_edit_merges_into_the_room_as_lf() {
     let (tmp, engine, _scratch) = engine_fixture().await;
     let sessions = CollabSessions::new(engine);
     let mut joined = sessions.join("eng", "alpha", None).await.unwrap();
@@ -494,34 +497,21 @@ async fn resolving_mine_adopts_their_text_as_the_base_so_the_choice_lands() {
         .replacen("---\n", "---\r\n", 1);
     std::fs::write(&path, &external).unwrap();
 
-    // The idle probe finds it, and the merge refuses to rewrite the endings.
     joined
         .session
         .tick_save(Instant::now() + Duration::from_millis(IDLE_CHECK_MS + 100))
         .await;
-    let Control::Conflict { conflict_kind, .. } = next_control(&mut joined.rx).await else {
-        panic!("a mixed-endings theirs is the room's decision");
-    };
-    assert_eq!(conflict_kind, "edit");
-
-    joined
-        .session
-        .handle_frame(
-            joined.conn,
-            &control::encode(&Control::Resolve {
-                choice: "mine".into(),
-            }),
-        )
-        .await;
-    joined.session.tick_save(Instant::now()).await;
     assert!(matches!(
         next_control(&mut joined.rx).await,
-        Control::Saved { .. }
+        Control::Merged
     ));
+    let (file_now, dirty) = joined.session.snapshot().await;
+    assert_eq!(file_now, external.replace("\r\n", "\n"));
+    assert!(!dirty, "their text is the room's base now");
     assert_eq!(
         std::fs::read_to_string(&path).unwrap(),
-        ALPHA,
-        "the room's own text landed over theirs"
+        external,
+        "a room that only read the file did not rewrite it"
     );
 }
 

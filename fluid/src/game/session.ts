@@ -39,7 +39,9 @@
  *
  * Space at a police box's front opens or closes its doors too
  * (`world/box.ts`'s `boxFocus` and `stepBoxDoors`), like a bulkhead door: a
- * fixture in focus always wins over a box, since the two rarely compete. Its
+ * terminal, door, hatch, portal or lift in focus wins over a box, since the
+ * two rarely compete, and a box wins over a machine, a poster, the placard
+ * or a screen (0.22 R13), which are only read. Its
  * door state is kept under `boxKey(index)`, alongside the fixture doors'
  * `door:<index>` keys, in the same map the renderer draws every mover's
  * fraction from.
@@ -89,13 +91,24 @@
  * (`fluidRouteOfStation`: `/` in the airlock, the domain page on a bridge,
  * the folder on a deck, the engram in its room), I inverts the
  * mouse's vertical look (remembered in `localStorage` under `INVERT_KEY`),
- * and M turns the sound off and on (with `sound`: its `toggleMute`, the
- * notice `SOUND OFF` or `SOUND ON`; without it M does nothing).
- * No key switches the look: the game always runs in Aperture grid (look
- * 2), and only the dev pages start in another (`initialLook`, their
- * `?look=`). Only the mouse looks up and down. The
+ * M turns the sound off and on (with `sound`: its `toggleMute`, the
+ * notice `SOUND OFF` or `SOUND ON`; without it M does nothing), and N
+ * turns the ambience (the room drones) off and on on its own (its
+ * `toggleAmbience`, the notice `AMBIENCE OFF` or `AMBIENCE ON`; without
+ * `sound` N does nothing).
+ * No key switches the look: the game always runs in the station's one look.
+ * Only the mouse looks up and down. The
  * browser's own meaning of Space, the arrows, comma, period and Alt is
- * cancelled while the session has the keys (`CLAIMED_KEYS`). While the CRT
+ * cancelled while the session has the keys (`CLAIMED_KEYS`). Space at a
+ * terminal, a machine, a poster, the placard or a screen opens the CRT
+ * reader with what that fixture reads (`fixtureReading` in
+ * `world/reading.ts`, through `openReading`); a terminal or a poster in a
+ * room with no place reads nothing and opens nothing. Space at a computer
+ * among the furniture, props, heroes and curios (`computerFocus` over the
+ * use points `computersOf` gives on every entry) opens the reader with the
+ * room's reading (`roomReading`): the computer comes last, only when no
+ * fixture and no police box is in focus, so it never takes Space from
+ * anything offered before it (spec 3a, 0.22 R13). While the CRT
  * reader is open it reads the keys itself: the session ignores its own
  * commands and all movement until the host calls `closeReader`.
  *
@@ -110,10 +123,14 @@
  * entrance, in front of the lift, its doors open and sliding shut. An
  * engram room's exit (C28) is walked through like a sliding door and
  * leads up to its deck, in front of the deck's door back to the room.
- * It is latched on every entry (`upLatched`): the entrance spawn stands
- * 1 m from it, so it stays shut and carries no one until the player has
- * once stood `UP_LATCH_CLEAR` from its wall. A failed stop or exit is a
- * notice only: neither marks a way (C29).
+ * Every arrival latches the way behind it by the exit's rule
+ * (`wayLatched`, 0.22 R1): the sliding door or portal an arrival stands in
+ * front of (`arrivalWay`; a bulkhead or blast door opens only on Space and
+ * is never latched), else the room's exit, which the entrance spawn stands
+ * 1 m from. The latched way stays shut and carries no one until the
+ * player has once stood `UP_LATCH_CLEAR` from its wall, so a player still
+ * walking backwards after a crossing does not step straight back. A
+ * failed stop or exit is a notice only: neither marks a way (C29).
  *
  * Typed with no pause longer than a second, `idclev` opens the level select
  * when the host passed `onLevels` (the game route): the word's I toggle is
@@ -245,7 +262,6 @@ import {
 } from "./paths";
 import { createBlink } from "./render/blink";
 import { createLights, type LightState } from "./render/lights";
-import { LOOKS, type LookId } from "./render/looks";
 import { createRenderer, type Renderer } from "./render/renderer";
 import {
   boxEntry,
@@ -270,8 +286,10 @@ import {
 import { ACCESS_DENIED, NOT_FOUND, generateRoom } from "./world/generate";
 import {
   arrivalSpawn,
+  arrivalWay,
   doorKey,
   focusOf,
+  isReadingKind,
   hatchTravel,
   approaches,
   stepDoors,
@@ -301,6 +319,14 @@ import {
 import { LIFT_RIDE_MS } from "./timing";
 import { LIFT_WORDS, deckLabel } from "./world/lifts";
 import { readerBody } from "./ui/crt";
+import {
+  computerFocus,
+  computersOf,
+  fixtureReading,
+  roomReading,
+  type ComputerPoint,
+  type Reading,
+} from "./world/reading";
 import { roomFor } from "./world/station";
 import type {
   Box,
@@ -314,18 +340,12 @@ import type {
 export type { Arrival } from "./world/interact";
 
 /**
- * What the CRT reader is opened with: the engram's title and markdown, the
- * section the terminal stands for (its `##` heading and how many sections
- * of the same heading come before it, or null for the top), and the look
- * the station was drawn in when it opened, which picks the reader's screen
- * (the C64's blue for `freescape`, phosphor green otherwise).
+ * What the CRT reader is opened with: a `Reading` (`world/reading.ts`), a
+ * title and markdown and the section to open at: a terminal's `##` heading
+ * and how many sections of the same heading come before it, or null for
+ * the top.
  */
-export interface ReaderState {
-  title: string;
-  content: string;
-  section: { heading: string; occurrence: number } | null;
-  look: LookId;
-}
+export type ReaderState = Reading;
 
 /**
  * Where the session writes what the player sees besides the room.
@@ -339,8 +359,8 @@ export interface ReaderState {
  * - `notice`: a centred message over the canvas (`ACCESS DENIED`), null to
  *   hide it.
  * - `connector`: the travel overlay, shown while a place loads, with the
- *   destination's label and the look to draw it in.
- * - `reader`: the CRT reader's content while a terminal is read, null when
+ *   destination's label.
+ * - `reader`: the CRT reader's content while a fixture is read, null when
  *   it closes.
  *
  * Every writer may be called at any rate; the ones called every quarter
@@ -351,7 +371,7 @@ export interface HudSink {
   status(text: string): void;
   frame(text: string): void;
   notice(text: string | null): void;
-  connector(active: boolean, label: string, look: LookId): void;
+  connector(active: boolean, label: string): void;
   reader(state: ReaderState | null): void;
 }
 
@@ -378,8 +398,6 @@ export type RendererFactory = (
  * - `openFluid`: opens a Fluid path (the F key) outside the game.
  * - `forceRgba8`: take the RGBA8 bloom path whatever the GPU offers.
  * - `createRenderer`: see `RendererFactory`.
- * - `initialLook`: the look the session runs in, for good; `aperture`
- *   when not given. Only the dev pages pass another (their `?look=`).
  * - `clock`: the loop's clock; the browser's when not given. Tests crank it
  *   by hand.
  * - `load`: loads a place in place of the query client. The gallery's
@@ -405,7 +423,6 @@ export interface SessionOptions {
   openFluid(path: string): void;
   forceRgba8: boolean;
   createRenderer?: RendererFactory;
-  initialLook?: LookId;
   clock?: Clock;
   load?: PlaceLoader;
   /**
@@ -477,13 +494,13 @@ export type PlaceLoader = (
  *   they stand and the doors as they are.
  * - `showRoom` shows a room built by hand, with no place behind it (the
  *   dev-only model gallery): no load, no navigation, the player at the
- *   room's entrance and every door shut. Its terminals open no reader,
- *   since there is no engram to read. `current` stays null (M3 C5) unless
- *   `at` names the address the room stands for, a seam for the tests that
- *   stand a hand-built room (a police box forced into a deck, say) where
- *   the session would have entered it. `view`, when given, sets the
- *   player's pitch after entering, clamped to `MAX_PITCH` (C18, 2.6b): the
- *   dev seams' close curio framing (`spotView` in `dev/spots.ts`). It is
+ *   room's entrance and every door shut. Its terminals and posters open
+ *   no reader, since there is no engram to read. `current` stays null
+ *   (M3 C5) unless `at` names the address the room stands for, a seam
+ *   for the tests that stand a hand-built room (a police box forced into
+ *   a deck, say) where the session would have entered it. `view`, when
+ *   given, sets the player's pitch after entering, clamped to `MAX_PITCH`
+ *   (C18, 2.6b): the dev seams' close curio framing (`spotView` in `dev/spots.ts`). It is
  *   for those dev seams only; every other caller omits it and keeps the
  *   entrance's own pitch of 0.
  * - `go`, `showCanned` and `showRoom` close an open CRT reader, level
@@ -582,9 +599,10 @@ export const LISTING_WAIT_MS = 5000;
 export { LIFT_RIDE_MS };
 
 /**
- * How far from its exit's wall point the player must once stand, in
- * metres, before the exit opens (M3 C28): the entrance spawn stands 1 m
- * from it, and a step back would otherwise go straight up again. Not the
+ * How far from a latched way's wall point the player must once stand, in
+ * metres, before it opens (M3 C28, 0.22 R1): the entrance spawn stands
+ * 1 m from the exit and an arrival `ARRIVAL_DISTANCE` from the way back,
+ * and a step back would otherwise go straight through again. Not the
  * console room's exit latch (`exitLatched`), which is its own.
  */
 export const UP_LATCH_CLEAR = 2.0;
@@ -657,11 +675,14 @@ const CLAIMED_KEYS: ReadonlySet<string> = new Set([
   ...ALT_KEYS,
 ]);
 
-/** The use key: doors, terminals, the hatch, a police box's doors. */
+/**
+ * The use key: doors, the hatch, a lift, a police box's doors, and every
+ * fixture that is read.
+ */
 const USE_KEY = "Space";
 
 /** Every key that commands the session, drained while the reader is open. */
-const COMMAND_KEYS = [USE_KEY, "KeyF", "KeyI", "KeyM"] as const;
+const COMMAND_KEYS = [USE_KEY, "KeyF", "KeyI", "KeyM", "KeyN"] as const;
 
 /** The renderer on a real WebGL2 context. */
 const defaultFactory: RendererFactory = (canvas, options) => {
@@ -718,7 +739,6 @@ export function createSession(opts: SessionOptions): Session {
   const now = () => (opts.clock ?? performance).now();
 
   let disposed = false;
-  const lookId: LookId = opts.initialLook ?? "aperture";
   let inverted = readInverted();
   let place: PlaceInput | null = null;
   let current: StationAddress | null = null;
@@ -737,6 +757,11 @@ export function createSession(opts: SessionOptions): Session {
   let player: Player | null = null;
   let previous: Player | null = null;
   let prefetched = new Set<string>();
+  /**
+   * The room's computers' use points (`computersOf`), worked out on every
+   * entry of a room.
+   */
+  let computers: ComputerPoint[] = [];
   let latched: number | null = null;
   let readerOpen = false;
   /** Whether the level select is open (only with `onLevels`). */
@@ -755,11 +780,12 @@ export function createSession(opts: SessionOptions): Session {
    */
   let ride: { start: number; held: (() => void) | null } | null = null;
   /**
-   * The room's exit while it is latched (M3 C28), by fixture index: set
-   * on every entry, cleared once the player stands `UP_LATCH_CLEAR` from
-   * its wall point.
+   * The way behind the arrival while it is latched (M3 C28, 0.22 R1), by
+   * fixture index: on every entry the way `arrivalWay` names, else the
+   * room's exit; cleared once the player stands `UP_LATCH_CLEAR` from its
+   * wall point.
    */
-  let upLatched: number | null = null;
+  let wayLatched: number | null = null;
   /** The level cheat's word, read only when the host passed `onLevels`. */
   const cheat = opts.onLevels === undefined ? null : createCheatReader();
   /** Ticks run so far: the clock the word's gap is counted on (C2). */
@@ -1046,11 +1072,11 @@ export function createSession(opts: SessionOptions): Session {
    * at all (no GPU yet, or a lost context) there is nothing to refuse, and
    * `boot` hands the room over when a renderer is made.
    */
-  const present = (next: RoomSpec, id: LookId): boolean => {
+  const present = (next: RoomSpec): boolean => {
     if (renderer === null) return true;
     const t0 = now();
     try {
-      renderer.setRoom(next, LOOKS[id]);
+      renderer.setRoom(next);
       lastBuildMs = now() - t0;
       return true;
     } catch {
@@ -1062,11 +1088,11 @@ export function createSession(opts: SessionOptions): Session {
    * Enters a generated room: hands it to the renderer and resets everything
    * that belongs to the room before it. `next` is the place the room was
    * generated from, or null for a room with none (the airlock, a deck, the
-   * console room, a room built by hand), whose terminals then open no
-   * reader. `address` becomes `current`: the station address entered, as
-   * `roomFor` resolved it, never read back from `built` (M3 C5). `keep`
-   * keeps the player, the doors and
-   * this visit's failed ways and faults, for the same place shown again.
+   * console room, a room built by hand), whose terminals and posters then
+   * open no reader. `address` becomes `current`: the station address
+   * entered, as `roomFor` resolved it, never read back from `built` (M3
+   * C5). `keep` keeps the player, the doors and this visit's failed ways
+   * and faults, for the same place shown again.
    * `spawn`, when given, places the player there (in metres) in place of
    * `arrivalSpawn` (the arrival box's step out). Every entry ends a visit
    * of the console room: `inside` is cleared and its listing read aborted
@@ -1093,7 +1119,7 @@ export function createSession(opts: SessionOptions): Session {
     landing: "box" | null = null,
     darkNow = false,
   ): boolean => {
-    if (!present(built, lookId)) {
+    if (!present(built)) {
       fail(LOAD_ERROR);
       return false;
     }
@@ -1118,14 +1144,17 @@ export function createSession(opts: SessionOptions): Session {
     }
     previous = player;
     prefetched = new Set();
+    computers = computersOf(room, place);
     latched = null;
     boxLatched = null;
     exitLatched = false;
     answering = null;
     answered = new Set();
     liftAt = null;
+    // The way behind the arrival, else the exit beside the entrance (0.22
+    // R1, M3 C28).
     const exit = room.fixtures.findIndex((f) => f.kind === "exit");
-    upLatched = exit < 0 ? null : exit;
+    wayLatched = arrivalWay(room, arrival) ?? (exit < 0 ? null : exit);
     inside = null;
     listing?.abort();
     listing = null;
@@ -1200,7 +1229,7 @@ export function createSession(opts: SessionOptions): Session {
     ride = null;
     loading = false;
     controller = null;
-    hud.connector(false, label, lookId);
+    hud.connector(false, label);
     arrive();
     if (isFailure(loaded)) {
       fail(FAILED[loaded.kind]);
@@ -1320,7 +1349,7 @@ export function createSession(opts: SessionOptions): Session {
     }
     if (loading) {
       loading = false;
-      hud.connector(false, loadingLabel, lookId);
+      hud.connector(false, loadingLabel);
     }
     return gen;
   };
@@ -1354,7 +1383,7 @@ export function createSession(opts: SessionOptions): Session {
     const shown = label ?? labelFor(address);
     loading = true;
     loadingLabel = shown;
-    hud.connector(true, shown, lookId);
+    hud.connector(true, shown);
     const abort = new AbortController();
     controller = abort;
     loader(address, abort.signal).then(
@@ -1368,7 +1397,7 @@ export function createSession(opts: SessionOptions): Session {
         travelling = null;
         ride = null;
         arrive();
-        hud.connector(false, shown, lookId);
+        hud.connector(false, shown);
         if (!isAbort(error)) fail(LOAD_ERROR);
         retryCheck();
       },
@@ -1494,9 +1523,13 @@ export function createSession(opts: SessionOptions): Session {
     travel(bridgeAddress(picked), null, picked, "box");
   };
 
-  const openReader = (index: number) => {
-    const fixture = room?.fixtures[index];
-    if (fixture?.kind !== "terminal" || place === null) return;
+  /**
+   * Opens the CRT reader with `reading`, or does nothing for null: the
+   * session goes modal, forgets the keys held, releases the pointer lock,
+   * clears the prompt and beeps.
+   */
+  const openReading = (reading: Reading | null) => {
+    if (reading === null) return;
     readerOpen = true;
     input.clear();
     cheat?.reset();
@@ -1505,12 +1538,7 @@ export function createSession(opts: SessionOptions): Session {
     }
     setPrompt(null);
     cue({ kind: "terminal" });
-    hud.reader({
-      title: place.title,
-      content: place.content,
-      section: { heading: fixture.heading, occurrence: fixture.section },
-      look: lookId,
-    });
+    hud.reader(reading);
   };
 
   const closeReader = () => {
@@ -1697,9 +1725,9 @@ export function createSession(opts: SessionOptions): Session {
   };
 
   /** The latches an entry resets, for the keep paths to put back. */
-  const latches = () => ({ latched, boxLatched, exitLatched, upLatched });
+  const latches = () => ({ latched, boxLatched, exitLatched, wayLatched });
   const restoreLatches = (saved: ReturnType<typeof latches>) => {
-    ({ latched, boxLatched, exitLatched, upLatched } = saved);
+    ({ latched, boxLatched, exitLatched, wayLatched } = saved);
   };
 
   /**
@@ -1951,7 +1979,7 @@ export function createSession(opts: SessionOptions): Session {
         renderer = made.renderer;
         if (room !== null) {
           const t0 = now();
-          renderer.setRoom(room, LOOKS[lookId]);
+          renderer.setRoom(room);
           lastBuildMs = now() - t0;
         }
         sizeCanvas();
@@ -2065,6 +2093,11 @@ export function createSession(opts: SessionOptions): Session {
         if (muted !== undefined)
           flash(muted ? "SOUND OFF" : "SOUND ON", LOOK_NOTICE_MS);
       }
+      if (input.pressed("KeyN")) {
+        const off = opts.sound?.toggleAmbience();
+        if (off !== undefined)
+          flash(off ? "AMBIENCE OFF" : "AMBIENCE ON", LOOK_NOTICE_MS);
+      }
       const page = target ?? current;
       if (input.pressed("KeyF") && page !== null) {
         opts.openFluid(fluidRouteOfStation(page));
@@ -2122,17 +2155,30 @@ export function createSession(opts: SessionOptions): Session {
       }
     }
 
-    const focus = modal() ? null : focusOf(room, player, doors, failed);
+    // Today's fixture offers first, then a police box, then the reading
+    // offers (0.22 R13): a placard, a poster, a machine or a screen never
+    // takes Space from a box the player faces.
+    const offered = modal() ? null : focusOf(room, player, doors, failed);
+    const reads = offered !== null && isReadingKind(offered.kind);
     const boxAt =
-      modal() || focus !== null ? null : boxFocus(room, player, boxes);
+      modal() || (offered !== null && !reads)
+        ? null
+        : boxFocus(room, player, boxes);
+    const focus = reads && boxAt !== null ? null : offered;
+    // A computer comes last (spec 3a): only with no fixture and no box in
+    // focus.
+    const computerAt =
+      modal() || focus !== null || boxAt !== null
+        ? null
+        : computerFocus(computers, player, room.title);
     let pressedDoor: number | null = null;
     let pressedWay: number | null = null;
     let pressedBox: number | null = null;
     const used = !still && input.pressed(USE_KEY);
     if (used && focus !== null) {
       if (isBrokenWay(room, focus.index, failed)) pressedWay = focus.index;
-      if (focus.kind === "terminal") {
-        openReader(focus.index);
+      if (focus.kind === "terminal" || isReadingKind(focus.kind)) {
+        openReading(fixtureReading(room, focus.index, place));
       } else if (focus.kind === "door") {
         pressedDoor = focus.index;
       } else if (focus.kind === "hatch") {
@@ -2144,20 +2190,22 @@ export function createSession(opts: SessionOptions): Session {
       }
     } else if (used && boxAt !== null) {
       pressedBox = boxAt.index;
+    } else if (used && computerAt !== null) {
+      openReading(roomReading(room, place));
     }
-    // The exit's latch holds until the player has once stood
-    // `UP_LATCH_CLEAR` from its wall point (M3 C28).
-    if (upLatched !== null) {
-      const exit = room.fixtures[upLatched];
-      if (exit === undefined) {
-        upLatched = null;
+    // The way's latch holds until the player has once stood
+    // `UP_LATCH_CLEAR` from its wall point (M3 C28, 0.22 R1).
+    if (wayLatched !== null) {
+      const way = room.fixtures[wayLatched];
+      if (way === undefined) {
+        wayLatched = null;
       } else {
-        const w = wallPoint(exit.slot);
+        const w = wallPoint(way.slot);
         if (Math.hypot(player.x - w.x, player.z - w.z) > UP_LATCH_CLEAR)
-          upLatched = null;
+          wayLatched = null;
       }
     }
-    const shut = upLatched === null ? NONE_SHUT : new Set([upLatched]);
+    const shut = wayLatched === null ? NONE_SHUT : new Set([wayLatched]);
     const targetsBefore = doorTargets();
     const faultsBefore = faults;
     doors = stepDoors(room, player, doors, pressedDoor, failed, shut);
@@ -2203,7 +2251,9 @@ export function createSession(opts: SessionOptions): Session {
       }
     }
     setPrompt(
-      modal() || loading ? null : (focus?.prompt ?? boxAt?.prompt ?? null),
+      modal() || loading
+        ? null
+        : (focus?.prompt ?? boxAt?.prompt ?? computerAt?.prompt ?? null),
     );
     listenForAnswer(loading ? null : focus);
 
@@ -2364,7 +2414,7 @@ export function createSession(opts: SessionOptions): Session {
       opts.onLevels?.(false);
       opts.onLift?.(null);
       opts.onPause?.(false);
-      hud.connector(false, loadingLabel, lookId);
+      hud.connector(false, loadingLabel);
       disposed = true;
       generation++;
       controller?.abort();

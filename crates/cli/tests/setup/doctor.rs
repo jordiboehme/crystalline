@@ -608,6 +608,11 @@ fn without_a_daemon_the_index_is_read_directly() {
         report["embeddings"].is_object(),
         "including the embedding summary, which needs the open store: {report}"
     );
+    assert_eq!(
+        report["contradictions"]["profile"],
+        serde_json::json!("off"),
+        "{report}"
+    );
 }
 
 /// A diagnostic tool that dies when one of its sources is unavailable is no

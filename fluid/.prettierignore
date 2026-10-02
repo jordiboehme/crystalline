@@ -1,7 +1,7 @@
 dist
 node_modules
 pnpm-lock.yaml
-src/api/types.ts
+src/api/gen
 
 # The browser smoke's fixture domain: engram files, written in the shape
 # Crystalline's own emitter writes them (an unindented YAML sequence for tags

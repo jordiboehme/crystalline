@@ -30,10 +30,10 @@ import {
   domainOf,
   fluidRouteOfStation,
   gameRouteOf,
+  sameStation,
   stationOfPlace,
 } from "./paths";
 import { BLINK_CHANNELS, createBlink } from "./render/blink";
-import { LOOK_ORDER, LOOKS } from "./render/looks";
 import type { Camera, Renderer } from "./render/renderer";
 import {
   INVERT_KEY,
@@ -51,7 +51,7 @@ import {
   type Session,
   type SessionOptions,
 } from "./session";
-import { boxFront, type DomainRow } from "./world/box";
+import { boxFocus, boxFront, type DomainRow } from "./world/box";
 import { airlockRoom } from "./world/airlock";
 import { atConsoleExit, consoleRoom } from "./world/consoleRoom";
 import {
@@ -68,9 +68,22 @@ import {
 import { generateDeck, type DeckRow } from "./world/deck";
 import { ACCESS_DENIED, NOT_FOUND, generateRoom } from "./world/generate";
 import { LIFT_WORDS } from "./world/lifts";
-import { REACH, wallFacingSpawn, wallPoint } from "./world/interact";
+import {
+  ARRIVAL_DISTANCE,
+  REACH,
+  focusOf,
+  wallFacingSpawn,
+  wallPoint,
+} from "./world/interact";
+import { computerFocus, computersOf, roomReading } from "./world/reading";
+import { wallAnchor } from "./world/sites";
 import { faultSeed, planRun, type FaultFrame } from "./world/malfunction";
-import { MAX_PITCH, PLAYER_RADIUS, blockersFor } from "./world/move";
+import {
+  MAX_PITCH,
+  PLAYER_RADIUS,
+  blockersFor,
+  type Player,
+} from "./world/move";
 import {
   DIP_SWAP_MS,
   FLICKER_MS,
@@ -81,6 +94,7 @@ import {
 import { withPadHeroes } from "./world/hangar";
 import { roomFor } from "./world/station";
 import type {
+  Curio,
   Fixture,
   Hero,
   PlaceInput,
@@ -97,10 +111,13 @@ vi.mock("../api/client", async (importOriginal) => {
 /**
  * The kind of fixture a room `roomFor` builds puts the player in front of,
  * or null for the room's own spawn: a seam for the live-change tests,
- * which need a terminal or a door in reach without walking there.
+ * which need a terminal or a door in reach without walking there. `edit`,
+ * when set, changes the room `roomFor` built after that (the computer
+ * tests put a curio in it).
  */
 const facing = vi.hoisted(() => ({
-  kind: null as "terminal" | "door" | null,
+  kind: null as "terminal" | "door" | "machine" | "poster" | null,
+  edit: null as ((room: RoomSpec) => RoomSpec) | null,
 }));
 
 vi.mock("./world/station", async (importOriginal) => {
@@ -111,11 +128,15 @@ vi.mock("./world/station", async (importOriginal) => {
     roomFor: (...args: Parameters<typeof actual.roomFor>) => {
       const built = actual.roomFor(...args);
       const fixture = built.room.fixtures.find((f) => f.kind === facing.kind);
-      if (fixture === undefined) return built;
-      return {
-        ...built,
-        room: { ...built.room, spawn: wallFacingSpawn(fixture.slot) },
-      };
+      const faced =
+        fixture === undefined
+          ? built
+          : {
+              ...built,
+              room: { ...built.room, spawn: wallFacingSpawn(fixture.slot) },
+            };
+      if (facing.edit === null) return faced;
+      return { ...faced, room: facing.edit(faced.room) };
     },
   };
 });
@@ -225,16 +246,24 @@ function stubHud() {
 
 /**
  * A sound sink that records every cue, and answers `toggleMute` from
- * `mutes` in turn (false once they run out).
+ * `mutes` in turn and `toggleAmbience` from `ambience` in turn (false once
+ * they run out).
  */
-function recordSound(mutes: readonly boolean[] = []) {
+function recordSound(
+  mutes: readonly boolean[] = [],
+  ambience: readonly boolean[] = [],
+) {
   const cues: Cue[] = [];
   let next = 0;
+  let nextAmbience = 0;
   const sink = {
     cue: vi.fn<SoundSink["cue"]>((c) => {
       cues.push(c);
     }),
     toggleMute: vi.fn<SoundSink["toggleMute"]>(() => mutes[next++] ?? false),
+    toggleAmbience: vi.fn<SoundSink["toggleAmbience"]>(
+      () => ambience[nextAmbience++] ?? false,
+    ),
   };
   return { cues, sink };
 }
@@ -320,7 +349,7 @@ function start(
 
 /** The rooms `setRoom` was handed, by permalink. */
 function roomsSet(): string[] {
-  return renderer.setRoom.mock.calls.map(([room]: [RoomSpec, unknown]) => {
+  return renderer.setRoom.mock.calls.map(([room]: [RoomSpec]) => {
     return room.permalink;
   });
 }
@@ -376,6 +405,7 @@ beforeEach(() => {
   openFluid = vi.fn();
   sessions = [];
   facing.kind = null;
+  facing.edit = null;
   now = 0;
   pending = null;
   window.history.replaceState(null, "", "/");
@@ -447,22 +477,14 @@ describe("go", () => {
     serve();
     const session = start();
     session.go({ kind: "engram", domain: "eng", permalink: "alpha" });
-    expect(hud.connector).toHaveBeenLastCalledWith(
-      true,
-      "alpha",
-      expect.any(String),
-    );
+    expect(hud.connector).toHaveBeenLastCalledWith(true, "alpha");
     await vi.waitFor(() => {
       expect(navigate).toHaveBeenCalledTimes(1);
     });
     expect(navigate).toHaveBeenCalledWith("/%CF%80/d/eng/e/alpha");
     expect(roomsSet()).toEqual(["alpha"]);
     expect(session.current).toEqual(engramAt("eng", "alpha"));
-    expect(hud.connector).toHaveBeenLastCalledWith(
-      false,
-      "alpha",
-      expect.any(String),
-    );
+    expect(hud.connector).toHaveBeenLastCalledWith(false, "alpha");
   });
 
   it("lets a second go win over one still in flight", async () => {
@@ -505,22 +527,17 @@ describe("go", () => {
     const session = start();
     session.go({ kind: "engram", domain: "eng", permalink: "alpha" });
     session.dispose();
-    expect(hud.connector).toHaveBeenLastCalledWith(
-      false,
-      "alpha",
-      expect.any(String),
-    );
+    expect(hud.connector).toHaveBeenLastCalledWith(false, "alpha");
     expect(hud.reader).toHaveBeenLastCalledWith(null);
   });
 
-  it("keeps the connector in the game's look while loading, whatever digit is pressed", () => {
+  it("keeps the connector as it is while loading, whatever digit is pressed", () => {
     // Mutation caught: a look key read again while a place loads (the
-    // connector would be redrawn in the day shift's or the third look's
-    // colours).
+    // connector would be redrawn).
     serve({ "/domains/eng/engrams/alpha": () => new Promise(() => {}) });
     const session = start();
     session.go({ kind: "engram", domain: "eng", permalink: "alpha" });
-    expect(hud.connector).toHaveBeenLastCalledWith(true, "alpha", "aperture");
+    expect(hud.connector).toHaveBeenLastCalledWith(true, "alpha");
     const calls = hud.connector.mock.calls.length;
     for (const code of ["Digit1", "Digit2", "Digit3", "Digit4"]) {
       key("keydown", code);
@@ -528,7 +545,7 @@ describe("go", () => {
       key("keyup", code);
     }
     expect(hud.connector.mock.calls.length).toBe(calls);
-    expect(hud.connector).toHaveBeenLastCalledWith(true, "alpha", "aperture");
+    expect(hud.connector).toHaveBeenLastCalledWith(true, "alpha");
   });
 
   it("warms the cache once for the place behind a door the player walks up to", async () => {
@@ -694,21 +711,13 @@ describe("a load in flight", () => {
     key("keyup", "ArrowLeft");
     frames(5);
     expect(hud.prompt).toHaveBeenLastCalledWith("SPACE CRAWL Beta relates_to");
-    expect(hud.connector).toHaveBeenLastCalledWith(
-      false,
-      "alpha",
-      expect.any(String),
-    );
+    expect(hud.connector).toHaveBeenLastCalledWith(false, "alpha");
     expect(roomsSet()).toEqual(["alpha"]);
 
     // A fresh use in the new room still crawls back.
     key("keydown", "Space");
     frames(1);
-    expect(hud.connector).toHaveBeenLastCalledWith(
-      true,
-      "Beta",
-      expect.any(String),
-    );
+    expect(hud.connector).toHaveBeenLastCalledWith(true, "Beta");
   });
 
   it("forgets a use pressed while loading when the load fails", async () => {
@@ -771,10 +780,10 @@ describe("a room the renderer refuses", () => {
     expect(eyeAt()[1]).toBeLessThan(before[1] - 0.5);
   });
 
-  it("never switches the look from a key: the room stays in Aperture grid and the status names no look", () => {
+  it("never switches the look from a key: the room stays in the one look", () => {
     // Mutation caught: the digit keys mapped to looks again (the room would
-    // be handed to the renderer a second time, in another look), or the
-    // look's name put back on the status line.
+    // be handed to the renderer a second time), or the session handing the
+    // renderer a look again.
     const session = start({ client: null });
     session.showCanned(CANNED_BRIDGE);
     frames(1);
@@ -788,13 +797,11 @@ describe("a room the renderer refuses", () => {
       frames(1);
     }
     expect(renderer.setRoom.mock.calls.length).toBe(rooms);
-    for (const [, look] of renderer.setRoom.mock.calls)
-      expect(look.id).toBe("aperture");
+    // The renderer reads `LOOK` itself: no call hands it a look.
+    for (const call of renderer.setRoom.mock.calls)
+      expect(call).toHaveLength(1);
     expect(hud.notice).not.toHaveBeenCalled();
     expect(hud.status).toHaveBeenCalled();
-    for (const [text] of hud.status.mock.calls)
-      for (const id of LOOK_ORDER)
-        expect(text).not.toContain(LOOKS[id].name.toUpperCase());
     expect(session.current).toEqual(engramAt("station", "manifest"));
   });
 });
@@ -1033,7 +1040,6 @@ describe("the reader", () => {
       title: "Station Crystalline",
       content: CANNED_BRIDGE.content,
       section: { heading: "Scope", occurrence: 0 },
-      look: "aperture",
     });
     frames(10);
 
@@ -1086,6 +1092,282 @@ describe("the reader", () => {
     );
     session.showCanned({ ...CANNED_BRIDGE, status: "archived" });
     expect(hud.reader).toHaveBeenLastCalledWith(null);
+  });
+});
+
+describe("reading the walls (0.22 spec 3b)", () => {
+  /** A loader that answers every engram with `place`. */
+  const engramLoad =
+    (place: PlaceInput): PlaceLoader =>
+    () =>
+      Promise.resolve({ kind: "engram", place, folder: "" });
+
+  /**
+   * A session standing in `place`'s room in front of its first fixture of
+   * the kind `facing.kind` names (the `roomFor` seam).
+   */
+  async function standInPlace(place: PlaceInput): Promise<Session> {
+    const session = start({ load: engramLoad(place) });
+    const at: StationAddress = {
+      kind: "engram",
+      domain: place.domain,
+      permalink: place.permalink,
+    };
+    session.go(at);
+    await flush();
+    frames(1);
+    expect(session.current).toEqual(at);
+    return session;
+  }
+
+  /** `room` shown by hand with the player in front of its first `kind`. */
+  function standAt(room: RoomSpec, kind: Fixture["kind"]): Fixture {
+    const fixture = room.fixtures.find((f) => f.kind === kind);
+    if (fixture === undefined) throw new Error(`no ${kind}`);
+    start({ client: null }).showRoom({
+      ...room,
+      spawn: wallFacingSpawn(fixture.slot),
+    });
+    frames(1);
+    return fixture;
+  }
+
+  /** Presses and releases Space over one tick. */
+  function use() {
+    key("keydown", "Space");
+    frames(1);
+    key("keyup", "Space");
+  }
+
+  it("opens the reader with the placard's reading at Space", () => {
+    // Mutation caught: the placard offered but left out of the use branch,
+    // so Space at it opens nothing.
+    const room = generateRoom(CANNED_WORKSHOP);
+    const placard = standAt(room, "placard");
+    if (placard.kind !== "placard") throw new Error("not a placard");
+    expect(hud.prompt).toHaveBeenLastCalledWith("SPACE READ PLACARD");
+    use();
+    expect(hud.reader).toHaveBeenLastCalledWith({
+      title: room.title,
+      content: placard.lines.join("\n\n"),
+      section: null,
+    });
+  });
+
+  it("opens the reader at the top of the engram at a machine", async () => {
+    // Mutation caught: a machine opened through the terminal's reading,
+    // which reads nothing for a fixture that is no terminal.
+    facing.kind = "machine";
+    const place = { ...CANNED_BRIDGE, permalink: "hall" };
+    await standInPlace(place);
+    expect(hud.prompt).toHaveBeenLastCalledWith(`SPACE READ ${place.title}`);
+    use();
+    expect(hud.reader).toHaveBeenLastCalledWith({
+      title: place.title,
+      content: place.content,
+      section: null,
+    });
+  });
+
+  it("opens the deck screen's reading at Space", () => {
+    // Mutation caught: the screen left out of the use branch.
+    const room = generateDeck(CANNED_DECK, 1);
+    const screen = standAt(room, "screen");
+    if (screen.kind !== "screen") throw new Error("not a screen");
+    use();
+    expect(hud.reader).toHaveBeenLastCalledWith({
+      title: screen.lines[0],
+      content: screen.lines.slice(1).join("\n\n"),
+      section: null,
+    });
+  });
+
+  it("closes a poster's reader on closeReader and gives the keys back", async () => {
+    // Mutation caught: a reading opened without going modal, so the W
+    // pressed while it is open walks.
+    facing.kind = "poster";
+    const session = await standInPlace(CANNED_WORKSHOP);
+    use();
+    expect(hud.reader).toHaveBeenLastCalledWith(
+      expect.objectContaining({ title: CANNED_WORKSHOP.title, section: null }),
+    );
+    frames(5);
+    const still = eyeAt();
+    key("keydown", "KeyS");
+    frames(5);
+    expect(eyeAt()[0]).toBeCloseTo(still[0], 6);
+    expect(eyeAt()[1]).toBeCloseTo(still[1], 6);
+    session.closeReader();
+    expect(hud.reader).toHaveBeenLastCalledWith(null);
+    // The S held from before is forgotten; a new press walks back.
+    key("keyup", "KeyS");
+    key("keydown", "KeyS");
+    frames(5);
+    key("keyup", "KeyS");
+    const moved = eyeAt();
+    expect(
+      Math.hypot(moved[0] - still[0], moved[1] - still[1]),
+    ).toBeGreaterThan(0.01);
+  });
+});
+
+describe("the computers (0.22 spec 3a)", () => {
+  /** A loader that answers every engram with `place`. */
+  const engramLoad =
+    (place: PlaceInput): PlaceLoader =>
+    () =>
+      Promise.resolve({ kind: "engram", place, folder: "" });
+
+  /** Goes to `place`'s room through the `roomFor` seam and lands there. */
+  async function enterPlace(place: PlaceInput): Promise<void> {
+    start({ load: engramLoad(place) }).go({
+      kind: "engram",
+      domain: place.domain,
+      permalink: place.permalink,
+    });
+    await flush();
+    frames(1);
+  }
+
+  /** Where the player stands at `room`'s spawn, as `arrivalSpawn` puts it. */
+  function spawnPlayer(room: RoomSpec): Player {
+    return {
+      x: (room.spawn.x + 0.5) * CELL,
+      z: (room.spawn.y + 0.5) * CELL,
+      vx: 0,
+      vz: 0,
+      yaw: room.spawn.yaw,
+      pitch: 0,
+      bob: 0,
+    };
+  }
+
+  /** A curio computer standing `ahead` metres in front of `player`. */
+  function laptopAhead(player: Player, ahead: number): Curio {
+    return {
+      kind: "beige-laptop",
+      variant: 0,
+      x: (player.x - Math.sin(player.yaw) * ahead) / CELL,
+      y: (player.z - Math.cos(player.yaw) * ahead) / CELL,
+      h: 0,
+      turn: 0,
+      seed: 1,
+    };
+  }
+
+  /** Presses and releases Space over one tick. */
+  function use() {
+    key("keydown", "Space");
+    frames(1);
+    key("keyup", "Space");
+  }
+
+  it("opens the reader at the top of the engram at a curio computer", async () => {
+    // Mutation caught: the computer focus never consulted, or Space at it
+    // left out of the use branch, so Space at the laptop opens nothing.
+    const shown: { room: RoomSpec | null } = { room: null };
+    facing.edit = (built) => {
+      const faced = { ...built, spawn: { ...built.spawn, yaw: 0 } };
+      const laptop = laptopAhead(spawnPlayer(faced), CELL);
+      shown.room = { ...faced, curios: [...faced.curios, laptop] };
+      return shown.room;
+    };
+    await enterPlace(CANNED_WORKSHOP);
+    const room = shown.room;
+    if (room === null) throw new Error("no room shown");
+    // Nothing else is offered there, so only the laptop can answer Space.
+    expect(focusOf(room, spawnPlayer(room))).toBeNull();
+    expect(hud.prompt).toHaveBeenLastCalledWith(`SPACE READ ${room.title}`);
+    use();
+    expect(hud.reader).toHaveBeenLastCalledWith({
+      title: CANNED_WORKSHOP.title,
+      content: CANNED_WORKSHOP.content,
+      section: null,
+    });
+  });
+
+  it("reads the terminal in focus, not a nearer computer", async () => {
+    // Mutation caught: the computer consulted before the fixture focus, so
+    // the laptop in front of the terminal takes Space and the reader opens
+    // at the top instead of at the terminal's section.
+    facing.kind = "terminal";
+    const shown: { room: RoomSpec | null } = { room: null };
+    facing.edit = (built) => {
+      const laptop = laptopAhead(spawnPlayer(built), 0.5);
+      shown.room = { ...built, curios: [...built.curios, laptop] };
+      return shown.room;
+    };
+    await enterPlace(CANNED_WORKSHOP);
+    const room = shown.room;
+    if (room === null) throw new Error("no room shown");
+    const player = spawnPlayer(room);
+    const terminal = focusOf(room, player);
+    expect(terminal?.kind).toBe("terminal");
+    const at = computerFocus(
+      computersOf(room, CANNED_WORKSHOP),
+      player,
+      room.title,
+    );
+    expect(at).not.toBeNull();
+    const fixture = room.fixtures[terminal?.index ?? -1];
+    if (fixture?.kind !== "terminal") throw new Error("not a terminal");
+    const w = wallPoint(fixture.slot);
+    const p = at?.point.point ?? { x: Infinity, z: Infinity };
+    expect(Math.hypot(p.x - player.x, p.z - player.z)).toBeLessThan(
+      Math.hypot(w.x - player.x, w.z - player.z),
+    );
+    use();
+    expect(hud.reader).toHaveBeenLastCalledWith({
+      title: CANNED_WORKSHOP.title,
+      content: CANNED_WORKSHOP.content,
+      section: { heading: fixture.heading, occurrence: fixture.section },
+    });
+  });
+
+  it("reads a deck screen in focus, not a nearer computer", () => {
+    // Mutation caught: a computer ranked above the reading offers, so the
+    // laptop in front of the screen reads the deck's listing instead.
+    const deck = generateDeck(CANNED_DECK, 1);
+    const screen = deck.fixtures.find((f) => f.kind === "screen");
+    if (screen?.kind !== "screen") throw new Error("no screen");
+    const faced = { ...deck, spawn: wallFacingSpawn(screen.slot) };
+    const player = spawnPlayer(faced);
+    const room = { ...faced, curios: [laptopAhead(player, 0.5)] };
+    expect(focusOf(room, player)?.kind).toBe("screen");
+    expect(
+      computerFocus(computersOf(room, null), player, room.title),
+    ).not.toBeNull();
+    start({ client: null }).showRoom(room);
+    frames(1);
+    use();
+    expect(hud.reader).toHaveBeenLastCalledWith({
+      title: screen.lines[0],
+      content: screen.lines.slice(1).join("\n\n"),
+      section: null,
+    });
+  });
+
+  it("opens the deck's listing at a wall monitor on a deck", () => {
+    // Mutation caught: the wall monitor left out of the computer props, or
+    // a deck given no use points since it has no place.
+    const deck = generateDeck(CANNED_DECK, 1);
+    const faced = { ...deck, spawn: { ...deck.spawn, yaw: 0 } };
+    const at = wallAnchor({ x: faced.spawn.x, y: faced.spawn.y, side: "n" });
+    const room: RoomSpec = {
+      ...faced,
+      props: [
+        ...faced.props,
+        { kind: "wall-monitor", variant: 0, anchor: "wall", ...at, seed: 1 },
+      ],
+    };
+    expect(focusOf(room, spawnPlayer(room))).toBeNull();
+    start({ client: null }).showRoom(room);
+    frames(1);
+    expect(hud.prompt).toHaveBeenLastCalledWith(`SPACE READ ${room.title}`);
+    use();
+    const listing = roomReading(room, null);
+    expect(listing?.content).toContain("- ");
+    expect(hud.reader).toHaveBeenLastCalledWith(listing);
   });
 });
 
@@ -1510,13 +1792,8 @@ describe("the level cheat", () => {
     expect(openFluid).not.toHaveBeenCalled();
     expect(hud.reader).not.toHaveBeenCalled();
     expect(renderer.setRoom.mock.calls.length).toBe(rooms);
-    // No key switches the look, so Digit1 does nothing here either, and
-    // the status line names no look.
+    // No key switches the look, so Digit1 does nothing here either.
     expect(hud.status).toHaveBeenCalled();
-    for (const [text] of hud.status.mock.calls) {
-      for (const id of LOOK_ORDER)
-        expect(text).not.toContain(LOOKS[id].name.toUpperCase());
-    }
 
     // Closed: nothing typed inside comes back as a command or a step.
     session.closeLevels();
@@ -1582,11 +1859,7 @@ describe("the level cheat", () => {
     session.jump("eng");
     expect(levels).toHaveBeenLastCalledWith(false);
     // The connector names the domain, not the bridge's permalink (C10).
-    expect(hud.connector).toHaveBeenLastCalledWith(
-      true,
-      "eng",
-      expect.any(String),
-    );
+    expect(hud.connector).toHaveBeenLastCalledWith(true, "eng");
     await vi.waitFor(() => {
       expect(navigate).toHaveBeenCalledTimes(2);
     });
@@ -1595,11 +1868,7 @@ describe("the level cheat", () => {
     expect(roomsSet()).toEqual(["alpha", "manifest"]);
     // The connector's closing call names the domain too, not just the
     // opening one.
-    expect(hud.connector).toHaveBeenCalledWith(
-      false,
-      "eng",
-      expect.any(String),
-    );
+    expect(hud.connector).toHaveBeenCalledWith(false, "eng");
   });
 
   it("closes the select on a go from outside and on dispose", () => {
@@ -1823,11 +2092,7 @@ describe("malfunctions", () => {
     expect(lastDoors().get(`door:${String(door1)}`)).toBe(1);
     walkIn();
     await flush();
-    expect(hud.connector).toHaveBeenLastCalledWith(
-      false,
-      expect.any(String),
-      expect.any(String),
-    );
+    expect(hud.connector).toHaveBeenLastCalledWith(false, expect.any(String));
     expect(hud.notice).toHaveBeenCalledWith("ACCESS DENIED");
 
     const mark = renderer.draw.mock.calls.length;
@@ -2204,6 +2469,61 @@ describe("the police box's doors", () => {
     expect(lastDoors().get(`box:${String(i)}`)).toBe(0);
   });
 
+  it("keeps Space at the box with a placard nearer in reach (0.22 R13)", () => {
+    // Mutation caught: the session taking any fixture focus before the box,
+    // so the nearer placard opens the reader and the box never opens.
+    const hall = heroHallRoom();
+    const index = hall.heroes.findIndex((h) => h.kind === "police-box");
+    expect(index).toBeGreaterThanOrEqual(0);
+    const front = boxFront(hall.heroes[index]!);
+    const dist = REACH - 0.4;
+    // The spot `standAtBox` stands the player on, looking at the box.
+    const player = {
+      x: front.x + front.inward[0] * dist,
+      z: front.z + front.inward[1] * dist,
+      vx: 0,
+      vz: 0,
+      yaw: Math.atan2(front.inward[0], front.inward[1]),
+      pitch: 0,
+      bob: 0,
+    };
+    // A placard on the first wall edge near the player that `focusOf`
+    // offers from there, nearer than the box's front.
+    const sides = ["n", "e", "s", "w"] as const;
+    let room: RoomSpec | null = null;
+    for (let y = 0; y < hall.depth && room === null; y++) {
+      for (let x = 0; x < hall.width && room === null; x++) {
+        for (const side of sides) {
+          const slot = { x, y, side };
+          const w = wallPoint(slot);
+          if (Math.hypot(w.x - player.x, w.z - player.z) >= dist) continue;
+          const candidate: RoomSpec = {
+            ...hall,
+            fixtures: [
+              ...hall.fixtures,
+              { kind: "placard", slot, lines: ["NEAR"] },
+            ],
+          };
+          if (focusOf(candidate, player)?.kind === "placard") {
+            room = candidate;
+            break;
+          }
+        }
+      }
+    }
+    if (room === null) throw new Error("no placard spot nearer than the box");
+    expect(boxFocus(room, player, new Map())).not.toBeNull();
+    const session = start();
+    const i = standAtBox(session, room);
+    expect(i).toBe(index);
+    expect(hud.prompt).toHaveBeenLastCalledWith("SPACE OPEN");
+    key("keydown", "Space");
+    key("keyup", "Space");
+    frames(19);
+    expect(hud.reader).not.toHaveBeenCalled();
+    expect(lastDoors().get(`box:${String(i)}`)).toBe(1);
+  });
+
   it("never walks in without the console room option (2.6e C21)", () => {
     // Mutation caught: a walk-in on a dev route.
     const session = start();
@@ -2323,7 +2643,7 @@ describe("the console room", () => {
     walkIn();
     await flush();
     backOut();
-    expect(hud.connector).toHaveBeenCalledWith(true, "ops", expect.any(String));
+    expect(hud.connector).toHaveBeenCalledWith(true, "ops");
     await vi.waitFor(() => {
       expect(navigate).toHaveBeenCalledWith("/%CF%80/d/ops");
     });
@@ -2999,11 +3319,7 @@ describe("station addresses (M3)", () => {
     for (let t = 0; t < 80 && hud.connector.mock.calls.length === 0; t++)
       frames(1);
     key("keyup", "KeyW");
-    expect(hud.connector).toHaveBeenCalledWith(
-      true,
-      door.label,
-      expect.any(String),
-    );
+    expect(hud.connector).toHaveBeenCalledWith(true, door.label);
   });
 
   it("says where the player is, as the status line does (M4's pause screen)", async () => {
@@ -3045,6 +3361,18 @@ describe("station addresses (M3)", () => {
       expect(session.current).toEqual({ kind: "airlock" });
     });
     expect(hud.notice).not.toHaveBeenCalledWith("?LOAD ERROR");
+  });
+
+  it("starts the airlock facing the lift, offering SPACE LIFT on the first tick (0.22 R2)", async () => {
+    // Mutation caught: the session placing the start through `spawnPlayer`
+    // (the room's spawn, facing the hatch) instead of `arrivalSpawn`.
+    const session = start({ load: stationLoad });
+    session.go({ kind: "airlock" });
+    await vi.waitFor(() => {
+      expect(session.current).toEqual({ kind: "airlock" });
+    });
+    frames(1);
+    expect(hud.prompt).toHaveBeenLastCalledWith("SPACE LIFT");
   });
 });
 
@@ -3305,11 +3633,7 @@ describe("the lifts and the exit (M3 C26 to C29)", () => {
     const t0 = now;
     session.ride(i);
     expect(onLift).toHaveBeenLastCalledWith(null);
-    expect(hud.connector).toHaveBeenLastCalledWith(
-      true,
-      stop.label,
-      expect.any(String),
-    );
+    expect(hud.connector).toHaveBeenLastCalledWith(true, stop.label);
     crank(200);
     settled.resolve(await stationLoad(stop.to, new AbortController().signal));
     await flush();
@@ -3321,11 +3645,7 @@ describe("the lifts and the exit (M3 C26 to C29)", () => {
     expect(landedAt).not.toBeNull();
     expect(landedAt ?? 0).toBeGreaterThanOrEqual(t0 + LIFT_RIDE_MS);
     expect(landedAt ?? 0).toBeLessThan(t0 + LIFT_RIDE_MS + 3 * TICK_MS);
-    expect(hud.connector).toHaveBeenLastCalledWith(
-      false,
-      stop.label,
-      expect.any(String),
-    );
+    expect(hud.connector).toHaveBeenLastCalledWith(false, stop.label);
     const bridge = lastRoom();
     if (bridge === undefined) throw new Error("no room");
     const lift = bridge.fixtures.findIndex((f) => f.kind === "lift");
@@ -3450,11 +3770,7 @@ describe("the lifts and the exit (M3 C26 to C29)", () => {
     const rooms = renderer.setRoom.mock.calls.length;
     session.ride(here);
     expect(onLift).toHaveBeenLastCalledWith(null);
-    expect(hud.connector).not.toHaveBeenCalledWith(
-      true,
-      stops[here]?.label,
-      expect.any(String),
-    );
+    expect(hud.connector).not.toHaveBeenCalledWith(true, stops[here]?.label);
     expect(renderer.setRoom.mock.calls.length).toBe(rooms);
     expect(session.current).toEqual(DECK_AT);
   });
@@ -3524,6 +3840,196 @@ describe("the lifts and the exit (M3 C26 to C29)", () => {
     await vi.waitFor(() => {
       expect(session.current?.kind).toBe("deck");
     });
+  });
+
+  it("walks backwards up through the exit and stays on the deck (0.22 R1)", async () => {
+    // Mutation caught: the latch not set on an exit arrival (the deck's
+    // door back, right behind the player, slides open and carries the
+    // player still walking backwards straight back into the room).
+    // `stationLoad` answers every engram in the root folder, whose deck
+    // holds `notes/n00`, so the deck has a door back to this room.
+    const from = engramAt("station", "notes/n00");
+    const session = start({ load: stationLoad, onLift: liftSpy() });
+    session.go(from);
+    await vi.waitFor(() => {
+      frames(1);
+      expect(session.current).toEqual(from);
+    });
+    frames(1);
+    // In past UP_LATCH_CLEAR, facing into the room with the exit behind.
+    holdUntil("ArrowUp", () => exitDepth() > UP_LATCH_CLEAR + 0.5);
+    expect(exitDepth()).toBeGreaterThan(UP_LATCH_CLEAR);
+    frames(10);
+    const ups = connectorUps();
+    // Backwards out through the exit, the back key held across the travel.
+    key("keydown", "ArrowDown");
+    for (let t = 0; t < 200 && session.current?.kind !== "deck"; t++) {
+      frames(1);
+      await flush();
+    }
+    expect(session.current?.kind).toBe("deck");
+    const deckNow = lastRoom();
+    const back = deckNow?.fixtures.findIndex(
+      (f) =>
+        f.kind === "door" &&
+        f.address !== null &&
+        sameStation(stationOfPlace(f.address), from),
+    );
+    if (deckNow === undefined || back === undefined || back < 0)
+      throw new Error("the deck has no door back");
+    // The arrival stands in front of that door (one tick of walking back
+    // on): the match placed it there.
+    const w = wallPoint(deckNow.fixtures[back]!.slot);
+    frames(1);
+    const eye = lastCamera().eye;
+    expect(
+      (eye[0] - w.x) * w.inward[0] + (eye[2] - w.z) * w.inward[1],
+    ).toBeLessThan(ARRIVAL_DISTANCE + 0.5);
+    // Three seconds more with the back key held.
+    for (let t = 0; t < 105; t++) {
+      frames(1);
+      await flush();
+    }
+    key("keyup", "ArrowDown");
+    expect(connectorUps()).toBe(ups + 1);
+    expect(session.current?.kind).toBe("deck");
+    expect(lastDoors().get(`door:${String(back)}`) ?? 0).toBe(0);
+  });
+
+  it("keeps the way behind a hatch crawl shut until the player stepped clear (0.22 R1)", async () => {
+    // Mutation caught: the latch cleared on the first tick, or the portal
+    // left out of `shut` (a step back from the arrival touches the portal
+    // and carries the player straight back).
+    const from = engramAt("logistics", "cargo-manifest");
+    const to = engramAt("station", "crew-handbook");
+    const start0 = roomFor(
+      {
+        kind: "engram",
+        place: {
+          ...CANNED_BRIDGE,
+          domain: "logistics",
+          permalink: "cargo-manifest",
+        },
+        folder: "",
+      },
+      null,
+      null,
+    ).room;
+    const hatch = start0.fixtures.find((f) => f.kind === "hatch");
+    if (hatch?.kind !== "hatch") throw new Error("no hatch");
+    expect(stationOfPlace(hatch.address)).toEqual(to);
+    const session = start({ load: stationLoad, onLift: liftSpy() });
+    session.showRoom(
+      { ...start0, spawn: wallFacingSpawn(hatch.slot) },
+      undefined,
+      from,
+    );
+    frames(1);
+    pressUse();
+    await vi.waitFor(() => {
+      frames(1);
+      expect(session.current).toEqual(to);
+    });
+    frames(1);
+    const room = lastRoom();
+    const portal =
+      room?.fixtures.findIndex(
+        (f) =>
+          f.kind === "portal" &&
+          f.address !== null &&
+          sameStation(stationOfPlace(f.address), from),
+      ) ?? -1;
+    expect(portal).toBeGreaterThanOrEqual(0);
+    /** How far in front of the portal's wall the eye is. */
+    const portalDepth = () => {
+      const w = wallPoint(room!.fixtures[portal]!.slot);
+      const eye = lastCamera().eye;
+      return (eye[0] - w.x) * w.inward[0] + (eye[2] - w.z) * w.inward[1];
+    };
+    // The crawl stands the player in front of the portal back, facing away.
+    expect(portalDepth()).toBeLessThan(ARRIVAL_DISTANCE + 0.1);
+    // A walk straight back reaches the portal and goes nowhere.
+    const ups = connectorUps();
+    let nearest = Infinity;
+    key("keydown", "ArrowDown");
+    for (let t = 0; t < 60; t++) {
+      frames(1);
+      nearest = Math.min(nearest, portalDepth());
+    }
+    key("keyup", "ArrowDown");
+    await flush();
+    expect(nearest).toBeLessThan(0.6);
+    expect(connectorUps()).toBe(ups);
+    expect(session.current).toEqual(to);
+    // Out past UP_LATCH_CLEAR and back in: through the portal.
+    holdUntil("ArrowUp", () => portalDepth() > UP_LATCH_CLEAR + 0.5);
+    expect(portalDepth()).toBeGreaterThan(UP_LATCH_CLEAR);
+    frames(10);
+    holdUntil("ArrowDown", () => connectorUps() > ups);
+    expect(connectorUps()).toBe(ups + 1);
+    await vi.waitFor(() => {
+      expect(session.current).toEqual(from);
+    });
+  });
+
+  it("opens a blast door behind a hatch crawl on the first Space (0.22 R1)", async () => {
+    // Mutation caught: `arrivalWay` latching a door that does not slide.
+    // A bulkhead or blast door only opens on Space, so the latch kept it
+    // shut while the HUD still offered it, and the press did nothing.
+    const from = engramAt("station", "reactor-core");
+    const to = engramAt("station", "crew-handbook");
+    const start0 = roomFor(
+      {
+        kind: "engram",
+        place: {
+          ...CANNED_BRIDGE,
+          domain: "station",
+          permalink: "reactor-core",
+        },
+        folder: "",
+      },
+      null,
+      null,
+    ).room;
+    const hatch = start0.fixtures.find((f) => f.kind === "hatch");
+    if (hatch?.kind !== "hatch") throw new Error("no hatch");
+    expect(stationOfPlace(hatch.address)).toEqual(to);
+    const session = start({ load: stationLoad, onLift: liftSpy() });
+    session.showRoom(
+      { ...start0, spawn: wallFacingSpawn(hatch.slot) },
+      undefined,
+      from,
+    );
+    frames(1);
+    pressUse();
+    await vi.waitFor(() => {
+      frames(1);
+      expect(session.current).toEqual(to);
+    });
+    frames(1);
+    const room = lastRoom();
+    const back =
+      room?.fixtures.findIndex(
+        (f) =>
+          f.kind === "door" &&
+          f.address !== null &&
+          sameStation(stationOfPlace(f.address), from),
+      ) ?? -1;
+    expect(back).toBeGreaterThanOrEqual(0);
+    const door = room!.fixtures[back]!;
+    expect(door.kind === "door" ? door.style : null).toBe("blast");
+    // Turn round on the spot until the door is offered, then press Space.
+    holdUntil(
+      "ArrowLeft",
+      () =>
+        hud.prompt.mock.calls.at(-1)?.[0]?.startsWith("SPACE OPEN") === true,
+    );
+    expect(hud.prompt.mock.calls.at(-1)?.[0]).toMatch(
+      /^SPACE OPEN depends_on /,
+    );
+    pressUse();
+    frames(10);
+    expect(lastDoors().get(`door:${String(back)}`) ?? 0).toBeGreaterThan(0);
   });
 });
 
@@ -3658,11 +4164,7 @@ describe("the pause (M4 C6 to C9)", () => {
     session.showCanned(CANNED_BRIDGE);
     frames(1);
     session.go({ kind: "airlock" });
-    expect(hud.connector).toHaveBeenLastCalledWith(
-      true,
-      expect.any(String),
-      expect.any(String),
-    );
+    expect(hud.connector).toHaveBeenLastCalledWith(true, expect.any(String));
     lock();
     unlock();
     expect(onPause).toHaveBeenLastCalledWith(true);
@@ -3702,11 +4204,7 @@ describe("the pause (M4 C6 to C9)", () => {
     frames(35);
     expect(lastCamera().eye).toEqual(eye);
     expect(lastDoors().get(`door:${String(i)}`) ?? 0).toBe(shut);
-    expect(hud.connector).not.toHaveBeenCalledWith(
-      true,
-      expect.any(String),
-      expect.any(String),
-    );
+    expect(hud.connector).not.toHaveBeenCalledWith(true, expect.any(String));
 
     session.resume();
     expect(onPause).toHaveBeenLastCalledWith(false);
@@ -4419,6 +4917,68 @@ describe("live changes (M4 C13 to C19)", () => {
     await run(1500);
     expect(shown()).toEqual(built(retexted()));
     expect(loadsOf(to)).toBe(1);
+  });
+
+  it("keeps the way latch through a text change (0.22 R1)", async () => {
+    // Mutation caught: `wayLatched` left out of `latches()` (the keep
+    // path's entry latches the way behind the arrival again, so a player
+    // who had stepped clear and walks back in is held at a shut way).
+    const cargo = engramAt("logistics", "cargo-manifest");
+    answers.set("hall", engramOf(placeOf()));
+    const session = start({ load: liveLoad });
+    session.go(ROOM_AT, { via: "hatch", from: cargo });
+    await micro();
+    frames(1);
+    expect(session.current).toEqual(ROOM_AT);
+    const room = shown();
+    const portal = room.fixtures.findIndex(
+      (f) =>
+        f.kind === "portal" &&
+        f.address !== null &&
+        sameStation(stationOfPlace(f.address), cargo),
+    );
+    expect(portal).toBeGreaterThanOrEqual(0);
+    /** How far in front of the portal's wall the eye is. */
+    const depth = () => {
+      const w = wallPoint(room.fixtures[portal]!.slot);
+      const eye = lastCamera().eye;
+      return (eye[0] - w.x) * w.inward[0] + (eye[2] - w.z) * w.inward[1];
+    };
+    expect(depth()).toBeLessThan(ARRIVAL_DISTANCE + 0.1);
+    // A text change while latched: a step back still goes nowhere.
+    answers.set("hall", engramOf(retexted()));
+    session.changed(frameOf());
+    await run(1500);
+    expect(shown()).toEqual(built(retexted()));
+    key("keydown", "ArrowDown");
+    for (let i = 0; i < 60; i++) await run(TICK_MS);
+    key("keyup", "ArrowDown");
+    expect(depth()).toBeLessThan(0.6);
+    expect(loadsOf("cargo-manifest")).toBe(0);
+    // Clear of the latch, a step back towards the portal, a text change
+    // there: the way stays open, and walking on goes through.
+    key("keydown", "ArrowUp");
+    for (let i = 0; i < 200 && depth() <= UP_LATCH_CLEAR + 0.5; i++)
+      await run(TICK_MS);
+    key("keyup", "ArrowUp");
+    expect(depth()).toBeGreaterThan(UP_LATCH_CLEAR);
+    await run(500);
+    key("keydown", "ArrowDown");
+    for (let i = 0; i < 200 && depth() > 1.4; i++) await run(TICK_MS);
+    key("keyup", "ArrowDown");
+    await run(500);
+    expect(depth()).toBeGreaterThan(0.6);
+    expect(depth()).toBeLessThan(UP_LATCH_CLEAR);
+    answers.set("hall", engramOf(retexted("newer")));
+    session.changed(frameOf({ checksum: "2" }));
+    await run(1500);
+    expect(shown()).toEqual(built(retexted("newer")));
+    expect(loadsOf("cargo-manifest")).toBe(0);
+    key("keydown", "ArrowDown");
+    for (let i = 0; i < 120 && loadsOf("cargo-manifest") === 0; i++)
+      await run(TICK_MS);
+    key("keyup", "ArrowDown");
+    expect(loadsOf("cargo-manifest")).toBe(1);
   });
 
   describe("reshapes behind the dip and keeps the player on free floor", () => {
@@ -5179,6 +5739,63 @@ describe("sound cues (M4 Task 7)", () => {
     frames(2);
     expect(
       hud.notice.mock.calls.some(([t]) => t !== null && t.startsWith("SOUND")),
+    ).toBe(false);
+  });
+
+  it("switches the ambience on N, on its own beside M", () => {
+    // Mutation caught: N unhandled or wired to the master, a notice
+    // missing, a sink-less N doing something, N handled while the reader
+    // is open or replayed when it closes, M and N sharing one toggle.
+    // (Dropping "KeyN" from COMMAND_KEYS alone survives: every way out of
+    // a modal state clears the input's presses, so the drain is belt and
+    // braces.)
+    const { cues, sink } = recordSound([true], [true, false]);
+    const session = start({ client: null, sound: sink });
+    session.showCanned(CANNED_BRIDGE);
+    frames(1);
+    const press = (code: string) => {
+      key("keydown", code);
+      frames(1);
+      key("keyup", code);
+    };
+    press("KeyN");
+    expect(sink.toggleAmbience).toHaveBeenCalledTimes(1);
+    expect(sink.toggleMute).not.toHaveBeenCalled();
+    expect(hud.notice).toHaveBeenLastCalledWith("AMBIENCE OFF");
+    press("KeyN");
+    expect(sink.toggleAmbience).toHaveBeenCalledTimes(2);
+    expect(hud.notice).toHaveBeenLastCalledWith("AMBIENCE ON");
+    press("KeyM");
+    expect(sink.toggleMute).toHaveBeenCalledTimes(1);
+    expect(sink.toggleAmbience).toHaveBeenCalledTimes(2);
+    expect(hud.notice).toHaveBeenLastCalledWith("SOUND OFF");
+
+    // With the reader open, N is the reader's, and not replayed after.
+    walkToScope();
+    key("keydown", "Space");
+    frames(1);
+    key("keyup", "Space");
+    expect(cues.at(-1)).toEqual({ kind: "terminal" });
+    const notices = hud.notice.mock.calls.length;
+    press("KeyN");
+    frames(2);
+    session.closeReader();
+    frames(3);
+    expect(sink.toggleAmbience).toHaveBeenCalledTimes(2);
+    expect(hud.notice.mock.calls.length).toBe(notices);
+    session.dispose();
+
+    // Without a sink, N is nothing at all.
+    hud.notice.mockClear();
+    const silent = start({ client: null });
+    silent.showCanned(CANNED_BRIDGE);
+    frames(1);
+    press("KeyN");
+    frames(2);
+    expect(
+      hud.notice.mock.calls.some(
+        ([t]) => t !== null && t.startsWith("AMBIENCE"),
+      ),
     ).toBe(false);
   });
 

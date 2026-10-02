@@ -1,5 +1,20 @@
 use super::*;
 
+/// How many times an edit without an `expected_checksum` is applied to a
+/// virtual engram before a race with another writer is reported: the first
+/// try and two more, each against the text stored at that moment. Three
+/// writers landing on one row inside the same few milliseconds three times in
+/// a row is not a race an agent can win by retrying faster either, so the
+/// last refusal comes back as the `Conflict` a guarded edit would get.
+const UNGUARDED_EDIT_ATTEMPTS: usize = 3;
+
+/// Whether an error is the store's stale compare-and-swap rather than any
+/// other conflict (a permalink another engram owns, say), which applying the
+/// edit again could never resolve.
+fn is_stale_edit(e: &EngineError) -> bool {
+    matches!(e, EngineError::Conflict(m) if m.starts_with("stale edit:"))
+}
+
 impl Engine {
     // --- edit ----------------------------------------------------------------
 
@@ -77,7 +92,7 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
-        let p = &self.localized_for(p, scope).await?;
+        let p = &self.localized_for(p, scope).await?.lf_only();
         let view = DomainView::for_write_joined(self, &p.domain, scope, join).await?;
         let overlay = view.actor();
         // The join as this view actually took it: one naming another domain,
@@ -227,7 +242,7 @@ impl Engine {
         apply: F,
     ) -> Result<Option<String>>
     where
-        F: FnOnce(&str) -> Result<String>,
+        F: FnMut(&str) -> Result<String>,
     {
         // The live landing is dropped here rather than plumbed on: the callers
         // that reach this shorthand (a retirement, a split's tail, a
@@ -276,11 +291,18 @@ impl Engine {
         model: Option<&str>,
         scope: &crate::scope::Scope,
         peer: Option<&AgentPeer>,
-        apply: F,
+        mut apply: F,
     ) -> std::result::Result<SourceEdited, SourceEditFailure>
     where
-        F: FnOnce(&str) -> Result<String>,
+        F: FnMut(&str) -> Result<String>,
     {
+        // Every arm below edits the LF form of what it read, whatever line
+        // endings the file, the row or the draft held: the whole document is
+        // written back as LF, and an edit's own LF text (a find_text, a
+        // section heading) matches it. Each arm compares its
+        // `expected_checksum` against the bytes it read BEFORE this
+        // conversion, which is what a read handed out.
+        let mut apply = move |current: &str| apply(&crystalline_core::to_lf(current));
         // **The live arm, and it comes before every other one.** While a
         // co-editing room is open over this document, the room's text IS the
         // engram: somebody has it on screen, the file and the row are both
@@ -308,15 +330,20 @@ impl Engine {
                 // a moment ago, so it is what the guard compares against - the
                 // file's checksum would refuse every guarded edit made while
                 // anybody had the page open.
+                //
+                // A clean room stands for the stored bytes and accepts their
+                // checksum, so a guard taken before it opened still holds;
+                // the checksum of its text is accepted too, since that is the
+                // same document.
                 if let Some(expected) = expected_checksum {
-                    let found = sha256_hex(live.as_bytes());
-                    if found != expected {
+                    let text_sum = sha256_hex(live.text.as_bytes());
+                    if expected != live.checksum && expected != text_sum {
                         return Err(SourceEditFailure::before(EngineError::Conflict(
-                            stale_edit_message(expected, &found),
+                            stale_edit_message(expected, &live.checksum),
                         )));
                     }
                 }
-                let edited = apply(&live).map_err(SourceEditFailure::before)?;
+                let edited = apply(&live.text).map_err(SourceEditFailure::before)?;
                 // The same two passes every other arm makes, in the same
                 // order. An edit that skipped them would put a document in
                 // front of a person that the saver then refuses, minutes
@@ -415,12 +442,8 @@ impl Engine {
                 let abs = join_rel(root, &desc.path);
                 let lock = self.write_lock(&abs);
                 let _guard = lock.lock().await;
-                let current = std::fs::read_to_string(&abs).map_err(|source| {
-                    SourceEditFailure::before(EngineError::Io {
-                        path: abs.display().to_string(),
-                        source,
-                    })
-                })?;
+                let current = std::fs::read_to_string(&abs)
+                    .map_err(|source| SourceEditFailure::before(text_read_error(&abs, source)))?;
                 // The CAS token, when the caller presents one: compared inside
                 // the lock, against the bytes just read, exactly as save_engram
                 // compares.
@@ -461,64 +484,95 @@ impl Engine {
                 )
             }
             ContentSource::Virtual => {
-                let current = {
-                    let store = self.store.lock().await;
-                    store
-                        .engram_content(desc.domain_id, &desc.path)
+                // An edit without a checksum is last-write-wins, and on a
+                // shared Postgres database that has to survive another
+                // instance writing the same row: the store's compare waits for
+                // that writer and then refuses, because the text this edit was
+                // applied to is gone. So the edit is applied again to what is
+                // stored now, up to `UNGUARDED_EDIT_ATTEMPTS` times, and lands
+                // on top of the other writer's text. An edit that presents a
+                // checksum is never retried: the refusal is what it asked for.
+                let mut attempt = 0usize;
+                loop {
+                    attempt += 1;
+                    let current = {
+                        let store = self.store.lock().await;
+                        store
+                            .engram_content(desc.domain_id, &desc.path)
+                            .await
+                            .map_err(|e| SourceEditFailure::before(EngineError::from(e)))?
+                            .ok_or_else(|| {
+                                SourceEditFailure::before(EngineError::NotFound(format!(
+                                    "no content stored for '{}' in domain '{}'",
+                                    desc.permalink, desc.domain
+                                )))
+                            })?
+                    };
+                    let expected = expected_checksum
+                        .map(str::to_string)
+                        .unwrap_or_else(|| sha256_hex(current.as_bytes()));
+                    let edited = apply(&current).map_err(SourceEditFailure::before)?;
+                    let edited = touch_generated(&edited, actor, model, now_offset());
+                    let edited =
+                        Self::enforce_temporal(edited).map_err(SourceEditFailure::before)?;
+                    let (edited, count) = self
+                        .normalize_domain_spellings_for(&edited, scope)
                         .await
-                        .map_err(|e| SourceEditFailure::before(EngineError::from(e)))?
-                        .ok_or_else(|| {
-                            SourceEditFailure::before(EngineError::NotFound(format!(
-                                "no content stored for '{}' in domain '{}'",
-                                desc.permalink, desc.domain
-                            )))
-                        })?
-                };
-                let expected = expected_checksum
-                    .map(str::to_string)
-                    .unwrap_or_else(|| sha256_hex(current.as_bytes()));
-                let edited = apply(&current).map_err(SourceEditFailure::before)?;
-                let edited = touch_generated(&edited, actor, model, now_offset());
-                let edited = Self::enforce_temporal(edited).map_err(SourceEditFailure::before)?;
-                let (edited, count) = self
-                    .normalize_domain_spellings_for(&edited, scope)
-                    .await
-                    .map_err(SourceEditFailure::before)?;
-                let stamp = virtual_stamp(&edited);
-                // The seam, on this arm: a token nothing can match, so the
-                // store raises its own compare-and-swap conflict and rolls the
-                // transaction back. See `Engine::fail_next_source_edit`.
-                let expected = if self.take_armed_failure() {
-                    "0".repeat(64)
-                } else {
-                    expected
-                };
-                let store = self.store.lock().await;
-                // Every failure here is a `before`, and that is exact rather
-                // than generous: `index_markdown` runs the compare and swap,
-                // the chunking and the reference resolution inside one store
-                // transaction and rolls it back on any error, so a virtual
-                // source that refuses still holds the bytes it held. A
-                // concurrent edit therefore comes back as the `Conflict` it is
-                // and the caller may undo whatever it wrote first, which is the
-                // failure that actually happens in the field.
-                self.index_markdown(
-                    &*store,
-                    desc.domain_id,
-                    &desc.path,
-                    &edited,
-                    stamp,
-                    Some(&expected),
-                    true,
-                )
-                .await
-                .map_err(SourceEditFailure::before)?;
-                (
-                    count,
-                    sha256_hex(edited.as_bytes()),
-                    engram_names(&current, &desc.permalink),
-                    engram_names(&edited, &desc.permalink),
-                )
+                        .map_err(SourceEditFailure::before)?;
+                    let stamp = virtual_stamp(&edited);
+                    // The seam, on this arm: a token nothing can match, so the
+                    // store raises its own compare-and-swap conflict and rolls
+                    // the transaction back. See `Engine::fail_next_source_edit`.
+                    // Never retried: it stands for a conflict, not a race.
+                    let armed = self.take_armed_failure();
+                    let expected = if armed { "0".repeat(64) } else { expected };
+                    let store = self.store.lock().await;
+                    // Every failure here is a `before`, and that is exact rather
+                    // than generous: `index_markdown` runs the compare and swap,
+                    // the chunking and the reference resolution inside one store
+                    // transaction and rolls it back on any error, so a virtual
+                    // source that refuses still holds the bytes it held. A
+                    // concurrent edit therefore comes back as the `Conflict` it
+                    // is and the caller may undo whatever it wrote first, which
+                    // is the failure that actually happens in the field.
+                    let indexed = self
+                        .index_markdown(
+                            &*store,
+                            desc.domain_id,
+                            &desc.path,
+                            &edited,
+                            stamp,
+                            Some(&expected),
+                            true,
+                        )
+                        .await;
+                    drop(store);
+                    match indexed {
+                        Ok(_) => {
+                            break (
+                                count,
+                                sha256_hex(edited.as_bytes()),
+                                engram_names(&current, &desc.permalink),
+                                engram_names(&edited, &desc.permalink),
+                            );
+                        }
+                        Err(e)
+                            if expected_checksum.is_none()
+                                && !armed
+                                && attempt < UNGUARDED_EDIT_ATTEMPTS
+                                && is_stale_edit(&e) =>
+                        {
+                            tracing::debug!(
+                                domain = desc.domain.as_str(),
+                                path = desc.path.as_str(),
+                                attempt,
+                                "an unguarded edit lost a race with another writer; \
+                                 applying it again to the stored text"
+                            );
+                        }
+                        Err(e) => return Err(SourceEditFailure::before(e)),
+                    }
+                }
             }
         };
 
@@ -733,6 +787,23 @@ impl Engine {
                 ))
             })?;
         let value = p.value.as_deref().map(str::trim).filter(|v| !v.is_empty());
+        // A list key takes the whole new list and nothing else, and a scalar
+        // key takes one value: each mix-up is refused with the other form
+        // named, rather than guessed at. A key outside the settable set falls
+        // through to the refusal that names that set.
+        if LIST_FRONTMATTER_KEYS.contains(&key) {
+            return match (&p.values, value) {
+                (Some(values), None) => Self::set_tags(source, values),
+                _ => Err(EngineError::Invalid(format!(
+                    "{key} is a list: pass the whole new list as values"
+                ))),
+            };
+        }
+        if p.values.is_some() && SETTABLE_FRONTMATTER_KEYS.contains(&key) {
+            return Err(EngineError::Invalid(format!(
+                "{key} takes one value: pass value"
+            )));
+        }
         Self::guard_one_line_scalar(source, key, value, permalink)?;
 
         match key {
@@ -888,6 +959,31 @@ impl Engine {
         }
     }
 
+    /// Replace an engram's whole `tags` list, the list form of
+    /// `set_frontmatter`. Each entry is trimmed and folded to the canonical
+    /// lowercase-with-hyphens spelling ([`crystalline_core::fold_tag`]), blanks
+    /// are dropped and repeats are kept once in first order. One entry that
+    /// cannot fold refuses the whole edit by name rather than writing a tag
+    /// verify would flag. The list is written as a block list whatever shape
+    /// the old value had; an empty list removes the key.
+    fn set_tags(source: &str, values: &[String]) -> Result<String> {
+        let mut tags: Vec<String> = Vec::with_capacity(values.len());
+        for raw in values.iter().map(|v| v.trim()).filter(|v| !v.is_empty()) {
+            let tag = crystalline_core::fold_tag(raw).ok_or_else(|| {
+                EngineError::Invalid(format!(
+                    "'{}' cannot be a tag: a tag is lowercase letters, digits and hyphens, such as confluence-source",
+                    raw.escape_debug()
+                ))
+            })?;
+            if !tags.contains(&tag) {
+                tags.push(tag);
+            }
+        }
+        Ok(crystalline_core::emit::set_frontmatter_list(
+            source, "tags", &tags,
+        ))
+    }
+
     fn require_content<'a>(&self, p: &'a EditParams) -> Result<&'a str> {
         p.content.as_deref().ok_or_else(|| {
             EngineError::Invalid(format!("operation '{}' requires content", p.operation))
@@ -943,12 +1039,14 @@ mod settable_keys_tests {
     }
 
     fn set(key: &str) -> Result<String> {
+        let list = LIST_FRONTMATTER_KEYS.contains(&key);
         let p = EditParams {
             identifier: "t".to_string(),
             domain: "d".to_string(),
             operation: "set_frontmatter".to_string(),
             key: Some(key.to_string()),
-            value: value_for(key),
+            value: if list { None } else { value_for(key) },
+            values: list.then(|| vec!["x".to_string()]),
             ..EditParams::default()
         };
         Engine::apply_set_frontmatter(SOURCE, &p, "t", "tester", None, None)
@@ -969,11 +1067,17 @@ mod settable_keys_tests {
         }
         assert!(SETTABLE_FRONTMATTER_KEYS.contains(&"resource"));
         assert!(SETTABLE_FRONTMATTER_KEYS.contains(&"source_version"));
+        assert!(SETTABLE_FRONTMATTER_KEYS.contains(&"tags"));
+        for key in LIST_FRONTMATTER_KEYS {
+            assert!(
+                SETTABLE_FRONTMATTER_KEYS.contains(key),
+                "{key} is a list key but not settable"
+            );
+        }
         for key in [
             "title",
             "permalink",
             "type",
-            "tags",
             "recorded_at",
             "generated",
             "not_a_key",
@@ -1080,5 +1184,143 @@ mod settable_keys_tests {
         let removed = set_on(&one, "resource", None).unwrap();
         assert!(!removed.contains("resource"), "{removed}");
         crystalline_core::parse_engram(&removed).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod list_keys_tests {
+    use super::*;
+
+    fn engram(tags: &str) -> String {
+        format!(
+            "---\ntype: engram\ntitle: T\npermalink: t\n{tags}status: stable\nrecorded_at: 2026-01-01\n---\n\nbody\n"
+        )
+    }
+
+    fn params(key: &str, value: Option<&str>, values: Option<&[&str]>) -> EditParams {
+        EditParams {
+            identifier: "t".to_string(),
+            domain: "d".to_string(),
+            operation: "set_frontmatter".to_string(),
+            key: Some(key.to_string()),
+            value: value.map(str::to_string),
+            values: values.map(|v| v.iter().map(|s| s.to_string()).collect()),
+            ..EditParams::default()
+        }
+    }
+
+    fn set_values(source: &str, key: &str, values: &[&str]) -> Result<String> {
+        Engine::apply_set_frontmatter(
+            source,
+            &params(key, None, Some(values)),
+            "t",
+            "tester",
+            None,
+            None,
+        )
+    }
+
+    fn tags_of(source: &str) -> Vec<String> {
+        crystalline_core::parse_engram(source)
+            .unwrap()
+            .frontmatter
+            .tags
+    }
+
+    #[test]
+    fn a_tag_is_added_whatever_shape_the_old_tags_had() {
+        for old in [
+            "tags:\n  - old\n",
+            "tags: [old]\n",
+            "tags:\n- old\n",
+            "tags: old\n",
+        ] {
+            let out = set_values(&engram(old), "tags", &["old", "new"]).unwrap();
+            assert_eq!(tags_of(&out), ["old", "new"], "{old:?}: {out}");
+            assert!(out.contains("tags:\n  - old\n  - new\n"), "{old:?}: {out}");
+            assert_eq!(out.matches("old").count(), 1, "{old:?}: {out}");
+        }
+    }
+
+    #[test]
+    fn tags_are_written_where_there_were_none() {
+        let out = set_values(&engram(""), "tags", &["first"]).unwrap();
+        assert_eq!(tags_of(&out), ["first"], "{out}");
+    }
+
+    #[test]
+    fn a_shorter_list_removes_a_tag_and_an_empty_one_removes_the_key() {
+        let source = engram("tags:\n  - a\n  - b\n");
+        let out = set_values(&source, "tags", &["b"]).unwrap();
+        assert_eq!(tags_of(&out), ["b"], "{out}");
+        let out = set_values(&source, "tags", &[]).unwrap();
+        assert!(!out.contains("tags"), "{out}");
+        assert!(tags_of(&out).is_empty());
+        // Entries that are blank after trimming count as nothing.
+        let out = set_values(&source, "tags", &["  ", ""]).unwrap();
+        assert!(!out.contains("tags"), "{out}");
+    }
+
+    #[test]
+    fn tags_are_folded_and_deduped_in_first_order() {
+        let out = set_values(
+            &engram(""),
+            "tags",
+            &[
+                "Confluence Source",
+                "api",
+                "confluence-source",
+                "API",
+                "a_b",
+            ],
+        )
+        .unwrap();
+        assert_eq!(tags_of(&out), ["confluence-source", "api", "a-b"], "{out}");
+    }
+
+    #[test]
+    fn a_tag_that_cannot_fold_is_refused_by_name() {
+        let source = engram("tags:\n  - a\n");
+        let e = set_values(&source, "tags", &["ok", "c++"])
+            .expect_err("c++ is not a tag")
+            .to_string();
+        assert!(e.contains("'c++'"), "{e}");
+        assert!(!e.contains('\n'), "one line: {e}");
+    }
+
+    #[test]
+    fn value_on_a_list_key_points_at_values() {
+        let p = params("tags", Some("new"), None);
+        let e = Engine::apply_set_frontmatter(&engram(""), &p, "t", "tester", None, None)
+            .expect_err("value on tags")
+            .to_string();
+        assert!(
+            e.contains("tags is a list: pass the whole new list as values"),
+            "{e}"
+        );
+        // Neither given is the same mistake, not a removal.
+        let p = params("tags", None, None);
+        let e = Engine::apply_set_frontmatter(&engram(""), &p, "t", "tester", None, None)
+            .expect_err("nothing on tags")
+            .to_string();
+        assert!(e.contains("pass the whole new list as values"), "{e}");
+    }
+
+    #[test]
+    fn values_on_a_scalar_key_points_at_value() {
+        for key in ["status", "resource", "valid_to", "salience"] {
+            let e = set_values(&engram(""), key, &["x"])
+                .expect_err(key)
+                .to_string();
+            assert!(
+                e.contains(&format!("{key} takes one value: pass value")),
+                "{key}: {e}"
+            );
+        }
+        // An identity key is refused as unsettable, whatever form it came in.
+        let e = set_values(&engram(""), "title", &["x"])
+            .expect_err("title")
+            .to_string();
+        assert!(e.contains("cannot set 'title'"), "{e}");
     }
 }

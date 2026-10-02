@@ -28,12 +28,12 @@
  * nobody could see.
  *
  * The queue arrives ranked across the whole result and is drawn under the
- * catalog's three families, in the catalog's own order, because the shape of a
+ * catalog's four families, in the catalog's own order, because the shape of a
  * backlog is what somebody opening this page came to see - a flat hundred rows
  * would answer a different question. The family of a row is read off its rule
  * id (`api/evolve.ts` says why), and a rule from a catalog newer than this
  * client is drawn under its own heading rather than guessed into one of the
- * three.
+ * four.
  *
  * Two things the page refuses to blur. A judgment finding wears its class on
  * its face, because it is a question for a person rather than a change to
@@ -653,6 +653,14 @@ function FindingRow({
           <span className="sr-only">{"Finding class "}</span>
           {finding.class}
         </Chip>
+        {finding.probability !== null && (
+          <Chip>
+            <span className="sr-only">{"Probability "}</span>
+            <span className="tabular-nums">
+              {finding.probability.toFixed(2)}
+            </span>
+          </Chip>
+        )}
         {finding.acknowledged && <Chip>acknowledged</Chip>}
         {anchored ? (
           <Link
@@ -672,6 +680,52 @@ function FindingRow({
         </span>
       </div>
       <p className="mt-1 text-sm">{finding.finding}</p>
+      {finding.counterpart !== null && (
+        <div className="mt-1">
+          <ul
+            aria-label="The two lines"
+            className="space-y-0.5 text-sm break-words"
+          >
+            {/*
+              The row's own engram is plain text here: the row header above
+              already links it, and a second link of the same name in one row
+              is noise for a screen reader. The counterpart is the link.
+            */}
+            <li>
+              {finding.title}
+              {finding.line !== null && ` line ${String(finding.line)}`}
+              {finding.lineText !== null && `: "${finding.lineText}"`}
+            </li>
+            <li>
+              <Link
+                to={engramRoute(finding.domain, finding.counterpart.permalink)}
+                className="text-sky-700 underline underline-offset-2 hover:no-underline dark:text-sky-400"
+              >
+                {finding.counterpart.title}
+              </Link>
+              {finding.counterpart.line !== null &&
+                ` line ${String(finding.counterpart.line)}`}
+              {finding.counterpart.lineText !== null &&
+                `: "${finding.counterpart.lineText}"`}
+            </li>
+          </ul>
+          <p className="text-caption mt-0.5 text-slate-500 dark:text-slate-400">
+            {/*
+              "Read as", never "contradicts": every visible V302 sentence says
+              "possible" or "read as" rather than stating the two engrams
+              contradict.
+            */}
+            {"Read as contradicting"}
+            {finding.similarity !== null &&
+              `, line similarity ${finding.similarity.toFixed(2)}`}
+            {finding.moreLinePairs > 0 &&
+              `, and ${String(finding.moreLinePairs)} more line ${
+                finding.moreLinePairs === 1 ? "pair" : "pairs"
+              }`}
+            {". A model's reading, never a verdict."}
+          </p>
+        </div>
+      )}
       <p className="text-caption mt-0.5 font-mono break-words text-slate-500 dark:text-slate-400">
         {finding.evidence}
       </p>

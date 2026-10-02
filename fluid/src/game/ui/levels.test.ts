@@ -11,6 +11,7 @@ import {
   hereKey,
   levelWindow,
   levelsOf,
+  optionId,
   sortLevels,
   stepSelection,
 } from "./levels";
@@ -160,5 +161,14 @@ describe("stepSelection (C13)", () => {
     expect(stepSelection(3, 2, 1)).toBe(2);
     expect(stepSelection(3, 7, 0)).toBe(2);
     expect(stepSelection(3, 0, 1)).toBe(1);
+  });
+});
+
+describe("optionId", () => {
+  // Mutation caught: the index left out, so every option shares one id.
+  it("names an option by the list id and its filtered index", () => {
+    expect(optionId("l", 0)).toBe("l-option-0");
+    expect(optionId("l", 12)).toBe("l-option-12");
+    expect(optionId("l", 1)).not.toBe(optionId("m", 1));
   });
 });

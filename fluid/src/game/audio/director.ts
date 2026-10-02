@@ -48,7 +48,9 @@
  *   dropped like another one-shot.
  * - **Mute** is the master's alone (`toggleMute`, the mixer's): the cues
  *   play on into a silent master, so sound coming back mid-room brings the
- *   drone back at once.
+ *   drone back at once. The ambience switch (`toggleAmbience`) is the
+ *   ambience bus's alone: the drones keep running into a silent bus, the
+ *   effects, signature cues and modem stay audible.
  * - **Gestures.** A click or a key on the window while the context is not
  *   running unlocks it (Safari may refuse the resume after a hidden tab,
  *   F29), inside that gesture; the first one also makes the context on a
@@ -384,6 +386,7 @@ export function createDirector(mixer: Mixer): Director {
       shot(up ? reconnectPatch() : hangupPatch(), { bus: "modem" });
     },
     toggleMute: () => mixer.toggleMute(),
+    toggleAmbience: () => mixer.toggleAmbience(),
     suspend: () => {
       if (disposed) return;
       quiet = true;

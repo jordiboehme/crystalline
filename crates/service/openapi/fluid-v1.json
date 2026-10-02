@@ -816,16 +816,6 @@
               }
             }
           },
-          "409": {
-            "description": "Mixed line endings: this file cannot hold a shared session; edit solo.",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetail"
-                }
-              }
-            }
-          },
           "422": {
             "description": "`overlay` names somebody whose draft a live share-link shows this caller, and this session has not joined it: seeing a draft and editing it are two steps. The detail is the sentence that says how to take the second.",
             "content": {
@@ -2517,7 +2507,7 @@
           "engrams"
         ],
         "summary": "Save an engram's complete markdown text.",
-        "description": "The text lands verbatim, frontmatter included: nothing rebuilds it and nothing stamps provenance, so a client that saves what it read writes back byte-identical bytes.\n\nThe write is guarded by `If-Match`, whose token is the `ETag` of the detail read it is based on: a save that arrives without one is answered 428, and one whose token is stale is answered 412 carrying the version the server holds now, so a client can merge rather than lose the edit.\n\nEditing the `permalink` in the frontmatter moves the engram's address, since the index takes the permalink from the file. Such a save is answered 200 with the engram read at its new address, so a client can follow the move rather than lose track of what it just wrote.\n\nOn a domain that reviews changes the save lands in the caller's own private draft and the folder the team reads does not move. A save made from inside somebody else's draft - `X-Crystalline-Join` naming a live join this session opened through a share-link - lands in THAT person's draft instead, and is answered with the draft itself rather than with a detail read: the same body `POST /draft-links/accept` returns (`domain`, `path`, `owner`, `permalink`, `editable`, `reason`, `content`, `checksum`, `join_key`, `joined`), because the caller's ordinary view does not carry the owner's draft and a read-back would answer 404 for a write that landed.",
+        "description": "The text lands verbatim, frontmatter included, apart from line endings, which are stored as LF: nothing rebuilds it and nothing stamps provenance, so a client that saves what it read writes back the bytes it read.\n\nThe write is guarded by `If-Match`, whose token is the `ETag` of the detail read it is based on: a save that arrives without one is answered 428, and one whose token is stale is answered 412 carrying the version the server holds now, so a client can merge rather than lose the edit.\n\nEditing the `permalink` in the frontmatter moves the engram's address, since the index takes the permalink from the file. Such a save is answered 200 with the engram read at its new address, so a client can follow the move rather than lose track of what it just wrote.\n\nOn a domain that reviews changes the save lands in the caller's own private draft and the folder the team reads does not move. A save made from inside somebody else's draft - `X-Crystalline-Join` naming a live join this session opened through a share-link - lands in THAT person's draft instead, and is answered with the draft itself rather than with a detail read: the same body `POST /draft-links/accept` returns (`domain`, `path`, `owner`, `permalink`, `editable`, `reason`, `content`, `checksum`, `join_key`, `joined`), because the caller's ordinary view does not carry the owner's draft and a read-back would answer 404 for a write that landed.",
         "operationId": "save_engram",
         "parameters": [
           {
@@ -2794,7 +2784,7 @@
           "maintenance"
         ],
         "summary": "Acknowledge one evolve finding on one engram.",
-        "description": "Records `evolve_ack` on the engram: the rule, the evidence it fired on, the note, the acknowledging user and the instant. A matching acknowledgment keeps the finding out of the queue and counted in `acknowledged`; when the evidence changes the finding returns marked `ack_stale`. The evidence is the server's, either picked by running detection or - when the body names the row's `scope`, which is how a caller says which of an engram's two `V301` findings it read - checked against it.",
+        "description": "Records `evolve_ack` on the engram: the rule, the evidence it fired on, the note, the acknowledging user and the instant. A matching acknowledgment keeps the finding out of the queue and counted in `acknowledged`; when the evidence changes the finding returns marked `ack_stale`. The evidence is the server's, either picked by running detection or - when the body names the row's `scope`, which is how a caller says which of an engram's `V301` or `V302` findings it read - checked against it.",
         "operationId": "acknowledge_finding",
         "parameters": [
           {
@@ -2892,7 +2882,7 @@
           "maintenance"
         ],
         "summary": "Withdraw an acknowledgment.",
-        "description": "Removes the engram's `evolve_ack` entries for that rule, leaving the other rules' alone. A rule has one entry, except `V301`, which has one per twin pair: name the row's `scope` to take one pair back and leave the engram's other pairs silenced, or send none to take every pair at once. 404 when the engram carries no entry the body names, rather than reporting a removal that did not happen.",
+        "description": "Removes the engram's `evolve_ack` entries for that rule, leaving the other rules' alone. A rule has one entry, except `V301` and `V302`, which have one per pair: name the row's `scope` to take one pair back and leave the engram's other pairs silenced, or send none to take every pair at once. 404 when the engram carries no entry the body names, rather than reporting a removal that did not happen.",
         "operationId": "unacknowledge_finding",
         "parameters": [
           {
@@ -3645,7 +3635,7 @@
           "domains"
         ],
         "summary": "Save a domain's MANIFEST markdown, guarded by If-Match.",
-        "description": "The text lands verbatim, frontmatter included, guarded the same way an engram save is: 428 with no `If-Match`, 412 when the token is stale (carrying the version the server holds now), 200 once it lands. A read-only instance answers 403 ahead of the precondition check, so it is never 428.",
+        "description": "The text lands verbatim, frontmatter included, apart from line endings, which are stored as LF, guarded the same way an engram save is: 428 with no `If-Match`, 412 when the token is stale (carrying the version the server holds now), 200 once it lands. A read-only instance answers 403 ahead of the precondition check, so it is never 428.",
         "operationId": "save_domain_manifest",
         "parameters": [
           {
@@ -6116,7 +6106,7 @@
           "maintenance"
         ],
         "summary": "`GET /evolve` - the consolidation queue: the ranked list of what the\nregistered domains need next, with the evidence behind each finding and the\ninstruction that says how to work it.",
-        "description": "A read and only a read. Detection runs over the scope and nothing at all is\nwritten, the maintenance state included: viewing the queue never counts as a\nconsolidation run, so opening this page does not stop a Stop hook from asking\nfor the sweep that is actually owed. The `evolve` MCP tool is the surface that\nrecords a run, because an agent calling it is about to do the work.\n\nEach row carries its rank across the whole result (`n`), its priority, the\nrule that fired, the engram it fired on, and a `class`: `mechanical` for work\nthat completes intent the knowledge already records, `judgment` for work that\nchanges what it claims. A client renders the two differently - a judgment\nfinding is a question for a person, never a change to apply.\n\nThe per-rule instruction rides `actions` rather than a column, so a page of\nfindings from one rule carries it once; only the rules on this page appear,\neach with the catalog's short `summary` beside its `instruction` so a\nrenderer has both a heading and a body without deriving one from the other.\n`families` counts the whole filtered result rather than the page, which is\nwhat section headings are drawn from, and `truncations` names any per-domain\ncap that fired so a short queue is never mistaken for a finished one.\n\n`acknowledged` counts what acknowledgments kept out of the queue, whole and\nper family, and those counts are domain-wide rather than page-wide: they are\ntaken before `families`, `rules` and `min_priority` narrow the result, so a\nshort queue is never mistaken for a healthy one. A row whose acknowledgment\nwas given for evidence that has since changed comes back carrying\n`ack_stale`, the old `ack_note` and the `ack_scope` it was given for. Pass\n`include_acknowledged` to see the suppressed rows themselves, each marked\n`acknowledged` and carrying the same two fields.\n\nA `V301` row carries one column the others do not: its own `scope`, the\ntwin pair it fired on. It is the one rule that fires more than once on an\nengram, so naming the engram and the rule does not name the finding - send\nthis value back on the acknowledgment route to silence the pair that was\nread rather than whichever one the server would have picked.\n\n`today` is not exposed. The temporal rules are evaluated as of now, which is\nthe only question a page asks; the tool takes a pinned date for a run that\nhas to be reproducible.",
+        "description": "A read and only a read. Detection runs over the scope and nothing at all is\nwritten, the maintenance state included: viewing the queue never counts as a\nconsolidation run, so opening this page does not stop a Stop hook from asking\nfor the sweep that is actually owed. The `evolve` MCP tool is the surface that\nrecords a run, because an agent calling it is about to do the work.\n\nEach row carries its rank across the whole result (`n`), its priority, the\nrule that fired, the engram it fired on, and a `class`: `mechanical` for work\nthat completes intent the knowledge already records, `judgment` for work that\nchanges what it claims. A client renders the two differently - a judgment\nfinding is a question for a person, never a change to apply.\n\nThe per-rule instruction rides `actions` rather than a column, so a page of\nfindings from one rule carries it once; only the rules on this page appear,\neach with the catalog's short `summary` beside its `instruction` so a\nrenderer has both a heading and a body without deriving one from the other.\n`families` counts the whole filtered result rather than the page, which is\nwhat section headings are drawn from, and `truncations` names any per-domain\ncap that fired so a short queue is never mistaken for a finished one.\n\n`acknowledged` counts what acknowledgments kept out of the queue, whole and\nper family, and those counts are domain-wide rather than page-wide: they are\ntaken before `families`, `rules` and `min_priority` narrow the result, so a\nshort queue is never mistaken for a healthy one. A row whose acknowledgment\nwas given for evidence that has since changed comes back carrying\n`ack_stale`, the old `ack_note` and the `ack_scope` it was given for. Pass\n`include_acknowledged` to see the suppressed rows themselves, each marked\n`acknowledged` and carrying the same two fields.\n\nA `V301` or `V302` row carries its own `scope`: the twin pair, or the pair\nof observation lines, it fired on. They are the two rules that fire more\nthan once on an engram, so naming the engram and the rule does not name the\nfinding - send this value back on the acknowledgment route to silence the\npair that was read rather than whichever one the server would have picked.\nA `V302` row also carries `counterpart` (the other engram's permalink),\n`counterpart_title`, `counterpart_line`, `probability`, `similarity` (the\ntwo lines' cosine), `line_text` and `counterpart_line_text` (both lines,\ncut to about 200 characters) and, when more line pairs of the same two\nengrams stand, `more_line_pairs`, so a page can link both engrams and show\nboth lines without parsing the evidence. There is one `V302` row per pair\nof engrams, its strongest line pair, at most ten per domain.\n\n`today` is not exposed. The temporal rules are evaluated as of now, which is\nthe only question a page asks; the tool takes a pinned date for a run that\nhas to be reproducible.",
         "operationId": "get_evolve_queue",
         "parameters": [
           {
@@ -6132,7 +6122,7 @@
           {
             "name": "families",
             "in": "query",
-            "description": "Restrict to these detector families, comma separated: `temporal`,\n`structure` or `redundancy`. Defaults to all three.",
+            "description": "Restrict to these detector families, comma separated: `temporal`,\n`structure`, `redundancy` or `meaning`. Defaults to all four.",
             "required": false,
             "schema": {
               "type": "string"
@@ -6205,6 +6195,7 @@
                 "example": {
                   "acknowledged": {
                     "by_family": {
+                      "meaning": 0,
                       "redundancy": 0,
                       "structure": 1,
                       "temporal": 0
@@ -8971,7 +8962,7 @@
               "string",
               "null"
             ],
-            "description": "The evidence this acknowledgment is for, copied from the queue row's\nown `scope`.\n\nOnly `V301` sends one: it is the one rule that fires more than once on\nan engram (an engram can be the semantic twin of several others), so it\nis the one where naming the rule does not name the finding. On `POST`\nthe server checks the scope is really firing and refuses with a 422 if\nit is not, which is what a queue read too long ago looks like; on\n`DELETE` it takes back that pair's entry and leaves the engram's other\npairs silenced. Every other rule ignores it, and omitting it on `V301`\nmeans the whole rule: the server's own pick on `POST`, every pair at\nonce on `DELETE`.",
+            "description": "The evidence this acknowledgment is for, copied from the queue row's\nown `scope`.\n\nOnly `V301` and `V302` send one: they are the two rules that fire more\nthan once on an engram (an engram can be the semantic twin of several\nothers, and several of its lines can read as contradicting another's),\nso they are the ones where naming the rule does not name the finding.\nOn `POST` the server checks the scope is really firing and refuses with\na 422 if it is not, which is what a queue read too long ago looks like;\non `DELETE` it takes back that pair's entry and leaves the engram's\nother pairs silenced. Every other rule ignores it, and omitting it on\n`V301` or `V302` means the whole rule: the server's own pick on `POST`,\nevery pair at once on `DELETE`.",
             "example": "notes/backoff-lesson, notes/retry-queue-gotcha"
           }
         }
@@ -9541,11 +9532,11 @@
           "from": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/MovedFrom",
                 "description": "`moved` only."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -9614,11 +9605,11 @@
           "pending": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/GithubPendingView",
                 "description": "This account's device flow waiting for the browser side. Poll this\nroute until it goes null; the flow either connected or set `error`."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -9688,11 +9679,11 @@
           "pending": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/GithubPendingView",
                 "description": "A device flow waiting for the browser side. Poll this route until it\ngoes null; the flow either connected or set `error`."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -9959,11 +9950,11 @@
           "provisioning": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/ProvisioningView",
                 "description": "The `Provisioning` section, or `null` when the MANIFEST has none."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -9992,11 +9983,11 @@
           "tag_aliases": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/TagAliasesView",
                 "description": "The `Tag Aliases` section, or `null` when the MANIFEST has none."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -10083,11 +10074,11 @@
           "user": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/User",
                 "description": "The account behind this request, or null when there is none."
+              },
+              {
+                "type": "null"
               }
             ]
           },
@@ -10443,11 +10434,11 @@
           "role": {
             "oneOf": [
               {
-                "type": "null"
-              },
-              {
                 "$ref": "#/components/schemas/Role",
                 "description": "The new role."
+              },
+              {
+                "type": "null"
               }
             ]
           }
@@ -10871,7 +10862,7 @@
       },
       "SaveEngramBody": {
         "type": "object",
-        "description": "The complete file text, frontmatter included. It is written verbatim: nothing here rebuilds the frontmatter or stamps provenance, so what a client reads back is what its author typed.",
+        "description": "The complete file text, frontmatter included. It is written verbatim apart from line endings, which are stored as LF: nothing here rebuilds the frontmatter or stamps provenance, so what a client reads back is what its author typed.",
         "required": [
           "content"
         ],
@@ -10885,7 +10876,7 @@
       },
       "SaveManifestBody": {
         "type": "object",
-        "description": "The full MANIFEST markdown as the editor holds it, written verbatim: nothing here rebuilds the frontmatter or stamps provenance.",
+        "description": "The full MANIFEST markdown as the editor holds it, written verbatim apart from line endings, which are stored as LF: nothing here rebuilds the frontmatter or stamps provenance.",
         "required": [
           "markdown"
         ],

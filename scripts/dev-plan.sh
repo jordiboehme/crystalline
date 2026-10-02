@@ -19,6 +19,8 @@
 # dev.yml's publish job deletes a leftover draft of the same tag before it
 # creates the release, so a draft never blocks a version.
 #
+# dev.yml runs this only when a dev build was asked for (its opt-in check).
+#
 #   bash scripts/dev-plan.sh <version> <releases.json> <formula.rb>
 #
 # <releases.json> is `gh release list --json tagName,isPrerelease,isDraft`.

@@ -17,17 +17,23 @@
  * person is the only safe direction. And a queue row carries no family of its
  * own. The engine counts families over the whole filtered result and numbers
  * every rule by family in its catalog (`V0xx` temporal, `V1xx` structure,
- * `V2xx` redundancy), so the section a row belongs under is read off its rule
- * id, and a rule id from a newer catalog belongs to no section rather than to
- * the wrong one.
+ * `V2xx` redundancy, `V3xx` meaning), so the section a row belongs under is
+ * read off its rule id, and a rule id from a newer catalog belongs to no
+ * section rather than to the wrong one.
  */
 
 import { api, encodeSegment } from "./client";
 import { asArray, asNumber, asObject, asString } from "./json";
+import type { JsonObject } from "./json";
 import type { AckBody } from "./model";
 
 /** The detector families, in the catalog's own order. */
-export const EVOLVE_FAMILIES = ["temporal", "structure", "redundancy"] as const;
+export const EVOLVE_FAMILIES = [
+  "temporal",
+  "structure",
+  "redundancy",
+  "meaning",
+] as const;
 
 /**
  * The rule whose subject is an attachment nothing references, and the only one
@@ -43,6 +49,7 @@ export const EVOLVE_FAMILY_TITLES: Record<EvolveFamily, string> = {
   temporal: "Temporal",
   structure: "Structure",
   redundancy: "Redundancy",
+  meaning: "Meaning",
 };
 
 /** What a family section says it is about, in one line. */
@@ -50,6 +57,8 @@ export const EVOLVE_FAMILY_BLURBS: Record<EvolveFamily, string> = {
   temporal: "Validity windows, staleness and the supersede lifecycle.",
   structure: "References, reciprocity, orphans, stubs and size.",
   redundancy: "Duplicate content, colliding titles and tag drift.",
+  meaning:
+    "Semantic twins and possible contradictions, by embedding and by a local model's reading.",
 };
 
 /**
@@ -138,14 +147,14 @@ export interface EvolveFinding {
   /** The note the matching or stale acknowledgment carries, when it has one. */
   ackNote: string | null;
   /**
-   * The evidence this row fired on, which the sweep sends for `V301` alone.
-   *
-   * It is the one rule that fires more than once on an engram - an engram can
-   * be the semantic twin of several others - so the engram and the rule do not
-   * name the finding and this is what tells two rows apart. Send it back to
-   * acknowledge the pair that was read rather than whichever one the server
-   * would have picked. Null for every other rule, which answers for its engram
-   * and has nothing to choose between.
+   * The evidence this row fired on, which the sweep sends for `V301` and
+   * `V302` alone. They are the two rules that fire more than once on an
+   * engram - an engram can be the semantic twin of several others, and
+   * several of its lines can read as contradicting another engram's - so the
+   * engram and the rule do not name the finding and this is what tells two
+   * rows apart. Send it back to acknowledge the pair that was read rather
+   * than whichever one the server would have picked. Null for every other
+   * rule, which answers for its engram and has nothing to choose between.
    */
   scope: string | null;
   /**
@@ -159,6 +168,28 @@ export interface EvolveFinding {
    * nothing in particular.
    */
   ackScope: string | null;
+  /**
+   * The other engram of a `V302` row: its permalink in the row's own domain,
+   * its title, the line of its observation and that line's text. Null for
+   * every other rule.
+   */
+  counterpart: {
+    permalink: string;
+    title: string;
+    line: number | null;
+    lineText: string | null;
+  } | null;
+  /** A `V302` row's own line text, cut by the server. Null for every other rule. */
+  lineText: string | null;
+  /** How similar a `V302` row's two lines are, 0 to 1. Null for every other rule. */
+  similarity: number | null;
+  /** How many more line pairs of the same two engrams stand; 0 when none. */
+  moreLinePairs: number;
+  /**
+   * The model's contradiction probability for a `V302` row, 0 to 1, as the
+   * finding text states it. Null for every other rule.
+   */
+  probability: number | null;
 }
 
 /** What acknowledgments kept out of the queue. */
@@ -221,18 +252,14 @@ export interface EvolveQueue {
 
 /**
  * Which family each rule series files under, as the sweep's own catalog files
- * it.
- *
- * A table rather than the series number used as an index, because the two
- * stopped agreeing: `V3xx` finds redundancy by meaning where `V2xx` finds it
- * by wording, and the catalog puts both under the one heading. Two engrams
- * that say the same thing are one kind of work whichever pass noticed it.
+ * it. A table rather than the series number used as an index, so a series the
+ * catalog has not named reads as no family at all.
  */
 const EVOLVE_FAMILY_OF_SERIES: Record<string, EvolveFamily> = {
   "0": "temporal",
   "1": "structure",
   "2": "redundancy",
-  "3": "redundancy",
+  "3": "meaning",
 };
 
 /**
@@ -252,6 +279,22 @@ export function evolveFamily(rule: string): EvolveFamily | null {
 /** Read one class, falling back to the one that asks before acting. */
 function readClass(value: unknown): EvolveClass {
   return value === "mechanical" ? "mechanical" : DEFAULT_EVOLVE_CLASS;
+}
+
+/** A `V302` row's other engram, or null when the row names none. */
+function counterpartOf(
+  record: JsonObject | null,
+): EvolveFinding["counterpart"] {
+  const permalink = asString(record?.counterpart);
+  if (permalink === null) {
+    return null;
+  }
+  return {
+    permalink,
+    title: asString(record?.counterpart_title) ?? permalink,
+    line: asNumber(record?.counterpart_line),
+    lineText: asString(record?.counterpart_line_text),
+  };
 }
 
 /**
@@ -298,6 +341,13 @@ function readFinding(value: unknown): EvolveFinding | null {
     ackNote: asString(record?.ack_note),
     scope: asString(record?.scope),
     ackScope: asString(record?.ack_scope),
+    // Both halves or nothing: a counterpart without its permalink would be a
+    // link to nowhere.
+    counterpart: counterpartOf(record),
+    probability: asNumber(record?.probability),
+    lineText: asString(record?.line_text),
+    similarity: asNumber(record?.similarity),
+    moreLinePairs: asNumber(record?.more_line_pairs) ?? 0,
   };
 }
 
@@ -486,10 +536,11 @@ export async function acknowledgeFinding(
 /**
  * Take an acknowledgment back, leaving the engram's other rules alone.
  *
- * A rule has one acknowledgment, so this takes back one - except `V301`, which
- * has one per twin pair. Pass the row's own {@link EvolveFinding.ackScope},
- * the entry the engram actually holds, and the engram's other pairs stay
- * silenced; omit it and every pair goes at once.
+ * A rule has one acknowledgment, so this takes back one - except `V301` and
+ * `V302`, which have one per pair. Pass the row's own
+ * {@link EvolveFinding.ackScope}, the entry the engram actually holds, and
+ * the engram's other pairs stay silenced; omit it and every pair goes at
+ * once.
  */
 export async function unacknowledgeFinding(
   domain: string,

@@ -107,6 +107,11 @@ pub const MIGRATIONS: &[Migration] = &[
         label: "unbind references an unknown prefix bound at home",
         sql: SCHEMA_V17,
     },
+    Migration {
+        version: 18,
+        label: "contradiction scores",
+        sql: SCHEMA_V18,
+    },
 ];
 
 const SCHEMA_V1: &str = r#"
@@ -600,6 +605,93 @@ WHERE to_domain IS NOT NULL AND to_id IS NOT NULL
                   AND (e.permalink = link.to_raw OR lower(e.title) = lower(link.to_raw)));
 "#;
 
+// The contradiction check's persisted output. `contradiction_pair` is one row
+// per scored engram pair and says "up to date at these checksums";
+// `contradiction` holds the line pairs that cleared the store floor, both
+// reading orders. Both carry `domain_id`, so a domain clear and the sweep's
+// read never name the `engram` table. The cascades are declared for the
+// record; this connection does not enforce foreign keys, so `delete_engram`
+// and `clear_domain` delete by hand. Never in `delete_children`: that runs on
+// every upsert, and `reindex --full` would erase every score.
+//
+// `idx_contradiction_pair_domain` carries the pair columns after the seek
+// key so it also serves the read's `ORDER BY engram_a, engram_b`; on
+// `(domain_id, model)` alone the planner scans the primary key for the
+// order instead, which `tests/plans.rs` rejects.
+//
+// `idx_contradiction_pair_model` serves `Store::scored_pair_count`'s
+// `WHERE model=?1`, which names no domain: `idx_contradiction_pair_domain`
+// leads with `domain_id`, so it cannot seek on `model` alone and that count
+// would otherwise scan the whole table. `ctl status` and a daemon-mode
+// `doctor` run call it on every request.
+//
+// `delete_engram` deletes by `engram_a=?1 OR engram_b=?1` on both tables.
+// Each primary key leads with `engram_a` and serves one half of the OR; the
+// two `engram_b` indexes serve the other, so a delete never walks a table.
+//
+// `observation_vector` caches the embedding of each observation line the
+// contradiction check pairs, keyed by the embedding model and the row hash of
+// the folded text, so a text shared by many engrams is embedded once and an
+// edit embeds only the lines whose text changed. It holds no text at all
+// (hash, width and vector), and no engram id, so no per-engram statement ever
+// reads it: it is derived and disposable, pruned by the daemon when no current
+// line uses a hash, cleared when the check is switched off and by `wipe`, and
+// kept by `reindex --full` because a vector keyed by its text stays valid.
+// The primary key serves every read, which all name the model and one hash
+// (a hash list on postgres).
+//
+// `domain.parse_generation` is the parser generation
+// (`crystalline_core::PARSE_GENERATION`) the domain's rows were last derived
+// with. An index this migration upgrades has every row at 0, older than any
+// parser that records one, so the first sync after the upgrade reparses each
+// domain once and stamps it; a domain row created later is stamped with the
+// current generation on insert, so a fresh index reparses nothing. Unreleased
+// when it joined this migration, so it rides here rather than in one of its own.
+const SCHEMA_V18: &str = r#"
+CREATE TABLE contradiction_pair (
+    domain_id INTEGER NOT NULL REFERENCES domain(id) ON DELETE CASCADE,
+    engram_a INTEGER NOT NULL REFERENCES engram(id) ON DELETE CASCADE,
+    engram_b INTEGER NOT NULL REFERENCES engram(id) ON DELETE CASCADE,
+    checksum_a TEXT NOT NULL,
+    checksum_b TEXT NOT NULL,
+    cosine REAL NOT NULL,
+    model TEXT NOT NULL,
+    scored_at TEXT NOT NULL,
+    PRIMARY KEY (engram_a, engram_b, model)
+);
+CREATE INDEX idx_contradiction_pair_domain ON contradiction_pair(domain_id, model, engram_a, engram_b);
+CREATE INDEX idx_contradiction_pair_model ON contradiction_pair(model);
+
+CREATE TABLE contradiction (
+    domain_id INTEGER NOT NULL REFERENCES domain(id) ON DELETE CASCADE,
+    engram_a INTEGER NOT NULL REFERENCES engram(id) ON DELETE CASCADE,
+    engram_b INTEGER NOT NULL REFERENCES engram(id) ON DELETE CASCADE,
+    line_a INTEGER NOT NULL,
+    line_b INTEGER NOT NULL,
+    hash_a TEXT NOT NULL,
+    hash_b TEXT NOT NULL,
+    model TEXT NOT NULL,
+    score_ab REAL NOT NULL,
+    score_ba REAL NOT NULL,
+    similarity REAL NOT NULL DEFAULT 0,
+    period INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (engram_a, engram_b, hash_a, hash_b, model)
+);
+CREATE INDEX idx_contradiction_engram_b ON contradiction(engram_b);
+CREATE INDEX idx_contradiction_pair_engram_b ON contradiction_pair(engram_b);
+CREATE INDEX idx_contradiction_domain ON contradiction(domain_id, model);
+
+CREATE TABLE observation_vector (
+    model TEXT NOT NULL,
+    hash TEXT NOT NULL,
+    dims INTEGER NOT NULL,
+    vector BLOB NOT NULL,
+    PRIMARY KEY (model, hash)
+);
+
+ALTER TABLE domain ADD COLUMN parse_generation INTEGER NOT NULL DEFAULT 0;
+"#;
+
 const SCHEMA_V9: &str = r#"
 CREATE TABLE attachment (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -623,8 +715,13 @@ CREATE TABLE attachment_blob (
 /// `domain_lock` and `domain_spelling` all reference `domain(id)`, so they are
 /// cleared before `domain`; `attachment_blob` references `attachment`, so it
 /// goes before it, and `engram_content` references `engram`, so it goes
-/// before that.
+/// before that. `contradiction` and `contradiction_pair` reference `engram`
+/// and `domain`, so they go first. `observation_vector` references nothing
+/// and leads the list.
 pub const WIPE_TABLES: &[&str] = &[
+    "observation_vector",
+    "contradiction",
+    "contradiction_pair",
     "observation_tag",
     "engram_tag",
     "chunk",
@@ -977,8 +1074,8 @@ mod tests {
     async fn v17_unbinds_what_an_unknown_prefix_bound_at_home() {
         let db = Builder::new_local(":memory:").build().await.unwrap();
         let conn = db.connect().unwrap();
-        let (v17, before) = MIGRATIONS.split_last().unwrap();
-        assert_eq!(v17.version, 17, "the last migration is v17");
+        let (before, v17) = (&MIGRATIONS[..16], &MIGRATIONS[16]);
+        assert_eq!(v17.version, 17, "the seventeenth migration is v17");
         apply_migrations(&conn, before).await.unwrap();
 
         conn.execute_batch(
@@ -1709,6 +1806,19 @@ mod tests {
                 2,
                 "and nothing else"
             );
+            // `WIPE_TABLES` is the current list, so the migrations after v16
+            // run first (stamped, so the store opened below runs nothing
+            // again) and the tables they add are checked with the rest.
+            for m in &MIGRATIONS[16..] {
+                conn.execute_batch(m.sql).await.unwrap();
+                conn.execute_batch(&format!(
+                    "INSERT INTO schema_migration(version, applied_at) \
+                     VALUES ({},'2026-09-27T00:00:00Z');",
+                    m.version
+                ))
+                .await
+                .unwrap();
+            }
             for table in WIPE_TABLES {
                 assert_eq!(
                     scalar(
@@ -1719,7 +1829,7 @@ mod tests {
                     )
                     .await,
                     1,
-                    "wipe names a table that exists at v16: {table}"
+                    "wipe names a table that exists once every migration ran: {table}"
                 );
             }
             let at = |t: &str| WIPE_TABLES.iter().position(|w| *w == t);
@@ -1928,5 +2038,40 @@ mod tests {
             known + 1,
             "the refusal touches nothing; the recorded version is untouched"
         );
+    }
+
+    /// An index an older binary built, at v17 with a domain row in it: opening
+    /// it runs v18, whose `parse_generation` default leaves that row behind,
+    /// and the first plain sync reparses its files and stamps it. Built the way
+    /// the other upgrade tests build an old database, on a file so the store
+    /// can open it afterwards.
+    #[tokio::test]
+    async fn an_index_from_before_v18_reparses_on_its_first_sync() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let root = tmp.path().join("d");
+        {
+            let db = Builder::new_local(db_path.to_str().unwrap())
+                .build()
+                .await
+                .unwrap();
+            let conn = db.connect().unwrap();
+            assert_eq!(
+                MIGRATIONS[17].version, 18,
+                "the eighteenth migration is v18"
+            );
+            apply_migrations(&conn, &MIGRATIONS[..17]).await.unwrap();
+            conn.execute(
+                "INSERT INTO domain(name, path, kind) VALUES (?1, ?2, 'file')",
+                vec![
+                    turso::Value::Text("d".to_string()),
+                    turso::Value::Text(root.to_string_lossy().into_owned()),
+                ],
+            )
+            .await
+            .unwrap();
+        }
+        let store = crate::TursoStore::open(&db_path).await.unwrap();
+        crate::sync::upgrade_fixture::first_sync_after_the_upgrade_reparses(&store, &root).await;
     }
 }

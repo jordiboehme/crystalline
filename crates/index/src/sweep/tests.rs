@@ -2,7 +2,9 @@
 //! every false-positive guard the design commits to.
 
 use super::*;
-use crate::store::{EdgeKind, EngramId, GraphEdge, GraphNode, RETIRED_STATUSES};
+use crate::nli::OrderAggregation;
+use crate::nli::candidates::observation_hash;
+use crate::store::{ContradictionRow, EdgeKind, EngramId, GraphEdge, GraphNode, RETIRED_STATUSES};
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -1330,7 +1332,7 @@ fn v301_flags_a_twin_pair_on_lead_vectors_and_scopes_the_pair() {
 
     let report = detect(&input(vec![a, b, c]));
     let finding = only(&report, "V301");
-    assert_eq!(finding.family, Family::Redundancy);
+    assert_eq!(finding.family, Family::Meaning);
     assert_eq!(finding.class, Class::Judgment);
     assert_eq!(finding.priority, 75);
     assert_eq!(
@@ -1538,7 +1540,7 @@ fn v301_acknowledgment_is_scoped_to_the_pair() {
     two.lead_vector = Some(unit(&[1.0, 0.0]));
 
     let report = detect(&input(vec![hub, one, two]));
-    assert_eq!(report.acknowledged.redundancy, 1);
+    assert_eq!(report.acknowledged.meaning, 1);
     let twins: Vec<&Finding> = report
         .findings
         .iter()
@@ -1578,7 +1580,7 @@ fn v301_acknowledgment_is_scoped_to_the_pair() {
     two.lead_vector = Some(unit(&[1.0, 0.0]));
 
     let report = detect(&input(vec![hub, one, two]));
-    assert_eq!(report.acknowledged.redundancy, 2);
+    assert_eq!(report.acknowledged.meaning, 2);
     let twins: Vec<&Finding> = report
         .findings
         .iter()
@@ -2200,8 +2202,8 @@ fn v111_exempt_types_are_matched_case_insensitively() {
 }
 
 #[test]
-fn the_catalog_carries_twenty_five_rules_and_v006_is_temporal() {
-    assert_eq!(RULES.len(), 25);
+fn the_catalog_carries_twenty_six_rules_and_v006_is_temporal() {
+    assert_eq!(RULES.len(), 26);
     let info = rule_info("V006").expect("V006 is in the catalog");
     assert_eq!(info.family, Family::Temporal);
     assert_eq!(info.base, 50);
@@ -2245,7 +2247,7 @@ fn the_catalog_covers_every_rule_id_exactly_once() {
         vec![
             "V001", "V002", "V003", "V004", "V005", "V006", "V007", "V008", "V009", "V010", "V101",
             "V102", "V103", "V104", "V105", "V106", "V107", "V108", "V109", "V110", "V111", "V201",
-            "V202", "V203", "V301",
+            "V202", "V203", "V301", "V302",
         ]
     );
     for rule in RULES {
@@ -2255,15 +2257,22 @@ fn the_catalog_covers_every_rule_id_exactly_once() {
         let expected = match &rule.id[..2] {
             "V0" => Family::Temporal,
             "V1" => Family::Structure,
-            _ => Family::Redundancy,
+            "V2" => Family::Redundancy,
+            _ => Family::Meaning,
         };
         assert_eq!(rule.family, expected, "{}", rule.id);
     }
     assert_eq!(
         rule_info("V301").expect("V301 is in the catalog").family,
-        Family::Redundancy,
-        "semantic twins are redundancy, which is what they are"
+        Family::Meaning,
+        "semantic twins compare what two engrams say, which is the meaning family"
     );
+    assert_eq!(
+        rule_info("V302").expect("V302 is in the catalog").family,
+        Family::Meaning
+    );
+    assert_eq!(Family::ALL.len(), 4);
+    assert_eq!(Family::parse("meaning"), Some(Family::Meaning));
 }
 
 #[test]
@@ -2347,6 +2356,7 @@ fn a_scoped_ack_suppresses_its_finding_and_is_counted() {
     assert_eq!(report.acknowledged.structure, 1);
     assert_eq!(report.acknowledged.temporal, 0);
     assert_eq!(report.acknowledged.redundancy, 0);
+    assert_eq!(report.acknowledged.meaning, 0);
 }
 
 #[test]
@@ -2606,7 +2616,7 @@ fn every_rule_in_the_catalog_has_a_decided_scope() {
     // catalog and the scope function are read together.
     let scoped = [
         "V007", "V008", "V010", "V101", "V102", "V103", "V107", "V109", "V110", "V201", "V202",
-        "V301",
+        "V301", "V302",
     ];
     for info in RULES {
         let produced = scope_for(info.id, vec!["one".to_string()]);
@@ -2955,4 +2965,854 @@ fn v110_ignores_a_spelled_ref_whose_prefix_respell_does_not_name() {
 
     let report = detect(&sweep);
     assert!(!fired(&report).contains(&"V110"), "{:?}", fired(&report));
+}
+
+// ---------------------------------------------------------------------------
+// V302 - possible contradiction, from stored rows
+// ---------------------------------------------------------------------------
+
+fn observed(id: i64, permalink: &str, lines: &[(usize, &str)]) -> EngramFacts {
+    let mut f = fact(id, permalink);
+    f.observations = lines
+        .iter()
+        .map(|(line, text)| FactObservation {
+            line: *line,
+            text: text.to_string(),
+        })
+        .collect();
+    f
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stored(
+    a: i64,
+    b: i64,
+    la: usize,
+    ta: &str,
+    lb: usize,
+    tb: &str,
+    ab: f32,
+    ba: f32,
+) -> ContradictionRow {
+    ContradictionRow {
+        a: EngramId(a),
+        b: EngramId(b),
+        line_a: la,
+        line_b: lb,
+        hash_a: observation_hash(ta),
+        hash_b: observation_hash(tb),
+        score_ab: ab,
+        score_ba: ba,
+        similarity: 0.9,
+        period: false,
+    }
+}
+
+/// The finding line and the aggregation are pinned here rather than read from
+/// the model table and the product constant, so the measurement moving either
+/// never moves these tests.
+fn meaning_input(facts: Vec<EngramFacts>, rows: Vec<ContradictionRow>) -> SweepInput {
+    let mut sweep = input(facts);
+    sweep.contradictions = rows;
+    sweep.contradiction_model = "nli-x".to_string();
+    sweep.options.contradiction_threshold = 0.85;
+    sweep.options.order_aggregation = OrderAggregation::Mean;
+    sweep
+}
+
+#[test]
+fn v302_names_both_lines_scores_and_similarity_and_counts_the_rest() {
+    let a = observed(
+        1,
+        "node-version",
+        &[
+            (5, "The build uses Node 18"),
+            (6, "Deploys need a manual trigger"),
+        ],
+    );
+    let b = observed(
+        2,
+        "ci-runtime",
+        &[
+            (7, "The build uses Node 20"),
+            (8, "Deploys run without approval"),
+        ],
+    );
+    let rows = vec![
+        stored(
+            1,
+            2,
+            5,
+            "The build uses Node 18",
+            7,
+            "The build uses Node 20",
+            0.93,
+            0.89,
+        ),
+        stored(
+            1,
+            2,
+            6,
+            "Deploys need a manual trigger",
+            8,
+            "Deploys run without approval",
+            0.88,
+            0.87,
+        ),
+    ];
+    let report = detect(&meaning_input(vec![a, b], rows));
+    let f = only(&report, "V302");
+    assert_eq!(f.family, Family::Meaning);
+    assert_eq!(f.class, Class::Judgment);
+    assert_eq!(f.priority, 85);
+    assert_eq!(
+        f.permalink, "ci-runtime",
+        "equal salience: the smaller address leads, as for V301"
+    );
+    assert_eq!(f.line, Some(7));
+    assert_eq!(
+        f.finding,
+        "Possible contradiction: line 7 of \"ci runtime\" and line 5 of \"node version\" read as contradicting at probability 0.91, line similarity 0.90, and 1 more line pair"
+    );
+    assert_eq!(
+        f.evidence,
+        "engineering/ci-runtime line 7; engineering/node-version line 5; probability 0.91; similarity 0.90; model nli-x"
+    );
+    assert_eq!(
+        f.fix,
+        "read both then supersede or close a window or acknowledge V302"
+    );
+    // Each hash stays beside its engram: ordered by address, never sorted.
+    assert_eq!(
+        f.scope,
+        format!(
+            "engineering/ci-runtime, engineering/node-version, {}, {}",
+            observation_hash("The build uses Node 20"),
+            observation_hash("The build uses Node 18")
+        )
+    );
+    let c = f
+        .counterpart
+        .as_ref()
+        .expect("a V302 finding names the other engram");
+    assert_eq!(
+        (c.permalink.as_str(), c.title.as_str()),
+        ("node-version", "node version")
+    );
+    assert_eq!(c.anchor_text, "The build uses Node 20");
+    assert_eq!(c.text, "The build uses Node 18");
+    assert_eq!((c.line, c.more_line_pairs), (5, 1));
+    assert!((c.probability - 0.91).abs() < 1e-6);
+    assert!((c.similarity - 0.90).abs() < 1e-9);
+    assert!(report.truncations.is_empty(), "{:?}", report.truncations);
+}
+
+#[test]
+fn a_line_is_cut_at_two_hundred_characters_never_inside_a_character() {
+    let long = format!("{}ü{}", "a".repeat(196), "b".repeat(40));
+    let a = observed(1, "one", &[(5, &long)]);
+    let b = observed(2, "two", &[(7, "short")]);
+    let rows = vec![stored(1, 2, 5, &long, 7, "short", 0.95, 0.95)];
+    let f = only(&detect(&meaning_input(vec![a, b], rows)), "V302").clone();
+    let c = f.counterpart.unwrap();
+    let cut = if c.anchor_text == "short" {
+        c.text
+    } else {
+        c.anchor_text
+    };
+    assert_eq!(cut.chars().count(), 200);
+    assert!(cut.ends_with("ü..."), "{cut}");
+}
+
+#[test]
+fn one_finding_per_engram_pair_ranked_and_capped() {
+    let mut facts = vec![observed(99, "hub", &[(1, "hub fact"), (2, "hub other")])];
+    let mut rows = Vec::new();
+    for i in 1..=12 {
+        facts.push(observed(
+            i,
+            &format!("e{i:02}"),
+            &[(1, &format!("fact {i}")), (2, &format!("more {i}"))],
+        ));
+        let p = 0.85 + i as f32 * 0.01;
+        rows.push(stored(i, 99, 1, &format!("fact {i}"), 1, "hub fact", p, p));
+        rows.push(stored(
+            i,
+            99,
+            2,
+            &format!("more {i}"),
+            2,
+            "hub other",
+            p - 0.001,
+            p - 0.001,
+        ));
+    }
+    let report = detect(&meaning_input(facts, rows));
+    let v302: Vec<&Finding> = report
+        .findings
+        .iter()
+        .filter(|f| f.rule == "V302")
+        .collect();
+    assert_eq!(v302.len(), 10, "one per engram pair, ten kept");
+    let probs: Vec<f64> = v302
+        .iter()
+        .map(|f| f.counterpart.as_ref().unwrap().probability)
+        .collect();
+    assert!(
+        probs.windows(2).all(|w| w[0] >= w[1]),
+        "highest first: {probs:?}"
+    );
+    assert!(
+        v302.iter()
+            .all(|f| f.counterpart.as_ref().unwrap().more_line_pairs == 1)
+    );
+    assert!(
+        report
+            .truncations
+            .contains(&"V302 findings capped at 10".to_string())
+    );
+}
+
+#[test]
+fn an_acknowledged_line_pair_hands_the_engram_pair_to_the_next_line_pair() {
+    let a = observed(
+        1,
+        "node-version",
+        &[
+            (5, "The build uses Node 18"),
+            (6, "Deploys need a manual trigger"),
+        ],
+    );
+    let mut b = observed(
+        2,
+        "ci-runtime",
+        &[
+            (7, "The build uses Node 20"),
+            (8, "Deploys run without approval"),
+        ],
+    );
+    let rows = vec![
+        stored(
+            1,
+            2,
+            5,
+            "The build uses Node 18",
+            7,
+            "The build uses Node 20",
+            0.93,
+            0.89,
+        ),
+        stored(
+            1,
+            2,
+            6,
+            "Deploys need a manual trigger",
+            8,
+            "Deploys run without approval",
+            0.88,
+            0.87,
+        ),
+    ];
+    // ci-runtime anchors the pair; it acknowledges the strongest line pair.
+    let first = only(
+        &detect(&meaning_input(vec![a.clone(), b.clone()], rows.clone())),
+        "V302",
+    )
+    .scope
+    .clone();
+    b.acks = vec![AckEntry {
+        rule: "V302".to_string(),
+        scope: Some(first.clone()),
+        note: None,
+    }];
+    let report = detect(&meaning_input(vec![a.clone(), b.clone()], rows.clone()));
+    let f = only(&report, "V302");
+    assert_ne!(f.scope, first, "the next line pair is the evidence now");
+    assert!(
+        !f.ack_stale,
+        "a pair-scoped rule's other line pair is unanswered, never stale"
+    );
+    assert_eq!(f.line, Some(8));
+    assert_eq!(f.counterpart.as_ref().unwrap().more_line_pairs, 0);
+    assert_eq!(
+        report.acknowledged.meaning, 1,
+        "the acknowledged line pair is still counted"
+    );
+    // Every line pair acknowledged: nothing in the queue, both counted.
+    let second = f.scope.clone();
+    b.acks.push(AckEntry {
+        rule: "V302".to_string(),
+        scope: Some(second),
+        note: None,
+    });
+    let report = detect(&meaning_input(vec![a, b], rows));
+    assert!(!fired(&report).contains(&"V302"));
+    assert_eq!(report.acknowledged.meaning, 2);
+}
+
+/// Preflight H4: the queue shows one finding per engram pair, but the audit
+/// view still lists every acknowledged line pair of it, each marked.
+#[test]
+fn the_audit_view_lists_every_acknowledged_line_pair_beside_the_open_one() {
+    let mut a = observed(1, "one", &[(5, "x"), (6, "p"), (7, "m")]);
+    let b = observed(2, "two", &[(5, "y"), (6, "q"), (7, "n")]);
+    let rows = vec![
+        stored(1, 2, 5, "x", 5, "y", 0.95, 0.95),
+        stored(1, 2, 6, "p", 6, "q", 0.93, 0.93),
+        stored(1, 2, 7, "m", 7, "n", 0.91, 0.91),
+    ];
+    let first = detect(&meaning_input(vec![a.clone(), b.clone()], rows.clone()));
+    assert_eq!(only(&first, "V302").line, Some(5));
+    // The anchor is `one`, the lower address; acknowledge the two strongest.
+    for (lx, ly) in [("x", "y"), ("p", "q")] {
+        a.acks.push(AckEntry {
+            rule: "V302".to_string(),
+            scope: Some(format!(
+                "engineering/one, engineering/two, {}, {}",
+                observation_hash(lx),
+                observation_hash(ly)
+            )),
+            note: Some("read".to_string()),
+        });
+    }
+    let mut audit = meaning_input(vec![a, b], rows);
+    audit.include_acknowledged = true;
+    let report = detect(&audit);
+    let v302: Vec<&Finding> = report
+        .findings
+        .iter()
+        .filter(|f| f.rule == "V302")
+        .collect();
+    assert_eq!(v302.len(), 3, "{:?}", fired(&report));
+    let open: Vec<&&Finding> = v302.iter().filter(|f| !f.acknowledged).collect();
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].line, Some(7));
+    assert_eq!(report.acknowledged.meaning, 2);
+}
+
+/// Review focus 4, the sweep half: leftover rows from a model with a floor
+/// never surface under one without, and the silence is explained.
+#[test]
+fn v302_without_a_floor_emits_nothing_and_says_why() {
+    let a = observed(1, "one", &[(5, "The build uses Node 18")]);
+    let b = observed(2, "two", &[(7, "The build uses Node 20")]);
+    let rows = vec![stored(
+        1,
+        2,
+        5,
+        "The build uses Node 18",
+        7,
+        "The build uses Node 20",
+        0.99,
+        0.99,
+    )];
+    let mut sweep = meaning_input(vec![a, b], rows);
+    sweep.contradiction_no_line_floor = Some("bge-small-en-v1.5".to_string());
+    sweep.contradictions_pending = 3;
+    let report = detect(&sweep);
+    assert!(!fired(&report).contains(&"V302"));
+    let v302: Vec<&String> = report
+        .truncations
+        .iter()
+        .filter(|t| t.starts_with("V302"))
+        .collect();
+    assert_eq!(
+        v302,
+        vec![
+            "V302 does not run: the embedding model 'bge-small-en-v1.5' has no measured line-similarity floor"
+        ],
+        "the one reason, and no pending line that promises a pass"
+    );
+}
+
+#[test]
+fn v302_is_quiet_below_the_line_when_off_and_on_a_retired_speculative_or_disjoint_pair() {
+    let a = observed(1, "one", &[(5, "x")]);
+    let b = observed(2, "two", &[(5, "y")]);
+    let low = detect(&meaning_input(
+        vec![a.clone(), b.clone()],
+        vec![stored(1, 2, 5, "x", 5, "y", 0.69, 0.69)],
+    ));
+    assert!(!fired(&low).contains(&"V302"));
+    let nan = detect(&meaning_input(
+        vec![a.clone(), b.clone()],
+        vec![stored(1, 2, 5, "x", 5, "y", f32::NAN, 0.99)],
+    ));
+    assert!(
+        !fired(&nan).contains(&"V302"),
+        "a NaN never clears the line"
+    );
+    let off = detect(&input(vec![a.clone(), b.clone()]));
+    assert!(!fired(&off).contains(&"V302"));
+    assert!(off.truncations.is_empty(), "an off check is silent");
+    for status in ["superseded", "draft"] {
+        let mut other = b.clone();
+        other.status = status.to_string();
+        let r = detect(&meaning_input(
+            vec![a.clone(), other],
+            vec![stored(1, 2, 5, "x", 5, "y", 0.95, 0.95)],
+        ));
+        assert!(!fired(&r).contains(&"V302"), "{status}");
+    }
+    // Both windows lie after today, so only their overlap decides: an
+    // engram past its valid_to is out for a reason of its own (below).
+    let mut closed = a.clone();
+    closed.valid_to = Some(day("2026-12-01"));
+    let mut later = b.clone();
+    later.valid_from = Some(day("2027-01-01"));
+    let w = detect(&meaning_input(
+        vec![closed, later],
+        vec![stored(1, 2, 5, "x", 5, "y", 0.95, 0.95)],
+    ));
+    assert!(
+        !fired(&w).contains(&"V302"),
+        "a window closed before the other opened is two periods"
+    );
+}
+
+/// Task 5b: a stored row whose engram is past its `valid_to` as of the
+/// sweep's date never surfaces, even before the next walk deletes it; a
+/// window that ends on the sweep's date still counts.
+#[test]
+fn v302_drops_a_row_whose_engram_expired_by_the_sweeps_date() {
+    let a = observed(1, "one", &[(5, "x")]);
+    let b = observed(2, "two", &[(5, "y")]);
+    let rows = vec![stored(1, 2, 5, "x", 5, "y", 0.95, 0.95)];
+    let mut ends_today = a.clone();
+    ends_today.valid_to = Some(today());
+    let open = detect(&meaning_input(vec![ends_today, b.clone()], rows.clone()));
+    assert!(
+        fired(&open).contains(&"V302"),
+        "a window ending today counts"
+    );
+    let mut expired = a.clone();
+    expired.valid_to = today().pred_opt();
+    let gone = detect(&meaning_input(vec![expired, b], rows));
+    assert!(
+        !fired(&gone).contains(&"V302"),
+        "an engram past its valid_to takes no part"
+    );
+}
+
+#[test]
+fn v302_drops_a_row_whose_line_was_edited_and_survives_a_renumbering() {
+    let a = observed(1, "one", &[(5, "The build uses Node 18")]);
+    // Moved from line 7 to line 9, and a whitespace change folds away.
+    let b = observed(2, "two", &[(9, "The build  uses Node 20")]);
+    let row = stored(
+        1,
+        2,
+        5,
+        "The build uses Node 18",
+        7,
+        "The build uses Node 20",
+        0.9,
+        0.9,
+    );
+    let moved = detect(&meaning_input(vec![a.clone(), b], vec![row.clone()]));
+    let f = only(&moved, "V302");
+    // Equal salience: `leader` picks the lower address, engineering/one.
+    assert_eq!(f.permalink, "one");
+    assert_eq!(f.line, Some(5), "the leader's own line");
+    let c = f.counterpart.clone().expect("the other engram");
+    assert_eq!(
+        (c.permalink.as_str(), c.line),
+        ("two", 9),
+        "the line comes from the engram, the hash from the row"
+    );
+    assert!(
+        f.evidence.contains("engineering/two line 9"),
+        "{}",
+        f.evidence
+    );
+    let edited = observed(2, "two", &[(9, "The build uses Node 22")]);
+    let gone = detect(&meaning_input(vec![a, edited], vec![row]));
+    assert!(
+        !fired(&gone).contains(&"V302"),
+        "an edited line is a new question"
+    );
+}
+
+#[test]
+fn v302_attaches_to_the_more_salient_engram_whatever_the_address() {
+    let a = observed(1, "alpha", &[(5, "x")]);
+    let mut b = observed(2, "beta", &[(8, "y")]);
+    b.salience = Some(7.0);
+    let f = only(
+        &detect(&meaning_input(
+            vec![a, b],
+            vec![stored(1, 2, 5, "x", 8, "y", 0.9, 0.9)],
+        )),
+        "V302",
+    );
+    assert_eq!((f.permalink.as_str(), f.line), ("beta", Some(8)));
+    let c = f.counterpart.clone().expect("the other engram");
+    assert_eq!((c.permalink.as_str(), c.line), ("alpha", 5));
+    // The scope is ordered by address, not by the anchor.
+    assert_eq!(
+        f.scope,
+        format!(
+            "engineering/alpha, engineering/beta, {}, {}",
+            observation_hash("x"),
+            observation_hash("y")
+        )
+    );
+}
+
+#[test]
+fn the_order_aggregation_decides_what_clears_the_line() {
+    let a = observed(1, "one", &[(5, "x")]);
+    let b = observed(2, "two", &[(5, "y")]);
+    let rows = vec![stored(1, 2, 5, "x", 5, "y", 0.95, 0.70)];
+    let mut sweep = meaning_input(vec![a, b], rows);
+    sweep.options.contradiction_threshold = 0.8;
+    sweep.options.order_aggregation = OrderAggregation::Mean;
+    assert!(
+        fired(&detect(&sweep)).contains(&"V302"),
+        "mean 0.825 clears 0.8"
+    );
+    sweep.options.order_aggregation = OrderAggregation::Min;
+    assert!(
+        !fired(&detect(&sweep)).contains(&"V302"),
+        "min 0.70 does not"
+    );
+}
+
+/// The product's own line, read from the defaults rather than pinned: the
+/// measurement moved it from 0.70 to 0.90 and then to 0.95, so 0.90 (where the
+/// real findings turned mostly noise) is no finding and 0.95 is.
+#[test]
+fn the_product_line_is_095_so_090_is_no_finding() {
+    let a = observed(1, "one", &[(5, "x")]);
+    let b = observed(2, "two", &[(5, "y")]);
+    let at = |score: f32| {
+        let mut sweep = input(vec![a.clone(), b.clone()]);
+        sweep.contradictions = vec![stored(1, 2, 5, "x", 5, "y", score, score)];
+        sweep.contradiction_model = "nli-x".to_string();
+        assert_eq!(sweep.options.contradiction_threshold, 0.95);
+        fired(&detect(&sweep)).contains(&"V302")
+    };
+    assert!(!at(0.90), "0.90 stays below the line");
+    assert!(at(0.95), "0.95 is on the line");
+}
+
+#[test]
+fn a_line_that_names_a_period_points_at_the_window() {
+    let a = observed(1, "one", &[(5, "Since 2024 the build uses Node 20")]);
+    let b = observed(2, "two", &[(5, "The build uses Node 18")]);
+    let mut row = stored(
+        1,
+        2,
+        5,
+        "Since 2024 the build uses Node 20",
+        5,
+        "The build uses Node 18",
+        0.9,
+        0.9,
+    );
+    row.period = true;
+    let f = only(&detect(&meaning_input(vec![a, b], vec![row])), "V302");
+    assert_eq!(
+        f.fix,
+        "One of these lines names a period; if both held at different times, close the older engram's validity window. read both then supersede or close a window or acknowledge V302"
+    );
+}
+
+#[test]
+fn v302_caps_at_ten_highest_score_first_and_names_what_is_not_scored() {
+    let mut facts = vec![observed(99, "hub", &[(1, "hub fact")])];
+    let mut rows = Vec::new();
+    for i in 1..=12 {
+        facts.push(observed(
+            i,
+            &format!("e{i:02}"),
+            &[(1, &format!("fact {i}"))],
+        ));
+        let p = 0.85 + i as f32 * 0.01;
+        rows.push(stored(i, 99, 1, &format!("fact {i}"), 1, "hub fact", p, p));
+    }
+    let mut sweep = meaning_input(facts, rows);
+    sweep.contradictions_pending = 3;
+    sweep.contradiction_candidates_capped = true;
+    let report = detect(&sweep);
+    let v302: Vec<&Finding> = report
+        .findings
+        .iter()
+        .filter(|f| f.rule == "V302")
+        .collect();
+    assert_eq!(v302.len(), 10);
+    assert!(
+        v302.iter().all(|f| !f.evidence.contains("probability 0.86")
+            && !f.evidence.contains("probability 0.87")),
+        "the two lowest were cut"
+    );
+    assert!(
+        report
+            .truncations
+            .contains(&"V302 findings capped at 10".to_string()),
+        "{:?}",
+        report.truncations
+    );
+    assert!(
+        report.truncations.contains(
+            &"V302: 3 related pairs not scored yet (the daemon scores them after embedding)"
+                .to_string()
+        )
+    );
+    assert!(report.truncations.contains(
+        &"V302: related pairs capped at 2000, the least related are never scored".to_string()
+    ));
+}
+
+/// Lesson 37 and spec 5: a quiet `V302` never reads as a clean domain. An
+/// engram that could take part but has no lead vector yet, and a scope over
+/// the vector cap, each say so.
+#[test]
+fn v302_names_unembedded_engrams_and_a_scope_over_the_vector_cap() {
+    let mut sweep = meaning_input(vec![observed(1, "one", &[(5, "x")])], Vec::new());
+    sweep.contradiction_unembedded = 4;
+    sweep.contradiction_vectors_capped = Some(5001);
+    let report = detect(&sweep);
+    assert!(
+        report.truncations.contains(
+            &"V302: 4 engrams have no embedding yet, their related pairs are not counted"
+                .to_string()
+        ),
+        "{:?}",
+        report.truncations
+    );
+    assert!(
+        report.truncations.contains(
+            &"V302 skipped: 5001 lead vectors over the 5000 cap, no related pairs are scored"
+                .to_string()
+        ),
+        "{:?}",
+        report.truncations
+    );
+}
+
+/// Lesson 7: an unknown count is said out loud, and it is never a zero. An
+/// off check carries the flag `false` and says nothing.
+#[test]
+fn an_uncounted_domain_says_so_and_an_off_check_says_nothing() {
+    let mut sweep = meaning_input(vec![observed(1, "one", &[(5, "x")])], Vec::new());
+    sweep.contradictions_uncounted = true;
+    assert_eq!(
+        detect(&sweep).truncations,
+        vec!["V302: related pairs not counted yet (the daemon counts them after embedding)"]
+    );
+    let off = input(vec![observed(1, "one", &[(5, "x")])]);
+    assert!(!off.contradictions_uncounted);
+    assert!(detect(&off).truncations.is_empty());
+}
+
+#[test]
+fn v302_acknowledgment_is_scoped_to_the_pair_of_lines() {
+    let mut a = observed(1, "one", &[(5, "x"), (6, "p")]);
+    let b = observed(2, "two", &[(5, "y"), (6, "q")]);
+    let first = detect(&meaning_input(
+        vec![a.clone(), b.clone()],
+        vec![stored(1, 2, 5, "x", 5, "y", 0.9, 0.9)],
+    ));
+    let f = only(&first, "V302");
+    assert_eq!(
+        f.permalink, "one",
+        "the smaller address anchors the pair, so the entry goes there"
+    );
+    a.acks = vec![AckEntry {
+        rule: "V302".into(),
+        scope: Some(f.scope),
+        note: Some("different builds".into()),
+    }];
+    let rows = vec![
+        stored(1, 2, 5, "x", 5, "y", 0.9, 0.9),
+        stored(1, 2, 6, "p", 6, "q", 0.9, 0.9),
+    ];
+    let report = detect(&meaning_input(vec![a, b], rows));
+    let left: Vec<&Finding> = report
+        .findings
+        .iter()
+        .filter(|f| f.rule == "V302")
+        .collect();
+    assert_eq!(
+        left.len(),
+        1,
+        "a new disagreement between the same two engrams still surfaces"
+    );
+    assert_eq!(left[0].line, Some(6));
+    assert!(
+        !left[0].ack_stale,
+        "a pair-scoped rule is never stale, only unanswered"
+    );
+    assert_eq!(report.acknowledged.meaning, 1);
+    assert!(is_pair_scoped("V302"));
+}
+
+/// Review mode: a draft is a row of its own and never scored, so a stored
+/// row never lands on the draft that shadows its base engram.
+#[test]
+fn a_draft_is_never_read_as_the_engram_its_row_names() {
+    let a = observed(1, "one", &[(5, "x")]);
+    let mut b = observed(2, "two", &[(5, "y")]);
+    b.actor = "alice".to_string();
+    let r = detect(&meaning_input(
+        vec![a, b],
+        vec![stored(1, 2, 5, "x", 5, "y", 0.95, 0.95)],
+    ));
+    assert!(!fired(&r).contains(&"V302"));
+}
+
+// ---------------------------------------------------------------------------
+// The pair caps count only what nobody acknowledged
+// ---------------------------------------------------------------------------
+
+/// Acknowledge every `rule` finding `report` shows, on its anchor in `facts`,
+/// for the scope it fired on.
+fn acknowledge_shown(facts: &mut [EngramFacts], report: &SweepReport, rule: &str) -> usize {
+    let mut n = 0;
+    for f in report.findings.iter().filter(|f| f.rule == rule) {
+        let anchor = facts
+            .iter_mut()
+            .find(|e| e.permalink == f.permalink)
+            .expect("the anchor is in scope");
+        anchor.acks.push(AckEntry {
+            rule: rule.to_string(),
+            scope: Some(f.scope.clone()),
+            note: Some("read".to_string()),
+        });
+        n += 1;
+    }
+    n
+}
+
+/// Eleven twin pairs, the ten closest acknowledged: the eleventh surfaces, the
+/// ten are counted, and nothing reads as capped. Capping before the
+/// acknowledgments were known would hide it for ever.
+#[test]
+fn v301_an_acknowledged_pair_takes_no_slot_so_the_eleventh_surfaces() {
+    let dims = 11;
+    let mut facts = Vec::new();
+    for k in 0..11usize {
+        let mut base = vec![0.0f32; dims];
+        base[k] = 1.0;
+        let mut near = base.clone();
+        near[(k + 1) % dims] = 0.01 * (k as f32 + 1.0);
+        let mut a = fact(2 * k as i64 + 1, &format!("p{k:02}-a"));
+        a.lead_vector = Some(unit(&base));
+        let mut b = fact(2 * k as i64 + 2, &format!("p{k:02}-b"));
+        b.lead_vector = Some(unit(&near));
+        facts.push(a);
+        facts.push(b);
+    }
+    let first = detect(&input(facts.clone()));
+    assert!(
+        first
+            .truncations
+            .contains(&"V301 findings capped at 10".to_string())
+    );
+    assert_eq!(acknowledge_shown(&mut facts, &first, "V301"), 10);
+    assert!(
+        !first.findings.iter().any(|f| f.permalink == "p10-a"),
+        "the loosest pair was the one cut"
+    );
+
+    let next = detect(&input(facts));
+    let left: Vec<&Finding> = next.findings.iter().filter(|f| f.rule == "V301").collect();
+    assert_eq!(left.len(), 1, "{:?}", fired(&next));
+    assert_eq!(left[0].permalink, "p10-a");
+    assert_eq!(next.acknowledged.meaning, 10);
+    assert!(
+        !next.truncations.iter().any(|t| t.starts_with("V301")),
+        "{:?}",
+        next.truncations
+    );
+}
+
+/// The same for `V302`: eleven stored rows, the ten highest acknowledged, and
+/// the eleventh surfaces - "a new disagreement still surfaces" holds past the
+/// cap.
+#[test]
+fn v302_an_acknowledged_pair_takes_no_slot_so_the_eleventh_surfaces() {
+    let mut facts = Vec::new();
+    let mut rows = Vec::new();
+    for k in 0..11i64 {
+        facts.push(observed(2 * k + 1, &format!("p{k:02}-a"), &[(3, "x")]));
+        facts.push(observed(2 * k + 2, &format!("p{k:02}-b"), &[(3, "y")]));
+        let p = 0.99 - 0.01 * k as f32;
+        rows.push(stored(2 * k + 1, 2 * k + 2, 3, "x", 3, "y", p, p));
+    }
+    let first = detect(&meaning_input(facts.clone(), rows.clone()));
+    assert!(
+        first
+            .truncations
+            .contains(&"V302 findings capped at 10".to_string())
+    );
+    assert_eq!(acknowledge_shown(&mut facts, &first, "V302"), 10);
+
+    let next = detect(&meaning_input(facts, rows));
+    let left: Vec<&Finding> = next.findings.iter().filter(|f| f.rule == "V302").collect();
+    assert_eq!(left.len(), 1, "{:?}", fired(&next));
+    assert_eq!(left[0].permalink, "p10-a");
+    assert_eq!(next.acknowledged.meaning, 10);
+    assert!(
+        !next.truncations.iter().any(|t| t.starts_with("V302")),
+        "{:?}",
+        next.truncations
+    );
+}
+
+/// The text and the probability column come from one rounded value.
+#[test]
+fn v302_rounds_the_probability_once() {
+    let a = observed(1, "one", &[(5, "x")]);
+    let b = observed(2, "two", &[(5, "y")]);
+    let f = only(
+        &detect(&meaning_input(
+            vec![a, b],
+            vec![stored(1, 2, 5, "x", 5, "y", 0.905, 0.905)],
+        )),
+        "V302",
+    );
+    let p = f
+        .counterpart
+        .as_ref()
+        .expect("the other engram")
+        .probability;
+    assert!(
+        f.finding.contains(&format!("probability {p:.2},")),
+        "{} against {p}",
+        f.finding
+    );
+    assert_eq!(p, (p * 100.0).round() / 100.0, "already two decimals");
+}
+
+/// With the model unavailable the daemon runs no pass, so neither the
+/// pending line nor the not-counted line may promise one.
+#[test]
+fn a_model_that_could_not_load_points_at_status_rather_than_a_pass() {
+    let mut sweep = meaning_input(vec![observed(1, "one", &[(5, "x")])], Vec::new());
+    sweep.contradiction_model_unavailable = true;
+    sweep.contradictions_pending = 2;
+    assert_eq!(
+        detect(&sweep).truncations,
+        vec![
+            "V302: 2 related pairs not scored: the contradiction model could not be loaded (crystalline status and crystalline doctor say why; setting evolve.contradictions again or restarting the daemon retries)"
+        ]
+    );
+    sweep.contradictions_pending = 0;
+    sweep.contradictions_uncounted = true;
+    assert_eq!(
+        detect(&sweep).truncations,
+        vec![
+            "V302: related pairs not counted: the contradiction model could not be loaded (crystalline status and crystalline doctor say why; setting evolve.contradictions again or restarting the daemon retries)"
+        ]
+    );
+    // A read-only daemon refuses the setting, so a restart is the remedy.
+    sweep.contradiction_read_only = true;
+    assert_eq!(
+        detect(&sweep).truncations,
+        vec![
+            "V302: related pairs not counted: the contradiction model could not be loaded (crystalline status and crystalline doctor say why; the daemon is read-only, so restarting it retries)"
+        ]
+    );
 }

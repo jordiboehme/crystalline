@@ -367,7 +367,7 @@ fn the_help_says_the_machine_operator_administers_every_domain() {
         let mut cmd = bin();
         isolate(&mut cmd, home.path());
         let out = cmd.args(args).output().unwrap();
-        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        let text = String::from_utf8_lossy_owned(out.stdout);
         assert!(
             text.contains("machine operator administers every domain"),
             "{args:?} must say who it acts as: {text}"

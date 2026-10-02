@@ -160,6 +160,7 @@ impl Engine {
                     &known_domains,
                     &respell,
                     p.include_acknowledged,
+                    true,
                     scope,
                     &hidden,
                 )
@@ -170,12 +171,14 @@ impl Engine {
             engrams_scanned += swept.report.engrams_scanned;
             unparsed += swept.unparsed;
             // A cap that fired is domain-local, so the merged list names the
-            // domain it fired in.
+            // domain it fired in. A line belongs to the rule it opens with and
+            // follows the same family and rule filters as the findings.
             truncations.extend(
                 swept
                     .report
                     .truncations
                     .iter()
+                    .filter(|t| truncation_in_scope(t, &families, &rules))
                     .map(|t| format!("{name} - {t}")),
             );
             // Counted before the family and rule filters below, because what an
@@ -185,6 +188,7 @@ impl Engine {
             acknowledged.temporal += swept.report.acknowledged.temporal;
             acknowledged.structure += swept.report.acknowledged.structure;
             acknowledged.redundancy += swept.report.acknowledged.redundancy;
+            acknowledged.meaning += swept.report.acknowledged.meaning;
             findings.extend(swept.report.findings);
         }
 
@@ -240,16 +244,34 @@ impl Engine {
                     "evidence": f.evidence,
                     "fix": f.fix,
                 });
-                // The pair a twin row is about, which is the value an
-                // acknowledgment for it is given for and the value the ack
-                // route takes back. Only a pair-scoped rule carries it: it is
-                // the one rule that fires more than once on an engram, so it
-                // is the one whose rows a caller has to be able to tell apart.
+                // The pair a twin or line-pair row is about, which is the value
+                // an acknowledgment for it is given for and the value the ack
+                // route takes back. Only a pair-scoped rule carries it: those
+                // are the rules that fire more than once on an engram, so they
+                // are the ones whose rows a caller has to be able to tell apart.
                 // Every other rule's acknowledgment is named by the engram and
                 // the rule alone, and a column repeating what those two fields
                 // already say would cost every queue tokens for nothing.
                 if crystalline_index::is_pair_scoped(f.rule) && !f.scope.is_empty() {
                     row["scope"] = Value::String(f.scope.clone());
+                }
+                // A V302 row names its counterpart flat, so a renderer links
+                // the other engram and shows the probability and the line
+                // similarity without parsing the evidence. Both are already
+                // rounded to the two decimals the text quotes, so the two
+                // never disagree. The two line texts ride the row once, in
+                // their own columns, never in the finding sentence.
+                if let Some(c) = &f.counterpart {
+                    row["counterpart"] = Value::String(c.permalink.clone());
+                    row["counterpart_title"] = Value::String(c.title.clone());
+                    row["counterpart_line"] = json!(c.line);
+                    row["probability"] = json!(c.probability);
+                    row["similarity"] = json!(c.similarity);
+                    row["line_text"] = Value::String(c.anchor_text.clone());
+                    row["counterpart_line_text"] = Value::String(c.text.clone());
+                    if c.more_line_pairs > 0 {
+                        row["more_line_pairs"] = json!(c.more_line_pairs);
+                    }
                 }
                 // The acknowledgment columns ride along only when they say
                 // something, so an ordinary queue row stays the flat shape every
@@ -316,6 +338,7 @@ impl Engine {
                     "temporal": acknowledged.temporal,
                     "structure": acknowledged.structure,
                     "redundancy": acknowledged.redundancy,
+                    "meaning": acknowledged.meaning,
                 },
             },
             "queue": queue,
@@ -474,12 +497,15 @@ impl Engine {
     /// dropping to a scope-less entry.
     ///
     /// **The unacknowledged finding wins when the rule fires more than once
-    /// here**, which only the pair-scoped rule does
+    /// here**, which only the pair-scoped rules do
     /// ([`crystalline_index::is_pair_scoped`]): an engram that twins two others
-    /// carries two `V301` findings and neither one is "the" finding. Taking
-    /// the first row every time made the second acknowledgment re-record the
-    /// pair the first already covered, so the other pair could never be
-    /// acknowledged at all. With every pair acknowledged the first row wins
+    /// carries two `V301` findings, one whose lines read as contradicting the
+    /// lines of two other engrams carries two `V302` findings, and an engram
+    /// pair with acknowledged line pairs carries those as suppressed `V302`
+    /// findings beside its one open line pair. None of them is "the" finding.
+    /// Taking the first row every time made the second acknowledgment
+    /// re-record the pair the first already covered, so the other pair could
+    /// never be acknowledged at all. With every pair acknowledged the first row wins
     /// again, which is what makes a re-acknowledgment update a note in place.
     async fn firing_scope(
         &self,
@@ -520,6 +546,7 @@ impl Engine {
                 &known_domains,
                 &respell,
                 true,
+                false,
                 scope,
                 &hidden,
             )
@@ -645,8 +672,8 @@ impl Engine {
     /// and like the recording half it speaks only for a
     /// [pair-scoped](crystalline_index::is_pair_scoped) rule: every other rule
     /// keeps one entry, so there is nothing to narrow. `None` takes every
-    /// entry the rule has, which is the whole of it for the ten and all pairs
-    /// at once for the one.
+    /// entry the rule has, which is the whole of it for a rule acknowledged
+    /// per engram and all pairs at once for `V301` and `V302`.
     ///
     /// Fluid's half of the take-back an agent asks for with the `remove
     /// <rule-id>` value form; both filter through [`without_ack`]. They differ
@@ -751,9 +778,14 @@ impl Engine {
     /// `Ok(None)` for a domain with no engrams: no domain row to query against
     /// and nothing to detect. An empty domain is quiet, not an error.
     ///
+    /// `count_pending` asks for `V302`'s truncation counts, which only a sweep
+    /// that renders a queue needs; the acknowledgment path passes `false`.
+    ///
     /// `hidden` is the set of domains this caller may not see. Every node from
     /// one of them, and every edge with an end on one, leaves the graph before
     /// any detector reads it.
+    // Nine, and the two flags are read by different halves of the sweep; a
+    // struct around them would sit between two private callers for no reader.
     #[allow(clippy::too_many_arguments)]
     async fn sweep_domain(
         &self,
@@ -762,6 +794,7 @@ impl Engine {
         known_domains: &[String],
         respell: &[(String, String)],
         include_acknowledged: bool,
+        count_pending: bool,
         scope: &crate::scope::Scope,
         hidden: &HashSet<String>,
     ) -> Result<Option<DomainSweep>> {
@@ -998,6 +1031,16 @@ impl Engine {
             });
         }
 
+        // `V302`'s input, only with the check on: the stored rows for the
+        // configured model and, on a sweep that renders a queue, what the
+        // daemon's last walk counted for the domain (or "not counted" when it
+        // changed since). Read, never scored or walked, and an off check
+        // reads nothing. The acknowledgment path passes
+        // `count_pending: false`, since it only needs the findings.
+        let meaning = self
+            .sweep_contradictions(domain_id, name, count_pending)
+            .await?;
+
         let input = SweepInput {
             domain: name.to_string(),
             today,
@@ -1012,6 +1055,16 @@ impl Engine {
             attachments,
             shadowed_asset_refs,
             share: self.share_facts(name).await,
+            contradictions: meaning.rows,
+            contradiction_model: meaning.model.map(|m| m.id.to_string()).unwrap_or_default(),
+            contradictions_uncounted: meaning.uncounted,
+            contradiction_model_unavailable: meaning.model_unavailable,
+            contradiction_read_only: meaning.read_only,
+            contradictions_pending: meaning.pending,
+            contradiction_candidates_capped: meaning.capped,
+            contradiction_unembedded: meaning.unembedded,
+            contradiction_vectors_capped: meaning.vectors_capped,
+            contradiction_no_line_floor: meaning.no_line_floor,
             include_acknowledged,
             // The sweep module's own constants, never literals repeated here:
             // the thresholds and the twin caps are one place, and nothing
@@ -1019,7 +1072,16 @@ impl Engine {
             // satisfy and a future settings surface has to keep - the pairs
             // retained bound the findings emitted, so `max_twin_pairs` stays
             // above `max_twin_findings` or the cap on findings is unreachable.
-            options: SweepOptions::default(),
+            options: SweepOptions {
+                // The `V302` finding line is per model: score distributions
+                // differ.
+                contradiction_threshold: meaning
+                    .model
+                    .map_or(SweepOptions::default().contradiction_threshold, |m| {
+                        m.threshold
+                    }),
+                ..SweepOptions::default()
+            },
         };
         let report = detect(&input);
         Ok(Some(DomainSweep { report, unparsed }))
@@ -1162,5 +1224,23 @@ impl Engine {
         }
         graph.nodes.sort_by_key(|n| n.id.0);
         Ok(graph)
+    }
+}
+
+/// Whether a truncation line passes the family and rule filters. Every line
+/// the sweep writes opens with its rule id (`V302: ...`, `V201 skipped ...`);
+/// a line that names no known rule is kept, so a filter never hides a note it
+/// cannot place.
+fn truncation_in_scope(line: &str, families: &[Family], rules: &[&str]) -> bool {
+    let id: String = line
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric())
+        .collect();
+    match rule_info(&id) {
+        Some(info) => {
+            (families.is_empty() || families.contains(&info.family))
+                && (rules.is_empty() || rules.contains(&info.id))
+        }
+        None => true,
     }
 }

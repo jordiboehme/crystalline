@@ -85,6 +85,21 @@ pub enum IndexError {
     /// The embedding model or its inference failed.
     #[error("embedding error: {0}")]
     Embedding(String),
+    /// The contradiction check's NLI model failed to download, load or score.
+    /// Kept distinct from `Embedding`: the two model families are unrelated to
+    /// a person reading `status` or `doctor`, and calling an NLI failure an
+    /// "embedding error" there would be confusing. The message already names
+    /// the model and its repository (the loader's own hub errors are mapped
+    /// into this variant at the call site).
+    #[error("contradiction model error: {0}")]
+    Nli(String),
+    /// The contradiction check's NLI model could not be fetched: the model
+    /// cache directory could not be made or the download failed. Rendered
+    /// like [`IndexError::Nli`], but kept apart because it is worth trying
+    /// again later on its own (a laptop comes back online, a proxy recovers),
+    /// where a checkpoint that fails to build is not.
+    #[error("contradiction model error: {0}")]
+    NliFetch(String),
     /// A remote embedding endpoint returned an error or was unreachable.
     #[error("remote embedding error: {0}")]
     Remote(String),

@@ -11,7 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { RELOCK_DELAY_MS } from "../core/input";
 import { PAUSE_ESC_GUARD_MS } from "../session";
-import { PAUSE_LEGEND } from "./keys";
+import { GAME_LEGEND, PAUSE_LEGEND } from "./keys";
 import {
   CONT_LABEL,
   PAUSE_LABEL,
@@ -76,6 +76,9 @@ describe("PauseScreen", () => {
     const items = legend.split(" · ");
     expect(items.length).toBeGreaterThan(5);
     expect(items).toContain("I\u00a0INVERT");
+    // Mutation caught: N AMBIENCE missing from either legend.
+    expect(PAUSE_LEGEND.endsWith(" · M SOUND · N AMBIENCE")).toBe(true);
+    expect(GAME_LEGEND.endsWith(" · M SOUND · N AMBIENCE")).toBe(true);
     for (const item of items) expect(item).not.toContain(" ");
     const cont = screen.getByRole("button", { name: CONT_LABEL });
     expect(cont).toBeEnabled();

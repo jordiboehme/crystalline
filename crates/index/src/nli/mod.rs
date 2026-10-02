@@ -1,0 +1,218 @@
+//! The contradiction check's model side: which NLI model a profile runs, the
+//! pure rules that pick and pair what gets scored, the scorer seam and a stub
+//! for tests. The daemon pass that drives it lives in the engine; the sweep
+//! that reads its stored output lives in [`crate::sweep`].
+//!
+//! Everything here but the candle loader is compiled into every build, so the
+//! profile table, status and doctor behave the same with and without the
+//! `local-embeddings` feature.
+
+pub mod candidates;
+#[cfg(feature = "local-embeddings")]
+pub mod local;
+pub mod models;
+pub mod period;
+mod stub;
+
+pub use candidates::{
+    CandidateFacts, CandidatePair, Candidates, KeptLine, LinePairs, LineRules,
+    contradiction_candidates, eligible, eligible_lines, expired, first_order_inputs, fold,
+    length_order, line_pairs, line_rows, max_related_pairs, observation_hash, observations_digest,
+    pending_pairs, related_threshold, scoring_checksum, second_order_input, second_order_needed,
+    similar_line_pairs, windows_overlap,
+};
+pub use models::{
+    CONTRADICTION_SETTING_VALUES, NLI_MODELS, NliModel, NliProfile, RETIRED_NLI_REPOS,
+    accepted_setting_values, is_nli_checkpoint, nli_model, nli_model_by_repo, repo_weights_cached,
+    unknown_setting_note, weights_cached,
+};
+pub use period::names_period;
+pub use stub::StubScorer;
+
+use crate::error::Result;
+
+/// How many ordered pairs one scorer call takes.
+pub const NLI_BATCH_SIZE: usize = 16;
+
+/// How many kept line pairs one scoring group takes across engram pairs, so
+/// the length-sorted batches of [`NLI_BATCH_SIZE`] fill up even though most
+/// engram pairs keep only a few line pairs. A group holds whole engram pairs:
+/// it closes once it reaches this many, so it holds at most this many plus
+/// [`crate::sweep::MAX_LINE_PAIRS_PER_ENGRAM_PAIR`] minus one.
+pub const NLI_GROUP_LINE_PAIRS: usize = 128;
+
+/// Each line is cut to this many model tokens, so a pair and its separators
+/// fit the 512-token window.
+pub const MAX_LINE_TOKENS: usize = 254;
+
+/// The kept line pairs one daemon pass scores before it yields. Each costs
+/// one forward pass in the first reading order, and a second only where the
+/// aggregation needs it ([`OrderAggregation::skips_second_order_below_floor`]).
+pub const MAX_INFERENCES_PER_PASS: usize = 2000;
+
+/// Whether this build carries the local NLI loader.
+pub const LOCAL_NLI_AVAILABLE: bool = cfg!(feature = "local-embeddings");
+
+/// What a build without the loader answers when a profile is asked for.
+pub const NLI_FEATURE_MISSING: &str =
+    "contradiction scoring needs the local-embeddings feature, which this build does not carry";
+
+/// Scores ordered sentence pairs for contradiction. Synchronous: inference
+/// blocks (on the CPU, or waiting for the GPU), and the caller runs it on a
+/// blocking thread.
+pub trait ContradictionScorer: Send + Sync {
+    /// The softmax contradiction probability of each `(premise, hypothesis)`
+    /// pair, in order. The caller batches by [`NLI_BATCH_SIZE`].
+    fn score(&self, pairs: &[(String, String)]) -> Result<Vec<f32>>;
+
+    /// The Hugging Face repository the scores are stored against.
+    fn model_repo(&self) -> &str;
+
+    /// The device the loaded model runs on ([`crate::device`]). `None` for a
+    /// scorer that runs no model (the test stub).
+    fn device(&self) -> Option<crate::device::DeviceReport> {
+        None
+    }
+}
+
+/// The classifier row that means "contradiction", read from the checkpoint's
+/// `id2label` and never assumed: label order differs between checkpoints. A
+/// checkpoint without the label (a binary entailment model) is refused with
+/// its label list. Only the loader reads it, so a build without the loader
+/// compiles it for the label-rule test alone.
+#[cfg(any(feature = "local-embeddings", test))]
+pub(crate) fn contradiction_index(
+    id2label: &std::collections::BTreeMap<u32, String>,
+) -> Result<usize> {
+    match id2label
+        .iter()
+        .find(|(_, l)| l.eq_ignore_ascii_case("contradiction"))
+    {
+        Some((i, _)) => Ok(*i as usize),
+        None => Err(crate::error::IndexError::Invalid(format!(
+            "the checkpoint's labels carry no 'contradiction' entry: {}",
+            id2label
+                .iter()
+                .map(|(i, l)| format!("{i}={l}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    }
+}
+
+/// Load `model`, downloading it on first use. A build without the
+/// `local-embeddings` feature refuses with [`NLI_FEATURE_MISSING`].
+#[cfg(feature = "local-embeddings")]
+pub async fn load_scorer(
+    model: &'static NliModel,
+) -> Result<std::sync::Arc<dyn ContradictionScorer>> {
+    Ok(std::sync::Arc::new(local::LocalNli::load(model).await?))
+}
+
+/// Load `model`, downloading it on first use. A build without the
+/// `local-embeddings` feature refuses with [`NLI_FEATURE_MISSING`].
+#[cfg(not(feature = "local-embeddings"))]
+pub async fn load_scorer(
+    _model: &'static NliModel,
+) -> Result<std::sync::Arc<dyn ContradictionScorer>> {
+    Err(crate::error::IndexError::Unsupported(
+        NLI_FEATURE_MISSING.to_string(),
+    ))
+}
+
+/// How the two reading orders of a line pair combine into one score.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderAggregation {
+    /// The mean of both orders.
+    Mean,
+    /// The lower of both orders: a true contradiction is symmetric, and a
+    /// one-sided high score often means one line is only more specific.
+    Min,
+}
+
+impl OrderAggregation {
+    /// The combined score of `ab` (a as premise) and `ba` (b as premise).
+    pub fn combine(self, ab: f32, ba: f32) -> f32 {
+        match self {
+            OrderAggregation::Mean => (ab + ba) / 2.0,
+            // `f32::min` ignores a NaN operand, which would let the other
+            // order alone clear the line; a NaN in either order stays a NaN,
+            // as it does under `Mean`, and a NaN never clears a threshold.
+            OrderAggregation::Min if ab.is_nan() || ba.is_nan() => f32::NAN,
+            OrderAggregation::Min => ab.min(ba),
+        }
+    }
+
+    /// Whether a line pair whose first order is below the store floor can be
+    /// left unread in the second order. True under `Min`: the minimum of both
+    /// orders is at most the first, so it can never reach a finding line. A
+    /// switch to `Mean` reads both orders again, with nobody having to
+    /// remember this rule.
+    pub fn skips_second_order_below_floor(self) -> bool {
+        matches!(self, OrderAggregation::Min)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_contradiction_label_is_read_never_assumed() {
+        let labels: std::collections::BTreeMap<u32, String> = [
+            (0, "entailment".to_string()),
+            (1, "neutral".to_string()),
+            (2, "contradiction".to_string()),
+        ]
+        .into();
+        assert_eq!(contradiction_index(&labels).unwrap(), 2);
+        let shouting: std::collections::BTreeMap<u32, String> = [
+            (0, "CONTRADICTION".to_string()),
+            (1, "ENTAILMENT".to_string()),
+            (2, "NEUTRAL".to_string()),
+        ]
+        .into();
+        assert_eq!(
+            contradiction_index(&shouting).unwrap(),
+            0,
+            "case-insensitive"
+        );
+        let binary: std::collections::BTreeMap<u32, String> = [
+            (0, "entailment".to_string()),
+            (1, "not_entailment".to_string()),
+        ]
+        .into();
+        let err = contradiction_index(&binary).unwrap_err().to_string();
+        assert!(
+            err.contains("0=entailment, 1=not_entailment"),
+            "the refusal lists the labels: {err}"
+        );
+    }
+
+    #[cfg(not(feature = "local-embeddings"))]
+    #[tokio::test]
+    async fn a_build_without_the_feature_refuses_every_profile() {
+        for model in &NLI_MODELS {
+            let err = load_scorer(model).await.err().expect("refused").to_string();
+            assert!(err.ends_with(NLI_FEATURE_MISSING), "{err}");
+        }
+    }
+
+    #[test]
+    fn the_two_aggregations_combine_both_orders() {
+        assert!((OrderAggregation::Mean.combine(0.9, 0.5) - 0.7).abs() < 1e-6);
+        assert_eq!(OrderAggregation::Min.combine(0.9, 0.5), 0.5);
+        for how in [OrderAggregation::Mean, OrderAggregation::Min] {
+            assert!(how.combine(f32::NAN, 0.99).is_nan(), "{how:?}");
+            assert!(how.combine(0.99, f32::NAN).is_nan(), "{how:?}");
+        }
+    }
+
+    /// 11c: under Min a first order below the store floor can never fire, so
+    /// the second is skipped; Mean needs both.
+    #[test]
+    fn only_min_skips_the_second_order() {
+        assert!(OrderAggregation::Min.skips_second_order_below_floor());
+        assert!(!OrderAggregation::Mean.skips_second_order_below_floor());
+    }
+}

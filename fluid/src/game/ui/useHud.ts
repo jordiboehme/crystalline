@@ -9,13 +9,12 @@
  * `Hud` hands its elements over through callback refs (`HudView`), and the
  * sink writes each one's `textContent`, so a title or heading from an
  * engram is shown as the characters it is. The connector and the reader
- * change once per journey or terminal, so they are React state for the
+ * change once per journey or reading, so they are React state for the
  * host to render.
  */
 
 import { useEffect, useState } from "react";
 
-import type { LookId } from "../render/looks";
 import type { HudSink, ReaderState } from "../session";
 import { CONNECTOR_MIN_MS, type ConnectorState } from "./Connector";
 
@@ -38,7 +37,7 @@ export interface HudBindings {
   view: HudView;
   /** The connector as the sink last set it, held up for its minimum. */
   connector: ConnectorState;
-  /** The reader's content while a terminal is read, else null. */
+  /** The reader's content while a fixture is read, else null. */
   reader: ReaderState | null;
 }
 
@@ -58,11 +57,10 @@ function write(el: HTMLElement | null, text: string | null) {
  * has been up for `CONNECTOR_MIN_MS`; a pending hide is dropped when the
  * host unmounts.
  */
-export function useHud(initialLook: LookId = "aperture"): HudBindings {
+export function useHud(): HudBindings {
   const [connector, setConnector] = useState<ConnectorState>({
     active: false,
     label: "",
-    look: initialLook,
   });
   const [reader, setReader] = useState<ReaderState | null>(null);
 
@@ -109,21 +107,21 @@ export function useHud(initialLook: LookId = "aperture"): HudBindings {
       notice: (text) => {
         set("notice", text);
       },
-      connector: (active, label, look) => {
+      connector: (active, label) => {
         cancelHide();
         if (active) {
           shownAt = performance.now();
-          setConnector({ active: true, label, look });
+          setConnector({ active: true, label });
           return;
         }
         const left = CONNECTOR_MIN_MS - (performance.now() - shownAt);
         if (left <= 0) {
-          setConnector({ active: false, label, look });
+          setConnector({ active: false, label });
           return;
         }
         hideTimer = setTimeout(() => {
           hideTimer = null;
-          setConnector({ active: false, label, look });
+          setConnector({ active: false, label });
         }, left);
       },
       reader: setReader,

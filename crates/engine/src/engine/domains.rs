@@ -326,6 +326,9 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
+        // Saved as LF, the one line ending anything is stored with.
+        let markdown = crystalline_core::to_lf(markdown);
+        let markdown: &str = &markdown;
         // Same hard gate as `save_engram`: a MANIFEST with no frontmatter (or
         // an empty block) is not a manifest at all - it carries the domain's
         // routing bullets and Tag Aliases, so losing the frontmatter here

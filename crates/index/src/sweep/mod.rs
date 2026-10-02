@@ -5,7 +5,7 @@
 //! it well organized?". This module is that third question, expressed as
 //! detectors over prepared facts.
 //!
-//! Three families, four letters:
+//! Four families, four letters:
 //!
 //! - `V0xx` **temporal and lifecycle** - a validity window that closed, a
 //!   staleness date that elapsed, a replacement that landed without the
@@ -19,10 +19,10 @@
 //!   tag spellings that drifted apart;
 //! - `V3xx` **meaning** - `V301`, two current engrams whose lead embeddings
 //!   sit at or above the twin threshold: knowledge that says the same thing
-//!   twice in different words. Filed under the redundancy family, because
-//!   that is what it is. It compares meaning to find twins and still never
-//!   confirms a contradiction, which no rule here can: two texts close in
-//!   embedding space agree about their topic, not about what is true.
+//!   twice in different words; and `V302`, two observation lines a local NLI
+//!   model read as a possible contradiction, from scores the daemon stored.
+//!   `V302` names a possible contradiction the model read; `V301` still only
+//!   says two engrams are about the same thing. Neither confirms one.
 //!
 //! # Detect and guide, never auto-consolidate
 //!
@@ -48,6 +48,7 @@
 //! follows the tag clusterer, which is likewise a store-free detector library
 //! living in the index crate because its inputs speak the index's vocabulary.
 
+mod contradictions;
 pub mod dedupe;
 pub mod twins;
 
@@ -57,9 +58,10 @@ use chrono::NaiveDate;
 use crystalline_core::similarity::{dice_coefficient, normalize};
 use serde::Serialize;
 
+use crate::nli::OrderAggregation;
 use crate::store::{
-    AttachmentRow, EdgeKind, EngramId, GraphEdge, GraphNode, GraphSlice, TagAlias, TagCount,
-    is_current_status, is_retired_status,
+    AttachmentRow, ContradictionRow, EdgeKind, EngramId, GraphEdge, GraphNode, GraphSlice,
+    TagAlias, TagCount, is_current_status, is_retired_status,
 };
 use crate::vocab::{tag_clusters, tag_clusters_with_aliases};
 
@@ -118,6 +120,50 @@ pub const MAX_TWIN_PAIRS: usize = 1000;
 
 /// The most `V301` findings one domain sweep emits, closest pairs first.
 pub const MAX_TWIN_FINDINGS: usize = 10;
+
+/// The lead-vector cosine at or above which two engrams are related enough for
+/// the contradiction check to score their observation lines. Measured on the
+/// probes corpus (research/2026-09-30-contradiction-measurement.md): 0.70 to
+/// 0.85 gave identical results there, and a lower value adds scoring work
+/// without a measured gain, so it stays at 0.80. Always below
+/// [`TWIN_THRESHOLD`], so twins are scored too. The eval harness overrides it
+/// with `CRYSTALLINE_NLI_RELATED`.
+pub const RELATED_THRESHOLD: f64 = 0.80;
+
+/// The most related pairs one domain keeps for scoring, highest cosine first.
+/// The eval harness overrides it with `CRYSTALLINE_NLI_MAX_PAIRS`.
+pub const MAX_RELATED_PAIRS: usize = 2000;
+
+/// The safety cap on the observation line pairs the NLI model reads per
+/// engram pair. Every line pair at or above the embedding model's
+/// line-similarity floor (`crate::embed::line_similarity_floor`) is read,
+/// every line of one engram against every line of the other; only when more
+/// than this many stand above the floor are the most similar kept, and the
+/// daemon logs once per walk how many engram pairs the cap bound on. An
+/// earlier limit of four picked by similarity before scoring and dropped a
+/// real contradiction ranked seventh among 24 same-subject line pairs
+/// (research/2026-10-01-v302-line-filter-measurement.md); 32 only bounds the
+/// worst case.
+pub const MAX_LINE_PAIRS_PER_ENGRAM_PAIR: usize = 32;
+
+/// A line pair is stored when its first reading order (the lower-id engram's
+/// line as premise) is at or above this under `Min`, which is also the only
+/// case where the second order is read at all: below it the minimum of both
+/// orders can never reach a finding line (every model threshold is above 0.5,
+/// pinned in `nli/models.rs`). Under `Mean` both orders are read and either
+/// one at the floor stores the pair. The finding line can move without a
+/// rescore as long as it stays above this.
+pub const CONTRADICTION_STORE_FLOOR: f32 = 0.5;
+
+/// How the two reading orders of a line pair combine into its score. `Min`
+/// reached the same recall as `Mean` with higher precision for the `full`
+/// model on the probes corpus (research/2026-09-30-contradiction-measurement.md).
+/// Both raw orders are stored, so a change needs no rescore.
+pub const ORDER_AGGREGATION: OrderAggregation = OrderAggregation::Min;
+
+/// The most `V302` findings one domain sweep emits, one per engram pair,
+/// highest score first.
+pub const MAX_CONTRADICTION_FINDINGS: usize = 10;
 
 /// The shortest normalized body `V201` will score. Below this the Dice
 /// coefficient is dominated by common English bigrams and two unrelated stubs
@@ -233,7 +279,7 @@ pub const RECIPROCAL_PAIRS: [(&str, &str); 3] = [
 // Vocabulary
 // ---------------------------------------------------------------------------
 
-/// The three detector families.
+/// The four detector families.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Family {
@@ -241,14 +287,21 @@ pub enum Family {
     Temporal,
     /// `V1xx`: references, reciprocity, orphans, stubs and size.
     Structure,
-    /// `V2xx` and `V301`: duplicate content, semantic twins, colliding titles
-    /// and tag drift.
+    /// `V2xx`: duplicate content, colliding titles and tag drift.
     Redundancy,
+    /// `V3xx`: what two engrams say. Semantic twins by embedding, and the
+    /// observation lines a local model read as a possible contradiction.
+    Meaning,
 }
 
 impl Family {
     /// Every family, in catalog order.
-    pub const ALL: [Family; 3] = [Family::Temporal, Family::Structure, Family::Redundancy];
+    pub const ALL: [Family; 4] = [
+        Family::Temporal,
+        Family::Structure,
+        Family::Redundancy,
+        Family::Meaning,
+    ];
 
     /// The wire name.
     pub fn as_str(self) -> &'static str {
@@ -256,6 +309,7 @@ impl Family {
             Family::Temporal => "temporal",
             Family::Structure => "structure",
             Family::Redundancy => "redundancy",
+            Family::Meaning => "meaning",
         }
     }
 
@@ -320,7 +374,7 @@ pub struct RuleInfo {
 
 /// The full rule catalog, in id order. The single place a base priority or a
 /// prescribed action is written down.
-pub const RULES: [RuleInfo; 25] = [
+pub const RULES: [RuleInfo; 26] = [
     RuleInfo {
         id: "V001",
         family: Family::Temporal,
@@ -491,10 +545,17 @@ pub const RULES: [RuleInfo; 25] = [
     },
     RuleInfo {
         id: "V301",
-        family: Family::Redundancy,
+        family: Family::Meaning,
         base: 75,
         summary: "semantic twins",
-        instruction: "These two current engrams say close to the same thing by meaning though their wording differs. Similarity is not a contradiction: this sweep still cannot confirm one. Read both. If one owns the topic, merge into it and supersede the other after repointing every inbound link. If they disagree on a fact, reconcile per the capture skill's falsification test. If they are genuinely distinct, link them and acknowledge with evolve_ack V301 so the finding stops.",
+        instruction: "These two current engrams say close to the same thing by meaning though their wording differs. Similarity is not a contradiction: V302 names a possible contradiction the model read; V301 still only says two engrams are about the same thing. Read both. If one owns the topic, merge into it and supersede the other after repointing every inbound link. If they disagree on a fact, reconcile per the capture skill's falsification test. If they are genuinely distinct, link them and acknowledge with evolve_ack V301 so the finding stops.",
+    },
+    RuleInfo {
+        id: "V302",
+        family: Family::Meaning,
+        base: 85,
+        summary: "possible contradiction",
+        instruction: "The model read these two observations as contradicting each other. It can be wrong, and it cannot see dates. Read both engrams. If one is false going forward, supersede it per the capture skill's falsification test. If both held in different periods, close the older one's validity window. If they do not contradict, acknowledge it with edit_engram set_frontmatter evolve_ack 'V302 <note>' and it stays silent for these two lines.",
     },
 ];
 
@@ -511,23 +572,26 @@ const SCOPE_SEPARATOR: &str = ", ";
 
 /// Whether `rule` is acknowledged **per pair** rather than per engram.
 ///
-/// `V301` is the one, and the distinction is about what an acknowledgment
-/// answers for rather than about how often a rule fires. Every other rule's
-/// acknowledgment is the engram's answer about that rule: re-acknowledging
-/// replaces the entry, and an entry whose scope no longer matches is that
-/// answer gone stale, which is what [`apply_acknowledgments`] reports. That
-/// holds even where such a rule fires more than once on one engram, as `V103`
-/// does over the three [`RECIPROCAL_PAIRS`]: those findings share the one
-/// answer, so acknowledging the second replaces the first and leaves the other
-/// marked stale wearing its note. An engram that twins two others carries two
-/// `V301` findings and neither one is an answer about the engram, so a twin
-/// acknowledgment is stored per pair and a pair with no entry of its own is a
-/// plain finding rather than a stale one - nobody has answered it yet.
+/// `V301` and `V302` are the two, and the distinction is about what an
+/// acknowledgment answers for rather than about how often a rule fires. Every
+/// other rule's acknowledgment is the engram's answer about that rule:
+/// re-acknowledging replaces the entry, and an entry whose scope no longer
+/// matches is that answer gone stale, which is what [`apply_acknowledgments`]
+/// reports. That holds even where such a rule fires more than once on one
+/// engram, as `V103` does over the three [`RECIPROCAL_PAIRS`]: those findings
+/// share the one answer, so acknowledging the second replaces the first and
+/// leaves the other marked stale wearing its note. An engram that twins two
+/// others carries two `V301` findings, and one whose lines read as
+/// contradicting two others' carries two `V302` findings; neither is an
+/// answer about the engram, so those acknowledgments are stored per pair (a
+/// twin pair, or a pair of observation lines) and a pair with no entry of its
+/// own is a plain finding rather than a stale one - nobody has answered it
+/// yet.
 ///
 /// Read by the sweep here and by the engine's `evolve_ack` write path, which
 /// keys its entries the same way. One predicate, so the two cannot drift.
 pub fn is_pair_scoped(rule: &str) -> bool {
-    rule.eq_ignore_ascii_case("V301")
+    rule.eq_ignore_ascii_case("V301") || rule.eq_ignore_ascii_case("V302")
 }
 
 /// The stable discriminator for a finding: the evidence an acknowledgment was
@@ -553,6 +617,10 @@ pub fn is_pair_scoped(rule: &str) -> bool {
 ///   an acknowledgment of a deliberate custom permalink holds exactly as long
 ///   as neither changes, and re-filing the engram or renaming the permalink
 ///   asks the question again;
+/// - `V302` names **a pair of lines**: the two engram addresses, lower first,
+///   then the hash of each one's line in the same order. Joined as given and
+///   never sorted, so each hash stays beside its engram and two swapped lines
+///   are a different scope;
 /// - every other rule's identity is just (engram, rule) - the plain temporal
 ///   rules, orphans, stubs, size, tag drift and the anchorless orphaned
 ///   attachment - and carries an empty scope, which matches whatever the engram
@@ -565,7 +633,7 @@ fn scope_for(rule: &str, mut parts: Vec<String>) -> String {
             parts.join(SCOPE_SEPARATOR)
         }
         "V007" | "V008" | "V110" => parts.into_iter().next().unwrap_or_default(),
-        "V109" => parts.join(SCOPE_SEPARATOR),
+        "V109" | "V302" => parts.join(SCOPE_SEPARATOR),
         _ => String::new(),
     }
 }
@@ -602,8 +670,10 @@ pub struct AckCounts {
     pub temporal: usize,
     /// Suppressed `V1xx` findings.
     pub structure: usize,
-    /// Suppressed redundancy findings: `V2xx` and `V301`.
+    /// Suppressed `V2xx` findings.
     pub redundancy: usize,
+    /// Suppressed `V3xx` findings.
+    pub meaning: usize,
 }
 
 impl AckCounts {
@@ -614,6 +684,7 @@ impl AckCounts {
             Family::Temporal => self.temporal += 1,
             Family::Structure => self.structure += 1,
             Family::Redundancy => self.redundancy += 1,
+            Family::Meaning => self.meaning += 1,
         }
     }
 }
@@ -903,6 +974,13 @@ pub struct SweepOptions {
     pub max_twin_pairs: usize,
     /// See [`MAX_TWIN_FINDINGS`].
     pub max_twin_findings: usize,
+    /// The `V302` finding line for the aggregated score: the configured
+    /// model's `threshold` from the NLI table.
+    pub contradiction_threshold: f32,
+    /// See [`ORDER_AGGREGATION`].
+    pub order_aggregation: OrderAggregation,
+    /// See [`MAX_CONTRADICTION_FINDINGS`].
+    pub max_contradiction_findings: usize,
 }
 
 impl Default for SweepOptions {
@@ -924,6 +1002,9 @@ impl Default for SweepOptions {
             max_twin_vectors: MAX_TWIN_VECTORS,
             max_twin_pairs: MAX_TWIN_PAIRS,
             max_twin_findings: MAX_TWIN_FINDINGS,
+            contradiction_threshold: crate::nli::NLI_MODELS[0].threshold,
+            order_aggregation: ORDER_AGGREGATION,
+            max_contradiction_findings: MAX_CONTRADICTION_FINDINGS,
         }
     }
 }
@@ -1015,6 +1096,41 @@ pub struct SweepInput {
     /// same thing as far as a detector is concerned: nothing is known to be
     /// unshared).
     pub share: Option<ShareFacts>,
+    /// The stored contradiction rows for the configured NLI model, `V302`'s
+    /// input. Empty when the check is off, which keeps the rule silent.
+    pub contradictions: Vec<ContradictionRow>,
+    /// The short id of the model the rows came from, for the evidence.
+    pub contradiction_model: String,
+    /// No walk of the daemon's has counted the domain as it stands now (a
+    /// write since the last walk, or a process that never walked), so the
+    /// counts below are unknown rather than zero. A truncation line of its
+    /// own: an unknown count never reads as a clean domain.
+    pub contradictions_uncounted: bool,
+    /// The configured model could not be loaded and the daemon waits for the
+    /// setting to be set again, so the lines above name that and point at
+    /// `status` and `doctor` rather than promise a pass that will not run.
+    pub contradiction_model_unavailable: bool,
+    /// The daemon serves read-only and refuses a set setting, so the line for
+    /// an unavailable model names a restart as the one way to retry.
+    pub contradiction_read_only: bool,
+    /// Related pairs the daemon has not scored yet; a non-zero count is a
+    /// truncation line, so a quiet `V302` never reads as a clean domain.
+    pub contradictions_pending: usize,
+    /// The related pairs reached the per-domain cap, so the least related are
+    /// never scored.
+    pub contradiction_candidates_capped: bool,
+    /// Current engrams with observations that have no lead vector yet: they
+    /// can take part in a related pair once embedded, so a non-zero count is
+    /// a truncation line too (lesson 37: partial coverage never reads as a
+    /// clean domain).
+    pub contradiction_unembedded: usize,
+    /// How many lead vectors the candidate walk met when the scope is over
+    /// [`SweepOptions::max_twin_vectors`] and nothing was compared, reported
+    /// the way `V301` reports its own skip. `None` when the walk ran.
+    pub contradiction_vectors_capped: Option<usize>,
+    /// The embedding model id when it has no measured line-similarity floor:
+    /// `V302` does not run and one truncation line says why.
+    pub contradiction_no_line_floor: Option<String>,
     /// Return the findings acknowledgments suppressed anyway, each marked
     /// [`Finding::acknowledged`] with the scope and note that silenced it. An
     /// audit view: the queue a run hands out drops them.
@@ -1041,6 +1157,16 @@ impl SweepInput {
             attachments: Vec::new(),
             shadowed_asset_refs: Vec::new(),
             share: None,
+            contradictions: Vec::new(),
+            contradiction_model: String::new(),
+            contradictions_uncounted: false,
+            contradiction_model_unavailable: false,
+            contradiction_read_only: false,
+            contradictions_pending: 0,
+            contradiction_candidates_capped: false,
+            contradiction_unembedded: 0,
+            contradiction_vectors_capped: None,
+            contradiction_no_line_floor: None,
             include_acknowledged: false,
             options: SweepOptions::default(),
         }
@@ -1116,6 +1242,35 @@ pub struct Finding {
     /// finding, or when the one that did carries no scope and so acknowledged
     /// nothing in particular.
     pub ack_scope: Option<String>,
+    /// The other engram of a pair finding. `V302` fills it; every other rule
+    /// leaves `None`. Skipped by the derived serialization: the engine renders
+    /// it as flat queue columns.
+    #[serde(skip)]
+    pub counterpart: Option<Counterpart>,
+}
+
+/// The other engram of a `V302` finding, flat, so a renderer can link it and
+/// show the score without parsing the evidence column.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Counterpart {
+    /// The other engram's permalink, in the finding's own domain.
+    pub permalink: String,
+    /// Its title.
+    pub title: String,
+    /// The one-based line of its observation.
+    pub line: usize,
+    /// The aggregated contradiction probability, rounded to two decimals:
+    /// the same number the finding's text quotes.
+    pub probability: f64,
+    /// The line similarity of the evidence pair, rounded to two decimals.
+    pub similarity: f64,
+    /// The anchor engram's line, cut to about 200 characters.
+    pub anchor_text: String,
+    /// The other engram's line, cut the same way.
+    pub text: String,
+    /// The other standing, unacknowledged line pairs of the same two engrams
+    /// at or above the finding line.
+    pub more_line_pairs: usize,
 }
 
 impl Finding {
@@ -1145,6 +1300,7 @@ impl Finding {
             ack_stale: false,
             ack_note: None,
             ack_scope: None,
+            counterpart: None,
         }
     }
 
@@ -1169,6 +1325,7 @@ impl Finding {
             ack_stale: false,
             ack_note: None,
             ack_scope: None,
+            counterpart: None,
         }
     }
 
@@ -1203,6 +1360,20 @@ impl Finding {
     /// nothing here keeps the empty scope, which any acknowledgment matches.
     fn scoped(mut self, parts: impl IntoIterator<Item = String>) -> Finding {
         self.scope = scope_for(self.rule, parts.into_iter().collect());
+        self
+    }
+
+    /// Set a scope the caller already shaped with [`scope_for`], so a
+    /// detector that tested it against the acknowledgments first carries the
+    /// very same bytes.
+    fn scoped_as(mut self, scope: String) -> Finding {
+        self.scope = scope;
+        self
+    }
+
+    /// Name the other engram of a pair finding.
+    fn with_counterpart(mut self, counterpart: Counterpart) -> Finding {
+        self.counterpart = Some(counterpart);
         self
     }
 }
@@ -1257,23 +1428,36 @@ pub fn priority(base: u8, salience: Option<f64>, inbound: usize, human_authored:
     (i64::from(base) + boost + hub + human).clamp(0, i64::from(MAX_PRIORITY)) as u8
 }
 
-/// Sort findings into queue order: priority descending, then rule, domain and
-/// permalink ascending. The sort is stable, so findings a rule emitted in a
-/// deterministic order keep that order when every key ties.
+/// Sort findings into queue order: priority descending, then rule and domain
+/// ascending, then a `V302` row's probability descending (its findings are
+/// sorted by score, highest first), then permalink ascending. The sort is
+/// stable, so findings a rule emitted in a deterministic order keep that order
+/// when every key ties.
 ///
 /// **That stability is load-bearing, not a convenience.** Two `V301` findings
-/// on one engram tie on every key here - same anchor, so the same priority -
-/// and the engine's `evolve_ack` write path acknowledges "the first finding
-/// still standing" for a rule on an engram. A switch to `sort_unstable_by`
-/// would make which twin pair an acknowledgment lands on depend on the sort's
-/// internals, so keep the stable sort and let `find_twins`' deterministic
-/// emission order settle the ties.
+/// on one engram tie on every key here, and two `V302` findings on one engram
+/// (same anchor, so the same priority) tie when their probabilities are equal;
+/// otherwise they order by probability, which is the detector's own emission
+/// order. The engine's `evolve_ack` write path acknowledges "the first finding
+/// still standing" for a rule on an engram, so it lands on the strongest open
+/// line pair. A switch to `sort_unstable_by` would make which pair an
+/// acknowledgment lands on depend on the sort's internals for the exact ties,
+/// so keep the stable sort and let each detector's deterministic emission
+/// order (`find_twins`' for `V301`, highest score first for `V302`) settle
+/// them.
 pub fn rank(findings: &mut [Finding]) {
     findings.sort_by(|a, b| {
         b.priority
             .cmp(&a.priority)
             .then_with(|| a.rule.cmp(b.rule))
             .then_with(|| a.domain.cmp(&b.domain))
+            // Only `V302` carries a counterpart, and the rule is compared
+            // first, so two rows reaching here either both carry one or
+            // neither does.
+            .then_with(|| match (&a.counterpart, &b.counterpart) {
+                (Some(x), Some(y)) => y.probability.total_cmp(&x.probability),
+                _ => std::cmp::Ordering::Equal,
+            })
             .then_with(|| a.permalink.cmp(&b.permalink))
     });
 }
@@ -1296,11 +1480,70 @@ pub fn detect(input: &SweepInput) -> SweepReport {
     detect_lifecycle(input, &graph, &mut report);
     detect_structure(input, &graph, &mut report);
     detect_redundancy(input, &mut report);
+    contradictions::detect_contradictions(input, &mut report);
     detect_attachments(input, &mut report);
 
     apply_acknowledgments(input, &mut report);
     rank(&mut report.findings);
     report
+}
+
+/// The entry among `entries` that silences `finding`: one for its rule whose
+/// scope is absent or equals the finding's. The generous match wins over a
+/// stale one, so an engram carrying both a scope-less entry and an outdated
+/// scoped one is acknowledged. One predicate for [`apply_acknowledgments`]
+/// and for [`FindingCap`], so the cap and the suppression cannot disagree
+/// about which findings are silenced.
+fn matching_ack<'a>(entries: &'a [AckEntry], finding: &Finding) -> Option<&'a AckEntry> {
+    matching_ack_scope(entries, finding.rule, &finding.scope)
+}
+
+/// [`matching_ack`] for a rule and scope, so a detector can ask before it
+/// builds the finding (`V302` picks its evidence line pair this way).
+fn matching_ack_scope<'a>(
+    entries: &'a [AckEntry],
+    rule: &str,
+    scope: &str,
+) -> Option<&'a AckEntry> {
+    entries
+        .iter()
+        .filter(|a| a.rule.eq_ignore_ascii_case(rule))
+        .find(|a| a.scope.as_deref().is_none_or(|s| s == scope))
+}
+
+/// The per-domain cap of a pair rule (`V301`, `V302`), applied with the
+/// acknowledgments in view. A finding its anchor already acknowledges is
+/// emitted without taking a slot - [`apply_acknowledgments`] then counts and
+/// suppresses it - so once the highest pairs are acknowledged the next ones
+/// still surface. Capping before acknowledgments were known would hide every
+/// later pair behind ten silenced ones for ever.
+struct FindingCap {
+    /// Slots left for findings nobody has acknowledged.
+    left: usize,
+    /// An unacknowledged finding was dropped, which is a truncation line.
+    cut: bool,
+}
+
+impl FindingCap {
+    fn new(cap: usize) -> FindingCap {
+        FindingCap {
+            left: cap,
+            cut: false,
+        }
+    }
+
+    /// Emit `finding` about `anchor` unless the cap is spent and nothing on
+    /// `anchor` acknowledges it.
+    fn push(&mut self, report: &mut SweepReport, anchor: &EngramFacts, finding: Finding) {
+        if matching_ack(&anchor.acks, &finding).is_some() {
+            report.findings.push(finding);
+        } else if self.left > 0 {
+            self.left -= 1;
+            report.findings.push(finding);
+        } else {
+            self.cut = true;
+        }
+    }
 }
 
 /// Drop the findings an acknowledgment silences, count them, and mark the ones
@@ -1317,10 +1560,10 @@ pub fn detect(input: &SweepInput) -> SweepReport {
 ///   different thing to read than a fresh finding. One entry is what a rule
 ///   acknowledged per engram always has, since the write path replaces it;
 /// - nothing matches and the rule is pair-scoped ([`is_pair_scoped`], which is
-///   `V301`): **returned plain**. A twin acknowledgment answers one pair, so a
-///   pair with no entry of its own is unanswered rather than stale, and lending
-///   it another pair's note would tell a reader they have seen evidence they
-///   have not;
+///   `V301` and `V302`): **returned plain**. A twin or line-pair
+///   acknowledgment answers one pair, so a pair with no entry of its own is
+///   unanswered rather than stale, and lending it another pair's note would
+///   tell a reader they have seen evidence they have not;
 /// - nothing matches and the engram carries several entries for the rule, which
 ///   only a hand-edited file can hold for a rule acknowledged per engram:
 ///   **returned plain**, since which of them went stale is unknowable;
@@ -1345,13 +1588,7 @@ fn apply_acknowledgments(input: &SweepInput, report: &mut SweepReport) {
         let Some(entries) = acks.get(finding.permalink.as_str()) else {
             return true;
         };
-        // The generous match wins over a stale one: an engram carrying both a
-        // scope-less entry and an outdated scoped one is acknowledged.
-        let matching = entries
-            .iter()
-            .filter(|a| a.rule.eq_ignore_ascii_case(finding.rule))
-            .find(|a| a.scope.as_deref().is_none_or(|s| s == finding.scope));
-        if let Some(ack) = matching {
+        if let Some(ack) = matching_ack(entries, finding) {
             counts.add(finding.family);
             finding.acknowledged = true;
             finding.ack_note = ack.note.clone();
@@ -2600,7 +2837,10 @@ fn detect_twins(
         ));
         return;
     }
-    let mut emitted = 0usize;
+    // Capped after the acknowledgments are known, as `V302` is: an
+    // acknowledged pair takes no slot, so ten acknowledged twins never hide
+    // the eleventh.
+    let mut cap = FindingCap::new(input.options.max_twin_findings);
     for pair in &found.pairs {
         // Two rows standing at one path are one engram's versions, not two
         // engrams: a draft and the row it is a draft of say close to the same
@@ -2616,18 +2856,13 @@ fn detect_twins(
         {
             continue;
         }
-        if emitted == input.options.max_twin_findings {
-            report.truncations.push(format!(
-                "V301 findings capped at {}",
-                input.options.max_twin_findings
-            ));
-            break;
-        }
         let Some(lead) = leader(live, &[pair.a, pair.b]) else {
             continue;
         };
         let other = if lead == pair.a { pair.b } else { pair.a };
-        report.findings.push(
+        cap.push(
+            report,
+            live[lead],
             Finding::about("V301", live[lead])
                 .with(
                     Class::Judgment,
@@ -2644,7 +2879,12 @@ fn detect_twins(
                 // nothing about the next.
                 .scoped(vec![live[pair.a].address(), live[pair.b].address()]),
         );
-        emitted += 1;
+    }
+    if cap.cut {
+        report.truncations.push(format!(
+            "V301 findings capped at {}",
+            input.options.max_twin_findings
+        ));
     }
 }
 

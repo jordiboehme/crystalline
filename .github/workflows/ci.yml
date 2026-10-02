@@ -8,6 +8,12 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# A newer push to a pull request cancels the run it supersedes. A push to main
+# keeps one group per commit and never cancels, so dev.yml sees every main run.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   # Documentation-only changes skip the heavy jobs. The filter is per job and
   # deliberately NOT a `paths-ignore:` on the trigger above. Two reasons, and
@@ -37,13 +43,32 @@ jobs:
   # zeroed or unreachable base, a force push, a git error or an empty file list
   # all set code=true. The gate below reads `!cancelled() && ... != 'false'`, so
   # a `changes` job that fails outright runs everything instead of skipping it.
+  #
+  # On a push to main the job also asks whether a pull request run already
+  # passed this exact tree (the `ci-passed` job at the end uploads the proof).
+  # The tree is compared, never a commit sha: a merge commit carries the same
+  # tree as the `refs/pull/N/merge` commit its pull request tested when main
+  # did not move in between, and a different tree when it did. With
+  # tested=true the test legs only compile (so main still saves the caches
+  # pull requests restore) and the other heavy jobs are skipped; style,
+  # cargo-deny, fluid-audit and verify-action still run, and the run still ends
+  # green, so dev.yml still fires. That check fails open as well: an API error,
+  # an empty answer or anything unclear leaves tested=false, and the gates read
+  # `!= 'true'`, so a missing output runs everything as before.
   changes:
     name: changes
+    timeout-minutes: 10
     runs-on: ubuntu-latest
+    # The artifact lookup needs actions: read. Naming one permission drops the
+    # rest to none, so checkout's contents: read is named as well.
+    permissions:
+      contents: read
+      actions: read
     outputs:
       code: ${{ steps.classify.outputs.code }}
+      tested: ${{ steps.tested.outputs.tested }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # The classifier diffs against a base commit, which the default
           # shallow clone does not have. Only this job pays for the history,
@@ -123,6 +148,10 @@ jobs:
               # would read a root file like LICENSE_KEYS.rs as prose.
               LICENSE|LICENSE.md|LICENSE.txt) verdict=docs ;;
               .github/*.md)        verdict=docs ;;
+              # The skill-training harness's Python dependencies and scripts:
+              # no Rust test or build script reads them (the NLI parity fixture
+              # lives under evals/nli, not here). Its fixtures stay code.
+              evals/skill-training/pyproject.toml|evals/skill-training/uv.lock|evals/skill-training/*.py) verdict=docs ;;
               # Anything else in a subdirectory, markdown included.
               */*)                 verdict=code ;;
               *.md)                verdict=docs ;;
@@ -141,8 +170,57 @@ jobs:
             echo "changes: documentation only, so the heavy jobs are skipped. style still runs."
           fi
 
+      # Only artifacts of runs whose head is in this repository count: a fork's
+      # pull request runs its own copy of this file and could upload any name.
+      # A branch of this repository was pushed by someone with write access,
+      # who could change this file anyway.
+      - name: Look for a green pull request run of this tree
+        id: tested
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          REPO_ID: ${{ github.repository_id }}
+        run: |
+          # As in the classifier: every failure in here has to end in
+          # tested=false and exit 0, never in a red job.
+          set +e
+          set -u
+
+          run_the_tests() {
+            echo "tested: $1, so the tests run."
+            echo "tested=false" >>"$GITHUB_OUTPUT"
+            exit 0
+          }
+
+          case "$REPO_ID" in
+            ''|*[!0-9]*) run_the_tests "the repository id '$REPO_ID' is not a number" ;;
+          esac
+
+          if ! tree=$(git rev-parse 'HEAD^{tree}'); then
+            run_the_tests "git could not name the tree of HEAD"
+          fi
+          case "$tree" in
+            ''|*[!0-9a-f]*) run_the_tests "'$tree' is not a tree sha" ;;
+          esac
+
+          name="tested-tree-$tree"
+          echo "tested: looking for the artifact $name"
+          if ! runs=$(gh api "repos/$REPO/actions/artifacts?name=$name&per_page=100" \
+            --jq "[.artifacts[] | select(.name == \"$name\" and .expired == false and .workflow_run.repository_id == $REPO_ID and .workflow_run.head_repository_id == $REPO_ID) | .workflow_run.id] | unique | map(tostring) | join(\" \")"); then
+            run_the_tests "the artifact lookup for $name failed"
+          fi
+          if [ -z "$runs" ]; then
+            run_the_tests "no pull request run of this repository left an unexpired $name"
+          fi
+
+          echo "tested: the pull request run(s) $runs passed every gated job on the tree $tree, so the test legs only compile and the other heavy jobs are skipped."
+          echo "tested=true" >>"$GITHUB_OUTPUT"
+
   test:
     name: test (${{ matrix.os }})
+    timeout-minutes: 90
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ${{ matrix.os }}
@@ -160,7 +238,7 @@ jobs:
     env:
       RUSTFLAGS: ${{ matrix.rustflags }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain
         run: rustup show
@@ -169,27 +247,44 @@ jobs:
         with:
           tool: nextest@0.9.146
 
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Named, so fluid-smoke reads this very entry (same job key as before).
+          shared-key: test
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # On a push to main whose tree a pull request run already passed (see
+      # `changes`), the checks below are skipped and the leg only compiles the
+      # tests, so the cache step above still saves what pull requests restore.
+      - name: Compile the tests only (the pull request tested this tree)
+        if: ${{ needs.changes.outputs.tested == 'true' }}
+        run: cargo nextest run --workspace --no-run --locked
+
+      # Formatting does not depend on the OS, so one leg checks it.
       - name: cargo fmt --check
+        if: ${{ matrix.os == 'ubuntu-latest' && needs.changes.outputs.tested != 'true' }}
         run: cargo fmt --all --check
 
       - name: cargo clippy
+        if: ${{ needs.changes.outputs.tested != 'true' }}
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: cargo nextest run
+        if: ${{ needs.changes.outputs.tested != 'true' }}
         # The `ci` profile is the default one plus a single retry, so an
         # environmental failure on a hosted runner reports FLAKY instead of
         # turning a green change red. A test that fails twice still fails.
         run: cargo nextest run --workspace --profile ci --locked
 
       - name: cargo test --doc
+        if: ${{ needs.changes.outputs.tested != 'true' }}
         run: cargo test --workspace --doc --locked
 
   postgres-parity:
     name: postgres-parity
+    timeout-minutes: 15
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && needs.changes.outputs.tested != 'true' }}
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -207,12 +302,14 @@ jobs:
     env:
       CRYSTALLINE_TEST_POSTGRES_URL: postgres://postgres:crystalline@localhost:5432/crystalline_test
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain
         run: rustup show
 
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Create the pgvector extension
         # Pre-create it in public so the migration's defensive CREATE EXTENSION
@@ -228,8 +325,9 @@ jobs:
   # nor hold it up.
   fluid:
     name: fluid
+    timeout-minutes: 20
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && needs.changes.outputs.tested != 'true' }}
     runs-on: ubuntu-latest
     env:
       # Corepack fetches the pinned pnpm on first use, and the confirmation it
@@ -240,7 +338,7 @@ jobs:
       run:
         working-directory: fluid
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Pinned to the same major fluid/Dockerfile:18 pins (node:26-alpine), so
       # CI, the image and a laptop are one fact. vitest 5 needs Node 22.12 or
@@ -279,7 +377,7 @@ jobs:
           fi
           echo "version parity: $fluid_version"
 
-      # src/api/types.ts is generated from the OpenAPI snapshot the service
+      # src/api/gen is generated from the OpenAPI snapshot the service
       # crate emits, and is the only description of the API the UI has. A
       # regenerated file that differs means the snapshot moved and the UI is
       # typed against an API that no longer exists.
@@ -287,8 +385,9 @@ jobs:
         run: |
           set -euo pipefail
           pnpm generate:api
-          if ! git diff --exit-code src/api/types.ts; then
-            echo "::error file=fluid/src/api/types.ts::the generated types differ from the committed ones. Run 'pnpm generate:api' in fluid/ and commit the result."
+          git add -N src/api/gen
+          if ! git diff --exit-code src/api/gen; then
+            echo "::error file=fluid/src/api/gen::the generated types differ from the committed ones. Run 'pnpm generate:api' in fluid/ and commit the result."
             exit 1
           fi
 
@@ -321,19 +420,24 @@ jobs:
   # own because it needs the Rust toolchain as well as Node.
   fluid-smoke:
     name: fluid-smoke
+    timeout-minutes: 20
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && needs.changes.outputs.tested != 'true' }}
     runs-on: ubuntu-latest
     env:
       # See the fluid job: corepack must not stop to ask before fetching pnpm.
       COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain
         run: rustup show
 
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # The ubuntu test leg's entry (same profile, same target dir). Read only.
+          shared-key: test
+          save-if: false
 
       # Pinned to the same major fluid/Dockerfile:18 pins (node:26-alpine), so
       # CI, the image and a laptop are one fact. vitest 5 needs Node 22.12 or
@@ -397,11 +501,12 @@ jobs:
   # the entrypoint renders is one nginx accepts.
   fluid-image:
     name: fluid-image
+    timeout-minutes: 10
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && needs.changes.outputs.tested != 'true' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # The build context is fluid/, exactly as the release job and the compose
       # file build it.
@@ -430,9 +535,10 @@ jobs:
 
   style:
     name: style
+    timeout-minutes: 10
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Run style lint
         run: bash scripts/style-lint.sh
@@ -450,16 +556,17 @@ jobs:
   # and it should show on the next pull request, whatever that touches.
   cargo-deny:
     name: cargo-deny
+    timeout-minutes: 10
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           # The workspace pin, so the action's container does not resolve a
           # different toolchain than the build. Move it together with
           # rust-toolchain.toml.
-          rust-version: '1.98.0'
+          rust-version: '1.99.0'
           arguments: --all-features --locked
           command: check
 
@@ -468,6 +575,7 @@ jobs:
   # tools (vite, vitest, eslint) never reach a reader.
   fluid-audit:
     name: fluid-audit
+    timeout-minutes: 10
     runs-on: ubuntu-latest
     env:
       COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
@@ -475,7 +583,7 @@ jobs:
       run:
         working-directory: fluid
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -492,11 +600,12 @@ jobs:
 
   musl-spike:
     name: musl-spike
+    timeout-minutes: 30
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && needs.changes.outputs.tested != 'true' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain
         run: rustup show
@@ -509,7 +618,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y musl-tools
 
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # The release musl entry the dev channel writes from main (build.yml key
+          # release-<target>, job id build). Read only.
+          shared-key: release-x86_64-unknown-linux-musl-build
+          save-if: false
 
       - name: Build crystalline for musl
         run: cargo build --release --locked --target x86_64-unknown-linux-musl -p crystalline
@@ -520,13 +634,63 @@ jobs:
   # this job guards against) would fail at the download step.
   verify-action:
     name: verify-action
+    timeout-minutes: 10
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: ./action
         with:
           paths: tests/fixtures/domain-good
           comment: 'false'
+
+  # The proof `changes` looks for on main: this pull request run passed every
+  # gated job on this tree. A job `if` without a status function means
+  # `success() && ...`, and a skipped need skips this job, so a run with a
+  # failed, cancelled or skipped gated job uploads nothing. That includes a
+  # documentation-only pull request, whose heavy jobs were skipped; main's own
+  # classifier skips the same tree anyway. The ungated jobs (style, cargo-deny,
+  # fluid-audit) are left out on purpose: they run again on every push to main,
+  # and the two audits can go red on a new advisory that has nothing to do with
+  # this tree.
+  ci-passed:
+    name: ci-passed
+    timeout-minutes: 10
+    needs:
+      - changes
+      - test
+      - postgres-parity
+      - fluid
+      - fluid-smoke
+      - fluid-image
+      - musl-spike
+      - verify-action
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    steps:
+      # The commit every job above checked out: refs/pull/N/merge at
+      # github.sha.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Name the tested tree
+        id: tree
+        run: |
+          set -euo pipefail
+          tree=$(git rev-parse 'HEAD^{tree}')
+          echo "ci-passed: every gated job passed on the tree $tree (commit $GITHUB_SHA)"
+          echo "tree=$tree" >>"$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/tested-tree"
+          printf 'tree %s\ncommit %s\nrun %s\n' "$tree" "$GITHUB_SHA" "$GITHUB_RUN_ID" \
+            >"$RUNNER_TEMP/tested-tree/tested-tree.txt"
+
+      # A re-run of this job uploads the same name again, hence overwrite.
+      - name: Upload the proof
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tested-tree-${{ steps.tree.outputs.tree }}
+          path: ${{ runner.temp }}/tested-tree/tested-tree.txt
+          retention-days: 7
+          overwrite: true
+          if-no-files-found: error

@@ -13,8 +13,7 @@
  * vertically by the quad's aspect and the quad squeezes it back. Labels
  * share a layer six to a layer, each drawn into its own row with the same
  * squeeze per row, as `layerPlan` in `layers.ts` lays them out. Terminals
- * use the look's terminal style: green phosphor on dark glass in the manner
- * of MU/TH/UR, or the C64's light blue on blue with upper-case characters.
+ * are green phosphor on dark glass.
  *
  * A line that starts with `KEY_MARK` (M3 C20, C24) is drawn with the key
  * pictogram (`SIGNS.key`) in front of it, one glyph wide and as tall as the
@@ -22,6 +21,13 @@
  * call panel (`panel`) lists up to `LIFT_LINES` stops and two more lines
  * in amber on black, with no heading. A station wall screen (`station`)
  * is drawn in the terminal's style, `SCREEN_LINES` rows on a wide quad.
+ *
+ * A terminal's screen, the placard and a poster wrap: the text keeps the
+ * kind's glyph size, its first line is the heading row and the rest fills the
+ * body rows, each line reduced to its text (a link shows its words) and
+ * wrapped at word boundaries to the columns that fit (`fitRows`); a row cut
+ * for want of room ends with `CUT_MARK`. A lift's panel and a station screen
+ * keep one row per line.
  */
 
 import { LIFT_LINES, SCREEN_LINES } from "../world/lifts";
@@ -34,7 +40,8 @@ import {
   type TextKind,
   type TextRequest,
 } from "./layers";
-import { C64_PALETTE, type Look, type Rgb } from "./looks";
+import { fitRows } from "../textFlow";
+import type { Look, Rgb } from "./looks";
 
 /** A copy of RGBA rows in reverse order. */
 export function flipRows(
@@ -76,17 +83,12 @@ export function colours(
   kind: TextKind,
   look: Look,
 ): { background: Rgb; ink: Rgb } {
-  const petscii = look.terminal === "petscii";
   switch (kind) {
     case "screen":
     case "station":
       return {
-        background: petscii
-          ? (C64_PALETTE[6] ?? look.palette.screen)
-          : look.palette.screen,
-        ink: petscii
-          ? (C64_PALETTE[14] ?? look.palette.screenText)
-          : look.palette.screenText,
+        background: look.palette.screen,
+        ink: look.palette.screenText,
       };
     case "placard":
     case "poster":
@@ -98,7 +100,7 @@ export function colours(
       return { background: [0.05, 0.05, 0.06], ink: [1, 1, 1] };
     case "panel":
       // A lift's call panel: amber stop names on black, like a lit floor
-      // indicator, the same in every look.
+      // indicator.
       return { background: [0.03, 0.03, 0.035], ink: [1, 0.72, 0.28] };
   }
 }
@@ -171,10 +173,7 @@ function drawRequest(
 ) {
   const aspect = ASPECT[request.kind];
   const logicalHeight = size / aspect;
-  const petscii = look.terminal === "petscii";
-  const lines = petscii
-    ? request.lines.map((l) => l.toUpperCase())
-    : request.lines;
+  const lines = request.lines;
   const { background, ink } = colours(request.kind, look);
 
   ctx.save();
@@ -202,7 +201,25 @@ function drawRequest(
     const rows = ROWS[request.kind];
     const px = logicalHeight / (rows + 1);
     const glyph = px * 0.85;
-    lines.slice(0, rows).forEach((line, i) => {
+    const wraps =
+      request.kind === "screen" ||
+      request.kind === "placard" ||
+      request.kind === "poster";
+    let shown: string[];
+    if (wraps) {
+      ctx.font = `${glyph}px ui-monospace, Menlo, Consolas, monospace`;
+      const columns = Math.max(
+        1,
+        Math.floor((size - px) / ctx.measureText("M").width),
+      );
+      shown = [
+        ...fitRows([lines[0] ?? ""], columns, 1),
+        ...fitRows(lines.slice(1), columns, rows - 1),
+      ];
+    } else {
+      shown = lines.slice(0, rows);
+    }
+    shown.forEach((line, i) => {
       const heading = i === 0 && request.kind !== "panel";
       ctx.font = `${heading ? "bold " : ""}${glyph}px ui-monospace, Menlo, Consolas, monospace`;
       if (heading && crt(request.kind)) {

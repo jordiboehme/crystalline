@@ -14,7 +14,7 @@
 //! (see [`CURRENT_STATUS_CLASS`]), so a domain written before the vocabulary
 //! flip and a foreign OKF bundle both stay first-class.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use async_trait::async_trait;
@@ -456,6 +456,33 @@ pub(crate) fn rename_onto_taken_row(old: &str, new: &str) -> crate::IndexError {
         "cannot rename the index row of domain `{old}` to `{new}`: another domain row is \
          already named `{new}`; rename or remove domain `{new}` first, or pick another name"
     ))
+}
+
+/// How many hashes one `observation_vector` statement names at most. The
+/// postgres store cuts every hash list into runs of this many, so a domain of
+/// any size costs bounded statements and stays far below the bind limit. The
+/// turso store issues one point statement per hash instead, because turso
+/// seeks an `IN` list on the key's leading column only.
+pub const OBSERVATION_VECTOR_CHUNK: usize = 256;
+
+/// A vector as the raw little-endian f32 bytes both backends store it as.
+pub(crate) fn pack_f32_le(v: &[f32]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(v.len() * 4);
+    for f in v {
+        b.extend_from_slice(&f.to_le_bytes());
+    }
+    b
+}
+
+/// The bytes [`pack_f32_le`] wrote, back as floats. A length that is not a
+/// whole number of floats cannot come from that packing and decodes to
+/// nothing, so a caller's width check skips it rather than trusting a prefix.
+pub(crate) fn unpack_f32_le(bytes: &[u8]) -> Vec<f32> {
+    let (quads, partial) = bytes.as_chunks::<4>();
+    if !partial.is_empty() {
+        return Vec::new();
+    }
+    quads.iter().copied().map(f32::from_le_bytes).collect()
 }
 
 /// Run `body` inside one write transaction on `store`: commit when it
@@ -1532,6 +1559,71 @@ pub struct LeadVector {
     pub vector: Vec<f32>,
 }
 
+/// One scored engram pair as `contradiction_pair` records it: the two engrams,
+/// ordered `a < b` by id, and the content checksums they were scored at. The
+/// daemon's pending set is "candidate pairs minus the ones whose row here still
+/// carries both current checksums for the model", so this row is what says
+/// "this pair is up to date".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScoredPair {
+    /// The engram with the lower id.
+    pub a: EngramId,
+    /// The engram with the higher id.
+    pub b: EngramId,
+    /// `a`'s scoring checksum at scoring time
+    /// ([`crate::nli::scoring_checksum`]): what the model read under the line
+    /// rules, not the file's checksum, so a frontmatter-only edit keeps the
+    /// pair scored and a change of the rules scores it again.
+    pub checksum_a: String,
+    /// `b`'s scoring checksum at scoring time.
+    pub checksum_b: String,
+}
+
+/// One scored observation-line pair as `contradiction` records it.
+///
+/// `line_*` are the one-based lines `read_engram` reports; `hash_*` are the
+/// sha256 of the observation text with its category and tags stripped and its
+/// whitespace folded, so a row survives a renumbering and dies with an edit of
+/// the line. Both reading orders are kept, so the order aggregation can change
+/// without a rescore.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContradictionRow {
+    /// The engram with the lower id.
+    pub a: EngramId,
+    /// The engram with the higher id.
+    pub b: EngramId,
+    /// `a`'s observation line at scoring time.
+    pub line_a: usize,
+    /// `b`'s observation line at scoring time.
+    pub line_b: usize,
+    /// The hash of `a`'s observation text.
+    pub hash_a: String,
+    /// The hash of `b`'s observation text.
+    pub hash_b: String,
+    /// The contradiction probability with `a` as premise and `b` as hypothesis.
+    pub score_ab: f32,
+    /// The same with the order reversed.
+    pub score_ba: f32,
+    /// The cosine of the two lines' vectors under the embedding model the
+    /// pair was scored with: how much the two lines are about the same
+    /// subject, which is what let them reach the model at all.
+    pub similarity: f32,
+    /// Whether either line names a period (a year, a date, a month, since or
+    /// until): the finding then points at the validity window.
+    pub period: bool,
+}
+
+/// One observation line's embedding as `observation_vector` keeps it: the
+/// row hash of its folded text ([`crate::nli::observation_hash`]) and the
+/// vector the embedding model gave it. Never the text (lessons 5 and 6).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObservationVector {
+    /// [`crate::nli::observation_hash`] of the line.
+    pub hash: String,
+    /// The embedding, unit-normalized as every provider returns it.
+    pub vector: Vec<f32>,
+}
+
 /// A freshly computed chunk to store against an engram. Produced by the chunker
 /// and handed to [`Store::replace_chunks`], which reconciles it against the
 /// engram's existing chunk rows and carries over any matching embedding.
@@ -2129,6 +2221,25 @@ pub trait Store: Send + Sync {
         expected_sha: Option<&str>,
     ) -> Result<EngramId>;
 
+    /// Rewrite the base row at `record.path` only if it still exists and still
+    /// carries `expected_sha`, with the same guarded compare as
+    /// [`Store::upsert_engram_checked`]: `Ok(Some(id))` when it was rewritten,
+    /// `Ok(None)` when no row stands at the path any more (deleted or renamed
+    /// since it was read), [`crate::IndexError::StaleEdit`] when one stands
+    /// there with other content. Never inserts, which is what the reparse
+    /// after a parser change needs: it rewrites what it read, and a row that
+    /// vanished meanwhile must stay gone. On Postgres the never-insert
+    /// guarantee holds only inside a transaction: the compare's row lock is
+    /// what keeps a concurrent delete out until the rewrite, and without a
+    /// transaction it is released when the compare statement ends, so a row
+    /// deleted between the compare and the rewrite would be inserted again.
+    async fn update_engram_checked(
+        &self,
+        domain: DomainId,
+        record: &EngramRecord,
+        expected_sha: &str,
+    ) -> Result<Option<EngramId>>;
+
     /// The full markdown content stored for the engram at a domain-relative
     /// path, or `None` when no such row exists. Serves the database read path
     /// (virtual domains and non-host reads) and reads current content for a
@@ -2148,6 +2259,8 @@ pub trait Store: Send + Sync {
     /// still answers to that, while a canonical name or former name left behind
     /// would keep resolving references to a domain nobody registers and would
     /// hold the spelling against the next domain that claims it.
+    ///
+    /// It also clears the domain's contradiction pairs and line rows.
     ///
     /// A reindex does not use this, and deliberately: `--full` re-reads and
     /// re-upserts instead, so rows a reader is using are never absent between
@@ -2565,11 +2678,114 @@ pub trait Store: Send + Sync {
         actor: Option<&str>,
     ) -> Result<Vec<LeadVector>>;
 
+    /// Every engram pair `model` has scored in `domain`, with the checksums it
+    /// was scored at, ordered by `(a, b)`.
+    async fn contradiction_pairs_scored(
+        &self,
+        domain: DomainId,
+        model: &str,
+    ) -> Result<Vec<ScoredPair>>;
+
+    /// Record one scoring of `pair` by `model`: the pair row with `cosine` and
+    /// `scored_at`, and its line rows, replacing whatever an earlier scoring
+    /// left, in one transaction. `rows` may be empty: a pair with nothing above
+    /// the store floor is scored with nothing to say and is not asked again
+    /// until an edit moves a checksum. Refuses inside an open `begin`.
+    async fn replace_contradictions(
+        &self,
+        domain: DomainId,
+        pair: &ScoredPair,
+        cosine: f64,
+        model: &str,
+        scored_at: &str,
+        rows: &[ContradictionRow],
+    ) -> Result<()>;
+
+    /// Delete what `model` stored for the pair `a`, `b` (lower id first): its
+    /// pair row and its line rows, in one transaction, through the primary
+    /// keys. The contradiction walk's delete for a pair one of whose engrams is
+    /// past its `valid_to`: with the pair row gone, a window opened again later
+    /// makes the pair pending, not scored with nothing to say. Refuses inside
+    /// an open `begin`.
+    async fn delete_contradiction_pair(&self, model: &str, a: EngramId, b: EngramId) -> Result<()>;
+
+    /// Every stored line pair in `domain` for `model` whose higher reading
+    /// order is at or above `min_score`, ordered by `(a, b, line_a, line_b)`.
+    /// The sweep's read: it filters by status, window and line hash itself, so
+    /// a pair that stopped being a candidate still comes back here.
+    async fn contradictions(
+        &self,
+        domain: DomainId,
+        model: &str,
+        min_score: f32,
+    ) -> Result<Vec<ContradictionRow>>;
+
+    /// How many engram pairs `model` has scored across the whole index. The
+    /// status block's figure.
+    async fn scored_pair_count(&self, model: &str) -> Result<u64>;
+
+    /// Which of `hashes` carry a line vector for `model`. The contradiction
+    /// walk's per-domain check before it embeds what is missing; narrow, the
+    /// hash column only. Read on the full `(model, hash)` key: in runs of
+    /// [`OBSERVATION_VECTOR_CHUNK`] on postgres, one hash at a time on turso.
+    async fn observation_vectors_present(
+        &self,
+        model: &str,
+        hashes: &[String],
+    ) -> Result<HashSet<String>>;
+
+    /// The line vectors for `model` of those `hashes` that have one, by hash.
+    /// A row whose stored width disagrees with its `dims` is skipped with a
+    /// warning. Read like [`Store::observation_vectors_present`].
+    async fn observation_vectors(
+        &self,
+        model: &str,
+        hashes: &[String],
+    ) -> Result<HashMap<String, Vec<f32>>>;
+
+    /// Store line vectors for `model`. A (model, hash) already stored keeps
+    /// its vector: the same text under the same model is the same vector. One
+    /// transaction per call; refuses inside an open `begin`.
+    async fn store_observation_vectors(
+        &self,
+        model: &str,
+        rows: &[ObservationVector],
+    ) -> Result<()>;
+
+    /// Every hash with a line vector for `model`, unordered. The pruning read:
+    /// narrow, one short column per row.
+    async fn observation_vector_hashes(&self, model: &str) -> Result<Vec<String>>;
+
+    /// Delete the line vectors of `hashes` under `model` in one transaction,
+    /// on the full key like [`Store::observation_vectors_present`]; returns
+    /// how many went.
+    async fn delete_observation_vectors(&self, model: &str, hashes: &[String]) -> Result<u64>;
+
+    /// Delete every line vector of any embedding model but `model`, once a
+    /// daemon knows which model it runs. Not a hot statement: it runs once per
+    /// process.
+    async fn delete_observation_vectors_except(&self, model: &str) -> Result<u64>;
+
+    /// Delete every line vector. The contradiction check's off switch.
+    async fn clear_observation_vectors(&self) -> Result<u64>;
+
+    /// Delete the contradiction pair and line rows of `domains`, or of every
+    /// domain when `None`, in one transaction. The contradiction check's off
+    /// switch; a domain's own clear stays `clear_domain`.
+    async fn clear_contradictions(&self, domains: Option<&[DomainId]>) -> Result<()>;
+
+    /// Whether this database may be shared by several instances at once, so
+    /// per-instance housekeeping must not delete shared rows.
+    fn shares_database(&self) -> bool {
+        false
+    }
+
     /// Delete all indexed data, keeping the schema. The corruption-recovery
     /// path behind `crystalline reindex --wipe`, and nothing else: an ordinary
     /// rebuild (`--full`) never comes here, because destroying every embedding
     /// to re-read files that mostly did not change costs hours and buys
-    /// nothing.
+    /// nothing. The contradiction tables and the line vectors go with
+    /// everything else.
     async fn wipe(&self) -> Result<()>;
 
     /// Best-effort WAL checkpoint in TRUNCATE mode, shrinking a local WAL file
@@ -2633,6 +2849,18 @@ pub trait Store: Send + Sync {
     /// domain's rebuild is unfinished and is never cleared by a run that did
     /// not finish one.
     async fn end_rebuild(&self, domain: DomainId) -> Result<()>;
+
+    /// The parser generation ([`crystalline_core::PARSE_GENERATION`]) the
+    /// domain's rows were last derived with: 0 for a domain an upgrade found,
+    /// the current generation for a row created since. A sync that reads an
+    /// older value than the current one reparses the domain whole once.
+    async fn parse_generation(&self, domain: DomainId) -> Result<u32>;
+
+    /// Record the parser generation a domain's rows were derived with. Called
+    /// inside the transaction that commits a whole-domain reparse, so the
+    /// stamp moves exactly when that reparse is complete and a run that died
+    /// before it leaves the old value standing for the next one to repeat.
+    async fn set_parse_generation(&self, domain: DomainId, generation: u32) -> Result<()>;
 
     /// The unreadable database this store was opened beside, when it was opened
     /// resiliently and found one. `None` for every ordinary open, and for every

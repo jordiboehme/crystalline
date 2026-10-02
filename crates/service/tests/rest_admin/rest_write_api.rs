@@ -377,6 +377,87 @@ async fn a_created_title_that_will_not_read_back_carries_its_notice() {
     assert!(plain.get("notices").is_none(), "{plain}");
 }
 
+/// A CRLF file reads back as LF over the JSON API, its ETag is the checksum
+/// of the bytes on disk, and the guarded save made with that ETag lands as
+/// LF. The same holds for a CRLF MANIFEST.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_crlf_engram_and_manifest_read_as_lf_and_their_etag_guards_a_save() {
+    let _serialized = crate::support::maintenance_guard().await;
+    let fx = serve(Options::default()).await;
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+    let alpha = fx._tmp.path().join("eng/alpha.md");
+    let crlf = ALPHA.replace('\n', "\r\n");
+    std::fs::write(&alpha, &crlf).unwrap();
+
+    let (etag, content) = read_alpha(fx.addr, &editor).await;
+    assert!(!content.contains('\r'), "{content:?}");
+    assert_eq!(content, ALPHA);
+    assert!(
+        etag.starts_with(&crate::support::sha256_hex(crlf.as_bytes())),
+        "the ETag is the checksum of the bytes on disk: {etag}"
+    );
+    let saved = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/engrams/alpha",
+        &editor,
+    )
+    .header("if-match", format!("\"{etag}\""))
+    .json(&serde_json::json!({"content": content.replace("A rule about alpha.", "Saved.")}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(saved.status(), 200);
+    let on_disk = std::fs::read_to_string(&alpha).unwrap();
+    assert!(!on_disk.contains('\r'), "{on_disk:?}");
+    assert!(on_disk.contains("Saved."), "{on_disk:?}");
+
+    let manifest = fx._tmp.path().join("eng/MANIFEST.md");
+    let crlf_manifest = std::fs::read_to_string(&manifest)
+        .unwrap()
+        .replace('\n', "\r\n");
+    std::fs::write(&manifest, &crlf_manifest).unwrap();
+    // A MANIFEST is an admin's to save.
+    let editor = login(fx.addr, "root", "rootpw").await;
+    let read = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/eng/manifest",
+        &editor,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(read.status(), 200);
+    let manifest_etag = read.headers()["etag"].to_str().unwrap().to_string();
+    let body: serde_json::Value = read.json().await.unwrap();
+    let markdown = body["markdown"].as_str().unwrap().to_string();
+    assert!(!markdown.contains('\r'), "{markdown:?}");
+    assert_eq!(
+        body["checksum"],
+        crate::support::sha256_hex(crlf_manifest.as_bytes())
+    );
+    let saved = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/manifest",
+        &editor,
+    )
+    .header("if-match", manifest_etag)
+    .json(&serde_json::json!({"markdown": markdown.replace("Everything about eng", "All of eng")}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(saved.status(), 200);
+    let answer: serde_json::Value = saved.json().await.unwrap();
+    let on_disk = std::fs::read_to_string(&manifest).unwrap();
+    assert!(!on_disk.contains('\r'), "{on_disk:?}");
+    assert_eq!(
+        answer["checksum"],
+        crate::support::sha256_hex(on_disk.as_bytes())
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn save_walks_the_if_match_contract() {
     // Serialized against every other test here that writes the shared

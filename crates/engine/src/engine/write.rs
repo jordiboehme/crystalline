@@ -354,7 +354,7 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
-        let p = &self.localized_for(p, scope).await?;
+        let p = &self.localized_for(p, scope).await?.lf_only();
         let source = self.content_source(&p.domain)?;
         let view = DomainView::for_write_joined(self, &p.domain, scope, join).await?;
         let overlay = view.actor();
@@ -484,7 +484,7 @@ impl Engine {
         // with the canonical one instead, wherever this caller's own
         // visibility allows it.
         let (markdown, domain_names_normalized) = self
-            .normalize_domain_spellings_for(&markdown, scope)
+            .normalize_domain_spellings_for(&crystalline_core::to_lf(&markdown), scope)
             .await?;
 
         let mut receipt = json!({
@@ -919,7 +919,7 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
-        let p = &self.localized_for(p, scope).await?;
+        let p = &self.localized_for(p, scope).await?.lf_only();
         let view = DomainView::for_write_joined(self, &p.domain, scope, join).await?;
         let overlay = view.actor();
         // The join as this view actually took it: one naming another domain,
@@ -1011,12 +1011,7 @@ impl Engine {
                             abs.display()
                         )));
                     }
-                    Err(source) => {
-                        return Err(EngineError::Io {
-                            path: abs.display().to_string(),
-                            source,
-                        });
-                    }
+                    Err(source) => return Err(text_read_error(&abs, source)),
                 };
                 let found = sha256_hex(current.as_bytes());
                 if found != p.expected_checksum {
@@ -1283,10 +1278,11 @@ impl Engine {
     /// reason - there is no stored version to compare against.
     ///
     /// Deliberately exempt from domain-spelling normalization: this restores
-    /// the exact prior bytes a room held after an external deletion, a
-    /// recovery of what was already there rather than a new authoring act,
-    /// and `content` is what the caller already normalized (or chose not to)
-    /// on its way in.
+    /// the prior text a room held after an external deletion, a recovery of
+    /// what was already there rather than a new authoring act, and `content`
+    /// is what the caller already normalized (or chose not to) on its way in.
+    /// Its line endings are the one thing changed: it lands as LF, like every
+    /// write.
     ///
     /// `scope` is the acting scope every write verb carries; see
     /// [`Engine::write_engram_as`].
@@ -1323,6 +1319,9 @@ impl Engine {
             return Err(EngineError::ReadOnly);
         }
         let overlay = view.actor();
+        // Restored as LF, the one line ending anything is stored with.
+        let content = crystalline_core::to_lf(content);
+        let content: &str = &content;
         refuse_not_an_engram(content)?;
         // Normalized and screened before the two reserved checks read it, the
         // same order the create and move paths use. A stored path is already in

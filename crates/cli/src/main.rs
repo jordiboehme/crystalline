@@ -476,19 +476,24 @@ enum Command {
         /// The content to add or the replacement. For the section operations
         /// this is the section body; the heading line stays, so never repeat
         /// it (a repeated heading is dropped). Read from stdin when omitted,
-        /// except for set_frontmatter, which takes --key and --value instead.
-        /// Accepts a value that begins with `-`.
+        /// except for set_frontmatter, which takes --key and --value (or
+        /// --values) instead. Accepts a value that begins with `-`.
         #[arg(long, allow_hyphen_values = true)]
         content: Option<String>,
-        /// The frontmatter field to assign, for set_frontmatter: status,
-        /// valid_from, valid_to, stale_after, source_date, resource,
-        /// source_version, salience or verified.
+        /// The frontmatter field to assign, for set_frontmatter: tags (with
+        /// --values), or status, valid_from, valid_to, stale_after,
+        /// source_date, resource, source_version, salience or verified (with
+        /// --value).
         #[arg(long)]
         key: Option<String>,
         /// The value to assign, for set_frontmatter. Omit to remove the field;
         /// omit on verified to stamp a verification as yourself.
         #[arg(long, allow_hyphen_values = true)]
         value: Option<String>,
+        /// The whole new list, for set_frontmatter on tags, comma-separated
+        /// (--values api,retries). Pass --values alone to remove every tag.
+        #[arg(long, num_args = 0.., value_delimiter = ',')]
+        values: Option<Vec<String>>,
         /// The heading path for the *_section operations.
         #[arg(long)]
         section: Option<String>,
@@ -566,8 +571,9 @@ enum Command {
         #[arg(long)]
         folder: Option<String>,
         /// The checksum from a prior read; the split is refused as a conflict if
-        /// the source changed since, whichever storage kind holds it. Omit for
-        /// last-write-wins.
+        /// the source changed since, whichever storage kind holds it. Without
+        /// it the split can still be refused while another write to the same
+        /// engram is in flight; try it again then.
         #[arg(long)]
         expected_checksum: Option<String>,
         /// Load the global config from this file instead of the default path.
@@ -660,10 +666,12 @@ enum Command {
     },
     /// Sweep for the maintenance the knowledge needs and print a ranked queue.
     ///
-    /// Read-only: it detects temporal and lifecycle debt, structural gaps and
-    /// redundancy by dates, links, graph shape and embedding similarity
-    /// (semantic twins), never confirming a contradiction, and
-    /// changes nothing itself. Work the queue with the write verbs and re-run
+    /// Read-only: it detects temporal and lifecycle debt, structural gaps,
+    /// redundancy and meaning by dates, links, graph shape, embedding
+    /// similarity (semantic twins) and, with the contradiction check on, a
+    /// local model's reading of two observation lines as a possible
+    /// contradiction; it never confirms a contradiction and changes nothing
+    /// itself. Work the queue with the write verbs and re-run
     /// the same scope to confirm it shrank.
     Evolve {
         /// Restrict the sweep to these domains (repeatable). Omit to sweep
@@ -671,7 +679,7 @@ enum Command {
         #[arg(long)]
         domain: Vec<String>,
         /// Restrict to these detector families (repeatable): temporal,
-        /// structure or redundancy.
+        /// structure, redundancy or meaning.
         #[arg(long = "family")]
         families: Vec<String>,
         /// Restrict to these rule ids (repeatable), for example V001 or V201.
@@ -3289,6 +3297,7 @@ async fn run_data(command: Command, db: Option<PathBuf>, json: bool) -> anyhow::
             content,
             key,
             value,
+            values,
             section,
             find_text,
             expected_replacements,
@@ -3312,6 +3321,7 @@ async fn run_data(command: Command, db: Option<PathBuf>, json: bool) -> anyhow::
                     "content": body,
                     "key": key,
                     "value": value,
+                    "values": values,
                     "section": section,
                     "find_text": find_text,
                     "expected_replacements": expected_replacements,

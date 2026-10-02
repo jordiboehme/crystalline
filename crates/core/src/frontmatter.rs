@@ -383,34 +383,6 @@ fn consistent(preamble: &str, blocks: &[KeyBlock]) -> bool {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Ending {
-    Lf,
-    CrLf,
-}
-
-/// The one line ending a frontmatter section uses, or `None` when it mixes.
-fn ending(section: &str) -> Option<Ending> {
-    let mut seen = None;
-    for line in section.split_inclusive('\n').filter(|l| l.ends_with('\n')) {
-        let this = if line.ends_with("\r\n") {
-            Ending::CrLf
-        } else {
-            Ending::Lf
-        };
-        match seen {
-            None => seen = Some(this),
-            Some(before) if before != this => return None,
-            Some(_) => {}
-        }
-    }
-    Some(seen.unwrap_or(Ending::Lf))
-}
-
-fn head_of<'a>(source: &'a str, parts: &FrontmatterParts<'a>) -> &'a str {
-    &source[..source.len() - parts.body.len()]
-}
-
 /// The three-way rule on plain text: local unchanged or equal to upstream
 /// takes upstream, upstream unchanged takes local, anything else collides.
 fn settle(base: &str, local: &str, upstream: &str) -> Option<String> {
@@ -574,9 +546,10 @@ fn pick(
 /// added the file.
 ///
 /// Steps aside ([`FrontmatterMerge::NotApplicable`]) when local or upstream
-/// has no frontmatter, when any side cannot be cut into key blocks, when a
-/// side's blocks read together do not say what they say one by one, or when
-/// the sides do not use one line ending. A base without frontmatter counts
+/// has no frontmatter, when any side cannot be cut into key blocks, or when a
+/// side's blocks read together do not say what they say one by one. The
+/// texts are compared as given, so they are expected as LF; [`merge_text`]
+/// converts them before it gets here. A base without frontmatter counts
 /// as an empty one with its whole text as the body; so does a missing base,
 /// with an empty body. A key local or upstream holds twice with one value
 /// keeps its first copy; with different values it is a conflict. When only
@@ -621,13 +594,6 @@ pub fn merge_frontmatter<'a>(
         (Some(text), None) => text,
         (None, None) => "",
     };
-    let mut endings = vec![ending(head_of(local, &l)), ending(head_of(upstream, &u))];
-    if let (Some(text), Some(parts)) = (base, b) {
-        endings.push(ending(head_of(text, &parts)));
-    }
-    if endings.iter().any(Option::is_none) || endings.windows(2).any(|w| w[0] != w[1]) {
-        return FrontmatterMerge::NotApplicable;
-    }
     let sides = (
         b.map_or_else(|| Ok(Prepared::default()), |parts| prepare(parts.yaml)),
         prepare(l.yaml),
@@ -688,12 +654,20 @@ pub enum MergedText {
 /// frontmatter cannot be merged by key. A clean result that no longer parses
 /// while local and upstream both did is a conflict: a merge never makes a
 /// parseable file unparseable.
+///
+/// Every side is merged as LF, whatever line endings it came with, and the
+/// result is LF: a CRLF base against LF sides is the same document and never
+/// makes every line look changed.
 pub fn merge_text(
     base: Option<&str>,
     local: &str,
     upstream: &str,
     line_merge: LineMerge<'_>,
 ) -> MergedText {
+    let base = base.map(crate::to_lf);
+    let local = crate::to_lf(local);
+    let upstream = crate::to_lf(upstream);
+    let (base, local, upstream) = (base.as_deref(), local.as_ref(), upstream.as_ref());
     let merged = match merge_frontmatter(base, local, upstream, line_merge) {
         FrontmatterMerge::Clean {
             head,
@@ -1058,25 +1032,33 @@ mod tests {
     }
 
     #[test]
-    fn mixed_line_endings_step_aside() {
+    fn mixed_line_endings_merge_by_key_as_lf() {
         let local = with(SCOTTY, "status: stable\n", "domain_name: scotty\n");
-        let upstream =
-            with(SCOTTY, "title: Scotty\n", "domain_name: scotty\n").replace('\n', "\r\n");
+        let upstream = with(SCOTTY, "title: Scotty\n", "domain_name: scotty\n");
         assert_eq!(
-            merge_frontmatter(Some(SCOTTY), &local, &upstream, &trivial),
-            FrontmatterMerge::NotApplicable
+            merge_text(
+                Some(SCOTTY),
+                &local,
+                &upstream.replace('\n', "\r\n"),
+                &trivial
+            ),
+            MergedText::Clean(upstream)
         );
     }
 
     #[test]
-    fn crlf_on_every_side_merges_and_keeps_crlf() {
+    fn crlf_on_every_side_merges_as_lf() {
         let base = SCOTTY.replace('\n', "\r\n");
         let local = with(SCOTTY, "status: stable\n", "domain_name: scotty\n").replace('\n', "\r\n");
-        let upstream =
-            with(SCOTTY, "title: Scotty\n", "domain_name: scotty\n").replace('\n', "\r\n");
+        let upstream = with(SCOTTY, "title: Scotty\n", "domain_name: scotty\n");
         assert_eq!(
-            merge_text(Some(&base), &local, &upstream, &trivial),
-            MergedText::Clean(upstream.clone())
+            merge_text(
+                Some(&base),
+                &local,
+                &upstream.replace('\n', "\r\n"),
+                &trivial
+            ),
+            MergedText::Clean(upstream)
         );
     }
 
@@ -1285,13 +1267,13 @@ mod tests {
     }
 
     #[test]
-    fn a_base_with_another_line_ending_steps_aside() {
+    fn a_crlf_base_with_lf_sides_merges_as_lf() {
         let base = SCOTTY.replace('\n', "\r\n");
         let local = with(SCOTTY, "status: stable\n", "domain_name: scotty\n");
         let upstream = with(SCOTTY, "- Engineering\n", "- Warp\n");
         assert_eq!(
-            merge_frontmatter(Some(&base), &local, &upstream, &trivial),
-            FrontmatterMerge::NotApplicable
+            merge_text(Some(&base), &local, &upstream, &trivial),
+            MergedText::Clean(with(&local, "- Engineering\n", "- Warp\n"))
         );
     }
 

@@ -111,6 +111,12 @@ impl Engine {
     pub async fn sync_take_over(&self, only: Option<&str>, take_over: bool) -> Result<Value> {
         let _activity = ActivityState::begin(&self.activity, "sync", only);
         let targets = self.sync_targets(only)?;
+        // The virtual domains have no files to walk, but an older parser may
+        // have derived their rows too: they are reparsed from the content the
+        // database stores, once, before the file domains are walked. A domain
+        // whose reparse fails is reported and retried on the next sync; it
+        // never holds up the others or the file domains.
+        let mut failed = self.reparse_virtual_domains(only).await?;
         let collab = !self.instance_id.is_empty();
         // Each domain this run applied, paired with the report its apply
         // produced, for the final cross-domain resolution pass. A domain that
@@ -118,7 +124,6 @@ impl Engine {
         // not in the list at all.
         let mut applied: Vec<(DomainId, SyncReport)> = Vec::new();
         let mut skipped = Vec::new();
-        let mut failed = Vec::new();
         // Two short store-lock windows per domain with the scan in between, so the
         // walk-and-hash pass of a large domain no longer blocks every concurrent
         // read behind the mutex. The first window claims the host, resolves the
@@ -139,7 +144,7 @@ impl Engine {
                 skipped.push(json!({ "domain": name, "renaming": true }));
                 continue;
             };
-            let (domain, snapshot) = {
+            let (domain, snapshot, force) = {
                 let store = self.store.lock().await;
                 if collab {
                     match self.claim_file_host(&*store, name, root, take_over).await? {
@@ -166,9 +171,13 @@ impl Engine {
                     .upsert_domain(name, Some(&root.to_string_lossy()), DomainKind::File)
                     .await?;
                 let snapshot = store.file_stamps(domain).await?;
-                (domain, snapshot)
+                // A domain an older parser derived is walked whole, once: every
+                // file is re-read and re-parsed, nothing on disk is written,
+                // and the apply stamps the current generation as it commits.
+                let force = crystalline_index::reparse_due(&*store, domain).await?;
+                (domain, snapshot, force)
             };
-            let scan = match scan_domain(name, root, snapshot, &self.chunk_params, false).await {
+            let scan = match scan_domain(name, root, snapshot, &self.chunk_params, force).await {
                 Ok(scan) => scan,
                 Err(e) if only.is_none() => {
                     // One denied domain must not block the rest of the
@@ -358,6 +367,77 @@ impl Engine {
         }))
     }
 
+    /// Reparse every virtual domain in scope whose rows an older parser
+    /// derived, from the content the database stores for it, which stays
+    /// byte for byte what it was (see
+    /// [`crystalline_index::reparse_stored_domain`]). A domain already at the
+    /// current generation costs one read of its stamp, and a domain the index
+    /// holds no row for yet has nothing to reparse.
+    ///
+    /// A reparse that fails rolls back and leaves the domain's generation
+    /// where it was, so the next sync tries again; it is logged and answered
+    /// as a `failed` entry of the sync, never as the sync's error, so one
+    /// virtual domain that cannot be reparsed never stops the rest.
+    async fn reparse_virtual_domains(&self, only: Option<&str>) -> Result<Vec<Value>> {
+        let names: Vec<String> = match only {
+            Some(name) => match self.content_source(name)? {
+                ContentSource::Virtual => vec![name.to_string()],
+                ContentSource::File { .. } => Vec::new(),
+            },
+            None => {
+                let config = self.config.read().unwrap();
+                config
+                    .domains
+                    .iter()
+                    .filter(|(_, entry)| entry.is_virtual())
+                    .map(|(name, _)| name.clone())
+                    .collect()
+            }
+        };
+        let mut failed = Vec::new();
+        for name in names {
+            let store = self.store.lock().await;
+            let domain = match store.domain_id(&name).await {
+                Ok(Some(domain)) => domain,
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!(domain = name.as_str(), error = %e, "reparse of '{name}' skipped: {e}");
+                    failed.push(json!({ "domain": name, "error": e.to_string() }));
+                    continue;
+                }
+            };
+            let outcome = crystalline_index::reparse_stored_domain(
+                &*store,
+                &name,
+                domain,
+                &self.chunk_params,
+            )
+            .await;
+            drop(store);
+            let reparsed = match outcome {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::warn!(
+                        domain = name.as_str(),
+                        error = %e,
+                        "reparse of '{name}' after a parser change failed; the next sync tries again: {e}"
+                    );
+                    failed.push(json!({ "domain": name, "error": e.to_string() }));
+                    continue;
+                }
+            };
+            if reparsed > 0 {
+                tracing::info!(
+                    domain = name.as_str(),
+                    reparsed,
+                    "reparsed {reparsed} engram(s) of '{name}' after a parser change"
+                );
+                self.announce_domain(&name, None, None);
+            }
+        }
+        Ok(failed)
+    }
+
     /// The file domains to sync, as `(name, root)` pairs. Virtual domains have
     /// no files, so they are skipped everywhere sync and reindex walk domains; a
     /// named sync of a virtual domain is a clean no-op.
@@ -433,6 +513,7 @@ impl Engine {
         let stats = store.domain_stats().await?;
         let coverage = store.embedding_coverage().await?;
         drop(store);
+        let contradictions = self.contradictions_status().await?;
         let active_embedded = coverage.embedded_for(&self.model_id);
         // Annotate each domain with its ownership relative to this instance so an
         // operator sees at a glance which domains this daemon hosts in a shared
@@ -495,6 +576,7 @@ impl Engine {
                 "total_chunks": coverage.total_chunks,
                 "hybrid_available": coverage.has_active_embeddings(&self.model_id),
             },
+            "contradictions": contradictions,
             "activity": activity,
         });
         let pruned: Vec<Value> = self
@@ -537,24 +619,24 @@ impl Engine {
         *self.model_cache_pruned.write().unwrap() = removed;
     }
 
-    /// The repository the model cache is pruned down to, or `None` when this
+    /// The repositories the model cache is pruned down to, or `None` when this
     /// instance must not prune weights at all.
     ///
-    /// Three conditions, and every one of them has to hold. The instance is
-    /// writable: a read-only instance serves a database and a model cache it
-    /// does not own, and deleting another install's weights is not its
-    /// business. The configured provider is the local one: a remote config may
-    /// legitimately name one of the table's models by its repository id,
-    /// because that is what the endpoint serving it calls it, and that string
-    /// says nothing about which weights this disk needs. And the active model
-    /// is one the table knows, so there is a repository to keep; a model this
-    /// build does not know keeps everything, since nothing is deleted on a
-    /// guess.
-    fn model_cache_keep(&self) -> Option<&'static str> {
+    /// `None` in the same three cases as before: a read-only instance, a
+    /// remote embedding provider, or an active embedding model this build
+    /// does not know. Otherwise the active embedding model's repository, plus
+    /// the configured contradiction profile's when `evolve.contradictions` is
+    /// not off, so a changed profile's previous checkpoint goes at the next
+    /// start and a profile turned off leaves no checkpoint behind.
+    fn model_cache_keep(&self) -> Option<Vec<&'static str>> {
         if self.read_only {
             return None;
         }
-        self.active_local_model().map(|m| m.repo)
+        let mut keep = vec![self.active_local_model()?.repo];
+        if let Some(nli) = self.contradiction_model() {
+            keep.push(nli.repo);
+        }
+        Some(keep)
     }
 
     /// The table entry of the active model when the configured provider is
@@ -661,16 +743,16 @@ impl Engine {
     ///
     /// The daemon calls this once per start and only after the active model has
     /// LOADED, never before: a failed download must not be the reason the only
-    /// working weights are deleted. The keep list is a slice because the
-    /// contradiction scorer adds its own model id to it; until then it holds
-    /// one entry. Every failure is logged and swallowed, because an unpruned
-    /// cache costs disk and nothing else.
+    /// working weights are deleted. The keep list holds the embedding model
+    /// and, when the contradiction check is on, its profile's checkpoint.
+    /// Every failure is logged and swallowed, because an unpruned cache costs
+    /// disk and nothing else.
     pub async fn prune_model_cache(&self, models_dir: PathBuf) {
         let Some(keep) = self.model_cache_keep() else {
             return;
         };
         let removed = tokio::task::spawn_blocking(move || {
-            crystalline_index::prune_model_cache(&models_dir, &[keep])
+            crystalline_index::prune_model_cache(&models_dir, &keep)
         })
         .await;
         match removed {
@@ -679,7 +761,7 @@ impl Engine {
                 tracing::info!(
                     models = removed.len(),
                     bytes,
-                    "pruned unused embedding models from the cache"
+                    "pruned unused models from the cache"
                 );
                 self.record_model_cache_prune(removed);
             }
@@ -782,7 +864,7 @@ impl Engine {
     /// virtual domain (whose single source of truth is the shared database, so
     /// every instance is jointly responsible for keeping them embedded). An empty
     /// set is returned as `Some([])`, which the store treats as "nothing to do".
-    async fn embed_scope(&self, store: &dyn Store) -> Result<Option<Vec<DomainId>>> {
+    pub(super) async fn embed_scope(&self, store: &dyn Store) -> Result<Option<Vec<DomainId>>> {
         if self.instance_id.is_empty() {
             return Ok(None);
         }

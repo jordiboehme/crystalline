@@ -13,11 +13,24 @@ import { describe, expect, it } from "vitest";
 
 import { stationOfPlace } from "../paths";
 import { BLAST_HALF, BULK_HALF, SLIDE_HALF } from "../render/models/doors";
-import { CANNED_BRIDGE, CANNED_DECK, CANNED_HUB, galleryRoom } from "./canned";
+import { airlockRoom } from "./airlock";
+import {
+  CANNED_BRIDGE,
+  CANNED_DECK,
+  CANNED_DOMAINS,
+  CANNED_HUB,
+  galleryRoom,
+} from "./canned";
 import { generateDeck } from "./deck";
-import { ACCESS_DENIED, NOT_FOUND, generateRoom } from "./generate";
+import {
+  ACCESS_DENIED,
+  MACHINE_KINDS,
+  NOT_FOUND,
+  generateRoom,
+} from "./generate";
 import { isFloor } from "./layout";
 import {
+  AIRLOCK_START,
   APPROACH,
   ARRIVAL_DISTANCE,
   DOOR_HALF,
@@ -27,6 +40,7 @@ import {
   REACH,
   approaches,
   arrivalSpawn,
+  arrivalWay,
   focusOf,
   hatchTravel,
   stepDoors,
@@ -186,7 +200,7 @@ describe("focusOf at the station's fixtures (M3 C26, C28)", () => {
     seed: 3,
   });
 
-  it("offers the lift within reach, and nothing at a screen or an exit", () => {
+  it("offers the lift within reach, a screen to be read, and nothing at an exit", () => {
     // Mutation caught: the lift's case returning null, the exit offered as
     // a door.
     expect(focusOf(lift, inFront(lift, 0, 1.2))).toEqual({
@@ -195,8 +209,124 @@ describe("focusOf at the station's fixtures (M3 C26, C28)", () => {
       prompt: "SPACE LIFT",
     });
     expect(focusOf(lift, inFront(lift, 0, REACH + 0.3))).toBeNull();
-    expect(focusOf(screen, inFront(screen, 0, 1.2))).toBeNull();
+    expect(focusOf(screen, inFront(screen, 0, 1.2))).toEqual({
+      kind: "screen",
+      index: 0,
+      prompt: "SPACE READ S",
+    });
     expect(focusOf(exit, inFront(exit, 0, 1.2))).toBeNull();
+  });
+});
+
+describe("focusOf at the read fixtures (0.22 R12, R13)", () => {
+  const scope = bridge.fixtures[scopeIndex]!.slot;
+  /** The scope terminal's slot moved `dy` cells along the west wall. */
+  const beside = (dy: number): WallSlot => ({ ...scope, y: scope.y + dy });
+  /** The bridge with only `fixtures`. */
+  const only = (...fixtures: Fixture[]): RoomSpec => ({ ...bridge, fixtures });
+  const placard: Fixture = { kind: "placard", slot: scope, lines: ["P"] };
+  const poster: Fixture = {
+    kind: "poster",
+    slot: scope,
+    category: "warning",
+    lines: ["W"],
+    seed: 4,
+  };
+  const machine: Fixture = {
+    kind: "machine",
+    slot: scope,
+    machine: MACHINE_KINDS[0]!,
+    tag: "reactor",
+    hue: 0,
+    seed: 5,
+  };
+  const bulkhead: Fixture = {
+    kind: "door",
+    slot: beside(1),
+    style: "bulkhead",
+    relType: "depends_on",
+    label: "Reactor Core",
+    address: { domain: "station", permalink: "reactor-core" },
+    sealedLabel: null,
+    seed: 6,
+  };
+
+  it("offers a placard, a poster, a screen and a machine with their prompts", () => {
+    // Mutation caught: a reading kind left returning null, or a prompt
+    // naming the wrong thing (the poster's first line, not its category).
+    const cases: [Fixture, string][] = [
+      [placard, "SPACE READ PLACARD"],
+      [poster, "SPACE READ warning"],
+      [machine, `SPACE READ ${bridge.title}`],
+      [
+        {
+          kind: "screen",
+          slot: scope,
+          lines: ["DECK 3", "x"],
+          keys: [],
+          seed: 7,
+        },
+        "SPACE READ DECK 3",
+      ],
+    ];
+    expect(cases.length).toBeGreaterThan(0);
+    for (const [fixture, prompt] of cases) {
+      const room = only(fixture);
+      expect(focusOf(room, inFront(room, 0, 1.4))).toEqual({
+        kind: fixture.kind,
+        index: 0,
+        prompt,
+      });
+    }
+  });
+
+  /**
+   * A player 1.5 m out from the wall between slot 0 and slot 1, 1.2 m
+   * along it from slot 1's point towards slot 0's: slot 0 is nearer, and
+   * both are in reach and within FACING, looking straight at the wall.
+   */
+  const between = (room: RoomSpec): Player => {
+    const w0 = wallPoint(room.fixtures[0]!.slot);
+    const w1 = wallPoint(room.fixtures[1]!.slot);
+    const len = Math.hypot(w0.x - w1.x, w0.z - w1.z);
+    const t = 1.2 / len;
+    const x = w1.x + (w0.x - w1.x) * t + w1.inward[0] * 1.5;
+    const z = w1.z + (w0.z - w1.z) * t + w1.inward[1] * 1.5;
+    return at(x, z, yawAlong(-w1.inward[0], -w1.inward[1]));
+  };
+  const near = (room: RoomSpec, p: Player, i: number) => {
+    const w = wallPoint(room.fixtures[i]!.slot);
+    return Math.hypot(w.x - p.x, w.z - p.z);
+  };
+
+  it("keeps a bulkhead in focus with a placard nearer", () => {
+    // Mutation caught: one nearest-wins pass over every kind, so the nearer
+    // placard takes Space from the door.
+    const room = only(placard, bulkhead);
+    const p = between(room);
+    expect(near(room, p, 0)).toBeLessThan(near(room, p, 1));
+    // Each alone is in focus from the same spot.
+    expect(focusOf(only(placard), p)?.kind).toBe("placard");
+    expect(focusOf(only(bulkhead), p)?.kind).toBe("door");
+    expect(focusOf(room, p)).toEqual({
+      kind: "door",
+      index: 1,
+      prompt: "SPACE OPEN Reactor Core",
+    });
+  });
+
+  it("keeps the nearest-wins between a terminal and a door", () => {
+    // Mutation caught: the terminal ranked with the readings, so the
+    // farther door takes Space from the nearer terminal.
+    const terminal = bridge.fixtures[scopeIndex]!;
+    const room = only(terminal, bulkhead);
+    const p = between(room);
+    expect(near(room, p, 0)).toBeLessThan(near(room, p, 1));
+    expect(focusOf(room, p)).toEqual({
+      kind: "terminal",
+      index: 0,
+      prompt: "SPACE READ Scope",
+    });
   });
 });
 
@@ -443,6 +573,135 @@ describe("arrivalSpawn", () => {
       }),
       entrance,
     );
+  });
+});
+
+describe("the airlock start (0.22 R2 to R4)", () => {
+  const airlock = airlockRoom({ domains: CANNED_DOMAINS, here: null });
+  const liftIndex = airlock.fixtures.findIndex((f) => f.kind === "lift");
+  const settled = (at: { x: number; z: number; yaw: number }): Player => ({
+    ...at,
+    vx: 0,
+    vz: 0,
+    pitch: 0,
+    bob: 0,
+  });
+  const from: StationAddress = { kind: "bridge", domain: "orbit" };
+
+  it("faces the lift within reach on the first tick", () => {
+    // Mutation caught: a yaw that faces the hatch, or a distance past REACH.
+    expect(liftIndex).toBeGreaterThanOrEqual(0);
+    const focus = focusOf(airlock, settled(arrivalSpawn(airlock, null)));
+    expect(focus?.kind).toBe("lift");
+    expect(focus?.prompt).toBe("SPACE LIFT");
+  });
+
+  it("stands AIRLOCK_START from the lift's wall point", () => {
+    // Mutation caught: the distance left at the cell's 1 m.
+    const w = wallPoint(airlock.fixtures[liftIndex]!.slot);
+    const at = arrivalSpawn(airlock, null);
+    expect(AIRLOCK_START).toBe(2.0);
+    expect(Math.hypot(at.x - w.x, at.z - w.z)).toBeCloseTo(AIRLOCK_START);
+  });
+
+  it("steps a lift ride out at the entrance facing the room", () => {
+    // Mutation caught: the ride turned to the lift too (R3).
+    const ride = arrivalSpawn(airlock, { via: "lift", from });
+    expect(ride.x).toBeCloseTo((airlock.spawn.x + 0.5) * CELL);
+    expect(ride.z).toBeCloseTo((airlock.spawn.y + 0.5) * CELL);
+    expect(ride.yaw).toBe(airlock.spawn.yaw);
+  });
+
+  it("leaves the canned bridge's start at its spawn", () => {
+    // Mutation caught: the rule widened to every room with no arrival.
+    const at = arrivalSpawn(bridge, null);
+    expect(at.x).toBeCloseTo((bridge.spawn.x + 0.5) * CELL);
+    expect(at.z).toBeCloseTo((bridge.spawn.y + 0.5) * CELL);
+    expect(at.yaw).toBe(bridge.spawn.yaw);
+  });
+});
+
+describe("arrivalWay (0.22 R1)", () => {
+  const handbook: StationAddress = {
+    kind: "engram",
+    domain: "station",
+    permalink: "crew-handbook",
+  };
+
+  it("names the door or portal a hatch crawl stands the player in front of", () => {
+    // Mutation caught: the hatch crawl's match not returned (no way to
+    // latch, so a step back walks through the way the player came by).
+    expect(
+      arrivalWay(bridge, {
+        via: "hatch",
+        from: { kind: "engram", domain: "station", permalink: "old-bridge" },
+      }),
+    ).toBe(slidingIndex);
+    expect(
+      arrivalWay(bridge, {
+        via: "hatch",
+        from: {
+          kind: "engram",
+          domain: "logistics",
+          permalink: "cargo-manifest",
+        },
+      }),
+    ).toBe(portalIndex);
+  });
+
+  it("is null for a matched bulkhead or blast door, which only Space opens", () => {
+    // Mutation caught: the style check dropped or narrowed to one style (a
+    // latched bulkhead or blast door stays shut while it is offered, so the
+    // first Space at it does nothing).
+    const from: StationAddress = {
+      kind: "engram",
+      domain: "station",
+      permalink: "old-bridge",
+    };
+    const styles = ["sliding", "bulkhead", "blast"] as const;
+    const found = styles.map((style) =>
+      arrivalWay(
+        {
+          ...bridge,
+          fixtures: bridge.fixtures.map((f, i) =>
+            i === slidingIndex && f.kind === "door" ? { ...f, style } : f,
+          ),
+        },
+        { via: "hatch", from },
+      ),
+    );
+    expect(found).toEqual([slidingIndex, null, null]);
+  });
+
+  it("is null for no arrival, a lift ride, no match and a matched hatch", () => {
+    // Mutation caught: a matched hatch returned (Space crawls a hatch, it
+    // carries no one on its own, and its latch would only hide its offer
+    // from nothing), or a lift ride matched like a crossing.
+    expect(arrivalWay(bridge, null)).toBeNull();
+    // A door arrival matches the hatch back: the hatch is no way to latch.
+    expect(
+      arrivalSpawn(bridge, { via: "door", from: handbook }).x,
+    ).not.toBeCloseTo((bridge.spawn.x + 0.5) * CELL);
+    expect(arrivalWay(bridge, { via: "door", from: handbook })).toBeNull();
+    expect(arrivalWay(bridge, { via: "portal", from: handbook })).toBeNull();
+    expect(
+      arrivalWay(bridge, {
+        via: "door",
+        from: { kind: "engram", domain: "station", permalink: "nowhere" },
+      }),
+    ).toBeNull();
+    // From cargo-manifest a hatch crawl matches the portal; a lift ride
+    // matches nothing (the deck case is in "the exit and the lift").
+    expect(
+      arrivalWay(bridge, {
+        via: "lift",
+        from: {
+          kind: "engram",
+          domain: "logistics",
+          permalink: "cargo-manifest",
+        },
+      }),
+    ).toBeNull();
   });
 });
 
@@ -758,6 +1017,27 @@ describe("the exit and the lift (M3 C27, C28)", () => {
       z: (deck.spawn.y + 0.5) * CELL,
       yaw: deck.spawn.yaw,
     });
+  });
+
+  it("names the deck's door back as the way behind an exit arrival, and nothing for a lift ride (0.22 R1)", () => {
+    // Mutation caught: the exit arrival's door not returned (the session
+    // would leave the way behind unlatched), or a lift ride matched like
+    // an exit (its latch would shut a door the player never came by).
+    const deck = roomFor(
+      { kind: "deck", input: CANNED_DECK, section: null },
+      { from: engram },
+      null,
+    ).room;
+    const back = indexOf(
+      deck,
+      (f) =>
+        f.kind === "door" &&
+        f.address !== null &&
+        f.address.permalink === row.permalink,
+    );
+    expect(arrivalWay(deck, { via: "exit", from: engram })).toBe(back);
+    expect(arrivalWay(deck, { via: "lift", from: engram })).toBeNull();
+    expect(arrivalWay(deck, null)).toBeNull();
   });
 
   it("holds a latched exit shut and carries no one through it", () => {

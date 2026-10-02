@@ -1545,6 +1545,82 @@ async fn split_refuses_a_stale_checksum_and_writes_nothing() {
     );
 }
 
+/// A bullet that wraps onto further lines is one observation: read_engram
+/// reports it once, at its first line and with the joined text, and a split
+/// by that line moves every line of it, never leaving a continuation behind.
+#[tokio::test]
+async fn split_moves_every_line_of_a_wrapped_bullet() {
+    let (tmp, engine) = engine_fixture().await;
+    let wrapped = BUNDLE.replace(
+        "- [fact] The loop needs a 40 minute purge before a mix swap\n",
+        "- [fact] The loop needs a 40 minute purge before a mix swap,\n  which is why the swap runs in the night shift\nand never during a docking #purge\n",
+    );
+    std::fs::write(tmp.path().join("eng/coolant-bundle.md"), &wrapped).unwrap();
+    engine.sync(None).await.unwrap();
+
+    let read = engine
+        .read_engram(
+            &ReadParams {
+                identifier: "coolant-bundle".to_string(),
+                domain: Some("eng".to_string()),
+                share_link: None,
+            },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    let purge: Vec<&serde_json::Value> = read["observations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|o| {
+            o["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("40 minute")
+        })
+        .collect();
+    assert_eq!(purge.len(), 1, "one observation: {purge:?}");
+    assert_eq!(
+        purge[0]["content"],
+        "The loop needs a 40 minute purge before a mix swap, which is why the swap runs in \
+         the night shift and never during a docking"
+    );
+    assert_eq!(purge[0]["tags"], serde_json::json!(["purge"]));
+    let first = wrapped
+        .lines()
+        .position(|l| l.contains("40 minute purge"))
+        .unwrap()
+        + 1;
+    assert_eq!(purge[0]["line"], first, "the bullet's own line");
+
+    engine
+        .split_engram(&SplitParams {
+            domain: "eng".to_string(),
+            identifier: "coolant-bundle".to_string(),
+            title: "Purge Procedure".to_string(),
+            folder: None,
+            observations: vec![first],
+            sections: Vec::new(),
+            expected_checksum: None,
+        })
+        .await
+        .unwrap();
+
+    let new = std::fs::read_to_string(tmp.path().join("eng/purge-procedure.md")).unwrap();
+    assert!(
+        new.contains(
+            "- [fact] The loop needs a 40 minute purge before a mix swap,\n  which is why the swap \
+             runs in the night shift\nand never during a docking #purge\n"
+        ),
+        "{new}"
+    );
+    let source = std::fs::read_to_string(tmp.path().join("eng/coolant-bundle.md")).unwrap();
+    assert!(!source.contains("night shift"), "{source}");
+    assert!(!source.contains("docking"), "{source}");
+    assert!(source.contains("- [fact] The purge pump is rated for 12 bar"));
+}
+
 #[tokio::test]
 async fn split_moves_a_section_by_heading_path() {
     let (tmp, engine, _) = bundle_fixture().await;
@@ -2613,4 +2689,204 @@ async fn a_hidden_domain_is_never_normalized_into() {
     assert_eq!(seen["domain_names_normalized"], 1, "{seen}");
     let stored = std::fs::read_to_string(tmp.path().join("platform/keeper-link.md")).unwrap();
     assert!(stored.contains("[[eng:x]]"), "{stored}");
+}
+
+// ---------------------------------------------------------------------------
+// the reparse after a parser change
+// ---------------------------------------------------------------------------
+
+/// Rewrite one engram's rows to what the parser before generation 1 derived
+/// from a bullet that wraps: the observation is its first line, without the
+/// tag its continuation line carries. Everything else, the stamp and the
+/// stored content included, stays as it is.
+async fn stage_fragment(
+    store: &dyn crystalline_index::Store,
+    domain: crystalline_index::DomainId,
+    path: &str,
+    content: &str,
+    keep_content: bool,
+) {
+    let stamp = store.file_stamps(domain).await.unwrap()[path].clone();
+    let engram = crystalline_core::parse_engram(content).unwrap();
+    let mut record = crystalline_index::EngramRecord::from_engram(&engram, path, stamp);
+    if keep_content {
+        record.content = content.to_string();
+    }
+    let obs = record
+        .observations
+        .iter_mut()
+        .find(|o| o.tags.contains(&"purge".to_string()))
+        .expect("the wrapped bullet carries #purge");
+    obs.content = "the purge runs before every mix swap,".to_string();
+    obs.tags.clear();
+    store.upsert_engram(domain, &record).await.unwrap();
+    store.set_parse_generation(domain, 0).await.unwrap();
+}
+
+async fn purge_observations(store: &dyn crystalline_index::Store, domain: &str) -> i64 {
+    store
+        .vocabulary(Some(domain), None)
+        .await
+        .unwrap()
+        .tags
+        .iter()
+        .find(|t| t.name == "purge")
+        .map(|t| t.observations)
+        .unwrap_or(0)
+}
+
+/// The upgrade as a daemon sees it: an index an older parser built, a file
+/// domain and a virtual domain both holding a wrapped bullet as a fragment,
+/// and the startup sync. Both domains come out with the joined observation,
+/// nothing on disk or in the stored documents changed, and nobody ran a
+/// reindex.
+#[tokio::test]
+async fn the_sync_after_a_parser_change_reparses_file_and_virtual_domains_once() {
+    let (tmp, engine) = engine_fixture().await;
+    let wrapped_body = "The purge rules.\n\n- [fact] the purge runs before every mix swap,\n  which is why the swap waits for night #purge\n";
+    let file = format!(
+        "---\ntype: engram\ntitle: Purge\npermalink: purge\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Purge\n\n{wrapped_body}"
+    );
+    let file_path = tmp.path().join("eng/purge.md");
+    std::fs::write(&file_path, &file).unwrap();
+    engine.sync(None).await.unwrap();
+    engine
+        .write_engram(&crystalline_service::params::WriteParams {
+            domain: "scratch".to_string(),
+            title: "Purge Notes".to_string(),
+            content: wrapped_body.to_string(),
+            folder: None,
+            engram_type: None,
+            tags: vec![],
+            status: None,
+            metadata: None,
+            overwrite: false,
+            share_link: None,
+            model: None,
+        })
+        .await
+        .unwrap();
+
+    let store = engine.store();
+    let stored_before = {
+        let store = store.lock().await;
+        let eng = store.domain_id("eng").await.unwrap().unwrap();
+        let scratch = store.domain_id("scratch").await.unwrap().unwrap();
+        assert_eq!(purge_observations(&*store, "eng").await, 1);
+        assert_eq!(purge_observations(&*store, "scratch").await, 1);
+        stage_fragment(&*store, eng, "purge.md", &file, false).await;
+        let rows = store.all_engram_contents(scratch).await.unwrap();
+        let row = rows.iter().find(|r| r.content.contains("#purge")).unwrap();
+        stage_fragment(&*store, scratch, &row.path, &row.content, true).await;
+        assert_eq!(purge_observations(&*store, "eng").await, 0);
+        assert_eq!(purge_observations(&*store, "scratch").await, 0);
+        rows
+    };
+
+    engine.sync(None).await.unwrap();
+
+    let store = store.lock().await;
+    assert_eq!(purge_observations(&*store, "eng").await, 1);
+    assert_eq!(purge_observations(&*store, "scratch").await, 1);
+    for name in ["eng", "scratch"] {
+        let id = store.domain_id(name).await.unwrap().unwrap();
+        assert_eq!(
+            store.parse_generation(id).await.unwrap(),
+            crystalline_core::PARSE_GENERATION,
+            "{name} is stamped current"
+        );
+    }
+    assert_eq!(std::fs::read_to_string(&file_path).unwrap(), file);
+    let scratch = store.domain_id("scratch").await.unwrap().unwrap();
+    let stored_after = store.all_engram_contents(scratch).await.unwrap();
+    assert_eq!(
+        stored_after
+            .iter()
+            .map(|r| (&r.path, &r.content, &r.sha256))
+            .collect::<Vec<_>>(),
+        stored_before
+            .iter()
+            .map(|r| (&r.path, &r.content, &r.sha256))
+            .collect::<Vec<_>>(),
+        "the stored documents are byte for byte what they were"
+    );
+}
+
+/// A virtual domain whose reparse fails never holds up the sync: the failure
+/// is reported under `failed`, the domain stays behind so the next sync tries
+/// again, and the file domains are synced as on any other day. The failure is
+/// a stored row whose document claims a permalink another row owns, which the
+/// index refuses.
+#[tokio::test]
+async fn a_failing_virtual_reparse_does_not_stop_the_sync() {
+    let (tmp, engine) = engine_fixture().await;
+    for (title, content) in [
+        ("First Note", "The first note, long enough to stand."),
+        ("Second Note", "The second note, long enough to stand."),
+    ] {
+        engine
+            .write_engram(&crystalline_service::params::WriteParams {
+                domain: "scratch".to_string(),
+                title: title.to_string(),
+                content: content.to_string(),
+                folder: None,
+                engram_type: None,
+                tags: vec![],
+                status: None,
+                metadata: None,
+                overwrite: false,
+                share_link: None,
+                model: None,
+            })
+            .await
+            .unwrap();
+    }
+    let store = engine.store();
+    let scratch = {
+        let store = store.lock().await;
+        let scratch = store.domain_id("scratch").await.unwrap().unwrap();
+        let rows = store.all_engram_contents(scratch).await.unwrap();
+        let (first, second) = (&rows[0], &rows[1]);
+        // The second row's stored document now claims the first one's
+        // permalink, while its index row still answers to its own.
+        let clash = second.content.replace(
+            &format!("permalink: {}", second.permalink),
+            &format!("permalink: {}", first.permalink),
+        );
+        assert_ne!(clash, second.content);
+        let engram = crystalline_core::parse_engram(&clash).unwrap();
+        let stamp = store.file_stamps(scratch).await.unwrap()[&second.path].clone();
+        let mut record = crystalline_index::EngramRecord::from_engram(&engram, &second.path, stamp);
+        record.permalink = second.permalink.clone();
+        record.content = clash.clone();
+        record.stamp.sha256 = {
+            use sha2::Digest;
+            crystalline_index::hex_lower(&sha2::Sha256::digest(clash.as_bytes()))
+        };
+        store.upsert_engram(scratch, &record).await.unwrap();
+        store.set_parse_generation(scratch, 0).await.unwrap();
+        scratch
+    };
+    std::fs::write(
+        tmp.path().join("eng/beta.md"),
+        "---\ntype: engram\ntitle: Beta\npermalink: beta\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Beta\n\nA file that arrived while the reparse was failing.\n",
+    )
+    .unwrap();
+
+    let result = engine.sync(None).await.expect("the sync goes on");
+    let failed = result["failed"].as_array().unwrap();
+    assert!(
+        failed.iter().any(|f| f["domain"] == "scratch"),
+        "the failure is reported: {result}"
+    );
+    let store = store.lock().await;
+    assert_eq!(
+        store.parse_generation(scratch).await.unwrap(),
+        0,
+        "behind, so the next sync tries again"
+    );
+    assert!(
+        store.find_engram("eng", "beta").await.unwrap().is_some(),
+        "the file domain was synced"
+    );
 }

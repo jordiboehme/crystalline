@@ -312,10 +312,22 @@ pub struct SchemaDef {
 }
 
 /// A top-level observation bullet: `- [category] content #tag (context)`.
+///
+/// A bullet that wraps onto further lines is one observation: its
+/// continuation lines are joined into the text with single spaces, so the
+/// trailing tags and context are read from the end of the whole bullet.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Observation {
-    /// One-based line number in the source file.
+    /// One-based line number in the source file: the bullet's own line, also
+    /// when the bullet wraps onto further lines.
     pub line: usize,
+    /// One-based line number of the last source line the observation's text
+    /// was read from. Equal to [`Observation::line`] for a bullet on one line;
+    /// for a wrapped bullet it is its last continuation line, so a caller that
+    /// moves or rewrites the bullet takes `line..=end_line`. Not serialized:
+    /// the wire shape stays the bullet's first line.
+    #[serde(skip)]
+    pub end_line: usize,
     /// The single bracket token category.
     pub category: String,
     /// The observation text with trailing tags and context removed.
@@ -329,8 +341,13 @@ pub struct Observation {
 /// A top-level relation bullet: `- rel_type [[Target]]`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Relation {
-    /// One-based line number in the source file.
+    /// One-based line number in the source file: the bullet's own line, also
+    /// when the bullet wraps onto further lines.
     pub line: usize,
+    /// One-based line number of the last source line the relation was read
+    /// from; see [`Observation::end_line`]. Not serialized.
+    #[serde(skip)]
+    pub end_line: usize,
     /// The relation type; a single token or a quoted phrase.
     pub rel_type: String,
     /// The link target.

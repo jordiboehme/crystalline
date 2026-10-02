@@ -308,4 +308,11 @@ mod tests {
                 .any(|i| i.rule == "Q002")
         );
     }
+
+    #[test]
+    fn near_miss_leaves_a_link_bullet_alone() {
+        assert!(near_miss("- [label](https://x) - text").is_none());
+        assert!(near_miss("- [label][ref] text").is_none());
+        assert!(near_miss("- [label text").is_some());
+    }
 }

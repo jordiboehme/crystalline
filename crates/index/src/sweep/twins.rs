@@ -14,7 +14,9 @@
 //! its finding cap off the top.
 //!
 //! What this is not: a contradiction detector. Two texts close in embedding
-//! space agree about their topic and nothing else; the finding text says so.
+//! space agree about their topic and nothing else; `V302` names a possible
+//! contradiction a model read, and `V301` still only says two engrams are
+//! about the same thing.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -105,6 +107,18 @@ impl PartialOrd for Ranked {
 /// caller's queue is unchanged. That is why no truncation line is owed for it,
 /// where the vector cap - which skips the pass whole - reports one.
 pub fn find_twins(vectors: &[Option<&[f32]>], options: &SweepOptions) -> TwinPairs {
+    find_twins_where(vectors, options, |_, _| true)
+}
+
+/// [`find_twins`] with a pair filter applied inside the walk, before the
+/// retention guard: a pair `keep(a, b)` refuses (indices into `vectors`, `a`
+/// the lower) takes no slot, so it can never evict a pair the caller wants.
+/// The contradiction check passes its validity-window rule here.
+pub fn find_twins_where(
+    vectors: &[Option<&[f32]>],
+    options: &SweepOptions,
+    keep: impl Fn(usize, usize) -> bool,
+) -> TwinPairs {
     // Carrying the slice alongside its index keeps the `Option` out of the
     // inner loop, which runs up to `max_twin_vectors` squared over two times.
     let present: Vec<(usize, &[f32])> = vectors
@@ -133,7 +147,7 @@ pub fn find_twins(vectors: &[Option<&[f32]>], options: &SweepOptions) -> TwinPai
                 continue;
             }
             let sim = cosine(a, b);
-            if sim < options.twin_threshold {
+            if sim < options.twin_threshold || !keep(i, j) {
                 continue;
             }
             let pair = Ranked(TwinPair {

@@ -6,7 +6,7 @@ import { generateRoom } from "../world/generate";
 import { wallAnchor } from "../world/sites";
 import type { Prop, RoomSpec } from "../world/types";
 import { CELL } from "../world/units";
-import { LOOKS } from "./looks";
+import { LOOK } from "./looks";
 import {
   MARGIN,
   SHADOW_TEXELS,
@@ -188,13 +188,10 @@ describe("contact shadows", () => {
     }
   });
 
-  it("shows on look 2's dark floor without blacking it out, and appears only in look 2", () => {
-    // Mutation caught: a contact shadow in look 1 or 3, one back at the
-    // first strength (0.7, too faint on the dark floor), or one that
-    // blacks the floor out.
-    expect(LOOKS.day.contactShadow).toBeUndefined();
-    expect(LOOKS.freescape.contactShadow).toBeUndefined();
-    const k = LOOKS.aperture.contactShadow ?? 0;
+  it("shows on the dark floor without blacking it out", () => {
+    // Mutation caught: a contact shadow back at the first strength (0.7,
+    // too faint on the dark floor), or one that blacks the floor out.
+    const k = LOOK.contactShadow ?? 0;
     expect(k).toBeGreaterThan(0.75);
     expect(k).toBeLessThanOrEqual(0.9);
   });

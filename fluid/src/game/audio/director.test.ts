@@ -503,6 +503,23 @@ describe("createDirector", () => {
     expect(director.toggleMute()).toBe(false);
   });
 
+  // Mutation caught: the director's toggleAmbience not reaching the mixer,
+  // or silencing the effects bus with it.
+  it("switches the ambience bus only, through the mixer", () => {
+    const { ctx, mixer, director } = setup();
+    disposers.push(() => director.dispose());
+    expect(director.toggleAmbience()).toBe(true);
+    expect(mixer.ambienceOff).toBe(true);
+    expect(mixer.muted).toBe(false);
+    expect((bus(mixer, "ambience") as FakeGain).gain.events.at(-1)?.[1]).toBe(
+      0,
+    );
+    director.cue({ kind: "terminal" });
+    expect(levelsInto(ctx, bus(mixer, "effects"))).toHaveLength(1);
+    expect(director.toggleAmbience()).toBe(false);
+    expect(mixer.ambienceOff).toBe(false);
+  });
+
   // Mutation caught: a drone or a hum left playing after the route went,
   // the mixer left open, or cues still played after.
   it("stops everything and closes the mixer on dispose", () => {

@@ -1,9 +1,14 @@
 name: Dev channel
 
-# The Homebrew dev channel: every commit on main that CI passed becomes a
-# GitHub pre-release and the formula `crystalline-dev` in
-# jordiboehme/homebrew-tap, installed with
-# `brew install jordiboehme/tap/crystalline-dev`.
+# The Homebrew dev channel: a commit on main that CI passed becomes a GitHub
+# pre-release and the formula `crystalline-dev` in jordiboehme/homebrew-tap,
+# installed with `brew install jordiboehme/tap/crystalline-dev`, but only when
+# it asks for a dev build (see the opt-in check in the `version` job). It asks
+# when its commit message contains `[dev-build]`, or when it came from a merged
+# pull request that has the label `dev-build` or `[dev-build]` in its title or
+# body. A manual dispatch on main always builds. Without an opt-in the run
+# ends green and builds nothing, so a release PR's merge commit, which the
+# stable release builds, carries no opt-in.
 #
 # The stable channel is untouched by this: a `v*` tag runs release.yml, which
 # publishes the latest release and Formula/crystalline.rb exactly as before.
@@ -34,11 +39,12 @@ on:
 # nothing would ship. The condition is the `version` job's guard.
 #
 # The tip check matters because CI runs on main can finish out of order
-# (ci.yml has no concurrency group and a docs-only fast path) and an old CI
-# run can be re-run. For workflow_run, github.sha is main's tip when this run
-# started, so `head_sha == github.sha` means CI tested the tip. It also keeps
-# `uses: ./.github/workflows/build.yml`, which resolves at github.sha, on the
-# same commit as the source the build checks out.
+# (ci.yml groups main runs per commit and never cancels them, and it has a
+# docs-only fast path) and an old CI run can be re-run. For workflow_run,
+# github.sha is main's tip when this run started, so `head_sha ==
+# github.sha` means CI tested the tip. It also keeps `uses:
+# ./.github/workflows/build.yml`, which resolves at github.sha, on the same
+# commit as the source the build checks out.
 concurrency:
   group: >-
     ${{ ((github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
@@ -57,6 +63,10 @@ jobs:
   version:
     name: compute the dev version
     runs-on: ubuntu-latest
+    # pull-requests: read for the opt-in check's pull request lookup.
+    permissions:
+      contents: read
+      pull-requests: read
     # Only a green CI run of a push to main in this repository, for the commit
     # that is still main's tip, ships. The branches filter above matches a
     # head branch by name, so a pull request from a fork's own `main` would
@@ -75,10 +85,64 @@ jobs:
       build: ${{ steps.plan.outputs.build }}
       formula: ${{ steps.plan.outputs.formula }}
     steps:
+      # The dev channel builds only on request. A manual dispatch is a
+      # request. A CI run asks when the head commit's message contains
+      # `[dev-build]`, or when the commit came from a merged pull request that
+      # has the label `dev-build` or `[dev-build]` in its title or body. This
+      # is opt-in, so every doubt (a failed pull request lookup, unreadable
+      # output) means no build, and the run still ends green. All later steps
+      # run only when a build was asked for, so a run without an opt-in needs
+      # neither the tap token nor a checkout.
+      - name: Is a dev build asked for
+        id: ask
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+          MESSAGE: ${{ github.event.workflow_run.head_commit.message }}
+        run: |
+          set -u
+          asked() {
+            echo "dev build asked for: $1"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+          not_asked() {
+            echo "$1"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            asked "manual dispatch"
+          fi
+          if printf '%s' "$MESSAGE" | grep -qF '[dev-build]'; then
+            asked "the commit message contains [dev-build]"
+          fi
+          if ! pulls="$(gh api "repos/$REPO/commits/$SHA/pulls" 2> "$RUNNER_TEMP/pulls.err")"; then
+            cat "$RUNNER_TEMP/pulls.err"
+            not_asked "the pull request lookup for $SHA failed, so no dev build"
+          fi
+          if ! match="$(jq -r '
+              [.[]
+               | select(.merged_at != null)
+               | select(any(.labels[]?; .name == "dev-build")
+                        or ((.title // "") | contains("[dev-build]"))
+                        or ((.body // "") | contains("[dev-build]")))
+               | .number]
+              | first // empty' <<<"$pulls")"; then
+            not_asked "the pull request lookup for $SHA returned unreadable output, so no dev build"
+          fi
+          if [ -n "$match" ]; then
+            asked "pull request #$match has the dev-build label or [dev-build] in its title or body"
+          fi
+          not_asked "no [dev-build] token or dev-build label, so no dev build"
+
       # Before anything is signed or published: without the tap token the run
       # would build, notarize and publish a release and then fail to point the
       # formula at it.
       - name: The tap token is configured
+        if: steps.ask.outputs.build == 'true'
         env:
           TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
         run: |
@@ -87,7 +151,8 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.ask.outputs.build == 'true'
         with:
           # The commit CI tested, which the guard above makes main's tip.
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
@@ -96,6 +161,7 @@ jobs:
 
       - name: Compute the version
         id: version
+        if: steps.ask.outputs.build == 'true'
         run: |
           set -euo pipefail
           sha="$(git rev-parse HEAD)"
@@ -112,6 +178,7 @@ jobs:
       # finishes the formula.
       - name: Plan the run
         id: plan
+        if: steps.ask.outputs.build == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
@@ -244,7 +311,7 @@ jobs:
       VERSION: ${{ needs.version.outputs.version }}
       TAG: dev-${{ needs.version.outputs.version }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.version.outputs.sha }}
 

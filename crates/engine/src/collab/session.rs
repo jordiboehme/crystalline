@@ -39,9 +39,9 @@ use yrs::{ClientID, Doc, GetString, Options, ReadTxn, Text, Transact, Update};
 
 use super::control::{self, Control};
 use super::merge::{self, MergeOutcome};
-use super::text::{Separator, collab_eligible, file_text, separator_of, session_text};
 use crate::domain_view::DomainView;
 use crate::engine::{Engine, EngineError, EngramText};
+use crystalline_core::to_lf;
 
 /// The address a room reads and saves its engram at: the `crystalline://`
 /// URL, the one absolute form, which names the room's domain and permalink
@@ -102,14 +102,24 @@ pub struct Frame {
     pub bytes: Bytes,
 }
 
+/// An open room's text and the checksum that stands for it: the version
+/// token a read over the room hands out and a guarded write over it accepts.
+#[derive(Debug, Clone)]
+pub struct LiveText {
+    /// The room's text, LF only.
+    pub text: String,
+    /// The checksum of the stored bytes while the room is clean (its text is
+    /// what it loaded or last saved), so a guard taken before the room opened
+    /// or after it closes still holds even when the file is CRLF; the
+    /// checksum of `text` once anything was typed.
+    pub checksum: String,
+}
+
 /// Why a join did not produce a session.
 #[derive(Debug)]
 pub enum JoinError {
     /// The engram could not be read.
     Engine(EngineError),
-    /// The file mixes line endings, so the LF session transform would not be
-    /// invertible; it edits solo rather than being silently rewritten.
-    MixedEndings,
     /// This daemon already holds [`MAX_SESSIONS`] documents.
     ServerFull,
     /// This document already holds [`MAX_PARTICIPANTS`] connections.
@@ -120,10 +130,6 @@ impl std::fmt::Display for JoinError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             JoinError::Engine(err) => write!(f, "{err}"),
-            JoinError::MixedEndings => write!(
-                f,
-                "this engram mixes line endings, so it cannot host a shared session"
-            ),
             JoinError::ServerFull => write!(f, "too many documents are open for co-editing"),
             JoinError::SessionFull => write!(f, "too many people are editing this engram"),
         }
@@ -525,9 +531,8 @@ impl CollabSessions {
     /// or the row is the truth, exactly as it always was, which is what nearly
     /// every read and write on this instance gets.
     ///
-    /// FILE space, not session space: the caller is an engine verb that parses
-    /// markdown and compares checksums, so it is handed the bytes the file
-    /// would hold rather than the LF transform the room edits in.
+    /// The text is the bytes the room's next save writes, which are LF: the
+    /// caller is an engine verb that parses markdown and compares checksums.
     ///
     /// `overlay` is whose document to ask about, and it is the caller's own
     /// actor - see [`RoomKey`]. An agent writing in a direct domain asks about
@@ -539,9 +544,9 @@ impl CollabSessions {
         domain: &str,
         permalink: &str,
         overlay: Option<&str>,
-    ) -> Option<String> {
+    ) -> Option<LiveText> {
         let session = self.live_room(domain, permalink, overlay).await?;
-        Some(session.snapshot().await.0)
+        Some(session.live().await)
     }
 
     /// Compose `target` into the live document as one transaction tagged with
@@ -756,14 +761,15 @@ struct SessionState {
     /// Owns the Doc (yrs::sync::Awareness::new takes it); the doc is built
     /// with OffsetKind::Utf16 so every index agrees with JS clients.
     awareness: Awareness,
-    separator: Separator,
     /// The domain-relative file path, as loaded and as each save receipt
     /// reports it back. The address a restore writes back to.
     path: String,
     permalink: String,
     /// The checksum backing last_saved_text: the CAS token of the next save.
     checksum: String,
-    /// FILE-space text as last loaded or saved.
+    /// The text as last loaded or saved, as LF: the room's own text is LF,
+    /// and a CRLF file it opened on is the same document as its LF form, so a
+    /// room that was only opened never writes.
     last_saved_text: String,
     /// Awareness client ids seen per connection, nulled on its disconnect.
     conns: HashMap<ConnId, HashSet<ClientID>>,
@@ -901,9 +907,10 @@ impl CollabSession {
             .engram_text(&room_address(&key.0, &key.1))
             .await
             .map_err(JoinError::Engine)?;
-        if !collab_eligible(&loaded.content) {
-            return Err(JoinError::MixedEndings);
-        }
+        // The room's text is LF whatever the file holds; a CRLF or mixed
+        // file is written as LF on the room's first save. The checksum stays
+        // the one of the bytes on disk, the CAS token that save presents.
+        let lf_content = to_lf(&loaded.content).into_owned();
         // OffsetKind::Utf16 rather than the default Bytes: every index the
         // server computes then counts the same units the UTF-16 indexed JS
         // client counts, so a non-ASCII document does not desync.
@@ -914,7 +921,7 @@ impl CollabSession {
         let text = doc.get_or_insert_text(TEXT_NAME);
         {
             let mut txn = doc.transact_mut();
-            text.insert(&mut txn, 0, &session_text(&loaded.content));
+            text.insert(&mut txn, 0, &lf_content);
         }
         let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         Ok(Arc::new(CollabSession {
@@ -930,12 +937,11 @@ impl CollabSession {
             has_agents: AtomicBool::new(false),
             disposed: AtomicBool::new(false),
             state: Mutex::new(SessionState {
-                separator: separator_of(&loaded.content),
                 awareness: Awareness::new(doc),
                 path: loaded.path,
                 permalink: loaded.permalink,
                 checksum: loaded.checksum,
-                last_saved_text: loaded.content,
+                last_saved_text: lf_content,
                 conns: HashMap::new(),
                 agents: HashMap::new(),
                 guests: HashMap::new(),
@@ -975,7 +981,8 @@ impl CollabSession {
         // control message in front. One buffer; concatenation is legal.
         let mut greeting = control::encode(&Control::Hello {
             epoch: self.epoch.clone(),
-            separator: state.separator.as_str().to_string(),
+            // Always LF: the room's text is, and so is every save of it.
+            separator: "\n".to_string(),
             checksum: state.checksum.clone(),
             permalink: state.permalink.clone(),
             save_state: state.save_state.as_str().to_string(),
@@ -1352,10 +1359,22 @@ impl CollabSession {
         self.state.lock().await.conns.is_empty()
     }
 
-    /// The session text back in FILE space, and whether it differs from the
-    /// last saved text. The dirty FLAG says "an update arrived"; the equality
-    /// check is what stops a no-op session from ever writing (the byte
-    /// fidelity property for open-then-close).
+    /// The room's text and the checksum that stands for it; see [`LiveText`].
+    pub async fn live(&self) -> LiveText {
+        let state = self.state.lock().await;
+        let text = Self::file_text_locked(&state);
+        let checksum = if text == state.last_saved_text {
+            state.checksum.clone()
+        } else {
+            crate::engine::sha256_hex(text.as_bytes())
+        };
+        LiveText { text, checksum }
+    }
+
+    /// The session text, and whether it differs from the last saved text.
+    /// The dirty FLAG says "an update arrived"; the equality check is what
+    /// stops a no-op session from ever writing (open-then-close never touches
+    /// the file, whatever line endings it holds).
     pub async fn snapshot(&self) -> (String, bool) {
         let state = self.state.lock().await;
         let file = Self::file_text_locked(&state);
@@ -1363,18 +1382,16 @@ impl CollabSession {
         (file, dirty)
     }
 
-    /// The session text in FILE space, read off the locked state.
+    /// The session text, read off the locked state: LF, exactly what a save
+    /// writes.
     fn file_text_locked(state: &SessionState) -> String {
-        let session = {
-            // The text handle is taken before the transaction:
-            // `get_or_insert_text` opens one of its own, which would deadlock
-            // against a read transaction already held here.
-            let doc = state.awareness.doc();
-            let text = doc.get_or_insert_text(TEXT_NAME);
-            let txn = doc.transact();
-            text.get_string(&txn)
-        };
-        file_text(&session, state.separator)
+        // The text handle is taken before the transaction:
+        // `get_or_insert_text` opens one of its own, which would deadlock
+        // against a read transaction already held here.
+        let doc = state.awareness.doc();
+        let text = doc.get_or_insert_text(TEXT_NAME);
+        let txn = doc.transact();
+        text.get_string(&txn)
     }
 
     /// Whether this room is over: disposed by the registry or poisoned by a
@@ -1646,7 +1663,7 @@ impl CollabSession {
         {
             Ok((normalized, count)) => {
                 if count > 0 {
-                    self.converge(state, &session_text(&normalized));
+                    self.converge(state, &to_lf(&normalized));
                 }
                 normalized
             }
@@ -1814,13 +1831,13 @@ impl CollabSession {
         theirs: EngramText,
         detail: String,
     ) -> bool {
-        let mine = session_text(&Self::file_text_locked(state));
+        let mine = Self::file_text_locked(state);
         match merge::three_way(&state.last_saved_text, &mine, &theirs.content) {
             MergeOutcome::Clean(merged) => {
                 self.converge(state, &merged);
                 // Their text is what the file holds now, so it is the base of
                 // the next merge and its checksum is the next CAS token.
-                state.last_saved_text = theirs.content;
+                state.last_saved_text = to_lf(&theirs.content).into_owned();
                 state.checksum = theirs.checksum;
                 // The save state is deliberately left alone: the save that
                 // follows this merge owns the whole failed/ok lifecycle, and
@@ -1930,7 +1947,7 @@ impl CollabSession {
             ) => {
                 // Their version wins whole: the live text becomes the file's,
                 // and this room's unsaved edits are what the author gave up.
-                self.converge(state, &session_text(&theirs));
+                self.converge(state, &to_lf(&theirs));
                 state.last_saved_text = theirs;
                 state.checksum = theirs_checksum;
                 state.dirty = false;
@@ -1977,7 +1994,7 @@ impl CollabSession {
             return None;
         };
         match view.engram_text_at_path(&state.path).await {
-            Ok(Some(theirs)) if theirs.content != state.last_saved_text => {
+            Ok(Some(theirs)) if to_lf(&theirs.content) != state.last_saved_text => {
                 let detail = format!(
                     "'{}' is on disk again with somebody else's text, so restoring \
                      would overwrite it; pick again with their version in view",
@@ -2009,7 +2026,8 @@ impl CollabSession {
         let file = Self::file_text_locked(state);
         // Normalized and converged first, exactly as `save_attempt` does and
         // for the same reason: `restore_engram` itself is deliberately exempt
-        // (it restores prior bytes exactly, see its own doc comment), so this
+        // (it restores the prior text as it is apart from its line endings,
+        // see its own doc comment), so this
         // is the one place that has to make sure what gets restored, what the
         // document shows and what `last_saved_text` is set to below all agree
         // on the canonical spelling, rather than restoring - and then living
@@ -2021,7 +2039,7 @@ impl CollabSession {
         {
             Ok((normalized, count)) => {
                 if count > 0 {
-                    self.converge(state, &session_text(&normalized));
+                    self.converge(state, &to_lf(&normalized));
                 }
                 normalized
             }
@@ -2112,8 +2130,11 @@ impl CollabSession {
     fn raise_edit(&self, state: &mut SessionState, theirs: EngramText, detail: String) {
         state.save_state = SaveStateTag::Conflict;
         state.failure_detail = None;
+        // Their text as LF, the only form a room shows or keeps; the checksum
+        // stays the one of the bytes they wrote.
+        let theirs_text = to_lf(&theirs.content).into_owned();
         state.pending = Some(PendingConflict::Edit {
-            theirs: theirs.content.clone(),
+            theirs: theirs_text.clone(),
             theirs_checksum: theirs.checksum,
         });
         let _ = self.tx.send(Frame {
@@ -2121,13 +2142,13 @@ impl CollabSession {
             to: None,
             bytes: Bytes::from(control::encode(&Control::Conflict {
                 conflict_kind: "edit".to_string(),
-                theirs: Some(theirs.content),
+                theirs: Some(theirs_text),
                 detail,
             })),
         });
     }
 
-    /// Morph the live text into `target` (SESSION space) as one minimal edit
+    /// Morph the live text into `target` (LF text) as one minimal edit
     /// script in ONE transaction - every client sees a single update rather
     /// than a flicker of half-applied lines - broadcast that update to the
     /// room and tell it the external change is in.
@@ -2194,11 +2215,9 @@ impl CollabSession {
                 "this co-editing session ended while the write was being prepared".to_string(),
             );
         }
-        // Session space: the engine works in FILE space (the bytes a file
-        // holds), the document is a LF view of it, and this is the one
-        // conversion between them on the way in. `file_text` is the way back
-        // out, in `snapshot`.
-        let target = session_text(target);
+        // The room's text is LF only, whatever line endings the engine verb's
+        // text carried.
+        let target = to_lf(target);
         self.converge_with(&mut state, &target, Some(origin));
         // Armed exactly as an update from a socket arms it (see
         // `CollabSession::handle_frame`), so the agent's text saves on the

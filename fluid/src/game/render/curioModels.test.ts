@@ -23,7 +23,7 @@ import {
 import type { Curio, CurioKind } from "../world/types";
 import { CELL } from "../world/units";
 import { FLAG, createBuilder, type MeshData, type V3 } from "./geometry";
-import { LOOKS } from "./looks";
+import { LOOK } from "./looks";
 import {
   floatingGlow,
   inBox,
@@ -53,7 +53,7 @@ function buildRecorded(
 ): { mesh: MeshData; parts: Part[] } {
   const builder = createBuilder();
   const parts: Part[] = [];
-  buildCurio(recordingKitAt(builder, parts), kind, variant, LOOKS.aperture);
+  buildCurio(recordingKitAt(builder, parts), kind, variant, LOOK);
   return { mesh: builder.build(), parts };
 }
 
@@ -69,7 +69,7 @@ describe("curio models", () => {
       triangles.push(`${kind} ${String(v)}: ${String(mesh.count / 3)}`);
 
       it(`${kind} variant ${String(v)} builds the same floats twice`, () => {
-        const again = buildCurioMesh(kind, v, LOOKS.aperture);
+        const again = buildCurioMesh(kind, v, LOOK);
         expect(again.count).toBe(mesh.count);
         expect(Array.from(again.vertices)).toEqual(Array.from(mesh.vertices));
       });
@@ -139,10 +139,10 @@ describe("curio models", () => {
   }
 
   it("refuses a variant the catalogue does not have", () => {
-    expect(() => buildCurioMesh("green-pistol", 1, LOOKS.aperture)).toThrow(
+    expect(() => buildCurioMesh("green-pistol", 1, LOOK)).toThrow(
       /no variant 1/,
     );
-    expect(() => buildCurioMesh("light-sword", -1, LOOKS.aperture)).toThrow(
+    expect(() => buildCurioMesh("light-sword", -1, LOOK)).toThrow(
       /no variant -1/,
     );
   });

@@ -34,7 +34,7 @@ pub use search::{
     semantic_hydrate_sql, semantic_phase1_sql,
 };
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -44,16 +44,17 @@ use turso::{Builder, Connection, Database, Row, Value};
 use crate::alias::{AliasMap, query_uses_tags};
 use crate::error::{IndexError, Result};
 use crate::store::{
-    AttachmentRow, BrowseLevel, ChunkJob, ChunkModelCount, ContentMention, DomainHost, DomainId,
-    DomainKind, DomainStats, EdgeKind, EmbeddingCoverage, EmbeddingRow, EngramDescriptor, EngramId,
-    EngramRecord, EngramSummary, FileStamp, FtsMode, GraphSlice, HostClaim, InboundHit,
-    InboundPage, InboundQuery, InboundRef, LINKS_TO, LeadVector, NamedCount, NewChunk, OutboundRef,
-    Page, RebuildKind, RecentFilter, ReferenceCandidates, SearchHit, SearchMode, SearchQuery,
-    SpellingPlan, Store, StoreInfo, StoredEngram, Vocabulary, build_vocabulary, changed_spellings,
-    count_references_to_sql, domain_url_needles, folder_slash, in_transaction, names_a_domain_url,
-    page_window, reference_match, referencing_domains_sql, rename_onto_taken_row,
-    reset_spelled_references_sql, resolve_references_to_sql, resolve_spelled_references_sql,
-    spelled_references_sql, spelling_plan,
+    AttachmentRow, BrowseLevel, ChunkJob, ChunkModelCount, ContentMention, ContradictionRow,
+    DomainHost, DomainId, DomainKind, DomainStats, EdgeKind, EmbeddingCoverage, EmbeddingRow,
+    EngramDescriptor, EngramId, EngramRecord, EngramSummary, FileStamp, FtsMode, GraphSlice,
+    HostClaim, InboundHit, InboundPage, InboundQuery, InboundRef, LINKS_TO, LeadVector, NamedCount,
+    NewChunk, ObservationVector, OutboundRef, Page, RebuildKind, RecentFilter, ReferenceCandidates,
+    ScoredPair, SearchHit, SearchMode, SearchQuery, SpellingPlan, Store, StoreInfo, StoredEngram,
+    Vocabulary, build_vocabulary, changed_spellings, count_references_to_sql, domain_url_needles,
+    folder_slash, in_transaction, names_a_domain_url, page_window, reference_match,
+    referencing_domains_sql, rename_onto_taken_row, reset_spelled_references_sql,
+    resolve_references_to_sql, resolve_spelled_references_sql, spelled_references_sql,
+    spelling_plan,
 };
 use crate::sweep::{SpelledRef, UnresolvedRef};
 
@@ -397,6 +398,38 @@ impl TursoStore {
     async fn truncate_wal(&self) -> Result<()> {
         query_all(&self.conn, "PRAGMA wal_checkpoint(TRUNCATE)", vec![]).await?;
         Ok(())
+    }
+
+    /// The compare of a compare-and-swap on the base row at `path`, as a
+    /// guarded write: the same statement the Postgres twin needs to be safe
+    /// against a second writer, a no-op UPDATE that only matches the row while
+    /// it still carries the expected sha. `Ok(true)` when it matched (the row
+    /// is the caller's to rewrite), `Ok(false)` when there is no row at all,
+    /// and [`IndexError::StaleEdit`] when there is one that moved on.
+    async fn guarded_compare(&self, domain: DomainId, path: &str, expected: &str) -> Result<bool> {
+        let matched = self
+            .conn
+            .execute(
+                "UPDATE engram SET sha256=sha256 \
+                 WHERE domain_id=?1 AND path=?2 AND actor = '' AND sha256=?3",
+                vec![
+                    Value::Integer(domain.0),
+                    Value::Text(path.to_string()),
+                    Value::Text(expected.to_string()),
+                ],
+            )
+            .await?;
+        if matched > 0 {
+            return Ok(true);
+        }
+        let stored = query_first(
+            &self.conn,
+            "SELECT sha256 FROM engram WHERE domain_id=?1 AND path=?2 AND actor = ''",
+            vec![Value::Integer(domain.0), Value::Text(path.to_string())],
+        )
+        .await?
+        .and_then(|r| cell_text(&r, 0));
+        compare_outcome(stored, expected)
     }
 
     /// Write one row of the `engram` table, in one actor's dimension.
@@ -902,11 +935,7 @@ fn cell_blob(row: &Row, idx: usize) -> Option<Vec<u8>> {
 /// from a blob that is demonstrably not the vector that was written. An empty
 /// vector can never match a positive `dims`, so the caller skips and warns.
 fn unpack_vector(bytes: &[u8]) -> Vec<f32> {
-    let (quads, partial) = bytes.as_chunks::<4>();
-    if !partial.is_empty() {
-        return Vec::new();
-    }
-    quads.iter().copied().map(f32::from_le_bytes).collect()
+    crate::store::unpack_f32_le(bytes)
 }
 
 fn opt_text(o: &Option<String>) -> Value {
@@ -980,6 +1009,125 @@ fn resolve_pending_sql(table: &str) -> String {
 #[doc(hidden)]
 pub const FILE_STAMPS_SQL: &str =
     "SELECT path, mtime, size, sha256 FROM engram WHERE domain_id=?1 AND actor = ''";
+
+/// The read behind [`Store::contradiction_pairs_scored`], one domain's pair
+/// rows for one model through `idx_contradiction_pair_domain`.
+#[doc(hidden)]
+pub const CONTRADICTION_PAIRS_SCORED_SQL: &str = "SELECT cp.engram_a, cp.engram_b, cp.checksum_a, cp.checksum_b FROM contradiction_pair cp \
+     WHERE cp.domain_id=?1 AND cp.model=?2 ORDER BY cp.engram_a, cp.engram_b";
+
+/// The sweep's read behind [`Store::contradictions`], through
+/// `idx_contradiction_domain`. The floor applies to the higher reading order.
+#[doc(hidden)]
+pub const CONTRADICTIONS_SQL: &str = "SELECT cn.engram_a, cn.engram_b, cn.line_a, cn.line_b, cn.hash_a, cn.hash_b, \
+     cn.score_ab, cn.score_ba, cn.similarity, cn.period FROM contradiction cn \
+     WHERE cn.domain_id=?1 AND cn.model=?2 AND (cn.score_ab >= ?3 OR cn.score_ba >= ?3) \
+     ORDER BY cn.engram_a, cn.engram_b, cn.line_a, cn.line_b";
+
+/// The pair row [`Store::replace_contradictions`] writes, stored only while
+/// both engrams still exist: a delete that lands while a batch scores the
+/// pair leaves nothing behind (turso enforces no foreign key that would
+/// refuse the orphan). Each `EXISTS` seeks the engram primary key.
+///
+/// -- actor: by id - both engrams are named by their ids, which are base
+/// rows: drafts are never scored.
+#[doc(hidden)]
+pub const INSERT_CONTRADICTION_PAIR_SQL: &str = "INSERT INTO contradiction_pair (domain_id, engram_a, engram_b, checksum_a, checksum_b, cosine, model, scored_at) \
+     SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8 \
+     WHERE EXISTS (SELECT 1 FROM engram e WHERE e.id=?2) AND EXISTS (SELECT 1 FROM engram e WHERE e.id=?3)";
+
+/// One pair's line rows for one model, deleted by
+/// [`Store::replace_contradictions`] before a rescore and by
+/// [`Store::delete_contradiction_pair`]: the primary key serves all three
+/// columns.
+#[doc(hidden)]
+pub const DELETE_PAIR_CONTRADICTIONS_SQL: &str =
+    "DELETE FROM contradiction WHERE engram_a=?1 AND engram_b=?2 AND model=?3";
+
+/// One pair row for one model, deleted like [`DELETE_PAIR_CONTRADICTIONS_SQL`]
+/// through the primary key `(engram_a, engram_b, model)`.
+#[doc(hidden)]
+pub const DELETE_CONTRADICTION_PAIR_SQL: &str =
+    "DELETE FROM contradiction_pair WHERE engram_a=?1 AND engram_b=?2 AND model=?3";
+
+/// One engram's line rows, deleted by [`Store::delete_engram`]: the primary
+/// key serves `engram_a`, `idx_contradiction_engram_b` serves `engram_b`.
+#[doc(hidden)]
+pub const DELETE_ENGRAM_CONTRADICTIONS_SQL: &str =
+    "DELETE FROM contradiction WHERE engram_a=?1 OR engram_b=?1";
+
+/// One engram's pair rows, deleted by [`Store::delete_engram`]: the primary
+/// key serves `engram_a`, `idx_contradiction_pair_engram_b` serves `engram_b`.
+#[doc(hidden)]
+pub const DELETE_ENGRAM_CONTRADICTION_PAIRS_SQL: &str =
+    "DELETE FROM contradiction_pair WHERE engram_a=?1 OR engram_b=?1";
+
+/// The read behind [`Store::scored_pair_count`], through
+/// `idx_contradiction_pair_model`: unlike [`CONTRADICTION_PAIRS_SCORED_SQL`],
+/// this names no domain, so it cannot seek `idx_contradiction_pair_domain`,
+/// which leads with `domain_id`. Called on every `ctl status` and every
+/// daemon-mode `doctor` run.
+#[doc(hidden)]
+pub const SCORED_PAIR_COUNT_SQL: &str = "SELECT COUNT(*) FROM contradiction_pair WHERE model=?1";
+
+/// One domain's line rows, deleted by [`Store::clear_contradictions`] through
+/// `idx_contradiction_domain`.
+#[doc(hidden)]
+pub const CLEAR_DOMAIN_CONTRADICTIONS_SQL: &str = "DELETE FROM contradiction WHERE domain_id=?1";
+
+/// One domain's pair rows, deleted by [`Store::clear_contradictions`] through
+/// `idx_contradiction_pair_domain`.
+#[doc(hidden)]
+pub const CLEAR_DOMAIN_CONTRADICTION_PAIRS_SQL: &str =
+    "DELETE FROM contradiction_pair WHERE domain_id=?1";
+
+/// Every line row, deleted by [`Store::clear_contradictions`] with no domain
+/// named: the contradiction check's off switch, a full pass by design.
+#[doc(hidden)]
+pub const CLEAR_ALL_CONTRADICTIONS_SQL: &str = "DELETE FROM contradiction";
+
+/// Every pair row, deleted by [`Store::clear_contradictions`] with no domain
+/// named: the contradiction check's off switch, a full pass by design.
+#[doc(hidden)]
+pub const CLEAR_ALL_CONTRADICTION_PAIRS_SQL: &str = "DELETE FROM contradiction_pair";
+
+/// The pruning read behind [`Store::observation_vector_hashes`]: the primary
+/// key `(model, hash)` serves `model=?1` as its leading column.
+#[doc(hidden)]
+pub const OBSERVATION_VECTOR_HASHES_SQL: &str =
+    "SELECT ov.hash FROM observation_vector ov WHERE ov.model=?1";
+
+/// The presence check behind [`Store::observation_vectors_present`], one
+/// hash at a time. A point statement on purpose: turso seeks `model=? AND
+/// hash IN (...)` on `model` alone and filters the list inside that range, so
+/// with one embedding model every run would walk every stored vector. One
+/// prepared statement per hash seeks the full `(model, hash)` key.
+#[doc(hidden)]
+pub const OBSERVATION_VECTOR_PRESENT_SQL: &str =
+    "SELECT ov.hash FROM observation_vector ov WHERE ov.model=?1 AND ov.hash=?2";
+
+/// The read behind [`Store::observation_vectors`], one hash at a time on the
+/// full key, for the reason [`OBSERVATION_VECTOR_PRESENT_SQL`] gives.
+#[doc(hidden)]
+pub const OBSERVATION_VECTOR_SQL: &str = "SELECT ov.hash, ov.dims, ov.vector FROM observation_vector ov \
+     WHERE ov.model=?1 AND ov.hash=?2";
+
+/// The prune behind [`Store::delete_observation_vectors`], one hash at a time
+/// on the full key, for the reason [`OBSERVATION_VECTOR_PRESENT_SQL`] gives.
+#[doc(hidden)]
+pub const DELETE_OBSERVATION_VECTOR_SQL: &str =
+    "DELETE FROM observation_vector WHERE model=?1 AND hash=?2";
+
+/// The delete behind [`Store::delete_observation_vectors_except`]: every
+/// other model's line vectors, a full pass by design, once per process.
+#[doc(hidden)]
+pub const DELETE_OBSERVATION_VECTORS_EXCEPT_SQL: &str =
+    "DELETE FROM observation_vector WHERE model <> ?1";
+
+/// The delete behind [`Store::clear_observation_vectors`]: every line vector,
+/// the contradiction check's off switch.
+#[doc(hidden)]
+pub const CLEAR_OBSERVATION_VECTORS_SQL: &str = "DELETE FROM observation_vector";
 
 /// The address lookup behind [`Store::find_engram`].
 ///
@@ -1141,12 +1289,16 @@ impl Store for TursoStore {
         let kind = kind_str(kind);
         self.conn
             .execute(
-                "INSERT INTO domain(name, path, kind) VALUES(?1, ?2, ?3) \
+                // A new row is stamped with the current parser generation, so
+                // a fresh index never reparses what it has only just parsed; an
+                // existing row keeps the generation it has.
+                "INSERT INTO domain(name, path, kind, parse_generation) VALUES(?1, ?2, ?3, ?4) \
                  ON CONFLICT(name) DO UPDATE SET path=excluded.path, kind=excluded.kind",
                 vec![
                     Value::Text(name.to_string()),
                     Value::Text(path.to_string()),
                     Value::Text(kind.to_string()),
+                    Value::Integer(i64::from(crystalline_core::PARSE_GENERATION)),
                 ],
             )
             .await?;
@@ -1545,25 +1697,27 @@ impl Store for TursoStore {
         // Compare-and-swap: if a row exists at this path and the caller supplied
         // an expected sha that no longer matches the stored one, refuse. The
         // engine holds the transaction open around this, so the compare and the
-        // subsequent write are one atomic unit.
+        // subsequent write are one atomic unit. No row at all is an insert,
+        // which nothing guards.
         if let Some(expected) = expected_sha {
-            let stored = query_first(
-                &self.conn,
-                "SELECT sha256 FROM engram WHERE domain_id=?1 AND path=?2 AND actor = ''",
-                vec![Value::Integer(domain.0), Value::Text(record.path.clone())],
-            )
-            .await?
-            .and_then(|r| cell_text(&r, 0));
-            if let Some(found) = stored
-                && found != expected
-            {
-                return Err(IndexError::StaleEdit {
-                    expected: expected.to_string(),
-                    found,
-                });
-            }
+            self.guarded_compare(domain, &record.path, expected).await?;
         }
         self.upsert_engram(domain, record).await
+    }
+
+    async fn update_engram_checked(
+        &self,
+        domain: DomainId,
+        record: &EngramRecord,
+        expected_sha: &str,
+    ) -> Result<Option<EngramId>> {
+        if !self
+            .guarded_compare(domain, &record.path, expected_sha)
+            .await?
+        {
+            return Ok(None);
+        }
+        self.upsert_engram(domain, record).await.map(Some)
     }
 
     async fn engram_content(&self, domain: DomainId, path: &str) -> Result<Option<String>> {
@@ -1620,6 +1774,8 @@ impl Store for TursoStore {
         // same paths so the rows and their mirror go together.
         let did = vec![Value::Integer(domain.0)];
         for sql in [
+            "DELETE FROM contradiction WHERE domain_id=?1",
+            "DELETE FROM contradiction_pair WHERE domain_id=?1",
             "DELETE FROM observation_tag WHERE observation_id IN \
              (SELECT o.id FROM observation o JOIN engram e ON e.id=o.engram_id WHERE e.domain_id=?1)",
             "DELETE FROM engram_tag WHERE engram_id IN (SELECT id FROM engram WHERE domain_id=?1)",
@@ -1659,6 +1815,15 @@ impl Store for TursoStore {
         .await?
         .and_then(|r| cell_i64(&r, 0));
         if let Some(id) = id {
+            // The scores of every pair this engram is in. Here and in
+            // `clear_domain` only, never in `delete_children`, which every
+            // upsert runs: a full reindex would erase every score.
+            for sql in [
+                DELETE_ENGRAM_CONTRADICTIONS_SQL,
+                DELETE_ENGRAM_CONTRADICTION_PAIRS_SQL,
+            ] {
+                self.conn.execute(sql, vec![Value::Integer(id)]).await?;
+            }
             self.delete_children(id).await?;
             self.conn
                 .execute(
@@ -2707,6 +2872,331 @@ impl Store for TursoStore {
         Ok(out)
     }
 
+    async fn contradiction_pairs_scored(
+        &self,
+        domain: DomainId,
+        model: &str,
+    ) -> Result<Vec<ScoredPair>> {
+        let rows = query_all(
+            &self.conn,
+            CONTRADICTION_PAIRS_SCORED_SQL,
+            vec![Value::Integer(domain.0), Value::Text(model.to_string())],
+        )
+        .await?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| {
+                Some(ScoredPair {
+                    a: EngramId(cell_i64(r, 0)?),
+                    b: EngramId(cell_i64(r, 1)?),
+                    checksum_a: cell_text(r, 2)?,
+                    checksum_b: cell_text(r, 3)?,
+                })
+            })
+            .collect())
+    }
+
+    async fn replace_contradictions(
+        &self,
+        domain: DomainId,
+        pair: &ScoredPair,
+        cosine: f64,
+        model: &str,
+        scored_at: &str,
+        rows: &[ContradictionRow],
+    ) -> Result<()> {
+        in_transaction(self, async {
+            let key = vec![
+                Value::Integer(pair.a.0),
+                Value::Integer(pair.b.0),
+                Value::Text(model.to_string()),
+            ];
+            self.conn
+                .execute(DELETE_PAIR_CONTRADICTIONS_SQL, key.clone())
+                .await?;
+            self.conn
+                .execute(DELETE_CONTRADICTION_PAIR_SQL, key)
+                .await?;
+            let stored = self
+                .conn
+                .execute(
+                    INSERT_CONTRADICTION_PAIR_SQL,
+                    vec![
+                        Value::Integer(domain.0),
+                        Value::Integer(pair.a.0),
+                        Value::Integer(pair.b.0),
+                        Value::Text(pair.checksum_a.clone()),
+                        Value::Text(pair.checksum_b.clone()),
+                        Value::Real(cosine),
+                        Value::Text(model.to_string()),
+                        Value::Text(scored_at.to_string()),
+                    ],
+                )
+                .await?;
+            // Either engram went while the pair was scored: nothing to keep.
+            if stored == 0 {
+                return Ok(());
+            }
+            for row in rows {
+                self.conn
+                    .execute(
+                        "INSERT INTO contradiction (domain_id, engram_a, engram_b, line_a, line_b, hash_a, hash_b, model, score_ab, score_ba, similarity, period) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                        vec![
+                            Value::Integer(domain.0),
+                            Value::Integer(row.a.0),
+                            Value::Integer(row.b.0),
+                            Value::Integer(row.line_a as i64),
+                            Value::Integer(row.line_b as i64),
+                            Value::Text(row.hash_a.clone()),
+                            Value::Text(row.hash_b.clone()),
+                            Value::Text(model.to_string()),
+                            Value::Real(f64::from(row.score_ab)),
+                            Value::Real(f64::from(row.score_ba)),
+                            Value::Real(f64::from(row.similarity)),
+                            Value::Integer(i64::from(row.period)),
+                        ],
+                    )
+                    .await?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    async fn delete_contradiction_pair(&self, model: &str, a: EngramId, b: EngramId) -> Result<()> {
+        in_transaction(self, async {
+            let key = vec![
+                Value::Integer(a.0),
+                Value::Integer(b.0),
+                Value::Text(model.to_string()),
+            ];
+            self.conn
+                .execute(DELETE_PAIR_CONTRADICTIONS_SQL, key.clone())
+                .await?;
+            self.conn
+                .execute(DELETE_CONTRADICTION_PAIR_SQL, key)
+                .await?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn contradictions(
+        &self,
+        domain: DomainId,
+        model: &str,
+        min_score: f32,
+    ) -> Result<Vec<ContradictionRow>> {
+        let rows = query_all(
+            &self.conn,
+            CONTRADICTIONS_SQL,
+            vec![
+                Value::Integer(domain.0),
+                Value::Text(model.to_string()),
+                Value::Real(f64::from(min_score)),
+            ],
+        )
+        .await?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| {
+                Some(ContradictionRow {
+                    a: EngramId(cell_i64(r, 0)?),
+                    b: EngramId(cell_i64(r, 1)?),
+                    line_a: cell_i64(r, 2)? as usize,
+                    line_b: cell_i64(r, 3)? as usize,
+                    hash_a: cell_text(r, 4)?,
+                    hash_b: cell_text(r, 5)?,
+                    score_ab: cell_real(r, 6)? as f32,
+                    score_ba: cell_real(r, 7)? as f32,
+                    similarity: cell_real(r, 8)? as f32,
+                    period: cell_i64(r, 9)? != 0,
+                })
+            })
+            .collect())
+    }
+
+    async fn scored_pair_count(&self, model: &str) -> Result<u64> {
+        let row = query_first(
+            &self.conn,
+            SCORED_PAIR_COUNT_SQL,
+            vec![Value::Text(model.to_string())],
+        )
+        .await?;
+        Ok(row.and_then(|r| cell_i64(&r, 0)).unwrap_or(0).max(0) as u64)
+    }
+
+    async fn observation_vectors_present(
+        &self,
+        model: &str,
+        hashes: &[String],
+    ) -> Result<HashSet<String>> {
+        let mut out = HashSet::with_capacity(hashes.len());
+        if hashes.is_empty() {
+            return Ok(out);
+        }
+        let mut stmt = self.conn.prepare(OBSERVATION_VECTOR_PRESENT_SQL).await?;
+        for hash in hashes {
+            let mut rows = stmt
+                .query(vec![
+                    Value::Text(model.to_string()),
+                    Value::Text(hash.clone()),
+                ])
+                .await?;
+            // Drained to the end so the statement completes before its reuse.
+            while let Some(r) = rows.next().await? {
+                if let Some(h) = cell_text(&r, 0) {
+                    out.insert(h);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    async fn observation_vectors(
+        &self,
+        model: &str,
+        hashes: &[String],
+    ) -> Result<HashMap<String, Vec<f32>>> {
+        let mut out = HashMap::with_capacity(hashes.len());
+        if hashes.is_empty() {
+            return Ok(out);
+        }
+        let mut stmt = self.conn.prepare(OBSERVATION_VECTOR_SQL).await?;
+        for wanted in hashes {
+            let mut rows = stmt
+                .query(vec![
+                    Value::Text(model.to_string()),
+                    Value::Text(wanted.clone()),
+                ])
+                .await?;
+            let mut found = Vec::new();
+            // Drained to the end so the statement completes before its reuse.
+            while let Some(r) = rows.next().await? {
+                found.push(r);
+            }
+            for r in found {
+                let (Some(hash), Some(dims), Some(blob)) =
+                    (cell_text(&r, 0), cell_i64(&r, 1), cell_blob(&r, 2))
+                else {
+                    continue;
+                };
+                let vector = unpack_vector(&blob);
+                if vector.len() as i64 != dims {
+                    tracing::warn!(
+                        hash = %hash,
+                        dims,
+                        stored = vector.len(),
+                        "skipping a line vector whose stored width disagrees with its dims column"
+                    );
+                    continue;
+                }
+                out.insert(hash, vector);
+            }
+        }
+        Ok(out)
+    }
+
+    async fn store_observation_vectors(
+        &self,
+        model: &str,
+        rows: &[ObservationVector],
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        in_transaction(self, async {
+            for row in rows {
+                self.conn
+                    .execute(
+                        "INSERT INTO observation_vector (model, hash, dims, vector) \
+                         VALUES (?1, ?2, ?3, ?4) ON CONFLICT(model, hash) DO NOTHING",
+                        vec![
+                            Value::Text(model.to_string()),
+                            Value::Text(row.hash.clone()),
+                            Value::Integer(row.vector.len() as i64),
+                            Value::Blob(crate::store::pack_f32_le(&row.vector)),
+                        ],
+                    )
+                    .await?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    async fn observation_vector_hashes(&self, model: &str) -> Result<Vec<String>> {
+        let rows = query_all(
+            &self.conn,
+            OBSERVATION_VECTOR_HASHES_SQL,
+            vec![Value::Text(model.to_string())],
+        )
+        .await?;
+        Ok(rows.iter().filter_map(|r| cell_text(r, 0)).collect())
+    }
+
+    async fn delete_observation_vectors(&self, model: &str, hashes: &[String]) -> Result<u64> {
+        if hashes.is_empty() {
+            return Ok(0);
+        }
+        in_transaction(self, async {
+            let mut stmt = self.conn.prepare(DELETE_OBSERVATION_VECTOR_SQL).await?;
+            let mut gone = 0u64;
+            for hash in hashes {
+                gone += stmt
+                    .execute(vec![
+                        Value::Text(model.to_string()),
+                        Value::Text(hash.clone()),
+                    ])
+                    .await?;
+            }
+            Ok(gone)
+        })
+        .await
+    }
+
+    async fn delete_observation_vectors_except(&self, model: &str) -> Result<u64> {
+        Ok(self
+            .conn
+            .execute(
+                DELETE_OBSERVATION_VECTORS_EXCEPT_SQL,
+                vec![Value::Text(model.to_string())],
+            )
+            .await?)
+    }
+
+    async fn clear_observation_vectors(&self) -> Result<u64> {
+        Ok(self.conn.execute(CLEAR_OBSERVATION_VECTORS_SQL, ()).await?)
+    }
+
+    async fn clear_contradictions(&self, domains: Option<&[DomainId]>) -> Result<()> {
+        in_transaction(self, async {
+            match domains {
+                None => {
+                    for sql in [
+                        CLEAR_ALL_CONTRADICTIONS_SQL,
+                        CLEAR_ALL_CONTRADICTION_PAIRS_SQL,
+                    ] {
+                        self.conn.execute(sql, ()).await?;
+                    }
+                }
+                Some(ids) => {
+                    for id in ids {
+                        for sql in [
+                            CLEAR_DOMAIN_CONTRADICTIONS_SQL,
+                            CLEAR_DOMAIN_CONTRADICTION_PAIRS_SQL,
+                        ] {
+                            self.conn.execute(sql, vec![Value::Integer(id.0)]).await?;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })
+        .await
+    }
+
     async fn wipe(&self) -> Result<()> {
         // Deletes every chunk, so the coverage snapshot is now stale.
         self.invalidate_coverage();
@@ -2791,6 +3281,32 @@ impl Store for TursoStore {
         Ok(())
     }
 
+    async fn parse_generation(&self, domain: DomainId) -> Result<u32> {
+        let row = query_first(
+            &self.conn,
+            "SELECT parse_generation FROM domain WHERE id=?1",
+            vec![Value::Integer(domain.0)],
+        )
+        .await?;
+        Ok(row
+            .and_then(|r| cell_i64(&r, 0))
+            .map(|g| u32::try_from(g).unwrap_or(0))
+            .unwrap_or(0))
+    }
+
+    async fn set_parse_generation(&self, domain: DomainId, generation: u32) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE domain SET parse_generation=?2 WHERE id=?1",
+                vec![
+                    Value::Integer(domain.0),
+                    Value::Integer(i64::from(generation)),
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
     fn set_aside_database(&self) -> Option<PathBuf> {
         self.set_aside.clone()
     }
@@ -2862,6 +3378,7 @@ impl Store for TursoStore {
             return Ok(false);
         }
         // Deletes the draft's chunks, so the coverage snapshot is now stale.
+        // No contradiction rows to delete: drafts are never scored.
         self.invalidate_coverage();
         let id = query_first(
             &self.conn,
@@ -3364,12 +3881,97 @@ impl Store for TursoStore {
     }
 }
 
+/// What [`TursoStore::guarded_compare`] answers when its no-op UPDATE
+/// reported no changed row, from the sha the fallback SELECT read: no row is
+/// `Ok(false)`, a row that moved on is [`IndexError::StaleEdit`], and a row
+/// that still carries the expected sha is `Ok(true)`. That last arm cannot
+/// happen while turso counts matched rows, but a release that counted only
+/// changed values would report zero changes for every no-op UPDATE, and this
+/// keeps such a release from refusing every guarded edit.
+fn compare_outcome(stored: Option<String>, expected: &str) -> Result<bool> {
+    match stored {
+        Some(found) if found == expected => Ok(true),
+        Some(found) => Err(IndexError::StaleEdit {
+            expected: expected.to_string(),
+            found,
+        }),
+        None => Ok(false),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    // Mutation caught: a matching row read back after an UPDATE that
+    // reported zero changes answered as a StaleEdit with two equal shas.
+    #[test]
+    fn a_guarded_compare_whose_row_still_matches_is_a_match_even_with_zero_changes() {
+        assert!(matches!(
+            compare_outcome(Some("abc".into()), "abc"),
+            Ok(true)
+        ));
+        assert!(matches!(compare_outcome(None, "abc"), Ok(false)));
+        match compare_outcome(Some("def".into()), "abc") {
+            Err(IndexError::StaleEdit { expected, found }) => {
+                assert_eq!(expected, "abc");
+                assert_eq!(found, "def");
+            }
+            other => panic!("expected a StaleEdit, got {other:?}"),
+        }
+    }
+
     use std::collections::BTreeMap;
 
     use super::*;
     use crate::store::{FileStamp, ObservationRecord};
+
+    /// A line vector whose stored blob disagrees with its `dims` column is
+    /// skipped, not returned: a blob of one float under `dims` 4, and a blob
+    /// that is not a whole number of floats, beside one good row.
+    #[tokio::test]
+    async fn a_line_vector_whose_width_disagrees_with_its_dims_is_skipped() {
+        let store = TursoStore::open_in_memory().await.unwrap();
+        store
+            .store_observation_vectors(
+                "m",
+                &[ObservationVector {
+                    hash: "good".to_string(),
+                    vector: vec![0.1, 0.2, 0.3, 0.4],
+                }],
+            )
+            .await
+            .unwrap();
+        for (hash, blob) in [("narrow", vec![0u8; 4]), ("ragged", vec![0u8; 17])] {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO observation_vector (model, hash, dims, vector) VALUES (?1, ?2, 4, ?3)",
+                    vec![
+                        Value::Text("m".to_string()),
+                        Value::Text(hash.to_string()),
+                        Value::Blob(blob),
+                    ],
+                )
+                .await
+                .unwrap();
+        }
+        let asked: Vec<String> = ["good", "narrow", "ragged"]
+            .iter()
+            .map(|h| h.to_string())
+            .collect();
+        let got = store.observation_vectors("m", &asked).await.unwrap();
+        assert_eq!(got.len(), 1, "only the good row comes back: {got:?}");
+        assert_eq!(got["good"], vec![0.1, 0.2, 0.3, 0.4]);
+        // Present still reports the rows: presence is about the key, the
+        // width check is the reader's.
+        assert_eq!(
+            store
+                .observation_vectors_present("m", &asked)
+                .await
+                .unwrap()
+                .len(),
+            3
+        );
+    }
 
     #[test]
     fn observation_insert_is_one_statement_with_a_tuple_per_row() {

@@ -10,8 +10,8 @@
 use std::path::PathBuf;
 
 use crystalline_core::config::{
-    AuthConfig, CaptureConfig, DatabaseBackend, DatabaseConfig, GitHubConfig, GlobalConfig,
-    HttpSetting, IdentityConfig, IndexConfig, LoginConfig, OidcConfig, RecallConfig,
+    AuthConfig, CaptureConfig, DatabaseBackend, DatabaseConfig, EvolveConfig, GitHubConfig,
+    GlobalConfig, HttpSetting, IdentityConfig, IndexConfig, LoginConfig, OidcConfig, RecallConfig,
     ResponseFormat, SearchConfig, ServiceConfig, ShareIdentityMode, SkillsConfig, SkillsServe,
 };
 use crystalline_index::{DEFAULT_RETIRED_WEIGHT, DEFAULT_SALIENCE_WEIGHT};
@@ -374,6 +374,16 @@ pub fn registry() -> &'static [SettingSpec] {
             effective: capture_similar_effective,
         },
         SettingSpec {
+            key: "evolve.contradictions",
+            doc: "Let the daemon read the observation lines of related engrams with a local NLI model, so evolve raises V302 for a pair it reads as a possible contradiction: off (default) or full (German, English and mixed; a pair counts at a contradiction probability of 0.95 or more, and it is a question, never a verdict, because the model can be wrong; the model is about 550 MB on disk; loaded, it adds about 2.6 GB of memory on the CPU and about 1.8 GB on Apple Silicon, up to about 3.2 GB while scoring there, and the daemon unloads it after 10 to 15 idle minutes); full needs the local-embeddings build feature and downloads its model on first use",
+            kind: SettingKind::String,
+            startup_effective: false,
+            secret: false,
+            apply: set_evolve_contradictions,
+            clear: clear_evolve_contradictions,
+            effective: evolve_contradictions_effective,
+        },
+        SettingSpec {
             key: "recall.enabled",
             doc: "Whether the per-prompt hook crystalline install wires hands the agent the engrams that may apply to each prompt (default true; it works in Claude Code and Codex, Copilot has no channel for its output yet); false keeps the hook installed but silent, without touching the harness settings file",
             kind: SettingKind::Bool,
@@ -733,6 +743,14 @@ fn drop_index_if_empty(config: &mut GlobalConfig) {
 fn drop_capture_if_empty(config: &mut GlobalConfig) {
     if config.capture.as_ref() == Some(&CaptureConfig::default()) {
         config.capture = None;
+    }
+}
+
+/// Drop the `evolve` block once every field in it has been cleared, so an
+/// unset config round-trips to exactly the pre-feature shape.
+fn drop_evolve_if_empty(config: &mut GlobalConfig) {
+    if config.evolve.as_ref() == Some(&EvolveConfig::default()) {
+        config.evolve = None;
     }
 }
 
@@ -1567,6 +1585,44 @@ fn capture_similar_effective(config: &GlobalConfig) -> (String, bool) {
     (config.capture_similar().to_string(), is_default)
 }
 
+// --- evolve.contradictions ---------------------------------------------------
+
+fn set_evolve_contradictions(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    let parsed = value.trim().to_ascii_lowercase();
+    if !crystalline_index::nli::CONTRADICTION_SETTING_VALUES.contains(&parsed.as_str()) {
+        return Err(SettingsError(format!(
+            "evolve.contradictions must be {}, got '{value}'",
+            crystalline_index::nli::accepted_setting_values()
+        )));
+    }
+    if parsed != "off" && !crystalline_index::nli::LOCAL_NLI_AVAILABLE {
+        return Err(SettingsError(
+            crystalline_index::nli::NLI_FEATURE_MISSING.to_string(),
+        ));
+    }
+    config
+        .evolve
+        .get_or_insert_with(EvolveConfig::default)
+        .contradictions = Some(parsed);
+    Ok(())
+}
+
+fn clear_evolve_contradictions(config: &mut GlobalConfig) {
+    if let Some(e) = config.evolve.as_mut() {
+        e.contradictions = None;
+    }
+    drop_evolve_if_empty(config);
+}
+
+fn evolve_contradictions_effective(config: &GlobalConfig) -> (String, bool) {
+    let is_default = config
+        .evolve
+        .as_ref()
+        .and_then(|e| e.contradictions.as_ref())
+        .is_none();
+    (config.evolve_contradictions().to_string(), is_default)
+}
+
 // --- recall.enabled ----------------------------------------------------------
 
 fn set_recall_enabled(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
@@ -2271,7 +2327,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_lists_exactly_the_forty_one_keys_in_order() {
+    fn registry_lists_exactly_the_forty_two_keys_in_order() {
         assert_eq!(
             known_keys(),
             vec![
@@ -2297,6 +2353,7 @@ mod tests {
                 "search.retired_weight",
                 "index.files",
                 "capture.similar",
+                "evolve.contradictions",
                 "recall.enabled",
                 "recall.limit",
                 "recall.min_score",
@@ -2382,6 +2439,10 @@ mod tests {
                 ),
                 ("index.files", "CRYSTALLINE_INDEX_FILES".to_string()),
                 ("capture.similar", "CRYSTALLINE_CAPTURE_SIMILAR".to_string()),
+                (
+                    "evolve.contradictions",
+                    "CRYSTALLINE_EVOLVE_CONTRADICTIONS".to_string()
+                ),
                 ("recall.enabled", "CRYSTALLINE_RECALL_ENABLED".to_string()),
                 ("recall.limit", "CRYSTALLINE_RECALL_LIMIT".to_string()),
                 (
@@ -2928,7 +2989,7 @@ mod tests {
         apply(&mut cfg, "github.enabled", "true").unwrap();
 
         let views = snapshot(&cfg, &EnvOverlay::default());
-        assert_eq!(views.len(), 41);
+        assert_eq!(views.len(), 42);
         assert_eq!(
             views.iter().map(|v| v.key.as_str()).collect::<Vec<_>>(),
             vec![
@@ -2954,6 +3015,7 @@ mod tests {
                 "search.retired_weight",
                 "index.files",
                 "capture.similar",
+                "evolve.contradictions",
                 "recall.enabled",
                 "recall.limit",
                 "recall.min_score",
@@ -3077,27 +3139,32 @@ mod tests {
         assert_eq!(capture_similar.value, "true");
         assert_eq!(capture_similar.source, SettingSource::Default);
 
-        let recall_enabled = &views[22];
+        let contradictions = &views[22];
+        assert_eq!(contradictions.key, "evolve.contradictions");
+        assert_eq!(contradictions.value, "off");
+        assert_eq!(contradictions.source, SettingSource::Default);
+
+        let recall_enabled = &views[23];
         assert_eq!(recall_enabled.value, "true");
         assert_eq!(recall_enabled.source, SettingSource::Default);
 
-        let recall_limit = &views[23];
+        let recall_limit = &views[24];
         assert_eq!(recall_limit.value, "3");
         assert_eq!(recall_limit.source, SettingSource::Default);
 
-        let recall_min_score = &views[24];
+        let recall_min_score = &views[25];
         assert_eq!(recall_min_score.value, "0.69");
         assert_eq!(recall_min_score.source, SettingSource::Default);
 
-        let identity_actor = &views[25];
+        let identity_actor = &views[26];
         assert_eq!(identity_actor.value, "");
         assert_eq!(identity_actor.source, SettingSource::Default);
 
-        let trusted_header = &views[26];
+        let trusted_header = &views[27];
         assert_eq!(trusted_header.value, "");
         assert_eq!(trusted_header.source, SettingSource::Default);
 
-        let anonymous = &views[27];
+        let anonymous = &views[28];
         assert_eq!(anonymous.value, "false");
         assert_eq!(anonymous.source, SettingSource::Default);
     }
@@ -3480,6 +3547,56 @@ mod tests {
         unset(&mut cfg, "capture.similar").unwrap();
         assert!(cfg.capture.is_none(), "an unset block is dropped whole");
         assert!(cfg.capture_similar());
+    }
+
+    // --- evolve.contradictions ----------------------------------------------
+
+    #[test]
+    fn evolve_contradictions_takes_a_profile_or_off_and_refuses_the_rest() {
+        let mut cfg = GlobalConfig::default();
+        assert_eq!(cfg.evolve_contradictions(), "off", "absent means off");
+        let err = apply(&mut cfg, "evolve.contradictions", "maybe")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "evolve.contradictions must be off or full, got 'maybe'"
+        );
+        // The two profiles a development build had are refused like any
+        // other unknown value, naming what is accepted.
+        for removed in ["light", "english-only", "English-Only"] {
+            let err = apply(&mut cfg, "evolve.contradictions", removed)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                err,
+                format!("evolve.contradictions must be off or full, got '{removed}'")
+            );
+            assert_eq!(cfg.evolve, None, "a refused value writes nothing");
+        }
+        // An explicit off is written, so a later default never overrides it.
+        apply(&mut cfg, "evolve.contradictions", "off").unwrap();
+        assert_eq!(
+            evolve_contradictions_effective(&cfg),
+            ("off".to_string(), false)
+        );
+        let got = apply(&mut cfg, "evolve.contradictions", "full");
+        if crystalline_index::nli::LOCAL_NLI_AVAILABLE {
+            got.unwrap();
+            assert_eq!(cfg.evolve_contradictions(), "full");
+        } else {
+            assert_eq!(
+                got.unwrap_err().to_string(),
+                crystalline_index::nli::NLI_FEATURE_MISSING
+            );
+        }
+        unset(&mut cfg, "evolve.contradictions").unwrap();
+        assert_eq!(
+            cfg.evolve, None,
+            "an unset key leaves no empty evolve block"
+        );
+        let yaml = serde_yaml_ng::to_string(&cfg).unwrap();
+        assert!(!yaml.contains("evolve"), "{yaml}");
     }
 
     // --- recall.* ----------------------------------------------------------

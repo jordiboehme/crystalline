@@ -2213,7 +2213,8 @@ impl Engine {
             EngineError::Invalid(format!("domain '{domain}' has no origin state"))
         })?;
         let base = ops::unshared_base(&state);
-        let local = crystalline_remote::changes::detect_local_changes(&root, &base)?;
+        let local =
+            crystalline_remote::changes::detect_local_changes_against(&root, &base, &state_dir)?;
         Ok((root, state_dir, base, local))
     }
 

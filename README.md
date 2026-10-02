@@ -94,7 +94,7 @@ Via MSI: download `crystalline-<version>-windows-amd64.msi` (or `crystalline-<ve
 <details>
 <summary>Dev channel</summary>
 
-Every change on main that passes CI is built and published as a pre-release, installable with Homebrew:
+A change on main that passes CI is built and published as a pre-release, installable with Homebrew, when it asks for a dev build: put `[dev-build]` in the commit message, or merge it through a pull request that has the `dev-build` label or `[dev-build]` in its title or description. A maintainer can also run the Dev channel workflow by hand on main. Other changes, including the merge of a release, build no dev release:
 
 ```sh
 brew uninstall crystalline   # if you have the stable release
@@ -127,7 +127,7 @@ A chat memory is a hidden blob. One vendor owns it, it is tied to one model, and
 
 ## What sets it apart
 
-- **Plain markdown, an open format.** An engram is a markdown file with YAML frontmatter in [Google's Open Knowledge Format (OKF) v0.2](https://github.com/GoogleCloudPlatform/knowledge-catalog/tree/main/okf). Any tool reads it, nothing locks you in and the index is disposable: `crystalline reindex --full` rebuilds it from the files.
+- **Plain markdown, an open format.** An engram is a markdown file with YAML frontmatter in [Google's Open Knowledge Format (OKF) v0.2](https://github.com/GoogleCloudPlatform/knowledge-catalog/tree/main/okf). Any tool reads it, nothing locks you in and the index is disposable: `crystalline reindex --full` rebuilds it from the files. Files are written as UTF-8 with LF line endings; a file with CRLF line endings is read as it is and converted to LF on its next write.
 - **Scales past a folder of files.** Domains with MANIFEST routing, hybrid text-plus-semantic search, a knowledge graph and temporal filtering: the ten-thousandth engram is as findable as the tenth.
 - **Knowledge retires, it does not disappear.** A fact that stopped holding is superseded, not overwritten. The old engram stays addressable by date ("what applied last June"), retired knowledge fades in ranking instead of vanishing and `crystalline evolve` tells you what the archive needs next.
 - **Agents and people share one intelligence.** Agents work over MCP, people work in Fluid, and a team shares through GitHub pull requests, with review mode and private drafts for a domain that wants a gate.
@@ -153,7 +153,7 @@ Crystalline runs the same way in every scenario: a daemon in the middle keeps on
 | [Team server with Fluid](docs/deployment.md#team-server-with-fluid) | The scale-out variant: nginx replicas in front when one daemon port is not enough |
 | [Linux server with systemd](docs/deployment.md#linux-server-with-systemd) | The .deb ships a unit, disabled by default; enable it once and agents connect over HTTP |
 | [Published read-only domains](docs/deployment.md#published-read-only-domains) | Knowledge curated in a git repository, served read-only to agents |
-| [Air-gapped or egress-restricted](docs/deployment.md#air-gapped-or-egress-restricted) | The `with-model` image or a pre-fetched model directory; nothing at runtime needs the network |
+| [Air-gapped or egress-restricted](docs/deployment.md#air-gapped-or-egress-restricted) | The `with-model` image or a pre-fetched model directory; nothing at runtime needs the network (with `evolve.contradictions` off, or its checkpoint pre-fetched too) |
 | [Shared database collaboration](docs/deployment.md#shared-database-collaboration) | Several instances share one PostgreSQL index, so every capture is visible to all of them that registered the domain |
 | [Team knowledge on GitHub](docs/deployment.md#team-knowledge-on-github) | A domain tracks a GitHub repository; sharing goes through reviewed proposals, or straight to the branch where the domain says so |
 | [Authenticated agents](docs/deployment.md#authenticated-agents) | HTTP MCP requires a personal token per agent, issued in Fluid or from the CLI |
@@ -189,6 +189,7 @@ One outbound connection happens by default:
 Every other connection exists only after you turn it on:
 
 - **GitHub**, once you turn on team collaboration (`crystalline config set github.enabled true` and `crystalline connect github`). It uses your own OAuth token, and engram data flows only to the repositories you choose to share it with. `github.api_url` points it at a GitHub Enterprise server instead. Governed by [GitHub's privacy statement](https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement) or your own server's terms.
+- **Hugging Face again**, once you turn on the contradiction check (`evolve.contradictions`), for a one-time download of its local NLI model into the same cache. It sends no engram data.
 - **Your single sign-on provider**, when you configure OIDC sign-in for the web UI. Crystalline talks to the issuer you name.
 - **A remote embedding service**, when you set `embeddings.provider: openai-compatible` in `config.yaml`. The text of your engrams is then sent to the endpoint you configure, to compute its embeddings. The default provider is local and sends nothing.
 - **A PostgreSQL server**, when you set `database.backend: postgres` and `database.url` to share one search index between instances. The index holds the text of your engrams.

@@ -1357,6 +1357,9 @@ impl Engine {
                     let id = store.upsert_domain(&row.name, path, row.kind).await?;
                     store.clear_domain(id).await?;
                     drop(store);
+                    // Its contradiction rows went with the clear, so the
+                    // pass must not remember the domain as settled.
+                    self.forget_contradiction_domain(&row.name);
                     engrams_removed += row.engrams;
                     // This path never goes through `unregister_domain`, so the
                     // journal sweep is repeated here rather than inherited. A

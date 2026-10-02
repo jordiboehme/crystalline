@@ -261,7 +261,8 @@ fn render_named_counts(items: &[Value], out: &mut impl Write) -> io::Result<()> 
 /// printed uppercase in the header line of every block, which is what keeps a
 /// `MECHANICAL` item (complete intent the archive already records) visually
 /// apart from a `JUDGMENT` one (change what the archive claims, propose first)
-/// without colour.
+/// without colour. An empty queue still prints its truncation notes, so
+/// "nothing to work" never hides a cap or a count nobody has made yet.
 pub fn render_evolve(v: &Value, out: &mut impl Write) -> io::Result<()> {
     let (Some(queue), Some(total)) = (
         v.get("queue").and_then(Value::as_array),
@@ -329,7 +330,9 @@ pub fn render_evolve(v: &Value, out: &mut impl Write) -> io::Result<()> {
     if queue.is_empty() {
         writeln!(out)?;
         writeln!(out, "nothing to work in this scope")?;
-        return Ok(());
+        // A cap or an unknown count is still worth saying on an empty queue:
+        // it is what keeps "nothing to work" from reading as a clean domain.
+        return render_truncations(v, out);
     }
 
     for item in queue {
@@ -365,6 +368,23 @@ pub fn render_evolve(v: &Value, out: &mut impl Write) -> io::Result<()> {
         {
             writeln!(out, "   {finding}")?;
         }
+        // A V302 row carries both lines in their own columns rather than in
+        // the sentence, so a reader sees what the model read.
+        if let Some(text) = item.get("line_text").and_then(Value::as_str) {
+            let line = item.get("line").and_then(Value::as_u64).unwrap_or(0);
+            writeln!(out, "   line {line}: \"{text}\"")?;
+        }
+        if let Some(text) = item.get("counterpart_line_text").and_then(Value::as_str) {
+            let other = item
+                .get("counterpart_title")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let line = item
+                .get("counterpart_line")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            writeln!(out, "   {other} line {line}: \"{text}\"")?;
+        }
         if let Some(evidence) = item.get("evidence").and_then(Value::as_str)
             && !evidence.is_empty()
         {
@@ -391,6 +411,18 @@ pub fn render_evolve(v: &Value, out: &mut impl Write) -> io::Result<()> {
         }
     }
 
+    render_truncations(v, out)?;
+
+    // The one fixed string the engine returns on every call, printed from the
+    // constant rather than re-typed here so the CLI and the tool can never
+    // state different authority.
+    writeln!(out)?;
+    writeln!(out, "{}", crystalline_service::engine::EVOLVE_GUIDANCE)
+}
+
+/// The `Truncated:` block of an evolve queue, when a cap fired or a count is
+/// unknown.
+fn render_truncations(v: &Value, out: &mut impl Write) -> io::Result<()> {
     if let Some(truncations) = v.get("truncations").and_then(Value::as_array)
         && !truncations.is_empty()
     {
@@ -400,12 +432,7 @@ pub fn render_evolve(v: &Value, out: &mut impl Write) -> io::Result<()> {
             writeln!(out, "  {t}")?;
         }
     }
-
-    // The one fixed string the engine returns on every call, printed from the
-    // constant rather than re-typed here so the CLI and the tool can never
-    // state different authority.
-    writeln!(out)?;
-    writeln!(out, "{}", crystalline_service::engine::EVOLVE_GUIDANCE)
+    Ok(())
 }
 
 /// `write`: a confirmation line carrying the new engram's address, and where
@@ -818,6 +845,34 @@ mod tests {
         assert!(!out.contains("crystalline://eng/"), "{out}");
     }
 
+    /// A `V302` row prints both lines under its finding, each with its line
+    /// number and the other one with its engram's title.
+    #[test]
+    fn a_v302_row_prints_both_lines_under_its_finding() {
+        let v = json!({
+            "scope": { "domains": ["eng"], "today": "2026-10-01" },
+            "engrams_scanned": 2,
+            "total": 1, "page": 1, "limit": 10, "count": 1,
+            "families": [{ "family": "meaning", "findings": 1 }],
+            "queue": [{
+                "n": 1, "priority": 85, "rule": "V302", "class": "judgment",
+                "domain": "eng", "permalink": "ci-runtime", "title": "CI runtime", "line": 7,
+                "finding": "Possible contradiction: line 7 of \"CI runtime\" and line 5 of \"Node version\" read as contradicting at probability 0.91, line similarity 0.90",
+                "evidence": "e", "fix": "f",
+                "counterpart": "node-version", "counterpart_title": "Node version",
+                "counterpart_line": 5, "probability": 0.91, "similarity": 0.9,
+                "line_text": "The build uses Node 20",
+                "counterpart_line_text": "The build uses Node 18",
+            }],
+            "actions": [], "truncations": [],
+        });
+        let out = render_to_string(render_evolve, &v);
+        assert!(
+            out.contains("read as contradicting at probability 0.91, line similarity 0.90\n   line 7: \"The build uses Node 20\"\n   Node version line 5: \"The build uses Node 18\"\n   evidence: e\n"),
+            "{out}"
+        );
+    }
+
     /// A clean sweep says so rather than printing an empty list, and still
     /// reports what it scanned.
     #[test]
@@ -832,6 +887,25 @@ mod tests {
         assert_eq!(
             out,
             "Sweep of eng, ops as of 2026-08-02\n1 engram scanned, 0 findings (showing 0, page 1)\n\nnothing to work in this scope\n"
+        );
+    }
+
+    /// An empty queue still prints what a cap or an unknown count left out:
+    /// with the contradiction check on and the daemon behind, "nothing to work"
+    /// alone would read as a domain with no possible contradictions.
+    #[test]
+    fn evolve_empty_queue_still_names_what_is_not_counted() {
+        let v = json!({
+            "scope": { "domains": ["eng"], "today": "2026-08-02" },
+            "engrams_scanned": 3,
+            "total": 0, "page": 1, "limit": 10, "count": 0,
+            "families": [], "queue": [], "actions": [],
+            "truncations": ["eng - V302: related pairs not counted yet (the daemon counts them after embedding)"],
+        });
+        let out = render_to_string(render_evolve, &v);
+        assert_eq!(
+            out,
+            "Sweep of eng as of 2026-08-02\n3 engrams scanned, 0 findings (showing 0, page 1)\n\nnothing to work in this scope\n\nTruncated:\n  eng - V302: related pairs not counted yet (the daemon counts them after embedding)\n"
         );
     }
 
