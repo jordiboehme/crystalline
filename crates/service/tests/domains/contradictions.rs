@@ -3890,6 +3890,23 @@ async fn instance_on(
     id: &str,
     scorer: Arc<dyn ContradictionScorer>,
 ) -> (tempfile::TempDir, Arc<Engine>) {
+    instance_with(
+        url,
+        schema,
+        id,
+        loader_of(scorer, Arc::new(AtomicUsize::new(0))),
+    )
+    .await
+}
+
+/// [`instance_on`] with this loader.
+#[cfg(feature = "postgres")]
+async fn instance_with(
+    url: &str,
+    schema: &str,
+    id: &str,
+    loader: ScorerLoader,
+) -> (tempfile::TempDir, Arc<Engine>) {
     let tmp = tempfile::tempdir().unwrap();
     let mut cfg = GlobalConfig::default();
     cfg.domains
@@ -3913,7 +3930,7 @@ async fn instance_on(
         Some(config_path),
     )
     .with_instance_id(id.to_string())
-    .with_scorer_loader(loader_of(scorer, Arc::new(AtomicUsize::new(0))));
+    .with_scorer_loader(loader);
     (tmp, Arc::new(engine))
 }
 
@@ -3948,6 +3965,52 @@ async fn two_instances_score_a_virtual_domain_once() {
     assert_eq!(a.score_contradictions().await.unwrap(), scored(0, 0, 0));
     assert_eq!(b.score_contradictions().await.unwrap(), scored(0, 0, 0));
     assert_eq!(s.forwards(), 2, "nothing is left to read");
+
+    drop((a, b));
+    let cleanup = crystalline_index::PostgresStore::open_in_schema(&url, &schema)
+        .await
+        .unwrap();
+    cleanup.drop_schema().await.unwrap();
+}
+
+/// A walk that went stale while it waited: `b` walks while the pair is still
+/// pending, then its model takes long to load, and by the time it holds the
+/// claim `a` has scored the pair, stored it and let go. Under the claim `b`
+/// reads the stored pairs again, leaves the pair alone and counts it as up to
+/// date, so nothing is pending afterwards.
+#[cfg(feature = "postgres")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_walk_that_went_stale_leaves_a_pair_another_instance_stored() {
+    let Some(url) = pg_url() else {
+        return;
+    };
+    let schema = unique_schema();
+    let s = stub();
+    let slow: Arc<dyn ContradictionScorer> = Arc::new(Slow(s.clone()));
+    let late: ScorerLoader = {
+        let slow = slow.clone();
+        Arc::new(move |_model: &'static NliModel| {
+            let slow = slow.clone();
+            Box::pin(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                Ok(slow)
+            })
+        })
+    };
+    let (_ta, a) = instance_on(&url, &schema, "a", slow).await;
+    let (_tb, b) = instance_with(&url, &schema, "b", late).await;
+    three(&a).await;
+    b.embed_pending().await.unwrap();
+
+    let (ra, rb) = tokio::join!(a.score_contradictions(), b.score_contradictions());
+    assert_eq!(ra.unwrap(), scored(1, 1, 0));
+    assert_eq!(
+        rb.unwrap(),
+        scored(0, 0, 0),
+        "the stored pair is up to date, not pending"
+    );
+    assert_eq!(s.forwards(), 2, "the pair is read once in total");
+    assert!(!b.contradictions_wanted(), "nothing left to ask for");
 
     drop((a, b));
     let cleanup = crystalline_index::PostgresStore::open_in_schema(&url, &schema)
