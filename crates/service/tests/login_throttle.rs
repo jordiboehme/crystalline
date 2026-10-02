@@ -26,6 +26,11 @@ use tokio::sync::Mutex;
 struct LoginCtx {
     addr: SocketAddr,
     auth: Arc<AuthStore>,
+    /// One client for every request, built before anything is timed. A new
+    /// client per request put its construction (a system proxy lookup on
+    /// macOS) and a fresh connection inside every timed window, and the
+    /// asserts below compare one window with another.
+    client: reqwest::Client,
     _tmp: tempfile::TempDir,
 }
 
@@ -76,9 +81,14 @@ impl LoginCtx {
             .await
             .unwrap();
         });
+        // Proxy discovery off: the target is loopback, where a system proxy
+        // must never be consulted, and the lookup can block for a minute on a
+        // managed network configuration.
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
         LoginCtx {
             addr,
             auth,
+            client,
             _tmp: tmp,
         }
     }
@@ -93,13 +103,7 @@ impl LoginCtx {
 
     /// One sign-in attempt.
     async fn login(&self, name: &str, password: &str) -> reqwest::Response {
-        // Proxy discovery off: the target is loopback, where a system proxy
-        // must never be consulted, and the lookup can block for a minute on a
-        // managed network configuration.
-        reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .unwrap()
+        self.client
             .post(format!("http://{}/api/v1/auth/login", self.addr))
             .json(&serde_json::json!({"name": name, "password": password}))
             .send()
@@ -202,13 +206,16 @@ async fn the_refusal_body_never_changes() {
 async fn a_correct_password_inside_the_free_attempts_is_not_delayed() {
     let ctx = LoginCtx::start_with_throttle(2, 8).await;
     ctx.create_account("ada", "correct horse").await;
-    // The baseline is measured rather than assumed: one failed attempt, itself
-    // inside the free window, so it pays for a password check and nothing else.
-    // An absolute bound here would be a bet on how fast the machine is, and
-    // that bet loses on a shared runner - where a single argon2 verification
-    // can outlast any constant worth writing down.
-    let baseline = ctx.timed_login("ada", "wrong").await;
-    assert_eq!(baseline.response.status(), 401);
+    // The baseline is measured rather than assumed: a sign-in before any
+    // mistype, so it pays for the same password check and the same session
+    // write as the one under test, and nothing else. An absolute bound here
+    // would be a bet on how fast the machine is, and that bet loses on a
+    // shared runner - where a single argon2 verification can outlast any
+    // constant worth writing down. A failed attempt is no baseline either: it
+    // writes no session, and that write is the part a loaded disk slows down.
+    let baseline = ctx.timed_login("ada", "correct horse").await;
+    assert_eq!(baseline.response.status(), 200);
+    assert_eq!(ctx.login("ada", "wrong").await.status(), 401);
     let ok = ctx.timed_login("ada", "correct horse").await;
     assert_eq!(ok.response.status(), 200);
     // The smallest nap the schedule can impose is a full second, so anything
