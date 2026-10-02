@@ -152,11 +152,14 @@ fn stored_program(run: &Run) -> Option<String> {
     })
 }
 
-/// The program to write for `harness`, keeping a stored absolute path that
-/// still runs (spec decision 6), and the warning about it, if any.
-fn program_for(run: &Run) -> (String, Option<String>) {
+/// The program to write for `harness`, and the warning about it, if any.
+/// `keep` is for the session-start refresh only: it keeps a stored absolute
+/// path that still runs, because a GUI app's PATH there may lack crystalline
+/// (spec decision 6). An explicit install always takes the crystalline on
+/// PATH (or this binary), so it can move a harness off an old binary.
+fn program_for(run: &Run, keep: bool) -> (String, Option<String>) {
     let harness = run.harness;
-    let keep = stored_program(run);
+    let keep = if keep { stored_program(run) } else { None };
     let path = std::env::var_os("PATH");
     let resolved = resolve_program(
         harness,
@@ -410,7 +413,7 @@ fn remove_owned_file(path: &Path) -> anyhow::Result<()> {
 /// [`install::hooks_style`] callers: a failure is an error.
 pub(crate) fn install_hook_report(harness: HarnessKind) -> anyhow::Result<HooksReport> {
     let mut run = Run::new(harness);
-    let (program, _) = program_for(&run);
+    let (program, _) = program_for(&run, false);
     let outcome = install_hook(&mut run, &program);
     match outcome.error {
         Some(e) => Err(anyhow::anyhow!(e)),
@@ -531,7 +534,8 @@ fn install_skills(
 // --- notices -------------------------------------------------------------------------
 
 /// The version-skew notice for the program a profile harness runs. The bare
-/// spelling is the legacy PATH check; an absolute one is asked directly.
+/// spelling is the legacy PATH check; an absolute one, which an install takes
+/// from PATH (or this binary), is asked directly.
 fn program_notice(harness: HarnessKind, program: &str) -> Option<String> {
     if program == "crystalline" {
         return install::path_binary_notice();
@@ -550,35 +554,40 @@ fn program_notice(harness: HarnessKind, program: &str) -> Option<String> {
     match version {
         Some(v) if v == mine => None,
         Some(v) => Some(format!(
-            "{} runs {program}, which is version {v}, not this binary's {mine}. Upgrade that crystalline, or run the install with the binary you want {} to use.",
-            harness.display_name(),
+            "{} runs {program}, the crystalline on your PATH, which is version {v}, not this binary's {mine}. Upgrade it, or put this binary first on your PATH and run the install again.",
             harness.display_name()
         )),
         None => Some(format!(
-            "{} runs {program}, but it did not answer --version. Check that this path is the crystalline you want.",
+            "{} runs {program}, the crystalline on your PATH, but it did not answer --version. Check which crystalline your PATH finds and run the install again.",
             harness.display_name()
         )),
     }
 }
 
-/// The notes a harness adds after every install.
-fn harness_notes(harness: HarnessKind, book: &Receipt) -> Vec<String> {
+/// The notes a harness adds after an install. `hook_done` is whether this
+/// run installed the session hook.
+fn harness_notes(harness: HarnessKind, book: &Receipt, hook_done: bool) -> Vec<String> {
     let mut notes = Vec::new();
+    let hooked = |kind: HarnessKind| {
+        book.find(kind.id(), "user", None)
+            .is_some_and(|row| row.parts.hooks)
+    };
     match harness {
         HarnessKind::Cursor => {
-            if book
-                .find(HarnessKind::ClaudeCode.id(), "user", None)
-                .is_some()
-            {
+            // The Claude Code hook is silenced inside Cursor only while
+            // Cursor has a hook of its own.
+            if hooked(HarnessKind::ClaudeCode) && hooked(HarnessKind::Cursor) {
                 notes.push(
                     "Cursor also runs your Claude Code hooks. The Claude Code routing hook stays silent inside Cursor, so the routing block arrives once."
                         .to_string(),
                 );
             }
-            notes.push(
-                "Cursor reads ~/.cursor/hooks.json when it starts. Restart Cursor to load the hook."
-                    .to_string(),
-            );
+            if hook_done {
+                notes.push(
+                    "Cursor reads ~/.cursor/hooks.json when it starts. Restart Cursor to load the hook."
+                        .to_string(),
+                );
+            }
         }
         HarnessKind::ClaudeCode
         | HarnessKind::Codex
@@ -635,7 +644,7 @@ pub(crate) fn run_install(opts: &InstallOptions, json: bool) -> anyhow::Result<(
     let (program, program_warning) = if opts.skip_mcp && opts.skip_hooks {
         (String::new(), None)
     } else {
-        program_for(&run)
+        program_for(&run, false)
     };
 
     // A failed MCP part carries its reason in its own report line.
@@ -702,7 +711,7 @@ pub(crate) fn run_install(opts: &InstallOptions, json: bool) -> anyhow::Result<(
         );
     }
     notices.append(&mut run.notices);
-    notices.extend(harness_notes(harness, &book));
+    notices.extend(harness_notes(harness, &book, hook_done));
     notices.extend(rebalance_notices);
     let receipt_report = save_receipt(
         receipt_path.as_deref(),
@@ -751,7 +760,7 @@ pub(crate) fn run_uninstall(
 
     let dir = run.at(harness.profile().skills_write);
     let prior_skills = prior.as_ref().map(|p| p.skills.as_slice()).unwrap_or(&[]);
-    let skills = install::skills_to_remove(
+    let mut skills = install::skills_to_remove(
         harness,
         true,
         &dir,
@@ -760,6 +769,12 @@ pub(crate) fn run_uninstall(
         &book,
         &run.folders(),
     )?;
+    // A covered row wrote nothing, so nothing was removed: say whose folder
+    // covered it.
+    if let Some(by) = prior_skills.iter().find_map(skills_placement::covered_by) {
+        skills.dir = run.at(by.profile().skills_write).display().to_string();
+        skills.covered_by = Some(by.id());
+    }
 
     let removed = book.remove(harness.id(), "user", None);
     // With this row gone, a harness it covered writes its own folder again
@@ -800,7 +815,7 @@ pub(crate) fn run_uninstall(
 pub(crate) fn reconcile(harness: HarnessKind, entry: &mut InstallRecord) -> anyhow::Result<()> {
     let mut run = Run::new(harness);
     if entry.parts.hooks {
-        let (program, _) = program_for(&run);
+        let (program, _) = program_for(&run, true);
         if let Some(error) = install_hook(&mut run, &program).error {
             anyhow::bail!(error);
         }

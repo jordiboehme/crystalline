@@ -237,6 +237,54 @@ fn the_skip_flags_leave_their_part_alone() {
     assert!(!b.home.join(".cursor/hooks.json").exists());
 }
 
+/// An explicit install points the harness at the crystalline on PATH, even
+/// when the files name an older binary that still runs: keeping it would
+/// leave Cursor on the old binary with no way to move it.
+#[test]
+fn an_explicit_install_replaces_a_stale_stored_program_with_the_path_binary() {
+    use std::os::unix::fs::PermissionsExt;
+    let b = sandbox();
+    let old = b.home.join("old/bin/crystalline");
+    write(&old, b"#!/bin/sh\necho 'crystalline 0.21.0'\n");
+    std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let old = old.display().to_string();
+    write(
+        &b.home.join(".cursor/hooks.json"),
+        json!({"version": 1, "hooks": {"sessionStart": [{"command": format!("{old} prompt system --format cursor --harness cursor")}]}})
+            .to_string()
+            .as_bytes(),
+    );
+    write(
+        &b.home.join(".cursor/mcp.json"),
+        json!({"mcpServers": {"crystalline": {"type": "stdio", "command": old, "args": ["mcp", "--harness", "cursor"]}}})
+            .to_string()
+            .as_bytes(),
+    );
+    let out = cmd(&b)
+        .args(["install", "cursor"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let read = |p: &str| -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(b.home.join(p)).unwrap()).unwrap()
+    };
+    assert_eq!(
+        read(".cursor/hooks.json")["hooks"]["sessionStart"][0]["command"],
+        format!("{} prompt system --format cursor --harness cursor", abs(&b))
+    );
+    assert_eq!(
+        read(".cursor/mcp.json")["mcpServers"]["crystalline"]["command"],
+        abs(&b)
+    );
+    let out = String::from_utf8_lossy(&out);
+    assert!(
+        !out.contains("0.21.0"),
+        "no notice about the old binary: {out}"
+    );
+}
+
 /// Decision 6 and review focus 4.
 #[test]
 fn a_session_start_reconcile_without_crystalline_on_path_keeps_the_absolute_hook() {
@@ -282,7 +330,7 @@ fn a_linked_private_file_stays_a_link_and_keeps_its_mode() {
     let b = sandbox();
     let real = b.home.join("dotfiles/cursor-mcp.json");
     write(&real, MCP.as_bytes());
-    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o640)).unwrap();
     let link = b.home.join(".cursor/mcp.json");
     std::fs::create_dir_all(link.parent().unwrap()).unwrap();
     std::os::unix::fs::symlink(&real, &link).unwrap();
@@ -302,7 +350,7 @@ fn a_linked_private_file_stays_a_link_and_keeps_its_mode() {
     );
     assert_eq!(
         std::fs::metadata(&real).unwrap().permissions().mode() & 0o777,
-        0o600
+        0o640
     );
     cmd(&b).args(["uninstall", "cursor"]).assert().success();
     assert!(is_link(&link));

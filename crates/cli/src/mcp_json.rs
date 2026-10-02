@@ -142,10 +142,9 @@ pub(crate) fn plan_mcp_install(
     };
     let mut state = classify(harness, entry);
     // A command that is not the wanted program is rewritten: bare where an
-    // absolute path is wanted, or another path (maybe dead). A stored path
-    // that still runs arrives here as `program` already (spec decision 6).
-    // Task 8: with no hook to read a stored path from, pass this entry's
-    // own `command` as the path to keep when it still runs.
+    // absolute path is wanted, or another path (maybe dead or old). An
+    // explicit install passes the crystalline on PATH, so a stale path is
+    // replaced.
     if state == EntryState::UpToDate
         && entry.get("command").and_then(Value::as_str) != Some(program)
     {
