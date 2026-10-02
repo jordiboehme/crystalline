@@ -139,9 +139,19 @@ pub struct LockInfo {
 ///   came from that variable is kept. Whoever displaces the daemon must have
 ///   every one of them set, or it starts no successor at all (see
 ///   [`attach_after_displacement`]); a variable it has that is not listed is
-///   removed from the successor's environment.
+///   removed from the successor's environment. Known limit: variables are
+///   compared by name only, so a displacing process that sets a listed
+///   variable to another value (a `CRYSTALLINE_DATABASE_URL` naming another
+///   database, say) hands the successor its own value. Read-only cannot be
+///   relaxed that way, since it is replayed as a flag.
 /// - `partial` says one of the paths could not be written down (it is not
 ///   UTF-8); such a record is treated like a missing variable.
+///
+/// The environment outside the overlay is not recorded either and passes from
+/// the displacing process as it is: `CRYSTALLINE_CONFIG` (harmless, the
+/// recorded `--config` wins), the cache directories the model is kept in,
+/// `RUST_LOG` and proxy variables among it. A successor started with another
+/// cache directory downloads the model again; nothing it serves changes.
 ///
 /// Not recorded: `--take-over` (a one-time migration of host locks the
 /// predecessor already made; the successor claims the locks its predecessor
@@ -1600,8 +1610,9 @@ pub async fn dislodge_unresponsive() -> anyhow::Result<DislodgeOutcome> {
 /// Attach to whatever daemon follows one this call displaced: another
 /// client's respawn when one publishes inside the wait, else one this
 /// call spawns. Bounded by the same 15 s readiness budget `ensure_daemon`
-/// uses; `None` only when no daemon became ready, and the caller then
-/// falls back as before.
+/// uses (a shorter one when the record says nothing, see
+/// [`successor_plan`]); `None` only when no daemon became ready, and the
+/// caller then falls back as before.
 ///
 /// `displaced` is what the displaced daemon's record said about how it was
 /// started, and the successor is started with exactly that (see
@@ -1611,8 +1622,9 @@ pub async fn dislodge_unresponsive() -> anyhow::Result<DislodgeOutcome> {
 /// never reaches this path (`use_daemon` sends such a command to the index
 /// directly), and a `CRYSTALLINE_*` variable the predecessor did not apply is
 /// removed from the successor's environment. A daemon whose start cannot be
-/// reproduced here gets no successor from this call; the wait still attaches
-/// to one another client starts.
+/// reproduced here, or whose record does not say how it was started, gets no
+/// successor from this call; the wait still attaches to one another client
+/// starts.
 ///
 /// The spawn-and-poll part is [`ensure_daemon_with`] itself, so a successor
 /// another client already spawned wins the ownership race and this call's
@@ -1627,11 +1639,11 @@ pub async fn attach_after_displacement(displaced: Option<StartOptions>) -> Optio
     );
     let options = match plan {
         SuccessorPlan::Spawn(options) => options,
-        SuccessorPlan::Wait(why) => {
+        SuccessorPlan::Wait { why, budget } => {
             tracing::warn!(
                 "not starting a successor for the displaced daemon: {why}; waiting for another client to start one"
             );
-            return wait_for_successor().await;
+            return wait_for_successor(budget).await;
         }
     };
     match ensure_daemon_with(true, &options).await {
@@ -1648,9 +1660,23 @@ pub async fn attach_after_displacement(displaced: Option<StartOptions>) -> Optio
 pub(crate) enum SuccessorPlan {
     /// Start one with these options.
     Spawn(SpawnOptions),
-    /// Start none and only wait for another client's, for this reason.
-    Wait(String),
+    /// Start none and only wait up to `budget` for another client's, for
+    /// the reason `why`.
+    Wait { why: String, budget: Duration },
 }
+
+/// How long a displacing client waits for another client's successor when it
+/// starts none itself because the record could not be reproduced here: the
+/// same window [`ensure_daemon_with`] gives its own spawn.
+const SUCCESSOR_WAIT: Duration = Duration::from_secs(15);
+
+/// How long it waits when the displaced daemon's record says nothing about
+/// how it was started (a daemon older than 0.22.1). Long enough for a
+/// connected bridge, which reconnects the moment its socket closes
+/// (`pump_stdio` in the client), to start the successor with its own flags;
+/// short, because with no bridge connected nobody will, and the command then
+/// answers on its own.
+const UNRECORDED_SUCCESSOR_WAIT: Duration = Duration::from_secs(3);
 
 /// Decide how to start the successor of a displaced daemon whose record
 /// said `displaced`. `current` is the list of overlay variables this process
@@ -1658,11 +1684,14 @@ pub(crate) enum SuccessorPlan {
 /// successor would fail on too), and `has_var` asks whether a variable is set
 /// here.
 ///
-/// - No recorded options (a record from 0.22.0 or older): the successor is
-///   started with the defaults, which is what 0.22.1 did before options were
-///   recorded. Nothing else can be done for such a record, and a default
-///   successor is still better than a command that collides on the index lock
-///   with one a bridge starts.
+/// - No recorded options (a record from 0.22.0 or older): no successor, and
+///   only a short wait ([`UNRECORDED_SUCCESSOR_WAIT`]). Nobody can tell from
+///   such a record whether the daemon ran read-only or on another index, so a
+///   successor with the defaults could hand the next bridge a writable daemon
+///   on the wrong index (the I2 finding of 0.22.1). A connected bridge starts
+///   the successor itself with its own flags inside the wait, the existing
+///   "first spawner decides" rule; with none connected the command answers on
+///   its own, as before 0.22.1.
 /// - A recorded variable this process does not have, a path the record could
 ///   not hold, or an environment that does not parse: no successor. The
 ///   database, a domain or the read-only switch may have come from that
@@ -1674,20 +1703,27 @@ pub(crate) fn successor_plan(
     current: Result<&[String], &crate::overlay::OverlayError>,
     has_var: impl Fn(&str) -> bool,
 ) -> SuccessorPlan {
+    let wait = |why: String| SuccessorPlan::Wait {
+        why,
+        budget: SUCCESSOR_WAIT,
+    };
     let Some(start) = displaced else {
-        return SuccessorPlan::Spawn(SpawnOptions::default());
+        return SuccessorPlan::Wait {
+            why: "its record does not say how it was started".to_string(),
+            budget: UNRECORDED_SUCCESSOR_WAIT,
+        };
     };
     if start.partial {
-        return SuccessorPlan::Wait("its record could not hold one of its paths".to_string());
+        return wait("its record could not hold one of its paths".to_string());
     }
     if let Some(missing) = start.env.iter().find(|name| !has_var(name)) {
-        return SuccessorPlan::Wait(format!(
+        return wait(format!(
             "it read {missing} from its environment and that variable is not set here"
         ));
     }
     let current = match current {
         Ok(current) => current,
-        Err(e) => return SuccessorPlan::Wait(format!("this environment does not parse ({e})")),
+        Err(e) => return wait(format!("this environment does not parse ({e})")),
     };
     SuccessorPlan::Spawn(SpawnOptions {
         db: start.db.as_ref().map(PathBuf::from),
@@ -1704,16 +1740,19 @@ pub(crate) fn successor_plan(
     })
 }
 
-/// Poll for a daemon another client starts, for the same 15 s window
-/// [`ensure_daemon_with`] gives its own spawn, without spawning one.
-async fn wait_for_successor() -> Option<Connection> {
-    for _ in 0..300 {
+/// Poll for a daemon another client starts, for up to `budget`, without
+/// spawning one.
+async fn wait_for_successor(budget: Duration) -> Option<Connection> {
+    let deadline = Instant::now() + budget;
+    loop {
         if let Some(conn) = try_attach().await {
             return Some(conn);
         }
+        if Instant::now() >= deadline {
+            return None;
+        }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    None
 }
 
 /// How [`spawn_daemon`] starts a daemon. `ensure_daemon` fills the first
@@ -2532,20 +2571,23 @@ mod tests {
     }
 
     /// A record a 0.22.0 daemon wrote has no start options. It still parses,
-    /// and its successor is started with the defaults, as 0.22.1 did before
-    /// options were recorded.
+    /// and a displacing command starts no successor for it: it only waits a
+    /// moment for a connected bridge to start one with its own flags.
     #[test]
-    fn a_record_without_start_options_parses_and_gets_a_default_successor() {
+    fn a_record_without_start_options_parses_and_gets_no_successor_from_a_command() {
         let record = r#"{"pid":4242,"socket_path":"/s/service.sock","version":"0.22.0",
             "started_at":"2026-09-30T10:00:00Z","mcp_line_options":true,
             "started_by":"autostart","http":"127.0.0.1:7411","allowed_hosts":[],
             "runs_in":{"working_dir":"/s","breakaway_refused":false,"exits_when_idle":false}}"#;
         let info: LockInfo = serde_json::from_str(record).expect("a 0.22.0 record parses");
         assert_eq!(info.start, None);
-        assert_eq!(
-            successor_plan(info.start.as_ref(), Ok(&[]), |_| false),
-            SuccessorPlan::Spawn(SpawnOptions::default())
-        );
+        match successor_plan(info.start.as_ref(), Ok(&[]), |_| true) {
+            SuccessorPlan::Wait { budget, .. } => {
+                assert_eq!(budget, UNRECORDED_SUCCESSOR_WAIT);
+                assert!(budget <= Duration::from_secs(3), "{budget:?}");
+            }
+            other => panic!("no successor for a 0.22.0 record: {other:?}"),
+        }
     }
 
     /// What a daemon records about its start carries no secret: a database
@@ -2651,7 +2693,10 @@ mod tests {
             })
         );
         match successor_plan(Some(&start), Ok(&[]), |_| false) {
-            SuccessorPlan::Wait(why) => assert!(why.contains("CRYSTALLINE_DATABASE_URL"), "{why}"),
+            SuccessorPlan::Wait { why, budget } => {
+                assert!(why.contains("CRYSTALLINE_DATABASE_URL"), "{why}");
+                assert_eq!(budget, SUCCESSOR_WAIT);
+            }
             other => panic!("a missing variable starts no successor: {other:?}"),
         }
         let partial = StartOptions {
@@ -2661,7 +2706,7 @@ mod tests {
         };
         assert!(matches!(
             successor_plan(Some(&partial), Ok(&[]), |_| true),
-            SuccessorPlan::Wait(_)
+            SuccessorPlan::Wait { .. }
         ));
         let args = match successor_plan(Some(&start), Ok(&here), |_| true) {
             SuccessorPlan::Spawn(options) => daemon_args(&options, false),

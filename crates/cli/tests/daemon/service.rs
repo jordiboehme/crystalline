@@ -3979,6 +3979,11 @@ const OLD_DAEMON_START_ENV: &str = "CRYSTALLINE_TEST_OLD_DAEMON_START";
 /// Set, the stand-in leaves on a `shutdown` without starting a successor:
 /// no bridge is connected, so the displacing command is the only spawner.
 const OLD_DAEMON_LEAVE_ENV: &str = "CRYSTALLINE_TEST_OLD_DAEMON_LEAVE";
+/// The version the stand-in's record claims when it starts, when not
+/// [`OLD_DAEMON_VERSION`]: a bridge of this build attaches to a daemon of
+/// its own version without displacing it, and the test then rewrites the
+/// record to the old version.
+const OLD_DAEMON_CLAIM_ENV: &str = "CRYSTALLINE_TEST_OLD_DAEMON_CLAIM";
 
 /// A daemon of an older version that, asked to shut down, leaves behind a
 /// successor already holding the index - the shape an in-place upgrade takes
@@ -3999,10 +4004,38 @@ impl OldDaemonStandIn {
         OldDaemonStandIn::spawn_with(env, None, false)
     }
 
+    /// A stand-in that starts no successor and first claims this build's own
+    /// version, so a real `crystalline mcp` bridge can attach to it; the
+    /// test turns it into an old daemon with [`OldDaemonStandIn::age`].
+    fn spawn_for_a_bridge(env: &Env) -> OldDaemonStandIn {
+        OldDaemonStandIn::spawn_claiming(env, None, true, env!("CARGO_PKG_VERSION"))
+    }
+
+    /// Rewrite the record to claim [`OLD_DAEMON_VERSION`], so the next client
+    /// displaces this stand-in.
+    fn age(&self, env: &Env) {
+        let mut record = env.lock_record().expect("the stand-in's record");
+        assert_eq!(record["pid"], json!(self.pid), "{record}");
+        record["version"] = json!(OLD_DAEMON_VERSION);
+        let tmp = env.info_path().with_extension("json.tmp");
+        std::fs::write(&tmp, record.to_string()).unwrap();
+        std::fs::rename(&tmp, env.info_path()).unwrap();
+    }
+
     /// [`OldDaemonStandIn::spawn`] with `start` written into the record as its
     /// start options, and with `leave` set, a stand-in that starts no
     /// successor when it is asked to shut down.
     fn spawn_with(env: &Env, start: Option<Value>, leave: bool) -> OldDaemonStandIn {
+        OldDaemonStandIn::spawn_claiming(env, start, leave, OLD_DAEMON_VERSION)
+    }
+
+    /// [`OldDaemonStandIn::spawn_with`] whose record first claims `claim`.
+    fn spawn_claiming(
+        env: &Env,
+        start: Option<Value>,
+        leave: bool,
+        claim: &str,
+    ) -> OldDaemonStandIn {
         std::fs::create_dir_all(env.state_dir()).unwrap();
         let log = std::fs::File::create(env.dir.join("old-daemon.log")).unwrap();
         let mut cmd = Command::new(std::env::current_exe().unwrap());
@@ -4023,6 +4056,7 @@ impl OldDaemonStandIn {
         if leave {
             cmd.env(OLD_DAEMON_LEAVE_ENV, "1");
         }
+        cmd.env(OLD_DAEMON_CLAIM_ENV, claim);
         let mut child = cmd
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -4037,9 +4071,9 @@ impl OldDaemonStandIn {
         });
         let start = Instant::now();
         loop {
-            let published = env.lock_record().is_some_and(|r| {
-                r["pid"] == json!(pid) && r["version"] == json!(OLD_DAEMON_VERSION)
-            });
+            let published = env
+                .lock_record()
+                .is_some_and(|r| r["pid"] == json!(pid) && r["version"] == json!(claim));
             if published && env.sock_path().exists() {
                 break;
             }
@@ -4077,13 +4111,17 @@ impl Drop for OldDaemonStandIn {
 /// Not a test: the older daemon [`OldDaemonStandIn`] starts. It runs only
 /// with [`OLD_DAEMON_ENV`] set and returns at once any other way.
 ///
-/// It publishes a record claiming [`OLD_DAEMON_VERSION`] and answers on the
-/// socket. A `shutdown` is acknowledged, then the record, socket and lock file
-/// are removed, the real `crystalline serve` is started detached, and the
-/// stand-in exits only once that successor has published a record of its
-/// own. The order is the point: the displacing command must find the index
-/// already held when it moves on, or it can win the race and pass without
-/// the fix.
+/// It publishes a record claiming [`OLD_DAEMON_VERSION`] (or the version in
+/// [`OLD_DAEMON_CLAIM_ENV`]) and answers on the socket, one thread per
+/// connection. An `mcp` connection gets a canned result for every request,
+/// enough for a bridge's `initialize`, and stays open until the stand-in
+/// exits, which is the end of file a connected bridge reconnects on. A ctl
+/// `shutdown` is acknowledged, then the record, socket and lock file are
+/// removed. Without [`OLD_DAEMON_LEAVE_ENV`] the real `crystalline serve` is
+/// then started detached, and the stand-in exits only once that successor
+/// has published a record of its own. The order is the point: the
+/// displacing command must find the index already held when it moves on, or
+/// it can win the race and pass without the fix.
 #[test]
 #[ignore = "a stand-in process for a daemon test, started by that test"]
 fn old_daemon_stand_in() {
@@ -4101,13 +4139,15 @@ fn old_daemon_stand_in() {
     let lock = state.join("service.lock");
     let me = std::process::id();
     let leave = std::env::var_os(OLD_DAEMON_LEAVE_ENV).is_some();
+    let claim =
+        std::env::var(OLD_DAEMON_CLAIM_ENV).unwrap_or_else(|_| OLD_DAEMON_VERSION.to_string());
 
     let _ = std::fs::remove_file(&sock);
     let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
     let mut record = json!({
         "pid": me,
         "socket_path": sock.display().to_string(),
-        "version": OLD_DAEMON_VERSION,
+        "version": claim,
         "started_at": "2026-01-01T00:00:00Z",
     });
     if let Ok(start) = std::env::var(OLD_DAEMON_START_ENV) {
@@ -4115,22 +4155,7 @@ fn old_daemon_stand_in() {
     }
     std::fs::write(&info, serde_json::to_string(&record).unwrap()).unwrap();
 
-    for stream in listener.incoming() {
-        let Ok(mut stream) = stream else { break };
-        let mut reader = BufReader::new(stream.try_clone().unwrap());
-        // The `ctl` handshake line, then the request line.
-        let mut line = String::new();
-        let _ = reader.read_line(&mut line);
-        line.clear();
-        let _ = reader.read_line(&mut line);
-        if !line.contains("\"shutdown\"") {
-            let _ =
-                stream.write_all(b"{\"v\":1,\"ok\":false,\"error\":\"an old daemon stand-in\"}\n");
-            continue;
-        }
-        let _ = stream.write_all(b"{\"v\":1,\"ok\":true,\"data\":null}\n");
-        let _ = stream.flush();
-        drop(stream);
+    let shutdown = move || {
         let _ = std::fs::remove_file(&info);
         let _ = std::fs::remove_file(&sock);
         let _ = std::fs::remove_file(&lock);
@@ -4164,6 +4189,56 @@ fn old_daemon_stand_in() {
             std::thread::sleep(Duration::from_millis(20));
         }
         std::process::exit(0);
+    };
+    let shutdown = std::sync::Arc::new(shutdown);
+
+    for stream in listener.incoming() {
+        let Ok(mut stream) = stream else { break };
+        let shutdown = std::sync::Arc::clone(&shutdown);
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line);
+            if line.trim_start().starts_with("mcp") {
+                // A bridge's session: answer every request, keep the socket.
+                loop {
+                    line.clear();
+                    match reader.read_line(&mut line) {
+                        Ok(0) | Err(_) => return,
+                        Ok(_) => {}
+                    }
+                    let Ok(msg) = serde_json::from_str::<Value>(line.trim()) else {
+                        continue;
+                    };
+                    let Some(id) = msg.get("id").filter(|_| msg.get("method").is_some()) else {
+                        continue;
+                    };
+                    let reply = json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "protocolVersion": "2025-06-18",
+                            "capabilities": {},
+                            "serverInfo": { "name": "old-stand-in", "version": OLD_DAEMON_VERSION },
+                        },
+                    });
+                    let _ = stream.write_all(format!("{reply}\n").as_bytes());
+                    let _ = stream.flush();
+                }
+            }
+            // A ctl connection: the request line follows the handshake.
+            line.clear();
+            let _ = reader.read_line(&mut line);
+            if !line.contains("\"shutdown\"") {
+                let _ = stream
+                    .write_all(b"{\"v\":1,\"ok\":false,\"error\":\"an old daemon stand-in\"}\n");
+                return;
+            }
+            let _ = stream.write_all(b"{\"v\":1,\"ok\":true,\"data\":null}\n");
+            let _ = stream.flush();
+            drop(stream);
+            shutdown();
+        });
     }
 }
 
@@ -4207,8 +4282,8 @@ fn process_args(pid: u64) -> String {
     String::from_utf8_lossy_owned(out.stdout)
 }
 
-/// The I2 finding of 0.22.1, as a test: an older daemon started with `--db`
-/// and `--read-only`, displaced by a plain CLI command while no bridge is
+/// The I2 finding of 0.22.1, as a test: an older daemon started with `--db`,
+/// `--read-only` and `--http`, displaced by a plain CLI command while no bridge is
 /// connected, comes back with exactly those options. Before the fix the
 /// command spawned a writable daemon on the default index, and the next
 /// read-only or `--db` bridge attached to it.
@@ -4217,12 +4292,17 @@ fn a_displaced_daemon_comes_back_with_its_own_db_and_read_only() {
     let env = Env::new("succ-opts");
     env.setup_domain("eng");
     let alt = env.dir.join("alt.db");
+    let http = {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("127.0.0.1:{}", probe.local_addr().unwrap().port())
+    };
     let old = OldDaemonStandIn::spawn_with(
         &env,
         Some(json!({
             "db": alt.display().to_string(),
             "config": env.config_path().display().to_string(),
             "read_only": true,
+            "http": http,
             "env": ["CRYSTALLINE_SERVICE_HTTP"],
         })),
         true,
@@ -4254,31 +4334,81 @@ fn a_displaced_daemon_comes_back_with_its_own_db_and_read_only() {
         "and records them again for its own successor: {record}"
     );
     assert_eq!(record["start"]["read_only"], json!(true), "{record}");
+    assert_eq!(
+        record["http"],
+        json!(http),
+        "the recorded --http wins over the environment's http off: {record}"
+    );
+    assert_eq!(record["start"]["http"], json!(http), "{record}");
     let _ = env.run(&["ctl", "shutdown"]);
 }
 
 /// A record a 0.22.0 daemon wrote carries no start options, so nothing says
-/// how to start its successor: the displacing command keeps the behaviour
-/// 0.22.1 shipped with and starts one with the defaults.
+/// whether that daemon ran read-only or on another index. With no bridge
+/// connected the displacing command starts no successor (a default one could
+/// hand the next bridge a writable daemon on the wrong index) and answers on
+/// its own after a short wait, as before 0.22.1.
 #[test]
-fn a_displaced_daemon_without_recorded_options_gets_a_default_successor() {
+fn a_displaced_daemon_without_recorded_options_is_not_restarted_by_a_command() {
     let env = Env::new("succ-legacy");
     env.setup_domain("eng");
-    let old = OldDaemonStandIn::spawn_with(&env, None, true);
+    let _old = OldDaemonStandIn::spawn_with(&env, None, true);
+    let began = Instant::now();
+    let (ok, stdout, stderr) =
+        env.run_full(&["search", "token", "--search-type", "text", "--json"]);
+    assert!(ok, "answered on its own: stdout={stdout} stderr={stderr}");
+    assert!(
+        env.lock_record().is_none(),
+        "no successor was started: {:?}",
+        env.lock_record()
+    );
+    assert!(
+        began.elapsed() < Duration::from_secs(12),
+        "only a short wait: {:?}",
+        began.elapsed()
+    );
+}
+
+/// Gate check A of the 0.22.1 leftovers, with a real bridge: a 0.22.0
+/// daemon (no start options in its record) with a `crystalline mcp
+/// --read-only` session connected. The first new CLI command displaces it,
+/// the bridge reconnects at once and starts the successor with its own
+/// flags, the command is answered by that successor, and the session's next
+/// request is served.
+#[test]
+fn a_connected_bridge_brings_up_the_successor_of_an_unrecorded_daemon() {
+    let env = Env::new("succ-bridge");
+    env.setup_domain("eng");
+    let old = OldDaemonStandIn::spawn_for_a_bridge(&env);
+    let mut bridge = Mcp::spawn_read_only(&env);
+    bridge.initialize();
+    old.age(&env);
+
     let (ok, stdout, stderr) =
         env.run_full(&["search", "token", "--search-type", "text", "--json"]);
     assert!(ok, "answered: stdout={stdout} stderr={stderr}");
+    assert!(
+        !stderr.contains("locked by another process") && !stderr.contains("did not answer"),
+        "{stderr}"
+    );
     let record = env
         .lock_record()
         .unwrap_or_else(|| panic!("no successor under {}", env.state_dir().display()));
     assert_ne!(record["pid"], json!(old.pid), "{record}");
+    assert_ne!(record["version"], json!(OLD_DAEMON_VERSION), "{record}");
     let status = status_json(&env);
-    assert_eq!(status["read_only"], json!(false), "{status}");
-    let args = process_args(record["pid"].as_u64().unwrap());
-    assert!(
-        !args.contains("--db") && !args.contains("--read-only"),
-        "a default successor: {args}"
+    assert_eq!(
+        status["read_only"],
+        json!(true),
+        "the bridge started it with its own flags: {status}"
     );
+
+    let tools = bridge.list_tools();
+    assert!(
+        tools.iter().any(|t| t == "search_engrams"),
+        "the session is served by the successor: {tools:?}"
+    );
+    drop(bridge);
     let _ = env.run(&["ctl", "shutdown"]);
 }
 
