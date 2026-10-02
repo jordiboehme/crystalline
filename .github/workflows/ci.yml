@@ -43,12 +43,30 @@ jobs:
   # zeroed or unreachable base, a force push, a git error or an empty file list
   # all set code=true. The gate below reads `!cancelled() && ... != 'false'`, so
   # a `changes` job that fails outright runs everything instead of skipping it.
+  #
+  # On a push to main the job also asks whether a pull request run already
+  # passed this exact tree (the `ci-passed` job at the end uploads the proof).
+  # The tree is compared, never a commit sha: a merge commit carries the same
+  # tree as the `refs/pull/N/merge` commit its pull request tested when main
+  # did not move in between, and a different tree when it did. With
+  # tested=true the test legs only compile (so main still saves the caches
+  # pull requests restore) and the other heavy jobs are skipped; style,
+  # cargo-deny, fluid-audit and verify-action still run, and the run still ends
+  # green, so dev.yml still fires. That check fails open as well: an API error,
+  # an empty answer or anything unclear leaves tested=false, and the gates read
+  # `!= 'true'`, so a missing output runs everything as before.
   changes:
     name: changes
     timeout-minutes: 10
     runs-on: ubuntu-latest
+    # The artifact lookup needs actions: read. Naming one permission drops the
+    # rest to none, so checkout's contents: read is named as well.
+    permissions:
+      contents: read
+      actions: read
     outputs:
       code: ${{ steps.classify.outputs.code }}
+      tested: ${{ steps.tested.outputs.tested }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -152,6 +170,54 @@ jobs:
             echo "changes: documentation only, so the heavy jobs are skipped. style still runs."
           fi
 
+      # Only artifacts of runs whose head is in this repository count: a fork's
+      # pull request runs its own copy of this file and could upload any name.
+      # A branch of this repository was pushed by someone with write access,
+      # who could change this file anyway.
+      - name: Look for a green pull request run of this tree
+        id: tested
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          REPO_ID: ${{ github.repository_id }}
+        run: |
+          # As in the classifier: every failure in here has to end in
+          # tested=false and exit 0, never in a red job.
+          set +e
+          set -u
+
+          run_the_tests() {
+            echo "tested: $1, so the tests run."
+            echo "tested=false" >>"$GITHUB_OUTPUT"
+            exit 0
+          }
+
+          case "$REPO_ID" in
+            ''|*[!0-9]*) run_the_tests "the repository id '$REPO_ID' is not a number" ;;
+          esac
+
+          if ! tree=$(git rev-parse 'HEAD^{tree}'); then
+            run_the_tests "git could not name the tree of HEAD"
+          fi
+          case "$tree" in
+            ''|*[!0-9a-f]*) run_the_tests "'$tree' is not a tree sha" ;;
+          esac
+
+          name="tested-tree-$tree"
+          echo "tested: looking for the artifact $name"
+          if ! runs=$(gh api "repos/$REPO/actions/artifacts?name=$name&per_page=100" \
+            --jq "[.artifacts[] | select(.name == \"$name\" and .expired == false and .workflow_run.repository_id == $REPO_ID and .workflow_run.head_repository_id == $REPO_ID) | .workflow_run.id] | unique | map(tostring) | join(\" \")"); then
+            run_the_tests "the artifact lookup for $name failed"
+          fi
+          if [ -z "$runs" ]; then
+            run_the_tests "no pull request run of this repository left an unexpired $name"
+          fi
+
+          echo "tested: the pull request run(s) $runs passed every job on the tree $tree, so the test legs only compile and the other heavy jobs are skipped."
+          echo "tested=true" >>"$GITHUB_OUTPUT"
+
   test:
     name: test (${{ matrix.os }})
     timeout-minutes: 90
@@ -187,28 +253,38 @@ jobs:
           shared-key: test
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # On a push to main whose tree a pull request run already passed (see
+      # `changes`), the checks below are skipped and the leg only compiles the
+      # tests, so the cache step above still saves what pull requests restore.
+      - name: Compile the tests only (the pull request tested this tree)
+        if: ${{ needs.changes.outputs.tested == 'true' }}
+        run: cargo nextest run --workspace --no-run --locked
+
       # Formatting does not depend on the OS, so one leg checks it.
       - name: cargo fmt --check
-        if: ${{ matrix.os == 'ubuntu-latest' }}
+        if: ${{ matrix.os == 'ubuntu-latest' && needs.changes.outputs.tested != 'true' }}
         run: cargo fmt --all --check
 
       - name: cargo clippy
+        if: ${{ needs.changes.outputs.tested != 'true' }}
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: cargo nextest run
+        if: ${{ needs.changes.outputs.tested != 'true' }}
         # The `ci` profile is the default one plus a single retry, so an
         # environmental failure on a hosted runner reports FLAKY instead of
         # turning a green change red. A test that fails twice still fails.
         run: cargo nextest run --workspace --profile ci --locked
 
       - name: cargo test --doc
+        if: ${{ needs.changes.outputs.tested != 'true' }}
         run: cargo test --workspace --doc --locked
 
   postgres-parity:
     name: postgres-parity
     timeout-minutes: 15
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && needs.changes.outputs.tested != 'true' }}
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -251,7 +327,7 @@ jobs:
     name: fluid
     timeout-minutes: 20
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && needs.changes.outputs.tested != 'true' }}
     runs-on: ubuntu-latest
     env:
       # Corepack fetches the pinned pnpm on first use, and the confirmation it
@@ -346,7 +422,7 @@ jobs:
     name: fluid-smoke
     timeout-minutes: 20
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && needs.changes.outputs.tested != 'true' }}
     runs-on: ubuntu-latest
     env:
       # See the fluid job: corepack must not stop to ask before fetching pnpm.
@@ -427,7 +503,7 @@ jobs:
     name: fluid-image
     timeout-minutes: 10
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && needs.changes.outputs.tested != 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -526,7 +602,7 @@ jobs:
     name: musl-spike
     timeout-minutes: 30
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && needs.changes.outputs.tested != 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -569,3 +645,52 @@ jobs:
         with:
           paths: tests/fixtures/domain-good
           comment: 'false'
+
+  # The proof `changes` looks for on main: this pull request run passed every
+  # job on this tree. A job `if` without a status function means `success() &&
+  # ...`, and a skipped need skips this job, so a run with a failed, cancelled
+  # or skipped job uploads nothing. That includes a documentation-only pull
+  # request, whose heavy jobs were skipped; main's own classifier skips the
+  # same tree anyway.
+  ci-passed:
+    name: ci-passed
+    timeout-minutes: 10
+    needs:
+      - changes
+      - test
+      - postgres-parity
+      - fluid
+      - fluid-smoke
+      - fluid-image
+      - style
+      - cargo-deny
+      - fluid-audit
+      - musl-spike
+      - verify-action
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    steps:
+      # The commit every job above checked out: refs/pull/N/merge at
+      # github.sha.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Name the tested tree
+        id: tree
+        run: |
+          set -euo pipefail
+          tree=$(git rev-parse 'HEAD^{tree}')
+          echo "ci-passed: every job passed on the tree $tree (commit $GITHUB_SHA)"
+          echo "tree=$tree" >>"$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/tested-tree"
+          printf 'tree %s\ncommit %s\nrun %s\n' "$tree" "$GITHUB_SHA" "$GITHUB_RUN_ID" \
+            >"$RUNNER_TEMP/tested-tree/tested-tree.txt"
+
+      # A re-run of this job uploads the same name again, hence overwrite.
+      - name: Upload the proof
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tested-tree-${{ steps.tree.outputs.tree }}
+          path: ${{ runner.temp }}/tested-tree/tested-tree.txt
+          retention-days: 7
+          overwrite: true
+          if-no-files-found: error
