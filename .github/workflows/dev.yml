@@ -71,7 +71,7 @@ permissions:
 jobs:
   version:
     name: compute the dev version
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # The tap token lives in the protected `release` environment (main and
     # `v*` tags only). deployment: false, because this job runs for every
     # green CI run on main and would otherwise record a deployment each time.
@@ -251,7 +251,7 @@ jobs:
     name: publish the dev pre-release
     needs: [version, build]
     if: needs.version.outputs.build == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # Publishes, so it runs in the protected environment like the rest of
     # the release path, though it needs none of its secrets.
     environment:
@@ -340,7 +340,7 @@ jobs:
       needs.version.outputs.formula == 'true' &&
       (needs.publish.result == 'success' ||
        (needs.publish.result == 'skipped' && needs.version.outputs.build != 'true'))
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # The tap token lives in the protected `release` environment.
     environment:
       name: release
@@ -405,7 +405,7 @@ jobs:
   prune:
     name: prune old dev pre-releases
     needs: homebrew
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: write
     env:

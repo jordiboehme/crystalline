@@ -33,7 +33,7 @@ jobs:
   # run building end to end without a notes file.
   notes:
     name: verify the release notes file
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -87,7 +87,7 @@ jobs:
   mcpb:
     name: package MCP bundles
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # No tag guard, unlike publish/images/homebrew below: a workflow_dispatch
     # dry run packages and validates all five bundles too (four per-arch
     # plus the universal one), it just has nowhere to upload them.
@@ -228,7 +228,7 @@ jobs:
   sbom:
     name: generate the SBOMs
     needs: notes
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # Read only: the tools this job installs never get a token that can write.
     permissions:
       contents: read
@@ -339,7 +339,7 @@ jobs:
   publish:
     name: publish release
     needs: [build, mcpb, sbom]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # Only a tag push produces a real GitHub Release; workflow_dispatch stops
     # after the build matrix above so it can be used as a dry run.
     if: github.ref_type == 'tag'
@@ -508,7 +508,7 @@ jobs:
     name: publish container images
     # sbom too, so a release whose SBOMs failed pushes no image either.
     needs: [build, sbom]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # Same tag guard as publish: workflow_dispatch is a build-matrix dry run
     # only, it never pushes an image.
     if: github.ref_type == 'tag'
@@ -705,7 +705,7 @@ jobs:
   fluid-image:
     name: publish the Fluid image
     needs: [build, sbom]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # Same tag guard as publish and images: workflow_dispatch is a build-matrix
     # dry run only, it never pushes an image.
     if: github.ref_type == 'tag'
@@ -785,7 +785,7 @@ jobs:
   homebrew:
     name: update homebrew tap
     needs: publish
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     if: github.ref_type == 'tag'
     # The protected `release` environment (main and `v*` tags only).
     environment:

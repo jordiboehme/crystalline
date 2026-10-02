@@ -63,7 +63,7 @@ jobs:
   changes:
     name: changes
     timeout-minutes: 10
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # The artifact lookup needs actions: read. Naming one permission drops the
     # rest to none, so checkout's contents: read is named as well.
     permissions:
@@ -231,7 +231,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+        os: [ubuntu-26.04, ubuntu-24.04-arm, macos-latest, windows-latest]
         include:
           # candle-core pulls in gemm-f16, whose aarch64 NEON kernels emit
           # fullfp16 asm without gating it behind a target-feature check
@@ -268,7 +268,7 @@ jobs:
 
       # Formatting does not depend on the OS, so one leg checks it.
       - name: cargo fmt --check
-        if: ${{ matrix.os == 'ubuntu-latest' && needs.changes.outputs.tested != 'true' }}
+        if: ${{ matrix.os == 'ubuntu-26.04' && needs.changes.outputs.tested != 'true' }}
         run: cargo fmt --all --check
 
       - name: cargo clippy
@@ -291,7 +291,7 @@ jobs:
     timeout-minutes: 15
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && needs.changes.outputs.tested != 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     services:
       postgres:
         image: pgvector/pgvector:0.8.2-pg17-bookworm
@@ -322,7 +322,7 @@ jobs:
       - name: Create the pgvector extension
         # Pre-create it in public so the migration's defensive CREATE EXTENSION
         # is always a no-op and the parallel per-test schema creation is race
-        # free. psql ships on the ubuntu-latest runner image.
+        # free. psql ships on the ubuntu-26.04 runner image.
         run: PGPASSWORD=crystalline psql -h localhost -U postgres -d crystalline_test -c "CREATE EXTENSION IF NOT EXISTS vector;"
 
       - name: cargo test (parity suite on both backends)
@@ -336,7 +336,7 @@ jobs:
     timeout-minutes: 20
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && needs.changes.outputs.tested != 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     env:
       # Corepack fetches the pinned pnpm on first use, and the confirmation it
       # would otherwise ask for has nobody to answer it here. Set the same way
@@ -437,7 +437,7 @@ jobs:
     timeout-minutes: 20
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && needs.changes.outputs.tested != 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     env:
       # See the fluid job: corepack must not stop to ask before fetching pnpm.
       COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
@@ -521,7 +521,7 @@ jobs:
     timeout-minutes: 10
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && needs.changes.outputs.tested != 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -555,7 +555,7 @@ jobs:
   style:
     name: style
     timeout-minutes: 10
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -583,7 +583,7 @@ jobs:
   workflow-lint:
     name: workflow-lint
     timeout-minutes: 10
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -607,7 +607,7 @@ jobs:
   cargo-deny:
     name: cargo-deny
     timeout-minutes: 10
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -628,7 +628,7 @@ jobs:
   fluid-audit:
     name: fluid-audit
     timeout-minutes: 10
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     env:
       COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
     defaults:
@@ -658,7 +658,7 @@ jobs:
     timeout-minutes: 30
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && needs.changes.outputs.tested != 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -694,7 +694,7 @@ jobs:
     timeout-minutes: 10
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -733,7 +733,7 @@ jobs:
       - verify-action
       - workflow-lint
     if: ${{ github.event_name == 'pull_request' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       # The commit every job above checked out: refs/pull/N/merge at
       # github.sha.

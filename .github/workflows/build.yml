@@ -66,7 +66,7 @@ jobs:
   # and the binary carries the copy.
   fluid-dist:
     name: build the fluid bundle
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     env:
       # Corepack fetches the pinned pnpm on first use, and the confirmation it
       # would otherwise ask for has nobody to answer it here. Set the way
@@ -128,7 +128,7 @@ jobs:
   # Runs beside fluid-dist, so it costs no wall time.
   legs:
     name: pick the build legs
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     outputs:
       include: ${{ steps.pick.outputs.include }}
     steps:
@@ -164,7 +164,7 @@ jobs:
              "archive_ext": "tar.gz", "codesign": true, "homebrew": true},
             {"target": "x86_64-apple-darwin", "platform": "macos-intel", "os": "macos-15-intel",
              "archive_ext": "tar.gz", "codesign": true, "homebrew": true},
-            {"target": "x86_64-unknown-linux-musl", "platform": "linux-amd64", "os": "ubuntu-latest",
+            {"target": "x86_64-unknown-linux-musl", "platform": "linux-amd64", "os": "ubuntu-26.04",
              "archive_ext": "tar.gz", "musl": true, "deb_arch": "amd64", "homebrew": true},
             {"target": "aarch64-unknown-linux-musl", "platform": "linux-arm64", "os": "ubuntu-24.04-arm",
              "archive_ext": "tar.gz", "musl": true, "deb_arch": "arm64", "homebrew": true,
