@@ -324,10 +324,10 @@ pub(crate) fn cache_client(cache_dir: &Path) -> Result<HFClient> {
 ///
 /// A dropped xet download may leave `spawn_blocking` parts running on
 /// detached; the process still leaves through `std::process::exit`. Before a
-/// file goes to the network, a `<blob>.incomplete` in the repository's
-/// `blobs/` that was written to inside the stall window means such a download
-/// may still be writing, and the call refuses with a download error rather
-/// than start a second writer into the same blob.
+/// file goes to the network, when this process has dropped a download of the
+/// repository and a `<blob>.incomplete` in its `blobs/` was written to inside
+/// the stall window, that download may still be writing, and the call refuses
+/// with a download error rather than start a second writer into the same blob.
 pub(crate) async fn ensure_files_with(
     client: &HFClient,
     cache_dir: &Path,
@@ -386,6 +386,7 @@ pub(crate) async fn ensure_files_with(
                         ))
                     })?,
                     None => {
+                        note_dropped_download(cache_dir, repo);
                         return Err(IndexError::Embedding(format!(
                             "downloading {file} for {} {}: no data arrived for {} s",
                             repo.what,
@@ -425,13 +426,44 @@ async fn until_stalled<F: std::future::Future>(
     }
 }
 
-/// True when the repository's `blobs/` holds a `<blob>.incomplete` written to
-/// inside the last `stall`. hf-hub's plain HTTP path and its xet path both
-/// write there and rename on success, so a fresh one is a download that may
-/// still be running, perhaps one this process dropped on a stall. An older
-/// one is a leftover that a new download overwrites.
+/// The `blobs/` directories of repositories whose download this process
+/// dropped on a stall. Detached xet parts only ever live in the process that
+/// dropped them, so only these can still be writing; a fresh `.incomplete`
+/// left by a daemon that exited, or by a Ctrl-C'd command, is not a reason to
+/// wait. Keyed by path, so tests on separate cache directories never meet.
+static DROPPED_DOWNLOADS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+fn blobs_dir(cache_dir: &Path, repo: &HubRepo<'_>) -> PathBuf {
+    cache_dir.join(hub_dir_name(repo.repo)).join("blobs")
+}
+
+/// Records that this process dropped a download of `repo` on a stall.
+fn note_dropped_download(cache_dir: &Path, repo: &HubRepo<'_>) {
+    let blobs = blobs_dir(cache_dir, repo);
+    let mut dropped = DROPPED_DOWNLOADS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !dropped.contains(&blobs) {
+        dropped.push(blobs);
+    }
+}
+
+/// True when this process dropped a download of `repo` on a stall and the
+/// repository's `blobs/` holds a `<blob>.incomplete` written to inside the
+/// last `stall`. hf-hub's plain HTTP path and its xet path both write there
+/// and rename on success, so a fresh one may be the dropped download still
+/// writing. An older one is a leftover that a new download overwrites. A
+/// download running in another process still meets hf-hub's own cache lock,
+/// as before.
 fn partial_download_running(cache_dir: &Path, repo: &HubRepo<'_>, stall: Duration) -> bool {
-    let blobs = cache_dir.join(hub_dir_name(repo.repo)).join("blobs");
+    let blobs = blobs_dir(cache_dir, repo);
+    let dropped_here = DROPPED_DOWNLOADS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(&blobs);
+    if !dropped_here {
+        return false;
+    }
     let Ok(entries) = std::fs::read_dir(&blobs) else {
         return false;
     };
@@ -609,14 +641,23 @@ mod tests {
         );
         assert!(err.to_string().contains("no data arrived"), "{err}");
         assert!(err.to_string().contains("config.json"), "{err}");
+        assert!(
+            DROPPED_DOWNLOADS
+                .lock()
+                .unwrap()
+                .contains(&blobs_dir(cache.path(), &TEST_REPO)),
+            "the stall is remembered, so a fresh partial file holds off the retry"
+        );
     }
 
-    /// A `<blob>.incomplete` written to inside the stall window may be a
-    /// dropped download still writing, so the retry refuses instead of
-    /// starting a second writer into the same blob; an older one is a
-    /// leftover and does not stand in the way.
+    /// After this process dropped a stalled download, a `<blob>.incomplete`
+    /// written to inside the stall window may be that download still
+    /// writing, so the retry refuses instead of starting a second writer into
+    /// the same blob. A fresh one this process never dropped (a daemon that
+    /// exited mid-download, a Ctrl-C'd command) does not stand in the way,
+    /// and neither does an old one.
     #[tokio::test]
-    async fn a_fresh_partial_download_holds_off_a_new_fetch_and_an_old_one_does_not() {
+    async fn a_fresh_partial_download_holds_off_a_new_fetch_only_after_a_stall_here() {
         let cache = tempfile::tempdir().unwrap();
         let blobs = cache
             .path()
@@ -632,11 +673,26 @@ mod tests {
             stall: Duration::from_secs(60),
         };
 
+        // A partial file no download of this process left: the successor
+        // daemon's case. The fetch goes out (and fails on the closed port).
+        assert!(!partial_download_running(
+            cache.path(),
+            &TEST_REPO,
+            limits.stall
+        ));
         let err = ensure_files_with(&client, cache.path(), &TEST_REPO, false, &limits)
             .await
             .err()
-            .expect("a fresh partial download refuses the fetch");
+            .expect("nothing serves the files");
+        assert!(!err.to_string().contains("may still be running"), "{err}");
+
+        note_dropped_download(cache.path(), &TEST_REPO);
+        let err = ensure_files_with(&client, cache.path(), &TEST_REPO, false, &limits)
+            .await
+            .err()
+            .expect("a fresh partial download after a stall refuses the fetch");
         assert!(err.to_string().contains("may still be running"), "{err}");
+        assert!(err.to_string().contains("config.json"), "{err}");
 
         std::fs::File::options()
             .write(true)
@@ -644,11 +700,11 @@ mod tests {
             .unwrap()
             .set_modified(std::time::SystemTime::now() - Duration::from_secs(120))
             .unwrap();
-        let err = ensure_files_with(&client, cache.path(), &TEST_REPO, false, &limits)
-            .await
-            .err()
-            .expect("nothing serves the files");
-        assert!(!err.to_string().contains("may still be running"), "{err}");
+        assert!(!partial_download_running(
+            cache.path(),
+            &TEST_REPO,
+            limits.stall
+        ));
     }
 
     /// The pad id is what the tokenizer says the configured pad token is, and
