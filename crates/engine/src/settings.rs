@@ -375,7 +375,7 @@ pub fn registry() -> &'static [SettingSpec] {
         },
         SettingSpec {
             key: "evolve.contradictions",
-            doc: "Let the daemon read the observation lines of related engrams with a local NLI model, so evolve raises V302 for a pair it reads as a possible contradiction: off (default) or full (experimental, because real contradictions scored 0.955 or higher in testing, below about 0.95 most findings were noise, and the threshold is 0.90; German, English and mixed, about 1.1 GB while scoring); full needs the local-embeddings build feature and downloads its model on first use",
+            doc: "Let the daemon read the observation lines of related engrams with a local NLI model, so evolve raises V302 for a pair it reads as a possible contradiction: off (default) or full (German, English and mixed; a pair counts at a contradiction probability of 0.95 or more, and it is a question, never a verdict, because the model can be wrong; the model is about 550 MB on disk; loaded, it adds about 2.6 GB of memory on the CPU and about 1.8 GB on Apple Silicon, up to about 3.2 GB while scoring there, and the daemon unloads it after 10 to 15 idle minutes); full needs the local-embeddings build feature and downloads its model on first use",
             kind: SettingKind::String,
             startup_effective: false,
             secret: false,

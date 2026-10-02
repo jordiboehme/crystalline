@@ -284,7 +284,7 @@ fn stub() -> Arc<StubScorer> {
     Arc::new(StubScorer::new(full().repo, 0.05).with(
         "The build uses Node 18",
         "The build uses Node 20",
-        0.93,
+        0.97,
     ))
 }
 
@@ -377,15 +377,15 @@ async fn the_pass_is_off_until_a_profile_is_set_then_scores_related_pairs() {
         scored(1, 1, 0)
     );
     assert_eq!(loads.load(Ordering::SeqCst), 1, "loaded lazily, once");
-    // One first order, and the 0.93 pair read back in the second.
+    // One first order, and the 0.97 pair read back in the second.
     assert_eq!(s.forwards(), 2);
     let stored = rows(&engine, full().repo).await;
     assert_eq!(
         stored.len(),
         1,
-        "only the 0.93 pair clears the floor: {stored:?}"
+        "only the 0.97 pair clears the floor: {stored:?}"
     );
-    assert!((stored[0].score_ab - 0.93).abs() < 1e-6);
+    assert!((stored[0].score_ab - 0.97).abs() < 1e-6);
 
     assert_eq!(
         engine.score_contradictions().await.unwrap(),
@@ -507,7 +507,7 @@ async fn a_repeated_observation_line_is_scored_once_and_the_pass_drains() {
     assert_eq!(
         s.forwards(),
         2,
-        "one line pair, both orders (0.93), nothing twice"
+        "one line pair, both orders (0.97), nothing twice"
     );
     assert_eq!(rows(&engine, full().repo).await.len(), 1);
     // Off and on again forgets the settled digest, so the next walk parses
@@ -2043,10 +2043,10 @@ async fn evolve_raises_v302_from_stored_rows_and_never_scores_inline() {
     let finding = row["finding"].as_str().unwrap();
     assert!(
         finding.starts_with("Possible contradiction: line 14 of ")
-            && finding.contains("read as contradicting at probability 0.93, line similarity "),
+            && finding.contains("read as contradicting at probability 0.97, line similarity "),
         "{row}"
     );
-    assert_eq!(row["probability"], 0.93);
+    assert_eq!(row["probability"], 0.97);
     assert!(row["similarity"].as_f64().is_some(), "{row}");
     let mut texts = [
         row["line_text"].as_str().unwrap(),
@@ -2313,7 +2313,7 @@ async fn a_v302_row_renders_in_the_toon_queue_beside_a_v301_row() {
         vec![
             "queue[2]{class,counterpart,counterpart_line,counterpart_line_text,counterpart_title,domain,evidence,finding,fix,line,line_text,n,permalink,priority,probability,rule,scope,similarity,title}:".to_string(),
             format!(
-                "  judgment,twenty,14,The build uses Node 20,Twenty,notes,notes/eighteen line 14; notes/twenty line 14; probability 0.93; similarity 1.00; model mdeberta-v3-base-xnli-2mil7,\"Possible contradiction: line 14 of \\\"Eighteen\\\" and line 14 of \\\"Twenty\\\" read as contradicting at probability 0.93, line similarity 1.00\",read both then supersede or close a window or acknowledge V302,14,The build uses Node 18,1,eighteen,85,0.93,V302,\"{v302_scope}\",1.0,Eighteen"
+                "  judgment,twenty,14,The build uses Node 20,Twenty,notes,notes/eighteen line 14; notes/twenty line 14; probability 0.97; similarity 1.00; model mdeberta-v3-base-xnli-2mil7,\"Possible contradiction: line 14 of \\\"Eighteen\\\" and line 14 of \\\"Twenty\\\" read as contradicting at probability 0.97, line similarity 1.00\",read both then supersede or close a window or acknowledge V302,14,The build uses Node 18,1,eighteen,85,0.97,V302,\"{v302_scope}\",1.0,Eighteen"
             ),
             format!(
                 "  judgment,null,null,null,null,notes,\"lead-vector cosine 1.00 at or above 0.94; twin: notes/twenty\",semantic twin of notes/twenty,read both then merge and supersede or link and acknowledge,null,null,2,eighteen,75,null,V301,\"{v301_scope}\",null,Eighteen"
@@ -2365,12 +2365,12 @@ async fn acknowledging_two_line_pairs_of_one_engram_pair_silences_both() {
             .with(
                 "Staging needs a manual trigger on the queue",
                 "Staging retries the queue without a manual trigger",
-                0.92,
+                0.97,
             )
             .with(
                 "The login session cookie lasts a day",
                 "Token auth uses a csrf cookie",
-                0.90,
+                0.96,
             ),
     );
     let (_tmp, engine) = engine_with(loader(s, Arc::new(AtomicUsize::new(0)))).await;
@@ -3099,7 +3099,7 @@ async fn only_lines_about_the_same_subject_reach_the_model() {
     let s = Arc::new(StubScorer::new(full().repo, 0.05).with(
         "Staging needs a manual trigger on the queue",
         "Staging retries the queue without a manual trigger",
-        0.92,
+        0.97,
     ));
     let (_tmp, engine) = engine_with(loader(s.clone(), Arc::new(AtomicUsize::new(0)))).await;
     set(&engine, "evolve.contradictions", "full").await;
@@ -3116,7 +3116,7 @@ async fn only_lines_about_the_same_subject_reach_the_model() {
         engine.score_contradictions().await.unwrap(),
         scored(1, 2, 0)
     );
-    // Two kept line pairs read once each, the staging pair (0.92) a second
+    // Two kept line pairs read once each, the staging pair (0.97) a second
     // time; the cookie pair (0.05) never in the other order.
     assert_eq!(s.forwards(), 3);
     let stored = rows(&engine, full().repo).await;
@@ -3333,7 +3333,7 @@ async fn both_reading_orders_land_on_their_own_pair_in_a_shared_group() {
     );
     let s = Arc::new(
         StubScorer::new(full().repo, 0.05)
-            .with_directional(n18, n20, 0.91)
+            .with_directional(n18, n20, 0.96)
             .with_directional(n20, n18, 0.81)
             .with_directional(n18, n19, 0.71)
             .with_directional(n19, n18, 0.61),
@@ -3373,7 +3373,7 @@ async fn both_reading_orders_land_on_their_own_pair_in_a_shared_group() {
             (
                 observation_hash(n18),
                 observation_hash(n20),
-                0.91,
+                0.96,
                 0.81,
                 line
             ),
@@ -3470,7 +3470,7 @@ async fn an_engram_that_expires_between_walks_leaves_the_queue_without_an_edit()
     three(&engine).await;
     valid_to(&engine, "eighteen", "2026-10-01").await;
     engine.embed_pending().await.unwrap();
-    // Eighteen against Twenty, the 0.93 Node pair.
+    // Eighteen against Twenty, the 0.97 Node pair.
     assert_eq!(
         engine.score_contradictions().await.unwrap(),
         scored(1, 1, 0)
@@ -3594,7 +3594,7 @@ async fn a_wrapped_bullet_is_embedded_and_scored_as_its_whole_text() {
     );
     let stored = rows(&engine, full().repo).await;
     assert_eq!(stored.len(), 1, "{stored:?}");
-    assert!((stored[0].score_ab - 0.93).abs() < 1e-6);
+    assert!((stored[0].score_ab - 0.97).abs() < 1e-6);
 
     let read = engine
         .read_engram(

@@ -16,9 +16,9 @@ hard negative), and reports per model:
   a dotted version string such as "18.19.0" the same way it fires on a day
   and month, so that hit rate is reported on its own to show the misfire
   rate rather than folding it into the dated-pair rate);
-- the probes gate at the product's finding line (0.90 under min): the
-  planted flips that reach it (`flips_at_0_90`, gate: at least 150 of 200)
-  and the planted negatives that reach it (`negatives_at_0_90`, gate: 0),
+- the probes gate at the product's finding line (0.95 under min): the
+  planted flips that reach it (`flips_at_0_95`, gate: at least 150 of 200)
+  and the planted negatives that reach it (`negatives_at_0_95`, gate: 0),
   recall at higher line floors read off the stored `similarity`, and with
   `--top N` the product's ranked list per domain;
 - findings on unplanted pairs (noise), milliseconds per batch of 16, line
@@ -45,7 +45,7 @@ FLOORS = [0.84, 0.86, 0.88, 0.90, 0.94]
 # The product's V302 finding line for the full model (`NliModel::threshold`
 # in crates/index/src/nli/models.rs) and the probes gate measured at it: at
 # least 150 of every 200 planted flips, and no planted negative.
-FINDING_LINE = 0.90
+FINDING_LINE = 0.95
 GATE_FLIPS = (150, 200)
 GATE_NEGATIVES = 0
 
@@ -239,9 +239,9 @@ def report(dump: dict, sidecar: list, langs=None, log=None, rss_path=None) -> di
         },
     }
     out["planted_flips"] = sum(i["kind"] == "flip" for i in items)
-    out["flips_at_0_90"] = flips_at(items)
-    out["negatives_at_0_90"] = flips_at(items, kind="negative")
-    out["gate"] = gate(out["flips_at_0_90"], out["planted_flips"], out["negatives_at_0_90"])
+    out["flips_at_0_95"] = flips_at(items)
+    out["negatives_at_0_95"] = flips_at(items, kind="negative")
+    out["gate"] = gate(out["flips_at_0_95"], out["planted_flips"], out["negatives_at_0_95"])
     # Rows are stored only at or above the product floor, so higher floors are
     # read off the stored similarity.
     out["line_floors"] = [
@@ -308,10 +308,10 @@ def markdown(r: dict) -> str:
     if not r.get("drained", True):
         lines += ["**PARTIAL: the backlog had not drained within DRAIN_LIMIT; every number below undercounts.**", ""]
     need = -(-r["planted_flips"] * GATE_FLIPS[0] // GATE_FLIPS[1])
-    lines += [f"planted flips at or above 0.90 (min of both orders, related 0.80): {r['flips_at_0_90']} of {r['planted_flips']} (gate {need})",
-              f"planted negatives at or above 0.90: {r['negatives_at_0_90']} (gate {GATE_NEGATIVES})",
+    lines += [f"planted flips at or above 0.95 (min of both orders, related 0.80): {r['flips_at_0_95']} of {r['planted_flips']} (gate {need})",
+              f"planted negatives at or above 0.95: {r['negatives_at_0_95']} (gate {GATE_NEGATIVES})",
               f"probes gate: {'pass' if r['gate'] else 'FAIL'}", "",
-              "| line floor (similarity) | recall at 0.90 |", "|---|---|"]
+              "| line floor (similarity) | recall at 0.95 |", "|---|---|"]
     lines += [f"| {f['floor']:.2f} | {f['recall']:.3f} |" for f in r["line_floors"]] + [""]
     for how in ("mean", "min"):
         m = r[how]
@@ -371,7 +371,7 @@ def self_test() -> int:
             {"domain": "d", "a": "n0a", "b": "n0b", "cosine": 0.9},
         ],
         "rows": [
-            {"domain": "d", "a": "p0a", "b": "p0b", "line_a": 9, "line_b": 9, "score_ab": 0.95, "score_ba": 0.93, "period": 0, "cosine": 0.9, "similarity": 0.93, "a_text": "a_text", "b_text": "b_text"},
+            {"domain": "d", "a": "p0a", "b": "p0b", "line_a": 9, "line_b": 9, "score_ab": 0.97, "score_ba": 0.96, "period": 0, "cosine": 0.9, "similarity": 0.93, "a_text": "a_text", "b_text": "b_text"},
             {"domain": "d", "a": "p1b", "b": "p1a", "line_a": 9, "line_b": 9, "score_ab": 0.90, "score_ba": 0.60, "period": 0, "cosine": 0.72, "similarity": 0.88, "a_text": "a_text", "b_text": "b_text"},
             {"domain": "d", "a": "n0a", "b": "n0b", "line_a": 9, "line_b": 9, "score_ab": 0.55, "score_ba": 0.50, "period": 0, "cosine": 0.9, "similarity": 0.90, "a_text": "a_text", "b_text": "b_text"},
             {"domain": "d", "a": "n0a", "b": "n0b", "line_a": 10, "line_b": 10, "score_ab": 0.99, "score_ba": 0.99, "period": 0, "cosine": 0.9, "similarity": 0.95, "a_text": "a_text", "b_text": "b_text"},
@@ -394,8 +394,8 @@ def self_test() -> int:
         "every planted item here has both a pair cosine and a scored row"
     )
     assert r["planted_flips"] == 2, r["planted_flips"]
-    assert r["flips_at_0_90"] == 1, "p0 clears 0.90 under min at related 0.80; p1 sits at related 0.72"
-    assert r["negatives_at_0_90"] == 0, "n0's planted line 9 sits at min 0.50; its line 10 is unplanted"
+    assert r["flips_at_0_95"] == 1, "p0 clears 0.95 under min at related 0.80; p1 sits at related 0.72"
+    assert r["negatives_at_0_95"] == 0, "n0's planted line 9 sits at min 0.50; its line 10 is unplanted"
     assert r["gate"] is False, "1 of 2 flips is under 150 of 200"
     assert gate(150, 200, 0) and not gate(149, 200, 0) and not gate(150, 200, 1)
     assert gate(2, 2, 0) and not gate(1, 2, 0)
@@ -404,8 +404,8 @@ def self_test() -> int:
     assert top["d"][0]["more"] == 0 and top["d"][0]["score"] == 0.99
     floors = {f["floor"]: f["recall"] for f in r["line_floors"]}
     assert floors[0.86] == 0.5 and floors[0.90] == 0.5 and floors[0.94] == 0.0, floors
-    assert "planted flips at or above 0.90 (min of both orders, related 0.80): 1 of 2 (gate 2)" in markdown(r)
-    assert "planted negatives at or above 0.90: 0 (gate 0)" in markdown(r)
+    assert "planted flips at or above 0.95 (min of both orders, related 0.80): 1 of 2 (gate 2)" in markdown(r)
+    assert "planted negatives at or above 0.95: 0 (gate 0)" in markdown(r)
     assert "probes gate: FAIL" in markdown(r)
     assert "| 1 | n0a | 10 | a_text |" in top_markdown(top)
     print("self-test passed")

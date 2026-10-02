@@ -13,7 +13,7 @@ Two scripts for the contradiction check (V302).
   language, noise, speed and resident size. The dump carries `similarity`, the line pair's
   cosine. `--top N` prints the product's ranking per domain. The mean table is
   unreliable since the second order is skipped below the store floor under Min.
-  The probes gate is read at the product's finding line, 0.90 under min: at
-  least 150 of 200 planted flips (`flips_at_0_90`) and 0 planted negatives
-  (`negatives_at_0_90`); the report prints pass or FAIL. `--self-test` checks its own
+  The probes gate is read at the product's finding line, 0.95 under min: at
+  least 150 of 200 planted flips (`flips_at_0_95`) and 0 planted negatives
+  (`negatives_at_0_95`); the report prints pass or FAIL. `--self-test` checks its own
   arithmetic on a tiny synthetic case.

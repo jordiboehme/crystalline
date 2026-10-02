@@ -848,7 +848,7 @@ fn serve_flat_embeddings() -> String {
 
 /// Lesson 10 for the contradiction check: a daemon asked to stop while the
 /// contradiction pass is loading its model (held on a blocking thread by the
-/// test hook, where a real run downloads about 1.1 GB) is gone within the
+/// test hook, where a real run downloads about 550 MB) is gone within the
 /// shutdown deadline, and the index opens from another process straight
 /// after. The embeddings come from a loopback endpoint, so the pass has lead
 /// vectors and a pending pair, which is what makes it ask for the model.

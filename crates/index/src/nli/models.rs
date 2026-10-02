@@ -19,7 +19,9 @@ use crate::embed::models::PinnedRepo;
 /// One value of `evolve.contradictions` other than `off`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NliProfile {
-    /// Multilingual, experimental, about 1.1 GB while scoring.
+    /// Multilingual, about 550 MB on disk. Loaded, it adds about 2.6 GB of
+    /// memory on the CPU and about 1.8 GB on Apple Silicon (up to about 3.2 GB
+    /// while scoring there); the daemon unloads it after 10 to 15 idle minutes.
     Full,
 }
 
@@ -148,13 +150,14 @@ pub const NLI_MODELS: [NliModel; 1] = [NliModel {
     download_mb: 558,
     // Measured on the probes corpus and on real domains
     // (research/2026-10-01-v302-line-filter-measurement.md): with the Min
-    // aggregation, 0.90 keeps 158 of 200 planted flips and no planted
-    // negative, cuts the real domains from 99 engram pairs to 35, and every
-    // real contradiction seen scored 0.977 or more, while the small domains'
-    // noise sat at 0.80 to 0.85. Rows are still stored from
-    // `CONTRADICTION_STORE_FLOOR`, so the line can move again without a
-    // rescore.
-    threshold: 0.90,
+    // aggregation, 0.95 keeps 151 of 200 planted flips and no planted
+    // negative, and every real contradiction seen scored 0.955 or more
+    // (research/2026-10-02-v302-remeasurement.md); of the real findings at
+    // this line 62% were a contradiction or a worth-a-look pair. 0.90 kept
+    // 158 flips but passed far more noise. Rows are still stored from
+    // `CONTRADICTION_STORE_FLOOR`, and the line is applied when evolve reads
+    // them, so it can move again without a rescore.
+    threshold: 0.95,
 }];
 
 /// The model a profile runs.
