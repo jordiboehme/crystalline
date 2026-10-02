@@ -937,12 +937,11 @@ mod splice {
             } else {
                 let item_end = own_comma.map(|c| c + 1).unwrap_or(end);
                 let line_end = past_blank_line_end(text, item_end);
-                // A block comment with the close after the item on the same
-                // line (`"a": 1 /* x */ }`) had our line break put after it by
-                // `insert`: that break is ours and goes again. A `//` comment's
-                // break, or one before an item that ends its own line, stays.
-                let keep_break =
-                    after_comment && (gap_before.last_comment_is_line || line_end > item_end);
+                // A `//` comment's line break is its own and stays. After a
+                // block comment, `insert` put our entry right after `*/`, so
+                // the whitespace from there to the end of the item is ours
+                // and goes, and the person's blanks after the item stay.
+                let keep_break = after_comment && gap_before.last_comment_is_line;
                 let (from, to) = match first_break_after(before) {
                     Some(from) if keep_break => (from, line_end),
                     _ => (before, item_end),
@@ -1847,6 +1846,21 @@ mod tests {
                 "SessionStart",
             ),
             (
+                "blanks after a block comment at the line end",
+                "{\n  \"a\": 1 /* x */ \n}\n",
+                "SessionStart",
+            ),
+            (
+                "a tab after a block comment at the line end, crlf",
+                "{\r\n  \"a\": 1, /* x */\t\r\n}\r\n",
+                "SessionStart",
+            ),
+            (
+                "hooks array with blanks after a block comment",
+                "{\"hooks\": {\"SessionStart\": [\n    {\"x\": 1} /* m */ \n  ]}}",
+                "SessionStart",
+            ),
+            (
                 "hooks array with a block comment before the close",
                 "{\"hooks\": {\"SessionStart\": [\n  {\"x\": 1} /* mine */ ]}}",
                 "SessionStart",
@@ -1982,6 +1996,11 @@ mod tests {
             "{\n  \"a\": 1, /* x */ }\n",
             "{\n  \"mcpServers\": {\n    \"o\": 1 /* x */ }\n}\n",
             "{\n  \"a\": 1 /* x\n */ }\n",
+            // Re-review 2, R1: blanks after the comment at the line end.
+            "{\n  \"a\": 1 /* x */ \n}\n",
+            "{\n  \"a\": 1 /* x */ \n\n}\n",
+            "{\r\n  \"a\": 1 /* x */\t\r\n}\r\n",
+            "{\n  \"a\": 1, /* x */  \n}\n",
         ] {
             assert_eq!(
                 uninstall(&install(Some(original))),
@@ -1990,6 +2009,20 @@ mod tests {
             );
         }
         let original = "{\"h\": [\n  {\"x\": 1} /* mine */ ]}";
+        let pushed = apply_edits(
+            Some(original),
+            &[Edit::Push {
+                path: vec![key("h")],
+                value: JsonIn::Object(vec![]),
+            }],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            remove_never(&pushed, vec![key("h"), SegBuf::Index(1)]),
+            original
+        );
+        let original = "{\"h\": [\n    {\"x\": 1} /* m */ \n  ]}";
         let pushed = apply_edits(
             Some(original),
             &[Edit::Push {
