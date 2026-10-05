@@ -141,6 +141,10 @@ impl Engine {
         scope: &crate::scope::Scope,
     ) -> Result<Value> {
         let (private, hidden) = self.visibility_for(scope).await?;
+        // A local domain a connected server hides is not listed while it is
+        // hidden (decision D19); the mounted domain is listed by the router.
+        let mut hidden = hidden;
+        hidden.extend(self.shadowed_domains());
         let store = self.store.lock().await;
         let stats = store.domain_stats().await.unwrap_or_default();
         drop(store);
@@ -684,8 +688,29 @@ impl Engine {
     /// `None` branch below. So the re-read stays for as long as `domain add`
     /// is a mutation path that does not refresh `self.config`, and
     /// [`Engine::registered_domain_entries`] is the same rule for the listing.
+    ///
+    /// On a machine with connected servers the block also lists every
+    /// mounted domain, after every local one and in mount-table order, and
+    /// leaves out each local domain a mount hides (decision D25). With
+    /// nothing mounted it is the same bytes as on a machine with no source.
     pub fn routing_text(&self) -> String {
-        crystalline_core::render_instructions(&self.routing_output(&HashSet::new()))
+        let mut output = self.routing_output(&self.shadowed_domains());
+        if let Some(sources) = self.sources() {
+            output
+                .domains
+                .extend(
+                    sources
+                        .table()
+                        .mounts
+                        .iter()
+                        .map(|m| crystalline_core::PromptDomain {
+                            name: m.local.clone(),
+                            bullets: m.bullets.clone(),
+                            preferred: false,
+                        }),
+                );
+        }
+        crystalline_core::render_instructions(&output)
     }
 
     /// [`Engine::routing_text`] with the domain lines replaced by the count

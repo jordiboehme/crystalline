@@ -1409,6 +1409,9 @@ impl Engine {
         // After both configurations hold the new name: a lookup that took the
         // stale mark persist set would have built from the old snapshot.
         self.mark_names_stale();
+        // The mount table reads this machine's names: a domain that moved
+        // off or onto a name a source gave out is shown or hidden at once.
+        self.sync_sources_local();
         if let Some(tx) = &self.watch_tx
             && !entry.is_virtual()
             && let Some(root) = entry.file_path()

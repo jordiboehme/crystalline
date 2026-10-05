@@ -147,6 +147,13 @@ impl Engine {
                 (choice.name, choice.origin, declared_by_manifest)
             }
         };
+        // A name a connected server already gave out is the mount's; a new
+        // local domain under it is the latecomer and gets the local suffix
+        // (decision D13), before the name is checked and the default folder
+        // derived from it. A registration of that name here keeps its name,
+        // so adopting it in place works as before.
+        let wanted = domain_name;
+        let domain_name = self.beside_mounts(&wanted);
         // A name nothing holds is a new registration: check it before the
         // default folder is derived from it. A derived name passes by
         // construction (`origin::default_domain_name`, and
@@ -292,6 +299,8 @@ impl Engine {
             *file_guard = file;
             *self.config.write().unwrap() = effective;
         }
+        // Its origin may make it a copy of a mounted domain, hidden from now on.
+        self.sync_sources_local();
 
         // Tell a running daemon's watcher to start watching the new root; it
         // also runs its own catch-up sync and embed once the watch is armed.
@@ -331,6 +340,7 @@ impl Engine {
             "local_changes": report.local_changes,
         });
         self.append_name_fields(&mut result, &domain_name).await?;
+        self.note_beside_mounts(&mut result, &wanted, &domain_name);
         Ok(result)
     }
 

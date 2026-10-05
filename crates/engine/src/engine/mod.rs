@@ -1060,6 +1060,12 @@ pub struct Engine {
     // router built over one engine keeps the first store rather than silently
     // swapping the authority mid-flight.
     domain_access: std::sync::OnceLock<Arc<crate::scope::DomainAccess>>,
+    // The servers this machine offers domains from (`crystalline connect`),
+    // installed once by whoever serves this engine to its owner: the daemon at
+    // start, a one-shot CLI command before it routes. Absent everywhere else
+    // (a served instance's HTTP surface, most tests), where nothing is
+    // mounted and nothing is hidden.
+    sources: std::sync::OnceLock<Arc<crystalline_remote::SourceSet>>,
     // The origin rule the HTTP surface was built with, installed once by
     // `http_base`. It answers what this instance is called, for a local caller
     // and an HTTP one alike; absent in every process that serves no HTTP
@@ -2125,6 +2131,7 @@ impl Engine {
             join_fence: tokio::sync::RwLock::new(()),
             collab: std::sync::OnceLock::new(),
             domain_access: std::sync::OnceLock::new(),
+            sources: std::sync::OnceLock::new(),
             web_origin: std::sync::OnceLock::new(),
             joins: Arc::new(crate::join::Joins::default()),
             rename_pause: crate::rename::RenamePause::default(),
@@ -2298,6 +2305,120 @@ impl Engine {
         let _ = self.domain_access.set(access);
     }
 
+    /// Install this machine's sources. A no-op on a second call.
+    pub fn set_sources(&self, sources: Arc<crystalline_remote::SourceSet>) {
+        let _ = self.sources.set(sources);
+    }
+
+    /// This machine's sources, when any were installed.
+    pub fn sources(&self) -> Option<Arc<crystalline_remote::SourceSet>> {
+        self.sources.get().cloned()
+    }
+
+    /// The local domains hidden while their source is connected (decision
+    /// D19): a copy of a mounted domain, or a late local name a source gave
+    /// out first. Every read answers them as unregistered, and a source that
+    /// is down keeps them hidden: a hidden copy is never an offline fallback.
+    pub fn shadowed_domains(&self) -> HashSet<String> {
+        self.sources()
+            .map(|s| s.shadowed().into_iter().collect())
+            .unwrap_or_default()
+    }
+
+    /// This machine's registered domains as the mount table reads them: the
+    /// name, its machine-local aliases and its origin identity.
+    pub fn local_domains(&self) -> Vec<crystalline_remote::LocalDomain> {
+        self.registered_domain_entries()
+            .into_iter()
+            .map(|(name, entry)| crystalline_remote::LocalDomain {
+                origin: self.origin_identity_of(&name),
+                aliases: entry.aliases.clone(),
+                name,
+            })
+            .collect()
+    }
+
+    /// Tell the sources this machine's domains changed, so a copy registered
+    /// or removed just now is hidden or shown at once rather than at the next
+    /// poll.
+    pub fn sync_sources_local(&self) {
+        if let Some(sources) = self.sources() {
+            sources.set_local(self.local_domains());
+        }
+    }
+
+    /// The name a new local domain gets when `wanted` is already a mounted
+    /// domain's: `<wanted>-local`, counted up past anything taken (decision
+    /// D13). `wanted` itself when no source holds it, and when a domain of
+    /// that name is already registered here: an existing registration keeps
+    /// its name, so adopting it again never registers a second one.
+    pub fn beside_mounts(&self, wanted: &str) -> String {
+        let Some(sources) = self.sources() else {
+            return wanted.to_string();
+        };
+        let table = sources.table();
+        let registered = self.registered_domain_entries();
+        if table.mount(wanted).is_none() || registered.contains_key(wanted) {
+            return wanted.to_string();
+        }
+        let free = |name: &str| {
+            table.mount(name).is_none()
+                && !registered.contains_key(name)
+                && !registered
+                    .values()
+                    .any(|entry| entry.aliases.iter().any(|alias| alias == name))
+        };
+        let base = format!("{wanted}-{}", crystalline_remote::LOCAL_SUFFIX);
+        if free(&base) {
+            return base;
+        }
+        (2..)
+            .map(|n| format!("{base}-{n}"))
+            .find(|name| free(name))
+            .expect("an unbounded count finds a free name")
+    }
+
+    /// Add to a new local domain's report what the mounts did to it: the
+    /// name [`Engine::beside_mounts`] gave it when `wanted` was a mount's,
+    /// and the line that says it is hidden when it is the same domain as a
+    /// mount (its origin), so a fresh registration that answers nothing says
+    /// why. Joined to a `note` the report already carries.
+    pub(crate) fn note_beside_mounts(&self, result: &mut Value, wanted: &str, name: &str) {
+        let Some(sources) = self.sources() else {
+            return;
+        };
+        let table = sources.table();
+        let mut notes = Vec::new();
+        if name != wanted {
+            notes.push(format!(
+                "'{wanted}' is a domain from {} on this machine, so this local domain is registered as '{name}'",
+                table.source_of(wanted).unwrap_or_default()
+            ));
+        }
+        for hidden in table.hidden(name) {
+            notes.push(match hidden.reason {
+                crystalline_remote::HiddenReason::Copy => format!(
+                    "the local domain '{name}' is hidden while {source} is connected; disconnect {source} to use it again",
+                    source = hidden.source
+                ),
+                crystalline_remote::HiddenReason::Collision => {
+                    crystalline_remote::Announcement::LocalShadowed {
+                        local: name.to_string(),
+                        source: hidden.source.clone(),
+                    }
+                    .to_string()
+                }
+            });
+        }
+        if notes.is_empty() {
+            return;
+        }
+        if let Some(earlier) = result.get("note").and_then(Value::as_str) {
+            notes.insert(0, earlier.trim_end_matches('.').to_string());
+        }
+        result["note"] = json!(notes.join(". "));
+    }
+
     /// The origin rule the HTTP surface was built with, installed once by
     /// `http_base`. It is what answers a local caller's `service.public_url`
     /// (the value the daemon STARTED with, so a runtime configure of the key
@@ -2448,6 +2569,7 @@ impl Engine {
     pub async fn hidden_for(&self, scope: &crate::scope::Scope) -> Result<HashSet<String>> {
         let mut hidden = self.hidden_domains(scope).await?.unwrap_or_default();
         hidden.extend(self.unregistered_domains().await?);
+        hidden.extend(self.shadowed_domains());
         Ok(hidden)
     }
 

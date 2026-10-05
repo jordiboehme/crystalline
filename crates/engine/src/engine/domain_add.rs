@@ -37,6 +37,13 @@ impl Engine {
         let mut cfg = self.config();
         cfg.domains = self.registered_domain_entries();
 
+        // A name a connected server already gave out is the mount's; a new
+        // local domain under it is the latecomer and gets the local suffix
+        // (decision D13), before the default folder is derived from it. A
+        // registration of that name here keeps its name.
+        let mut wanted = name.map(str::to_string);
+        let beside = name.map(|n| self.beside_mounts(n));
+        let name = beside.as_deref();
         if let Some(n) = name {
             // An env-defined domain of this name is owned by its variable.
             if let Some(env) = self.overlay.env_domain(n) {
@@ -105,10 +112,13 @@ impl Engine {
                                 || table.resolve(candidate).is_some()
                         },
                     );
-                    (choice.name, false, choice.origin)
+                    let name = self.beside_mounts(&choice.name);
+                    wanted = Some(choice.name);
+                    (name, false, choice.origin)
                 }
             },
         };
+        let wanted = wanted.unwrap_or_else(|| domain_name.clone());
 
         // Create-or-adopt: scaffold a MANIFEST.md only when the folder lacks one.
         let manifest = canonical.join("MANIFEST.md");
@@ -139,6 +149,9 @@ impl Engine {
             let effective = self.overlay.apply(&file);
             *file_guard = file;
             *self.config.write().unwrap() = effective;
+        }
+        if !adopted {
+            self.sync_sources_local();
         }
 
         // Tell a running daemon's watcher to watch the new root; an adopted
@@ -177,6 +190,7 @@ impl Engine {
             "sync": sync,
         });
         self.append_name_fields(&mut result, &domain_name).await?;
+        self.note_beside_mounts(&mut result, &wanted, &domain_name);
         Ok(result)
     }
 
@@ -191,6 +205,11 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
+        // A name a connected server already gave out is the mount's; a new
+        // local domain under it is the latecomer and gets the local suffix
+        // (decision D13).
+        let wanted = name;
+        let name = &self.beside_mounts(wanted);
         if let Some(env) = self.overlay.env_domain(name) {
             return Err(EngineError::Conflict(format!(
                 "domain '{name}' is defined by the environment variable {}; unset it to manage this domain in the config file",
@@ -226,6 +245,9 @@ impl Engine {
             let effective = self.overlay.apply(&file);
             *file_guard = file;
             *self.config.write().unwrap() = effective;
+        }
+        if is_new {
+            self.sync_sources_local();
         }
 
         let today = Utc::now().date_naive().format("%Y-%m-%d").to_string();
@@ -263,6 +285,7 @@ impl Engine {
             "registered": is_new,
         });
         self.append_name_fields(&mut result, name).await?;
+        self.note_beside_mounts(&mut result, wanted, name);
         Ok(result)
     }
 
@@ -963,6 +986,8 @@ impl Engine {
             None => 0,
         };
         let mut report = self.domain_remove(name).await?;
+        // A local copy a mount hid is gone now, so nothing hides it any more.
+        self.sync_sources_local();
         self.announce_domain(name, None, Some(audience));
         self.forget_domain_records(name).await;
         // Every draft in this domain has just ended, whichever way each one

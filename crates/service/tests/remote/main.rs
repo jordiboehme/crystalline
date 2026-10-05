@@ -12,5 +12,6 @@ mod client;
 mod connect;
 mod ctl;
 mod fixture;
+pub mod local;
 mod revoke;
 mod tool;
