@@ -26,7 +26,7 @@
 
 use std::sync::Arc;
 
-use axum::body::Bytes;
+use axum::body::Body;
 use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
@@ -44,10 +44,36 @@ use crate::web_url::WebBase;
 /// the same constant.
 pub use crystalline_remote::CTL_PATH;
 
-/// The commands a connected Crystalline may send. Pinned by
-/// `tests/remote/answers.rs::the_remote_allow_list_is_exactly_six_commands`
-/// (Task 7).
-pub const REMOTE_COMMANDS: &[&str] = &["status"];
+/// The commands a connected Crystalline may send. Pinned exactly by
+/// `tests/remote/ctl.rs::the_remote_allow_lists_are_pinned`.
+pub const REMOTE_COMMANDS: &[&str] = &["status", "tool"];
+
+/// The engine verbs a remote `tool` call may run: exactly the ones the control
+/// socket's `tool` command dispatches. Pinned exactly by
+/// `tests/remote/ctl.rs::the_remote_allow_lists_are_pinned`. Each has its arm
+/// in `McpServer::remote_tool`, which runs the same verb core the MCP handler
+/// of that name runs.
+pub const REMOTE_TOOLS: &[&str] = &[
+    "write_engram",
+    "read_engram",
+    "edit_engram",
+    "move_engram",
+    "split_engram",
+    "delete_engram",
+    "search_engrams",
+    "build_context",
+    "recent_activity",
+    "list_domains",
+    "browse_domain",
+    "validate_engrams",
+    "infer_schema",
+    "vocabulary",
+    crate::EVOLVE_TOOL_NAME,
+];
+
+/// The client half a remote write records when the connected machine named
+/// no agent: a CLI verb or a hook.
+pub const REMOTE_CLIENT: &str = "crystalline-cli";
 
 /// The end of every refusal of a command off the allow-list.
 pub const NOT_REMOTE: &str = "is not available over a remote connection";
@@ -68,23 +94,28 @@ pub struct CtlState {
     pub origin_rule: OriginRule,
 }
 
-/// The route, with the JSON API's body ceiling.
+/// The route. The JSON API's body ceiling ([`crate::rest::MAX_BODY_BYTES`])
+/// is applied by [`handle`] itself, after the bearer check, rather than by a
+/// body-limit layer in front of an extractor that would read the body first.
 pub fn route(state: CtlState) -> axum::Router {
     axum::Router::new()
         .route(CTL_PATH, axum::routing::post(handle))
-        .layer(axum::extract::DefaultBodyLimit::max(
-            crate::rest::MAX_BODY_BYTES,
-        ))
         .with_state(state)
 }
 
-async fn handle(State(state): State<CtlState>, headers: HeaderMap, body: Bytes) -> Response {
+/// The body is read only once the origin and the bearer passed, so a caller
+/// with no token cannot make the server buffer a request body at all.
+async fn handle(State(state): State<CtlState>, headers: HeaderMap, body: Body) -> Response {
     if let Err(refused) = state.origin_rule.origin(&headers) {
         return refused.into_response();
     }
     let identity = match resolve_bearer(&state.auth, state.oauth.as_ref(), &headers).await {
         Bearer::Account(identity) => identity,
         Bearer::Refused(response) | Bearer::Unavailable(response) => return response,
+    };
+    let body = match axum::body::to_bytes(body, crate::rest::MAX_BODY_BYTES).await {
+        Ok(body) => body,
+        Err(e) => return axum::Json(envelope_err(format!("invalid body: {e}"))).into_response(),
     };
     let request: Value = match serde_json::from_slice(&body) {
         Ok(request) => request,
@@ -109,10 +140,9 @@ pub(crate) async fn dispatch(
         account: identity.name.clone(),
         admin: identity.admin,
     };
-    // Not read yet: the remote `tool` call builds its links on it.
-    let _ = base;
     let answer = match cmd {
         "status" => remote_status(engine, identity, &scope).await,
+        "tool" => remote_tool(engine, request, identity, &scope, base).await,
         other => Err(format!("'{other}' {NOT_REMOTE}")),
     };
     match answer {
@@ -153,4 +183,47 @@ async fn remote_status(
         "admin": identity.admin,
         "domains": domains,
     }))
+}
+
+/// The client half the connected machine forwarded (decision D11), at most
+/// 200 characters of it (the actor and the chip each budget their own share),
+/// or [`REMOTE_CLIENT`] when it named none.
+fn forwarded_client(request: &Value) -> String {
+    request
+        .get("agent")
+        .and_then(|agent| agent.get("client"))
+        .and_then(Value::as_str)
+        .map(|client| client.chars().take(200).collect::<String>())
+        .filter(|client| !client.trim().is_empty())
+        .unwrap_or_else(|| REMOTE_CLIENT.to_string())
+}
+
+/// A remote `tool` call, through `McpServer::remote_tool` on a server object
+/// built for this one request, as the forwarded agent for the account. The
+/// account always comes from the token, never from the request. The holder is
+/// the one a sessionless HTTP peer gets (decision D10): keyed by the account,
+/// ended by `IDLE_JOIN_LIMIT` after the last use.
+async fn remote_tool(
+    engine: &Arc<Engine>,
+    request: &Value,
+    identity: &McpIdentity,
+    scope: &Scope,
+    base: &WebBase,
+) -> Result<Value, String> {
+    let tool = request.get("tool").and_then(Value::as_str).unwrap_or("");
+    if !REMOTE_TOOLS.contains(&tool) {
+        return Err(format!("the tool '{tool}' {NOT_REMOTE}"));
+    }
+    let args = request.get("args").cloned().unwrap_or_else(|| json!({}));
+    let caller = crate::mcp::Caller {
+        scope: scope.clone(),
+        account: Some(identity.name.clone()),
+        client: Some(forwarded_client(request)),
+        holder: Some(crate::join::Holder::Token(identity.name.clone())),
+        base: base.clone(),
+    };
+    crate::mcp::McpServer::new_http(engine.clone())
+        .remote_tool(tool, args, &caller)
+        .await
+        .map_err(crate::mcp::RemoteToolError::into_message)
 }

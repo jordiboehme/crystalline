@@ -107,11 +107,9 @@ async fn every_command_off_the_allow_list_is_refused_remotely() {
         let (code, reply) = server.ctl(Some(&boss), json!({ "v": 1, "cmd": cmd })).await;
         assert_eq!(code, 200, "{cmd}: a refusal is an envelope, not a status");
         assert_eq!(reply["ok"], false, "{cmd}: {reply}");
-        assert!(
-            reply["error"]
-                .as_str()
-                .unwrap()
-                .contains("not available over a remote connection"),
+        assert_eq!(
+            reply["error"],
+            format!("'{cmd}' is not available over a remote connection"),
             "{cmd}: {reply}"
         );
     }
@@ -171,6 +169,94 @@ async fn a_bad_body_is_an_envelope_error() {
     assert_eq!(reply["ok"], false);
     assert!(
         reply["error"].as_str().unwrap().starts_with("invalid json"),
+        "{reply}"
+    );
+}
+
+/// The two allow-lists, exactly: a command or a tool reaches a connected
+/// machine only by being added here on purpose.
+#[test]
+fn the_remote_allow_lists_are_pinned() {
+    use crystalline_service::remote_ctl::{REMOTE_COMMANDS, REMOTE_TOOLS};
+    assert_eq!(REMOTE_COMMANDS, &["status", "tool"]);
+    assert_eq!(
+        REMOTE_TOOLS,
+        &[
+            "write_engram",
+            "read_engram",
+            "edit_engram",
+            "move_engram",
+            "split_engram",
+            "delete_engram",
+            "search_engrams",
+            "build_context",
+            "recent_activity",
+            "list_domains",
+            "browse_domain",
+            "validate_engrams",
+            "infer_schema",
+            "vocabulary",
+            "evolve_engrams",
+        ]
+    );
+}
+
+/// An OAuth access token the store really holds is no credential here while
+/// `auth.oauth` is off, exactly as at the MCP door.
+#[tokio::test]
+async fn an_oauth_token_is_refused_at_the_ctl_route_while_oauth_is_off() {
+    let server = RemoteServer::start(Options::TOKENS).await;
+    let client = server
+        .auth
+        .register_oauth_client(
+            "a hosted client",
+            None,
+            &["https://claude.ai/api/mcp/auth_callback".to_string()],
+        )
+        .await
+        .unwrap();
+    let grant = server
+        .auth
+        .issue_oauth_grant("keeper", &client.client_id, &server.origin())
+        .await
+        .unwrap();
+    assert!(grant.access_token.starts_with("coa_"));
+    let (status_code, _) = server.ctl(Some(&grant.access_token), status()).await;
+    assert_eq!(
+        status_code, 401,
+        "a coa_ token is refused while OAuth is off"
+    );
+}
+
+/// The body is read only after the bearer check: a caller with no token is
+/// refused at the door whatever it sends, and a body past the API's ceiling
+/// from a caller with one is the envelope's error, not a buffered request.
+#[tokio::test]
+async fn the_body_is_read_only_after_the_bearer_check() {
+    let server = RemoteServer::start(Options::TOKENS).await;
+    let oversized = "x".repeat(crystalline_service::rest::MAX_BODY_BYTES + 1);
+    let refused = server
+        .http
+        .post(format!("{}/api/v1/ctl", server.origin()))
+        .body(oversized.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 401, "no token, no body read");
+    let token = server.token_for("keeper").await;
+    let response = server
+        .http
+        .post(format!("{}/api/v1/ctl", server.origin()))
+        .bearer_auth(&token)
+        .body(oversized)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let reply: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(reply["ok"], false, "{reply}");
+    assert!(
+        reply["error"].as_str().unwrap().starts_with("invalid body"),
         "{reply}"
     );
 }

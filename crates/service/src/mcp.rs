@@ -1238,7 +1238,7 @@ fn display_client(raw: &str) -> Option<String> {
 /// How this call shows up in the participant strip of a room it works in.
 ///
 /// **Display, and display only.** What a write RECORDS is
-/// [`acting_actor`]'s hyphenated OKF token and is untouched by this; what a
+/// [`compose_actor`]'s hyphenated OKF token and is untouched by this; what a
 /// person SEES beside their own name while an agent is in their document is
 /// this, and the two are built from the same two halves so they can never
 /// name different agents. The name leads because that is who the work is
@@ -1247,10 +1247,19 @@ fn display_client(raw: &str) -> Option<String> {
 ///
 /// `None` when no ACCOUNT is known, whatever the client calls itself: see
 /// [`presence_label`].
-fn agent_peer(ctx: &RequestContext<RoleServer>, scope: &crate::scope::Scope) -> Option<AgentPeer> {
+///
+/// Over plain values - the account the door resolved, the client half as
+/// reported, the scope - so an rmcp call and a remote `tool` call, whose
+/// client half the connected machine forwarded, draw the same chip. Read
+/// through [`Caller::peer`].
+fn peer_for(
+    account: Option<String>,
+    client: Option<&str>,
+    scope: &crate::scope::Scope,
+) -> Option<AgentPeer> {
     presence_label(
-        presence_identity(mcp_account(ctx), scope),
-        client_actor(ctx).and_then(|client| display_client(&client)),
+        presence_identity(account, scope),
+        client.and_then(display_client),
     )
 }
 
@@ -1343,12 +1352,16 @@ fn presence_label(identity: Option<(String, String)>, client: Option<String>) ->
 ///
 /// `None` only when neither half is known, which is [`Engine::actor`]'s
 /// fallback case and behaves exactly as it did before.
-fn acting_actor(ctx: &RequestContext<RoleServer>) -> Option<String> {
-    let account = mcp_account(ctx)
-        .map(|account| sanitize_actor(&account))
+///
+/// Over plain values, so a caller with no request context - a remote `tool`
+/// call, whose client half the connected machine forwarded - composes exactly
+/// the same way. Read through [`Caller::actor`].
+pub(crate) fn compose_actor(account: Option<&str>, client: Option<&str>) -> Option<String> {
+    let account = account
+        .map(sanitize_actor)
         .filter(|account| !account.is_empty());
-    let client = client_actor(ctx)
-        .map(|client| without_the_join(&sanitize_actor(&client)))
+    let client = client
+        .map(|client| without_the_join(&sanitize_actor(client)))
         .filter(|client| !client.is_empty());
     let Some(account) = account else {
         // Nobody authenticated: the client alone, exactly as before, minus a
@@ -1468,6 +1481,78 @@ impl Drop for SessionJoins {
             self.registry.close(key, account, holder);
         }
     }
+}
+
+/// Who a verb acts for, as plain values: what an rmcp request context says
+/// about its caller, or what a remote `tool` call says about the agent a
+/// connected machine forwarded. Every verb core takes one, so the two doors
+/// run the same gate, record the same actor, draw the same chip in a room and
+/// hold a draft under the same holder.
+#[derive(Clone)]
+pub(crate) struct Caller {
+    /// The scope every engine call runs under.
+    pub(crate) scope: Scope,
+    /// The account the door resolved, `None` on stdio and the open tier.
+    pub(crate) account: Option<String>,
+    /// The client half as reported: `clientInfo` over MCP, the forwarded
+    /// `agent.client` (or [`crate::remote_ctl::REMOTE_CLIENT`]) remotely.
+    /// Sanitized where it is used, never here.
+    pub(crate) client: Option<String>,
+    /// Who a draft join of this call belongs to; `None` when the call has no
+    /// account to bind a join to.
+    pub(crate) holder: Option<crate::join::Holder>,
+    /// Where this caller opens a page.
+    pub(crate) base: crate::web_url::WebBase,
+}
+
+impl Caller {
+    /// The actor a write records ([`compose_actor`]).
+    pub(crate) fn actor(&self) -> Option<String> {
+        compose_actor(self.account.as_deref(), self.client.as_deref())
+    }
+
+    /// The chip a room draws for this call ([`peer_for`]).
+    pub(crate) fn peer(&self) -> Option<AgentPeer> {
+        peer_for(self.account.clone(), self.client.as_deref(), &self.scope)
+    }
+}
+
+/// Whether a verb core may put a question to a person before it acts, and
+/// what the person answered on this round.
+///
+/// An MCP peer that declared elicitation is [`Ask::Elicit`]; every other
+/// caller is [`Ask::Never`]: an MCP client that cannot be asked and a remote
+/// `tool` call alike, so the two run the one no-question branch of each verb
+/// (decision D12) rather than two copies of it.
+#[derive(Clone, Copy)]
+enum Ask<'a> {
+    /// Nobody can be asked: a delete or an acknowledgment runs as typed, an
+    /// overwrite of a live document is refused.
+    Never,
+    /// The peer can elicit, and these are its answers so far.
+    Elicit(&'a Option<rmcp::model::InputResponses>),
+}
+
+impl<'a> Ask<'a> {
+    /// What this rmcp call may be asked.
+    fn of(ctx: &RequestContext<RoleServer>, responses: &'a InputResponses) -> Ask<'a> {
+        if confirmation_supported(ctx) {
+            Ask::Elicit(&responses.0)
+        } else {
+            Ask::Never
+        }
+    }
+}
+
+/// What a verb core decided, before either door renders it.
+enum Verdict {
+    /// The engine answered: raw JSON, with this caller's page addresses on it.
+    Done(Value),
+    /// Refused in words the caller must read: a tool error over MCP, an
+    /// envelope error remotely.
+    Refused(String),
+    /// A question for the person, only ever under [`Ask::Elicit`].
+    Asked(Box<InputRequiredResult>),
 }
 
 /// The `Mcp-Session-Id` a request carried, if any.
@@ -1689,6 +1774,18 @@ impl McpServer {
         }
     }
 
+    /// The caller of this request, as plain values: the one thing a verb core
+    /// reads about who asked.
+    fn caller(&self, ctx: &RequestContext<RoleServer>) -> Caller {
+        Caller {
+            scope: self.scope_of(ctx),
+            account: mcp_account(ctx),
+            client: client_actor(ctx),
+            holder: self.holder_of(ctx),
+            base: self.web_base(ctx),
+        }
+    }
+
     /// Where this caller opens a page.
     ///
     /// The same question [`holder_of`](Self::holder_of) answers about identity,
@@ -1718,13 +1815,16 @@ impl McpServer {
     /// [`Engine::open_share_link`]), because an agent that was handed a link
     /// and passed it to a verb has decided both: it means to see the draft and
     /// it means to work in it.
-    async fn enter_draft(
+    ///
+    /// `holder` is the caller's ([`Caller::holder`]): [`McpServer::holder_of`]
+    /// over MCP, the token's account remotely (decision D10).
+    async fn enter_draft_for(
         &self,
         scope: &Scope,
-        ctx: &RequestContext<RoleServer>,
+        holder: Option<crate::join::Holder>,
         token: &str,
     ) -> std::result::Result<crate::engine::OpenedLink, crate::engine::EngineError> {
-        let Some(holder) = self.holder_of(ctx) else {
+        let Some(holder) = holder else {
             return Err(crate::engine::EngineError::Refused(
                 "a draft share-link binds to an account, and this session has none: authenticate \
                  before presenting one"
@@ -1744,13 +1844,13 @@ impl McpServer {
     /// The other half of [`crate::engine::OpenedLink`]'s two answers. A read
     /// takes `ReadOnly` as an answer; a write asked to land inside the draft
     /// and cannot, so for it the sentence is the refusal it always was.
-    async fn joined_by(
+    async fn joined_by_holder(
         &self,
         scope: &Scope,
-        ctx: &RequestContext<RoleServer>,
+        holder: Option<crate::join::Holder>,
         token: &str,
     ) -> Result<crate::join::Join, ErrorData> {
-        match self.enter_draft(scope, ctx, token).await {
+        match self.enter_draft_for(scope, holder, token).await {
             Ok(crate::engine::OpenedLink::Joined { join, .. }) => Ok(join),
             Ok(crate::engine::OpenedLink::ReadOnly(reason)) => {
                 Err(to_error(crate::engine::EngineError::Refused(reason)))
@@ -1773,19 +1873,19 @@ impl McpServer {
     /// its title - and against the path the join was opened for,
     /// so one of the owner's other drafts answering the same name routes
     /// nothing.
-    async fn joined_for(
+    async fn joined_for_holder(
         &self,
         scope: &Scope,
-        ctx: &RequestContext<RoleServer>,
+        holder: Option<&crate::join::Holder>,
         domain: &str,
         identifier: &str,
     ) -> Option<crate::join::Join> {
         let account = crate::scope::overlay_actor(scope)?;
-        let holder = self.holder_of(ctx)?;
+        let holder = holder?;
         // The registry, not a list kept on this object: a stateless peer's
         // second request is a different object, so anything this one
         // remembered it would have forgotten. See [`SessionJoins`].
-        let held = self.engine.joins().held_by(&account, &holder, domain);
+        let held = self.engine.joins().held_by(&account, holder, domain);
         for join in held {
             let named = self
                 .engine
@@ -1869,10 +1969,7 @@ impl McpServer {
         p: P,
         ctx: &RequestContext<RoleServer>,
     ) -> Result<P, ErrorData> {
-        self.engine
-            .localized_for(&p, &self.scope_of(ctx))
-            .await
-            .map_err(to_error)
+        self.localized_in(p, &self.scope_of(ctx)).await
     }
 
     /// The gate every write verb passes before it touches a domain, answering
@@ -2061,15 +2158,11 @@ impl McpServer {
     ///
     /// Never on a refusal and never on a question: both are answered before a
     /// write happens, so neither reaches this.
-    async fn nudged(
-        &self,
-        mut result: CallToolResult,
-        ctx: &RequestContext<RoleServer>,
-    ) -> CallToolResult {
+    async fn nudged(&self, mut result: CallToolResult, caller: &Caller) -> CallToolResult {
         let Some(trailer) = crate::nudge::write_verb_trailer(
             &self.engine,
-            mcp_account(ctx).as_deref(),
-            &self.scope_of(ctx),
+            caller.account.as_deref(),
+            &caller.scope,
         )
         .await
         else {
@@ -2082,26 +2175,37 @@ impl McpServer {
     }
 }
 
-#[tool_router]
+/// The verb cores: each engine verb's body once, for whichever door asked.
+///
+/// An rmcp handler builds a [`Caller`] from its request context
+/// ([`McpServer::caller`]) and an [`Ask`] from its client's capabilities; a
+/// remote `tool` call ([`McpServer::remote_tool`]) builds a `Caller` from the
+/// token's account and the agent the connected machine forwarded, and asks
+/// nothing. Everything that decides what happens - localization, the write
+/// gate, the join a share link opens, the actor, the chip in a room, the
+/// confirmation rounds and the page addresses - lives here, so the two doors
+/// cannot drift apart. Only argument parsing and the rendering differ: TOON,
+/// resource links and the ride-along trailer are the MCP side's
+/// ([`McpServer::answered`]), raw engine JSON the remote side's.
 impl McpServer {
-    #[tool(
-        name = "write_engram",
-        title = "Capture engram",
-        description = "Capture a new engram - a unit of knowledge - into a domain. Writes the markdown file and indexes it. Body bullets: '- [decision] we chose X #tag' become observations, '- rel_type [[Target]]' become relations. domain is required so an engram never lands in the wrong place. Pass folder to file the engram under a topic prefix: reuse the domain's existing layout (browse_domain shows it), start a subfolder when a topic cluster is forming and keep singletons at the root; the folder path becomes the permalink prefix build_context globs as crystalline://domain/folder/*. permalink, status, recorded_at and generated (who wrote it, with which model, and when) are filled in; pass model with your own model id, the one you were told you are (for example claude-opus-5), on every capture, so a later reader can weigh the page by which model wrote it - leave it out only when you do not know it; valid_from/valid_to are never auto-set - absence means always valid; to bound validity pass them inside metadata as plain ISO dates (YYYY-MM-DD). Any other date format is rejected; a sentinel far-future valid_to and an explicit null are dropped, since absence already means valid forever. Recommended type values: engram, guide, decision, architecture, runbook, reference. Recommended status values (guidance, not enforced): stable, implemented, draft, proposed, idea, poc, deprecated, superseded, archived, legacy. stable is the default and the word for knowledge that holds now; current is the legacy alias for the same state, and a status filter on either word matches engrams carrying either. Of those, deprecated, superseded, archived and legacy are the recognized retirement set: a status inside it softly fades in search ranking, any other value ranks at full strength. Errors if the permalink exists in the same folder unless overwrite is true, and an overwrite replaces the engram that owns the permalink in its own file, whatever that file is called; a permalink owned by an engram in another folder is refused whether or not overwrite is set, and no overwrite is offered for it (move_engram it first, or change it in place with edit_engram); it refuses a title that would file the engram as the reserved index.md or log.md (Crystalline generates the folder index itself). On a 2026-07-28 peer that declared an elicitation capability a same-folder permalink collision is not the bare error: the call writes nothing and answers input_required instead, a single-select question offering overwrite or cancel, which the client puts to the user and answers by re-sending the same call with the choice; cancel leaves the existing engram exactly as it is, and an explicit overwrite=true never asks. The vocabulary tool lists tags already in use; reuse one before coining a new tag. Set an optional numeric salience metadata key (0-10) to mark exceptionally valuable knowledge; salient engrams are lifted in hybrid search ranking. Raise it later to elevate an engram that proved load-bearing. The receipt may carry a similar list: up to three existing engrams closest in meaning to what was just written, with guidance - read the one that fits and merge into it, supersede it or link it, and say so; never ignore the list silently. Replacing an engram somebody has open in the web editor is never silent: an overwrite of a live document asks them first, by name, and on a yes it lands in their document (receipt: landed live) rather than over it, so use edit_engram when the change is a targeted one. In a domain in review mode (review: overlay) your write lands in your own private draft; share_changes proposes exactly your drafts for review, and a receipt marked draft means the tree did not move. To capture into somebody's shared draft rather than a copy of your own, pass the draft share-link they handed you (dl_...) as share_link on that call: it opens their draft for this session and the write lands in their copy, at the page the link was minted on and nowhere else.",
-        annotations(
-            read_only_hint = false,
-            destructive_hint = false,
-            idempotent_hint = false,
-            open_world_hint = false
-        )
-    )]
-    async fn write_engram(
+    /// `p` with every domain it names spelled as a local name, for `scope`.
+    /// See [`McpServer::localized`].
+    async fn localized_in<P: DomainArgs + Clone>(
         &self,
-        Parameters(p): Parameters<WriteParams>,
-        responses: InputResponses,
-        ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResponse, ErrorData> {
-        let mut p = self.localized(p, &ctx).await?;
+        p: P,
+        scope: &Scope,
+    ) -> Result<P, ErrorData> {
+        self.engine.localized_for(&p, scope).await.map_err(to_error)
+    }
+
+    /// `write_engram` for one caller.
+    async fn write_core(
+        &self,
+        p: WriteParams,
+        caller: &Caller,
+        ask: Ask<'_>,
+    ) -> Result<Verdict, ErrorData> {
+        let mut p = self.localized_in(p, &caller.scope).await?;
         // The model an agent reports is client-supplied text exactly as the
         // client identity is, so it is sanitized the same way and an id that
         // sanitizes away counts as none reported. Belt and braces rather than
@@ -2116,16 +2220,19 @@ impl McpServer {
             .as_deref()
             .map(sanitize_actor)
             .filter(|m| !m.is_empty());
-        let scope = self.scope_of(&ctx);
-        if let Some(refusal) = self.refuse_unwritable(&p.domain, &scope).await? {
-            return refuse(refusal).map(CallToolResponse::from);
+        let scope = &caller.scope;
+        if let Some(refusal) = self.refuse_unwritable(&p.domain, scope).await? {
+            return Ok(Verdict::Refused(refusal));
         }
-        let actor = acting_actor(&ctx);
+        let actor = caller.actor();
         // A capture inside somebody's draft names that draft on the call: this
         // verb derives its destination from the title rather than resolving a
         // page, so there is no identifier to work out which draft was meant.
         let join = match p.share_link.as_deref() {
-            Some(token) => Some(self.joined_by(&scope, &ctx, token).await?),
+            Some(token) => Some(
+                self.joined_by_holder(scope, caller.holder.clone(), token)
+                    .await?,
+            ),
             None => None,
         };
 
@@ -2142,14 +2249,14 @@ impl McpServer {
         // refuses a write that would have succeeded, which the caller fixes by
         // re-sending without the answer - and that is the only direction a
         // confirmation is allowed to fail in.
-        if confirmation_supported(&ctx)
+        if let Ask::Elicit(responses) = ask
             && !p.overwrite
-            && resolved_overwrite(&responses.0) == Some(false)
+            && resolved_overwrite(responses) == Some(false)
         {
-            return refuse(COLLISION_REFUSAL).map(CallToolResponse::from);
+            return Ok(Verdict::Refused(COLLISION_REFUSAL.to_string()));
         }
 
-        let peer = agent_peer(&ctx, &scope);
+        let peer = caller.peer();
 
         // **A wholesale replacement of a document somebody has open is asked
         // about before it happens.** An `edit_engram` composes into that
@@ -2191,26 +2298,28 @@ impl McpServer {
         // show them what happened.
         if let Some(target) = self
             .engine
-            .live_write_target(&p, &scope, join.as_ref(), peer.as_ref())
+            .live_write_target(&p, scope, join.as_ref(), peer.as_ref())
             .await
         {
-            if !confirmation_supported(&ctx) {
-                return refuse(live_overwrite_refusal(&target)).map(CallToolResponse::from);
-            }
+            let Ask::Elicit(responses) = ask else {
+                return Ok(Verdict::Refused(live_overwrite_refusal(&target)));
+            };
             let answered = match p.overwrite {
-                true => confirmed(&responses.0),
-                false => resolved_overwrite(&responses.0),
+                true => confirmed(responses),
+                false => resolved_overwrite(responses),
             };
             match answered {
                 None if p.overwrite => {
-                    return Ok(confirm_question(live_overwrite_question_text(&p, &target)).into());
+                    return Ok(Verdict::Asked(Box::new(confirm_question(
+                        live_overwrite_question_text(&p, &target),
+                    ))));
                 }
                 None => {
-                    return Ok(
-                        collision_question(live_collision_question_text(&p, &target)).into(),
-                    );
+                    return Ok(Verdict::Asked(Box::new(collision_question(
+                        live_collision_question_text(&p, &target),
+                    ))));
                 }
-                Some(false) => return refuse(LIVE_OVERWRITE_REFUSAL).map(CallToolResponse::from),
+                Some(false) => return Ok(Verdict::Refused(LIVE_OVERWRITE_REFUSAL.to_string())),
                 // The answered call runs here rather than falling through to
                 // the collision round below: the yes was given about replacing
                 // the page at that permalink, so routing it through the error
@@ -2225,29 +2334,26 @@ impl McpServer {
                         .write_engram_present(
                             &confirmed_write,
                             actor.as_deref(),
-                            &scope,
+                            scope,
                             join.as_ref(),
                             peer.as_ref(),
                         )
                         .await
                     {
                         Ok(receipt) => receipt,
-                        Err(e) => return overlay_write_error(e).map(CallToolResponse::from),
+                        Err(e) => return overlay_refusal(e).map(Verdict::Refused),
                     };
                     let receipt = self
-                        .with_similar(receipt, SimilarProbe::for_write(&confirmed_write), &scope)
+                        .with_similar(receipt, SimilarProbe::for_write(&confirmed_write), scope)
                         .await;
-                    return Ok(self
-                        .nudged(ok_written(receipt, &self.web_base(&ctx))?, &ctx)
-                        .await
-                        .into());
+                    return Ok(done_written(receipt, &caller.base));
                 }
             }
         }
 
         let written = self
             .engine
-            .write_engram_present(&p, actor.as_deref(), &scope, join.as_ref(), peer.as_ref())
+            .write_engram_present(&p, actor.as_deref(), scope, join.as_ref(), peer.as_ref())
             .await;
 
         // A permalink collision is the one failure here with a real choice
@@ -2258,7 +2364,7 @@ impl McpServer {
         // internals, and it is what the flow promises: a caller that asked for
         // the overwrite is never asked about it.
         let collision = match &written {
-            Err(e) if !p.overwrite && confirmation_supported(&ctx) => {
+            Err(e) if !p.overwrite && matches!(ask, Ask::Elicit(_)) => {
                 let message = e.to_string();
                 message
                     .contains(COLLISION_MARKER)
@@ -2270,23 +2376,28 @@ impl McpServer {
         let Some(permalink) = collision else {
             let receipt = match written {
                 Ok(receipt) => receipt,
-                Err(e) => return overlay_write_error(e).map(CallToolResponse::from),
+                Err(e) => return overlay_refusal(e).map(Verdict::Refused),
             };
             let receipt = self
-                .with_similar(receipt, SimilarProbe::for_write(&p), &scope)
+                .with_similar(receipt, SimilarProbe::for_write(&p), scope)
                 .await;
-            return Ok(self
-                .nudged(ok_written(receipt, &self.web_base(&ctx))?, &ctx)
-                .await
-                .into());
+            return Ok(done_written(receipt, &caller.base));
         };
 
-        match resolved_overwrite(&responses.0) {
-            None => Ok(collision_question(collision_question_text(&p, &permalink)).into()),
+        // Only an elicitation reaches here: the collision above is read only
+        // under one.
+        let answers = match ask {
+            Ask::Elicit(responses) => resolved_overwrite(responses),
+            Ask::Never => None,
+        };
+        match answers {
+            None => Ok(Verdict::Asked(Box::new(collision_question(
+                collision_question_text(&p, &permalink),
+            )))),
             // Unreachable while the guard above stands, and written out anyway:
             // the arm that must never fall through to a write is not one to
             // leave implicit under a `_`.
-            Some(false) => refuse(COLLISION_REFUSAL).map(CallToolResponse::from),
+            Some(false) => Ok(Verdict::Refused(COLLISION_REFUSAL.to_string())),
             // The retry is the original call with the answer applied, so
             // everything else about the write - folder, tags, metadata, the
             // actor - is the caller's, not a reconstruction. What it is not is
@@ -2302,39 +2413,27 @@ impl McpServer {
                     .write_engram_present(
                         &retry,
                         actor.as_deref(),
-                        &scope,
+                        scope,
                         join.as_ref(),
                         peer.as_ref(),
                     )
                     .await
                 {
                     Ok(receipt) => receipt,
-                    Err(e) => return overlay_write_error(e).map(CallToolResponse::from),
+                    Err(e) => return overlay_refusal(e).map(Verdict::Refused),
                 };
                 let receipt = self
-                    .with_similar(receipt, SimilarProbe::for_write(&retry), &scope)
+                    .with_similar(receipt, SimilarProbe::for_write(&retry), scope)
                     .await;
-                Ok(self
-                    .nudged(ok_written(receipt, &self.web_base(&ctx))?, &ctx)
-                    .await
-                    .into())
+                Ok(done_written(receipt, &caller.base))
             }
         }
     }
 
-    #[tool(
-        name = "read_engram",
-        title = "Read engram",
-        description = "Read an engram's full markdown and resolved frontmatter to learn what is already known before acting or writing. Identify it by bare permalink, title or a crystalline:// URL; pass domain to disambiguate. An identifier without crystalline:// is domain-relative: 'onboarding/setup', never 'mydomain/onboarding/setup'. A file path is not an identifier: a miss names the permalink it probably meant. The response flags whether each relation and prose link resolves, summarizes what links back and names a build_context anchor for exploring nearby knowledge. Attachments the engram references come back as resource links; fetch one with resources/read when the file itself matters. Somebody may have the engram open in the web editor while you read it: the reply then carries live: true, present (who is in there) and their unsaved text, which is what the engram says right now - read it as work in progress and expect it to move. An engram open in a live editor is read through the live document whenever you are reading your own view of it, so you see what the person sees; a draft you reach with a share_link answers its author's last saved text instead, so an edit inside one is best sent without expected_checksum. Reading a live document is not a private act: you usually join that person's participant strip by name for a minute, so they can see an agent is reading along. If somebody handed you a draft share-link (dl_...), pass it as share_link to read their draft of the page instead of the page the domain holds; that also opens the draft for this connection, so a later edit_engram of it lands in their copy. A stdio server or an MCP session holds that open until the session ends; a sessionless HTTP connection holds it for 30 minutes after your last call about that draft, so present the link again whenever an edit is refused as unjoined. A link you may only read still opens the draft for reading. Where this instance serves the web UI the reply carries web_url, the address a person opens the engram at, to hand to somebody who wants to see it; add # and a heading's slug to open it at a section.",
-        annotations(read_only_hint = true, open_world_hint = false)
-    )]
-    async fn read_engram(
-        &self,
-        Parameters(p): Parameters<ReadParams>,
-        ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let p = self.localized(p, &ctx).await?;
-        let scope = self.scope_of(&ctx);
+    /// `read_engram` for one caller.
+    async fn read_core(&self, p: ReadParams, caller: &Caller) -> Result<Value, ErrorData> {
+        let p = self.localized_in(p, &caller.scope).await?;
+        let scope = &caller.scope;
         // A link presented here binds it to this account and opens the draft
         // for this holder, so the read below answers the draft it names and a
         // later edit of that page lands in its author's copy. The read itself
@@ -2354,7 +2453,7 @@ impl McpServer {
         // domain's own page in silence would let them report it as somebody's
         // draft.
         if let Some(token) = p.share_link.as_deref() {
-            self.enter_draft(&scope, &ctx, token)
+            self.enter_draft_for(scope, caller.holder.clone(), token)
                 .await
                 .map_err(to_error)?;
         }
@@ -2363,13 +2462,552 @@ impl McpServer {
         // it works, exactly as it names a person who has the page open.
         let mut value = self
             .engine
-            .read_engram_present(&p, &scope, agent_peer(&ctx, &scope).as_ref())
+            .read_engram_present(&p, scope, caller.peer().as_ref())
             .await
             .map_err(to_error)?;
         // The page this caller opens the engram at, worked out here because
         // the base is a fact about the caller rather than about the engram.
-        crate::web_url::attach_engram_url(&mut value, &self.web_base(&ctx));
-        let links = self.attachment_links(&value, &scope).await;
+        crate::web_url::attach_engram_url(&mut value, &caller.base);
+        Ok(value)
+    }
+
+    /// `edit_engram` for one caller.
+    async fn edit_core(
+        &self,
+        p: EditParams,
+        caller: &Caller,
+        ask: Ask<'_>,
+    ) -> Result<Verdict, ErrorData> {
+        let mut p = self.localized_in(p, &caller.scope).await?;
+        // The model an agent reports is client-supplied text exactly as the
+        // client identity is, so it is sanitized the same way and an id that
+        // sanitizes away counts as none reported. Belt and braces rather than
+        // the load-bearing pass: `Engine::stamped_model` sanitizes whatever
+        // reaches it, which is what covers the surfaces that never come through
+        // here (the CLI and the control socket decode these params themselves).
+        // Whether the model is recorded at all is the engine's call rather than
+        // this one either: it resolves the actor the write lands under, and a
+        // person's write never carries a model.
+        p.model = p
+            .model
+            .as_deref()
+            .map(sanitize_actor)
+            .filter(|m| !m.is_empty());
+        // Before the confirmation round, not after it: a question naming an
+        // engram in a domain the caller may not see is the leak this gate
+        // exists to prevent, and a question about a write that would be
+        // refused is a question nobody should be asked.
+        let scope = &caller.scope;
+        if let Some(refusal) = self.refuse_unwritable(&p.domain, scope).await? {
+            return Ok(Verdict::Refused(refusal));
+        }
+        // One key arms the round and every other edit runs untouched. The
+        // parse failure is swallowed rather than reported here on purpose: the
+        // engine is the one place that words it, and asking a user about an
+        // edit that cannot run is worse than letting it fail where it always
+        // failed. Round one resolves before it asks, exactly as the delete's
+        // preview does, so the same rule holds for the identifier as for the
+        // value: what cannot run is never put to a user.
+        if let Ask::Elicit(responses) = ask
+            && let Ok(Some(intent)) = Engine::ack_intent(&p)
+        {
+            match confirmed(responses) {
+                None => {
+                    let preview = self.engine.ack_preview(&p).await.map_err(to_error)?;
+                    return Ok(Verdict::Asked(Box::new(confirm_question(ack_question(
+                        &preview, &intent,
+                    )))));
+                }
+                Some(false) => return Ok(Verdict::Refused(ack_refusal(&intent))),
+                Some(true) => {}
+            }
+        }
+        // Which draft this edit is inside, if any: the link presented on this
+        // call, or - for a session already inside one - the join whose draft
+        // the identifier names. An edit of anything else in that domain is the
+        // session's own, exactly as it was before it joined anything.
+        let join = match p.share_link.as_deref() {
+            Some(token) => Some(
+                self.joined_by_holder(scope, caller.holder.clone(), token)
+                    .await?,
+            ),
+            None => {
+                self.joined_for_holder(scope, caller.holder.as_ref(), &p.domain, &p.identifier)
+                    .await
+            }
+        };
+        let receipt = match self
+            .engine
+            .edit_engram_present(
+                &p,
+                caller.actor().as_deref(),
+                scope,
+                join.as_ref(),
+                caller.peer().as_ref(),
+            )
+            .await
+        {
+            Ok(receipt) => receipt,
+            Err(e) => return overlay_refusal(e).map(Verdict::Refused),
+        };
+        // `for_edit` is `None` for `set_frontmatter` and for any operation that
+        // carried no content, which is what keeps a lifecycle flip silent.
+        let receipt = match SimilarProbe::for_edit(&p) {
+            Some(probe) => self.with_similar(receipt, probe, scope).await,
+            None => receipt,
+        };
+        Ok(done_written(receipt, &caller.base))
+    }
+
+    /// `move_engram` for one caller. It never asks.
+    async fn move_core(&self, p: MoveParams, caller: &Caller) -> Result<Verdict, ErrorData> {
+        let p = self.localized_in(p, &caller.scope).await?;
+        let scope = &caller.scope;
+        // Both ends, because a move writes at both: a caller who may write only
+        // one of the two could otherwise carry knowledge out of a private
+        // domain into a shared one, or into a domain it was never invited to.
+        // A destination it may not see answers the same not-found the source
+        // would - naming a domain is not a way to learn that it exists.
+        //
+        // The destination is gated whether or not it repeats the source's
+        // spelling: an omitted or equal `destination_domain` means the source
+        // domain, which the first gate already passed, so the second call is a
+        // no-op there rather than a case to skip - and a skip is how a check
+        // goes missing when the two spellings stop coinciding.
+        //
+        // Read exactly as `Engine::move_engram` reads it, untrimmed and
+        // unfiltered, the way the REST move route reads it too: a gate that
+        // normalizes what the verb does not is gating a different string from
+        // the one that gets written to, which is the same disagreement between
+        // the gate and the engine that this gate exists to end.
+        let destination = p.destination_domain.as_deref().unwrap_or(&p.domain);
+        for end in [p.domain.as_str(), destination] {
+            if let Some(refusal) = self.refuse_unwritable(end, scope).await? {
+                return Ok(Verdict::Refused(refusal));
+            }
+        }
+        let mut receipt = match self
+            .engine
+            .move_engram_as(&p, caller.actor().as_deref(), scope)
+            .await
+        {
+            Ok(receipt) => receipt,
+            Err(e) => return overlay_refusal(e).map(Verdict::Refused),
+        };
+        // The page address lands on `to` and nowhere else: `from` is the
+        // address the engram stopped answering to.
+        if let Some(to) = receipt.get_mut("to") {
+            crate::web_url::attach_engram_url(to, &caller.base);
+        }
+        Ok(Verdict::Done(receipt))
+    }
+
+    /// `split_engram` for one caller. It never asks.
+    async fn split_core(&self, p: SplitParams, caller: &Caller) -> Result<Verdict, ErrorData> {
+        let p = self.localized_in(p, &caller.scope).await?;
+        // One domain, because a split writes twice inside it: the new engram
+        // lands in the source's domain, so the source's gate is the whole gate.
+        let scope = &caller.scope;
+        if let Some(refusal) = self.refuse_unwritable(&p.domain, scope).await? {
+            return Ok(Verdict::Refused(refusal));
+        }
+        let receipt = match self
+            .engine
+            .split_engram_as(&p, caller.actor().as_deref(), scope)
+            .await
+        {
+            Ok(receipt) => receipt,
+            Err(e) => return overlay_refusal(e).map(Verdict::Refused),
+        };
+        Ok(Verdict::Done(receipt))
+    }
+
+    /// `delete_engram` for one caller.
+    async fn delete_core(
+        &self,
+        p: DeleteParams,
+        caller: &Caller,
+        ask: Ask<'_>,
+    ) -> Result<Verdict, ErrorData> {
+        let p = self.localized_in(p, &caller.scope).await?;
+        // Before the confirmation round, for the reason `edit_engram` states.
+        let scope = &caller.scope;
+        if let Some(refusal) = self.refuse_unwritable(&p.domain, scope).await? {
+            return Ok(Verdict::Refused(refusal));
+        }
+        // The whole confirmation flow lives inside this gate, so a peer that
+        // cannot be asked is served exactly what it was served before the flow
+        // existed: one call, one delete, one `CallToolResult`.
+        if let Ask::Elicit(responses) = ask {
+            match confirmed(responses) {
+                None => {
+                    let preview = self
+                        .engine
+                        .delete_preview_as(&p, scope)
+                        .await
+                        .map_err(to_error)?;
+                    return Ok(Verdict::Asked(Box::new(confirm_question(delete_question(
+                        &preview,
+                    )))));
+                }
+                Some(false) => {
+                    return Ok(Verdict::Refused(
+                        "The delete was not confirmed, so nothing was deleted. Call delete_engram again if the user asks for it."
+                            .to_string(),
+                    ));
+                }
+                Some(true) => {}
+            }
+        }
+        let receipt = match self
+            .engine
+            .delete_engram_as(&p, caller.actor().as_deref(), scope)
+            .await
+        {
+            Ok(receipt) => receipt,
+            Err(e) => return overlay_refusal(e).map(Verdict::Refused),
+        };
+        Ok(Verdict::Done(receipt))
+    }
+
+    /// `search_engrams` for one caller.
+    async fn search_engrams_core(
+        &self,
+        p: SearchParams,
+        caller: &Caller,
+    ) -> Result<Value, ErrorData> {
+        let p = self.localized_in(p, &caller.scope).await?;
+        let mut v = self
+            .engine
+            .search_engrams(&p, &caller.scope)
+            .await
+            .map_err(to_error)?;
+        crate::web_url::attach_template(&mut v, &caller.base);
+        Ok(v)
+    }
+
+    /// `build_context` for one caller.
+    async fn build_context_core(
+        &self,
+        p: ContextParams,
+        caller: &Caller,
+    ) -> Result<Value, ErrorData> {
+        let p = self.localized_in(p, &caller.scope).await?;
+        let mut v = self
+            .engine
+            .build_context(&p, &caller.scope)
+            .await
+            .map_err(to_error)?;
+        crate::web_url::attach_template(&mut v, &caller.base);
+        Ok(v)
+    }
+
+    /// `recent_activity` for one caller.
+    async fn recent_activity_core(
+        &self,
+        p: RecentParams,
+        caller: &Caller,
+    ) -> Result<Value, ErrorData> {
+        let p = self.localized_in(p, &caller.scope).await?;
+        let mut v = self
+            .engine
+            .recent_activity(&p, &caller.scope)
+            .await
+            .map_err(to_error)?;
+        crate::web_url::attach_template(&mut v, &caller.base);
+        Ok(v)
+    }
+
+    /// `list_domains` for one caller.
+    async fn list_domains_core(
+        &self,
+        p: ListDomainsParams,
+        caller: &Caller,
+    ) -> Result<Value, ErrorData> {
+        let v = self
+            .engine
+            .list_domains(&p, &caller.scope)
+            .await
+            .map_err(to_error)?;
+        Ok(v)
+    }
+
+    /// `browse_domain` for one caller.
+    async fn browse_domain_core(
+        &self,
+        p: BrowseParams,
+        caller: &Caller,
+    ) -> Result<Value, ErrorData> {
+        let p = self.localized_in(p, &caller.scope).await?;
+        let mut v = self
+            .engine
+            .browse_domain(&p, &caller.scope)
+            .await
+            .map_err(to_error)?;
+        crate::web_url::attach_template(&mut v, &caller.base);
+        Ok(v)
+    }
+
+    /// `validate_engrams` for one caller.
+    async fn validate_engrams_core(
+        &self,
+        p: ValidateParams,
+        caller: &Caller,
+    ) -> Result<Value, ErrorData> {
+        let p = self.localized_in(p, &caller.scope).await?;
+        let v = self
+            .engine
+            .validate_engrams(&p, &caller.scope)
+            .await
+            .map_err(to_error)?;
+        Ok(v)
+    }
+
+    /// `infer_schema` for one caller.
+    async fn infer_schema_core(&self, p: InferParams, caller: &Caller) -> Result<Value, ErrorData> {
+        let p = self.localized_in(p, &caller.scope).await?;
+        let v = self
+            .engine
+            .infer_schema(&p, &caller.scope)
+            .await
+            .map_err(to_error)?;
+        Ok(v)
+    }
+
+    /// `vocabulary` for one caller.
+    async fn vocabulary_core(
+        &self,
+        p: VocabularyParams,
+        caller: &Caller,
+    ) -> Result<Value, ErrorData> {
+        let p = self.localized_in(p, &caller.scope).await?;
+        let v = self
+            .engine
+            .vocabulary(&p, &caller.scope)
+            .await
+            .map_err(to_error)?;
+        Ok(v)
+    }
+
+    /// `evolve_engrams` for one caller.
+    async fn evolve_engrams_core(
+        &self,
+        p: EvolveParams,
+        caller: &Caller,
+    ) -> Result<Value, ErrorData> {
+        let p = self.localized_in(p, &caller.scope).await?;
+        let v = self
+            .engine
+            .evolve_engrams(&p, &caller.scope)
+            .await
+            .map_err(to_error)?;
+        Ok(v)
+    }
+
+    /// A write verb's [`Verdict`] as the MCP answer: the receipt rendered by
+    /// `render` with the ride-along trailer after it, a refusal as a tool
+    /// error, a question as the round it is.
+    async fn answered(
+        &self,
+        verdict: Verdict,
+        caller: &Caller,
+        render: fn(Value) -> Result<CallToolResult, ErrorData>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        match verdict {
+            Verdict::Done(receipt) => Ok(self.nudged(render(receipt)?, caller).await.into()),
+            Verdict::Refused(text) => refuse(text).map(CallToolResponse::from),
+            Verdict::Asked(question) => Ok((*question).into()),
+        }
+    }
+
+    /// [`McpServer::answered`] for the two write verbs that never ask, whose
+    /// tools answer a plain result.
+    async fn answered_result(
+        &self,
+        verdict: Verdict,
+        caller: &Caller,
+        render: fn(Value) -> Result<CallToolResult, ErrorData>,
+    ) -> Result<CallToolResult, ErrorData> {
+        match verdict {
+            Verdict::Done(receipt) => Ok(self.nudged(render(receipt)?, caller).await),
+            Verdict::Refused(text) => refuse(text),
+            Verdict::Asked(_) => Err(ErrorData::internal_error(
+                "a verb that never asks asked a question",
+                None,
+            )),
+        }
+    }
+}
+
+/// Why a remote `tool` call did not produce an answer.
+pub(crate) enum RemoteToolError {
+    /// Refused in the words an MCP call by the same caller gets as a tool
+    /// error: a write gate, a live document, a call off the allow-list.
+    Refused(String),
+    /// The arguments did not parse, or the engine failed: the message an MCP
+    /// call gets as its protocol error.
+    Failed(String),
+}
+
+impl RemoteToolError {
+    /// The sentence the envelope carries.
+    pub(crate) fn into_message(self) -> String {
+        match self {
+            RemoteToolError::Refused(text) | RemoteToolError::Failed(text) => text,
+        }
+    }
+}
+
+/// A remote call's `args` as the params the MCP handler of the same verb
+/// parses.
+fn remote_args<T: serde::de::DeserializeOwned>(args: Value) -> Result<T, RemoteToolError> {
+    serde_json::from_value(args)
+        .map_err(|e| RemoteToolError::Failed(format!("invalid arguments: {e}")))
+}
+
+/// A verb core's answer for a remote caller: the raw receipt, or the refusal
+/// or error message an MCP call would carry.
+fn remote_verdict(verdict: Result<Verdict, ErrorData>) -> Result<Value, RemoteToolError> {
+    match verdict {
+        Ok(Verdict::Done(value)) => Ok(value),
+        Ok(Verdict::Refused(text)) => Err(RemoteToolError::Refused(text)),
+        // A core asks only under `Ask::Elicit`, and a remote call is always
+        // `Ask::Never`; answered rather than unwrapped all the same.
+        Ok(Verdict::Asked(_)) => Err(RemoteToolError::Failed(
+            "this call needs a confirmation, which a remote connection cannot give".to_string(),
+        )),
+        Err(error) => Err(remote_failed(error)),
+    }
+}
+
+fn remote_failed(error: ErrorData) -> RemoteToolError {
+    RemoteToolError::Failed(error.message.to_string())
+}
+
+impl McpServer {
+    /// One engine verb for a connected machine's `tool` command, through the
+    /// verb core the MCP handler of the same name runs: localized for this
+    /// caller, gated by [`McpServer::refuse_unwritable`], recorded as the
+    /// caller's actor, drawn in an open room as the caller's chip, and inside
+    /// a draft when a share link opened one for the caller's holder. Every
+    /// core runs with [`Ask::Never`], the answer a client that cannot be
+    /// asked gets (decision D12): a delete or an acknowledgment runs as typed,
+    /// an overwrite of a live document is refused, a permalink collision is
+    /// the engine's error. The answer is raw engine JSON, as the control
+    /// socket's `tool` answers, never the session's TOON.
+    ///
+    /// `tool` is one of `remote_ctl::REMOTE_TOOLS`; the route has refused
+    /// anything else, and so does the last arm here. This never reaches the
+    /// engine's sources: a remote call is answered from this server's own
+    /// domains (decision D8).
+    pub(crate) async fn remote_tool(
+        &self,
+        tool: &str,
+        args: Value,
+        caller: &Caller,
+    ) -> Result<Value, RemoteToolError> {
+        match tool {
+            "write_engram" => remote_verdict(
+                self.write_core(remote_args(args)?, caller, Ask::Never)
+                    .await,
+            ),
+            "read_engram" => self
+                .read_core(remote_args(args)?, caller)
+                .await
+                .map_err(remote_failed),
+            "edit_engram" => {
+                remote_verdict(self.edit_core(remote_args(args)?, caller, Ask::Never).await)
+            }
+            "move_engram" => remote_verdict(self.move_core(remote_args(args)?, caller).await),
+            "split_engram" => remote_verdict(self.split_core(remote_args(args)?, caller).await),
+            "delete_engram" => remote_verdict(
+                self.delete_core(remote_args(args)?, caller, Ask::Never)
+                    .await,
+            ),
+            "search_engrams" => self
+                .search_engrams_core(remote_args(args)?, caller)
+                .await
+                .map_err(remote_failed),
+            "build_context" => self
+                .build_context_core(remote_args(args)?, caller)
+                .await
+                .map_err(remote_failed),
+            "recent_activity" => self
+                .recent_activity_core(remote_args(args)?, caller)
+                .await
+                .map_err(remote_failed),
+            "list_domains" => self
+                .list_domains_core(remote_args(args)?, caller)
+                .await
+                .map_err(remote_failed),
+            "browse_domain" => self
+                .browse_domain_core(remote_args(args)?, caller)
+                .await
+                .map_err(remote_failed),
+            "validate_engrams" => self
+                .validate_engrams_core(remote_args(args)?, caller)
+                .await
+                .map_err(remote_failed),
+            "infer_schema" => self
+                .infer_schema_core(remote_args(args)?, caller)
+                .await
+                .map_err(remote_failed),
+            "vocabulary" => self
+                .vocabulary_core(remote_args(args)?, caller)
+                .await
+                .map_err(remote_failed),
+            t if t == crate::EVOLVE_TOOL_NAME => self
+                .evolve_engrams_core(remote_args(args)?, caller)
+                .await
+                .map_err(remote_failed),
+            other => Err(RemoteToolError::Refused(format!(
+                "the tool '{other}' {}",
+                crate::remote_ctl::NOT_REMOTE
+            ))),
+        }
+    }
+}
+
+#[tool_router]
+impl McpServer {
+    #[tool(
+        name = "write_engram",
+        title = "Capture engram",
+        description = "Capture a new engram - a unit of knowledge - into a domain. Writes the markdown file and indexes it. Body bullets: '- [decision] we chose X #tag' become observations, '- rel_type [[Target]]' become relations. domain is required so an engram never lands in the wrong place. Pass folder to file the engram under a topic prefix: reuse the domain's existing layout (browse_domain shows it), start a subfolder when a topic cluster is forming and keep singletons at the root; the folder path becomes the permalink prefix build_context globs as crystalline://domain/folder/*. permalink, status, recorded_at and generated (who wrote it, with which model, and when) are filled in; pass model with your own model id, the one you were told you are (for example claude-opus-5), on every capture, so a later reader can weigh the page by which model wrote it - leave it out only when you do not know it; valid_from/valid_to are never auto-set - absence means always valid; to bound validity pass them inside metadata as plain ISO dates (YYYY-MM-DD). Any other date format is rejected; a sentinel far-future valid_to and an explicit null are dropped, since absence already means valid forever. Recommended type values: engram, guide, decision, architecture, runbook, reference. Recommended status values (guidance, not enforced): stable, implemented, draft, proposed, idea, poc, deprecated, superseded, archived, legacy. stable is the default and the word for knowledge that holds now; current is the legacy alias for the same state, and a status filter on either word matches engrams carrying either. Of those, deprecated, superseded, archived and legacy are the recognized retirement set: a status inside it softly fades in search ranking, any other value ranks at full strength. Errors if the permalink exists in the same folder unless overwrite is true, and an overwrite replaces the engram that owns the permalink in its own file, whatever that file is called; a permalink owned by an engram in another folder is refused whether or not overwrite is set, and no overwrite is offered for it (move_engram it first, or change it in place with edit_engram); it refuses a title that would file the engram as the reserved index.md or log.md (Crystalline generates the folder index itself). On a 2026-07-28 peer that declared an elicitation capability a same-folder permalink collision is not the bare error: the call writes nothing and answers input_required instead, a single-select question offering overwrite or cancel, which the client puts to the user and answers by re-sending the same call with the choice; cancel leaves the existing engram exactly as it is, and an explicit overwrite=true never asks. The vocabulary tool lists tags already in use; reuse one before coining a new tag. Set an optional numeric salience metadata key (0-10) to mark exceptionally valuable knowledge; salient engrams are lifted in hybrid search ranking. Raise it later to elevate an engram that proved load-bearing. The receipt may carry a similar list: up to three existing engrams closest in meaning to what was just written, with guidance - read the one that fits and merge into it, supersede it or link it, and say so; never ignore the list silently. Replacing an engram somebody has open in the web editor is never silent: an overwrite of a live document asks them first, by name, and on a yes it lands in their document (receipt: landed live) rather than over it, so use edit_engram when the change is a targeted one. In a domain in review mode (review: overlay) your write lands in your own private draft; share_changes proposes exactly your drafts for review, and a receipt marked draft means the tree did not move. To capture into somebody's shared draft rather than a copy of your own, pass the draft share-link they handed you (dl_...) as share_link on that call: it opens their draft for this session and the write lands in their copy, at the page the link was minted on and nowhere else.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn write_engram(
+        &self,
+        Parameters(p): Parameters<WriteParams>,
+        responses: InputResponses,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        let caller = self.caller(&ctx);
+        let verdict = self
+            .write_core(p, &caller, Ask::of(&ctx, &responses))
+            .await?;
+        self.answered(verdict, &caller, ok_written).await
+    }
+
+    #[tool(
+        name = "read_engram",
+        title = "Read engram",
+        description = "Read an engram's full markdown and resolved frontmatter to learn what is already known before acting or writing. Identify it by bare permalink, title or a crystalline:// URL; pass domain to disambiguate. An identifier without crystalline:// is domain-relative: 'onboarding/setup', never 'mydomain/onboarding/setup'. A file path is not an identifier: a miss names the permalink it probably meant. The response flags whether each relation and prose link resolves, summarizes what links back and names a build_context anchor for exploring nearby knowledge. Attachments the engram references come back as resource links; fetch one with resources/read when the file itself matters. Somebody may have the engram open in the web editor while you read it: the reply then carries live: true, present (who is in there) and their unsaved text, which is what the engram says right now - read it as work in progress and expect it to move. An engram open in a live editor is read through the live document whenever you are reading your own view of it, so you see what the person sees; a draft you reach with a share_link answers its author's last saved text instead, so an edit inside one is best sent without expected_checksum. Reading a live document is not a private act: you usually join that person's participant strip by name for a minute, so they can see an agent is reading along. If somebody handed you a draft share-link (dl_...), pass it as share_link to read their draft of the page instead of the page the domain holds; that also opens the draft for this connection, so a later edit_engram of it lands in their copy. A stdio server or an MCP session holds that open until the session ends; a sessionless HTTP connection holds it for 30 minutes after your last call about that draft, so present the link again whenever an edit is refused as unjoined. A link you may only read still opens the draft for reading. Where this instance serves the web UI the reply carries web_url, the address a person opens the engram at, to hand to somebody who wants to see it; add # and a heading's slug to open it at a section.",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn read_engram(
+        &self,
+        Parameters(p): Parameters<ReadParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let caller = self.caller(&ctx);
+        let value = self.read_core(p, &caller).await?;
+        let links = self.attachment_links(&value, &caller.scope).await;
         let mut result = ok(value)?;
         result.content.extend(links);
         Ok(result)
@@ -2392,83 +3030,11 @@ impl McpServer {
         responses: InputResponses,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
-        let mut p = self.localized(p, &ctx).await?;
-        // The model an agent reports is client-supplied text exactly as the
-        // client identity is, so it is sanitized the same way and an id that
-        // sanitizes away counts as none reported. Belt and braces rather than
-        // the load-bearing pass: `Engine::stamped_model` sanitizes whatever
-        // reaches it, which is what covers the surfaces that never come through
-        // here (the CLI and the control socket decode these params themselves).
-        // Whether the model is recorded at all is the engine's call rather than
-        // this one either: it resolves the actor the write lands under, and a
-        // person's write never carries a model.
-        p.model = p
-            .model
-            .as_deref()
-            .map(sanitize_actor)
-            .filter(|m| !m.is_empty());
-        // Before the confirmation round, not after it: a question naming an
-        // engram in a domain the caller may not see is the leak this gate
-        // exists to prevent, and a question about a write that would be
-        // refused is a question nobody should be asked.
-        let scope = self.scope_of(&ctx);
-        if let Some(refusal) = self.refuse_unwritable(&p.domain, &scope).await? {
-            return refuse(refusal).map(CallToolResponse::from);
-        }
-        // One key arms the round and every other edit runs untouched. The
-        // parse failure is swallowed rather than reported here on purpose: the
-        // engine is the one place that words it, and asking a user about an
-        // edit that cannot run is worse than letting it fail where it always
-        // failed. Round one resolves before it asks, exactly as the delete's
-        // preview does, so the same rule holds for the identifier as for the
-        // value: what cannot run is never put to a user.
-        if confirmation_supported(&ctx)
-            && let Ok(Some(intent)) = Engine::ack_intent(&p)
-        {
-            match confirmed(&responses.0) {
-                None => {
-                    let preview = self.engine.ack_preview(&p).await.map_err(to_error)?;
-                    return Ok(confirm_question(ack_question(&preview, &intent)).into());
-                }
-                Some(false) => return refuse(ack_refusal(&intent)).map(CallToolResponse::from),
-                Some(true) => {}
-            }
-        }
-        // Which draft this edit is inside, if any: the link presented on this
-        // call, or - for a session already inside one - the join whose draft
-        // the identifier names. An edit of anything else in that domain is the
-        // session's own, exactly as it was before it joined anything.
-        let join = match p.share_link.as_deref() {
-            Some(token) => Some(self.joined_by(&scope, &ctx, token).await?),
-            None => {
-                self.joined_for(&scope, &ctx, &p.domain, &p.identifier)
-                    .await
-            }
-        };
-        let receipt = match self
-            .engine
-            .edit_engram_present(
-                &p,
-                acting_actor(&ctx).as_deref(),
-                &scope,
-                join.as_ref(),
-                agent_peer(&ctx, &scope).as_ref(),
-            )
-            .await
-        {
-            Ok(receipt) => receipt,
-            Err(e) => return overlay_write_error(e).map(CallToolResponse::from),
-        };
-        // `for_edit` is `None` for `set_frontmatter` and for any operation that
-        // carried no content, which is what keeps a lifecycle flip silent.
-        let receipt = match SimilarProbe::for_edit(&p) {
-            Some(probe) => self.with_similar(receipt, probe, &scope).await,
-            None => receipt,
-        };
-        Ok(self
-            .nudged(ok_written(receipt, &self.web_base(&ctx))?, &ctx)
-            .await
-            .into())
+        let caller = self.caller(&ctx);
+        let verdict = self
+            .edit_core(p, &caller, Ask::of(&ctx, &responses))
+            .await?;
+        self.answered(verdict, &caller, ok_written).await
     }
 
     #[tool(
@@ -2487,42 +3053,9 @@ impl McpServer {
         Parameters(p): Parameters<MoveParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        let p = self.localized(p, &ctx).await?;
-        let scope = self.scope_of(&ctx);
-        // Both ends, because a move writes at both: a caller who may write only
-        // one of the two could otherwise carry knowledge out of a private
-        // domain into a shared one, or into a domain it was never invited to.
-        // A destination it may not see answers the same not-found the source
-        // would - naming a domain is not a way to learn that it exists.
-        //
-        // The destination is gated whether or not it repeats the source's
-        // spelling: an omitted or equal `destination_domain` means the source
-        // domain, which the first gate already passed, so the second call is a
-        // no-op there rather than a case to skip - and a skip is how a check
-        // goes missing when the two spellings stop coinciding.
-        //
-        // Read exactly as `Engine::move_engram` reads it, untrimmed and
-        // unfiltered, the way the REST move route reads it too: a gate that
-        // normalizes what the verb does not is gating a different string from
-        // the one that gets written to, which is the same disagreement between
-        // the gate and the engine that this gate exists to end.
-        let destination = p.destination_domain.as_deref().unwrap_or(&p.domain);
-        for end in [p.domain.as_str(), destination] {
-            if let Some(refusal) = self.refuse_unwritable(end, &scope).await? {
-                return refuse(refusal);
-            }
-        }
-        let receipt = match self
-            .engine
-            .move_engram_as(&p, acting_actor(&ctx).as_deref(), &scope)
-            .await
-        {
-            Ok(receipt) => receipt,
-            Err(e) => return overlay_write_error(e),
-        };
-        Ok(self
-            .nudged(ok_moved(receipt, &self.web_base(&ctx))?, &ctx)
-            .await)
+        let caller = self.caller(&ctx);
+        let verdict = self.move_core(p, &caller).await?;
+        self.answered_result(verdict, &caller, ok_moved).await
     }
 
     #[tool(
@@ -2541,22 +3074,9 @@ impl McpServer {
         Parameters(p): Parameters<SplitParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        let p = self.localized(p, &ctx).await?;
-        // One domain, because a split writes twice inside it: the new engram
-        // lands in the source's domain, so the source's gate is the whole gate.
-        let scope = self.scope_of(&ctx);
-        if let Some(refusal) = self.refuse_unwritable(&p.domain, &scope).await? {
-            return refuse(refusal);
-        }
-        let receipt = match self
-            .engine
-            .split_engram_as(&p, acting_actor(&ctx).as_deref(), &scope)
-            .await
-        {
-            Ok(receipt) => receipt,
-            Err(e) => return overlay_write_error(e),
-        };
-        Ok(self.nudged(ok_split(receipt)?, &ctx).await)
+        let caller = self.caller(&ctx);
+        let verdict = self.split_core(p, &caller).await?;
+        self.answered_result(verdict, &caller, ok_split).await
     }
 
     #[tool(
@@ -2576,43 +3096,11 @@ impl McpServer {
         responses: InputResponses,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
-        let p = self.localized(p, &ctx).await?;
-        // Before the confirmation round, for the reason `edit_engram` states.
-        let scope = self.scope_of(&ctx);
-        if let Some(refusal) = self.refuse_unwritable(&p.domain, &scope).await? {
-            return refuse(refusal).map(CallToolResponse::from);
-        }
-        // The whole confirmation flow lives inside this gate, so a peer that
-        // cannot be asked is served exactly what it was served before the flow
-        // existed: one call, one delete, one `CallToolResult`.
-        if confirmation_supported(&ctx) {
-            match confirmed(&responses.0) {
-                None => {
-                    let preview = self
-                        .engine
-                        .delete_preview_as(&p, &scope)
-                        .await
-                        .map_err(to_error)?;
-                    return Ok(confirm_question(delete_question(&preview)).into());
-                }
-                Some(false) => {
-                    return refuse(
-                        "The delete was not confirmed, so nothing was deleted. Call delete_engram again if the user asks for it.",
-                    )
-                    .map(CallToolResponse::from);
-                }
-                Some(true) => {}
-            }
-        }
-        let receipt = match self
-            .engine
-            .delete_engram_as(&p, acting_actor(&ctx).as_deref(), &scope)
-            .await
-        {
-            Ok(receipt) => receipt,
-            Err(e) => return overlay_write_error(e).map(CallToolResponse::from),
-        };
-        Ok(self.nudged(ok(receipt)?, &ctx).await.into())
+        let caller = self.caller(&ctx);
+        let verdict = self
+            .delete_core(p, &caller, Ask::of(&ctx, &responses))
+            .await?;
+        self.answered(verdict, &caller, ok).await
     }
 
     #[tool(
@@ -2626,15 +3114,9 @@ impl McpServer {
         Parameters(p): Parameters<SearchParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        let p = self.localized(p, &ctx).await?;
-        self.engine
-            .search_engrams(&p, &self.scope_of(&ctx))
+        let caller = self.caller(&ctx);
+        self.search_engrams_core(p, &caller)
             .await
-            .map_err(to_error)
-            .map(|mut v| {
-                crate::web_url::attach_template(&mut v, &self.web_base(&ctx));
-                v
-            })
             .and_then(|v| self.ok_found(v))
     }
 
@@ -2649,15 +3131,9 @@ impl McpServer {
         Parameters(p): Parameters<ContextParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        let p = self.localized(p, &ctx).await?;
-        self.engine
-            .build_context(&p, &self.scope_of(&ctx))
+        let caller = self.caller(&ctx);
+        self.build_context_core(p, &caller)
             .await
-            .map_err(to_error)
-            .map(|mut v| {
-                crate::web_url::attach_template(&mut v, &self.web_base(&ctx));
-                v
-            })
             .and_then(|v| self.ok_list(v))
     }
 
@@ -2672,15 +3148,9 @@ impl McpServer {
         Parameters(p): Parameters<RecentParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        let p = self.localized(p, &ctx).await?;
-        self.engine
-            .recent_activity(&p, &self.scope_of(&ctx))
+        let caller = self.caller(&ctx);
+        self.recent_activity_core(p, &caller)
             .await
-            .map_err(to_error)
-            .map(|mut v| {
-                crate::web_url::attach_template(&mut v, &self.web_base(&ctx));
-                v
-            })
             .and_then(|v| self.ok_list(v))
     }
 
@@ -2695,10 +3165,9 @@ impl McpServer {
         Parameters(p): Parameters<ListDomainsParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.engine
-            .list_domains(&p, &self.scope_of(&ctx))
+        let caller = self.caller(&ctx);
+        self.list_domains_core(p, &caller)
             .await
-            .map_err(to_error)
             .and_then(|v| self.ok_list(v))
     }
 
@@ -2713,15 +3182,9 @@ impl McpServer {
         Parameters(p): Parameters<BrowseParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        let p = self.localized(p, &ctx).await?;
-        self.engine
-            .browse_domain(&p, &self.scope_of(&ctx))
+        let caller = self.caller(&ctx);
+        self.browse_domain_core(p, &caller)
             .await
-            .map_err(to_error)
-            .map(|mut v| {
-                crate::web_url::attach_template(&mut v, &self.web_base(&ctx));
-                v
-            })
             .and_then(|v| self.ok_list(v))
     }
 
@@ -2736,11 +3199,9 @@ impl McpServer {
         Parameters(p): Parameters<ValidateParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        let p = self.localized(p, &ctx).await?;
-        self.engine
-            .validate_engrams(&p, &self.scope_of(&ctx))
+        let caller = self.caller(&ctx);
+        self.validate_engrams_core(p, &caller)
             .await
-            .map_err(to_error)
             .and_then(|v| self.ok_list(v))
     }
 
@@ -2755,12 +3216,8 @@ impl McpServer {
         Parameters(p): Parameters<InferParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        let p = self.localized(p, &ctx).await?;
-        self.engine
-            .infer_schema(&p, &self.scope_of(&ctx))
-            .await
-            .map_err(to_error)
-            .and_then(ok)
+        let caller = self.caller(&ctx);
+        self.infer_schema_core(p, &caller).await.and_then(ok)
     }
 
     #[tool(
@@ -2774,11 +3231,9 @@ impl McpServer {
         Parameters(p): Parameters<VocabularyParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        let p = self.localized(p, &ctx).await?;
-        self.engine
-            .vocabulary(&p, &self.scope_of(&ctx))
+        let caller = self.caller(&ctx);
+        self.vocabulary_core(p, &caller)
             .await
-            .map_err(to_error)
             .and_then(|v| self.ok_list(v))
     }
 
@@ -2793,11 +3248,9 @@ impl McpServer {
         Parameters(p): Parameters<EvolveParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        let p = self.localized(p, &ctx).await?;
-        self.engine
-            .evolve_engrams(&p, &self.scope_of(&ctx))
+        let caller = self.caller(&ctx);
+        self.evolve_engrams_core(p, &caller)
             .await
-            .map_err(to_error)
             .and_then(|v| self.ok_list(v))
     }
 
@@ -3973,7 +4426,7 @@ impl ServerHandler for McpServer {
     /// per-connection prohibition forbids, and the decision moved to the
     /// spawned process (see `McpServer::gate`). What survives is
     /// what rmcp's own default does: publishing the peer info, which is what
-    /// `acting_actor` and every `generated.by` write read afterwards, and the
+    /// `client_actor` and every `generated.by` write read afterwards, and the
     /// version echo.
     ///
     /// # A version we do not serve is refused here, but only over HTTP
@@ -4600,15 +5053,10 @@ fn engram_link(domain: &str, permalink: &str, title: &str, web_url: Option<&str>
 /// built from half a shape would send it somewhere else entirely, and no
 /// engine result is worth a panic in the layer that only reports it.
 ///
-/// `base` is where this caller opens the page, so the receipt gains `web_url`
-/// and the link gains the same address in its `_meta`. The payload is written
-/// first and the link reads the URL back off it, which is what keeps the two
-/// from ever naming different pages.
-fn ok_written(
-    mut value: Value,
-    base: &crate::web_url::WebBase,
-) -> Result<CallToolResult, ErrorData> {
-    crate::web_url::attach_engram_url(&mut value, base);
+/// The verb core has already put `web_url` on the receipt for this caller
+/// ([`done_written`]), so the link reads the URL back off it, which is what keeps
+/// the two from ever naming different pages.
+fn ok_written(value: Value) -> Result<CallToolResult, ErrorData> {
     let link = (|| {
         let domain = value.get("domain").and_then(Value::as_str)?;
         let permalink = value.get("permalink").and_then(Value::as_str)?;
@@ -4629,13 +5077,10 @@ fn ok_written(
 /// address the engram answers to now, off the result's own `to` block. Same
 /// tolerance as [`ok_written`] for a shape that is not there.
 ///
-/// The page address lands on `to` and nowhere else: `from` is the address the
-/// engram stopped answering to, which is the one page a person following the
-/// receipt must not be sent to.
-fn ok_moved(mut value: Value, base: &crate::web_url::WebBase) -> Result<CallToolResult, ErrorData> {
-    if let Some(to) = value.get_mut("to") {
-        crate::web_url::attach_engram_url(to, base);
-    }
+/// The page address lands on `to` and nowhere else (the verb core put it
+/// there): `from` is the address the engram stopped answering to, which is the
+/// one page a person following the receipt must not be sent to.
+fn ok_moved(value: Value) -> Result<CallToolResult, ErrorData> {
     let link = (|| {
         let to = value.get("to")?;
         let domain = to.get("domain").and_then(Value::as_str)?;
@@ -5486,12 +5931,25 @@ fn refusal_or_error(e: EngineError) -> Result<CallToolResponse, ErrorData> {
 /// reads adds `.map(CallToolResponse::from)` where it knows which it is; a
 /// second helper that did only that wrapping was one name for no decision.
 fn overlay_write_error(e: EngineError) -> Result<CallToolResult, ErrorData> {
-    match &e {
-        EngineError::Refused(message) if message == OVERLAY_NEEDS_IDENTITY => {
-            refuse(message.clone())
-        }
-        _ => Err(to_error(e)),
+    refuse(overlay_refusal(e)?)
+}
+
+/// [`overlay_write_error`]'s rule before it is rendered: `Ok` with the
+/// teaching text a caller must read, `Err` with the protocol error for every
+/// other engine error. The verb cores read their errors through this, so both
+/// doors refuse in the same words.
+fn overlay_refusal(e: EngineError) -> Result<String, ErrorData> {
+    match e {
+        EngineError::Refused(message) if message == OVERLAY_NEEDS_IDENTITY => Ok(message),
+        other => Err(to_error(other)),
     }
+}
+
+/// A write receipt as a finished [`Verdict`], with the page this caller opens
+/// the engram at.
+fn done_written(mut receipt: Value, base: &crate::web_url::WebBase) -> Verdict {
+    crate::web_url::attach_engram_url(&mut receipt, base);
+    Verdict::Done(receipt)
 }
 
 /// Map an engine error to an rmcp tool error with an actionable message.
@@ -5618,7 +6076,7 @@ mod tests {
     /// thing a participant strip must not be able to say.
     #[test]
     fn an_unauthenticated_caller_gets_no_chip_however_it_names_itself() {
-        // What `agent_peer` resolves on that tier: no gate identity at all,
+        // What `peer_for` resolves on that tier: no gate identity at all,
         // and no draft identity either.
         let nobody = presence_identity(None, &Scope::Anonymous);
         assert!(nobody.is_none(), "the open tier holds nobody in particular");
@@ -5854,7 +6312,7 @@ mod tests {
             ("x-for--ada", "x-ada"),
             ("x--for--ada", "x-ada"),
             // A name that is nothing but the word leaves nothing, which
-            // `acting_actor` reads as no client at all.
+            // `compose_actor` reads as no client at all.
             ("for", ""),
             ("for-for", ""),
             // `for` inside a word is a word, not the join, and is untouched.
