@@ -19,6 +19,7 @@
 pub mod archive;
 pub mod changes;
 pub mod error;
+pub mod fanout;
 pub mod github;
 pub mod merge;
 pub mod mounts;
@@ -33,6 +34,10 @@ pub mod state;
 pub mod token;
 
 pub use error::RemoteError;
+pub use fanout::{
+    Missing, Part, RRF_K, attach_row_urls, merge_evolve, merge_list_domains, merge_recent,
+    merge_search, missing_from, missing_note, part_request_limit,
+};
 pub use github::GitHubProvider;
 pub use github::auth::{DeviceFlowStart, DevicePoll, GITHUB_CLIENT_ID};
 pub use github::{validate_repo, validate_repo_path};
