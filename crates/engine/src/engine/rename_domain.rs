@@ -288,6 +288,19 @@ impl Engine {
                 )
             }));
         }
+        // A name a connected server holds (mounted, or kept for a domain it
+        // does not offer right now) is that source's (decision D13): the
+        // renamed domain would be hidden under it at once. One check for both
+        // modes. A caller who is not the owner is not told which server.
+        if let Some(source) = self.mount_holder(new) {
+            return Err(EngineError::Conflict(
+                if matches!(scope, crate::scope::Scope::Unrestricted) {
+                    format!("'{new}' is a domain from {source} on this machine; pick another name")
+                } else {
+                    format!("'{new}' cannot be used as a name here")
+                },
+            ));
+        }
         let reviewing_draft = if local_only {
             false
         } else {

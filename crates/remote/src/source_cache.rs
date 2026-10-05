@@ -75,7 +75,8 @@ pub fn write_cached(host_dir: &Path, file: &str, cached: &Cached) -> Result<(), 
         .map_err(|e| RemoteError::State(format!("could not save a cached answer: {e}")))
 }
 
-fn stale_or_missing(
+/// `cached` served stale with `failure` recorded in it, or nothing cached.
+pub(crate) fn stale_or_missing(
     host_dir: &Path,
     file: &str,
     cached: Option<Cached>,

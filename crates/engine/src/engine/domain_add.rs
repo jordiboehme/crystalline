@@ -208,8 +208,20 @@ impl Engine {
         // A name a connected server already gave out is the mount's; a new
         // local domain under it is the latecomer and gets the local suffix
         // (decision D13).
+        // A retry is idempotent: the `<name>-local` an earlier add of the same
+        // name registered is answered again rather than counted past.
         let wanted = name;
-        let name = &self.beside_mounts(wanted);
+        let beside = self.beside_mounts(wanted);
+        let first = format!("{wanted}-{}", crystalline_remote::LOCAL_SUFFIX);
+        let earlier_virtual = beside != wanted
+            && self
+                .config
+                .read()
+                .unwrap()
+                .domains
+                .get(&first)
+                .is_some_and(DomainEntry::is_virtual);
+        let name = &if earlier_virtual { first } else { beside };
         if let Some(env) = self.overlay.env_domain(name) {
             return Err(EngineError::Conflict(format!(
                 "domain '{name}' is defined by the environment variable {}; unset it to manage this domain in the config file",
@@ -986,8 +998,6 @@ impl Engine {
             None => 0,
         };
         let mut report = self.domain_remove(name).await?;
-        // A local copy a mount hid is gone now, so nothing hides it any more.
-        self.sync_sources_local();
         self.announce_domain(name, None, Some(audience));
         self.forget_domain_records(name).await;
         // Every draft in this domain has just ended, whichever way each one

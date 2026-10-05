@@ -2325,6 +2325,18 @@ impl Engine {
             .unwrap_or_default()
     }
 
+    /// Refuse a write into a local domain a connected server hides, in the
+    /// words a domain nobody registered gets: a write never lands in the
+    /// hidden copy in the server's place, whatever the caller's scope
+    /// (decision D19). Every write view starts here.
+    pub(crate) fn refuse_shadowed(&self, name: &str) -> Result<()> {
+        let shadowed = self.shadowed_domains();
+        if shadowed.contains(name) {
+            self.domain_entry_scoped(name, &shadowed)?;
+        }
+        Ok(())
+    }
+
     /// This machine's registered domains as the mount table reads them: the
     /// name, its machine-local aliases and its origin identity.
     pub fn local_domains(&self) -> Vec<crystalline_remote::LocalDomain> {
@@ -2347,26 +2359,49 @@ impl Engine {
         }
     }
 
-    /// The name a new local domain gets when `wanted` is already a mounted
-    /// domain's: `<wanted>-local`, counted up past anything taken (decision
-    /// D13). `wanted` itself when no source holds it, and when a domain of
-    /// that name is already registered here: an existing registration keeps
-    /// its name, so adopting it again never registers a second one.
+    /// The source that holds `name` on this machine: the one that mounts
+    /// it, or the one whose `sources.json` record keeps it for a domain it
+    /// does not offer right now (decision D13: a name, once given, stays
+    /// that source's). `None` when no source holds it or none is installed.
+    pub fn mount_holder(&self, name: &str) -> Option<String> {
+        self.sources()?.holder_of(name)
+    }
+
+    /// The name a new local domain gets when a source holds `wanted` (it
+    /// mounts it, or keeps it reserved): `<wanted>-local`, counted up past
+    /// anything taken (decision D13). `wanted` itself when no source holds
+    /// it, and when a domain of that name is already registered here: an
+    /// existing registration keeps its name, so adopting it again never
+    /// registers a second one.
     pub fn beside_mounts(&self, wanted: &str) -> String {
         let Some(sources) = self.sources() else {
             return wanted.to_string();
         };
-        let table = sources.table();
         let registered = self.registered_domain_entries();
-        if table.mount(wanted).is_none() || registered.contains_key(wanted) {
+        if registered.contains_key(wanted) || sources.holder_of(wanted).is_none() {
             return wanted.to_string();
         }
+        let table = sources.table();
+        let held: BTreeSet<String> = table
+            .mounts
+            .iter()
+            .map(|m| m.local.clone())
+            .chain(
+                sources
+                    .records()
+                    .into_iter()
+                    .flat_map(|s| s.mounts.into_iter().map(|m| m.local)),
+            )
+            .collect();
+        let names = self.names.read().unwrap().1.clone();
         let free = |name: &str| {
-            table.mount(name).is_none()
+            !held.contains(name)
                 && !registered.contains_key(name)
                 && !registered
                     .values()
                     .any(|entry| entry.aliases.iter().any(|alias| alias == name))
+                && names.resolve(name).is_none()
+                && self.overlay.env_domain(name).is_none()
         };
         let base = format!("{wanted}-{}", crystalline_remote::LOCAL_SUFFIX);
         if free(&base) {
@@ -2379,20 +2414,23 @@ impl Engine {
     }
 
     /// Add to a new local domain's report what the mounts did to it: the
-    /// name [`Engine::beside_mounts`] gave it when `wanted` was a mount's,
+    /// name [`Engine::beside_mounts`] gave it when a source held `wanted`,
     /// and the line that says it is hidden when it is the same domain as a
     /// mount (its origin), so a fresh registration that answers nothing says
-    /// why. Joined to a `note` the report already carries.
+    /// why. Joined to a `note` the report already carries. The source is
+    /// named; [`Engine::screen_mount_note`] takes the names out for a caller
+    /// who is not the machine owner.
     pub(crate) fn note_beside_mounts(&self, result: &mut Value, wanted: &str, name: &str) {
         let Some(sources) = self.sources() else {
             return;
         };
         let table = sources.table();
         let mut notes = Vec::new();
-        if name != wanted {
+        if name != wanted
+            && let Some(source) = sources.holder_of(wanted)
+        {
             notes.push(format!(
-                "'{wanted}' is a domain from {} on this machine, so this local domain is registered as '{name}'",
-                table.source_of(wanted).unwrap_or_default()
+                "'{wanted}' is a domain from {source} on this machine, so this local domain is registered as '{name}'"
             ));
         }
         for hidden in table.hidden(name) {
@@ -2417,6 +2455,43 @@ impl Engine {
             notes.insert(0, earlier.trim_end_matches('.').to_string());
         }
         result["note"] = json!(notes.join(". "));
+    }
+
+    /// The `note` of an add report with every source's name taken out, for
+    /// a caller who is not the machine owner (a REST admin): which servers
+    /// this machine is connected to is the owner's business. The sentences
+    /// [`Engine::note_beside_mounts`] wrote keep their meaning.
+    pub fn screen_mount_note(&self, result: &mut Value) {
+        let Some(sources) = self.sources() else {
+            return;
+        };
+        let Some(mut note) = result
+            .get("note")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
+            return;
+        };
+        for source in sources.records().into_iter().map(|s| s.name) {
+            note = note
+                .replace(
+                    &format!("is a domain from {source} on this machine"),
+                    "is a domain from a connected server on this machine",
+                )
+                .replace(
+                    &format!(
+                        "is hidden while {source} is connected; disconnect {source} to use it again"
+                    ),
+                    "is hidden while the server it comes from is connected",
+                )
+                .replace(
+                    &format!(
+                        "has a name {source} gave out first; it is hidden until you change its name in config.yaml or disconnect {source}"
+                    ),
+                    "has a name a connected server gave out first; it is hidden until you change its name in config.yaml",
+                );
+        }
+        result["note"] = json!(note);
     }
 
     /// The origin rule the HTTP surface was built with, installed once by

@@ -3440,6 +3440,14 @@ impl McpServer {
                 .domain_add_local(p.domain.as_deref(), p.folder.as_deref())
                 .await
         };
+        // Which servers this machine is connected to is the owner's
+        // business: an HTTP caller's note names none.
+        let result = result.map(|mut report| {
+            if !matches!(self.scope_of(&ctx), Scope::Unrestricted) {
+                self.engine.screen_mount_note(&mut report);
+            }
+            report
+        });
         result.map_err(to_error).and_then(ok)
     }
 

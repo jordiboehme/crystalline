@@ -17,27 +17,47 @@ use std::time::Duration;
 use chrono::Utc;
 use serde_json::Value;
 
-use crate::mounts::{Announcement, LocalDomain, Mount, MountTable, assign};
+use crate::mounts::{Announcement, Hidden, HiddenReason, LocalDomain, Mount, MountTable, assign};
 use crate::server_client::{Connection, ForwardedAgent, RemoteFailure};
 use crate::source_cache::{
     Fetched, HOOK_STATUS_FILE, ROUTING_FILE, STALE_AFTER, cached_offers, fetch_cached, read_cached,
-    stale_line, write_cached,
+    stale_line, stale_or_missing,
 };
 use crate::sources::{
     REMOTE_TOKEN_ENV, SourceRecord, SourcesFile, env_source, load_sources, update_sources,
 };
 
-/// What a fetch answers for a source whose connection could not be opened
-/// (no credential, a keychain that failed): its cache served stale with the
-/// failure recorded, so a reader with no daemon names it too.
-fn not_opened(host_dir: &Path, file: &str, account: &str, failure: RemoteFailure) -> Fetched {
-    match read_cached(host_dir, file, account) {
-        Some(mut cached) => {
-            cached.last_failure = Some(failure.to_string());
-            let _ = write_cached(host_dir, file, &cached);
-            Fetched::Stale { cached, failure }
-        }
-        None => Fetched::Missing(failure),
+/// Whether an open connection still belongs to `record`: the same server,
+/// account and sign-in. A disconnect and a new connect under the same name,
+/// or a fresh sign-in, is another connection.
+fn same_sign_in(open: &SourceRecord, record: &SourceRecord) -> bool {
+    open.url == record.url
+        && open.account == record.account
+        && open.kind == record.kind
+        && open.connected_at == record.connected_at
+        && open.from_env == record.from_env
+}
+
+/// Open one source's connection on a blocking thread (one bounded keychain
+/// read), within `limit`.
+async fn open_connection(
+    record: SourceRecord,
+    dir: PathBuf,
+    token: Option<String>,
+    limit: Duration,
+) -> Result<Arc<Connection>, RemoteFailure> {
+    let name = record.name.clone();
+    let opening = tokio::task::spawn_blocking(move || {
+        Connection::open_with(record, &dir, move |var| {
+            (var == REMOTE_TOKEN_ENV).then(|| token.clone()).flatten()
+        })
+    });
+    match tokio::time::timeout(limit, opening).await {
+        Ok(Ok(opened)) => opened.map(Arc::new),
+        Ok(Err(e)) => Err(RemoteFailure::Credential(e.to_string())),
+        Err(_) => Err(RemoteFailure::Credential(format!(
+            "reading the sign-in for {name} on this machine did not finish in time"
+        ))),
     }
 }
 
@@ -53,7 +73,6 @@ pub struct MountedRouting {
 
 struct Inner {
     file: SourcesFile,
-    local: Vec<LocalDomain>,
     table: Arc<MountTable>,
     failures: BTreeMap<String, String>,
 }
@@ -64,7 +83,14 @@ pub struct SourceSet {
     env_source: Option<SourceRecord>,
     env_token: Option<String>,
     inner: RwLock<Inner>,
-    connections: tokio::sync::Mutex<BTreeMap<String, Arc<Connection>>>,
+    /// This machine's own domains. Apart from `inner`, so the save in
+    /// [`SourceSet::refresh`] reads them as they are when it decides names.
+    local: Arc<RwLock<Vec<LocalDomain>>>,
+    /// Held while a table is computed, so two rebuilds never swap in an
+    /// older table after a newer one. Readers of the table never take it.
+    rebuilding: std::sync::Mutex<()>,
+    /// Never held across an await.
+    connections: std::sync::Mutex<BTreeMap<String, Arc<Connection>>>,
 }
 
 impl SourceSet {
@@ -88,11 +114,12 @@ impl SourceSet {
             env_token,
             inner: RwLock::new(Inner {
                 file,
-                local,
                 table: Arc::new(MountTable::default()),
                 failures: BTreeMap::new(),
             }),
-            connections: tokio::sync::Mutex::new(BTreeMap::new()),
+            local: Arc::new(RwLock::new(local)),
+            rebuilding: std::sync::Mutex::new(()),
+            connections: std::sync::Mutex::new(BTreeMap::new()),
         };
         set.rebuild();
         set
@@ -107,11 +134,12 @@ impl SourceSet {
             env_token: None,
             inner: RwLock::new(Inner {
                 file: SourcesFile::default(),
-                local: Vec::new(),
                 table: Arc::new(MountTable::default()),
                 failures: BTreeMap::new(),
             }),
-            connections: tokio::sync::Mutex::new(BTreeMap::new()),
+            local: Arc::new(RwLock::new(Vec::new())),
+            rebuilding: std::sync::Mutex::new(()),
+            connections: std::sync::Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -128,6 +156,14 @@ impl SourceSet {
         self.inner.write().unwrap_or_else(|e| e.into_inner())
     }
 
+    fn local(&self) -> Vec<LocalDomain> {
+        self.local.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn connections(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Arc<Connection>>> {
+        self.connections.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// The saved file with the environment's source after it.
     fn combined(&self, file: &SourcesFile) -> SourcesFile {
         let mut combined = file.clone();
@@ -137,13 +173,42 @@ impl SourceSet {
         combined
     }
 
-    /// Recompute the table from the caches, without writing anything.
+    /// Recompute the table from the caches, without writing anything. The
+    /// disk reads and the assignment run outside the table's lock, so a read
+    /// that asks what is hidden never waits on them.
+    ///
+    /// A source with no usable cache (none yet, one this build cannot read,
+    /// or one answered for another account) offers nothing, so it mounts
+    /// nothing. Its reserved names still hold, though: every local domain
+    /// under one of them is hidden until the source answers again, so a
+    /// copy is never answered in the server's place while it is down
+    /// (decision D19).
     fn rebuild(&self) -> Vec<Announcement> {
-        let mut inner = self.write();
-        let mut combined = self.combined(&inner.file);
+        let _one_at_a_time = self.rebuilding.lock().unwrap_or_else(|e| e.into_inner());
+        let mut combined = self.combined(&self.read().file);
+        let local = self.local();
         let offers = cached_offers(&combined, &self.remote_dir);
-        let (table, said) = assign(&mut combined, &inner.local, &offers);
-        inner.table = Arc::new(table);
+        let (mut table, said) = assign(&mut combined, &local, &offers);
+        for source in &combined.sources {
+            if offers.contains_key(&source.name) {
+                continue;
+            }
+            for reserved in &source.mounts {
+                if local.iter().any(|d| d.name == reserved.local)
+                    && !table
+                        .hidden(&reserved.local)
+                        .any(|h| h.source == source.name)
+                {
+                    table.shadowed.push(Hidden {
+                        local: reserved.local.clone(),
+                        source: source.name.clone(),
+                        reason: HiddenReason::Copy,
+                        by: reserved.local.clone(),
+                    });
+                }
+            }
+        }
+        self.write().table = Arc::new(table);
         said
     }
 
@@ -180,6 +245,19 @@ impl SourceSet {
         self.records().into_iter().find(|s| s.name == name)
     }
 
+    /// The source that holds `local` on this machine: the one that mounts it,
+    /// or the one whose `sources.json` record keeps it for a domain it does
+    /// not offer right now. `None` when no source holds that name.
+    pub fn holder_of(&self, local: &str) -> Option<String> {
+        if let Some(source) = self.table().source_of(local) {
+            return Some(source.to_string());
+        }
+        self.records()
+            .into_iter()
+            .find(|s| s.mounts.iter().any(|m| m.local == local))
+            .map(|s| s.name)
+    }
+
     /// A source's server URL.
     pub fn source_url(&self, name: &str) -> Option<String> {
         self.record(name).map(|s| s.url)
@@ -192,7 +270,7 @@ impl SourceSet {
 
     /// This machine's own domains changed: recompute who is shadowed.
     pub fn set_local(&self, local: Vec<LocalDomain>) -> Vec<Announcement> {
-        self.write().local = local;
+        *self.local.write().unwrap_or_else(|e| e.into_inner()) = local;
         self.rebuild()
     }
 
@@ -204,11 +282,13 @@ impl SourceSet {
             tracing::warn!("the connected servers could not be read, so none are used: {e}");
             SourcesFile::default()
         });
-        let names = self.combined(&file).names();
+        let records = self.combined(&file).sources;
         self.write().file = file;
-        if let Ok(mut connections) = self.connections.try_lock() {
-            connections.retain(|name, _| names.contains(name));
-        }
+        self.connections().retain(|name, open| {
+            records
+                .iter()
+                .any(|r| &r.name == name && same_sign_in(open.source(), r))
+        });
         self.rebuild()
     }
 
@@ -221,61 +301,98 @@ impl SourceSet {
         let Some(mount) = table.mount(local).cloned() else {
             return Err(format!("'{local}' is not a domain from a connected server"));
         };
-        let taken = {
-            let inner = self.read();
-            inner
-                .local
+        if self
+            .env_source
+            .as_ref()
+            .is_some_and(|e| e.name == mount.source)
+        {
+            return Err(format!(
+                "'{local}' comes from {}, the server CRYSTALLINE_REMOTE_URL names, and its \
+                 domains are named again at every start, so a new name would not last; \
+                 connect that server with crystalline connect to keep a name",
+                mount.source
+            ));
+        }
+        let taken = self
+            .local()
+            .iter()
+            .any(|d| d.name == new || d.aliases.iter().any(|a| a == new))
+            || table.mount(new).is_some()
+            || self
+                .read()
+                .file
+                .sources
                 .iter()
-                .any(|d| d.name == new || d.aliases.iter().any(|a| a == new))
-                || inner
-                    .file
-                    .sources
-                    .iter()
-                    .any(|s| s.mounts.iter().any(|m| m.local == new))
-        };
+                .any(|s| s.mounts.iter().any(|m| m.local == new));
         if taken {
             return Err(format!(
                 "the name '{new}' is taken on this machine; pick another"
             ));
         }
         crystalline_core::config::registration::validate_domain_name(new)?;
-        update_sources(&self.remote_dir, |file| {
+        let renamed = update_sources(&self.remote_dir, |file| {
             if let Some(source) = file.find_mut(&mount.source)
                 && let Some(record) = source.mounts.iter_mut().find(|m| m.remote == mount.remote)
             {
                 record.local = new.to_string();
+                return Ok(true);
             }
-            Ok(())
+            Ok(false)
         })
         .map_err(|e| e.to_string())?;
         self.reload();
-        Ok(())
+        if renamed {
+            Ok(())
+        } else {
+            Err(format!(
+                "{} is no longer connected on this machine, so '{local}' was not renamed",
+                mount.source
+            ))
+        }
     }
 
-    /// The connection to one source, opened on first use. The keychain read
-    /// runs on a blocking thread.
-    async fn connection(&self, name: &str) -> Result<Arc<Connection>, RemoteFailure> {
-        let mut connections = self.connections.lock().await;
-        if let Some(open) = connections.get(name) {
-            return Ok(open.clone());
-        }
+    /// The open connection to `record`, when it is still that sign-in's.
+    fn open_for(&self, record: &SourceRecord) -> Option<Arc<Connection>> {
+        self.connections()
+            .get(&record.name)
+            .filter(|open| same_sign_in(open.source(), record))
+            .cloned()
+    }
+
+    /// Keep a connection just opened, replacing one of an earlier sign-in.
+    fn keep(&self, opened: &Arc<Connection>) {
+        self.connections()
+            .insert(opened.source().name.clone(), opened.clone());
+    }
+
+    /// The connection to one source, opened on first use and opened again
+    /// when the source's record changed (a new sign-in, or a disconnect and a
+    /// connect under the same name). The keychain read runs on a blocking
+    /// thread, within `limit`.
+    async fn connection(
+        &self,
+        name: &str,
+        limit: Duration,
+    ) -> Result<Arc<Connection>, RemoteFailure> {
         let record = self.record(name).ok_or_else(|| {
             RemoteFailure::Refused(format!("no connected server is called {name}"))
         })?;
-        let dir = self.remote_dir.clone();
-        let token = self.env_token.clone();
-        let opened = tokio::task::spawn_blocking(move || {
-            Connection::open_with(record, &dir, move |var| {
-                (var == REMOTE_TOKEN_ENV).then(|| token.clone()).flatten()
-            })
-        })
-        .await
-        .map_err(|e| RemoteFailure::Credential(e.to_string()))??;
-        let opened = Arc::new(opened);
-        connections.insert(name.to_string(), opened.clone());
+        if let Some(open) = self.open_for(&record) {
+            return Ok(open);
+        }
+        let opened = open_connection(
+            record,
+            self.remote_dir.clone(),
+            self.env_token.clone(),
+            limit,
+        )
+        .await?;
+        self.keep(&opened);
         Ok(opened)
     }
 
+    /// Ask every source at once, each within `deadline`, opening the
+    /// connections it needs inside that time too.
     async fn fetch_all(
         &self,
         cmd: &'static str,
@@ -283,27 +400,56 @@ impl SourceSet {
         deadline: Duration,
     ) -> Vec<(String, Fetched)> {
         let mut tasks = tokio::task::JoinSet::new();
-        for record in self.records() {
+        let mut names = BTreeMap::new();
+        let records = self.records();
+        for record in records.clone() {
+            let open = self.open_for(&record);
             let dir = self.remote_dir.clone();
-            let opened = self.connection(&record.name).await;
-            tasks.spawn(async move {
-                let fetched = match opened {
-                    Ok(connection) => fetch_cached(&connection, cmd, file, deadline).await,
+            let token = self.env_token.clone();
+            let name = record.name.clone();
+            let handle = tasks.spawn(async move {
+                let (opened, fresh) = match open {
+                    Some(open) => (Ok(open), false),
+                    None => (
+                        open_connection(record.clone(), dir.clone(), token, deadline).await,
+                        true,
+                    ),
+                };
+                let fetched = match &opened {
+                    Ok(connection) => fetch_cached(connection, cmd, file, deadline).await,
                     Err(failure) => {
-                        not_opened(&record.host_dir(&dir), file, &record.account, failure)
+                        let host_dir = record.host_dir(&dir);
+                        let cached = read_cached(&host_dir, file, &record.account);
+                        stale_or_missing(&host_dir, file, cached, failure.clone())
                     }
                 };
-                (record.name, fetched)
+                let kept = opened.ok().filter(|_| fresh);
+                (record.name, kept, fetched)
             });
+            names.insert(handle.id(), name);
         }
         let mut out = Vec::new();
-        while let Some(done) = tasks.join_next().await {
-            if let Ok(pair) = done {
-                out.push(pair);
+        while let Some(done) = tasks.join_next_with_id().await {
+            match done {
+                Ok((_, (name, kept, fetched))) => {
+                    if let Some(opened) = kept {
+                        self.keep(&opened);
+                    }
+                    out.push((name, fetched));
+                }
+                Err(e) => {
+                    let name = names.get(&e.id()).cloned().unwrap_or_default();
+                    tracing::warn!("asking {name} stopped before it answered: {e}");
+                    out.push((
+                        name.clone(),
+                        Fetched::Missing(RemoteFailure::Refused(format!(
+                            "asking {name} stopped before it answered"
+                        ))),
+                    ));
+                }
             }
         }
-        let order = self.records();
-        out.sort_by_key(|(name, _)| order.iter().position(|s| &s.name == name));
+        out.sort_by_key(|(name, _)| records.iter().position(|s| &s.name == name));
         out
     }
 
@@ -328,11 +474,13 @@ impl SourceSet {
                 }
             }
         }
-        let local = self.read().local.clone();
+        let local = self.local.clone();
         let dir = self.remote_dir.clone();
         let env = self.env_source.clone();
         let saved = tokio::task::spawn_blocking(move || {
             update_sources(&dir, |file| {
+                // Read under the sources lock, as the domains stand now.
+                let local = local.read().unwrap_or_else(|e| e.into_inner()).clone();
                 let mut combined = file.clone();
                 if let Some(env) = &env {
                     combined.sources.push(env.clone());
@@ -347,14 +495,18 @@ impl SourceSet {
             })
         })
         .await;
+        // A name is used only once it is written down (decision D13): when
+        // the save failed, the table stays as it was.
         match saved {
-            Ok(Ok(file)) => self.write().file = file,
+            Ok(Ok(file)) => {
+                self.write().file = file;
+                self.rebuild();
+            }
             Ok(Err(e)) => {
                 tracing::warn!("the names of the connected servers could not be saved: {e}")
             }
             Err(e) => tracing::warn!("the names of the connected servers could not be saved: {e}"),
         }
-        self.rebuild();
         fetched
     }
 
@@ -374,8 +526,10 @@ impl SourceSet {
         agent: &ForwardedAgent,
         deadline: Duration,
     ) -> Result<Value, RemoteFailure> {
-        let connection = self.connection(source).await?;
-        connection.tool_within(tool, args, agent, deadline).await
+        let started = std::time::Instant::now();
+        let connection = self.connection(source, deadline).await?;
+        let left = deadline.saturating_sub(started.elapsed());
+        connection.tool_within(tool, args, agent, left).await
     }
 
     /// The mounted part of the routing block from the caches alone, for a

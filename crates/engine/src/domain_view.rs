@@ -329,6 +329,7 @@ impl<'a> DomainView<'a> {
         name: &str,
         scope: &crate::scope::Scope,
     ) -> Result<DomainView<'a>> {
+        engine.refuse_shadowed(name)?;
         // A domain a rename has paused is waited for before anything is
         // decided about it, and this write is counted until the view goes.
         let ticket = engine.enter_write(name).await?;
@@ -386,6 +387,7 @@ impl<'a> DomainView<'a> {
         scope: &crate::scope::Scope,
         join: Option<&crate::join::Join>,
     ) -> Result<DomainView<'a>> {
+        engine.refuse_shadowed(name)?;
         let joined = join.filter(|j| j.domain == name && engine.reviews_changes(name));
         let Some(join) = joined else {
             return DomainView::for_write(engine, name, scope).await;

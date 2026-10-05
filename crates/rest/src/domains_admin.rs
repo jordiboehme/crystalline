@@ -281,7 +281,10 @@ pub async fn create(
         }
     };
     match report {
-        Ok(report) => {
+        Ok(mut report) => {
+            // A REST caller is never the machine owner: the note names no
+            // connected server.
+            state.engine.screen_mount_note(&mut report);
             if body.private {
                 close_new_domain(&state, &report, caller.name()).await?;
             }
