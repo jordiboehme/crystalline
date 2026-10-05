@@ -56,3 +56,7 @@ pub use sources::{
 pub use token::{
     MAX_IDENTITY_NAME_BYTES, StoredToken, TokenIdentity, TokenStore, valid_identity_name,
 };
+
+/// Where a served instance answers the control protocol for a connected
+/// Crystalline: the server mounts its route here and the client posts here.
+pub const CTL_PATH: &str = "/api/v1/ctl";

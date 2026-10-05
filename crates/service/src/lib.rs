@@ -16,6 +16,7 @@ pub mod instance;
 pub use crystalline_identity::join;
 pub mod mcp;
 pub mod mcp_gate;
+pub mod remote_ctl;
 pub mod runs_in;
 pub use crystalline_identity::scope;
 pub use crystalline_rest as rest;

@@ -873,11 +873,11 @@ async fn localized_request(req: &Value, engine: &Engine) -> Option<Value> {
     Some(req)
 }
 
-fn envelope_ok(data: Value) -> Value {
+pub(crate) fn envelope_ok(data: Value) -> Value {
     json!({ "v": CTL_VERSION, "ok": true, "data": data })
 }
 
-fn envelope_err(message: impl Into<String>) -> Value {
+pub(crate) fn envelope_err(message: impl Into<String>) -> Value {
     json!({ "v": CTL_VERSION, "ok": false, "error": message.into() })
 }
 

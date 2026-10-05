@@ -500,6 +500,36 @@ This is what following `auth.mcp` buys a [Team server with Fluid](#team-server-w
 
 To keep tokens only on a shared instance, set `auth.oauth: false` and stop there - `auth.mcp` still governs agents, only the OAuth surface is off.
 
+## A local Crystalline with domains from shared servers
+
+Your own domains live on your laptop; your team's live on a shared server, and maybe a second team runs another one. Until 0.23 an agent saw one or the other: the hooks and the CLI only knew the local daemon, and a second MCP registration per server pushed every name collision onto you. `crystalline connect` adds a server as a **source**. From then on your local Crystalline offers its own domains and the domains of every connected server at the same time, through the same local daemon, the one MCP registration and the unchanged hooks.
+
+**Connecting.** `crystalline connect https://crystalline.acme.com` checks that a Crystalline server answers there, then signs in through the server's own OAuth: it registers itself as a public client, opens your browser on the consent page and waits on a loopback port for the answer (PKCE with `S256`, a redirect to `http://127.0.0.1:<port>/callback`). On a machine without a browser, or against a server without `auth.oauth`, issue a personal MCP token in Fluid (profile > Agent access) and run `crystalline connect https://crystalline.acme.com --token`; the token is read from stdin or a prompt, never from the command line. Plain `http` is refused unless the server is on this machine. Each source gets a short name, the most specific word of its host (`acme` here); `--name` picks another. Connect as many servers as you like; `crystalline disconnect acme` removes one.
+
+**One name per domain.** Every domain has exactly one source and one name on this machine. A server's domain keeps its own name when it is free. A name, once given, never changes on its own: whoever comes later gets a suffix, `<domain>-<source name>` (`jordi-acme`), whether that is a second server, a domain that appears on a server later, or a local domain you add later. `connect` says so at once and `crystalline status` keeps showing it; `crystalline domain rename jordi-acme acme-notes --local` picks another name. Your agent only ever sees plain names, never a server qualifier.
+
+**The same domain twice.** A team domain you cloned locally and the same domain on a server (the same repository, folder and branch) are one domain. The server wins: its copy is used and your local copy is hidden while you are connected, untouched on disk, and back on `disconnect`. `connect` warns when the hidden copy holds changes you have not shared yet. The same domain on two servers is taken from the one you connected first.
+
+**What it costs.** A call for one domain (read, write, edit, browse) goes only to that domain's source: one hop. A call over all domains (`search_engrams` without `domains`, `recent_activity`, `list_domains`, `evolve_engrams` without a domain) asks your local index and every server in parallel and waits at most `remote.deadline_ms` (3 seconds by default) for each. A server that is slower, or down, is left out of that answer and named in it. Search hits from several indexes are merged by rank (reciprocal rank fusion), because their scores cannot be compared; each server is asked for up to 100 hits per call. Live documents and draft links work on a server's domain: the server sees your agent by name in the participant strip, and a `dl_` share link holds its draft for 30 minutes after your agent's last call.
+
+**What reaches the server.** The local daemon forwards calls to `POST /api/v1/ctl`, the control protocol over HTTPS, with the source's token and the name of the calling agent (for example `claude-code`). The route always needs a token, whatever `auth.mcp` says, runs as the token's account (the same domain rights as over MCP) and serves six commands: `status`, `tool`, `routing_bullets`, `hook_status`, `origin_status` and `origin_changes`. Every other command answers "not available over a remote connection". A `tool` call goes through the same per-tool checks an MCP call by that account does, and `configure` and `provision` are not reachable through it. A server never forwards a call it got this way to its own sources. Only your own sessions reach the servers: an HTTP client of your local daemon never borrows your sign-in.
+
+**What stays on this machine.** The credential of each source lives in the OS keychain under `crystalline-server:<host>`, or in a file only you can read when no keychain works; the token only ever travels to its own server. Per source, `<state_dir>/remote/<host>/` keeps two small cached answers: the routing model with the domain list (`routing.json`) and the maintenance status the end-of-session nudge reads (`hook_status.json`). Nothing else of a server's knowledge is stored here. With a server down, session start prints its cached part of the routing block with one line saying it may be out of date, and its domains are missing from answers until it is back; the hidden local copy of a replaced domain is never used in its place. The local web UI shows your local domains and lists the servers' domains with a link to each server's Fluid.
+
+**Headless machines.** `CRYSTALLINE_REMOTE_URL` and `CRYSTALLINE_REMOTE_TOKEN` (a personal MCP token) add one source without running `connect`, for CI jobs and containers. It is never written down, so its names are worked out again at each start.
+
+```mermaid
+flowchart LR
+    H[Harness] -->|stdio MCP| D[Local daemon: mount table]
+    K[Hooks and CLI] -->|socket| D
+    D --> L[(Local domains)]
+    D -->|HTTPS, Bearer, POST /api/v1/ctl| A[Server acme]
+    D -->|HTTPS, Bearer, POST /api/v1/ctl| B[Server beta]
+    D -.->|server down| C[(routing.json and hook_status.json per server)]
+    N[crystalline connect] -->|OAuth consent in the browser, or a pasted token| A
+    N --> T[(keychain: crystalline-server:host)]
+```
+
 ## Enterprise SSO
 
 Setting `auth.oidc.issuer`, `auth.oidc.client_id` and `auth.oidc.client_secret` (or the three matching `CRYSTALLINE_AUTH_OIDC_*` variables) turns on a sign-in button beside the local one. It is opt-in and additive: local accounts keep working, and an instance with none of the three set behaves exactly as it did before. All seven keys are read once when the HTTP surface starts, like `service.read_only`, so a change takes effect at the next start; a block missing any of the three required keys leaves single sign-on off and says which key is missing in a startup warning rather than refusing to come up.

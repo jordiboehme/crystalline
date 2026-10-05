@@ -293,9 +293,8 @@ enum Challenge {
 /// token is not a credential here, whoever minted it: the setting is read when
 /// the HTTP surface starts, so turning OAuth off stops every token it ever
 /// issued from opening anything, without anybody having to sweep a table.
-fn presented_token(request: &Request, oauth: bool) -> Option<Presented> {
-    let raw = request
-        .headers()
+fn presented_token(headers: &axum::http::HeaderMap, oauth: bool) -> Option<Presented> {
+    let raw = headers
         .get(axum::http::header::AUTHORIZATION)?
         .to_str()
         .ok()?;
@@ -385,6 +384,78 @@ fn store_unavailable() -> Response {
         .into_response()
 }
 
+/// What a bearer credential resolved to, for the two doors that take one: the
+/// MCP transport (through [`McpGate`]) and `POST /api/v1/ctl`
+/// ([`crate::remote_ctl`]). One resolution for both, so a token that opens one
+/// opens the other and a token refused at one is refused at the other in the
+/// same bytes.
+pub(crate) enum Bearer {
+    /// A live credential of this account.
+    Account(McpIdentity),
+    /// No credential, one that is not ours in shape, or one that resolves to
+    /// nobody: the one refusal.
+    Refused(Response),
+    /// The account store could not be read.
+    Unavailable(Response),
+}
+
+/// Resolve the bearer credential in `headers`. `oauth` is this instance's
+/// origin rule when `auth.oauth` is on and `None` otherwise; with it `None`
+/// an OAuth access token is not a credential here at all.
+///
+/// The origin this request arrived at is derived once and used twice: as the
+/// audience an OAuth token must have been minted for, and as the address the
+/// refusal's metadata pointer is built on. Nothing to derive with OAuth off,
+/// and a `Host` the rule will not name - a malformed one, or one
+/// `service.allowed_hosts` does not cover - leaves it `None`, which refuses
+/// every OAuth token and drops the pointer, leaving the bare `Bearer`
+/// challenge. That is the right way round: a request the transport itself
+/// would answer `403` is not one to hand an address to authorize against.
+pub(crate) async fn resolve_bearer(
+    auth: &AuthStore,
+    oauth: Option<&OriginRule>,
+    headers: &axum::http::HeaderMap,
+) -> Bearer {
+    let origin = oauth.and_then(|rule| rule.origin(headers).ok());
+    let challenge = || match oauth {
+        Some(_) => Challenge::Oauth(origin.clone()),
+        None => Challenge::TokenOnly,
+    };
+    let Some(presented) = presented_token(headers, oauth.is_some()) else {
+        return Bearer::Refused(refusal(challenge()));
+    };
+    // One lookup, whichever door the credential came through, and it is also
+    // what stamps `last_used` so a token list or a connected-client list in
+    // Fluid can show when an agent last connected.
+    let resolved = match (&presented, &origin) {
+        (Presented::Mcp(token), _) => auth.mcp_token_user(token).await,
+        (Presented::Oauth(token), Some(origin)) => auth.oauth_access_user(token, origin).await,
+        // No origin is no audience, and an audience-bound credential with
+        // nothing to check the audience against resolves to nobody. The store
+        // is never asked, so nothing about this can be read as the token being
+        // unknown either.
+        (Presented::Oauth(_), None) => Ok(None),
+    };
+    match resolved {
+        Ok(Some(user)) => Bearer::Account(McpIdentity {
+            admin: matches!(user.role, Role::Admin),
+            name: user.name,
+        }),
+        Ok(None) => Bearer::Refused(refusal(challenge())),
+        Err(error) => {
+            // Never the token itself, at any level: the store holds only its
+            // hash, and this is the one place a live one is in hand. Both doors
+            // fail this way, so a store that cannot be read never reads as a
+            // bad credential whichever kind was presented.
+            tracing::error!(
+                error = %format!("{error:#}"),
+                "a bearer check could not read the account store"
+            );
+            Bearer::Unavailable(store_unavailable())
+        }
+    }
+}
+
 impl<S> tower_service::Service<Request> for McpGate<S>
 where
     S: tower_service::Service<Request, Error = Infallible> + Clone + Send + 'static,
@@ -415,88 +486,39 @@ where
         let sessions = self.sessions.clone();
         let oauth = self.oauth.clone();
         Box::pin(async move {
-            // The origin this request arrived at, derived once and used twice:
-            // as the audience an OAuth token must have been minted for, and as
-            // the address the refusal's metadata pointer is built on. Nothing
-            // to derive with OAuth off, and a `Host` the rule will not name -
-            // a malformed one, or one `service.allowed_hosts` does not cover -
-            // leaves it `None`, which refuses every OAuth token and drops the
-            // pointer, leaving the bare `Bearer` challenge. That is the right
-            // way round: a request the transport itself would answer `403` is
-            // not one to hand an address to authorize against.
-            let origin = oauth
-                .as_ref()
-                .and_then(|rule| rule.origin(request.headers()).ok());
-            let challenge = || match &oauth {
-                Some(_) => Challenge::Oauth(origin.clone()),
-                None => Challenge::TokenOnly,
+            let identity = match resolve_bearer(&auth, oauth.as_ref(), request.headers()).await {
+                Bearer::Account(identity) => identity,
+                Bearer::Refused(response) | Bearer::Unavailable(response) => return Ok(response),
             };
-            let Some(presented) = presented_token(&request, oauth.is_some()) else {
-                return Ok(refusal(challenge()));
-            };
-            // One lookup, whichever door the credential came through, and it is
-            // also what stamps `last_used` so a token list or a connected-client
-            // list in Fluid can show when an agent last connected.
-            let resolved = match (&presented, &origin) {
-                (Presented::Mcp(token), _) => auth.mcp_token_user(token).await,
-                (Presented::Oauth(token), Some(origin)) => {
-                    auth.oauth_access_user(token, origin).await
-                }
-                // No origin is no audience, and an audience-bound credential
-                // with nothing to check the audience against resolves to
-                // nobody. The store is never asked, so nothing about this can
-                // be read as the token being unknown either.
-                (Presented::Oauth(_), None) => Ok(None),
-            };
-            match resolved {
-                Ok(Some(user)) => {
-                    let named = session_of(&request);
-                    // A revoked or rotated token never reaches here at all: it
-                    // stops resolving, and the `Ok(None)` arm below refuses it
-                    // with the ordinary 401 whether or not it names a session.
-                    if let Some(session) = &named
-                        && let Some(owner) = sessions.owner(session)
-                        && owner != user.name
-                    {
-                        return Ok(session_mismatch());
-                    }
-                    let terminating = request.method() == axum::http::Method::DELETE;
-                    let name = user.name.clone();
-                    request.extensions_mut().insert(McpIdentity {
-                        admin: matches!(user.role, Role::Admin),
-                        name: user.name,
-                    });
-                    let response = inner.call(request).await?.into_response();
-                    if let Some(session) = minted_session(&response) {
-                        sessions.claim(session, name);
-                    }
-                    // rmcp has already called `close_session` by the time it
-                    // answers a DELETE (`tower.rs:2073`), so the wrapper has
-                    // released this claim already; doing it again here costs a
-                    // map lookup and means the release does not depend on which
-                    // side of that ordering a future rmcp lands on.
-                    if terminating
-                        && response.status().is_success()
-                        && let Some(session) = &named
-                    {
-                        sessions.release(session);
-                    }
-                    Ok(response)
-                }
-                Ok(None) => Ok(refusal(challenge())),
-                Err(error) => {
-                    // Never the token itself, at any level: the store holds
-                    // only its hash, and this is the one place a live one is in
-                    // hand. Both doors fail this way, so a store that cannot be
-                    // read never reads as a bad credential whichever kind was
-                    // presented.
-                    tracing::error!(
-                        error = %format!("{error:#}"),
-                        "MCP gate could not read the account store"
-                    );
-                    Ok(store_unavailable())
-                }
+            let named = session_of(&request);
+            // A revoked or rotated token never reaches here at all: it stops
+            // resolving and `resolve_bearer` refuses it with the ordinary 401
+            // whether or not it names a session.
+            if let Some(session) = &named
+                && let Some(owner) = sessions.owner(session)
+                && owner != identity.name
+            {
+                return Ok(session_mismatch());
             }
+            let terminating = request.method() == axum::http::Method::DELETE;
+            let name = identity.name.clone();
+            request.extensions_mut().insert(identity);
+            let response = inner.call(request).await?.into_response();
+            if let Some(session) = minted_session(&response) {
+                sessions.claim(session, name);
+            }
+            // rmcp has already called `close_session` by the time it answers a
+            // DELETE (`tower.rs:2073`), so the wrapper has released this claim
+            // already; doing it again here costs a map lookup and means the
+            // release does not depend on which side of that ordering a future
+            // rmcp lands on.
+            if terminating
+                && response.status().is_success()
+                && let Some(session) = &named
+            {
+                sessions.release(session);
+            }
+            Ok(response)
         })
     }
 }
@@ -529,7 +551,7 @@ mod tests {
         let live = format!("{MCP_TOKEN_PREFIX}{}", "a".repeat(64));
         assert_eq!(
             credential(&presented_token(
-                &request_with(Some(&format!("Bearer {live}"))),
+                request_with(Some(&format!("Bearer {live}"))).headers(),
                 false
             )),
             Some(live.as_str()),
@@ -537,7 +559,7 @@ mod tests {
         );
         assert_eq!(
             credential(&presented_token(
-                &request_with(Some(&format!("bearer {live}"))),
+                request_with(Some(&format!("bearer {live}"))).headers(),
                 false
             )),
             Some(live.as_str()),
@@ -552,7 +574,7 @@ mod tests {
             Some(&live as &str),
         ] {
             assert!(
-                presented_token(&request_with(rejected), false).is_none(),
+                presented_token(request_with(rejected).headers(), false).is_none(),
                 "must not reach the store: {rejected:?}"
             );
         }
@@ -573,27 +595,31 @@ mod tests {
 
         assert!(
             matches!(
-                presented_token(&request_with(Some(&format!("Bearer {mcp}"))), true),
+                presented_token(request_with(Some(&format!("Bearer {mcp}"))).headers(), true),
                 Some(Presented::Mcp(_))
             ),
             "an MCP token is never looked up as an OAuth one, whatever the setting says"
         );
         assert!(
             matches!(
-                presented_token(&request_with(Some(&format!("Bearer {access}"))), true),
+                presented_token(request_with(Some(&format!("Bearer {access}"))).headers(), true),
                 Some(Presented::Oauth(token)) if token == access
             ),
             "and an access token is never looked up as an MCP one"
         );
         assert!(
-            presented_token(&request_with(Some(&format!("Bearer {access}"))), false).is_none(),
+            presented_token(
+                request_with(Some(&format!("Bearer {access}"))).headers(),
+                false
+            )
+            .is_none(),
             "with OAuth off an access token is not a credential here at all"
         );
         // A refresh token is not an access token: it is spent at the token
         // endpoint and never presented at this door.
         assert!(
             presented_token(
-                &request_with(Some(&format!("Bearer cor_{}", "c".repeat(64)))),
+                request_with(Some(&format!("Bearer cor_{}", "c".repeat(64)))).headers(),
                 true
             )
             .is_none()

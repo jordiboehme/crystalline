@@ -2006,6 +2006,16 @@ fn http_base(
     // both router builders funnel through.
     engine.set_web_origin(Arc::new(origin_rule.clone()));
 
+    // The control protocol for a connected Crystalline. Built from the same
+    // store and origin rule as the gate, and always given the store: this
+    // route needs a token even where `auth.mcp` leaves the MCP transport open.
+    let ctl = crate::remote_ctl::CtlState {
+        engine: engine.clone(),
+        auth: auth.clone(),
+        oauth: oauth.then(|| origin_rule.clone()),
+        origin_rule: origin_rule.clone(),
+    };
+
     // The session manager drives per-request stream priming (e.g. the
     // tools/list response); its own `session_config.sse_retry` default must be
     // cleared independently of `http_config`'s, since `SessionConfig` is
@@ -2072,7 +2082,14 @@ fn http_base(
     // here". See `rest::oauth`.
     let mut router = axum::Router::new()
         .route("/health", axum::routing::get(health))
-        .merge(crate::rest::well_known_routes(oauth.then_some(origin_rule)));
+        .merge(crate::rest::well_known_routes(oauth.then_some(origin_rule)))
+        // One exact path on the outer router, beside the `/api/v1` nest below.
+        // The nest mounts the JSON API under a catch-all for the prefix, and
+        // an exact path wins over a catch-all, so the API keeps every other
+        // path under `/api/v1`, never sees this one, and its session guard
+        // and CSRF check do not run here: this route has its own bearer
+        // check. Mounted whether or not the API is served.
+        .merge(crate::remote_ctl::route(ctl));
     if let Some(rest) = rest {
         router = router.nest("/api/v1", rest);
     }
