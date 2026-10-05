@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::RemoteError;
 
 /// The keyring service name every Crystalline credential is stored under.
-const KEYRING_SERVICE: &str = "crystalline";
+pub(crate) const KEYRING_SERVICE: &str = "crystalline";
 
 /// How long one OS keychain call may take before the backend is treated as
 /// unusable. Generous enough that a machine merely showing the user an
@@ -37,7 +37,7 @@ const KEYRING_SERVICE: &str = "crystalline";
 /// Every keychain touch in this module goes through
 /// [`keyring_call_with_timeout`] under this bound, so no caller - the daemon
 /// least of all - can block on the platform keychain indefinitely.
-const KEYRING_TIMEOUT: Duration = Duration::from_secs(15);
+pub(crate) const KEYRING_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The file name the file-backed store writes within its state directory for
 /// the instance credential. Byte-identical to what every existing install
@@ -77,7 +77,7 @@ const TOKEN_FILE_NAME: &str = "github-token.json";
 /// the same reason).
 const NO_REAL_KEYCHAIN_ENV: &str = "CRYSTALLINE_TEST_NO_KEYCHAIN";
 
-fn refuse_real_keychain() -> bool {
+pub(crate) fn refuse_real_keychain() -> bool {
     std::env::var_os(NO_REAL_KEYCHAIN_ENV).is_some_and(|v| !v.is_empty())
 }
 
@@ -570,8 +570,9 @@ fn quotable(name: &str) -> String {
 /// What one bounded keychain read came back with, as owned data: the
 /// closure that runs on the worker thread maps `keyring`'s own error type
 /// here rather than sending it across, so nothing in the bound depends on
-/// that type staying `Send`.
-enum KeyringRead {
+/// that type staying `Send`. Shared with [`crate::server_token`], which keeps
+/// the server credential under the same service name.
+pub(crate) enum KeyringRead {
     /// The entry exists and holds this serialized token.
     Found(String),
     /// The backend works and holds nothing for this account. Never a
@@ -636,7 +637,11 @@ where
 /// GitHub token: the OS keychain did not answer within 15s" - one fault
 /// described twice. So the framing happens once, at whichever layer is
 /// speaking.
-fn keyring_call_bounded<T, F>(timeout: Duration, operation: &str, f: F) -> Result<T, String>
+pub(crate) fn keyring_call_bounded<T, F>(
+    timeout: Duration,
+    operation: &str,
+    f: F,
+) -> Result<T, String>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
@@ -676,7 +681,7 @@ where
 /// this ever fires, some new path reached the real OS keychain from a test
 /// without going through either of those two functions - the fix is to route
 /// it through them, not to silence this.
-fn refuse_real_keychain_under_test(operation: &str) {
+pub(crate) fn refuse_real_keychain_under_test(operation: &str) {
     if refuse_real_keychain() {
         panic!(
             "a test reached the real OS keychain to {operation} a credential while \
@@ -692,7 +697,7 @@ fn refuse_real_keychain_under_test(operation: &str) {
 /// through. A timeout is reported as [`KeyringRead::Failed`], which is the
 /// same unusable-backend answer a machine with no keychain daemon gives, so
 /// the file fallback takes over on both.
-fn keyring_read(account: &str, timeout: Duration) -> KeyringRead {
+pub(crate) fn keyring_read(account: &str, timeout: Duration) -> KeyringRead {
     refuse_real_keychain_under_test("read");
     let owned = account.to_string();
     let read = keyring_call_bounded(timeout, "read", move || {
@@ -805,14 +810,14 @@ fn delete_file(path: &Path) -> Result<(), RemoteError> {
 /// is not readable by other local accounts. A no-op on non-unix platforms,
 /// which have no equivalent bit this crate manages directly.
 #[cfg(unix)]
-fn set_owner_only(path: &Path) -> Result<(), RemoteError> {
+pub(crate) fn set_owner_only(path: &Path) -> Result<(), RemoteError> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn set_owner_only(_path: &Path) -> Result<(), RemoteError> {
+pub(crate) fn set_owner_only(_path: &Path) -> Result<(), RemoteError> {
     Ok(())
 }
 

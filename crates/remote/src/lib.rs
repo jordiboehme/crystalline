@@ -23,6 +23,7 @@ pub mod github;
 pub mod merge;
 pub mod ops;
 pub mod provider;
+pub mod server_token;
 pub mod state;
 pub mod token;
 
@@ -40,6 +41,7 @@ pub use provider::{
     ChangeKind, CompareResult, Feedback, HeadProbe, OpenProposalRef, OriginSpec, ProposalHandle,
     ProposalRequest, ProposalState, Provider, StackInfo, StackMember, TreeWrite, UpstreamChange,
 };
+pub use server_token::{CredentialKind, ServerCredential, ServerCredentialStore, server_key};
 pub use token::{
     MAX_IDENTITY_NAME_BYTES, StoredToken, TokenIdentity, TokenStore, valid_identity_name,
 };

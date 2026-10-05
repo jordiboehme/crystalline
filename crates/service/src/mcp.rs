@@ -5557,6 +5557,7 @@ fn remote_to_error(e: RemoteError) -> ErrorData {
         | RemoteError::Io(_)
         | RemoteError::State(_)
         | RemoteError::Credential { .. }
+        | RemoteError::ServerCredential { .. }
         | RemoteError::BaseUnavailable => ErrorData::internal_error(message, None),
         RemoteError::NotEnabled
         | RemoteError::NotConnected
