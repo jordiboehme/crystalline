@@ -155,7 +155,9 @@ async fn a_server_that_is_down_is_unreachable_not_a_sign_in_problem() {
     let record = token_source(&server, dir.path(), "acme", "keeper").await;
     server.stop().await;
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let connection = Connection::open(record, dir.path()).unwrap();
+    let connection = Connection::open(record, dir.path())
+        .unwrap()
+        .with_health(Health::new(Duration::from_secs(30)));
     let failure = connection
         .ctl(json!({ "v": 1, "cmd": "status" }))
         .await
@@ -485,7 +487,9 @@ async fn with_the_server_down_the_cache_is_served_stale_and_the_failure_is_recor
     let dir = tempfile::tempdir().unwrap();
     let record = token_source(&server, dir.path(), "acme", "keeper").await;
     let host = record.host_dir(dir.path());
-    let connection = Connection::open(record, dir.path()).unwrap();
+    let connection = Connection::open(record, dir.path())
+        .unwrap()
+        .with_health(Health::new(Duration::from_secs(30)));
     fetch_cached(&connection, "routing_bullets", ROUTING_FILE, BUDGET).await;
     server.stop().await;
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -784,4 +788,34 @@ async fn a_source_that_comes_back_is_used_again_without_a_restart() {
     let data = connection.ctl_data(status()).await.unwrap();
     assert_eq!(data["account"], "keeper");
     assert_eq!(connection.down(), None, "the answer cleared the down state");
+}
+
+/// The per-prompt recall passes its own budget, and a source that does not
+/// answer there opens the window like any other call.
+#[tokio::test]
+async fn the_no_refresh_path_ends_at_its_own_budget_and_opens_the_window() {
+    let (url, _) = blackhole().await;
+    let dir = tempfile::tempdir().unwrap();
+    let connection = Connection::open(pasted(&url, dir.path()), dir.path())
+        .unwrap()
+        .with_health(Health::new(Duration::from_secs(30)));
+    let started = Instant::now();
+    let failure = connection
+        .ctl_without_refresh_within(status(), LIMIT)
+        .await
+        .unwrap_err();
+    assert!(
+        started.elapsed() < LIMIT + Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        failure,
+        RemoteFailure::TimedOut {
+            source: "acme".to_string(),
+            url: url.clone(),
+            after: LIMIT,
+        }
+    );
+    assert_eq!(connection.down(), Some(failure));
 }

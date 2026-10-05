@@ -556,19 +556,21 @@ impl Connection {
     /// within the margin of its expiry.
     pub async fn bearer(&self) -> Result<String, RemoteFailure> {
         self.skip()?;
-        let result = self.bearer_by(Instant::now() + self.limit).await;
+        let result = self
+            .bearer_by(Instant::now() + self.limit, self.limit)
+            .await;
         self.note(&result);
         result
     }
 
-    async fn bearer_by(&self, deadline: Instant) -> Result<String, RemoteFailure> {
+    async fn bearer_by(&self, deadline: Instant, limit: Duration) -> Result<String, RemoteFailure> {
         let current = self.current.lock().await.clone();
         match current {
             Some(credential) if !credential.needs_refresh(Utc::now()) => {
                 Ok(credential.access_token)
             }
             Some(credential) => {
-                self.refresh_by(Some(&credential.access_token), deadline)
+                self.refresh_by(Some(&credential.access_token), deadline, limit)
                     .await
             }
             None => Err(self.sign_in_again()),
@@ -595,7 +597,9 @@ impl Connection {
     /// fresh was refreshed by somebody else, and is used as it is.
     pub async fn refresh(&self, rejected: Option<&str>) -> Result<String, RemoteFailure> {
         self.skip()?;
-        let result = self.refresh_by(rejected, Instant::now() + self.limit).await;
+        let result = self
+            .refresh_by(rejected, Instant::now() + self.limit, self.limit)
+            .await;
         self.note(&result);
         result
     }
@@ -604,6 +608,7 @@ impl Connection {
         &self,
         rejected: Option<&str>,
         deadline: Instant,
+        limit: Duration,
     ) -> Result<String, RemoteFailure> {
         let mut current = self.current.lock().await;
         if let Some(credential) = current.as_ref()
@@ -639,7 +644,7 @@ impl Connection {
             Err(_) => Err(RemoteFailure::TimedOut {
                 source: self.source.name.clone(),
                 url: self.source.url.clone(),
-                after: self.limit,
+                after: limit,
             }),
         }
     }
@@ -669,11 +674,11 @@ impl Connection {
         deadline: Instant,
         limit: Duration,
     ) -> Result<CtlAnswer, RemoteFailure> {
-        let bearer = self.bearer_by(deadline).await?;
+        let bearer = self.bearer_by(deadline, limit).await?;
         match self.post_ctl(request, &bearer, deadline, limit).await? {
             Posted::Answer(answer) => Ok(answer),
             Posted::Unauthorized => {
-                let bearer = self.refresh_by(Some(&bearer), deadline).await?;
+                let bearer = self.refresh_by(Some(&bearer), deadline, limit).await?;
                 match self.post_ctl(request, &bearer, deadline, limit).await? {
                     Posted::Answer(answer) => Ok(answer),
                     Posted::Unauthorized => Err(self.sign_in_again()),
@@ -684,14 +689,22 @@ impl Connection {
 
     /// [`Connection::ctl`] without any refresh.
     pub async fn ctl_without_refresh(&self, request: Value) -> Result<CtlAnswer, RemoteFailure> {
+        self.ctl_without_refresh_within(request, self.limit).await
+    }
+
+    /// [`Connection::ctl_without_refresh`] within `limit` overall: the
+    /// per-prompt recall passes its one second here, so a source that does
+    /// not answer opens its down window like any other call.
+    pub async fn ctl_without_refresh_within(
+        &self,
+        request: Value,
+        limit: Duration,
+    ) -> Result<CtlAnswer, RemoteFailure> {
         self.skip()?;
         let result = async {
             let bearer = self.bearer_without_refresh().await?;
-            let deadline = Instant::now() + self.limit;
-            match self
-                .post_ctl(&request, &bearer, deadline, self.limit)
-                .await?
-            {
+            let deadline = Instant::now() + limit;
+            match self.post_ctl(&request, &bearer, deadline, limit).await? {
                 Posted::Answer(answer) => Ok(answer),
                 Posted::Unauthorized if self.source.kind == CredentialKind::Oauth => {
                     Err(RemoteFailure::Expired {
