@@ -683,9 +683,12 @@ fn client() -> Result<reqwest::Client, SignInError> {
 pub enum Revocation {
     /// The server revoked the grant.
     Revoked,
-    /// The server could not be reached, or refused; why, in plain words. The
-    /// grant stops working after 30 days unused, or is revoked in Fluid.
+    /// The server could not be reached; why, in plain words. The grant stops
+    /// working after 30 days unused, or is revoked in Fluid.
     NotReached(String),
+    /// The server answered, but with this status instead of the revocation
+    /// (OAuth turned off there since, or a failure on its side).
+    Refused(u16),
     /// A pasted token, or a server without a revocation endpoint: forgotten
     /// here only.
     NotApplicable,
@@ -706,14 +709,19 @@ impl Disconnected {
     /// What to tell the person when the grant could not be ended on the
     /// server; `None` when there is nothing to add.
     pub fn note(&self) -> Option<String> {
-        let Revocation::NotReached(why) = &self.revocation else {
-            return None;
+        let what = match &self.revocation {
+            Revocation::NotReached(why) => format!(
+                "could not be reached to end the sign-in there: {why} (check the VPN or the network)"
+            ),
+            Revocation::Refused(status) => {
+                format!("answered {status} instead of ending the sign-in there")
+            }
+            Revocation::Revoked | Revocation::NotApplicable => return None,
         };
         Some(format!(
-            "{} ({}) could not be reached to end the sign-in there: {why} (check the VPN or the network). \
-             This machine has forgotten it anyway. The sign-in can be revoked on the server \
-             later in Fluid under profile > Connected clients, and it stops working by itself \
-             after 30 days unused.",
+            "{} ({}) {what}. This machine has forgotten it anyway. The sign-in can be revoked \
+             on the server later in Fluid under profile > Connected clients, and it stops \
+             working by itself after 30 days unused.",
             self.name, self.url
         ))
     }
@@ -800,7 +808,7 @@ async fn revoke(
         ]));
     match send(request, url, budget).await {
         Ok(answer) if answer.ok() => Revocation::Revoked,
-        Ok(answer) => Revocation::NotReached(format!("the server answered {}", answer.status)),
+        Ok(answer) => Revocation::Refused(answer.status),
         Err(SignInError::Unreachable { detail, .. }) => Revocation::NotReached(detail),
         Err(other) => Revocation::NotReached(other.to_string()),
     }

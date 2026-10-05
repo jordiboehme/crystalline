@@ -656,6 +656,49 @@ async fn disconnect_from_a_server_that_never_answers_ends_at_the_limit() {
     assert!(!source.host_dir(dir.path()).exists());
 }
 
+/// A server that answers the revocation with an error was reached: the
+/// note names its answer and does not send the person to check the network.
+#[tokio::test]
+async fn a_revocation_the_server_refuses_is_not_called_unreachable() {
+    let server = Arc::new(RemoteServer::start(Options::OAUTH).await);
+    let dir = tempfile::tempdir().unwrap();
+    let source = connect_with_browser(
+        &server.origin(),
+        Some("acme"),
+        dir.path(),
+        &[],
+        fake_browser(server.clone(), "keeper", "allow"),
+        no_paste,
+    )
+    .await
+    .unwrap()
+    .source;
+    let origin = server.origin();
+    update_sources(dir.path(), |file| {
+        file.find_mut("acme").unwrap().revocation_endpoint =
+            Some(format!("{origin}/api/v1/oauth/no-such-endpoint"));
+        Ok(())
+    })
+    .unwrap();
+    let gone = disconnect(dir.path(), "acme").await.unwrap().unwrap();
+    let Revocation::Refused(status) = gone.revocation else {
+        panic!(
+            "a server that answered is not unreachable: {:?}",
+            gone.revocation
+        );
+    };
+    assert!(status >= 400, "{status}");
+    let note = gone.note().unwrap();
+    assert!(
+        note.contains(&format!("answered {status}"))
+            && note.contains("forgotten")
+            && !note.contains("VPN"),
+        "{note}"
+    );
+    assert!(load_sources(dir.path()).unwrap().sources.is_empty());
+    assert!(!source.host_dir(dir.path()).exists());
+}
+
 #[tokio::test]
 async fn a_server_that_never_answers_ends_the_sign_in_at_the_limit() {
     warm_up();
