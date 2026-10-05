@@ -21,6 +21,7 @@ pub mod changes;
 pub mod error;
 pub mod github;
 pub mod merge;
+pub mod mounts;
 pub mod ops;
 pub mod provider;
 pub mod server_token;
@@ -32,6 +33,10 @@ pub use error::RemoteError;
 pub use github::GitHubProvider;
 pub use github::auth::{DeviceFlowStart, DevicePoll, GITHUB_CLIENT_ID};
 pub use github::{validate_repo, validate_repo_path};
+pub use mounts::{
+    Announcement, LocalDomain, Mount, MountTable, NameMap, OriginIdentity, RemoteDomain, Route,
+    Skipped, ToolShape, assign, translate_answer,
+};
 pub use ops::{
     ChangeSides, CommitReport, DIRECT_NO_AMEND, DiscardRefusal, DiscardReport, DiscardTarget,
     OriginStatusReport, PlannedAction, ProposeOutcome, ProposeReport, PullReport, SharePlan,

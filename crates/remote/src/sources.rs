@@ -3,10 +3,10 @@
 //! One record per server `crystalline connect` signed in to, in the order
 //! they were connected. That order is load bearing: when two sources bring a
 //! domain of the same name, or the same domain, the one connected first keeps
-//! it (the mount table decides it). Each record also holds every name it handed
-//! out to a domain of its server ([`MountRecord`]), so a name, once given,
-//! never changes on its own: the next assignment reads it back before it
-//! decides anything new.
+//! it ([`crate::mounts::assign`] decides it). Each record also holds every
+//! name it handed out to a domain of its server ([`MountRecord`]), so a name,
+//! once given, never changes on its own: the next assignment reads it back
+//! before it decides anything new.
 //!
 //! The credential is not here. It lives in the keychain or the host folder's
 //! `credential.json` ([`crate::server_token`]); this file holds nothing
@@ -20,8 +20,8 @@
 //!
 //! The environment's source (`CRYSTALLINE_REMOTE_URL` with
 //! `CRYSTALLINE_REMOTE_TOKEN`) is never written here. [`env_source`] builds
-//! it at every load, after the saved ones, so a CI job or a container stays
-//! stateless.
+//! it at every load, after the saved ones, and [`update_sources`] drops it
+//! before it saves, so a CI job or a container stays stateless.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -238,6 +238,8 @@ pub fn update_sources<T>(
     let _lock = SourcesLock::acquire(&remote_dir.join(SOURCES_LOCK))?;
     let mut file = load_sources(remote_dir)?;
     let answer = f(&mut file)?;
+    // The environment's source lives only as long as the process does.
+    file.sources.retain(|s| !s.from_env);
     file.v = SOURCES_VERSION;
     let json = serde_json::to_vec_pretty(&file)
         .map_err(|e| RemoteError::State(format!("could not write the sources: {e}")))?;
@@ -394,6 +396,29 @@ mod tests {
         let text = std::fs::read_to_string(dir.path().join(SOURCES_FILE)).unwrap();
         assert!(text.contains("\"v\": 1"), "{text}");
         assert!(!text.contains("from_env"), "never written: {text}");
+    }
+
+    #[test]
+    fn the_environment_source_is_never_written_to_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = |name: &str| match name {
+            REMOTE_URL_ENV => Some("https://kb.envcorp.com".to_string()),
+            REMOTE_TOKEN_ENV => Some("cmt_env".to_string()),
+            _ => None,
+        };
+        update_sources(dir.path(), |file| {
+            file.upsert(record("https://crystalline.acme.com", "acme"));
+            file.upsert(env_source(env, &file.names()).unwrap());
+            assert_eq!(file.sources.len(), 2, "the change itself sees it");
+            Ok(())
+        })
+        .unwrap();
+        let text = std::fs::read_to_string(dir.path().join(SOURCES_FILE)).unwrap();
+        assert!(!text.contains("envcorp"), "{text}");
+        assert_eq!(
+            load_sources(dir.path()).unwrap().names(),
+            vec!["acme".to_string()]
+        );
     }
 
     #[test]
