@@ -547,7 +547,9 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
             let domain = req.get("domain").and_then(Value::as_str).unwrap_or("");
             let path = req.get("path").and_then(Value::as_str);
             let sides = req.get("sides").and_then(Value::as_bool).unwrap_or(false);
-            match origin_changes_inline(&shared.engine, domain, path, sides).await {
+            match origin_changes_inline(&shared.engine, domain, path, sides, &ShareActor::Owner)
+                .await
+            {
                 Ok(data) => (envelope_ok(data), false),
                 Err(e) => (envelope_err(e.to_string()), false),
             }
@@ -682,23 +684,20 @@ pub(crate) async fn origin_changes_inline(
     domain: &str,
     path: Option<&str>,
     sides: bool,
+    actor: &ShareActor,
 ) -> crate::engine::Result<Value> {
     if let Some(path) = path {
-        let mut listed = engine.local_changes(domain, &ShareActor::Owner).await?;
+        let mut listed = engine.local_changes(domain, actor).await?;
         // Resolved through the detail, which is what refuses an unknown path
         // by name; the list is then exactly that one entry.
-        let one = engine
-            .local_change(domain, path, &ShareActor::Owner, None)
-            .await?;
+        let one = engine.local_change(domain, path, actor, None).await?;
         listed["changes"] = json!([one]);
         return Ok(listed);
     }
     if sides {
-        return engine
-            .local_changes_detailed(domain, &ShareActor::Owner)
-            .await;
+        return engine.local_changes_detailed(domain, actor).await;
     }
-    engine.local_changes(domain, &ShareActor::Owner).await
+    engine.local_changes(domain, actor).await
 }
 
 /// Run a background-equivalent embed pass and record the count on the response.

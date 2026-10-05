@@ -33,7 +33,7 @@ use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 
 use crate::control::{envelope_err, envelope_ok};
-use crate::engine::Engine;
+use crate::engine::{Engine, ShareActor};
 use crate::mcp_gate::{Bearer, McpIdentity, resolve_bearer};
 use crate::params::ListDomainsParams;
 use crate::rest::{AuthStore, OriginRule};
@@ -46,7 +46,43 @@ pub use crystalline_remote::CTL_PATH;
 
 /// The commands a connected Crystalline may send. Pinned exactly by
 /// `tests/remote/ctl.rs::the_remote_allow_lists_are_pinned`.
-pub const REMOTE_COMMANDS: &[&str] = &["status", "tool"];
+pub const REMOTE_COMMANDS: &[&str] = &[
+    "status",
+    "tool",
+    "routing_bullets",
+    "hook_status",
+    "origin_status",
+    "origin_changes",
+];
+
+/// The commands whose answer carries an etag, because a client caches it.
+pub const ETAG_COMMANDS: &[&str] = &["routing_bullets", "hook_status"];
+
+/// The etag of an answer: the sha256 of its JSON. `serde_json` sorts object
+/// keys in this workspace (no `preserve_order`), so the same answer always
+/// hashes the same.
+pub fn etag_of(data: &Value) -> String {
+    use sha2::{Digest, Sha256};
+    let bytes = serde_json::to_vec(data).unwrap_or_default();
+    crystalline_index::hex_lower(&Sha256::digest(&bytes))
+}
+
+/// `data` as an envelope with its etag, or the short `not_modified` answer
+/// when the request already holds that etag.
+fn conditional(request: &Value, data: Value) -> Value {
+    let etag = etag_of(&data);
+    if request.get("if_none_match").and_then(Value::as_str) == Some(etag.as_str()) {
+        return json!({
+            "v": crate::control::CTL_VERSION,
+            "ok": true,
+            "not_modified": true,
+            "etag": etag,
+        });
+    }
+    let mut envelope = envelope_ok(data);
+    envelope["etag"] = json!(etag);
+    envelope
+}
 
 /// The engine verbs a remote `tool` call may run: exactly the ones the control
 /// socket's `tool` command dispatches. Pinned exactly by
@@ -143,9 +179,14 @@ pub(crate) async fn dispatch(
     let answer = match cmd {
         "status" => remote_status(engine, identity, &scope).await,
         "tool" => remote_tool(engine, request, identity, &scope, base).await,
+        "routing_bullets" => routing_model(engine, identity, &scope).await,
+        "hook_status" => hook_status(engine, identity, &scope).await,
+        "origin_status" => origin_status(engine, request, &scope).await,
+        "origin_changes" => origin_changes(engine, request, identity, &scope).await,
         other => Err(format!("'{other}' {NOT_REMOTE}")),
     };
     match answer {
+        Ok(data) if ETAG_COMMANDS.contains(&cmd) => conditional(request, data),
         Ok(data) => envelope_ok(data),
         Err(message) => envelope_err(message),
     }
@@ -183,6 +224,133 @@ async fn remote_status(
         "admin": identity.admin,
         "domains": domains,
     }))
+}
+
+/// The routing model for a connected machine: the whole block's content for
+/// this account, because the machine has no MANIFEST of these domains on
+/// disk, and each domain's origin identity, so it recognizes a domain it
+/// already holds (decision D3). `identity` is unused in 0.23.0; 0.25.0 reads
+/// it to count the Reflections this account curates.
+async fn routing_model(
+    engine: &Arc<Engine>,
+    identity: &McpIdentity,
+    scope: &Scope,
+) -> Result<Value, String> {
+    let _ = identity;
+    let output = engine
+        .routing_model_scoped(scope)
+        .await
+        .map_err(|e| e.to_string())?;
+    let domains: Vec<Value> = output
+        .domains
+        .iter()
+        .map(|d| {
+            json!({
+                "name": d.name,
+                "bullets": d.bullets,
+                "origin": engine.origin_identity_of(&d.name),
+            })
+        })
+        .collect();
+    Ok(json!({ "read_only": output.read_only, "domains": domains }))
+}
+
+/// The names this account may see, which is also the set of names still
+/// registered: a pending domain that was removed since is not named.
+async fn visible_names(
+    engine: &Arc<Engine>,
+    scope: &Scope,
+) -> Result<std::collections::HashSet<String>, String> {
+    let listing = engine
+        .list_domains(
+            &ListDomainsParams {
+                include_routing: false,
+            },
+            scope,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(listing["domains"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| row["name"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// What a connected machine's Stop hook reads: this server's maintenance
+/// record, narrowed to what the account may see. `identity` is unused in
+/// 0.23.0; 0.25.0 fills the `reflect` member from it.
+async fn hook_status(
+    engine: &Arc<Engine>,
+    identity: &McpIdentity,
+    scope: &Scope,
+) -> Result<Value, String> {
+    let _ = identity;
+    let visible = visible_names(engine, scope).await?;
+    let status = crate::maintenance::HookStatus::from_state(&crate::maintenance::load(), &visible);
+    serde_json::to_value(status).map_err(|e| e.to_string())
+}
+
+/// A domain the request names, spelled as this server's local name for this
+/// account. A domain it may not see stays as typed, so it is refused in the
+/// caller's own words.
+async fn localized(engine: &Arc<Engine>, typed: &str, scope: &Scope) -> Result<String, String> {
+    let hidden = engine.hidden_for(scope).await.map_err(|e| e.to_string())?;
+    Ok(engine.localize_visible(typed, &hidden).await)
+}
+
+async fn origin_status(
+    engine: &Arc<Engine>,
+    request: &Value,
+    scope: &Scope,
+) -> Result<Value, String> {
+    let domain = match request.get("domain").and_then(Value::as_str) {
+        Some(typed) => Some(localized(engine, typed, scope).await?),
+        None => None,
+    };
+    let detail = request
+        .get("detail")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let diff = request
+        .get("diff")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    engine
+        .origin_status(domain.as_deref(), detail, diff, scope)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+async fn origin_changes(
+    engine: &Arc<Engine>,
+    request: &Value,
+    identity: &McpIdentity,
+    scope: &Scope,
+) -> Result<Value, String> {
+    let typed = request.get("domain").and_then(Value::as_str).unwrap_or("");
+    let domain = localized(engine, typed, scope).await?;
+    engine
+        .require_domain(&domain, scope)
+        .await
+        .map_err(|e| e.to_string())?;
+    let path = request.get("path").and_then(Value::as_str);
+    let sides = request
+        .get("sides")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    crate::control::origin_changes_inline(
+        engine,
+        &domain,
+        path,
+        sides,
+        &ShareActor::Account(identity.name.clone()),
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// The client half the connected machine forwarded (decision D11), at most

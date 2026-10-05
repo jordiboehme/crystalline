@@ -1700,7 +1700,10 @@ pub async fn origin_changes(
     let db_path = resolve_db(db)?;
     let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
     let domain = localize_standalone(&engine, domain).await;
-    Ok(crate::control::origin_changes_inline(&engine, &domain, path, sides).await?)
+    Ok(
+        crate::control::origin_changes_inline(&engine, &domain, path, sides, &ShareActor::Owner)
+            .await?,
+    )
 }
 
 /// Put named paths of one team domain back the way the team has them, for

@@ -795,6 +795,18 @@ impl Engine {
         ))
     }
 
+    /// The routing model `scope` may see, for a client that renders the block
+    /// itself: a connected Crystalline's session-start hook, which has no
+    /// MANIFEST on disk to read. The same model [`Engine::routing_text_scoped`]
+    /// renders, minus the rendering.
+    pub async fn routing_model_scoped(
+        &self,
+        scope: &crate::scope::Scope,
+    ) -> Result<crystalline_core::PromptOutput> {
+        let hidden = self.hidden_for(scope).await?;
+        Ok(self.routing_output(&hidden))
+    }
+
     // --- browse --------------------------------------------------------------
 
     /// Browse a domain's engrams under a folder path. Works for any registered

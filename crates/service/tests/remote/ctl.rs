@@ -178,7 +178,17 @@ async fn a_bad_body_is_an_envelope_error() {
 #[test]
 fn the_remote_allow_lists_are_pinned() {
     use crystalline_service::remote_ctl::{REMOTE_COMMANDS, REMOTE_TOOLS};
-    assert_eq!(REMOTE_COMMANDS, &["status", "tool"]);
+    assert_eq!(
+        REMOTE_COMMANDS,
+        &[
+            "status",
+            "tool",
+            "routing_bullets",
+            "hook_status",
+            "origin_status",
+            "origin_changes"
+        ]
+    );
     assert_eq!(
         REMOTE_TOOLS,
         &[

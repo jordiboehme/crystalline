@@ -3301,6 +3301,20 @@ impl Engine {
         Ok(self.domain_entry(name)?.origin.is_some())
     }
 
+    /// What makes this domain the same domain as a copy elsewhere: the
+    /// repository, folder and branch its origin tracks, on the forge
+    /// `github.api_url` names. `None` for a domain with no origin, or one
+    /// nobody registered. A connected machine compares it with its own
+    /// domains' (spec A2, A3).
+    pub fn origin_identity_of(&self, name: &str) -> Option<crystalline_remote::OriginIdentity> {
+        let origin = self.domain_entry(name).ok()?.origin?;
+        let api_url = self.config().github.and_then(|g| g.api_url);
+        Some(crystalline_remote::OriginIdentity::of(
+            &origin,
+            api_url.as_deref(),
+        ))
+    }
+
     /// Resolve a registered domain to its content source: a filesystem root for
     /// a file domain, or the database for a virtual domain. Errors when the
     /// domain is not registered (the write path wants that), the layered lookup

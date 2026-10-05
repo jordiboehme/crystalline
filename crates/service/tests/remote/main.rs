@@ -7,6 +7,7 @@
 #[path = "../support/mod.rs"]
 mod support;
 
+mod answers;
 mod ctl;
 mod fixture;
 mod tool;
