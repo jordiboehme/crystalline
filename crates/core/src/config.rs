@@ -98,6 +98,11 @@ pub struct GlobalConfig {
     /// defaults, so every existing config keeps working untouched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recall: Option<RecallConfig>,
+    /// Settings for the servers this machine offers domains from
+    /// (`crystalline connect`). Absent means the defaults, so every existing
+    /// config keeps working untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<RemoteConfig>,
     /// Write-provenance settings. Absent means the actor recorded on a write
     /// is derived from the connected client, so every existing config keeps
     /// working untouched.
@@ -310,6 +315,16 @@ impl GlobalConfig {
             .as_ref()
             .and_then(|r| r.min_score)
             .unwrap_or(DEFAULT_RECALL_MIN_SCORE)
+    }
+
+    /// How long a call over all domains waits for each connected server, from
+    /// `remote.deadline_ms`, clamped to 100 to 60000. Absent means 3000.
+    pub fn remote_deadline_ms(&self) -> u64 {
+        self.remote
+            .as_ref()
+            .and_then(|r| r.deadline_ms)
+            .unwrap_or(DEFAULT_REMOTE_DEADLINE_MS)
+            .clamp(100, 60_000)
     }
 
     /// The configured actor recorded as `generated.by` on every write, from
@@ -897,6 +912,20 @@ pub const DEFAULT_RECALL_LIMIT: u64 = 3;
 /// rounds its own bge-era `0.5015` down to `0.50`. See
 /// `research/2026-09-22-granite-thresholds.md`.
 pub const DEFAULT_RECALL_MIN_SCORE: f64 = 0.69;
+
+/// The `remote` block: how the local daemon treats its connected servers.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteConfig {
+    /// How long a call over all domains waits for each server, in
+    /// milliseconds, 100 to 60000. Absent means 3000.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_ms: Option<u64>,
+}
+
+/// `remote.deadline_ms`'s default: three seconds per server for a call over
+/// all domains, after which the server's domains are left out of that answer
+/// and named.
+pub const DEFAULT_REMOTE_DEADLINE_MS: u64 = 3000;
 
 /// The `identity` block: who Crystalline records as the writer of an engram.
 /// Reads like a settings-page section - see the `configure` tool, which

@@ -155,6 +155,13 @@ const RESERVED_VARS: &[&str] = &[
     // environment in `crate::stub`, never through the settings registry, so
     // reserve it here or every mcpb session logs a spurious warning.
     CHANNEL_ENV,
+    // A connected server from the environment (`crystalline_remote::env_source`):
+    // its URL and a personal MCP token for it. Read straight from the
+    // environment, never through the settings registry, and sharing the
+    // `CRYSTALLINE_REMOTE_` prefix with `remote.deadline_ms`'s own variable,
+    // so reserved here or every container that sets them logs a warning.
+    "CRYSTALLINE_REMOTE_URL",
+    "CRYSTALLINE_REMOTE_TOKEN",
 ];
 
 /// An error parsing the environment overlay. The message names the offending
@@ -1593,5 +1600,13 @@ mod tests {
         // Everything else still prints, so the redaction is targeted rather
         // than blanking the whole struct.
         assert!(debugged.contains("github.enabled"), "{debugged}");
+    }
+
+    #[test]
+    fn the_remote_source_variables_are_reserved_and_the_deadline_is_a_setting() {
+        assert!(is_reserved("CRYSTALLINE_REMOTE_URL"));
+        assert!(is_reserved("CRYSTALLINE_REMOTE_TOKEN"));
+        let ov = overlay(&[("CRYSTALLINE_REMOTE_DEADLINE_MS", "700")]).unwrap();
+        assert_eq!(ov.apply(&GlobalConfig::default()).remote_deadline_ms(), 700);
     }
 }

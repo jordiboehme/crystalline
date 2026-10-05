@@ -12,7 +12,8 @@ use std::path::PathBuf;
 use crystalline_core::config::{
     AuthConfig, CaptureConfig, DatabaseBackend, DatabaseConfig, EvolveConfig, GitHubConfig,
     GlobalConfig, HttpSetting, IdentityConfig, IndexConfig, LoginConfig, OidcConfig, RecallConfig,
-    ResponseFormat, SearchConfig, ServiceConfig, ShareIdentityMode, SkillsConfig, SkillsServe,
+    RemoteConfig, ResponseFormat, SearchConfig, ServiceConfig, ShareIdentityMode, SkillsConfig,
+    SkillsServe,
 };
 use crystalline_index::{DEFAULT_RETIRED_WEIGHT, DEFAULT_SALIENCE_WEIGHT};
 use crystalline_remote::{MAX_IDENTITY_NAME_BYTES, valid_identity_name};
@@ -414,6 +415,16 @@ pub fn registry() -> &'static [SettingSpec] {
             effective: recall_min_score_effective,
         },
         SettingSpec {
+            key: "remote.deadline_ms",
+            doc: "How long a call over all domains (search without domains, recent_activity, list_domains, evolve_engrams without a domain) waits for each connected server, in milliseconds, 100 to 60000 (default 3000); a server that misses it is left out of that answer and named in it",
+            kind: SettingKind::U64,
+            startup_effective: false,
+            secret: false,
+            apply: set_remote_deadline_ms,
+            clear: clear_remote_deadline_ms,
+            effective: remote_deadline_ms_effective,
+        },
+        SettingSpec {
             key: "identity.actor",
             doc: "Who is recorded as the writer of an engram (generated.by), for example team-bot/1.0 or human:jordi; unset means the connected client is used",
             kind: SettingKind::String,
@@ -760,6 +771,14 @@ fn drop_evolve_if_empty(config: &mut GlobalConfig) {
 fn drop_recall_if_empty(config: &mut GlobalConfig) {
     if config.recall.as_ref() == Some(&RecallConfig::default()) {
         config.recall = None;
+    }
+}
+
+/// Drop the `remote` block entirely once every field in it has been cleared,
+/// so an unset config round-trips to exactly the pre-feature shape.
+fn drop_remote_if_empty(config: &mut GlobalConfig) {
+    if config.remote.as_ref() == Some(&RemoteConfig::default()) {
+        config.remote = None;
     }
 }
 
@@ -1714,6 +1733,37 @@ fn recall_min_score_effective(config: &GlobalConfig) -> (String, bool) {
     (config.recall_min_score().to_string(), is_default)
 }
 
+// --- remote.deadline_ms ----------------------------------------------------
+
+fn set_remote_deadline_ms(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    let refused = || {
+        SettingsError(format!(
+            "remote.deadline_ms must be between 100 and 60000, got '{value}'"
+        ))
+    };
+    let parsed: u64 = value.parse().map_err(|_| refused())?;
+    if !(100..=60_000).contains(&parsed) {
+        return Err(refused());
+    }
+    config
+        .remote
+        .get_or_insert_with(RemoteConfig::default)
+        .deadline_ms = Some(parsed);
+    Ok(())
+}
+
+fn clear_remote_deadline_ms(config: &mut GlobalConfig) {
+    if let Some(r) = config.remote.as_mut() {
+        r.deadline_ms = None;
+    }
+    drop_remote_if_empty(config);
+}
+
+fn remote_deadline_ms_effective(config: &GlobalConfig) -> (String, bool) {
+    let is_default = config.remote.as_ref().and_then(|r| r.deadline_ms).is_none();
+    (config.remote_deadline_ms().to_string(), is_default)
+}
+
 // --- identity.actor ---------------------------------------------------------
 
 fn set_identity_actor(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
@@ -2327,7 +2377,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_lists_exactly_the_forty_two_keys_in_order() {
+    fn registry_lists_exactly_the_forty_three_keys_in_order() {
         assert_eq!(
             known_keys(),
             vec![
@@ -2357,6 +2407,7 @@ mod tests {
                 "recall.enabled",
                 "recall.limit",
                 "recall.min_score",
+                "remote.deadline_ms",
                 "identity.actor",
                 "auth.trusted_header",
                 "auth.anonymous",
@@ -2448,6 +2499,10 @@ mod tests {
                 (
                     "recall.min_score",
                     "CRYSTALLINE_RECALL_MIN_SCORE".to_string()
+                ),
+                (
+                    "remote.deadline_ms",
+                    "CRYSTALLINE_REMOTE_DEADLINE_MS".to_string()
                 ),
                 ("identity.actor", "CRYSTALLINE_IDENTITY_ACTOR".to_string()),
                 (
@@ -2989,7 +3044,7 @@ mod tests {
         apply(&mut cfg, "github.enabled", "true").unwrap();
 
         let views = snapshot(&cfg, &EnvOverlay::default());
-        assert_eq!(views.len(), 42);
+        assert_eq!(views.len(), 43);
         assert_eq!(
             views.iter().map(|v| v.key.as_str()).collect::<Vec<_>>(),
             vec![
@@ -3019,6 +3074,7 @@ mod tests {
                 "recall.enabled",
                 "recall.limit",
                 "recall.min_score",
+                "remote.deadline_ms",
                 "identity.actor",
                 "auth.trusted_header",
                 "auth.anonymous",
@@ -3156,15 +3212,15 @@ mod tests {
         assert_eq!(recall_min_score.value, "0.69");
         assert_eq!(recall_min_score.source, SettingSource::Default);
 
-        let identity_actor = &views[26];
+        let identity_actor = &views[27];
         assert_eq!(identity_actor.value, "");
         assert_eq!(identity_actor.source, SettingSource::Default);
 
-        let trusted_header = &views[27];
+        let trusted_header = &views[28];
         assert_eq!(trusted_header.value, "");
         assert_eq!(trusted_header.source, SettingSource::Default);
 
-        let anonymous = &views[28];
+        let anonymous = &views[29];
         assert_eq!(anonymous.value, "false");
         assert_eq!(anonymous.source, SettingSource::Default);
     }
@@ -4458,5 +4514,36 @@ mod tests {
         {
             assert!(spec.startup_effective, "{}", spec.key);
         }
+    }
+
+    #[test]
+    fn the_remote_deadline_is_milliseconds_between_a_tenth_and_sixty_seconds() {
+        let mut cfg = GlobalConfig::default();
+        assert_eq!(cfg.remote_deadline_ms(), 3000, "three seconds unless set");
+        apply(&mut cfg, "remote.deadline_ms", "1500").unwrap();
+        assert_eq!(cfg.remote_deadline_ms(), 1500);
+        for bad in ["99", "60001", "soon", "-1"] {
+            let err = apply(&mut cfg, "remote.deadline_ms", bad).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("remote.deadline_ms must be between 100 and 60000"),
+                "{bad}: {err}"
+            );
+        }
+        unset(&mut cfg, "remote.deadline_ms").unwrap();
+        assert!(
+            cfg.remote.is_none(),
+            "an unset key leaves no empty block behind"
+        );
+    }
+
+    #[test]
+    fn the_remote_deadline_applies_without_a_restart() {
+        let spec = registry()
+            .iter()
+            .find(|s| s.key == "remote.deadline_ms")
+            .unwrap();
+        assert!(!spec.startup_effective, "the next fan-out reads it");
+        assert_eq!(spec.kind, SettingKind::U64);
     }
 }
