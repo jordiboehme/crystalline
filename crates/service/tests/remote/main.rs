@@ -10,4 +10,5 @@ mod support;
 mod answers;
 mod ctl;
 mod fixture;
+mod revoke;
 mod tool;

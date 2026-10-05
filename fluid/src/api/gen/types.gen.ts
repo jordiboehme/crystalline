@@ -1479,6 +1479,25 @@ export type ReviewBody = {
 export type ReviewModeArg = 'overlay' | 'direct';
 
 /**
+ * The form of `POST /oauth/revoke` (RFC 7009 section 2.1).
+ */
+export type RevokeForm = {
+    /**
+     * The registration the token was issued to.
+     */
+    client_id?: string | null;
+    /**
+     * The access token (`coa_`) or refresh token (`cor_`) to revoke. Either
+     * ends the whole grant.
+     */
+    token?: string | null;
+    /**
+     * `access_token` or `refresh_token`. A hint only: the prefix decides.
+     */
+    token_type_hint?: string | null;
+};
+
+/**
  * What a user may do. Ordered least to most privileged; the REST layer maps
  * each endpoint to the minimum role it accepts.
  */
@@ -5561,6 +5580,44 @@ export type RegisterOauthClientResponses = {
 };
 
 export type RegisterOauthClientResponse = RegisterOauthClientResponses[keyof RegisterOauthClientResponses];
+
+export type OauthRevokeData = {
+    /**
+     * The revocation request.
+     */
+    body: RevokeForm;
+    path?: never;
+    query?: never;
+    url: '/api/v1/oauth/revoke';
+};
+
+export type OauthRevokeErrors = {
+    /**
+     * The body is not a form, or it lacks `token` or `client_id` (`invalid_request`).
+     */
+    400: OauthErrorBody;
+    /**
+     * A cookie session did not echo its CSRF token.
+     */
+    403: ProblemDetail;
+    /**
+     * This instance does not serve OAuth: `auth.oauth` is off.
+     */
+    404: ProblemDetail;
+    /**
+     * The accounts database could not be reached.
+     */
+    500: OauthErrorBody;
+};
+
+export type OauthRevokeError = OauthRevokeErrors[keyof OauthRevokeErrors];
+
+export type OauthRevokeResponses = {
+    /**
+     * Revoked, or nothing to revoke.
+     */
+    200: unknown;
+};
 
 export type OauthTokenData = {
     /**

@@ -477,3 +477,91 @@ async fn sync_client(joined: &Joined) -> Doc {
         .unwrap();
     doc
 }
+
+/// The PKCE pair the OAuth tests use (RFC 7636 appendix B).
+pub const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+pub const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+
+/// One OAuth grant, as a client holds it.
+pub struct OauthPair {
+    pub client_id: String,
+    pub access: String,
+    pub refresh: String,
+}
+
+fn encoded(value: &str) -> String {
+    percent_encoding::utf8_percent_encode(value, percent_encoding::NON_ALPHANUMERIC).to_string()
+}
+
+fn form(pairs: &[(&str, &str)]) -> String {
+    pairs
+        .iter()
+        .map(|(name, value)| format!("{}={}", encoded(name), encoded(value)))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+impl RemoteServer {
+    /// A registration, a consent by `account` and an exchange, by hand: the
+    /// grant a signed-in client holds.
+    pub async fn oauth_pair(&self, account: &str) -> OauthPair {
+        let registered: Value = self
+            .http
+            .post(format!("{}/api/v1/oauth/register", self.origin()))
+            .json(&json!({ "client_name": "remote test", "redirect_uris": ["http://127.0.0.1/callback"] }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let client_id = registered["client_id"].as_str().unwrap().to_string();
+        let redirect = "http://127.0.0.1:9/callback";
+        let authorize = format!(
+            "{}/api/v1/oauth/authorize?response_type=code&client_id={}&redirect_uri={}&code_challenge={CHALLENGE}&code_challenge_method=S256&state=s1",
+            self.origin(),
+            encoded(&client_id),
+            encoded(redirect),
+        );
+        let location = self.consent(account, &authorize).await;
+        let code = location
+            .split(['?', '&'])
+            .find_map(|pair| pair.strip_prefix("code="))
+            .unwrap()
+            .to_string();
+        let exchanged: Value = self
+            .http
+            .post(format!("{}/api/v1/oauth/token", self.origin()))
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(form(&[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("redirect_uri", redirect),
+                ("code_verifier", VERIFIER),
+                ("client_id", &client_id),
+                ("resource", &self.origin()),
+            ]))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        OauthPair {
+            client_id,
+            access: exchanged["access_token"].as_str().unwrap().to_string(),
+            refresh: exchanged["refresh_token"].as_str().unwrap().to_string(),
+        }
+    }
+
+    /// `POST /api/v1/oauth/revoke` with `pairs` as the form.
+    pub async fn revoke(&self, pairs: &[(&str, &str)]) -> reqwest::Response {
+        self.http
+            .post(format!("{}/api/v1/oauth/revoke", self.origin()))
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(form(pairs))
+            .send()
+            .await
+            .unwrap()
+    }
+}

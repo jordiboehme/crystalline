@@ -3758,6 +3758,31 @@ impl AuthStore {
         Ok(changed > 0)
     }
 
+    /// Revoke the grant `token` belongs to - its access token or its refresh
+    /// token - when it was issued to `client_id`, reporting whether a row went.
+    ///
+    /// For RFC 7009 revocation, where a public client presents a token and its
+    /// own `client_id` and nothing else. The client must match, so a leaked
+    /// token cannot be revoked by a stranger's registration; the endpoint
+    /// answers the same either way, so a caller learns nothing from it.
+    pub async fn revoke_oauth_grant_by_token(&self, token: &str, client_id: &str) -> Result<bool> {
+        let hash = token_hash(token);
+        let _guard = self.guard.lock().await;
+        let changed = self
+            .conn
+            .execute(
+                "DELETE FROM oauth_grants
+                 WHERE (access_hash = ?1 OR refresh_hash = ?1) AND client_id = ?2",
+                vec![Value::Text(hash), Value::Text(client_id.to_string())],
+            )
+            .await
+            .context("revoking an oauth grant by its token")?;
+        if changed > 0 {
+            tracing::info!(client_id, "revoked an oauth grant by its token");
+        }
+        Ok(changed > 0)
+    }
+
     /// Drop every OAuth grant of one account. Called by both removal paths
     /// inside their transaction, for the reason [`AuthStore::delete_mcp_tokens_of`]
     /// documents one table over: `oauth_grants` carries no foreign key, so a

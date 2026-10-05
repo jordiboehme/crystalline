@@ -74,7 +74,7 @@ pub use oauth::ALWAYS_ALLOWED_HOSTS;
 pub use oauth::{
     AUTHORIZATION_SERVER_PATH, AUTHORIZATIONS_PATH, AUTHORIZE_PATH, CONSENT_PAGE,
     MAX_OAUTH_CLIENTS, MAX_REGISTER_BYTES, MAX_TOKEN_BYTES, OauthError, OauthServer, OriginRule,
-    PROTECTED_RESOURCE_PATH, REGISTER_PATH, REGISTRATION_BURST, REGISTRATION_WINDOW,
+    PROTECTED_RESOURCE_PATH, REGISTER_PATH, REGISTRATION_BURST, REGISTRATION_WINDOW, REVOKE_PATH,
     RegistrationLimiter, TOKEN_PATH, redirect_matches, redirect_uri_problem, resource_metadata_url,
     well_known_routes,
 };
@@ -220,6 +220,7 @@ use crate::scope::{DomainAccess, DomainRight};
         oauth_grants::list,
         oauth_grants::revoke,
         oauth::token,
+        oauth::revoke,
         identity_links::list,
         identity_links::unlink,
         draft_links::mint,
@@ -308,6 +309,7 @@ use crate::scope::{DomainAccess, DomainRight};
         oauth::DecisionResponse,
         schemas::OauthGrantInfo,
         oauth::TokenForm,
+        oauth::RevokeForm,
         oauth::TokenResponse,
         schemas::EngramChanged,
         schemas::DomainChanged,
@@ -671,6 +673,13 @@ fn routes(state: RestState) -> Router {
         .route(
             oauth::TOKEN_PATH,
             post(oauth::token).route_layer(DefaultBodyLimit::max(oauth::MAX_TOKEN_BYTES)),
+        )
+        // RFC 7009 revocation, public by path for the token route's reason:
+        // the caller is a program holding a token, never a session. Its own
+        // small body limit, for the same reason too.
+        .route(
+            oauth::REVOKE_PATH,
+            post(oauth::revoke).route_layer(DefaultBodyLimit::max(oauth::MAX_TOKEN_BYTES)),
         )
         .route("/domains", get(domains::list).post(domains_admin::create))
         // Admin only, enforced in the handler like every other admin route

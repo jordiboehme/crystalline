@@ -3657,6 +3657,9 @@ async fn review_mode_route_is_owner_only_and_in_the_matrix() {
 /// the code rather than off the caller. What bounds it is the PKCE verifier
 /// behind the challenge the authorization was started with, and that, the RFC
 /// 6749 refusals and the rotation rules are pinned by `tests/auth/oauth.rs`.
+/// The revocation endpoint is the same case again: the grant it ends comes off
+/// the token in the body, not off the caller, and it is pinned by
+/// `tests/remote/revoke.rs`.
 /// The rename row's admin leg really renames `eng` (see its own comment in
 /// `write_ops()`), so every row that still addresses `eng` by that name has
 /// to run before it - an invariant a comment alone cannot enforce. A row
@@ -3686,6 +3689,7 @@ fn write_ops_covers_every_mutating_route_mounted() {
         "POST /api/v1/auth/setup",
         "POST /api/v1/oauth/register",
         "POST /api/v1/oauth/token",
+        "POST /api/v1/oauth/revoke",
     ];
 
     let mutating: BTreeSet<String> = crate::support::MOUNTED_OPERATIONS

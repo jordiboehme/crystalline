@@ -141,6 +141,9 @@ pub const CONSENT_PAGE: &str = "/authorize";
 /// Where a code or a refresh token is exchanged, relative to the API mount.
 pub const TOKEN_PATH: &str = "/oauth/token";
 
+/// RFC 7009 token revocation, under the API mount like the other three.
+pub const REVOKE_PATH: &str = "/oauth/revoke";
+
 /// Where a client registers itself, relative to the API mount.
 pub const REGISTER_PATH: &str = "/oauth/register";
 
@@ -878,6 +881,7 @@ fn authorization_server_document(origin: &str) -> Value {
         "authorization_endpoint": api_url(origin, AUTHORIZE_PATH),
         "token_endpoint": api_url(origin, TOKEN_PATH),
         "registration_endpoint": api_url(origin, REGISTER_PATH),
+        "revocation_endpoint": api_url(origin, REVOKE_PATH),
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code", "refresh_token"],
         "code_challenge_methods_supported": ["S256"],
@@ -3214,6 +3218,116 @@ async fn rotate_refresh(
     }
 }
 
+/// The form of `POST /oauth/revoke` (RFC 7009 section 2.1).
+#[derive(serde::Deserialize, utoipa::ToSchema)]
+pub struct RevokeForm {
+    /// The access token (`coa_`) or refresh token (`cor_`) to revoke. Either
+    /// ends the whole grant.
+    pub token: Option<String>,
+    /// `access_token` or `refresh_token`. A hint only: the prefix decides.
+    pub token_type_hint: Option<String>,
+    /// The registration the token was issued to.
+    #[schema(example = "coc_0f1e2d3c4b5a69788796a5b4c3d2e1f0")]
+    pub client_id: Option<String>,
+}
+
+impl std::fmt::Debug for RevokeForm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RevokeForm")
+            .field("token", &self.token.as_ref().map(|_| "[redacted]"))
+            .field("token_type_hint", &self.token_type_hint)
+            .field("client_id", &self.client_id)
+            .finish()
+    }
+}
+
+/// `POST /oauth/revoke` - end a grant by one of its tokens.
+///
+/// What `crystalline disconnect` calls, and what any public client may call:
+/// it holds no session and needs none, since the token it presents is the
+/// proof. The answer is `200` whether or not anything matched (RFC 7009
+/// section 2.2): a revocation of something already gone has done its job, and
+/// a different answer would tell a prober which tokens are live.
+#[utoipa::path(
+    post,
+    path = "/api/v1/oauth/revoke",
+    tag = "oauth",
+    operation_id = "oauth_revoke",
+    summary = "Revoke an OAuth grant by one of its tokens.",
+    description = "RFC 7009 token revocation, form-encoded. `token` is the \
+                   access or the refresh token and `client_id` the registration \
+                   it was issued to; either token ends the whole grant. The \
+                   answer is 200 with an empty body whether or not a grant \
+                   matched.",
+    request_body(
+        content = RevokeForm,
+        content_type = "application/x-www-form-urlencoded",
+        description = "The revocation request.",
+    ),
+    responses(
+        (status = 200, description = "Revoked, or nothing to revoke."),
+        (
+            status = 400,
+            description = "The body is not a form, or it lacks `token` or \
+                           `client_id` (`invalid_request`).",
+            body = OauthErrorBody,
+        ),
+        (
+            status = 403,
+            description = "A cookie session did not echo its CSRF token.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "This instance does not serve OAuth: `auth.oauth` \
+                           is off.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 500,
+            description = "The accounts database could not be reached.",
+            body = OauthErrorBody,
+        ),
+    ),
+)]
+pub async fn revoke(
+    State(state): State<RestState>,
+    form: Result<Form<RevokeForm>, FormRejection>,
+) -> Result<(NoStore, StatusCode), OauthError> {
+    state.oauth.as_ref().ok_or_else(OauthError::no_oauth_here)?;
+    let Form(form) = form.map_err(|_| {
+        OauthError::invalid_request(
+            "a revocation is a form body sent as application/x-www-form-urlencoded",
+        )
+    })?;
+    let token = form
+        .token
+        .as_deref()
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| OauthError::invalid_request("a revocation names the token to revoke"))?;
+    let client_id = form
+        .client_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|client| !client.is_empty())
+        .ok_or_else(|| {
+            OauthError::invalid_request("a revocation names the client_id the token was issued to")
+        })?;
+    if token.starts_with(super::auth_store::OAUTH_ACCESS_PREFIX)
+        || token.starts_with(super::auth_store::OAUTH_REFRESH_PREFIX)
+    {
+        state
+            .auth
+            .revoke_oauth_grant_by_token(token, client_id)
+            .await
+            .map_err(|error| store_unavailable("revoking an oauth grant", &error))?;
+    }
+    Ok((no_store(), StatusCode::OK))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3998,6 +4112,7 @@ mod tests {
                 "authorization_endpoint": "https://knowledge.example/api/v1/oauth/authorize",
                 "token_endpoint": "https://knowledge.example/api/v1/oauth/token",
                 "registration_endpoint": "https://knowledge.example/api/v1/oauth/register",
+                "revocation_endpoint": "https://knowledge.example/api/v1/oauth/revoke",
                 "response_types_supported": ["code"],
                 "grant_types_supported": ["authorization_code", "refresh_token"],
                 "code_challenge_methods_supported": ["S256"],

@@ -462,6 +462,7 @@ flowchart LR
 | `GET /api/v1/oauth/authorize` | Starts an authorization: validates the client, redirect URI and PKCE challenge, then redirects the browser to the Fluid consent screen |
 | `GET /api/v1/oauth/authorizations/{id}` and `POST /api/v1/oauth/authorizations/{id}` | The consent screen's own read and decision, guarded like any other Fluid page - the account making the decision has to be signed in |
 | `POST /api/v1/oauth/token` | Turns an authorization code into a token pair, or a refresh token into a fresh one |
+| `POST /api/v1/oauth/revoke` | Ends a grant by its access or refresh token (RFC 7009); `crystalline disconnect` calls it. Answers `200` whether or not the token was live |
 
 **Registration is open, and bounded rather than gated.** Anything may call `POST /api/v1/oauth/register`, the way any browser may load a login page: at most 30 registrations per 10 minutes per process, a 64 KiB request body, and at most 1000 stored registrations at once. A registration nobody ever brings to consent is pruned an hour after it was made, so an anonymous caller filling the table costs an operator nothing to wait out; one that has completed at least one consent is pruned only after 30 days with no further use. `client_name` is optional and shown on the consent screen (default "an MCP client" when a client sends none); `client_uri` and `redirect_uris` are the rest of what a client controls about how it is described.
 

@@ -7620,6 +7620,72 @@
         }
       }
     },
+    "/api/v1/oauth/revoke": {
+      "post": {
+        "tags": [
+          "oauth"
+        ],
+        "summary": "Revoke an OAuth grant by one of its tokens.",
+        "description": "RFC 7009 token revocation, form-encoded. `token` is the access or the refresh token and `client_id` the registration it was issued to; either token ends the whole grant. The answer is 200 with an empty body whether or not a grant matched.",
+        "operationId": "oauth_revoke",
+        "requestBody": {
+          "description": "The revocation request.",
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "$ref": "#/components/schemas/RevokeForm"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Revoked, or nothing to revoke."
+          },
+          "400": {
+            "description": "The body is not a form, or it lacks `token` or `client_id` (`invalid_request`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OauthErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A cookie session did not echo its CSRF token.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "This instance does not serve OAuth: `auth.oauth` is off.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The accounts database could not be reached.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OauthErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/oauth/token": {
       "post": {
         "tags": [
@@ -10841,6 +10907,34 @@
           "overlay",
           "direct"
         ]
+      },
+      "RevokeForm": {
+        "type": "object",
+        "description": "The form of `POST /oauth/revoke` (RFC 7009 section 2.1).",
+        "properties": {
+          "client_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The registration the token was issued to.",
+            "example": "coc_0f1e2d3c4b5a69788796a5b4c3d2e1f0"
+          },
+          "token": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The access token (`coa_`) or refresh token (`cor_`) to revoke. Either\nends the whole grant."
+          },
+          "token_type_hint": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`access_token` or `refresh_token`. A hint only: the prefix decides."
+          }
+        }
       },
       "Role": {
         "type": "string",
