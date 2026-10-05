@@ -8074,3 +8074,65 @@ async fn the_remote_origin_changes_run_as_the_calling_account() {
     .await;
     assert_eq!(status["ok"], true, "{status}");
 }
+
+/// The remote `origin_status` runs under the account's scope: for a domain
+/// the account cannot see it answers exactly as for a domain nobody
+/// registered, and the all-domains form never lists it.
+#[tokio::test]
+async fn the_remote_origin_status_hides_a_domain_the_account_cannot_see() {
+    let f = build_fixture(MANIFEST, true, true, None, true, true).await;
+    let auth = Arc::new(AuthStore::open(&f.root.join("web-auth.db")).await.unwrap());
+    let router = http_router(
+        f.engine.clone(),
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        &[],
+        auth.clone(),
+        None,
+    )
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    for who in ["alice", "bob"] {
+        auth.add_user(who, who, None, Role::Editor, "pw12345678")
+            .await
+            .unwrap();
+    }
+    auth.set_domain_visibility("team", true, "alice")
+        .await
+        .unwrap();
+    let token = auth.issue_mcp_token("bob", "t").await.unwrap().token;
+    let ask = |body: serde_json::Value| {
+        let token = token.clone();
+        async move {
+            reqwest::Client::new()
+                .post(format!("http://{addr}/api/v1/ctl"))
+                .bearer_auth(token)
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap()
+        }
+    };
+    let hidden = ask(serde_json::json!({ "v": 1, "cmd": "origin_status", "domain": "team" })).await;
+    let unknown =
+        ask(serde_json::json!({ "v": 1, "cmd": "origin_status", "domain": "nosuch" })).await;
+    assert_eq!(hidden["ok"], false, "{hidden}");
+    assert_eq!(
+        hidden.to_string().replace("team", "X"),
+        unknown.to_string().replace("nosuch", "X"),
+        "a private domain answers like one nobody registered"
+    );
+    let all = ask(serde_json::json!({ "v": 1, "cmd": "origin_status" })).await;
+    assert!(!all.to_string().contains("team"), "{all}");
+}
