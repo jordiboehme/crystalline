@@ -532,6 +532,11 @@ async fn a_connect_behind_the_sets_back_is_picked_up_by_the_look() {
     assert!(set.reload_if_changed().is_some(), "sources.json changed");
     assert_eq!(set.table().mount("open").unwrap().source, "acme");
     assert!(set.reload_if_changed().is_none(), "and only once");
+    set.refresh(Duration::from_secs(5)).await;
+    assert!(
+        set.reload_if_changed().is_none(),
+        "what a refresh saved is what the set holds, so the look never asks the servers again"
+    );
     assert!(
         set.set_local_if_changed(machine.engine.local_domains())
             .is_none(),
