@@ -104,6 +104,9 @@ const EVOLVE_TOOL: &str = "evolve_engrams";
 /// What every unreachable or timed-out failure says, and what
 /// [`crate::stale_line`] recognises it by.
 pub(crate) const UNREACHABLE_WORDS: &str = "cannot be reached right now";
+/// What the failure of a server without the control protocol says, and
+/// what [`crate::stale_line`] recognises it by.
+pub(crate) const TOO_OLD_WORDS: &str = "does not serve the remote control protocol";
 /// What a person can do about a source that does not answer.
 const NETWORK_HINT: &str =
     "check the VPN or the network; it recovers by itself once the server answers again";
@@ -414,6 +417,19 @@ struct TokenAnswer {
     expires_in: u64,
 }
 
+/// The credential in hand, shared with a running refresh job so the job can
+/// read the newest pair under the refresh lock and keep what it rotated even
+/// when its caller stopped waiting.
+type Held = Arc<std::sync::Mutex<Option<ServerCredential>>>;
+
+fn read_held(held: &Held) -> Option<ServerCredential> {
+    held.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+fn store_held(held: &Held, credential: ServerCredential) {
+    *held.lock().unwrap_or_else(|e| e.into_inner()) = Some(credential);
+}
+
 /// The HTTP client in hand and when the wall clock last saw it used.
 struct HttpSlot {
     client: reqwest::Client,
@@ -430,7 +446,7 @@ pub struct Connection {
     limit: Duration,
     /// The credential in hand. Only ever locked for a clone or a store,
     /// never across a wait: the refresh lock keeps a refresh single-flight.
-    current: std::sync::Mutex<Option<ServerCredential>>,
+    current: Held,
 }
 
 impl Connection {
@@ -472,7 +488,7 @@ impl Connection {
             store,
             health: Health::shared(),
             limit: ONE_DOMAIN_LIMIT,
-            current: std::sync::Mutex::new(Some(credential)),
+            current: Arc::new(std::sync::Mutex::new(Some(credential))),
         })
     }
 
@@ -536,14 +552,7 @@ impl Connection {
 
     /// A copy of the credential in hand.
     fn held(&self) -> Option<ServerCredential> {
-        self.current
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-    }
-
-    fn hold(&self, credential: ServerCredential) {
-        *self.current.lock().unwrap_or_else(|e| e.into_inner()) = Some(credential);
+        read_held(&self.current)
     }
 
     /// The failure this source is skipped for while its down window lasts,
@@ -669,17 +678,14 @@ impl Connection {
             rejected: rejected.map(str::to_string),
             health: self.health.clone(),
             key: self.source.key(),
-            held: self.held(),
+            held: self.current.clone(),
         };
         // Its own task: a caller that stops waiting does not stop the save.
         let running = tokio::spawn(job.run());
         let remaining = deadline.saturating_duration_since(Instant::now());
         match tokio::time::timeout(remaining, running).await {
-            Ok(Ok(Ok(fresh))) => {
-                let access = fresh.access_token.clone();
-                self.hold(fresh);
-                Ok(access)
-            }
+            // The job already put it in hand.
+            Ok(Ok(Ok(fresh))) => Ok(fresh.access_token),
             Ok(Ok(Err(failure))) => Err(failure),
             Ok(Err(stopped)) => Err(RemoteFailure::Credential(format!(
                 "the refresh of the sign-in to {} stopped: {stopped}",
@@ -854,7 +860,7 @@ impl Connection {
             || status == reqwest::StatusCode::METHOD_NOT_ALLOWED
         {
             return Err(RemoteFailure::Refused(format!(
-                "{} does not serve the remote control protocol; it needs Crystalline 0.23 or newer",
+                "{} {TOO_OLD_WORDS}; it needs Crystalline 0.23 or newer",
                 self.source.url
             )));
         }
@@ -912,9 +918,9 @@ struct RefreshJob {
     rejected: Option<String>,
     health: Health,
     key: String,
-    /// The credential in hand: newer than the stored one when a save after
-    /// a rotation failed.
-    held: Option<ServerCredential>,
+    /// The connection's credential in hand, read under the refresh lock:
+    /// newer than the stored one when a save after a rotation failed.
+    held: Held,
 }
 
 impl RefreshJob {
@@ -929,7 +935,7 @@ impl RefreshJob {
             .map_err(|e| RemoteFailure::Credential(e.to_string()))?;
         // Whichever pair is newer: a save that failed after a rotation left
         // the store holding a spent refresh token.
-        let stored = match (stored, self.held.clone()) {
+        let stored = match (stored, read_held(&self.held)) {
             (Some(stored), Some(held)) if held.created_at > stored.created_at => Some(held),
             (stored, _) => stored,
         };
@@ -937,6 +943,7 @@ impl RefreshJob {
             return Err(sign_in());
         };
         if settled(&stored, self.rejected.as_deref()) {
+            store_held(&self.held, stored.clone());
             return Ok(stored);
         }
         let (Some(refresh_token), Some(client_id), Some(endpoint)) = (
@@ -1021,6 +1028,10 @@ impl RefreshJob {
                 self.peer.url
             );
         }
+        // In hand before the lock is released: a job queued behind this one
+        // reads it and never presents the spent refresh token, and a caller
+        // that stopped waiting does not lose it.
+        store_held(&self.held, fresh.clone());
         Ok(fresh)
     }
 }
@@ -1068,5 +1079,72 @@ impl RefreshLock {
 impl Drop for RefreshLock {
     fn drop(&mut self) {
         let _ = fs4::FileExt::unlock(&self.file);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn connection(health: Health) -> Connection {
+        let dir = std::env::temp_dir();
+        let source = SourceRecord {
+            url: "https://crystalline.acme.test".to_string(),
+            name: "acme".to_string(),
+            account: "keeper".to_string(),
+            kind: CredentialKind::Oauth,
+            token_endpoint: None,
+            revocation_endpoint: None,
+            connected_at: Utc::now(),
+            mounts: Vec::new(),
+            from_env: false,
+        };
+        Connection {
+            http: std::sync::Mutex::new(HttpSlot {
+                client: http_client().unwrap(),
+                used: SystemTime::now(),
+            }),
+            host_dir: source.host_dir(&dir),
+            store: ServerCredentialStore::file(&dir.join("never-written")),
+            health,
+            limit: ONE_DOMAIN_LIMIT,
+            current: Arc::new(std::sync::Mutex::new(None)),
+            source,
+        }
+    }
+
+    /// Review M4: an outcome that never reached the server leaves a down
+    /// mark alone.
+    #[test]
+    fn a_local_outcome_neither_clears_nor_sets_the_down_mark() {
+        let connection = connection(Health::new(Duration::from_secs(30)));
+        let down = RemoteFailure::Unreachable {
+            source: "acme".to_string(),
+            url: connection.source.url.clone(),
+            detail: "nothing accepts connections at that address".to_string(),
+        };
+        connection.health.mark_down(&connection.source.key(), &down);
+        for local in [
+            RemoteFailure::Expired {
+                url: connection.source.url.clone(),
+            },
+            connection.sign_in_again(),
+            RemoteFailure::Credential("the keychain did not answer".to_string()),
+        ] {
+            connection.note(&Err::<(), _>(local));
+            assert_eq!(connection.down(), Some(down.clone()));
+        }
+        connection.note(&Ok::<(), RemoteFailure>(()));
+        assert_eq!(connection.down(), Some(down), "only an answer clears it");
+
+        let fresh = connection_with_no_mark();
+        fresh.note(&Err::<(), _>(RemoteFailure::Expired {
+            url: fresh.source.url.clone(),
+        }));
+        assert_eq!(fresh.down(), None, "and a local outcome never marks");
+    }
+
+    fn connection_with_no_mark() -> Connection {
+        connection(Health::new(Duration::from_secs(30)))
     }
 }

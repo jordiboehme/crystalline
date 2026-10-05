@@ -15,7 +15,9 @@ use serde_json::{Value, json};
 
 use crate::error::RemoteError;
 use crate::mounts::RemoteDomain;
-use crate::server_client::{Connection, CtlAnswer, RemoteFailure, UNREACHABLE_WORDS};
+use crate::server_client::{
+    Connection, CtlAnswer, RemoteFailure, TOO_OLD_WORDS, UNREACHABLE_WORDS,
+};
 
 /// The cached routing model.
 pub const ROUTING_FILE: &str = "routing.json";
@@ -157,8 +159,10 @@ pub fn remote_domains(routing: &Value) -> Vec<RemoteDomain> {
 
 /// The one line a stale part of the routing block carries. `failure` is the
 /// recorded reason (a [`RemoteFailure`]'s words), `None` for a copy that is
-/// merely old. The line names the real cause: a server that did not answer,
-/// a sign-in that ran out, or what the server answered instead.
+/// merely old. The line names the cause in a fixed sentence per kind (a
+/// server that did not answer, a sign-in that ran out, a server too old for
+/// the remote protocol, any other error) and never quotes the failure, so no
+/// text a server sent reaches the routing block.
 pub fn stale_line(
     source: &str,
     url: &str,
@@ -173,8 +177,13 @@ pub fn stale_line(
         Some(failure) if failure.contains(UNREACHABLE_WORDS) => format!(
             "Note: {source} ({url}) cannot be reached right now, so its domains in this routing block are the copy from {when} and may be out of date."
         ),
-        Some(failure) => format!(
-            "Note: {source} ({url}) did not send its routing ({failure}), so its domains in this routing block are the copy from {when} and may be out of date."
+        Some(failure) if failure.contains(TOO_OLD_WORDS) => format!(
+            "Note: {source} ({url}) runs a Crystalline older than 0.23, which does not speak the remote protocol, so its domains in this routing block are the copy from {when} and may be out of date."
+        ),
+        // Never the failure's own words: they can carry what the server sent,
+        // and this line goes into the agent's routing block.
+        Some(_) => format!(
+            "Note: {source} ({url}) answered with an error instead of its routing, so its domains in this routing block are the copy from {when} and may be out of date."
         ),
         None => format!(
             "Note: {source} ({url}) has not been refreshed since {when}, so its domains in this routing block may be out of date."
