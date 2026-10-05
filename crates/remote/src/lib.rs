@@ -24,7 +24,9 @@ pub mod merge;
 pub mod mounts;
 pub mod ops;
 pub mod provider;
+pub mod server_client;
 pub mod server_token;
+pub mod source_cache;
 pub mod sources;
 pub mod state;
 pub mod token;
@@ -47,7 +49,15 @@ pub use provider::{
     ChangeKind, CompareResult, Feedback, HeadProbe, OpenProposalRef, OriginSpec, ProposalHandle,
     ProposalRequest, ProposalState, Provider, StackInfo, StackMember, TreeWrite, UpstreamChange,
 };
+pub use server_client::{
+    CONNECT_TIMEOUT, CTL_TIMEOUT, Connection, CtlAnswer, DOWN_WINDOW, ForwardedAgent, Health,
+    ONE_DOMAIN_LIMIT, RemoteFailure, form_body, http_client,
+};
 pub use server_token::{CredentialKind, ServerCredential, ServerCredentialStore, server_key};
+pub use source_cache::{
+    Cached, Fetched, HOOK_STATUS_FILE, ROUTING_FILE, STALE_AFTER, fetch_cached, read_cached,
+    remote_domains, stale_line, write_cached,
+};
 pub use sources::{
     LOCAL_SUFFIX, MountRecord, REMOTE_TOKEN_ENV, REMOTE_URL_ENV, SOURCES_FILE, SourceRecord,
     SourcesFile, default_source_name, env_source, load_sources, remote_dir, update_sources,

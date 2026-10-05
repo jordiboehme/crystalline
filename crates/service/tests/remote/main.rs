@@ -8,6 +8,7 @@
 mod support;
 
 mod answers;
+mod client;
 mod ctl;
 mod fixture;
 mod revoke;

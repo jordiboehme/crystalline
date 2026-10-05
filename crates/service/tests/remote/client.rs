@@ -1,0 +1,787 @@
+//! The client half, one source at a time: the ctl exchange, the refresh
+//! under its lock, and the cached answers. The refresh tests run against a
+//! stand-in token endpoint that rotates exactly the way
+//! `AuthStore::refresh_oauth_grant` does, so a second use of a rotated refresh
+//! token fails. The last part pins a server that cannot be reached (spec
+//! A8), with short limits and windows so it stays fast.
+
+// Later suites use `source`, `save_credential` and `token_source`.
+#![allow(dead_code)]
+
+use std::net::SocketAddr;
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+
+use axum::extract::State;
+use axum::http::{HeaderMap, StatusCode};
+use chrono::{TimeDelta, Utc};
+use crystalline_remote::{
+    Connection, CredentialKind, Fetched, ForwardedAgent, Health, ROUTING_FILE, RemoteFailure,
+    ServerCredential, ServerCredentialStore, SourceRecord, fetch_cached, read_cached,
+    remote_domains, stale_line,
+};
+use serde_json::{Value, json};
+use tokio::net::TcpListener;
+
+use crate::fixture::{Options, RemoteServer};
+
+pub fn source(
+    url: &str,
+    name: &str,
+    kind: CredentialKind,
+    token_endpoint: Option<String>,
+) -> SourceRecord {
+    SourceRecord {
+        url: url.to_string(),
+        name: name.to_string(),
+        account: "keeper".to_string(),
+        kind,
+        token_endpoint,
+        revocation_endpoint: None,
+        connected_at: Utc::now(),
+        mounts: Vec::new(),
+        from_env: false,
+    }
+}
+
+pub fn save_credential(remote_dir: &Path, source: &SourceRecord, credential: &ServerCredential) {
+    ServerCredentialStore::save_resolving(&source.key(), &source.host_dir(remote_dir), credential)
+        .unwrap();
+}
+
+/// A source signed in with a pasted token for `account` on `server`.
+pub async fn token_source(
+    server: &RemoteServer,
+    remote_dir: &Path,
+    name: &str,
+    account: &str,
+) -> SourceRecord {
+    let token = server.token_for(account).await;
+    let mut record = source(&server.origin(), name, CredentialKind::Token, None);
+    record.account = account.to_string();
+    save_credential(
+        remote_dir,
+        &record,
+        &ServerCredential::token(token, server.origin(), account.into(), Utc::now()),
+    );
+    record
+}
+
+#[tokio::test]
+async fn a_pasted_token_reaches_ctl_as_its_account() {
+    let server = RemoteServer::start(Options::TOKENS).await;
+    let dir = tempfile::tempdir().unwrap();
+    let record = token_source(&server, dir.path(), "acme", "keeper").await;
+    let connection = Connection::open(record, dir.path()).unwrap();
+    let data = connection
+        .ctl_data(json!({ "v": 1, "cmd": "status" }))
+        .await
+        .unwrap();
+    assert_eq!(data["account"], "keeper");
+}
+
+/// The tool envelope carries the agent; the server records it.
+#[tokio::test]
+async fn a_forwarded_tool_call_names_its_agent() {
+    let server = RemoteServer::start(Options::TOKENS).await;
+    let dir = tempfile::tempdir().unwrap();
+    let record = token_source(&server, dir.path(), "acme", "keeper").await;
+    let connection = Connection::open(record, dir.path()).unwrap();
+    let agent = ForwardedAgent {
+        client: Some("claude-code/2.1.290".to_string()),
+    };
+    let receipt = connection
+        .tool(
+            "write_engram",
+            json!({ "domain": "open", "title": "Via Client", "content": "- [fact] forwarded" }),
+            &agent,
+        )
+        .await
+        .unwrap();
+    assert_eq!(receipt["domain"], "open", "{receipt}");
+    let written = std::fs::read_to_string(server.file("open", "via-client.md")).unwrap();
+    assert!(
+        written.contains("claude-code/2.1.290-for-keeper"),
+        "{written}"
+    );
+}
+
+#[tokio::test]
+async fn a_revoked_pasted_token_says_sign_in_again() {
+    let server = RemoteServer::start(Options::TOKENS).await;
+    let issued = server
+        .auth
+        .issue_mcp_token("keeper", "doomed")
+        .await
+        .unwrap();
+    server
+        .auth
+        .revoke_mcp_token("keeper", issued.id)
+        .await
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let record = source(&server.origin(), "acme", CredentialKind::Token, None);
+    save_credential(
+        dir.path(),
+        &record,
+        &ServerCredential::token(issued.token, server.origin(), "keeper".into(), Utc::now()),
+    );
+    let connection = Connection::open(record, dir.path()).unwrap();
+    let failure = connection
+        .ctl(json!({ "v": 1, "cmd": "status" }))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        failure,
+        RemoteFailure::SignInAgain {
+            url: server.origin()
+        }
+    );
+    assert_eq!(
+        failure.to_string(),
+        format!(
+            "the sign-in to {0} is no longer valid; sign in again: crystalline connect {0}",
+            server.origin()
+        )
+    );
+}
+
+#[tokio::test]
+async fn a_server_that_is_down_is_unreachable_not_a_sign_in_problem() {
+    let server = RemoteServer::start(Options::TOKENS).await;
+    let dir = tempfile::tempdir().unwrap();
+    let record = token_source(&server, dir.path(), "acme", "keeper").await;
+    server.stop().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let connection = Connection::open(record, dir.path()).unwrap();
+    let failure = connection
+        .ctl(json!({ "v": 1, "cmd": "status" }))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(failure, RemoteFailure::Unreachable { .. }),
+        "{failure:?}"
+    );
+    assert!(!failure.is_sign_in());
+    assert_eq!(
+        failure.to_string(),
+        format!(
+            "acme ({}) cannot be reached right now: nothing accepts connections at that address (check the VPN or the network; it recovers by itself once the server answers again)",
+            server.origin()
+        )
+    );
+}
+
+#[test]
+fn an_environment_source_reads_its_token_from_the_environment() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut record = source(
+        "https://crystalline.acme.com",
+        "acme",
+        CredentialKind::Token,
+        None,
+    );
+    record.from_env = true;
+    let env = |name: &str| (name == "CRYSTALLINE_REMOTE_TOKEN").then(|| "cmt_env ".to_string());
+    let connection = Connection::open_with(record, dir.path(), env).unwrap();
+    assert_eq!(connection.store_kind(), "environment");
+}
+
+// --- the refresh, against a stand-in token endpoint ------------------------
+
+struct FakeServer {
+    url: String,
+    refreshes: Arc<AtomicUsize>,
+}
+
+#[derive(Clone)]
+struct Fake {
+    refreshes: Arc<AtomicUsize>,
+    live: Arc<std::sync::Mutex<(String, String)>>,
+}
+
+impl FakeServer {
+    async fn start(live_access: &str, live_refresh: &str) -> FakeServer {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        FakeServer::start_on(listener, live_access, live_refresh)
+    }
+
+    /// The stand-in on `listener`: a server that comes back on the address
+    /// it had.
+    fn start_on(listener: TcpListener, live_access: &str, live_refresh: &str) -> FakeServer {
+        let fake = Fake {
+            refreshes: Arc::new(AtomicUsize::new(0)),
+            live: Arc::new(std::sync::Mutex::new((
+                live_access.to_string(),
+                live_refresh.to_string(),
+            ))),
+        };
+        let refreshes = fake.refreshes.clone();
+        let app = axum::Router::new()
+            .route("/api/v1/oauth/token", axum::routing::post(fake_token))
+            .route("/api/v1/ctl", axum::routing::post(fake_ctl))
+            .with_state(fake);
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        FakeServer { url, refreshes }
+    }
+
+    fn token_endpoint(&self) -> Option<String> {
+        Some(format!("{}/api/v1/oauth/token", self.url))
+    }
+}
+
+async fn fake_token(State(fake): State<Fake>, body: String) -> (StatusCode, axum::Json<Value>) {
+    let n = fake.refreshes.fetch_add(1, Ordering::SeqCst) + 1;
+    // Wide enough that two refreshers racing without a lock both arrive.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let presented = body
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("refresh_token="))
+        .unwrap_or("")
+        .to_string();
+    let mut live = fake.live.lock().unwrap();
+    if presented != live.1 {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({ "error": "invalid_grant", "error_description": "replayed" })),
+        );
+    }
+    *live = (format!("coa_{n}"), format!("cor_{n}"));
+    (
+        StatusCode::OK,
+        axum::Json(json!({
+            "access_token": live.0,
+            "token_type": "Bearer",
+            "expires_in": 3600,
+            "refresh_token": live.1,
+        })),
+    )
+}
+
+async fn fake_ctl(State(fake): State<Fake>, headers: HeaderMap) -> (StatusCode, axum::Json<Value>) {
+    let presented = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("")
+        .to_string();
+    if presented != fake.live.lock().unwrap().0 {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(json!({ "error": "no" })),
+        );
+    }
+    (
+        StatusCode::OK,
+        axum::Json(json!({ "v": 1, "ok": true, "data": { "account": "keeper" } })),
+    )
+}
+
+fn oauth(access: &str, refresh: &str, issued_ago: TimeDelta, resource: &str) -> ServerCredential {
+    ServerCredential::oauth(
+        access.to_string(),
+        refresh.to_string(),
+        3600,
+        "coc_test".to_string(),
+        resource.to_string(),
+        "keeper".to_string(),
+        Utc::now() - issued_ago,
+    )
+}
+
+/// Review focus 3: two processes find one source's access token expired at
+/// the same moment. Exactly one of them spends the refresh token; the other
+/// waits on the lock, reads what the first saved, and uses it.
+#[tokio::test]
+async fn two_connections_refreshing_at_once_spend_the_refresh_token_once() {
+    let fake = FakeServer::start("coa_0", "cor_0").await;
+    let dir = tempfile::tempdir().unwrap();
+    let record = source(
+        &fake.url,
+        "acme",
+        CredentialKind::Oauth,
+        fake.token_endpoint(),
+    );
+    save_credential(
+        dir.path(),
+        &record,
+        &oauth("coa_0", "cor_0", TimeDelta::hours(2), &fake.url),
+    );
+    let a = Connection::open(record.clone(), dir.path()).unwrap();
+    let b = Connection::open(record, dir.path()).unwrap();
+    let (first, second) = tokio::join!(a.bearer(), b.bearer());
+    assert_eq!(first.unwrap(), "coa_1");
+    assert_eq!(
+        second.unwrap(),
+        "coa_1",
+        "the second process used what the first saved"
+    );
+    assert_eq!(
+        fake.refreshes.load(Ordering::SeqCst),
+        1,
+        "the refresh token was spent once"
+    );
+}
+
+/// Review focus 3: a refused refresh is that source's problem only. The other
+/// source keeps answering and its credential is not touched.
+#[tokio::test]
+async fn a_failed_refresh_marks_only_that_source() {
+    let broken = FakeServer::start("coa_0", "cor_other").await;
+    let fine = FakeServer::start("coa_fine", "cor_fine").await;
+    let dir = tempfile::tempdir().unwrap();
+    let a = source(
+        &broken.url,
+        "acme",
+        CredentialKind::Oauth,
+        broken.token_endpoint(),
+    );
+    let b = source(
+        &fine.url,
+        "beta",
+        CredentialKind::Oauth,
+        fine.token_endpoint(),
+    );
+    save_credential(
+        dir.path(),
+        &a,
+        &oauth("coa_0", "cor_stale", TimeDelta::hours(2), &broken.url),
+    );
+    save_credential(
+        dir.path(),
+        &b,
+        &oauth("coa_fine", "cor_fine", TimeDelta::zero(), &fine.url),
+    );
+    let a = Connection::open(a, dir.path()).unwrap();
+    let b = Connection::open(b, dir.path()).unwrap();
+    let failure = a.ctl(json!({ "v": 1, "cmd": "status" })).await.unwrap_err();
+    assert_eq!(
+        failure,
+        RemoteFailure::SignInAgain {
+            url: broken.url.clone()
+        }
+    );
+    assert!(failure.is_sign_in());
+    assert_eq!(a.down(), None, "a refusal is an answer, not a down server");
+    let data = b
+        .ctl_data(json!({ "v": 1, "cmd": "status" }))
+        .await
+        .unwrap();
+    assert_eq!(data["account"], "keeper");
+    assert_eq!(
+        fine.refreshes.load(Ordering::SeqCst),
+        0,
+        "beta never refreshed"
+    );
+}
+
+/// The server refuses a token this machine's clock still calls fresh. One
+/// refresh, one retry, and the rotated pair is saved for the next process.
+#[tokio::test]
+async fn a_401_on_a_token_the_clock_thinks_is_fresh_refreshes_once() {
+    let fake = FakeServer::start("coa_server_side", "cor_0").await;
+    let dir = tempfile::tempdir().unwrap();
+    let record = source(
+        &fake.url,
+        "acme",
+        CredentialKind::Oauth,
+        fake.token_endpoint(),
+    );
+    save_credential(
+        dir.path(),
+        &record,
+        &oauth("coa_thinks_fresh", "cor_0", TimeDelta::zero(), &fake.url),
+    );
+    let connection = Connection::open(record.clone(), dir.path()).unwrap();
+    let data = connection
+        .ctl_data(json!({ "v": 1, "cmd": "status" }))
+        .await
+        .unwrap();
+    assert_eq!(data["account"], "keeper");
+    connection
+        .ctl_data(json!({ "v": 1, "cmd": "status" }))
+        .await
+        .unwrap();
+    assert_eq!(fake.refreshes.load(Ordering::SeqCst), 1);
+    let reopened = Connection::open(record, dir.path()).unwrap();
+    assert_eq!(reopened.bearer().await.unwrap(), "coa_1");
+    assert_eq!(fake.refreshes.load(Ordering::SeqCst), 1);
+}
+
+/// The per-prompt recall never refreshes, and an expired token there is not
+/// a reason to sign in again: the next call that may refresh renews it.
+#[tokio::test]
+async fn the_no_refresh_path_never_spends_the_refresh_token() {
+    let fake = FakeServer::start("coa_0", "cor_0").await;
+    let dir = tempfile::tempdir().unwrap();
+    let record = source(
+        &fake.url,
+        "acme",
+        CredentialKind::Oauth,
+        fake.token_endpoint(),
+    );
+    save_credential(
+        dir.path(),
+        &record,
+        &oauth("coa_0", "cor_0", TimeDelta::hours(2), &fake.url),
+    );
+    let connection = Connection::open(record, dir.path()).unwrap();
+    let failure = connection
+        .ctl_without_refresh(json!({ "v": 1, "cmd": "status" }))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(failure, RemoteFailure::Expired { .. }),
+        "{failure:?}"
+    );
+    assert!(!failure.is_sign_in());
+    assert_eq!(fake.refreshes.load(Ordering::SeqCst), 0);
+}
+
+// --- the cached answers ------------------------------------------------------
+
+const BUDGET: Duration = Duration::from_secs(5);
+
+#[tokio::test]
+async fn a_fetch_caches_the_answer_and_revalidates_it() {
+    let server = RemoteServer::start(Options::TOKENS).await;
+    let dir = tempfile::tempdir().unwrap();
+    let record = token_source(&server, dir.path(), "acme", "keeper").await;
+    let host = record.host_dir(dir.path());
+    let connection = Connection::open(record, dir.path()).unwrap();
+    let Fetched::Fresh(first) =
+        fetch_cached(&connection, "routing_bullets", ROUTING_FILE, BUDGET).await
+    else {
+        panic!("the server is up");
+    };
+    let domains = remote_domains(&first.data);
+    let platform = domains.iter().find(|d| d.name == "platform").unwrap();
+    assert_eq!(
+        platform.origin.as_ref().unwrap().repository,
+        "acme/platform"
+    );
+    let on_disk = read_cached(&host, ROUTING_FILE, "keeper").unwrap();
+    assert_eq!(on_disk.etag, first.etag);
+    assert_eq!(on_disk.last_failure, None);
+    let Fetched::Fresh(second) =
+        fetch_cached(&connection, "routing_bullets", ROUTING_FILE, BUDGET).await
+    else {
+        panic!("the server is up");
+    };
+    assert_eq!(
+        second.data, first.data,
+        "a not_modified answer serves the cached data"
+    );
+}
+
+#[tokio::test]
+async fn with_the_server_down_the_cache_is_served_stale_and_the_failure_is_recorded() {
+    let server = RemoteServer::start(Options::TOKENS).await;
+    let dir = tempfile::tempdir().unwrap();
+    let record = token_source(&server, dir.path(), "acme", "keeper").await;
+    let host = record.host_dir(dir.path());
+    let connection = Connection::open(record, dir.path()).unwrap();
+    fetch_cached(&connection, "routing_bullets", ROUTING_FILE, BUDGET).await;
+    server.stop().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    match fetch_cached(&connection, "routing_bullets", ROUTING_FILE, BUDGET).await {
+        Fetched::Stale { cached, failure } => {
+            assert!(cached.data.to_string().contains("shared questions"));
+            assert!(
+                matches!(failure, RemoteFailure::Unreachable { .. }),
+                "{failure:?}"
+            );
+        }
+        other => panic!("expected the stale cache, got {other:?}"),
+    }
+    let on_disk = read_cached(&host, ROUTING_FILE, "keeper").unwrap();
+    assert!(
+        on_disk
+            .last_failure
+            .as_deref()
+            .is_some_and(|f| f.contains("cannot be reached right now")),
+        "a hook with no daemon reads that the copy is stale: {on_disk:?}"
+    );
+}
+
+#[test]
+fn a_cache_written_for_another_account_is_not_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let cached = crystalline_remote::Cached {
+        account: "someone".to_string(),
+        etag: "e".to_string(),
+        fetched_at: Utc::now(),
+        data: json!({ "domains": [] }),
+        last_failure: None,
+    };
+    crystalline_remote::write_cached(dir.path(), ROUTING_FILE, &cached).unwrap();
+    assert_eq!(
+        read_cached(dir.path(), ROUTING_FILE, "someone"),
+        Some(cached)
+    );
+    assert_eq!(read_cached(dir.path(), ROUTING_FILE, "keeper"), None);
+}
+
+#[test]
+fn the_staleness_line_names_the_source_the_time_and_the_remedy() {
+    let at = chrono::DateTime::parse_from_rfc3339("2026-09-30T08:15:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    assert_eq!(
+        stale_line(
+            "acme",
+            "https://crystalline.acme.com",
+            at,
+            Some(
+                "acme (https://crystalline.acme.com) cannot be reached right now: nothing accepts connections at that address (check the VPN or the network; it recovers by itself once the server answers again)"
+            )
+        ),
+        "Note: acme (https://crystalline.acme.com) could not be reached, so its domains in this routing block are the copy from 2026-09-30 08:15 UTC and may be out of date."
+    );
+    let expired = stale_line(
+        "acme",
+        "https://crystalline.acme.com",
+        at,
+        Some(
+            "the sign-in to https://crystalline.acme.com is no longer valid; sign in again: crystalline connect https://crystalline.acme.com",
+        ),
+    );
+    assert!(
+        expired.contains("Ask the user to run: crystalline connect https://crystalline.acme.com"),
+        "{expired}"
+    );
+    let old = stale_line("acme", "https://crystalline.acme.com", at, None);
+    assert!(
+        old.contains("has not been refreshed since 2026-09-30 08:15 UTC"),
+        "{old}"
+    );
+}
+
+// --- a server that cannot be reached (spec A8) -------------------------------
+
+/// The overall limit the tests below inject in place of the ten seconds.
+const LIMIT: Duration = Duration::from_millis(300);
+/// The one command these tests send.
+fn status() -> Value {
+    json!({ "v": 1, "cmd": "status" })
+}
+
+/// A listener that accepts every connection and never answers, the way a
+/// server looks behind a VPN that dropped its packets. It counts what it
+/// accepted, and holds every socket so none is reset.
+async fn blackhole() -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counter = accepted.clone();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            counter.fetch_add(1, Ordering::SeqCst);
+            held.push(socket);
+        }
+    });
+    (url, accepted)
+}
+
+/// An address nothing listens on yet, which a server can come back on.
+async fn free_address() -> SocketAddr {
+    let spare = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    spare.local_addr().unwrap()
+}
+
+/// A source at `url` signed in with the pasted token `cmt_live`.
+fn pasted(url: &str, remote_dir: &Path) -> SourceRecord {
+    let record = source(url, "acme", CredentialKind::Token, None);
+    save_credential(
+        remote_dir,
+        &record,
+        &ServerCredential::token(
+            "cmt_live".into(),
+            url.to_string(),
+            "keeper".into(),
+            Utc::now(),
+        ),
+    );
+    record
+}
+
+#[tokio::test]
+async fn a_server_that_accepts_and_never_answers_ends_at_the_limit() {
+    let (url, _) = blackhole().await;
+    let dir = tempfile::tempdir().unwrap();
+    let connection = Connection::open(pasted(&url, dir.path()), dir.path())
+        .unwrap()
+        .with_limit(LIMIT)
+        .with_health(Health::new(Duration::from_secs(30)));
+    let started = Instant::now();
+    let failure = connection.ctl(status()).await.unwrap_err();
+    let took = started.elapsed();
+    assert!(
+        matches!(failure, RemoteFailure::TimedOut { .. }),
+        "{failure:?}"
+    );
+    assert!(!failure.is_sign_in());
+    assert!(
+        took >= LIMIT && took < LIMIT + Duration::from_secs(2),
+        "{took:?}"
+    );
+    assert_eq!(
+        failure.to_string(),
+        format!(
+            "acme ({url}) cannot be reached right now: it did not answer within 0.3 s (check the VPN or the network; it recovers by itself once the server answers again)"
+        )
+    );
+}
+
+#[tokio::test]
+async fn a_name_that_does_not_resolve_is_unreachable_quickly() {
+    let url = "http://crystalline-remote-test.invalid";
+    let limit = Duration::from_secs(5);
+    let dir = tempfile::tempdir().unwrap();
+    let connection = Connection::open(pasted(url, dir.path()), dir.path())
+        .unwrap()
+        .with_limit(limit)
+        .with_health(Health::new(Duration::from_secs(30)));
+    let started = Instant::now();
+    let failure = connection.ctl(status()).await.unwrap_err();
+    assert!(started.elapsed() < limit, "{:?}", started.elapsed());
+    match &failure {
+        RemoteFailure::Unreachable { detail, .. } => assert_eq!(
+            detail,
+            "the name crystalline-remote-test.invalid does not resolve"
+        ),
+        other => panic!("expected unreachable, got {other:?}"),
+    }
+    assert!(!failure.is_sign_in());
+}
+
+#[tokio::test]
+async fn a_refresh_that_fails_on_the_network_keeps_the_refresh_token_and_tries_again() {
+    let addr = free_address().await;
+    let url = format!("http://{addr}");
+    let dir = tempfile::tempdir().unwrap();
+    let record = source(
+        &url,
+        "acme",
+        CredentialKind::Oauth,
+        Some(format!("{url}/api/v1/oauth/token")),
+    );
+    save_credential(
+        dir.path(),
+        &record,
+        &oauth("coa_0", "cor_0", TimeDelta::hours(2), &url),
+    );
+    let window = Duration::from_millis(200);
+    let connection = Connection::open(record.clone(), dir.path())
+        .unwrap()
+        .with_limit(Duration::from_secs(5))
+        .with_health(Health::new(window));
+    let failure = connection.ctl(status()).await.unwrap_err();
+    assert!(
+        matches!(failure, RemoteFailure::Unreachable { .. }),
+        "{failure:?}"
+    );
+    assert!(
+        !failure.is_sign_in(),
+        "a network failure never asks to sign in"
+    );
+    let stored = ServerCredentialStore::file(&record.host_dir(dir.path()))
+        .load()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.refresh_token.as_deref(),
+        Some("cor_0"),
+        "kept as it was"
+    );
+    assert_eq!(stored.access_token, "coa_0");
+
+    let fake = FakeServer::start_on(TcpListener::bind(addr).await.unwrap(), "coa_0", "cor_0");
+    tokio::time::sleep(window + Duration::from_millis(50)).await;
+    let data = connection.ctl_data(status()).await.unwrap();
+    assert_eq!(data["account"], "keeper");
+    assert_eq!(
+        fake.refreshes.load(Ordering::SeqCst),
+        1,
+        "the kept refresh token was spent on the next call"
+    );
+}
+
+#[tokio::test]
+async fn a_source_that_failed_is_skipped_at_once_and_tried_again_after_the_window() {
+    let (url, accepted) = blackhole().await;
+    let dir = tempfile::tempdir().unwrap();
+    let record = pasted(&url, dir.path());
+    let window = Duration::from_millis(800);
+    let health = Health::new(window);
+    let connection = Connection::open(record.clone(), dir.path())
+        .unwrap()
+        .with_limit(LIMIT)
+        .with_health(health.clone());
+    let first = connection.ctl(status()).await.unwrap_err();
+    assert!(matches!(first, RemoteFailure::TimedOut { .. }), "{first:?}");
+    let marked = Instant::now();
+    assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    assert_eq!(connection.down(), Some(first.clone()));
+
+    let started = Instant::now();
+    let skipped = connection.ctl(status()).await.unwrap_err();
+    assert!(
+        started.elapsed() < Duration::from_millis(100),
+        "answered at once"
+    );
+    assert_eq!(skipped, first, "the recorded failure");
+    let other = Connection::open(record, dir.path())
+        .unwrap()
+        .with_limit(LIMIT)
+        .with_health(health);
+    let started = Instant::now();
+    assert_eq!(other.ctl(status()).await.unwrap_err(), first);
+    assert!(
+        started.elapsed() < Duration::from_millis(100),
+        "every connection to the source shares the window"
+    );
+    assert_eq!(accepted.load(Ordering::SeqCst), 1, "no network while down");
+
+    tokio::time::sleep((marked + window + Duration::from_millis(50)) - Instant::now()).await;
+    let again = connection.ctl(status()).await.unwrap_err();
+    assert!(matches!(again, RemoteFailure::TimedOut { .. }), "{again:?}");
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        2,
+        "tried again after the window, on a fresh connection"
+    );
+}
+
+#[tokio::test]
+async fn a_source_that_comes_back_is_used_again_without_a_restart() {
+    let addr = free_address().await;
+    let url = format!("http://{addr}");
+    let dir = tempfile::tempdir().unwrap();
+    let window = Duration::from_millis(200);
+    let connection = Connection::open(pasted(&url, dir.path()), dir.path())
+        .unwrap()
+        .with_limit(Duration::from_secs(5))
+        .with_health(Health::new(window));
+    let failure = connection.ctl(status()).await.unwrap_err();
+    assert!(
+        matches!(failure, RemoteFailure::Unreachable { .. }),
+        "{failure:?}"
+    );
+
+    let _back = FakeServer::start_on(TcpListener::bind(addr).await.unwrap(), "cmt_live", "-");
+    assert!(
+        connection.ctl(status()).await.is_err(),
+        "still inside the window"
+    );
+    tokio::time::sleep(window + Duration::from_millis(50)).await;
+    let data = connection.ctl_data(status()).await.unwrap();
+    assert_eq!(data["account"], "keeper");
+    assert_eq!(connection.down(), None, "the answer cleared the down state");
+}
