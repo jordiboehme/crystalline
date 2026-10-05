@@ -101,6 +101,14 @@ pub enum SignInError {
         /// The likely cause, in plain words.
         detail: String,
     },
+    /// The server's OAuth metadata names an issuer or an endpoint that is not
+    /// https (or plain http to this machine), or an issuer other than the one
+    /// its protected-resource document names. The browser flow does not go
+    /// there; a pasted token still can.
+    InsecureEndpoints {
+        /// The server, as the person typed it.
+        url: String,
+    },
     /// Something answered, but not Crystalline's `/health`.
     NotCrystalline {
         /// The address.
@@ -136,6 +144,13 @@ impl std::fmt::Display for SignInError {
                 f,
                 "{url} {UNREACHABLE_WORDS}: {detail}. Check the VPN or the network and run \
                  crystalline connect {url} again; nothing was changed on this machine"
+            ),
+            SignInError::InsecureEndpoints { url } => write!(
+                f,
+                "the sign-in endpoints of {url} are not secure (plain http to another machine, \
+                 or an issuer that does not match), so this machine does not sign in there \
+                 through the browser; nothing was saved. Paste a personal MCP token instead: \
+                 crystalline connect {url} --token"
             ),
             SignInError::NotCrystalline { url } => {
                 write!(
@@ -179,6 +194,20 @@ pub fn normalize_server_url(input: &str) -> Result<String, SignInError> {
         Some(port) => format!("{}://{host}:{port}", url.scheme()),
         None => format!("{}://{host}", url.scheme()),
     })
+}
+
+/// Whether `url` may carry a sign-in: https anywhere, plain http only to
+/// this machine. The rule [`normalize_server_url`] applies to what the
+/// person typed, applied to what a server names.
+fn is_secure_endpoint(url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    match (url.scheme(), url.host_str()) {
+        ("https", Some(_)) => true,
+        ("http", Some(host)) => is_loopback(host),
+        _ => false,
+    }
 }
 
 fn is_loopback(host: &str) -> bool {
@@ -318,6 +347,9 @@ pub struct OauthEndpoints {
     pub registration_endpoint: String,
     /// Where a grant is revoked, when the server offers it (0.23 and later).
     pub revocation_endpoint: Option<String>,
+    /// Whether the server says it puts `iss` in every authorization answer
+    /// (RFC 9207); an answer without it is then refused.
+    pub iss_parameter_supported: bool,
 }
 
 /// What a server said about itself.
@@ -356,8 +388,16 @@ async fn discover_by(
         budget,
     )
     .await?;
-    if !resource.ok() {
+    // Only "there is no such document" means no browser sign-in; any other
+    // refusal is a server with OAuth that did not answer properly.
+    if resource.status == 404 {
         return Ok(none());
+    }
+    if !resource.ok() {
+        return Err(SignInError::Protocol(format!(
+            "the protected-resource document of {origin} could not be read (it answered {})",
+            resource.status
+        )));
     }
     let document = resource.json();
     let (Some(resource_id), Some(issuer)) = (
@@ -369,6 +409,12 @@ async fn discover_by(
         )));
     };
     let issuer = issuer.trim_end_matches('/').to_string();
+    let insecure = || SignInError::InsecureEndpoints {
+        url: origin.to_string(),
+    };
+    if !is_secure_endpoint(&issuer) {
+        return Err(insecure());
+    }
     let meta = send(
         http.get(format!("{issuer}/.well-known/oauth-authorization-server")),
         origin,
@@ -387,12 +433,26 @@ async fn discover_by(
         )));
     }
     let meta = meta.json();
+    // RFC 8414 section 3.3: the metadata names the issuer it was fetched for.
+    if meta["issuer"].as_str().map(|i| i.trim_end_matches('/')) != Some(issuer.as_str()) {
+        return Err(insecure());
+    }
     let endpoint = |name: &str| {
-        meta[name].as_str().map(str::to_string).ok_or_else(|| {
+        let url = meta[name].as_str().ok_or_else(|| {
             SignInError::Protocol(format!(
                 "the authorization server metadata of {origin} has no {name}"
             ))
-        })
+        })?;
+        if is_secure_endpoint(url) {
+            Ok(url.to_string())
+        } else {
+            Err(insecure())
+        }
+    };
+    let revocation_endpoint = match meta["revocation_endpoint"].as_str() {
+        Some(url) if is_secure_endpoint(url) => Some(url.to_string()),
+        Some(_) => return Err(insecure()),
+        None => None,
     };
     Ok(Discovered {
         origin: origin.to_string(),
@@ -402,7 +462,8 @@ async fn discover_by(
             authorization_endpoint: endpoint("authorization_endpoint")?,
             token_endpoint: endpoint("token_endpoint")?,
             registration_endpoint: endpoint("registration_endpoint")?,
-            revocation_endpoint: meta["revocation_endpoint"].as_str().map(str::to_string),
+            revocation_endpoint,
+            iss_parameter_supported: meta["authorization_response_iss_parameter_supported"] == true,
         }),
     })
 }
@@ -513,22 +574,28 @@ where
     let callback = wait_for_callback(listener, wait);
     open_browser(&authorize_url);
     let answer = callback.await?;
-    if let Some(error) = answer.get("error") {
-        return Err(SignInError::Denied(oauth_code(error)));
-    }
+    // The state first: an answer that is not this sign-in's says nothing,
+    // not even that it was refused.
     if answer.get("state") != Some(&state) {
         return Err(SignInError::Protocol(
             "the browser came back with another sign-in's answer; run crystalline connect again"
                 .to_string(),
         ));
     }
-    if let Some(iss) = answer.get("iss")
-        && iss.trim_end_matches('/') != oauth.issuer
-    {
-        return Err(SignInError::Protocol(format!(
-            "the answer names another issuer than {}; nothing was saved",
-            oauth.issuer
-        )));
+    let from_another_server = || {
+        SignInError::Protocol(format!(
+            "the browser came back with an answer from another server than {origin}; nothing was saved"
+        ))
+    };
+    match answer.get("iss") {
+        Some(iss) if iss.trim_end_matches('/') != oauth.issuer => {
+            return Err(from_another_server());
+        }
+        None if oauth.iss_parameter_supported => return Err(from_another_server()),
+        _ => {}
+    }
+    if let Some(error) = answer.get("error") {
+        return Err(SignInError::Denied(oauth_code(error)));
     }
     let code = answer
         .get("code")
@@ -549,35 +616,85 @@ where
         &after,
     )
     .await?;
-    let account = whoami(&http, &origin, &token.access_token, &after)
-        .await
-        .map_err(|e| match e {
-            SignInError::BadToken(text) => SignInError::Protocol(text),
-            other => other,
-        })?;
-    let routing = routing_model(&http, &origin, &token.access_token, &after).await;
-    let now = Utc::now();
-    let credential = ServerCredential::oauth(
-        token.access_token,
-        token.refresh_token,
-        token.expires_in,
-        client_id,
-        oauth.resource.clone(),
-        account.clone(),
-        now,
-    );
-    let record = SourceRecord {
-        url: origin,
-        name: String::new(),
-        account,
-        kind: CredentialKind::Oauth,
-        token_endpoint: Some(oauth.token_endpoint),
-        revocation_endpoint: oauth.revocation_endpoint,
-        connected_at: now,
-        mounts: Vec::new(),
-        from_env: false,
+    let refresh_token = token.refresh_token.clone();
+    let finished = async {
+        let account = whoami(&http, &origin, &token.access_token, &after)
+            .await
+            .map_err(|e| match e {
+                SignInError::BadToken(text) => SignInError::Protocol(text),
+                other => other,
+            })?;
+        let routing = routing_model(&http, &origin, &token.access_token, &after).await;
+        let now = Utc::now();
+        let credential = ServerCredential::oauth(
+            token.access_token,
+            token.refresh_token,
+            token.expires_in,
+            client_id.clone(),
+            oauth.resource.clone(),
+            account.clone(),
+            now,
+        );
+        let record = SourceRecord {
+            url: origin.clone(),
+            name: String::new(),
+            account,
+            kind: CredentialKind::Oauth,
+            token_endpoint: Some(oauth.token_endpoint.clone()),
+            revocation_endpoint: oauth.revocation_endpoint.clone(),
+            connected_at: now,
+            mounts: Vec::new(),
+            from_env: false,
+        };
+        save(remote_dir, record, name, &credential, routing, local)
+    }
+    .await;
+    match finished {
+        Ok((connected, replaced)) => {
+            retire(replaced, &origin).await;
+            Ok(connected)
+        }
+        Err(failure) => {
+            // The server issued a grant this machine will not hold: end it
+            // rather than leave it under Connected clients.
+            if let Some(endpoint) = &oauth.revocation_endpoint {
+                let _ = revoke_token(
+                    endpoint,
+                    &refresh_token,
+                    "refresh_token",
+                    &client_id,
+                    &origin,
+                    &Budget::new(DISCONNECT_LIMIT),
+                )
+                .await;
+            }
+            Err(failure)
+        }
+    }
+}
+
+/// End the grant a successful re-sign-in replaced, best effort within
+/// [`DISCONNECT_LIMIT`]: nothing on this machine holds it any more.
+async fn retire(replaced: Option<Replaced>, url: &str) {
+    let Some(replaced) = replaced else {
+        return;
     };
-    save(remote_dir, record, name, &credential, routing, local)
+    let outcome = revoke(
+        &replaced.endpoint,
+        &replaced.credential,
+        url,
+        &Budget::new(DISCONNECT_LIMIT),
+    )
+    .await;
+    if outcome != Revocation::Revoked {
+        tracing::debug!("the replaced sign-in to {url} was not revoked: {outcome:?}");
+    }
+}
+
+/// A sign-in that a new one replaced, with where it is revoked.
+struct Replaced {
+    credential: ServerCredential,
+    endpoint: String,
 }
 
 /// Ask the person for a token, because `origin` has no browser sign-in. The
@@ -661,7 +778,7 @@ async fn with_token(
     let credential =
         ServerCredential::token(token.to_string(), origin.clone(), account.clone(), now);
     let record = SourceRecord {
-        url: origin,
+        url: origin.clone(),
         name: String::new(),
         account,
         kind: CredentialKind::Token,
@@ -671,7 +788,9 @@ async fn with_token(
         mounts: Vec::new(),
         from_env: false,
     };
-    save(remote_dir, record, name, &credential, routing, local)
+    let (connected, replaced) = save(remote_dir, record, name, &credential, routing, local)?;
+    retire(replaced, &origin).await;
+    Ok(connected)
 }
 
 fn client() -> Result<reqwest::Client, SignInError> {
@@ -763,17 +882,19 @@ pub async fn disconnect_within(
         }
         _ => Revocation::NotApplicable,
     };
+    // The record first: once it is gone the source is gone, and a credential
+    // or folder that could not be removed after it is only left over.
+    update_sources(remote_dir, |file| {
+        file.remove(&source.name);
+        Ok(())
+    })
+    .map_err(store_error)?;
     store.delete().map_err(store_error)?;
     match std::fs::remove_dir_all(&host_dir) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(SignInError::Store(e.to_string())),
     }
-    update_sources(remote_dir, |file| {
-        file.remove(&source.name);
-        Ok(())
-    })
-    .map_err(store_error)?;
     Ok(Some(Disconnected {
         name: source.name,
         url: source.url,
@@ -794,6 +915,18 @@ async fn revoke(
         None => (credential.access_token.as_str(), "access_token"),
     };
     let client_id = credential.client_id.as_deref().unwrap_or("");
+    revoke_token(endpoint, token, hint, client_id, url, budget).await
+}
+
+/// One RFC 7009 revocation of `token`.
+async fn revoke_token(
+    endpoint: &str,
+    token: &str,
+    hint: &str,
+    client_id: &str,
+    url: &str,
+    budget: &Budget,
+) -> Revocation {
     let http = match client() {
         Ok(http) => http,
         Err(e) => return Revocation::NotReached(e.to_string()),
@@ -856,7 +989,7 @@ fn save(
     credential: &ServerCredential,
     routing: Option<Value>,
     local: &[LocalDomain],
-) -> Result<Connected, SignInError> {
+) -> Result<(Connected, Option<Replaced>), SignInError> {
     let store_error = |e: crate::error::RemoteError| SignInError::Store(e.to_string());
     let host_dir = record.host_dir(remote_dir);
     let host_dir_was_there = host_dir.exists();
@@ -864,7 +997,11 @@ fn save(
         ServerCredentialStore::resolve_and_load(&record.key(), &host_dir).map_err(store_error)?;
     let store = ServerCredentialStore::save_resolving(&record.key(), &host_dir, credential)
         .map_err(store_error)?;
+    let mut replaced_endpoint = None;
     let updated = update_sources(remote_dir, |file| {
+        replaced_endpoint = file
+            .find(&record.url)
+            .and_then(|s| s.revocation_endpoint.clone());
         let known = file.find(&record.url).map(|s| s.name.clone());
         record.name = match (known, name) {
             (Some(known), _) => known,
@@ -927,11 +1064,28 @@ fn save(
             },
         );
     }
-    Ok(Connected {
-        source,
-        routing,
-        announcements,
-    })
+    // The grant this sign-in replaced, when it was another OAuth grant.
+    let replaced = match (previous, replaced_endpoint) {
+        (Some(previous), Some(endpoint))
+            if previous.kind == CredentialKind::Oauth
+                && previous.refresh_token.is_some()
+                && previous.refresh_token != credential.refresh_token =>
+        {
+            Some(Replaced {
+                credential: previous,
+                endpoint,
+            })
+        }
+        _ => None,
+    };
+    Ok((
+        Connected {
+            source,
+            routing,
+            announcements,
+        },
+        replaced,
+    ))
 }
 
 /// The server's routing model for `token`, best effort: a server that
@@ -1058,9 +1212,12 @@ async fn wait_for_callback(
                 .accept()
                 .await
                 .map_err(|e| SignInError::Protocol(format!("the loopback listener failed: {e}")))?;
-            let mut buffer = vec![0u8; 8192];
-            let n = stream.read(&mut buffer).await.unwrap_or(0);
-            let head = String::from_utf8_lossy(&buffer[..n]).to_string();
+            // A browser may open a connection it sends nothing on (a
+            // preconnect); it gets a short while, then the next one is served.
+            let Ok(head) = tokio::time::timeout(REQUEST_LINE_WAIT, request_line(&mut stream)).await
+            else {
+                continue;
+            };
             let target = head
                 .lines()
                 .next()
@@ -1077,6 +1234,27 @@ async fn wait_for_callback(
     })
     .await
     .map_err(|_| SignInError::TimedOut)?
+}
+
+/// How long one connection to the loopback port has to send its request
+/// line.
+const REQUEST_LINE_WAIT: Duration = Duration::from_secs(2);
+
+/// The request line of what `stream` sends, read until its line ends, the
+/// connection closes or 8 KiB have come.
+async fn request_line(stream: &mut tokio::net::TcpStream) -> String {
+    let mut buffer = vec![0u8; 8192];
+    let mut filled = 0;
+    while filled < buffer.len() {
+        match stream.read(&mut buffer[filled..]).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => filled += n,
+        }
+        if buffer[..filled].windows(2).any(|w| w == b"\r\n") {
+            break;
+        }
+    }
+    String::from_utf8_lossy(&buffer[..filled]).to_string()
 }
 
 fn parse_query(query: &str) -> HashMap<String, String> {
@@ -1178,6 +1356,26 @@ mod tests {
         assert_eq!(answer["code"], "abc");
         assert_eq!(answer["state"], "s/1");
         assert_eq!(answer["iss"], "http://127.0.0.1:7411");
+    }
+
+    #[test]
+    fn a_sign_in_endpoint_is_https_or_on_this_machine() {
+        for good in [
+            "https://kb.example/api/v1/oauth/token",
+            "http://127.0.0.1:7411/api/v1/oauth/token",
+            "http://localhost:7411/x",
+            "http://[::1]:7411/x",
+        ] {
+            assert!(is_secure_endpoint(good), "{good}");
+        }
+        for bad in [
+            "http://kb.example/api/v1/oauth/token",
+            "ftp://kb.example/x",
+            "/api/v1/oauth/token",
+            "",
+        ] {
+            assert!(!is_secure_endpoint(bad), "{bad}");
+        }
     }
 
     #[test]

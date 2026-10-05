@@ -13,7 +13,7 @@ use crystalline_remote::{
     connect_with_browser, connect_with_browser_within, connect_with_token,
     connect_with_token_within, disconnect, disconnect_within, load_sources, update_sources,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
 use crate::fixture::{Options, RemoteServer};
@@ -33,6 +33,115 @@ fn fake_browser(
             let _ = reqwest::get(location).await;
         });
     }
+}
+
+/// The port the authorization URL asks the browser to come back to.
+fn callback_port(authorize_url: &str) -> u16 {
+    let raw = authorize_url
+        .split(['?', '&'])
+        .find_map(|pair| pair.strip_prefix("redirect_uri="))
+        .unwrap();
+    let redirect = percent_encoding::percent_decode_str(raw)
+        .decode_utf8()
+        .unwrap()
+        .to_string();
+    reqwest::Url::parse(&redirect).unwrap().port().unwrap()
+}
+
+/// [`fake_browser`] that drops `iss` from the answer on its way back.
+fn browser_without_iss(server: Arc<RemoteServer>) -> impl FnOnce(&str) + Send {
+    move |authorize_url: &str| {
+        let url = authorize_url.to_string();
+        tokio::spawn(async move {
+            let location = server.consent_with("keeper", &url, "allow").await;
+            let (base, query) = location.split_once('?').unwrap();
+            let kept: Vec<&str> = query
+                .split('&')
+                .filter(|pair| !pair.starts_with("iss="))
+                .collect();
+            let _ = reqwest::get(format!("{base}?{}", kept.join("&"))).await;
+        });
+    }
+}
+
+/// A stand-in Crystalline whose `/health` answers and whose two OAuth
+/// documents are what `documents` makes of its origin: the
+/// protected-resource status and body, and the authorization server
+/// metadata.
+async fn stub(documents: impl FnOnce(&str) -> (u16, Value, Value)) -> String {
+    use axum::routing::get;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let (status, resource, meta) = documents(&origin);
+    let router = axum::Router::new()
+        .route(
+            "/health",
+            get(|| async { axum::Json(json!({ "status": "ok" })) }),
+        )
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(move || {
+                let resource = resource.clone();
+                async move {
+                    (
+                        axum::http::StatusCode::from_u16(status).unwrap(),
+                        axum::Json(resource),
+                    )
+                }
+            }),
+        )
+        .route(
+            "/.well-known/oauth-authorization-server",
+            get(move || {
+                let meta = meta.clone();
+                async move { axum::Json(meta) }
+            }),
+        );
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    origin
+}
+
+/// Metadata in the shape this server publishes, for `issuer`.
+fn metadata(issuer: &str) -> Value {
+    json!({
+        "issuer": issuer,
+        "authorization_endpoint": format!("{issuer}/api/v1/oauth/authorize"),
+        "token_endpoint": format!("{issuer}/api/v1/oauth/token"),
+        "registration_endpoint": format!("{issuer}/api/v1/oauth/register"),
+        "revocation_endpoint": format!("{issuer}/api/v1/oauth/revoke"),
+    })
+}
+
+/// A front for `backend` that passes every GET through and answers the
+/// control protocol with a 500: the documents name the backend (they follow
+/// the Host they are asked with), so the browser flow runs against it, and
+/// only the account check after the code exchange fails.
+async fn front_with_a_failing_ctl(backend: String) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let router = axum::Router::new()
+        .route(
+            "/api/v1/ctl",
+            axum::routing::post(|| async { axum::http::StatusCode::INTERNAL_SERVER_ERROR }),
+        )
+        .fallback(move |uri: axum::http::Uri| {
+            let backend = backend.clone();
+            async move {
+                let answer = reqwest::get(format!("{backend}{uri}")).await.unwrap();
+                let status = axum::http::StatusCode::from_u16(answer.status().as_u16()).unwrap();
+                (
+                    status,
+                    [("content-type", "application/json")],
+                    answer.text().await.unwrap(),
+                )
+            }
+        });
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    origin
 }
 
 /// The paste door of a server that has OAuth: never opened.
@@ -147,7 +256,12 @@ async fn a_sign_in_the_person_denies_is_reported_and_saves_nothing() {
     )
     .await
     .unwrap_err();
-    assert!(matches!(failure, SignInError::Denied(_)), "{failure}");
+    assert_eq!(failure, SignInError::Denied("access_denied".to_string()));
+    assert_eq!(
+        failure.to_string(),
+        "the sign-in was not allowed (access_denied); nothing was saved",
+        "the code and nothing the server wrote beside it"
+    );
     assert!(load_sources(dir.path()).unwrap().sources.is_empty());
 }
 
@@ -779,6 +893,66 @@ async fn a_browser_that_never_comes_back_saves_nothing() {
     assert_eq!(failure, SignInError::TimedOut);
     assert!(load_sources(dir.path()).unwrap().sources.is_empty());
     assert!(
+        !dir.path()
+            .join(crystalline_remote::server_key(&server.origin()))
+            .exists(),
+        "no host folder"
+    );
+}
+
+/// Review I1: a sign-in that fails after the code exchange ends the grant it
+/// was issued, so failed tries do not pile up under Connected clients.
+#[tokio::test]
+async fn a_failed_account_check_after_the_exchange_leaves_no_grant() {
+    let server = Arc::new(RemoteServer::start(Options::OAUTH).await);
+    let front = front_with_a_failing_ctl(server.origin()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let failure = connect_with_browser(
+        &front,
+        Some("acme"),
+        dir.path(),
+        &[],
+        fake_browser(server.clone(), "keeper", "allow"),
+        no_paste,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(failure, SignInError::Protocol(_)), "{failure}");
+    assert!(
+        server
+            .auth
+            .list_oauth_grants("keeper")
+            .await
+            .unwrap()
+            .is_empty(),
+        "the grant was ended"
+    );
+    assert!(load_sources(dir.path()).unwrap().sources.is_empty());
+}
+
+/// Review I1, the save: a sources file that cannot be written fails the
+/// sign-in after the exchange, and the grant is ended too.
+#[tokio::test]
+async fn a_failed_save_after_the_exchange_leaves_no_grant() {
+    let server = Arc::new(RemoteServer::start(Options::OAUTH).await);
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("sources.json"),
+        json!({ "v": 99, "sources": [] }).to_string(),
+    )
+    .unwrap();
+    let failure = connect_with_browser(
+        &server.origin(),
+        None,
+        dir.path(),
+        &[],
+        fake_browser(server.clone(), "keeper", "allow"),
+        no_paste,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(failure, SignInError::Store(_)), "{failure}");
+    assert!(
         server
             .auth
             .list_oauth_grants("keeper")
@@ -786,4 +960,212 @@ async fn a_browser_that_never_comes_back_saves_nothing() {
             .unwrap()
             .is_empty()
     );
+}
+
+/// Review M6: signing in again replaces the grant instead of adding one.
+#[tokio::test]
+async fn signing_in_again_ends_the_grant_it_replaces() {
+    let server = Arc::new(RemoteServer::start(Options::OAUTH).await);
+    let dir = tempfile::tempdir().unwrap();
+    for _ in 0..2 {
+        connect_with_browser(
+            &server.origin(),
+            Some("acme"),
+            dir.path(),
+            &[],
+            fake_browser(server.clone(), "keeper", "allow"),
+            no_paste,
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        server.auth.list_oauth_grants("keeper").await.unwrap().len(),
+        1,
+        "only the new grant is left"
+    );
+    let source = load_sources(dir.path()).unwrap().sources[0].clone();
+    let connection = Connection::open(source, dir.path()).unwrap();
+    let data = connection
+        .ctl_data(json!({ "v": 1, "cmd": "status" }))
+        .await
+        .unwrap();
+    assert_eq!(data["account"], "keeper", "and it is the one saved");
+}
+
+/// Review I2: an endpoint over plain http off this machine is refused, by
+/// the address the person typed and without the server's words.
+#[tokio::test]
+async fn a_token_endpoint_over_plain_http_is_refused() {
+    let origin = stub(|origin| {
+        let mut meta = metadata(origin);
+        meta["token_endpoint"] = json!("http://kb.example/api/v1/oauth/token");
+        (
+            200,
+            json!({ "resource": origin, "authorization_servers": [origin] }),
+            meta,
+        )
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let failure = connect_with_browser(
+        &origin,
+        None,
+        dir.path(),
+        &[],
+        |_url: &str| panic!("no browser for endpoints that are not secure"),
+        no_paste,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        failure,
+        SignInError::InsecureEndpoints {
+            url: origin.clone()
+        }
+    );
+    let said = failure.to_string();
+    assert!(
+        said.contains("not secure") && said.contains("--token") && !said.contains("kb.example"),
+        "{said}"
+    );
+    assert!(load_sources(dir.path()).unwrap().sources.is_empty());
+}
+
+/// Review I2: metadata that names another issuer than the one it was
+/// fetched for is refused (RFC 8414 section 3.3).
+#[tokio::test]
+async fn metadata_for_another_issuer_is_refused() {
+    let origin = stub(|origin| {
+        let mut meta = metadata(origin);
+        meta["issuer"] = json!("https://elsewhere.example");
+        (
+            200,
+            json!({ "resource": origin, "authorization_servers": [origin] }),
+            meta,
+        )
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let failure = connect_with_browser(
+        &origin,
+        None,
+        dir.path(),
+        &[],
+        |_url: &str| panic!("no browser for a mismatched issuer"),
+        no_paste,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(failure, SignInError::InsecureEndpoints { url: origin });
+    assert!(!failure.to_string().contains("elsewhere"), "{failure}");
+}
+
+/// Review M5: only a missing protected-resource document means no browser
+/// sign-in; a server that fails to answer it is not asked for a token.
+#[tokio::test]
+async fn a_failing_protected_resource_document_is_not_a_server_without_oauth() {
+    let origin = stub(|origin| (500, json!({}), metadata(origin))).await;
+    let dir = tempfile::tempdir().unwrap();
+    let failure = connect_with_browser(
+        &origin,
+        None,
+        dir.path(),
+        &[],
+        |_url: &str| panic!("no browser"),
+        |_note: String| panic!("no token prompt for a server that failed"),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&failure, SignInError::Protocol(text) if text.contains("500")),
+        "{failure}"
+    );
+}
+
+/// Review M1: the server says every answer carries `iss`, so one without it
+/// is refused.
+#[tokio::test]
+async fn an_answer_without_iss_is_refused_when_the_server_promises_it() {
+    let server = Arc::new(RemoteServer::start(Options::OAUTH).await);
+    let dir = tempfile::tempdir().unwrap();
+    let failure = connect_with_browser(
+        &server.origin(),
+        None,
+        dir.path(),
+        &[],
+        browser_without_iss(server.clone()),
+        no_paste,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&failure, SignInError::Protocol(text) if text.contains("another server")),
+        "{failure}"
+    );
+    assert!(load_sources(dir.path()).unwrap().sources.is_empty());
+}
+
+/// Review M2: a refusal that is not this sign-in's answer is not taken as
+/// the person's no.
+#[tokio::test]
+async fn a_stray_refusal_is_another_sign_ins_answer() {
+    let server = RemoteServer::start(Options::OAUTH).await;
+    let dir = tempfile::tempdir().unwrap();
+    let failure = connect_with_browser(
+        &server.origin(),
+        None,
+        dir.path(),
+        &[],
+        |authorize_url: &str| {
+            let port = callback_port(authorize_url);
+            tokio::spawn(async move {
+                let _ = reqwest::get(format!(
+                    "http://127.0.0.1:{port}/callback?error=access_denied&state=not-this-one"
+                ))
+                .await;
+            });
+        },
+        no_paste,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&failure, SignInError::Protocol(text) if text.contains("another sign-in")),
+        "{failure}"
+    );
+}
+
+/// Review M3: a connection the browser opens and sends nothing on does not
+/// hold the loopback port; the real answer behind it is served.
+#[tokio::test]
+async fn a_silent_connection_to_the_loopback_port_does_not_hold_the_sign_in() {
+    let server = Arc::new(RemoteServer::start(Options::OAUTH).await);
+    let dir = tempfile::tempdir().unwrap();
+    let browser = {
+        let server = server.clone();
+        move |authorize_url: &str| {
+            let port = callback_port(authorize_url);
+            // Opened first and held open, silent, the way a preconnect is.
+            let silent = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            let url = authorize_url.to_string();
+            tokio::spawn(async move {
+                let location = server.consent_with("keeper", &url, "allow").await;
+                let _ = reqwest::get(location).await;
+                drop(silent);
+            });
+        }
+    };
+    let connected = connect_with_browser_within(
+        &server.origin(),
+        Some("acme"),
+        dir.path(),
+        &[],
+        browser,
+        no_paste,
+        Duration::from_secs(8),
+    )
+    .await
+    .unwrap();
+    assert_eq!(connected.source.account, "keeper");
 }
