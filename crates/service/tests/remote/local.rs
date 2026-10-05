@@ -37,6 +37,19 @@ impl LocalMachine {
     /// [`LocalMachine::start`] with GitHub enabled and `forge` as the
     /// origin provider, when one is given.
     pub async fn start_with(with_platform: bool, forge: Option<Arc<MockProvider>>) -> LocalMachine {
+        LocalMachine::start_full(with_platform, forge, false).await
+    }
+
+    /// [`LocalMachine::start`] serving read-only (`serve --read-only`).
+    pub async fn start_read_only(with_platform: bool) -> LocalMachine {
+        LocalMachine::start_full(with_platform, None, true).await
+    }
+
+    async fn start_full(
+        with_platform: bool,
+        forge: Option<Arc<MockProvider>>,
+        read_only: bool,
+    ) -> LocalMachine {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
         let mut cfg = GlobalConfig::default();
@@ -93,7 +106,8 @@ impl LocalMachine {
             None,
             Some(config_path),
         )
-        .with_state_dir(root.join("state"));
+        .with_state_dir(root.join("state"))
+        .with_read_only(read_only);
         if let Some(forge) = forge {
             engine = engine
                 .with_origin_provider(forge)

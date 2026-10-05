@@ -2406,42 +2406,63 @@ const SOURCE_LOOK: Duration = Duration::from_secs(5);
 const SOURCE_POLL_DEADLINE: Duration = crystalline_remote::ONE_DOMAIN_LIMIT;
 
 /// The source poller. The first poll runs right after the start, in the
-/// background; a source that is down is asked again at the next poll, and
+/// background; a source that failed is asked again at the next poll, and
 /// its first answer clears its failure, so nothing ever needs a restart.
-async fn run_source_poller(
+/// One poll or look runs at a time (a tick that comes due meanwhile waits),
+/// and a shutdown ends the poller at once, even in the middle of one.
+pub async fn run_source_poller(
     engine: Arc<Engine>,
     poll: Duration,
     look: Duration,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    enum Due {
+        Poll,
+        Look,
+    }
     let mut polls = tokio::time::interval(poll);
     let mut looks = tokio::time::interval(look);
     polls.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     looks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
+        let due = tokio::select! {
+            _ = wait_true(&mut shutdown) => break,
+            _ = looks.tick() => Due::Look,
+            _ = polls.tick() => Due::Poll,
+        };
+        let Some(sources) = engine.sources() else {
+            continue;
+        };
+        let work = async {
+            match due {
+                Due::Look => {
+                    // Before the empty check: the first `connect` on a
+                    // machine with no sources is one of the changes this
+                    // looks for.
+                    let reloaded = sources.reload_if_changed();
+                    if sources.is_empty() {
+                        return;
+                    }
+                    crate::route::sync_local(&engine, &sources).await;
+                    // A source just connected is asked at once, not at the
+                    // next poll.
+                    if reloaded.is_some() {
+                        sources.refresh(SOURCE_POLL_DEADLINE).await;
+                    }
+                }
+                Due::Poll => {
+                    if sources.is_empty() {
+                        return;
+                    }
+                    crate::route::sync_local(&engine, &sources).await;
+                    sources.refresh(SOURCE_POLL_DEADLINE).await;
+                    sources.refresh_hook_status(SOURCE_POLL_DEADLINE).await;
+                }
+            }
+        };
         tokio::select! {
             _ = wait_true(&mut shutdown) => break,
-            _ = looks.tick() => {
-                let Some(sources) = engine.sources() else { continue };
-                // Before the empty check: the first `connect` on a machine
-                // with no sources is one of the changes this looks for.
-                let reloaded = sources.reload_if_changed();
-                sources.set_local_if_changed(engine.local_domains());
-                // A source just connected is asked at once, not at the next
-                // poll.
-                if reloaded.is_some() && !sources.is_empty() {
-                    sources.refresh(SOURCE_POLL_DEADLINE).await;
-                }
-            }
-            _ = polls.tick() => {
-                let Some(sources) = engine.sources() else { continue };
-                if sources.is_empty() {
-                    continue;
-                }
-                sources.set_local_if_changed(engine.local_domains());
-                sources.refresh(SOURCE_POLL_DEADLINE).await;
-                sources.refresh_hook_status(SOURCE_POLL_DEADLINE).await;
-            }
+            _ = work => {}
         }
     }
 }

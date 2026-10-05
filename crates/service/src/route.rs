@@ -33,12 +33,25 @@ use std::time::Duration;
 use crystalline_remote::{
     CTL_TIMEOUT, ForwardedAgent, MountTable, NameMap, ONE_DOMAIN_LIMIT, Part, RemoteFailure, Route,
     SourceSet, ToolShape, attach_row_urls, merge_evolve, merge_list_domains, merge_recent,
-    merge_search, missing_from, part_request_limit, translate_answer,
+    merge_search, missing_from, missing_from_evolve, part_request_limit, seconds, translate_answer,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
-use crate::engine::{EVOLVE_DEFAULT_LIMIT, Engine, SEARCH_DEFAULT_LIMIT};
+use crate::engine::{
+    EVOLVE_DEFAULT_LIMIT, EVOLVE_MAX_LIMIT, Engine, EngineError, MAX_PAGE_LIMIT,
+    SEARCH_DEFAULT_LIMIT,
+};
+
+/// The tools that change content: refused on a read-only instance for a
+/// mounted domain too, as they are for a local one.
+const WRITE_TOOLS: &[&str] = &[
+    "write_engram",
+    "edit_engram",
+    "split_engram",
+    "delete_engram",
+    "move_engram",
+];
 use crate::params::*;
 
 /// The tools a call can be forwarded with: the server's `REMOTE_TOOLS`.
@@ -244,16 +257,6 @@ fn unreachable(source: &str, domain: &str, url: &str, cause: &str) -> String {
     )
 }
 
-/// `3 s`, `0.7 s`: a limit as a person reads it.
-fn seconds(after: Duration) -> String {
-    let millis = after.as_millis();
-    if millis.is_multiple_of(1000) {
-        format!("{} s", millis / 1000)
-    } else {
-        format!("{:.1} s", after.as_secs_f64())
-    }
-}
-
 /// Install this machine's sources on `engine`, from `<state_dir>/remote` and
 /// the environment, even when there are none yet: a later `connect` then
 /// reaches a running daemon through `sources_reload` or its poller. Nothing
@@ -276,6 +279,7 @@ pub fn sources_status(engine: &Arc<Engine>) -> Value {
     };
     let table = sources.table();
     let failures = sources.failures();
+    let details = sources.failure_details();
     Value::Array(
         sources
             .records()
@@ -288,6 +292,9 @@ pub fn sources_status(engine: &Arc<Engine>) -> Value {
                     "kind": s.kind.as_str(),
                     "from_env": s.from_env,
                     "failure": failures.get(&s.name),
+                    // What the server itself wrote, for a person reading
+                    // `status` or `doctor`; never part of an agent's answer.
+                    "failure_detail": details.get(&s.name),
                     "mounts": table
                         .of_source(&s.name)
                         .map(|m| json!({
@@ -336,18 +343,32 @@ pub async fn routed(
     }
     // A hand edit of config.yaml (a domain added, renamed or removed) shows
     // in the table before this call is planned.
-    sources.set_local_if_changed(engine.local_domains());
-    let table = sources.table();
+    sync_local(engine, &sources).await;
+    let table = sources.routing_table();
     let route = plan(tool, args, &table).ok()?;
     match route {
         Route::Local => None,
         Route::Refused(text) => Some(Err(RouteError::Refused(text))),
         Route::Remote { source } => {
             let names = table.names(&source);
-            let domain = named_domains(tool, args)
-                .ok()
-                .and_then(|n| n.into_iter().find(|d| names.to_remote.contains_key(d)))
+            let named = named_domains(tool, args).unwrap_or_default();
+            let domain = named
+                .iter()
+                .find(|d| names.to_remote.contains_key(*d))
+                .cloned()
                 .unwrap_or_default();
+            // Every name the call carries must be this source's: a second
+            // domain is never sent to a server under this machine's name.
+            if let Some(other) = named.iter().find(|d| !names.to_remote.contains_key(*d)) {
+                return Some(Err(RouteError::Refused(format!(
+                    "this call names '{domain}', a domain from {source}, and also '{other}', \
+                     which is not; a call for a domain from {source} names only that \
+                     server's domains, so ask about each domain in a call of its own"
+                ))));
+            }
+            if engine.read_only() && WRITE_TOOLS.contains(&tool) {
+                return Some(Err(RouteError::Refused(EngineError::ReadOnly.to_string())));
+            }
             let forwarded = forwarded_args(args, &names, false);
             let limit = if tool == crate::EVOLVE_TOOL_NAME {
                 CTL_TIMEOUT
@@ -387,6 +408,26 @@ pub async fn routed(
     }
 }
 
+/// Read this machine's domains again when the configuration file changed
+/// since the last look (a stat, no parse when it did not), on a blocking
+/// thread, and hand them to the sources.
+pub async fn sync_local(engine: &Arc<Engine>, sources: &Arc<SourceSet>) {
+    let path = engine.config_file_path();
+    let stamp = tokio::task::spawn_blocking(move || {
+        path.and_then(|p| std::fs::metadata(p).ok())
+            .map(|m| (m.modified().ok(), m.len()))
+    })
+    .await
+    .unwrap_or(None);
+    if !sources.note_config_stamp(stamp) {
+        return;
+    }
+    let reading = engine.clone();
+    if let Ok(local) = tokio::task::spawn_blocking(move || reading.local_domains()).await {
+        sources.set_local_if_changed(local);
+    }
+}
+
 /// A timed-out failure names the limit the caller set, not what was left of
 /// it once the connection was open.
 fn within(failure: RemoteFailure, limit: Duration) -> RemoteFailure {
@@ -418,11 +459,16 @@ async fn fan_out(
     } else {
         EVOLVE_DEFAULT_LIMIT
     };
+    let limit_max = if tool == "search_engrams" {
+        MAX_PAGE_LIMIT
+    } else {
+        EVOLVE_MAX_LIMIT
+    };
     let limit = args
         .get("limit")
         .and_then(Value::as_u64)
         .map_or(limit_default, |l| l as usize)
-        .max(1);
+        .clamp(1, limit_max);
     let paged = tool == "search_engrams" || tool == crate::EVOLVE_TOOL_NAME;
     let part_args = |mut a: Value| {
         if paged && let Some(obj) = a.as_object_mut() {
@@ -514,7 +560,15 @@ async fn fan_out(
                     },
                 ));
             }
-            Err(failure) => missing.push(missing_from(&source, &within(failure, deadline))),
+            Err(failure) => {
+                let failure = within(failure, deadline);
+                missing.push(if tool == crate::EVOLVE_TOOL_NAME {
+                    let example = names.to_remote.keys().next().map(String::as_str);
+                    missing_from_evolve(&source, &failure, example)
+                } else {
+                    missing_from(&source, &failure)
+                });
+            }
         }
     }
     // Part order is connect order, whatever order the answers arrived in.

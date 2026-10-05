@@ -143,6 +143,18 @@ pub enum RemoteFailure {
     /// server's own words, word for word), or a status that is not the
     /// protocol.
     Refused(String),
+    /// The server answered with an HTTP status that is not the protocol (a
+    /// proxy's error page, a crash). The body is kept for `status` and
+    /// `doctor` only ([`RemoteFailure::server_text`]); what an agent reads
+    /// names the status and nothing the server wrote.
+    Status {
+        /// The server.
+        url: String,
+        /// The HTTP status code.
+        status: u16,
+        /// The start of the body, as the server sent it.
+        body: String,
+    },
     /// The server did not answer within the limit.
     TimedOut {
         /// The source's name.
@@ -158,6 +170,16 @@ impl RemoteFailure {
     /// Whether this source needs a new sign-in.
     pub fn is_sign_in(&self) -> bool {
         matches!(self, RemoteFailure::SignInAgain { .. })
+    }
+
+    /// What the server itself wrote, when this failure carries any that is
+    /// not the protocol's own refusal: for `status` and `doctor`, never for
+    /// anything an agent reads.
+    pub fn server_text(&self) -> Option<&str> {
+        match self {
+            RemoteFailure::Status { body, .. } => Some(body),
+            _ => None,
+        }
     }
 
     /// Whether the server gave no answer at all: what opens the down window.
@@ -189,6 +211,10 @@ impl std::fmt::Display for RemoteFailure {
                 "the access token for {url} has expired; the next call that may refresh it renews it by itself"
             ),
             RemoteFailure::Credential(text) | RemoteFailure::Refused(text) => f.write_str(text),
+            RemoteFailure::Status { url, status, .. } => write!(
+                f,
+                "{url} answered with HTTP status {status} instead of the remote control protocol"
+            ),
             RemoteFailure::TimedOut { source, url, after } => write!(
                 f,
                 "{source} ({url}) {UNREACHABLE_WORDS}: it did not answer within {} ({NETWORK_HINT})",
@@ -201,7 +227,7 @@ impl std::fmt::Display for RemoteFailure {
 impl std::error::Error for RemoteFailure {}
 
 /// `3 s`, `0.7 s`: a deadline as a person reads it.
-pub(crate) fn seconds(after: Duration) -> String {
+pub fn seconds(after: Duration) -> String {
     let millis = after.as_millis();
     if millis.is_multiple_of(1000) {
         format!("{} s", millis / 1000)
@@ -303,6 +329,26 @@ pub fn http_client() -> Result<reqwest::Client, RemoteFailure> {
         .user_agent(concat!("crystalline/", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(|e| RemoteFailure::Refused(format!("could not build the HTTP client: {e}")))
+}
+
+/// Whether this process has built its first HTTP client.
+static WARMED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+
+/// Build this process's first HTTP client on a blocking thread and wait for
+/// it, once per process. The first build loads the platform's certificate
+/// roots, which takes most of a second; every later one takes a few
+/// milliseconds. Callers await this before any call budget starts, so a cold
+/// process never spends a caller's deadline on it, and a cold start never
+/// reads as a sign-in that could not be used.
+pub async fn warm_http_client() {
+    WARMED
+        .get_or_init(|| async {
+            let _ = tokio::task::spawn_blocking(|| {
+                let _ = http_client();
+            })
+            .await;
+        })
+        .await;
 }
 
 /// What a form body leaves as it is: letters, digits and `*-._`, the
@@ -871,11 +917,11 @@ impl Connection {
             )));
         }
         if !status.is_success() {
-            let excerpt: String = text.chars().take(200).collect();
-            return Err(RemoteFailure::Refused(format!(
-                "{} answered {status}: {excerpt}",
-                self.source.url
-            )));
+            return Err(RemoteFailure::Status {
+                url: self.source.url.clone(),
+                status: status.as_u16(),
+                body: text.chars().take(200).collect(),
+            });
         }
         let envelope: Value = serde_json::from_str(&text).map_err(|_| {
             RemoteFailure::Refused(format!(
@@ -1036,7 +1082,12 @@ impl RefreshJob {
             if error == "invalid_grant" || error == "invalid_client" {
                 return Err(sign_in());
             }
-            let what = if error.is_empty() {
+            // An OAuth error code is a short lowercase word; anything else
+            // the server wrote is left out of a sentence an agent may read.
+            let code_shaped = !error.is_empty()
+                && error.len() <= 40
+                && error.bytes().all(|b| b.is_ascii_lowercase() || b == b'_');
+            let what = if !code_shaped {
                 status.to_string()
             } else {
                 format!("{status}, {error}")
@@ -1046,9 +1097,9 @@ impl RefreshJob {
                 self.peer.url
             )));
         }
-        let answer: TokenAnswer = serde_json::from_str(&text).map_err(|e| {
+        let answer: TokenAnswer = serde_json::from_str(&text).map_err(|_| {
             RemoteFailure::Refused(format!(
-                "the token endpoint of {} answered something that is not a token: {e}",
+                "the token endpoint of {} answered something that is not a token",
                 self.peer.url
             ))
         })?;

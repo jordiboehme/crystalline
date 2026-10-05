@@ -37,7 +37,7 @@ pub mod token;
 pub use error::RemoteError;
 pub use fanout::{
     Missing, Part, RRF_K, attach_row_urls, merge_evolve, merge_list_domains, merge_recent,
-    merge_search, missing_from, missing_note, part_request_limit,
+    merge_search, missing_from, missing_from_evolve, missing_note, part_request_limit,
 };
 pub use github::GitHubProvider;
 pub use github::auth::{DeviceFlowStart, DevicePoll, GITHUB_CLIENT_ID};
@@ -58,7 +58,8 @@ pub use provider::{
 };
 pub use server_client::{
     CONNECT_TIMEOUT, CTL_TIMEOUT, Connection, CtlAnswer, DOWN_WINDOW, ForwardedAgent, Health,
-    ONE_DOMAIN_LIMIT, RemoteFailure, form_body, http_client, settle_refreshes,
+    ONE_DOMAIN_LIMIT, RemoteFailure, form_body, http_client, seconds, settle_refreshes,
+    warm_http_client,
 };
 pub use server_token::{CredentialKind, ServerCredential, ServerCredentialStore, server_key};
 pub use sign_in::{
@@ -70,7 +71,7 @@ pub use source_cache::{
     Cached, Fetched, HOOK_STATUS_FILE, ROUTING_FILE, STALE_AFTER, cached_offers, fetch_cached,
     read_cached, remote_domains, stale_line, write_cached,
 };
-pub use source_set::{MountNote, MountedRouting, SourceSet};
+pub use source_set::{ConfigStamp, MountNote, MountedRouting, SourceSet};
 pub use sources::{
     LOCAL_SUFFIX, MountRecord, REMOTE_TOKEN_ENV, REMOTE_URL_ENV, SOURCES_FILE, SourceRecord,
     SourcesFile, default_source_name, env_source, load_sources, remote_dir, update_sources,

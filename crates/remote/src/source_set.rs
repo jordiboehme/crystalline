@@ -47,6 +47,9 @@ async fn open_connection(
     limit: Duration,
 ) -> Result<Arc<Connection>, RemoteFailure> {
     let name = record.name.clone();
+    // Outside the budget: a cold process's first client build is not a
+    // sign-in that did not finish in time.
+    crate::server_client::warm_http_client().await;
     let opening = tokio::task::spawn_blocking(move || {
         Connection::open_with(record, &dir, move |var| {
             (var == REMOTE_TOKEN_ENV).then(|| token.clone()).flatten()
@@ -140,8 +143,18 @@ pub struct MountedRouting {
 
 struct Inner {
     file: SourcesFile,
+    /// Counts every [`SourceSet::reload`], so a refresh that read the file
+    /// before one never stores its older copy over the newer one.
+    generation: u64,
     table: Arc<MountTable>,
+    /// The names a source with no usable cache keeps in `sources.json`, as
+    /// mounts for routing only: a call for one goes to that source, which
+    /// answers it or is named as unreachable, and never falls to a local
+    /// copy (decision D19).
+    reserved: Vec<Mount>,
     failures: BTreeMap<String, String>,
+    /// What a server wrote alongside a failure, for `status` and `doctor`.
+    failure_details: BTreeMap<String, String>,
 }
 
 /// The sources of this machine.
@@ -158,7 +171,15 @@ pub struct SourceSet {
     rebuilding: std::sync::Mutex<()>,
     /// Never held across an await.
     connections: std::sync::Mutex<BTreeMap<String, Arc<Connection>>>,
+    /// The configuration file's stamp when the local domains were last
+    /// read, `None` before the first look.
+    local_stamp: std::sync::Mutex<Option<ConfigStamp>>,
 }
+
+/// What a stat says about the configuration file: its modification time
+/// and length, `None` when it does not exist. Comparing two is how a caller
+/// knows a hand edit happened without reading and parsing the file.
+pub type ConfigStamp = Option<(Option<std::time::SystemTime>, u64)>;
 
 impl SourceSet {
     /// The sources saved under `remote_dir`, plus the environment's, with the
@@ -181,12 +202,16 @@ impl SourceSet {
             env_token,
             inner: RwLock::new(Inner {
                 file,
+                generation: 0,
                 table: Arc::new(MountTable::default()),
+                reserved: Vec::new(),
                 failures: BTreeMap::new(),
+                failure_details: BTreeMap::new(),
             }),
             local: Arc::new(RwLock::new(local)),
             rebuilding: std::sync::Mutex::new(()),
             connections: std::sync::Mutex::new(BTreeMap::new()),
+            local_stamp: std::sync::Mutex::new(None),
         };
         set.rebuild();
         set
@@ -201,12 +226,16 @@ impl SourceSet {
             env_token: None,
             inner: RwLock::new(Inner {
                 file: SourcesFile::default(),
+                generation: 0,
                 table: Arc::new(MountTable::default()),
+                reserved: Vec::new(),
                 failures: BTreeMap::new(),
+                failure_details: BTreeMap::new(),
             }),
             local: Arc::new(RwLock::new(Vec::new())),
             rebuilding: std::sync::Mutex::new(()),
             connections: std::sync::Mutex::new(BTreeMap::new()),
+            local_stamp: std::sync::Mutex::new(None),
         }
     }
 
@@ -256,11 +285,21 @@ impl SourceSet {
         let local = self.local();
         let offers = cached_offers(&combined, &self.remote_dir);
         let (mut table, said) = assign(&mut combined, &local, &offers);
+        let mut held = Vec::new();
         for source in &combined.sources {
             if offers.contains_key(&source.name) {
                 continue;
             }
             for reserved in &source.mounts {
+                if table.mount(&reserved.local).is_none() {
+                    held.push(Mount {
+                        local: reserved.local.clone(),
+                        remote: reserved.remote.clone(),
+                        source: source.name.clone(),
+                        bullets: Vec::new(),
+                        replaces_local: false,
+                    });
+                }
                 if local.iter().any(|d| d.name == reserved.local)
                     && !table
                         .hidden(&reserved.local)
@@ -275,13 +314,30 @@ impl SourceSet {
                 }
             }
         }
-        self.write().table = Arc::new(table);
+        let mut inner = self.write();
+        inner.table = Arc::new(table);
+        inner.reserved = held;
         said
     }
 
     /// The mount table as it stands.
     pub fn table(&self) -> Arc<MountTable> {
         self.read().table.clone()
+    }
+
+    /// The table calls are routed by: [`SourceSet::table`] plus the names a
+    /// source with no usable cache keeps in `sources.json`, each as a mount
+    /// of that source. So a call for such a name goes to its source (and
+    /// says so when it is down), and a call over all domains asks it and
+    /// names it when it does not answer. Never listed in a routing block.
+    pub fn routing_table(&self) -> Arc<MountTable> {
+        let inner = self.read();
+        if inner.reserved.is_empty() {
+            return inner.table.clone();
+        }
+        let mut table = (*inner.table).clone();
+        table.mounts.extend(inner.reserved.iter().cloned());
+        Arc::new(table)
     }
 
     /// The local domains hidden while their source is connected: a copy of
@@ -335,6 +391,12 @@ impl SourceSet {
         self.read().failures.clone()
     }
 
+    /// What a server wrote beside its last failure, for `status` and
+    /// `doctor` only.
+    pub fn failure_details(&self) -> BTreeMap<String, String> {
+        self.read().failure_details.clone()
+    }
+
     /// This machine's own domains changed: recompute who is shadowed.
     pub fn set_local(&self, local: Vec<LocalDomain>) -> Vec<Announcement> {
         *self.local.write().unwrap_or_else(|e| e.into_inner()) = local;
@@ -350,6 +412,18 @@ impl SourceSet {
             return None;
         }
         Some(self.set_local(local))
+    }
+
+    /// Record `stamp` as the configuration file's, and answer whether it
+    /// differs from the one recorded before (always true the first time):
+    /// whether the local domains need reading again.
+    pub fn note_config_stamp(&self, stamp: ConfigStamp) -> bool {
+        let mut seen = self.local_stamp.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.as_ref() == Some(&stamp) {
+            return false;
+        }
+        *seen = Some(stamp);
+        true
     }
 
     /// [`SourceSet::reload`] when `sources.json` on disk differs from the
@@ -378,7 +452,11 @@ impl SourceSet {
             SourcesFile::default()
         });
         let records = self.combined(&file).sources;
-        self.write().file = file;
+        {
+            let mut inner = self.write();
+            inner.file = file;
+            inner.generation += 1;
+        }
         self.connections().retain(|name, open| {
             records
                 .iter()
@@ -556,19 +634,27 @@ impl SourceSet {
         let fetched = self
             .fetch_all("routing_bullets", ROUTING_FILE, deadline)
             .await;
-        {
+        let generation = {
             let mut inner = self.write();
             for (name, outcome) in &fetched {
                 match outcome {
                     Fetched::Fresh(_) => {
                         inner.failures.remove(name);
+                        inner.failure_details.remove(name);
                     }
                     Fetched::Stale { failure, .. } | Fetched::Missing(failure) => {
                         inner.failures.insert(name.clone(), failure.to_string());
+                        match failure.server_text() {
+                            Some(text) => {
+                                inner.failure_details.insert(name.clone(), text.to_string())
+                            }
+                            None => inner.failure_details.remove(name),
+                        };
                     }
                 }
             }
-        }
+            inner.generation
+        };
         let local = self.local.clone();
         let dir = self.remote_dir.clone();
         let env = self.env_source.clone();
@@ -594,7 +680,14 @@ impl SourceSet {
         // the save failed, the table stays as it was.
         match saved {
             Ok(Ok(file)) => {
-                self.write().file = file;
+                {
+                    // A reload that ran meanwhile read the file after this
+                    // save, so its copy is the newer one and stays.
+                    let mut inner = self.write();
+                    if inner.generation == generation {
+                        inner.file = file;
+                    }
+                }
                 self.rebuild();
             }
             Ok(Err(e)) => {
@@ -621,6 +714,9 @@ impl SourceSet {
         agent: &ForwardedAgent,
         deadline: Duration,
     ) -> Result<Value, RemoteFailure> {
+        // Before the clock starts: a cold process's first client build is
+        // not the caller's to wait for.
+        crate::server_client::warm_http_client().await;
         let started = std::time::Instant::now();
         let connection = self.connection(source, deadline).await?;
         let left = deadline.saturating_sub(started.elapsed());

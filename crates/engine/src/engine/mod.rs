@@ -129,7 +129,7 @@ pub const TREE_LEVEL_CAP: usize = 500;
 /// its own constant because the two bound different queries and either could
 /// move without the other: this one bounds a sorter holding bodies, that one
 /// bounds how much of the reference index a popover materializes.
-const MAX_PAGE_LIMIT: usize = 100;
+pub const MAX_PAGE_LIMIT: usize = 100;
 
 /// The deepest level [`Engine::browse_domain`] walks.
 ///
@@ -149,7 +149,7 @@ pub const EVOLVE_DEFAULT_LIMIT: usize = 10;
 pub const SEARCH_DEFAULT_LIMIT: usize = 10;
 
 /// The largest `evolve_engrams` page size.
-const EVOLVE_MAX_LIMIT: usize = 100;
+pub const EVOLVE_MAX_LIMIT: usize = 100;
 
 /// The largest `inbound_references` page size.
 ///
@@ -4473,7 +4473,7 @@ impl Engine {
     ///
     /// Says nothing about whether the file exists or parses; a caller that
     /// needs to know reads it.
-    fn config_file_path(&self) -> Option<PathBuf> {
+    pub fn config_file_path(&self) -> Option<PathBuf> {
         match &self.config_path {
             Some(p) => Some(p.clone()),
             None => crystalline_core::config::global_config_path().ok(),

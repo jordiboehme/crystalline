@@ -70,10 +70,31 @@ pub fn missing_from(source: &str, failure: &RemoteFailure) -> Missing {
             "could not use its saved sign-in on this machine".to_string()
         }
         RemoteFailure::Refused(_) => "answered with an error".to_string(),
+        RemoteFailure::Status { status, .. } => {
+            format!("answered with an error (HTTP status {status})")
+        }
     };
     Missing {
         source: source.to_string(),
         reason,
+    }
+}
+
+/// [`missing_from`] for a merged `evolve_engrams`. A sweep on a server can
+/// take longer than a call over all domains waits, so a source that timed
+/// out is told apart: the reason says to run the sweep for one of its
+/// domains (`domain`, this machine's name for it), which waits the long
+/// limit of a call to one server.
+pub fn missing_from_evolve(source: &str, failure: &RemoteFailure, domain: Option<&str>) -> Missing {
+    match (failure, domain) {
+        (RemoteFailure::TimedOut { after, .. }, Some(domain)) => Missing {
+            source: source.to_string(),
+            reason: format!(
+                "did not finish its sweep within {} (run evolve_engrams with domains [\"{domain}\"] to give it longer)",
+                seconds(*after)
+            ),
+        },
+        _ => missing_from(source, failure),
     }
 }
 
@@ -609,6 +630,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_sweep_that_timed_out_points_to_the_long_single_server_call() {
+        let timed_out = RemoteFailure::TimedOut {
+            source: "acme".into(),
+            url: "https://kb.acme.com".into(),
+            after: std::time::Duration::from_secs(3),
+        };
+        assert_eq!(
+            missing_note(&missing_from_evolve("acme", &timed_out, Some("platform"))),
+            "acme did not finish its sweep within 3 s (run evolve_engrams with domains [\"platform\"] to give it longer); its domains are missing from these results"
+        );
+        let refused = RemoteFailure::Refused("x".into());
+        assert_eq!(
+            missing_from_evolve("acme", &refused, Some("platform")),
+            missing_from("acme", &refused)
+        );
+    }
+
     /// No server-supplied text reaches an agent: a refusal's body, a
     /// credential error's chain and an unreachable detail stay out.
     #[test]
@@ -617,6 +656,11 @@ mod tests {
         let failures = [
             RemoteFailure::Refused(html.into()),
             RemoteFailure::Credential(html.into()),
+            RemoteFailure::Status {
+                url: "https://kb.acme.com".into(),
+                status: 502,
+                body: html.into(),
+            },
             RemoteFailure::Unreachable {
                 source: "acme".into(),
                 url: "https://kb.acme.com/x".into(),

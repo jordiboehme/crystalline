@@ -136,9 +136,11 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
             let args = req.get("args").cloned().unwrap_or_else(|| json!({}));
             // A caller on a budget (the recall hook) says how long a source
             // may take; it never waits longer than the route's own limits.
+            // Zero is no budget at all, so it is read as none given.
             let deadline = req
                 .get("deadline_ms")
                 .and_then(Value::as_u64)
+                .filter(|ms| *ms > 0)
                 .map(std::time::Duration::from_millis);
             let agent = crystalline_remote::ForwardedAgent::default();
             match crate::route::run_tool_routed(&shared.engine, tool, args, &agent, deadline).await
@@ -154,15 +156,22 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
         "sources_reload" => {
             let said = match shared.engine.sources() {
                 Some(sources) => {
-                    sources.set_local(shared.engine.local_domains());
-                    let said = sources.reload();
+                    let mut said = sources.set_local(shared.engine.local_domains());
+                    said.extend(sources.reload());
                     let refreshing = sources.clone();
                     tokio::spawn(async move {
                         refreshing
                             .refresh(crystalline_remote::ONE_DOMAIN_LIMIT)
                             .await;
                     });
-                    said
+                    // Both halves can say the same thing: once is enough.
+                    let mut once = Vec::new();
+                    for announcement in said {
+                        if !once.contains(&announcement) {
+                            once.push(announcement);
+                        }
+                    }
+                    once
                 }
                 None => Vec::new(),
             };
@@ -180,7 +189,7 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
             let routing = match shared.engine.sources() {
                 Some(sources) => {
                     sources.reload_if_changed();
-                    sources.set_local_if_changed(shared.engine.local_domains());
+                    crate::route::sync_local(&shared.engine, &sources).await;
                     if !sources.is_empty() {
                         sources.refresh(deadline).await;
                     }
