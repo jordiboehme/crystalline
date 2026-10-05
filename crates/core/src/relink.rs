@@ -312,7 +312,8 @@ fn respell_line(line: &str, respell: &dyn Fn(&str) -> Option<String>) -> (String
 }
 
 /// A char that can be part of the bare domain run right after `crystalline://`.
-fn is_domain_char(c: char) -> bool {
+/// A run of them, with any trailing `.` trimmed, is the address's authority.
+pub fn is_domain_char(c: char) -> bool {
     c.is_alphanumeric() || matches!(c, '-' | '_' | '.')
 }
 

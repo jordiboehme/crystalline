@@ -8,7 +8,8 @@
 //! origin_update, origin_status,
 //! origin_share, origin_withdraw, origin_changes, origin_discard, origin_resolve,
 //! provision, forget_domain,
-//! forget_credential, shutdown. This is the operator channel plus the `tool` command, which
+//! forget_credential, sources_reload, mounted_routing, shutdown. This is the
+//! operator channel plus the `tool` command, which
 //! dispatches a daemon-attached CLI data verb to the shared engine and
 //! returns raw engine JSON; an MCP client's data operations still go over the
 //! MCP handshake.
@@ -102,6 +103,12 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                     if let (Value::Object(a), Value::Object(b)) = (&mut data, report) {
                         a.extend(b);
                     }
+                    // The connected servers, and the local domains they hide.
+                    data["sources"] = crate::route::sources_status(&shared.engine);
+                    let mut hidden: Vec<String> =
+                        shared.engine.shadowed_domains().into_iter().collect();
+                    hidden.sort();
+                    data["shadowed_domains"] = json!(hidden);
                     (envelope_ok(data), false)
                 }
                 Err(e) => (envelope_err(e.to_string()), false),
@@ -119,13 +126,77 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
         // than the MCP stream's format-dependent tool envelope (TOON by
         // default). The engine methods self-guard read-only mutations, so this
         // keeps the same refusals the MCP path gave.
+        //
+        // The caller is this machine's owner, so a call for a domain from a
+        // connected server goes to that server and a call over all domains
+        // asks every server too (`crate::route`). With no server connected
+        // the answer is exactly the engine's.
         "tool" => {
             let tool = req.get("tool").and_then(Value::as_str).unwrap_or("");
             let args = req.get("args").cloned().unwrap_or_else(|| json!({}));
-            match crate::client::dispatch_engine(&shared.engine, tool, args).await {
+            // A caller on a budget (the recall hook) says how long a source
+            // may take; it never waits longer than the route's own limits.
+            let deadline = req
+                .get("deadline_ms")
+                .and_then(Value::as_u64)
+                .map(std::time::Duration::from_millis);
+            let agent = crystalline_remote::ForwardedAgent::default();
+            match crate::route::run_tool_routed(&shared.engine, tool, args, &agent, deadline).await
+            {
                 Ok(data) => (envelope_ok(data), false),
                 Err(e) => (envelope_err(e.to_string()), false),
             }
+        }
+        // `crystalline connect`, `disconnect` and `domain rename --local`
+        // wrote sources.json from their own process: read it again (with this
+        // machine's domains as they stand now), and ask the sources once in
+        // the background.
+        "sources_reload" => {
+            let said = match shared.engine.sources() {
+                Some(sources) => {
+                    sources.set_local(shared.engine.local_domains());
+                    let said = sources.reload();
+                    let refreshing = sources.clone();
+                    tokio::spawn(async move {
+                        refreshing
+                            .refresh(crystalline_remote::ONE_DOMAIN_LIMIT)
+                            .await;
+                    });
+                    said
+                }
+                None => Vec::new(),
+            };
+            let said: Vec<String> = said.iter().map(ToString::to_string).collect();
+            (envelope_ok(json!({ "announcements": said })), false)
+        }
+        // Session start: every source's routing model, refreshed through its
+        // etag within the deadline, then the mounted part from the caches.
+        "mounted_routing" => {
+            let deadline = std::time::Duration::from_millis(
+                req.get("deadline_ms")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_else(|| shared.engine.config().remote_deadline_ms()),
+            );
+            let routing = match shared.engine.sources() {
+                Some(sources) => {
+                    sources.reload_if_changed();
+                    sources.set_local_if_changed(shared.engine.local_domains());
+                    if !sources.is_empty() {
+                        sources.refresh(deadline).await;
+                    }
+                    sources.mounted_routing_from_cache()
+                }
+                None => crystalline_remote::MountedRouting::default(),
+            };
+            let domains: Vec<Value> = routing
+                .domains
+                .iter()
+                .map(|m| json!({ "name": m.local, "source": m.source, "bullets": m.bullets }))
+                .collect();
+            (
+                envelope_ok(json!({ "domains": domains, "stale": routing.stale })),
+                false,
+            )
         }
         "sync" => {
             let domain = req.get("domain").and_then(Value::as_str);

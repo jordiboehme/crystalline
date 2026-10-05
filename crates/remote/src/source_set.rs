@@ -341,6 +341,34 @@ impl SourceSet {
         self.rebuild()
     }
 
+    /// [`SourceSet::set_local`] when `local` differs from the domains the
+    /// table was built with, `None` (and no rebuild) when it does not: what
+    /// the daemon calls on every routed call and on its poller's cheap tick,
+    /// so a hand edit of config.yaml reaches the table without a restart.
+    pub fn set_local_if_changed(&self, local: Vec<LocalDomain>) -> Option<Vec<Announcement>> {
+        if self.local() == local {
+            return None;
+        }
+        Some(self.set_local(local))
+    }
+
+    /// [`SourceSet::reload`] when `sources.json` on disk differs from the
+    /// file this set holds, `None` otherwise: a `connect` or `disconnect`
+    /// that ran while the daemon could not be told, or a hand edit, reaches
+    /// the running daemon on its poller's cheap tick. A file that cannot be
+    /// read is left to the next full reload.
+    pub fn reload_if_changed(&self) -> Option<Vec<Announcement>> {
+        // [`SourceSet::empty`] has no folder to read.
+        if self.remote_dir.as_os_str().is_empty() {
+            return None;
+        }
+        let on_disk = load_sources(&self.remote_dir).ok()?;
+        if on_disk == self.read().file {
+            return None;
+        }
+        Some(self.reload())
+    }
+
     /// `sources.json` changed under this process (a CLI `connect`,
     /// `disconnect` or rename): read it again and forget the connections of
     /// sources that are gone.

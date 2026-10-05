@@ -681,7 +681,13 @@ impl Connection {
             held: self.current.clone(),
         };
         // Its own task: a caller that stops waiting does not stop the save.
-        let running = tokio::spawn(job.run());
+        // Counted from before the spawn, so a process that asks
+        // [`settle_refreshes`] right after never misses one not yet polled.
+        let counted = Refreshing::enter();
+        let running = tokio::spawn(async move {
+            let _counted = counted;
+            job.run().await
+        });
         let remaining = deadline.saturating_duration_since(Instant::now());
         match tokio::time::timeout(remaining, running).await {
             // The job already put it in hand.
@@ -908,6 +914,43 @@ fn settled(credential: &ServerCredential, rejected: Option<&str>) -> bool {
     Some(credential.access_token.as_str()) != rejected && !credential.needs_refresh(Utc::now())
 }
 
+/// How many refresh jobs of this process are still running.
+static REFRESHING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// One running refresh job, counted while it lives.
+struct Refreshing;
+
+impl Refreshing {
+    fn enter() -> Refreshing {
+        REFRESHING.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Refreshing
+    }
+}
+
+impl Drop for Refreshing {
+    fn drop(&mut self) {
+        REFRESHING.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Wait until every refresh this process started has finished, for at most
+/// `limit`; whether none is left running. A short-lived process (a CLI
+/// command, a hook) calls it before it leaves, so a token pair the server
+/// rotated is saved even when the call that started the refresh stopped
+/// waiting for it (see the module documentation).
+pub async fn settle_refreshes(limit: Duration) -> bool {
+    let until = Instant::now() + limit;
+    loop {
+        if REFRESHING.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            return true;
+        }
+        if Instant::now() >= until {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// The locked part of a refresh, owned so it runs as a task of its own.
 struct RefreshJob {
     peer: Peer,
@@ -1085,6 +1128,24 @@ impl Drop for RefreshLock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn settling_waits_for_a_running_refresh_and_gives_up_at_the_limit() {
+        let held = Refreshing::enter();
+        assert!(
+            !settle_refreshes(Duration::from_millis(60)).await,
+            "a refresh still running is not settled"
+        );
+        let job = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            drop(held);
+        });
+        assert!(
+            settle_refreshes(Duration::from_secs(5)).await,
+            "settled once it finished"
+        );
+        job.await.unwrap();
+    }
 
     fn connection(health: Health) -> Connection {
         let dir = std::env::temp_dir();

@@ -44,7 +44,7 @@ pub use github::auth::{DeviceFlowStart, DevicePoll, GITHUB_CLIENT_ID};
 pub use github::{validate_repo, validate_repo_path};
 pub use mounts::{
     Announcement, Hidden, HiddenReason, LocalDomain, Mount, MountTable, NameMap, OriginIdentity,
-    RemoteDomain, Route, Skipped, ToolShape, assign, translate_answer,
+    RemoteDomain, Route, Skipped, ToolShape, assign, translate_address_to, translate_answer,
 };
 pub use ops::{
     ChangeSides, CommitReport, DIRECT_NO_AMEND, DiscardRefusal, DiscardReport, DiscardTarget,
@@ -58,7 +58,7 @@ pub use provider::{
 };
 pub use server_client::{
     CONNECT_TIMEOUT, CTL_TIMEOUT, Connection, CtlAnswer, DOWN_WINDOW, ForwardedAgent, Health,
-    ONE_DOMAIN_LIMIT, RemoteFailure, form_body, http_client,
+    ONE_DOMAIN_LIMIT, RemoteFailure, form_body, http_client, settle_refreshes,
 };
 pub use server_token::{CredentialKind, ServerCredential, ServerCredentialStore, server_key};
 pub use sign_in::{

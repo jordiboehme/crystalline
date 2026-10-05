@@ -646,6 +646,12 @@ async fn build_embedded(
     // A rename a stopped daemon left half done is finished before the first
     // sync and before the routing cache reads a name, as the daemon does.
     engine.finish_leftover_rename().await;
+    // This machine's sources, once that rename is done (its recovery reads
+    // names the mount table could hide). An explicit --db or --config serves
+    // this machine's own index only.
+    if use_daemon(db, config_path) {
+        crate::route::install_sources(&engine);
+    }
 
     let bg = engine.clone();
     let bg_config = loaded.effective.clone();
@@ -897,7 +903,27 @@ pub async fn run_tool(
     let want_embeddings = matches!(tool, "search_engrams");
     let engine =
         open_standalone_reporting(loaded, &db_path, want_embeddings, db, config_path).await?;
-    dispatch_engine(&engine, tool, args).await
+    // An explicit --db or --config keeps every verb on this machine's own
+    // index, as it keeps it off the daemon; otherwise the sources are this
+    // machine's, read from disk for this one command. The opener above has
+    // already finished any rename an earlier run left half done.
+    let engine = Arc::new(engine);
+    if use_daemon(db, config_path) {
+        crate::route::install_sources(&engine);
+    }
+    let answer = crate::route::run_tool_routed(
+        &engine,
+        tool,
+        args,
+        &crystalline_remote::ForwardedAgent::default(),
+        None,
+    )
+    .await;
+    // A refresh a source call started runs as a task of its own: this
+    // process waits for it before it leaves, so a token pair the server
+    // rotated is saved.
+    crystalline_remote::settle_refreshes(crystalline_remote::ONE_DOMAIN_LIMIT).await;
+    answer
 }
 
 /// Scaffold a virtual domain's MANIFEST from prebuilt markdown: over the daemon

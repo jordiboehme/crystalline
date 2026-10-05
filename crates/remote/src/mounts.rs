@@ -670,9 +670,25 @@ fn walk(value: &mut Value, names: &NameMap) {
 }
 
 /// Every `crystalline://<remote>/...` and a bare `crystalline://<remote>` in
-/// `text` with the local name, and nothing else: the authority ends at a `/`
-/// or the end of the string, so `crystalline://a-b` is never taken for `a`.
+/// `text` with the local name, and nothing else.
 fn translate_addresses(text: &str, names: &NameMap) -> String {
+    map_authorities(text, &names.to_local)
+}
+
+/// `address` with its authority mapped through `map` (local name to the
+/// source's name, for a call on its way out) when it is a `crystalline://`
+/// address whose authority `map` names; unchanged otherwise.
+pub fn translate_address_to(address: &str, map: &BTreeMap<String, String>) -> String {
+    map_authorities(address, map)
+}
+
+/// Every `crystalline://` authority in `text` that `map` names, replaced by
+/// what it maps to. The authority is the run of domain characters right
+/// after the scheme, with a trailing `.` left out, the way relink reads it
+/// ([`crystalline_core::relink::is_domain_char`]): `crystalline://a-b` is
+/// never taken for `a`, and `crystalline://a, ...` or `crystalline://a.` in
+/// prose is `a`.
+fn map_authorities(text: &str, map: &BTreeMap<String, String>) -> String {
     const SCHEME: &str = "crystalline://";
     if !text.contains(SCHEME) {
         return text.to_string();
@@ -682,15 +698,15 @@ fn translate_addresses(text: &str, names: &NameMap) -> String {
     while let Some(at) = rest.find(SCHEME) {
         out.push_str(&rest[..at + SCHEME.len()]);
         let tail = &rest[at + SCHEME.len()..];
-        let end = tail
-            .find(|c: char| c == '/' || c.is_whitespace() || c == ')' || c == ']')
+        let run = tail
+            .find(|c: char| !crystalline_core::relink::is_domain_char(c))
             .unwrap_or(tail.len());
-        let authority = &tail[..end];
-        match names.to_local.get(authority) {
-            Some(local) => out.push_str(local),
+        let authority = tail[..run].trim_end_matches('.');
+        match map.get(authority) {
+            Some(mapped) => out.push_str(mapped),
             None => out.push_str(authority),
         }
-        rest = &tail[end..];
+        rest = &tail[authority.len()..];
     }
     out.push_str(rest);
     out
@@ -1340,5 +1356,42 @@ mod tests {
             "a-b is another domain"
         );
         assert_eq!(answer["anchor"], "crystalline://a-x");
+    }
+
+    #[test]
+    fn an_outbound_address_takes_the_sources_name() {
+        let map: BTreeMap<String, String> =
+            [("jordi-acme".to_string(), "jordi".to_string())].into();
+        assert_eq!(
+            translate_address_to("crystalline://jordi-acme/x", &map),
+            "crystalline://jordi/x"
+        );
+        assert_eq!(
+            translate_address_to("crystalline://jordi-acme", &map),
+            "crystalline://jordi"
+        );
+        assert_eq!(translate_address_to("plain", &map), "plain");
+        assert_eq!(
+            translate_address_to("crystalline://jordi-acme-2/x", &map),
+            "crystalline://jordi-acme-2/x",
+            "a longer name is another domain"
+        );
+    }
+
+    #[test]
+    fn an_authority_ends_where_the_domain_characters_end() {
+        let map: BTreeMap<String, String> = [("a".to_string(), "b".to_string())].into();
+        assert_eq!(
+            translate_address_to("see crystalline://a, then crystalline://a.", &map),
+            "see crystalline://b, then crystalline://b."
+        );
+        assert_eq!(
+            translate_address_to("crystalline://a#frag", &map),
+            "crystalline://b#frag"
+        );
+        assert_eq!(
+            translate_address_to("crystalline://a.b/x", &map),
+            "crystalline://a.b/x"
+        );
     }
 }

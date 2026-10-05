@@ -70,7 +70,10 @@ impl Engine {
             // identity names no actor either way and gets the base dimension
             // alone.
             actor: self.reading_actor(scope, &p.domains),
-            limit: p.limit.unwrap_or(10).clamp(1, MAX_PAGE_LIMIT),
+            limit: p
+                .limit
+                .unwrap_or(SEARCH_DEFAULT_LIMIT)
+                .clamp(1, MAX_PAGE_LIMIT),
             page: p.page.unwrap_or(1).max(1),
             ..SearchQuery::default()
         };

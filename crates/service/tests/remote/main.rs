@@ -14,4 +14,5 @@ mod ctl;
 mod fixture;
 pub mod local;
 mod revoke;
+mod routing;
 mod tool;

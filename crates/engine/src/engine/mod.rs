@@ -140,8 +140,13 @@ const MAX_PAGE_LIMIT: usize = 100;
 const TREE_MAX_DEPTH: usize = 64;
 
 /// The default `evolve_engrams` page size. Small on purpose: the queue is meant
-/// to be worked top-down and agreed item by item, not read in bulk.
-const EVOLVE_DEFAULT_LIMIT: usize = 10;
+/// to be worked top-down and agreed item by item, not read in bulk. Public so
+/// a merged page over connected servers is cut at the same size.
+pub const EVOLVE_DEFAULT_LIMIT: usize = 10;
+
+/// The default `search_engrams` page size. Public so a merged page over
+/// connected servers is cut at the same size.
+pub const SEARCH_DEFAULT_LIMIT: usize = 10;
 
 /// The largest `evolve_engrams` page size.
 const EVOLVE_MAX_LIMIT: usize = 100;

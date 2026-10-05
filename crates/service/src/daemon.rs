@@ -465,6 +465,16 @@ pub async fn run_serve(
     // every other domain is served.
     engine.finish_leftover_rename().await;
 
+    // This machine's sources (`crystalline connect`): the mount table its
+    // owner's calls route through and the local copies it hides. Installed
+    // only now, once the rename above is done, because that recovery reads
+    // names the table could hide. Built from the caches alone, so a server
+    // that is down never holds the start up. An explicit --db or --config
+    // serves this machine's own index only.
+    if crate::client::use_daemon(db.as_deref(), config_path.as_deref()) {
+        crate::route::install_sources(&engine);
+    }
+
     // Prime the routing cache once as the HTTP baseline: every HTTP session
     // shares this engine and reads its cache at initialize, and each socket
     // connection refreshes it again in `handle_conn` before serving.
@@ -675,6 +685,19 @@ pub async fn run_serve(
         let rx = shared.watch();
         tokio::spawn(async move {
             run_origin_poller(e, rx).await;
+        });
+    }
+
+    // The source poller: each connected server's routing model and
+    // maintenance status, asked through their etags every SOURCE_POLL, and a
+    // cheap look at sources.json and config.yaml every SOURCE_LOOK. A no-op
+    // on a machine with no sources. Its own task, so the start never waits
+    // on a server.
+    {
+        let e = engine.clone();
+        let rx = shared.watch();
+        tokio::spawn(async move {
+            run_source_poller(e, SOURCE_POLL, SOURCE_LOOK, rx).await;
         });
     }
 
@@ -2370,6 +2393,59 @@ const POLLER_HEARTBEAT: Duration = Duration::from_secs(5);
 /// bookkeeping, jitter and per-domain pulling live in
 /// [`Engine::origin_poll_tick`], which this loop never reimplements; it only
 /// wakes it on a modest cadence and exits promptly on shutdown.
+/// How often the daemon asks its sources for their routing model and
+/// maintenance status.
+const SOURCE_POLL: Duration = Duration::from_secs(180);
+
+/// How often the daemon looks at `sources.json` and its own domains for a
+/// change made behind its back: a `connect` that could not tell it, or a
+/// hand edit of either file. Reads two small files; asks no server.
+const SOURCE_LOOK: Duration = Duration::from_secs(5);
+
+/// How long one poll waits for each source.
+const SOURCE_POLL_DEADLINE: Duration = crystalline_remote::ONE_DOMAIN_LIMIT;
+
+/// The source poller. The first poll runs right after the start, in the
+/// background; a source that is down is asked again at the next poll, and
+/// its first answer clears its failure, so nothing ever needs a restart.
+async fn run_source_poller(
+    engine: Arc<Engine>,
+    poll: Duration,
+    look: Duration,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let mut polls = tokio::time::interval(poll);
+    let mut looks = tokio::time::interval(look);
+    polls.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    looks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = wait_true(&mut shutdown) => break,
+            _ = looks.tick() => {
+                let Some(sources) = engine.sources() else { continue };
+                // Before the empty check: the first `connect` on a machine
+                // with no sources is one of the changes this looks for.
+                let reloaded = sources.reload_if_changed();
+                sources.set_local_if_changed(engine.local_domains());
+                // A source just connected is asked at once, not at the next
+                // poll.
+                if reloaded.is_some() && !sources.is_empty() {
+                    sources.refresh(SOURCE_POLL_DEADLINE).await;
+                }
+            }
+            _ = polls.tick() => {
+                let Some(sources) = engine.sources() else { continue };
+                if sources.is_empty() {
+                    continue;
+                }
+                sources.set_local_if_changed(engine.local_domains());
+                sources.refresh(SOURCE_POLL_DEADLINE).await;
+                sources.refresh_hook_status(SOURCE_POLL_DEADLINE).await;
+            }
+        }
+    }
+}
+
 async fn run_origin_poller(engine: Arc<Engine>, mut shutdown: watch::Receiver<bool>) {
     let mut ticker = tokio::time::interval(POLLER_HEARTBEAT);
     loop {
