@@ -1515,6 +1515,7 @@ dependencies = [
  "crystalline-core",
  "diffy",
  "flate2",
+ "fs4 1.1.0",
  "keyring",
  "percent-encoding",
  "reqwest",

@@ -24,6 +24,7 @@ pub mod merge;
 pub mod ops;
 pub mod provider;
 pub mod server_token;
+pub mod sources;
 pub mod state;
 pub mod token;
 
@@ -42,6 +43,11 @@ pub use provider::{
     ProposalRequest, ProposalState, Provider, StackInfo, StackMember, TreeWrite, UpstreamChange,
 };
 pub use server_token::{CredentialKind, ServerCredential, ServerCredentialStore, server_key};
+pub use sources::{
+    LOCAL_SUFFIX, MountRecord, REMOTE_TOKEN_ENV, REMOTE_URL_ENV, SOURCES_FILE, SourceRecord,
+    SourcesFile, default_source_name, env_source, load_sources, remote_dir, update_sources,
+    valid_source_name,
+};
 pub use token::{
     MAX_IDENTITY_NAME_BYTES, StoredToken, TokenIdentity, TokenStore, valid_identity_name,
 };
