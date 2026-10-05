@@ -65,8 +65,12 @@ async fn routing_bullets_answers_the_routing_model_for_the_account() {
     );
 
     let out = server.token_for("out").await;
-    let (_, reply) = server.ctl(Some(&out), cmd("routing_bullets")).await;
-    assert!(!reply.to_string().contains("lab"), "{reply}");
+    let (_, outsider) = server.ctl(Some(&out), cmd("routing_bullets")).await;
+    assert!(!outsider.to_string().contains("lab"), "{outsider}");
+    assert_ne!(
+        reply["etag"], outsider["etag"],
+        "callers with different rights get different answers and etags"
+    );
 }
 
 /// The etag round trip: an unchanged answer is `not_modified`, a changed
@@ -144,6 +148,31 @@ async fn hook_status_answers_the_backlog_the_account_may_see() {
         json!(["open"]),
         "{reply}"
     );
+}
+
+/// A write to a domain the caller cannot see does not move the caller's
+/// `hook_status`: no pending time, the same etag.
+#[tokio::test]
+async fn a_write_to_a_hidden_domain_does_not_move_the_hook_status() {
+    let server = RemoteServer::start(Options::TOKENS).await;
+    let _guard = crate::support::maintenance_guard().await;
+    crystalline_service::maintenance::save(&Default::default()).unwrap();
+    let out = server.token_for("out").await;
+    let (_, before) = server.ctl(Some(&out), cmd("hook_status")).await;
+
+    crystalline_service::maintenance::save(&crystalline_service::maintenance::MaintenanceState {
+        pending_domains: vec!["lab".to_string()],
+        pending_since: chrono::DateTime::from_timestamp(1_800_000_000, 0),
+        ..Default::default()
+    })
+    .unwrap();
+    let (_, after) = server.ctl(Some(&out), cmd("hook_status")).await;
+    assert_eq!(
+        after["data"]["evolve"]["pending_since"],
+        Value::Null,
+        "{after}"
+    );
+    assert_eq!(before["etag"], after["etag"], "{before} {after}");
 }
 
 /// Review focus 5: an account outside a private domain learns nothing of it

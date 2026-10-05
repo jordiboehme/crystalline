@@ -207,10 +207,14 @@ pub struct EvolveStatus {
     /// Domains a human wrote to since the last sweep, that the caller may see.
     #[serde(default)]
     pub pending_domains: Vec<String>,
-    /// When the backlog started.
+    /// When the backlog started. Null whenever the caller's own pending list
+    /// is empty: the record keeps one time for the whole backlog, so a time
+    /// beside an empty list would tell a caller that somebody wrote to a
+    /// domain it cannot see.
     #[serde(default)]
     pub pending_since: Option<DateTime<Utc>>,
-    /// When a sweep last ran on the server.
+    /// When a sweep last ran on the server. A global sweep time, not narrowed
+    /// to the caller's domains: it says nothing about any one domain.
     #[serde(default)]
     pub last_run_at: Option<DateTime<Utc>>,
 }
@@ -221,15 +225,21 @@ impl HookStatus {
         state: &MaintenanceState,
         visible: &std::collections::HashSet<String>,
     ) -> HookStatus {
+        let pending_domains: Vec<String> = state
+            .pending_domains
+            .iter()
+            .filter(|d| visible.contains(d.as_str()))
+            .cloned()
+            .collect();
+        let pending_since = if pending_domains.is_empty() {
+            None
+        } else {
+            state.pending_since
+        };
         HookStatus {
             evolve: EvolveStatus {
-                pending_domains: state
-                    .pending_domains
-                    .iter()
-                    .filter(|d| visible.contains(d.as_str()))
-                    .cloned()
-                    .collect(),
-                pending_since: state.pending_since,
+                pending_domains,
+                pending_since,
                 last_run_at: state.last_run_at,
             },
         }
@@ -585,6 +595,24 @@ mod tests {
         assert_eq!(merged.last_run_at, local.last_run_at);
         assert_eq!(merged.last_nudge_at, local.last_nudge_at);
         assert_eq!(merged.first_seen, local.first_seen);
+    }
+
+    /// A write to a domain the caller cannot see leaves no trace in its
+    /// answer: no pending time, so the same answer and the same etag.
+    #[test]
+    fn a_hidden_pending_domain_leaves_no_pending_since() {
+        let visible: std::collections::HashSet<String> = ["open".to_string()].into();
+        let before = HookStatus::from_state(&MaintenanceState::default(), &visible);
+        let after = HookStatus::from_state(
+            &MaintenanceState {
+                pending_domains: vec!["lab".to_string()],
+                pending_since: DateTime::from_timestamp(1_800_000_000, 0),
+                ..MaintenanceState::default()
+            },
+            &visible,
+        );
+        assert_eq!(after.evolve.pending_since, None);
+        assert_eq!(before, after);
     }
 
     /// A newer server's extra member (Part B's `reflect`) and an older

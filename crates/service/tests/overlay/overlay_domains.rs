@@ -8004,3 +8004,73 @@ async fn a_review_mode_share_lists_the_open_pull_requests_once() {
         "the backport keeps it: {delta:?}"
     );
 }
+
+/// The remote `origin_changes` runs as the account whose token asked: each
+/// member reads exactly their own drafts of the reviewing domain, and a
+/// request answered as the machine owner would list neither.
+#[tokio::test]
+async fn the_remote_origin_changes_run_as_the_calling_account() {
+    let f = build_fixture(MANIFEST, true, true, None, true, true).await;
+    let auth = Arc::new(AuthStore::open(&f.root.join("web-auth.db")).await.unwrap());
+    let router = http_router(
+        f.engine.clone(),
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        &[],
+        auth.clone(),
+        None,
+    )
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    for who in ["alice", "bob"] {
+        auth.add_user(who, who, None, Role::Editor, "pw12345678")
+            .await
+            .unwrap();
+    }
+    f.draft("team", "alice", "plan.md", ALICE_DRAFT).await;
+    f.draft("team", "bob", "bob.md", ALICE_NEW).await;
+
+    let ask = |who: &'static str, body: serde_json::Value| {
+        let auth = auth.clone();
+        async move {
+            let token = auth.issue_mcp_token(who, "t").await.unwrap().token;
+            reqwest::Client::new()
+                .post(format!("http://{addr}/api/v1/ctl"))
+                .bearer_auth(token)
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap()
+        }
+    };
+    let changes = serde_json::json!({ "v": 1, "cmd": "origin_changes", "domain": "team" });
+    let alice = ask("alice", changes.clone()).await;
+    assert_eq!(alice["ok"], true, "{alice}");
+    assert_eq!(
+        alice["data"]["changes"].as_array().unwrap().len(),
+        1,
+        "{alice}"
+    );
+    assert_eq!(alice["data"]["changes"][0]["path"], "plan.md", "{alice}");
+    let bob = ask("bob", changes).await;
+    assert_eq!(bob["data"]["changes"].as_array().unwrap().len(), 1, "{bob}");
+    assert_eq!(bob["data"]["changes"][0]["path"], "bob.md", "{bob}");
+
+    let status = ask(
+        "alice",
+        serde_json::json!({ "v": 1, "cmd": "origin_status", "domain": "team" }),
+    )
+    .await;
+    assert_eq!(status["ok"], true, "{status}");
+}
