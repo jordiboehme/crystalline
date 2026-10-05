@@ -8,10 +8,9 @@
 // Later suites use `source`, `save_credential` and `token_source`.
 #![allow(dead_code)]
 
-use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use axum::extract::State;
@@ -23,7 +22,8 @@ use crystalline_remote::{
     remote_domains, stale_line,
 };
 use serde_json::{Value, json};
-use tokio::net::TcpListener;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
 
 use crate::fixture::{Options, RemoteServer};
 
@@ -545,7 +545,19 @@ fn the_staleness_line_names_the_source_the_time_and_the_remedy() {
                 "acme (https://crystalline.acme.com) cannot be reached right now: nothing accepts connections at that address (check the VPN or the network; it recovers by itself once the server answers again)"
             )
         ),
-        "Note: acme (https://crystalline.acme.com) could not be reached, so its domains in this routing block are the copy from 2026-09-30 08:15 UTC and may be out of date."
+        "Note: acme (https://crystalline.acme.com) cannot be reached right now, so its domains in this routing block are the copy from 2026-09-30 08:15 UTC and may be out of date."
+    );
+    let too_old = stale_line(
+        "acme",
+        "https://crystalline.acme.com",
+        at,
+        Some(
+            "https://crystalline.acme.com does not serve the remote control protocol; it needs Crystalline 0.23 or newer",
+        ),
+    );
+    assert_eq!(
+        too_old,
+        "Note: acme (https://crystalline.acme.com) did not send its routing (https://crystalline.acme.com does not serve the remote control protocol; it needs Crystalline 0.23 or newer), so its domains in this routing block are the copy from 2026-09-30 08:15 UTC and may be out of date."
     );
     let expired = stale_line(
         "acme",
@@ -593,10 +605,93 @@ async fn blackhole() -> (String, Arc<AtomicUsize>) {
     (url, accepted)
 }
 
-/// An address nothing listens on yet, which a server can come back on.
-async fn free_address() -> SocketAddr {
-    let spare = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    spare.local_addr().unwrap()
+/// A front for `backend` on an address of its own that never changes
+/// hands. While it is down it cuts every connection off as soon as it is
+/// opened, the way a network that just dropped looks to a client; once it is
+/// up it passes them through.
+async fn switchable(backend: &str) -> (String, Arc<AtomicBool>) {
+    let backend = backend.trim_start_matches("http://").to_string();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let up = Arc::new(AtomicBool::new(false));
+    let switch = up.clone();
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            if !switch.load(Ordering::SeqCst) {
+                drop(socket);
+                continue;
+            }
+            let backend = backend.clone();
+            tokio::spawn(async move {
+                if let Ok(mut far) = TcpStream::connect(&backend).await {
+                    let _ = tokio::io::copy_bidirectional(&mut socket, &mut far).await;
+                }
+            });
+        }
+    });
+    (url, up)
+}
+
+/// What a scripted server does with a request, by the index of the
+/// connection it came on: answer after a delay, or `None` to stay silent on
+/// that connection for good.
+type Script = Arc<dyn Fn(usize) -> Option<Duration> + Send + Sync>;
+
+/// A hand-written HTTP/1.1 server that keeps its connections alive and
+/// answers every request with a ctl result, as `script` says. It counts the
+/// connections it accepted.
+async fn scripted(script: Script) -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counter = accepted.clone();
+    tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(serve_scripted(socket, n, script.clone()));
+        }
+    });
+    (url, accepted)
+}
+
+async fn serve_scripted(socket: TcpStream, n: usize, script: Script) {
+    let (read, mut write) = socket.into_split();
+    let mut read = BufReader::new(read);
+    loop {
+        let mut length = 0usize;
+        loop {
+            let mut line = String::new();
+            if read.read_line(&mut line).await.unwrap_or(0) == 0 {
+                return;
+            }
+            let line = line.trim_end();
+            if line.is_empty() {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':')
+                && name.eq_ignore_ascii_case("content-length")
+            {
+                length = value.trim().parse().unwrap_or(0);
+            }
+        }
+        let mut body = vec![0; length];
+        if read.read_exact(&mut body).await.is_err() {
+            return;
+        }
+        let Some(delay) = script(n) else {
+            std::future::pending::<()>().await;
+            return;
+        };
+        tokio::time::sleep(delay).await;
+        let answer = json!({ "v": 1, "ok": true, "data": { "account": "keeper" } }).to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{answer}",
+            answer.len()
+        );
+        if write.write_all(response.as_bytes()).await.is_err() {
+            return;
+        }
+    }
 }
 
 /// A source at `url` signed in with the pasted token `cmt_live`.
@@ -667,8 +762,8 @@ async fn a_name_that_does_not_resolve_is_unreachable_quickly() {
 
 #[tokio::test]
 async fn a_refresh_that_fails_on_the_network_keeps_the_refresh_token_and_tries_again() {
-    let addr = free_address().await;
-    let url = format!("http://{addr}");
+    let fake = FakeServer::start("coa_0", "cor_0").await;
+    let (url, up) = switchable(&fake.url).await;
     let dir = tempfile::tempdir().unwrap();
     let record = source(
         &url,
@@ -681,7 +776,7 @@ async fn a_refresh_that_fails_on_the_network_keeps_the_refresh_token_and_tries_a
         &record,
         &oauth("coa_0", "cor_0", TimeDelta::hours(2), &url),
     );
-    let window = Duration::from_millis(200);
+    let window = Duration::from_millis(300);
     let connection = Connection::open(record.clone(), dir.path())
         .unwrap()
         .with_limit(Duration::from_secs(5))
@@ -706,7 +801,7 @@ async fn a_refresh_that_fails_on_the_network_keeps_the_refresh_token_and_tries_a
     );
     assert_eq!(stored.access_token, "coa_0");
 
-    let fake = FakeServer::start_on(TcpListener::bind(addr).await.unwrap(), "coa_0", "cor_0");
+    up.store(true, Ordering::SeqCst);
     tokio::time::sleep(window + Duration::from_millis(50)).await;
     let data = connection.ctl_data(status()).await.unwrap();
     assert_eq!(data["account"], "keeper");
@@ -765,10 +860,10 @@ async fn a_source_that_failed_is_skipped_at_once_and_tried_again_after_the_windo
 
 #[tokio::test]
 async fn a_source_that_comes_back_is_used_again_without_a_restart() {
-    let addr = free_address().await;
-    let url = format!("http://{addr}");
+    let fake = FakeServer::start("cmt_live", "-").await;
+    let (url, up) = switchable(&fake.url).await;
     let dir = tempfile::tempdir().unwrap();
-    let window = Duration::from_millis(200);
+    let window = Duration::from_secs(1);
     let connection = Connection::open(pasted(&url, dir.path()), dir.path())
         .unwrap()
         .with_limit(Duration::from_secs(5))
@@ -779,7 +874,7 @@ async fn a_source_that_comes_back_is_used_again_without_a_restart() {
         "{failure:?}"
     );
 
-    let _back = FakeServer::start_on(TcpListener::bind(addr).await.unwrap(), "cmt_live", "-");
+    up.store(true, Ordering::SeqCst);
     assert!(
         connection.ctl(status()).await.is_err(),
         "still inside the window"
@@ -787,7 +882,7 @@ async fn a_source_that_comes_back_is_used_again_without_a_restart() {
     tokio::time::sleep(window + Duration::from_millis(50)).await;
     let data = connection.ctl_data(status()).await.unwrap();
     assert_eq!(data["account"], "keeper");
-    assert_eq!(connection.down(), None, "the answer cleared the down state");
+    assert_eq!(connection.down(), None, "nothing left of the down state");
 }
 
 /// The per-prompt recall passes its own budget, and a source that does not
@@ -818,4 +913,203 @@ async fn the_no_refresh_path_ends_at_its_own_budget_and_opens_the_window() {
         }
     );
     assert_eq!(connection.down(), Some(failure));
+}
+
+/// Review I1: a refresh that hangs (the token endpoint is behind a dropped
+/// VPN) holds up no other caller on the same connection past its own budget.
+#[tokio::test]
+async fn a_refresh_that_hangs_does_not_hold_up_another_caller_on_the_same_connection() {
+    let (url, _) = blackhole().await;
+    let dir = tempfile::tempdir().unwrap();
+    let record = source(
+        &url,
+        "acme",
+        CredentialKind::Oauth,
+        Some(format!("{url}/api/v1/oauth/token")),
+    );
+    save_credential(
+        dir.path(),
+        &record,
+        &oauth("coa_0", "cor_0", TimeDelta::hours(2), &url),
+    );
+    let connection = Connection::open(record, dir.path())
+        .unwrap()
+        .with_health(Health::new(Duration::from_secs(30)));
+    let first = connection.ctl_within(status(), Duration::from_secs(3));
+    let second = async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let started = Instant::now();
+        let answer = connection.ctl_within(status(), LIMIT).await;
+        (started.elapsed(), answer)
+    };
+    let quick = async {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let started = Instant::now();
+        let answer = connection.ctl_without_refresh_within(status(), LIMIT).await;
+        (started.elapsed(), answer)
+    };
+    let (first, (second_took, second), (quick_took, quick)) = tokio::join!(first, second, quick);
+    assert!(
+        matches!(first, Err(RemoteFailure::TimedOut { .. })),
+        "{first:?}"
+    );
+    assert!(
+        second_took < LIMIT + Duration::from_millis(500),
+        "the second refresher ended within its own budget: {second_took:?}"
+    );
+    assert!(
+        matches!(second, Err(RemoteFailure::TimedOut { .. })),
+        "{second:?}"
+    );
+    assert!(
+        quick_took < LIMIT,
+        "the quick path never waited: {quick_took:?}"
+    );
+    assert!(
+        matches!(quick, Err(RemoteFailure::Expired { .. })),
+        "{quick:?}"
+    );
+}
+
+/// Review M2: after a network failure no pooled connection is used again. Two
+/// kept-alive connections are in the pool, both go silent; the first call
+/// after the failure's window opens a new connection instead of taking the
+/// other silent one.
+#[tokio::test]
+async fn after_a_failure_the_next_call_opens_a_fresh_connection() {
+    let silent_below = Arc::new(AtomicUsize::new(0));
+    let gate = silent_below.clone();
+    let (url, accepted) = scripted(Arc::new(move |n| {
+        (n >= gate.load(Ordering::SeqCst)).then_some(Duration::from_millis(100))
+    }))
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let window = Duration::from_millis(500);
+    let connection = Connection::open(pasted(&url, dir.path()), dir.path())
+        .unwrap()
+        .with_health(Health::new(window));
+    let long = Duration::from_secs(3);
+    let (a, b) = tokio::join!(
+        connection.ctl_within(status(), long),
+        connection.ctl_within(status(), long)
+    );
+    a.unwrap();
+    b.unwrap();
+    assert_eq!(accepted.load(Ordering::SeqCst), 2, "two pooled connections");
+
+    silent_below.store(2, Ordering::SeqCst);
+    let failure = connection.ctl_within(status(), LIMIT).await.unwrap_err();
+    assert!(
+        matches!(failure, RemoteFailure::TimedOut { .. }),
+        "{failure:?}"
+    );
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        2,
+        "the failed call used a pooled connection"
+    );
+
+    tokio::time::sleep(window + Duration::from_millis(50)).await;
+    let data = connection.ctl_data(status()).await.unwrap();
+    assert_eq!(data["account"], "keeper");
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        3,
+        "the call after the failure connected fresh"
+    );
+}
+
+/// Review M3: an answer clears the down mark even when it belongs to a call
+/// that was already on its way when another call set the mark.
+#[tokio::test]
+async fn an_answer_to_a_call_in_flight_clears_the_down_mark() {
+    let (url, _) = scripted(Arc::new(|n| (n == 0).then_some(Duration::from_millis(700)))).await;
+    let dir = tempfile::tempdir().unwrap();
+    let connection = Connection::open(pasted(&url, dir.path()), dir.path())
+        .unwrap()
+        .with_health(Health::new(Duration::from_secs(30)));
+    let slow = connection.ctl_within(status(), Duration::from_secs(3));
+    let failing = async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let failure = connection.ctl_within(status(), LIMIT).await.unwrap_err();
+        (failure, connection.down())
+    };
+    let (slow, (failure, marked)) = tokio::join!(slow, failing);
+    assert!(
+        matches!(failure, RemoteFailure::TimedOut { .. }),
+        "{failure:?}"
+    );
+    assert_eq!(
+        marked,
+        Some(failure),
+        "the silent call marked the source down"
+    );
+    slow.unwrap();
+    assert_eq!(connection.down(), None, "the slow answer cleared the mark");
+}
+
+/// Review M6: the cause is read below reqwest's own message, which carries
+/// the URL, so words in the address do not pick it.
+#[tokio::test]
+async fn words_in_the_address_do_not_pick_the_cause() {
+    let fake = FakeServer::start("cmt_live", "-").await;
+    let (front, _down) = switchable(&fake.url).await;
+    let url = format!("{front}/tls-certificate-handshake");
+    let dir = tempfile::tempdir().unwrap();
+    let connection = Connection::open(pasted(&url, dir.path()), dir.path())
+        .unwrap()
+        .with_health(Health::new(Duration::from_secs(30)));
+    match connection.ctl_within(status(), LIMIT).await.unwrap_err() {
+        RemoteFailure::Unreachable { detail, .. } => {
+            assert_eq!(detail, "the connection broke off")
+        }
+        other => panic!("expected unreachable, got {other:?}"),
+    }
+}
+
+/// Review M7: when the save after a rotation fails, the rotated pair is kept
+/// in memory and used, and the next refresh presents the new refresh token,
+/// never the spent one still on disk.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_rotation_whose_save_fails_is_kept_and_used() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fake = FakeServer::start("coa_0", "cor_0").await;
+    let dir = tempfile::tempdir().unwrap();
+    let record = source(
+        &fake.url,
+        "acme",
+        CredentialKind::Oauth,
+        fake.token_endpoint(),
+    );
+    save_credential(
+        dir.path(),
+        &record,
+        &oauth("coa_0", "cor_0", TimeDelta::hours(2), &fake.url),
+    );
+    let host = record.host_dir(dir.path());
+    std::fs::write(host.join("refresh.lock"), b"").unwrap();
+    let connection = Connection::open(record.clone(), dir.path()).unwrap();
+    std::fs::set_permissions(&host, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let first = connection.ctl_data(status()).await;
+    let again = connection.ctl_data(status()).await;
+    let rotated = connection.refresh(Some("coa_1")).await;
+    std::fs::set_permissions(&host, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert_eq!(first.unwrap()["account"], "keeper");
+    assert_eq!(again.unwrap()["account"], "keeper");
+    assert_eq!(
+        rotated.unwrap(),
+        "coa_2",
+        "the next refresh presented cor_1, not the spent cor_0"
+    );
+    assert_eq!(fake.refreshes.load(Ordering::SeqCst), 2);
+    let on_disk = ServerCredentialStore::file(&host).load().unwrap().unwrap();
+    assert_eq!(
+        on_disk.refresh_token.as_deref(),
+        Some("cor_0"),
+        "the save did fail"
+    );
 }

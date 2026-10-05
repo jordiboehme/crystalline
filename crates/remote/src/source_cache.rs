@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 
 use crate::error::RemoteError;
 use crate::mounts::RemoteDomain;
-use crate::server_client::{Connection, CtlAnswer, RemoteFailure};
+use crate::server_client::{Connection, CtlAnswer, RemoteFailure, UNREACHABLE_WORDS};
 
 /// The cached routing model.
 pub const ROUTING_FILE: &str = "routing.json";
@@ -156,7 +156,9 @@ pub fn remote_domains(routing: &Value) -> Vec<RemoteDomain> {
 }
 
 /// The one line a stale part of the routing block carries. `failure` is the
-/// recorded reason, `None` for a copy that is merely old.
+/// recorded reason (a [`RemoteFailure`]'s words), `None` for a copy that is
+/// merely old. The line names the real cause: a server that did not answer,
+/// a sign-in that ran out, or what the server answered instead.
 pub fn stale_line(
     source: &str,
     url: &str,
@@ -168,8 +170,11 @@ pub fn stale_line(
         Some(failure) if failure.contains("sign in again") => format!(
             "Note: the sign-in to {source} ({url}) has run out, so its domains in this routing block are the copy from {when} and may be out of date. Ask the user to run: crystalline connect {url}"
         ),
-        Some(_) => format!(
-            "Note: {source} ({url}) could not be reached, so its domains in this routing block are the copy from {when} and may be out of date."
+        Some(failure) if failure.contains(UNREACHABLE_WORDS) => format!(
+            "Note: {source} ({url}) cannot be reached right now, so its domains in this routing block are the copy from {when} and may be out of date."
+        ),
+        Some(failure) => format!(
+            "Note: {source} ({url}) did not send its routing ({failure}), so its domains in this routing block are the copy from {when} and may be out of date."
         ),
         None => format!(
             "Note: {source} ({url}) has not been refreshed since {when}, so its domains in this routing block may be out of date."

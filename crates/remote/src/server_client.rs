@@ -10,18 +10,29 @@
 //! expired at the same moment. So a refresh runs under `refresh.lock` in the
 //! source's host folder, re-reads the stored credential once it holds the
 //! lock, and refreshes only when what it reads is still the expired or
-//! refused token. Inside one process the in-memory credential's mutex makes
-//! it single-flight too. Each source has its own folder, so a refresh of one
+//! refused token. The same lock and re-read make it single-flight inside one
+//! process too: two callers on one connection both wait on the file lock, and
+//! the second reads what the first saved. No in-memory lock is held while a
+//! refresh runs, so a caller never waits past its own deadline for another
+//! caller's refresh. Each source has its own folder, so a refresh of one
 //! source never waits for another, and a refused one marks only its own
 //! source.
 //!
 //! The locked part (lock, re-read, token request, save) runs as a task of
-//! its own. A caller whose budget runs out stops waiting for it, but the task
-//! still saves what the server rotated, so a fan-out deadline never throws a
-//! fresh refresh token away and the next call never replays a spent one.
+//! its own. A caller whose budget runs out stops waiting for it, and while
+//! the async runtime lives the task still saves what the server rotated: in
+//! the daemon a fan-out deadline does not throw a fresh refresh token away.
+//! A short-lived process (the CLI, a hook) that returns from `main` while
+//! the task runs shuts the runtime down and cancels it; that process has to
+//! wait for an in-flight refresh before it exits, or it can lose the
+//! rotated pair.
 //!
-//! One window stays: the server rotated and this process died before it
-//! saved the new pair. The next refresh then presents the old token, the
+//! If the save itself fails after the server rotated, the fresh pair is
+//! still kept in memory and used, and the failure is logged, so this process
+//! never presents the spent token again.
+//!
+//! One window stays: the server rotated and the process ended before the
+//! new pair was saved. The next refresh then presents the old token, the
 //! server revokes the grant, and the person is told to sign in again. That
 //! is the server's replay rule doing its job, and it costs one sign-in.
 //!
@@ -48,7 +59,10 @@
 //! - **A source that failed is down for a short window** ([`DOWN_WINDOW`]).
 //!   While it lasts every call answers the recorded failure at once without
 //!   touching the network; the first call after it tries again, and the first
-//!   answer from the server clears it. The window lives in [`Health`], one
+//!   answer from the server clears it, even one to a call that was already
+//!   on its way when the window opened. An outcome that never reached the
+//!   server (an expired token on the quick path, nothing saved) neither opens
+//!   nor clears it. The window lives in [`Health`], one
 //!   per process by default, so every connection to a source in the daemon
 //!   shares it. It is never written to disk, so no restart is ever needed.
 //! - **Pooled connections are dropped after a network failure**, and before
@@ -87,6 +101,9 @@ pub const REFRESH_LOCK_FILE: &str = "refresh.lock";
 const LOCK_WAIT: Duration = Duration::from_secs(15);
 /// The forwarded tool that runs a sweep on the server.
 const EVOLVE_TOOL: &str = "evolve_engrams";
+/// What every unreachable or timed-out failure says, and what
+/// [`crate::stale_line`] recognises it by.
+pub(crate) const UNREACHABLE_WORDS: &str = "cannot be reached right now";
 /// What a person can do about a source that does not answer.
 const NETWORK_HINT: &str =
     "check the VPN or the network; it recovers by itself once the server answers again";
@@ -158,7 +175,7 @@ impl std::fmt::Display for RemoteFailure {
                 detail,
             } => write!(
                 f,
-                "{source} ({url}) cannot be reached right now: {detail} ({NETWORK_HINT})"
+                "{source} ({url}) {UNREACHABLE_WORDS}: {detail} ({NETWORK_HINT})"
             ),
             RemoteFailure::SignInAgain { url } => write!(
                 f,
@@ -171,7 +188,7 @@ impl std::fmt::Display for RemoteFailure {
             RemoteFailure::Credential(text) | RemoteFailure::Refused(text) => f.write_str(text),
             RemoteFailure::TimedOut { source, url, after } => write!(
                 f,
-                "{source} ({url}) cannot be reached right now: it did not answer within {} ({NETWORK_HINT})",
+                "{source} ({url}) {UNREACHABLE_WORDS}: it did not answer within {} ({NETWORK_HINT})",
                 seconds(*after)
             ),
         }
@@ -321,10 +338,17 @@ impl Peer {
     /// A transport error, as the failure a person reads.
     fn failure(&self, e: &reqwest::Error, limit: Duration) -> RemoteFailure {
         if e.is_timeout() {
+            // A connect that gave up waited the connect limit; anything else
+            // ran into the request's overall limit.
+            let after = if e.is_connect() {
+                CONNECT_TIMEOUT.min(limit)
+            } else {
+                limit
+            };
             return RemoteFailure::TimedOut {
                 source: self.source.clone(),
                 url: self.url.clone(),
-                after: limit,
+                after,
             };
         }
         RemoteFailure::Unreachable {
@@ -345,10 +369,12 @@ impl Peer {
 }
 
 /// The likely cause of a transport error, read off its chain of sources.
+/// The chain starts below reqwest's own message, which carries the URL: a
+/// host named `tls-gw` must not read as a TLS failure.
 fn cause(e: &reqwest::Error, url: &str) -> String {
     let mut chain = Vec::new();
     let mut refused = false;
-    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    let mut current = std::error::Error::source(e);
     while let Some(error) = current {
         if let Some(io) = error.downcast_ref::<std::io::Error>()
             && io.kind() == std::io::ErrorKind::ConnectionRefused
@@ -402,9 +428,9 @@ pub struct Connection {
     http: std::sync::Mutex<HttpSlot>,
     health: Health,
     limit: Duration,
-    /// The credential in hand. Its mutex is also what makes a refresh
-    /// single-flight inside this process.
-    current: tokio::sync::Mutex<Option<ServerCredential>>,
+    /// The credential in hand. Only ever locked for a clone or a store,
+    /// never across a wait: the refresh lock keeps a refresh single-flight.
+    current: std::sync::Mutex<Option<ServerCredential>>,
 }
 
 impl Connection {
@@ -446,7 +472,7 @@ impl Connection {
             store,
             health: Health::shared(),
             limit: ONE_DOMAIN_LIMIT,
-            current: tokio::sync::Mutex::new(Some(credential)),
+            current: std::sync::Mutex::new(Some(credential)),
         })
     }
 
@@ -505,7 +531,19 @@ impl Connection {
 
     /// The credential in hand, for `status` and `doctor`.
     pub async fn credential(&self) -> Option<ServerCredential> {
-        self.current.lock().await.clone()
+        self.held()
+    }
+
+    /// A copy of the credential in hand.
+    fn held(&self) -> Option<ServerCredential> {
+        self.current
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn hold(&self, credential: ServerCredential) {
+        *self.current.lock().unwrap_or_else(|e| e.into_inner()) = Some(credential);
     }
 
     /// The failure this source is skipped for while its down window lasts,
@@ -529,19 +567,24 @@ impl Connection {
     }
 
     /// Record how an exchange ended: no answer opens the down window and
-    /// drops the pool, any answer from the server closes the window. A
-    /// refresh the caller stopped waiting for counts as no answer too; it
-    /// was the token request that did not finish in time, or (rarely)
-    /// another process holding the refresh lock that long.
+    /// drops the pool. A refresh the caller stopped waiting for counts as no
+    /// answer too; it was the token request that did not finish in time, or
+    /// (rarely) another process holding the refresh lock that long. Closing
+    /// the window is not done here but where an answer arrives
+    /// ([`Connection::answered`]), so an outcome that never reached the
+    /// server cannot erase a mark another call just set.
     pub(crate) fn note<T>(&self, result: &Result<T, RemoteFailure>) {
-        match result {
-            Err(failure) if failure.is_unreachable() => {
-                self.health.mark_down(&self.source.key(), failure);
-                self.drop_pool();
-            }
-            Err(RemoteFailure::Credential(_)) => {}
-            _ => self.health.clear(&self.source.key()),
+        if let Err(failure) = result
+            && failure.is_unreachable()
+        {
+            self.health.mark_down(&self.source.key(), failure);
+            self.drop_pool();
         }
+    }
+
+    /// The server answered: whatever it said, it is reachable.
+    fn answered(&self) {
+        self.health.clear(&self.source.key());
     }
 
     /// The failure a call answers at once while the source is down.
@@ -564,8 +607,7 @@ impl Connection {
     }
 
     async fn bearer_by(&self, deadline: Instant, limit: Duration) -> Result<String, RemoteFailure> {
-        let current = self.current.lock().await.clone();
-        match current {
+        match self.held() {
             Some(credential) if !credential.needs_refresh(Utc::now()) => {
                 Ok(credential.access_token)
             }
@@ -581,7 +623,7 @@ impl Connection {
     /// recall, which has a one-second budget and must not spend a refresh
     /// token another process may be about to spend.
     pub async fn bearer_without_refresh(&self) -> Result<String, RemoteFailure> {
-        match self.current.lock().await.clone() {
+        match self.held() {
             Some(credential) if !credential.needs_refresh(Utc::now()) => {
                 Ok(credential.access_token)
             }
@@ -610,11 +652,10 @@ impl Connection {
         deadline: Instant,
         limit: Duration,
     ) -> Result<String, RemoteFailure> {
-        let mut current = self.current.lock().await;
-        if let Some(credential) = current.as_ref()
-            && settled(credential, rejected)
+        if let Some(credential) = self.held()
+            && settled(&credential, rejected)
         {
-            return Ok(credential.access_token.clone());
+            return Ok(credential.access_token);
         }
         if self.source.kind == CredentialKind::Token || self.source.from_env {
             return Err(self.sign_in_again());
@@ -626,6 +667,9 @@ impl Connection {
             lock: self.host_dir.join(REFRESH_LOCK_FILE),
             endpoint: self.source.token_endpoint.clone(),
             rejected: rejected.map(str::to_string),
+            health: self.health.clone(),
+            key: self.source.key(),
+            held: self.held(),
         };
         // Its own task: a caller that stops waiting does not stop the save.
         let running = tokio::spawn(job.run());
@@ -633,7 +677,7 @@ impl Connection {
         match tokio::time::timeout(remaining, running).await {
             Ok(Ok(Ok(fresh))) => {
                 let access = fresh.access_token.clone();
-                *current = Some(fresh);
+                self.hold(fresh);
                 Ok(access)
             }
             Ok(Ok(Err(failure))) => Err(failure),
@@ -701,9 +745,9 @@ impl Connection {
         limit: Duration,
     ) -> Result<CtlAnswer, RemoteFailure> {
         self.skip()?;
+        let deadline = Instant::now() + limit;
         let result = async {
             let bearer = self.bearer_without_refresh().await?;
-            let deadline = Instant::now() + limit;
             match self.post_ctl(&request, &bearer, deadline, limit).await? {
                 Posted::Answer(answer) => Ok(answer),
                 Posted::Unauthorized if self.source.kind == CredentialKind::Oauth => {
@@ -800,6 +844,7 @@ impl Connection {
         if let Some(down) = peer.gateway(status) {
             return Err(down);
         }
+        self.answered();
         if status == reqwest::StatusCode::UNAUTHORIZED {
             return Ok(Posted::Unauthorized);
         }
@@ -865,6 +910,11 @@ struct RefreshJob {
     lock: PathBuf,
     endpoint: Option<String>,
     rejected: Option<String>,
+    health: Health,
+    key: String,
+    /// The credential in hand: newer than the stored one when a save after
+    /// a rotation failed.
+    held: Option<ServerCredential>,
 }
 
 impl RefreshJob {
@@ -877,6 +927,12 @@ impl RefreshJob {
             .store
             .load()
             .map_err(|e| RemoteFailure::Credential(e.to_string()))?;
+        // Whichever pair is newer: a save that failed after a rotation left
+        // the store holding a spent refresh token.
+        let stored = match (stored, self.held.clone()) {
+            (Some(stored), Some(held)) if held.created_at > stored.created_at => Some(held),
+            (stored, _) => stored,
+        };
         let Some(stored) = stored else {
             return Err(sign_in());
         };
@@ -910,6 +966,7 @@ impl RefreshJob {
         if let Some(down) = self.peer.gateway(status) {
             return Err(down);
         }
+        self.health.clear(&self.key);
         let text = response
             .text()
             .await
@@ -954,9 +1011,16 @@ impl RefreshJob {
             stored.account.clone(),
             Utc::now(),
         );
-        self.store
-            .save(&fresh)
-            .map_err(|e| RemoteFailure::Credential(e.to_string()))?;
+        // The server has spent the old refresh token. A failed save must not
+        // lose the new pair as well: this process keeps using it, and the
+        // next refresh here presents it, not the spent one.
+        if let Err(e) = self.store.save(&fresh) {
+            tracing::warn!(
+                source = %self.peer.source,
+                "could not save the refreshed sign-in to {}; it is kept in memory for now: {e}",
+                self.peer.url
+            );
+        }
         Ok(fresh)
     }
 }
