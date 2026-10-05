@@ -4,7 +4,7 @@
 
 # The Rust toolchain manager. Homebrew links only rustup itself; the cargo,
 # rustc, clippy and rustfmt proxies live in /opt/homebrew/opt/rustup/bin,
-# which is not on the default PATH (see CLAUDE.md). rustup enforces the
+# which is not on the default PATH (see AGENTS.md). rustup enforces the
 # rust-toolchain.toml pin, so no pinned channel needs installing by hand.
 brew "rustup"
 
