@@ -70,7 +70,7 @@ pub use source_cache::{
     Cached, Fetched, HOOK_STATUS_FILE, ROUTING_FILE, STALE_AFTER, cached_offers, fetch_cached,
     read_cached, remote_domains, stale_line, write_cached,
 };
-pub use source_set::{MountedRouting, SourceSet};
+pub use source_set::{MountNote, MountedRouting, SourceSet};
 pub use sources::{
     LOCAL_SUFFIX, MountRecord, REMOTE_TOKEN_ENV, REMOTE_URL_ENV, SOURCES_FILE, SourceRecord,
     SourcesFile, default_source_name, env_source, load_sources, remote_dir, update_sources,

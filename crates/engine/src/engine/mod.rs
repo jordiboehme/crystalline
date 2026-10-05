@@ -2413,41 +2413,64 @@ impl Engine {
             .expect("an unbounded count finds a free name")
     }
 
-    /// Add to a new local domain's report what the mounts did to it: the
-    /// name [`Engine::beside_mounts`] gave it when a source held `wanted`,
-    /// and the line that says it is hidden when it is the same domain as a
-    /// mount (its origin), so a fresh registration that answers nothing says
-    /// why. Joined to a `note` the report already carries. The source is
-    /// named; [`Engine::screen_mount_note`] takes the names out for a caller
-    /// who is not the machine owner.
-    pub(crate) fn note_beside_mounts(&self, result: &mut Value, wanted: &str, name: &str) {
+    /// What the mounts did to a new local domain: the name
+    /// [`Engine::beside_mounts`] gave it when a source held `wanted`, and
+    /// whether it is hidden at once (the same domain as a mount, by its
+    /// origin, or a name a source gave out first).
+    pub(crate) fn mount_notes(
+        &self,
+        wanted: &str,
+        name: &str,
+    ) -> Vec<crystalline_remote::MountNote> {
         let Some(sources) = self.sources() else {
-            return;
+            return Vec::new();
         };
-        let table = sources.table();
         let mut notes = Vec::new();
         if name != wanted
             && let Some(source) = sources.holder_of(wanted)
         {
-            notes.push(format!(
-                "'{wanted}' is a domain from {source} on this machine, so this local domain is registered as '{name}'"
-            ));
+            notes.push(crystalline_remote::MountNote::Renamed {
+                wanted: wanted.to_string(),
+                name: name.to_string(),
+                source,
+            });
         }
-        for hidden in table.hidden(name) {
+        for hidden in sources.table().hidden(name) {
             notes.push(match hidden.reason {
-                crystalline_remote::HiddenReason::Copy => format!(
-                    "the local domain '{name}' is hidden while {source} is connected; disconnect {source} to use it again",
-                    source = hidden.source
-                ),
-                crystalline_remote::HiddenReason::Collision => {
-                    crystalline_remote::Announcement::LocalShadowed {
-                        local: name.to_string(),
+                crystalline_remote::HiddenReason::Copy => {
+                    crystalline_remote::MountNote::HiddenCopy {
+                        name: name.to_string(),
                         source: hidden.source.clone(),
                     }
-                    .to_string()
+                }
+                crystalline_remote::HiddenReason::Collision => {
+                    crystalline_remote::MountNote::Collision {
+                        name: name.to_string(),
+                        source: hidden.source.clone(),
+                    }
                 }
             });
         }
+        notes
+    }
+
+    /// Add [`Engine::mount_notes`] to a new local domain's report, joined to
+    /// a `note` it already carries. The source is named only for the machine
+    /// owner ([`crate::scope::Scope::Unrestricted`]): which servers this
+    /// machine is connected to is not anybody else's business.
+    pub(crate) fn note_beside_mounts(
+        &self,
+        result: &mut Value,
+        wanted: &str,
+        name: &str,
+        scope: &crate::scope::Scope,
+    ) {
+        let owner = matches!(scope, crate::scope::Scope::Unrestricted);
+        let mut notes: Vec<String> = self
+            .mount_notes(wanted, name)
+            .iter()
+            .map(|note| note.render(owner))
+            .collect();
         if notes.is_empty() {
             return;
         }
@@ -2455,43 +2478,6 @@ impl Engine {
             notes.insert(0, earlier.trim_end_matches('.').to_string());
         }
         result["note"] = json!(notes.join(". "));
-    }
-
-    /// The `note` of an add report with every source's name taken out, for
-    /// a caller who is not the machine owner (a REST admin): which servers
-    /// this machine is connected to is the owner's business. The sentences
-    /// [`Engine::note_beside_mounts`] wrote keep their meaning.
-    pub fn screen_mount_note(&self, result: &mut Value) {
-        let Some(sources) = self.sources() else {
-            return;
-        };
-        let Some(mut note) = result
-            .get("note")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-        else {
-            return;
-        };
-        for source in sources.records().into_iter().map(|s| s.name) {
-            note = note
-                .replace(
-                    &format!("is a domain from {source} on this machine"),
-                    "is a domain from a connected server on this machine",
-                )
-                .replace(
-                    &format!(
-                        "is hidden while {source} is connected; disconnect {source} to use it again"
-                    ),
-                    "is hidden while the server it comes from is connected",
-                )
-                .replace(
-                    &format!(
-                        "has a name {source} gave out first; it is hidden until you change its name in config.yaml or disconnect {source}"
-                    ),
-                    "has a name a connected server gave out first; it is hidden until you change its name in config.yaml",
-                );
-        }
-        result["note"] = json!(note);
     }
 
     /// The origin rule the HTTP surface was built with, installed once by
@@ -9734,5 +9720,86 @@ mod announce_tests {
         );
         assert!(matches!(rx.try_recv().unwrap().change, Change::Domain(_)));
         assert!(rx.try_recv().is_err());
+    }
+}
+
+#[cfg(test)]
+mod hidden_copy_tests {
+    use super::*;
+    use crystalline_core::config::DomainEntry;
+    use crystalline_index::TursoStore;
+    use crystalline_remote::{CredentialKind, MountRecord, SourceRecord, SourceSet};
+
+    /// An engine with `notes` registered and a connected source `acme` that
+    /// keeps the name `notes` and has never answered, so `notes` is hidden.
+    async fn engine_hiding_notes(dir: &Path) -> Engine {
+        let store = TursoStore::open_in_memory().await.unwrap();
+        let mut config = GlobalConfig::default();
+        let root = dir.join("notes");
+        std::fs::create_dir_all(&root).unwrap();
+        config
+            .domains
+            .insert("notes".to_string(), DomainEntry::file(root));
+        let engine = Engine::new(Arc::new(Mutex::new(store)), config, None, None);
+        let remote = dir.join("remote");
+        crystalline_remote::update_sources(&remote, |file| {
+            file.upsert(SourceRecord {
+                url: "http://127.0.0.1:9".to_string(),
+                name: "acme".to_string(),
+                account: "ada".to_string(),
+                kind: CredentialKind::Token,
+                token_endpoint: None,
+                revocation_endpoint: None,
+                connected_at: Utc::now(),
+                mounts: vec![MountRecord {
+                    remote: "notes".to_string(),
+                    local: "notes".to_string(),
+                }],
+                from_env: false,
+            });
+            Ok(())
+        })
+        .unwrap();
+        let set = SourceSet::load(remote, engine.local_domains(), |_| None);
+        engine.set_sources(Arc::new(set));
+        assert!(engine.shadowed_domains().contains("notes"));
+        engine
+    }
+
+    /// Review N3: a co-editing room's save into a draft of a domain that
+    /// became hidden is refused as an unregistered domain.
+    #[tokio::test]
+    async fn a_room_save_into_a_hidden_domain_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = engine_hiding_notes(tmp.path()).await;
+        let view = DomainView::for_actor(&engine, "notes", &HashSet::new(), "ada").unwrap();
+        let p: crate::params::SaveParams = serde_json::from_value(json!({
+            "domain": "notes",
+            "identifier": "page",
+            "content": "---\ntype: engram\ntitle: Page\npermalink: page\nstatus: stable\n---\n\n# Page\n",
+            "expected_checksum": "",
+        }))
+        .unwrap();
+        let refused = engine
+            .save_engram_in_overlay(&view, &p, "page.md")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(refused, EngineError::UnknownDomain { .. }),
+            "{refused}"
+        );
+    }
+
+    /// Review N1: the collaboration verbs' common entry refuses a hidden
+    /// copy, so share, withdraw, discard and resolve never act on it.
+    #[tokio::test]
+    async fn the_origin_lock_refuses_a_hidden_domain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = engine_hiding_notes(tmp.path()).await;
+        let refused = engine.origin_lock_registered("notes").unwrap_err();
+        assert!(
+            matches!(refused, EngineError::UnknownDomain { .. }),
+            "{refused}"
+        );
     }
 }

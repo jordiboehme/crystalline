@@ -97,7 +97,19 @@ impl LocalMachine {
         if let Some(forge) = forge {
             engine = engine
                 .with_origin_provider(forge)
-                .with_origins_dir(root.join("origins"));
+                .with_origins_dir(root.join("origins"))
+                .with_token_store_dir(root.join("github"));
+            // A GitHub connection on file, so the origin poller spends ticks.
+            crystalline_remote::TokenStore::File {
+                path: root.join("github").join("github-token.json"),
+            }
+            .save(&crystalline_remote::StoredToken {
+                access_token: "test-token".to_string(),
+                host: "github.com".to_string(),
+                user: "mock-user".to_string(),
+                created_at: chrono::Utc::now(),
+            })
+            .unwrap();
         }
         let engine = Arc::new(engine);
         engine.sync(None).await.unwrap();
@@ -702,11 +714,19 @@ async fn an_origin_added_beside_a_mount_steps_aside_and_a_copy_says_it_is_hidden
         "{report}"
     );
     assert!(machine.engine.shadowed_domains().contains("platform-local"));
-    let mut screened = report.clone();
-    machine.engine.screen_mount_note(&mut screened);
-    assert!(
-        !screened["note"].as_str().unwrap().contains("acme"),
-        "{screened}"
+    let admin = Scope::User {
+        account: "boss".into(),
+        admin: true,
+    };
+    let report = machine
+        .engine
+        .domain_add_virtual_as("team", &admin)
+        .await
+        .unwrap();
+    assert_eq!(
+        report["note"],
+        "'team' is a domain from a connected server on this machine, so this local domain is registered as 'team-local'",
+        "a caller who is not the owner is not told which server: {report}"
     );
 }
 
@@ -734,5 +754,90 @@ async fn a_hand_edited_collision_is_hidden_with_its_sentence() {
         set.table().source_of("open"),
         Some("acme"),
         "the mount keeps the name"
+    );
+}
+
+/// Review N1 and N2: while a team copy is hidden, the origin poller leaves
+/// its files alone and no collaboration verb acts on it from the engine
+/// entries the CLI and the control socket call; on disconnect it is polled
+/// again.
+#[tokio::test]
+async fn a_hidden_team_copy_is_neither_polled_nor_shared() {
+    use crystalline_service::engine::ShareActor;
+
+    let server = RemoteServer::start(Options::TOKENS).await;
+    let mock = Arc::new(MockProvider::new());
+    let manifest = b"---\ntype: manifest\ntitle: Team\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Team\n\n## When to Use\n\n- always\n".to_vec();
+    let first = mock.add_commit(BTreeMap::from([(
+        "MANIFEST.md".to_string(),
+        manifest.clone(),
+    )]));
+    mock.set_branch("main", &first);
+    let machine = LocalMachine::start_with(false, Some(mock.clone())).await;
+    machine.connect(&server, "acme", "keeper").await;
+    let set = machine.mount();
+    let report = machine
+        .engine
+        .origin_add("acme/platform", None, None, Some("main"), None)
+        .await
+        .unwrap();
+    let root = std::path::PathBuf::from(report["root"].as_str().unwrap());
+    assert!(machine.engine.shadowed_domains().contains("platform-local"));
+
+    let fresh = engram("Fresh", "fresh", "a page pushed upstream");
+    let second = mock.add_commit(BTreeMap::from([
+        ("MANIFEST.md".to_string(), manifest),
+        ("fresh.md".to_string(), fresh.into_bytes()),
+    ]));
+    mock.set_branch("main", &second);
+    machine
+        .engine
+        .origin_poll_tick(std::time::Instant::now(), chrono::Utc::now())
+        .await;
+    assert!(
+        !root.join("fresh.md").exists(),
+        "a hidden copy's files stay as they are"
+    );
+
+    let unknown = |r: Result<serde_json::Value, EngineError>| {
+        matches!(r, Err(EngineError::UnknownDomain { .. }))
+    };
+    let e = &machine.engine;
+    let d = "platform-local";
+    assert!(
+        unknown(
+            e.origin_share(d, None, None, None, None, ShareActor::Owner)
+                .await
+        ),
+        "share"
+    );
+    assert!(
+        unknown(e.origin_withdraw(d, None, false, ShareActor::Owner).await),
+        "withdraw"
+    );
+    assert!(
+        unknown(e.discard_local_changes(d, &[], &ShareActor::Owner).await),
+        "discard"
+    );
+    assert!(
+        unknown(
+            e.origin_resolve(d, "fresh.md", Some("mine"), None, ShareActor::Owner)
+                .await
+        ),
+        "resolve"
+    );
+
+    crystalline_remote::disconnect(&machine.remote_dir(), "acme")
+        .await
+        .unwrap();
+    set.reload();
+    assert!(!machine.engine.shadowed_domains().contains(d));
+    machine
+        .engine
+        .origin_poll_tick(std::time::Instant::now(), chrono::Utc::now())
+        .await;
+    assert!(
+        root.join("fresh.md").exists(),
+        "polled again once it is back"
     );
 }

@@ -61,6 +61,73 @@ async fn open_connection(
     }
 }
 
+/// What the mounts did to a local domain just registered, for the note of
+/// its report. Kept typed until it is shown, so each caller gets the
+/// rendering it may see: the machine owner the sentence with the source's
+/// name, anyone else the same sentence naming no server (which servers this
+/// machine is connected to is the owner's business).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MountNote {
+    /// A source holds `wanted`, so the domain was registered as `name`.
+    Renamed {
+        /// The name asked for.
+        wanted: String,
+        /// The name it got.
+        name: String,
+        /// The source that holds `wanted`.
+        source: String,
+    },
+    /// It is the same domain as a mount of `source`, so it is hidden.
+    HiddenCopy {
+        /// The local domain.
+        name: String,
+        /// The source whose mount hides it.
+        source: String,
+    },
+    /// A different domain under a name `source` gave out first.
+    Collision {
+        /// The local domain.
+        name: String,
+        /// The source that gave the name out first.
+        source: String,
+    },
+}
+
+impl MountNote {
+    /// The sentence, naming the source when `name_source` is set.
+    pub fn render(&self, name_source: bool) -> String {
+        match (self, name_source) {
+            (
+                MountNote::Renamed {
+                    wanted,
+                    name,
+                    source,
+                },
+                true,
+            ) => format!(
+                "'{wanted}' is a domain from {source} on this machine, so this local domain is registered as '{name}'"
+            ),
+            (MountNote::Renamed { wanted, name, .. }, false) => format!(
+                "'{wanted}' is a domain from a connected server on this machine, so this local domain is registered as '{name}'"
+            ),
+            (MountNote::HiddenCopy { name, source }, true) => format!(
+                "the local domain '{name}' is hidden while {source} is connected; disconnect {source} to use it again"
+            ),
+            (MountNote::HiddenCopy { name, .. }, false) => format!(
+                "the local domain '{name}' is hidden while the server it comes from is connected"
+            ),
+            (MountNote::Collision { name, source }, true) => Announcement::LocalShadowed {
+                local: name.clone(),
+                source: source.clone(),
+            }
+            .to_string(),
+            (MountNote::Collision { name, .. }, false) => format!(
+                "the local domain '{name}' has a name a connected server gave out first; it is hidden until you change its name in config.yaml"
+            ),
+        }
+    }
+}
+
 /// The mounted part of the routing block, and one staleness line per source
 /// whose part may be out of date.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -567,5 +634,63 @@ impl SourceSet {
             domains: table.mounts.clone(),
             stale,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn both(note: MountNote) -> (String, String) {
+        (note.render(true), note.render(false))
+    }
+
+    #[test]
+    fn a_renamed_note_names_the_source_only_for_the_owner() {
+        let (owner, other) = both(MountNote::Renamed {
+            wanted: "open".into(),
+            name: "open-local".into(),
+            source: "acme".into(),
+        });
+        assert_eq!(
+            owner,
+            "'open' is a domain from acme on this machine, so this local domain is registered as 'open-local'"
+        );
+        assert_eq!(
+            other,
+            "'open' is a domain from a connected server on this machine, so this local domain is registered as 'open-local'"
+        );
+    }
+
+    #[test]
+    fn a_hidden_copy_note_names_the_source_only_for_the_owner() {
+        let (owner, other) = both(MountNote::HiddenCopy {
+            name: "platform-local".into(),
+            source: "acme".into(),
+        });
+        assert_eq!(
+            owner,
+            "the local domain 'platform-local' is hidden while acme is connected; disconnect acme to use it again"
+        );
+        assert_eq!(
+            other,
+            "the local domain 'platform-local' is hidden while the server it comes from is connected"
+        );
+    }
+
+    #[test]
+    fn a_collision_note_names_the_source_only_for_the_owner() {
+        let (owner, other) = both(MountNote::Collision {
+            name: "open".into(),
+            source: "acme".into(),
+        });
+        assert_eq!(
+            owner,
+            "the local domain 'open' has a name acme gave out first; it is hidden until you change its name in config.yaml or disconnect acme"
+        );
+        assert_eq!(
+            other,
+            "the local domain 'open' has a name a connected server gave out first; it is hidden until you change its name in config.yaml"
+        );
     }
 }

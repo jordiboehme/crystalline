@@ -21,6 +21,19 @@ impl Engine {
         name: Option<&str>,
         folder: Option<&str>,
     ) -> Result<Value> {
+        self.domain_add_local_as(name, folder, &crate::scope::Scope::Unrestricted)
+            .await
+    }
+
+    /// [`Engine::domain_add_local`] for `scope`, which decides only how the
+    /// report's note names a connected server: by name for the machine
+    /// owner, not at all for anyone else.
+    pub async fn domain_add_local_as(
+        &self,
+        name: Option<&str>,
+        folder: Option<&str>,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
@@ -190,7 +203,7 @@ impl Engine {
             "sync": sync,
         });
         self.append_name_fields(&mut result, &domain_name).await?;
-        self.note_beside_mounts(&mut result, &wanted, &domain_name);
+        self.note_beside_mounts(&mut result, &wanted, &domain_name, scope);
         Ok(result)
     }
 
@@ -202,6 +215,17 @@ impl Engine {
     /// no sync. Refuses on a read-only instance; no `github.enabled` gate.
     /// Returns `{ domain, kind, manifest_created, registered }`.
     pub async fn domain_add_virtual(&self, name: &str) -> Result<Value> {
+        self.domain_add_virtual_as(name, &crate::scope::Scope::Unrestricted)
+            .await
+    }
+
+    /// [`Engine::domain_add_virtual`] for `scope`, which decides only how the
+    /// report's note names a connected server.
+    pub async fn domain_add_virtual_as(
+        &self,
+        name: &str,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
@@ -297,7 +321,7 @@ impl Engine {
             "registered": is_new,
         });
         self.append_name_fields(&mut result, name).await?;
-        self.note_beside_mounts(&mut result, wanted, name);
+        self.note_beside_mounts(&mut result, wanted, name, scope);
         Ok(result)
     }
 

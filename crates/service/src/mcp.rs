@@ -3397,6 +3397,9 @@ impl McpServer {
         // flip on this call. That no longer moves any list - `provision` is
         // listed whatever is declared and refuses its mutating actions instead
         // - so nothing is announced; see [`McpServer::listen`].
+        // Decides only how a note names a connected server: by name for the
+        // machine owner, not at all for an HTTP caller.
+        let scope = self.scope_of(&ctx);
         let result: Result<Value, EngineError> = if let Some(repo) = p.repo.as_deref() {
             // Caught here rather than left to the engine's own url building:
             // the same shared check the JSON API's create and domain-name
@@ -3412,13 +3415,14 @@ impl McpServer {
                 return Err(to_error(e.into()));
             }
             self.engine
-                .origin_add_with_progress(
+                .origin_add_with_progress_as(
                     repo,
                     p.domain.as_deref(),
                     p.path.as_deref(),
                     p.branch.as_deref(),
                     p.folder.as_deref(),
                     progress,
+                    &scope,
                 )
                 .await
         } else if p.is_virtual {
@@ -3429,7 +3433,7 @@ impl McpServer {
                 ))
             } else {
                 match p.domain.as_deref() {
-                    Some(domain) => self.engine.domain_add_virtual(domain).await,
+                    Some(domain) => self.engine.domain_add_virtual_as(domain, &scope).await,
                     None => Err(EngineError::Invalid(
                         "add_domain: a virtual domain requires a domain name".to_string(),
                     )),
@@ -3437,17 +3441,9 @@ impl McpServer {
             }
         } else {
             self.engine
-                .domain_add_local(p.domain.as_deref(), p.folder.as_deref())
+                .domain_add_local_as(p.domain.as_deref(), p.folder.as_deref(), &scope)
                 .await
         };
-        // Which servers this machine is connected to is the owner's
-        // business: an HTTP caller's note names none.
-        let result = result.map(|mut report| {
-            if !matches!(self.scope_of(&ctx), Scope::Unrestricted) {
-                self.engine.screen_mount_note(&mut report);
-            }
-            report
-        });
         result.map_err(to_error).and_then(ok)
     }
 

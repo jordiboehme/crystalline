@@ -6752,6 +6752,10 @@ fn another_actors_view_is_reached_only_by_the_owner_gated_surfaces() {
         ("engine.rs", "discard_into_overlay"),
         // A conflict resolution inside one actor's own draft.
         ("engine.rs", "resolve_in_overlay"),
+        // A `#[cfg(test)]` unit test standing in for an open co-editing room,
+        // to pin that a room's save into a domain a connected server hides
+        // is refused. It answers no reader.
+        ("engine.rs", "a_room_save_into_a_hidden_domain_is_refused"),
         // A share resolved through `ShareActor`.
         ("engine.rs", "stage_overlay_share"),
         // A write made INSIDE somebody else's draft: the one write-side
