@@ -19,6 +19,7 @@ chrono = { workspace = true, features = ["serde"] }
 diffy = { workspace = true }
 fs4 = { workspace = true }
 flate2 = { workspace = true }
+getrandom = { workspace = true }
 keyring = { workspace = true }
 percent-encoding = { workspace = true }
 reqwest = { workspace = true }

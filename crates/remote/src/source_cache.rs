@@ -157,6 +157,23 @@ pub fn remote_domains(routing: &Value) -> Vec<RemoteDomain> {
         .unwrap_or_default()
 }
 
+/// What every saved source offered when it last answered: its cached routing
+/// model's domains, keyed by source name. A source with no cache yet offers
+/// nothing, so it mounts nothing until the poller has asked it.
+pub fn cached_offers(
+    sources: &crate::sources::SourcesFile,
+    remote_dir: &Path,
+) -> std::collections::BTreeMap<String, Vec<RemoteDomain>> {
+    sources
+        .sources
+        .iter()
+        .filter_map(|s| {
+            let cached = read_cached(&s.host_dir(remote_dir), ROUTING_FILE, &s.account)?;
+            Some((s.name.clone(), remote_domains(&cached.data)))
+        })
+        .collect()
+}
+
 /// The one line a stale part of the routing block carries. `failure` is the
 /// recorded reason (a [`RemoteFailure`]'s words), `None` for a copy that is
 /// merely old. The line names the cause in a fixed sentence per kind (a

@@ -9,6 +9,7 @@ mod support;
 
 mod answers;
 mod client;
+mod connect;
 mod ctl;
 mod fixture;
 mod revoke;

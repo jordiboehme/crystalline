@@ -374,7 +374,7 @@ impl Peer {
 /// The likely cause of a transport error, read off its chain of sources.
 /// The chain starts below reqwest's own message, which carries the URL: a
 /// host named `tls-gw` must not read as a TLS failure.
-fn cause(e: &reqwest::Error, url: &str) -> String {
+pub(crate) fn cause(e: &reqwest::Error, url: &str) -> String {
     let mut chain = Vec::new();
     let mut refused = false;
     let mut current = std::error::Error::source(e);

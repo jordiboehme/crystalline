@@ -26,6 +26,7 @@ pub mod ops;
 pub mod provider;
 pub mod server_client;
 pub mod server_token;
+pub mod sign_in;
 pub mod source_cache;
 pub mod sources;
 pub mod state;
@@ -54,9 +55,14 @@ pub use server_client::{
     ONE_DOMAIN_LIMIT, RemoteFailure, form_body, http_client,
 };
 pub use server_token::{CredentialKind, ServerCredential, ServerCredentialStore, server_key};
+pub use sign_in::{
+    Connected, Disconnected, Revocation, SignInError, connect_with_browser,
+    connect_with_browser_within, connect_with_token, connect_with_token_within, disconnect,
+    disconnect_within, normalize_server_url,
+};
 pub use source_cache::{
-    Cached, Fetched, HOOK_STATUS_FILE, ROUTING_FILE, STALE_AFTER, fetch_cached, read_cached,
-    remote_domains, stale_line, write_cached,
+    Cached, Fetched, HOOK_STATUS_FILE, ROUTING_FILE, STALE_AFTER, cached_offers, fetch_cached,
+    read_cached, remote_domains, stale_line, write_cached,
 };
 pub use sources::{
     LOCAL_SUFFIX, MountRecord, REMOTE_TOKEN_ENV, REMOTE_URL_ENV, SOURCES_FILE, SourceRecord,
