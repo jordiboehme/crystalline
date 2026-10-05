@@ -95,7 +95,7 @@ pub struct CtlState {
 }
 
 /// The route. The JSON API's body ceiling ([`crate::rest::MAX_BODY_BYTES`])
-/// is applied by [`handle`] itself, after the bearer check, rather than by a
+/// is applied by `handle` itself, after the bearer check, rather than by a
 /// body-limit layer in front of an extractor that would read the body first.
 pub fn route(state: CtlState) -> axum::Router {
     axum::Router::new()

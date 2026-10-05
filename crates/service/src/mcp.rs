@@ -2187,6 +2187,11 @@ impl McpServer {
 /// cannot drift apart. Only argument parsing and the rendering differ: TOON,
 /// resource links and the ride-along trailer are the MCP side's
 /// ([`McpServer::answered`]), raw engine JSON the remote side's.
+///
+/// **Routing a call to a connected source belongs in the handlers, never in
+/// a core.** The remote door runs these cores directly, and a remote call is
+/// answered from this server's own domains (decision D8); a core that routed
+/// would let two servers connected to each other forward one call for ever.
 impl McpServer {
     /// `p` with every domain it names spelled as a local name, for `scope`.
     /// See [`McpServer::localized`].

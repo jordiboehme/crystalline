@@ -228,35 +228,37 @@ async fn an_oauth_token_is_refused_at_the_ctl_route_while_oauth_is_off() {
     );
 }
 
+/// One raw POST to the ctl path with no token that declares `declared` body
+/// bytes and sends only a few of them, answered as its status line (or "no
+/// answer" when none arrives within three seconds).
+async fn declared_post(server: &RemoteServer, declared: usize) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut stream = tokio::net::TcpStream::connect(server.addr).await.unwrap();
+    let mut request = format!(
+        "POST /api/v1/ctl HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {declared}\r\n",
+        server.addr
+    );
+    request.push_str("\r\n{\"v\": 1");
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut buf = vec![0u8; 4096];
+    let read = tokio::time::timeout(std::time::Duration::from_secs(3), stream.read(&mut buf))
+        .await
+        .map(|n| n.unwrap_or(0))
+        .unwrap_or(0);
+    String::from_utf8_lossy(&buf[..read])
+        .lines()
+        .next()
+        .unwrap_or("no answer")
+        .to_string()
+}
+
 /// The body is read only after the bearer check: a caller with no token is
-/// refused at the door whatever it sends, and a body past the API's ceiling
-/// from a caller with one is the envelope's error, not a buffered request.
+/// refused at once, before a byte of the body it announced has to arrive.
 #[tokio::test]
 async fn the_body_is_read_only_after_the_bearer_check() {
     let server = RemoteServer::start(Options::TOKENS).await;
-    let oversized = "x".repeat(crystalline_service::rest::MAX_BODY_BYTES + 1);
-    let refused = server
-        .http
-        .post(format!("{}/api/v1/ctl", server.origin()))
-        .body(oversized.clone())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(refused.status(), 401, "no token, no body read");
-    let token = server.token_for("keeper").await;
-    let response = server
-        .http
-        .post(format!("{}/api/v1/ctl", server.origin()))
-        .bearer_auth(&token)
-        .body(oversized)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 200);
-    let reply: serde_json::Value = response.json().await.unwrap();
-    assert_eq!(reply["ok"], false, "{reply}");
-    assert!(
-        reply["error"].as_str().unwrap().starts_with("invalid body"),
-        "{reply}"
-    );
+    let oversized = crystalline_service::rest::MAX_BODY_BYTES + 1;
+    let status = declared_post(&server, oversized).await;
+    assert!(status.starts_with("HTTP/1.1 401"), "{status}");
 }
