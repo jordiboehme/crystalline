@@ -110,8 +110,10 @@ pub struct Mount {
     pub source: String,
     /// Its routing bullets, from the source's routing model.
     pub bullets: Vec<String>,
-    /// Whether it is the same domain as a local copy, which is hidden while
-    /// this source is connected.
+    /// Whether it is the same domain as a local copy (same origin), which
+    /// is hidden while this source is connected. True whatever name either
+    /// of them has; the hidden copy is in [`MountTable::shadowed`] with
+    /// [`HiddenReason::Copy`].
     pub replaces_local: bool,
 }
 
@@ -155,8 +157,12 @@ pub enum Announcement {
         /// The source whose copy is mounted.
         kept_by: String,
     },
-    /// A local domain holds a name a source gave out earlier, and is hidden
-    /// while that source is connected. No rename is offered (ruling F8).
+    /// A different local domain holds a name a source gave out first (a
+    /// hand edit of config.yaml gave it that name after the mount held it,
+    /// decision D13). The mount keeps the name, and the local domain is
+    /// hidden until its name changes in config.yaml or the source is
+    /// disconnected. Not the hidden copy of the same domain, which is
+    /// [`Announcement::ReplacesLocal`].
     LocalShadowed {
         /// The local domain.
         local: String,
@@ -190,10 +196,37 @@ impl std::fmt::Display for Announcement {
             ),
             Announcement::LocalShadowed { local, source } => write!(
                 f,
-                "the local domain '{local}' has a name {source} gave out first; hidden while {source} is connected; disconnect {source} to use it again"
+                "the local domain '{local}' has a name {source} gave out first; it is hidden until you change its name in config.yaml or disconnect {source}"
             ),
         }
     }
+}
+
+/// Why a local domain is hidden.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HiddenReason {
+    /// It is the same domain (same origin) as a mount of the source: the
+    /// server's copy is used while the source is connected, and the local
+    /// copy comes back on disconnect.
+    Copy,
+    /// It is a different domain whose name the source gave out first: it is
+    /// hidden until its name changes in config.yaml or the source is
+    /// disconnected (D13).
+    Collision,
+}
+
+/// One local domain that is hidden, the source that hides it and why.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Hidden {
+    /// The local domain's name.
+    pub local: String,
+    /// The source whose mount hides it.
+    pub source: String,
+    /// Why.
+    pub reason: HiddenReason,
+    /// The local name of the mount that hides it: the same as `local` for a
+    /// collision, and for a copy whatever name the mount has.
+    pub by: String,
 }
 
 /// Every domain this machine offers from a source, and the local copies
@@ -206,9 +239,11 @@ pub struct MountTable {
     pub mounts: Vec<Mount>,
     /// The domains left out because an earlier source offers them.
     pub skipped: Vec<Skipped>,
-    /// Local domains hidden while their source is connected: copies of a
-    /// mounted domain, and late local names a source gave out first.
-    pub shadowed: BTreeSet<String>,
+    /// Local domains hidden while their source is connected, one row per
+    /// local domain, source and reason, in assignment order. A local domain
+    /// can have two rows (a collision with one source and a copy on
+    /// another), and it is visible again only when every row is gone.
+    pub shadowed: Vec<Hidden>,
 }
 
 /// How a tool reaches domains, for [`MountTable::route`].
@@ -274,6 +309,16 @@ impl MountTable {
     /// The mount a local name names.
     pub fn mount(&self, local: &str) -> Option<&Mount> {
         self.mounts.iter().find(|m| m.local == local)
+    }
+
+    /// Whether a local domain is hidden.
+    pub fn is_hidden(&self, local: &str) -> bool {
+        self.shadowed.iter().any(|h| h.local == local)
+    }
+
+    /// Why a local domain is hidden: every row for it.
+    pub fn hidden<'a>(&'a self, local: &'a str) -> impl Iterator<Item = &'a Hidden> {
+        self.shadowed.iter().filter(move |h| h.local == local)
     }
 
     /// The source a local name comes from, `None` for a local domain.
@@ -387,6 +432,11 @@ impl MountTable {
 
 /// Build the mount table (decision D13). `sources` is updated in place with
 /// every name decided for the first time; persist it afterwards.
+///
+/// The same domain (same origin) is mounted once: an established mount (one
+/// whose source already handed out a name for it) keeps serving it, and
+/// only among sources offering it for the first time does the one
+/// connected first win. Every other copy is skipped with a note.
 pub fn assign(
     sources: &mut SourcesFile,
     local: &[LocalDomain],
@@ -399,15 +449,32 @@ pub fn assign(
     }
     // Every name a source handed out is reserved before anything new is
     // decided, whether or not its domain is offered right now.
+    let mut mount_names: BTreeSet<String> = BTreeSet::new();
     for source in &sources.sources {
-        taken.extend(source.mounts.iter().map(|m| m.local.clone()));
+        mount_names.extend(source.mounts.iter().map(|m| m.local.clone()));
+    }
+    taken.extend(mount_names.iter().cloned());
+    // Established mounts claim their origin first, in connect order, so a
+    // domain never moves to another source on its own.
+    let mut claimed: Vec<(OriginIdentity, String, String)> = Vec::new();
+    for source in &sources.sources {
+        let Some(offered) = remote.get(&source.name) else {
+            continue;
+        };
+        for domain in offered {
+            if let Some(identity) = &domain.origin
+                && source.mounts.iter().any(|m| m.remote == domain.name)
+                && !claimed.iter().any(|(id, _, _)| id.same_as(identity))
+            {
+                claimed.push((identity.clone(), source.name.clone(), domain.name.clone()));
+            }
+        }
     }
     let mut table = MountTable {
         sources: sources.names(),
         ..MountTable::default()
     };
     let mut said = Vec::new();
-    let mut claimed: Vec<(OriginIdentity, String)> = Vec::new();
     for source in sources.sources.iter_mut() {
         let Some(offered) = remote.get(&source.name) else {
             continue;
@@ -416,7 +483,9 @@ pub fn assign(
         offered.sort_by(|a, b| a.name.cmp(&b.name));
         for domain in offered {
             if let Some(identity) = &domain.origin
-                && let Some((_, kept_by)) = claimed.iter().find(|(id, _)| id.same_as(identity))
+                && let Some((_, kept_by, _)) = claimed.iter().find(|(id, by, remote)| {
+                    id.same_as(identity) && (by != &source.name || remote != &domain.name)
+                })
             {
                 said.push(Announcement::Skipped {
                     source: source.name.clone(),
@@ -444,9 +513,10 @@ pub fn assign(
                 Some(name) => name,
                 None => {
                     let name = match copy {
-                        Some(copy) => copy.name.clone(),
-                        None if !taken.contains(&domain.name) => domain.name.clone(),
-                        None => {
+                        // The copy's name, unless a mount already holds it.
+                        Some(copy) if !mount_names.contains(&copy.name) => copy.name.clone(),
+                        _ if !taken.contains(&domain.name) => domain.name.clone(),
+                        _ => {
                             let base = format!("{}-{}", domain.name, source.name);
                             let name = if taken.contains(&base) {
                                 (2..)
@@ -475,23 +545,39 @@ pub fn assign(
                         local: name.clone(),
                     });
                     taken.insert(name.clone());
+                    mount_names.insert(name.clone());
                     name
                 }
             };
             if let Some(copy) = copy {
-                table.shadowed.insert(copy.name.clone());
-            } else if local_names.contains(&name) {
-                table.shadowed.insert(name.clone());
+                table.shadowed.push(Hidden {
+                    local: copy.name.clone(),
+                    source: source.name.clone(),
+                    reason: HiddenReason::Copy,
+                    by: name.clone(),
+                });
+            }
+            // A different local domain under the mount's name (a hand edit
+            // of config.yaml): the mount keeps the name.
+            if local_names.contains(&name) && copy.is_none_or(|c| c.name != name) {
+                table.shadowed.push(Hidden {
+                    local: name.clone(),
+                    source: source.name.clone(),
+                    reason: HiddenReason::Collision,
+                    by: name.clone(),
+                });
                 said.push(Announcement::LocalShadowed {
                     local: name.clone(),
                     source: source.name.clone(),
                 });
             }
-            if let Some(identity) = &domain.origin {
-                claimed.push((identity.clone(), source.name.clone()));
+            if let Some(identity) = &domain.origin
+                && !claimed.iter().any(|(id, _, _)| id.same_as(identity))
+            {
+                claimed.push((identity.clone(), source.name.clone(), domain.name.clone()));
             }
             table.mounts.push(Mount {
-                replaces_local: copy.is_some_and(|c| c.name == name),
+                replaces_local: copy.is_some(),
                 local: name,
                 remote: domain.name,
                 source: source.name.clone(),
@@ -514,6 +600,8 @@ const TEXT_KEYS: &[&str] = &[
     "fix",
     "line_text",
     "counterpart_line_text",
+    "markdown",
+    "body",
 ];
 
 /// The keys whose subtree points at the server's own Fluid or carries the
@@ -612,7 +700,7 @@ fn translate_addresses(text: &str, names: &NameMap) -> String {
 mod tests {
     use super::*;
     use crate::server_token::CredentialKind;
-    use crate::sources::{SourceRecord, SourcesFile};
+    use crate::sources::{MountRecord, SourceRecord, SourcesFile};
     use serde_json::json;
 
     fn source(name: &str) -> SourceRecord {
@@ -779,7 +867,15 @@ mod tests {
         // latecomer: the mount keeps the name and the local one is shadowed.
         let (table, said) = assign(&mut file, &[local("jordi", None)], &both);
         assert_eq!(table.mounts[0].local, "jordi", "the first name stands");
-        assert!(table.shadowed.contains("jordi"));
+        assert_eq!(
+            table.hidden("jordi").collect::<Vec<_>>(),
+            vec![&Hidden {
+                local: "jordi".into(),
+                source: "acme".into(),
+                reason: HiddenReason::Collision,
+                by: "jordi".into(),
+            }]
+        );
         assert!(said.contains(&Announcement::LocalShadowed {
             local: "jordi".into(),
             source: "acme".into(),
@@ -790,8 +886,8 @@ mod tests {
                 source: "acme".into(),
             }
             .to_string(),
-            "the local domain 'jordi' has a name acme gave out first; hidden while acme is connected; disconnect acme to use it again",
-            "no rename is offered (ruling F8)"
+            "the local domain 'jordi' has a name acme gave out first; it is hidden until you change its name in config.yaml or disconnect acme",
+            "no rename command is offered (ruling F8 revised)"
         );
 
         // beta's domain disappears and comes back: same name again, and
@@ -839,7 +935,15 @@ mod tests {
             .expect("mounted under the local name");
         assert_eq!(mount.remote, "platform-team");
         assert!(mount.replaces_local);
-        assert!(table.shadowed.contains("platform"));
+        assert_eq!(
+            table.shadowed,
+            vec![Hidden {
+                local: "platform".into(),
+                source: "acme".into(),
+                reason: HiddenReason::Copy,
+                by: "platform".into(),
+            }]
+        );
         assert_eq!(
             said,
             vec![Announcement::ReplacesLocal {
@@ -890,6 +994,151 @@ mod tests {
             file.sources[1].mounts.is_empty(),
             "a skipped domain hands out no name"
         );
+    }
+
+    /// Fix round 1, I2: the copy stays hidden as a copy and the mount still
+    /// replaces it, whatever name the mount was given since.
+    #[test]
+    fn a_mount_renamed_since_still_replaces_and_hides_the_local_copy() {
+        let mut file = SourcesFile::default();
+        let mut acme = source("acme");
+        acme.mounts.push(MountRecord {
+            remote: "platform-team".into(),
+            local: "platform-x".into(),
+        });
+        file.sources.push(acme);
+        let (table, said) = assign(
+            &mut file,
+            &[local("platform", Some("acme/platform"))],
+            &served(&[("acme", vec![remote("platform-team", Some("acme/platform"))])]),
+        );
+        let mount = table
+            .mount("platform-x")
+            .expect("the persisted name stands");
+        assert!(mount.replaces_local);
+        assert!(table.mount("platform").is_none());
+        assert_eq!(
+            table.shadowed,
+            vec![Hidden {
+                local: "platform".into(),
+                source: "acme".into(),
+                reason: HiddenReason::Copy,
+                by: "platform-x".into(),
+            }]
+        );
+        assert!(said.is_empty(), "nothing new was decided: {said:?}");
+    }
+
+    /// Fix round 1, I3: a copy's name a mount already holds is not handed
+    /// out a second time, and a different domain under a mount's name is a
+    /// collision, not a copy.
+    #[test]
+    fn a_copy_never_gets_a_name_a_mount_already_holds() {
+        let mut file = SourcesFile::default();
+        file.sources.push(source("acme"));
+        file.sources.push(source("beta"));
+        let (table, _) = assign(
+            &mut file,
+            &[],
+            &served(&[("acme", vec![remote("platform", None)]), ("beta", vec![])]),
+        );
+        assert_eq!(table.mounts[0].local, "platform");
+
+        let (table, said) = assign(
+            &mut file,
+            &[local("platform", Some("acme/platform"))],
+            &served(&[
+                ("acme", vec![remote("platform", None)]),
+                ("beta", vec![remote("plat", Some("acme/platform"))]),
+            ]),
+        );
+        assert_eq!(
+            names(&table),
+            vec![
+                ("acme".into(), "platform".into(), "platform".into()),
+                ("beta".into(), "plat".into(), "plat".into()),
+            ]
+        );
+        let locals: BTreeSet<&str> = table.mounts.iter().map(|m| m.local.as_str()).collect();
+        assert_eq!(
+            locals.len(),
+            table.mounts.len(),
+            "no two mounts share a name"
+        );
+        assert!(table.mount("plat").unwrap().replaces_local);
+        assert_eq!(
+            table.hidden("platform").collect::<Vec<_>>(),
+            vec![
+                &Hidden {
+                    local: "platform".into(),
+                    source: "acme".into(),
+                    reason: HiddenReason::Collision,
+                    by: "platform".into(),
+                },
+                &Hidden {
+                    local: "platform".into(),
+                    source: "beta".into(),
+                    reason: HiddenReason::Copy,
+                    by: "plat".into(),
+                },
+            ]
+        );
+        assert!(said.contains(&Announcement::LocalShadowed {
+            local: "platform".into(),
+            source: "acme".into(),
+        }));
+        assert!(said.contains(&Announcement::ReplacesLocal {
+            source: "beta".into(),
+            local: "plat".into(),
+        }));
+    }
+
+    /// Fix round 1, M4: an established mount stays with its source and its
+    /// name when an earlier-connected source starts offering the same domain.
+    #[test]
+    fn an_established_mount_stays_when_an_earlier_source_offers_the_same_domain() {
+        let mut file = SourcesFile::default();
+        file.sources.push(source("acme"));
+        file.sources.push(source("beta"));
+        let (table, _) = assign(
+            &mut file,
+            &[],
+            &served(&[
+                ("acme", vec![]),
+                ("beta", vec![remote("plat", Some("acme/platform"))]),
+            ]),
+        );
+        assert_eq!(
+            names(&table),
+            vec![("beta".into(), "plat".into(), "plat".into())]
+        );
+
+        let (table, said) = assign(
+            &mut file,
+            &[],
+            &served(&[
+                ("acme", vec![remote("platform", Some("acme/platform"))]),
+                ("beta", vec![remote("plat", Some("acme/platform"))]),
+            ]),
+        );
+        assert_eq!(
+            names(&table),
+            vec![("beta".into(), "plat".into(), "plat".into())]
+        );
+        assert_eq!(
+            table.skipped,
+            vec![Skipped {
+                source: "acme".into(),
+                remote: "platform".into(),
+                kept_by: "beta".into(),
+            }]
+        );
+        assert!(said.contains(&Announcement::Skipped {
+            source: "acme".into(),
+            remote: "platform".into(),
+            kept_by: "beta".into(),
+        }));
+        assert!(file.sources[0].mounts.is_empty(), "acme hands out no name");
     }
 
     #[test]
@@ -1025,6 +1274,8 @@ mod tests {
             "related": "build_context anchor crystalline://jordi/runbooks/deploy to explore linked knowledge",
             "web_url": "https://crystalline.acme.com/d/jordi/e/runbooks/deploy",
             "content": "See crystalline://jordi/other and [[jordi:Other]] in domain jordi.",
+            "markdown": "# jordi\n\ncrystalline://jordi/p",
+            "body": { "domain": "jordi", "text": "crystalline://jordi/p" },
             "frontmatter": { "domain": "jordi", "url": "crystalline://jordi/x" },
             "relations": [{ "line": 3, "rel_type": "relates_to", "target": { "domain": "jordi", "target": "Other" }, "resolved": true }],
             "links": [{ "line": 4, "target": { "domain": null, "target": "Plain" }, "resolved": false }],
@@ -1063,6 +1314,11 @@ mod tests {
             "See crystalline://jordi/other and [[jordi:Other]] in domain jordi."
         );
         assert_eq!(answer["frontmatter"]["url"], "crystalline://jordi/x");
+        assert_eq!(answer["markdown"], "# jordi\n\ncrystalline://jordi/p");
+        assert_eq!(
+            answer["body"],
+            json!({ "domain": "jordi", "text": "crystalline://jordi/p" })
+        );
         assert_eq!(
             answer["hits"][0]["snippet"],
             "jordi says crystalline://jordi/p"
