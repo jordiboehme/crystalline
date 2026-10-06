@@ -320,7 +320,14 @@ pub fn sources_status(engine: &Arc<Engine>) -> Value {
                         .skipped
                         .iter()
                         .filter(|k| k.source == s.name)
-                        .map(|k| json!({ "remote": k.remote, "kept_by": k.kept_by }))
+                        .map(|k| json!({
+                            "remote": k.remote,
+                            "kept_by": k.kept_by,
+                            "reason": match k.reason {
+                                crystalline_remote::SkipReason::SameDomain => "same_domain",
+                                crystalline_remote::SkipReason::InvalidName => "invalid_name",
+                            },
+                        }))
                         .collect::<Vec<_>>(),
                     "shadowed": table
                         .shadowed

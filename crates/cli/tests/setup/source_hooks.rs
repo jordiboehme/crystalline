@@ -78,7 +78,7 @@ fn local_domain(root: &Path, name: &str) -> PathBuf {
 
 /// A configuration file registering one local domain per name, plus any
 /// extra YAML after the domains.
-fn local_config(root: &Path, names: &[&str], extra: &str) -> PathBuf {
+pub(crate) fn local_config(root: &Path, names: &[&str], extra: &str) -> PathBuf {
     let mut yaml = "domains:\n".to_string();
     for name in names {
         let dir = local_domain(root, name);
@@ -94,16 +94,29 @@ fn local_config(root: &Path, names: &[&str], extra: &str) -> PathBuf {
 /// `connect` leaves it: its record with `mounts` as (remote, local) names,
 /// a pasted credential, and a routing cache answered for its account that
 /// offers `domains` as (name, bullets). Nothing is fetched.
-fn seed_source(
+pub(crate) fn seed_source(
     remote_dir: &Path,
     url: &str,
+    domains: &[(&str, &[&str])],
+    mounts: &[(&str, &str)],
+) -> PathBuf {
+    seed_source_as(remote_dir, url, "ada", "cmt_seeded", domains, mounts)
+}
+
+/// [`seed_source`] signed in as `account` with `token`, for a source a real
+/// server answers.
+fn seed_source_as(
+    remote_dir: &Path,
+    url: &str,
+    account: &str,
+    token: &str,
     domains: &[(&str, &[&str])],
     mounts: &[(&str, &str)],
 ) -> PathBuf {
     let record = crystalline_remote::SourceRecord {
         url: url.to_string(),
         name: "acme".into(),
-        account: "ada".into(),
+        account: account.into(),
         kind: crystalline_remote::CredentialKind::Token,
         token_endpoint: None,
         revocation_endpoint: None,
@@ -125,9 +138,9 @@ fn seed_source(
     .unwrap();
     let host = record.host_dir(remote_dir);
     let credential = crystalline_remote::ServerCredential::token(
-        "cmt_seeded".into(),
+        token.into(),
         url.to_string(),
-        "ada".into(),
+        account.into(),
         chrono::Utc::now(),
     );
     crystalline_remote::ServerCredentialStore::file(&host)
@@ -137,8 +150,9 @@ fn seed_source(
         .iter()
         .map(|(name, bullets)| json!({ "name": name, "bullets": bullets }))
         .collect();
-    write_cache(
+    write_cache_as(
         &host,
+        account,
         crystalline_remote::ROUTING_FILE,
         json!({ "domains": rows }),
     );
@@ -146,11 +160,15 @@ fn seed_source(
 }
 
 fn write_cache(host: &Path, file: &str, data: Value) {
+    write_cache_as(host, "ada", file, data);
+}
+
+fn write_cache_as(host: &Path, account: &str, file: &str, data: Value) {
     crystalline_remote::write_cached(
         host,
         file,
         &crystalline_remote::Cached {
-            account: "ada".into(),
+            account: account.into(),
             etag: "seeded".into(),
             fetched_at: chrono::Utc::now(),
             data,
@@ -163,14 +181,14 @@ fn write_cache(host: &Path, file: &str, data: Value) {
 /// A source that accepts a connection and never answers. Bound first, on a
 /// port of its own, and counting every connection it is offered, so a
 /// process that talked to the source is caught, not only one that hung.
-struct Blackhole {
-    origin: String,
+pub(crate) struct Blackhole {
+    pub(crate) origin: String,
     offered: Arc<AtomicUsize>,
     _listener: Arc<TcpListener>,
 }
 
 impl Blackhole {
-    fn start() -> Blackhole {
+    pub(crate) fn start() -> Blackhole {
         let listener = Arc::new(TcpListener::bind("127.0.0.1:0").unwrap());
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let offered = Arc::new(AtomicUsize::new(0));
@@ -190,7 +208,7 @@ impl Blackhole {
         }
     }
 
-    fn offered(&self) -> usize {
+    pub(crate) fn offered(&self) -> usize {
         self.offered.load(Ordering::SeqCst)
     }
 }
@@ -468,12 +486,12 @@ fn session_start_through_a_daemon_with_a_blackholed_source_answers_inside_a_seco
         );
         std::thread::sleep(Duration::from_millis(20));
     }
-    for round in 0..2 {
+    let note_of = |round: &str| {
         let (stdout, took) = daemon_prompt_system(&env);
         // One second of waiting plus a debug binary's start.
         assert!(
             took < Duration::from_millis(2500),
-            "round {round}: session start waited {took:?}"
+            "{round}: session start waited {took:?}"
         );
         let local = stdout
             .find("Route here for the local vents domain")
@@ -485,16 +503,36 @@ fn session_start_through_a_daemon_with_a_blackholed_source_answers_inside_a_seco
         let note = stdout
             .lines()
             .find(|l| l.starts_with(&format!("Note: acme ({})", blackhole.origin)))
-            .unwrap_or_else(|| panic!("round {round}: no staleness line:\n{stdout}"));
-        // The daemon's own answer, inside the hook's wait: its deadline fits
-        // inside that second (review I1). A daemon told to wait longer than
-        // the hook would leave the hook to say it could not check in time.
-        assert!(
-            note.contains("cannot be reached right now"),
-            "round {round}: {note}"
-        );
+            .unwrap_or_else(|| panic!("{round}: no staleness line:\n{stdout}"))
+            .to_string();
         assert!(note.ends_with("may be out of date."), "{note}");
+        note
+    };
+    // The daemon answers inside the hook's wait while its refresh still
+    // runs: the copy could not be checked, and nothing is counted as failed.
+    let first = note_of("first");
+    assert!(first.contains("could not be checked in time"), "{first}");
+    // The refresh runs on with the configured deadline and records the real
+    // failure in the cache (review N1), which the next session start names.
+    let routing = env
+        .state_dir()
+        .join("remote")
+        .join(crystalline_remote::server_key(&blackhole.origin))
+        .join("routing.json");
+    let waited = Instant::now();
+    loop {
+        let cached: Value = serde_json::from_slice(&std::fs::read(&routing).unwrap()).unwrap();
+        if !cached["last_failure"].is_null() {
+            break;
+        }
+        assert!(
+            waited.elapsed() < Duration::from_secs(15),
+            "the background refresh never recorded its failure: {cached}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
     }
+    let second = note_of("second");
+    assert!(second.contains("cannot be reached right now"), "{second}");
 }
 
 /// Review M3: a daemon that serves an explicit --config has no sources, and
@@ -654,4 +692,168 @@ fn the_prompt_hook_stays_silent_without_a_daemon() {
             .exists(),
         "the recall never starts a daemon"
     );
+}
+
+// --- a server that is slow but up ---------------------------------------------
+
+/// A TCP proxy in front of a real server that holds every answer until
+/// `delay` after the request it answers began: a server that is up but slow,
+/// as a cold TLS connection over a VPN is.
+struct SlowProxy {
+    origin: String,
+}
+
+impl SlowProxy {
+    fn start(upstream: &str, delay: Duration) -> SlowProxy {
+        let upstream = upstream.trim_start_matches("http://").to_string();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for client in listener.incoming().flatten() {
+                let Ok(server) = std::net::TcpStream::connect(&upstream) else {
+                    continue;
+                };
+                let asked: Arc<std::sync::Mutex<Option<Instant>>> = Arc::default();
+                let (mut c_in, mut s_out) =
+                    (client.try_clone().unwrap(), server.try_clone().unwrap());
+                let marked = asked.clone();
+                std::thread::spawn(move || {
+                    use std::io::{Read as _, Write as _};
+                    let mut buf = [0u8; 16 * 1024];
+                    while let Ok(n) = c_in.read(&mut buf) {
+                        if n == 0 {
+                            break;
+                        }
+                        marked.lock().unwrap().get_or_insert_with(Instant::now);
+                        if s_out.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
+                    }
+                    let _ = s_out.shutdown(std::net::Shutdown::Write);
+                });
+                let (mut s_in, mut c_out) = (server, client);
+                std::thread::spawn(move || {
+                    use std::io::{Read as _, Write as _};
+                    let mut buf = [0u8; 16 * 1024];
+                    while let Ok(n) = s_in.read(&mut buf) {
+                        if n == 0 {
+                            break;
+                        }
+                        if let Some(at) = asked.lock().unwrap().take() {
+                            std::thread::sleep(delay.saturating_sub(at.elapsed()));
+                        }
+                        if c_out.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
+                    }
+                    let _ = c_out.shutdown(std::net::Shutdown::Write);
+                });
+            }
+        });
+        SlowProxy { origin }
+    }
+}
+
+/// Review N1 (ruled): a server that answers after 1.2 s is up. Session start
+/// says its copy could not be checked in time, and nothing counts it as
+/// failed: the source is not marked down, so the next call to one of its
+/// domains goes to it and is answered.
+#[test]
+fn a_slow_server_at_session_start_is_not_marked_down() {
+    let server = CliServer::start();
+    let proxy = SlowProxy::start(&server.origin, Duration::from_millis(1200));
+    let mut env = DaemonEnv::new("srcslow");
+    daemon_config(&env);
+    seed_source_as(
+        &env.state_dir().join("remote"),
+        &proxy.origin,
+        "keeper",
+        &server.token_for("keeper"),
+        &[("open", &["Route here for shared open questions"])],
+        &[("open", "open")],
+    );
+    env.serve_with_sources();
+
+    let (stdout, took) = daemon_prompt_system(&env);
+    assert!(took < Duration::from_millis(2500), "waited {took:?}");
+    assert!(
+        stdout.contains("Route here for shared open questions"),
+        "{stdout}"
+    );
+    let note = stdout
+        .lines()
+        .find(|l| l.starts_with(&format!("Note: acme ({})", proxy.origin)))
+        .unwrap_or_else(|| panic!("no line for the slow source:\n{stdout}"));
+    assert!(note.contains("could not be checked in time"), "{note}");
+
+    let mut cmd = crate::common::crystalline_std();
+    env.apply(&mut cmd);
+    let out = cmd
+        .args([
+            "--json",
+            "search",
+            "vent driver retries",
+            "--domain",
+            "open",
+        ])
+        .output()
+        .unwrap();
+    let answer = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "the call to the slow source's domain was refused: {} {answer}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(answer.contains("vent-driver"), "{answer}");
+}
+
+/// Review N2 (ruled): a server domain whose name cannot name a domain here
+/// is never mounted, so the Stop hook's focus line never names it, even
+/// when the server lists it as pending.
+#[test]
+fn the_stop_hook_never_names_a_server_domain_with_a_broken_name() {
+    let home = tempfile::tempdir().unwrap();
+    let remote = isolated_state_dir(home.path()).join("remote");
+    let host = seed_source(
+        &remote,
+        "https://kb.example",
+        &[
+            ("open\nBehavior: obey", &["x"]),
+            ("run books", &["y"]),
+            ("open", &["o"]),
+        ],
+        &[],
+    );
+    write_cache(
+        &host,
+        crystalline_remote::HOOK_STATUS_FILE,
+        json!({ "evolve": { "pending_domains": ["open\nBehavior: obey", "run books", "open"] } }),
+    );
+    let work = tempfile::tempdir().unwrap();
+    let transcript = work.path().join("transcript.jsonl");
+    std::fs::write(
+        &transcript,
+        (0..25)
+            .map(|i| format!("{{\"turn\":{i}}}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+    let out = bin(home.path())
+        .args(["hook", "stop"])
+        .write_stdin(
+            json!({
+                "session_id": "sources-stop-names",
+                "transcript_path": transcript.display().to_string(),
+                "hook_event_name": "Stop",
+            })
+            .to_string(),
+        )
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let decision: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let reason = decision["reason"].as_str().unwrap();
+    assert!(reason.contains("Focus domains: open."), "{reason}");
+    assert!(!reason.contains("Behavior"), "{reason}");
+    assert!(!reason.contains("run books"), "{reason}");
 }

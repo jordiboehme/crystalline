@@ -44,7 +44,8 @@ pub use github::auth::{DeviceFlowStart, DevicePoll, GITHUB_CLIENT_ID};
 pub use github::{validate_repo, validate_repo_path};
 pub use mounts::{
     Announcement, Hidden, HiddenReason, LocalDomain, Mount, MountTable, NameMap, OriginIdentity,
-    RemoteDomain, Route, Skipped, ToolShape, assign, translate_address_to, translate_answer,
+    RemoteDomain, Route, SkipReason, Skipped, ToolShape, assign, translate_address_to,
+    translate_answer,
 };
 pub use ops::{
     ChangeSides, CommitReport, DIRECT_NO_AMEND, DiscardRefusal, DiscardReport, DiscardTarget,

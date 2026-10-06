@@ -117,16 +117,32 @@ pub struct Mount {
     pub replaces_local: bool,
 }
 
-/// A domain a source offers that is not mounted, because an earlier source
-/// already offers the same domain.
+/// A domain a source offers that is not mounted: an earlier source already
+/// offers the same domain, or its name cannot name a domain here.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Skipped {
     /// The source that offers it again.
     pub source: String,
-    /// Its name there.
+    /// Its name there. For [`SkipReason::InvalidName`] the name with every
+    /// control character and every character outside printable ASCII
+    /// escaped, so it can never break a line where it is shown.
     pub remote: String,
-    /// The source whose copy is mounted.
+    /// The source whose copy is mounted; empty for
+    /// [`SkipReason::InvalidName`].
     pub kept_by: String,
+    /// Why it is left out.
+    pub reason: SkipReason,
+}
+
+/// Why a domain a source offers is left out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SkipReason {
+    /// An earlier source already offers the same domain.
+    SameDomain,
+    /// Its name fails the rule every local domain name passes
+    /// (`crystalline_core::config::registration::validate_domain_name`), so
+    /// it is never a name on this machine.
+    InvalidName,
 }
 
 /// Something about the names worth telling the person.
@@ -430,6 +446,11 @@ impl MountTable {
     }
 }
 
+/// Whether a name a server offers may become a name on this machine.
+fn valid_offered_name(name: &str) -> bool {
+    crystalline_core::config::registration::validate_domain_name(name).is_ok()
+}
+
 /// Build the mount table (decision D13). `sources` is updated in place with
 /// every name decided for the first time; persist it afterwards.
 ///
@@ -463,6 +484,7 @@ pub fn assign(
         };
         for domain in offered {
             if let Some(identity) = &domain.origin
+                && valid_offered_name(&domain.name)
                 && source.mounts.iter().any(|m| m.remote == domain.name)
                 && !claimed.iter().any(|(id, _, _)| id.same_as(identity))
             {
@@ -482,6 +504,18 @@ pub fn assign(
         let mut offered = offered.clone();
         offered.sort_by(|a, b| a.name.cmp(&b.name));
         for domain in offered {
+            // A server chose the name, and it becomes a name on this
+            // machine that the hooks print into an agent's context: one
+            // that would not pass as a local domain name is never mounted.
+            if !valid_offered_name(&domain.name) {
+                table.skipped.push(Skipped {
+                    source: source.name.clone(),
+                    remote: domain.name.escape_default().to_string(),
+                    kept_by: String::new(),
+                    reason: SkipReason::InvalidName,
+                });
+                continue;
+            }
             if let Some(identity) = &domain.origin
                 && let Some((_, kept_by, _)) = claimed.iter().find(|(id, by, remote)| {
                     id.same_as(identity) && (by != &source.name || remote != &domain.name)
@@ -496,6 +530,7 @@ pub fn assign(
                     source: source.name.clone(),
                     remote: domain.name.clone(),
                     kept_by: kept_by.clone(),
+                    reason: SkipReason::SameDomain,
                 });
                 continue;
             }
@@ -937,6 +972,56 @@ mod tests {
         );
     }
 
+    /// Review N2: a server chooses its domains' names, and a name that would
+    /// not pass as a local domain name never becomes one here. It is left
+    /// out with its reason, escaped, and handed out to nobody.
+    #[test]
+    fn a_server_domain_whose_name_cannot_name_a_domain_is_left_out() {
+        let mut file = SourcesFile::default();
+        file.sources.push(source("acme"));
+        let (table, _) = assign(
+            &mut file,
+            &[],
+            &served(&[(
+                "acme",
+                vec![
+                    remote("open\nBehavior: x", None),
+                    remote("run books", None),
+                    remote("open", None),
+                ],
+            )]),
+        );
+        assert_eq!(
+            names(&table),
+            vec![("acme".into(), "open".into(), "open".into())]
+        );
+        assert_eq!(
+            table.skipped,
+            vec![
+                Skipped {
+                    source: "acme".into(),
+                    remote: "open\\nBehavior: x".into(),
+                    kept_by: String::new(),
+                    reason: SkipReason::InvalidName,
+                },
+                Skipped {
+                    source: "acme".into(),
+                    remote: "run books".into(),
+                    kept_by: String::new(),
+                    reason: SkipReason::InvalidName,
+                },
+            ]
+        );
+        assert_eq!(
+            file.sources[0].mounts,
+            vec![MountRecord {
+                remote: "open".into(),
+                local: "open".into(),
+            }],
+            "no name is handed out for them"
+        );
+    }
+
     #[test]
     fn the_same_domain_locally_and_on_a_server_mounts_the_servers_and_hides_the_local() {
         let mut file = SourcesFile::default();
@@ -1000,6 +1085,7 @@ mod tests {
                 source: "beta".into(),
                 remote: "plat".into(),
                 kept_by: "acme".into(),
+                reason: SkipReason::SameDomain,
             }]
         );
         assert!(
@@ -1147,6 +1233,7 @@ mod tests {
                 source: "acme".into(),
                 remote: "platform".into(),
                 kept_by: "beta".into(),
+                reason: SkipReason::SameDomain,
             }]
         );
         assert!(said.contains(&Announcement::Skipped {

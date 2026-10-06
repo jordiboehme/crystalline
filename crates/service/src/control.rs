@@ -181,11 +181,18 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
         // Session start: every source's routing model, refreshed through its
         // etag within the deadline, then the mounted part from the caches.
         "mounted_routing" => {
-            let deadline = std::time::Duration::from_millis(
-                req.get("deadline_ms")
-                    .and_then(Value::as_u64)
-                    .unwrap_or_else(|| shared.engine.config().remote_deadline_ms()),
-            );
+            // How long the caller waits for this answer. The refresh itself
+            // runs with the configured deadline in a task of its own, so a
+            // server that is slow but up is never counted as failed (marked
+            // down, its pool dropped) because a caller stopped waiting. It
+            // finishes in the background and updates the cache.
+            let refresh_deadline =
+                std::time::Duration::from_millis(shared.engine.config().remote_deadline_ms());
+            let wait = req
+                .get("deadline_ms")
+                .and_then(Value::as_u64)
+                .map(std::time::Duration::from_millis)
+                .unwrap_or(refresh_deadline);
             // `shadowed` is said only when this daemon has its sources: one
             // serving an explicit --db or --config has none, and a hook then
             // reads the caches itself rather than lose the hidden copies and
@@ -194,27 +201,10 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                 Some(sources) => {
                     sources.reload_if_changed();
                     crate::route::sync_local(&shared.engine, &sources).await;
-                    // A source this process did not get to ask (its network
-                    // connection was still being set up) is served from its
-                    // cache, with a line saying it could not be checked.
-                    let unasked: std::collections::BTreeSet<String> = if sources.is_empty() {
+                    let unasked = if sources.is_empty() {
                         Default::default()
                     } else {
-                        sources
-                            .refresh(deadline)
-                            .await
-                            .into_iter()
-                            .filter(|(_, fetched)| {
-                                matches!(
-                                    fetched,
-                                    crystalline_remote::Fetched::Stale {
-                                        failure: crystalline_remote::RemoteFailure::Starting { .. },
-                                        ..
-                                    }
-                                )
-                            })
-                            .map(|(name, _)| name)
-                            .collect()
+                        refresh_within(&sources, refresh_deadline, wait).await
                     };
                     (
                         sources.mounted_routing_unasked(&unasked),
@@ -985,6 +975,53 @@ pub(crate) fn envelope_ok(data: Value) -> Value {
 
 pub(crate) fn envelope_err(message: impl Into<String>) -> Value {
     json!({ "v": CTL_VERSION, "ok": false, "error": message.into() })
+}
+
+/// Refresh every source's routing within `refresh_deadline` in a task of
+/// its own, and wait for it at most `wait`. Answers the sources whose copy is
+/// not known to be current: the ones the refresh did not get to ask (this
+/// process was still setting up its network connection), and, when the wait
+/// ran out first, every source the refresh has not confirmed yet. Those are
+/// served from their caches with a line saying they could not be checked;
+/// none of them is marked as failed for it.
+async fn refresh_within(
+    sources: &std::sync::Arc<crystalline_remote::SourceSet>,
+    refresh_deadline: std::time::Duration,
+    wait: std::time::Duration,
+) -> std::collections::BTreeSet<String> {
+    let started = chrono::Utc::now();
+    let refreshing = sources.clone();
+    let task = tokio::spawn(async move { refreshing.refresh(refresh_deadline).await });
+    match tokio::time::timeout(wait, task).await {
+        Ok(Ok(fetched)) => fetched
+            .into_iter()
+            .filter(|(_, fetched)| {
+                matches!(
+                    fetched,
+                    crystalline_remote::Fetched::Stale {
+                        failure: crystalline_remote::RemoteFailure::Starting { .. },
+                        ..
+                    }
+                )
+            })
+            .map(|(name, _)| name)
+            .collect(),
+        // Still running (or the task failed): a source whose cache was not
+        // written since this call began has not answered yet.
+        _ => sources
+            .records()
+            .into_iter()
+            .filter(|record| {
+                crystalline_remote::read_cached(
+                    &record.host_dir(sources.remote_dir()),
+                    crystalline_remote::ROUTING_FILE,
+                    &record.account,
+                )
+                .is_none_or(|cached| cached.fetched_at < started && cached.last_failure.is_none())
+            })
+            .map(|record| record.name)
+            .collect(),
+    }
 }
 
 #[cfg(test)]

@@ -1617,6 +1617,63 @@ fn the_prompt_hook_names_an_engram_once_per_session_and_again_after_a_compaction
     drop(stub);
 }
 
+/// Review M7: the recall's "nothing registered" bail lets a machine with a
+/// connected server through. Here this machine's own configuration (the one
+/// the hook reads) registers no domain at all, and a server is connected; the
+/// daemon serves the vents domain from its explicit --config. The block can
+/// only appear when the connected server keeps the hook from bailing.
+#[test]
+fn the_prompt_hook_asks_the_daemon_when_only_a_server_is_connected() {
+    let (endpoint, _stub) = spawn_embeddings_stub();
+    let mut env = DaemonEnv::new("recallsrc");
+    env.write_domain();
+    write_daemon_config(&env.config_path(), &env.domain_dir(), Some(&endpoint));
+    env.serve();
+    env.wait_embedded();
+    let search = env.search(PLAIN_PROMPT);
+    assert_eq!(search["mode"], json!("hybrid"), "{search}");
+
+    let no_domains = env.dir.join("no-domains.yaml");
+    std::fs::write(&no_domains, "domains: {}\nrecall:\n  min_score: 0.5\n").unwrap();
+    let ask = |session: &str| {
+        let mut cmd = crate::common::crystalline_std();
+        env.apply(&mut cmd);
+        cmd.env("CRYSTALLINE_CONFIG", &no_domains);
+        let mut child = cmd
+            .args(["hook", "prompt", "--harness", "claude-code"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(prompt_payload(session, PLAIN_PROMPT).as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    };
+
+    // Nothing registered and nothing connected: the bail, silent.
+    assert_silent(&ask("recall-no-source"), "no domain and no server");
+
+    let blackhole = crate::source_hooks::Blackhole::start();
+    crate::source_hooks::seed_source(
+        &env.state_dir().join("remote"),
+        &blackhole.origin,
+        &[("open", &["Route here for open"])],
+        &[("open", "open")],
+    );
+    let block = expect_block(&ask("recall-with-source"), "a server is connected");
+    assert!(block.contains(VENT_ADDRESS), "{block:?}");
+    assert_eq!(
+        blackhole.offered(),
+        0,
+        "the hook never asks the server itself"
+    );
+}
+
 /// The one line a speaking prompt hook prints, parsed, with the event name
 /// checked and the block handed back.
 fn expect_block(out: &std::process::Output, case: &str) -> String {

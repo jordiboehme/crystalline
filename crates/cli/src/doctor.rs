@@ -4399,6 +4399,9 @@ pub fn render_human(report: &DoctorReport) -> String {
         for hidden in &row.shadowed {
             let _ = writeln!(out, "  {}", hidden.note);
         }
+        for skipped in &row.skipped {
+            let _ = writeln!(out, "  {}", skipped.note);
+        }
         match &source.problem {
             Some(problem) => {
                 let _ = writeln!(out, "  PROBLEM: {problem}");

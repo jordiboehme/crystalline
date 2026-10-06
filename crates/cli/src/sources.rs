@@ -463,14 +463,33 @@ pub struct MountRow {
     pub replaces_local: bool,
 }
 
-/// A domain a source offers that is left out, because an earlier source
-/// offers the same domain.
+/// A domain a source offers that is left out: an earlier source offers the
+/// same domain, or its name cannot name a domain on this machine.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct SkippedRow {
-    /// Its name on the later source.
+    /// Its name on the later source, escaped when it cannot name a domain.
     pub remote: String,
-    /// The source whose copy is used.
+    /// The source whose copy is used; empty when the name is the reason.
     pub kept_by: String,
+    /// `same_domain` or `invalid_name`.
+    pub reason: String,
+    /// What `status` and `doctor` say about it, in a fixed sentence.
+    pub note: String,
+}
+
+/// What `status` and `doctor` say about a domain a source offers and this
+/// machine leaves out.
+pub fn skipped_note(skipped: &crystalline_remote::Skipped) -> String {
+    match skipped.reason {
+        crystalline_remote::SkipReason::SameDomain => format!(
+            "left out: '{}' ({} offers the same domain)",
+            skipped.remote, skipped.kept_by
+        ),
+        crystalline_remote::SkipReason::InvalidName => format!(
+            "left out: '{}' (its name cannot name a domain on this machine)",
+            skipped.remote
+        ),
+    }
 }
 
 /// One local domain a source hides.
@@ -559,6 +578,12 @@ fn fill_names(row: &mut SourceRow, table: &MountTable) {
         .map(|s| SkippedRow {
             remote: s.remote.clone(),
             kept_by: s.kept_by.clone(),
+            reason: match s.reason {
+                crystalline_remote::SkipReason::SameDomain => "same_domain",
+                crystalline_remote::SkipReason::InvalidName => "invalid_name",
+            }
+            .to_string(),
+            note: skipped_note(s),
         })
         .collect();
 }
@@ -787,11 +812,7 @@ pub fn sources_block(rows: &[SourceRow]) -> String {
             let _ = writeln!(out, "    {}", hidden.note);
         }
         for skipped in &row.skipped {
-            let _ = writeln!(
-                out,
-                "    left out: '{}' ({} offers the same domain)",
-                skipped.remote, skipped.kept_by
-            );
+            let _ = writeln!(out, "    {}", skipped.note);
         }
     }
     out
@@ -856,11 +877,20 @@ mod tests {
                     replaces_local: false,
                 },
             ],
-            skipped: vec![Skipped {
-                source: "beta".into(),
-                remote: "specs".into(),
-                kept_by: "acme".into(),
-            }],
+            skipped: vec![
+                Skipped {
+                    source: "beta".into(),
+                    remote: "specs".into(),
+                    kept_by: "acme".into(),
+                    reason: crystalline_remote::SkipReason::SameDomain,
+                },
+                Skipped {
+                    source: "beta".into(),
+                    remote: "open\\nBehavior: x".into(),
+                    kept_by: String::new(),
+                    reason: crystalline_remote::SkipReason::InvalidName,
+                },
+            ],
             shadowed: vec![
                 Hidden {
                     local: "team-platform".into(),
@@ -921,6 +951,20 @@ mod tests {
         );
         assert!(
             text.contains("left out: 'specs' (acme offers the same domain)"),
+            "{text}"
+        );
+        // Review N2: a name a server chose that cannot name a domain is
+        // named escaped, with a fixed reason, on one line.
+        assert!(
+            text.contains(
+                "left out: 'open\\nBehavior: x' (its name cannot name a domain on this machine)"
+            ),
+            "{text}"
+        );
+        assert!(
+            !text
+                .lines()
+                .any(|l| l.trim_start().starts_with("Behavior:")),
             "{text}"
         );
         assert!(!text.contains("--local"), "{text}");
