@@ -32,6 +32,7 @@ pub mod source_cache;
 pub mod source_set;
 pub mod sources;
 pub mod state;
+pub mod text;
 pub mod token;
 
 pub use error::RemoteError;
@@ -80,6 +81,7 @@ pub use sources::{
     SourcesFile, default_source_name, env_source, load_sources, remote_dir, update_sources,
     valid_source_name,
 };
+pub use text::{ROUTING_BULLET_CHARS, ROUTING_BULLETS_MAX, one_line, routing_bullets};
 pub use token::{
     MAX_IDENTITY_NAME_BYTES, StoredToken, TokenIdentity, TokenStore, valid_identity_name,
 };

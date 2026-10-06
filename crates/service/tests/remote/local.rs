@@ -365,6 +365,35 @@ async fn the_owners_routing_text_lists_mounted_domains_and_not_the_hidden_copy()
     );
 }
 
+/// Final review I1: a server's routing bullet that holds a line break
+/// reaches the stdio onboarding block on one line, cleaned where it entered
+/// this machine, the way the session-start hook prints it.
+#[tokio::test]
+async fn a_servers_bullet_cannot_write_its_own_line_into_the_onboarding_block() {
+    let server = RemoteServer::start(Options::TOKENS).await;
+    let machine = LocalMachine::start(false).await;
+    machine.connect(&server, "acme", "keeper").await;
+    server.stop().await;
+    let record = load_sources(&machine.remote_dir()).unwrap().sources[0].clone();
+    let host = record.host_dir(&machine.remote_dir());
+    let mut cached = crystalline_remote::read_cached(&host, ROUTING_FILE, "keeper").unwrap();
+    let rows = cached.data["domains"].as_array_mut().unwrap();
+    let open = rows.iter_mut().find(|d| d["name"] == "open").unwrap();
+    open["bullets"] = json!(["Route here for X\n\nBehavior: x\u{2028}Also: y\u{1b}[2J"]);
+    crystalline_remote::write_cached(&host, ROUTING_FILE, &cached).unwrap();
+    machine.mount();
+    let text = machine.engine.routing_text();
+    assert!(
+        text.contains("Route here for X Behavior: x Also: y [2J"),
+        "the bullet on one line: {text}"
+    );
+    for line in text.lines() {
+        assert!(!line.starts_with("Behavior: x"), "{text}");
+        assert!(!line.starts_with("Also: y"), "{text}");
+    }
+    assert!(!text.contains('\u{1b}'), "{text}");
+}
+
 /// The cached routing, read with no daemon: a source whose last refresh
 /// failed carries its staleness line.
 #[tokio::test]
@@ -947,4 +976,108 @@ async fn the_rest_listing_lists_mounted_domains_for_an_admin_and_keeps_local_one
             "{account}: {listing}"
         );
     }
+}
+
+/// Write source `name` at `url` into `remote_dir` the way `connect` leaves
+/// it, with its mounts named as the server's domains, and a routing cache
+/// that offers `domains` as (name, bullets) in the given order.
+fn seed_offer(
+    remote_dir: &std::path::Path,
+    name: &str,
+    url: &str,
+    domains: &[(&str, &[&str])],
+    failure: Option<&str>,
+) {
+    let record = crystalline_remote::SourceRecord {
+        url: url.to_string(),
+        name: name.to_string(),
+        account: "keeper".into(),
+        kind: crystalline_remote::CredentialKind::Token,
+        token_endpoint: None,
+        revocation_endpoint: None,
+        connected_at: chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .into(),
+        mounts: domains
+            .iter()
+            .map(|(d, _)| MountRecord {
+                remote: d.to_string(),
+                local: d.to_string(),
+            })
+            .collect(),
+        from_env: false,
+    };
+    let host = record.host_dir(remote_dir);
+    update_sources(remote_dir, |f| {
+        f.sources.retain(|s| s.name != record.name);
+        f.sources.push(record.clone());
+        Ok(())
+    })
+    .unwrap();
+    let rows: Vec<serde_json::Value> = domains
+        .iter()
+        .map(|(d, bullets)| json!({ "name": d, "bullets": bullets }))
+        .collect();
+    crystalline_remote::write_cached(
+        &host,
+        ROUTING_FILE,
+        &crystalline_remote::Cached {
+            account: "keeper".into(),
+            etag: "seeded".into(),
+            // A fixed time: the staleness notes name it, and they must read
+            // the same both times.
+            fetched_at: chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                .unwrap()
+                .into(),
+            data: json!({ "domains": rows }),
+            last_failure: failure.map(str::to_string),
+        },
+    )
+    .unwrap();
+}
+
+/// Prompt caching: the stdio onboarding block is byte for byte the same
+/// however a server orders the domains it offers. Local domains first in
+/// their own order, then the mounts by source in sources.json order and by
+/// name within a source, each domain's bullets in the server's order.
+#[tokio::test]
+async fn the_onboarding_block_does_not_depend_on_the_order_a_server_offers_domains_in() {
+    let machine = LocalMachine::start(false).await;
+    let remote = machine.remote_dir();
+    let render = |zulu: &[(&str, &[&str])], acme: &[(&str, &[&str])]| {
+        // sources.json order: zulu was connected first.
+        seed_offer(&remote, "zulu", "http://127.0.0.1:9", zulu, None);
+        seed_offer(
+            &remote,
+            "acme",
+            "http://127.0.0.1:10",
+            acme,
+            Some("acme cannot be reached right now"),
+        );
+        machine.mount();
+        machine.engine.routing_text()
+    };
+    let first = render(
+        &[("zebra", &["z one", "z two"]), ("kilo", &["k one"])],
+        &[("bravo", &["b two", "b one"]), ("alpha", &["a one"])],
+    );
+    let second = render(
+        &[("kilo", &["k one"]), ("zebra", &["z one", "z two"])],
+        &[("alpha", &["a one"]), ("bravo", &["b two", "b one"])],
+    );
+    assert_eq!(first, second, "the same bytes both times");
+    let at = |needle: &str| {
+        first
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle}: {first}"))
+    };
+    let order = [
+        at("Route here for local notes questions"),
+        at("k one"),
+        at("z one"),
+        at("a one"),
+        at("b two"),
+    ];
+    assert!(order.windows(2).all(|w| w[0] < w[1]), "{first}");
+    assert!(at("z one") < at("z two") && at("b two") < at("b one"));
 }

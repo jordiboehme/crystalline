@@ -857,3 +857,125 @@ fn the_stop_hook_never_names_a_server_domain_with_a_broken_name() {
     assert!(!reason.contains("Behavior"), "{reason}");
     assert!(!reason.contains("run books"), "{reason}");
 }
+
+/// Source `name` at `url` in `remote_dir`, its mounts named as the server's
+/// domains, and a routing cache offering `domains` in the given order. The
+/// cache carries a fixed time, so a staleness note reads the same each run.
+fn seed_named(
+    remote_dir: &Path,
+    name: &str,
+    url: &str,
+    domains: &[(&str, &[&str])],
+    failure: Option<&str>,
+) {
+    let fixed: chrono::DateTime<chrono::Utc> = "2026-01-01T00:00:00Z".parse().unwrap();
+    let record = crystalline_remote::SourceRecord {
+        url: url.to_string(),
+        name: name.to_string(),
+        account: "ada".into(),
+        kind: crystalline_remote::CredentialKind::Token,
+        token_endpoint: None,
+        revocation_endpoint: None,
+        connected_at: fixed,
+        mounts: domains
+            .iter()
+            .map(|(d, _)| crystalline_remote::MountRecord {
+                remote: d.to_string(),
+                local: d.to_string(),
+            })
+            .collect(),
+        from_env: false,
+    };
+    let host = record.host_dir(remote_dir);
+    crystalline_remote::update_sources(remote_dir, |f| {
+        f.sources.retain(|s| s.name != record.name);
+        f.sources.push(record.clone());
+        Ok(())
+    })
+    .unwrap();
+    let rows: Vec<Value> = domains
+        .iter()
+        .map(|(d, bullets)| json!({ "name": d, "bullets": bullets }))
+        .collect();
+    crystalline_remote::write_cached(
+        &host,
+        crystalline_remote::ROUTING_FILE,
+        &crystalline_remote::Cached {
+            account: "ada".into(),
+            etag: "seeded".into(),
+            fetched_at: fixed,
+            data: json!({ "domains": rows }),
+            last_failure: failure.map(str::to_string),
+        },
+    )
+    .unwrap();
+}
+
+/// Prompt caching: the session-start block is byte for byte the same
+/// however the servers order the domains they offer. The local block comes
+/// first in its own order, then the mounts by source in sources.json order
+/// and by name within a source, each domain's bullets in the server's
+/// order, and the staleness notes after the block in source order.
+#[test]
+fn session_start_does_not_depend_on_the_order_a_server_offers_domains_in() {
+    let home = tempfile::tempdir().unwrap();
+    let remote = isolated_state_dir(home.path()).join("remote");
+    let config = local_config(home.path(), &["yankee", "delta"], "");
+    let zulu = Blackhole::start();
+    let acme = Blackhole::start();
+    let run = |format: &str, z: &[(&str, &[&str])], a: &[(&str, &[&str])]| {
+        // sources.json order: zulu was connected first.
+        seed_named(
+            &remote,
+            "zulu",
+            &zulu.origin,
+            z,
+            Some("zulu cannot be reached right now"),
+        );
+        seed_named(&remote, "acme", &acme.origin, a, None);
+        stdout_of(
+            &bin_with(home.path(), &config)
+                .args(["prompt", "system", "--format", format])
+                .write_stdin("")
+                .output()
+                .unwrap(),
+        )
+    };
+    for format in ["text", "json"] {
+        let first = run(
+            format,
+            &[("zebra", &["z one", "z two"]), ("kilo", &["k one"])],
+            &[("bravo", &["b two", "b one"]), ("alpha", &["a one"])],
+        );
+        let second = run(
+            format,
+            &[("kilo", &["k one"]), ("zebra", &["z one", "z two"])],
+            &[("alpha", &["a one"]), ("bravo", &["b two", "b one"])],
+        );
+        assert_eq!(first, second, "{format}: the same bytes both times");
+        let at = |needle: &str| {
+            first
+                .find(needle)
+                .unwrap_or_else(|| panic!("{format}, {needle}: {first}"))
+        };
+        let order = [
+            at("Route here for the local yankee domain")
+                .min(at("Route here for the local delta domain")),
+            at("k one"),
+            at("z one"),
+            at("z two"),
+            at("a one"),
+            at("b two"),
+            at("b one"),
+            at(&format!("Note: zulu ({})", zulu.origin)),
+            at(&format!("Note: acme ({})", acme.origin)),
+        ];
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "{format}: {first}");
+        assert!(
+            at("Route here for the local yankee domain") < at("k one")
+                && at("Route here for the local delta domain") < at("k one"),
+            "{format}: the local block first: {first}"
+        );
+    }
+    assert_eq!(zulu.offered() + acme.offered(), 0, "no server was asked");
+}

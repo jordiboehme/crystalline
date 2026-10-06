@@ -146,13 +146,21 @@ pub async fn fetch_cached(
     }
 }
 
-/// The domains a cached or fresh routing model lists.
+/// The domains a cached or fresh routing model lists. This is where a
+/// server's routing bullets enter this machine, so each is cleaned here
+/// ([`crate::routing_bullets`]): whatever shows them (the stdio onboarding
+/// block, the session-start hook) never prints a line the
+/// server wrote on its own.
 pub fn remote_domains(routing: &Value) -> Vec<RemoteDomain> {
     routing["domains"]
         .as_array()
         .map(|rows| {
             rows.iter()
-                .filter_map(|row| serde_json::from_value(row.clone()).ok())
+                .filter_map(|row| serde_json::from_value::<RemoteDomain>(row.clone()).ok())
+                .map(|mut domain| {
+                    domain.bullets = crate::text::routing_bullets(&domain.bullets);
+                    domain
+                })
                 .collect()
         })
         .unwrap_or_default()

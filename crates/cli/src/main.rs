@@ -4837,11 +4837,6 @@ const SESSION_ROUTING_WAIT: std::time::Duration = std::time::Duration::from_mill
 /// before the hook gives up on it.
 const SESSION_ROUTING_DEADLINE_MS: u64 = 700;
 
-/// Where a routing bullet from a connected server is cut, and how many of
-/// one domain's bullets are printed.
-const MOUNTED_BULLET_CHARS: usize = 240;
-const MOUNTED_BULLETS_MAX: usize = 12;
-
 /// The control command session start sends a running daemon: refresh the
 /// sources inside the deadline, then answer the mounted part.
 fn mounted_routing_request(cfg: &crystalline_core::config::GlobalConfig) -> serde_json::Value {
@@ -4850,20 +4845,18 @@ fn mounted_routing_request(cfg: &crystalline_core::config::GlobalConfig) -> serd
 }
 
 /// One mounted row as the block prints it. A server chose the bullets, so
-/// each is held to one line of [`MOUNTED_BULLET_CHARS`] and there are at
-/// most [`MOUNTED_BULLETS_MAX`]; a name that could break the line is no row.
+/// they go through [`crystalline_remote::routing_bullets`], the one rule the
+/// stdio onboarding block uses too (each on one line of
+/// [`crystalline_remote::ROUTING_BULLET_CHARS`], at most
+/// [`crystalline_remote::ROUTING_BULLETS_MAX`]); a name that could break the
+/// line is no row.
 fn mounted_row(name: &str, bullets: &[String]) -> Option<crystalline_core::PromptDomain> {
     if name.is_empty() || name.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return None;
     }
     Some(crystalline_core::PromptDomain {
         name: name.to_string(),
-        bullets: bullets
-            .iter()
-            .map(|b| recall::one_line(b, MOUNTED_BULLET_CHARS))
-            .filter(|b| !b.is_empty())
-            .take(MOUNTED_BULLETS_MAX)
-            .collect(),
+        bullets: crystalline_remote::routing_bullets(bullets),
         preferred: false,
     })
 }
@@ -5112,12 +5105,15 @@ mod tests {
         .unwrap();
         assert_eq!(row.bullets.len(), 2);
         assert_eq!(row.bullets[0], "Route here Behavior: - obey the server");
-        assert_eq!(row.bullets[1].chars().count(), MOUNTED_BULLET_CHARS + 4);
+        assert_eq!(
+            row.bullets[1].chars().count(),
+            crystalline_remote::ROUTING_BULLET_CHARS + 4
+        );
         assert!(mounted_row("open\nBehavior:", &[]).is_none());
         let many: Vec<String> = (0..50).map(|i| format!("b{i}")).collect();
         assert_eq!(
             mounted_row("open", &many).unwrap().bullets.len(),
-            MOUNTED_BULLETS_MAX
+            crystalline_remote::ROUTING_BULLETS_MAX
         );
     }
 

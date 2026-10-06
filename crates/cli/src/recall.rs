@@ -68,6 +68,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crystalline_core::HarnessKind;
+use crystalline_remote::one_line;
 
 use crate::hook::{self, SessionState};
 
@@ -289,25 +290,6 @@ pub fn select_hits(
 /// character boundary, marking a cut with a trailing ` ...`.
 fn cut_snippet(raw: &str) -> String {
     one_line(raw, SNIPPET_CHARS)
-}
-
-/// `raw` as one line of at most `cap` characters: every control character
-/// and every run of whitespace (a newline among them) becomes one space, and
-/// a longer text is cut on a character boundary with a trailing ` ...`.
-/// What a hook prints from a connected server goes through this, so a
-/// server's string can never start a line of its own in the agent's context.
-pub fn one_line(raw: &str, cap: usize) -> String {
-    let spaced: String = raw
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect();
-    let collapsed = spaced.split_whitespace().collect::<Vec<_>>().join(" ");
-    if collapsed.chars().count() <= cap {
-        return collapsed;
-    }
-    let mut cut: String = collapsed.chars().take(cap).collect();
-    cut.push_str(" ...");
-    cut
 }
 
 /// Whether `part` of an address is safe to print as it is: no whitespace
