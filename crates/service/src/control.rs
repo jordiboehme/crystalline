@@ -186,26 +186,53 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                     .and_then(Value::as_u64)
                     .unwrap_or_else(|| shared.engine.config().remote_deadline_ms()),
             );
-            let routing = match shared.engine.sources() {
+            // `shadowed` is said only when this daemon has its sources: one
+            // serving an explicit --db or --config has none, and a hook then
+            // reads the caches itself rather than lose the hidden copies and
+            // the mounts both.
+            let (routing, shadowed) = match shared.engine.sources() {
                 Some(sources) => {
                     sources.reload_if_changed();
                     crate::route::sync_local(&shared.engine, &sources).await;
-                    if !sources.is_empty() {
-                        sources.refresh(deadline).await;
-                    }
-                    sources.mounted_routing_from_cache()
+                    // A source this process did not get to ask (its network
+                    // connection was still being set up) is served from its
+                    // cache, with a line saying it could not be checked.
+                    let unasked: std::collections::BTreeSet<String> = if sources.is_empty() {
+                        Default::default()
+                    } else {
+                        sources
+                            .refresh(deadline)
+                            .await
+                            .into_iter()
+                            .filter(|(_, fetched)| {
+                                matches!(
+                                    fetched,
+                                    crystalline_remote::Fetched::Stale {
+                                        failure: crystalline_remote::RemoteFailure::Starting { .. },
+                                        ..
+                                    }
+                                )
+                            })
+                            .map(|(name, _)| name)
+                            .collect()
+                    };
+                    (
+                        sources.mounted_routing_unasked(&unasked),
+                        Some(sources.shadowed()),
+                    )
                 }
-                None => crystalline_remote::MountedRouting::default(),
+                None => (crystalline_remote::MountedRouting::default(), None),
             };
             let domains: Vec<Value> = routing
                 .domains
                 .iter()
                 .map(|m| json!({ "name": m.local, "source": m.source, "bullets": m.bullets }))
                 .collect();
-            (
-                envelope_ok(json!({ "domains": domains, "stale": routing.stale })),
-                false,
-            )
+            let mut answer = json!({ "domains": domains, "stale": routing.stale });
+            if let Some(shadowed) = shadowed {
+                answer["shadowed"] = json!(shadowed);
+            }
+            (envelope_ok(answer), false)
         }
         "sync" => {
             let domain = req.get("domain").and_then(Value::as_str);

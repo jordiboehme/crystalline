@@ -21,7 +21,7 @@ use crate::mounts::{Announcement, Hidden, HiddenReason, LocalDomain, Mount, Moun
 use crate::server_client::{Connection, ForwardedAgent, RemoteFailure};
 use crate::source_cache::{
     Fetched, HOOK_STATUS_FILE, ROUTING_FILE, STALE_AFTER, cached_offers, fetch_cached, read_cached,
-    stale_line, stale_or_missing,
+    stale_line, stale_or_missing, unchecked_line,
 };
 use crate::sources::{
     REMOTE_TOKEN_ENV, SourceRecord, SourcesFile, env_source, load_sources, update_sources,
@@ -775,8 +775,29 @@ impl SourceSet {
     /// The mounted part of the routing block from the caches alone, for a
     /// hook with no daemon to ask (decision D20).
     pub fn mounted_routing_from_cache(&self) -> MountedRouting {
+        self.cached_routing(|_| false)
+    }
+
+    /// [`SourceSet::mounted_routing_from_cache`] for a hook whose daemon did
+    /// not answer in time: no copy is known to be current, so a source whose
+    /// cache would otherwise read as fresh gets [`unchecked_line`] instead of
+    /// no line at all.
+    pub fn mounted_routing_unchecked(&self) -> MountedRouting {
+        self.cached_routing(|_| true)
+    }
+
+    /// [`SourceSet::mounted_routing_from_cache`] after a refresh that did not
+    /// get to ask the sources named in `unasked` (this process was still
+    /// setting up its network connection): their copies are not known to be
+    /// current either.
+    pub fn mounted_routing_unasked(&self, unasked: &BTreeSet<String>) -> MountedRouting {
+        self.cached_routing(|name| unasked.contains(name))
+    }
+
+    fn cached_routing(&self, unchecked: impl Fn(&str) -> bool) -> MountedRouting {
         let table = self.table();
         let mut stale = Vec::new();
+        let mut listed: BTreeSet<String> = BTreeSet::new();
         for record in self.records() {
             match read_cached(
                 &record.host_dir(&self.remote_dir),
@@ -784,6 +805,7 @@ impl SourceSet {
                 &record.account,
             ) {
                 Some(cached) => {
+                    listed.insert(record.name.clone());
                     let old = Utc::now()
                         .signed_duration_since(cached.fetched_at)
                         .to_std()
@@ -795,6 +817,8 @@ impl SourceSet {
                             cached.fetched_at,
                             cached.last_failure.as_deref(),
                         ));
+                    } else if unchecked(&record.name) {
+                        stale.push(unchecked_line(&record.name, &record.url, cached.fetched_at));
                     }
                 }
                 None => stale.push(format!(
@@ -803,8 +827,16 @@ impl SourceSet {
                 )),
             }
         }
+        // A source with no readable cache is said to list nothing, so its
+        // mounts are left out even where a table built earlier still holds
+        // them.
         MountedRouting {
-            domains: table.mounts.clone(),
+            domains: table
+                .mounts
+                .iter()
+                .filter(|m| listed.contains(&m.source))
+                .cloned()
+                .collect(),
             stale,
         }
     }
@@ -864,6 +896,98 @@ mod tests {
         assert_eq!(
             other,
             "the local domain 'open' has a name a connected server gave out first; it is hidden until you change its name in config.yaml"
+        );
+    }
+
+    /// One source `acme` whose fresh routing cache offers `jordi`.
+    fn one_fresh_source(dir: &Path) -> SourceRecord {
+        let record = SourceRecord {
+            url: "https://crystalline.acme.com".into(),
+            name: "acme".into(),
+            account: "ada".into(),
+            kind: crate::CredentialKind::Token,
+            token_endpoint: None,
+            revocation_endpoint: None,
+            connected_at: Utc::now(),
+            mounts: Vec::new(),
+            from_env: false,
+        };
+        let saved = record.clone();
+        update_sources(dir, |f| {
+            f.sources.push(saved);
+            Ok(())
+        })
+        .unwrap();
+        crate::write_cached(
+            &record.host_dir(dir),
+            ROUTING_FILE,
+            &crate::Cached {
+                account: "ada".into(),
+                etag: "e".into(),
+                fetched_at: Utc::now(),
+                data: serde_json::json!({ "domains": [{ "name": "jordi", "bullets": ["b"] }] }),
+                last_failure: None,
+            },
+        )
+        .unwrap();
+        record
+    }
+
+    /// Review I1: a hook that stopped waiting for the daemon cannot call any
+    /// copy current, so a fresh-looking cache still gets a line.
+    #[test]
+    fn a_routing_not_checked_in_time_says_so_for_every_fresh_source() {
+        let dir = tempfile::tempdir().unwrap();
+        one_fresh_source(dir.path());
+        let set = SourceSet::load(dir.path().to_path_buf(), Vec::new(), |_| None);
+        assert!(set.mounted_routing_from_cache().stale.is_empty());
+        let unchecked = set.mounted_routing_unchecked();
+        assert_eq!(unchecked.domains.len(), 1);
+        assert_eq!(unchecked.stale.len(), 1);
+        assert!(
+            unchecked.stale[0].starts_with(
+                "Note: acme (https://crystalline.acme.com) could not be checked in time, so its domains in this routing block are the copy from "
+            ),
+            "{:?}",
+            unchecked.stale
+        );
+    }
+
+    /// Only the named sources get the line after a refresh that did not ask
+    /// them.
+    #[test]
+    fn an_unasked_source_alone_gets_the_unchecked_line() {
+        let dir = tempfile::tempdir().unwrap();
+        one_fresh_source(dir.path());
+        let set = SourceSet::load(dir.path().to_path_buf(), Vec::new(), |_| None);
+        assert!(
+            set.mounted_routing_unasked(&BTreeSet::new())
+                .stale
+                .is_empty()
+        );
+        let named: BTreeSet<String> = ["acme".to_string()].into();
+        let routing = set.mounted_routing_unasked(&named);
+        assert_eq!(routing.stale.len(), 1);
+        assert!(routing.stale[0].contains("could not be checked in time"));
+    }
+
+    /// Review M6: a source whose cache is gone is said to list nothing, so
+    /// its mounts are not listed above that line.
+    #[test]
+    fn a_source_whose_cache_is_gone_lists_no_domain() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = one_fresh_source(dir.path());
+        let set = SourceSet::load(dir.path().to_path_buf(), Vec::new(), |_| None);
+        assert_eq!(set.table().mounts.len(), 1);
+        std::fs::remove_file(record.host_dir(dir.path()).join(ROUTING_FILE)).unwrap();
+        let routing = set.mounted_routing_from_cache();
+        assert!(routing.domains.is_empty(), "{:?}", routing.domains);
+        assert_eq!(
+            routing.stale,
+            vec![
+                "Note: acme (https://crystalline.acme.com) has not answered yet, so its domains are not listed here."
+                    .to_string()
+            ]
         );
     }
 }

@@ -15,10 +15,12 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
 use serde_json::{Value, json};
+
+use crate::daemon_env::DaemonEnv;
 
 /// The exact reminder text `hook.rs` prints, duplicated here because the
 /// `crystalline` binary has no library target for a test to import it from;
@@ -1292,57 +1294,10 @@ fn write_daemon_config(path: &Path, domain_dir: &Path, endpoint: Option<&str>) {
     std::fs::write(path, yaml).unwrap();
 }
 
-/// An isolated, short-path environment holding one daemon.
-///
-/// The base is `/tmp` rather than a `tempfile` directory for the reason
-/// `crates/cli/tests/daemon/service.rs` gives: the daemon's unix socket path has to
-/// stay inside the platform's 104-byte limit.
-struct DaemonEnv {
-    dir: PathBuf,
-    serve: Option<std::process::Child>,
-}
-
 impl DaemonEnv {
-    fn new(tag: &str) -> DaemonEnv {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = PathBuf::from("/tmp").join(format!("cqp-{tag}-{nanos}"));
-        std::fs::create_dir_all(dir.join("config")).unwrap();
-        std::fs::create_dir_all(dir.join("state")).unwrap();
-        std::fs::create_dir_all(dir.join("cache")).unwrap();
-        DaemonEnv { dir, serve: None }
-    }
-
-    fn config_path(&self) -> PathBuf {
-        self.dir.join("config/crystalline/config.yaml")
-    }
     fn domain_dir(&self) -> PathBuf {
         self.dir.join("kb-vents")
     }
-    fn state_dir(&self) -> PathBuf {
-        self.dir.join("state/crystalline")
-    }
-    fn info_path(&self) -> PathBuf {
-        self.state_dir().join("service.json")
-    }
-    fn lock_path(&self) -> PathBuf {
-        self.state_dir().join("service.lock")
-    }
-
-    /// Isolate a child into this test's directories, with the HTTP endpoint
-    /// off (a real port is the one thing a temp directory cannot isolate) and
-    /// the real keychain refused.
-    fn apply(&self, cmd: &mut std::process::Command) {
-        cmd.env("HOME", &self.dir)
-            .env("XDG_CONFIG_HOME", self.dir.join("config"))
-            .env("XDG_STATE_HOME", self.dir.join("state"))
-            .env("XDG_CACHE_HOME", self.dir.join("cache"))
-            .env("CRYSTALLINE_SERVICE_HTTP", "false")
-            .env("CRYSTALLINE_TEST_NO_KEYCHAIN", "1");
-    }
-
     /// The domain on disk: a MANIFEST and the one engram the prompts recall.
     fn write_domain(&self) {
         let dir = self.domain_dir();
@@ -1359,60 +1314,6 @@ impl DaemonEnv {
             ),
         )
         .unwrap();
-    }
-
-    /// Start the daemon against this environment's config and wait until it
-    /// answers.
-    fn serve(&mut self) {
-        let mut cmd = crate::common::crystalline_std();
-        self.apply(&mut cmd);
-        let child = cmd
-            .args(["serve", "--config"])
-            .arg(self.config_path())
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
-        self.serve = Some(child);
-        let start = Instant::now();
-        while !self.run(&["ctl", "status", "--json"]).0 {
-            assert!(
-                start.elapsed() < Duration::from_secs(30),
-                "the daemon did not become ready"
-            );
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        // What every assertion below rests on: there is a real daemon here,
-        // this one, and not a command that answered by opening the index
-        // itself. The hook only ever speaks to a daemon that published this
-        // record.
-        let text =
-            std::fs::read_to_string(self.info_path()).expect("the daemon published a record");
-        let record: Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(record["started_by"], json!("serve"), "{record}");
-        assert!(
-            record["pid"].as_u64().is_some_and(|pid| pid > 0),
-            "{record}"
-        );
-    }
-
-    /// Run a one-shot command, returning (success, stdout).
-    fn run(&self, args: &[&str]) -> (bool, String) {
-        let mut cmd = crate::common::crystalline_std();
-        self.apply(&mut cmd);
-        let out = cmd.args(args).output().unwrap();
-        (
-            out.status.success(),
-            String::from_utf8_lossy_owned(out.stdout),
-        )
-    }
-
-    /// The daemon's status report.
-    fn status(&self) -> Value {
-        let (ok, out) = self.run(&["ctl", "status", "--json"]);
-        assert!(ok, "ctl status failed: {out}");
-        serde_json::from_str(&out).unwrap_or_else(|e| panic!("status json: {e}: {out}"))
     }
 
     /// One search through the daemon, the same default mode the agent's own
@@ -1539,39 +1440,6 @@ impl DaemonEnv {
                     .collect()
             })
             .unwrap_or_default()
-    }
-
-    /// Stop the daemon and wait until the lock is free, so the temp directory
-    /// goes away without a live writer in it.
-    fn shutdown(&mut self) {
-        let _ = self.run(&["ctl", "shutdown"]);
-        let start = Instant::now();
-        while start.elapsed() < Duration::from_secs(8) {
-            if !self.lock_path().exists() && !self.info_path().exists() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        if let Some(mut child) = self.serve.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-}
-
-impl Drop for DaemonEnv {
-    fn drop(&mut self) {
-        self.shutdown();
-        if let Ok(text) = std::fs::read_to_string(self.info_path())
-            && let Ok(v) = serde_json::from_str::<Value>(&text)
-            && let Some(pid) = v.get("pid").and_then(Value::as_u64)
-        {
-            let _ = std::process::Command::new("kill")
-                .arg("-9")
-                .arg(pid.to_string())
-                .status();
-        }
-        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 

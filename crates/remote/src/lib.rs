@@ -69,7 +69,7 @@ pub use sign_in::{
 };
 pub use source_cache::{
     Cached, Fetched, HOOK_STATUS_FILE, ROUTING_FILE, STALE_AFTER, cached_offers, fetch_cached,
-    read_cached, remote_domains, stale_line, write_cached,
+    read_cached, remote_domains, stale_line, unchecked_line, write_cached,
 };
 pub use source_set::{ConfigStamp, MountNote, MountedRouting, SourceSet, hidden_sentence};
 pub use sources::{

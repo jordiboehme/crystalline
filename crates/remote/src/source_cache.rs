@@ -175,6 +175,16 @@ pub fn cached_offers(
         .collect()
 }
 
+/// The line for a source whose cached routing could not be confirmed in
+/// time: the hook stopped waiting for the daemon before its refresh ended,
+/// so the copy may be out of date even though its last refresh succeeded.
+pub fn unchecked_line(source: &str, url: &str, fetched_at: DateTime<Utc>) -> String {
+    let when = fetched_at.format("%Y-%m-%d %H:%M UTC");
+    format!(
+        "Note: {source} ({url}) could not be checked in time, so its domains in this routing block are the copy from {when} and may be out of date."
+    )
+}
+
 /// The one line a stale part of the routing block carries. `failure` is the
 /// recorded reason (a [`RemoteFailure`]'s words), `None` for a copy that is
 /// merely old. The line names the cause in a fixed sentence per kind (a
