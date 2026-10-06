@@ -185,8 +185,14 @@ async fn a_fan_out_with_one_slow_and_one_unreachable_source_answers_within_the_d
         ),
         "{note}"
     );
+    // A closed port is refused at once on Linux and macOS, while Windows
+    // retries a refused loopback connect for about two seconds, so there the
+    // 0.7 s deadline runs out first. Both are "cannot be reached"; only the
+    // cause in the parenthesis differs.
+    let gone_refused = "gone cannot be reached right now (check the VPN or the network); its domains are missing from these results; it recovers by itself once the server answers again";
+    let gone_timed_out = "gone cannot be reached right now (it did not answer within 0.7 s; check the VPN or the network); its domains are missing from these results; it recovers by itself once the server answers again";
     assert!(
-        note.contains("gone cannot be reached right now (check the VPN or the network); its domains are missing from these results; it recovers by itself once the server answers again"),
+        note.contains(gone_refused) || note.contains(gone_timed_out),
         "{note}"
     );
 }
