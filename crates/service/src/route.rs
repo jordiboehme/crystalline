@@ -483,6 +483,7 @@ async fn fan_out(
         .is_some_and(|d| !d.is_empty());
 
     let mut remote = tokio::task::JoinSet::new();
+    let mut spawned = std::collections::BTreeMap::new();
     for source in asked {
         let names = table.names(&source);
         // A part names its source's domains: the ones the filter asked for,
@@ -492,12 +493,14 @@ async fn fan_out(
         let set = set.clone();
         let tool = tool.to_string();
         let agent = agent.clone();
-        remote.spawn(async move {
+        let asked_name = source.clone();
+        let task = remote.spawn(async move {
             let answer = set
                 .forward(&source, &tool, forwarded, &agent, deadline)
                 .await;
             (source, names, answer)
         });
+        spawned.insert(task.id(), asked_name);
     }
     // The local part runs while the sources are asked.
     let local_part = if local {
@@ -527,9 +530,20 @@ async fn fan_out(
     let mut parts: Vec<Part> = local_part.into_iter().collect();
     let mut missing = Vec::new();
     let mut answered: Vec<(String, Part)> = Vec::new();
-    while let Some(done) = remote.join_next().await {
-        let Ok((source, names, answer)) = done else {
-            continue;
+    while let Some(done) = remote.join_next_with_id().await {
+        let (source, names, answer) = match done {
+            Ok((_, part)) => part,
+            // The task asking a source stopped (a panic on this machine):
+            // that source is named, never silently left out.
+            Err(stopped) => {
+                if let Some(source) = spawned.get(&stopped.id()) {
+                    missing.push(crystalline_remote::Missing {
+                        source: source.clone(),
+                        reason: "was not asked to the end (the request stopped on this machine; the next call asks it again)".to_string(),
+                    });
+                }
+                continue;
+            }
         };
         match answer {
             Ok(mut value) => {

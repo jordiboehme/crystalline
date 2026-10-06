@@ -47,9 +47,13 @@ async fn open_connection(
     limit: Duration,
 ) -> Result<Arc<Connection>, RemoteFailure> {
     let name = record.name.clone();
-    // Outside the budget: a cold process's first client build is not a
-    // sign-in that did not finish in time.
-    crate::server_client::warm_http_client().await;
+    let started = std::time::Instant::now();
+    // Inside the budget, and told apart: a cold process's first client
+    // build is not a sign-in that did not finish in time.
+    if !crate::server_client::warm_http_client_within(limit).await {
+        return Err(RemoteFailure::Starting { source: name });
+    }
+    let limit = limit.saturating_sub(started.elapsed());
     let opening = tokio::task::spawn_blocking(move || {
         Connection::open_with(record, &dir, move |var| {
             (var == REMOTE_TOKEN_ENV).then(|| token.clone()).flatten()
@@ -581,6 +585,7 @@ impl SourceSet {
             let token = self.env_token.clone();
             let name = record.name.clone();
             let handle = tasks.spawn(async move {
+                let started = std::time::Instant::now();
                 let (opened, fresh) = match open {
                     Some(open) => (Ok(open), false),
                     None => (
@@ -589,7 +594,22 @@ impl SourceSet {
                     ),
                 };
                 let fetched = match &opened {
-                    Ok(connection) => fetch_cached(connection, cmd, file, deadline).await,
+                    Ok(connection) => {
+                        let left = deadline.saturating_sub(started.elapsed());
+                        fetch_cached(connection, cmd, file, left).await
+                    }
+                    // Not asked at all: the cache is served as it is, and
+                    // nothing is recorded against the source.
+                    Err(starting @ RemoteFailure::Starting { .. }) => {
+                        let host_dir = record.host_dir(&dir);
+                        match read_cached(&host_dir, file, &record.account) {
+                            Some(cached) => Fetched::Stale {
+                                cached,
+                                failure: starting.clone(),
+                            },
+                            None => Fetched::Missing(starting.clone()),
+                        }
+                    }
                     Err(failure) => {
                         let host_dir = record.host_dir(&dir);
                         let cached = read_cached(&host_dir, file, &record.account);
@@ -642,6 +662,13 @@ impl SourceSet {
                         inner.failures.remove(name);
                         inner.failure_details.remove(name);
                     }
+                    // A source this process did not get to ask keeps
+                    // whatever it had.
+                    Fetched::Stale {
+                        failure: RemoteFailure::Starting { .. },
+                        ..
+                    }
+                    | Fetched::Missing(RemoteFailure::Starting { .. }) => {}
                     Fetched::Stale { failure, .. } | Fetched::Missing(failure) => {
                         inner.failures.insert(name.clone(), failure.to_string());
                         match failure.server_text() {
@@ -680,15 +707,22 @@ impl SourceSet {
         // the save failed, the table stays as it was.
         match saved {
             Ok(Ok(file)) => {
-                {
-                    // A reload that ran meanwhile read the file after this
-                    // save, so its copy is the newer one and stays.
+                let current = {
                     let mut inner = self.write();
-                    if inner.generation == generation {
+                    let current = inner.generation == generation;
+                    if current {
                         inner.file = file;
                     }
+                    current
+                };
+                if current {
+                    self.rebuild();
+                } else {
+                    // A reload ran meanwhile and may have read the file
+                    // before this save: read it again, so memory is never
+                    // behind the disk.
+                    self.reload();
                 }
-                self.rebuild();
             }
             Ok(Err(e)) => {
                 tracing::warn!("the names of the connected servers could not be saved: {e}")
@@ -714,9 +748,6 @@ impl SourceSet {
         agent: &ForwardedAgent,
         deadline: Duration,
     ) -> Result<Value, RemoteFailure> {
-        // Before the clock starts: a cold process's first client build is
-        // not the caller's to wait for.
-        crate::server_client::warm_http_client().await;
         let started = std::time::Instant::now();
         let connection = self.connection(source, deadline).await?;
         let left = deadline.saturating_sub(started.elapsed());

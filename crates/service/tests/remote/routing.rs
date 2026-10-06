@@ -828,33 +828,113 @@ async fn a_call_for_one_source_that_names_another_domain_is_refused() {
     );
 }
 
-/// Ruling (1): a cold process builds its first HTTP client outside the
-/// call's budget, so a short budget is spent on the call, and a cold start
-/// never reads as a sign-in that could not be used. Nothing in this test
-/// builds a client before the call.
-#[tokio::test]
-async fn a_cold_process_spends_no_budget_on_its_first_client() {
-    let machine = LocalMachine::start(false).await;
-    let app = axum::Router::new().route(
+/// A fake server that answers every `read_engram` and `routing_bullets` at
+/// once, for the cold-process tests.
+fn quick_app() -> axum::Router {
+    axum::Router::new().route(
         "/api/v1/ctl",
-        axum::routing::post(|| async {
-            axum::Json(
-                json!({ "v": 1, "ok": true, "data": { "domain": "quick", "permalink": "x" } }),
-            )
+        axum::routing::post(|axum::Json(body): axum::Json<Value>| async move {
+            if body["cmd"] == "routing_bullets" {
+                return axum::Json(json!({
+                    "v": 1, "ok": true, "etag": "e2",
+                    "data": { "read_only": false, "domains": [{ "name": "quick", "bullets": [], "origin": null }] }
+                }));
+            }
+            axum::Json(json!({ "v": 1, "ok": true, "data": { "domain": "quick", "permalink": "x" } }))
         }),
-    );
-    connect_fake(&machine, "quick", "quick", app).await;
+    )
+}
+
+/// Re-review R1: a cold process's first HTTP client takes most of a second.
+/// A call on a shorter budget still ends within it, says the source was not
+/// asked yet (never that the sign-in could not be used), and the build goes
+/// on, so the next call is answered. Nothing builds a client before.
+#[tokio::test]
+async fn a_cold_process_keeps_the_callers_budget_and_answers_the_next_call() {
+    let machine = LocalMachine::start(false).await;
+    connect_fake(&machine, "quick", "quick", quick_app()).await;
     machine.mount();
-    let answer = run_tool_routed(
+    let started = Instant::now();
+    let first = run_tool_routed(
         &machine.engine,
         "read_engram",
         json!({ "identifier": "x", "domain": "quick" }),
         &agent(),
-        Some(Duration::from_millis(400)),
+        Some(Duration::from_millis(100)),
     )
-    .await
-    .unwrap();
+    .await;
+    assert!(
+        started.elapsed() < Duration::from_millis(400),
+        "the budget holds: {:?}",
+        started.elapsed()
+    );
+    if let Err(e) = first {
+        let text = e.to_string();
+        assert!(
+            text.starts_with(
+                "quick was not asked: this process was still setting up its network connection"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("sign-in"), "{text}");
+    }
+    // On a loaded machine the first build can take a few seconds.
+    let until = Instant::now() + Duration::from_secs(30);
+    let answer = loop {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        match run_tool_routed(
+            &machine.engine,
+            "read_engram",
+            json!({ "identifier": "x", "domain": "quick" }),
+            &agent(),
+            Some(Duration::from_millis(400)),
+        )
+        .await
+        {
+            Ok(answer) => break answer,
+            Err(e) if Instant::now() < until => drop(e),
+            Err(e) => panic!("never answered: {e}"),
+        }
+    };
     assert_eq!(answer["domain"], "quick", "{answer}");
+}
+
+/// Re-review R1 for the routing refresh a session start asks for: within its
+/// deadline in a cold process, the cache is served as it is and nothing is
+/// recorded against the source; the build goes on for the next refresh.
+#[tokio::test]
+async fn a_cold_refresh_keeps_its_deadline_and_records_no_failure() {
+    let machine = LocalMachine::start(false).await;
+    connect_fake(&machine, "quick", "quick", quick_app()).await;
+    let set = machine.mount();
+    let started = Instant::now();
+    let fetched = set.refresh(Duration::from_millis(100)).await;
+    assert!(
+        started.elapsed() < Duration::from_millis(400),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(fetched.len(), 1);
+    assert!(set.failures().is_empty(), "{:?}", set.failures());
+    assert!(
+        set.mounted_routing_from_cache().stale.is_empty(),
+        "the cache is not marked: {:?}",
+        set.mounted_routing_from_cache().stale
+    );
+    assert_eq!(set.table().mount("quick").unwrap().source, "quick");
+    let until = Instant::now() + Duration::from_secs(30);
+    while !crystalline_remote::warm_http_client_within(Duration::from_millis(100)).await {
+        assert!(
+            Instant::now() < until,
+            "the build went on in the background"
+        );
+    }
+    let again = set.refresh(Duration::from_millis(400)).await;
+    assert!(
+        matches!(again[0].1, crystalline_remote::Fetched::Fresh(_)),
+        "{:?}",
+        again[0].1
+    );
 }
 
 /// Ruling (2): a status that is not the protocol reaches an agent as a

@@ -155,6 +155,13 @@ pub enum RemoteFailure {
         /// The start of the body, as the server sent it.
         body: String,
     },
+    /// This process was still setting up its network client when the
+    /// caller's budget ran out, so the source was not asked. Nothing about
+    /// the source; the next call asks it.
+    Starting {
+        /// The source's name.
+        source: String,
+    },
     /// The server did not answer within the limit.
     TimedOut {
         /// The source's name.
@@ -211,6 +218,10 @@ impl std::fmt::Display for RemoteFailure {
                 "the access token for {url} has expired; the next call that may refresh it renews it by itself"
             ),
             RemoteFailure::Credential(text) | RemoteFailure::Refused(text) => f.write_str(text),
+            RemoteFailure::Starting { source } => write!(
+                f,
+                "{source} was not asked: this process was still setting up its network connection, and the next call asks it"
+            ),
             RemoteFailure::Status { url, status, .. } => write!(
                 f,
                 "{url} answered with HTTP status {status} instead of the remote control protocol"
@@ -337,9 +348,7 @@ static WARMED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
 /// Build this process's first HTTP client on a blocking thread and wait for
 /// it, once per process. The first build loads the platform's certificate
 /// roots, which takes most of a second; every later one takes a few
-/// milliseconds. Callers await this before any call budget starts, so a cold
-/// process never spends a caller's deadline on it, and a cold start never
-/// reads as a sign-in that could not be used.
+/// milliseconds.
 pub async fn warm_http_client() {
     WARMED
         .get_or_init(|| async {
@@ -349,6 +358,21 @@ pub async fn warm_http_client() {
             .await;
         })
         .await;
+}
+
+/// [`warm_http_client`] for a caller with a budget: wait for it at most
+/// `limit`, and answer whether the client is ready. Past the limit the
+/// build goes on in the background, so the next call finds it ready; the
+/// caller answers [`RemoteFailure::Starting`] instead of spending more than
+/// its budget. A cold start never reads as a sign-in that could not be used.
+pub async fn warm_http_client_within(limit: Duration) -> bool {
+    if WARMED.initialized() {
+        return true;
+    }
+    tokio::spawn(warm_http_client());
+    tokio::time::timeout(limit, warm_http_client())
+        .await
+        .is_ok()
 }
 
 /// What a form body leaves as it is: letters, digits and `*-._`, the

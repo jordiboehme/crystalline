@@ -59,7 +59,7 @@ pub use provider::{
 pub use server_client::{
     CONNECT_TIMEOUT, CTL_TIMEOUT, Connection, CtlAnswer, DOWN_WINDOW, ForwardedAgent, Health,
     ONE_DOMAIN_LIMIT, RemoteFailure, form_body, http_client, seconds, settle_refreshes,
-    warm_http_client,
+    warm_http_client, warm_http_client_within,
 };
 pub use server_token::{CredentialKind, ServerCredential, ServerCredentialStore, server_key};
 pub use sign_in::{
