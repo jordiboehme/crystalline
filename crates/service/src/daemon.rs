@@ -2395,12 +2395,12 @@ const POLLER_HEARTBEAT: Duration = Duration::from_secs(5);
 /// wakes it on a modest cadence and exits promptly on shutdown.
 /// How often the daemon asks its sources for their routing model and
 /// maintenance status.
-const SOURCE_POLL: Duration = Duration::from_secs(180);
+pub(crate) const SOURCE_POLL: Duration = Duration::from_secs(180);
 
 /// How often the daemon looks at `sources.json` and its own domains for a
 /// change made behind its back: a `connect` that could not tell it, or a
 /// hand edit of either file. Reads two small files; asks no server.
-const SOURCE_LOOK: Duration = Duration::from_secs(5);
+pub(crate) const SOURCE_LOOK: Duration = Duration::from_secs(5);
 
 /// How long one poll waits for each source.
 const SOURCE_POLL_DEADLINE: Duration = crystalline_remote::ONE_DOMAIN_LIMIT;

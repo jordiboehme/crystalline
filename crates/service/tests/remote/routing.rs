@@ -872,11 +872,12 @@ async fn a_cold_process_keeps_the_callers_budget_and_answers_the_next_call() {
         let text = e.to_string();
         assert!(
             text.starts_with(
-                "quick was not asked: this process was still setting up its network connection"
+                "quick was not asked yet: this process was still setting up its network connection"
             ),
             "{text}"
         );
         assert!(!text.contains("sign-in"), "{text}");
+        assert!(!text.contains("not available until"), "{text}");
     }
     // On a loaded machine the first build can take a few seconds.
     let until = Instant::now() + Duration::from_secs(30);

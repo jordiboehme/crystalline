@@ -231,6 +231,17 @@ impl std::fmt::Display for RouteError {
                     &format!("it did not answer within {}", seconds(*after))
                 )
             ),
+            // The source was never asked: this process was still starting,
+            // so nothing about the source failed.
+            RouteError::Source {
+                source,
+                domain,
+                failure: RemoteFailure::Starting { .. },
+            } => write!(
+                f,
+                "{source} was not asked yet: this process was still setting up its network \
+                 connection. '{domain}' comes from {source}; ask again and the next call reaches it"
+            ),
             RouteError::Source {
                 source,
                 domain,
@@ -612,5 +623,30 @@ pub async fn run_tool_routed(
         Some(Ok(value)) => Ok(value),
         Some(Err(e)) => Err(anyhow::anyhow!(e.to_string())),
         None => crate::client::dispatch_engine(engine, tool, args).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A one-domain call whose source was not asked yet (this process was
+    /// still starting) says so, and never reads as if the source had failed.
+    #[test]
+    fn a_source_not_asked_yet_is_not_called_unavailable() {
+        let text = RouteError::Source {
+            source: "acme".into(),
+            domain: "open".into(),
+            failure: RemoteFailure::Starting {
+                source: "acme".into(),
+            },
+        }
+        .to_string();
+        assert_eq!(
+            text,
+            "acme was not asked yet: this process was still setting up its network connection. \
+             'open' comes from acme; ask again and the next call reaches it"
+        );
+        assert!(!text.contains("not available until"), "{text}");
     }
 }

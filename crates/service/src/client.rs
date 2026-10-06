@@ -600,6 +600,8 @@ struct EmbeddedStack {
     /// can take its store before the process leaves.
     engine: Arc<Engine>,
     ownership: crate::instance::Ownership,
+    /// Stops the source poller when the session ends.
+    stop_sources: tokio::sync::watch::Sender<bool>,
 }
 
 /// Build the full in-process stack: take the index lock (refused if held),
@@ -649,8 +651,25 @@ async fn build_embedded(
     // This machine's sources, once that rename is done (its recovery reads
     // names the mount table could hide). An explicit --db or --config serves
     // this machine's own index only.
+    //
+    // With them, the daemon's source poller, run here because this stack is
+    // the one serving the session: a `connect` or `disconnect` made while it
+    // runs, and a hand edit of sources.json or config.yaml, show within the
+    // look, and the routing caches refresh on the poll as they do in a
+    // daemon. Its own task, so the start never waits on a server.
+    let (stop_sources, stopped) = tokio::sync::watch::channel(false);
     if use_daemon(db, config_path) {
         crate::route::install_sources(&engine);
+        let e = engine.clone();
+        tokio::spawn(async move {
+            crate::daemon::run_source_poller(
+                e,
+                crate::daemon::SOURCE_POLL,
+                crate::daemon::SOURCE_LOOK,
+                stopped,
+            )
+            .await;
+        });
     }
 
     let bg = engine.clone();
@@ -682,6 +701,7 @@ async fn build_embedded(
         server: McpServer::new(engine.clone()).with_harness_gate(harness_gate),
         engine,
         ownership,
+        stop_sources,
     })
 }
 
@@ -708,7 +728,14 @@ where
         "stopping (the client closed the session); exiting within {}s",
         SHUTDOWN_DEADLINE.as_secs()
     );
+    let _ = stack.stop_sources.send(true);
     let departure = Departure::begin(stack.ownership, SHUTDOWN_DEADLINE);
+    // A sign-in refresh a source call started runs as a task of its own: it
+    // is waited for, within one call's limit, before the process leaves, so
+    // a token pair the server rotated is saved. A step of the departure, so
+    // its watchdog still ends the process if this never returns.
+    departure.step("saving a refreshed sign-in");
+    crystalline_remote::settle_refreshes(crystalline_remote::ONE_DOMAIN_LIMIT).await;
     // Held to the exit, as in the daemon: an operation already inside the
     // store finishes and no new one starts.
     departure.step("waiting for the store");
