@@ -1716,6 +1716,29 @@ impl AuthStore {
         Ok(out)
     }
 
+    /// The names of the accounts that have no password (a token-only account,
+    /// or one a trusted header or a sign-on provisioned), so `users list` can
+    /// say so. Kept apart from [`User`], which crosses the REST API.
+    pub async fn passwordless_users(&self) -> Result<std::collections::HashSet<String>> {
+        let _guard = self.guard.lock().await;
+        let mut rows = self
+            .conn
+            .query("SELECT name FROM users WHERE pass_hash IS NULL", ())
+            .await
+            .context("listing accounts without a password")?;
+        let mut out = std::collections::HashSet::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .context("listing accounts without a password")?
+        {
+            if let Some(name) = cell_text(&row, 0) {
+                out.insert(name);
+            }
+        }
+        Ok(out)
+    }
+
     /// Return the account for `name`, creating a passwordless one at `role` if
     /// it is absent. This is the trusted-header path: an upstream proxy has
     /// already authenticated the request, so there is no password to store and
@@ -2526,26 +2549,112 @@ impl AuthStore {
                     format!("no such user: '{user}'"),
                 ));
             }
-            self.conn
-                .execute(
-                    "INSERT INTO mcp_tokens (user, token_hash, label, created_at)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    vec![
-                        Value::Text(user.clone()),
-                        Value::Text(hash),
-                        Value::Text(label.to_string()),
-                        Value::Text(created_at),
-                    ],
-                )
+            self.insert_mcp_token_row(&user, &hash, label, &created_at)
                 .await
-                .with_context(|| format!("issuing an mcp token for user '{user}'"))?;
-            Ok(())
         }
         .await;
         self.finish(result).await?;
         // Read after commit, still under `self.guard` and on this connection,
         // so nothing else on this connection can insert between the commit
         // above and this read - same reasoning `rotate_mcp_token` relies on.
+        let id = self.conn.last_insert_rowid();
+        Ok(IssuedMcpToken {
+            id,
+            token,
+            label: label.to_string(),
+        })
+    }
+
+    /// The `mcp_tokens` insert, shared by [`AuthStore::issue_mcp_token`] and
+    /// [`AuthStore::add_token_only_user`] so both write a token the same way.
+    /// The caller holds `self.guard` and an open transaction.
+    async fn insert_mcp_token_row(
+        &self,
+        user: &str,
+        hash: &str,
+        label: &str,
+        created_at: &str,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO mcp_tokens (user, token_hash, label, created_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                vec![
+                    Value::Text(user.to_string()),
+                    Value::Text(hash.to_string()),
+                    Value::Text(label.to_string()),
+                    Value::Text(created_at.to_string()),
+                ],
+            )
+            .await
+            .with_context(|| format!("issuing an mcp token for user '{user}'"))?;
+        Ok(())
+    }
+
+    /// Create an account with no password and issue one personal MCP token for
+    /// it, in one transaction: an account for a deployed agent, which
+    /// connects with the token and never signs in. The row has the same NULL
+    /// `pass_hash` as one [`AuthStore::ensure_user`] provisions, so password
+    /// sign-in never succeeds for it.
+    ///
+    /// The name is folded like [`AuthStore::add_user`] and a taken name is
+    /// refused by the primary key, the same way. If the token cannot be
+    /// written, the account is rolled back with it. Same lock and
+    /// `BEGIN IMMEDIATE` pattern as [`AuthStore::issue_mcp_token`].
+    pub async fn add_token_only_user(
+        &self,
+        name: &str,
+        display: &str,
+        email: Option<&str>,
+        role: Role,
+        label: &str,
+    ) -> Result<IssuedMcpToken> {
+        let token = format!("{MCP_TOKEN_PREFIX}{}", random_hex());
+        self.add_token_only_user_with(name, display, email, role, label, token)
+            .await
+    }
+
+    /// [`AuthStore::add_token_only_user`] with the token already minted, the
+    /// seam a test uses to force the token insert to fail.
+    async fn add_token_only_user_with(
+        &self,
+        name: &str,
+        display: &str,
+        email: Option<&str>,
+        role: Role,
+        label: &str,
+        token: String,
+    ) -> Result<IssuedMcpToken> {
+        let name = normalize_new_account_name(name)?;
+        let hash = token_hash(&token);
+        let created_at = chrono::Utc::now().to_rfc3339();
+        let _guard = self.guard.lock().await;
+        self.begin_immediate()
+            .await
+            .with_context(|| format!("adding user '{name}'"))?;
+        let result = async {
+            self.conn
+                .execute(
+                    "INSERT INTO users (name, display, email, role, pass_hash, disabled, created_at)
+                     VALUES (?1, ?2, ?3, ?4, NULL, 0, ?5)",
+                    vec![
+                        Value::Text(name.clone()),
+                        Value::Text(display.to_string()),
+                        match email {
+                            Some(e) => Value::Text(e.to_string()),
+                            None => Value::Null,
+                        },
+                        Value::Text(role.as_str().to_string()),
+                        Value::Text(created_at.clone()),
+                    ],
+                )
+                .await
+                .with_context(|| format!("adding user '{name}'"))?;
+            self.insert_mcp_token_row(&name, &hash, label, &created_at)
+                .await
+        }
+        .await;
+        self.finish(result).await?;
         let id = self.conn.last_insert_rowid();
         Ok(IssuedMcpToken {
             id,
@@ -6684,6 +6793,114 @@ mod tests {
 
         assert!(store.revoke_mcp_token("ada", issued.id).await.unwrap());
         assert!(store.mcp_token_user(&issued.token).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_token_only_account_has_no_password_and_one_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AuthStore::open(&dir.path().join("web-auth.db"))
+            .await
+            .unwrap();
+        let issued = store
+            .add_token_only_user("Agent-Build", "Agent-Build", None, Role::Editor, "build")
+            .await
+            .unwrap();
+        assert!(issued.token.starts_with("cmt_"));
+        assert_eq!(issued.token.len(), 4 + 64);
+        assert_eq!(issued.label, "build");
+
+        for attempt in ["", "pw12345678", "agent-build"] {
+            assert!(
+                store
+                    .verify_password("agent-build", attempt)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "password sign-in never succeeds for a token-only account"
+            );
+        }
+        assert!(matches!(
+            store.check_password("agent-build", "x").await.unwrap(),
+            PasswordCheck::NoHash
+        ));
+
+        let user = store.mcp_token_user(&issued.token).await.unwrap().unwrap();
+        assert_eq!(user.name, "agent-build");
+        assert_eq!(user.role, Role::Editor);
+        assert_eq!(store.list_mcp_tokens("agent-build").await.unwrap().len(), 1);
+        assert!(
+            store
+                .passwordless_users()
+                .await
+                .unwrap()
+                .contains("agent-build")
+        );
+        let debug = format!("{issued:?}");
+        assert!(!debug.contains(&issued.token), "{debug}");
+    }
+
+    #[tokio::test]
+    async fn a_token_only_account_with_a_taken_name_is_refused_and_issues_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AuthStore::open(&dir.path().join("web-auth.db"))
+            .await
+            .unwrap();
+        store
+            .add_user("ada", "Ada", None, Role::Viewer, "pw12345678")
+            .await
+            .unwrap();
+        let err = store
+            .add_token_only_user("ADA", "Ada", None, Role::Editor, "build")
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("UNIQUE constraint"), "{err:#}");
+        assert!(store.list_mcp_tokens("ada").await.unwrap().is_empty());
+        let ada = store.user("ada").await.unwrap().unwrap();
+        assert_eq!(ada.role, Role::Viewer, "the existing account is untouched");
+        assert!(
+            store
+                .verify_password("ada", "pw12345678")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_token_issue_leaves_no_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AuthStore::open(&dir.path().join("web-auth.db"))
+            .await
+            .unwrap();
+        store
+            .add_user("ada", "Ada", None, Role::Editor, "pw12345678")
+            .await
+            .unwrap();
+        let taken = store.issue_mcp_token("ada", "laptop").await.unwrap();
+        // The token hash is UNIQUE, so reusing a live token makes the second
+        // insert fail after the account insert succeeded.
+        let err = store
+            .add_token_only_user_with(
+                "agent-build",
+                "agent-build",
+                None,
+                Role::Editor,
+                "build",
+                taken.token.clone(),
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("UNIQUE constraint"), "{err:#}");
+        assert!(
+            store.user("agent-build").await.unwrap().is_none(),
+            "the account was rolled back with the token"
+        );
+        assert_eq!(store.list_mcp_tokens("ada").await.unwrap().len(), 1);
+        // The name is free again.
+        store
+            .add_token_only_user("agent-build", "agent-build", None, Role::Editor, "build")
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

@@ -174,6 +174,18 @@ impl CliServer {
             .token
     }
 
+    /// The token of a new token-only account (no password) named `name`, an
+    /// editor: what an agent connects with.
+    pub fn agent_token(&self, name: &str) -> String {
+        self.runtime
+            .block_on(
+                self.auth
+                    .add_token_only_user(name, name, None, Role::Editor, "agent"),
+            )
+            .unwrap()
+            .token
+    }
+
     /// Put a maintenance record where this server reads it.
     pub fn write_maintenance(&self, state: serde_json::Value) {
         let path = crystalline_service::maintenance::path().unwrap();

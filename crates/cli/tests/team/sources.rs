@@ -80,6 +80,30 @@ fn connect_with_a_pasted_token_lists_the_source_in_status() {
     );
 }
 
+/// An account with no password and one token is enough for an agent: the
+/// token opens `/api/v1/ctl` (connect asks it for the server's domains) under
+/// the account's own name.
+#[test]
+fn a_token_only_account_connects_and_lists_its_mounts() {
+    let server = CliServer::start();
+    let home = tempfile::tempdir().unwrap();
+    let out = bin(home.path())
+        .args(["connect", &server.origin, "--name", "acme", "--token"])
+        .write_stdin(format!("{}\n", server.agent_token("agent-build")))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let status = status_json(home.path());
+    let acme = &status["sources"][0];
+    assert_eq!(acme["account"], "agent-build", "{status}");
+    assert_eq!(acme["reachable"], true, "{status}");
+    assert_eq!(mounts(acme), vec![("open".to_string(), "open".to_string())]);
+}
+
 /// Review focus 2: the second server's `open` gets the suffix, said at once,
 /// and the first keeps its name.
 #[test]

@@ -56,6 +56,25 @@ flowchart LR
     D -->|volume| I[Index]
 ```
 
+### An account per agent
+
+An agent that runs on another machine does not need a password, because it never signs in to the web UI. Give it its own account with no password and one personal MCP token, in one step:
+
+```bash
+crystalline users add agent-build --role editor --mcp-token build
+```
+
+The command creates the account `agent-build` and prints the token once. Add `--json` to get `name`, `role`, `id`, `token` and `label` as one object for a script. `--mcp-token` and `--password-stdin` cannot be used together, and a name that already exists is refused: a token for an existing account is `crystalline users mcp-token <name>`. The account is created with the role you give (viewer if you give none), so an agent that writes needs `--role editor`. Password sign-in never works for it, and `crystalline users list` shows it as "no password". You can still list, rotate and revoke its tokens with `crystalline users mcp-token`, change its role with `users role` and turn it off with `users disable`.
+
+On the agent's machine, set the server and the token and nothing else:
+
+```bash
+export CRYSTALLINE_REMOTE_URL=https://crystalline.example.com
+export CRYSTALLINE_REMOTE_TOKEN=cmt_...
+```
+
+See [A local Crystalline with domains from shared servers](#a-local-crystalline-with-domains-from-shared-servers) for what that offers the agent.
+
 ## Web UI from the daemon
 
 The daemon serves Fluid itself, and it does so by default. The browser UI is built into the binary and the HTTP endpoint opens at `127.0.0.1:7411` unless something turns it off, so one process on one port answers both the agents that speak MCP and the people who want to read what those agents learned: point a browser at `http://localhost:7411` and the app is there, with no second container, no static bundle to deploy and no version to keep in step. `service.http: <host:port>` (or `CRYSTALLINE_SERVICE_HTTP`) moves the endpoint somewhere else and `service.http: false` closes it - that is the machine's answer, read by every daemon on it however it was started. `serve --http <host:port>` and `serve --http off` are the one-invocation override: a daemon whose flag disagrees with the configured value says so out loud at startup (see [Linux server with systemd](#linux-server-with-systemd)). It is the same UI the compose variant below runs - domains down the side, an engram with its frontmatter, observations, relations, backlinks and neighborhood graph, faceted search and Cmd+K to jump anywhere - served straight from the daemon that holds the index.

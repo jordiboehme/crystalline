@@ -947,8 +947,13 @@ enum UsersCommand {
         role: RoleArg,
         /// Read the password from stdin instead of prompting, for scripts and
         /// container provisioning. A single trailing newline is stripped.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "mcp_token")]
         password_stdin: bool,
+        /// Create the account with no password and issue one personal MCP
+        /// token with this label, in one step: an account for an agent. The
+        /// token is printed once.
+        #[arg(long, value_name = "LABEL", conflicts_with = "password_stdin")]
+        mcp_token: Option<String>,
     },
     /// List every account with its role and whether it is disabled.
     List,
