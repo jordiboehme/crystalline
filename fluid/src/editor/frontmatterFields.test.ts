@@ -63,6 +63,44 @@ describe("scalar fields", () => {
     const next = applied(DOC, writeScalar(DOC, "title", "Alpha: the rule"));
     expect(next).toContain('title: "Alpha: the rule"\n');
   });
+  it("a quoted value keeps its backslashes", () => {
+    const value = "C:\\temp\\new";
+    const next = applied(DOC, writeScalar(DOC, "title", value));
+    expect(next).toContain('title: "C:\\\\temp\\\\new"\n');
+    expect(readScalar(next, "title")).toBe(value);
+  });
+
+  it("a value ending in a backslash stays valid", () => {
+    const next = applied(DOC, writeScalar(DOC, "title", "a: b\\"));
+    expect(next).toContain('title: "a: b\\\\"\n');
+    expect(readScalar(next, "title")).toBe("a: b\\");
+  });
+
+  it("an escaped quote reads back without its backslash", () => {
+    const next = applied(DOC, writeScalar(DOC, "title", 'say "hi"'));
+    expect(next).toContain('title: "say \\"hi\\""\n');
+    expect(readScalar(next, "title")).toBe('say "hi"');
+  });
+
+  it("single quotes undo a doubled quote and nothing else", () => {
+    const doc = "---\ntitle: 'it''s C:\\x'\n---\n";
+    expect(readScalar(doc, "title")).toBe("it's C:\\x");
+  });
+
+  it("a yaml escape in a hand-written value is decoded", () => {
+    expect(readScalar('---\ntitle: "a\\tb"\n---\n', "title")).toBe("a\tb");
+    expect(readScalar('---\ntitle: "\\x41\\u00e9\\\\"\n---\n', "title")).toBe(
+      "A\u00e9\\",
+    );
+    expect(readScalar('---\ntitle: "a\\qb"\n---\n', "title")).toBe("a\\qb");
+  });
+
+  it("a tag with a backslash and a colon round-trips", () => {
+    const tag = "C:\\temp";
+    const next = applied(DOC, writeTagList(DOC, [tag, "plain"]));
+    expect(next).toContain('  - "C:\\\\temp"\n');
+    expect(readTagList(next)).toEqual([tag, "plain"]);
+  });
 });
 
 /**
