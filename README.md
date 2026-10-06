@@ -198,6 +198,7 @@ Every other connection exists only after you turn it on:
 - **Your single sign-on provider**, when you configure OIDC sign-in for the web UI. Crystalline talks to the issuer you name.
 - **A remote embedding service**, when you set `embeddings.provider: openai-compatible` in `config.yaml`. The text of your engrams is then sent to the endpoint you configure, to compute its embeddings. The default provider is local and sends nothing.
 - **A PostgreSQL server**, when you set `database.backend: postgres` and `database.url` to share one search index between instances. The index holds the text of your engrams.
+- **A Crystalline server you connect to**, after `crystalline connect <url>` (or with `CRYSTALLINE_REMOTE_URL` and `CRYSTALLINE_REMOTE_TOKEN` set). Searches and engram reads and writes for its domains go to that server, under your account there. A search over all domains also sends the search text to it. Your local engrams stay on your machine.
 
 Nothing else leaves the machine.
 
