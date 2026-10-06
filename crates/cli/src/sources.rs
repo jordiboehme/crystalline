@@ -66,18 +66,45 @@ pub fn token_refusal(url: Option<&str>, name: Option<&str>) -> String {
 /// What `connect <url>` says about a word after the URL that is not a token.
 pub const EXTRA_WORD: &str = "crystalline connect takes one server address and nothing after it; to give the source a name on this machine, use --name <name>";
 
-/// The refusal of `--token=<value>` after `connect`, before clap reads the
-/// command line (clap's own error would repeat the value). `None` for any
-/// other command line, `connect github --token=...` included.
+/// The flags of `connect` and the global ones that take a value as the next
+/// word.
+const VALUE_FLAGS: [&str; 4] = ["--name", "--db", "--config", "--format"];
+
+/// The refusal of a token anywhere after `connect`, before clap reads the
+/// command line (clap's own errors, and the checks after it, would repeat
+/// the value): a word with a token's prefix, as an argument or as a flag's
+/// value, or `--token=<value>`. `None` for any other command line, and for
+/// `connect github`, whose own `--token` takes a GitHub token.
 pub fn inline_token_refusal(args: &[String]) -> Option<String> {
     let at = args.iter().position(|a| a == "connect")?;
     let rest = &args[at + 1..];
-    if rest.iter().any(|a| a == "github") {
+    // The first word that is no flag and no flag's value: the subcommand,
+    // when there is one, since it must come before any argument.
+    let mut words = rest.iter();
+    let mut first = None;
+    while let Some(word) = words.next() {
+        if VALUE_FLAGS.contains(&word.as_str()) {
+            words.next();
+        } else if !word.starts_with('-') {
+            first = Some(word.as_str());
+            break;
+        }
+    }
+    if first == Some("github") {
         return None;
     }
-    rest.iter()
-        .any(|a| a.starts_with("--token="))
-        .then(|| token_refusal(None, None))
+    let token = |word: &String| {
+        let value = word.split_once('=').map_or(word.as_str(), |(_, v)| v);
+        word.starts_with("--token=") || looks_like_token(word) || looks_like_token(value)
+    };
+    if !rest.iter().any(token) {
+        return None;
+    }
+    let url = rest
+        .iter()
+        .find(|w| crystalline_remote::normalize_server_url(w).is_ok())
+        .map(String::as_str);
+    Some(token_refusal(url, None))
 }
 
 /// The local copies of the same domain `source` hides now: their names on
@@ -224,16 +251,16 @@ pub fn read_token_from_stdin() -> anyhow::Result<String> {
     use std::io::{BufRead, IsTerminal};
     let mut line = String::new();
     if std::io::stdin().is_terminal() {
-        let hidden = cfg!(unix);
+        // Echo off first, so the prompt says what really happens.
+        let echo = EchoOff::new();
         eprint!(
             "Paste the personal MCP token (cmt_...) and press Enter{}: ",
-            if hidden {
+            if echo.is_off() {
                 " (it is not shown)"
             } else {
                 " (visible while typing)"
             }
         );
-        let echo = EchoOff::new();
         let read = std::io::stdin().lock().read_line(&mut line);
         drop(echo);
         read?;
@@ -278,6 +305,16 @@ impl EchoOff {
         }
         #[cfg(not(unix))]
         EchoOff {}
+    }
+}
+
+impl EchoOff {
+    /// Whether echo is off now.
+    fn is_off(&self) -> bool {
+        #[cfg(unix)]
+        return self.saved.is_some();
+        #[cfg(not(unix))]
+        false
     }
 }
 

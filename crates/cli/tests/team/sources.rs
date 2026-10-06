@@ -114,7 +114,25 @@ fn connecting_a_second_server_announces_the_collision_name_and_keeps_the_first()
 #[test]
 fn a_token_on_the_command_line_is_refused() {
     let home = tempfile::tempdir().unwrap();
-    let forms: [&[&str]; 7] = [
+    let forms: [&[&str]; 11] = [
+        // Re-review R1 and R2: a `github` word that is not the subcommand, a
+        // third word, and a token as the --name value.
+        &[
+            "connect",
+            "https://kb.example",
+            "--name",
+            "github",
+            "--token=cmt_SECRET7",
+        ],
+        &[
+            "connect",
+            "--name",
+            "github",
+            "--token=cmt_SECRET8",
+            "https://kb.example",
+        ],
+        &["connect", "https://kb.example", "extra", "cmt_SECRET9"],
+        &["connect", "https://kb.example", "--name", "cmt_SECRET10"],
         &["connect", "https://kb.example", "--token", "cmt_SECRET0"],
         // The `connect github --token <value>` habit.
         &["connect", "--token", "cmt_SECRET1", "https://kb.example"],
@@ -181,6 +199,8 @@ fn home_with_a_team_copy(home: &Path) -> std::path::PathBuf {
         branch: None,
         poll_secs: None,
     });
+    // Re-review R4: an alias of the copy is refused in the same words.
+    entry.aliases.push("old-platform".into());
     cfg.domains.insert("team-platform".into(), entry);
     crystalline_core::config::save_yaml(&home.join("config.yaml"), &cfg).unwrap();
     // An origin state with nothing in its base: every file is unshared work.
@@ -261,6 +281,8 @@ fn a_hidden_copy_is_warned_about_and_cannot_be_removed_or_renamed() {
     refused(&["domain", "remove", "team-platform", "--purge"]);
     refused(&["domain", "rename", "team-platform", "other"]);
     refused(&["domain", "rename", "team-platform", "other", "--local"]);
+    refused(&["domain", "rename", "old-platform", "other"]);
+    refused(&["domain", "remove", "old-platform", "--purge"]);
     assert!(dir.join("local-note.md").is_file(), "the files stay");
 
     // The same through a running daemon.

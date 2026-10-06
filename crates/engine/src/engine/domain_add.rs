@@ -968,7 +968,7 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
-        self.refuse_hidden_admin(name, scope)?;
+        self.refuse_hidden_admin(name, scope).await?;
         let _admin = self.domain_admin().await;
         let _fence = self.fence_joins().await;
         self.require_domain_owner(name, scope).await?;

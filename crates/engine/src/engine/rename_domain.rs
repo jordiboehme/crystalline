@@ -132,7 +132,7 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
-        self.refuse_hidden_admin(old, scope)?;
+        self.refuse_hidden_admin(old, scope).await?;
         // A rename moves this machine's state folders and writes its
         // configuration under a journal in the state directory: only the
         // process that holds that directory runs one, so no two processes

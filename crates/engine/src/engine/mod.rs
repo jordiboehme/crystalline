@@ -2346,10 +2346,11 @@ impl Engine {
     /// for the machine owner in the words `status` uses for it: a hidden copy
     /// stays as it is until its source is disconnected (decision D19). Any
     /// other caller is answered by the ownership gate, which answers a hidden
-    /// domain as one nobody registered.
-    pub(crate) fn refuse_hidden_admin(
+    /// domain as one nobody registered. `spelling` may be an alias or the
+    /// canonical name: it is resolved first, hidden domains included.
+    pub(crate) async fn refuse_hidden_admin(
         &self,
-        name: &str,
+        spelling: &str,
         scope: &crate::scope::Scope,
     ) -> Result<()> {
         if !matches!(scope, crate::scope::Scope::Unrestricted) {
@@ -2359,6 +2360,11 @@ impl Engine {
             return Ok(());
         };
         let table = sources.table();
+        if table.shadowed.is_empty() {
+            return Ok(());
+        }
+        let names = self.name_table_now().await;
+        let name = names.resolve(spelling).unwrap_or(spelling);
         match table.hidden(name).next() {
             Some(hidden) => Err(EngineError::Conflict(crystalline_remote::hidden_sentence(
                 hidden,
