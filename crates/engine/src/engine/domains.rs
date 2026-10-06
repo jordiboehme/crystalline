@@ -695,6 +695,13 @@ impl Engine {
     /// nothing mounted it is the same bytes as on a machine with no source.
     pub fn routing_text(&self) -> String {
         let mut output = self.routing_output(&self.shadowed_domains());
+        self.append_mounts(&mut output);
+        crystalline_core::render_instructions(&output)
+    }
+
+    /// Every mounted domain as a routing row, after the rows already in
+    /// `output` and in mount-table order. Nothing when nothing is mounted.
+    fn append_mounts(&self, output: &mut crystalline_core::PromptOutput) {
         if let Some(sources) = self.sources() {
             output
                 .domains
@@ -710,7 +717,6 @@ impl Engine {
                         }),
                 );
         }
-        crystalline_core::render_instructions(&output)
     }
 
     /// [`Engine::routing_text`] with the domain lines replaced by the count
@@ -818,6 +824,22 @@ impl Engine {
         Ok(crystalline_core::render_instructions(
             &self.routing_output(&hidden),
         ))
+    }
+
+    /// [`Engine::routing_text_scoped`] for this machine's owner: the same
+    /// block with every mounted domain appended, as [`Engine::routing_text`]
+    /// appends them (decision D25). Only an owner session asks for it (a
+    /// stdio MCP session); an HTTP session never sees a mounted domain, so
+    /// the caller decides by the transport, never by the scope (decision
+    /// D8). With nothing mounted it is the same bytes as the scoped block.
+    pub async fn routing_text_scoped_with_mounts(
+        &self,
+        scope: &crate::scope::Scope,
+    ) -> Result<String> {
+        let hidden = self.hidden_for(scope).await?;
+        let mut output = self.routing_output(&hidden);
+        self.append_mounts(&mut output);
+        Ok(crystalline_core::render_instructions(&output))
     }
 
     /// The routing model `scope` may see, for a client that renders the block

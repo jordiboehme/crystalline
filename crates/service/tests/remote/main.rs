@@ -12,6 +12,7 @@ mod client;
 mod connect;
 mod ctl;
 mod fixture;
+mod live;
 pub mod local;
 mod revoke;
 mod routing;

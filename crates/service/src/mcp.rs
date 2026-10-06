@@ -2173,6 +2173,58 @@ impl McpServer {
         }
         result
     }
+
+    /// The call routed to the source that holds its domain, or refused here
+    /// for one that cannot act on a mounted domain; `None` for a call this
+    /// machine answers itself, which then runs the handler exactly as before.
+    ///
+    /// **Owner sessions only** (decision D8): a stdio session is this
+    /// machine's owner; an HTTP session on this daemon is whoever reached the
+    /// port, and must never borrow the owner's sign-in to a server. The agent
+    /// forwarded with the call is this session's `clientInfo` (decision D11).
+    ///
+    /// Every limit is the router's own (spec A8): one domain waits at most
+    /// [`crystalline_remote::ONE_DOMAIN_LIMIT`], a sweep at most the fan-out
+    /// deadline per source, and a source in its down window answers at once.
+    async fn mounted<P: serde::Serialize>(
+        &self,
+        tool: &str,
+        p: &P,
+        ctx: &RequestContext<RoleServer>,
+    ) -> Option<Result<CallToolResult, ErrorData>> {
+        if self.transport != Transport::Stdio {
+            return None;
+        }
+        let args = serde_json::to_value(p).ok()?;
+        let agent = crystalline_remote::ForwardedAgent {
+            client: client_actor(ctx),
+        };
+        let routed = crate::route::routed(&self.engine, tool, &args, &agent, None).await?;
+        Some(match routed {
+            Ok(value) => self.render_routed(tool, value),
+            // The local part of a sweep failed: the shape a local call gets.
+            Err(crate::route::RouteError::Local(e)) => Err(match e.downcast::<EngineError>() {
+                Ok(engine) => to_error(engine),
+                Err(e) => ErrorData::internal_error(format!("{e:#}"), None),
+            }),
+            Err(other) => refuse(other.to_string()),
+        })
+    }
+
+    /// A routed answer as the handler of `tool` renders its own. The page
+    /// address stays the server's (the receipt already carries it, and
+    /// nothing here attaches one of this machine's over it), and a mounted
+    /// read carries no attachment links (decision D24).
+    fn render_routed(&self, tool: &str, value: Value) -> Result<CallToolResult, ErrorData> {
+        match tool {
+            "write_engram" | "edit_engram" => ok_written(value),
+            "move_engram" => ok_moved(value),
+            "split_engram" => ok_split(value),
+            "read_engram" | "delete_engram" | "infer_schema" => ok(value),
+            "search_engrams" => self.ok_found(value),
+            _ => self.ok_list(value),
+        }
+    }
 }
 
 /// The verb cores: each engine verb's body once, for whichever door asked.
@@ -2992,6 +3044,9 @@ impl McpServer {
         responses: InputResponses,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        if let Some(answer) = self.mounted("write_engram", &p, &ctx).await {
+            return answer.map(CallToolResponse::from);
+        }
         let caller = self.caller(&ctx);
         let verdict = self
             .write_core(p, &caller, Ask::of(&ctx, &responses))
@@ -3010,6 +3065,9 @@ impl McpServer {
         Parameters(p): Parameters<ReadParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Some(answer) = self.mounted("read_engram", &p, &ctx).await {
+            return answer;
+        }
         let caller = self.caller(&ctx);
         let value = self.read_core(p, &caller).await?;
         let links = self.attachment_links(&value, &caller.scope).await;
@@ -3035,6 +3093,9 @@ impl McpServer {
         responses: InputResponses,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        if let Some(answer) = self.mounted("edit_engram", &p, &ctx).await {
+            return answer.map(CallToolResponse::from);
+        }
         let caller = self.caller(&ctx);
         let verdict = self
             .edit_core(p, &caller, Ask::of(&ctx, &responses))
@@ -3058,6 +3119,9 @@ impl McpServer {
         Parameters(p): Parameters<MoveParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Some(answer) = self.mounted("move_engram", &p, &ctx).await {
+            return answer;
+        }
         let caller = self.caller(&ctx);
         let verdict = self.move_core(p, &caller).await?;
         self.answered_result(verdict, &caller, ok_moved).await
@@ -3079,6 +3143,9 @@ impl McpServer {
         Parameters(p): Parameters<SplitParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Some(answer) = self.mounted("split_engram", &p, &ctx).await {
+            return answer;
+        }
         let caller = self.caller(&ctx);
         let verdict = self.split_core(p, &caller).await?;
         self.answered_result(verdict, &caller, ok_split).await
@@ -3101,6 +3168,9 @@ impl McpServer {
         responses: InputResponses,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        if let Some(answer) = self.mounted("delete_engram", &p, &ctx).await {
+            return answer.map(CallToolResponse::from);
+        }
         let caller = self.caller(&ctx);
         let verdict = self
             .delete_core(p, &caller, Ask::of(&ctx, &responses))
@@ -3119,6 +3189,9 @@ impl McpServer {
         Parameters(p): Parameters<SearchParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Some(answer) = self.mounted("search_engrams", &p, &ctx).await {
+            return answer;
+        }
         let caller = self.caller(&ctx);
         self.search_engrams_core(p, &caller)
             .await
@@ -3136,6 +3209,9 @@ impl McpServer {
         Parameters(p): Parameters<ContextParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Some(answer) = self.mounted("build_context", &p, &ctx).await {
+            return answer;
+        }
         let caller = self.caller(&ctx);
         self.build_context_core(p, &caller)
             .await
@@ -3153,6 +3229,9 @@ impl McpServer {
         Parameters(p): Parameters<RecentParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Some(answer) = self.mounted("recent_activity", &p, &ctx).await {
+            return answer;
+        }
         let caller = self.caller(&ctx);
         self.recent_activity_core(p, &caller)
             .await
@@ -3170,6 +3249,9 @@ impl McpServer {
         Parameters(p): Parameters<ListDomainsParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Some(answer) = self.mounted("list_domains", &p, &ctx).await {
+            return answer;
+        }
         let caller = self.caller(&ctx);
         self.list_domains_core(p, &caller)
             .await
@@ -3187,6 +3269,9 @@ impl McpServer {
         Parameters(p): Parameters<BrowseParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Some(answer) = self.mounted("browse_domain", &p, &ctx).await {
+            return answer;
+        }
         let caller = self.caller(&ctx);
         self.browse_domain_core(p, &caller)
             .await
@@ -3204,6 +3289,9 @@ impl McpServer {
         Parameters(p): Parameters<ValidateParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Some(answer) = self.mounted("validate_engrams", &p, &ctx).await {
+            return answer;
+        }
         let caller = self.caller(&ctx);
         self.validate_engrams_core(p, &caller)
             .await
@@ -3221,6 +3309,9 @@ impl McpServer {
         Parameters(p): Parameters<InferParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Some(answer) = self.mounted("infer_schema", &p, &ctx).await {
+            return answer;
+        }
         let caller = self.caller(&ctx);
         self.infer_schema_core(p, &caller).await.and_then(ok)
     }
@@ -3236,6 +3327,9 @@ impl McpServer {
         Parameters(p): Parameters<VocabularyParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Some(answer) = self.mounted("vocabulary", &p, &ctx).await {
+            return answer;
+        }
         let caller = self.caller(&ctx);
         self.vocabulary_core(p, &caller)
             .await
@@ -3253,6 +3347,9 @@ impl McpServer {
         Parameters(p): Parameters<EvolveParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Some(answer) = self.mounted(crate::EVOLVE_TOOL_NAME, &p, &ctx).await {
+            return answer;
+        }
         let caller = self.caller(&ctx);
         self.evolve_engrams_core(p, &caller)
             .await
@@ -3275,6 +3372,9 @@ impl McpServer {
         Parameters(p): Parameters<ConfigureParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Some(answer) = self.mounted("configure", &p, &ctx).await {
+            return answer;
+        }
         if self.engine.read_only() {
             return Err(ErrorData::invalid_params(CONFIGURE_READ_ONLY_REFUSAL, None));
         }
@@ -3350,6 +3450,9 @@ impl McpServer {
         Parameters(p): Parameters<AddDomainParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Some(answer) = self.mounted("add_domain", &p, &ctx).await {
+            return answer;
+        }
         // Read-only first, matching `configure` and `remove_domain`: on an
         // instance where nobody may register a domain, "this instance is
         // read-only" is the more useful of the two true answers, and it is the
@@ -3464,6 +3567,9 @@ impl McpServer {
         responses: InputResponses,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        if let Some(answer) = self.mounted("remove_domain", &p, &ctx).await {
+            return answer.map(CallToolResponse::from);
+        }
         let p = self.localized(p, &ctx).await?;
         if self.engine.read_only() {
             return Err(to_error(EngineError::ReadOnly));
@@ -3530,6 +3636,9 @@ impl McpServer {
         responses: InputResponses,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        if let Some(answer) = self.mounted("share_changes", &p, &ctx).await {
+            return answer.map(CallToolResponse::from);
+        }
         let p = self.localized(p, &ctx).await?;
         if refused_collab_tool("share_changes", self.engine.github_enabled()) {
             return refuse(RemoteError::NotEnabled.to_string()).map(CallToolResponse::from);
@@ -3631,6 +3740,9 @@ impl McpServer {
         Parameters(p): Parameters<UpdateDomainParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Some(answer) = self.mounted("update_domain", &p, &ctx).await {
+            return answer;
+        }
         let p = self.localized(p, &ctx).await?;
         if refused_collab_tool("update_domain", self.engine.github_enabled()) {
             return refuse(RemoteError::NotEnabled.to_string());
@@ -3662,6 +3774,9 @@ impl McpServer {
         Parameters(p): Parameters<OriginStatusParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Some(answer) = self.mounted("origin_status", &p, &ctx).await {
+            return answer;
+        }
         let p = self.localized(p, &ctx).await?;
         if refused_collab_tool("origin_status", self.engine.github_enabled()) {
             return refuse(RemoteError::NotEnabled.to_string());
@@ -3697,6 +3812,9 @@ impl McpServer {
         responses: InputResponses,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        if let Some(answer) = self.mounted("resolve_conflict", &p, &ctx).await {
+            return answer.map(CallToolResponse::from);
+        }
         let p = self.localized(p, &ctx).await?;
         if refused_collab_tool("resolve_conflict", self.engine.github_enabled()) {
             return refuse(RemoteError::NotEnabled.to_string()).map(CallToolResponse::from);
@@ -3770,6 +3888,9 @@ impl McpServer {
         responses: InputResponses,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        if let Some(answer) = self.mounted("withdraw_proposal", &p, &ctx).await {
+            return answer.map(CallToolResponse::from);
+        }
         let p = self.localized(p, &ctx).await?;
         if refused_collab_tool("withdraw_proposal", self.engine.github_enabled()) {
             return refuse(RemoteError::NotEnabled.to_string()).map(CallToolResponse::from);
@@ -3848,6 +3969,9 @@ impl McpServer {
         responses: InputResponses,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        if let Some(answer) = self.mounted("discard_changes", &p, &ctx).await {
+            return answer.map(CallToolResponse::from);
+        }
         let p = self.localized(p, &ctx).await?;
         if refused_collab_tool("discard_changes", self.engine.github_enabled()) {
             return refuse(RemoteError::NotEnabled.to_string()).map(CallToolResponse::from);
@@ -3937,6 +4061,9 @@ impl McpServer {
         Parameters(p): Parameters<ProvisionParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Some(answer) = self.mounted("provision", &p, &ctx).await {
+            return answer;
+        }
         let p = self.localized(p, &ctx).await?;
         let action = match p.action.as_str() {
             "status" => ProvisionAction::Status,
@@ -4020,7 +4147,11 @@ impl McpServer {
     async fn skills(
         &self,
         Parameters(p): Parameters<SkillsParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Some(answer) = self.mounted("skills", &p, &ctx).await {
+            return answer;
+        }
         let Some(name) = p.name.as_deref() else {
             let index: Vec<Value> = SKILL_ASSETS
                 .iter()
@@ -4077,8 +4208,7 @@ impl McpServer {
         // caller's own index. On stdio the scope is unrestricted and the bytes
         // are the whole block, exactly as before.
         let text = self
-            .engine
-            .routing_text_scoped(&self.scope_of(&ctx))
+            .routing_text_for(&self.scope_of(&ctx))
             .await
             .map_err(to_error)?;
         Ok(vec![PromptMessage::new_text(Role::User, text)])
@@ -4157,16 +4287,25 @@ impl McpServer {
         {
             return Ok(info);
         }
-        let mut instructions = self
-            .engine
-            .routing_text_scoped(scope)
-            .await
-            .map_err(to_error)?;
+        let mut instructions = self.routing_text_for(scope).await.map_err(to_error)?;
         if self.engine.response_format() == ResponseFormat::Toon {
             instructions.push_str(TOON_INSTRUCTIONS_NOTE);
         }
         info.instructions = Some(instructions);
         Ok(info)
+    }
+
+    /// The routing block a scoped channel (`server/discover`, the
+    /// `onboarding` prompt) hands this session: on stdio, this machine's
+    /// owner, it lists the mounted domains after the local ones, as the stdio
+    /// `initialize` block does (decision D25); an HTTP session gets the
+    /// scoped block alone. Decided by the transport, never by the scope
+    /// (decision D8).
+    async fn routing_text_for(&self, scope: &Scope) -> Result<String, EngineError> {
+        match self.transport {
+            Transport::Stdio => self.engine.routing_text_scoped_with_mounts(scope).await,
+            Transport::Http => self.engine.routing_text_scoped(scope).await,
+        }
     }
 
     /// The resource links a `read_engram` result carries: one per distinct
