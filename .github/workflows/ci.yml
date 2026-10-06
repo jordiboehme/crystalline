@@ -553,6 +553,22 @@ jobs:
       - name: The rendered nginx configuration is valid
         run: docker run --rm -e CRYSTALLINE_UPSTREAM=127.0.0.1:7411 crystalline-fluid:ci nginx -t
 
+      - name: The rendered nginx configuration is valid under a path
+        run: |
+          docker run --rm -e CRYSTALLINE_UPSTREAM=127.0.0.1:7411 -e CRYSTALLINE_BASE_PATH=/crystalline \
+            crystalline-fluid:ci sh -c '/docker-entrypoint.sh nginx -t && cat /etc/nginx/conf.d/default.conf /etc/nginx/conf.d/crystalline/*.conf' \
+            | tee rendered.conf
+          grep -q 'location /crystalline/api/' rendered.conf
+          grep -q 'location = /.well-known/oauth-protected-resource/crystalline' rendered.conf
+          grep -q "sub_filter '<base href=\"/\" />' '<base href=\"/crystalline/\" />';" rendered.conf
+
+      - name: A base path that cannot be a prefix stops the container
+        run: |
+          if docker run --rm -e CRYSTALLINE_UPSTREAM=127.0.0.1:7411 -e CRYSTALLINE_BASE_PATH=crystalline/ crystalline-fluid:ci nginx -t; then
+            echo "a bad CRYSTALLINE_BASE_PATH was accepted" >&2
+            exit 1
+          fi
+
       - name: The bundle is where nginx serves from
         run: |
           docker run --rm --entrypoint sh crystalline-fluid:ci -c '

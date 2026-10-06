@@ -14,6 +14,7 @@
 #[path = "../support/mod.rs"]
 mod support;
 
+mod nginx_base_path;
 mod nginx_body_cap;
 mod no_cors;
 mod openapi_snapshot;

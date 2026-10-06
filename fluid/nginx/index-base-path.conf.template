@@ -1,0 +1,6 @@
+# Installed by 15-crystalline-base-path.sh only when CRYSTALLINE_BASE_PATH is
+# set, and included inside the index.html location. The match is the exact
+# tag the build emits (BASE_TAG in crates/service/src/ui.rs), so the browser
+# resolves the relative asset urls under the prefix from any deep link.
+sub_filter_once on;
+sub_filter '<base href="/" />' '<base href="${CRYSTALLINE_BASE_PATH}/" />';

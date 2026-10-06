@@ -87,6 +87,7 @@ services:
       # configuration, so it needs the crystalline container to exist first -
       # which is what depends_on below guarantees.
       CRYSTALLINE_UPSTREAM: "crystalline:7411"
+      # CRYSTALLINE_BASE_PATH: "/crystalline"   # serve under a path; set CRYSTALLINE_SERVICE_PUBLIC_URL with the same path on crystalline
     ports:
       - "80:80"
     depends_on:
