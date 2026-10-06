@@ -16,7 +16,7 @@
 
 use serde_json::{Map, Value, json};
 
-use crate::server_client::{NETWORK_HINT, RemoteFailure, seconds};
+use crate::server_client::{RemoteFailure, seconds};
 
 /// The reciprocal rank fusion constant.
 pub const RRF_K: f64 = 60.0;
@@ -45,6 +45,10 @@ pub struct Missing {
     pub source: String,
     /// Why, as the end of a sentence that starts with the name.
     pub reason: String,
+    /// Whether the source did not answer at all, so the note ends with
+    /// that it recovers by itself, the way status and the one-domain
+    /// refusal say it.
+    pub recovers: bool,
 }
 
 /// The reason a failure gives for leaving `source` out. Every reason is a
@@ -54,11 +58,11 @@ pub struct Missing {
 pub fn missing_from(source: &str, failure: &RemoteFailure) -> Missing {
     let reason = match failure {
         RemoteFailure::TimedOut { after, .. } => format!(
-            "cannot be reached right now (it did not answer within {}; {NETWORK_HINT})",
+            "cannot be reached right now (it did not answer within {}; check the VPN or the network)",
             seconds(*after)
         ),
         RemoteFailure::Unreachable { .. } => {
-            format!("cannot be reached right now ({NETWORK_HINT})")
+            "cannot be reached right now (check the VPN or the network)".to_string()
         }
         RemoteFailure::SignInAgain { url } => {
             format!("needs a new sign-in (run crystalline connect {url} again)")
@@ -78,6 +82,7 @@ pub fn missing_from(source: &str, failure: &RemoteFailure) -> Missing {
     Missing {
         source: source.to_string(),
         reason,
+        recovers: failure.is_unreachable(),
     }
 }
 
@@ -94,6 +99,7 @@ pub fn missing_from_evolve(source: &str, failure: &RemoteFailure, domain: Option
                 "did not finish its sweep within {} (run evolve_engrams with domains [\"{domain}\"] to give it longer)",
                 seconds(*after)
             ),
+            recovers: false,
         },
         _ => missing_from(source, failure),
     }
@@ -101,11 +107,18 @@ pub fn missing_from_evolve(source: &str, failure: &RemoteFailure, domain: Option
 
 /// The sentence for one missing source.
 pub fn missing_note(missing: &Missing) -> String {
-    format!(
+    let mut note = format!(
         "{} {}; its domains are missing from these results",
         missing.source, missing.reason
-    )
+    );
+    if missing.recovers {
+        note.push_str(RECOVERS);
+    }
+    note
 }
+
+/// How the note for a source that did not answer ends.
+const RECOVERS: &str = "; it recovers by itself once the server answers again";
 
 /// How many hits a part is asked for so the merged page can be cut from
 /// them: every hit up to the page, never more than the engine's cap.
@@ -557,7 +570,7 @@ mod tests {
         assert_eq!(merge_search(parts, 1, 10, &[])["mode"], "mixed");
     }
 
-    const UNREACHABLE: &str = "cannot be reached right now (check the VPN or the network; it recovers by itself once the server answers again)";
+    const UNREACHABLE: &str = "cannot be reached right now (check the VPN or the network)";
 
     #[test]
     fn a_missingsource_is_named_in_the_answer() {
@@ -577,11 +590,13 @@ mod tests {
         ];
         assert_eq!(
             missing_note(&missing[0]),
-            "acme cannot be reached right now (it did not answer within 3 s; check the VPN or the network; it recovers by itself once the server answers again); its domains are missing from these results"
+            "acme cannot be reached right now (it did not answer within 3 s; check the VPN or the network); its domains are missing from these results; it recovers by itself once the server answers again"
         );
         assert_eq!(
             missing_note(&missing[1]),
-            format!("beta {UNREACHABLE}; its domains are missing from these results")
+            format!(
+                "beta {UNREACHABLE}; its domains are missing from these results; it recovers by itself once the server answers again"
+            )
         );
         let merged = merge_search(
             vec![Part {
@@ -595,14 +610,14 @@ mod tests {
         assert_eq!(
             merged["missing"],
             json!([
-                { "source": "acme", "reason": "cannot be reached right now (it did not answer within 3 s; check the VPN or the network; it recovers by itself once the server answers again)" },
+                { "source": "acme", "reason": "cannot be reached right now (it did not answer within 3 s; check the VPN or the network)" },
                 { "source": "beta", "reason": UNREACHABLE },
             ])
         );
         assert_eq!(
             merged["note"],
             format!(
-                "acme cannot be reached right now (it did not answer within 3 s; check the VPN or the network; it recovers by itself once the server answers again); its domains are missing from these results. beta {UNREACHABLE}; its domains are missing from these results."
+                "acme cannot be reached right now (it did not answer within 3 s; check the VPN or the network); its domains are missing from these results; it recovers by itself once the server answers again. beta {UNREACHABLE}; its domains are missing from these results; it recovers by itself once the server answers again."
             )
         );
     }

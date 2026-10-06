@@ -987,6 +987,7 @@ fn seed_offer(
     url: &str,
     domains: &[(&str, &[&str])],
     failure: Option<&str>,
+    fetched_at: &str,
 ) {
     let record = crystalline_remote::SourceRecord {
         url: url.to_string(),
@@ -1024,9 +1025,7 @@ fn seed_offer(
         &crystalline_remote::Cached {
             account: "keeper".into(),
             etag: "seeded".into(),
-            // A fixed time: the staleness notes name it, and they must read
-            // the same both times.
-            fetched_at: chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            fetched_at: chrono::DateTime::parse_from_rfc3339(fetched_at)
                 .unwrap()
                 .into(),
             data: json!({ "domains": rows }),
@@ -1044,15 +1043,16 @@ fn seed_offer(
 async fn the_onboarding_block_does_not_depend_on_the_order_a_server_offers_domains_in() {
     let machine = LocalMachine::start(false).await;
     let remote = machine.remote_dir();
-    let render = |zulu: &[(&str, &[&str])], acme: &[(&str, &[&str])]| {
+    let render = |zulu: &[(&str, &[&str])], acme: &[(&str, &[&str])], at: &str| {
         // sources.json order: zulu was connected first.
-        seed_offer(&remote, "zulu", "http://127.0.0.1:9", zulu, None);
+        seed_offer(&remote, "zulu", "http://127.0.0.1:9", zulu, None, at);
         seed_offer(
             &remote,
             "acme",
             "http://127.0.0.1:10",
             acme,
             Some("acme cannot be reached right now"),
+            at,
         );
         machine.mount();
         machine.engine.routing_text()
@@ -1060,12 +1060,18 @@ async fn the_onboarding_block_does_not_depend_on_the_order_a_server_offers_domai
     let first = render(
         &[("zebra", &["z one", "z two"]), ("kilo", &["k one"])],
         &[("bravo", &["b two", "b one"]), ("alpha", &["a one"])],
+        "2026-01-01T00:00:00Z",
     );
     let second = render(
         &[("kilo", &["k one"]), ("zebra", &["z one", "z two"])],
         &[("alpha", &["a one"]), ("bravo", &["b two", "b one"])],
+        "2026-01-01T03:17:00Z",
     );
+    // No time and no note in the block: the stdio text is the same bytes
+    // whenever the servers last answered.
     assert_eq!(first, second, "the same bytes both times");
+    assert!(!first.contains("Note: "), "{first}");
+    assert!(!first.contains("2026-01-01"), "{first}");
     let at = |needle: &str| {
         first
             .find(needle)

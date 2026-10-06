@@ -859,16 +859,17 @@ fn the_stop_hook_never_names_a_server_domain_with_a_broken_name() {
 }
 
 /// Source `name` at `url` in `remote_dir`, its mounts named as the server's
-/// domains, and a routing cache offering `domains` in the given order. The
-/// cache carries a fixed time, so a staleness note reads the same each run.
+/// domains, and a routing cache offering `domains` in the given order,
+/// confirmed at `fetched_at`.
 fn seed_named(
     remote_dir: &Path,
     name: &str,
     url: &str,
     domains: &[(&str, &[&str])],
     failure: Option<&str>,
+    fetched_at: &str,
 ) {
-    let fixed: chrono::DateTime<chrono::Utc> = "2026-01-01T00:00:00Z".parse().unwrap();
+    let fixed: chrono::DateTime<chrono::Utc> = fetched_at.parse().unwrap();
     let record = crystalline_remote::SourceRecord {
         url: url.to_string(),
         name: name.to_string(),
@@ -923,7 +924,7 @@ fn session_start_does_not_depend_on_the_order_a_server_offers_domains_in() {
     let config = local_config(home.path(), &["yankee", "delta"], "");
     let zulu = Blackhole::start();
     let acme = Blackhole::start();
-    let run = |format: &str, z: &[(&str, &[&str])], a: &[(&str, &[&str])]| {
+    let run = |format: &str, z: &[(&str, &[&str])], a: &[(&str, &[&str])], at: &str| {
         // sources.json order: zulu was connected first.
         seed_named(
             &remote,
@@ -931,8 +932,9 @@ fn session_start_does_not_depend_on_the_order_a_server_offers_domains_in() {
             &zulu.origin,
             z,
             Some("zulu cannot be reached right now"),
+            at,
         );
-        seed_named(&remote, "acme", &acme.origin, a, None);
+        seed_named(&remote, "acme", &acme.origin, a, None, at);
         stdout_of(
             &bin_with(home.path(), &config)
                 .args(["prompt", "system", "--format", format])
@@ -941,18 +943,51 @@ fn session_start_does_not_depend_on_the_order_a_server_offers_domains_in() {
                 .unwrap(),
         )
     };
+    let ordered: &[&[(&str, &[&str])]] = &[
+        &[("zebra", &["z one", "z two"]), ("kilo", &["k one"])],
+        &[("bravo", &["b two", "b one"]), ("alpha", &["a one"])],
+    ];
+    let shuffled: &[&[(&str, &[&str])]] = &[
+        &[("kilo", &["k one"]), ("zebra", &["z one", "z two"])],
+        &[("alpha", &["a one"]), ("bravo", &["b two", "b one"])],
+    ];
+    const T1: &str = "2026-01-01T00:00:00Z";
+    const T2: &str = "2026-01-01T03:17:00Z";
     for format in ["text", "json"] {
-        let first = run(
-            format,
-            &[("zebra", &["z one", "z two"]), ("kilo", &["k one"])],
-            &[("bravo", &["b two", "b one"]), ("alpha", &["a one"])],
-        );
-        let second = run(
-            format,
-            &[("kilo", &["k one"]), ("zebra", &["z one", "z two"])],
-            &[("alpha", &["a one"]), ("bravo", &["b two", "b one"])],
-        );
+        let first = run(format, ordered[0], ordered[1], T1);
+        let second = run(format, shuffled[0], shuffled[1], T1);
         assert_eq!(first, second, "{format}: the same bytes both times");
+        // Another time changes the trailing notes and nothing else.
+        let later = run(format, shuffled[0], shuffled[1], T2);
+        assert_ne!(first, later, "{format}: the notes name the time");
+        if format == "text" {
+            let block = |out: &str| -> Vec<String> {
+                out.lines()
+                    .filter(|l| !l.starts_with("Note: "))
+                    .map(str::to_string)
+                    .collect()
+            };
+            assert_eq!(block(&first), block(&later), "the block itself");
+            let lines: Vec<&str> = first.lines().collect();
+            let first_note = lines.iter().position(|l| l.starts_with("Note: ")).unwrap();
+            assert!(
+                lines[first_note..]
+                    .iter()
+                    .all(|l| l.starts_with("Note: ") || l.trim().is_empty()),
+                "the notes come after the whole block: {first}"
+            );
+        } else {
+            let without_stale = |out: &str| {
+                let mut v: Value = serde_json::from_str(out).unwrap();
+                v.as_object_mut().unwrap().remove("stale");
+                v
+            };
+            assert_eq!(
+                without_stale(&first),
+                without_stale(&later),
+                "the block itself"
+            );
+        }
         let at = |needle: &str| {
             first
                 .find(needle)

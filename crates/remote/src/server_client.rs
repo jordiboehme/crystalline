@@ -132,7 +132,7 @@ pub(crate) const UNREACHABLE_WORDS: &str = "cannot be reached right now";
 /// what [`crate::stale_line`] recognises it by.
 pub(crate) const TOO_OLD_WORDS: &str = "does not serve the remote control protocol";
 /// What a person can do about a source that does not answer.
-pub(crate) const NETWORK_HINT: &str =
+const NETWORK_HINT: &str =
     "check the VPN or the network; it recovers by itself once the server answers again";
 
 /// Why a remote exchange did not produce an answer.

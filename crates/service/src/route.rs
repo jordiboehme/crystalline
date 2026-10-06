@@ -576,6 +576,7 @@ async fn fan_out(
                     missing.push(crystalline_remote::Missing {
                         source: source.clone(),
                         reason: "was not asked to the end (the request stopped on this machine; the next call asks it again)".to_string(),
+                        recovers: false,
                     });
                 }
                 continue;
