@@ -6,9 +6,11 @@
 //! not cached yet, and drawn as a byte-progress line on a live terminal. A file
 //! already in the cache is resolved with no network call at all. The fetch is
 //! an async future, but hf-xet runs parts of a download as `spawn_blocking`
-//! tasks on the calling runtime, which a runtime drop waits for: a process
+//! tasks on the runtime it runs on, which a runtime drop waits for: a process
 //! that owns the index leaves through `std::process::exit`, never a runtime
-//! drop, while a download may be in flight.
+//! drop, while a download may be in flight. A fetch runs on a runtime of its
+//! own ([`on_fetch_runtime`]), never on the caller's, so a download keeps the
+//! caller's worker threads free.
 
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -26,6 +28,7 @@ use crate::embed::hub_dir_name;
 use crate::error::{IndexError, Result};
 
 /// What a fetch needs to know about one repository.
+#[derive(Clone, Copy)]
 pub(crate) struct HubRepo<'a> {
     /// The Hugging Face repository id, `<owner>/<name>`.
     pub repo: &'a str,
@@ -291,7 +294,7 @@ impl ProgressHandler for ByteProgress {
 /// through here, so the watchdog guards both.
 pub(crate) async fn ensure_files(
     cache_dir: &Path,
-    repo: &HubRepo<'_>,
+    repo: &HubRepo<'static>,
     announce: bool,
 ) -> Result<HubFiles> {
     let client = cache_client(cache_dir)?;
@@ -331,7 +334,78 @@ pub(crate) fn cache_client(cache_dir: &Path) -> Result<HFClient> {
 pub(crate) async fn ensure_files_with(
     client: &HFClient,
     cache_dir: &Path,
-    repo: &HubRepo<'_>,
+    repo: &HubRepo<'static>,
+    announce: bool,
+    limits: &HubLimits,
+) -> Result<HubFiles> {
+    let client = client.clone();
+    let cache_dir = cache_dir.to_path_buf();
+    let repo = *repo;
+    let limits = HubLimits {
+        stall: limits.stall,
+    };
+    on_fetch_runtime(
+        async move { fetch_files(&client, &cache_dir, &repo, announce, &limits).await },
+    )
+    .await
+}
+
+/// The runtime every model fetch runs on: two worker threads of its own,
+/// made on first use and kept for the life of the process, so a pooled
+/// connection of the hub client never outlives the runtime it was made on.
+///
+/// hf-xet runs a download on whatever runtime it is called from, and its
+/// transfer keeps that runtime's worker threads busy. On a daemon's runtime
+/// that starved every timer and accept beside it: on a three-core runner the
+/// 5 s idle exit of a daemon whose first model download was running had not
+/// fired 15 s after its last client left, and on one worker thread it fired
+/// after 11 s. On a runtime of its own the download only competes for the
+/// CPU, which the operating system shares fairly. Being a separate runtime is
+/// what fixes that; the two workers are only a cap on what a download takes.
+static FETCH_RUNTIME: std::sync::OnceLock<Option<tokio::runtime::Runtime>> =
+    std::sync::OnceLock::new();
+
+/// Run `fetch` on [`FETCH_RUNTIME`] and wait for it here. Dropping the wait
+/// drops the fetch too, as awaiting it in place would. When that runtime
+/// cannot be made, the fetch runs in place.
+async fn on_fetch_runtime<T, F>(fetch: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: std::future::Future<Output = Result<T>> + Send + 'static,
+{
+    let runtime = FETCH_RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("model-fetch")
+            .enable_all()
+            .build()
+            .ok()
+    });
+    let Some(runtime) = runtime else {
+        return fetch.await;
+    };
+    /// Aborts the fetch when the wait for it is dropped.
+    struct AbortOnDrop(tokio::task::AbortHandle);
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let task = runtime.spawn(fetch);
+    let _abort = AbortOnDrop(task.abort_handle());
+    match task.await {
+        Ok(result) => result,
+        Err(e) => Err(IndexError::Embedding(format!(
+            "the model fetch stopped: {e}"
+        ))),
+    }
+}
+
+/// [`ensure_files_with`] on the runtime it was moved to.
+async fn fetch_files(
+    client: &HFClient,
+    cache_dir: &Path,
+    repo: &HubRepo<'static>,
     announce: bool,
     limits: &HubLimits,
 ) -> Result<HubFiles> {
@@ -594,6 +668,39 @@ mod tests {
         download_mb: 1,
         what: "test model",
     };
+
+    /// A fetch never runs on the caller's runtime, so a download cannot keep
+    /// the caller's worker threads busy; and every fetch shares one runtime.
+    #[tokio::test]
+    async fn a_fetch_runs_on_its_own_runtime() {
+        let caller = tokio::runtime::Handle::current().id();
+        let first = on_fetch_runtime(async { Ok(tokio::runtime::Handle::current().id()) })
+            .await
+            .unwrap();
+        let second = on_fetch_runtime(async { Ok(tokio::runtime::Handle::current().id()) })
+            .await
+            .unwrap();
+        assert_ne!(first, caller);
+        assert_eq!(first, second);
+    }
+
+    /// Dropping the wait for a fetch drops the fetch.
+    #[tokio::test]
+    async fn a_dropped_wait_stops_the_fetch() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let wait = on_fetch_runtime(async move {
+            let _tx = tx;
+            std::future::pending::<Result<()>>().await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), wait)
+                .await
+                .is_err()
+        );
+        // The fetch held the sender; once it is dropped, the channel closes.
+        let closed = tokio::time::timeout(Duration::from_secs(5), rx).await;
+        assert!(matches!(closed, Ok(Err(_))), "the fetch is still running");
+    }
 
     fn test_client(cache: &Path, endpoint: &str) -> HFClient {
         HFClient::builder()
