@@ -20,6 +20,7 @@ import type { ReactElement } from "react";
 import { useState } from "react";
 
 import { problemDetail } from "../api/client";
+import { absoluteUrl } from "../base";
 import {
   draftLinksKey,
   fetchDraftLinks,
@@ -119,7 +120,7 @@ export function DraftLinkDialog({
                 className="mt-1 block break-all text-xs"
                 data-testid="minted-link"
               >
-                {`${window.location.origin}/draft/${minted}`}
+                {absoluteUrl(`/draft/${minted}`)}
               </code>
             </div>
           )}

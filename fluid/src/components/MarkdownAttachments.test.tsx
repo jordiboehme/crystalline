@@ -180,10 +180,11 @@ describe("attachments in the reading view", () => {
       DOMAIN,
     );
     expect(image(container).getAttribute("src")).toBe("assets/../../evil.png");
-    expect(screen.getByRole("link", { name: "y" })).toHaveAttribute(
-      "href",
-      "assets/../secret.pdf",
-    );
+    // An ordinary link, resolved against the page it is on the way the
+    // browser resolved it before the base tag: never the files route.
+    const link = screen.getByRole("link", { name: "y" });
+    expect(link).toHaveAttribute("href", "/secret.pdf");
+    expect(link.getAttribute("href")).not.toContain("/api/");
   });
 
   it("leaves an external image and an absolute one exactly as written", async () => {

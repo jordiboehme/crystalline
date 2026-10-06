@@ -19,6 +19,7 @@
  * cookie, and hands back where to navigate.
  */
 
+import { withBase } from "../base";
 import { API_BASE, api, encodeSegment } from "./client";
 import type {
   IdentityLinksResponse,
@@ -71,10 +72,15 @@ export async function unlinkIdentity(issuer: string): Promise<void> {
  * screen, and a provider sign-in started from there has to come back to that
  * exact address, because the pending authorization it names is only
  * reachable by its id.
+ *
+ * `returnTo` is a router path; the base path is put in front, because the
+ * server accepts only a path under its own base.
  */
 export function ssoSignInUrl(returnTo?: string): string {
   const url = `${API_BASE}/auth/oidc/login`;
-  return returnTo ? `${url}?return_to=${encodeURIComponent(returnTo)}` : url;
+  return returnTo
+    ? `${url}?return_to=${encodeURIComponent(withBase(returnTo))}`
+    : url;
 }
 
 /**

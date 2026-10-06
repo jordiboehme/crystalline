@@ -55,6 +55,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import { openRoute } from "../../base";
 import { detectEnvironment, refusalReason, type Refusal } from "../device";
 import { hasWebGL2 } from "../gl/context";
 import { fluidRouteOfStation } from "../paths";
@@ -82,7 +83,7 @@ const ROOMS: Record<string, PlaceInput> = {
 
 /** Opens a Fluid page in a new tab, as the F key does in the game. */
 function openFluid(path: string) {
-  window.open(path, "_blank", "noopener");
+  openRoute(path);
 }
 
 /**

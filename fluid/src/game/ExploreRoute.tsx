@@ -127,6 +127,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router";
 
 import { ME_QUERY_KEY } from "../auth/keys";
+import { openRoute } from "../base";
 import { subscribeToChanges } from "../events/ChangeStreamProvider";
 import { createDirector } from "./audio/director";
 import { createMixer, makeAudioContext } from "./audio/mixer";
@@ -160,7 +161,7 @@ import type { LiftStop, StationAddress } from "./world/types";
 
 /** Opens a Fluid page in a new tab: the F key, in the room and the reader. */
 function openFluid(path: string) {
-  window.open(path, "_blank", "noopener");
+  openRoute(path);
 }
 
 /** What the connecting screen shows: the number dialled and the place. */
