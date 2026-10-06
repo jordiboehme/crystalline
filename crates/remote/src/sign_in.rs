@@ -223,37 +223,60 @@ fn is_loopback(host: &str) -> bool {
 #[derive(Clone, Copy, Debug)]
 struct Budget {
     until: Instant,
+    limit: Duration,
+}
+
+/// The limit of one request: how long it may run, and the limit a timeout
+/// names, which is the one the caller set and not what was left of it.
+#[derive(Clone, Copy, Debug)]
+struct RequestLimit {
+    runs: Duration,
+    named: Duration,
 }
 
 impl Budget {
     fn new(limit: Duration) -> Budget {
         Budget {
             until: Instant::now() + limit,
+            limit,
         }
     }
 
     /// The overall limit of the next request: what is left of the step, at
-    /// most [`ONE_DOMAIN_LIMIT`].
-    fn next(&self, url: &str) -> Result<Duration, SignInError> {
+    /// most [`ONE_DOMAIN_LIMIT`]. A request cut by the step names the step's
+    /// limit, so time spent before it (building the client, loading the
+    /// credential) never shows up as a shorter limit than the one set; one
+    /// cut by [`ONE_DOMAIN_LIMIT`] names that.
+    fn next(&self, url: &str) -> Result<RequestLimit, SignInError> {
         let left = self.until.saturating_duration_since(Instant::now());
         if left.is_zero() {
             return Err(SignInError::Unreachable {
                 url: url.to_string(),
-                detail: "it did not answer in time".to_string(),
+                detail: format!("it did not answer within {}", seconds(self.limit)),
             });
         }
-        Ok(left.min(ONE_DOMAIN_LIMIT))
+        Ok(if left > ONE_DOMAIN_LIMIT {
+            RequestLimit {
+                runs: ONE_DOMAIN_LIMIT,
+                named: ONE_DOMAIN_LIMIT,
+            }
+        } else {
+            RequestLimit {
+                runs: left,
+                named: self.limit,
+            }
+        })
     }
 }
 
 /// A transport failure of a request that had `limit` overall, in plain
 /// words.
-fn transport(url: &str, e: &reqwest::Error, limit: Duration) -> SignInError {
+fn transport(url: &str, e: &reqwest::Error, limit: RequestLimit) -> SignInError {
     let detail = if e.is_timeout() {
-        let waited = if e.is_connect() {
-            CONNECT_TIMEOUT.min(limit)
+        let waited = if e.is_connect() && CONNECT_TIMEOUT < limit.runs {
+            CONNECT_TIMEOUT
         } else {
-            limit
+            limit.named
         };
         format!("it did not answer within {}", seconds(waited))
     } else {
@@ -274,7 +297,7 @@ async fn send(
 ) -> Result<Answer, SignInError> {
     let limit = budget.next(url)?;
     let response = request
-        .timeout(limit)
+        .timeout(limit.runs)
         .send()
         .await
         .map_err(|e| transport(url, &e, limit))?;
@@ -1290,6 +1313,30 @@ fn sha256(text: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Time spent before a request leaves less of the step to run, but the
+    /// limit a timeout names stays the one the caller set.
+    #[test]
+    fn a_request_cut_by_the_step_names_the_step_limit() {
+        let budget = Budget::new(Duration::from_millis(300));
+        std::thread::sleep(Duration::from_millis(120));
+        let limit = budget.next("https://kb.example").unwrap();
+        assert!(limit.runs <= Duration::from_millis(180), "{:?}", limit.runs);
+        assert_eq!(limit.named, Duration::from_millis(300));
+        let long = Budget::new(Duration::from_secs(60))
+            .next("https://kb.example")
+            .unwrap();
+        assert_eq!(long.runs, ONE_DOMAIN_LIMIT);
+        assert_eq!(long.named, ONE_DOMAIN_LIMIT);
+        let spent = Budget::new(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(110));
+        match spent.next("https://kb.example") {
+            Err(SignInError::Unreachable { detail, .. }) => {
+                assert_eq!(detail, "it did not answer within 0.1 s")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
 
     #[test]
     fn a_server_url_becomes_its_origin() {
