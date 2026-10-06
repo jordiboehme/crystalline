@@ -1760,6 +1760,14 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Before clap, whose own error would repeat the value (ruling F19).
+    let words: Vec<String> = std::env::args_os()
+        .skip(1)
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    if let Some(refusal) = sources::inline_token_refusal(&words) {
+        anyhow::bail!(refusal);
+    }
     let cli = Cli::parse();
     init_cli_tracing(cli.command.as_ref());
     match cli.command {
@@ -1797,16 +1805,18 @@ fn main() -> anyhow::Result<()> {
             command: None,
             url: Some(url),
             name,
-            stray: Some(_),
+            stray: Some(stray),
             ..
-        }) => anyhow::bail!(
-            "refusing a token on the command line, because it lands in the shell history and the process list; run crystalline connect {}{} --token and paste it when asked, or pipe it on stdin",
-            // `--token cmt_... <url>` puts the token first: never repeat it.
-            crystalline_remote::normalize_server_url(&url)
-                .map(|_| url)
-                .unwrap_or_else(|_| "<url>".to_string()),
-            name.map(|n| format!(" --name {n}")).unwrap_or_default()
-        ),
+        }) => {
+            if sources::looks_like_token(&url) {
+                // `--token cmt_... <url>`: the address came second.
+                anyhow::bail!(sources::token_refusal(Some(&stray), name.as_deref()))
+            }
+            if sources::looks_like_token(&stray) {
+                anyhow::bail!(sources::token_refusal(Some(&url), name.as_deref()))
+            }
+            anyhow::bail!(sources::EXTRA_WORD)
+        }
         Some(Command::Connect {
             command: None,
             url: Some(url),

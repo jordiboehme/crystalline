@@ -39,6 +39,13 @@ impl CliServer {
     }
 
     pub fn start_with(extra: &[&str]) -> CliServer {
+        CliServer::start_full(extra, &[])
+    }
+
+    /// [`CliServer::start_with`] plus one shared domain per `(name, repo)`
+    /// that tracks that GitHub repository, so a local domain tracking the
+    /// same one is the same domain.
+    pub fn start_full(extra: &[&str], tracked: &[(&str, &str)]) -> CliServer {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("server-home");
         // SAFETY: one process per test under nextest, and this runs before
@@ -58,7 +65,12 @@ impl CliServer {
             .build()
             .unwrap();
         let root = tmp.path().to_path_buf();
-        let extra: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
+        let mut extra: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
+        extra.extend(tracked.iter().map(|(name, _)| name.to_string()));
+        let tracked: Vec<(String, String)> = tracked
+            .iter()
+            .map(|(n, r)| (n.to_string(), r.to_string()))
+            .collect();
         let (origin, auth, serve) = runtime.block_on(async move {
             let mut cfg = GlobalConfig::default();
             let mut names = vec!["open".to_string()];
@@ -67,7 +79,16 @@ impl CliServer {
                 let dir = root.join(name);
                 std::fs::create_dir_all(&dir).unwrap();
                 std::fs::write(dir.join("MANIFEST.md"), manifest(name)).unwrap();
-                cfg.domains.insert(name.clone(), DomainEntry::file(dir));
+                let mut entry = DomainEntry::file(dir);
+                if let Some((_, repo)) = tracked.iter().find(|(n, _)| n == name) {
+                    entry.origin = Some(crystalline_core::config::OriginConfig {
+                        repo: repo.clone(),
+                        path: None,
+                        branch: None,
+                        poll_secs: None,
+                    });
+                }
+                cfg.domains.insert(name.clone(), entry);
             }
             std::fs::write(
                 root.join("open").join("vent-driver.md"),

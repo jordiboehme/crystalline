@@ -88,6 +88,10 @@ dunce = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+# A pasted token is read without echo at a terminal.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 # The in-process Crystalline server the source tests connect to.
 axum = { workspace = true }

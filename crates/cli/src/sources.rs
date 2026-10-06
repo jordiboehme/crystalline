@@ -6,9 +6,8 @@ use std::time::{Duration, Instant};
 
 use crystalline_core::config::GlobalConfig;
 use crystalline_remote::{
-    Announcement, Connection, HiddenReason, LocalDomain, MountNote, MountTable, ONE_DOMAIN_LIMIT,
-    OriginIdentity, ROUTING_FILE, RemoteFailure, Revocation, SourceRecord, SourceSet, read_cached,
-    remote_dir,
+    Connection, HiddenReason, LocalDomain, MountTable, ONE_DOMAIN_LIMIT, OriginIdentity,
+    ROUTING_FILE, RemoteFailure, Revocation, SourceRecord, SourceSet, read_cached, remote_dir,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -40,6 +39,45 @@ pub fn unshared_warning(local: &str, source: &str, changes: usize) -> String {
     format!(
         "warning: your local copy of '{local}' holds {changes} change(s) you have not shared; share them first: they stay hidden while you are connected to {source}"
     )
+}
+
+/// The prefixes of the tokens a Crystalline server issues: a personal MCP
+/// token, and an OAuth access and refresh token.
+const TOKEN_PREFIXES: [&str; 3] = ["cmt_", "coa_", "cor_"];
+
+/// Whether a command-line word looks like a token a server issued.
+pub fn looks_like_token(word: &str) -> bool {
+    let word = word.trim();
+    TOKEN_PREFIXES.iter().any(|p| word.starts_with(p))
+}
+
+/// The refusal of a token written on the command line (ruling F19). It
+/// repeats `url` only when it is a server address, and never the token.
+pub fn token_refusal(url: Option<&str>, name: Option<&str>) -> String {
+    let url = url
+        .filter(|u| crystalline_remote::normalize_server_url(u).is_ok())
+        .unwrap_or("<url>");
+    let name = name.map(|n| format!(" --name {n}")).unwrap_or_default();
+    format!(
+        "refusing a token on the command line, because it lands in the shell history and the process list; run crystalline connect {url}{name} --token and paste it when asked, or pipe it on stdin"
+    )
+}
+
+/// What `connect <url>` says about a word after the URL that is not a token.
+pub const EXTRA_WORD: &str = "crystalline connect takes one server address and nothing after it; to give the source a name on this machine, use --name <name>";
+
+/// The refusal of `--token=<value>` after `connect`, before clap reads the
+/// command line (clap's own error would repeat the value). `None` for any
+/// other command line, `connect github --token=...` included.
+pub fn inline_token_refusal(args: &[String]) -> Option<String> {
+    let at = args.iter().position(|a| a == "connect")?;
+    let rest = &args[at + 1..];
+    if rest.iter().any(|a| a == "github") {
+        return None;
+    }
+    rest.iter()
+        .any(|a| a.starts_with("--token="))
+        .then(|| token_refusal(None, None))
 }
 
 /// The local copies of the same domain `source` hides now: their names on
@@ -81,8 +119,18 @@ pub async fn connect_server(
 ) -> anyhow::Result<()> {
     use crystalline_remote::{connect_with_browser, connect_with_token, normalize_server_url};
     // The address first, so a URL that can never work is refused before
-    // anyone pastes a token for it.
-    normalize_server_url(&url)?;
+    // anyone pastes a token for it; and a value that is no address is never
+    // repeated, because it may be a token typed in the wrong place.
+    if looks_like_token(&url) {
+        anyhow::bail!(token_refusal(None, name.as_deref()));
+    }
+    match normalize_server_url(&url) {
+        Ok(_) => {}
+        Err(crystalline_remote::SignInError::BadUrl(_)) => anyhow::bail!(
+            "that is not a server address; give one like https://crystalline.acme.com"
+        ),
+        Err(other) => return Err(other.into()),
+    }
     let loaded = crate::cmd::load(None)?;
     let local = local_domains_of(&loaded.effective);
     let dir = remote_dir()?;
@@ -112,22 +160,10 @@ pub async fn connect_server(
     // The local copies this server hides, by their own names: the
     // announcement names the mount, which may be called differently.
     let table = SourceSet::load(dir.clone(), local.clone(), |n| std::env::var(n).ok()).table();
-    let mut warnings = Vec::new();
-    if let Ok(origins) = crystalline_core::config::origins_state_dir() {
-        for hidden in hidden_copies(&table, &source.name) {
-            if let Some(root) = loaded
-                .effective
-                .domains
-                .get(&hidden)
-                .and_then(|e| e.file_path())
-                && let Some(work) =
-                    crystalline_service::unshared_work(&root, &origins.join(&hidden))
-                && work.count() > 0
-            {
-                warnings.push(unshared_warning(&hidden, &source.name, work.count()));
-            }
-        }
-    }
+    let warnings = match crystalline_core::config::origins_state_dir() {
+        Ok(origins) => unshared_warnings(&table, &loaded.effective, &origins, &source.name),
+        Err(_) => Vec::new(),
+    };
     let _ = reload_daemon().await;
     if json {
         println!(
@@ -163,21 +199,98 @@ pub async fn connect_server(
     Ok(())
 }
 
+/// One [`unshared_warning`] per local copy `source` hides that holds work
+/// the team has not seen, read from its origin state under `origins`.
+pub fn unshared_warnings(
+    table: &MountTable,
+    cfg: &GlobalConfig,
+    origins: &std::path::Path,
+    source: &str,
+) -> Vec<String> {
+    hidden_copies(table, source)
+        .into_iter()
+        .filter_map(|hidden| {
+            let root = cfg.domains.get(&hidden)?.file_path()?;
+            let work = crystalline_service::unshared_work(&root, &origins.join(&hidden))?;
+            (work.count() > 0).then(|| unshared_warning(&hidden, source, work.count()))
+        })
+        .collect()
+}
+
 /// The pasted token: one line from stdin, with a prompt when stdin is a
 /// terminal. Never from the command line, where it would land in the shell
 /// history and the process list.
 pub fn read_token_from_stdin() -> anyhow::Result<String> {
     use std::io::{BufRead, IsTerminal};
-    if std::io::stdin().is_terminal() {
-        eprint!("Paste the personal MCP token (cmt_...) and press Enter: ");
-    }
     let mut line = String::new();
-    std::io::stdin().lock().read_line(&mut line)?;
+    if std::io::stdin().is_terminal() {
+        let hidden = cfg!(unix);
+        eprint!(
+            "Paste the personal MCP token (cmt_...) and press Enter{}: ",
+            if hidden {
+                " (it is not shown)"
+            } else {
+                " (visible while typing)"
+            }
+        );
+        let echo = EchoOff::new();
+        let read = std::io::stdin().lock().read_line(&mut line);
+        drop(echo);
+        read?;
+    } else {
+        std::io::stdin().lock().read_line(&mut line)?;
+    }
     let token = line.trim().to_string();
     if token.is_empty() {
         anyhow::bail!("no token was given; issue one in Fluid under profile > Agent access");
     }
     Ok(token)
+}
+
+/// The terminal on stdin stops echoing what is typed while this lives, so a
+/// pasted token stays off the screen and out of the scrollback. Unix only;
+/// elsewhere it does nothing and the prompt says the paste is visible.
+struct EchoOff {
+    #[cfg(unix)]
+    saved: Option<libc::termios>,
+}
+
+impl EchoOff {
+    fn new() -> EchoOff {
+        #[cfg(unix)]
+        {
+            // SAFETY: tcgetattr and tcsetattr on stdin with a termios this
+            // function owns; a failure leaves the terminal as it was.
+            unsafe {
+                let mut term: libc::termios = std::mem::zeroed();
+                if libc::tcgetattr(libc::STDIN_FILENO, &mut term) != 0 {
+                    return EchoOff { saved: None };
+                }
+                let saved = term;
+                // No echo, but the Enter still moves to the next line.
+                term.c_lflag &= !libc::ECHO;
+                term.c_lflag |= libc::ECHONL;
+                if libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &term) != 0 {
+                    return EchoOff { saved: None };
+                }
+                EchoOff { saved: Some(saved) }
+            }
+        }
+        #[cfg(not(unix))]
+        EchoOff {}
+    }
+}
+
+impl Drop for EchoOff {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(saved) = &self.saved {
+            // SAFETY: puts back the settings read in `new`.
+            unsafe {
+                libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, saved);
+            }
+        }
+    }
 }
 
 /// Open `url` in the default browser, best effort: the URL is printed first
@@ -240,8 +353,20 @@ pub async fn rename_mounted(
     local: bool,
     json: bool,
 ) -> Option<anyhow::Result<()>> {
-    let loaded = crate::cmd::load(None).ok()?;
     let dir = remote_dir().ok()?;
+    let loaded = match crate::cmd::load(None) {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            // A mounted name gets the configuration's own words, not the
+            // engine's rename refusal further on; any other name goes on to
+            // the ordinary rename, which a running daemon may still answer.
+            let set = SourceSet::load(dir, Vec::new(), |n| std::env::var(n).ok());
+            set.table().mount(domain)?;
+            return Some(Err(e.context(format!(
+                "'{domain}' comes from a connected server, and its name on this machine cannot change while this machine's configuration does not load"
+            ))));
+        }
+    };
     let set = SourceSet::load(dir, local_domains_of(&loaded.effective), |n| {
         std::env::var(n).ok()
     });
@@ -384,20 +509,17 @@ fn fill_names(row: &mut SourceRow, table: &MountTable) {
 /// What `status` and `doctor` say about a hidden local domain (ruling F8
 /// REVISED).
 pub fn hidden_note(local: &str, source: &str, reason: HiddenReason) -> String {
+    let sentence = crystalline_remote::hidden_sentence(&crystalline_remote::Hidden {
+        local: local.to_string(),
+        source: source.to_string(),
+        reason,
+        by: local.to_string(),
+    });
     match reason {
-        HiddenReason::Copy => format!(
-            "{}; it cannot be removed or renamed while {source} is connected",
-            MountNote::HiddenCopy {
-                name: local.to_string(),
-                source: source.to_string(),
-            }
-            .render(true)
-        ),
-        HiddenReason::Collision => Announcement::LocalShadowed {
-            local: local.to_string(),
-            source: source.to_string(),
+        HiddenReason::Copy => {
+            format!("{sentence}; it cannot be removed or renamed while {source} is connected")
         }
-        .to_string(),
+        HiddenReason::Collision => sentence,
     }
 }
 
@@ -469,7 +591,7 @@ async fn ask_one(record: SourceRecord, dir: std::path::PathBuf) -> SourceRow {
 /// up: its row shows the cached names and why it did not answer. Before it
 /// returns, a sign-in refresh one of the asks started is waited for with
 /// what is left of [`ONE_DOMAIN_LIMIT`], so a token pair the server rotated
-/// is saved.
+/// is saved: up to about 5 s more after the asks, 10 s in all at most.
 pub async fn source_rows(cfg: &GlobalConfig) -> Vec<SourceRow> {
     let started = Instant::now();
     let Ok(dir) = remote_dir() else {
@@ -500,7 +622,7 @@ pub async fn source_rows(cfg: &GlobalConfig) -> Vec<SourceRow> {
         .map(|(row, record)| {
             let mut row = row.unwrap_or_else(|| SourceRow {
                 error: Some(format!(
-                    "asking {} ({}) stopped before it answered",
+                    "asking {} ({}) stopped before it answered, most likely a fault on this machine rather than the server; it recovers by itself, run crystalline status again",
                     record.name, record.url
                 )),
                 name: record.name.clone(),

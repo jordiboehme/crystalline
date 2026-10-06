@@ -1329,7 +1329,13 @@ pub async fn run(
 
     let rename = check_rename_journal(discard_rename);
 
-    let sources = check_sources(cfg).await;
+    // An override names an exact config and index, so doctor checks this
+    // machine's own state alone, as status does.
+    let sources = if config_override.is_none() && db_override.is_none() {
+        check_sources(cfg).await
+    } else {
+        Vec::new()
+    };
 
     Ok(DoctorReport {
         index,

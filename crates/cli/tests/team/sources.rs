@@ -5,7 +5,6 @@
 use std::path::Path;
 
 use assert_cmd::Command;
-use predicates::prelude::PredicateBooleanExt;
 use serde_json::Value;
 
 use crate::common::{crystalline, isolate};
@@ -110,36 +109,275 @@ fn connecting_a_second_server_announces_the_collision_name_and_keeps_the_first()
     );
 }
 
+/// Ruling F19: a token anywhere on the command line is refused in the same
+/// sentence, and its text is never repeated on either stream.
 #[test]
 fn a_token_on_the_command_line_is_refused() {
     let home = tempfile::tempdir().unwrap();
-    bin(home.path())
+    let forms: [&[&str]; 7] = [
+        &["connect", "https://kb.example", "--token", "cmt_SECRET0"],
+        // The `connect github --token <value>` habit.
+        &["connect", "--token", "cmt_SECRET1", "https://kb.example"],
+        &["connect", "--token", "cmt_SECRET2"],
+        &["connect", "cmt_SECRET3", "--token"],
+        &["connect", "coa_SECRET4"],
+        &["connect", "https://kb.example", "--token=cmt_SECRET5"],
+        &["connect", "--token=cor_SECRET6", "https://kb.example"],
+    ];
+    for form in forms {
+        let out = bin(home.path()).args(form).output().unwrap();
+        let said = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!out.status.success(), "{form:?}: {said}");
+        assert!(
+            said.contains("refusing a token on the command line"),
+            "{form:?}: {said}"
+        );
+        assert!(
+            !said.contains("SECRET"),
+            "{form:?} repeats the token: {said}"
+        );
+    }
+}
+
+/// Review M2: a word after the URL that is no token is named as unexpected,
+/// with the flag that was probably meant.
+#[test]
+fn an_extra_word_after_the_url_points_to_the_name_flag() {
+    let home = tempfile::tempdir().unwrap();
+    let out = bin(home.path())
+        .args(["connect", "https://kb.example", "acme"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(stderr.contains("use --name <name>"), "{stderr}");
+    assert!(!stderr.contains("refusing a token"), "{stderr}");
+}
+
+/// A home whose own configuration registers `team-platform`, tracking the
+/// repository the server's `platform` tracks: the same domain.
+fn home_with_a_team_copy(home: &Path) -> std::path::PathBuf {
+    let dir = home.join("team-platform");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("MANIFEST.md"),
+        "---\ntype: manifest\ntitle: platform\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# platform\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("local-note.md"),
+        "---\ntype: engram\ntitle: Local\npermalink: local-note\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# Local\n\n- [fact] not shared yet\n",
+    )
+    .unwrap();
+    let mut cfg = crystalline_core::config::GlobalConfig::default();
+    let mut entry = crystalline_core::config::DomainEntry::file(&dir);
+    entry.origin = Some(crystalline_core::config::OriginConfig {
+        repo: "acme/platform".into(),
+        path: None,
+        branch: None,
+        poll_secs: None,
+    });
+    cfg.domains.insert("team-platform".into(), entry);
+    crystalline_core::config::save_yaml(&home.join("config.yaml"), &cfg).unwrap();
+    // An origin state with nothing in its base: every file is unshared work.
+    crystalline_remote::state::OriginState::new("acme/platform", "main")
+        .save(
+            &crate::common::isolated_state_dir(home)
+                .join("origins")
+                .join("team-platform"),
+        )
+        .unwrap();
+    dir
+}
+
+/// [`bin`] reading the home's own configuration file.
+fn bin_cfg(home: &Path) -> Command {
+    let mut cmd = bin(home);
+    cmd.env("CRYSTALLINE_CONFIG", home.join("config.yaml"));
+    cmd
+}
+
+/// Decision D19 and review I1: connect warns about the unshared work of the
+/// local copy it hides, naming the copy; and the hidden copy can be neither
+/// removed nor renamed, with or without a daemon, in the words status uses.
+#[test]
+fn a_hidden_copy_is_warned_about_and_cannot_be_removed_or_renamed() {
+    let server = CliServer::start_full(&[], &[("platform", "acme/platform")]);
+    let home = tempfile::tempdir().unwrap();
+    let dir = home_with_a_team_copy(home.path());
+    let out = bin_cfg(home.path())
+        .args(["connect", &server.origin, "--name", "acme", "--token"])
+        .write_stdin(format!("{}\n", server.token_for("keeper")))
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("warning: your local copy of 'team-platform' holds"),
+        "{stderr}"
+    );
+    let hidden = "the local domain 'team-platform' is hidden while acme is connected; disconnect acme to use it again";
+    let refused = |args: &[&str]| {
+        let out = bin_cfg(home.path()).args(args).output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        assert!(!out.status.success(), "{args:?} went through: {stderr}");
+        assert!(stderr.contains(hidden), "{args:?}: {stderr}");
+    };
+    // The mount took the copy's name, so a remove of that name meets the
+    // hidden copy.
+    let out = bin_cfg(home.path())
+        .args(["status", "--json"])
+        .output()
+        .unwrap();
+    let status: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        mounts(&status["sources"][0])
+            .contains(&("team-platform".to_string(), "platform".to_string())),
+        "{status}"
+    );
+    assert_eq!(
+        status["sources"][0]["hidden_local"],
+        serde_json::json!(["team-platform"]),
+        "{status}"
+    );
+    refused(&["domain", "remove", "team-platform"]);
+    refused(&["domain", "remove", "team-platform", "--purge"]);
+    // Once the mount has a name of its own, the copy is reached by its name
+    // alone, and still refused.
+    bin_cfg(home.path())
         .args([
-            "connect",
-            "https://kb.example",
-            "--token",
-            "cmt_on_the_command_line",
+            "domain",
+            "rename",
+            "team-platform",
+            "acme-platform",
+            "--local",
         ])
         .assert()
-        .failure()
-        .stderr(predicates::str::contains(
-            "refusing a token on the command line",
-        ))
-        .stderr(predicates::str::contains("cmt_on_the_command_line").not());
-    // The `connect github --token <value>` habit: the token comes first.
-    bin(home.path())
-        .args([
-            "connect",
-            "--token",
-            "cmt_on_the_command_line",
-            "https://kb.example",
-        ])
-        .assert()
-        .failure()
-        .stderr(predicates::str::contains(
-            "refusing a token on the command line",
-        ))
-        .stderr(predicates::str::contains("cmt_on_the_command_line").not());
+        .success();
+    refused(&["domain", "remove", "team-platform", "--purge"]);
+    refused(&["domain", "rename", "team-platform", "other"]);
+    refused(&["domain", "rename", "team-platform", "other", "--local"]);
+    assert!(dir.join("local-note.md").is_file(), "the files stay");
+
+    // The same through a running daemon.
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    let mut serve = crate::common::crystalline_std();
+    for (name, value) in crate::common::isolation_env(home.path()) {
+        serve.env(name, value);
+    }
+    serve.env("CRYSTALLINE_CONFIG", home.path().join("config.yaml"));
+    let mut daemon = serve
+        .args(["serve", "--http", "off"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let start = Instant::now();
+    while !bin_cfg(home.path())
+        .args(["ctl", "status", "--json"])
+        .output()
+        .unwrap()
+        .status
+        .success()
+    {
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "daemon not ready"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    refused(&["domain", "remove", "team-platform", "--purge"]);
+    refused(&["domain", "rename", "team-platform", "other"]);
+    let _ = bin_cfg(home.path()).args(["ctl", "shutdown"]).output();
+    let _ = daemon.wait();
+    assert!(dir.join("local-note.md").is_file(), "the files stay");
+}
+
+/// Review M1: the note about a sign-in the server could not end is printed.
+#[test]
+fn disconnect_says_when_the_server_could_not_end_the_sign_in() {
+    let server = CliServer::start();
+    let home = tempfile::tempdir().unwrap();
+    connect(&server, home.path(), "acme");
+    // Make it a browser sign-in whose revocation the server must answer.
+    let remote = crate::common::isolated_state_dir(home.path()).join("remote");
+    let sources_file = remote.join("sources.json");
+    let mut sources: Value =
+        serde_json::from_slice(&std::fs::read(&sources_file).unwrap()).unwrap();
+    sources["sources"][0]["kind"] = "oauth".into();
+    sources["sources"][0]["revocation_endpoint"] =
+        format!("{}/api/v1/oauth/revoke", server.origin).into();
+    std::fs::write(&sources_file, serde_json::to_vec(&sources).unwrap()).unwrap();
+    let credential = walk(&remote)
+        .into_iter()
+        .find(|p| p.file_name().is_some_and(|n| n == "credential.json"))
+        .expect("the credential is a file under the test switch");
+    let mut saved: Value = serde_json::from_slice(&std::fs::read(&credential).unwrap()).unwrap();
+    saved["kind"] = "oauth".into();
+    saved["refresh_token"] = "cor_test".into();
+    std::fs::write(&credential, serde_json::to_vec(&saved).unwrap()).unwrap();
+    server.stop();
+    let out = bin(home.path())
+        .args(["disconnect", "acme"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(stderr.contains("note: acme ("), "{stderr}");
+    assert!(
+        stderr.contains("could not be reached to end the sign-in there"),
+        "{stderr}"
+    );
+}
+
+fn walk(dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(walk(&path));
+        } else {
+            out.push(path);
+        }
+    }
+    out
+}
+
+/// Review M1 and M3: doctor names a server that is down as a problem, and
+/// checks no source under a --config override.
+#[test]
+fn doctor_counts_a_server_that_is_down_and_skips_sources_under_an_override() {
+    let server = CliServer::start();
+    let home = tempfile::tempdir().unwrap();
+    connect(&server, home.path(), "acme");
+    server.stop();
+    let out = bin(home.path())
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(!out.status.success(), "a problem fails doctor: {report}");
+    let problem = report["sources"][0]["problem"].as_str().unwrap_or_default();
+    assert!(problem.contains("cannot be reached right now"), "{report}");
+    let human = bin(home.path()).args(["doctor"]).output().unwrap();
+    let text = String::from_utf8_lossy(&human.stdout);
+    assert!(text.contains("PROBLEM: acme ("), "{text}");
+
+    let other = home.path().join("other.yaml");
+    crystalline_core::config::save_yaml(&other, &crystalline_core::config::GlobalConfig::default())
+        .unwrap();
+    let out = bin(home.path())
+        .args(["doctor", "--json", "--config", other.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["sources"], serde_json::json!([]), "{report}");
 }
 
 /// Spec A1 (ruling F16): a server without browser sign-in asks for a token
@@ -332,4 +570,24 @@ fn a_running_daemon_learns_of_a_connect_at_once_and_status_merges_its_rows() {
 
     let _ = bin(home.path()).args(["ctl", "shutdown"]).output();
     let _ = daemon.wait();
+}
+
+/// Review M7: a mounted name with a configuration that does not load gets
+/// the configuration's own error.
+#[test]
+fn a_local_rename_of_a_mount_says_when_the_configuration_does_not_load() {
+    let server = CliServer::start();
+    let home = tempfile::tempdir().unwrap();
+    connect(&server, home.path(), "acme");
+    std::fs::write(home.path().join("config.yaml"), "domains: [not a mapping\n").unwrap();
+    let out = bin_cfg(home.path())
+        .args(["domain", "rename", "open", "acme-open", "--local"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("'open' comes from a connected server, and its name on this machine cannot change while this machine's configuration does not load"),
+        "{stderr}"
+    );
 }
