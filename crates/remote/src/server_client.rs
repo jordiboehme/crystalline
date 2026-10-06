@@ -357,9 +357,13 @@ impl Health {
 /// The HTTP client every remote exchange uses: the workspace's reqwest over
 /// rustls, a short connect timeout, a short idle pool with TCP keepalive, and
 /// a user agent naming this binary. Every request sets its own overall
-/// limit.
+/// limit. It never follows a redirect: a server that speaks this protocol
+/// never sends one, and following it would carry a request body (a refresh
+/// token, a sign-in code, a forwarded call) to an address nobody checked,
+/// plain http included.
 pub fn http_client() -> Result<reqwest::Client, RemoteFailure> {
     reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(CONNECT_TIMEOUT)
         .pool_idle_timeout(POOL_IDLE)
         .tcp_keepalive(Duration::from_secs(15))
@@ -457,6 +461,13 @@ impl Peer {
         }
     }
 
+    /// A redirect: refused, never followed ([`http_client`]).
+    fn redirect(&self, status: reqwest::StatusCode) -> Option<RemoteFailure> {
+        status
+            .is_redirection()
+            .then(|| RemoteFailure::Refused(redirect_sentence(&self.url)))
+    }
+
     /// A gateway's `502`, `503` or `504`: the server behind it is down.
     fn gateway(&self, status: reqwest::StatusCode) -> Option<RemoteFailure> {
         matches!(status.as_u16(), 502..=504).then(|| RemoteFailure::Unreachable {
@@ -465,6 +476,11 @@ impl Peer {
             detail: format!("its gateway answered {status}, so the server behind it is down"),
         })
     }
+}
+
+/// What a server that answered with a redirect is told, on every path.
+pub(crate) fn redirect_sentence(url: &str) -> String {
+    format!("{url} answered with a redirect, which Crystalline does not follow; check the address")
 }
 
 /// The likely cause of a transport error, read off its chain of sources.
@@ -993,6 +1009,9 @@ impl Connection {
             return Err(down);
         }
         self.answered();
+        if let Some(redirect) = peer.redirect(status) {
+            return Err(redirect);
+        }
         if status == reqwest::StatusCode::UNAUTHORIZED {
             return Ok(Posted::Unauthorized);
         }
@@ -1153,6 +1172,9 @@ impl RefreshJob {
             return Err(down);
         }
         self.health.clear(&self.key);
+        if let Some(redirect) = self.peer.redirect(status) {
+            return Err(redirect);
+        }
         let text = response
             .text()
             .await

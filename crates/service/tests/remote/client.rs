@@ -1208,3 +1208,124 @@ async fn a_caller_that_gave_up_does_not_lose_a_pair_it_could_not_save() {
         "nothing presented the spent cor_0 again"
     );
 }
+
+/// A server on an address of its own that counts every request it gets,
+/// whatever the path: where a redirect would land.
+async fn counting_target() -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counter = hits.clone();
+    let app = axum::Router::new().fallback(move |body: String| {
+        let counter = counter.clone();
+        async move {
+            counter.fetch_add(1, Ordering::SeqCst);
+            drop(body);
+            (
+                StatusCode::OK,
+                axum::Json(json!({ "v": 1, "ok": true, "data": { "account": "keeper" } })),
+            )
+        }
+    });
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (url, hits)
+}
+
+/// A server that answers every request with `307` to the same path on
+/// `target`, the way a misconfigured proxy in front of a server does.
+async fn redirector(target: &str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let target = target.to_string();
+    let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+        let location = format!("{target}{}", uri.path());
+        async move {
+            (
+                StatusCode::TEMPORARY_REDIRECT,
+                [(axum::http::header::LOCATION, location)],
+            )
+        }
+    });
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    url
+}
+
+/// Final review I2: a token endpoint that answers a refresh with a redirect
+/// to plain http never gets the refresh token sent on. The call fails with
+/// a sentence that names the server, and the sign-in is kept as it was.
+#[tokio::test]
+async fn a_refresh_answered_with_a_redirect_never_sends_the_refresh_token_on() {
+    let (target, hits) = counting_target().await;
+    let url = redirector(&target).await;
+    let dir = tempfile::tempdir().unwrap();
+    let record = source(
+        &url,
+        "acme",
+        CredentialKind::Oauth,
+        Some(format!("{url}/api/v1/oauth/token")),
+    );
+    save_credential(
+        dir.path(),
+        &record,
+        &oauth("coa_0", "cor_0", TimeDelta::hours(2), &url),
+    );
+    let connection = Connection::open(record.clone(), dir.path()).unwrap();
+    let failure = connection.ctl(status()).await.unwrap_err();
+    assert_eq!(
+        failure.to_string(),
+        format!(
+            "{url} answered with a redirect, which Crystalline does not follow; check the address"
+        ),
+        "{failure:?}"
+    );
+    assert!(!failure.is_sign_in(), "{failure:?}");
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "nothing reached the target");
+    let stored = ServerCredentialStore::file(&record.host_dir(dir.path()))
+        .load()
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.refresh_token.as_deref(), Some("cor_0"));
+}
+
+/// Final review I2: a control call answered with a redirect is not sent on
+/// to the redirect's target: neither the bearer nor the body goes there.
+#[tokio::test]
+async fn a_control_call_answered_with_a_redirect_is_not_sent_on() {
+    let (target, hits) = counting_target().await;
+    let url = redirector(&target).await;
+    let dir = tempfile::tempdir().unwrap();
+    let connection = Connection::open(pasted(&url, dir.path()), dir.path()).unwrap();
+    let failure = connection.ctl(status()).await.unwrap_err();
+    assert_eq!(
+        failure.to_string(),
+        format!(
+            "{url} answered with a redirect, which Crystalline does not follow; check the address"
+        ),
+        "{failure:?}"
+    );
+    assert!(!failure.is_unreachable(), "{failure:?}");
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "nothing reached the target");
+}
+
+/// Final review I2: the sign-in uses the same client, so a server address
+/// that answers with a redirect is refused before anything is sent on.
+#[tokio::test]
+async fn a_sign_in_answered_with_a_redirect_is_not_sent_on() {
+    let (target, hits) = counting_target().await;
+    let url = redirector(&target).await;
+    let dir = tempfile::tempdir().unwrap();
+    let failure = crystalline_remote::connect_with_token(&url, None, "cmt_secret", dir.path(), &[])
+        .await
+        .unwrap_err();
+    assert!(
+        failure.to_string().contains(
+            "answered with a redirect, which Crystalline does not follow; check the address"
+        ),
+        "{failure}"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "nothing reached the target");
+}

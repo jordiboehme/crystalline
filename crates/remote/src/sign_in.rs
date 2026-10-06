@@ -55,7 +55,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::mounts::{Announcement, LocalDomain, assign};
 use crate::server_client::{
-    CONNECT_TIMEOUT, ONE_DOMAIN_LIMIT, UNREACHABLE_WORDS, cause, form_body, http_client, seconds,
+    CONNECT_TIMEOUT, ONE_DOMAIN_LIMIT, UNREACHABLE_WORDS, cause, form_body, http_client,
+    redirect_sentence, seconds,
 };
 use crate::server_token::{CredentialKind, ServerCredential, ServerCredentialStore};
 use crate::source_cache::{Cached, ROUTING_FILE, cached_offers, remote_domains, write_cached};
@@ -286,6 +287,9 @@ async fn send(
                 status.as_u16()
             ),
         });
+    }
+    if status.is_redirection() {
+        return Err(SignInError::Protocol(redirect_sentence(url)));
     }
     // The request's own limit runs until the body has finished.
     let text = response
