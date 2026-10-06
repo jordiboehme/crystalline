@@ -107,8 +107,12 @@ export interface MountedDomain {
 /** Whether a link is plain http or https, the only kind this screen opens. */
 function isWebLink(value: string): boolean {
   try {
-    const { protocol } = new URL(value);
-    return protocol === "https:" || protocol === "http:";
+    const { protocol, username, password } = new URL(value);
+    return (
+      (protocol === "https:" || protocol === "http:") &&
+      username === "" &&
+      password === ""
+    );
   } catch {
     return false;
   }

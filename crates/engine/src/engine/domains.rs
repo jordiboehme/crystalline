@@ -284,10 +284,7 @@ impl Engine {
                 .iter()
                 .filter_map(|m| {
                     let url = sources.source_url(&m.source)?;
-                    let base = url.trim_end_matches('/');
-                    let lower = base.to_ascii_lowercase();
-                    let web_url = (lower.starts_with("https://") || lower.starts_with("http://"))
-                        .then(|| crate::web_url::domain_url(base, &m.remote));
+                    let (url, web_url) = public_source_address(&url, &m.remote);
                     Some(json!({
                         "name": m.local,
                         "source": m.source,
@@ -991,5 +988,63 @@ impl Engine {
             "truncated": truncated,
             "total": level.total,
         }))
+    }
+}
+
+/// What a listing may say of a source's address: the address without any
+/// userinfo, query or fragment, and the remote domain's page on it. A
+/// `sources.json` that was edited by hand can carry credentials or a scheme
+/// that is not http or https; those never reach an answer, so an address
+/// that cannot be made safe comes back empty with no page.
+fn public_source_address(raw: &str, remote: &str) -> (String, Option<String>) {
+    let Ok(mut parsed) = url::Url::parse(raw) else {
+        return (String::new(), None);
+    };
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return (String::new(), None);
+    }
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    let base = parsed.as_str().trim_end_matches('/').to_string();
+    let page = crate::web_url::domain_url(&base, remote);
+    (base, Some(page))
+}
+
+#[cfg(test)]
+mod public_address_tests {
+    use super::public_source_address;
+
+    #[test]
+    fn credentials_never_reach_a_listing() {
+        let (url, page) = public_source_address("https://user:pass@kb.acme.com/", "jordi");
+        assert_eq!(url, "https://kb.acme.com");
+        assert_eq!(page.as_deref(), Some("https://kb.acme.com/d/jordi"));
+        let (url, page) = public_source_address("https://tok@kb.acme.com", "j");
+        assert!(!url.contains("tok") && !page.unwrap().contains("tok"));
+    }
+
+    #[test]
+    fn a_query_or_fragment_is_dropped_and_a_slash_trimmed() {
+        let (url, page) = public_source_address("http://kb.local:8080/x//?a=b#c", "j");
+        assert_eq!(url, "http://kb.local:8080/x");
+        assert_eq!(page.as_deref(), Some("http://kb.local:8080/x/d/j"));
+    }
+
+    #[test]
+    fn another_scheme_or_garbage_has_no_address_and_no_page() {
+        assert_eq!(
+            public_source_address("javascript:alert(1)", "j"),
+            (String::new(), None)
+        );
+        assert_eq!(
+            public_source_address("ftp://u:p@h/", "j"),
+            (String::new(), None)
+        );
+        assert_eq!(
+            public_source_address("not a url", "j"),
+            (String::new(), None)
+        );
     }
 }

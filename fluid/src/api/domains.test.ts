@@ -41,12 +41,16 @@ describe("readListing", () => {
         { name: "a", source: "s", web_url: "javascript:alert(1)" },
         { name: "b", source: "s", web_url: "data:text/html,x" },
         { name: "c", source: "s", web_url: "http://kb.local/d/c" },
+        { name: "d", source: "s", web_url: "https://user:pw@kb.local/d/d" },
+        { name: "e", source: "s", web_url: "https://tok@kb.local/d/e" },
       ],
     });
     expect(listing.mounted.map((m) => m.webUrl)).toEqual([
       null,
       null,
       "http://kb.local/d/c",
+      null,
+      null,
     ]);
   });
 });
