@@ -58,6 +58,11 @@ async fn connect_fake(
     domain: &str,
     app: axum::Router,
 ) -> String {
+    // This process's first HTTP client, built before any budget a test sets
+    // starts: under a loaded machine its certificate roots can take seconds
+    // to load, and a call inside that wait answers that it did not get to
+    // ask the source at all.
+    crystalline_remote::warm_http_client().await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move {
@@ -184,6 +189,49 @@ async fn a_fan_out_with_one_slow_and_one_unreachable_source_answers_within_the_d
         note.contains("gone cannot be reached right now (check the VPN or the network); its domains are missing from these results"),
         "{note}"
     );
+}
+
+/// Ruling (Task 16 fix round 3): a caller's budget shorter than the source's
+/// own limit says nothing about the source when it runs out. A server that
+/// answers after a second is cut by the recall's 700 ms fan-out, and the next
+/// call to its domain, with the source's own limit, is answered: the cut
+/// opened no down window and dropped no pool.
+#[tokio::test]
+async fn a_fan_out_cut_short_by_its_caller_never_marks_the_source_down() {
+    let machine = LocalMachine::start(false).await;
+    let app = axum::Router::new().route(
+        "/api/v1/ctl",
+        axum::routing::post(|| async {
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+            axum::Json(json!({
+                "v": 1,
+                "ok": true,
+                "data": { "mode": "text", "total": 0, "page": 1, "limit": 8, "count": 0, "hits": [] },
+            }))
+        }),
+    );
+    connect_fake(&machine, "slowish", "drafts", app).await;
+    machine.mount();
+    let cut = run_tool_routed(
+        &machine.engine,
+        "search_engrams",
+        json!({ "query": "vent driver retries", "search_type": "hybrid", "limit": 8 }),
+        &agent(),
+        Some(Duration::from_millis(700)),
+    )
+    .await
+    .unwrap();
+    assert!(
+        cut.to_string().contains("slowish"),
+        "the cut part is named missing: {cut}"
+    );
+    call(
+        &machine,
+        "read_engram",
+        json!({ "identifier": "x", "domain": "drafts" }),
+    )
+    .await
+    .expect("the next call to the slow source's domain is answered");
 }
 
 /// A caller's own budget holds on one hop too: a one-domain call to a source

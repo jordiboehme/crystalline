@@ -977,51 +977,44 @@ pub(crate) fn envelope_err(message: impl Into<String>) -> Value {
     json!({ "v": CTL_VERSION, "ok": false, "error": message.into() })
 }
 
-/// Refresh every source's routing within `refresh_deadline` in a task of
-/// its own, and wait for it at most `wait`. Answers the sources whose copy is
-/// not known to be current: the ones the refresh did not get to ask (this
-/// process was still setting up its network connection), and, when the wait
-/// ran out first, every source the refresh has not confirmed yet. Those are
-/// served from their caches with a line saying they could not be checked;
-/// none of them is marked as failed for it.
+/// Refresh every source's routing within `refresh_deadline` in the
+/// background (single flight: a refresh already running is joined, never
+/// started again), and wait for it at most `wait`. Answers the sources whose
+/// copy is not known to be current: the ones the refresh did not get to ask
+/// (this process was still setting up its network connection), and, when
+/// the wait ran out first, every source the refresh has not confirmed yet.
+/// Those are served from their caches with a line saying they could not be
+/// checked; none of them is marked as failed for it.
 async fn refresh_within(
     sources: &std::sync::Arc<crystalline_remote::SourceSet>,
     refresh_deadline: std::time::Duration,
     wait: std::time::Duration,
 ) -> std::collections::BTreeSet<String> {
-    let started = chrono::Utc::now();
-    let refreshing = sources.clone();
-    let task = tokio::spawn(async move { refreshing.refresh(refresh_deadline).await });
-    match tokio::time::timeout(wait, task).await {
-        Ok(Ok(fetched)) => fetched
-            .into_iter()
-            .filter(|(_, fetched)| {
-                matches!(
-                    fetched,
-                    crystalline_remote::Fetched::Stale {
-                        failure: crystalline_remote::RemoteFailure::Starting { .. },
-                        ..
-                    }
-                )
-            })
-            .map(|(name, _)| name)
-            .collect(),
-        // Still running (or the task failed): a source whose cache was not
-        // written since this call began has not answered yet.
-        _ => sources
-            .records()
-            .into_iter()
-            .filter(|record| {
-                crystalline_remote::read_cached(
-                    &record.host_dir(sources.remote_dir()),
-                    crystalline_remote::ROUTING_FILE,
-                    &record.account,
-                )
-                .is_none_or(|cached| cached.fetched_at < started && cached.last_failure.is_none())
-            })
-            .map(|record| record.name)
-            .collect(),
+    let running = sources.refresh_in_background(refresh_deadline);
+    let mut outcome = running.outcome.clone();
+    let done = tokio::time::timeout(wait, outcome.wait_for(Option::is_some)).await;
+    if let Ok(Ok(unasked)) = done
+        && let Some(unasked) = unasked.as_ref()
+    {
+        return unasked.clone();
     }
+    // Still running (or its task ended without an outcome): a source whose
+    // cache was not written since the refresh began has not answered yet.
+    sources
+        .records()
+        .into_iter()
+        .filter(|record| {
+            crystalline_remote::read_cached(
+                &record.host_dir(sources.remote_dir()),
+                crystalline_remote::ROUTING_FILE,
+                &record.account,
+            )
+            .is_none_or(|cached| {
+                cached.fetched_at < running.started && cached.last_failure.is_none()
+            })
+        })
+        .map(|record| record.name)
+        .collect()
 }
 
 #[cfg(test)]

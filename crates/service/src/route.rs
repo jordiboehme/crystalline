@@ -396,9 +396,19 @@ pub async fn routed(
             } else {
                 ONE_DOMAIN_LIMIT
             };
-            let limit = deadline.map_or(limit, |d| d.min(limit));
+            let own = limit;
+            let limit = deadline.map_or(own, |d| d.min(own));
+            // A caller's shorter budget running out says nothing about the
+            // source, so it never opens the down window (Budget::Cut).
             let answer = sources
-                .forward(&source, tool, forwarded, agent, limit)
+                .forward_as(
+                    &source,
+                    tool,
+                    forwarded,
+                    agent,
+                    limit,
+                    crystalline_remote::Budget::of(limit, own),
+                )
                 .await;
             Some(match answer {
                 Ok(mut value) => {
@@ -417,11 +427,14 @@ pub async fn routed(
             local,
             sources: asked,
         } => {
-            let budget = Duration::from_millis(engine.config().remote_deadline_ms());
-            let deadline = deadline.map_or(budget, |d| d.min(budget));
+            let own = Duration::from_millis(engine.config().remote_deadline_ms());
+            let deadline = deadline.map_or(own, |d| d.min(own));
+            // The recall's 700 ms is a cut inside the configured deadline: a
+            // source still answering when it ends is not counted as down.
+            let budget = crystalline_remote::Budget::of(deadline, own);
             Some(
                 fan_out(
-                    engine, &sources, &table, tool, args, agent, local, asked, deadline,
+                    engine, &sources, &table, tool, args, agent, local, asked, deadline, budget,
                 )
                 .await,
             )
@@ -473,6 +486,7 @@ async fn fan_out(
     local: bool,
     asked: Vec<String>,
     deadline: Duration,
+    budget: crystalline_remote::Budget,
 ) -> Result<Value, RouteError> {
     let page = args.get("page").and_then(Value::as_u64).unwrap_or(1).max(1) as usize;
     let limit_default = if tool == "search_engrams" {
@@ -517,7 +531,7 @@ async fn fan_out(
         let asked_name = source.clone();
         let task = remote.spawn(async move {
             let answer = set
-                .forward(&source, &tool, forwarded, &agent, deadline)
+                .forward_as(&source, &tool, forwarded, &agent, deadline, budget)
                 .await;
             (source, names, answer)
         });

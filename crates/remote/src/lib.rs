@@ -58,8 +58,8 @@ pub use provider::{
     ProposalRequest, ProposalState, Provider, StackInfo, StackMember, TreeWrite, UpstreamChange,
 };
 pub use server_client::{
-    CONNECT_TIMEOUT, CTL_TIMEOUT, Connection, CtlAnswer, DOWN_WINDOW, ForwardedAgent, Health,
-    ONE_DOMAIN_LIMIT, RemoteFailure, form_body, http_client, seconds, settle_refreshes,
+    Budget, CONNECT_TIMEOUT, CTL_TIMEOUT, Connection, CtlAnswer, DOWN_WINDOW, ForwardedAgent,
+    Health, ONE_DOMAIN_LIMIT, RemoteFailure, form_body, http_client, seconds, settle_refreshes,
     warm_http_client, warm_http_client_within,
 };
 pub use server_token::{CredentialKind, ServerCredential, ServerCredentialStore, server_key};
@@ -72,7 +72,9 @@ pub use source_cache::{
     Cached, Fetched, HOOK_STATUS_FILE, ROUTING_FILE, STALE_AFTER, cached_offers, fetch_cached,
     read_cached, remote_domains, stale_line, unchecked_line, write_cached,
 };
-pub use source_set::{ConfigStamp, MountNote, MountedRouting, SourceSet, hidden_sentence};
+pub use source_set::{
+    BackgroundRefresh, ConfigStamp, MountNote, MountedRouting, SourceSet, hidden_sentence,
+};
 pub use sources::{
     LOCAL_SUFFIX, MountRecord, REMOTE_TOKEN_ENV, REMOTE_URL_ENV, SOURCES_FILE, SourceRecord,
     SourcesFile, default_source_name, env_source, load_sources, remote_dir, update_sources,

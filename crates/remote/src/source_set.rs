@@ -18,7 +18,7 @@ use chrono::Utc;
 use serde_json::Value;
 
 use crate::mounts::{Announcement, Hidden, HiddenReason, LocalDomain, Mount, MountTable, assign};
-use crate::server_client::{Connection, ForwardedAgent, RemoteFailure};
+use crate::server_client::{Budget, Connection, ForwardedAgent, RemoteFailure};
 use crate::source_cache::{
     Fetched, HOOK_STATUS_FILE, ROUTING_FILE, STALE_AFTER, cached_offers, fetch_cached, read_cached,
     stale_line, stale_or_missing, unchecked_line,
@@ -196,6 +196,28 @@ pub struct SourceSet {
     /// The configuration file's stamp when the local domains were last
     /// read, `None` before the first look.
     local_stamp: std::sync::Mutex<Option<ConfigStamp>>,
+    /// The routing refresh running in the background, if one is
+    /// ([`SourceSet::refresh_in_background`]).
+    background: std::sync::Mutex<Option<BackgroundRefresh>>,
+}
+
+/// A routing refresh running in the background: when it began, and where its
+/// outcome (the sources it did not get to ask) arrives.
+#[derive(Clone)]
+pub struct BackgroundRefresh {
+    /// When the refresh began.
+    pub started: chrono::DateTime<Utc>,
+    /// `None` while it runs; then the sources it did not get to ask because
+    /// this process was still setting up its network connection.
+    pub outcome: tokio::sync::watch::Receiver<Option<BTreeSet<String>>>,
+}
+
+impl BackgroundRefresh {
+    /// Whether it is still running: no outcome yet, and its task still holds
+    /// the sender.
+    fn running(&self) -> bool {
+        self.outcome.borrow().is_none() && self.outcome.has_changed().is_ok()
+    }
 }
 
 /// What a stat says about the configuration file: its modification time
@@ -234,6 +256,7 @@ impl SourceSet {
             rebuilding: std::sync::Mutex::new(()),
             connections: std::sync::Mutex::new(BTreeMap::new()),
             local_stamp: std::sync::Mutex::new(None),
+            background: std::sync::Mutex::new(None),
         };
         set.rebuild();
         set
@@ -258,6 +281,7 @@ impl SourceSet {
             rebuilding: std::sync::Mutex::new(()),
             connections: std::sync::Mutex::new(BTreeMap::new()),
             local_stamp: std::sync::Mutex::new(None),
+            background: std::sync::Mutex::new(None),
         }
     }
 
@@ -750,6 +774,44 @@ impl SourceSet {
         fetched
     }
 
+    /// [`SourceSet::refresh`] within `deadline` in a task of its own, single
+    /// flight: while one runs, a second call joins it rather than asking the
+    /// same sources again. A caller waits on the handle as long as it likes;
+    /// one that stops waiting leaves the refresh to finish and record what
+    /// really happened.
+    pub fn refresh_in_background(self: &Arc<Self>, deadline: Duration) -> BackgroundRefresh {
+        let mut slot = self.background.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(running) = slot.as_ref().filter(|b| b.running()) {
+            return running.clone();
+        }
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        let started = BackgroundRefresh {
+            started: Utc::now(),
+            outcome: rx,
+        };
+        *slot = Some(started.clone());
+        let set = self.clone();
+        tokio::spawn(async move {
+            let unasked = set
+                .refresh(deadline)
+                .await
+                .into_iter()
+                .filter(|(_, fetched)| {
+                    matches!(
+                        fetched,
+                        Fetched::Stale {
+                            failure: RemoteFailure::Starting { .. },
+                            ..
+                        } | Fetched::Missing(RemoteFailure::Starting { .. })
+                    )
+                })
+                .map(|(name, _)| name)
+                .collect();
+            let _ = tx.send(Some(unasked));
+        });
+        started
+    }
+
     /// Ask every source for its maintenance status, for the Stop hook's cache.
     pub async fn refresh_hook_status(&self, deadline: Duration) -> Vec<(String, Fetched)> {
         self.fetch_all("hook_status", HOOK_STATUS_FILE, deadline)
@@ -766,10 +828,28 @@ impl SourceSet {
         agent: &ForwardedAgent,
         deadline: Duration,
     ) -> Result<Value, RemoteFailure> {
+        self.forward_as(source, tool, args, agent, deadline, Budget::Own)
+            .await
+    }
+
+    /// [`SourceSet::forward`] for a `deadline` that is `budget`: the
+    /// source's own limit, or a caller's shorter cut, whose running out
+    /// never marks the source down ([`Budget::Cut`]).
+    pub async fn forward_as(
+        &self,
+        source: &str,
+        tool: &str,
+        args: Value,
+        agent: &ForwardedAgent,
+        deadline: Duration,
+        budget: Budget,
+    ) -> Result<Value, RemoteFailure> {
         let started = std::time::Instant::now();
         let connection = self.connection(source, deadline).await?;
         let left = deadline.saturating_sub(started.elapsed());
-        connection.tool_within(tool, args, agent, left).await
+        connection
+            .tool_within_as(tool, args, agent, left, budget)
+            .await
     }
 
     /// The mounted part of the routing block from the caches alone, for a
@@ -988,6 +1068,49 @@ mod tests {
                 "Note: acme (https://crystalline.acme.com) has not answered yet, so its domains are not listed here."
                     .to_string()
             ]
+        );
+    }
+
+    /// Ruling (Task 16 fix round 3): the background routing refresh is single
+    /// flight. A second session start while one runs joins it and asks no
+    /// source again: the source, which accepts and never answers, is offered
+    /// one connection, not two.
+    #[tokio::test]
+    async fn a_second_background_refresh_joins_the_one_running() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        crate::server_client::warm_http_client().await;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let offered = Arc::new(AtomicUsize::new(0));
+        let counted = offered.clone();
+        std::thread::spawn(move || {
+            let mut open = Vec::new();
+            for stream in listener.incoming().flatten() {
+                counted.fetch_add(1, Ordering::SeqCst);
+                open.push(stream);
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        // The environment's source, so no credential store is touched.
+        let env_url = url.clone();
+        let set = Arc::new(SourceSet::load(
+            dir.path().to_path_buf(),
+            Vec::new(),
+            move |name| match name {
+                crate::sources::REMOTE_URL_ENV => Some(env_url.clone()),
+                REMOTE_TOKEN_ENV => Some("cmt_env".to_string()),
+                _ => None,
+            },
+        ));
+        let first = set.refresh_in_background(Duration::from_secs(5));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let second = set.refresh_in_background(Duration::from_secs(5));
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(first.started, second.started, "the second call joined");
+        assert_eq!(
+            offered.load(Ordering::SeqCst),
+            1,
+            "the source was asked once"
         );
     }
 }

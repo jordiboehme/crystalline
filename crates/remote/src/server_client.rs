@@ -93,6 +93,32 @@ pub const ONE_DOMAIN_LIMIT: Duration = Duration::from_secs(10);
 pub const CTL_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long a source that failed to answer is skipped.
 pub const DOWN_WINDOW: Duration = Duration::from_secs(30);
+
+/// Whose limit a call runs within, which decides what a timeout says about
+/// the source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Budget {
+    /// The source's own limit: `remote.deadline_ms` for a call over all
+    /// domains, [`ONE_DOMAIN_LIMIT`] for one domain, [`CTL_TIMEOUT`] where a
+    /// long server-side operation needs it. A timeout here is the source not
+    /// answering, and opens its down window.
+    Own,
+    /// A caller's budget shorter than the source's own limit (the per-prompt
+    /// recall's cut, a hook's wait). Running out of it says nothing about the
+    /// source: no down window, no dropped pool.
+    Cut,
+}
+
+impl Budget {
+    /// [`Budget::Cut`] when `limit` is shorter than `own`.
+    pub fn of(limit: Duration, own: Duration) -> Budget {
+        if limit < own {
+            Budget::Cut
+        } else {
+            Budget::Own
+        }
+    }
+}
 /// How long a pooled connection may sit idle, by the wall clock.
 pub const POOL_IDLE: Duration = Duration::from_secs(30);
 /// The refresh lock, in the source's host folder.
@@ -661,6 +687,21 @@ impl Connection {
         }
     }
 
+    /// [`Connection::note`] for an exchange run within `budget`. A caller's
+    /// budget that is shorter than the source's own limit (the recall's cut,
+    /// session start's wait) says nothing about the source when it runs out:
+    /// that timeout neither opens the down window nor drops the pool. A
+    /// failure that is not a timeout (a refused connection, a name that does
+    /// not resolve) counts whatever the budget.
+    fn note_as<T>(&self, result: &Result<T, RemoteFailure>, budget: Budget) {
+        if budget == Budget::Cut
+            && let Err(RemoteFailure::TimedOut { .. }) = result
+        {
+            return;
+        }
+        self.note(result);
+    }
+
     /// The server answered: whatever it said, it is reachable.
     fn answered(&self) {
         self.health.clear(&self.source.key());
@@ -788,9 +829,20 @@ impl Connection {
         request: Value,
         limit: Duration,
     ) -> Result<CtlAnswer, RemoteFailure> {
+        self.ctl_within_as(request, limit, Budget::Own).await
+    }
+
+    /// [`Connection::ctl_within`] for a `limit` that is `budget`: the
+    /// source's own, or a caller's shorter cut.
+    pub async fn ctl_within_as(
+        &self,
+        request: Value,
+        limit: Duration,
+        budget: Budget,
+    ) -> Result<CtlAnswer, RemoteFailure> {
         self.skip()?;
         let result = self.ctl_by(&request, Instant::now() + limit, limit).await;
-        self.note(&result);
+        self.note_as(&result, budget);
         result
     }
 
@@ -847,15 +899,16 @@ impl Connection {
 
     /// [`Connection::ctl`] for a command without an etag: its `data`.
     pub async fn ctl_data(&self, request: Value) -> Result<Value, RemoteFailure> {
-        self.ctl_data_within(request, self.limit).await
+        self.ctl_data_within(request, self.limit, Budget::Own).await
     }
 
     async fn ctl_data_within(
         &self,
         request: Value,
         limit: Duration,
+        budget: Budget,
     ) -> Result<Value, RemoteFailure> {
-        match self.ctl_within(request, limit).await? {
+        match self.ctl_within_as(request, limit, budget).await? {
             CtlAnswer::Data { data, .. } => Ok(data),
             CtlAnswer::NotModified { .. } => Ok(Value::Null),
         }
@@ -889,11 +942,24 @@ impl Connection {
         agent: &ForwardedAgent,
         limit: Duration,
     ) -> Result<Value, RemoteFailure> {
+        self.tool_within_as(tool, args, agent, limit, Budget::Own)
+            .await
+    }
+
+    /// [`Connection::tool_within`] for a `limit` that is `budget`.
+    pub async fn tool_within_as(
+        &self,
+        tool: &str,
+        args: Value,
+        agent: &ForwardedAgent,
+        limit: Duration,
+        budget: Budget,
+    ) -> Result<Value, RemoteFailure> {
         let mut request = json!({ "v": 1, "cmd": "tool", "tool": tool, "args": args });
         if let Some(client) = &agent.client {
             request["agent"] = json!({ "client": client });
         }
-        self.ctl_data_within(request, limit).await
+        self.ctl_data_within(request, limit, budget).await
     }
 
     async fn post_ctl(
