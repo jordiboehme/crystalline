@@ -224,14 +224,20 @@ pub async fn create(
             require_absent(&body.repo, "repo", "local")?;
             require_absent(&body.branch, "branch", "local")?;
             require_absent(&body.path, "path", "local")?;
-            state.engine.domain_add_local(Some(name), None).await
+            state
+                .engine
+                .domain_add_local_as(Some(name), None, &identity.scope())
+                .await
         }
         "virtual" => {
             let name = body.name.as_deref().unwrap_or_default().trim();
             require_absent(&body.repo, "repo", "virtual")?;
             require_absent(&body.branch, "branch", "virtual")?;
             require_absent(&body.path, "path", "virtual")?;
-            state.engine.domain_add_virtual(name).await
+            state
+                .engine
+                .domain_add_virtual_as(name, &identity.scope())
+                .await
         }
         "github" => {
             let repo = body
@@ -263,7 +269,7 @@ pub async fn create(
             }
             state
                 .engine
-                .origin_add(
+                .origin_add_with_progress_as(
                     repo,
                     name,
                     body.path.as_deref(),
@@ -271,6 +277,8 @@ pub async fn create(
                     // Never from this surface: a team domain lands under the
                     // domains root like a local one, for the same reason.
                     None,
+                    None,
+                    &identity.scope(),
                 )
                 .await
         }

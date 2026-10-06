@@ -66,6 +66,7 @@ pub const MOUNTED_OPERATIONS: &[&str] = &[
     "GET /api/v1/oauth/authorizations/{id}",
     "POST /api/v1/oauth/authorizations/{id}",
     "POST /api/v1/oauth/token",
+    "POST /api/v1/oauth/revoke",
     "GET /api/v1/me/identity-links",
     "DELETE /api/v1/me/identity-links/{issuer}",
     "GET /api/v1/domains",

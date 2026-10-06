@@ -131,7 +131,7 @@ pub const SETUP_PATH: &str = "/auth/setup";
 /// every other `POST`. This list is a path list, so it exempts both; the guard
 /// that matters for the second one lives in the handler rather than here, and
 /// that is the first thing to check when reading this exemption.
-const PUBLIC_PATHS: [&str; 10] = [
+const PUBLIC_PATHS: [&str; 11] = [
     LOGIN_PATH,
     "/auth/logout",
     "/auth/me",
@@ -155,6 +155,9 @@ const PUBLIC_PATHS: [&str; 10] = [
     // What proves it may have one is the PKCE verifier behind the challenge the
     // authorization was started with. See `super::oauth::token`.
     super::oauth::TOKEN_PATH,
+    // Where a client ends a grant it holds. Like the token route, the proof is
+    // the token in the body, never a session. See `super::oauth::revoke`.
+    super::oauth::REVOKE_PATH,
 ];
 
 /// The three auth settings, resolved once when the HTTP surface is built.

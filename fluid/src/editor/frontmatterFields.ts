@@ -75,23 +75,64 @@ function lineText(doc: string, span: LineSpan): string {
   return doc.slice(span.lineStart, span.lineEnd).replace(/\r?\n$/, "");
 }
 
+/** The characters a one-letter yaml double-quoted escape stands for. */
+const SIMPLE_ESCAPES: Record<string, string> = {
+  "0": "\0",
+  "\\": "\\",
+  '"': '"',
+  "/": "/",
+  n: "\n",
+  t: "\t",
+  r: "\r",
+};
+
+/** The hex-digit count of the escapes that carry a code point. */
+const HEX_ESCAPES: Record<string, number> = { x: 2, u: 4, U: 8 };
+
+/**
+ * Decode a yaml double-quoted body in one left-to-right pass, so `\\"` is a
+ * backslash followed by a quote and never a quote followed by a backslash. An
+ * escape this does not know is kept as written rather than refused.
+ */
+function decodeDoubleQuoted(body: string): string {
+  return body.replace(
+    /\\(?:([0\\"/ntr])|([xuU])([0-9a-fA-F]+))/g,
+    (whole: string, simple?: string, kind?: string, digits?: string) => {
+      if (simple !== undefined) {
+        return SIMPLE_ESCAPES[simple] ?? whole;
+      }
+      const width = HEX_ESCAPES[kind ?? ""];
+      if (width === undefined || digits === undefined) {
+        return whole;
+      }
+      // Exactly `width` digits belong to the escape; any more are text.
+      const code = Number.parseInt(digits.slice(0, width), 16);
+      if (digits.length < width || code > 0x10ffff) {
+        return whole;
+      }
+      return String.fromCodePoint(code) + digits.slice(width);
+    },
+  );
+}
+
 function unquote(value: string): string {
   const trimmed = value.trim();
-  if (
-    trimmed.length >= 2 &&
-    ((trimmed.startsWith('"') && trimmed.endsWith('"')) ||
-      (trimmed.startsWith("'") && trimmed.endsWith("'")))
-  ) {
-    return trimmed.slice(1, -1);
+  if (trimmed.length >= 2 && trimmed.startsWith('"') && trimmed.endsWith('"')) {
+    return decodeDoubleQuoted(trimmed.slice(1, -1));
+  }
+  if (trimmed.length >= 2 && trimmed.startsWith("'") && trimmed.endsWith("'")) {
+    return trimmed.slice(1, -1).replace(/''/g, "'");
   }
   return trimmed;
 }
 
 /** Quote a value yaml would misread as structure; pass plain ones through. */
 function plainOrQuoted(value: string): string {
+  // The backslash is escaped first: escaping the quote first would hand its
+  // own new backslash to this pass and double it.
   return /[:#[\]{}&*!|>'"%@`]|^\s|\s$/.test(value) &&
     !/^\d+(\.\d+)?$/.test(value)
-    ? `"${value.replace(/"/g, '\\"')}"`
+    ? `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`
     : value;
 }
 

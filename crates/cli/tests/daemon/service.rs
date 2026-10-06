@@ -5675,3 +5675,198 @@ fn doctor_collects_orphaned_rows_through_the_running_daemon() {
     drop(client);
     let _ = env.run(&["ctl", "shutdown"]);
 }
+
+/// The embedded MCP stack runs the source poller: a source written into
+/// `sources.json` after the session started is seen within a few looks,
+/// and a call naming its domain is answered with that source's sentence
+/// within one call's limit, never as a domain nobody registered.
+#[test]
+fn the_embedded_stack_sees_a_source_connected_after_its_start() {
+    let env = Env::new("embsrc");
+    env.setup_domain("eng");
+    let mut mcp = Mcp::spawn_embedded(&env);
+    mcp.initialize();
+
+    // An address nothing listens on: refused at once.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let remote = env.state_dir().join("remote");
+    std::fs::create_dir_all(&remote).unwrap();
+    std::fs::write(
+        remote.join("sources.json"),
+        serde_json::to_vec(&json!({
+            "v": 1,
+            "sources": [{
+                "url": format!("http://127.0.0.1:{port}"),
+                "name": "far",
+                "account": "me",
+                "kind": "token",
+                "connected_at": "2026-10-01T00:00:00Z",
+                "mounts": [{ "remote": "far", "local": "far" }],
+            }],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let answer = |mcp: &mut Mcp| {
+        let started = Instant::now();
+        mcp.send_call("read_engram", json!({ "identifier": "x", "domain": "far" }));
+        let resp = mcp.read();
+        let took = started.elapsed();
+        assert!(
+            took < Duration::from_secs(10),
+            "within one call's limit: {took:?}"
+        );
+        resp.pointer("/result/content/0/text")
+            .or_else(|| resp.pointer("/error/message"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    let until = Instant::now() + Duration::from_secs(30);
+    let text = loop {
+        let text = answer(&mut mcp);
+        if text.contains("far") && text.contains("comes from far")
+            || text.starts_with("far cannot be reached right now")
+        {
+            break text;
+        }
+        assert!(
+            Instant::now() < until,
+            "the embedded stack never saw the source: {text}"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    assert!(!text.contains("unknown domain"), "{text}");
+}
+
+/// One foreground `serve` on a reachable bind, with the admin variables given,
+/// its stderr in `log`. Returns the child once the endpoint is up, or `None`
+/// with the exit status when it ended instead.
+fn serve_with_admin_env(
+    env: &Env,
+    addr: &str,
+    log: &Path,
+    admin: &[(&str, &Path)],
+    plain: &[(&str, &str)],
+) -> Child {
+    let mut serve = Command::new(bin());
+    env.apply(&mut serve);
+    for (k, v) in admin {
+        serve.env(k, v);
+    }
+    for (k, v) in plain {
+        serve.env(k, v);
+    }
+    serve
+        .args(["serve", "--http", addr, "--config"])
+        .arg(env.config_path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(log).unwrap())
+        .spawn()
+        .unwrap()
+}
+
+fn sign_in(addr: &str, name: &str, password: &str) -> u16 {
+    reqwest::blocking::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .post(format!("http://{addr}/api/v1/auth/login"))
+        .json(&json!({ "name": name, "password": password }))
+        .send()
+        .unwrap()
+        .status()
+        .as_u16()
+}
+
+/// The first admin comes from the environment: a reachable `serve` with a name
+/// and a password file creates it, says so and prints no setup token; a second
+/// start with another password changes nothing, says nothing about a creation
+/// and prints no token either.
+#[test]
+fn serve_creates_the_first_admin_from_the_environment_once() {
+    let env = Env::new("admin");
+    env.setup_domain("eng");
+    let secret = env.dir.join("admin-password");
+    std::fs::write(&secret, "first-password\n").unwrap();
+    let addr = format!("0.0.0.0:{}", free_port());
+    let probe = addr.replace("0.0.0.0", "127.0.0.1");
+
+    let log = env.dir.join("serve1.log");
+    let mut child = serve_with_admin_env(
+        &env,
+        &addr,
+        &log,
+        &[("CRYSTALLINE_ADMIN_PASSWORD_FILE", &secret)],
+        &[("CRYSTALLINE_ADMIN_NAME", "ada")],
+    );
+    wait_port_or_exit(&probe, Duration::from_secs(20), &mut child);
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        text.contains("created the first admin 'ada' from the environment"),
+        "{text}"
+    );
+    assert!(!text.contains("setup token"), "no token is drawn: {text}");
+    assert!(!text.contains("first-password"), "{text}");
+    assert_eq!(sign_in(&probe, "ada", "first-password"), 200);
+    let _ = env.run(&["ctl", "shutdown"]);
+    let _ = child.wait();
+    wait_lock_released(&env);
+
+    std::fs::write(&secret, "second-password\n").unwrap();
+    let log = env.dir.join("serve2.log");
+    let mut child = serve_with_admin_env(
+        &env,
+        &addr,
+        &log,
+        &[("CRYSTALLINE_ADMIN_PASSWORD_FILE", &secret)],
+        &[("CRYSTALLINE_ADMIN_NAME", "ada")],
+    );
+    wait_port_or_exit(&probe, Duration::from_secs(20), &mut child);
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert!(!text.contains("created the first admin"), "{text}");
+    assert!(!text.contains("setup token"), "{text}");
+    assert!(
+        text.contains(
+            "an account exists already, so CRYSTALLINE_ADMIN_PASSWORD_FILE is ignored; you can remove it"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("second-password"), "{text}");
+    assert_eq!(sign_in(&probe, "ada", "first-password"), 200);
+    assert_eq!(sign_in(&probe, "ada", "second-password"), 401);
+    let _ = env.run(&["ctl", "shutdown"]);
+    let _ = child.wait();
+}
+
+/// A half done configuration stops the first start with a sentence naming the
+/// variable, and never echoes the password.
+#[test]
+fn serve_refuses_a_half_done_admin_configuration_on_a_fresh_instance() {
+    let env = Env::new("adminbad");
+    env.setup_domain("eng");
+    let log = env.dir.join("serve.log");
+    let mut child = serve_with_admin_env(
+        &env,
+        &format!("127.0.0.1:{}", free_port()),
+        &log,
+        &[],
+        &[("CRYSTALLINE_ADMIN_PASSWORD", "never-printed-value")],
+    );
+    let status = child.wait().unwrap();
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert!(!status.success(), "{status:?}\n{text}");
+    assert!(
+        text.contains(
+            "CRYSTALLINE_ADMIN_PASSWORD is set but no admin name is: set CRYSTALLINE_ADMIN_NAME or CRYSTALLINE_ADMIN_NAME_FILE as well"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("never-printed-value"), "{text}");
+}

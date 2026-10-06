@@ -181,6 +181,87 @@ pub struct MaintenanceState {
     pub mcp_nudges: BTreeMap<String, DateTime<Utc>>,
 }
 
+/// What a connected Crystalline's Stop hook asks this server for
+/// (`hook_status` on `POST /api/v1/ctl`): one member per nudge the hook can
+/// raise.
+///
+/// **Shaped to grow.** Reflection (0.25.0) adds a `reflect` member beside
+/// `evolve`. Every member is `#[serde(default)]` and unknown members are
+/// ignored, so an older client reading a newer server skips what it does not
+/// know and a newer client reading an older server sees nothing due there.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HookStatus {
+    /// The evolve nudge's server half.
+    #[serde(default)]
+    pub evolve: EvolveStatus,
+}
+
+/// The server half of the evolve nudge: the backlog of human writes and the
+/// last sweep, narrowed to the domains the caller may see. The cooldown
+/// (`last_nudge_at`) and the quiet first week (`first_seen`) stay on the
+/// client's machine, in its own `maintenance.json`, and the client appends
+/// `pending_domains` to its own backlog
+/// ([`MaintenanceState::with_remote_pending`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvolveStatus {
+    /// Domains a human wrote to since the last sweep, that the caller may see.
+    #[serde(default)]
+    pub pending_domains: Vec<String>,
+    /// When the backlog started. Null whenever the caller's own pending list
+    /// is empty: the record keeps one time for the whole backlog, so a time
+    /// beside an empty list would tell a caller that somebody wrote to a
+    /// domain it cannot see.
+    #[serde(default)]
+    pub pending_since: Option<DateTime<Utc>>,
+    /// When a sweep last ran on the server. A global sweep time, not narrowed
+    /// to the caller's domains: it says nothing about any one domain.
+    #[serde(default)]
+    pub last_run_at: Option<DateTime<Utc>>,
+}
+
+impl HookStatus {
+    /// The status `state` implies for a caller who may see `visible`.
+    pub fn from_state(
+        state: &MaintenanceState,
+        visible: &std::collections::HashSet<String>,
+    ) -> HookStatus {
+        let pending_domains: Vec<String> = state
+            .pending_domains
+            .iter()
+            .filter(|d| visible.contains(d.as_str()))
+            .cloned()
+            .collect();
+        let pending_since = if pending_domains.is_empty() {
+            None
+        } else {
+            state.pending_since
+        };
+        HookStatus {
+            evolve: EvolveStatus {
+                pending_domains,
+                pending_since,
+                last_run_at: state.last_run_at,
+            },
+        }
+    }
+}
+
+impl MaintenanceState {
+    /// The state the Stop hook decides from on a machine with connected
+    /// servers: this machine's backlog with every server's pending domains
+    /// appended (already translated to their local names, never twice), and
+    /// this machine's own cooldown, quiet week and weekly clock (decision D4).
+    pub fn with_remote_pending(&self, remote: &[String]) -> MaintenanceState {
+        let mut merged = self.clone();
+        for domain in remote {
+            if !merged.pending_domains.contains(domain) {
+                merged.pending_domains.push(domain.clone());
+            }
+        }
+        merged
+    }
+}
+
 /// The maintenance state path, `<state_dir>/hooks/maintenance.json`.
 ///
 /// Errors only when the state directory itself cannot be resolved, which is a
@@ -467,6 +548,84 @@ fn record_run_unscoped_at(path: &Path) -> Result<(), ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hook_status_names_only_what_the_caller_may_see() {
+        let state = MaintenanceState {
+            pending_domains: vec!["open".to_string(), "lab".to_string()],
+            pending_since: DateTime::from_timestamp(1_800_000_000, 0),
+            last_run_at: DateTime::from_timestamp(1_799_000_000, 0),
+            last_nudge_at: DateTime::from_timestamp(1_800_100_000, 0),
+            first_seen: DateTime::from_timestamp(1_790_000_000, 0),
+            ..MaintenanceState::default()
+        };
+        let visible: std::collections::HashSet<String> = ["open".to_string()].into();
+        let status = HookStatus::from_state(&state, &visible);
+        assert_eq!(status.evolve.pending_domains, vec!["open".to_string()]);
+        assert_eq!(status.evolve.last_run_at, state.last_run_at);
+        let json = serde_json::to_value(&status).unwrap();
+        assert!(
+            json["evolve"].get("last_nudge_at").is_none()
+                && json["evolve"].get("first_seen").is_none(),
+            "the cooldown and the quiet week are the client's own: {json}"
+        );
+    }
+
+    /// Decision D4: the servers' backlogs join this machine's; the cooldown,
+    /// the quiet week and the weekly clock stay this machine's own.
+    #[test]
+    fn the_remote_backlog_is_appended_and_the_clocks_stay_local() {
+        let local = MaintenanceState {
+            pending_domains: vec!["notes".to_string(), "jordi-acme".to_string()],
+            last_run_at: DateTime::from_timestamp(1, 0),
+            last_nudge_at: DateTime::from_timestamp(1_800_100_000, 0),
+            first_seen: DateTime::from_timestamp(1_790_000_000, 0),
+            ..MaintenanceState::default()
+        };
+        let merged = local.with_remote_pending(&["jordi-acme".to_string(), "runbooks".to_string()]);
+        assert_eq!(
+            merged.pending_domains,
+            vec![
+                "notes".to_string(),
+                "jordi-acme".to_string(),
+                "runbooks".to_string()
+            ],
+            "appended in order, never twice"
+        );
+        assert_eq!(merged.last_run_at, local.last_run_at);
+        assert_eq!(merged.last_nudge_at, local.last_nudge_at);
+        assert_eq!(merged.first_seen, local.first_seen);
+    }
+
+    /// A write to a domain the caller cannot see leaves no trace in its
+    /// answer: no pending time, so the same answer and the same etag.
+    #[test]
+    fn a_hidden_pending_domain_leaves_no_pending_since() {
+        let visible: std::collections::HashSet<String> = ["open".to_string()].into();
+        let before = HookStatus::from_state(&MaintenanceState::default(), &visible);
+        let after = HookStatus::from_state(
+            &MaintenanceState {
+                pending_domains: vec!["lab".to_string()],
+                pending_since: DateTime::from_timestamp(1_800_000_000, 0),
+                ..MaintenanceState::default()
+            },
+            &visible,
+        );
+        assert_eq!(after.evolve.pending_since, None);
+        assert_eq!(before, after);
+    }
+
+    /// A newer server's extra member (Part B's `reflect`) and an older
+    /// server's missing one both read cleanly.
+    #[test]
+    fn hook_status_tolerates_members_it_does_not_know_and_missing_ones() {
+        let newer: HookStatus =
+            serde_json::from_str(r#"{"evolve":{"pending_domains":["a"]},"reflect":{"open":3}}"#)
+                .unwrap();
+        assert_eq!(newer.evolve.pending_domains, vec!["a".to_string()]);
+        let older: HookStatus = serde_json::from_str("{}").unwrap();
+        assert_eq!(older, HookStatus::default());
+    }
 
     fn scratch() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();

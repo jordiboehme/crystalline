@@ -17,3 +17,5 @@ overrides:
   "nanoid@<3.3.18": ^3.3.18
   # GHSA-p98j-92pf-mc4p: mermaid 12.0.0 allows dompurify ^3.4.12, keep it at the fixed release
   "dompurify@<3.4.16": ^3.4.16
+  # GHSA-238p-pmpm-9mq7: mermaid 12 allows katex ^0.16.47, keep it at the fixed release
+  "katex@<0.18.2": ^0.18.2

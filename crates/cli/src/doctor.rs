@@ -384,6 +384,28 @@ pub struct GithubDoctor {
     pub origins: Vec<OriginDoctor>,
 }
 
+/// One connected server, as doctor checks it.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SourceDoctor {
+    /// The source and what it said; the same row `status` prints.
+    #[serde(flatten)]
+    pub row: crate::sources::SourceRow,
+    /// What is wrong, when something is: the words a person acts on.
+    pub problem: Option<String>,
+}
+
+/// Every connected server, each asked at once within its own short limit.
+async fn check_sources(cfg: &crystalline_core::config::GlobalConfig) -> Vec<SourceDoctor> {
+    crate::sources::source_rows(cfg)
+        .await
+        .into_iter()
+        .map(|row| SourceDoctor {
+            problem: row.error.clone(),
+            row,
+        })
+        .collect()
+}
+
 /// One flat setting override from the environment, `(variable, key, value)`
 /// reshaped into a record. Sourced from [`EnvOverlay::active_overrides`],
 /// filtered to drop `domain.*` and `github.token` rows: those get the richer
@@ -936,6 +958,8 @@ pub struct DoctorReport {
     pub rename: Option<RenameDoctor>,
     /// Whether this report was produced with `--fix`.
     pub fix: bool,
+    /// Every connected server; empty when none.
+    pub sources: Vec<SourceDoctor>,
 }
 
 /// A rename journal waiting in the state directory: a domain rename an
@@ -1110,6 +1134,10 @@ impl DoctorReport {
         // answer, and drift, edited and orphaned rows all self-heal at the
         // next `crystalline provision` (edited rows are left alone by
         // design, never "fixed").
+        // A connected server that does not answer, or whose sign-in no
+        // longer works, is one problem each: its domains are unavailable
+        // until it answers again.
+        n += self.sources.iter().filter(|s| s.problem.is_some()).count();
         n
     }
 }
@@ -1301,6 +1329,14 @@ pub async fn run(
 
     let rename = check_rename_journal(discard_rename);
 
+    // An override names an exact config and index, so doctor checks this
+    // machine's own state alone, as status does.
+    let sources = if config_override.is_none() && db_override.is_none() {
+        check_sources(cfg).await
+    } else {
+        Vec::new()
+    };
+
     Ok(DoctorReport {
         index,
         domains,
@@ -1317,6 +1353,7 @@ pub async fn run(
         names,
         rename,
         fix,
+        sources,
     })
 }
 
@@ -4343,6 +4380,42 @@ pub fn render_human(report: &DoctorReport) -> String {
                 c.tags.join(", "),
                 c.reason
             );
+        }
+    }
+
+    for source in &report.sources {
+        let row = &source.row;
+        let _ = writeln!(
+            out,
+            "source {} ({}) as {} ({})",
+            row.name, row.url, row.account, row.kind
+        );
+        if let Some(store) = &row.credential_store {
+            let _ = writeln!(out, "  credential: {store}");
+        }
+        if let Some(at) = &row.expires_at {
+            let _ = writeln!(out, "  access token valid until {at}, renewed on its own");
+        }
+        for hidden in &row.shadowed {
+            let _ = writeln!(out, "  {}", hidden.note);
+        }
+        for skipped in &row.skipped {
+            let _ = writeln!(out, "  {}", skipped.note);
+        }
+        match &source.problem {
+            Some(problem) => {
+                let _ = writeln!(out, "  PROBLEM: {problem}");
+                if let Some(detail) = &row.error_detail {
+                    let _ = writeln!(out, "  the server wrote: {detail}");
+                }
+            }
+            None => {
+                let _ = writeln!(
+                    out,
+                    "  the server answers; {} domain(s) mounted",
+                    row.mounts.len()
+                );
+            }
         }
     }
 

@@ -38,37 +38,72 @@ pub async fn run(command: UsersCommand, json: bool) -> Result<()> {
             email,
             role,
             password_stdin,
+            mcp_token,
         } => {
-            let password = read_password(password_stdin)?;
             // The login name as typed makes the better default display name:
             // the store folds the login name but keeps this one as given.
             let display = display.unwrap_or_else(|| name.trim().to_string());
             let role: Role = role.into();
-            if let Err(e) = store
-                .add_user(&name, &display, email.as_deref(), role, &password)
-                .await
-            {
-                // The store's primary key is what actually refuses a duplicate
-                // (and it is the only thing that can, without racing a second
-                // invocation); this only turns its constraint violation into a
-                // sentence, and re-raises anything else untouched.
-                if format!("{e:#}").contains("UNIQUE constraint") {
-                    bail!(
-                        "a user named '{}' already exists; \
-                         change it with `crystalline users passwd` or `crystalline users role`",
-                        stored_name(&name)
-                    );
+            let added = match &mcp_token {
+                // An account for an agent: no password to ask for, and the
+                // token is issued in the same transaction as the account.
+                Some(label) => store
+                    .add_token_only_user(&name, &display, email.as_deref(), role, label)
+                    .await
+                    .map(Some),
+                None => {
+                    let password = read_password(password_stdin)?;
+                    store
+                        .add_user(&name, &display, email.as_deref(), role, &password)
+                        .await
+                        .map(|()| None)
                 }
-                return Err(e);
+            };
+            let issued = match added {
+                Ok(issued) => issued,
+                Err(e) => {
+                    // The store's primary key is what actually refuses a duplicate
+                    // (and it is the only thing that can, without racing a second
+                    // invocation); this only turns its constraint violation into a
+                    // sentence, and re-raises anything else untouched.
+                    if format!("{e:#}").contains("UNIQUE constraint") {
+                        bail!(
+                            "a user named '{}' already exists; \
+                         change it with `crystalline users passwd` or `crystalline users role`",
+                            stored_name(&name)
+                        );
+                    }
+                    return Err(e);
+                }
+            };
+            match issued {
+                Some(issued) => {
+                    if !json {
+                        println!(
+                            "Added user '{}' with role {role} and no password.",
+                            stored_name(&name)
+                        );
+                    }
+                    print_issued_token(&issued, &stored_name(&name), json, None, Some(role));
+                }
+                None => println!("Added user '{}' with role {role}.", stored_name(&name)),
             }
-            println!("Added user '{}' with role {role}.", stored_name(&name));
         }
         UsersCommand::List => {
             let users = store.list_users().await?;
+            let passwordless = store.passwordless_users().await?;
             if json {
-                crate::print_value(&serde_json::json!({ "users": users }), true);
+                let rows: Vec<serde_json::Value> = users
+                    .iter()
+                    .map(|u| {
+                        let mut row = serde_json::to_value(u).unwrap_or_default();
+                        row["has_password"] = (!passwordless.contains(&u.name)).into();
+                        row
+                    })
+                    .collect();
+                crate::print_value(&serde_json::json!({ "users": rows }), true);
             } else {
-                print_users(&users);
+                print_users(&users, &passwordless);
             }
         }
         UsersCommand::Passwd {
@@ -150,14 +185,14 @@ pub async fn run(command: UsersCommand, json: bool) -> Result<()> {
                 );
             } else if let Some(id) = rotate {
                 let issued = store.rotate_mcp_token(&name, id).await?;
-                print_issued_token(&issued, &stored_name(&name), json, Some(id));
+                print_issued_token(&issued, &stored_name(&name), json, Some(id), None);
             } else {
                 // The account must exist before a token is minted for it; the
                 // store says so itself, so a mistyped name is reported rather
                 // than silently issuing against nothing.
                 let label = label.unwrap_or_else(|| "cli".to_string());
                 let issued = store.issue_mcp_token(&name, &label).await?;
-                print_issued_token(&issued, &stored_name(&name), json, None);
+                print_issued_token(&issued, &stored_name(&name), json, None, None);
             }
         }
         UsersCommand::Link {
@@ -307,16 +342,20 @@ fn print_issued_token(
     account: &str,
     json: bool,
     replaced: Option<i64>,
+    created_with_role: Option<Role>,
 ) {
     if json {
-        crate::print_value(
-            &serde_json::json!({
-                "id": issued.id,
-                "token": issued.token,
-                "label": issued.label,
-            }),
-            true,
-        );
+        let mut object = serde_json::json!({
+            "id": issued.id,
+            "token": issued.token,
+            "label": issued.label,
+        });
+        // A token issued together with its account also names the account.
+        if let Some(role) = created_with_role {
+            object["name"] = account.into();
+            object["role"] = role.to_string().into();
+        }
+        crate::print_value(&object, true);
         eprintln!("{TOKEN_TEACHING}");
         return;
     }
@@ -407,7 +446,7 @@ fn stored_name(name: &str) -> String {
 
 /// One line per account: name, role, whether it is disabled, display name,
 /// email and when it was last seen, columns aligned to the widest entry.
-fn print_users(users: &[User]) {
+fn print_users(users: &[User], passwordless: &std::collections::HashSet<String>) {
     if users.is_empty() {
         println!("No users yet. Add one with: crystalline users add <name> --role admin");
         return;
@@ -418,7 +457,12 @@ fn print_users(users: &[User]) {
             [
                 u.name.clone(),
                 u.role.to_string(),
-                if u.disabled { "disabled" } else { "active" }.to_string(),
+                match (u.disabled, passwordless.contains(&u.name)) {
+                    (true, _) => "disabled",
+                    (false, true) => "active, no password",
+                    (false, false) => "active",
+                }
+                .to_string(),
                 u.display.clone(),
                 u.email.clone().unwrap_or_default(),
                 u.last_seen.clone().unwrap_or_default(),

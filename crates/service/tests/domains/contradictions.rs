@@ -2362,7 +2362,7 @@ async fn a_v302_row_renders_in_the_toon_queue_beside_a_v301_row() {
         vec![
             "queue[2]{class,counterpart,counterpart_line,counterpart_line_text,counterpart_title,domain,evidence,finding,fix,line,line_text,n,permalink,priority,probability,rule,scope,similarity,title}:".to_string(),
             format!(
-                "  judgment,twenty,14,The build uses Node 20,Twenty,notes,notes/eighteen line 14; notes/twenty line 14; probability 0.97; similarity 1.00; model mdeberta-v3-base-xnli-2mil7,\"Possible contradiction: line 14 of \\\"Eighteen\\\" and line 14 of \\\"Twenty\\\" read as contradicting at probability 0.97, line similarity 1.00\",read both then supersede or close a window or acknowledge V302,14,The build uses Node 18,1,eighteen,85,0.97,V302,\"{v302_scope}\",1.0,Eighteen"
+                "  judgment,twenty,14,The build uses Node 20,Twenty,notes,notes/eighteen line 14; notes/twenty line 14; probability 0.97; similarity 1.00; model mdeberta-v3-base-xnli-2mil7,\"Possible contradiction: line 14 of \\\"Eighteen\\\" and line 14 of \\\"Twenty\\\" read as contradicting at probability 0.97, line similarity 1.00\",\"read both then supersede the older (valid_to set to the real date), correct the stale line or acknowledge V302\",14,The build uses Node 18,1,eighteen,85,0.97,V302,\"{v302_scope}\",1.0,Eighteen"
             ),
             format!(
                 "  judgment,null,null,null,null,notes,\"lead-vector cosine 1.00 at or above 0.94; twin: notes/twenty\",semantic twin of notes/twenty,read both then merge and supersede or link and acknowledge,null,null,2,eighteen,75,null,V301,\"{v301_scope}\",null,Eighteen"

@@ -12,10 +12,13 @@
 pub mod client;
 pub mod control;
 pub mod daemon;
+mod first_admin;
 pub mod instance;
 pub use crystalline_identity::join;
 pub mod mcp;
 pub mod mcp_gate;
+pub mod remote_ctl;
+pub mod route;
 pub mod runs_in;
 pub use crystalline_identity::scope;
 pub use crystalline_rest as rest;

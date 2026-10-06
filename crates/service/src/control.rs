@@ -8,7 +8,8 @@
 //! origin_update, origin_status,
 //! origin_share, origin_withdraw, origin_changes, origin_discard, origin_resolve,
 //! provision, forget_domain,
-//! forget_credential, shutdown. This is the operator channel plus the `tool` command, which
+//! forget_credential, sources_reload, mounted_routing, shutdown. This is the
+//! operator channel plus the `tool` command, which
 //! dispatches a daemon-attached CLI data verb to the shared engine and
 //! returns raw engine JSON; an MCP client's data operations still go over the
 //! MCP handshake.
@@ -102,6 +103,12 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                     if let (Value::Object(a), Value::Object(b)) = (&mut data, report) {
                         a.extend(b);
                     }
+                    // The connected servers, and the local domains they hide.
+                    data["sources"] = crate::route::sources_status(&shared.engine);
+                    let mut hidden: Vec<String> =
+                        shared.engine.shadowed_domains().into_iter().collect();
+                    hidden.sort();
+                    data["shadowed_domains"] = json!(hidden);
                     (envelope_ok(data), false)
                 }
                 Err(e) => (envelope_err(e.to_string()), false),
@@ -119,13 +126,103 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
         // than the MCP stream's format-dependent tool envelope (TOON by
         // default). The engine methods self-guard read-only mutations, so this
         // keeps the same refusals the MCP path gave.
+        //
+        // The caller is this machine's owner, so a call for a domain from a
+        // connected server goes to that server and a call over all domains
+        // asks every server too (`crate::route`). With no server connected
+        // the answer is exactly the engine's.
         "tool" => {
             let tool = req.get("tool").and_then(Value::as_str).unwrap_or("");
             let args = req.get("args").cloned().unwrap_or_else(|| json!({}));
-            match crate::client::dispatch_engine(&shared.engine, tool, args).await {
+            // A caller on a budget (the recall hook) says how long a source
+            // may take; it never waits longer than the route's own limits.
+            // Zero is no budget at all, so it is read as none given.
+            let deadline = req
+                .get("deadline_ms")
+                .and_then(Value::as_u64)
+                .filter(|ms| *ms > 0)
+                .map(std::time::Duration::from_millis);
+            let agent = crystalline_remote::ForwardedAgent::default();
+            match crate::route::run_tool_routed(&shared.engine, tool, args, &agent, deadline).await
+            {
                 Ok(data) => (envelope_ok(data), false),
                 Err(e) => (envelope_err(e.to_string()), false),
             }
+        }
+        // `crystalline connect`, `disconnect` and `domain rename --local`
+        // wrote sources.json from their own process: read it again (with this
+        // machine's domains as they stand now), and ask the sources once in
+        // the background.
+        "sources_reload" => {
+            let said = match shared.engine.sources() {
+                Some(sources) => {
+                    let mut said = sources.set_local(shared.engine.local_domains());
+                    said.extend(sources.reload());
+                    let refreshing = sources.clone();
+                    tokio::spawn(async move {
+                        refreshing
+                            .refresh(crystalline_remote::ONE_DOMAIN_LIMIT)
+                            .await;
+                    });
+                    // Both halves can say the same thing: once is enough.
+                    let mut once = Vec::new();
+                    for announcement in said {
+                        if !once.contains(&announcement) {
+                            once.push(announcement);
+                        }
+                    }
+                    once
+                }
+                None => Vec::new(),
+            };
+            let said: Vec<String> = said.iter().map(ToString::to_string).collect();
+            (envelope_ok(json!({ "announcements": said })), false)
+        }
+        // Session start: every source's routing model, refreshed through its
+        // etag within the deadline, then the mounted part from the caches.
+        "mounted_routing" => {
+            // How long the caller waits for this answer. The refresh itself
+            // runs with the configured deadline in a task of its own, so a
+            // server that is slow but up is never counted as failed (marked
+            // down, its pool dropped) because a caller stopped waiting. It
+            // finishes in the background and updates the cache.
+            let refresh_deadline =
+                std::time::Duration::from_millis(shared.engine.config().remote_deadline_ms());
+            let wait = req
+                .get("deadline_ms")
+                .and_then(Value::as_u64)
+                .map(std::time::Duration::from_millis)
+                .unwrap_or(refresh_deadline);
+            // `shadowed` is said only when this daemon has its sources: one
+            // serving an explicit --db or --config has none, and a hook then
+            // reads the caches itself rather than lose the hidden copies and
+            // the mounts both.
+            let (routing, shadowed) = match shared.engine.sources() {
+                Some(sources) => {
+                    sources.reload_if_changed();
+                    crate::route::sync_local(&shared.engine, &sources).await;
+                    let unasked = if sources.is_empty() {
+                        Default::default()
+                    } else {
+                        refresh_within(&sources, refresh_deadline, wait).await
+                    };
+                    (
+                        sources.mounted_routing_unasked(&unasked),
+                        Some(sources.shadowed()),
+                    )
+                }
+                None => (crystalline_remote::MountedRouting::default(), None),
+            };
+            let domains: Vec<Value> = routing
+                .domains
+                .iter()
+                .map(|m| json!({ "name": m.local, "source": m.source, "bullets": m.bullets }))
+                .collect();
+            let mut answer = json!({ "domains": domains, "stale": routing.stale });
+            if let Some(shadowed) = shadowed {
+                answer["shadowed"] = json!(shadowed);
+            }
+            (envelope_ok(answer), false)
         }
         "sync" => {
             let domain = req.get("domain").and_then(Value::as_str);
@@ -547,7 +644,9 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
             let domain = req.get("domain").and_then(Value::as_str).unwrap_or("");
             let path = req.get("path").and_then(Value::as_str);
             let sides = req.get("sides").and_then(Value::as_bool).unwrap_or(false);
-            match origin_changes_inline(&shared.engine, domain, path, sides).await {
+            match origin_changes_inline(&shared.engine, domain, path, sides, &ShareActor::Owner)
+                .await
+            {
                 Ok(data) => (envelope_ok(data), false),
                 Err(e) => (envelope_err(e.to_string()), false),
             }
@@ -682,23 +781,20 @@ pub(crate) async fn origin_changes_inline(
     domain: &str,
     path: Option<&str>,
     sides: bool,
+    actor: &ShareActor,
 ) -> crate::engine::Result<Value> {
     if let Some(path) = path {
-        let mut listed = engine.local_changes(domain, &ShareActor::Owner).await?;
+        let mut listed = engine.local_changes(domain, actor).await?;
         // Resolved through the detail, which is what refuses an unknown path
         // by name; the list is then exactly that one entry.
-        let one = engine
-            .local_change(domain, path, &ShareActor::Owner, None)
-            .await?;
+        let one = engine.local_change(domain, path, actor, None).await?;
         listed["changes"] = json!([one]);
         return Ok(listed);
     }
     if sides {
-        return engine
-            .local_changes_detailed(domain, &ShareActor::Owner)
-            .await;
+        return engine.local_changes_detailed(domain, actor).await;
     }
-    engine.local_changes(domain, &ShareActor::Owner).await
+    engine.local_changes(domain, actor).await
 }
 
 /// Run a background-equivalent embed pass and record the count on the response.
@@ -873,12 +969,52 @@ async fn localized_request(req: &Value, engine: &Engine) -> Option<Value> {
     Some(req)
 }
 
-fn envelope_ok(data: Value) -> Value {
+pub(crate) fn envelope_ok(data: Value) -> Value {
     json!({ "v": CTL_VERSION, "ok": true, "data": data })
 }
 
-fn envelope_err(message: impl Into<String>) -> Value {
+pub(crate) fn envelope_err(message: impl Into<String>) -> Value {
     json!({ "v": CTL_VERSION, "ok": false, "error": message.into() })
+}
+
+/// Refresh every source's routing within `refresh_deadline` in the
+/// background (single flight: a refresh already running is joined, never
+/// started again), and wait for it at most `wait`. Answers the sources whose
+/// copy is not known to be current: the ones the refresh did not get to ask
+/// (this process was still setting up its network connection), and, when
+/// the wait ran out first, every source the refresh has not confirmed yet.
+/// Those are served from their caches with a line saying they could not be
+/// checked; none of them is marked as failed for it.
+async fn refresh_within(
+    sources: &std::sync::Arc<crystalline_remote::SourceSet>,
+    refresh_deadline: std::time::Duration,
+    wait: std::time::Duration,
+) -> std::collections::BTreeSet<String> {
+    let running = sources.refresh_in_background(refresh_deadline);
+    let mut outcome = running.outcome.clone();
+    let done = tokio::time::timeout(wait, outcome.wait_for(Option::is_some)).await;
+    if let Ok(Ok(unasked)) = done
+        && let Some(unasked) = unasked.as_ref()
+    {
+        return unasked.clone();
+    }
+    // Still running (or its task ended without an outcome): a source whose
+    // cache was not written since the refresh began has not answered yet.
+    sources
+        .records()
+        .into_iter()
+        .filter(|record| {
+            crystalline_remote::read_cached(
+                &record.host_dir(sources.remote_dir()),
+                crystalline_remote::ROUTING_FILE,
+                &record.account,
+            )
+            .is_none_or(|cached| {
+                cached.fetched_at < running.started && cached.last_failure.is_none()
+            })
+        })
+        .map(|record| record.name)
+        .collect()
 }
 
 #[cfg(test)]

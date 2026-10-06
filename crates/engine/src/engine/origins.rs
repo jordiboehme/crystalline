@@ -55,6 +55,32 @@ impl Engine {
         folder: Option<&str>,
         progress: Option<OriginProgress>,
     ) -> Result<Value> {
+        self.origin_add_with_progress_as(
+            repo,
+            domain,
+            path,
+            branch,
+            folder,
+            progress,
+            &crate::scope::Scope::Unrestricted,
+        )
+        .await
+    }
+
+    /// [`Engine::origin_add_with_progress`] for `scope`, which decides only
+    /// how the report's note names a connected server: by name for the
+    /// machine owner, not at all for anyone else.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn origin_add_with_progress_as(
+        &self,
+        repo: &str,
+        domain: Option<&str>,
+        path: Option<&str>,
+        branch: Option<&str>,
+        folder: Option<&str>,
+        progress: Option<OriginProgress>,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
         let progress_at = |step: u64, msg: &str| {
             if let Some(p) = &progress {
                 p(step, 4, msg);
@@ -147,6 +173,13 @@ impl Engine {
                 (choice.name, choice.origin, declared_by_manifest)
             }
         };
+        // A name a connected server already gave out is the mount's; a new
+        // local domain under it is the latecomer and gets the local suffix
+        // (decision D13), before the name is checked and the default folder
+        // derived from it. A registration of that name here keeps its name,
+        // so adopting it in place works as before.
+        let wanted = domain_name;
+        let domain_name = self.beside_mounts(&wanted);
         // A name nothing holds is a new registration: check it before the
         // default folder is derived from it. A derived name passes by
         // construction (`origin::default_domain_name`, and
@@ -292,6 +325,8 @@ impl Engine {
             *file_guard = file;
             *self.config.write().unwrap() = effective;
         }
+        // Its origin may make it a copy of a mounted domain, hidden from now on.
+        self.sync_sources_local();
 
         // Tell a running daemon's watcher to start watching the new root; it
         // also runs its own catch-up sync and embed once the watch is armed.
@@ -331,6 +366,7 @@ impl Engine {
             "local_changes": report.local_changes,
         });
         self.append_name_fields(&mut result, &domain_name).await?;
+        self.note_beside_mounts(&mut result, &wanted, &domain_name, scope);
         Ok(result)
     }
 
@@ -1170,9 +1206,11 @@ impl Engine {
             }
             return;
         }
-        // The poller is the machine itself rather than a caller, so nothing is
-        // subtracted: it polls every origin this daemon hosts.
-        let Ok(targets) = self.origin_targets(None, &HashSet::new()) else {
+        // The poller is the machine itself rather than a caller, so no privacy
+        // is subtracted: it polls every origin this daemon hosts, except a
+        // local copy a connected server hides, whose files stay as they are
+        // until it comes back on disconnect (spec A3).
+        let Ok(targets) = self.origin_targets(None, &self.shadowed_domains()) else {
             return;
         };
         let github_poll_secs = self
@@ -2923,11 +2961,16 @@ impl Engine {
     /// exactly the `UnknownDomain` [`Engine::origin_spec_for_domain`] would
     /// raise a line later, so a registered name behaves identically and an
     /// unregistered one answers the same, only without leaving an entry behind.
+    ///
+    /// A local copy a connected server hides answers as unregistered here
+    /// too, so no share, withdraw, discard or resolve acts on it from any
+    /// surface while it is hidden (decision D19).
     pub(super) fn origin_lock_registered(
         &self,
         domain: &str,
     ) -> Result<Arc<tokio::sync::Mutex<()>>> {
         self.domain_entry(domain)?;
+        self.refuse_shadowed(domain)?;
         Ok(self.origin_lock(domain))
     }
 

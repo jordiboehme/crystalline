@@ -1145,6 +1145,9 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
+        // A room that was open when its domain became hidden saves nothing
+        // into the hidden copy (decision D19).
+        self.refuse_shadowed(view.domain())?;
         refuse_not_an_engram(&p.content)?;
         let (desc, source) = view.resolve(&p.identifier).await?;
         if desc.path != expected_path {

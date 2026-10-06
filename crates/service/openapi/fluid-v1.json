@@ -997,7 +997,7 @@
         "operationId": "list_domains",
         "responses": {
           "200": {
-            "description": "The engine's own domain listing, unchanged.\n\nA domain that reviews changes before they land carries `review: \"overlay\"` and, for a caller with an account, `my_drafts`: how many draft changes of theirs are waiting to be shared. Both are absent on a domain that takes changes directly, and `my_drafts` is absent rather than zero when there is no account to count for - a client reads presence, since null and 0 are different facts.\n\nEvery domain also carries `canonical_name` (the name its content carries), `aliases` (its former local names, still accepted as input), `name_origin` (`explicit` or `derived`, `null` for a legacy entry nothing has inferred yet), `shadowed` (whether another domain's local name already holds this one's canonical name - a bool, never naming the other domain) and `renaming` (whether a rename has this domain paused right now; always present, so every row keeps the same columns).",
+            "description": "The engine's own domain listing, unchanged.\n\nA domain that reviews changes before they land carries `review: \"overlay\"` and, for a caller with an account, `my_drafts`: how many draft changes of theirs are waiting to be shared. Both are absent on a domain that takes changes directly, and `my_drafts` is absent rather than zero when there is no account to count for - a client reads presence, since null and 0 are different facts.\n\nEvery domain also carries `canonical_name` (the name its content carries), `aliases` (its former local names, still accepted as input), `name_origin` (`explicit` or `derived`, `null` for a legacy entry nothing has inferred yet), `shadowed` (whether another domain's local name already holds this one's canonical name - a bool, never naming the other domain) and `renaming` (whether a rename has this domain paused right now; always present, so every row keeps the same columns).\n\nFor an instance admin, `mounted` lists the domains this machine offers from connected servers (`crystalline connect`): each one's local `name`, its `source`, the server's `source_url`, its `remote_name` there and the `web_url` of its page on that server (`null` unless the address is http or https). They are not served here.",
             "content": {
               "application/json": {
                 "schema": {
@@ -7620,6 +7620,72 @@
         }
       }
     },
+    "/api/v1/oauth/revoke": {
+      "post": {
+        "tags": [
+          "oauth"
+        ],
+        "summary": "Revoke an OAuth grant by one of its tokens.",
+        "description": "RFC 7009 token revocation, form-encoded. `token` is the access or the refresh token and `client_id` the registration it was issued to; either token ends the whole grant. The answer is 200 with an empty body whether or not a grant matched.",
+        "operationId": "oauth_revoke",
+        "requestBody": {
+          "description": "The revocation request.",
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "$ref": "#/components/schemas/RevokeForm"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Revoked, or nothing to revoke."
+          },
+          "400": {
+            "description": "The body is not a form, or it lacks `token` or `client_id` (`invalid_request`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OauthErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A cookie session did not echo its CSRF token.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "This instance does not serve OAuth: `auth.oauth` is off.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The accounts database could not be reached.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OauthErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/oauth/token": {
       "post": {
         "tags": [
@@ -10841,6 +10907,34 @@
           "overlay",
           "direct"
         ]
+      },
+      "RevokeForm": {
+        "type": "object",
+        "description": "The form of `POST /oauth/revoke` (RFC 7009 section 2.1).",
+        "properties": {
+          "client_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The registration the token was issued to.",
+            "example": "coc_0f1e2d3c4b5a69788796a5b4c3d2e1f0"
+          },
+          "token": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The access token (`coa_`) or refresh token (`cor_`) to revoke. Either\nends the whole grant."
+          },
+          "token_type_hint": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`access_token` or `refresh_token`. A hint only: the prefix decides."
+          }
+        }
       },
       "Role": {
         "type": "string",

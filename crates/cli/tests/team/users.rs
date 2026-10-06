@@ -939,3 +939,122 @@ fn rust_log_reaches_the_cli_on_stderr_only() {
     );
     assert!(!String::from_utf8_lossy(&loud.stdout).contains("cannot address a credential"));
 }
+
+/// The token-only account an agent runs under: no password, one personal
+/// token, created in one step. Every field of the JSON object is asserted,
+/// because a script reads them by name.
+#[test]
+fn add_with_mcp_token_creates_a_passwordless_account_and_prints_its_token() {
+    let home = tempfile::tempdir().unwrap();
+    let mut cmd = bin();
+    isolate(&mut cmd, home.path());
+    let out = cmd
+        .args([
+            "users",
+            "add",
+            "Agent-Build",
+            "--role",
+            "editor",
+            "--mcp-token",
+            "build",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let issued: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(issued["name"], "agent-build");
+    assert_eq!(issued["role"], "editor");
+    assert_eq!(issued["label"], "build");
+    assert!(issued["id"].is_i64(), "{issued}");
+    let token = issued["token"].as_str().unwrap();
+    assert!(token.starts_with("cmt_") && token.len() == 68, "{token}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("Authorization: Bearer"),
+        "the teaching line stays on stderr"
+    );
+
+    let listed: serde_json::Value =
+        serde_json::from_str(&users_ok(home.path(), &["--json", "list"], None)).unwrap();
+    let row = &listed["users"][0];
+    assert_eq!(row["name"], "agent-build");
+    assert_eq!(row["has_password"], false, "{listed}");
+
+    let text = users_ok(home.path(), &["list"], None);
+    assert!(text.contains("active, no password"), "{text}");
+
+    // A second account with a password lists as having one.
+    users_ok(
+        home.path(),
+        &["add", "ada", "--password-stdin"],
+        Some("s3cret\n"),
+    );
+    let listed: serde_json::Value =
+        serde_json::from_str(&users_ok(home.path(), &["--json", "list"], None)).unwrap();
+    assert_eq!(listed["users"][0]["name"], "ada");
+    assert_eq!(listed["users"][0]["has_password"], true, "{listed}");
+    assert_eq!(listed["users"][1]["has_password"], false, "{listed}");
+
+    // The same name again is refused with the existing sentence.
+    let refused = users_err(
+        home.path(),
+        &["add", "agent-build", "--mcp-token", "again"],
+        None,
+    );
+    assert!(
+        refused.contains("a user named 'agent-build' already exists"),
+        "{refused}"
+    );
+}
+
+#[test]
+fn add_with_mcp_token_prints_the_human_text_and_the_token_block() {
+    let home = tempfile::tempdir().unwrap();
+    let out = users_ok(
+        home.path(),
+        &[
+            "add",
+            "agent-build",
+            "--role",
+            "editor",
+            "--mcp-token",
+            "build",
+        ],
+        None,
+    );
+    assert!(
+        out.contains("Added user 'agent-build' with role editor and no password."),
+        "{out}"
+    );
+    assert!(
+        out.contains("for 'agent-build' (label 'build'), shown once:"),
+        "{out}"
+    );
+    assert!(out.contains("cmt_"), "{out}");
+}
+
+#[test]
+fn mcp_token_and_password_stdin_cannot_be_combined() {
+    let home = tempfile::tempdir().unwrap();
+    let err = users_err(
+        home.path(),
+        &[
+            "add",
+            "agent-build",
+            "--mcp-token",
+            "build",
+            "--password-stdin",
+        ],
+        Some("s3cret\n"),
+    );
+    assert!(err.contains("cannot be used with"), "{err}");
+    let listed = users_ok(home.path(), &["list"], None);
+    assert!(
+        listed.contains("No users yet"),
+        "nothing was created: {listed}"
+    );
+}

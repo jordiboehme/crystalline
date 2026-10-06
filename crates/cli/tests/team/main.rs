@@ -8,6 +8,8 @@
 
 #[path = "../common/mod.rs"]
 mod common;
+#[path = "../common/remote_server.rs"]
+mod remote_server;
 
 mod connect;
 mod domain_members;
@@ -15,4 +17,5 @@ mod domain_rename;
 mod domain_review;
 mod env_token;
 mod origin;
+mod sources;
 mod users;

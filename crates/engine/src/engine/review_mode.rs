@@ -1003,6 +1003,9 @@ impl Engine {
         };
         // Record whether the entry was a file domain before removing it.
         let files_kept = !removed.is_virtual();
+        // A local copy a mount hid is gone now, so nothing hides it any more,
+        // and no server name is decided against a domain that is not there.
+        self.sync_sources_local();
 
         // Tell the runtime: drop it from the discovered overlay and stop
         // watching its root.

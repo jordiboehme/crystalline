@@ -1371,10 +1371,11 @@ dependencies = [
 
 [[package]]
 name = "crystalline"
-version = "0.22.1"
+version = "0.23.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
+ "axum",
  "chrono",
  "clap",
  "crystalline-core",
@@ -1385,6 +1386,7 @@ dependencies = [
  "flate2",
  "fs4 1.1.0",
  "insta",
+ "libc",
  "predicates",
  "reqwest",
  "serde",
@@ -1402,7 +1404,7 @@ dependencies = [
 
 [[package]]
 name = "crystalline-core"
-version = "0.22.1"
+version = "0.23.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1424,7 +1426,7 @@ dependencies = [
 
 [[package]]
 name = "crystalline-engine"
-version = "0.22.1"
+version = "0.23.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1457,7 +1459,7 @@ dependencies = [
 
 [[package]]
 name = "crystalline-identity"
-version = "0.22.1"
+version = "0.23.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1477,7 +1479,7 @@ dependencies = [
 
 [[package]]
 name = "crystalline-index"
-version = "0.22.1"
+version = "0.23.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -1506,7 +1508,7 @@ dependencies = [
 
 [[package]]
 name = "crystalline-remote"
-version = "0.22.1"
+version = "0.23.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -1515,6 +1517,8 @@ dependencies = [
  "crystalline-core",
  "diffy",
  "flate2",
+ "fs4 1.1.0",
+ "getrandom 0.4.3",
  "keyring",
  "percent-encoding",
  "reqwest",
@@ -1532,7 +1536,7 @@ dependencies = [
 
 [[package]]
 name = "crystalline-rest"
-version = "0.22.1"
+version = "0.23.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1567,7 +1571,7 @@ dependencies = [
 
 [[package]]
 name = "crystalline-service"
-version = "0.22.1"
+version = "0.23.0"
 dependencies = [
  "anyhow",
  "async-trait",

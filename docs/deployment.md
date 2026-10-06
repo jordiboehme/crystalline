@@ -56,6 +56,25 @@ flowchart LR
     D -->|volume| I[Index]
 ```
 
+### An account per agent
+
+An agent that runs on another machine does not need a password, because it never signs in to the web UI. Give it its own account with no password and one personal MCP token, in one step:
+
+```bash
+crystalline users add agent-build --role editor --mcp-token build
+```
+
+The command creates the account `agent-build` and prints the token once. Add `--json` to get `name`, `role`, `id`, `token` and `label` as one object for a script. `--mcp-token` and `--password-stdin` cannot be used together, and a name that already exists is refused: a token for an existing account is `crystalline users mcp-token <name>`. The account is created with the role you give (viewer if you give none), so an agent that writes needs `--role editor`. Password sign-in never works for it, and `crystalline users list` shows it as "active, no password". You can still list, rotate and revoke its tokens with `crystalline users mcp-token`, change its role with `users role` and turn it off with `users disable`.
+
+On the agent's machine, set the server and the token and nothing else:
+
+```bash
+export CRYSTALLINE_REMOTE_URL=https://crystalline.example.com
+export CRYSTALLINE_REMOTE_TOKEN=cmt_...
+```
+
+See [A local Crystalline with domains from shared servers](#a-local-crystalline-with-domains-from-shared-servers) for what that offers the agent.
+
 ## Web UI from the daemon
 
 The daemon serves Fluid itself, and it does so by default. The browser UI is built into the binary and the HTTP endpoint opens at `127.0.0.1:7411` unless something turns it off, so one process on one port answers both the agents that speak MCP and the people who want to read what those agents learned: point a browser at `http://localhost:7411` and the app is there, with no second container, no static bundle to deploy and no version to keep in step. `service.http: <host:port>` (or `CRYSTALLINE_SERVICE_HTTP`) moves the endpoint somewhere else and `service.http: false` closes it - that is the machine's answer, read by every daemon on it however it was started. `serve --http <host:port>` and `serve --http off` are the one-invocation override: a daemon whose flag disagrees with the configured value says so out loud at startup (see [Linux server with systemd](#linux-server-with-systemd)). It is the same UI the compose variant below runs - domains down the side, an engram with its frontmatter, observations, relations, backlinks and neighborhood graph, faceted search and Cmd+K to jump anywhere - served straight from the daemon that holds the index.
@@ -104,7 +123,7 @@ flowchart LR
 
 The bundled nginx config carries its own dedicated location for the collab WebSocket, `/api/v1/collab/`, with the Upgrade and Connection headers the plain `/api/` block does not send. Anyone who replaces the Fluid image's nginx config with their own has to carry that block over, or the upgrade never reaches the daemon and the editor runs solo-only with nothing on screen to explain why. The config also raises `client_max_body_size` to 10 MiB to match the daemon's own limit, and a replacement config that leaves nginx's 1 MiB default in place turns every save and every archive import of a larger engram into a proxy refusal. The archive routes get a second, larger directive of their own, in a regex location matching `^/api/v1/domains/[^/]+/archive`: a domain export is re-imported as one zip with its `assets/` attachments inside it, so those two paths accept 64 MiB where everything else keeps 10 MiB, exactly as the daemon does. A replacement config that carries the server-level directive over but not that location refuses an archive the same deployment produced, which reads on screen like a Fluid bug rather than a proxy one. The same template turns proxy buffering off in its `/api/` location, for the change stream the web UI keeps open (see [Web UI from the daemon](#web-ui-from-the-daemon)); a replacement config that leaves buffering on gives a page that never follows a change.
 
-Nothing is readable until an account exists: the JSON API answers `401` to a request that carries no identity. Creating the first admin is the one bootstrap step, and there are two ways to take it. From the host, `users add` writes the accounts database directly (never through the daemon), so a running instance picks the new account up on its next lookup with nothing to restart:
+Nothing is readable until an account exists: the JSON API answers `401` to a request that carries no identity. Creating the first admin is the one bootstrap step, and there are three ways to take it. From the host, `users add` writes the accounts database directly (never through the daemon), so a running instance picks the new account up on its next lookup with nothing to restart:
 
 ```sh
 docker compose -f deploy/fluid/docker-compose.yml up -d
@@ -113,7 +132,25 @@ printf '%s' 'the-password' | docker compose -f deploy/fluid/docker-compose.yml \
   exec -T crystalline crystalline users add ada --role admin --password-stdin
 ```
 
-Or take it in the browser instead: open Fluid and an instance with no accounts renders the create-first-admin form ([Web UI from the daemon](#web-ui-from-the-daemon)). The daemon binds `0.0.0.0` inside its container, so that form asks for the one-time setup token the daemon printed when it started, and `docker compose -f deploy/fluid/docker-compose.yml logs crystalline` is where to read it (a restarted daemon prints a new one, until the admin exists and none is printed again). Either route mints the same admin, and either one closes the form for good.
+Or let the daemon create it at its first start, from the environment. Set `CRYSTALLINE_ADMIN_NAME` and `CRYSTALLINE_ADMIN_PASSWORD_FILE` on the crystalline service, and mount the password as a Docker secret:
+
+```yaml
+services:
+  crystalline:
+    environment:
+      CRYSTALLINE_ADMIN_NAME: ada
+      CRYSTALLINE_ADMIN_PASSWORD_FILE: /run/secrets/crystalline_admin_password
+    secrets:
+      - crystalline_admin_password
+
+secrets:
+  crystalline_admin_password:
+    file: ./admin-password.txt
+```
+
+The admin is created at a start only while no account exists. A later start never changes it, and it never brings back an admin you deleted. Once it exists the browser form asks for nothing, because the instance has an account, and the daemon prints no setup token. The plain `CRYSTALLINE_ADMIN_PASSWORD` works too, but it shows up in `docker inspect`, so use the file form. A file loses one trailing line break and nothing else. If the name or the password is missing, or the file cannot be read, or the password is empty, the first start stops with a message that names the variable. It also stops when a variable and its file form are both set, and when the store refuses the name (for example a name with a space in it); the message names the variable and the reason. When an account exists already, the variables are ignored, and a password variable that is still set logs one warning per start so you can remove it.
+
+Or take it in the browser instead: open Fluid and an instance with no accounts renders the create-first-admin form ([Web UI from the daemon](#web-ui-from-the-daemon)). The daemon binds `0.0.0.0` inside its container, so that form asks for the one-time setup token the daemon printed when it started, and `docker compose -f deploy/fluid/docker-compose.yml logs crystalline` is where to read it (a restarted daemon prints a new one, until the admin exists and none is printed again). Every route mints the same admin, and each one closes the form for good.
 
 Restart the daemon after upgrading the binary, before editing accounts, so both sides open the accounts database the same way. A container upgrade recreates the container and has this covered already; a native install upgraded underneath a daemon that keeps running does not.
 
@@ -286,7 +323,7 @@ docker run -d \
   ghcr.io/jordiboehme/crystalline:latest
 ```
 
-That one published port carries the browser too: the image serves the web UI built in, so `open http://localhost:7411` lands on Fluid while agents keep speaking MCP to the same address (see [Web UI from the daemon](#web-ui-from-the-daemon) for accounts, TLS and the two toggles). A fresh container has no accounts, so that first visit renders the create-first-admin form. The container binds `0.0.0.0`, which is not loopback, so the form asks for the one-time setup token the daemon prints as it starts: `docker logs crystalline` is where to read it, and a restarted container prints a new one until that first admin exists.
+That one published port carries the browser too: the image serves the web UI built in, so `open http://localhost:7411` lands on Fluid while agents keep speaking MCP to the same address (see [Web UI from the daemon](#web-ui-from-the-daemon) for accounts, TLS and the two toggles). A fresh container has no accounts, so that first visit renders the create-first-admin form. The container binds `0.0.0.0`, which is not loopback, so the form asks for the one-time setup token the daemon prints as it starts: `docker logs crystalline` is where to read it, and a restarted container prints a new one until that first admin exists. To skip the form, set `CRYSTALLINE_ADMIN_NAME` and `CRYSTALLINE_ADMIN_PASSWORD_FILE` and the container creates the admin at its first start (see [Team server with Fluid](#team-server-with-fluid)).
 
 What persists where:
 
@@ -350,6 +387,7 @@ An immutable image with no `config.yaml` to mount or edit configures purely thro
 | `CRYSTALLINE_RECALL_ENABLED` | `recall.enabled` | `true` (default) lets the per-prompt hook that `crystalline install` wires hand the agent the engrams that may apply to each prompt; it works today in Claude Code and Codex, while Copilot gets the same hook entry but has no channel yet for its output. `false` keeps the hook installed but silent |
 | `CRYSTALLINE_RECALL_LIMIT` | `recall.limit` | 1 to 5 (default 3); how many engrams the per-prompt hook may name at once |
 | `CRYSTALLINE_RECALL_MIN_SCORE` | `recall.min_score` | 0.0 to 1.0 (default 0.69); the hybrid score an engram must reach before the per-prompt hook names it |
+| `CRYSTALLINE_REMOTE_DEADLINE_MS` | `remote.deadline_ms` | 100 to 60000 (default 3000); how long a call over all domains waits for each connected server before its domains are left out of that answer and named. See [A local Crystalline with domains from shared servers](#a-local-crystalline-with-domains-from-shared-servers) |
 | `CRYSTALLINE_AUTH_TRUSTED_HEADER` | `auth.trusted_header` | the request header a trusted reverse proxy sets to name the already-authenticated user, for example `remote-user`. Unset (default) means no header is believed, whatever a client sends; an account named by a configured header is created at viewer role the first time it is seen. Only safe when the proxy in front of Crystalline strips the header from client requests and sets it itself. Read once when the HTTP surface starts, like `service.read_only` |
 | `CRYSTALLINE_AUTH_PROXY_HEADERS` | `auth.proxy_headers` | `true` trusts the standard forward-auth quartet a reverse proxy sets - `Remote-User` names the person, `Remote-Name` and `Remote-Email` say how to show them, `Remote-Groups` is parsed and ignored until claim mapping exists. `false` (default) believes none of them, whatever a client sends. **Trust-the-proxy: only safe when Crystalline is unreachable except through that proxy and the proxy strips client-supplied copies of those headers.** Mutually exclusive with `CRYSTALLINE_AUTH_TRUSTED_HEADER`; setting both leaves the HTTP endpoint refusing to start (a warning names both keys and says to pick one) while the daemon keeps running and MCP over stdio is unaffected. See [Proxy forward auth](#proxy-forward-auth). Read once when the HTTP surface starts, like `service.read_only` |
 | `CRYSTALLINE_AUTH_ANONYMOUS` | `auth.anonymous` | `true` serves JSON API requests that carry no identity at all, at viewer level; `false` (default) answers them `401`. Read once when the HTTP surface starts, like `service.read_only` |
@@ -372,6 +410,12 @@ An immutable image with no `config.yaml` to mount or edit configures purely thro
 | `CRYSTALLINE_DOMAIN_<NAME>_ORIGIN` | `owner/repo[/subpath][@branch]` | bootstraps the domain on first start. Without `@branch` the domain tracks `main`, not the repository's default branch: the variable is read at startup with no call to GitHub, so name the branch when it is not `main` |
 | `CRYSTALLINE_DOMAIN_<NAME>_REVIEW` | `overlay`, the only value it takes | puts the domain in review mode: every write joins its author's own draft and the folder goes on saying what the team reviewed. Pair it with an origin - the `_ORIGIN` variable here, or an origin in `config.yaml` for a domain the file defines - because a reviewed change is proposed to the team on GitHub, and a reviewing domain with no origin collects drafts nobody can propose. The mode is taken as written: `crystalline domain review` refuses to turn it on without an origin, but a variable and a hand-edited config are believed. Any other value refuses at startup naming the variable, rather than being read as off |
 | `CRYSTALLINE_GITHUB_TOKEN` | this machine's GitHub token | read-only; `connect github` refuses while set |
+| `CRYSTALLINE_REMOTE_URL` | a server this machine offers domains from | a source only together with `CRYSTALLINE_REMOTE_TOKEN`; added after the servers `crystalline connect` saved, and never written down. See [A local Crystalline with domains from shared servers](#a-local-crystalline-with-domains-from-shared-servers) |
+| `CRYSTALLINE_REMOTE_TOKEN` | a personal MCP token for that server | read-only; `crystalline disconnect` cannot remove this source, unset the two variables instead |
+| `CRYSTALLINE_ADMIN_NAME` | the name of the first admin | read at every `serve` start and used only while no account exists. Needs a password variable too. See [Team server with Fluid](#team-server-with-fluid) |
+| `CRYSTALLINE_ADMIN_NAME_FILE` | a path to a file holding that name | the file form of the variable above; set one of the two, never both. One trailing line break is dropped |
+| `CRYSTALLINE_ADMIN_PASSWORD` | the password of the first admin | works, but shows up in `docker inspect`; prefer the file form. Never logged. Ignored, with one warning per start, once an account exists |
+| `CRYSTALLINE_ADMIN_PASSWORD_FILE` | a path to a file holding that password (a Docker secret, `/run/secrets/<name>`) | the file form of the variable above; set one of the two, never both. One trailing line break is dropped |
 | `CRYSTALLINE_MODELS_DIR` | the model cache path | pre-existing, unchanged |
 | `CRYSTALLINE_ACCELERATION` | n/a (environment only) | `off` keeps the local embedding model and the contradiction check's NLI model on the CPU on an Apple Silicon Mac, where they otherwise run on the GPU through Metal. Any other value, and no value, leaves the GPU on. Has no effect on other platforms, which always use the CPU. Read when the model loads. A model that fails on the GPU after it loaded moves to the CPU on its own, without this switch. See [Embedding model hardware](#embedding-model-hardware) |
 | `CRYSTALLINE_CHANNEL` | install channel marker | set to `mcpb` by the Claude Desktop extension manifest so degraded-startup copy tells the user to update the extension rather than the binary; not meant to be set by hand |
@@ -459,6 +503,7 @@ flowchart LR
 | `GET /api/v1/oauth/authorize` | Starts an authorization: validates the client, redirect URI and PKCE challenge, then redirects the browser to the Fluid consent screen |
 | `GET /api/v1/oauth/authorizations/{id}` and `POST /api/v1/oauth/authorizations/{id}` | The consent screen's own read and decision, guarded like any other Fluid page - the account making the decision has to be signed in |
 | `POST /api/v1/oauth/token` | Turns an authorization code into a token pair, or a refresh token into a fresh one |
+| `POST /api/v1/oauth/revoke` | Ends a grant by its access or refresh token (RFC 7009); `crystalline disconnect` calls it. Answers `200` whether or not the token was live |
 
 **Registration is open, and bounded rather than gated.** Anything may call `POST /api/v1/oauth/register`, the way any browser may load a login page: at most 30 registrations per 10 minutes per process, a 64 KiB request body, and at most 1000 stored registrations at once. A registration nobody ever brings to consent is pruned an hour after it was made, so an anonymous caller filling the table costs an operator nothing to wait out; one that has completed at least one consent is pruned only after 30 days with no further use. `client_name` is optional and shown on the consent screen (default "an MCP client" when a client sends none); `client_uri` and `redirect_uris` are the rest of what a client controls about how it is described.
 
@@ -491,11 +536,41 @@ flowchart LR
 
 This is what following `auth.mcp` buys a [Team server with Fluid](#team-server-with-fluid): nobody sets `auth.oauth` at all, and hosted clients connect anyway.
 
-1. **Create the first admin.** [Team server with Fluid](#team-server-with-fluid) covers both ways to take that bootstrap step - `users add` from the host, or the create-first-admin form in Fluid.
+1. **Create the first admin.** [Team server with Fluid](#team-server-with-fluid) covers the ways to take that bootstrap step - `users add` from the host, the admin variables in the compose file, or the create-first-admin form in Fluid.
 2. **Set `auth.mcp` true**, so every agent over HTTP MCP presents a credential instead of connecting on the open tier: see [Authenticated agents](#authenticated-agents).
 3. **Nothing.** `auth.oauth` is unset, so it follows: the UI is serving (the default) and every agent now has to authenticate, so OAuth is on. A hosted client such as Claude.ai connects through the sign-in and consent flow above with no token pasted anywhere; a harness that cannot speak OAuth keeps using a personal MCP token from step 2's world, issued in Fluid or with `crystalline users mcp-token`. Either way, whichever human sign-in this instance uses - local accounts, `auth.oidc` for an external provider such as Authelia or Keycloak, or `auth.proxy_headers` - is what the consent page rides on, since it is an ordinary signed-in Fluid page: nothing about OAuth itself asks which one an instance chose.
 
 To keep tokens only on a shared instance, set `auth.oauth: false` and stop there - `auth.mcp` still governs agents, only the OAuth surface is off.
+
+## A local Crystalline with domains from shared servers
+
+Your own domains live on your laptop; your team's live on a shared server, and maybe a second team runs another one. Until 0.23 an agent saw one or the other: the hooks and the CLI only knew the local daemon, and a second MCP registration per server pushed every name collision onto you. `crystalline connect` adds a server as a **source**. From then on your local Crystalline offers its own domains and the domains of every connected server at the same time, through the same local daemon, the one MCP registration and the unchanged hooks.
+
+**Connecting.** `crystalline connect https://crystalline.acme.com` checks that a Crystalline server answers there, then signs in through the server's own OAuth: it registers itself as a public client, opens your browser on the consent page and waits on a loopback port for the answer (PKCE with `S256`, a redirect to `http://127.0.0.1:<port>/callback`). A server without `auth.oauth` asks for a personal MCP token instead, issued in Fluid (profile > Agent access). On a machine without a browser, run `crystalline connect https://crystalline.acme.com --token`. Either way the token is read from stdin or a prompt, never from the command line. Plain `http` is refused unless the server is on this machine. Each source gets a short name, the most specific word of its host (`acme` here); `--name` picks another. Connect as many servers as you like; `crystalline disconnect acme` removes one.
+
+**One name per domain.** Every domain has exactly one source and one name on this machine. A server's domain keeps its own name when it is free. A name, once given, never changes on its own: whoever comes later gets a suffix, `<domain>-<source name>` (`jordi-acme`), whether that is a second server, a domain that appears on a server later, or a local domain you add later. `connect` says so at once and `crystalline status` keeps showing it; `crystalline domain rename jordi-acme acme-notes --local` picks another name. Your agent only ever sees plain names, never a server qualifier.
+
+**The same domain twice.** A team domain you cloned locally and the same domain on a server (the same repository, folder and branch) are one domain. The server wins: its copy is used and your local copy is hidden while you are connected, untouched on disk, and back on `disconnect`. `connect` warns when the hidden copy holds changes you have not shared yet. The same domain on two servers is taken from the one you connected first.
+
+**What it costs.** A call for one domain (read, write, edit, browse) goes only to that domain's source: one hop. A call over all domains (`search_engrams` without `domains`, `recent_activity`, `list_domains`, `evolve_engrams` without a domain) asks your local index and every server in parallel and waits at most `remote.deadline_ms` (3 seconds by default) for each. A server that is slower, or down, is left out of that answer and named in it. Search hits from several indexes are merged by rank (reciprocal rank fusion), because their scores cannot be compared; each server is asked for up to 100 hits per call. Live documents and draft links work on a server's domain: the server sees your agent by name in the participant strip, and a `dl_` share link holds its draft for 30 minutes after your agent's last call.
+
+**What reaches the server.** The local daemon forwards calls to `POST /api/v1/ctl`, the control protocol over HTTPS, with the source's token and the name of the calling agent (for example `claude-code`). The route always needs a token, whatever `auth.mcp` says, runs as the token's account (the same domain rights as over MCP) and serves six commands: `status`, `tool`, `routing_bullets`, `hook_status`, `origin_status` and `origin_changes`. Every other command answers "not available over a remote connection". A `tool` call goes through the same per-tool checks an MCP call by that account does, and `configure` and `provision` are not reachable through it. A server never forwards a call it got this way to its own sources. Only your own sessions reach the servers: an HTTP client of your local daemon never borrows your sign-in.
+
+**What stays on this machine.** The credential of each source lives in the OS keychain under `crystalline-server:<host>`, or in a file only you can read when no keychain works; the token only ever travels to its own server. Per source, `<state_dir>/remote/<host>/` keeps two small cached answers: the routing model with the domain list (`routing.json`) and the maintenance status the end-of-session nudge reads (`hook_status.json`). Nothing else of a server's knowledge is stored here. With a server down, session start prints its cached part of the routing block with one line saying it may be out of date, and its domains are missing from answers until it is back; the hidden local copy of a replaced domain is never used in its place. The local web UI shows your local domains and lists the servers' domains with a link to each server's Fluid.
+
+**Headless machines.** `CRYSTALLINE_REMOTE_URL` and `CRYSTALLINE_REMOTE_TOKEN` (a personal MCP token) add one source without running `connect`, for CI jobs and containers. It is never written down, so its names are worked out again at each start.
+
+```mermaid
+flowchart LR
+    H[Harness] -->|stdio MCP| D[Local daemon: mount table]
+    K[Hooks and CLI] -->|socket| D
+    D --> L[(Local domains)]
+    D -->|HTTPS, Bearer, POST /api/v1/ctl| A[Server acme]
+    D -->|HTTPS, Bearer, POST /api/v1/ctl| B[Server beta]
+    D -.->|server down| C[(routing.json and hook_status.json per server)]
+    N[crystalline connect] -->|OAuth consent in the browser, or a pasted token| A
+    N --> T[(keychain: crystalline-server:host)]
+```
 
 ## Enterprise SSO
 

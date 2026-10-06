@@ -1479,6 +1479,25 @@ export type ReviewBody = {
 export type ReviewModeArg = 'overlay' | 'direct';
 
 /**
+ * The form of `POST /oauth/revoke` (RFC 7009 section 2.1).
+ */
+export type RevokeForm = {
+    /**
+     * The registration the token was issued to.
+     */
+    client_id?: string | null;
+    /**
+     * The access token (`coa_`) or refresh token (`cor_`) to revoke. Either
+     * ends the whole grant.
+     */
+    token?: string | null;
+    /**
+     * `access_token` or `refresh_token`. A hint only: the prefix decides.
+     */
+    token_type_hint?: string | null;
+};
+
+/**
  * What a user may do. Ordered least to most privileged; the REST layer maps
  * each endpoint to the minimum role it accepts.
  */
@@ -2367,6 +2386,8 @@ export type ListDomainsResponses = {
      * A domain that reviews changes before they land carries `review: "overlay"` and, for a caller with an account, `my_drafts`: how many draft changes of theirs are waiting to be shared. Both are absent on a domain that takes changes directly, and `my_drafts` is absent rather than zero when there is no account to count for - a client reads presence, since null and 0 are different facts.
      *
      * Every domain also carries `canonical_name` (the name its content carries), `aliases` (its former local names, still accepted as input), `name_origin` (`explicit` or `derived`, `null` for a legacy entry nothing has inferred yet), `shadowed` (whether another domain's local name already holds this one's canonical name - a bool, never naming the other domain) and `renaming` (whether a rename has this domain paused right now; always present, so every row keeps the same columns).
+     *
+     * For an instance admin, `mounted` lists the domains this machine offers from connected servers (`crystalline connect`): each one's local `name`, its `source`, the server's `source_url`, its `remote_name` there and the `web_url` of its page on that server (`null` unless the address is http or https). They are not served here.
      */
     200: {
         [key: string]: unknown;
@@ -5561,6 +5582,44 @@ export type RegisterOauthClientResponses = {
 };
 
 export type RegisterOauthClientResponse = RegisterOauthClientResponses[keyof RegisterOauthClientResponses];
+
+export type OauthRevokeData = {
+    /**
+     * The revocation request.
+     */
+    body: RevokeForm;
+    path?: never;
+    query?: never;
+    url: '/api/v1/oauth/revoke';
+};
+
+export type OauthRevokeErrors = {
+    /**
+     * The body is not a form, or it lacks `token` or `client_id` (`invalid_request`).
+     */
+    400: OauthErrorBody;
+    /**
+     * A cookie session did not echo its CSRF token.
+     */
+    403: ProblemDetail;
+    /**
+     * This instance does not serve OAuth: `auth.oauth` is off.
+     */
+    404: ProblemDetail;
+    /**
+     * The accounts database could not be reached.
+     */
+    500: OauthErrorBody;
+};
+
+export type OauthRevokeError = OauthRevokeErrors[keyof OauthRevokeErrors];
+
+export type OauthRevokeResponses = {
+    /**
+     * Revoked, or nothing to revoke.
+     */
+    200: unknown;
+};
 
 export type OauthTokenData = {
     /**

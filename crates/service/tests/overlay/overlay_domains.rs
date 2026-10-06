@@ -6752,6 +6752,10 @@ fn another_actors_view_is_reached_only_by_the_owner_gated_surfaces() {
         ("engine.rs", "discard_into_overlay"),
         // A conflict resolution inside one actor's own draft.
         ("engine.rs", "resolve_in_overlay"),
+        // A `#[cfg(test)]` unit test standing in for an open co-editing room,
+        // to pin that a room's save into a domain a connected server hides
+        // is refused. It answers no reader.
+        ("engine.rs", "a_room_save_into_a_hidden_domain_is_refused"),
         // A share resolved through `ShareActor`.
         ("engine.rs", "stage_overlay_share"),
         // A write made INSIDE somebody else's draft: the one write-side
@@ -8003,4 +8007,136 @@ async fn a_review_mode_share_lists_the_open_pull_requests_once() {
         !delta.contains(&format!("delete_branch:{branch}")),
         "the backport keeps it: {delta:?}"
     );
+}
+
+/// The remote `origin_changes` runs as the account whose token asked: each
+/// member reads exactly their own drafts of the reviewing domain, and a
+/// request answered as the machine owner would list neither.
+#[tokio::test]
+async fn the_remote_origin_changes_run_as_the_calling_account() {
+    let f = build_fixture(MANIFEST, true, true, None, true, true).await;
+    let auth = Arc::new(AuthStore::open(&f.root.join("web-auth.db")).await.unwrap());
+    let router = http_router(
+        f.engine.clone(),
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        &[],
+        auth.clone(),
+        None,
+    )
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    for who in ["alice", "bob"] {
+        auth.add_user(who, who, None, Role::Editor, "pw12345678")
+            .await
+            .unwrap();
+    }
+    f.draft("team", "alice", "plan.md", ALICE_DRAFT).await;
+    f.draft("team", "bob", "bob.md", ALICE_NEW).await;
+
+    let ask = |who: &'static str, body: serde_json::Value| {
+        let auth = auth.clone();
+        async move {
+            let token = auth.issue_mcp_token(who, "t").await.unwrap().token;
+            reqwest::Client::new()
+                .post(format!("http://{addr}/api/v1/ctl"))
+                .bearer_auth(token)
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap()
+        }
+    };
+    let changes = serde_json::json!({ "v": 1, "cmd": "origin_changes", "domain": "team" });
+    let alice = ask("alice", changes.clone()).await;
+    assert_eq!(alice["ok"], true, "{alice}");
+    assert_eq!(
+        alice["data"]["changes"].as_array().unwrap().len(),
+        1,
+        "{alice}"
+    );
+    assert_eq!(alice["data"]["changes"][0]["path"], "plan.md", "{alice}");
+    let bob = ask("bob", changes).await;
+    assert_eq!(bob["data"]["changes"].as_array().unwrap().len(), 1, "{bob}");
+    assert_eq!(bob["data"]["changes"][0]["path"], "bob.md", "{bob}");
+
+    let status = ask(
+        "alice",
+        serde_json::json!({ "v": 1, "cmd": "origin_status", "domain": "team" }),
+    )
+    .await;
+    assert_eq!(status["ok"], true, "{status}");
+}
+
+/// The remote `origin_status` runs under the account's scope: for a domain
+/// the account cannot see it answers exactly as for a domain nobody
+/// registered, and the all-domains form never lists it.
+#[tokio::test]
+async fn the_remote_origin_status_hides_a_domain_the_account_cannot_see() {
+    let f = build_fixture(MANIFEST, true, true, None, true, true).await;
+    let auth = Arc::new(AuthStore::open(&f.root.join("web-auth.db")).await.unwrap());
+    let router = http_router(
+        f.engine.clone(),
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        &[],
+        auth.clone(),
+        None,
+    )
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    for who in ["alice", "bob"] {
+        auth.add_user(who, who, None, Role::Editor, "pw12345678")
+            .await
+            .unwrap();
+    }
+    auth.set_domain_visibility("team", true, "alice")
+        .await
+        .unwrap();
+    let token = auth.issue_mcp_token("bob", "t").await.unwrap().token;
+    let ask = |body: serde_json::Value| {
+        let token = token.clone();
+        async move {
+            reqwest::Client::new()
+                .post(format!("http://{addr}/api/v1/ctl"))
+                .bearer_auth(token)
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap()
+        }
+    };
+    let hidden = ask(serde_json::json!({ "v": 1, "cmd": "origin_status", "domain": "team" })).await;
+    let unknown =
+        ask(serde_json::json!({ "v": 1, "cmd": "origin_status", "domain": "nosuch" })).await;
+    assert_eq!(hidden["ok"], false, "{hidden}");
+    assert_eq!(
+        hidden.to_string().replace("team", "X"),
+        unknown.to_string().replace("nosuch", "X"),
+        "a private domain answers like one nobody registered"
+    );
+    let all = ask(serde_json::json!({ "v": 1, "cmd": "origin_status" })).await;
+    assert!(!all.to_string().contains("team"), "{all}");
 }

@@ -3080,7 +3080,7 @@ fn v302_names_both_lines_scores_and_similarity_and_counts_the_rest() {
     );
     assert_eq!(
         f.fix,
-        "read both then supersede or close a window or acknowledge V302"
+        "read both then supersede the older (valid_to set to the real date), correct the stale line or acknowledge V302"
     );
     // Each hash stays beside its engram: ordered by address, never sorted.
     assert_eq!(
@@ -3370,6 +3370,21 @@ fn v302_is_quiet_below_the_line_when_off_and_on_a_retired_speculative_or_disjoin
     );
 }
 
+#[test]
+fn v302_advice_never_tells_to_close_a_window_alone() {
+    let entry = crate::sweep::rule_info("V302").expect("V302 is in the catalog");
+    for text in [
+        entry.instruction,
+        super::contradictions::FIX,
+        super::contradictions::PERIOD,
+    ] {
+        assert!(!text.contains("close a window"), "{text}");
+        assert!(!text.contains("close the older"), "{text}");
+    }
+    assert!(entry.instruction.contains("V001"));
+    assert!(entry.instruction.contains("V010"));
+}
+
 /// Task 5b: a stored row whose engram is past its `valid_to` as of the
 /// sweep's date never surfaces, even before the next walk deletes it; a
 /// window that ends on the sweep's date still counts.
@@ -3514,7 +3529,7 @@ fn a_line_that_names_a_period_points_at_the_window() {
     let f = only(&detect(&meaning_input(vec![a, b], vec![row])), "V302");
     assert_eq!(
         f.fix,
-        "One of these lines names a period; if both held at different times, close the older engram's validity window. read both then supersede or close a window or acknowledge V302"
+        "One of these lines names a period; if both held at different times, the newer engram supersedes the older one, whose valid_to is set to the real date. read both then supersede the older (valid_to set to the real date), correct the stale line or acknowledge V302"
     );
 }
 

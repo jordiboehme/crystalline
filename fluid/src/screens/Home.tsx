@@ -118,6 +118,48 @@ export default function Home() {
         </ul>
       </section>
 
+      {listing.data && listing.data.mounted.length > 0 && (
+        <section aria-labelledby="home-mounted">
+          <h2 id="home-mounted" className="mb-1 text-section">
+            From connected servers
+          </h2>
+          {/*
+            Listed, not served: each one opens on its own server's Fluid, in
+            a tab of its own, because this instance holds none of it.
+          */}
+          <p className="mb-3 text-sm text-slate-500 dark:text-slate-400">
+            Your agents use these beside the domains above. Each one opens on
+            its server.
+          </p>
+          <ul className="grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
+            {listing.data.mounted.map((mounted) => (
+              <li key={mounted.name} className="text-sm">
+                {mounted.webUrl ? (
+                  <a
+                    href={mounted.webUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className={`hover:underline ${FOCUS_RING}`}
+                  >
+                    {mounted.name} on {mounted.source}
+                  </a>
+                ) : (
+                  <span>
+                    {mounted.name} on {mounted.source}
+                  </span>
+                )}
+                {mounted.remoteName !== mounted.name && (
+                  <span className="text-slate-500 dark:text-slate-400">
+                    {" "}
+                    (called {mounted.remoteName} there)
+                  </span>
+                )}
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+
       <section aria-labelledby="home-activity">
         <h2 id="home-activity" className="mb-1 text-section">
           Recent activity

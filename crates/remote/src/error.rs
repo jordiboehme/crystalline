@@ -244,6 +244,19 @@ pub enum RemoteError {
         /// A short, human-readable description of what went wrong.
         detail: String,
     },
+
+    /// The saved sign-in to a Crystalline server (`crystalline connect <url>`)
+    /// could not be read, written or deleted: the keychain refused, or the
+    /// fallback file is not valid JSON. Its own variant because
+    /// [`RemoteError::Credential`]'s sentence names GitHub and tells the reader
+    /// to use configure, and neither is true here.
+    #[error(
+        "The saved sign-in to a Crystalline server could not be read or written: {detail}. Run crystalline connect <url> again."
+    )]
+    ServerCredential {
+        /// A short, human-readable description of what went wrong.
+        detail: String,
+    },
 }
 
 impl RemoteError {
@@ -275,7 +288,8 @@ impl RemoteError {
             | RemoteError::BranchProtected { .. }
             | RemoteError::Io(_)
             | RemoteError::State(_)
-            | RemoteError::Credential { .. } => false,
+            | RemoteError::Credential { .. }
+            | RemoteError::ServerCredential { .. } => false,
         }
     }
 }

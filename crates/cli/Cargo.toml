@@ -63,10 +63,12 @@ fluid-ui = ["crystalline-service/fluid-ui"]
 crystalline-service = { workspace = true }
 crystalline-index = { workspace = true }
 crystalline-core = { workspace = true }
-# Only `connect github` (inherently local: signing in is machine identity, not
-# content) uses this crate directly. Every other origin verb routes through
-# crystalline-service's socket-first client entry points, never linking this
-# crate for its in-process fallback.
+# `connect github` and the connected-server verbs (`connect <url>`,
+# `disconnect`, a local rename of a mounted domain, the source rows of
+# `status` and `doctor`) use this crate directly: signing in and the list of
+# sources are this machine's own, not content. Every origin verb routes
+# through crystalline-service's socket-first client entry points, never
+# linking this crate for its in-process fallback.
 crystalline-remote = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
@@ -86,7 +88,13 @@ dunce = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+# A pasted token is read without echo at a terminal.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
+# The in-process Crystalline server the source tests connect to.
+axum = { workspace = true }
 assert_cmd = { workspace = true }
 predicates = "3.1.4"
 tempfile = { workspace = true }

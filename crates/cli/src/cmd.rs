@@ -2926,24 +2926,6 @@ pub fn render_status(data: &serde_json::Value, daemon_note: &str) {
     }
 }
 
-/// Show per-domain counts and index diagnostics from the index the dispatch
-/// reached. `daemon_note` says which view this is, so a direct read never
-/// masquerades as a running daemon's.
-pub async fn status(
-    route: IndexRoute,
-    cfg: &GlobalConfig,
-    json: bool,
-    daemon_note: &str,
-) -> Result<()> {
-    let value = status_value(route, cfg).await?;
-    if json {
-        println!("{value}");
-    } else {
-        render_status(&value, daemon_note);
-    }
-    Ok(())
-}
-
 // --- model download ----------------------------------------------------------
 
 /// Pre-fetch the local embedding model, printing the cache path and size. Exits

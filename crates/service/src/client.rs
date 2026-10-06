@@ -600,6 +600,8 @@ struct EmbeddedStack {
     /// can take its store before the process leaves.
     engine: Arc<Engine>,
     ownership: crate::instance::Ownership,
+    /// Stops the source poller when the session ends.
+    stop_sources: tokio::sync::watch::Sender<bool>,
 }
 
 /// Build the full in-process stack: take the index lock (refused if held),
@@ -646,6 +648,29 @@ async fn build_embedded(
     // A rename a stopped daemon left half done is finished before the first
     // sync and before the routing cache reads a name, as the daemon does.
     engine.finish_leftover_rename().await;
+    // This machine's sources, once that rename is done (its recovery reads
+    // names the mount table could hide). An explicit --db or --config serves
+    // this machine's own index only.
+    //
+    // With them, the daemon's source poller, run here because this stack is
+    // the one serving the session: a `connect` or `disconnect` made while it
+    // runs, and a hand edit of sources.json or config.yaml, show within the
+    // look, and the routing caches refresh on the poll as they do in a
+    // daemon. Its own task, so the start never waits on a server.
+    let (stop_sources, stopped) = tokio::sync::watch::channel(false);
+    if use_daemon(db, config_path) {
+        crate::route::install_sources(&engine);
+        let e = engine.clone();
+        tokio::spawn(async move {
+            crate::daemon::run_source_poller(
+                e,
+                crate::daemon::SOURCE_POLL,
+                crate::daemon::SOURCE_LOOK,
+                stopped,
+            )
+            .await;
+        });
+    }
 
     let bg = engine.clone();
     let bg_config = loaded.effective.clone();
@@ -676,6 +701,7 @@ async fn build_embedded(
         server: McpServer::new(engine.clone()).with_harness_gate(harness_gate),
         engine,
         ownership,
+        stop_sources,
     })
 }
 
@@ -702,12 +728,17 @@ where
         "stopping (the client closed the session); exiting within {}s",
         SHUTDOWN_DEADLINE.as_secs()
     );
+    let _ = stack.stop_sources.send(true);
     let departure = Departure::begin(stack.ownership, SHUTDOWN_DEADLINE);
     // Held to the exit, as in the daemon: an operation already inside the
     // store finishes and no new one starts.
     departure.step("waiting for the store");
     let store = stack.engine.store();
     let _held = store.lock().await;
+    // Then a sign-in refresh a source call started, which runs as a task of
+    // its own, is waited for with what is left of the deadline, so a token
+    // pair the server rotated is saved.
+    departure.settle_sign_ins().await;
     departure.finish(None)
 }
 
@@ -897,7 +928,27 @@ pub async fn run_tool(
     let want_embeddings = matches!(tool, "search_engrams");
     let engine =
         open_standalone_reporting(loaded, &db_path, want_embeddings, db, config_path).await?;
-    dispatch_engine(&engine, tool, args).await
+    // An explicit --db or --config keeps every verb on this machine's own
+    // index, as it keeps it off the daemon; otherwise the sources are this
+    // machine's, read from disk for this one command. The opener above has
+    // already finished any rename an earlier run left half done.
+    let engine = Arc::new(engine);
+    if use_daemon(db, config_path) {
+        crate::route::install_sources(&engine);
+    }
+    let answer = crate::route::run_tool_routed(
+        &engine,
+        tool,
+        args,
+        &crystalline_remote::ForwardedAgent::default(),
+        None,
+    )
+    .await;
+    // A refresh a source call started runs as a task of its own: this
+    // process waits for it before it leaves, so a token pair the server
+    // rotated is saved.
+    crystalline_remote::settle_refreshes(crystalline_remote::ONE_DOMAIN_LIMIT).await;
+    answer
 }
 
 /// Scaffold a virtual domain's MANIFEST from prebuilt markdown: over the daemon
@@ -1193,6 +1244,11 @@ pub async fn domain_remove(
                 config_file.display()
             )
         })?;
+    // This machine's sources, as the daemon has them: a local copy a
+    // connected server hides is refused here too (decision D19).
+    if use_daemon(db, config_path) {
+        crate::route::install_sources(&engine);
+    }
     let name = localize_standalone(&engine, name).await;
     let name = name.as_str();
     if let Ok(auth_path) = crystalline_core::config::web_auth_db_path()
@@ -1261,6 +1317,13 @@ pub async fn domain_rename(
         && report["domain"] == new
     {
         return Ok(report);
+    }
+    // This machine's sources, as the daemon has them: a local copy a
+    // connected server hides is refused here too (decision D19). Installed
+    // only now, after the opener finished any rename an earlier run left
+    // half done, because that recovery reads names the table would hide.
+    if use_daemon(db, config_path) {
+        crate::route::install_sources(&engine);
     }
     // A rename runs only while this process holds the state directory, as a
     // daemon does; the engine refuses it otherwise, in words that name the
@@ -1700,7 +1763,10 @@ pub async fn origin_changes(
     let db_path = resolve_db(db)?;
     let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
     let domain = localize_standalone(&engine, domain).await;
-    Ok(crate::control::origin_changes_inline(&engine, &domain, path, sides).await?)
+    Ok(
+        crate::control::origin_changes_inline(&engine, &domain, path, sides, &ShareActor::Owner)
+            .await?,
+    )
 }
 
 /// Put named paths of one team domain back the way the team has them, for

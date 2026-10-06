@@ -21,6 +21,19 @@ impl Engine {
         name: Option<&str>,
         folder: Option<&str>,
     ) -> Result<Value> {
+        self.domain_add_local_as(name, folder, &crate::scope::Scope::Unrestricted)
+            .await
+    }
+
+    /// [`Engine::domain_add_local`] for `scope`, which decides only how the
+    /// report's note names a connected server: by name for the machine
+    /// owner, not at all for anyone else.
+    pub async fn domain_add_local_as(
+        &self,
+        name: Option<&str>,
+        folder: Option<&str>,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
@@ -37,6 +50,13 @@ impl Engine {
         let mut cfg = self.config();
         cfg.domains = self.registered_domain_entries();
 
+        // A name a connected server already gave out is the mount's; a new
+        // local domain under it is the latecomer and gets the local suffix
+        // (decision D13), before the default folder is derived from it. A
+        // registration of that name here keeps its name.
+        let mut wanted = name.map(str::to_string);
+        let beside = name.map(|n| self.beside_mounts(n));
+        let name = beside.as_deref();
         if let Some(n) = name {
             // An env-defined domain of this name is owned by its variable.
             if let Some(env) = self.overlay.env_domain(n) {
@@ -105,10 +125,13 @@ impl Engine {
                                 || table.resolve(candidate).is_some()
                         },
                     );
-                    (choice.name, false, choice.origin)
+                    let name = self.beside_mounts(&choice.name);
+                    wanted = Some(choice.name);
+                    (name, false, choice.origin)
                 }
             },
         };
+        let wanted = wanted.unwrap_or_else(|| domain_name.clone());
 
         // Create-or-adopt: scaffold a MANIFEST.md only when the folder lacks one.
         let manifest = canonical.join("MANIFEST.md");
@@ -139,6 +162,9 @@ impl Engine {
             let effective = self.overlay.apply(&file);
             *file_guard = file;
             *self.config.write().unwrap() = effective;
+        }
+        if !adopted {
+            self.sync_sources_local();
         }
 
         // Tell a running daemon's watcher to watch the new root; an adopted
@@ -177,6 +203,7 @@ impl Engine {
             "sync": sync,
         });
         self.append_name_fields(&mut result, &domain_name).await?;
+        self.note_beside_mounts(&mut result, &wanted, &domain_name, scope);
         Ok(result)
     }
 
@@ -188,9 +215,37 @@ impl Engine {
     /// no sync. Refuses on a read-only instance; no `github.enabled` gate.
     /// Returns `{ domain, kind, manifest_created, registered }`.
     pub async fn domain_add_virtual(&self, name: &str) -> Result<Value> {
+        self.domain_add_virtual_as(name, &crate::scope::Scope::Unrestricted)
+            .await
+    }
+
+    /// [`Engine::domain_add_virtual`] for `scope`, which decides only how the
+    /// report's note names a connected server.
+    pub async fn domain_add_virtual_as(
+        &self,
+        name: &str,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
+        // A name a connected server already gave out is the mount's; a new
+        // local domain under it is the latecomer and gets the local suffix
+        // (decision D13).
+        // A retry is idempotent: the `<name>-local` an earlier add of the same
+        // name registered is answered again rather than counted past.
+        let wanted = name;
+        let beside = self.beside_mounts(wanted);
+        let first = format!("{wanted}-{}", crystalline_remote::LOCAL_SUFFIX);
+        let earlier_virtual = beside != wanted
+            && self
+                .config
+                .read()
+                .unwrap()
+                .domains
+                .get(&first)
+                .is_some_and(DomainEntry::is_virtual);
+        let name = &if earlier_virtual { first } else { beside };
         if let Some(env) = self.overlay.env_domain(name) {
             return Err(EngineError::Conflict(format!(
                 "domain '{name}' is defined by the environment variable {}; unset it to manage this domain in the config file",
@@ -226,6 +281,9 @@ impl Engine {
             let effective = self.overlay.apply(&file);
             *file_guard = file;
             *self.config.write().unwrap() = effective;
+        }
+        if is_new {
+            self.sync_sources_local();
         }
 
         let today = Utc::now().date_naive().format("%Y-%m-%d").to_string();
@@ -263,6 +321,7 @@ impl Engine {
             "registered": is_new,
         });
         self.append_name_fields(&mut result, name).await?;
+        self.note_beside_mounts(&mut result, wanted, name, scope);
         Ok(result)
     }
 
@@ -909,6 +968,7 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
+        self.refuse_hidden_admin(name, scope).await?;
         let _admin = self.domain_admin().await;
         let _fence = self.fence_joins().await;
         self.require_domain_owner(name, scope).await?;

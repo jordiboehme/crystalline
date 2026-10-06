@@ -245,7 +245,20 @@ fn virtual_routing_bullets(
 }
 
 fn included_domain_names(global: &GlobalConfig, workspace: &Path) -> BTreeSet<String> {
-    let all: BTreeSet<String> = global.domains.keys().cloned().collect();
+    included_domain_names_among(global, workspace, &[])
+}
+
+/// The names `prompt.rules` keeps for `workspace`, out of the registered
+/// domains plus `extra`: the domains a connected server lends this machine,
+/// which a rule names by their local name like any other. With no rule that
+/// matches, every name is kept, so a block with no rules is unchanged.
+pub fn included_domain_names_among(
+    global: &GlobalConfig,
+    workspace: &Path,
+    extra: &[String],
+) -> BTreeSet<String> {
+    let mut all: BTreeSet<String> = global.domains.keys().cloned().collect();
+    all.extend(extra.iter().cloned());
     let Some(prompt_cfg) = &global.prompt else {
         return all;
     };
@@ -904,6 +917,31 @@ mod tests {
         );
         global.prompt = Some(crate::config::PromptConfig { rules });
         (tmp, global)
+    }
+
+    /// Review M4: a rule names a lent domain by its local name like any
+    /// other. An include list that names only a lent domain keeps only it,
+    /// an exclude drops it, and no matching rule keeps everything.
+    #[test]
+    fn prompt_rules_apply_to_the_names_a_server_lends() {
+        let (tmp, mut global) = fixture_with_prompt_rules();
+        let lent = vec!["jordi-acme".to_string()];
+        let names = |g: &GlobalConfig| -> Vec<String> {
+            included_domain_names_among(g, tmp.path(), &lent)
+                .into_iter()
+                .collect()
+        };
+        assert_eq!(names(&global), vec!["alpha"], "include alpha only");
+        fn rule(g: &mut GlobalConfig) -> &mut crate::config::PromptRule {
+            g.prompt.as_mut().unwrap().rules.get_mut("**").unwrap()
+        }
+        rule(&mut global).include = Some(vec!["jordi-acme".to_string()]);
+        assert_eq!(names(&global), vec!["jordi-acme"]);
+        rule(&mut global).include = None;
+        rule(&mut global).exclude = Some(vec!["jordi-acme".to_string()]);
+        assert_eq!(names(&global), vec!["alpha", "beta"]);
+        global.prompt = None;
+        assert_eq!(names(&global), vec!["alpha", "beta", "jordi-acme"]);
     }
 
     #[test]

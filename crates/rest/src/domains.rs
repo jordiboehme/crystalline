@@ -23,6 +23,7 @@ use super::{
 };
 use crate::engine::EngineError;
 use crate::params::{BrowseParams, ListDomainsParams};
+use crate::scope::Scope;
 use crystalline_core::{
     Manifest, PolicyKind, ProblemKind, TagAliasProblemKind, manifest_template, parse_engram,
     policy_registry, starter_stanzas,
@@ -61,7 +62,15 @@ use crystalline_core::{
                            never naming the other domain) and `renaming` \
                            (whether a rename has this domain paused right \
                            now; always present, so every row keeps the same \
-                           columns).",
+                           columns).\n\n\
+                           For an instance admin, `mounted` lists the \
+                           domains this machine offers from connected \
+                           servers (`crystalline connect`): each one's \
+                           local `name`, its `source`, the server's \
+                           `source_url`, its `remote_name` there and the \
+                           `web_url` of its page on that server (`null` \
+                           unless the address is http or https). They are \
+                           not served here.",
             body = Object,
             example = json!({
                 "behavior": [
@@ -104,7 +113,7 @@ pub async fn list(
     State(state): State<RestState>,
     identity: Identity,
 ) -> Result<Json<Value>, ApiError> {
-    let value = state
+    let mut value = state
         .engine
         .list_domains(
             &ListDomainsParams {
@@ -113,6 +122,14 @@ pub async fn list(
             &identity.scope(),
         )
         .await?;
+    // The servers this machine is connected to are its owner's business: an
+    // instance admin sees their domains listed, nobody else does, so a team
+    // server that happens to have sources never shows them to its members.
+    if matches!(identity.scope(), Scope::User { admin: true, .. })
+        && let Value::Object(map) = &mut value
+    {
+        map.insert("mounted".to_string(), state.engine.mounted_listing());
+    }
     Ok(Json(value))
 }
 

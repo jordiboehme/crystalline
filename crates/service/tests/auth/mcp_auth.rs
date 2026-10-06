@@ -3485,6 +3485,7 @@ async fn both_well_known_documents_name_this_origin_and_vanish_when_off() {
             "authorization_endpoint": format!("{origin}/api/v1/oauth/authorize"),
             "token_endpoint": format!("{origin}/api/v1/oauth/token"),
             "registration_endpoint": format!("{origin}/api/v1/oauth/register"),
+            "revocation_endpoint": format!("{origin}/api/v1/oauth/revoke"),
             "response_types_supported": ["code"],
             "grant_types_supported": ["authorization_code", "refresh_token"],
             "code_challenge_methods_supported": ["S256"],

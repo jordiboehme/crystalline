@@ -465,6 +465,16 @@ pub async fn run_serve(
     // every other domain is served.
     engine.finish_leftover_rename().await;
 
+    // This machine's sources (`crystalline connect`): the mount table its
+    // owner's calls route through and the local copies it hides. Installed
+    // only now, once the rename above is done, because that recovery reads
+    // names the table could hide. Built from the caches alone, so a server
+    // that is down never holds the start up. An explicit --db or --config
+    // serves this machine's own index only.
+    if crate::client::use_daemon(db.as_deref(), config_path.as_deref()) {
+        crate::route::install_sources(&engine);
+    }
+
     // Prime the routing cache once as the HTTP baseline: every HTTP session
     // shares this engine and reads its cache at initialize, and each socket
     // connection refreshes it again in `handle_conn` before serving.
@@ -521,6 +531,12 @@ pub async fn run_serve(
     // [`setup_token_for`] and the print just below - the token is said once and
     // never written anywhere again.
     let accounts_db = crystalline_core::config::web_auth_db_path().ok();
+    // The first admin from the environment (A9), made before the token is
+    // asked about so an instance that just got its admin draws none. The store
+    // it opens is dropped inside, so `setup_token_for`'s own open is the only
+    // handle left. A refused configuration fails the start here, with a
+    // sentence that never carries the password.
+    let created_admin = crate::first_admin::seed_from_environment(accounts_db.as_deref()).await?;
     let setup_token = match http_addr.as_deref() {
         Some(addr) => setup_token_for(addr, accounts_db.as_deref()).await,
         None => None,
@@ -549,6 +565,9 @@ pub async fn run_serve(
                 }
             }
         }
+        if let Some(line) = &created_admin {
+            eprintln!("{line}");
+        }
         if read_only {
             eprintln!("crystalline serving read-only: content-mutating tools are disabled");
         }
@@ -557,13 +576,18 @@ pub async fn run_serve(
                 "no domains registered yet - agents can create one with add_domain, or run: crystalline domain add <name> <path>"
             );
         }
-    } else if let (Some(addr), Some(token)) = (&http_addr, &setup_token) {
-        // Daemonized, so there is no terminal reading the banner: the same two
-        // lines go to the daemon log instead, once. Without them a backgrounded
-        // non-loopback serve would offer a first-run wizard nobody can get
-        // through and no way to find out why.
-        for line in setup_token_lines(&setup_address(&loaded.effective, addr), token) {
+    } else {
+        if let Some(line) = &created_admin {
             tracing::info!("{line}");
+        }
+        if let (Some(addr), Some(token)) = (&http_addr, &setup_token) {
+            // Daemonized, so there is no terminal reading the banner: the same two
+            // lines go to the daemon log instead, once. Without them a backgrounded
+            // non-loopback serve would offer a first-run wizard nobody can get
+            // through and no way to find out why.
+            for line in setup_token_lines(&setup_address(&loaded.effective, addr), token) {
+                tracing::info!("{line}");
+            }
         }
     }
 
@@ -675,6 +699,19 @@ pub async fn run_serve(
         let rx = shared.watch();
         tokio::spawn(async move {
             run_origin_poller(e, rx).await;
+        });
+    }
+
+    // The source poller: each connected server's routing model and
+    // maintenance status, asked through their etags every SOURCE_POLL, and a
+    // cheap look at sources.json and config.yaml every SOURCE_LOOK. A no-op
+    // on a machine with no sources. Its own task, so the start never waits
+    // on a server.
+    {
+        let e = engine.clone();
+        let rx = shared.watch();
+        tokio::spawn(async move {
+            run_source_poller(e, SOURCE_POLL, SOURCE_LOOK, rx).await;
         });
     }
 
@@ -793,7 +830,27 @@ pub async fn run_serve(
     let store = engine.store();
     let _held = store.lock().await;
 
+    // With the store held: a sign-in refresh a source call started is
+    // waited for, with what is left of the deadline, so a token pair a
+    // server rotated is saved. The refresh touches no store.
+    departure.settle_sign_ins().await;
+
     departure.finish((!daemon_flag).then_some("crystalline stopped"))
+}
+
+/// What a departure keeps back for the steps after the sign-in settle (the
+/// removal and the exit), and so the least the watchdog never sees spent.
+const SETTLE_MARGIN: Duration = Duration::from_secs(2);
+
+/// How long a departure that began `elapsed` ago, with `deadline` in all,
+/// waits for a sign-in refresh: what is left of the deadline minus
+/// [`SETTLE_MARGIN`], and never more than half the deadline, so the wait can
+/// never be what the watchdog ends.
+fn settle_budget(deadline: Duration, elapsed: Duration) -> Duration {
+    deadline
+        .saturating_sub(elapsed)
+        .saturating_sub(SETTLE_MARGIN)
+        .min(deadline / 2)
 }
 
 /// How long a stopping daemon has from the moment it decides to stop to the
@@ -828,6 +885,9 @@ pub const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(10);
 /// stuck runtime cannot starve, does the same after [`SHUTDOWN_DEADLINE`] when
 /// a step never finishes, and names that step in the log.
 pub(crate) struct Departure {
+    /// When the departure began, and how long the watchdog gives it.
+    began: Instant,
+    deadline: Duration,
     /// The step in progress, for the watchdog's line.
     step: Arc<std::sync::Mutex<&'static str>>,
     /// The ownership, shared with the watchdog so whichever of the two ends
@@ -842,6 +902,8 @@ impl Departure {
     /// so first.
     pub(crate) fn begin(ownership: crate::instance::Ownership, deadline: Duration) -> Departure {
         let departure = Departure {
+            began: Instant::now(),
+            deadline,
             step: Arc::new(std::sync::Mutex::new("starting")),
             ownership: Arc::new(std::sync::Mutex::new(Some(ownership))),
         };
@@ -880,6 +942,16 @@ impl Departure {
             .step
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = name;
+    }
+
+    /// Wait for every sign-in refresh this process started, with what is
+    /// left of the deadline ([`settle_budget`]), so a token pair a server
+    /// rotated is saved before the exit. Called after the store is held, so
+    /// a refresh that never ends costs this wait and never the store step.
+    pub(crate) async fn settle_sign_ins(&self) {
+        self.step("saving a refreshed sign-in");
+        let budget = settle_budget(self.deadline, self.began.elapsed());
+        crystalline_remote::settle_refreshes(budget).await;
     }
 
     /// Remove the record, the socket and the lock file, print `farewell` to
@@ -2006,6 +2078,16 @@ fn http_base(
     // both router builders funnel through.
     engine.set_web_origin(Arc::new(origin_rule.clone()));
 
+    // The control protocol for a connected Crystalline. Built from the same
+    // store and origin rule as the gate, and always given the store: this
+    // route needs a token even where `auth.mcp` leaves the MCP transport open.
+    let ctl = crate::remote_ctl::CtlState {
+        engine: engine.clone(),
+        auth: auth.clone(),
+        oauth: oauth.then(|| origin_rule.clone()),
+        origin_rule: origin_rule.clone(),
+    };
+
     // The session manager drives per-request stream priming (e.g. the
     // tools/list response); its own `session_config.sse_retry` default must be
     // cleared independently of `http_config`'s, since `SessionConfig` is
@@ -2072,7 +2154,14 @@ fn http_base(
     // here". See `rest::oauth`.
     let mut router = axum::Router::new()
         .route("/health", axum::routing::get(health))
-        .merge(crate::rest::well_known_routes(oauth.then_some(origin_rule)));
+        .merge(crate::rest::well_known_routes(oauth.then_some(origin_rule)))
+        // One exact path on the outer router, beside the `/api/v1` nest below.
+        // The nest mounts the JSON API under a catch-all for the prefix, and
+        // an exact path wins over a catch-all, so the API keeps every other
+        // path under `/api/v1`, never sees this one, and its session guard
+        // and CSRF check do not run here: this route has its own bearer
+        // check. Mounted whether or not the API is served.
+        .merge(crate::remote_ctl::route(ctl));
     if let Some(rest) = rest {
         router = router.nest("/api/v1", rest);
     }
@@ -2353,6 +2442,80 @@ const POLLER_HEARTBEAT: Duration = Duration::from_secs(5);
 /// bookkeeping, jitter and per-domain pulling live in
 /// [`Engine::origin_poll_tick`], which this loop never reimplements; it only
 /// wakes it on a modest cadence and exits promptly on shutdown.
+/// How often the daemon asks its sources for their routing model and
+/// maintenance status.
+pub(crate) const SOURCE_POLL: Duration = Duration::from_secs(180);
+
+/// How often the daemon looks at `sources.json` and its own domains for a
+/// change made behind its back: a `connect` that could not tell it, or a
+/// hand edit of either file. Reads two small files; asks no server.
+pub(crate) const SOURCE_LOOK: Duration = Duration::from_secs(5);
+
+/// How long one poll waits for each source.
+const SOURCE_POLL_DEADLINE: Duration = crystalline_remote::ONE_DOMAIN_LIMIT;
+
+/// The source poller. The first poll runs right after the start, in the
+/// background; a source that failed is asked again at the next poll, and
+/// its first answer clears its failure, so nothing ever needs a restart.
+/// One poll or look runs at a time (a tick that comes due meanwhile waits),
+/// and a shutdown ends the poller at once, even in the middle of one.
+pub async fn run_source_poller(
+    engine: Arc<Engine>,
+    poll: Duration,
+    look: Duration,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    enum Due {
+        Poll,
+        Look,
+    }
+    let mut polls = tokio::time::interval(poll);
+    let mut looks = tokio::time::interval(look);
+    polls.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    looks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        let due = tokio::select! {
+            _ = wait_true(&mut shutdown) => break,
+            _ = looks.tick() => Due::Look,
+            _ = polls.tick() => Due::Poll,
+        };
+        let Some(sources) = engine.sources() else {
+            continue;
+        };
+        let work = async {
+            match due {
+                Due::Look => {
+                    // Before the empty check: the first `connect` on a
+                    // machine with no sources is one of the changes this
+                    // looks for.
+                    let reloaded = sources.reload_if_changed();
+                    if sources.is_empty() {
+                        return;
+                    }
+                    crate::route::sync_local(&engine, &sources).await;
+                    // A source just connected is asked at once, not at the
+                    // next poll.
+                    if reloaded.is_some() {
+                        sources.refresh(SOURCE_POLL_DEADLINE).await;
+                    }
+                }
+                Due::Poll => {
+                    if sources.is_empty() {
+                        return;
+                    }
+                    crate::route::sync_local(&engine, &sources).await;
+                    sources.refresh(SOURCE_POLL_DEADLINE).await;
+                    sources.refresh_hook_status(SOURCE_POLL_DEADLINE).await;
+                }
+            }
+        };
+        tokio::select! {
+            _ = wait_true(&mut shutdown) => break,
+            _ = work => {}
+        }
+    }
+}
+
 async fn run_origin_poller(engine: Arc<Engine>, mut shutdown: watch::Receiver<bool>) {
     let mut ticker = tokio::time::interval(POLLER_HEARTBEAT);
     loop {
@@ -3139,6 +3302,32 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The sign-in settle never spends what the watchdog keeps for the end
+    /// of a departure: at most half the deadline, and always the margin
+    /// short of what is left, down to nothing once the store took it all.
+    #[test]
+    fn the_sign_in_settle_never_reaches_the_watchdog() {
+        let deadline = SHUTDOWN_DEADLINE;
+        assert_eq!(settle_budget(deadline, Duration::ZERO), deadline / 2);
+        assert_eq!(
+            settle_budget(deadline, Duration::from_secs(7)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            settle_budget(deadline, Duration::from_secs(9)),
+            Duration::ZERO
+        );
+        assert_eq!(settle_budget(deadline, deadline * 2), Duration::ZERO);
+        for ms in (0..10_000).step_by(250) {
+            let elapsed = Duration::from_millis(ms);
+            let end = elapsed + settle_budget(deadline, elapsed);
+            assert!(
+                end + SETTLE_MARGIN <= deadline || settle_budget(deadline, elapsed).is_zero(),
+                "{elapsed:?}"
+            );
+        }
+    }
 
     /// Both handshake tokens parse to their gate, the verified one wins when
     /// both arrive, and a bare line or an unknown option serves everything.

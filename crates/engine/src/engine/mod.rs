@@ -129,7 +129,7 @@ pub const TREE_LEVEL_CAP: usize = 500;
 /// its own constant because the two bound different queries and either could
 /// move without the other: this one bounds a sorter holding bodies, that one
 /// bounds how much of the reference index a popover materializes.
-const MAX_PAGE_LIMIT: usize = 100;
+pub const MAX_PAGE_LIMIT: usize = 100;
 
 /// The deepest level [`Engine::browse_domain`] walks.
 ///
@@ -140,11 +140,16 @@ const MAX_PAGE_LIMIT: usize = 100;
 const TREE_MAX_DEPTH: usize = 64;
 
 /// The default `evolve_engrams` page size. Small on purpose: the queue is meant
-/// to be worked top-down and agreed item by item, not read in bulk.
-const EVOLVE_DEFAULT_LIMIT: usize = 10;
+/// to be worked top-down and agreed item by item, not read in bulk. Public so
+/// a merged page over connected servers is cut at the same size.
+pub const EVOLVE_DEFAULT_LIMIT: usize = 10;
+
+/// The default `search_engrams` page size. Public so a merged page over
+/// connected servers is cut at the same size.
+pub const SEARCH_DEFAULT_LIMIT: usize = 10;
 
 /// The largest `evolve_engrams` page size.
-const EVOLVE_MAX_LIMIT: usize = 100;
+pub const EVOLVE_MAX_LIMIT: usize = 100;
 
 /// The largest `inbound_references` page size.
 ///
@@ -246,7 +251,7 @@ pub const ACTOR_MAX_CHARS: usize = 120;
 ///
 /// Doc-hidden and `pub` rather than `pub(crate)`, because an actor composed
 /// out of two halves has to sanitize each half on its own rather than the
-/// composition (the service crate's `mcp::acting_actor`): a single pass over
+/// composition (the service crate's `mcp::compose_actor`): a single pass over
 /// the joined string lets the client-supplied half spend the whole budget and
 /// truncate away the half the server asserts.
 #[doc(hidden)]
@@ -1060,6 +1065,12 @@ pub struct Engine {
     // router built over one engine keeps the first store rather than silently
     // swapping the authority mid-flight.
     domain_access: std::sync::OnceLock<Arc<crate::scope::DomainAccess>>,
+    // The servers this machine offers domains from (`crystalline connect`),
+    // installed once by whoever serves this engine to its owner: the daemon at
+    // start, a one-shot CLI command before it routes. Absent everywhere else
+    // (a served instance's HTTP surface, most tests), where nothing is
+    // mounted and nothing is hidden.
+    sources: std::sync::OnceLock<Arc<crystalline_remote::SourceSet>>,
     // The origin rule the HTTP surface was built with, installed once by
     // `http_base`. It answers what this instance is called, for a local caller
     // and an HTTP one alike; absent in every process that serves no HTTP
@@ -2125,6 +2136,7 @@ impl Engine {
             join_fence: tokio::sync::RwLock::new(()),
             collab: std::sync::OnceLock::new(),
             domain_access: std::sync::OnceLock::new(),
+            sources: std::sync::OnceLock::new(),
             web_origin: std::sync::OnceLock::new(),
             joins: Arc::new(crate::join::Joins::default()),
             rename_pause: crate::rename::RenamePause::default(),
@@ -2298,6 +2310,212 @@ impl Engine {
         let _ = self.domain_access.set(access);
     }
 
+    /// Install this machine's sources. A no-op on a second call.
+    pub fn set_sources(&self, sources: Arc<crystalline_remote::SourceSet>) {
+        let _ = self.sources.set(sources);
+    }
+
+    /// This machine's sources, when any were installed.
+    pub fn sources(&self) -> Option<Arc<crystalline_remote::SourceSet>> {
+        self.sources.get().cloned()
+    }
+
+    /// The local domains hidden while their source is connected (decision
+    /// D19): a copy of a mounted domain, or a late local name a source gave
+    /// out first. Every read answers them as unregistered, and a source that
+    /// is down keeps them hidden: a hidden copy is never an offline fallback.
+    pub fn shadowed_domains(&self) -> HashSet<String> {
+        self.sources()
+            .map(|s| s.shadowed().into_iter().collect())
+            .unwrap_or_default()
+    }
+
+    /// Refuse a write into a local domain a connected server hides, in the
+    /// words a domain nobody registered gets: a write never lands in the
+    /// hidden copy in the server's place, whatever the caller's scope
+    /// (decision D19). Every write view starts here.
+    pub(crate) fn refuse_shadowed(&self, name: &str) -> Result<()> {
+        let shadowed = self.shadowed_domains();
+        if shadowed.contains(name) {
+            self.domain_entry_scoped(name, &shadowed)?;
+        }
+        Ok(())
+    }
+
+    /// Refuse removing or renaming a local domain a connected server hides,
+    /// for the machine owner in the words `status` uses for it: a hidden copy
+    /// stays as it is until its source is disconnected (decision D19). Any
+    /// other caller is answered by the ownership gate, which answers a hidden
+    /// domain as one nobody registered. `spelling` may be an alias or the
+    /// canonical name: it is resolved first, hidden domains included.
+    pub(crate) async fn refuse_hidden_admin(
+        &self,
+        spelling: &str,
+        scope: &crate::scope::Scope,
+    ) -> Result<()> {
+        if !matches!(scope, crate::scope::Scope::Unrestricted) {
+            return Ok(());
+        }
+        let Some(sources) = self.sources() else {
+            return Ok(());
+        };
+        let table = sources.table();
+        if table.shadowed.is_empty() {
+            return Ok(());
+        }
+        let names = self.name_table_now().await;
+        let name = names.resolve(spelling).unwrap_or(spelling);
+        match table.hidden(name).next() {
+            Some(hidden) => Err(EngineError::Conflict(crystalline_remote::hidden_sentence(
+                hidden,
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// This machine's registered domains as the mount table reads them: the
+    /// name, its machine-local aliases and its origin identity.
+    pub fn local_domains(&self) -> Vec<crystalline_remote::LocalDomain> {
+        self.registered_domain_entries()
+            .into_iter()
+            .map(|(name, entry)| crystalline_remote::LocalDomain {
+                origin: self.origin_identity_of(&name),
+                aliases: entry.aliases.clone(),
+                name,
+            })
+            .collect()
+    }
+
+    /// Tell the sources this machine's domains changed, so a copy registered
+    /// or removed just now is hidden or shown at once rather than at the next
+    /// poll.
+    pub fn sync_sources_local(&self) {
+        if let Some(sources) = self.sources() {
+            sources.set_local(self.local_domains());
+        }
+    }
+
+    /// The source that holds `name` on this machine: the one that mounts
+    /// it, or the one whose `sources.json` record keeps it for a domain it
+    /// does not offer right now (decision D13: a name, once given, stays
+    /// that source's). `None` when no source holds it or none is installed.
+    pub fn mount_holder(&self, name: &str) -> Option<String> {
+        self.sources()?.holder_of(name)
+    }
+
+    /// The name a new local domain gets when a source holds `wanted` (it
+    /// mounts it, or keeps it reserved): `<wanted>-local`, counted up past
+    /// anything taken (decision D13). `wanted` itself when no source holds
+    /// it, and when a domain of that name is already registered here: an
+    /// existing registration keeps its name, so adopting it again never
+    /// registers a second one.
+    pub fn beside_mounts(&self, wanted: &str) -> String {
+        let Some(sources) = self.sources() else {
+            return wanted.to_string();
+        };
+        let registered = self.registered_domain_entries();
+        if registered.contains_key(wanted) || sources.holder_of(wanted).is_none() {
+            return wanted.to_string();
+        }
+        let table = sources.table();
+        let held: BTreeSet<String> = table
+            .mounts
+            .iter()
+            .map(|m| m.local.clone())
+            .chain(
+                sources
+                    .records()
+                    .into_iter()
+                    .flat_map(|s| s.mounts.into_iter().map(|m| m.local)),
+            )
+            .collect();
+        let names = self.names.read().unwrap().1.clone();
+        let free = |name: &str| {
+            !held.contains(name)
+                && !registered.contains_key(name)
+                && !registered
+                    .values()
+                    .any(|entry| entry.aliases.iter().any(|alias| alias == name))
+                && names.resolve(name).is_none()
+                && self.overlay.env_domain(name).is_none()
+        };
+        let base = format!("{wanted}-{}", crystalline_remote::LOCAL_SUFFIX);
+        if free(&base) {
+            return base;
+        }
+        (2..)
+            .map(|n| format!("{base}-{n}"))
+            .find(|name| free(name))
+            .expect("an unbounded count finds a free name")
+    }
+
+    /// What the mounts did to a new local domain: the name
+    /// [`Engine::beside_mounts`] gave it when a source held `wanted`, and
+    /// whether it is hidden at once (the same domain as a mount, by its
+    /// origin, or a name a source gave out first).
+    pub(crate) fn mount_notes(
+        &self,
+        wanted: &str,
+        name: &str,
+    ) -> Vec<crystalline_remote::MountNote> {
+        let Some(sources) = self.sources() else {
+            return Vec::new();
+        };
+        let mut notes = Vec::new();
+        if name != wanted
+            && let Some(source) = sources.holder_of(wanted)
+        {
+            notes.push(crystalline_remote::MountNote::Renamed {
+                wanted: wanted.to_string(),
+                name: name.to_string(),
+                source,
+            });
+        }
+        for hidden in sources.table().hidden(name) {
+            notes.push(match hidden.reason {
+                crystalline_remote::HiddenReason::Copy => {
+                    crystalline_remote::MountNote::HiddenCopy {
+                        name: name.to_string(),
+                        source: hidden.source.clone(),
+                    }
+                }
+                crystalline_remote::HiddenReason::Collision => {
+                    crystalline_remote::MountNote::Collision {
+                        name: name.to_string(),
+                        source: hidden.source.clone(),
+                    }
+                }
+            });
+        }
+        notes
+    }
+
+    /// Add [`Engine::mount_notes`] to a new local domain's report, joined to
+    /// a `note` it already carries. The source is named only for the machine
+    /// owner ([`crate::scope::Scope::Unrestricted`]): which servers this
+    /// machine is connected to is not anybody else's business.
+    pub(crate) fn note_beside_mounts(
+        &self,
+        result: &mut Value,
+        wanted: &str,
+        name: &str,
+        scope: &crate::scope::Scope,
+    ) {
+        let owner = matches!(scope, crate::scope::Scope::Unrestricted);
+        let mut notes: Vec<String> = self
+            .mount_notes(wanted, name)
+            .iter()
+            .map(|note| note.render(owner))
+            .collect();
+        if notes.is_empty() {
+            return;
+        }
+        if let Some(earlier) = result.get("note").and_then(Value::as_str) {
+            notes.insert(0, earlier.trim_end_matches('.').to_string());
+        }
+        result["note"] = json!(notes.join(". "));
+    }
+
     /// The origin rule the HTTP surface was built with, installed once by
     /// `http_base`. It is what answers a local caller's `service.public_url`
     /// (the value the daemon STARTED with, so a runtime configure of the key
@@ -2448,6 +2666,7 @@ impl Engine {
     pub async fn hidden_for(&self, scope: &crate::scope::Scope) -> Result<HashSet<String>> {
         let mut hidden = self.hidden_domains(scope).await?.unwrap_or_default();
         hidden.extend(self.unregistered_domains().await?);
+        hidden.extend(self.shadowed_domains());
         Ok(hidden)
     }
 
@@ -3299,6 +3518,20 @@ impl Engine {
     /// without parsing an error string.
     pub fn domain_has_origin(&self, name: &str) -> Result<bool> {
         Ok(self.domain_entry(name)?.origin.is_some())
+    }
+
+    /// What makes this domain the same domain as a copy elsewhere: the
+    /// repository, folder and branch its origin tracks, on the forge
+    /// `github.api_url` names. `None` for a domain with no origin, or one
+    /// nobody registered. A connected machine compares it with its own
+    /// domains' (spec A2, A3).
+    pub fn origin_identity_of(&self, name: &str) -> Option<crystalline_remote::OriginIdentity> {
+        let origin = self.domain_entry(name).ok()?.origin?;
+        let api_url = self.config().github.and_then(|g| g.api_url);
+        Some(crystalline_remote::OriginIdentity::of(
+            &origin,
+            api_url.as_deref(),
+        ))
     }
 
     /// Resolve a registered domain to its content source: a filesystem root for
@@ -4271,7 +4504,7 @@ impl Engine {
     ///
     /// Says nothing about whether the file exists or parses; a caller that
     /// needs to know reads it.
-    fn config_file_path(&self) -> Option<PathBuf> {
+    pub fn config_file_path(&self) -> Option<PathBuf> {
         match &self.config_path {
             Some(p) => Some(p.clone()),
             None => crystalline_core::config::global_config_path().ok(),
@@ -9523,5 +9756,86 @@ mod announce_tests {
         );
         assert!(matches!(rx.try_recv().unwrap().change, Change::Domain(_)));
         assert!(rx.try_recv().is_err());
+    }
+}
+
+#[cfg(test)]
+mod hidden_copy_tests {
+    use super::*;
+    use crystalline_core::config::DomainEntry;
+    use crystalline_index::TursoStore;
+    use crystalline_remote::{CredentialKind, MountRecord, SourceRecord, SourceSet};
+
+    /// An engine with `notes` registered and a connected source `acme` that
+    /// keeps the name `notes` and has never answered, so `notes` is hidden.
+    async fn engine_hiding_notes(dir: &Path) -> Engine {
+        let store = TursoStore::open_in_memory().await.unwrap();
+        let mut config = GlobalConfig::default();
+        let root = dir.join("notes");
+        std::fs::create_dir_all(&root).unwrap();
+        config
+            .domains
+            .insert("notes".to_string(), DomainEntry::file(root));
+        let engine = Engine::new(Arc::new(Mutex::new(store)), config, None, None);
+        let remote = dir.join("remote");
+        crystalline_remote::update_sources(&remote, |file| {
+            file.upsert(SourceRecord {
+                url: "http://127.0.0.1:9".to_string(),
+                name: "acme".to_string(),
+                account: "ada".to_string(),
+                kind: CredentialKind::Token,
+                token_endpoint: None,
+                revocation_endpoint: None,
+                connected_at: Utc::now(),
+                mounts: vec![MountRecord {
+                    remote: "notes".to_string(),
+                    local: "notes".to_string(),
+                }],
+                from_env: false,
+            });
+            Ok(())
+        })
+        .unwrap();
+        let set = SourceSet::load(remote, engine.local_domains(), |_| None);
+        engine.set_sources(Arc::new(set));
+        assert!(engine.shadowed_domains().contains("notes"));
+        engine
+    }
+
+    /// Review N3: a co-editing room's save into a draft of a domain that
+    /// became hidden is refused as an unregistered domain.
+    #[tokio::test]
+    async fn a_room_save_into_a_hidden_domain_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = engine_hiding_notes(tmp.path()).await;
+        let view = DomainView::for_actor(&engine, "notes", &HashSet::new(), "ada").unwrap();
+        let p: crate::params::SaveParams = serde_json::from_value(json!({
+            "domain": "notes",
+            "identifier": "page",
+            "content": "---\ntype: engram\ntitle: Page\npermalink: page\nstatus: stable\n---\n\n# Page\n",
+            "expected_checksum": "",
+        }))
+        .unwrap();
+        let refused = engine
+            .save_engram_in_overlay(&view, &p, "page.md")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(refused, EngineError::UnknownDomain { .. }),
+            "{refused}"
+        );
+    }
+
+    /// Review N1: the collaboration verbs' common entry refuses a hidden
+    /// copy, so share, withdraw, discard and resolve never act on it.
+    #[tokio::test]
+    async fn the_origin_lock_refuses_a_hidden_domain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = engine_hiding_notes(tmp.path()).await;
+        let refused = engine.origin_lock_registered("notes").unwrap_err();
+        assert!(
+            matches!(refused, EngineError::UnknownDomain { .. }),
+            "{refused}"
+        );
     }
 }

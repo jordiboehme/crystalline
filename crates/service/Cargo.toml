@@ -75,6 +75,7 @@ tower-service = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
+sha2 = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -110,7 +111,6 @@ walkdir = { workspace = true }
 # name for it are the rest crate's dependencies, not this package's.
 reqwest = { workspace = true }
 openidconnect = { workspace = true }
-sha2 = { workspace = true }
 yrs = { workspace = true }
 zip = { workspace = true }
 # `test-util` adds the paused clock the device flow's countdown test runs on,

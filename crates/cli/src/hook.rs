@@ -460,6 +460,36 @@ fn unshared_team_work<'a>(
     (changes, names)
 }
 
+/// The pending domains of every source's cached maintenance status, by their
+/// names on this machine; a domain this machine does not mount is left out.
+/// Only the cached structured answer is read, never a server's text, and
+/// nothing is fetched: the Stop hook never talks to a server.
+fn remote_pending(set: &crystalline_remote::SourceSet) -> Vec<String> {
+    let table = set.table();
+    let mut pending = Vec::new();
+    for record in set.records() {
+        let Some(cached) = crystalline_remote::read_cached(
+            &record.host_dir(set.remote_dir()),
+            crystalline_remote::HOOK_STATUS_FILE,
+            &record.account,
+        ) else {
+            continue;
+        };
+        let Ok(status) = serde_json::from_value::<maintenance::HookStatus>(cached.data) else {
+            continue;
+        };
+        let names = table.names(&record.name);
+        for remote in status.evolve.pending_domains {
+            if let Some(local) = names.to_local.get(&remote)
+                && !pending.contains(local)
+            {
+                pending.push(local.clone());
+            }
+        }
+    }
+    pending
+}
+
 /// The sharing paragraph for a session holding `changes` unshared changes
 /// across `domains`, or `None` when there is nothing to ask about.
 ///
@@ -559,7 +589,26 @@ pub fn run_stop(harness: Option<&str>) {
     let Ok(loaded) = crystalline_service::overlay::load(None) else {
         return;
     };
-    let has_domains = !loaded.effective.domains.is_empty();
+    // Connected servers: their domains count as somewhere to capture into,
+    // and a local copy one of them replaces is out of this session's view.
+    // Read from the cache files only; this process never talks to a server.
+    let sources = crystalline_remote::remote_dir().ok().map(|dir| {
+        crystalline_remote::SourceSet::load(
+            dir,
+            crate::sources::local_domains_of(&loaded.effective),
+            |n| std::env::var(n).ok(),
+        )
+    });
+    let shadowed = sources.as_ref().map(|s| s.shadowed()).unwrap_or_default();
+    let mounted = sources
+        .as_ref()
+        .is_some_and(|s| !s.table().mounts.is_empty());
+    let has_domains = mounted
+        || loaded
+            .effective
+            .domains
+            .keys()
+            .any(|d| !shadowed.contains(d));
     let read_only = loaded.effective.read_only();
 
     let Ok(path) = state_path(&input.session_id) else {
@@ -609,9 +658,20 @@ pub fn run_stop(harness: Option<&str>) {
         let visible = MaintenanceState {
             pending_domains: registered_pending(
                 &maintenance_state.pending_domains,
-                loaded.effective.domains.keys().map(String::as_str),
+                loaded
+                    .effective
+                    .domains
+                    .keys()
+                    .map(String::as_str)
+                    .filter(|d| !shadowed.contains(*d)),
             ),
             ..maintenance_state.clone()
+        };
+        // Every server's backlog joins this machine's (decision D4); the
+        // cooldown and the weekly clock stay this machine's.
+        let visible = match &sources {
+            Some(set) => visible.with_remote_pending(&remote_pending(set)),
+            None => visible,
         };
         evolve_ask(&visible, now)
     } else {
@@ -633,7 +693,16 @@ pub fn run_stop(harness: Option<&str>) {
     // must not pay for it.
     let share = match (decision, config::origins_state_dir()) {
         (StopDecision::Nudge, Ok(origins_dir)) => {
-            let (changes, domains) = unshared_team_work(&loaded.effective.domains, &origins_dir);
+            // A local copy a server replaces is out of view, so its unshared
+            // work is not this session's to share.
+            let (changes, domains) = unshared_team_work(
+                loaded
+                    .effective
+                    .domains
+                    .iter()
+                    .filter(|(name, _)| !shadowed.contains(*name)),
+                &origins_dir,
+            );
             share_line(changes, &domains)
         }
         _ => None,
@@ -1648,6 +1717,62 @@ mod tests {
         assert!(
             dir.path().join(MAINTENANCE_FILE).exists(),
             "the maintenance throttle record is long-lived and must survive a quiet week"
+        );
+    }
+
+    #[test]
+    fn the_remote_backlog_names_the_local_names_of_mounted_domains() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut file = crystalline_remote::SourcesFile::default();
+        file.sources.push(crystalline_remote::SourceRecord {
+            url: "https://crystalline.acme.com".into(),
+            name: "acme".into(),
+            account: "ada".into(),
+            kind: crystalline_remote::CredentialKind::Token,
+            token_endpoint: None,
+            revocation_endpoint: None,
+            connected_at: chrono::Utc::now(),
+            mounts: vec![crystalline_remote::MountRecord {
+                remote: "jordi".into(),
+                local: "jordi-acme".into(),
+            }],
+            from_env: false,
+        });
+        crystalline_remote::update_sources(dir.path(), |f| {
+            *f = file.clone();
+            Ok(())
+        })
+        .unwrap();
+        let host = file.sources[0].host_dir(dir.path());
+        for (name, data) in [
+            (
+                crystalline_remote::ROUTING_FILE,
+                serde_json::json!({ "domains": [{ "name": "jordi", "bullets": [] }] }),
+            ),
+            (
+                crystalline_remote::HOOK_STATUS_FILE,
+                serde_json::json!({ "evolve": { "pending_domains": ["jordi", "unmounted"] } }),
+            ),
+        ] {
+            crystalline_remote::write_cached(
+                &host,
+                name,
+                &crystalline_remote::Cached {
+                    account: "ada".into(),
+                    etag: "e".into(),
+                    fetched_at: chrono::Utc::now(),
+                    data,
+                    last_failure: None,
+                },
+            )
+            .unwrap();
+        }
+        let set =
+            crystalline_remote::SourceSet::load(dir.path().to_path_buf(), Vec::new(), |_| None);
+        assert_eq!(
+            remote_pending(&set),
+            vec!["jordi-acme".to_string()],
+            "a domain this machine does not mount is not named"
         );
     }
 }
