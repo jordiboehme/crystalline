@@ -806,7 +806,7 @@ mod tests {
             "http://0.0.0.0:7411",
             "http://[::]:7411",
             "kb.example.com",
-            "https://kb.example.com/crystalline",
+            "https://kb.example.com/api",
         ] {
             let ov = overlay(&[("CRYSTALLINE_SERVICE_PUBLIC_URL", bad)])
                 .unwrap_or_else(|e| panic!("'{bad}' must not fail the load: {e}"));

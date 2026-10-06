@@ -101,6 +101,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Form, Json, Router};
+use crystalline_core::base::{BasePath, PublicBase};
 use crystalline_core::config::GlobalConfig;
 use openidconnect::url::{Host, Url};
 use serde_json::{Value, json};
@@ -372,15 +373,19 @@ const MAX_STATE_LEN: usize = MAX_URI_LEN;
 /// are one answer rather than three.
 #[derive(Clone, Debug)]
 pub struct OriginRule {
-    /// The configured public origin, already parsed down to scheme, host and
-    /// port. `None` means derive it from each request.
+    /// The configured public base: `service.public_url` with its path when
+    /// set, otherwise the origin of the configured callback address. `None`
+    /// means derive it from each request.
     override_origin: Option<String>,
     /// `service.public_url` as the rule was built with it, in the canonical
-    /// origin spelling. Kept apart from [`OriginRule::override_origin`]
+    /// spelling: origin plus path. Kept apart from [`OriginRule::override_origin`]
     /// because a callback address is not a page address: a caller with no
     /// request to derive from may follow this one and must not follow the
     /// other.
     public_url: Option<String>,
+    /// The path of `service.public_url`, or the root. What the consent
+    /// redirect and the two insertion routes are built under.
+    base_path: BasePath,
     /// The `Host` values a *derived* origin may name, normalized the way the
     /// transport normalizes one. Empty means every one of them, which is both
     /// an unconfigured `service.allowed_hosts` and a single `*` in it - the
@@ -505,18 +510,18 @@ impl OriginRule {
         // value that reached a config some other way - hand-built, hand-edited
         // past the load that drops it - refuses it too rather than publishing
         // an address nothing can open.
-        let public_url = config.service_public_url().and_then(|value| {
+        let public = config.service_public_url().and_then(|value| {
             if let Some(warning) = crate::settings::unusable_public_url_warning(value) {
                 tracing::warn!("{warning}");
                 return None;
             }
-            Some(super::auth_store::normalize_resource(
-                &openidconnect::url::Url::parse(value)
-                    .expect("the validator above parsed it")
-                    .origin()
-                    .ascii_serialization(),
-            ))
+            Some(PublicBase::parse(value).expect("the validator above accepted it"))
         });
+        let public_url = public
+            .as_ref()
+            .map(|base| super::auth_store::normalize_resource(&base.to_string()));
+        let public_origin = public.as_ref().map(|base| base.origin().to_string());
+        let base_path = public.map(|base| base.path().clone()).unwrap_or_default();
         let configured = config
             .auth_oidc()
             .and_then(|oidc| oidc.redirect_uri.as_deref())
@@ -535,7 +540,7 @@ impl OriginRule {
                     None
                 }
             });
-        if let (Some(p), Some(r)) = (public_url.as_deref(), redirect_origin.as_deref())
+        if let (Some(p), Some(r)) = (public_origin.as_deref(), redirect_origin.as_deref())
             && p != r
         {
             tracing::info!(
@@ -563,18 +568,25 @@ impl OriginRule {
         OriginRule {
             override_origin,
             public_url,
+            base_path,
             allowed_hosts,
         }
     }
 
     /// `service.public_url` as the rule was built with it, in the canonical
-    /// origin spelling. `None` where the key is unset, which is where a
+    /// spelling: origin plus path. `None` where the key is unset, which is where a
     /// caller with no request behind it falls back to the bind instead.
     pub fn public_url(&self) -> Option<&str> {
         self.public_url.as_deref()
     }
 
-    /// The origin a request arrived at, in the spelling everything else
+    /// The path this instance is served under, empty at the root.
+    pub fn base_path(&self) -> &BasePath {
+        &self.base_path
+    }
+
+    /// The base a request arrived at: `service.public_url` with its path when
+    /// set, the derived origin otherwise, in the spelling everything else
     /// compares.
     ///
     /// [`normalize_resource`] is applied once, here, on both branches: the
@@ -3801,6 +3813,27 @@ mod tests {
             rule.origin(&headers_with("evil.test/x", None)).is_err(),
             "and a Host that could open a path is not interpolated into one"
         );
+    }
+
+    #[test]
+    fn the_origin_rule_keeps_the_path_of_public_url() {
+        let mut config = GlobalConfig::default();
+        crate::settings::apply(
+            &mut config,
+            "service.public_url",
+            "https://example.com/crystalline/",
+        )
+        .unwrap();
+        let rule = OriginRule::from_config(&config, &[]);
+        assert_eq!(rule.public_url(), Some("https://example.com/crystalline"));
+        assert_eq!(rule.base_path().as_str(), "/crystalline");
+        assert_eq!(
+            rule.origin(&HeaderMap::new()).unwrap(),
+            "https://example.com/crystalline"
+        );
+
+        let root = OriginRule::from_config(&GlobalConfig::default(), &[]);
+        assert!(root.base_path().is_root());
     }
 
     /// A configured callback address names the origin, path and all cut off,
