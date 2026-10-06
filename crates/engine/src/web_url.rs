@@ -118,6 +118,11 @@ pub fn engram_url(base: &str, domain: &str, permalink: &str) -> String {
     )
 }
 
+/// The page a domain opens at on the Fluid served at `base`.
+pub fn domain_url(base: &str, domain: &str) -> String {
+    format!("{base}/d/{}", encode_segment(domain))
+}
+
 /// The one shape a list result carries instead of a URL per row, for an agent
 /// to fill in from a hit's own `domain` and `permalink`.
 pub fn url_template(base: &str) -> String {
@@ -173,6 +178,18 @@ mod tests {
 
     fn bound(addr: &str) -> HttpBinding {
         HttpBinding::Bound(addr.to_string())
+    }
+
+    #[test]
+    fn a_domain_page_is_its_route_on_the_servers_fluid() {
+        assert_eq!(
+            domain_url("https://kb.acme.com", "jordi"),
+            "https://kb.acme.com/d/jordi"
+        );
+        assert_eq!(
+            domain_url("https://kb.acme.com", "a b"),
+            "https://kb.acme.com/d/a%20b"
+        );
     }
 
     #[test]

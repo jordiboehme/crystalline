@@ -185,4 +185,44 @@ describe("the home screen", () => {
     await screen.findByText(/Nothing was recorded in the last 7d/);
     expect(screen.queryByRole("link", { name: /^Start in/ })).toBeNull();
   });
+
+  it("lists the domains from connected servers with a link to each server", async () => {
+    serve({
+      "/domains": () => ({
+        ...domainsResponse(),
+        mounted: [
+          {
+            name: "jordi-acme",
+            source: "acme",
+            source_url: "https://kb.acme.com",
+            remote_name: "jordi",
+            web_url: "https://kb.acme.com/d/jordi",
+          },
+        ],
+      }),
+    });
+    renderApp("/");
+    const section = await screen.findByRole("region", {
+      name: "From connected servers",
+    });
+    const link = within(section).getByRole("link", {
+      name: "jordi-acme on acme",
+    });
+    expect(link).toHaveAttribute("href", "https://kb.acme.com/d/jordi");
+    expect(link).toHaveAttribute("target", "_blank");
+    expect(link).toHaveAttribute("rel", "noopener noreferrer");
+    expect(
+      within(section).getByText(/opens on its server/),
+    ).toBeInTheDocument();
+  });
+
+  it("shows no server section when nothing is connected", async () => {
+    serve();
+    renderApp("/");
+    const home = await main();
+    await home.findByRole("heading", { name: "Domains" });
+    expect(
+      home.queryByRole("region", { name: "From connected servers" }),
+    ).not.toBeInTheDocument();
+  });
 });

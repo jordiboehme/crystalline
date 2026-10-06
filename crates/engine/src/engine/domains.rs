@@ -268,6 +268,38 @@ impl Engine {
         Ok(json!({ "domains": out }))
     }
 
+    /// The domains this machine offers from connected servers, for a screen
+    /// that lists them and links to each server's own Fluid (decision D23).
+    /// Names and addresses only, taken from this machine's own
+    /// `sources.json`: nothing a server sent, and nothing is forwarded.
+    /// `web_url` is `null` unless the address is plain http or https.
+    pub fn mounted_listing(&self) -> Value {
+        let Some(sources) = self.sources() else {
+            return json!([]);
+        };
+        let table = sources.table();
+        Value::Array(
+            table
+                .mounts
+                .iter()
+                .filter_map(|m| {
+                    let url = sources.source_url(&m.source)?;
+                    let base = url.trim_end_matches('/');
+                    let lower = base.to_ascii_lowercase();
+                    let web_url = (lower.starts_with("https://") || lower.starts_with("http://"))
+                        .then(|| crate::web_url::domain_url(base, &m.remote));
+                    Some(json!({
+                        "name": m.local,
+                        "source": m.source,
+                        "source_url": url,
+                        "remote_name": m.remote,
+                        "web_url": web_url,
+                    }))
+                })
+                .collect(),
+        )
+    }
+
     /// One domain's MANIFEST markdown, read through the same source its routing
     /// bullets are read through: a file domain's `MANIFEST.md` on disk, a
     /// virtual domain's MANIFEST engram in the database.

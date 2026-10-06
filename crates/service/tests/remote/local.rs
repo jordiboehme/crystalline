@@ -855,3 +855,96 @@ async fn a_hidden_team_copy_is_neither_polled_nor_shared() {
         "polled again once it is back"
     );
 }
+
+/// Spec A4: the local Fluid lists the mounted domains with their source and
+/// a link to the server's Fluid; the listing itself keeps local domains only.
+#[tokio::test]
+async fn the_rest_listing_lists_mounted_domains_for_an_admin_and_keeps_local_ones_only() {
+    let server = RemoteServer::start(Options::TOKENS).await;
+    let machine = LocalMachine::start(true).await;
+    machine.connect(&server, "acme", "keeper").await;
+    machine.mount();
+    let mounted = machine.engine.mounted_listing();
+    let open = mounted
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["name"] == "open")
+        .unwrap();
+    assert_eq!(open["source"], "acme");
+    assert_eq!(open["source_url"], server.origin());
+    assert_eq!(open["remote_name"], "open");
+    assert_eq!(open["web_url"], format!("{}/d/open", server.origin()));
+
+    let auth = std::sync::Arc::new(
+        crystalline_service::rest::AuthStore::open(&machine.tmp.path().join("web-auth.db"))
+            .await
+            .unwrap(),
+    );
+    for (name, role) in [
+        ("boss", crystalline_service::rest::Role::Admin),
+        ("guest", crystalline_service::rest::Role::Viewer),
+    ] {
+        auth.add_user(name, name, None, role, crate::fixture::PASSWORD)
+            .await
+            .unwrap();
+    }
+    let router = crystalline_service::daemon::http_router(
+        machine.engine.clone(),
+        std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        &[],
+        auth,
+        None,
+    )
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let _ = axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await;
+    });
+    let http = reqwest::Client::new();
+    for (account, sees) in [("boss", true), ("guest", false)] {
+        let login = http
+            .post(format!("{origin}/api/v1/auth/login"))
+            .json(&serde_json::json!({ "name": account, "password": crate::fixture::PASSWORD }))
+            .send()
+            .await
+            .unwrap();
+        let cookie = login
+            .headers()
+            .get_all(reqwest::header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok()?.split(';').next().map(str::to_string))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let listing: serde_json::Value = http
+            .get(format!("{origin}/api/v1/domains"))
+            .header("cookie", cookie)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let names: Vec<&str> = listing["domains"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["notes"],
+            "{account}: local domains only, the replaced copy hidden"
+        );
+        assert_eq!(
+            listing.get("mounted").is_some(),
+            sees,
+            "{account}: {listing}"
+        );
+    }
+}
