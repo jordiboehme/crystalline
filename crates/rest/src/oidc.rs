@@ -1268,11 +1268,17 @@ const MAX_RETURN_PATH: usize = 512;
 /// - **At most [`MAX_RETURN_PATH`] characters.**
 /// - **Under the base path.** On an instance served under `/crystalline`, a
 ///   path outside it is somewhere else on the host.
+/// - **No `.` or `..` segment**, nor their `%2e` spellings in any case. A
+///   browser resolves them before it navigates, so `/crystalline/../admin`
+///   would pass the prefix check and land outside the prefix.
 pub(crate) fn safe_return_path(path: &str, base: &BasePath) -> Option<String> {
     if !path.starts_with('/') || path.starts_with("//") {
         return None;
     }
     if !base.contains(path) {
+        return None;
+    }
+    if has_dot_segment(path) {
         return None;
     }
     if path.len() > MAX_RETURN_PATH {
@@ -1285,6 +1291,16 @@ pub(crate) fn safe_return_path(path: &str, base: &BasePath) -> Option<String> {
         return None;
     }
     Some(path.to_string())
+}
+
+/// Whether the path part of `path` (before the first `?` or `#`) has a `.` or
+/// `..` segment, with `%2e` read as a dot in either case.
+fn has_dot_segment(path: &str) -> bool {
+    let end = path.find(['?', '#']).unwrap_or(path.len());
+    path[..end].split('/').any(|segment| {
+        let decoded = segment.to_ascii_lowercase().replace("%2e", ".");
+        decoded == "." || decoded == ".."
+    })
 }
 
 /// What `POST /auth/oidc/login` answers with: where to send the browser.
@@ -2597,6 +2613,11 @@ mod tests {
             "/\\evil.test",
             "\\\\evil.test",
             "/authorize\\..\\..",
+            // Dot segments, plain and percent-encoded: a browser resolves
+            // them, so the path it lands on is not the one checked here.
+            "/../x",
+            "/a/%2e%2e/b",
+            "/a/./b",
             // Not a header value: a newline here is response splitting, and a
             // non-ASCII byte is not one either.
             "/authorize\r\nSet-Cookie: a=b",
@@ -2639,6 +2660,22 @@ mod tests {
         assert_eq!(safe_return_path("/authorize?request=x", &base), None);
         assert_eq!(safe_return_path("/crystallinex", &base), None);
         assert_eq!(safe_return_path("//evil.test/crystalline", &base), None);
+        for dotted in [
+            "/crystalline/../admin",
+            "/crystalline/%2e%2e/admin",
+            "/crystalline/.%2E/x",
+            "/crystalline/%2E./x",
+            "/crystalline/%2e/x",
+            "/crystalline/..",
+            "/crystalline/x/..?a=b",
+        ] {
+            assert_eq!(safe_return_path(dotted, &base), None, "{dotted}");
+        }
+        assert_eq!(
+            safe_return_path("/crystalline/a..b/.x?q=..", &base).as_deref(),
+            Some("/crystalline/a..b/.x?q=.."),
+            "dots inside a segment or in the query are fine"
+        );
     }
 
     /// The secret is a field of the settings struct, so the struct's own
