@@ -170,8 +170,6 @@ jobs:
         if: steps.ask.outputs.build == 'true'
         with:
           persist-credentials: false
-          # The commit CI tested, which the guard above makes main's tip.
-          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
           # The commit count is the version's last field, so the full history.
           fetch-depth: 0
 
@@ -226,15 +224,14 @@ jobs:
     name: build
     needs: version
     if: needs.version.outputs.build == 'true'
-    # A local reusable workflow resolves at github.sha, the commit this run
-    # started on (see `concurrency` above), which is what the self-repository
-    # syntax `$/` would give too. actionlint 1.7.12 does not parse `$/` yet,
-    # so zizmor's self-repository finding is ignored here.
+    # The called workflow checks out github.sha. The run-level `if` guard above
+    # only lets a run through when that is the commit CI tested (head_sha ==
+    # github.sha) or main's tip for a manual run. actionlint 1.7.12 does not
+    # parse `$/` yet, so zizmor's self-repository finding is ignored here.
     uses: ./.github/workflows/build.yml # zizmor: ignore[self-repository]
     with:
       channel: dev
       version: ${{ needs.version.outputs.version }}
-      ref: ${{ needs.version.outputs.sha }}
     # Only the six Apple secrets, by name, never `inherit`. Once they live in
     # the `release` environment, which build.yml's signing legs declare, the
     # environment's copy wins and these resolve to nothing here; until then
@@ -353,7 +350,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: ${{ needs.version.outputs.sha }}
 
       - name: Download the release checksums
         run: |

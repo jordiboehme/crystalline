@@ -24,10 +24,6 @@ on:
         description: 'dev only: the version to build, without a prefix (0.22.0-dev.4817). stable reads the tag.'
         type: string
         default: ''
-      ref:
-        description: 'The commit to check out. Empty checks out what triggered the caller.'
-        type: string
-        default: ''
     # The signing secrets live in the `release` environment, which the build
     # job below declares for its signing legs. A secret of that environment
     # wins over one passed in here, so the callers' explicit pass only
@@ -79,7 +75,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: ${{ inputs.ref }}
 
       # The UI freezes its package.json version into the bundle and compares it
       # against the server's, so a dev bundle carries the dev version too or
@@ -221,7 +216,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: ${{ inputs.ref }}
 
       - name: Install Rust toolchain
         run: rustup show
