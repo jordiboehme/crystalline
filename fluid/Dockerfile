@@ -73,4 +73,4 @@ EXPOSE 80
 # page. Shell form, since this image has one, and busybox wget is already
 # present.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-    CMD wget --spider -q http://127.0.0.1/ || exit 1
+    CMD wget --spider -q http://127.0.0.1${CRYSTALLINE_BASE_PATH}/ || exit 1

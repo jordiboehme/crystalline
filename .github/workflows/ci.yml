@@ -562,6 +562,15 @@ jobs:
           grep -q 'location = /.well-known/oauth-protected-resource/crystalline' rendered.conf
           grep -q "sub_filter '<base href=\"/\" />' '<base href=\"/crystalline/\" />';" rendered.conf
 
+      - name: The app answers under a path
+        run: |
+          docker run -d --name fluid-base -e CRYSTALLINE_UPSTREAM=127.0.0.1:7411 -e CRYSTALLINE_BASE_PATH=/crystalline crystalline-fluid:ci
+          sleep 3
+          status=0
+          docker exec fluid-base wget --spider -q http://127.0.0.1/crystalline/ || status=$?
+          docker rm -f fluid-base
+          exit $status
+
       - name: A base path that cannot be a prefix stops the container
         run: |
           if docker run --rm -e CRYSTALLINE_UPSTREAM=127.0.0.1:7411 -e CRYSTALLINE_BASE_PATH=crystalline/ crystalline-fluid:ci nginx -t; then

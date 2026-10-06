@@ -140,4 +140,8 @@ fn the_dockerfile_defines_the_variable_and_installs_the_script() {
         "defined, so envsubst renders it empty"
     );
     assert!(dockerfile.contains("/docker-entrypoint.d/15-crystalline-base-path.sh"));
+    assert!(
+        dockerfile.contains("wget --spider -q http://127.0.0.1${CRYSTALLINE_BASE_PATH}/ || exit 1"),
+        "the healthcheck probes the prefixed root, shell form so the variable expands at run time"
+    );
 }
