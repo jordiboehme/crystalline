@@ -24,6 +24,7 @@ etcetera = { workspace = true }
 walkdir = { workspace = true }
 globset = { workspace = true }
 uuid = { workspace = true }
+url = { workspace = true }
 sha2 = { workspace = true }
 anyhow = { workspace = true }
 
