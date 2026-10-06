@@ -1989,18 +1989,18 @@ pub fn http_router_with_assets<E: rust_embed::RustEmbed + 'static>(
         router
             .route(
                 "/",
-                axum::routing::any_service(service.clone())
-                    .layer(axum::middleware::from_fn(serve_index::<E>)),
+                axum::routing::any_service(service.clone()).layer(
+                    axum::middleware::from_fn_with_state(base_path.clone(), serve_index::<E>),
+                ),
             )
             .route(
                 "/assets/{*path}",
                 axum::routing::any_service(service.clone())
                     .layer(axum::middleware::from_fn(serve_asset::<E>)),
             )
-            .fallback_service(
-                axum::routing::any_service(service)
-                    .layer(axum::middleware::from_fn(dispatch_ui::<E>)),
-            ),
+            .fallback_service(axum::routing::any_service(service).layer(
+                axum::middleware::from_fn_with_state(base_path.clone(), dispatch_ui::<E>),
+            )),
         base_path,
     ))
 }
@@ -2252,13 +2252,14 @@ fn http_base(
 /// narrower Accept rule applies to the app's other routes alone.
 #[cfg(feature = "fluid-ui")]
 async fn serve_index<E: rust_embed::RustEmbed>(
+    axum::extract::State(base): axum::extract::State<crystalline_core::base::BasePath>,
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     if !is_ui_fetch(&request) {
         return next.run(request).await;
     }
-    crate::ui::index_response::<E>()
+    crate::ui::index_response::<E>(&base)
 }
 
 /// `/assets/{*path}`: one content-hashed chunk, held for a year, and a plain
@@ -2285,6 +2286,7 @@ async fn serve_asset<E: rust_embed::RustEmbed>(
 /// plumbing of its own to do it.
 #[cfg(feature = "fluid-ui")]
 async fn dispatch_ui<E: rust_embed::RustEmbed>(
+    axum::extract::State(base): axum::extract::State<crystalline_core::base::BasePath>,
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
@@ -2310,7 +2312,7 @@ async fn dispatch_ui<E: rust_embed::RustEmbed>(
         }
     }
     if crate::ui::wants_spa(request.method(), accept_of(&request)) {
-        return crate::ui::index_response::<E>();
+        return crate::ui::index_response::<E>(&base);
     }
     next.run(request).await
 }

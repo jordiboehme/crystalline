@@ -21,6 +21,7 @@ use std::sync::atomic::AtomicUsize;
 
 use axum::http::{Method, StatusCode, header};
 use axum::response::Response;
+use crystalline_core::base::BasePath;
 use crystalline_core::config::{
     AuthConfig, DomainEntry, GlobalConfig, ResponseFormat, ServiceConfig,
 };
@@ -29,7 +30,8 @@ use crystalline_service::Engine;
 use crystalline_service::daemon::http_router_with_assets;
 use crystalline_service::rest::{AuthStore, Role};
 use crystalline_service::ui::{
-    asset_response, exact_response, index_response, ui_available, wants_event_stream, wants_spa,
+    BASE_TAG, asset_response, exact_response, index_response, ui_available, wants_event_stream,
+    wants_spa,
 };
 use rust_embed::RustEmbed;
 use tokio::sync::Mutex;
@@ -95,7 +97,7 @@ fn a_bundle_is_available_and_an_empty_embed_is_not() {
 
 #[tokio::test]
 async fn the_index_is_served_and_never_stored() {
-    let response = index_response::<Fixture>();
+    let response = index_response::<Fixture>(&BasePath::root());
     assert_eq!(response.status(), StatusCode::OK);
     assert!(
         header_of(&response, header::CONTENT_TYPE).contains("text/html"),
@@ -334,7 +336,7 @@ fn sourcemaps_never_enter_the_embed() {
 
 #[tokio::test]
 async fn an_embed_with_no_bundle_says_so_out_loud() {
-    let response = index_response::<EmptyAssets>();
+    let response = index_response::<EmptyAssets>(&BasePath::root());
     assert_eq!(
         response.status(),
         StatusCode::SERVICE_UNAVAILABLE,
@@ -459,6 +461,8 @@ struct Options {
     ui: Option<bool>,
     /// `service.api`, absent meaning on.
     api: Option<bool>,
+    /// The path of `service.public_url`, absent meaning a server at the root.
+    public_url_path: Option<&'static str>,
 }
 
 /// A served router plus the pieces a test reaches behind it. The temp
@@ -476,6 +480,9 @@ struct Server {
 /// temp-directory domain synced into an in-memory store, response format
 /// pinned to plain JSON.
 async fn serve<E: RustEmbed + 'static>(opts: Options) -> Server {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     let mut cfg = GlobalConfig {
@@ -505,6 +512,7 @@ async fn serve<E: RustEmbed + 'static>(opts: Options) -> Server {
         read_only: Some(opts.read_only),
         ui: opts.ui,
         api: opts.api,
+        public_url: opts.public_url_path.map(|p| format!("http://{addr}{p}")),
         ..ServiceConfig::default()
     });
     let config_path = root.join("config.yaml");
@@ -528,9 +536,6 @@ async fn serve<E: RustEmbed + 'static>(opts: Options) -> Server {
         None,
     )
     .unwrap();
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         let listener = tokio::net::TcpListener::from_std(listener).unwrap();
         // Served the way `run_http` serves it, connect info included: the peer
@@ -1295,4 +1300,123 @@ async fn a_binary_with_no_bundle_says_so_on_every_navigation() {
         200,
         "and the rest of the surface is unaffected by an empty embed"
     );
+}
+
+#[tokio::test]
+async fn at_the_root_the_shell_is_the_embedded_file_byte_for_byte() {
+    let response = index_response::<Fixture>(&BasePath::root());
+    let etag = header_of(&response, header::ETAG);
+    let body = body_of(response).await;
+    let embedded = String::from_utf8(Fixture::get("index.html").unwrap().data.to_vec()).unwrap();
+    assert_eq!(
+        body, embedded,
+        "a server at the root serves the tag as built"
+    );
+    assert!(body.contains(BASE_TAG));
+    assert!(!etag.is_empty());
+}
+
+#[tokio::test]
+async fn under_a_prefix_only_the_base_tag_changes() {
+    let base = BasePath::parse("/crystalline").unwrap();
+    let response = index_response::<Fixture>(&base);
+    assert_eq!(header_of(&response, header::CACHE_CONTROL), "no-store");
+    assert_eq!(
+        header_of(&response, header::CONTENT_SECURITY_POLICY),
+        "frame-ancestors 'none'"
+    );
+    let root_etag = header_of(&index_response::<Fixture>(&BasePath::root()), header::ETAG);
+    assert_ne!(
+        header_of(&response, header::ETAG),
+        root_etag,
+        "another body, another validator"
+    );
+    let body = body_of(response).await;
+    let embedded = String::from_utf8(Fixture::get("index.html").unwrap().data.to_vec()).unwrap();
+    assert_eq!(
+        body,
+        embedded.replacen(BASE_TAG, "<base href=\"/crystalline/\" />", 1)
+    );
+}
+
+#[test]
+fn the_fluid_source_index_carries_the_base_tag_the_server_rewrites() {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fluid/index.html");
+    let Ok(html) = std::fs::read_to_string(&path) else {
+        eprintln!("note: skipping, this checkout does not carry fluid/");
+        return;
+    };
+    assert_eq!(
+        html.matches(BASE_TAG).count(),
+        1,
+        "fluid/index.html carries {BASE_TAG} exactly once"
+    );
+    let tag_at = html.find(BASE_TAG).unwrap();
+    assert!(
+        html.find("<link").is_none_or(|link| tag_at < link)
+            && html.find("<script").is_none_or(|s| tag_at < s),
+        "the base tag comes before any relative url"
+    );
+}
+
+#[tokio::test]
+async fn a_deep_link_under_the_prefix_gets_the_shell_with_the_prefixed_base() {
+    let server = serve::<Fixture>(Options {
+        public_url_path: Some("/crystalline"),
+        ..Options::default()
+    })
+    .await;
+    for path in ["/crystalline/d/eng/e/a/b", "/crystalline/", "/d/eng"] {
+        let response = get_accepting(server.addr, path, BROWSER_ACCEPT).await;
+        assert_eq!(response.status(), 200, "{path}");
+        let body = response.text().await.unwrap();
+        assert!(
+            body.contains("<base href=\"/crystalline/\" />"),
+            "{path}: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_bare_prefix_serves_the_shell_with_the_prefixed_base() {
+    let server = serve::<Fixture>(Options {
+        public_url_path: Some("/crystalline"),
+        ..Options::default()
+    })
+    .await;
+    let response = get_accepting(server.addr, "/crystalline", BROWSER_ACCEPT).await;
+    assert_eq!(response.status(), 200, "no redirect");
+    assert!(
+        response
+            .text()
+            .await
+            .unwrap()
+            .contains("<base href=\"/crystalline/\" />")
+    );
+}
+
+#[tokio::test]
+async fn an_asset_under_the_prefix_is_the_hashed_chunk() {
+    let server = serve::<Fixture>(Options {
+        public_url_path: Some("/crystalline"),
+        ..Options::default()
+    })
+    .await;
+    let response = get_accepting(server.addr, "/crystalline/assets/app-fixture01.js", "*/*").await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        head(&response, header::CACHE_CONTROL),
+        "public, max-age=31536000, immutable"
+    );
+}
+
+#[tokio::test]
+async fn a_root_server_serves_the_unprefixed_base() {
+    let server = serve_fixture().await;
+    let body = get_accepting(server.addr, "/d/eng", BROWSER_ACCEPT)
+        .await
+        .text()
+        .await
+        .unwrap();
+    assert!(body.contains(BASE_TAG));
 }

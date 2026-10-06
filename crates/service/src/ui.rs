@@ -58,7 +58,9 @@ use axum::body::Body;
 use axum::http::{HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
+use crystalline_core::base::BasePath;
 use rust_embed::{EmbeddedFile, RustEmbed};
+use sha2::Digest as _;
 
 /// The Fluid bundle staged by `build.rs`. Empty when `fluid/dist` was absent
 /// at compile time.
@@ -70,6 +72,12 @@ pub struct FluidAssets;
 /// The bundle's entry point, and the only name in it that is not
 /// content-hashed.
 const INDEX: &str = "index.html";
+
+/// The base tag Fluid's `index.html` carries, spelled exactly as the build
+/// leaves it. The daemon writes the base path into it at serve time; the nginx
+/// image's `sub_filter` matches the same bytes. `fluid/index.html` is pinned
+/// to it by `tests/rest/ui_serving.rs`.
+pub const BASE_TAG: &str = "<base href=\"/\" />";
 
 /// What the hashed chunks under `/assets/` may be held for.
 const IMMUTABLE: &str = "public, max-age=31536000, immutable";
@@ -112,15 +120,23 @@ pub fn ui_available<E: RustEmbed>() -> bool {
 }
 
 /// `GET /` and the SPA fallback body: the entry point, never stored, or the
-/// 503 not-built page when the embed is empty.
+/// 503 not-built page when the embed is empty. Under a base path the one
+/// change to the file is the base tag, which then names the prefix, so the
+/// relative asset urls resolve under it from any deep link. At the root the
+/// file is served as built.
 ///
 /// Both shapes carry [`SHELL_CSP`] and `X-Frame-Options: DENY`, added here
 /// rather than in [`embedded`]: every app route this SPA answers - `/authorize`
 /// included - is this same response, so a policy that unframes the shell
 /// unframes every one of them, while an asset chunk under `/assets/` (served
 /// through [`asset_response`] instead) has no reason to carry it.
-pub fn index_response<E: RustEmbed>() -> Response {
-    let mut response = embedded::<E>(INDEX, NO_STORE, None).unwrap_or_else(|| {
+pub fn index_response<E: RustEmbed>(base: &BasePath) -> Response {
+    let served = if base.is_root() {
+        embedded::<E>(INDEX, NO_STORE, None)
+    } else {
+        rebased_index::<E>(base)
+    };
+    let mut response = served.unwrap_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             [
@@ -138,6 +154,35 @@ pub fn index_response<E: RustEmbed>() -> Response {
     );
     headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
     response
+}
+
+/// The entry point with its base tag naming `base`, validated by a hash of
+/// what is actually sent. A bundle without the tag is served as it is: it
+/// predates the tag, and a shell that loads from the root is still a page
+/// somebody can read the not-found screen of.
+fn rebased_index<E: RustEmbed>(base: &BasePath) -> Option<Response> {
+    let file = E::get(INDEX)?;
+    let text = String::from_utf8_lossy(&file.data);
+    let body = text.replacen(BASE_TAG, &format!("<base href=\"{}\" />", base.href()), 1);
+    let mut tag = String::with_capacity(66);
+    tag.push('"');
+    for byte in sha2::Sha256::digest(body.as_bytes()) {
+        let _ = write!(tag, "{byte:02x}");
+    }
+    tag.push('"');
+    let mime = file.metadata.mimetype().to_owned();
+    Some(
+        (
+            StatusCode::OK,
+            [
+                content_type(&mime),
+                cache_control(NO_STORE),
+                etag_header(&tag),
+            ],
+            Body::from(body),
+        )
+            .into_response(),
+    )
 }
 
 /// `GET /assets/{*path}`: immutable, validated by an `ETag`, 304 on a match,
