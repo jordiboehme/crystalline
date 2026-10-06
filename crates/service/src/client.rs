@@ -730,17 +730,15 @@ where
     );
     let _ = stack.stop_sources.send(true);
     let departure = Departure::begin(stack.ownership, SHUTDOWN_DEADLINE);
-    // A sign-in refresh a source call started runs as a task of its own: it
-    // is waited for, within one call's limit, before the process leaves, so
-    // a token pair the server rotated is saved. A step of the departure, so
-    // its watchdog still ends the process if this never returns.
-    departure.step("saving a refreshed sign-in");
-    crystalline_remote::settle_refreshes(crystalline_remote::ONE_DOMAIN_LIMIT).await;
     // Held to the exit, as in the daemon: an operation already inside the
     // store finishes and no new one starts.
     departure.step("waiting for the store");
     let store = stack.engine.store();
     let _held = store.lock().await;
+    // Then a sign-in refresh a source call started, which runs as a task of
+    // its own, is waited for with what is left of the deadline, so a token
+    // pair the server rotated is saved.
+    departure.settle_sign_ins().await;
     departure.finish(None)
 }
 

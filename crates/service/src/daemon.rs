@@ -816,7 +816,27 @@ pub async fn run_serve(
     let store = engine.store();
     let _held = store.lock().await;
 
+    // With the store held: a sign-in refresh a source call started is
+    // waited for, with what is left of the deadline, so a token pair a
+    // server rotated is saved. The refresh touches no store.
+    departure.settle_sign_ins().await;
+
     departure.finish((!daemon_flag).then_some("crystalline stopped"))
+}
+
+/// What a departure keeps back for the steps after the sign-in settle (the
+/// removal and the exit), and so the least the watchdog never sees spent.
+const SETTLE_MARGIN: Duration = Duration::from_secs(2);
+
+/// How long a departure that began `elapsed` ago, with `deadline` in all,
+/// waits for a sign-in refresh: what is left of the deadline minus
+/// [`SETTLE_MARGIN`], and never more than half the deadline, so the wait can
+/// never be what the watchdog ends.
+fn settle_budget(deadline: Duration, elapsed: Duration) -> Duration {
+    deadline
+        .saturating_sub(elapsed)
+        .saturating_sub(SETTLE_MARGIN)
+        .min(deadline / 2)
 }
 
 /// How long a stopping daemon has from the moment it decides to stop to the
@@ -851,6 +871,9 @@ pub const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(10);
 /// stuck runtime cannot starve, does the same after [`SHUTDOWN_DEADLINE`] when
 /// a step never finishes, and names that step in the log.
 pub(crate) struct Departure {
+    /// When the departure began, and how long the watchdog gives it.
+    began: Instant,
+    deadline: Duration,
     /// The step in progress, for the watchdog's line.
     step: Arc<std::sync::Mutex<&'static str>>,
     /// The ownership, shared with the watchdog so whichever of the two ends
@@ -865,6 +888,8 @@ impl Departure {
     /// so first.
     pub(crate) fn begin(ownership: crate::instance::Ownership, deadline: Duration) -> Departure {
         let departure = Departure {
+            began: Instant::now(),
+            deadline,
             step: Arc::new(std::sync::Mutex::new("starting")),
             ownership: Arc::new(std::sync::Mutex::new(Some(ownership))),
         };
@@ -903,6 +928,16 @@ impl Departure {
             .step
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = name;
+    }
+
+    /// Wait for every sign-in refresh this process started, with what is
+    /// left of the deadline ([`settle_budget`]), so a token pair a server
+    /// rotated is saved before the exit. Called after the store is held, so
+    /// a refresh that never ends costs this wait and never the store step.
+    pub(crate) async fn settle_sign_ins(&self) {
+        self.step("saving a refreshed sign-in");
+        let budget = settle_budget(self.deadline, self.began.elapsed());
+        crystalline_remote::settle_refreshes(budget).await;
     }
 
     /// Remove the record, the socket and the lock file, print `farewell` to
@@ -3253,6 +3288,32 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The sign-in settle never spends what the watchdog keeps for the end
+    /// of a departure: at most half the deadline, and always the margin
+    /// short of what is left, down to nothing once the store took it all.
+    #[test]
+    fn the_sign_in_settle_never_reaches_the_watchdog() {
+        let deadline = SHUTDOWN_DEADLINE;
+        assert_eq!(settle_budget(deadline, Duration::ZERO), deadline / 2);
+        assert_eq!(
+            settle_budget(deadline, Duration::from_secs(7)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            settle_budget(deadline, Duration::from_secs(9)),
+            Duration::ZERO
+        );
+        assert_eq!(settle_budget(deadline, deadline * 2), Duration::ZERO);
+        for ms in (0..10_000).step_by(250) {
+            let elapsed = Duration::from_millis(ms);
+            let end = elapsed + settle_budget(deadline, elapsed);
+            assert!(
+                end + SETTLE_MARGIN <= deadline || settle_budget(deadline, elapsed).is_zero(),
+                "{elapsed:?}"
+            );
+        }
+    }
 
     /// Both handshake tokens parse to their gate, the verified one wins when
     /// both arrive, and a bare line or an unknown option serves everything.

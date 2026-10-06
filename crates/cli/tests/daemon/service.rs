@@ -5675,3 +5675,71 @@ fn doctor_collects_orphaned_rows_through_the_running_daemon() {
     drop(client);
     let _ = env.run(&["ctl", "shutdown"]);
 }
+
+/// The embedded MCP stack runs the source poller: a source written into
+/// `sources.json` after the session started is seen within a few looks,
+/// and a call naming its domain is answered with that source's sentence
+/// within one call's limit, never as a domain nobody registered.
+#[test]
+fn the_embedded_stack_sees_a_source_connected_after_its_start() {
+    let env = Env::new("embsrc");
+    env.setup_domain("eng");
+    let mut mcp = Mcp::spawn_embedded(&env);
+    mcp.initialize();
+
+    // An address nothing listens on: refused at once.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let remote = env.state_dir().join("remote");
+    std::fs::create_dir_all(&remote).unwrap();
+    std::fs::write(
+        remote.join("sources.json"),
+        serde_json::to_vec(&json!({
+            "v": 1,
+            "sources": [{
+                "url": format!("http://127.0.0.1:{port}"),
+                "name": "far",
+                "account": "me",
+                "kind": "token",
+                "connected_at": "2026-10-01T00:00:00Z",
+                "mounts": [{ "remote": "far", "local": "far" }],
+            }],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let answer = |mcp: &mut Mcp| {
+        let started = Instant::now();
+        mcp.send_call("read_engram", json!({ "identifier": "x", "domain": "far" }));
+        let resp = mcp.read();
+        let took = started.elapsed();
+        assert!(
+            took < Duration::from_secs(10),
+            "within one call's limit: {took:?}"
+        );
+        resp.pointer("/result/content/0/text")
+            .or_else(|| resp.pointer("/error/message"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    let until = Instant::now() + Duration::from_secs(30);
+    let text = loop {
+        let text = answer(&mut mcp);
+        if text.contains("far") && text.contains("comes from far")
+            || text.starts_with("far cannot be reached right now")
+        {
+            break text;
+        }
+        assert!(
+            Instant::now() < until,
+            "the embedded stack never saw the source: {text}"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    assert!(!text.contains("unknown domain"), "{text}");
+}
