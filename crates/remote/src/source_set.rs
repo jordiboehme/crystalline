@@ -135,6 +135,24 @@ impl MountNote {
     }
 }
 
+/// What the machine owner reads about a local domain a connected server
+/// hides: in `status`, in `doctor`, and as the refusal of a removal or a
+/// rename of it (ruling F8 REVISED).
+pub fn hidden_sentence(hidden: &Hidden) -> String {
+    match hidden.reason {
+        HiddenReason::Copy => MountNote::HiddenCopy {
+            name: hidden.local.clone(),
+            source: hidden.source.clone(),
+        }
+        .render(true),
+        HiddenReason::Collision => Announcement::LocalShadowed {
+            local: hidden.local.clone(),
+            source: hidden.source.clone(),
+        }
+        .to_string(),
+    }
+}
+
 /// The mounted part of the routing block, and one staleness line per source
 /// whose part may be out of date.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

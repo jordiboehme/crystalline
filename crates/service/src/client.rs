@@ -1244,6 +1244,11 @@ pub async fn domain_remove(
                 config_file.display()
             )
         })?;
+    // This machine's sources, as the daemon has them: a local copy a
+    // connected server hides is refused here too (decision D19).
+    if use_daemon(db, config_path) {
+        crate::route::install_sources(&engine);
+    }
     let name = localize_standalone(&engine, name).await;
     let name = name.as_str();
     if let Ok(auth_path) = crystalline_core::config::web_auth_db_path()
@@ -1312,6 +1317,13 @@ pub async fn domain_rename(
         && report["domain"] == new
     {
         return Ok(report);
+    }
+    // This machine's sources, as the daemon has them: a local copy a
+    // connected server hides is refused here too (decision D19). Installed
+    // only now, after the opener finished any rename an earlier run left
+    // half done, because that recovery reads names the table would hide.
+    if use_daemon(db, config_path) {
+        crate::route::install_sources(&engine);
     }
     // A rename runs only while this process holds the state directory, as a
     // daemon does; the engine refuses it otherwise, in words that name the

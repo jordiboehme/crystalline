@@ -276,7 +276,7 @@ fn unreachable(source: &str, domain: &str, url: &str, cause: &str) -> String {
 /// happens when the state directory cannot be resolved. A daemon calls this
 /// only after it finished a rename an earlier run left half done, because
 /// that recovery reads names the mount table would otherwise hide.
-pub fn install_sources(engine: &Arc<Engine>) {
+pub fn install_sources(engine: &Engine) {
     let Ok(dir) = crystalline_remote::remote_dir() else {
         return;
     };

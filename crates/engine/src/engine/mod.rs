@@ -2342,6 +2342,31 @@ impl Engine {
         Ok(())
     }
 
+    /// Refuse removing or renaming a local domain a connected server hides,
+    /// for the machine owner in the words `status` uses for it: a hidden copy
+    /// stays as it is until its source is disconnected (decision D19). Any
+    /// other caller is answered by the ownership gate, which answers a hidden
+    /// domain as one nobody registered.
+    pub(crate) fn refuse_hidden_admin(
+        &self,
+        name: &str,
+        scope: &crate::scope::Scope,
+    ) -> Result<()> {
+        if !matches!(scope, crate::scope::Scope::Unrestricted) {
+            return Ok(());
+        }
+        let Some(sources) = self.sources() else {
+            return Ok(());
+        };
+        let table = sources.table();
+        match table.hidden(name).next() {
+            Some(hidden) => Err(EngineError::Conflict(crystalline_remote::hidden_sentence(
+                hidden,
+            ))),
+            None => Ok(()),
+        }
+    }
+
     /// This machine's registered domains as the mount table reads them: the
     /// name, its machine-local aliases and its origin identity.
     pub fn local_domains(&self) -> Vec<crystalline_remote::LocalDomain> {
