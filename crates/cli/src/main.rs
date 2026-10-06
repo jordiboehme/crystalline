@@ -28,6 +28,7 @@ mod recall;
 mod receipt;
 mod render;
 mod skills_placement;
+mod sources;
 mod users;
 
 /// What `-V` and `--version` print. clap's `version` attribute feeds both as
@@ -120,10 +121,37 @@ enum Command {
         #[command(subcommand)]
         command: TagsCommand,
     },
-    /// Connect this machine to GitHub, for sharing and updating team domains.
+    /// Add a Crystalline server as a source, so its domains are offered beside
+    /// this machine's own; or, with `github`, connect this machine to GitHub
+    /// for sharing and updating team domains.
+    #[command(args_conflicts_with_subcommands = true)]
     Connect {
         #[command(subcommand)]
-        command: ConnectCommand,
+        command: Option<ConnectCommand>,
+        /// The Crystalline server to add, for example
+        /// https://crystalline.acme.com. Signing in opens your browser.
+        url: Option<String>,
+        /// The source's short name on this machine, used in notes and in the
+        /// names of its domains when one collides. Defaults to the most
+        /// specific word of its host (acme for crystalline.acme.com).
+        #[arg(long, requires = "url")]
+        name: Option<String>,
+        /// Paste a personal MCP token instead of signing in through the
+        /// browser. The token is read from stdin, or asked for; it is never
+        /// taken from the command line.
+        #[arg(long, requires = "url")]
+        token: bool,
+        /// A word after the URL, refused: a token written there would land
+        /// in the shell history and the process list.
+        #[arg(hide = true, requires = "url")]
+        stray: Option<String>,
+    },
+    /// Remove a connected Crystalline server: revoke the sign-in when it
+    /// answers, forget the credential and the cached answers, and stop
+    /// offering its domains. The other servers stay.
+    Disconnect {
+        /// The source's name or its URL, as crystalline status lists it.
+        target: String,
     },
     /// Wire a coding harness up to Crystalline in one idempotent step:
     /// register the MCP server, install the SessionStart routing hook, the
@@ -1761,7 +1789,37 @@ fn main() -> anyhow::Result<()> {
         },
         Some(Command::Domain { command }) => run_domain(command, cli.db, cli.json),
         Some(Command::Tags { command }) => on_runtime(move || run_tags(command, cli.db, cli.json)),
-        Some(Command::Connect { command }) => on_runtime(move || run_connect(command, cli.json)),
+        Some(Command::Connect {
+            command: Some(command),
+            ..
+        }) => on_runtime(move || run_connect(command, cli.json)),
+        Some(Command::Connect {
+            command: None,
+            url: Some(url),
+            name,
+            stray: Some(_),
+            ..
+        }) => anyhow::bail!(
+            "refusing a token on the command line, because it lands in the shell history and the process list; run crystalline connect {}{} --token and paste it when asked, or pipe it on stdin",
+            // `--token cmt_... <url>` puts the token first: never repeat it.
+            crystalline_remote::normalize_server_url(&url)
+                .map(|_| url)
+                .unwrap_or_else(|_| "<url>".to_string()),
+            name.map(|n| format!(" --name {n}")).unwrap_or_default()
+        ),
+        Some(Command::Connect {
+            command: None,
+            url: Some(url),
+            name,
+            token,
+            stray: None,
+        }) => on_runtime(move || sources::connect_server(url, name, token, cli.json)),
+        Some(Command::Connect { .. }) => anyhow::bail!(
+            "name what to connect to: crystalline connect <url> for a Crystalline server, or crystalline connect github"
+        ),
+        Some(Command::Disconnect { target }) => {
+            on_runtime(move || sources::disconnect_server(target, cli.json))
+        }
         Some(Command::Install {
             harness,
             project,
@@ -2053,9 +2111,10 @@ fn opt_vec(v: Vec<String>) -> Option<Vec<String>> {
 /// override names an exact config and index the running daemon may not serve, so
 /// it always takes the direct path (see [`crystalline_service::use_daemon`]).
 /// Both paths render the same human shape (or, with `--json`, the same JSON
-/// shape), and the first output line always says which view this is - the
+/// shape), and the `Daemon:` line always says which view this is - the
 /// daemon's, a direct read because none runs, or a direct read because an
-/// override bypassed it.
+/// override bypassed it. It is the first line, unless servers are connected:
+/// then the `Sources:` block comes before it.
 async fn status_dispatch(
     config: Option<PathBuf>,
     db: Option<PathBuf>,
@@ -2063,6 +2122,17 @@ async fn status_dispatch(
 ) -> anyhow::Result<()> {
     use serde_json::json;
     let bypassed = db.is_some() || config.is_some();
+    // Every connected server, each asked at once within its own short limit,
+    // so one that is down never holds the report up. An override names an
+    // exact config and index, so it reports this machine's own alone.
+    let mut source_rows = if bypassed {
+        Vec::new()
+    } else {
+        let cfg = cmd::load(config.as_deref())
+            .map(|l| l.effective)
+            .unwrap_or_default();
+        sources::source_rows(&cfg).await
+    };
     // The daemon is asked before `config.yaml` is read, and `status` is the
     // only verb that does it in this order. It is the command a person reaches
     // for when something is broken, and a configuration this binary cannot
@@ -2076,10 +2146,16 @@ async fn status_dispatch(
             crystalline_service::ctl_if_running(json!({ "v": 1, "cmd": "status" })).await?
     {
         let config_error = cmd::load(config.as_deref()).err().map(|e| e.to_string());
+        sources::with_daemon_failures(&mut source_rows, &data["sources"]);
         if json {
             let mut data = data;
-            if let (Some(err), serde_json::Value::Object(map)) = (&config_error, &mut data) {
-                map.insert("config_error".to_string(), json!(err));
+            if let serde_json::Value::Object(map) = &mut data {
+                if let Some(err) = &config_error {
+                    map.insert("config_error".to_string(), json!(err));
+                }
+                // The daemon's own rows, with what this run asked each
+                // server added: the same keys, and more.
+                map.insert("sources".to_string(), serde_json::to_value(&source_rows)?);
             }
             println!("{data}");
         } else {
@@ -2094,6 +2170,7 @@ async fn status_dispatch(
                 data["version"].as_str().unwrap_or("unknown"),
                 format_uptime(data["uptime_secs"].as_u64().unwrap_or(0)),
             );
+            sources::render_sources(&source_rows);
             cmd::render_status(&data, &note);
         }
         return Ok(());
@@ -2121,11 +2198,12 @@ async fn status_dispatch(
                     "unresponsive (pid {pid} per its record); a connecting client will replace it, or run crystalline doctor --fix"
                 );
                 eprintln!("note: daemon {state}; reporting from a direct index read instead");
-                return cmd::status(
+                return finish_status(
                     route,
                     &cfg,
                     json,
                     &format!("{state}; reading the index directly"),
+                    &source_rows,
                 )
                 .await;
             }
@@ -2159,7 +2237,29 @@ async fn status_dispatch(
     } else {
         "not running; reading the index directly"
     };
-    cmd::status(route, &cfg, json, note).await
+    finish_status(route, &cfg, json, note, &source_rows).await
+}
+
+/// A direct read's `status`: the index's report with the sources added, the
+/// `Sources:` block before the rest in the human form.
+async fn finish_status(
+    route: cmd::IndexRoute,
+    cfg: &config::GlobalConfig,
+    json: bool,
+    daemon_note: &str,
+    source_rows: &[sources::SourceRow],
+) -> anyhow::Result<()> {
+    let mut value = cmd::status_value(route, cfg).await?;
+    if json {
+        if let serde_json::Value::Object(map) = &mut value {
+            map.insert("sources".to_string(), serde_json::to_value(source_rows)?);
+        }
+        println!("{value}");
+    } else {
+        sources::render_sources(source_rows);
+        cmd::render_status(&value, daemon_note);
+    }
+    Ok(())
 }
 
 /// Render seconds of uptime compactly: `42s`, `12m` or `3h07m`.
@@ -4359,6 +4459,12 @@ async fn domain_rename_dispatch(
     db: Option<PathBuf>,
     json: bool,
 ) -> anyhow::Result<()> {
+    if db.is_none()
+        && config.is_none()
+        && let Some(done) = sources::rename_mounted(&domain, &new, local, json).await
+    {
+        return done;
+    }
     let report =
         crystalline_service::domain_rename(&domain, &new, local, db.as_deref(), config.as_deref())
             .await?;

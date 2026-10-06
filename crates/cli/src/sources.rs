@@ -1,0 +1,819 @@
+//! The CLI's side of the connected servers: `connect <url>`,
+//! `disconnect <name|url>`, a local rename of a mounted domain, and the rows
+//! `status` and `doctor` print about every source.
+
+use std::time::{Duration, Instant};
+
+use crystalline_core::config::GlobalConfig;
+use crystalline_remote::{
+    Announcement, Connection, HiddenReason, LocalDomain, MountNote, MountTable, ONE_DOMAIN_LIMIT,
+    OriginIdentity, ROUTING_FILE, RemoteFailure, Revocation, SourceRecord, SourceSet, read_cached,
+    remote_dir,
+};
+use serde::Serialize;
+use serde_json::{Value, json};
+
+/// How long `status` and `doctor` wait for one source, everything included:
+/// the sign-in read on this machine and the server's answer.
+pub const SOURCE_STATUS_LIMIT: Duration = Duration::from_secs(5);
+
+/// This machine's domains as the mount table reads them, from the loaded
+/// config (the CLI has no engine at hand for `connect`).
+pub fn local_domains_of(cfg: &GlobalConfig) -> Vec<LocalDomain> {
+    let api_url = cfg.github.as_ref().and_then(|g| g.api_url.clone());
+    cfg.domains
+        .iter()
+        .map(|(name, entry)| LocalDomain {
+            name: name.clone(),
+            aliases: entry.aliases.clone(),
+            origin: entry
+                .origin
+                .as_ref()
+                .map(|origin| OriginIdentity::of(origin, api_url.as_deref())),
+        })
+        .collect()
+}
+
+/// The warning `connect` prints when the local copy a server replaces holds
+/// work the team has not seen (decision D19).
+pub fn unshared_warning(local: &str, source: &str, changes: usize) -> String {
+    format!(
+        "warning: your local copy of '{local}' holds {changes} change(s) you have not shared; share them first: they stay hidden while you are connected to {source}"
+    )
+}
+
+/// The local copies of the same domain `source` hides now: their names on
+/// this machine, which can differ from the names of the mounts that hide
+/// them.
+fn hidden_copies(table: &MountTable, source: &str) -> Vec<String> {
+    table
+        .shadowed
+        .iter()
+        .filter(|h| h.source == source && h.reason == HiddenReason::Copy)
+        .map(|h| h.local.clone())
+        .collect()
+}
+
+/// Tell a running daemon that `sources.json` changed, and answer what it
+/// said about the names. Best effort: a daemon that is not running reads the
+/// file when it starts, and a running one also finds the change on its own
+/// within seconds.
+async fn reload_daemon() -> Vec<String> {
+    let answer =
+        crystalline_service::ctl_if_running_passive(json!({ "v": 1, "cmd": "sources_reload" }))
+            .await
+            .ok()
+            .flatten();
+    answer
+        .and_then(|a| a["announcements"].as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|a| a.as_str().map(str::to_string))
+        .collect()
+}
+
+/// `crystalline connect <url> [--name] [--token]`.
+pub async fn connect_server(
+    url: String,
+    name: Option<String>,
+    token: bool,
+    json: bool,
+) -> anyhow::Result<()> {
+    use crystalline_remote::{connect_with_browser, connect_with_token, normalize_server_url};
+    // The address first, so a URL that can never work is refused before
+    // anyone pastes a token for it.
+    normalize_server_url(&url)?;
+    let loaded = crate::cmd::load(None)?;
+    let local = local_domains_of(&loaded.effective);
+    let dir = remote_dir()?;
+    let connected = if token {
+        let pasted = read_token_from_stdin()?;
+        connect_with_token(&url, name.as_deref(), &pasted, &dir, &local).await?
+    } else {
+        connect_with_browser(
+            &url,
+            name.as_deref(),
+            &dir,
+            &local,
+            |authorize_url| {
+                eprintln!(
+                    "Opening your browser to sign in. If it does not open, visit:\n\n  {authorize_url}\n"
+                );
+                open_in_browser(authorize_url);
+            },
+            |note| {
+                eprintln!("{note}");
+                read_token_from_stdin().ok()
+            },
+        )
+        .await?
+    };
+    let source = &connected.source;
+    // The local copies this server hides, by their own names: the
+    // announcement names the mount, which may be called differently.
+    let table = SourceSet::load(dir.clone(), local.clone(), |n| std::env::var(n).ok()).table();
+    let mut warnings = Vec::new();
+    if let Ok(origins) = crystalline_core::config::origins_state_dir() {
+        for hidden in hidden_copies(&table, &source.name) {
+            if let Some(root) = loaded
+                .effective
+                .domains
+                .get(&hidden)
+                .and_then(|e| e.file_path())
+                && let Some(work) =
+                    crystalline_service::unshared_work(&root, &origins.join(&hidden))
+                && work.count() > 0
+            {
+                warnings.push(unshared_warning(&hidden, &source.name, work.count()));
+            }
+        }
+    }
+    let _ = reload_daemon().await;
+    if json {
+        println!(
+            "{}",
+            json!({
+                "name": source.name,
+                "url": source.url,
+                "account": source.account,
+                "kind": source.kind.as_str(),
+                "announcements": connected.announcements.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                "warnings": warnings,
+            })
+        );
+    } else {
+        println!(
+            "connected to {} as {} ({}); this machine calls it {}",
+            source.url,
+            source.account,
+            source.kind.as_str(),
+            source.name
+        );
+        for said in &connected.announcements {
+            println!("{said}");
+        }
+        for warning in &warnings {
+            eprintln!("{warning}");
+        }
+        println!(
+            "your agents now see its domains beside this machine's own; crystalline disconnect {} removes it again",
+            source.name
+        );
+    }
+    Ok(())
+}
+
+/// The pasted token: one line from stdin, with a prompt when stdin is a
+/// terminal. Never from the command line, where it would land in the shell
+/// history and the process list.
+pub fn read_token_from_stdin() -> anyhow::Result<String> {
+    use std::io::{BufRead, IsTerminal};
+    if std::io::stdin().is_terminal() {
+        eprint!("Paste the personal MCP token (cmt_...) and press Enter: ");
+    }
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line)?;
+    let token = line.trim().to_string();
+    if token.is_empty() {
+        anyhow::bail!("no token was given; issue one in Fluid under profile > Agent access");
+    }
+    Ok(token)
+}
+
+/// Open `url` in the default browser, best effort: the URL is printed first
+/// either way.
+pub fn open_in_browser(url: &str) {
+    #[cfg(target_os = "macos")]
+    let opened = std::process::Command::new("open").arg(url).spawn();
+    #[cfg(target_os = "windows")]
+    let opened = std::process::Command::new("rundll32")
+        .args(["url.dll,FileProtocolHandler", url])
+        .spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let opened = std::process::Command::new("xdg-open").arg(url).spawn();
+    if let Err(e) = opened {
+        tracing::debug!("could not open a browser: {e}");
+    }
+}
+
+/// `crystalline disconnect <name|url>`.
+pub async fn disconnect_server(target: String, json: bool) -> anyhow::Result<()> {
+    let dir = remote_dir()?;
+    let Some(gone) = crystalline_remote::disconnect(&dir, &target).await? else {
+        let taken = crystalline_remote::load_sources(&dir)
+            .map(|f| f.names())
+            .unwrap_or_default();
+        let env = crystalline_remote::env_source(|n| std::env::var(n).ok(), &taken);
+        if env.is_some_and(|e| e.url == target || e.name == target) {
+            anyhow::bail!(
+                "this source comes from CRYSTALLINE_REMOTE_URL and CRYSTALLINE_REMOTE_TOKEN; unset them to remove it"
+            );
+        }
+        anyhow::bail!("no connected server is called {target}; crystalline status lists them");
+    };
+    if let Some(note) = gone.note() {
+        eprintln!("note: {note}");
+    }
+    let said = reload_daemon().await;
+    if json {
+        println!(
+            "{}",
+            json!({ "disconnected": gone.name, "url": gone.url, "revoked": gone.revocation == Revocation::Revoked })
+        );
+    } else {
+        println!(
+            "disconnected from {} ({}); its domains are gone from this machine",
+            gone.name, gone.url
+        );
+        for line in said {
+            println!("{line}");
+        }
+    }
+    Ok(())
+}
+
+/// `crystalline domain rename <domain> <new> [--local]` when `domain` is a
+/// mounted domain. `None` when it is not one, and the ordinary rename runs.
+pub async fn rename_mounted(
+    domain: &str,
+    new: &str,
+    local: bool,
+    json: bool,
+) -> Option<anyhow::Result<()>> {
+    let loaded = crate::cmd::load(None).ok()?;
+    let dir = remote_dir().ok()?;
+    let set = SourceSet::load(dir, local_domains_of(&loaded.effective), |n| {
+        std::env::var(n).ok()
+    });
+    let mount = set.table().mount(domain).cloned()?;
+    if !local {
+        return Some(Err(anyhow::anyhow!(
+            "'{domain}' comes from {}; only its name on this machine can change here: add --local",
+            mount.source
+        )));
+    }
+    if let Err(why) = set.rename_local(domain, new) {
+        return Some(Err(anyhow::anyhow!(why)));
+    }
+    let _ = reload_daemon().await;
+    if json {
+        println!(
+            "{}",
+            json!({ "renamed": domain, "to": new, "source": mount.source, "local": true })
+        );
+    } else {
+        println!(
+            "'{domain}' from {} is called '{new}' on this machine now",
+            mount.source
+        );
+    }
+    Some(Ok(()))
+}
+
+/// One mounted domain in a [`SourceRow`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct MountRow {
+    /// Its name on this machine.
+    pub local: String,
+    /// Its name on the server.
+    pub remote: String,
+    /// Whether it is the same domain as a local copy, which is hidden.
+    pub replaces_local: bool,
+}
+
+/// A domain a source offers that is left out, because an earlier source
+/// offers the same domain.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct SkippedRow {
+    /// Its name on the later source.
+    pub remote: String,
+    /// The source whose copy is used.
+    pub kept_by: String,
+}
+
+/// One local domain a source hides.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct HiddenRow {
+    /// The local domain.
+    pub local: String,
+    /// `"copy"`: the same domain as a mount, which is used instead.
+    /// `"collision"`: a different domain under a name the source gave out
+    /// first.
+    pub reason: String,
+    /// The local name of the mount that hides it.
+    pub by: String,
+    /// What it means and the way out, in plain words.
+    pub note: String,
+}
+
+/// One source, as `status` and `doctor` report it.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SourceRow {
+    pub name: String,
+    pub url: String,
+    pub account: String,
+    pub kind: String,
+    pub from_env: bool,
+    /// `"keyring"`, `"file"` or `"environment"`.
+    pub credential_store: Option<String>,
+    /// When the access token in hand expires, for a browser sign-in.
+    pub expires_at: Option<String>,
+    /// Whether the server answered this run (also true when it answered
+    /// with a refusal).
+    pub reachable: bool,
+    /// Why this run got no answer, in this machine's words: the source, its
+    /// address, the likely cause, and that it recovers by itself.
+    pub error: Option<String>,
+    /// What the server itself wrote beside `error`, for a person reading
+    /// `status` or `doctor` only.
+    pub error_detail: Option<String>,
+    /// When the server last confirmed the domain list this machine uses.
+    pub fetched_at: Option<String>,
+    /// Why the last try to refresh the domain list failed: the running
+    /// daemon's record, or the cached one.
+    pub failure: Option<String>,
+    /// What the server wrote beside `failure`, from the running daemon.
+    pub failure_detail: Option<String>,
+    /// Every mounted domain.
+    pub mounts: Vec<MountRow>,
+    /// The local domains this source hides, by name.
+    pub hidden_local: Vec<String>,
+    /// The same, with why and the way out.
+    pub shadowed: Vec<HiddenRow>,
+    /// The domains left out because an earlier source offers them.
+    pub skipped: Vec<SkippedRow>,
+}
+
+/// The table's part of one source's row: its names and what it hides.
+fn fill_names(row: &mut SourceRow, table: &MountTable) {
+    row.mounts = table
+        .of_source(&row.name)
+        .map(|m| MountRow {
+            local: m.local.clone(),
+            remote: m.remote.clone(),
+            replaces_local: m.replaces_local,
+        })
+        .collect();
+    row.shadowed = table
+        .shadowed
+        .iter()
+        .filter(|h| h.source == row.name)
+        .map(|h| HiddenRow {
+            local: h.local.clone(),
+            reason: match h.reason {
+                HiddenReason::Copy => "copy",
+                HiddenReason::Collision => "collision",
+            }
+            .to_string(),
+            by: h.by.clone(),
+            note: hidden_note(&h.local, &row.name, h.reason),
+        })
+        .collect();
+    row.hidden_local = row.shadowed.iter().map(|h| h.local.clone()).collect();
+    row.skipped = table
+        .skipped
+        .iter()
+        .filter(|s| s.source == row.name)
+        .map(|s| SkippedRow {
+            remote: s.remote.clone(),
+            kept_by: s.kept_by.clone(),
+        })
+        .collect();
+}
+
+/// What `status` and `doctor` say about a hidden local domain (ruling F8
+/// REVISED).
+pub fn hidden_note(local: &str, source: &str, reason: HiddenReason) -> String {
+    match reason {
+        HiddenReason::Copy => format!(
+            "{}; it cannot be removed or renamed while {source} is connected",
+            MountNote::HiddenCopy {
+                name: local.to_string(),
+                source: source.to_string(),
+            }
+            .render(true)
+        ),
+        HiddenReason::Collision => Announcement::LocalShadowed {
+            local: local.to_string(),
+            source: source.to_string(),
+        }
+        .to_string(),
+    }
+}
+
+/// Ask one source for its `status`, within [`SOURCE_STATUS_LIMIT`] for
+/// everything: the sign-in read here and the answer there.
+async fn ask_one(record: SourceRecord, dir: std::path::PathBuf) -> SourceRow {
+    let mut row = SourceRow {
+        name: record.name.clone(),
+        url: record.url.clone(),
+        account: record.account.clone(),
+        kind: record.kind.as_str().to_string(),
+        from_env: record.from_env,
+        ..SourceRow::default()
+    };
+    if let Some(cached) = read_cached(&record.host_dir(&dir), ROUTING_FILE, &record.account) {
+        row.fetched_at = Some(cached.fetched_at.to_rfc3339());
+        row.failure = cached.last_failure;
+    }
+    let timed_out = RemoteFailure::TimedOut {
+        source: record.name.clone(),
+        url: record.url.clone(),
+        after: SOURCE_STATUS_LIMIT,
+    };
+    let asked = async {
+        let opened = tokio::task::spawn_blocking(move || Connection::open(record, &dir))
+            .await
+            .map_err(|e| RemoteFailure::Credential(e.to_string()))
+            .and_then(|opened| opened);
+        let connection = match opened {
+            Ok(connection) => connection,
+            Err(failure) => return (None, None, Err((failure, false))),
+        };
+        let store = Some(connection.store_kind().to_string());
+        let expires_at = connection
+            .credential()
+            .await
+            .and_then(|c| c.expires_at)
+            .map(|at| at.to_rfc3339());
+        let answer = connection
+            .ctl_data(json!({ "v": 1, "cmd": "status" }))
+            .await
+            .map(|_| ())
+            .map_err(|failure| {
+                let reachable = !failure.is_unreachable();
+                (failure, reachable)
+            });
+        (store, expires_at, answer)
+    };
+    match tokio::time::timeout(SOURCE_STATUS_LIMIT, asked).await {
+        Ok((store, expires_at, answer)) => {
+            row.credential_store = store;
+            row.expires_at = expires_at;
+            match answer {
+                Ok(()) => row.reachable = true,
+                Err((failure, reachable)) => {
+                    row.reachable = reachable;
+                    row.error_detail = failure.server_text().map(str::to_string);
+                    row.error = Some(failure.to_string());
+                }
+            }
+        }
+        Err(_) => row.error = Some(timed_out.to_string()),
+    }
+    row
+}
+
+/// Every source, each asked for its `status` at once within
+/// [`SOURCE_STATUS_LIMIT`], so a source that is down never holds the report
+/// up: its row shows the cached names and why it did not answer. Before it
+/// returns, a sign-in refresh one of the asks started is waited for with
+/// what is left of [`ONE_DOMAIN_LIMIT`], so a token pair the server rotated
+/// is saved.
+pub async fn source_rows(cfg: &GlobalConfig) -> Vec<SourceRow> {
+    let started = Instant::now();
+    let Ok(dir) = remote_dir() else {
+        return Vec::new();
+    };
+    let set = SourceSet::load(dir.clone(), local_domains_of(cfg), |n| {
+        std::env::var(n).ok()
+    });
+    let records = set.records();
+    if records.is_empty() {
+        return Vec::new();
+    }
+    let table = set.table();
+    let mut tasks = tokio::task::JoinSet::new();
+    for (index, record) in records.iter().cloned().enumerate() {
+        let dir = dir.clone();
+        tasks.spawn(async move { (index, ask_one(record, dir).await) });
+    }
+    let mut rows: Vec<Option<SourceRow>> = vec![None; records.len()];
+    while let Some(done) = tasks.join_next().await {
+        if let Ok((index, row)) = done {
+            rows[index] = Some(row);
+        }
+    }
+    let rows = rows
+        .into_iter()
+        .zip(records)
+        .map(|(row, record)| {
+            let mut row = row.unwrap_or_else(|| SourceRow {
+                error: Some(format!(
+                    "asking {} ({}) stopped before it answered",
+                    record.name, record.url
+                )),
+                name: record.name.clone(),
+                url: record.url.clone(),
+                account: record.account.clone(),
+                kind: record.kind.as_str().to_string(),
+                from_env: record.from_env,
+                ..SourceRow::default()
+            });
+            fill_names(&mut row, &table);
+            row
+        })
+        .collect();
+    crystalline_remote::settle_refreshes(ONE_DOMAIN_LIMIT.saturating_sub(started.elapsed())).await;
+    rows
+}
+
+/// Add what a running daemon knows about each source to `rows`: its last
+/// failure to refresh, and what the server wrote beside it. `sources` is the
+/// daemon's `status` answer's `sources` member.
+pub fn with_daemon_failures(rows: &mut [SourceRow], sources: &Value) {
+    let Some(sources) = sources.as_array() else {
+        return;
+    };
+    for row in rows {
+        let Some(daemon) = sources.iter().find(|s| s["name"] == row.name.as_str()) else {
+            continue;
+        };
+        if let Some(failure) = daemon["failure"].as_str() {
+            row.failure = Some(failure.to_string());
+        }
+        if let Some(detail) = daemon["failure_detail"].as_str() {
+            row.failure_detail = Some(detail.to_string());
+        }
+    }
+}
+
+/// The human `Sources:` block.
+pub fn render_sources(rows: &[SourceRow]) {
+    print!("{}", sources_block(rows));
+}
+
+/// The human `Sources:` block as text; empty when there are no sources.
+pub fn sources_block(rows: &[SourceRow]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    if rows.is_empty() {
+        return out;
+    }
+    let _ = writeln!(out, "Sources:");
+    for row in rows {
+        let kind = match row.kind.as_str() {
+            "oauth" => "signed in through the browser; renews on its own",
+            _ if row.from_env => "a token from the environment",
+            _ => "a pasted token",
+        };
+        let state = match &row.error {
+            Some(error) => error.clone(),
+            None => "answers".to_string(),
+        };
+        let _ = writeln!(
+            out,
+            "  {} {} as {} ({kind}): {state}",
+            row.name, row.url, row.account
+        );
+        if let Some(detail) = &row.error_detail {
+            let _ = writeln!(out, "    the server wrote: {detail}");
+        }
+        if row.error.is_some() {
+            match &row.fetched_at {
+                Some(at) => {
+                    let _ = writeln!(out, "    domains as the server last listed them at {at}");
+                }
+                None => {
+                    let _ = writeln!(
+                        out,
+                        "    no domain list is cached yet; its domains are unavailable until it answers"
+                    );
+                }
+            }
+        }
+        if row.error.is_none()
+            && let Some(failure) = &row.failure
+        {
+            let _ = writeln!(out, "    last failure: {failure}");
+        }
+        if let Some(detail) = &row.failure_detail {
+            let _ = writeln!(out, "    the server wrote then: {detail}");
+        }
+        let names: Vec<String> = row
+            .mounts
+            .iter()
+            .map(|m| {
+                if m.local == m.remote {
+                    m.local.clone()
+                } else {
+                    format!("{} ('{}' on {})", m.local, m.remote, row.name)
+                }
+            })
+            .collect();
+        if !names.is_empty() {
+            let _ = writeln!(out, "    domains: {}", names.join(", "));
+        }
+        for hidden in &row.shadowed {
+            let _ = writeln!(out, "    {}", hidden.note);
+        }
+        for skipped in &row.skipped {
+            let _ = writeln!(
+                out,
+                "    left out: '{}' ({} offers the same domain)",
+                skipped.remote, skipped.kept_by
+            );
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_unshared_warning_says_what_to_do_and_why() {
+        assert_eq!(
+            unshared_warning("platform", "acme", 3),
+            "warning: your local copy of 'platform' holds 3 change(s) you have not shared; share them first: they stay hidden while you are connected to acme"
+        );
+    }
+
+    #[test]
+    fn the_local_domains_carry_their_aliases_and_their_origin() {
+        let mut cfg = GlobalConfig::default();
+        let mut entry = crystalline_core::config::DomainEntry::file("/x");
+        entry.aliases.push("old".into());
+        entry.origin = Some(crystalline_core::config::OriginConfig {
+            repo: "Acme/Platform".into(),
+            path: None,
+            branch: None,
+            poll_secs: None,
+        });
+        cfg.domains.insert("platform".into(), entry);
+        let local = local_domains_of(&cfg);
+        assert_eq!(local[0].aliases, vec!["old".to_string()]);
+        assert_eq!(
+            local[0].origin.as_ref().unwrap().repository,
+            "acme/platform"
+        );
+    }
+
+    fn table_with_hidden() -> MountTable {
+        use crystalline_remote::{Hidden, Mount, Skipped};
+        MountTable {
+            sources: vec!["acme".into(), "beta".into()],
+            mounts: vec![
+                Mount {
+                    local: "platform".into(),
+                    remote: "platform".into(),
+                    source: "acme".into(),
+                    bullets: Vec::new(),
+                    replaces_local: true,
+                },
+                Mount {
+                    local: "open".into(),
+                    remote: "open".into(),
+                    source: "acme".into(),
+                    bullets: Vec::new(),
+                    replaces_local: false,
+                },
+                Mount {
+                    local: "open-beta".into(),
+                    remote: "open".into(),
+                    source: "beta".into(),
+                    bullets: Vec::new(),
+                    replaces_local: false,
+                },
+            ],
+            skipped: vec![Skipped {
+                source: "beta".into(),
+                remote: "specs".into(),
+                kept_by: "acme".into(),
+            }],
+            shadowed: vec![
+                Hidden {
+                    local: "team-platform".into(),
+                    source: "acme".into(),
+                    reason: HiddenReason::Copy,
+                    by: "platform".into(),
+                },
+                Hidden {
+                    local: "open".into(),
+                    source: "acme".into(),
+                    reason: HiddenReason::Collision,
+                    by: "open".into(),
+                },
+            ],
+        }
+    }
+
+    /// Ruling F8 REVISED and Task 12's review (M10, M11): the two hidden
+    /// cases in their own words, no `rename --local` advice, and a renamed
+    /// latecomer read from the table.
+    #[test]
+    fn status_names_each_hidden_local_domain_with_its_way_out() {
+        let table = table_with_hidden();
+        let mut acme = SourceRow {
+            name: "acme".into(),
+            url: "https://crystalline.acme.example".into(),
+            account: "keeper".into(),
+            kind: "token".into(),
+            ..SourceRow::default()
+        };
+        fill_names(&mut acme, &table);
+        let mut beta = SourceRow {
+            name: "beta".into(),
+            url: "https://beta.example".into(),
+            account: "keeper".into(),
+            kind: "oauth".into(),
+            ..SourceRow::default()
+        };
+        fill_names(&mut beta, &table);
+        assert_eq!(acme.hidden_local, vec!["team-platform", "open"]);
+        assert_eq!(hidden_copies(&table, "acme"), vec!["team-platform"]);
+        let text = sources_block(&[acme, beta]);
+        assert!(
+            text.contains(
+                "the local domain 'team-platform' is hidden while acme is connected; disconnect acme to use it again; it cannot be removed or renamed while acme is connected"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "the local domain 'open' has a name acme gave out first; it is hidden until you change its name in config.yaml or disconnect acme"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("domains: open-beta ('open' on beta)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("left out: 'specs' (acme offers the same domain)"),
+            "{text}"
+        );
+        assert!(!text.contains("--local"), "{text}");
+    }
+
+    /// A8 (f): a source that does not answer is named with its address and
+    /// the likely cause, the cached names stay, and what the server wrote
+    /// shows only on a detail line.
+    #[test]
+    fn a_source_that_does_not_answer_keeps_its_cached_names() {
+        let mut row = SourceRow {
+            name: "acme".into(),
+            url: "https://crystalline.acme.example".into(),
+            account: "keeper".into(),
+            kind: "token".into(),
+            error: Some(
+                RemoteFailure::TimedOut {
+                    source: "acme".into(),
+                    url: "https://crystalline.acme.example".into(),
+                    after: SOURCE_STATUS_LIMIT,
+                }
+                .to_string(),
+            ),
+            fetched_at: Some("2026-10-06T08:00:00+00:00".into()),
+            ..SourceRow::default()
+        };
+        fill_names(&mut row, &table_with_hidden());
+        let text = sources_block(&[row]);
+        assert!(
+            text.contains("acme (https://crystalline.acme.example) cannot be reached right now"),
+            "{text}"
+        );
+        assert!(text.contains("recovers by itself"), "{text}");
+        assert!(
+            text.contains("domains as the server last listed them at 2026-10-06T08:00:00+00:00"),
+            "{text}"
+        );
+        assert!(text.contains("domains: platform, open"), "{text}");
+    }
+
+    #[test]
+    fn the_daemon_adds_its_last_failure() {
+        let mut rows = vec![SourceRow {
+            name: "acme".into(),
+            failure: Some("from the cache".into()),
+            ..SourceRow::default()
+        }];
+        with_daemon_failures(
+            &mut rows,
+            &json!([{ "name": "acme", "failure": "from the daemon", "failure_detail": "<html>" }]),
+        );
+        assert_eq!(rows[0].failure.as_deref(), Some("from the daemon"));
+        assert_eq!(rows[0].failure_detail.as_deref(), Some("<html>"));
+        let value = serde_json::to_value(&rows[0]).unwrap();
+        for key in [
+            "name",
+            "url",
+            "account",
+            "kind",
+            "from_env",
+            "failure",
+            "failure_detail",
+            "mounts",
+            "skipped",
+            "shadowed",
+            "credential_store",
+            "expires_at",
+            "reachable",
+            "error",
+            "hidden_local",
+        ] {
+            assert!(value.get(key).is_some(), "{key} in {value}");
+        }
+    }
+}
