@@ -241,6 +241,12 @@ jobs:
             rustflags: '-C target-feature=+fp16'
     env:
       RUSTFLAGS: ${{ matrix.rustflags }}
+      # Keeps every test off the runner's real OS keychain, the same switch
+      # the documented local test command sets. Without it a Windows runner's
+      # Credential Manager takes a test's credential write while a Linux or
+      # macOS runner falls back to the file, so a test that reads the file
+      # store passes on two legs and finds nothing on the third.
+      CRYSTALLINE_TEST_NO_KEYCHAIN: '1'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

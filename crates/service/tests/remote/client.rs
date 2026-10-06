@@ -51,6 +51,17 @@ pub fn save_credential(remote_dir: &Path, source: &SourceRecord, credential: &Se
         .unwrap();
 }
 
+/// The credential saved for `source`, read from the store that holds it.
+/// [`save_credential`] puts it in the OS keychain when that takes the write
+/// (Windows runners do, with no kill switch set) and in the file otherwise,
+/// so a read of the file alone finds nothing there.
+fn stored_credential(remote_dir: &Path, source: &SourceRecord) -> ServerCredential {
+    ServerCredentialStore::resolve_and_load(&source.key(), &source.host_dir(remote_dir))
+        .unwrap()
+        .1
+        .expect("a credential is saved")
+}
+
 /// A source signed in with a pasted token for `account` on `server`.
 pub async fn token_source(
     server: &RemoteServer,
@@ -802,10 +813,7 @@ async fn a_refresh_that_fails_on_the_network_keeps_the_refresh_token_and_tries_a
         !failure.is_sign_in(),
         "a network failure never asks to sign in"
     );
-    let stored = ServerCredentialStore::file(&record.host_dir(dir.path()))
-        .load()
-        .unwrap()
-        .unwrap();
+    let stored = stored_credential(dir.path(), &record);
     assert_eq!(
         stored.refresh_token.as_deref(),
         Some("cor_0"),
@@ -1285,10 +1293,7 @@ async fn a_refresh_answered_with_a_redirect_never_sends_the_refresh_token_on() {
     );
     assert!(!failure.is_sign_in(), "{failure:?}");
     assert_eq!(hits.load(Ordering::SeqCst), 0, "nothing reached the target");
-    let stored = ServerCredentialStore::file(&record.host_dir(dir.path()))
-        .load()
-        .unwrap()
-        .unwrap();
+    let stored = stored_credential(dir.path(), &record);
     assert_eq!(stored.refresh_token.as_deref(), Some("cor_0"));
 }
 
