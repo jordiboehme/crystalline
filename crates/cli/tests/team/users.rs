@@ -982,10 +982,10 @@ fn add_with_mcp_token_creates_a_passwordless_account_and_prints_its_token() {
         serde_json::from_str(&users_ok(home.path(), &["--json", "list"], None)).unwrap();
     let row = &listed["users"][0];
     assert_eq!(row["name"], "agent-build");
-    assert_eq!(row["password"], false, "{listed}");
+    assert_eq!(row["has_password"], false, "{listed}");
 
     let text = users_ok(home.path(), &["list"], None);
-    assert!(text.contains("no password"), "{text}");
+    assert!(text.contains("active, no password"), "{text}");
 
     // A second account with a password lists as having one.
     users_ok(
@@ -996,8 +996,8 @@ fn add_with_mcp_token_creates_a_passwordless_account_and_prints_its_token() {
     let listed: serde_json::Value =
         serde_json::from_str(&users_ok(home.path(), &["--json", "list"], None)).unwrap();
     assert_eq!(listed["users"][0]["name"], "ada");
-    assert_eq!(listed["users"][0]["password"], true, "{listed}");
-    assert_eq!(listed["users"][1]["password"], false, "{listed}");
+    assert_eq!(listed["users"][0]["has_password"], true, "{listed}");
+    assert_eq!(listed["users"][1]["has_password"], false, "{listed}");
 
     // The same name again is refused with the existing sentence.
     let refused = users_err(

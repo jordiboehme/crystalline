@@ -91,19 +91,18 @@ pub async fn run(command: UsersCommand, json: bool) -> Result<()> {
         }
         UsersCommand::List => {
             let users = store.list_users().await?;
+            let passwordless = store.passwordless_users().await?;
             if json {
-                let passwordless = store.passwordless_users().await?;
                 let rows: Vec<serde_json::Value> = users
                     .iter()
                     .map(|u| {
                         let mut row = serde_json::to_value(u).unwrap_or_default();
-                        row["password"] = (!passwordless.contains(&u.name)).into();
+                        row["has_password"] = (!passwordless.contains(&u.name)).into();
                         row
                     })
                     .collect();
                 crate::print_value(&serde_json::json!({ "users": rows }), true);
             } else {
-                let passwordless = store.passwordless_users().await?;
                 print_users(&users, &passwordless);
             }
         }
@@ -460,7 +459,7 @@ fn print_users(users: &[User], passwordless: &std::collections::HashSet<String>)
                 u.role.to_string(),
                 match (u.disabled, passwordless.contains(&u.name)) {
                     (true, _) => "disabled",
-                    (false, true) => "no password",
+                    (false, true) => "active, no password",
                     (false, false) => "active",
                 }
                 .to_string(),

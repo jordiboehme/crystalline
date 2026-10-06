@@ -64,7 +64,7 @@ An agent that runs on another machine does not need a password, because it never
 crystalline users add agent-build --role editor --mcp-token build
 ```
 
-The command creates the account `agent-build` and prints the token once. Add `--json` to get `name`, `role`, `id`, `token` and `label` as one object for a script. `--mcp-token` and `--password-stdin` cannot be used together, and a name that already exists is refused: a token for an existing account is `crystalline users mcp-token <name>`. The account is created with the role you give (viewer if you give none), so an agent that writes needs `--role editor`. Password sign-in never works for it, and `crystalline users list` shows it as "no password". You can still list, rotate and revoke its tokens with `crystalline users mcp-token`, change its role with `users role` and turn it off with `users disable`.
+The command creates the account `agent-build` and prints the token once. Add `--json` to get `name`, `role`, `id`, `token` and `label` as one object for a script. `--mcp-token` and `--password-stdin` cannot be used together, and a name that already exists is refused: a token for an existing account is `crystalline users mcp-token <name>`. The account is created with the role you give (viewer if you give none), so an agent that writes needs `--role editor`. Password sign-in never works for it, and `crystalline users list` shows it as "active, no password". You can still list, rotate and revoke its tokens with `crystalline users mcp-token`, change its role with `users role` and turn it off with `users disable`.
 
 On the agent's machine, set the server and the token and nothing else:
 
