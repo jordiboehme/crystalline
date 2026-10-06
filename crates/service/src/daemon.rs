@@ -531,6 +531,12 @@ pub async fn run_serve(
     // [`setup_token_for`] and the print just below - the token is said once and
     // never written anywhere again.
     let accounts_db = crystalline_core::config::web_auth_db_path().ok();
+    // The first admin from the environment (A9), made before the token is
+    // asked about so an instance that just got its admin draws none. The store
+    // it opens is dropped inside, so `setup_token_for`'s own open is the only
+    // handle left. A refused configuration fails the start here, with a
+    // sentence that never carries the password.
+    let created_admin = crate::first_admin::seed_from_environment(accounts_db.as_deref()).await?;
     let setup_token = match http_addr.as_deref() {
         Some(addr) => setup_token_for(addr, accounts_db.as_deref()).await,
         None => None,
@@ -559,6 +565,9 @@ pub async fn run_serve(
                 }
             }
         }
+        if let Some(line) = &created_admin {
+            eprintln!("{line}");
+        }
         if read_only {
             eprintln!("crystalline serving read-only: content-mutating tools are disabled");
         }
@@ -567,13 +576,18 @@ pub async fn run_serve(
                 "no domains registered yet - agents can create one with add_domain, or run: crystalline domain add <name> <path>"
             );
         }
-    } else if let (Some(addr), Some(token)) = (&http_addr, &setup_token) {
-        // Daemonized, so there is no terminal reading the banner: the same two
-        // lines go to the daemon log instead, once. Without them a backgrounded
-        // non-loopback serve would offer a first-run wizard nobody can get
-        // through and no way to find out why.
-        for line in setup_token_lines(&setup_address(&loaded.effective, addr), token) {
+    } else {
+        if let Some(line) = &created_admin {
             tracing::info!("{line}");
+        }
+        if let (Some(addr), Some(token)) = (&http_addr, &setup_token) {
+            // Daemonized, so there is no terminal reading the banner: the same two
+            // lines go to the daemon log instead, once. Without them a backgrounded
+            // non-loopback serve would offer a first-run wizard nobody can get
+            // through and no way to find out why.
+            for line in setup_token_lines(&setup_address(&loaded.effective, addr), token) {
+                tracing::info!("{line}");
+            }
         }
     }
 

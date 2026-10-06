@@ -104,7 +104,7 @@ flowchart LR
 
 The bundled nginx config carries its own dedicated location for the collab WebSocket, `/api/v1/collab/`, with the Upgrade and Connection headers the plain `/api/` block does not send. Anyone who replaces the Fluid image's nginx config with their own has to carry that block over, or the upgrade never reaches the daemon and the editor runs solo-only with nothing on screen to explain why. The config also raises `client_max_body_size` to 10 MiB to match the daemon's own limit, and a replacement config that leaves nginx's 1 MiB default in place turns every save and every archive import of a larger engram into a proxy refusal. The archive routes get a second, larger directive of their own, in a regex location matching `^/api/v1/domains/[^/]+/archive`: a domain export is re-imported as one zip with its `assets/` attachments inside it, so those two paths accept 64 MiB where everything else keeps 10 MiB, exactly as the daemon does. A replacement config that carries the server-level directive over but not that location refuses an archive the same deployment produced, which reads on screen like a Fluid bug rather than a proxy one. The same template turns proxy buffering off in its `/api/` location, for the change stream the web UI keeps open (see [Web UI from the daemon](#web-ui-from-the-daemon)); a replacement config that leaves buffering on gives a page that never follows a change.
 
-Nothing is readable until an account exists: the JSON API answers `401` to a request that carries no identity. Creating the first admin is the one bootstrap step, and there are two ways to take it. From the host, `users add` writes the accounts database directly (never through the daemon), so a running instance picks the new account up on its next lookup with nothing to restart:
+Nothing is readable until an account exists: the JSON API answers `401` to a request that carries no identity. Creating the first admin is the one bootstrap step, and there are three ways to take it. From the host, `users add` writes the accounts database directly (never through the daemon), so a running instance picks the new account up on its next lookup with nothing to restart:
 
 ```sh
 docker compose -f deploy/fluid/docker-compose.yml up -d
@@ -113,7 +113,25 @@ printf '%s' 'the-password' | docker compose -f deploy/fluid/docker-compose.yml \
   exec -T crystalline crystalline users add ada --role admin --password-stdin
 ```
 
-Or take it in the browser instead: open Fluid and an instance with no accounts renders the create-first-admin form ([Web UI from the daemon](#web-ui-from-the-daemon)). The daemon binds `0.0.0.0` inside its container, so that form asks for the one-time setup token the daemon printed when it started, and `docker compose -f deploy/fluid/docker-compose.yml logs crystalline` is where to read it (a restarted daemon prints a new one, until the admin exists and none is printed again). Either route mints the same admin, and either one closes the form for good.
+Or let the daemon create it at its first start, from the environment. Set `CRYSTALLINE_ADMIN_NAME` and `CRYSTALLINE_ADMIN_PASSWORD_FILE` on the crystalline service, and mount the password as a Docker secret:
+
+```yaml
+services:
+  crystalline:
+    environment:
+      CRYSTALLINE_ADMIN_NAME: ada
+      CRYSTALLINE_ADMIN_PASSWORD_FILE: /run/secrets/crystalline_admin_password
+    secrets:
+      - crystalline_admin_password
+
+secrets:
+  crystalline_admin_password:
+    file: ./admin-password.txt
+```
+
+The admin is created at a start only while no account exists. A later start never changes it, and it never brings back an admin you deleted. Once it exists the browser form asks for nothing, because the instance has an account, and the daemon prints no setup token. The plain `CRYSTALLINE_ADMIN_PASSWORD` works too, but it shows up in `docker inspect`, so use the file form. A file loses one trailing line break and nothing else. If the name or the password is missing, or the file cannot be read, or the password is empty, the first start stops with a message that names the variable. When an account exists already, the variables are ignored, and a password variable that is still set logs one warning per start so you can remove it.
+
+Or take it in the browser instead: open Fluid and an instance with no accounts renders the create-first-admin form ([Web UI from the daemon](#web-ui-from-the-daemon)). The daemon binds `0.0.0.0` inside its container, so that form asks for the one-time setup token the daemon printed when it started, and `docker compose -f deploy/fluid/docker-compose.yml logs crystalline` is where to read it (a restarted daemon prints a new one, until the admin exists and none is printed again). Every route mints the same admin, and each one closes the form for good.
 
 Restart the daemon after upgrading the binary, before editing accounts, so both sides open the accounts database the same way. A container upgrade recreates the container and has this covered already; a native install upgraded underneath a daemon that keeps running does not.
 
@@ -286,7 +304,7 @@ docker run -d \
   ghcr.io/jordiboehme/crystalline:latest
 ```
 
-That one published port carries the browser too: the image serves the web UI built in, so `open http://localhost:7411` lands on Fluid while agents keep speaking MCP to the same address (see [Web UI from the daemon](#web-ui-from-the-daemon) for accounts, TLS and the two toggles). A fresh container has no accounts, so that first visit renders the create-first-admin form. The container binds `0.0.0.0`, which is not loopback, so the form asks for the one-time setup token the daemon prints as it starts: `docker logs crystalline` is where to read it, and a restarted container prints a new one until that first admin exists.
+That one published port carries the browser too: the image serves the web UI built in, so `open http://localhost:7411` lands on Fluid while agents keep speaking MCP to the same address (see [Web UI from the daemon](#web-ui-from-the-daemon) for accounts, TLS and the two toggles). A fresh container has no accounts, so that first visit renders the create-first-admin form. The container binds `0.0.0.0`, which is not loopback, so the form asks for the one-time setup token the daemon prints as it starts: `docker logs crystalline` is where to read it, and a restarted container prints a new one until that first admin exists. To skip the form, set `CRYSTALLINE_ADMIN_NAME` and `CRYSTALLINE_ADMIN_PASSWORD_FILE` and the container creates the admin at its first start (see [Team server with Fluid](#team-server-with-fluid)).
 
 What persists where:
 
@@ -375,6 +393,10 @@ An immutable image with no `config.yaml` to mount or edit configures purely thro
 | `CRYSTALLINE_GITHUB_TOKEN` | this machine's GitHub token | read-only; `connect github` refuses while set |
 | `CRYSTALLINE_REMOTE_URL` | a server this machine offers domains from | a source only together with `CRYSTALLINE_REMOTE_TOKEN`; added after the servers `crystalline connect` saved, and never written down. See [A local Crystalline with domains from shared servers](#a-local-crystalline-with-domains-from-shared-servers) |
 | `CRYSTALLINE_REMOTE_TOKEN` | a personal MCP token for that server | read-only; `crystalline disconnect` cannot remove this source, unset the two variables instead |
+| `CRYSTALLINE_ADMIN_NAME` | the name of the first admin | read at every `serve` start and used only while no account exists. Needs a password variable too. See [Team server with Fluid](#team-server-with-fluid) |
+| `CRYSTALLINE_ADMIN_NAME_FILE` | a path to a file holding that name | the file form of the variable above; set one of the two, never both. One trailing line break is dropped |
+| `CRYSTALLINE_ADMIN_PASSWORD` | the password of the first admin | works, but shows up in `docker inspect`; prefer the file form. Never logged. Ignored, with one warning per start, once an account exists |
+| `CRYSTALLINE_ADMIN_PASSWORD_FILE` | a path to a file holding that password (a Docker secret, `/run/secrets/<name>`) | the file form of the variable above; set one of the two, never both. One trailing line break is dropped |
 | `CRYSTALLINE_MODELS_DIR` | the model cache path | pre-existing, unchanged |
 | `CRYSTALLINE_ACCELERATION` | n/a (environment only) | `off` keeps the local embedding model and the contradiction check's NLI model on the CPU on an Apple Silicon Mac, where they otherwise run on the GPU through Metal. Any other value, and no value, leaves the GPU on. Has no effect on other platforms, which always use the CPU. Read when the model loads. A model that fails on the GPU after it loaded moves to the CPU on its own, without this switch. See [Embedding model hardware](#embedding-model-hardware) |
 | `CRYSTALLINE_CHANNEL` | install channel marker | set to `mcpb` by the Claude Desktop extension manifest so degraded-startup copy tells the user to update the extension rather than the binary; not meant to be set by hand |
@@ -495,7 +517,7 @@ flowchart LR
 
 This is what following `auth.mcp` buys a [Team server with Fluid](#team-server-with-fluid): nobody sets `auth.oauth` at all, and hosted clients connect anyway.
 
-1. **Create the first admin.** [Team server with Fluid](#team-server-with-fluid) covers both ways to take that bootstrap step - `users add` from the host, or the create-first-admin form in Fluid.
+1. **Create the first admin.** [Team server with Fluid](#team-server-with-fluid) covers the ways to take that bootstrap step - `users add` from the host, the admin variables in the compose file, or the create-first-admin form in Fluid.
 2. **Set `auth.mcp` true**, so every agent over HTTP MCP presents a credential instead of connecting on the open tier: see [Authenticated agents](#authenticated-agents).
 3. **Nothing.** `auth.oauth` is unset, so it follows: the UI is serving (the default) and every agent now has to authenticate, so OAuth is on. A hosted client such as Claude.ai connects through the sign-in and consent flow above with no token pasted anywhere; a harness that cannot speak OAuth keeps using a personal MCP token from step 2's world, issued in Fluid or with `crystalline users mcp-token`. Either way, whichever human sign-in this instance uses - local accounts, `auth.oidc` for an external provider such as Authelia or Keycloak, or `auth.proxy_headers` - is what the consent page rides on, since it is an ordinary signed-in Fluid page: nothing about OAuth itself asks which one an instance chose.
 

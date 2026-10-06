@@ -162,6 +162,15 @@ const RESERVED_VARS: &[&str] = &[
     // so reserved here or every container that sets them logs a warning.
     "CRYSTALLINE_REMOTE_URL",
     "CRYSTALLINE_REMOTE_TOKEN",
+    // The first admin from the environment (`first_admin` in the service
+    // crate): a name and a password, each plain or as a `_FILE` path for a
+    // Docker secret. Read straight from the environment, never through the
+    // settings registry, so reserved here or every container that sets them
+    // logs an unknown-setting warning.
+    "CRYSTALLINE_ADMIN_NAME",
+    "CRYSTALLINE_ADMIN_NAME_FILE",
+    "CRYSTALLINE_ADMIN_PASSWORD",
+    "CRYSTALLINE_ADMIN_PASSWORD_FILE",
 ];
 
 /// An error parsing the environment overlay. The message names the offending
@@ -1600,6 +1609,18 @@ mod tests {
         // Everything else still prints, so the redaction is targeted rather
         // than blanking the whole struct.
         assert!(debugged.contains("github.enabled"), "{debugged}");
+    }
+
+    #[test]
+    fn the_first_admin_variables_are_reserved() {
+        for name in [
+            "CRYSTALLINE_ADMIN_NAME",
+            "CRYSTALLINE_ADMIN_NAME_FILE",
+            "CRYSTALLINE_ADMIN_PASSWORD",
+            "CRYSTALLINE_ADMIN_PASSWORD_FILE",
+        ] {
+            assert!(is_reserved(name), "{name}");
+        }
     }
 
     #[test]

@@ -12,6 +12,7 @@
 pub mod client;
 pub mod control;
 pub mod daemon;
+mod first_admin;
 pub mod instance;
 pub use crystalline_identity::join;
 pub mod mcp;
