@@ -1808,6 +1808,9 @@ fn main() -> anyhow::Result<()> {
             stray: Some(stray),
             ..
         }) => {
+            if url == "github" {
+                anyhow::bail!(sources::GITHUB_FIRST)
+            }
             if sources::looks_like_token(&url) {
                 // `--token cmt_... <url>`: the address came second.
                 anyhow::bail!(sources::token_refusal(Some(&stray), name.as_deref()))

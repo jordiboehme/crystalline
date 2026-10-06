@@ -161,6 +161,48 @@ fn a_token_on_the_command_line_is_refused() {
     }
 }
 
+/// Re-review R5: `github` after a flag is read as the server address, so
+/// it gets a sentence saying where it goes, and no token is repeated.
+#[test]
+fn github_after_a_flag_says_to_put_it_first() {
+    let home = tempfile::tempdir().unwrap();
+    let forms: [&[&str]; 4] = [
+        &["connect", "--json", "github", "--token=cmt_SECRET1"],
+        &["connect", "--json", "github", "--token=ghp_SECRET2"],
+        &["connect", "--db", "/tmp/x", "github", "--token=cmt_SECRET3"],
+        &["connect", "--json", "github"],
+    ];
+    for form in forms {
+        let out = bin(home.path()).args(form).output().unwrap();
+        let said = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!out.status.success(), "{form:?}: {said}");
+        assert!(
+            said.contains("put github right after connect, before any flag"),
+            "{form:?}: {said}"
+        );
+        assert!(
+            !said.contains("SECRET"),
+            "{form:?} repeats the token: {said}"
+        );
+    }
+}
+
+/// Re-review R6: the scan looks only at the `connect` command itself.
+#[test]
+fn a_connect_word_inside_another_command_is_not_scanned() {
+    let home = tempfile::tempdir().unwrap();
+    let out = bin(home.path())
+        .args(["search", "connect", "cmt_like_words"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("refusing a token"), "{stderr}");
+}
+
 /// Review M2: a word after the URL that is no token is named as unexpected,
 /// with the flag that was probably meant.
 #[test]

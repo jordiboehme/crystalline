@@ -70,27 +70,41 @@ pub const EXTRA_WORD: &str = "crystalline connect takes one server address and n
 /// word.
 const VALUE_FLAGS: [&str; 4] = ["--name", "--db", "--config", "--format"];
 
+/// What `connect` says when `github` came after a flag: clap reads a word
+/// after any flag as the server address, so the subcommand must come first.
+pub const GITHUB_FIRST: &str = "put github right after connect, before any flag, for example crystalline connect github --json";
+
+/// The first word of `words` that is no flag and no flag's value.
+fn first_word(words: &[String]) -> Option<usize> {
+    let mut at = 0;
+    while at < words.len() {
+        let word = &words[at];
+        if VALUE_FLAGS.contains(&word.as_str()) {
+            at += 2;
+        } else if word.starts_with('-') {
+            at += 1;
+        } else {
+            return Some(at);
+        }
+    }
+    None
+}
+
 /// The refusal of a token anywhere after `connect`, before clap reads the
 /// command line (clap's own errors, and the checks after it, would repeat
 /// the value): a word with a token's prefix, as an argument or as a flag's
 /// value, or `--token=<value>`. `None` for any other command line, and for
 /// `connect github`, whose own `--token` takes a GitHub token.
 pub fn inline_token_refusal(args: &[String]) -> Option<String> {
-    let at = args.iter().position(|a| a == "connect")?;
-    let rest = &args[at + 1..];
-    // The first word that is no flag and no flag's value: the subcommand,
-    // when there is one, since it must come before any argument.
-    let mut words = rest.iter();
-    let mut first = None;
-    while let Some(word) = words.next() {
-        if VALUE_FLAGS.contains(&word.as_str()) {
-            words.next();
-        } else if !word.starts_with('-') {
-            first = Some(word.as_str());
-            break;
-        }
+    // Only when `connect` is the command itself, after the global flags.
+    let at = first_word(args)?;
+    if args[at] != "connect" {
+        return None;
     }
-    if first == Some("github") {
+    let rest = &args[at + 1..];
+    // clap takes `github` as the subcommand only as the very first word;
+    // after any flag it is read as the server address.
+    if rest.first().map(String::as_str) == Some("github") {
         return None;
     }
     let token = |word: &String| {
@@ -99,6 +113,9 @@ pub fn inline_token_refusal(args: &[String]) -> Option<String> {
     };
     if !rest.iter().any(token) {
         return None;
+    }
+    if first_word(rest).is_some_and(|i| rest[i] == "github") {
+        return Some(GITHUB_FIRST.to_string());
     }
     let url = rest
         .iter()
@@ -148,6 +165,9 @@ pub async fn connect_server(
     // The address first, so a URL that can never work is refused before
     // anyone pastes a token for it; and a value that is no address is never
     // repeated, because it may be a token typed in the wrong place.
+    if url == "github" {
+        anyhow::bail!(GITHUB_FIRST);
+    }
     if looks_like_token(&url) {
         anyhow::bail!(token_refusal(None, name.as_deref()));
     }
