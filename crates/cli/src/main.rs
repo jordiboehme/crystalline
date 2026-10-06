@@ -4655,7 +4655,15 @@ fn run_prompt(
     // CRYSTALLINE_CONFIG, then the default) and applies the environment overlay,
     // so the routing prompt reflects env-configured settings.
     let loaded_config = crystalline_service::overlay::load(config_path.as_deref())?;
-    let global = loaded_config.effective;
+    let mut global = loaded_config.effective;
+    // Domains from connected servers: a local copy a server replaces leaves
+    // the block, the server's copy joins it under its local name. A name the
+    // daemon's fresher table mounts leaves it too, so no name is listed twice.
+    let (shadowed, mounted_rows, stale) =
+        mounted_part(&global, config_path.is_some() || db.is_some());
+    global.domains.retain(|name, _| {
+        !shadowed.contains(name) && !mounted_rows.iter().any(|m| &m.name == name)
+    });
     // Named so an env-defined domain never nags the pending block for a
     // decision it can never record - see `session_notices`'s doc comment.
     let env_domains: std::collections::HashSet<&str> = loaded_config
@@ -4712,11 +4720,15 @@ fn run_prompt(
     // nothing and says nothing, which is what "applies both filters" means; a
     // name that is registered nowhere is a typo, and the answer to a typo is
     // the list of real names.
-    if let Some(unknown) = only_domains
-        .iter()
-        .find(|n| !global.domains.contains_key(n.as_str()))
-    {
-        let mut known: Vec<&str> = global.domains.keys().map(String::as_str).collect();
+    if let Some(unknown) = only_domains.iter().find(|n| {
+        !global.domains.contains_key(n.as_str()) && !mounted_rows.iter().any(|m| &m.name == *n)
+    }) {
+        let mut known: Vec<&str> = global
+            .domains
+            .keys()
+            .map(String::as_str)
+            .chain(mounted_rows.iter().map(|m| m.name.as_str()))
+            .collect();
         known.sort_unstable();
         anyhow::bail!(
             "no domain named '{unknown}' is registered. Registered: {}. See them with: crystalline domain list",
@@ -4725,6 +4737,9 @@ fn run_prompt(
     }
 
     let mut output = crystalline_core::generate_prompt(&global, &workspace, &virtual_bullets);
+    // After the local rows, never sorted in among them (ruling F1): with
+    // nothing mounted the block is byte-identical to one without sources.
+    output.domains.extend(mounted_rows);
     crystalline_core::prompt::restrict_to_domains(&mut output, &only_domains);
     // The flag forces the read-only variant on top of service.read_only; it can
     // only turn the mode on, matching the daemon precedence.
@@ -4742,8 +4757,16 @@ fn run_prompt(
     // hook's output still sees them, because a hook's stderr is where a
     // harness shows them.
     match format {
-        PromptFormat::Json => println!("{}", crystalline_core::render_json(&output)),
-        PromptFormat::Text => print!("{}", crystalline_core::render_text(&output)),
+        PromptFormat::Json if stale.is_empty() => {
+            println!("{}", crystalline_core::render_json(&output))
+        }
+        PromptFormat::Json => {
+            let mut value: serde_json::Value =
+                serde_json::from_str(&crystalline_core::render_json(&output))?;
+            value["stale"] = serde_json::json!(stale);
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        }
+        PromptFormat::Text => print!("{}", rendered(&output, &stale)),
         PromptFormat::Copilot => {
             // Copilot parses stdout as one JSON document, so a bare line
             // printed beside the envelope would corrupt it - which is why the
@@ -4753,7 +4776,7 @@ fn run_prompt(
             println!(
                 "{}",
                 serde_json::to_string(&serde_json::json!({
-                    "additionalContext": crystalline_core::render_text(&output),
+                    "additionalContext": rendered(&output, &stale),
                 }))?
             );
         }
@@ -4764,7 +4787,7 @@ fn run_prompt(
             println!(
                 "{}",
                 serde_json::to_string(&serde_json::json!({
-                    "additional_context": crystalline_core::render_text(&output),
+                    "additional_context": rendered(&output, &stale),
                 }))?
             );
         }
@@ -4774,7 +4797,7 @@ fn run_prompt(
                 serde_json::to_string(&serde_json::json!({
                     "hookSpecificOutput": {
                         "hookEventName": "SessionStart",
-                        "additionalContext": crystalline_core::render_text(&output),
+                        "additionalContext": rendered(&output, &stale),
                     },
                 }))?
             );
@@ -4784,6 +4807,108 @@ fn run_prompt(
         eprintln!("{note}");
     }
     Ok(())
+}
+
+/// The text block with each stale source's line after it.
+fn rendered(output: &crystalline_core::PromptOutput, stale: &[String]) -> String {
+    let mut text = crystalline_core::render_text(output);
+    for line in stale {
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(line);
+        text.push('\n');
+    }
+    text
+}
+
+/// The mounted part of the routing block: the local domains hidden while
+/// their source is connected, the mounted rows, and one line per source whose
+/// part may be out of date. A running daemon refreshes its sources through
+/// their etags within the deadline (`mounted_routing`, passive attach: never
+/// a start or a takeover); without one the cache files are read directly
+/// (decision D20). This process never talks to a server itself. An explicit
+/// --config or --db shows this machine's own domains only.
+///
+/// The rows carry only what the server answered for the account (names and
+/// routing bullets, cached), and the stale lines are fixed sentences.
+fn mounted_part(
+    cfg: &crystalline_core::config::GlobalConfig,
+    bypassed: bool,
+) -> (
+    std::collections::BTreeSet<String>,
+    Vec<crystalline_core::PromptDomain>,
+    Vec<String>,
+) {
+    let empty = Default::default();
+    if bypassed {
+        return empty;
+    }
+    let Ok(dir) = crystalline_remote::remote_dir() else {
+        return empty;
+    };
+    let set = crystalline_remote::SourceSet::load(dir, sources::local_domains_of(cfg), |n| {
+        std::env::var(n).ok()
+    });
+    if set.is_empty() {
+        return empty;
+    }
+    let shadowed = set.shadowed();
+    let deadline = cfg.remote_deadline_ms();
+    let asked = on_runtime_value_current_thread(move || async move {
+        let request =
+            serde_json::json!({ "v": 1, "cmd": "mounted_routing", "deadline_ms": deadline });
+        tokio::time::timeout(
+            std::time::Duration::from_millis(deadline + 500),
+            crystalline_service::ctl_if_running_passive(request),
+        )
+        .await
+        .ok()
+        .and_then(|answer| answer.ok().flatten())
+    })
+    .ok()
+    .flatten();
+    let strings = |value: &serde_json::Value| -> Vec<String> {
+        value
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|s| s.as_str().map(str::to_string))
+            .collect()
+    };
+    let (rows, stale) = match asked {
+        Some(answer) => (
+            answer["domains"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|d| {
+                    Some(crystalline_core::PromptDomain {
+                        name: d["name"].as_str()?.to_string(),
+                        bullets: strings(&d["bullets"]),
+                        preferred: false,
+                    })
+                })
+                .collect(),
+            strings(&answer["stale"]),
+        ),
+        None => {
+            let routing = set.mounted_routing_from_cache();
+            (
+                routing
+                    .domains
+                    .into_iter()
+                    .map(|m| crystalline_core::PromptDomain {
+                        name: m.local,
+                        bullets: m.bullets,
+                        preferred: false,
+                    })
+                    .collect(),
+                routing.stale,
+            )
+        }
+    };
+    (shadowed, rows, stale)
 }
 
 /// Whether this routing hook must stay silent because it was written for
