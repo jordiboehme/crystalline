@@ -805,16 +805,33 @@ fn api_url(origin: &str, path: &str) -> String {
     format!("{origin}{API_PREFIX}{path}")
 }
 
-/// The two root documents, mounted beside `/health` on the root router.
+/// The two root documents, mounted beside `/health` on the root router, and
+/// under a prefix also at their RFC 9728 and RFC 8414 addresses, where the
+/// path is inserted after the host (`/.well-known/oauth-protected-resource/
+/// crystalline`). Those are outside the prefix by definition, so the strip
+/// layer never touches them. The copies inside the prefix
+/// (`/crystalline/.well-known/...`) need no route of their own: the strip
+/// layer hands them to the two root routes.
 ///
 /// `None` is `auth.oauth` off: the paths still exist and answer `404`, so a
 /// probe gets one answer whatever it accepts and whatever else the router
 /// serves. See the module documentation.
-pub fn well_known_routes(oauth: Option<OriginRule>) -> Router {
-    Router::new()
+pub fn well_known_routes(oauth: Option<OriginRule>, base_path: &BasePath) -> Router {
+    let mut router = Router::new()
         .route(PROTECTED_RESOURCE_PATH, get(protected_resource))
-        .route(AUTHORIZATION_SERVER_PATH, get(authorization_server))
-        .with_state(oauth)
+        .route(AUTHORIZATION_SERVER_PATH, get(authorization_server));
+    if !base_path.is_root() {
+        router = router
+            .route(
+                &format!("{PROTECTED_RESOURCE_PATH}{}", base_path.as_str()),
+                get(protected_resource),
+            )
+            .route(
+                &format!("{AUTHORIZATION_SERVER_PATH}{}", base_path.as_str()),
+                get(authorization_server),
+            );
+    }
+    router.with_state(oauth)
 }
 
 /// `GET /.well-known/oauth-protected-resource`.

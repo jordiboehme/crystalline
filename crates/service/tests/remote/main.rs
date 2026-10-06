@@ -14,6 +14,7 @@ mod ctl;
 mod fixture;
 mod live;
 pub mod local;
+mod prefix;
 mod revoke;
 mod routing;
 mod tool;
