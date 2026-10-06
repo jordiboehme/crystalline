@@ -363,6 +363,11 @@ pub struct RestState {
     /// collab upgrade route joins rooms in it, and every save it makes goes
     /// back through the engine above.
     pub collab: Arc<crate::collab::session::CollabSessions>,
+    /// The path this instance is served under, from `service.public_url`:
+    /// every cookie is scoped to it, so two instances on one host keep
+    /// separate sessions, and the sign-in landing and `return_to` are built
+    /// under it. The root where the key has no path.
+    pub base_path: crystalline_core::base::BasePath,
     /// The one-time token that lets a non-local caller reach
     /// `POST /auth/setup`, generated once per `serve` process and only for a
     /// non-loopback bind. `None` means the token path is closed: there is no
@@ -425,6 +430,7 @@ impl RestState {
         // `Engine::set_collab_sessions`.
         engine.set_collab_sessions(&collab);
         Ok(RestState {
+            base_path: crate::settings::base_path(&config),
             collab,
             engine,
             oauth,

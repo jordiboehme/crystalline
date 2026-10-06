@@ -71,6 +71,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
+use crystalline_core::base::BasePath;
 use crystalline_core::config::GlobalConfig;
 use openidconnect::core::{
     CoreAuthenticationFlow, CoreClient, CoreIdTokenClaims, CoreIdTokenVerifier,
@@ -195,6 +196,9 @@ pub struct OidcSettings {
     /// `auth.oidc.redirect_uri`. `None` means derive it from each request,
     /// which is what an instance the browser reaches directly wants.
     redirect_uri: Option<RedirectUrl>,
+    /// The path of `service.public_url`, which the derived callback carries
+    /// after the request's own origin.
+    base_path: BasePath,
 }
 
 impl OidcSettings {
@@ -303,6 +307,15 @@ impl OidcSettings {
             }
             None => None,
         };
+        // The callback and `service.public_url` have to name the same path.
+        // Checked here as well as at `configure` and `config set`: an
+        // environment variable or a hand-edited file reaches the config with
+        // nobody watching, and a callback under the wrong path is a sign-in
+        // that fails at the provider. The sentence names both values.
+        if let Some(problem) = crate::settings::oidc_pair_problem(config) {
+            tracing::warn!("single sign-on is off: {problem}");
+            return None;
+        }
         Some(OidcSettings {
             issuer,
             client_id: ClientId::new(client_id),
@@ -311,6 +324,7 @@ impl OidcSettings {
             scopes,
             default_role,
             redirect_uri,
+            base_path: crate::settings::base_path(config),
         })
     }
 
@@ -333,12 +347,13 @@ impl OidcSettings {
     /// registered with the provider, and the token exchange has to repeat that
     /// address byte for byte. With the key unset the address is derived from
     /// the request, which is right wherever the browser reached this instance
-    /// at the address the request says it did.
+    /// at the address the request says it did. Under a base path the derived
+    /// address carries the prefix in front of `/api/v1`.
     pub fn redirect_uri(&self, headers: &HeaderMap) -> Result<RedirectUrl, ApiError> {
         if let Some(configured) = &self.redirect_uri {
             return Ok(configured.clone());
         }
-        let derived = absolute_url(headers, CALLBACK_PATH).inspect_err(|_| {
+        let derived = absolute_url(headers, &self.base_path, CALLBACK_PATH).inspect_err(|_| {
             // The 400 an operator debugging a proxy most wants to see in the
             // log - and the moment to remember there is a key that fixes it.
             refused(
@@ -369,6 +384,7 @@ impl std::fmt::Debug for OidcSettings {
             .field("name", &self.name)
             .field("scopes", &self.scopes.len())
             .field("default_role", &self.default_role)
+            .field("base_path", &self.base_path.as_str())
             .finish()
     }
 }
@@ -1136,10 +1152,15 @@ fn sso_is_off() -> ApiError {
 /// The origin half is [`super::auth::request_origin`], shared with the OAuth
 /// resource identifier: this instance has one public address, and two rules for
 /// deriving it would be two addresses the day they disagreed.
-fn absolute_url(headers: &HeaderMap, path: &str) -> Result<String, ApiError> {
+///
+/// Only the path comes from `service.public_url`: the origin stays derived per
+/// request, so an instance reachable under several host names keeps one
+/// callback per host, and at the root the address is the one it always was.
+fn absolute_url(headers: &HeaderMap, base: &BasePath, path: &str) -> Result<String, ApiError> {
     Ok(format!(
-        "{}/api/v1{path}",
-        super::auth::request_origin(headers)?
+        "{}{}/api/v1{path}",
+        super::auth::request_origin(headers)?,
+        base.as_str()
     ))
 }
 
@@ -1216,8 +1237,8 @@ pub struct LoginQuery {
     /// only reachable by its id, so landing anywhere else loses it.
     ///
     /// Anything [`safe_return_path`] does not accept is dropped rather than
-    /// refused, and the sign-in lands on `/`: the person did sign in, and only
-    /// the destination was unusable.
+    /// refused, and the sign-in lands on the root of the base path (`/` at the
+    /// root): the person did sign in, and only the destination was unusable.
     pub return_to: Option<String>,
 }
 
@@ -1245,8 +1266,13 @@ const MAX_RETURN_PATH: usize = 512;
 ///   in one is a response-splitting attempt, and this is the check that ends
 ///   it. Same rule, and the same reason, as [`super::oauth::redirect_uri_problem`].
 /// - **At most [`MAX_RETURN_PATH`] characters.**
-pub(crate) fn safe_return_path(path: &str) -> Option<String> {
+/// - **Under the base path.** On an instance served under `/crystalline`, a
+///   path outside it is somewhere else on the host.
+pub(crate) fn safe_return_path(path: &str, base: &BasePath) -> Option<String> {
     if !path.starts_with('/') || path.starts_with("//") {
+        return None;
+    }
+    if !base.contains(path) {
         return None;
     }
     if path.len() > MAX_RETURN_PATH {
@@ -1313,9 +1339,10 @@ struct StartedSignOn {
                    `return_to` names where the callback should land the \
                    browser once the sign-in completes - the OAuth consent \
                    page is what it exists for. It must be a path on this \
-                   instance (starts with `/`, not `//`, no backslash, at most \
-                   512 printable ASCII characters); anything else is dropped \
-                   and the sign-in lands on `/`.",
+                   instance, under its base path (starts with `/`, not `//`, \
+                   no backslash, at most 512 printable ASCII characters); \
+                   anything else is dropped and the sign-in lands on the root \
+                   of the base path (`/` at the root).",
     responses(
         (
             status = 302,
@@ -1373,7 +1400,10 @@ pub async fn login(
              token - this GET starts an ordinary sign-in and will not link anything",
         ));
     }
-    let return_to = query.return_to.as_deref().and_then(safe_return_path);
+    let return_to = query
+        .return_to
+        .as_deref()
+        .and_then(|path| safe_return_path(path, &state.base_path));
     let started = start_sign_on(&state, &headers, None, return_to).await?;
     Ok((
         jar.add(started.cookie),
@@ -1563,7 +1593,7 @@ async fn start_sign_on(
         });
     }
     let cookie = Cookie::build((STATE_COOKIE, state_value))
-        .path("/")
+        .path(state.base_path.cookie_path().to_string())
         .http_only(true)
         // Lax, never Strict: the provider sends the browser back with a
         // top-level cross-site navigation, and a Strict cookie is not sent on
@@ -1688,7 +1718,11 @@ pub async fn callback(
     // Whatever happens next, this browser's pending sign-in is over: the
     // deletion goes out even when the flow failed, so a stale state cannot be
     // presented twice.
-    let jar = jar.remove(Cookie::build(STATE_COOKIE).path("/").build());
+    let jar = jar.remove(
+        Cookie::build(STATE_COOKIE)
+            .path(state.base_path.cookie_path().to_string())
+            .build(),
+    );
     let outcome = finish(&state, bound, query).await;
     let (claims, return_to) = match outcome {
         Ok(finished) => finished,
@@ -1700,10 +1734,12 @@ pub async fn callback(
         Err(err) => return Ok((jar, super::auth::no_store(), err).into_response()),
     };
     let jar = super::auth::issue_session(&state, jar, &headers, &user).await?;
-    // Where the page that started this asked to land, or the application root.
-    // The value came out of the pending record rather than off this request,
-    // so nothing the provider or the browser sent decides it.
-    let landing = return_to.as_deref().unwrap_or("/");
+    // Where the page that started this asked to land, or the application root
+    // under the base path. The value came out of the pending record rather
+    // than off this request, so nothing the provider or the browser sent
+    // decides it.
+    let root = state.base_path.href();
+    let landing = return_to.as_deref().unwrap_or(&root);
     Ok((jar, super::auth::no_store(), found(landing)).into_response())
 }
 
@@ -2293,7 +2329,7 @@ fn identity_is_taken() -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crystalline_core::config::{AuthConfig, OidcConfig};
+    use crystalline_core::config::{AuthConfig, OidcConfig, ServiceConfig};
 
     /// A config carrying `oidc`, spelled the way a caller would set it.
     fn config_with(oidc: OidcConfig) -> GlobalConfig {
@@ -2417,6 +2453,47 @@ mod tests {
         }
     }
 
+    /// The callback and `service.public_url` have to name the same path. An
+    /// environment variable or a hand-edited file reaches the config without
+    /// the setter's pair check, so the start checks it again and leaves
+    /// single sign-on off on a mismatch rather than offering a sign-in that
+    /// fails at the provider.
+    #[test]
+    fn a_callback_and_public_url_on_different_paths_leave_sso_off() {
+        let with = |redirect_uri: &str, public_url: Option<&str>| {
+            let mut oidc = complete();
+            oidc.redirect_uri = Some(redirect_uri.to_string());
+            let mut config = config_with(oidc);
+            config.service = Some(ServiceConfig {
+                public_url: public_url.map(str::to_string),
+                ..ServiceConfig::default()
+            });
+            OidcSettings::resolve(&config)
+        };
+        let prefixed = "https://kb.example.test/crystalline/api/v1/auth/oidc/callback";
+        let root = "https://kb.example.test/api/v1/auth/oidc/callback";
+        assert!(
+            with(prefixed, None).is_none(),
+            "a prefixed callback with no public_url"
+        );
+        assert!(
+            with(root, Some("https://kb.example.test/crystalline")).is_none(),
+            "a root callback under a prefixed public_url"
+        );
+        assert!(
+            with(prefixed, Some("https://kb.example.test/other")).is_none(),
+            "two different prefixes"
+        );
+        assert!(
+            with(prefixed, Some("https://kb.example.test/crystalline")).is_some(),
+            "the same prefix on both"
+        );
+        assert!(
+            with(root, Some("https://kb.example.test")).is_some(),
+            "the root on both"
+        );
+    }
+
     /// The path the settings layer validates a configured callback address
     /// against is the path this router serves it at. Two constants, one fact:
     /// moving the route without moving the guard would accept an address the
@@ -2500,7 +2577,7 @@ mod tests {
             "/a#section",
         ] {
             assert_eq!(
-                safe_return_path(accepted).as_deref(),
+                safe_return_path(accepted, &BasePath::root()).as_deref(),
                 Some(accepted),
                 "'{accepted}' is a path on this instance"
             );
@@ -2530,7 +2607,7 @@ mod tests {
             "/\u{0}",
         ] {
             assert_eq!(
-                safe_return_path(refused),
+                safe_return_path(refused, &BasePath::root()),
                 None,
                 "'{refused}' must not be returned to"
             );
@@ -2539,10 +2616,29 @@ mod tests {
         // The length bound, on both sides of it.
         let longest = format!("/{}", "a".repeat(MAX_RETURN_PATH - 1));
         assert_eq!(
-            safe_return_path(&longest).as_deref(),
+            safe_return_path(&longest, &BasePath::root()).as_deref(),
             Some(longest.as_str())
         );
-        assert_eq!(safe_return_path(&format!("{longest}a")), None);
+        assert_eq!(
+            safe_return_path(&format!("{longest}a"), &BasePath::root()),
+            None
+        );
+    }
+
+    #[test]
+    fn a_return_to_under_a_prefix_must_stay_under_it() {
+        let base = BasePath::parse("/crystalline").unwrap();
+        assert_eq!(
+            safe_return_path("/crystalline/authorize?request=x", &base).as_deref(),
+            Some("/crystalline/authorize?request=x")
+        );
+        assert_eq!(
+            safe_return_path("/crystalline", &base).as_deref(),
+            Some("/crystalline")
+        );
+        assert_eq!(safe_return_path("/authorize?request=x", &base), None);
+        assert_eq!(safe_return_path("/crystallinex", &base), None);
+        assert_eq!(safe_return_path("//evil.test/crystalline", &base), None);
     }
 
     /// The secret is a field of the settings struct, so the struct's own
@@ -2563,14 +2659,14 @@ mod tests {
         let mut plain = HeaderMap::new();
         plain.insert(header::HOST, "127.0.0.1:7411".parse().unwrap());
         assert_eq!(
-            absolute_url(&plain, CALLBACK_PATH).unwrap(),
+            absolute_url(&plain, &BasePath::root(), CALLBACK_PATH).unwrap(),
             "http://127.0.0.1:7411/api/v1/auth/oidc/callback"
         );
         let mut proxied = HeaderMap::new();
         proxied.insert(header::HOST, "knowledge.example".parse().unwrap());
         proxied.insert("x-forwarded-proto", "https".parse().unwrap());
         assert_eq!(
-            absolute_url(&proxied, CALLBACK_PATH).unwrap(),
+            absolute_url(&proxied, &BasePath::root(), CALLBACK_PATH).unwrap(),
             "https://knowledge.example/api/v1/auth/oidc/callback"
         );
         // A non-loopback Host with no forwarded scheme is still https: the
@@ -2578,10 +2674,20 @@ mod tests {
         let mut bare = HeaderMap::new();
         bare.insert(header::HOST, "knowledge.example".parse().unwrap());
         assert_eq!(
-            absolute_url(&bare, CALLBACK_PATH).unwrap(),
+            absolute_url(&bare, &BasePath::root(), CALLBACK_PATH).unwrap(),
             "https://knowledge.example/api/v1/auth/oidc/callback"
         );
-        assert!(absolute_url(&HeaderMap::new(), CALLBACK_PATH).is_err());
+        assert_eq!(
+            absolute_url(
+                &plain,
+                &BasePath::parse("/crystalline").unwrap(),
+                CALLBACK_PATH
+            )
+            .unwrap(),
+            "http://127.0.0.1:7411/crystalline/api/v1/auth/oidc/callback",
+            "under a base path the prefix sits in front of the API mount"
+        );
+        assert!(absolute_url(&HeaderMap::new(), &BasePath::root(), CALLBACK_PATH).is_err());
     }
 
     /// The five fields the identity layer reads, mapped off a token the way a
@@ -2928,7 +3034,7 @@ mod tests {
         }
         let mut forged = HeaderMap::new();
         forged.insert(header::HOST, "evil.test/x".parse().unwrap());
-        assert!(absolute_url(&forged, CALLBACK_PATH).is_err());
+        assert!(absolute_url(&forged, &BasePath::root(), CALLBACK_PATH).is_err());
     }
 
     /// Claims carrying just the two fields a derivation reads.

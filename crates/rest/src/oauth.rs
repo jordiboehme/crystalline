@@ -134,9 +134,10 @@ pub const AUTHORIZE_PATH: &str = "/oauth/authorize";
 /// [`super::auth::PUBLIC_PATHS`] the way [`AUTHORIZE_PATH`] is.
 pub const AUTHORIZATIONS_PATH: &str = "/oauth/authorizations/{id}";
 
-/// The Fluid screen a person consents on, at the application root rather than
-/// under the API mount: a browser is navigated here, and what it loads is the
-/// single-page app. `?request=<id>` names the pending authorization.
+/// The Fluid screen a person consents on, at the application root under the
+/// base path rather than under the API mount: a browser is navigated here, and
+/// what it loads is the single-page app. `?request=<id>` names the pending
+/// authorization.
 pub const CONSENT_PAGE: &str = "/authorize";
 
 /// Where a code or a refresh token is exchanged, relative to the API mount.
@@ -790,14 +791,19 @@ impl RegistrationLimiter {
     }
 }
 
-/// The url of the protected-resource document on `origin`, which is what a
-/// `401` points a client at.
+/// The url of the protected-resource document of `base`, which is what a
+/// `401` points a client at: the RFC 9728 address, with the path of a
+/// prefixed base inserted after the host.
 ///
 /// Deliberately not built through the same helper as the three endpoint urls:
-/// this one is a root document and those three live under the API mount, and a
-/// shared helper is how one of them would silently acquire the other's prefix.
-pub fn resource_metadata_url(origin: &str) -> String {
-    format!("{origin}{PROTECTED_RESOURCE_PATH}")
+/// this one is a well-known document and those three live under the API
+/// mount, and a shared helper is how one of them would silently acquire the
+/// other's prefix.
+pub fn resource_metadata_url(base: &str) -> String {
+    match PublicBase::parse(base) {
+        Ok(base) => base.well_known(PROTECTED_RESOURCE_PATH),
+        Err(_) => format!("{base}{PROTECTED_RESOURCE_PATH}"),
+    }
 }
 
 /// The absolute url of an endpoint that lives under the API mount.
@@ -2522,7 +2528,10 @@ pub async fn authorize(
         client_id = %client_id,
         "an mcp client started an authorization"
     );
-    Ok(found(format!("{CONSENT_PAGE}?request={id}")))
+    Ok(found(format!(
+        "{}{CONSENT_PAGE}?request={id}",
+        oauth.origin.base_path().as_str()
+    )))
 }
 
 /// `GET /oauth/authorizations/{id}` - what is being asked for.
@@ -4174,6 +4183,18 @@ mod tests {
             resource_metadata_url(origin),
             "https://knowledge.example/.well-known/oauth-protected-resource",
             "the pointer is a root document, with no API mount in it"
+        );
+    }
+
+    #[test]
+    fn the_resource_metadata_pointer_inserts_the_path_after_the_host() {
+        assert_eq!(
+            resource_metadata_url("https://example.com/crystalline"),
+            "https://example.com/.well-known/oauth-protected-resource/crystalline"
+        );
+        assert_eq!(
+            resource_metadata_url("https://knowledge.example"),
+            "https://knowledge.example/.well-known/oauth-protected-resource"
         );
     }
 

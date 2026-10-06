@@ -1378,7 +1378,7 @@ pub(super) async fn issue_session_with_csrf(
         .create_session(&user.name, SESSION_TTL_SECS)
         .await?;
     let cookie = Cookie::build((SESSION_COOKIE, session.token))
-        .path("/")
+        .path(state.base_path.cookie_path().to_string())
         .http_only(true)
         .same_site(SameSite::Lax)
         .secure(cookie_needs_secure(headers))
@@ -1904,9 +1904,11 @@ pub async fn logout(
     if let Some(cookie) = jar.get(SESSION_COOKIE) {
         state.auth.delete_session(cookie.value()).await?;
     }
-    // The removal has to carry the same path the cookie was set with, or the
-    // browser keeps the original and only shadows it.
-    let removal = Cookie::build(SESSION_COOKIE).path("/").build();
+    // The removal has to carry the same path the cookie was set with (the
+    // base path), or the browser keeps the original and only shadows it.
+    let removal = Cookie::build(SESSION_COOKIE)
+        .path(state.base_path.cookie_path().to_string())
+        .build();
     Ok((
         jar.remove(removal),
         no_store(),
@@ -2023,7 +2025,7 @@ pub async fn me(
         csrf = Some(mint.csrf().to_string());
         if let SessionMint::Created(session) = mint {
             let cookie = Cookie::build((SESSION_COOKIE, session.token))
-                .path("/")
+                .path(state.base_path.cookie_path().to_string())
                 .http_only(true)
                 .same_site(SameSite::Lax)
                 .secure(cookie_needs_secure(&headers))

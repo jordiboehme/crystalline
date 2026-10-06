@@ -597,6 +597,9 @@ struct RestCtx {
     /// The accounts database the instance serves from, so a test can ask what
     /// a sign-in actually wrote rather than infer it from a response.
     auth: Arc<AuthStore>,
+    /// The path the instance is served under, empty at the root. Every url
+    /// the test builds carries it, passed through to the daemon.
+    prefix: &'static str,
 }
 
 impl RestCtx {
@@ -669,11 +672,45 @@ impl RestCtx {
         RestCtx::build_with(oidc, max_users, None).await
     }
 
+    /// [`RestCtx::with_oidc`] for an instance under `prefix`, its
+    /// `service.public_url` naming the bound port, reached with the prefix
+    /// passed through.
+    async fn under(issuer: &str, prefix: &'static str) -> RestCtx {
+        RestCtx::build_full(
+            Some(OidcConfig {
+                issuer: Some(issuer.to_string()),
+                client_id: Some(CLIENT_ID.to_string()),
+                client_secret: Some(CLIENT_SECRET.to_string()),
+                name: Some("Contoso".to_string()),
+                scopes: None,
+                default_role: None,
+                redirect_uri: None,
+            }),
+            None,
+            None,
+            prefix,
+        )
+        .await
+    }
+
     async fn build_with(
         oidc: Option<OidcConfig>,
         max_users: Option<u32>,
         trusted_header: Option<String>,
     ) -> RestCtx {
+        RestCtx::build_full(oidc, max_users, trusted_header, "").await
+    }
+
+    async fn build_full(
+        oidc: Option<OidcConfig>,
+        max_users: Option<u32>,
+        trusted_header: Option<String>,
+        prefix: &'static str,
+    ) -> RestCtx {
+        // Bound first: a prefixed instance's `public_url` names this address.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("eng");
         std::fs::create_dir_all(&dir).unwrap();
@@ -696,6 +733,7 @@ impl RestCtx {
             }),
             service: Some(ServiceConfig {
                 response_format: Some(ResponseFormat::Json),
+                public_url: (!prefix.is_empty()).then(|| format!("http://{addr}{prefix}")),
                 ..ServiceConfig::default()
             }),
             ..GlobalConfig::default()
@@ -726,9 +764,6 @@ impl RestCtx {
             None,
         )
         .unwrap();
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let listener = tokio::net::TcpListener::from_std(listener).unwrap();
             axum::serve(
@@ -749,11 +784,12 @@ impl RestCtx {
                 .unwrap(),
             _tmp: tmp,
             auth,
+            prefix,
         }
     }
 
     fn url(&self, path: &str) -> String {
-        format!("http://{}/api/v1{path}", self.addr)
+        format!("http://{}{}/api/v1{path}", self.addr, self.prefix)
     }
 
     /// One account as the store holds it, or `None` when the name is nobody.
@@ -2398,4 +2434,66 @@ async fn sign_in_returning_to(ctx: &RestCtx, return_to: Option<&str>) -> String 
         "and it completed into a session"
     );
     location(&done)
+}
+
+/// Under a path the derived callback carries the prefix in front of the API
+/// mount, the state cookie is scoped to the prefix, and the browser lands on
+/// the page under the prefix that asked.
+#[tokio::test]
+async fn a_sign_in_under_a_prefix_derives_its_callback_and_lands_under_it() {
+    let idp = FakeIdp::start().await;
+    let ctx = RestCtx::under(&idp.issuer(), "/crystalline").await;
+
+    let start = ctx
+        .get(
+            &ctx.url("/auth/oidc/login?return_to=%2Fcrystalline%2Fd%2Feng"),
+            &[],
+        )
+        .await;
+    assert_eq!(start.status(), 302);
+    let authorize = location(&start);
+    let redirect_uri = reqwest::Url::parse(&authorize)
+        .unwrap()
+        .query_pairs()
+        .find(|(name, _)| name == "redirect_uri")
+        .map(|(_, value)| value.into_owned());
+    assert_eq!(
+        redirect_uri.as_deref(),
+        Some(format!("http://{}/crystalline/api/v1/auth/oidc/callback", ctx.addr).as_str()),
+        "{authorize}"
+    );
+    let state = start
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .map(|v| v.to_str().unwrap().to_string())
+        .find(|c| c.starts_with("fluid_oidc_state="))
+        .unwrap();
+    assert!(
+        state.split("; ").any(|p| p == "Path=/crystalline"),
+        "{state}"
+    );
+
+    let cookies = cookies_from(&start);
+    let bounced = ctx.client.get(&authorize).send().await.unwrap();
+    let done = ctx.get(&location(&bounced), &cookies).await;
+    assert_eq!(done.status(), 302);
+    assert_eq!(location(&done), "/crystalline/d/eng", "the page that asked");
+}
+
+/// A `return_to` outside the prefix is somewhere else on the host, so it is
+/// dropped and the sign-in lands on the root of the prefix.
+#[tokio::test]
+async fn a_return_to_outside_the_prefix_lands_on_the_prefix_root() {
+    let idp = FakeIdp::start().await;
+    let ctx = RestCtx::under(&idp.issuer(), "/crystalline").await;
+    for return_to in ["", "?return_to=%2Fd%2Feng", "?return_to=%2Fcrystallinex"] {
+        let start = ctx
+            .get(&ctx.url(&format!("/auth/oidc/login{return_to}")), &[])
+            .await;
+        let cookies = cookies_from(&start);
+        let bounced = ctx.client.get(location(&start)).send().await.unwrap();
+        let done = ctx.get(&location(&bounced), &cookies).await;
+        assert_eq!(location(&done), "/crystalline/", "{return_to:?}");
+    }
 }

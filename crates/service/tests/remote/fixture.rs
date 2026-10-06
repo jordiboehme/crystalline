@@ -647,7 +647,7 @@ impl RemoteServer {
     /// `POST /api/v1/oauth/revoke` with `pairs` as the form.
     pub async fn revoke(&self, pairs: &[(&str, &str)]) -> reqwest::Response {
         self.http
-            .post(format!("{}/api/v1/oauth/revoke", self.origin()))
+            .post(format!("{}/api/v1/oauth/revoke", self.base()))
             .header("content-type", "application/x-www-form-urlencoded")
             .body(form(pairs))
             .send()
