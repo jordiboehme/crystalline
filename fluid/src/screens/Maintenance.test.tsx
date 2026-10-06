@@ -290,7 +290,7 @@ function contradictionPayload() {
           'Possible contradiction: line 7 of "CI runtime" and line 5 of "Node version" read as contradicting at probability 0.91, line similarity 0.90, and 1 more line pair',
         evidence:
           "eng/ci-runtime line 7; eng/node-version line 5; probability 0.91; similarity 0.90; model mdeberta-v3-base-xnli-2mil7",
-        fix: "read both then supersede or close a window or acknowledge V302",
+        fix: "read both then supersede the older (valid_to set to the real date), correct the stale line or acknowledge V302",
         scope: "eng/ci-runtime, eng/node-version, aaaa, bbbb",
         counterpart: "node-version",
         counterpart_title: "Node version",

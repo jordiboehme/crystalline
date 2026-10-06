@@ -11,10 +11,10 @@ use crate::nli::candidates::{eligible, max_related_pairs, observation_hash, wind
 use crate::store::ContradictionRow;
 
 /// The fix every `V302` row carries.
-const FIX: &str = "read both then supersede or close a window or acknowledge V302";
+pub(crate) const FIX: &str = "read both then supersede the older (valid_to set to the real date), correct the stale line or acknowledge V302";
 
 /// What a row's fix says first when either line names a period.
-const PERIOD: &str = "One of these lines names a period; if both held at different times, close the older engram's validity window.";
+pub(crate) const PERIOD: &str = "One of these lines names a period; if both held at different times, the newer engram supersedes the older one, whose valid_to is set to the real date.";
 
 /// Why nothing is counted or scored while the model cannot be loaded, and
 /// where to read more.

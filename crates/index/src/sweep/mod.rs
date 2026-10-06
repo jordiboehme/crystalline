@@ -555,7 +555,7 @@ pub const RULES: [RuleInfo; 26] = [
         family: Family::Meaning,
         base: 85,
         summary: "possible contradiction",
-        instruction: "The model read these two observations as contradicting each other. It can be wrong, and it cannot see dates. Read both engrams. If one is false going forward, supersede it per the capture skill's falsification test. If both held in different periods, close the older one's validity window. If they do not contradict, acknowledge it with edit_engram set_frontmatter evolve_ack 'V302 <note>' and it stays silent for these two lines.",
+        instruction: "The model read these two observations as contradicting each other. It can be wrong, and it cannot see dates. Read both engrams. If one is false going forward, supersede it per the capture skill's falsification test. If both held in different periods, the newer engram supersedes the older one: set the older one's valid_to to the real date, its status to superseded and the supersedes and superseded_by pair; closing the window alone leaves it reading as current, which V001 then reports. If only one line is stale and the rest of that engram still holds, correct the line instead. If they do not contradict, acknowledge it with edit_engram set_frontmatter evolve_ack 'V302 <note>' and it stays silent for these two lines. After a supersede, V010 may name the line the retirement dropped; acknowledge it there when the drop is intended.",
     },
 ];
 
