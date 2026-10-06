@@ -17,7 +17,10 @@ use std::time::Duration;
 use chrono::Utc;
 use serde_json::Value;
 
-use crate::mounts::{Announcement, Hidden, HiddenReason, LocalDomain, Mount, MountTable, assign};
+use crate::mounts::{
+    Announcement, Hidden, HiddenReason, LocalDomain, Mount, MountTable, assign,
+    hidden_local_sentence,
+};
 use crate::server_client::{Budget, Connection, ForwardedAgent, RemoteFailure};
 use crate::source_cache::{
     Fetched, HOOK_STATUS_FILE, ROUTING_FILE, STALE_AFTER, cached_offers, fetch_cached, read_cached,
@@ -117,19 +120,15 @@ impl MountNote {
             (MountNote::Renamed { wanted, name, .. }, false) => format!(
                 "'{wanted}' is a domain from a connected server on this machine, so this local domain is registered as '{name}'"
             ),
-            (MountNote::HiddenCopy { name, source }, true) => format!(
-                "the local domain '{name}' is hidden while {source} is connected; disconnect {source} to use it again"
+            (MountNote::HiddenCopy { name, source }, name_source) => hidden_local_sentence(
+                name,
+                HiddenReason::Copy,
+                name_source.then_some(source.as_str()),
             ),
-            (MountNote::HiddenCopy { name, .. }, false) => format!(
-                "the local domain '{name}' is hidden while the server it comes from is connected"
-            ),
-            (MountNote::Collision { name, source }, true) => Announcement::LocalShadowed {
-                local: name.clone(),
-                source: source.clone(),
-            }
-            .to_string(),
-            (MountNote::Collision { name, .. }, false) => format!(
-                "the local domain '{name}' has a name a connected server gave out first; it is hidden until you change its name in config.yaml"
+            (MountNote::Collision { name, source }, name_source) => hidden_local_sentence(
+                name,
+                HiddenReason::Collision,
+                name_source.then_some(source.as_str()),
             ),
         }
     }
@@ -139,18 +138,7 @@ impl MountNote {
 /// hides: in `status`, in `doctor`, and as the refusal of a removal or a
 /// rename of it (ruling F8 REVISED).
 pub fn hidden_sentence(hidden: &Hidden) -> String {
-    match hidden.reason {
-        HiddenReason::Copy => MountNote::HiddenCopy {
-            name: hidden.local.clone(),
-            source: hidden.source.clone(),
-        }
-        .render(true),
-        HiddenReason::Collision => Announcement::LocalShadowed {
-            local: hidden.local.clone(),
-            source: hidden.source.clone(),
-        }
-        .to_string(),
-    }
+    hidden_local_sentence(&hidden.local, hidden.reason, Some(&hidden.source))
 }
 
 /// The mounted part of the routing block, and one staleness line per source

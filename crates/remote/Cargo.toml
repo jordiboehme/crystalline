@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
-description = "GitHub-backed team collaboration plumbing for Crystalline: the provider trait, the merge engine and origin state. Git itself is an implementation detail hidden from users."
+description = "GitHub-backed team collaboration plumbing for Crystalline (the provider trait, the merge engine and origin state) and the client for connected Crystalline servers (credentials, sources, connection, cache). Git itself is an implementation detail hidden from users."
 
 [lib]
 name = "crystalline_remote"

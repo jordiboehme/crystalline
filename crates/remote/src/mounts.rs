@@ -210,11 +210,38 @@ impl std::fmt::Display for Announcement {
                 f,
                 "{source}: '{remote}' is the same domain {kept_by} already offers; it is left out"
             ),
-            Announcement::LocalShadowed { local, source } => write!(
-                f,
-                "the local domain '{local}' has a name {source} gave out first; it is hidden until you change its name in config.yaml or disconnect {source}"
-            ),
+            Announcement::LocalShadowed { local, source } => f.write_str(&hidden_local_sentence(
+                local,
+                HiddenReason::Collision,
+                Some(source),
+            )),
         }
+    }
+}
+
+/// The one sentence for a local domain a connected server hides, for
+/// `reason`. With `source` it names the source and the way out through it;
+/// without, it speaks of a connected server. Every writer of these
+/// sentences calls this, so the wording cannot drift between `connect`,
+/// `status`, `doctor`, a refusal and a registration note.
+pub(crate) fn hidden_local_sentence(
+    local: &str,
+    reason: HiddenReason,
+    source: Option<&str>,
+) -> String {
+    match (reason, source) {
+        (HiddenReason::Copy, Some(source)) => format!(
+            "the local domain '{local}' is hidden while {source} is connected; disconnect {source} to use it again"
+        ),
+        (HiddenReason::Copy, None) => format!(
+            "the local domain '{local}' is hidden while the server it comes from is connected"
+        ),
+        (HiddenReason::Collision, Some(source)) => format!(
+            "the local domain '{local}' has a name {source} gave out first; it is hidden until you change its name in config.yaml or disconnect {source}"
+        ),
+        (HiddenReason::Collision, None) => format!(
+            "the local domain '{local}' has a name a connected server gave out first; it is hidden until you change its name in config.yaml"
+        ),
     }
 }
 
