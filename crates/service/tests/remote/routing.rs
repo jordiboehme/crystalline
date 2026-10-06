@@ -181,12 +181,12 @@ async fn a_fan_out_with_one_slow_and_one_unreachable_source_answers_within_the_d
     let note = answer["note"].as_str().unwrap();
     assert!(
         note.contains(
-            "slow cannot be reached right now (it did not answer within 0.7 s; check the VPN or the network); its domains are missing from these results"
+            "slow cannot be reached right now (it did not answer within 0.7 s; check the VPN or the network; it recovers by itself once the server answers again); its domains are missing from these results"
         ),
         "{note}"
     );
     assert!(
-        note.contains("gone cannot be reached right now (check the VPN or the network); its domains are missing from these results"),
+        note.contains("gone cannot be reached right now (check the VPN or the network; it recovers by itself once the server answers again); its domains are missing from these results"),
         "{note}"
     );
 }

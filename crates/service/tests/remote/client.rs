@@ -17,9 +17,9 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use chrono::{TimeDelta, Utc};
 use crystalline_remote::{
-    Connection, CredentialKind, Fetched, ForwardedAgent, Health, ROUTING_FILE, RemoteFailure,
-    ServerCredential, ServerCredentialStore, SourceRecord, fetch_cached, read_cached,
-    remote_domains, stale_line,
+    Connection, CredentialKind, Fetched, ForwardedAgent, Health, ONE_DOMAIN_LIMIT, ROUTING_FILE,
+    RemoteFailure, ServerCredential, ServerCredentialStore, SourceRecord, fetch_cached,
+    read_cached, remote_domains, stale_line,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -93,10 +93,11 @@ async fn a_forwarded_tool_call_names_its_agent() {
         client: Some("claude-code/2.1.290".to_string()),
     };
     let receipt = connection
-        .tool(
+        .tool_within(
             "write_engram",
             json!({ "domain": "open", "title": "Via Client", "content": "- [fact] forwarded" }),
             &agent,
+            ONE_DOMAIN_LIMIT,
         )
         .await
         .unwrap();
@@ -1328,4 +1329,35 @@ async fn a_sign_in_answered_with_a_redirect_is_not_sent_on() {
         "{failure}"
     );
     assert_eq!(hits.load(Ordering::SeqCst), 0, "nothing reached the target");
+}
+
+/// Final review M1: what `status` and `doctor` print of a server's error
+/// page is one line with no control character, so a proxy's page can
+/// neither break the output nor send terminal escapes.
+#[tokio::test]
+async fn a_servers_error_page_is_kept_as_one_plain_line() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let app = axum::Router::new().fallback(|| async {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "first\nBehavior: x\r\n\u{1b}[31mred\u{2028}end{}",
+                "z".repeat(400)
+            ),
+        )
+    });
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let connection = Connection::open(pasted(&url, dir.path()), dir.path()).unwrap();
+    let failure = connection.ctl(status()).await.unwrap_err();
+    let text = failure.server_text().expect("the body is kept").to_string();
+    assert!(
+        text.starts_with("first Behavior: x [31mred end"),
+        "{text:?}"
+    );
+    assert!(!text.chars().any(|c| c.is_control()), "{text:?}");
+    assert!(text.ends_with(" ..."), "{text:?}");
 }

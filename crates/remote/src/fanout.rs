@@ -16,7 +16,7 @@
 
 use serde_json::{Map, Value, json};
 
-use crate::server_client::{RemoteFailure, seconds};
+use crate::server_client::{NETWORK_HINT, RemoteFailure, seconds};
 
 /// The reciprocal rank fusion constant.
 pub const RRF_K: f64 = 60.0;
@@ -54,11 +54,11 @@ pub struct Missing {
 pub fn missing_from(source: &str, failure: &RemoteFailure) -> Missing {
     let reason = match failure {
         RemoteFailure::TimedOut { after, .. } => format!(
-            "cannot be reached right now (it did not answer within {}; check the VPN or the network)",
+            "cannot be reached right now (it did not answer within {}; {NETWORK_HINT})",
             seconds(*after)
         ),
         RemoteFailure::Unreachable { .. } => {
-            "cannot be reached right now (check the VPN or the network)".to_string()
+            format!("cannot be reached right now ({NETWORK_HINT})")
         }
         RemoteFailure::SignInAgain { url } => {
             format!("needs a new sign-in (run crystalline connect {url} again)")
@@ -557,7 +557,7 @@ mod tests {
         assert_eq!(merge_search(parts, 1, 10, &[])["mode"], "mixed");
     }
 
-    const UNREACHABLE: &str = "cannot be reached right now (check the VPN or the network)";
+    const UNREACHABLE: &str = "cannot be reached right now (check the VPN or the network; it recovers by itself once the server answers again)";
 
     #[test]
     fn a_missingsource_is_named_in_the_answer() {
@@ -577,7 +577,7 @@ mod tests {
         ];
         assert_eq!(
             missing_note(&missing[0]),
-            "acme cannot be reached right now (it did not answer within 3 s; check the VPN or the network); its domains are missing from these results"
+            "acme cannot be reached right now (it did not answer within 3 s; check the VPN or the network; it recovers by itself once the server answers again); its domains are missing from these results"
         );
         assert_eq!(
             missing_note(&missing[1]),
@@ -595,14 +595,14 @@ mod tests {
         assert_eq!(
             merged["missing"],
             json!([
-                { "source": "acme", "reason": "cannot be reached right now (it did not answer within 3 s; check the VPN or the network)" },
+                { "source": "acme", "reason": "cannot be reached right now (it did not answer within 3 s; check the VPN or the network; it recovers by itself once the server answers again)" },
                 { "source": "beta", "reason": UNREACHABLE },
             ])
         );
         assert_eq!(
             merged["note"],
             format!(
-                "acme cannot be reached right now (it did not answer within 3 s; check the VPN or the network); its domains are missing from these results. beta {UNREACHABLE}; its domains are missing from these results."
+                "acme cannot be reached right now (it did not answer within 3 s; check the VPN or the network; it recovers by itself once the server answers again); its domains are missing from these results. beta {UNREACHABLE}; its domains are missing from these results."
             )
         );
     }

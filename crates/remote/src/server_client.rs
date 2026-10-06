@@ -125,8 +125,6 @@ pub const POOL_IDLE: Duration = Duration::from_secs(30);
 pub const REFRESH_LOCK_FILE: &str = "refresh.lock";
 /// How long a refresh waits for another process's refresh to finish.
 const LOCK_WAIT: Duration = Duration::from_secs(15);
-/// The forwarded tool that runs a sweep on the server.
-const EVOLVE_TOOL: &str = "evolve_engrams";
 /// What every unreachable or timed-out failure says, and what
 /// [`crate::stale_line`] recognises it by.
 pub(crate) const UNREACHABLE_WORDS: &str = "cannot be reached right now";
@@ -134,7 +132,7 @@ pub(crate) const UNREACHABLE_WORDS: &str = "cannot be reached right now";
 /// what [`crate::stale_line`] recognises it by.
 pub(crate) const TOO_OLD_WORDS: &str = "does not serve the remote control protocol";
 /// What a person can do about a source that does not answer.
-const NETWORK_HINT: &str =
+pub(crate) const NETWORK_HINT: &str =
     "check the VPN or the network; it recovers by itself once the server answers again";
 
 /// Why a remote exchange did not produce an answer.
@@ -178,7 +176,8 @@ pub enum RemoteFailure {
         url: String,
         /// The HTTP status code.
         status: u16,
-        /// The start of the body, as the server sent it.
+        /// The start of the body on one line: control characters and line
+        /// breaks become spaces, and it is cut at 200 characters.
         body: String,
     },
     /// This process was still setting up its network client when the
@@ -930,27 +929,11 @@ impl Connection {
         }
     }
 
-    /// One forwarded tool call for one domain, in the source's own names,
-    /// with the agent it is for: within this connection's limit, or
-    /// [`CTL_TIMEOUT`] for `evolve_engrams`. A refusal comes back as
-    /// [`RemoteFailure::Refused`] carrying the server's sentence word for
-    /// word.
-    pub async fn tool(
-        &self,
-        tool: &str,
-        args: Value,
-        agent: &ForwardedAgent,
-    ) -> Result<Value, RemoteFailure> {
-        let limit = if tool == EVOLVE_TOOL {
-            CTL_TIMEOUT.max(self.limit)
-        } else {
-            self.limit
-        };
-        self.tool_within(tool, args, agent, limit).await
-    }
-
-    /// [`Connection::tool`] within `limit`: the fan-out deadline for a call
-    /// over all domains.
+    /// One forwarded tool call, in the source's own names, with the agent it
+    /// is for, within `limit`: the caller picks it (the fan-out deadline for
+    /// a call over all domains, or the long limit of a forwarded sweep). A
+    /// refusal comes back as [`RemoteFailure::Refused`] carrying the
+    /// server's sentence word for word.
     pub async fn tool_within(
         &self,
         tool: &str,
@@ -1029,7 +1012,7 @@ impl Connection {
             return Err(RemoteFailure::Status {
                 url: self.source.url.clone(),
                 status: status.as_u16(),
-                body: text.chars().take(200).collect(),
+                body: crate::text::one_line(&text, 200),
             });
         }
         let envelope: Value = serde_json::from_str(&text).map_err(|_| {
