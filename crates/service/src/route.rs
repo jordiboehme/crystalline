@@ -199,7 +199,9 @@ pub enum RouteError {
         /// What happened.
         failure: RemoteFailure,
     },
-    /// The local part failed.
+    /// The local part failed, or this machine refused the call itself in
+    /// the words and shape a local call gets (a write on a read-only
+    /// instance).
     Local(anyhow::Error),
 }
 
@@ -377,8 +379,9 @@ pub async fn routed(
                      server's domains, so ask about each domain in a call of its own"
                 ))));
             }
+            // This machine's own refusal, in the shape a local write gets.
             if engine.read_only() && WRITE_TOOLS.contains(&tool) {
-                return Some(Err(RouteError::Refused(EngineError::ReadOnly.to_string())));
+                return Some(Err(RouteError::Local(EngineError::ReadOnly.into())));
             }
             let forwarded = forwarded_args(args, &names, false);
             let limit = if tool == crate::EVOLVE_TOOL_NAME {
@@ -526,6 +529,7 @@ async fn fan_out(
                 .collect();
             obj.insert("domains".into(), Value::Array(kept));
         }
+        let local_args = localized_local(engine, tool, local_args).await?;
         let mut value = crate::client::dispatch_engine(engine, tool, local_args)
             .await
             .map_err(RouteError::Local)?;
@@ -608,6 +612,31 @@ async fn fan_out(
         "list_domains" => merge_list_domains(parts, &missing),
         _ => merge_evolve(parts, page, limit, &missing),
     })
+}
+
+/// The local half of a sweep with every domain it names spelled as the
+/// local name, the way the MCP verb cores spell theirs
+/// (`Engine::localized_for`): an old name or an alias resolves exactly as on
+/// a machine without sources, and a domain being renamed is waited for.
+async fn localized_local(engine: &Engine, tool: &str, args: Value) -> Result<Value, RouteError> {
+    async fn respelled<P>(engine: &Engine, args: Value) -> Result<Value, RouteError>
+    where
+        P: DomainArgs + Clone + DeserializeOwned + serde::Serialize,
+    {
+        let p: P = serde_json::from_value(args)
+            .map_err(|e| RouteError::Local(anyhow::anyhow!("invalid arguments: {e}")))?;
+        let p = engine
+            .localized_for(&p, &crate::scope::Scope::Unrestricted)
+            .await
+            .map_err(|e| RouteError::Local(e.into()))?;
+        serde_json::to_value(p).map_err(|e| RouteError::Local(e.into()))
+    }
+    match tool {
+        "search_engrams" => respelled::<SearchParams>(engine, args).await,
+        "recent_activity" => respelled::<RecentParams>(engine, args).await,
+        t if t == crate::EVOLVE_TOOL_NAME => respelled::<EvolveParams>(engine, args).await,
+        _ => Ok(args),
+    }
 }
 
 /// The ctl `tool` command's whole answer, and the in-process CLI's: routed

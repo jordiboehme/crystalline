@@ -173,12 +173,19 @@ async fn a_draft_link_works_on_a_mounted_domain_and_lapses_after_the_last_call()
         .engine
         .joins()
         .expire_idle(Instant::now() + IDLE_JOIN_LIMIT + Duration::from_secs(1));
-    let _ = call(
+    let lapsed = call(
         client.peer(),
         "edit_engram",
         json!({ "identifier": "plan", "domain": "team", "operation": "append", "content": "- [fact] too late" }),
     )
     .await;
+    let lapsed = lapsed.unwrap_err();
+    assert!(
+        lapsed.starts_with(
+            "'plan' is keeper's draft, shared with you to read: writing into it is a second step"
+        ),
+        "the lapsed join is refused as unjoined: {lapsed}"
+    );
     let draft = server
         .engine
         .overlay_draft_at("team", "keeper", "plan.md")
@@ -423,4 +430,121 @@ async fn an_http_sessions_onboarding_never_lists_the_mounted_domains() {
             "{channel} names a mounted domain: {text}"
         );
     }
+}
+
+/// The local half of a sweep resolves a domain's old name as a machine
+/// without sources does: a rename leaves the old name answering.
+#[tokio::test]
+async fn a_sweep_naming_a_renamed_local_domain_by_its_old_name_still_finds_it() {
+    let server = RemoteServer::start(Options::TOKENS).await;
+    let machine = LocalMachine::start(false).await;
+    machine
+        .engine
+        .rename_domain("notes", "journal", false, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    machine.connect(&server, "acme", "keeper").await;
+    machine.mount();
+    let (client, _s) = connect(McpServer::new(machine.engine.clone())).await;
+    let found = call(
+        client.peer(),
+        "search_engrams",
+        json!({ "query": "vent", "domains": ["notes", "open"] }),
+    )
+    .await
+    .unwrap();
+    let text = found.to_string();
+    assert!(text.contains("the local notes vent is green"), "{found}");
+    assert!(text.contains("the vent driver retries"), "{found}");
+    for tool in ["recent_activity", "evolve_engrams"] {
+        let swept = call(client.peer(), tool, json!({ "domains": ["notes", "open"] })).await;
+        let swept = swept.unwrap_or_else(|e| panic!("{tool}: {e}"));
+        assert!(
+            swept
+                .get("missing")
+                .is_none_or(|m| m.as_array().is_some_and(|a| a.is_empty())),
+            "{tool}: {swept}"
+        );
+    }
+}
+
+/// Decision D21 for the rest of the handler lines: `provision` with a
+/// domain and `discard_changes` refuse a mounted domain, and `add_domain`
+/// under a mounted name acts on this machine and says what it was named.
+#[tokio::test]
+async fn provision_discard_and_add_domain_meet_a_mounted_domain() {
+    let server = RemoteServer::start(Options::TOKENS).await;
+    let machine = LocalMachine::start(false).await;
+    machine.connect(&server, "acme", "keeper").await;
+    machine.mount();
+    let (client, _s) = connect(McpServer::new(machine.engine.clone())).await;
+    let provision = call(
+        client.peer(),
+        "provision",
+        json!({ "action": "allow", "domain": "open" }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        provision,
+        "'open' comes from acme; provision acts on this machine's own domains. Disconnect the source with crystalline disconnect acme"
+    );
+    let discard = call(
+        client.peer(),
+        "discard_changes",
+        json!({ "domain": "open", "paths": ["open-note.md"] }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        discard,
+        "'open' comes from acme, which shares this domain; share changes there"
+    );
+    let folder = machine.tmp.path().join("my-open");
+    let added = call(
+        client.peer(),
+        "add_domain",
+        json!({ "domain": "open", "folder": folder.to_string_lossy() }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(added["domain"], "open-local", "{added}");
+    assert_eq!(
+        added["note"],
+        "'open' is a domain from acme on this machine, so this local domain is registered as 'open-local'"
+    );
+    assert!(folder.join("MANIFEST.md").exists(), "acted on this machine");
+}
+
+/// A write on a read-only instance is refused in one shape whichever domain
+/// it names: the protocol error a local write gets, with the same words.
+#[tokio::test]
+async fn a_read_only_refusal_has_the_same_shape_for_a_mounted_domain() {
+    let server = RemoteServer::start(Options::TOKENS).await;
+    let machine = LocalMachine::start_read_only(false).await;
+    machine.connect(&server, "acme", "keeper").await;
+    machine.mount();
+    let (client, _s) = connect(McpServer::new(machine.engine.clone())).await;
+    let mut shapes = Vec::new();
+    for domain in ["notes", "open"] {
+        let mut params = CallToolRequestParams::new("write_engram");
+        if let Value::Object(map) =
+            json!({ "domain": domain, "title": "Not Here", "content": "- [fact] no" })
+        {
+            params = params.with_arguments(map);
+        }
+        let answer = client.peer().call_tool(params).await;
+        shapes.push(
+            answer
+                .map(|r| serde_json::to_value(r).unwrap())
+                .map_err(|e| e.to_string()),
+        );
+    }
+    assert_eq!(shapes[0], shapes[1]);
+    let refusal = shapes[1].clone().unwrap_err();
+    assert!(
+        refusal.contains("this instance is read-only; content mutations are disabled"),
+        "{refusal}"
+    );
+    assert!(!server.file("open", "not-here.md").exists());
 }

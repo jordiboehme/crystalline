@@ -2184,8 +2184,15 @@ impl McpServer {
     /// forwarded with the call is this session's `clientInfo` (decision D11).
     ///
     /// Every limit is the router's own (spec A8): one domain waits at most
-    /// [`crystalline_remote::ONE_DOMAIN_LIMIT`], a sweep at most the fan-out
-    /// deadline per source, and a source in its down window answers at once.
+    /// [`crystalline_remote::ONE_DOMAIN_LIMIT`], except `evolve_engrams` for
+    /// one source, which runs a sweep on the server and waits at most
+    /// [`crystalline_remote::CTL_TIMEOUT`] (120 s); a sweep over all domains
+    /// waits at most the fan-out deadline per source; and a source in its
+    /// down window answers at once.
+    ///
+    /// A refusal this machine makes itself (a write on a read-only instance)
+    /// has the shape the local call gets; every other routed refusal is a
+    /// tool error the agent reads.
     async fn mounted<P: serde::Serialize>(
         &self,
         tool: &str,
@@ -2202,7 +2209,8 @@ impl McpServer {
         let routed = crate::route::routed(&self.engine, tool, &args, &agent, None).await?;
         Some(match routed {
             Ok(value) => self.render_routed(tool, value),
-            // The local part of a sweep failed: the shape a local call gets.
+            // The local part of a sweep failed, or this machine refused: the
+            // shape a local call gets.
             Err(crate::route::RouteError::Local(e)) => Err(match e.downcast::<EngineError>() {
                 Ok(engine) => to_error(engine),
                 Err(e) => ErrorData::internal_error(format!("{e:#}"), None),
