@@ -4760,7 +4760,10 @@ mod tests {
         #[cfg(any(target_os = "linux", target_os = "macos", windows))]
         assert!(process_is_crystalline(std::process::id()));
         assert!(!process_is_crystalline(0));
-        assert!(!process_is_crystalline(u32::MAX - 1));
+        // Positive as a `pid_t`, so it names one process and never a
+        // process group, and above macOS's pid limit; on Linux it could be
+        // live, but not a Crystalline process.
+        assert!(!process_is_crystalline(4_000_000));
     }
 
     /// The lock probe: free while nobody holds it, held while ownership

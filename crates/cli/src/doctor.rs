@@ -963,7 +963,8 @@ fn same_account(a: &str, b: &str) -> bool {
 }
 
 /// A task runs for this user when its principal is a group (only the MSI
-/// registers one, for the Users group) or this account. The task under this
+/// registers one, for the Users group) or this account, and is taken to
+/// when its principal cannot be read at all. The task under this
 /// user's own name (`\Crystalline Daemon for <name>`) is always theirs:
 /// Task Scheduler may print the account as a SID, and a name outside ASCII
 /// may not survive the decoding of its output, but only `doctor --fix` run
@@ -979,13 +980,17 @@ pub(crate) fn task_finding(name: Option<&str>, xml: Option<&str>, account: &str)
     if own_name {
         return TaskFinding::Ready(name.to_string());
     }
-    let principals = principals_block(xml.unwrap_or_default());
-    let for_group = !element_texts(principals, "GroupId").is_empty();
-    let for_me = !account.is_empty()
-        && element_texts(principals, "UserId")
-            .iter()
-            .any(|user| same_account(user, account));
-    if for_group || for_me {
+    // No definition, or one with no principal doctor can read: doctor
+    // cannot tell, so it says nothing, as it does for the command.
+    let Some(xml) = xml else {
+        return TaskFinding::Ready(name.to_string());
+    };
+    let principals = principals_block(xml);
+    let groups = element_texts(principals, "GroupId");
+    let users = element_texts(principals, "UserId");
+    let unreadable = groups.is_empty() && users.is_empty();
+    let for_me = !account.is_empty() && users.iter().any(|user| same_account(user, account));
+    if unreadable || !groups.is_empty() || for_me {
         TaskFinding::Ready(name.to_string())
     } else {
         TaskFinding::ForOthers(name.to_string())
@@ -1007,28 +1012,77 @@ pub(crate) fn task_command(xml: &str) -> Option<std::path::PathBuf> {
     (!path.is_empty()).then(|| std::path::PathBuf::from(path))
 }
 
-/// A task that runs for this user but starts a binary `exists` cannot find
-/// (it survived an uninstall, or the binary moved) is as good as missing,
-/// so `--fix` registers it again. Arguments and trigger are not checked.
-pub(crate) fn with_command_check(
-    finding: TaskFinding,
-    xml: Option<&str>,
-    exists: impl Fn(&Path) -> bool,
-) -> TaskFinding {
-    match (&finding, xml.and_then(task_command)) {
-        (TaskFinding::Ready(_), Some(command)) if !exists(&command) => TaskFinding::Missing,
-        _ => finding,
-    }
-}
-
 /// The daemon task as doctor found it and what `--fix` did about it.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct TaskDoctor {
     pub finding: Option<TaskFinding>,
+    /// The program a task that runs for this user starts, when that file is
+    /// gone (the task survived an uninstall, or the binary moved).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gone_command: Option<String>,
     /// The task `--fix` registered for this user.
     pub registered_now: Option<String>,
     /// Why `--fix` could not register it.
     pub error: Option<String>,
+}
+
+impl TaskDoctor {
+    /// Whether the task still keeps Claude Desktop from starting the daemon.
+    fn is_problem(&self) -> bool {
+        let ready =
+            matches!(self.finding, Some(TaskFinding::Ready(_))) && self.gone_command.is_none();
+        !ready && self.registered_now.is_none()
+    }
+}
+
+/// What `--fix` may do about the task doctor found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TaskRepair {
+    /// The task runs for this user and starts a binary that is there.
+    Nothing,
+    /// Register this user's own task (again, with `/F`).
+    Register,
+    /// Only an administrator can help: the machine task is found first by
+    /// every bridge, so a per-user task beside it would never run.
+    Administrator,
+}
+
+fn is_machine_task(name: &str) -> bool {
+    name.eq_ignore_ascii_case(crystalline_service::daemon_task::MACHINE_TASK_NAME)
+}
+
+/// The task found under `name` (with its definition `xml`, when it could be
+/// read) for `account`, and what `--fix` may do about it. `exists` says
+/// whether the program the task starts is there. Arguments and trigger are
+/// not checked, and a definition that names no program is taken as fine.
+pub(crate) fn assess_task(
+    name: Option<&str>,
+    xml: Option<&str>,
+    account: &str,
+    exists: impl Fn(&Path) -> bool,
+) -> (TaskDoctor, TaskRepair) {
+    let finding = task_finding(name, xml, account);
+    let gone_command = match finding {
+        TaskFinding::Ready(_) => xml
+            .and_then(task_command)
+            .filter(|command| !exists(command))
+            .map(|command| command.display().to_string()),
+        _ => None,
+    };
+    let repair = match (&finding, &gone_command) {
+        (TaskFinding::Missing, _) => TaskRepair::Register,
+        (TaskFinding::Ready(_), None) => TaskRepair::Nothing,
+        (TaskFinding::Ready(name) | TaskFinding::ForOthers(name), _) if is_machine_task(name) => {
+            TaskRepair::Administrator
+        }
+        _ => TaskRepair::Register,
+    };
+    let task = TaskDoctor {
+        finding: Some(finding),
+        gone_command,
+        ..TaskDoctor::default()
+    };
+    (task, repair)
 }
 
 /// Whether the task concerns this machine at all: the binary is the one the
@@ -1059,10 +1113,12 @@ fn claude_desktop_installed() -> bool {
 }
 
 /// Windows only: the task, and with `fix` a task for this user when none
-/// runs for them. `--fix` registers only for the binary the MSI installed,
-/// so the task never points at a copy that may move or go.
+/// runs for them or theirs starts a binary that is gone. `--fix` registers
+/// only for the binary the MSI installed, so the task never points at a
+/// copy that may move or go, and never beside a machine task, which every
+/// bridge finds first.
 fn check_task(fix: bool) -> Option<TaskDoctor> {
-    use crystalline_service::daemon_task::{self, DaemonTask, Schtasks, TaskPrincipal};
+    use crystalline_service::daemon_task::{self, TaskPrincipal};
     if !cfg!(windows) {
         return None;
     }
@@ -1076,20 +1132,15 @@ fn check_task(fix: bool) -> Option<TaskDoctor> {
         return None;
     }
     let installed = task_concerns_this_machine(&exe, &program_files, false);
-    let tasks = Schtasks::for_this_user();
+    // The runner every bridge uses, so a debug build's test seam
+    // (`CRYSTALLINE_TEST_DAEMON_TASK`) stands in for Task Scheduler here too.
+    let tasks = daemon_task::for_this_process();
     let name = tasks.find();
-    let xml = name.as_deref().and_then(daemon_task::registered_xml);
+    let xml = name.as_deref().and_then(|name| tasks.definition(name));
     let account = daemon_task::current_account();
-    let finding = with_command_check(
-        task_finding(name.as_deref(), xml.as_deref(), &account),
-        xml.as_deref(),
-        Path::is_file,
-    );
-    let mut report = TaskDoctor {
-        finding: Some(finding.clone()),
-        ..TaskDoctor::default()
-    };
-    if fix && !matches!(finding, TaskFinding::Ready(_)) {
+    let (mut report, repair) =
+        assess_task(name.as_deref(), xml.as_deref(), &account, Path::is_file);
+    if fix && repair == TaskRepair::Register {
         if !installed {
             report.error = Some(
                 "this crystalline is not the one the MSI installed, so --fix registers no task for it. Install the MSI"
@@ -1349,8 +1400,7 @@ impl DoctorReport {
         // A task that does not run for this user leaves Claude Desktop with no
         // way to start the daemon, until `--fix` registers one.
         if let Some(task) = &self.daemon_task
-            && !matches!(task.finding, Some(TaskFinding::Ready(_)))
-            && task.registered_now.is_none()
+            && task.is_problem()
         {
             n += 1;
         }
@@ -4182,31 +4232,51 @@ pub fn render_human(report: &DoctorReport) -> String {
 
     if let Some(task) = &report.daemon_task {
         let _ = writeln!(out, "daemon task:");
-        match (&task.finding, &task.registered_now, &task.error) {
-            (_, Some(name), _) => {
+        let fix_error = |out: &mut String| {
+            if let Some(error) = &task.error {
+                let _ = writeln!(out, "  --fix could not register it: {error}");
+            }
+        };
+        match (&task.finding, &task.gone_command, &task.registered_now) {
+            (_, _, Some(name)) => {
                 let _ = writeln!(out, "  registered the task {name} for this user");
             }
-            (Some(TaskFinding::Ready(name)), _, _) => {
+            (Some(TaskFinding::Ready(name)), None, _) => {
                 let _ = writeln!(out, "  ok ({name})");
             }
-            (Some(TaskFinding::ForOthers(name)), _, error) => {
+            (Some(TaskFinding::Ready(name)), Some(command), _) if is_machine_task(name) => {
+                let _ = writeln!(
+                    out,
+                    "  [problem] the task {name} starts {command}, which is gone. Repair or reinstall Crystalline with the MSI, or ask an administrator to remove the task."
+                );
+            }
+            (Some(TaskFinding::Ready(name)), Some(command), _) => {
+                let _ = writeln!(
+                    out,
+                    "  [problem] the task {name} starts {command}, which is gone. Run crystalline doctor --fix to register it again."
+                );
+                fix_error(&mut out);
+            }
+            (Some(TaskFinding::ForOthers(name)), _, _) if is_machine_task(name) => {
+                let _ = writeln!(
+                    out,
+                    "  [problem] the task {name} does not run for this user. Ask an administrator to repair or remove it."
+                );
+            }
+            (Some(TaskFinding::ForOthers(name)), _, _) => {
                 let _ = writeln!(
                     out,
                     "  [problem] the task {name} does not run for this user, so Claude Desktop cannot start the daemon. Run crystalline doctor --fix to register one for you"
                 );
-                if let Some(error) = error {
-                    let _ = writeln!(out, "  --fix could not register it: {error}");
-                }
+                fix_error(&mut out);
             }
-            (_, _, error) => {
+            (Some(TaskFinding::Missing) | None, _, _) => {
                 let _ = writeln!(
                     out,
                     "  [problem] the task {} is missing, so Claude Desktop cannot start the daemon. Run crystalline doctor --fix to register it for you, or install the newest MSI",
                     crystalline_service::daemon_task::MACHINE_TASK_NAME
                 );
-                if let Some(error) = error {
-                    let _ = writeln!(out, "  --fix could not register it: {error}");
-                }
+                fix_error(&mut out);
             }
         }
     }
@@ -7721,6 +7791,7 @@ mod tests {
 
         report.daemon_task = Some(TaskDoctor {
             finding: Some(TaskFinding::Missing),
+            gone_command: None,
             registered_now: Some(r"\Crystalline Daemon for ada".to_string()),
             error: None,
         });
@@ -7748,40 +7819,196 @@ mod tests {
         assert_eq!(json["desktop_states"], serde_json::json!([]));
     }
 
-    /// A task that starts a binary which is gone (it survived an uninstall,
-    /// or the binary moved) is as good as missing, so `--fix` registers it
-    /// again. A definition that names no command is left as it was found.
+    /// When the definition says nothing doctor can read about who the task
+    /// runs for, doctor cannot tell, so it says nothing.
     #[test]
-    fn a_task_whose_binary_is_gone_counts_as_missing() {
-        use crystalline_service::daemon_task::{TaskPrincipal, task_xml};
-        let exe = r"C:\Program Files\Crystalline & Co\bin\crystalline.exe";
-        let xml = task_xml(std::path::Path::new(exe), &TaskPrincipal::AllUsers);
+    fn a_task_whose_principal_cannot_be_read_is_not_reported_as_for_others() {
+        let machine = crystalline_service::daemon_task::MACHINE_TASK_NAME;
+        let ready = TaskFinding::Ready(machine.to_string());
+        assert_eq!(task_finding(Some(machine), None, r"WORK\ada"), ready);
+        for garbled in [
+            "\u{fffd}\u{fffd}\u{fffd}",
+            "<Task><Principals></Principals></Task>",
+            "<Principals><Principal id=\"Author\"><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>",
+        ] {
+            assert_eq!(
+                task_finding(Some(machine), Some(garbled), r"WORK\ada"),
+                ready,
+                "{garbled}"
+            );
+        }
+    }
+
+    /// The definition fixture this binary registers, starting `exe`.
+    fn definition_starting(
+        exe: &str,
+        principal: &crystalline_service::daemon_task::TaskPrincipal,
+    ) -> String {
+        crystalline_service::daemon_task::task_xml(std::path::Path::new(exe), principal)
+    }
+
+    const GONE_EXE: &str = r"C:\Program Files\Crystalline & Co\bin\crystalline.exe";
+    const OWN_TASK: &str = r"\Crystalline Daemon for ada";
+
+    #[test]
+    fn the_command_is_read_from_the_definition() {
+        use crystalline_service::daemon_task::TaskPrincipal;
+        let xml = definition_starting(GONE_EXE, &TaskPrincipal::AllUsers);
         assert_eq!(
             task_command(&xml).as_deref(),
-            Some(std::path::Path::new(exe)),
+            Some(std::path::Path::new(GONE_EXE)),
             "quotes and entities are taken off"
         );
-        let ready = TaskFinding::Ready(r"\Crystalline\Daemon".to_string());
-        assert_eq!(
-            with_command_check(ready.clone(), Some(&xml), |p| p
-                == std::path::Path::new(exe)),
-            ready
+        assert_eq!(task_command("<Principals></Principals>"), None);
+    }
+
+    /// Each task doctor may find, what it reports and what `--fix` may do.
+    #[test]
+    fn doctor_assesses_each_task_and_repairs_only_what_this_user_can() {
+        use crystalline_service::daemon_task::{MACHINE_TASK_NAME, TaskPrincipal};
+        let machine_xml = definition_starting(GONE_EXE, &TaskPrincipal::AllUsers);
+        let own_xml = definition_starting(
+            GONE_EXE,
+            &TaskPrincipal::User {
+                account: r"WORK\ada".to_string(),
+            },
+        );
+        let bob = "<Principals><Principal><UserId>WORK\\bob</UserId></Principal></Principals><Command>C:\\x.exe</Command>";
+        let here = |_: &Path| true;
+        let gone = |_: &Path| false;
+
+        let (task, repair) = assess_task(None, None, r"WORK\ada", gone);
+        assert_eq!(task.finding, Some(TaskFinding::Missing));
+        assert_eq!(repair, TaskRepair::Register, "nothing found");
+
+        let (task, repair) = assess_task(
+            Some(MACHINE_TASK_NAME),
+            Some(&machine_xml),
+            r"WORK\ada",
+            here,
         );
         assert_eq!(
-            with_command_check(ready.clone(), Some(&xml), |_| false),
-            TaskFinding::Missing
+            task.finding,
+            Some(TaskFinding::Ready(MACHINE_TASK_NAME.to_string()))
         );
-        let no_command = "<Principal><GroupId>S-1-5-32-545</GroupId></Principal>";
-        assert_eq!(
-            with_command_check(ready.clone(), Some(no_command), |_| false),
-            ready
+        assert_eq!(task.gone_command, None);
+        assert_eq!(repair, TaskRepair::Nothing);
+
+        let (task, repair) = assess_task(
+            Some(MACHINE_TASK_NAME),
+            Some(&machine_xml),
+            r"WORK\ada",
+            gone,
         );
-        assert_eq!(with_command_check(ready.clone(), None, |_| false), ready);
-        let others = TaskFinding::ForOthers(r"\Crystalline\Daemon".to_string());
+        assert_eq!(task.gone_command.as_deref(), Some(GONE_EXE));
         assert_eq!(
-            with_command_check(others.clone(), Some(&xml), |_| false),
-            others,
-            "only a task that runs for this user is checked"
+            repair,
+            TaskRepair::Administrator,
+            "a per-user task would never run: the bridge finds the machine task first"
+        );
+
+        let (task, repair) = assess_task(Some(MACHINE_TASK_NAME), Some(bob), r"WORK\ada", here);
+        assert_eq!(
+            task.finding,
+            Some(TaskFinding::ForOthers(MACHINE_TASK_NAME.to_string()))
+        );
+        assert_eq!(repair, TaskRepair::Administrator);
+
+        let (task, repair) = assess_task(Some(OWN_TASK), Some(&own_xml), r"WORK\ada", gone);
+        assert_eq!(task.finding, Some(TaskFinding::Ready(OWN_TASK.to_string())));
+        assert_eq!(task.gone_command.as_deref(), Some(GONE_EXE));
+        assert_eq!(
+            repair,
+            TaskRepair::Register,
+            "this user's own task is replaced"
+        );
+
+        let (task, repair) = assess_task(Some(MACHINE_TASK_NAME), None, r"WORK\ada", gone);
+        assert_eq!(
+            (task.finding, task.gone_command, repair),
+            (
+                Some(TaskFinding::Ready(MACHINE_TASK_NAME.to_string())),
+                None,
+                TaskRepair::Nothing
+            ),
+            "no definition: doctor cannot tell"
+        );
+    }
+
+    /// What each finding says, and whether it still counts after `--fix`.
+    #[test]
+    fn each_task_problem_names_the_task_and_what_to_do() {
+        use crystalline_service::daemon_task::MACHINE_TASK_NAME;
+        let text = |task: TaskDoctor| {
+            let report = DoctorReport {
+                daemon_task: Some(task),
+                ..DoctorReport::default()
+            };
+            (render_human(&report), report.remaining_problems())
+        };
+
+        let (out, n) = text(TaskDoctor {
+            finding: Some(TaskFinding::Ready(MACHINE_TASK_NAME.to_string())),
+            gone_command: Some(GONE_EXE.to_string()),
+            ..TaskDoctor::default()
+        });
+        assert!(
+            out.contains(&format!(
+                "  [problem] the task {MACHINE_TASK_NAME} starts {GONE_EXE}, which is gone. Repair or reinstall Crystalline with the MSI, or ask an administrator to remove the task.\n"
+            )),
+            "{out}"
+        );
+        assert_eq!(n, 1, "--fix registers nothing for it, so it stays");
+
+        let (out, n) = text(TaskDoctor {
+            finding: Some(TaskFinding::ForOthers(MACHINE_TASK_NAME.to_string())),
+            ..TaskDoctor::default()
+        });
+        assert!(
+            out.contains(&format!(
+                "  [problem] the task {MACHINE_TASK_NAME} does not run for this user. Ask an administrator to repair or remove it.\n"
+            )),
+            "{out}"
+        );
+        assert!(!out.contains("doctor --fix"), "{out}");
+        assert_eq!(n, 1);
+
+        let (out, n) = text(TaskDoctor {
+            finding: Some(TaskFinding::Ready(OWN_TASK.to_string())),
+            gone_command: Some(GONE_EXE.to_string()),
+            ..TaskDoctor::default()
+        });
+        assert!(
+            out.contains(&format!(
+                "[problem] the task {OWN_TASK} starts {GONE_EXE}, which is gone."
+            )),
+            "{out}"
+        );
+        assert!(out.contains("crystalline doctor --fix"), "{out}");
+        assert!(!out.contains(MACHINE_TASK_NAME), "{out}");
+        assert_eq!(n, 1);
+
+        let (out, n) = text(TaskDoctor {
+            finding: Some(TaskFinding::Ready(OWN_TASK.to_string())),
+            gone_command: Some(GONE_EXE.to_string()),
+            registered_now: Some(OWN_TASK.to_string()),
+            error: None,
+        });
+        assert!(
+            out.contains(&format!("registered the task {OWN_TASK} for this user")),
+            "{out}"
+        );
+        assert_eq!(n, 0);
+
+        let (out, _) = text(TaskDoctor {
+            finding: Some(TaskFinding::Missing),
+            ..TaskDoctor::default()
+        });
+        assert!(
+            out.contains(&format!(
+                "[problem] the task {MACHINE_TASK_NAME} is missing"
+            )),
+            "{out}"
         );
     }
 }

@@ -24,7 +24,8 @@ pub struct DesktopState {
     pub daemon_alive: Option<u32>,
 }
 
-/// Every private state folder under `local_appdata`, sorted by path.
+/// Every private state folder under `local_appdata` that holds state (see
+/// [`holds_state`]), sorted by path.
 pub fn scan(local_appdata: Option<&Path>) -> Vec<DesktopState> {
     let Some(root) = local_appdata else {
         return Vec::new();
@@ -41,11 +42,19 @@ pub fn scan(local_appdata: Option<&Path>) -> Vec<DesktopState> {
                 .join("Roaming")
                 .join("crystalline")
         })
-        .filter(|folder| folder.is_dir())
+        .filter(|folder| holds_state(folder))
         .map(|folder| describe(&folder))
         .collect();
     found.sort_by(|a, b| a.folder.cmp(&b.folder));
     found
+}
+
+/// Whether `folder` holds Crystalline state: a `config.yaml` or an
+/// `index.db`. An empty folder an old extension left behind holds none.
+fn holds_state(folder: &Path) -> bool {
+    ["config.yaml", "index.db"]
+        .iter()
+        .any(|name| folder.join(name).is_file())
 }
 
 /// [`scan`] of this machine's `LOCALAPPDATA`.
@@ -159,8 +168,9 @@ mod tests {
         assert_eq!(status_line(&[]), None);
     }
 
-    /// Only a `Claude_*` package with a `crystalline` folder in its roaming
-    /// cache counts, and the states come back sorted by folder.
+    /// Only a `Claude_*` package whose roaming cache holds a `crystalline`
+    /// folder with a `config.yaml` or an `index.db` counts. An empty folder
+    /// left behind holds no knowledge. The states come back sorted by folder.
     #[test]
     fn the_scan_finds_only_crystalline_state_in_claude_packages() {
         assert!(scan(None).is_empty());
@@ -175,19 +185,30 @@ mod tests {
                 .join("Roaming")
                 .join("crystalline")
         };
-        std::fs::create_dir_all(state("Claude_b")).unwrap();
-        std::fs::create_dir_all(state("Claude_a")).unwrap();
-        std::fs::write(state("Claude_a").join("index.db-wal"), [0u8; 10]).unwrap();
-        std::fs::create_dir_all(state("Other_x")).unwrap();
+        for package in [
+            "Claude_a",
+            "Claude_b",
+            "Claude_empty",
+            "Claude_log",
+            "Other_x",
+        ] {
+            std::fs::create_dir_all(state(package)).unwrap();
+        }
+        std::fs::write(state("Claude_b").join("config.yaml"), "domains: {}\n").unwrap();
+        std::fs::write(state("Claude_a").join("index.db"), [0u8; 10]).unwrap();
+        std::fs::write(state("Claude_a").join("index.db-wal"), [0u8; 5]).unwrap();
+        std::fs::write(state("Claude_log").join("index.db-wal"), [0u8; 5]).unwrap();
+        std::fs::write(state("Other_x").join("index.db"), [0u8; 5]).unwrap();
         std::fs::create_dir_all(local.path().join("Packages").join("Claude_c")).unwrap();
         let found = scan(Some(local.path()));
         let folders: Vec<&Path> = found.iter().map(|s| s.folder.as_path()).collect();
         assert_eq!(
             folders,
-            [state("Claude_a").as_path(), state("Claude_b").as_path()]
+            [state("Claude_a").as_path(), state("Claude_b").as_path()],
+            "an empty folder, a log alone and another package are not state"
         );
         assert_eq!(found[0].domains, 0, "no config.yaml");
-        assert_eq!(found[0].index_bytes, Some(10), "the log alone counts");
+        assert_eq!(found[0].index_bytes, Some(15), "the index and its log");
         assert!(found[0].last_change.is_some());
         assert_eq!(found[1].index_bytes, None);
         assert_eq!(found[1].daemon_alive, None);

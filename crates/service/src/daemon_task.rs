@@ -29,6 +29,12 @@ pub trait DaemonTask: Send + Sync {
     fn find(&self) -> Option<String>;
     /// Start the task now.
     fn run(&self, name: &str) -> Result<(), String>;
+    /// The definition of the task `name`, as Task Scheduler holds it now.
+    /// `None` when it cannot be read, and always for a stand-in, so a test
+    /// never reads the real Task Scheduler through it.
+    fn definition(&self, _name: &str) -> Option<String> {
+        None
+    }
 }
 
 /// Why a packaged bridge has no daemon to relay to. Each one is its own
@@ -367,6 +373,10 @@ impl DaemonTask for Schtasks {
 
     fn run(&self, name: &str) -> Result<(), String> {
         schtasks(&["/Run".as_ref(), "/TN".as_ref(), name.as_ref()]).map(|_| ())
+    }
+
+    fn definition(&self, name: &str) -> Option<String> {
+        registered_xml(name)
     }
 }
 
