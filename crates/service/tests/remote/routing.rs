@@ -1286,6 +1286,7 @@ async fn a_call_over_all_domains_never_reaches_a_domain_left_out() {
         "a filter naming an unlisted domain never reaches the server under that name"
     );
 
+    acme.clear_ctl_log();
     let found = call(&machine, "search_engrams", json!({ "query": "vent" }))
         .await
         .unwrap();
@@ -1295,7 +1296,9 @@ async fn a_call_over_all_domains_never_reaches_a_domain_left_out() {
         !text.contains("lab-note") && !text.contains("three bar"),
         "keeper may read lab, but it is not on the list: {found}"
     );
+    assert_reached_only_open(&acme, "a search over all domains");
 
+    acme.clear_ctl_log();
     let listed = call(&machine, "list_domains", json!({}))
         .await
         .unwrap()
@@ -1304,14 +1307,43 @@ async fn a_call_over_all_domains_never_reaches_a_domain_left_out() {
         !listed.contains("\"lab\"") && !listed.contains("\"team\""),
         "{listed}"
     );
+    assert_reached_only_open(&acme, "a list_domains fan-out");
+
+    acme.clear_ctl_log();
+    call(&machine, "recent_activity", json!({})).await.unwrap();
+    assert_reached_only_open(&acme, "a recent_activity fan-out");
+
+    acme.clear_ctl_log();
     let read = call(
         &machine,
         "read_engram",
         json!({ "identifier": "lab-note", "domain": "lab" }),
     )
     .await;
-    assert!(
-        read.is_err() || !read.unwrap().to_string().contains("three bar"),
-        "a one-domain call stays local"
+    assert_eq!(
+        read.unwrap_err().to_string(),
+        "no engram 'lab-note' in domain 'lab'",
+        "an unlisted domain is answered here, as a domain this machine does not have"
     );
+    assert!(
+        acme.ctl_requests().is_empty(),
+        "a call naming an unlisted domain sends the server nothing: {:?}",
+        acme.ctl_requests()
+    );
+}
+
+/// Every ctl request `server` recorded since the last clear names no domain
+/// but `open`, in a `domains` filter, a `domain` argument or anywhere else.
+fn assert_reached_only_open(server: &RemoteServer, step: &str) {
+    let sent = server.ctl_requests();
+    assert!(!sent.is_empty(), "{step}: the server was asked nothing");
+    for body in sent {
+        let text = body.to_string();
+        for unlisted in ["lab", "team", "platform"] {
+            assert!(
+                !text.contains(unlisted),
+                "{step}: the server received a request naming {unlisted}: {text}"
+            );
+        }
+    }
 }

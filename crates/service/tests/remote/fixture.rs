@@ -147,6 +147,36 @@ impl tower_service::Service<axum::extract::Request> for StripsPrefix {
     }
 }
 
+/// Record the JSON body of every ctl request that carries a bearer, then pass the request on
+/// unchanged.
+async fn record_ctl(
+    axum::extract::State(log): axum::extract::State<Arc<std::sync::Mutex<Vec<Value>>>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    // A request without a bearer is left alone: the daemon refuses it before
+    // reading the body, and a test pins that.
+    if !request.uri().path().ends_with("/api/v1/ctl")
+        || !request
+            .headers()
+            .contains_key(axum::http::header::AUTHORIZATION)
+    {
+        return next.run(request).await;
+    }
+    let (parts, body) = request.into_parts();
+    let bytes = axum::body::to_bytes(body, 1 << 20)
+        .await
+        .unwrap_or_default();
+    if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
+        log.lock().unwrap().push(value);
+    }
+    next.run(axum::extract::Request::from_parts(
+        parts,
+        axum::body::Body::from(bytes),
+    ))
+    .await
+}
+
 /// The serving task and the switch that shuts it down gracefully.
 type Serving = (
     tokio::task::JoinHandle<()>,
@@ -181,6 +211,8 @@ pub struct RemoteServer {
     pub collab: Arc<CollabSessions>,
     pub http: reqwest::Client,
     serving: tokio::sync::Mutex<Option<Serving>>,
+    /// The JSON bodies of the ctl requests received, oldest first.
+    ctl_log: Arc<std::sync::Mutex<Vec<Value>>>,
     /// The path the instance is served under, empty at the root.
     prefix: &'static str,
     _scratch: ScratchStateDir,
@@ -370,6 +402,11 @@ impl RemoteServer {
             None,
         )
         .unwrap();
+        let ctl_log: Arc<std::sync::Mutex<Vec<Value>>> = Arc::default();
+        let router = router.layer(axum::middleware::from_fn_with_state(
+            ctl_log.clone(),
+            record_ctl,
+        ));
         let server = RemoteServer {
             addr,
             tmp,
@@ -381,10 +418,22 @@ impl RemoteServer {
                 .build()
                 .unwrap(),
             serving: tokio::sync::Mutex::new(None),
+            ctl_log,
             prefix: options.prefix.unwrap_or(""),
             _scratch: scratch,
         };
         (server, router)
+    }
+
+    /// The JSON bodies of the ctl requests received since the last
+    /// [`RemoteServer::clear_ctl_log`].
+    pub fn ctl_requests(&self) -> Vec<Value> {
+        self.ctl_log.lock().unwrap().clone()
+    }
+
+    /// Forget the ctl requests recorded so far.
+    pub fn clear_ctl_log(&self) {
+        self.ctl_log.lock().unwrap().clear();
     }
 
     /// The origin a client connects to.
