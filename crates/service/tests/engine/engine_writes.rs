@@ -128,16 +128,12 @@ async fn a_zero_edit_save_is_byte_identical() {
 
 /// **The permalink-collision message is an interface, not just prose.**
 ///
-/// `write_engram`'s MCP handler (`crates/service/src/mcp.rs`, the
-/// `COLLISION_MARKER` interception) recognizes this one failure by the marker
-/// `already exists in domain` in the error's display, and reads the colliding
-/// permalink back out of `permalink '<permalink>'` to word the
-/// overwrite-or-cancel question an eliciting 2026-07-28 peer is offered.
-/// Rewording the message would disarm that round silently - the write would
-/// simply go back to erroring - so both halves are pinned here, where a
-/// rewording breaks loudly beside the sentence being reworded.
+/// Every surface hands this error to the caller as it is, and an agent reads
+/// the colliding permalink and the `overwrite` hint out of it to decide what
+/// to do next, so its wording is pinned here, where a rewording breaks loudly
+/// beside the sentence being reworded.
 #[tokio::test]
-async fn a_permalink_collision_carries_the_marker_the_mcp_layer_intercepts() {
+async fn a_permalink_collision_names_the_permalink_and_the_overwrite_hint() {
     let (_tmp, engine) = engine_fixture().await;
 
     // `alpha.md` is in the fixture, so a second Alpha collides with it.
@@ -161,15 +157,15 @@ async fn a_permalink_collision_carries_the_marker_the_mcp_layer_intercepts() {
     let message = err.to_string();
     assert!(
         message.contains("already exists in domain"),
-        "the marker mcp.rs intercepts on: {message}"
+        "the collision is named as one: {message}"
     );
     assert!(
         message.contains("permalink 'alpha'"),
-        "the permalink, quoted where mcp.rs reads it out: {message}"
+        "the permalink, quoted: {message}"
     );
     assert!(
         message.contains("pass overwrite=true to replace"),
-        "and the hint every non-eliciting peer still gets: {message}"
+        "and the hint every peer gets: {message}"
     );
 }
 

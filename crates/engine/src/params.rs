@@ -707,10 +707,8 @@ pub struct ResolveConflictParams {
     /// The domain-relative path of the flagged engram.
     pub path: String,
     /// One of mine (keep your version), theirs (take the team's version) or
-    /// merged (use `content`). On a 2026-07-28 peer that declared an
-    /// elicitation capability it may be omitted: the call then answers with a
-    /// mine-or-theirs question previewing both sides. merged cannot be chosen
-    /// through the question - call again with resolution merged and content.
+    /// merged (use `content`). Pass it on every call: a call without it is
+    /// refused with text that names the three values.
     #[serde(default)]
     pub resolution: Option<String>,
     /// The merged markdown content. Required when `resolution` is merged.

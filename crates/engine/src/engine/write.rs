@@ -1958,7 +1958,7 @@ impl Engine {
 /// path or a landing path.
 const MANIFEST_CAPTURE_REFUSAL: &str = "a new engram cannot be written at the domain root as MANIFEST.md: in this domain that file is the MANIFEST, which routing reads. Change it with edit_engram, or pick another title or a folder";
 
-/// The one collision message: `mcp.rs` intercepts it by `COLLISION_MARKER`.
+/// The one collision message, which every surface hands the caller as it is.
 fn collision_message(permalink: &str, domain: &str, at: &str) -> String {
     format!(
         "permalink '{permalink}' already exists in domain '{domain}' (at {at}); pass overwrite=true to replace"

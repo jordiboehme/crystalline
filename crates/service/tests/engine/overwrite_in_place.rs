@@ -217,7 +217,7 @@ async fn an_overwrite_of_an_engram_in_another_folder_is_refused_before_disk() {
     );
     assert!(
         !err.contains("already exists in domain"),
-        "never the elicitation marker"
+        "never the collision message"
     );
     let notes = tmp.path().join("notes");
     assert!(
