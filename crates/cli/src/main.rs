@@ -368,6 +368,14 @@ enum Command {
         #[arg(long)]
         standalone: Option<String>,
     },
+    /// Windows: register, remove or print the Task Scheduler task that
+    /// starts the daemon outside any app package. The MSI runs it; `doctor
+    /// --fix` uses the same code for one user.
+    #[command(name = "daemon-task", hide = true)]
+    DaemonTask {
+        #[command(subcommand)]
+        action: DaemonTaskAction,
+    },
     /// Run the single-instance daemon: watch domains, embed and serve MCP and ctl
     /// over the socket, plus MCP, the JSON API and the web UI over HTTP at
     /// 127.0.0.1:7411 unless that is turned off.
@@ -399,6 +407,11 @@ enum Command {
         /// runs inside that job. Reported by `crystalline doctor`.
         #[arg(long, hide = true)]
         breakaway_refused: bool,
+        /// Started by the Windows task \Crystalline\Daemon: work in the state
+        /// folder, log to daemon.log and drop the console window. Implies
+        /// --daemon. Hidden: only the task passes it.
+        #[arg(long, hide = true)]
+        from_task: bool,
         /// Serve the content API read-only: the five content-mutating tools are
         /// hidden and refused, while sync, watching and embedding still run.
         /// Overrides service.read_only when set; the mode is fixed for the
@@ -1941,6 +1954,7 @@ fn main() -> anyhow::Result<()> {
         }) => on_runtime(move || run_doctor(domain, fix, discard_rename, config, cli.db, cli.json)),
         Some(Command::Healthcheck { addr }) => cmd::healthcheck(&addr),
         Some(Command::HoldLock { secs, standalone }) => hold_lock(secs, standalone.as_deref()),
+        Some(Command::DaemonTask { action }) => daemon_task_command(action),
         Some(Command::Serve {
             http,
             allowed_host,
@@ -1948,10 +1962,15 @@ fn main() -> anyhow::Result<()> {
             autostarted,
             exit_when_idle,
             breakaway_refused,
+            from_task,
             read_only,
             take_over,
             config,
         }) => {
+            // A task-started daemon is recorded as an autostart, like any
+            // daemon a client spawned: no new start mode an old reader would
+            // fail to parse.
+            let autostarted = autostarted || from_task;
             // Point this process's temp location at the daemon's own scratch
             // directory before the runtime starts. It has to happen here, on the
             // only thread this process has so far: setting an environment
@@ -1975,6 +1994,7 @@ fn main() -> anyhow::Result<()> {
                     take_over,
                     exit_when_idle,
                     breakaway_refused,
+                    from_task,
                 )
             }) {
                 Ok(()) => Ok(()),
@@ -4529,6 +4549,61 @@ async fn domain_rename_dispatch(
 /// would cap the daemon's log and switch its `RUST_LOG` off. A lifecycle
 /// hook logs only when `RUST_LOG` asks for it: a hook with nothing to say
 /// must say nothing on either stream.
+#[derive(Subcommand, Debug)]
+enum DaemonTaskAction {
+    /// Register the task, replacing one of the same name.
+    Register {
+        /// For every user (the MSI), instead of the current user.
+        #[arg(long)]
+        all_users: bool,
+    },
+    /// Remove the task. A task that is not there is no error.
+    Unregister {
+        /// The task for every user and also each user's own task (the MSI's
+        /// uninstall), instead of the current user's task.
+        #[arg(long)]
+        all_users: bool,
+    },
+    /// Print the definition this binary would register.
+    Show {
+        /// For every user (the MSI), instead of the current user.
+        #[arg(long)]
+        all_users: bool,
+    },
+}
+
+fn daemon_task_command(action: DaemonTaskAction) -> anyhow::Result<()> {
+    use crystalline_service::daemon_task::{self, TaskPrincipal};
+    let principal = |all_users: bool| {
+        if all_users {
+            TaskPrincipal::AllUsers
+        } else {
+            TaskPrincipal::User {
+                account: daemon_task::current_account(),
+            }
+        }
+    };
+    match action {
+        DaemonTaskAction::Register { all_users } => {
+            let exe = std::env::current_exe()?;
+            let name =
+                daemon_task::register(&principal(all_users), &exe).map_err(anyhow::Error::msg)?;
+            println!("registered the task {name}");
+        }
+        DaemonTaskAction::Unregister { all_users } => {
+            daemon_task::unregister(&principal(all_users)).map_err(anyhow::Error::msg)?;
+            println!("removed the daemon task");
+        }
+        DaemonTaskAction::Show { all_users } => {
+            print!(
+                "{}",
+                daemon_task::task_xml(&std::env::current_exe()?, &principal(all_users))
+            );
+        }
+    }
+    Ok(())
+}
+
 fn init_cli_tracing(command: Option<&Command>) {
     use tracing_subscriber::EnvFilter;
     let filter = match command {

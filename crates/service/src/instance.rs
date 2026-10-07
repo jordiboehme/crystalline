@@ -2190,13 +2190,14 @@ pub(crate) async fn ensure_daemon_with(
 /// How long `ensure_daemon` waits for the daemon it spawned to answer.
 const READINESS_BUDGET: Duration = Duration::from_secs(15);
 
-/// Open the daemon stderr log for appending, starting the file over once it
-/// outgrows 1 MiB. The cap is checked at spawn time and the reset is
-/// best-effort (a live holder can defeat the removal on Windows), so it bounds
-/// growth across spawns, not within one daemon's lifetime. `None` (and a null
-/// stderr) when the state dir or the file cannot be prepared: logging must
-/// never be the reason a daemon fails to spawn.
-fn daemon_log_sink() -> Option<std::process::Stdio> {
+/// The daemon log, opened for appending, and started over once it outgrows
+/// 1 MiB. The cap is checked when the file is opened (at spawn time, or when
+/// a task-started daemon starts) and the reset is best-effort (a live holder
+/// can defeat the removal on Windows), so it bounds growth across starts,
+/// not within one daemon's lifetime. `None` when the state dir or the file
+/// cannot be prepared: logging must never be the reason a daemon fails to
+/// start.
+pub(crate) fn daemon_log_file() -> Option<File> {
     let path = config::daemon_log_path().ok()?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).ok()?;
@@ -2207,12 +2208,17 @@ fn daemon_log_sink() -> Option<std::process::Stdio> {
     {
         let _ = std::fs::remove_file(&path);
     }
-    let file = OpenOptions::new()
+    OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)
-        .ok()?;
-    Some(file.into())
+        .ok()
+}
+
+/// The spawned daemon's stderr: [`daemon_log_file`], or a null stderr when
+/// it cannot be opened.
+fn daemon_log_sink() -> Option<std::process::Stdio> {
+    daemon_log_file().map(Into::into)
 }
 
 /// Spawn `current_exe serve --daemon`, forwarding `--read-only` when this
@@ -2320,6 +2326,14 @@ fn spawn_daemon(options: &SpawnOptions) -> anyhow::Result<()> {
             match cmd.spawn() {
                 Ok(_) => return Ok(()),
                 Err(e) if breakaway_refusal(&e) => {
+                    if let RefusedBreakaway::StartedByTask(name) =
+                        after_refused_breakaway(&*crate::daemon_task::for_this_process())
+                    {
+                        tracing::info!(
+                            "Windows refused the breakaway ({e}); the task {name} started the daemon instead"
+                        );
+                        return Ok(());
+                    }
                     tracing::warn!(
                         "Windows refused the breakaway ({e}); {}",
                         crate::runs_in::BREAKAWAY_REFUSED_WARNING
@@ -2425,6 +2439,26 @@ fn daemon_working_dir(state_dir: anyhow::Result<PathBuf>) -> anyhow::Result<Path
 #[cfg(any(windows, test))]
 fn breakaway_refusal(e: &io::Error) -> bool {
     e.raw_os_error() == Some(5)
+}
+
+/// What a spawner does after Windows refused the breakaway (D11 of the 0.24.0
+/// plan): a daemon inside the job dies with the program that owns the job,
+/// so the task starts it instead whenever one is registered and runs.
+#[cfg(any(windows, test))]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RefusedBreakaway {
+    StartedByTask(String),
+    InsideTheJob,
+}
+
+#[cfg(any(windows, test))]
+pub(crate) fn after_refused_breakaway(
+    task: &dyn crate::daemon_task::DaemonTask,
+) -> RefusedBreakaway {
+    match task.find() {
+        Some(name) if task.run(&name).is_ok() => RefusedBreakaway::StartedByTask(name),
+        _ => RefusedBreakaway::InsideTheJob,
+    }
 }
 
 /// The exit code a `crystalline serve` uses when it could not take the index
@@ -3089,6 +3123,54 @@ mod tests {
         assert!(breakaway_refusal(&io::Error::from_raw_os_error(5)));
         assert!(!breakaway_refusal(&io::Error::from_raw_os_error(2)));
         assert!(!breakaway_refusal(&io::Error::other("no")));
+    }
+
+    struct Answers {
+        find: Option<&'static str>,
+        run_ok: bool,
+    }
+
+    impl crate::daemon_task::DaemonTask for Answers {
+        fn find(&self) -> Option<String> {
+            self.find.map(str::to_string)
+        }
+        fn run(&self, _name: &str) -> Result<(), String> {
+            if self.run_ok {
+                Ok(())
+            } else {
+                Err("refused".to_string())
+            }
+        }
+    }
+
+    #[test]
+    fn a_refused_breakaway_uses_the_task_when_one_runs() {
+        let task = Answers {
+            find: Some(crate::daemon_task::MACHINE_TASK_NAME),
+            run_ok: true,
+        };
+        assert_eq!(
+            after_refused_breakaway(&task),
+            RefusedBreakaway::StartedByTask(crate::daemon_task::MACHINE_TASK_NAME.to_string())
+        );
+    }
+
+    #[test]
+    fn a_refused_breakaway_stays_inside_the_job_without_a_task() {
+        assert_eq!(
+            after_refused_breakaway(&Answers {
+                find: None,
+                run_ok: true
+            }),
+            RefusedBreakaway::InsideTheJob
+        );
+        assert_eq!(
+            after_refused_breakaway(&Answers {
+                find: Some("x"),
+                run_ok: false
+            }),
+            RefusedBreakaway::InsideTheJob
+        );
     }
 
     // --- the words a locked index is refused in -----------------------------

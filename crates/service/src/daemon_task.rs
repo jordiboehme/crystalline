@@ -5,6 +5,8 @@
 //! current user when it is missing, and a packaged `crystalline mcp` runs it
 //! on demand when no daemon answers.
 
+use std::path::{Path, PathBuf};
+
 /// The task the MSI registers for every user.
 pub const MACHINE_TASK_NAME: &str = r"\Crystalline\Daemon";
 
@@ -81,7 +83,8 @@ impl std::fmt::Display for BridgeFailure {
 impl std::error::Error for BridgeFailure {}
 
 /// The task runner this process uses: the debug seam when it is set, else
-/// none at all for now (the real `schtasks.exe` runner comes later).
+/// the real Task Scheduler through `schtasks.exe` (which answers "only on
+/// Windows" on any other OS).
 pub fn for_this_process() -> Box<dyn DaemonTask> {
     #[cfg(debug_assertions)]
     if let Ok(seam) = std::env::var(TEST_DAEMON_TASK_ENV)
@@ -89,19 +92,7 @@ pub fn for_this_process() -> Box<dyn DaemonTask> {
     {
         return Box::new(Seam(seam));
     }
-    Box::new(NoTask)
-}
-
-/// No Task Scheduler (any OS but Windows, until the real runner lands).
-struct NoTask;
-
-impl DaemonTask for NoTask {
-    fn find(&self) -> Option<String> {
-        None
-    }
-    fn run(&self, _name: &str) -> Result<(), String> {
-        Err("Task Scheduler exists only on Windows".to_string())
-    }
+    Box::new(Schtasks::for_this_user())
 }
 
 #[cfg(debug_assertions)]
@@ -128,5 +119,559 @@ impl DaemonTask for Seam {
             }
             other => Err(format!("unknown {TEST_DAEMON_TASK_ENV} value '{other}'")),
         }
+    }
+}
+
+/// Who the task runs for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskPrincipal {
+    /// Every member of the built-in Users group, each in their own session:
+    /// the MSI's task.
+    AllUsers,
+    /// One account, `DOMAIN\name`: what `doctor --fix` registers.
+    User { account: String },
+}
+
+/// Read and run for every user, full control for SYSTEM and the
+/// administrators: so a standard user may start a task an administrator
+/// registered.
+pub const TASK_SDDL: &str = "D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGX;;;BU)";
+
+fn xml_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// The task definition, as `schtasks /Create /XML` reads it. See D2 of the
+/// 0.24.0 plan for each setting, and `MultipleInstancesPolicy` in particular:
+/// `Parallel`, because the policy is per task and a second user signing in
+/// must get a daemon of their own; the daemon's lock keeps one per user.
+pub fn task_xml(exe: &Path, principal: &TaskPrincipal) -> String {
+    let (description, trigger, who) = match principal {
+        TaskPrincipal::AllUsers => (
+            "Starts the Crystalline daemon for whoever signs in, outside any app package.",
+            "    <LogonTrigger>\n      <Enabled>true</Enabled>\n    </LogonTrigger>\n".to_string(),
+            "    <Principal id=\"Author\">\n      <GroupId>S-1-5-32-545</GroupId>\n      \
+             <RunLevel>LeastPrivilege</RunLevel>\n    </Principal>\n"
+                .to_string(),
+        ),
+        TaskPrincipal::User { account } => {
+            let account = xml_escape(account);
+            (
+                "Starts the Crystalline daemon for this user when they sign in, outside any app package.",
+                format!(
+                    "    <LogonTrigger>\n      <Enabled>true</Enabled>\n      \
+                     <UserId>{account}</UserId>\n    </LogonTrigger>\n"
+                ),
+                format!(
+                    "    <Principal id=\"Author\">\n      <UserId>{account}</UserId>\n      \
+                     <LogonType>InteractiveToken</LogonType>\n      \
+                     <RunLevel>LeastPrivilege</RunLevel>\n    </Principal>\n"
+                ),
+            )
+        }
+    };
+    let exe = xml_escape(&exe.display().to_string());
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.3" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <SecurityDescriptor>{TASK_SDDL}</SecurityDescriptor>
+    <Author>Crystalline</Author>
+    <Description>{description}</Description>
+  </RegistrationInfo>
+  <Triggers>
+{trigger}  </Triggers>
+  <Principals>
+{who}  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>Parallel</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>false</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>"{exe}"</Command>
+      <Arguments>serve --daemon --from-task</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+"#
+    )
+}
+
+/// UTF-16LE with a byte order mark, the encoding `schtasks /XML` reads
+/// without guessing.
+pub fn utf16_with_bom(xml: &str) -> Vec<u8> {
+    let mut out = vec![0xFF, 0xFE];
+    for unit in xml.encode_utf16() {
+        out.extend_from_slice(&unit.to_le_bytes());
+    }
+    out
+}
+
+/// `DOMAIN\name` of the signed-in user, from the environment Windows sets.
+pub fn current_account() -> String {
+    match (std::env::var("USERDOMAIN"), std::env::var("USERNAME")) {
+        (Ok(domain), Ok(name)) if !domain.is_empty() => format!(r"{domain}\{name}"),
+        (_, Ok(name)) => name,
+        _ => String::new(),
+    }
+}
+
+/// The task names a bridge looks for, in order: the machine task, then this
+/// user's own (D4).
+pub fn candidate_names(user: Option<&str>) -> Vec<String> {
+    let mut names = vec![MACHINE_TASK_NAME.to_string()];
+    if let Some(user) = user.filter(|u| !u.is_empty()) {
+        names.push(user_task_name(user));
+    }
+    names
+}
+
+/// The names a registration for `principal` may use (D4): the machine name
+/// for every user, only the user's own name for one user.
+pub(crate) fn registration_names(principal: &TaskPrincipal, user: Option<&str>) -> Vec<String> {
+    match principal {
+        TaskPrincipal::AllUsers => vec![MACHINE_TASK_NAME.to_string()],
+        TaskPrincipal::User { .. } => user
+            .filter(|u| !u.is_empty())
+            .map(|u| vec![user_task_name(u)])
+            .unwrap_or_default(),
+    }
+}
+
+/// `schtasks` output as text: UTF-16LE when it starts with a byte order mark
+/// or carries NULs at odd offsets (what `/Query /XML` may write to a pipe),
+/// UTF-8 otherwise.
+pub(crate) fn decode_schtasks_output(bytes: &[u8]) -> String {
+    let bom = bytes.starts_with(&[0xFF, 0xFE]);
+    let wide =
+        bom || (bytes.len() >= 2 && bytes.iter().skip(1).step_by(2).take(8).all(|b| *b == 0));
+    if !wide {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    let body = if bom { &bytes[2..] } else { bytes };
+    let units: Vec<u16> = body
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair))
+        .collect();
+    String::from_utf16_lossy(&units)
+}
+
+/// Create the task under the first name `create` accepts; the last refusal
+/// when none does.
+pub(crate) fn register_with(
+    names: &[String],
+    mut create: impl FnMut(&str) -> Result<(), String>,
+) -> Result<String, String> {
+    let mut last = "no task name to register".to_string();
+    for name in names {
+        match create(name) {
+            Ok(()) => return Ok(name.clone()),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
+/// `schtasks.exe` from the system folder, never whatever `PATH` finds first.
+pub(crate) fn schtasks_exe_in(system_root: Option<&std::ffi::OsStr>) -> PathBuf {
+    match system_root.filter(|r| !r.is_empty()) {
+        Some(root) => Path::new(root).join("System32").join("schtasks.exe"),
+        None => PathBuf::from(r"C:\Windows\System32\schtasks.exe"),
+    }
+}
+
+/// Run `schtasks.exe` with `args`: its standard output, or the reason it
+/// gave.
+fn schtasks(args: &[&std::ffi::OsStr]) -> Result<String, String> {
+    if !cfg!(windows) {
+        return Err("Task Scheduler exists only on Windows".to_string());
+    }
+    let mut cmd =
+        std::process::Command::new(schtasks_exe_in(std::env::var_os("SystemRoot").as_deref()));
+    cmd.args(args);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+    }
+    let out = cmd.output().map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(decode_schtasks_output(&out.stdout))
+    } else {
+        let said = decode_schtasks_output(if out.stderr.is_empty() {
+            &out.stdout
+        } else {
+            &out.stderr
+        })
+        .trim()
+        .to_string();
+        Err(if said.is_empty() {
+            format!("schtasks exited with {}", out.status)
+        } else {
+            said
+        })
+    }
+}
+
+/// The real Task Scheduler, through `schtasks.exe`.
+pub struct Schtasks {
+    pub user: Option<String>,
+}
+
+impl Schtasks {
+    pub fn for_this_user() -> Schtasks {
+        Schtasks {
+            user: std::env::var("USERNAME").ok(),
+        }
+    }
+}
+
+impl DaemonTask for Schtasks {
+    fn find(&self) -> Option<String> {
+        candidate_names(self.user.as_deref())
+            .into_iter()
+            .find(|name| schtasks(&["/Query".as_ref(), "/TN".as_ref(), name.as_ref()]).is_ok())
+    }
+
+    fn run(&self, name: &str) -> Result<(), String> {
+        schtasks(&["/Run".as_ref(), "/TN".as_ref(), name.as_ref()]).map(|_| ())
+    }
+}
+
+/// Register the task for `principal`, starting `exe`. Answers the name it
+/// was registered under.
+pub fn register(principal: &TaskPrincipal, exe: &Path) -> Result<String, String> {
+    let file = std::env::temp_dir().join(format!(
+        "crystalline-daemon-task-{}.xml",
+        std::process::id()
+    ));
+    std::fs::write(&file, utf16_with_bom(&task_xml(exe, principal))).map_err(|e| e.to_string())?;
+    let names = registration_names(principal, std::env::var("USERNAME").ok().as_deref());
+    let result = register_with(&names, |name| {
+        schtasks(&[
+            "/Create".as_ref(),
+            "/TN".as_ref(),
+            name.as_ref(),
+            "/XML".as_ref(),
+            file.as_os_str(),
+            "/F".as_ref(),
+        ])
+        .map(|_| ())
+    });
+    let _ = std::fs::remove_file(&file);
+    result
+}
+
+/// The per-user tasks in a `schtasks /Query /FO CSV /NH` listing: every
+/// `\Crystalline Daemon for <user>` in the root folder, each once. The task
+/// name is the first quoted field of a row; any other line is skipped.
+pub(crate) fn per_user_task_names(listing: &str) -> Vec<String> {
+    let prefix = user_task_name("");
+    let mut names: Vec<String> = Vec::new();
+    for line in listing.lines() {
+        let Some(name) = line
+            .trim()
+            .strip_prefix('"')
+            .and_then(|rest| rest.split('"').next())
+        else {
+            continue;
+        };
+        let is_user_task = name
+            .strip_prefix(prefix.as_str())
+            .is_some_and(|user| !user.trim().is_empty() && !user.contains('\\'));
+        if is_user_task && !names.iter().any(|known| known == name) {
+            names.push(name.to_string());
+        }
+    }
+    names
+}
+
+/// The names an unregistration for `principal` removes. For one user, only
+/// their own task. For every user (the MSI's uninstall), the machine task
+/// and every per-user task in `listing`: a task `doctor --fix` registered
+/// must not outlive the binary it starts, or a bridge would still find it.
+pub(crate) fn unregistration_names(
+    principal: &TaskPrincipal,
+    user: Option<&str>,
+    listing: Option<&str>,
+) -> Vec<String> {
+    let mut names = registration_names(principal, user);
+    if *principal == TaskPrincipal::AllUsers {
+        names.extend(per_user_task_names(listing.unwrap_or_default()));
+    }
+    names
+}
+
+/// Remove the task(s) for `principal`: for every user, the machine task and
+/// each user's own; for one user, only theirs. A task that is not there is
+/// no error: an install older than 0.24.0 registered none.
+pub fn unregister(principal: &TaskPrincipal) -> Result<(), String> {
+    let listing = match principal {
+        TaskPrincipal::AllUsers => schtasks(&[
+            "/Query".as_ref(),
+            "/FO".as_ref(),
+            "CSV".as_ref(),
+            "/NH".as_ref(),
+        ])
+        .ok(),
+        TaskPrincipal::User { .. } => None,
+    };
+    let user = std::env::var("USERNAME").ok();
+    for name in unregistration_names(principal, user.as_deref(), listing.as_deref()) {
+        let _ = schtasks(&[
+            "/Delete".as_ref(),
+            "/TN".as_ref(),
+            name.as_ref(),
+            "/F".as_ref(),
+        ]);
+    }
+    Ok(())
+}
+
+/// The definition of a registered task, as Task Scheduler holds it now.
+pub fn registered_xml(name: &str) -> Option<String> {
+    schtasks(&[
+        "/Query".as_ref(),
+        "/TN".as_ref(),
+        name.as_ref(),
+        "/XML".as_ref(),
+    ])
+    .ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const EXE: &str = r"C:\Program Files\Crystalline\bin\crystalline.exe";
+
+    #[test]
+    fn the_machine_task_matches_the_checked_in_definition() {
+        assert_eq!(
+            task_xml(std::path::Path::new(EXE), &TaskPrincipal::AllUsers),
+            include_str!("../tests/fixtures/daemon-task-all-users.xml")
+        );
+    }
+
+    #[test]
+    fn the_machine_task_runs_as_whoever_signs_in() {
+        let xml = task_xml(std::path::Path::new(EXE), &TaskPrincipal::AllUsers);
+        assert!(
+            xml.contains("<GroupId>S-1-5-32-545</GroupId>"),
+            "the Users group, by SID"
+        );
+        assert!(
+            !xml.contains("<UserId>"),
+            "no user, neither as principal nor on the trigger"
+        );
+        assert!(xml.contains("<LogonTrigger>"));
+        assert!(xml.contains("<Arguments>serve --daemon --from-task</Arguments>"));
+    }
+
+    #[test]
+    fn a_second_user_signing_in_gets_a_daemon_too() {
+        let xml = task_xml(std::path::Path::new(EXE), &TaskPrincipal::AllUsers);
+        assert!(
+            xml.contains("<MultipleInstancesPolicy>Parallel</MultipleInstancesPolicy>"),
+            "IgnoreNew is per task, so a second user would get none"
+        );
+    }
+
+    #[test]
+    fn the_task_lets_every_user_read_and_run_it_without_limits() {
+        let xml = task_xml(std::path::Path::new(EXE), &TaskPrincipal::AllUsers);
+        assert!(xml.contains(&format!(
+            "<SecurityDescriptor>{TASK_SDDL}</SecurityDescriptor>"
+        )));
+        assert!(TASK_SDDL.contains("(A;;GRGX;;;BU)"));
+        assert!(xml.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"));
+        assert!(xml.contains("<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>"));
+        assert!(xml.contains("<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>"));
+    }
+
+    #[test]
+    fn a_user_task_names_the_user_with_an_interactive_token() {
+        let xml = task_xml(
+            std::path::Path::new(EXE),
+            &TaskPrincipal::User {
+                account: r"WORK\ada".to_string(),
+            },
+        );
+        assert!(xml.contains(r"<UserId>WORK\ada</UserId>"));
+        assert!(xml.contains("<LogonType>InteractiveToken</LogonType>"));
+        assert!(!xml.contains("<GroupId>"));
+        assert_eq!(
+            xml.matches(r"<UserId>WORK\ada</UserId>").count(),
+            2,
+            "principal and trigger"
+        );
+    }
+
+    #[test]
+    fn the_install_path_is_escaped_and_quoted() {
+        let xml = task_xml(
+            std::path::Path::new(r"D:\Tools & More\<x>\crystalline.exe"),
+            &TaskPrincipal::AllUsers,
+        );
+        assert!(
+            xml.contains(r#"<Command>"D:\Tools &amp; More\&lt;x&gt;\crystalline.exe"</Command>"#),
+            "{xml}"
+        );
+    }
+
+    #[test]
+    fn the_definition_is_written_as_utf16_with_a_bom() {
+        let bytes = utf16_with_bom("<a/>");
+        assert_eq!(&bytes[..2], &[0xFF, 0xFE]);
+        assert_eq!(&bytes[2..], &[b'<', 0, b'a', 0, b'/', 0, b'>', 0]);
+    }
+
+    #[test]
+    fn the_bridge_looks_for_the_machine_task_then_the_user_task() {
+        assert_eq!(candidate_names(None), [MACHINE_TASK_NAME.to_string()]);
+        assert_eq!(
+            candidate_names(Some("ada")),
+            [
+                MACHINE_TASK_NAME.to_string(),
+                r"\Crystalline Daemon for ada".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn a_user_task_never_takes_the_machine_name() {
+        assert_eq!(
+            registration_names(&TaskPrincipal::AllUsers, Some("ada")),
+            [MACHINE_TASK_NAME.to_string()]
+        );
+        let user = TaskPrincipal::User {
+            account: r"WORK\ada".to_string(),
+        };
+        assert_eq!(
+            registration_names(&user, Some("ada")),
+            [r"\Crystalline Daemon for ada".to_string()]
+        );
+        assert!(
+            registration_names(&user, None).is_empty(),
+            "no user name, no user task"
+        );
+        let mut tried = Vec::new();
+        let got = register_with(&registration_names(&user, Some("ada")), |name| {
+            tried.push(name.to_string());
+            Ok(())
+        });
+        assert_eq!(got.as_deref(), Ok(r"\Crystalline Daemon for ada"));
+        assert_eq!(tried, [r"\Crystalline Daemon for ada".to_string()]);
+        let refused = register_with(&registration_names(&user, Some("ada")), |_| {
+            Err("ERROR: Access is denied.".to_string())
+        });
+        assert_eq!(
+            refused,
+            Err("ERROR: Access is denied.".to_string()),
+            "the refusal is said"
+        );
+    }
+
+    #[test]
+    fn schtasks_output_in_utf16_is_read() {
+        let wide: Vec<u8> = [0xFF, 0xFE]
+            .into_iter()
+            .chain(
+                "<GroupId>S-1-5-32-545</GroupId>"
+                    .encode_utf16()
+                    .flat_map(u16::to_le_bytes),
+            )
+            .collect();
+        assert_eq!(
+            decode_schtasks_output(&wide),
+            "<GroupId>S-1-5-32-545</GroupId>"
+        );
+        let bare: Vec<u8> = "<a/>".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        assert_eq!(
+            decode_schtasks_output(&bare),
+            "<a/>",
+            "no BOM, NULs at odd offsets"
+        );
+        assert_eq!(decode_schtasks_output(b"SUCCESS: done"), "SUCCESS: done");
+    }
+
+    #[test]
+    fn schtasks_is_taken_from_system32_and_never_from_path() {
+        assert_eq!(
+            schtasks_exe_in(Some(std::ffi::OsStr::new(r"C:\Windows"))),
+            std::path::Path::new(r"C:\Windows")
+                .join("System32")
+                .join("schtasks.exe")
+        );
+        assert_eq!(
+            schtasks_exe_in(None),
+            std::path::PathBuf::from(r"C:\Windows\System32\schtasks.exe")
+        );
+    }
+
+    #[test]
+    fn an_uninstall_finds_every_per_user_task_in_the_root_folder() {
+        let listing = "\r\n\
+            \"\\Crystalline\\Daemon\",\"N/A\",\"Ready\"\r\n\
+            \"\\Crystalline Daemon for ada\",\"N/A\",\"Ready\"\r\n\
+            \"\\Crystalline Daemon for Bob Smith\",\"N/A\",\"Running\"\r\n\
+            \"\\Crystalline Daemon for ada\",\"N/A\",\"Ready\"\r\n\
+            \"\\Other\\Crystalline Daemon for eve\",\"N/A\",\"Ready\"\r\n\
+            \"\\Crystalline Daemon for \",\"N/A\",\"Ready\"\r\n\
+            \"\\Microsoft\\Windows\\Defrag\\ScheduledDefrag\",\"N/A\",\"Ready\"\r\n\
+            INFO: There are no scheduled tasks presently available at your access level.\r\n";
+        assert_eq!(
+            per_user_task_names(listing),
+            [
+                r"\Crystalline Daemon for ada".to_string(),
+                r"\Crystalline Daemon for Bob Smith".to_string(),
+            ],
+            "root folder only, each name once, never the machine task"
+        );
+        assert!(per_user_task_names("").is_empty());
+    }
+
+    #[test]
+    fn an_uninstall_removes_the_machine_task_and_every_per_user_task() {
+        let listing = "\"\\Crystalline Daemon for ada\",\"N/A\",\"Ready\"\r\n\
+            \"\\Crystalline Daemon for bob\",\"N/A\",\"Ready\"\r\n";
+        assert_eq!(
+            unregistration_names(&TaskPrincipal::AllUsers, Some("ada"), Some(listing)),
+            [
+                MACHINE_TASK_NAME.to_string(),
+                r"\Crystalline Daemon for ada".to_string(),
+                r"\Crystalline Daemon for bob".to_string(),
+            ]
+        );
+        assert_eq!(
+            unregistration_names(&TaskPrincipal::AllUsers, None, None),
+            [MACHINE_TASK_NAME.to_string()],
+            "a listing that failed still removes the machine task"
+        );
+        let user = TaskPrincipal::User {
+            account: r"WORK\ada".to_string(),
+        };
+        assert_eq!(
+            unregistration_names(&user, Some("ada"), Some(listing)),
+            [r"\Crystalline Daemon for ada".to_string()],
+            "one user removes only their own task"
+        );
     }
 }

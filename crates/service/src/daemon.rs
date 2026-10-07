@@ -250,6 +250,21 @@ impl Shared {
     }
 }
 
+/// See `run_serve`'s `from_task`. Answers the daemon log to write to.
+fn prepare_task_start() -> Option<std::fs::File> {
+    #[cfg(windows)]
+    // SAFETY: detaches this process from the console it was given; nothing
+    // here holds a handle to that console.
+    unsafe {
+        windows_sys::Win32::System::Console::FreeConsole();
+    }
+    if let Ok(dir) = config::state_dir() {
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::env::set_current_dir(&dir);
+    }
+    crate::instance::daemon_log_file()
+}
+
 /// Run the daemon: `crystalline serve [--daemon] [--http <addr>] [--read-only]
 /// [--take-over]`. The HTTP endpoint is on at [`DEFAULT_HTTP_ADDR`] unless it was
 /// turned off, so `--http` moves it or closes it rather than opening it; see
@@ -259,7 +274,8 @@ impl Shared {
 /// [`IDLE_EXIT_GRACE`] past its last socket session, the Claude Desktop
 /// extension's shape; see `spawn_daemon`. `breakaway_refused` says the
 /// spawner could not start this daemon outside its own job; see
-/// [`crate::runs_in`].
+/// [`crate::runs_in`]. `from_task` says Task Scheduler started it (the
+/// hidden `serve --from-task`); it implies `daemon_flag`.
 // The daemon's startup switches are flat on purpose, one clap flag each.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_serve(
@@ -273,16 +289,33 @@ pub async fn run_serve(
     take_over: bool,
     exit_when_idle: bool,
     breakaway_refused: bool,
+    from_task: bool,
 ) -> anyhow::Result<()> {
+    // A daemon Task Scheduler started (D3 of the 0.24.0 plan): its working
+    // directory is System32, nobody reads its stderr and, as a console
+    // program, it was given a console window. So it drops the window, works
+    // in the state folder like a spawned daemon and logs to daemon.log.
+    let daemon_flag = daemon_flag || from_task;
+    let log_file = if from_task {
+        prepare_task_start()
+    } else {
+        None
+    };
     // RUST_LOG filters the daemon's log (the tracing `EnvFilter` syntax),
     // `info` when it is unset or does not parse.
-    let _ = tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .try_init();
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let _ = match log_file {
+        Some(file) => tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(file))
+            .with_env_filter(filter)
+            .try_init(),
+        None => tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .with_env_filter(filter)
+            .try_init(),
+    };
 
     // The single load chokepoint: parse the environment overlay, resolve the
     // config path (flag, then CRYSTALLINE_CONFIG, then the default) and layer

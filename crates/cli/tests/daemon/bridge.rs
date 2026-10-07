@@ -205,3 +205,55 @@ fn a_packaged_bridge_runs_the_task_and_serves_the_daemon() {
         log.display()
     );
 }
+
+/// What `serve --from-task` changes for a daemon Task Scheduler started: it
+/// works in the state folder, wherever it was started, and logs to
+/// daemon.log, because nobody reads its stderr.
+#[test]
+fn a_task_started_daemon_works_in_its_state_folder_and_logs_there() {
+    let home = short_home();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| {
+        let mut cmd = Command::new(assert_cmd::cargo::cargo_bin("crystalline"));
+        for (name, value) in crate::common::isolation_env(home.path()) {
+            cmd.env(name, value);
+        }
+        cmd.env_remove("RUST_LOG")
+            .env("CRYSTALLINE_SERVICE_HTTP", "false")
+            .current_dir(elsewhere.path())
+            .args(args);
+        cmd
+    };
+    let mut daemon = run(&["serve", "--from-task"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let state = crate::common::isolated_state_dir(home.path());
+    let mut status = None;
+    for _ in 0..100 {
+        let out = run(&["ctl", "status", "--json"]).output().unwrap();
+        if out.status.success() {
+            status = Some(serde_json::from_slice::<Value>(&out.stdout).unwrap());
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if status.is_some() {
+        let _ = run(&["ctl", "shutdown"]).output();
+    } else {
+        let _ = daemon.kill();
+    }
+    let _ = daemon.wait();
+    let status = status.expect("the task-started daemon answers");
+    // Both sides canonical: macOS resolves /tmp to /private/tmp, and Windows
+    // answers a canonical path with the \\?\ prefix.
+    assert_eq!(
+        std::fs::canonicalize(status["runs_in"]["working_dir"].as_str().unwrap()).unwrap(),
+        std::fs::canonicalize(&state).unwrap(),
+        "it works in the state folder, not where it was started"
+    );
+    let log = std::fs::read_to_string(state.join("daemon.log")).unwrap();
+    assert!(!log.is_empty(), "it logs to daemon.log");
+}
