@@ -42,8 +42,15 @@ pub trait DaemonTask: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BridgeFailure {
     TaskMissing,
-    TaskDidNotStart(String),
-    NoAnswer,
+    /// The task `task` (the one the bridge found and ran) refused to start.
+    TaskDidNotStart {
+        task: String,
+        detail: String,
+    },
+    /// The task `task` started, but no daemon answered in time.
+    NoAnswer {
+        task: String,
+    },
     /// A daemon answered on the pipe, but the MCP handshake with it failed.
     HandshakeFailed(String),
 }
@@ -67,15 +74,12 @@ impl std::fmt::Display for BridgeFailure {
                 f,
                 "the Windows task {MACHINE_TASK_NAME} that starts the Crystalline daemon is missing"
             ),
-            BridgeFailure::TaskDidNotStart(detail) => {
-                write!(
-                    f,
-                    "the Windows task {MACHINE_TASK_NAME} did not start ({detail})"
-                )
+            BridgeFailure::TaskDidNotStart { task, detail } => {
+                write!(f, "the Windows task {task} did not start ({detail})")
             }
-            BridgeFailure::NoAnswer => write!(
+            BridgeFailure::NoAnswer { task } => write!(
                 f,
-                "the Windows task {MACHINE_TASK_NAME} started, but no Crystalline daemon answered within {} s",
+                "the Windows task {task} started, but no Crystalline daemon answered within {} s",
                 crate::instance::PACKAGED_TASK_WAIT.as_secs()
             ),
             BridgeFailure::HandshakeFailed(detail) => write!(

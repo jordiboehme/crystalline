@@ -221,11 +221,11 @@ impl StubStatus {
             StubCase::Bridge(BridgeFailure::TaskMissing) => format!(
                 "Crystalline is running in degraded mode: Claude Desktop runs Crystalline inside its own app package, so the Crystalline daemon has to start outside it, from the Windows task {MACHINE_TASK_NAME}, and that task is missing. No knowledge tools are available this session. Ask the user to run `crystalline doctor --fix` in a terminal, which registers the task, or to install the newest MSI from https://github.com/jordiboehme/crystalline/releases, then restart Claude Desktop. Call the status tool for the full details to relay."
             ),
-            StubCase::Bridge(BridgeFailure::TaskDidNotStart(detail)) => format!(
-                "Crystalline is running in degraded mode: the Windows task {MACHINE_TASK_NAME} that starts the Crystalline daemon did not start ({detail}), so no knowledge tools are available this session. Ask the user to run `crystalline doctor` in a terminal, which says why, then restart Claude Desktop. Call the status tool for the full details to relay."
+            StubCase::Bridge(BridgeFailure::TaskDidNotStart { task, detail }) => format!(
+                "Crystalline is running in degraded mode: the Windows task {task} that starts the Crystalline daemon did not start ({detail}), so no knowledge tools are available this session. Ask the user to run `crystalline doctor` in a terminal, which says why, then restart Claude Desktop. Call the status tool for the full details to relay."
             ),
-            StubCase::Bridge(BridgeFailure::NoAnswer) => format!(
-                "Crystalline is running in degraded mode: the Windows task {MACHINE_TASK_NAME} started, but no Crystalline daemon answered within {wait} s, so no knowledge tools are available this session. Ask the user to run `crystalline status` in a terminal and to look at daemon.log in the Crystalline state folder, then restart Claude Desktop. Call the status tool for the full details to relay."
+            StubCase::Bridge(BridgeFailure::NoAnswer { task }) => format!(
+                "Crystalline is running in degraded mode: the Windows task {task} started, but no Crystalline daemon answered within {wait} s, so no knowledge tools are available this session. Ask the user to run `crystalline status` in a terminal and to look at daemon.log in the Crystalline state folder, then restart Claude Desktop. Call the status tool for the full details to relay."
             ),
             StubCase::Bridge(BridgeFailure::HandshakeFailed(detail)) => format!(
                 "Crystalline is running in degraded mode: the Crystalline daemon answered, but it did not finish the MCP handshake ({detail}), so no knowledge tools are available this session. Ask the user to run `crystalline status` in a terminal, then restart Claude Desktop. Call the status tool for the full details to relay."
@@ -255,10 +255,10 @@ impl StubStatus {
             StubCase::Bridge(BridgeFailure::TaskMissing) => format!(
                 "Run `crystalline doctor --fix` in a terminal (it registers the task {MACHINE_TASK_NAME}), or install the newest MSI from https://github.com/jordiboehme/crystalline/releases, then restart Claude Desktop."
             ),
-            StubCase::Bridge(BridgeFailure::TaskDidNotStart(_)) => format!(
-                "Run `crystalline doctor` in a terminal to see why the task {MACHINE_TASK_NAME} did not start, then restart Claude Desktop."
+            StubCase::Bridge(BridgeFailure::TaskDidNotStart { task, .. }) => format!(
+                "Run `crystalline doctor` in a terminal to see why the task {task} did not start, then restart Claude Desktop."
             ),
-            StubCase::Bridge(BridgeFailure::NoAnswer) =>
+            StubCase::Bridge(BridgeFailure::NoAnswer { .. }) =>
                 "Run `crystalline status` in a terminal and check daemon.log in the Crystalline state folder, then restart Claude Desktop.".to_string(),
             StubCase::Bridge(BridgeFailure::HandshakeFailed(_)) =>
                 "Run `crystalline status` in a terminal, then restart Claude Desktop.".to_string(),
@@ -288,8 +288,8 @@ impl StubStatus {
         if let Some(bridge) = &self.bridge {
             let key = match bridge {
                 BridgeFailure::TaskMissing => "task_missing",
-                BridgeFailure::TaskDidNotStart(_) => "task_did_not_start",
-                BridgeFailure::NoAnswer => "no_answer",
+                BridgeFailure::TaskDidNotStart { .. } => "task_did_not_start",
+                BridgeFailure::NoAnswer { .. } => "no_answer",
                 BridgeFailure::HandshakeFailed(_) => "handshake_failed",
             };
             map.insert("bridge".to_string(), Value::String(key.to_string()));
@@ -740,20 +740,40 @@ mod tests {
         assert!(missing.fix().contains("crystalline doctor --fix"));
         assert_eq!(missing.tool_payload()["bridge"], "task_missing");
 
+        let user_task = r"\Crystalline Daemon for ada";
         let failed = StubStatus::for_bridge(
             "r".into(),
-            BridgeFailure::TaskDidNotStart("access is denied".into()),
+            BridgeFailure::TaskDidNotStart {
+                task: user_task.into(),
+                detail: "access is denied".into(),
+            },
         );
         assert!(
-            failed
-                .instructions()
-                .contains("did not start (access is denied)")
+            failed.instructions().contains(&format!(
+                "{user_task} that starts the Crystalline daemon did not start (access is denied)"
+            )),
+            "{}",
+            failed.instructions()
         );
         assert!(failed.fix().contains("crystalline doctor"));
+        assert!(failed.fix().contains(user_task), "{}", failed.fix());
+        assert!(!failed.instructions().contains(r"\Crystalline\Daemon"));
         assert_eq!(failed.tool_payload()["bridge"], "task_did_not_start");
 
-        let silent = StubStatus::for_bridge("r".into(), BridgeFailure::NoAnswer);
+        let silent = StubStatus::for_bridge(
+            "r".into(),
+            BridgeFailure::NoAnswer {
+                task: user_task.into(),
+            },
+        );
         assert!(silent.instructions().contains("within 15 s"));
+        assert!(
+            silent
+                .instructions()
+                .contains(&format!("the Windows task {user_task} started")),
+            "{}",
+            silent.instructions()
+        );
         assert!(silent.fix().contains("crystalline status"));
         assert_eq!(silent.tool_payload()["bridge"], "no_answer");
 
@@ -805,26 +825,31 @@ mod tests {
         );
         let missing = anyhow::Error::new(BridgeFailure::TaskMissing);
         assert_eq!(BridgeFailure::of(&missing), BridgeFailure::TaskMissing);
-        let silent = anyhow::Error::new(BridgeFailure::NoAnswer);
-        assert_eq!(BridgeFailure::of(&silent), BridgeFailure::NoAnswer);
+        let no_answer = BridgeFailure::NoAnswer {
+            task: crate::daemon_task::MACHINE_TASK_NAME.into(),
+        };
+        let silent = anyhow::Error::new(no_answer.clone());
+        assert_eq!(BridgeFailure::of(&silent), no_answer);
     }
 
     #[test]
     fn the_no_answer_copy_names_the_real_wait() {
         let wait = format!("within {} s", crate::instance::PACKAGED_TASK_WAIT.as_secs());
-        let silent =
-            StubStatus::for_bridge("r".into(), crate::daemon_task::BridgeFailure::NoAnswer);
+        let no_answer = crate::daemon_task::BridgeFailure::NoAnswer {
+            task: crate::daemon_task::user_task_name("ada"),
+        };
+        let silent = StubStatus::for_bridge("r".into(), no_answer.clone());
         assert!(
             silent.instructions().contains(&wait),
             "{}",
             silent.instructions()
         );
+        assert!(no_answer.to_string().contains(&wait), "{no_answer}");
         assert!(
-            crate::daemon_task::BridgeFailure::NoAnswer
+            no_answer
                 .to_string()
-                .contains(&wait),
-            "{}",
-            crate::daemon_task::BridgeFailure::NoAnswer
+                .contains(r"the Windows task \Crystalline Daemon for ada started"),
+            "{no_answer}"
         );
     }
 }

@@ -2095,14 +2095,18 @@ pub(crate) async fn ensure_daemon_in(
     };
     // `schtasks /Run` returns at once; the brief block before any session
     // exists is cheaper than a blocking-thread hop.
-    task.run(&name).map_err(BridgeFailure::TaskDidNotStart)?;
+    task.run(&name)
+        .map_err(|detail| BridgeFailure::TaskDidNotStart {
+            task: name.clone(),
+            detail,
+        })?;
     let deadline = Instant::now() + wait;
     loop {
         if let (Some(conn), _) = try_attach_displacing_in(here).await {
             return Ok(conn);
         }
         if Instant::now() >= deadline {
-            return Err(BridgeFailure::NoAnswer.into());
+            return Err(BridgeFailure::NoAnswer { task: name }.into());
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -5272,6 +5276,7 @@ mod tests {
     /// state folder's pipe the first time it is called and counts every call.
     #[cfg(unix)]
     struct FakeTask {
+        name: String,
         registered: bool,
         fails: bool,
         starts: bool,
@@ -5283,6 +5288,7 @@ mod tests {
     impl FakeTask {
         fn new(registered: bool, fails: bool, starts: bool) -> FakeTask {
             FakeTask {
+                name: crate::daemon_task::MACHINE_TASK_NAME.to_string(),
                 registered,
                 fails,
                 starts,
@@ -5290,13 +5296,18 @@ mod tests {
                 started: std::sync::atomic::AtomicBool::new(false),
             }
         }
+
+        /// The same task under the per-user name `doctor --fix` registers.
+        fn for_user(mut self, user: &str) -> FakeTask {
+            self.name = crate::daemon_task::user_task_name(user);
+            self
+        }
     }
 
     #[cfg(unix)]
     impl crate::daemon_task::DaemonTask for FakeTask {
         fn find(&self) -> Option<String> {
-            self.registered
-                .then(|| crate::daemon_task::MACHINE_TASK_NAME.to_string())
+            self.registered.then(|| self.name.clone())
         }
         fn run(&self, _name: &str) -> Result<(), String> {
             use std::sync::atomic::Ordering;
@@ -5403,7 +5414,7 @@ mod tests {
     #[tokio::test]
     async fn a_packaged_client_whose_task_fails_says_it_did_not_start() {
         let home = ScratchHome::new("pkg-fail");
-        let task = FakeTask::new(true, true, false);
+        let task = FakeTask::new(true, true, false).for_user("ada");
         let err = ensure_daemon_in(
             &packaged(),
             &task,
@@ -5415,7 +5426,8 @@ mod tests {
         .unwrap();
         assert!(matches!(
             err.downcast_ref::<crate::daemon_task::BridgeFailure>(),
-            Some(crate::daemon_task::BridgeFailure::TaskDidNotStart(detail)) if detail.contains("refused")
+            Some(crate::daemon_task::BridgeFailure::TaskDidNotStart { task, detail })
+                if detail.contains("refused") && task == r"\Crystalline Daemon for ada"
         ));
         drop(home);
     }
@@ -5425,7 +5437,7 @@ mod tests {
     async fn a_packaged_client_gives_up_when_no_daemon_answers_in_time() {
         let home = ScratchHome::new("pkg-silent");
         let state = config::state_dir().unwrap();
-        let task = FakeTask::new(true, false, false);
+        let task = FakeTask::new(true, false, false).for_user("ada");
         let started = Instant::now();
         let err = ensure_daemon_in(
             &packaged(),
@@ -5438,7 +5450,9 @@ mod tests {
         .unwrap();
         assert_eq!(
             err.downcast_ref::<crate::daemon_task::BridgeFailure>(),
-            Some(&crate::daemon_task::BridgeFailure::NoAnswer)
+            Some(&crate::daemon_task::BridgeFailure::NoAnswer {
+                task: r"\Crystalline Daemon for ada".to_string()
+            })
         );
         assert!(
             started.elapsed() < Duration::from_secs(4),
