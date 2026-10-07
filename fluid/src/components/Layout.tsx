@@ -72,6 +72,7 @@ import { problemDetail } from "../api/client";
 import { DOMAINS_QUERY_KEY, fetchDomains } from "../api/domains";
 import type { DomainListing, DomainSummary } from "../api/domains";
 import { useAuth } from "../auth/AuthContext";
+import { openWindow } from "../base";
 import { useRegisterCommands } from "../commands";
 import type { PaletteCommand } from "../commands";
 import { ChangeStreamProvider } from "../events/ChangeStreamProvider";
@@ -720,7 +721,7 @@ export function Layout() {
         id: "help.handbook",
         title: "Open the Handbook",
         run: () => {
-          window.open(HANDBOOK_URL, "_blank", "noopener,noreferrer");
+          openWindow(HANDBOOK_URL, "noopener,noreferrer");
         },
       },
       // Named for the act rather than for the state it is in: a palette row

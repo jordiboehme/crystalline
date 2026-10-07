@@ -23,7 +23,7 @@ const SSO_NAME = process.env.FLUID_E2E_SSO_NAME ?? "Contoso";
 test("the login screen offers the provider beside the local form", async ({
   page,
 }) => {
-  await page.goto("/");
+  await page.goto("./");
   await expect(page).toHaveURL(/\/login$/);
 
   // Local accounts first: single sign-on is layered over them, never in place
@@ -36,5 +36,8 @@ test("the login screen offers the provider beside the local form", async ({
   await expect(sso).toBeVisible();
   // The API path, not a client route: following it leaves the app for the
   // provider and comes back through the callback.
-  await expect(sso).toHaveAttribute("href", "/api/v1/auth/oidc/login");
+  await expect(sso).toHaveAttribute(
+    "href",
+    `${process.env.FLUID_E2E_BASE_PATH ?? ""}/api/v1/auth/oidc/login`,
+  );
 });

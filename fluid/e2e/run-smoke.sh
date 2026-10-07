@@ -30,6 +30,10 @@
 #   bash fluid/e2e/run-smoke.sh                 # the whole suite
 #   bash fluid/e2e/run-smoke.sh --headed        # arguments reach playwright
 #
+# `FLUID_E2E_BASE_PATH=/crystalline` runs the same journeys with the daemon
+# under a path prefix, against its embedded UI. The binary must be built after
+# `pnpm build`, as for the curl block.
+#
 # CRYSTALLINE_BIN names the binary to serve with; it defaults to the debug
 # build, then the release build, and says so when it finds neither.
 set -euo pipefail
@@ -115,6 +119,17 @@ export FLUID_E2E_USER FLUID_E2E_PASSWORD FLUID_E2E_DOMAIN
 export FLUID_E2E_PEER FLUID_E2E_PEER_PASSWORD
 export FLUID_E2E_OUTSIDER FLUID_E2E_OUTSIDER_PASSWORD
 export FLUID_E2E_PRIVATE_DOMAIN FLUID_E2E_OWNED_DOMAIN
+
+# A second run serves the daemon under a path prefix: its public_url names
+# the prefix, every curl below goes through it, and Playwright drives the
+# daemon's own embedded UI there instead of `vite preview`. Unset is the run
+# at the root.
+FLUID_E2E_BASE_PATH="${FLUID_E2E_BASE_PATH:-}"
+export FLUID_E2E_BASE_PATH
+base_env=()
+if [ -n "$FLUID_E2E_BASE_PATH" ]; then
+    base_env=("CRYSTALLINE_SERVICE_PUBLIC_URL=http://$DAEMON_ADDR$FLUID_E2E_BASE_PATH")
+fi
 
 bin="${CRYSTALLINE_BIN:-}"
 if [ -z "$bin" ]; then
@@ -228,7 +243,7 @@ oidc_env=(
 )
 
 echo "smoke: starting the daemon on $DAEMON_ADDR"
-"${isolated[@]}" "${oidc_env[@]}" "$bin" serve --http "$DAEMON_ADDR" > "$run_dir/daemon.log" 2>&1 &
+"${isolated[@]}" "${oidc_env[@]}" ${base_env[@]+"${base_env[@]}"} "$bin" serve --http "$DAEMON_ADDR" > "$run_dir/daemon.log" 2>&1 &
 daemon_pid=$!
 
 # The same probe an external monitor makes, so a daemon that answers here is a
@@ -274,14 +289,14 @@ setup_body="$run_dir/setup-body"
 api_get() {
     curl --silent --show-error --output "$setup_body" --dump-header "$setup_headers" \
         --write-out '%{http_code}' --max-time 30 \
-        --header 'Accept: application/json' "http://$DAEMON_ADDR$1"
+        --header 'Accept: application/json' "http://$DAEMON_ADDR$FLUID_E2E_BASE_PATH$1"
 }
 
 api_post_json() {
     curl --silent --show-error --output "$setup_body" --dump-header "$setup_headers" \
         --write-out '%{http_code}' --max-time 30 \
         --header 'Content-Type: application/json' --data "$2" \
-        "http://$DAEMON_ADDR$1"
+        "http://$DAEMON_ADDR$FLUID_E2E_BASE_PATH$1"
 }
 
 api_fail() {
@@ -363,7 +378,7 @@ echo "smoke: handing $FLUID_E2E_OWNED_DOMAIN to $FLUID_E2E_PEER"
 # The four checks below are the contract: the shell is served with no-store, a
 # hashed asset is immutable, a data route without a cookie is refused, and the
 # MCP standby stream at `/` is never answered with the shell.
-echo "smoke: checking the embedded web UI on http://$DAEMON_ADDR"
+echo "smoke: checking the embedded web UI on http://$DAEMON_ADDR$FLUID_E2E_BASE_PATH"
 
 ui_headers="$run_dir/ui-headers"
 ui_body="$run_dir/ui-body"
@@ -374,7 +389,7 @@ ui_body="$run_dir/ui-body"
 ui_get() {
     curl --silent --show-error --output "$ui_body" --dump-header "$ui_headers" \
         --write-out '%{http_code}' --max-time 30 \
-        --header "Accept: $2" "http://$DAEMON_ADDR$1"
+        --header "Accept: $2" "http://$DAEMON_ADDR$FLUID_E2E_BASE_PATH$1"
 }
 
 # Header names are case insensitive and every value here is ASCII, so both sides
@@ -399,6 +414,9 @@ ui_header_has content-type 'text/html' \
     || ui_fail "GET / is not text/html, so the daemon did not serve the app shell"
 ui_header_has cache-control 'no-store' \
     || ui_fail "GET / is not no-store; the one unhashed name must never be cached"
+expected_base="<base href=\"$FLUID_E2E_BASE_PATH/\" />"
+grep -qF "$expected_base" "$ui_body" \
+    || ui_fail "the served shell does not carry $expected_base, so its assets would load from the wrong place"
 
 # The asset is read out of the shell the daemon just served rather than off
 # disk, so it names a file THIS binary carries. dist/ is rebuilt further down
@@ -454,5 +472,9 @@ browsers=$(pnpm exec playwright install --dry-run chromium 2>/dev/null \
     | awk '/Install location/ { print $3; exit }')
 echo "smoke: playwright browsers at ${browsers:-an unknown location}"
 
+if [ -n "$FLUID_E2E_BASE_PATH" ]; then
+    export FLUID_E2E_BASE_URL="http://$DAEMON_ADDR$FLUID_E2E_BASE_PATH/"
+    echo "smoke: running playwright against the embedded UI at $FLUID_E2E_BASE_URL"
+fi
 echo "smoke: running playwright"
 pnpm exec playwright test "$@"

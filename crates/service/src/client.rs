@@ -1885,7 +1885,7 @@ pub async fn configure(
             let key = key.ok_or_else(|| anyhow::anyhow!("configure set requires a key"))?;
             let value = value.ok_or_else(|| anyhow::anyhow!("configure set requires a value"))?;
             let mut file = loaded.file.clone();
-            crate::settings::apply(&mut file, key, value)?;
+            crate::settings::apply_checked(&mut file, &loaded.overlay, key, value)?;
             save_file(&loaded.path, &file)?;
             Ok(setting_view(&file, key, &loaded.overlay))
         }
@@ -1895,7 +1895,7 @@ pub async fn configure(
             }
             let key = key.ok_or_else(|| anyhow::anyhow!("configure unset requires a key"))?;
             let mut file = loaded.file.clone();
-            crate::settings::unset(&mut file, key)?;
+            crate::settings::unset_checked(&mut file, &loaded.overlay, key)?;
             save_file(&loaded.path, &file)?;
             Ok(setting_view(&file, key, &loaded.overlay))
         }

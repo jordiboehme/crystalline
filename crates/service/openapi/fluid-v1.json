@@ -456,7 +456,7 @@
           "auth"
         ],
         "summary": "Start a single sign-on against the configured provider.",
-        "description": "Redirects to the provider's authorization endpoint with PKCE (S256), a server-generated state and a server-generated nonce, and sets the short-lived `fluid_oidc_state` cookie that binds the sign-in to this browser. Public, like the password login: there is no session yet. Linking a provider identity to an existing account is the POST on this same path, not a flag here: a GET carrying `link=true` is refused with a 400 that says so, because a GET could be sent by another origin. `return_to` names where the callback should land the browser once the sign-in completes - the OAuth consent page is what it exists for. It must be a path on this instance (starts with `/`, not `//`, no backslash, at most 512 printable ASCII characters); anything else is dropped and the sign-in lands on `/`.",
+        "description": "Redirects to the provider's authorization endpoint with PKCE (S256), a server-generated state and a server-generated nonce, and sets the short-lived `fluid_oidc_state` cookie that binds the sign-in to this browser. Public, like the password login: there is no session yet. Linking a provider identity to an existing account is the POST on this same path, not a flag here: a GET carrying `link=true` is refused with a 400 that says so, because a GET could be sent by another origin. `return_to` names where the callback should land the browser once the sign-in completes - the OAuth consent page is what it exists for. It must be a path on this instance, under its base path (starts with `/`, not `//`, no backslash, at most 512 printable ASCII characters); anything else is dropped and the sign-in lands on the root of the base path (`/` at the root).",
         "operationId": "oidc_login",
         "parameters": [
           {
@@ -471,7 +471,7 @@
           {
             "name": "return_to",
             "in": "query",
-            "description": "Where to send the browser once the sign-in completes: a path on this\ninstance, which the callback 302s to instead of `/`.\n\nThe OAuth consent page is what this exists for. A client sends a\nbrowser to `/authorize?request=<id>`, Fluid finds nobody signed in and\ncarries the intended location to the login page, and a provider sign-in\nhas to come back to that exact request: the pending authorization is\nonly reachable by its id, so landing anywhere else loses it.\n\nAnything [`safe_return_path`] does not accept is dropped rather than\nrefused, and the sign-in lands on `/`: the person did sign in, and only\nthe destination was unusable.",
+            "description": "Where to send the browser once the sign-in completes: a path on this\ninstance, which the callback 302s to instead of `/`.\n\nThe OAuth consent page is what this exists for. A client sends a\nbrowser to `/authorize?request=<id>`, Fluid finds nobody signed in and\ncarries the intended location to the login page, and a provider sign-in\nhas to come back to that exact request: the pending authorization is\nonly reachable by its id, so landing anywhere else loses it.\n\nAnything [`safe_return_path`] does not accept is dropped rather than\nrefused, and the sign-in lands on the root of the base path (`/` at the\nroot): the person did sign in, and only the destination was unusable.",
             "required": false,
             "schema": {
               "type": "string"

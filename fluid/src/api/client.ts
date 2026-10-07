@@ -9,8 +9,12 @@
  * site.
  */
 
-/** Where the API is mounted. Same origin as the app, always. */
-export const API_BASE = "/api/v1";
+import { API_BASE } from "../base";
+
+// Where the API is mounted and the one way to leave the page both live in
+// `src/base.ts`, which knows the path prefix; they are re-exported here so
+// every screen keeps importing them from the transport.
+export { API_BASE, navigateTo } from "../base";
 
 /** The header a mutating request echoes the session's CSRF token in. */
 export const CSRF_HEADER = "X-CSRF-Token";
@@ -91,21 +95,6 @@ export function setCsrfToken(token: string | null): void {
 /** The token currently held, if any. */
 export function getCsrfToken(): string | null {
   return csrfToken;
-}
-
-/**
- * Navigate the whole page to `location`, never a fetch.
- *
- * A handful of answers on this API are places to go rather than data to
- * render - an OAuth decision's redirect back to the client that asked, a
- * single sign-on hop to the provider - and a background fetch would follow
- * either invisibly and land nowhere anybody could act on. This is the one
- * seam every such screen calls through instead of reaching for
- * `window.location.assign` itself, so a test can watch where a screen
- * decided to send the browser without jsdom having to follow it there.
- */
-export function navigateTo(location: string): void {
-  window.location.assign(location);
 }
 
 /**

@@ -57,7 +57,7 @@ async function signIn(
   name: string,
   password: string,
 ): Promise<void> {
-  await page.goto("/");
+  await page.goto("./");
   await expect(page).toHaveURL(/\/login$/);
 
   await page.getByLabel("Name", { exact: true }).fill(name);
@@ -125,7 +125,7 @@ async function listingLoaded(page: Page): Promise<void> {
  * invitation landed would go on showing the answer it was given then.
  */
 async function reloadHome(page: Page): Promise<void> {
-  await page.goto("/");
+  await page.goto("./");
   await expect(
     page.getByRole("heading", { name: "Home", level: 1 }),
   ).toBeVisible();
@@ -162,14 +162,14 @@ test("an invitation is what makes a private domain visible", async ({
 
   // And the address is a dead end for them, in the words a domain nobody
   // registered gets.
-  await member.goto(`/d/${DOMAIN}`);
+  await member.goto(`d/${DOMAIN}`);
   await expect(
     member.getByRole("heading", { name: "Domain not found" }),
   ).toBeVisible();
 
   // The invitation, made in the browser on the card the owner administers it
   // from.
-  await owner.goto(`/d/${DOMAIN}`);
+  await owner.goto(`d/${DOMAIN}`);
   await expect(
     owner.getByRole("heading", { name: DOMAIN, level: 1 }),
   ).toBeVisible();
@@ -185,7 +185,7 @@ test("an invitation is what makes a private domain visible", async ({
   await expect(homeCard(member)).toBeVisible();
   await expect(badge(homeArticle(member))).toBeVisible();
   await expect(badge(sidebarLink(member))).toBeVisible();
-  await member.goto(`/d/${DOMAIN}`);
+  await member.goto(`d/${DOMAIN}`);
   await expect(
     member.getByRole("heading", { name: DOMAIN, level: 1 }),
   ).toBeVisible();
@@ -232,7 +232,7 @@ test("the owner of a private domain unregisters it from the danger zone", async 
   const peer = await context.newPage();
   await signIn(peer, PEER, PEER_PASSWORD);
 
-  await peer.goto(`/d/${OWNED_DOMAIN}`);
+  await peer.goto(`d/${OWNED_DOMAIN}`);
   await expect(
     peer.getByRole("heading", { name: OWNED_DOMAIN, level: 1 }),
   ).toBeVisible();

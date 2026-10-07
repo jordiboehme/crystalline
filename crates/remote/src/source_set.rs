@@ -18,7 +18,7 @@ use chrono::Utc;
 use serde_json::Value;
 
 use crate::mounts::{
-    Announcement, Hidden, HiddenReason, LocalDomain, Mount, MountTable, assign,
+    Announcement, Hidden, HiddenReason, LocalDomain, Mount, MountTable, RemoteDomain, assign,
     hidden_local_sentence,
 };
 use crate::server_client::{Budget, Connection, ForwardedAgent, RemoteFailure};
@@ -39,6 +39,33 @@ fn same_sign_in(open: &SourceRecord, record: &SourceRecord) -> bool {
         && open.kind == record.kind
         && open.connected_at == record.connected_at
         && open.from_env == record.from_env
+}
+
+/// The assignment a refresh writes down: `file` with the environment's
+/// source after it, decided over `offers`, and written back into `file`
+/// without that source. Answers every domain a list moved, for the caller
+/// to log once the file is saved (the daemon's refresh is where a listed
+/// domain first offered moves, D17); the other announcements stay unsaid
+/// here, as they were.
+fn assign_for_refresh(
+    file: &mut SourcesFile,
+    env: Option<&SourceRecord>,
+    local: &[LocalDomain],
+    offers: impl FnOnce(&SourcesFile) -> BTreeMap<String, Vec<RemoteDomain>>,
+) -> Vec<Announcement> {
+    let mut combined = file.clone();
+    if let Some(env) = env {
+        combined.sources.push(env.clone());
+    }
+    let offers = offers(&combined);
+    let (_, said) = assign(&mut combined, local, &offers);
+    if env.is_some() {
+        combined.sources.pop();
+    }
+    *file = combined;
+    said.into_iter()
+        .filter(|a| matches!(a, Announcement::Moved { .. }))
+        .collect()
 }
 
 /// Open one source's connection on a blocking thread (one bounded keychain
@@ -719,24 +746,21 @@ impl SourceSet {
             update_sources(&dir, |file| {
                 // Read under the sources lock, as the domains stand now.
                 let local = local.read().unwrap_or_else(|e| e.into_inner()).clone();
-                let mut combined = file.clone();
-                if let Some(env) = &env {
-                    combined.sources.push(env.clone());
-                }
-                let offers = cached_offers(&combined, &dir);
-                let _ = assign(&mut combined, &local, &offers);
-                if env.is_some() {
-                    combined.sources.pop();
-                }
-                *file = combined.clone();
-                Ok(combined)
+                let moved = assign_for_refresh(file, env.as_ref(), &local, |combined| {
+                    cached_offers(combined, &dir)
+                });
+                Ok((file.clone(), moved))
             })
         })
         .await;
         // A name is used only once it is written down (decision D13): when
         // the save failed, the table stays as it was.
         match saved {
-            Ok(Ok(file)) => {
+            Ok(Ok((file, moved))) => {
+                // Said once it is written down, one line per move.
+                for one in &moved {
+                    tracing::info!("{one}");
+                }
                 let current = {
                     let mut inner = self.write();
                     let current = inner.generation == generation;
@@ -913,6 +937,78 @@ impl SourceSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mounts::{OriginIdentity, RemoteDomain};
+    use crate::server_token::CredentialKind;
+    use crate::sources::MountRecord;
+
+    fn plain(name: &str, list: Option<&[&str]>) -> SourceRecord {
+        SourceRecord {
+            url: format!("https://crystalline.{name}.com"),
+            name: name.to_string(),
+            account: "ada".to_string(),
+            kind: CredentialKind::Token,
+            token_endpoint: None,
+            revocation_endpoint: None,
+            connected_at: chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap(),
+            mounts: Vec::new(),
+            domains: list.map(|l| l.iter().map(|d| d.to_string()).collect()),
+            from_env: false,
+        }
+    }
+
+    fn platform(name: &str) -> RemoteDomain {
+        RemoteDomain {
+            name: name.to_string(),
+            bullets: Vec::new(),
+            origin: Some(OriginIdentity {
+                forge: "github.com".to_string(),
+                repository: "acme/platform".to_string(),
+                path: String::new(),
+                branch: "main".to_string(),
+            }),
+        }
+    }
+
+    #[test]
+    fn the_refresh_answers_the_moves_it_writes_down_and_nothing_else() {
+        let mut file = SourcesFile::default();
+        file.sources.push(plain("acme", None));
+        file.sources[0].mounts.push(MountRecord {
+            remote: "platform".into(),
+            local: "platform".into(),
+        });
+        file.sources.push(plain("beta", Some(&["plat"])));
+        let offers = |_: &SourcesFile| {
+            BTreeMap::from([
+                ("acme".to_string(), vec![platform("platform")]),
+                ("beta".to_string(), vec![platform("plat")]),
+            ])
+        };
+        let moved = assign_for_refresh(&mut file, None, &[], offers);
+        assert_eq!(
+            moved,
+            vec![Announcement::Moved {
+                local: "platform".into(),
+                from: "acme".into(),
+                to: "beta".into(),
+            }]
+        );
+        assert!(
+            file.sources[0].mounts.is_empty(),
+            "the move is written down"
+        );
+        assert_eq!(
+            file.sources[1].mounts,
+            vec![MountRecord {
+                remote: "plat".into(),
+                local: "platform".into(),
+            }]
+        );
+        assert!(
+            assign_for_refresh(&mut file, None, &[], offers).is_empty(),
+            "a move written down is not made again at the next refresh"
+        );
+    }
 
     fn both(note: MountNote) -> (String, String) {
         (note.render(true), note.render(false))
@@ -978,6 +1074,7 @@ mod tests {
             revocation_endpoint: None,
             connected_at: Utc::now(),
             mounts: Vec::new(),
+            domains: None,
             from_env: false,
         };
         let saved = record.clone();
@@ -1100,5 +1197,72 @@ mod tests {
             1,
             "the source was asked once"
         );
+    }
+
+    #[test]
+    fn an_environment_source_that_lists_a_domain_serves_one_name_and_saves_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut acme = plain("acme", None);
+        acme.mounts.push(MountRecord {
+            remote: "platform".into(),
+            local: "platform".into(),
+        });
+        let saved = acme.clone();
+        update_sources(dir.path(), |f| {
+            f.sources.push(saved);
+            Ok(())
+        })
+        .unwrap();
+        let cache = |record: &SourceRecord, domain: RemoteDomain| {
+            crate::write_cached(
+                &record.host_dir(dir.path()),
+                ROUTING_FILE,
+                &crate::Cached {
+                    account: record.account.clone(),
+                    etag: "e".into(),
+                    fetched_at: Utc::now(),
+                    data: serde_json::json!({ "domains": [domain] }),
+                    last_failure: None,
+                },
+            )
+            .unwrap();
+        };
+        cache(&acme, platform("platform"));
+        let env = |name: &str| match name {
+            crate::sources::REMOTE_URL_ENV => Some("https://kb.acme.com".to_string()),
+            REMOTE_TOKEN_ENV => Some("cmt_x".to_string()),
+            crate::sources::REMOTE_DOMAINS_ENV => Some("plat".to_string()),
+            _ => None,
+        };
+        let kb = env_source(env, &["acme".to_string()]).unwrap();
+        cache(&kb, platform("plat"));
+        let set = SourceSet::load(dir.path().to_path_buf(), Vec::new(), env);
+        let served = |set: &SourceSet| {
+            set.table()
+                .mounts
+                .iter()
+                .map(|m| (m.source.clone(), m.local.clone()))
+                .collect::<Vec<_>>()
+        };
+        let first = served(&set);
+        assert_eq!(first, vec![(kb.name.clone(), "platform".to_string())]);
+        set.reload();
+        assert_eq!(served(&set), first, "the name never flips between rebuilds");
+
+        // What the refresh writes down, then the rebuild after it.
+        let moved = update_sources(dir.path(), |file| {
+            Ok(assign_for_refresh(file, Some(&kb), &[], |combined| {
+                cached_offers(combined, dir.path())
+            }))
+        })
+        .unwrap();
+        assert!(moved.is_empty(), "{moved:?}");
+        assert_eq!(
+            load_sources(dir.path()).unwrap().sources[0].mounts,
+            acme.mounts,
+            "sources.json still holds acme's record"
+        );
+        set.reload();
+        assert_eq!(served(&set), first, "nor after a refresh");
     }
 }

@@ -1829,6 +1829,68 @@ pub fn http_router_with_shutdown(
     )
 }
 
+/// The whole router behind its base path: a request that carries the prefix
+/// of `service.public_url` (`/crystalline`, `/crystalline/` or
+/// `/crystalline/...`) is routed without it, and every other request is
+/// routed unchanged. So `proxy_pass http://daemon:7411/;` (the proxy strips)
+/// and `proxy_pass http://daemon:7411;` (it passes the prefix through) both
+/// work, and the bare prefix answers like the prefix with a slash, with no
+/// redirect a client would refuse to follow.
+///
+/// A service around the router rather than `Router::layer`: middleware added
+/// with `layer` runs after routing, and a rewritten path would never be
+/// routed again. Returned as a router (one fallback service) so every caller
+/// keeps serving a router. At the root nothing is wrapped, so the router is
+/// the 0.23.0 one.
+fn under_base_path(router: axum::Router, base: crystalline_core::base::BasePath) -> axum::Router {
+    if base.is_root() {
+        return router;
+    }
+    axum::Router::new().fallback_service(StripBasePath {
+        base,
+        inner: router,
+    })
+}
+
+/// See [`under_base_path`].
+#[derive(Clone)]
+struct StripBasePath {
+    base: crystalline_core::base::BasePath,
+    inner: axum::Router,
+}
+
+impl tower_service::Service<axum::extract::Request> for StripBasePath {
+    type Response = axum::response::Response;
+    type Error = std::convert::Infallible;
+    type Future = <axum::Router as tower_service::Service<axum::extract::Request>>::Future;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        tower_service::Service::<axum::extract::Request>::poll_ready(&mut self.inner, cx)
+    }
+
+    fn call(&mut self, mut request: axum::extract::Request) -> Self::Future {
+        if let Some(rest) = self.base.strip(request.uri().path()) {
+            let target = match request.uri().query() {
+                Some(query) => format!("{rest}?{query}"),
+                None => rest.to_string(),
+            };
+            // A path the router already parsed, minus a prefix of
+            // `[a-z0-9._-]` segments, is always a valid path and query.
+            if let Ok(path_and_query) = target.parse::<axum::http::uri::PathAndQuery>() {
+                let mut parts = request.uri().clone().into_parts();
+                parts.path_and_query = Some(path_and_query);
+                if let Ok(uri) = axum::http::Uri::from_parts(parts) {
+                    *request.uri_mut() = uri;
+                }
+            }
+        }
+        self.inner.call(request)
+    }
+}
+
 /// The body both router builders above share; `shutdown` is `None` for a
 /// router with no daemon behind it.
 fn http_router_inner(
@@ -1857,6 +1919,7 @@ fn http_router_inner(
         let config = engine.config();
         let api = config.api_enabled();
         let mcp_auth = config.auth_mcp().then(|| auth.clone());
+        let base_path = crate::settings::base_path(&config);
         let (router, service) = http_base(
             engine,
             http_sessions,
@@ -1867,7 +1930,7 @@ fn http_router_inner(
             mcp_auth,
             shutdown,
         )?;
-        Ok(router.fallback_service(service))
+        Ok(under_base_path(router.fallback_service(service), base_path))
     }
 }
 
@@ -1894,6 +1957,7 @@ pub fn http_router_with_assets<E: rust_embed::RustEmbed + 'static>(
     // Read here with the other two, and for the same reason: the `auth.*` keys
     // are startup-effective, so a running daemon serves the tier it started in.
     let mcp_auth = config.auth_mcp().then(|| auth.clone());
+    let base_path = crate::settings::base_path(&config);
     let (router, service) = http_base(
         engine,
         http_sessions,
@@ -1905,7 +1969,7 @@ pub fn http_router_with_assets<E: rust_embed::RustEmbed + 'static>(
         shutdown,
     )?;
     if !ui {
-        return Ok(router.fallback_service(service));
+        return Ok(under_base_path(router.fallback_service(service), base_path));
     }
     // The UI is mounted whether or not a bundle was embedded: with an empty
     // embed every navigation gets the 503 not-built page rather than falling
@@ -1921,20 +1985,24 @@ pub fn http_router_with_assets<E: rust_embed::RustEmbed + 'static>(
     // these paths is byte for byte the response the same request got before the
     // UI existed - a `get(...).fallback_service(...)` pair would decorate every
     // MCP answer at `/` with `Allow: GET,HEAD`.
-    Ok(router
-        .route(
-            "/",
-            axum::routing::any_service(service.clone())
-                .layer(axum::middleware::from_fn(serve_index::<E>)),
-        )
-        .route(
-            "/assets/{*path}",
-            axum::routing::any_service(service.clone())
-                .layer(axum::middleware::from_fn(serve_asset::<E>)),
-        )
-        .fallback_service(
-            axum::routing::any_service(service).layer(axum::middleware::from_fn(dispatch_ui::<E>)),
-        ))
+    Ok(under_base_path(
+        router
+            .route(
+                "/",
+                axum::routing::any_service(service.clone()).layer(
+                    axum::middleware::from_fn_with_state(base_path.clone(), serve_index::<E>),
+                ),
+            )
+            .route(
+                "/assets/{*path}",
+                axum::routing::any_service(service.clone())
+                    .layer(axum::middleware::from_fn(serve_asset::<E>)),
+            )
+            .fallback_service(axum::routing::any_service(service).layer(
+                axum::middleware::from_fn_with_state(base_path.clone(), dispatch_ui::<E>),
+            )),
+        base_path,
+    ))
 }
 
 /// Whether the UI may answer this request at all, which is the guard in front
@@ -2013,6 +2081,7 @@ fn http_base(
     use rmcp::transport::streamable_http_server::tower::StreamableHttpService;
 
     let config = engine.config();
+    let base_path = crate::settings::base_path(&config);
     // `auth.oauth`'s endpoints are REST routes under `/api/v1`; with the API
     // off there is nowhere for them to live, so the refusal happens here
     // rather than waiting for `RestState::new` below, which never runs when
@@ -2154,7 +2223,10 @@ fn http_base(
     // here". See `rest::oauth`.
     let mut router = axum::Router::new()
         .route("/health", axum::routing::get(health))
-        .merge(crate::rest::well_known_routes(oauth.then_some(origin_rule)))
+        .merge(crate::rest::well_known_routes(
+            oauth.then_some(origin_rule),
+            &base_path,
+        ))
         // One exact path on the outer router, beside the `/api/v1` nest below.
         // The nest mounts the JSON API under a catch-all for the prefix, and
         // an exact path wins over a catch-all, so the API keeps every other
@@ -2180,13 +2252,14 @@ fn http_base(
 /// narrower Accept rule applies to the app's other routes alone.
 #[cfg(feature = "fluid-ui")]
 async fn serve_index<E: rust_embed::RustEmbed>(
+    axum::extract::State(base): axum::extract::State<crystalline_core::base::BasePath>,
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     if !is_ui_fetch(&request) {
         return next.run(request).await;
     }
-    crate::ui::index_response::<E>()
+    crate::ui::index_response::<E>(&base)
 }
 
 /// `/assets/{*path}`: one content-hashed chunk, held for a year, and a plain
@@ -2213,6 +2286,7 @@ async fn serve_asset<E: rust_embed::RustEmbed>(
 /// plumbing of its own to do it.
 #[cfg(feature = "fluid-ui")]
 async fn dispatch_ui<E: rust_embed::RustEmbed>(
+    axum::extract::State(base): axum::extract::State<crystalline_core::base::BasePath>,
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
@@ -2238,7 +2312,7 @@ async fn dispatch_ui<E: rust_embed::RustEmbed>(
         }
     }
     if crate::ui::wants_spa(request.method(), accept_of(&request)) {
-        return crate::ui::index_response::<E>();
+        return crate::ui::index_response::<E>(&base);
     }
     next.run(request).await
 }

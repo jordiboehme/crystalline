@@ -43,17 +43,18 @@
 //! No text a server sent reaches a message: an OAuth error is named by its
 //! code only, and only when the code is the plain shape RFC 6749 gives it.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use chrono::Utc;
+use crystalline_core::base::{BasePath, PublicBase};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::mounts::{Announcement, LocalDomain, assign};
+use crate::mounts::{Announcement, HiddenReason, LocalDomain, MountTable, SkipReason, assign};
 use crate::server_client::{
     CONNECT_TIMEOUT, ONE_DOMAIN_LIMIT, UNREACHABLE_WORDS, cause, form_body, http_client,
     redirect_sentence, seconds,
@@ -172,9 +173,19 @@ impl std::fmt::Display for SignInError {
 
 impl std::error::Error for SignInError {}
 
-/// The origin of `input`: scheme, host and port, no path and no trailing
-/// slash. `https` anywhere, plain `http` only to this machine.
+/// The base address of `input`: scheme, host, port and the path (one leading
+/// slash, no trailing slash), so `https://example.com/crystalline/` and
+/// `https://example.com/crystalline` are the same server. No query, no
+/// fragment, and the path follows the rules a server's `service.public_url`
+/// does. `https` anywhere, plain `http` only to this machine.
 pub fn normalize_server_url(input: &str) -> Result<String, SignInError> {
+    // A URL parser reads a backslash as a slash, so `https://host\\kb` would
+    // quietly name the root of `host`.
+    if input.contains('\\') {
+        return Err(SignInError::BadUrl(format!(
+            "'{input}' has a backslash; a server address uses '/' only"
+        )));
+    }
     let url = reqwest::Url::parse(input.trim())
         .map_err(|e| SignInError::BadUrl(format!("'{input}' is not a URL: {e}")))?;
     let host = url
@@ -191,10 +202,122 @@ pub fn normalize_server_url(input: &str) -> Result<String, SignInError> {
             )));
         }
     }
-    Ok(match url.port() {
+    let path = BasePath::of_url(input).map_err(|problem| {
+        SignInError::BadUrl(format!(
+            "'{input}' cannot be a server address: {}",
+            problem.sentence()
+        ))
+    })?;
+    let origin = match url.port() {
         Some(port) => format!("{}://{host}:{port}", url.scheme()),
         None => format!("{}://{host}", url.scheme()),
-    })
+    };
+    Ok(format!("{origin}{}", path.as_str()))
+}
+
+/// Where the two OAuth documents live, by specification.
+const PROTECTED_RESOURCE_PATH: &str = "/.well-known/oauth-protected-resource";
+const AUTHORIZATION_SERVER_PATH: &str = "/.well-known/oauth-authorization-server";
+
+/// The addresses of `document` for `base`, in the order to ask them: the RFC
+/// 8414 and RFC 9728 address with the path inserted after the host, then the
+/// copy inside the prefix. One address at the root, where the two are the
+/// same, so a root server is asked exactly what 0.23.0 asked.
+fn document_addresses(base: &str, document: &str) -> Vec<String> {
+    let Ok(parsed) = PublicBase::parse(base) else {
+        return vec![format!("{base}{document}")];
+    };
+    let inserted = parsed.well_known(document);
+    let inside = parsed.join(document);
+    if inserted == inside {
+        vec![inserted]
+    } else {
+        vec![inserted, inside]
+    }
+}
+
+/// The answer to use from `urls`, asked in order: the first that `usable`
+/// accepts, otherwise whatever the last one answers, refusal or failure
+/// included. So an address before the last that answers no usable document
+/// (any status that is not a success, a body that is not the document, a
+/// document for another server, or no answer at all) only moves on to the
+/// next, and every check on the answer used still applies in full.
+async fn first_usable(
+    http: &reqwest::Client,
+    urls: &[String],
+    origin: &str,
+    budget: &Budget,
+    usable: impl Fn(&Answer) -> bool,
+) -> Result<Answer, SignInError> {
+    let (last, before) = urls.split_last().expect("at least one address");
+    for url in before {
+        if let Ok(answer) = send(http.get(url.as_str()), origin, budget).await
+            && usable(&answer)
+        {
+            return Ok(answer);
+        }
+    }
+    send(http.get(last.as_str()), origin, budget).await
+}
+
+/// `value` without one trailing slash.
+fn one_slash_off(value: &str) -> &str {
+    value.strip_suffix('/').unwrap_or(value)
+}
+
+/// Whether a protected-resource document of a server under a prefix names
+/// its `base` as both the resource and the authorization server.
+fn resource_stays_inside(document: &Value, base: &str) -> bool {
+    let names_base = |value: &Value| value.as_str().is_some_and(|v| one_slash_off(v) == base);
+    names_base(&document["resource"]) && names_base(&document["authorization_servers"][0])
+}
+
+/// The metadata members a client uses or stores.
+const METADATA_ENDPOINTS: [&str; 4] = [
+    "authorization_endpoint",
+    "token_endpoint",
+    "registration_endpoint",
+    "revocation_endpoint",
+];
+
+/// `url` as a request would send it, when that is under `base`: the same
+/// origin, and a path that is the base path or below it. Read after the
+/// parser has removed dot segments (`..`, `%2e%2e`), so the check is made on
+/// the address a request goes to, and that address is what gets stored.
+fn under_base(url: &str, base: &PublicBase) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let path = parsed.path();
+    let base_path = base.path().as_str();
+    let inside = path == base_path
+        || path
+            .strip_prefix(base_path)
+            .is_some_and(|rest| rest.starts_with('/'));
+    (parsed.origin().ascii_serialization() == base.origin() && inside).then(|| parsed.to_string())
+}
+
+/// Whether the metadata of a server under a prefix names its `base` as the
+/// issuer and keeps every endpoint under it: the three it needs present,
+/// the revocation endpoint when it names one.
+fn metadata_stays_inside(meta: &Value, base: &PublicBase) -> bool {
+    let base_text = base.to_string();
+    meta["issuer"]
+        .as_str()
+        .is_some_and(|i| one_slash_off(i) == base_text)
+        && METADATA_ENDPOINTS
+            .iter()
+            .all(|name| match meta[*name].as_str() {
+                Some(url) => under_base(url, base).is_some(),
+                None => *name == "revocation_endpoint",
+            })
+}
+
+/// The refusal of OAuth documents that lead away from `base`.
+fn outside_base(base: &str) -> SignInError {
+    SignInError::Protocol(format!(
+        "the OAuth documents of {base} name an address outside {base}, so this machine does \
+         not sign in there through the browser; nothing was saved. Paste a personal MCP token \
+         instead: crystalline connect {base} --token"
+    ))
 }
 
 /// Whether `url` may carry a sign-in: https anywhere, plain http only to
@@ -382,13 +505,13 @@ pub struct OauthEndpoints {
 /// What a server said about itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Discovered {
-    /// The origin.
+    /// The base address.
     pub origin: String,
     /// Its OAuth endpoints, `None` where `auth.oauth` is off.
     pub oauth: Option<OauthEndpoints>,
 }
 
-/// Check that a Crystalline server answers at `origin`, and read its OAuth
+/// Check that a Crystalline server answers at the base address `origin`, and read its OAuth
 /// metadata when it has any, within [`SIGN_IN_LIMIT`].
 pub async fn discover(http: &reqwest::Client, origin: &str) -> Result<Discovered, SignInError> {
     discover_by(http, origin, &Budget::new(SIGN_IN_LIMIT)).await
@@ -409,10 +532,30 @@ async fn discover_by(
         origin: origin.to_string(),
         oauth: None,
     };
-    let resource = send(
-        http.get(format!("{origin}/.well-known/oauth-protected-resource")),
+    // A protected-resource document is usable when it names this base as
+    // its resource and names an authorization server.
+    // Under a prefix the documents can be answered by whatever else runs on
+    // the host, so every document used must stay inside the base.
+    let prefix = PublicBase::parse(origin)
+        .ok()
+        .filter(|base| !base.path().is_root());
+    let prefixed = prefix.is_some();
+    let resource = first_usable(
+        http,
+        &match prefix {
+            Some(_) => document_addresses(origin, PROTECTED_RESOURCE_PATH),
+            None => vec![format!("{origin}{PROTECTED_RESOURCE_PATH}")],
+        },
         origin,
         budget,
+        |answer| {
+            answer.ok()
+                && answer.json()["authorization_servers"][0].is_string()
+                && answer.json()["resource"]
+                    .as_str()
+                    .is_some_and(|r| r.trim_end_matches('/') == origin)
+                && (!prefixed || resource_stays_inside(answer.json(), origin))
+        },
     )
     .await?;
     // Only "there is no such document" means no browser sign-in; any other
@@ -435,6 +578,9 @@ async fn discover_by(
             "the protected-resource document of {origin} names no resource or authorization server"
         )));
     };
+    if prefixed && !resource_stays_inside(document, origin) {
+        return Err(outside_base(origin));
+    }
     let issuer = issuer.trim_end_matches('/').to_string();
     let insecure = || SignInError::InsecureEndpoints {
         url: origin.to_string(),
@@ -442,10 +588,25 @@ async fn discover_by(
     if !is_secure_endpoint(&issuer) {
         return Err(insecure());
     }
-    let meta = send(
-        http.get(format!("{issuer}/.well-known/oauth-authorization-server")),
+    // Metadata is usable when it names the issuer it was fetched for.
+    let meta = first_usable(
+        http,
+        &match prefix {
+            Some(_) => document_addresses(&issuer, AUTHORIZATION_SERVER_PATH),
+            None => vec![format!("{issuer}{AUTHORIZATION_SERVER_PATH}")],
+        },
         origin,
         budget,
+        |answer| {
+            answer.ok()
+                && answer.json()["issuer"]
+                    .as_str()
+                    .map(|i| i.trim_end_matches('/'))
+                    == Some(issuer.as_str())
+                && prefix
+                    .as_ref()
+                    .is_none_or(|base| metadata_stays_inside(answer.json(), base))
+        },
     )
     .await?;
     // An authorization server without metadata offers nothing a browser
@@ -464,6 +625,17 @@ async fn discover_by(
     if meta["issuer"].as_str().map(|i| i.trim_end_matches('/')) != Some(issuer.as_str()) {
         return Err(insecure());
     }
+    if let Some(base) = &prefix
+        && !metadata_stays_inside(meta, base)
+    {
+        return Err(outside_base(origin));
+    }
+    // Under a prefix an endpoint is stored as a request sends it, which the
+    // check above read; at the root it is stored as written, as in 0.23.0.
+    let as_used = |url: &str| match &prefix {
+        Some(base) => under_base(url, base).ok_or_else(|| outside_base(origin)),
+        None => Ok(url.to_string()),
+    };
     let endpoint = |name: &str| {
         let url = meta[name].as_str().ok_or_else(|| {
             SignInError::Protocol(format!(
@@ -471,13 +643,13 @@ async fn discover_by(
             ))
         })?;
         if is_secure_endpoint(url) {
-            Ok(url.to_string())
+            as_used(url)
         } else {
             Err(insecure())
         }
     };
     let revocation_endpoint = match meta["revocation_endpoint"].as_str() {
-        Some(url) if is_secure_endpoint(url) => Some(url.to_string()),
+        Some(url) if is_secure_endpoint(url) => Some(as_used(url)?),
         Some(_) => return Err(insecure()),
         None => None,
     };
@@ -506,6 +678,38 @@ pub struct Connected {
     /// The collisions, replaced local copies and skipped duplicates this
     /// source brought, in the order they were decided.
     pub announcements: Vec<Announcement>,
+    /// The local names of the domains this source serves now.
+    pub taken: Vec<String>,
+    /// The domains it offers that are not on its list, by their names there.
+    pub not_chosen: Vec<String>,
+    /// Listed names its server does not offer to this account right now.
+    pub not_offered: Vec<String>,
+    /// Local domains a mount of any source hid as a copy before this
+    /// connect and nothing hides now.
+    pub came_back: Vec<String>,
+}
+
+/// What a `connect` does with the source's list of domains.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DomainChoice {
+    /// No `--domains` and no `--all-domains`: the saved list stays, so a new
+    /// sign-in never widens it quietly. A new source takes all.
+    Keep,
+    /// `--domains`: the list, already checked by `parse_domain_list`.
+    Only(Vec<String>),
+    /// `--all-domains`: every domain the server offers again.
+    All,
+}
+
+impl DomainChoice {
+    /// The list the source has after this connect, given the one it had.
+    pub fn applied(&self, saved: Option<Vec<String>>) -> Option<Vec<String>> {
+        match self {
+            DomainChoice::Keep => saved,
+            DomainChoice::Only(list) => Some(list.clone()),
+            DomainChoice::All => None,
+        }
+    }
 }
 
 /// Add a server as a source and sign in through the browser. `open_browser`
@@ -553,6 +757,63 @@ where
     F: FnOnce(&str) + Send,
     P: FnOnce(String) -> Option<String> + Send + 'static,
 {
+    browser_inner(
+        input,
+        name,
+        DomainChoice::Keep,
+        remote_dir,
+        local,
+        open_browser,
+        paste_token,
+        wait,
+    )
+    .await
+}
+
+/// [`connect_with_browser`] that also sets the source's list of domains:
+/// [`DomainChoice::Keep`] leaves it as it is.
+pub async fn connect_with_browser_choosing<F, P>(
+    input: &str,
+    name: Option<&str>,
+    choice: DomainChoice,
+    remote_dir: &Path,
+    local: &[LocalDomain],
+    open_browser: F,
+    paste_token: P,
+) -> Result<Connected, SignInError>
+where
+    F: FnOnce(&str) + Send,
+    P: FnOnce(String) -> Option<String> + Send + 'static,
+{
+    browser_inner(
+        input,
+        name,
+        choice,
+        remote_dir,
+        local,
+        open_browser,
+        paste_token,
+        SIGN_IN_WAIT,
+    )
+    .await
+}
+
+/// The browser sign-in, with the choice of domains and the wait.
+#[allow(clippy::too_many_arguments)]
+async fn browser_inner<F, P>(
+    input: &str,
+    name: Option<&str>,
+    choice: DomainChoice,
+    remote_dir: &Path,
+    local: &[LocalDomain],
+    open_browser: F,
+    paste_token: P,
+    wait: Duration,
+) -> Result<Connected, SignInError>
+where
+    F: FnOnce(&str) + Send,
+    P: FnOnce(String) -> Option<String> + Send + 'static,
+{
     let origin = normalize_server_url(input)?;
     check_name(remote_dir, &origin, name)?;
     let http = client()?;
@@ -564,6 +825,7 @@ where
             &http,
             origin,
             name,
+            &choice,
             &token,
             remote_dir,
             local,
@@ -671,9 +933,18 @@ where
             revocation_endpoint: oauth.revocation_endpoint.clone(),
             connected_at: now,
             mounts: Vec::new(),
+            domains: None,
             from_env: false,
         };
-        save(remote_dir, record, name, &credential, routing, local)
+        save(
+            remote_dir,
+            record,
+            name,
+            &choice,
+            &credential,
+            routing,
+            local,
+        )
     }
     .await;
     match finished {
@@ -766,13 +1037,51 @@ pub async fn connect_with_token_within(
     local: &[LocalDomain],
     limit: Duration,
 ) -> Result<Connected, SignInError> {
+    token_inner(
+        input,
+        name,
+        DomainChoice::Keep,
+        token,
+        remote_dir,
+        local,
+        limit,
+    )
+    .await
+}
+
+/// [`connect_with_token`] that also sets the source's list of domains:
+/// [`DomainChoice::Keep`] leaves it as it is.
+pub async fn connect_with_token_choosing(
+    input: &str,
+    name: Option<&str>,
+    choice: DomainChoice,
+    token: &str,
+    remote_dir: &Path,
+    local: &[LocalDomain],
+) -> Result<Connected, SignInError> {
+    token_inner(input, name, choice, token, remote_dir, local, SIGN_IN_LIMIT).await
+}
+
+/// The token sign-in, with the choice of domains and the limit.
+async fn token_inner(
+    input: &str,
+    name: Option<&str>,
+    choice: DomainChoice,
+    token: &str,
+    remote_dir: &Path,
+    local: &[LocalDomain],
+    limit: Duration,
+) -> Result<Connected, SignInError> {
     let origin = normalize_server_url(input)?;
     check_name(remote_dir, &origin, name)?;
     shaped(token)?;
     let http = client()?;
     let budget = Budget::new(limit);
     discover_by(&http, &origin, &budget).await?;
-    with_token(&http, origin, name, token, remote_dir, local, &budget).await
+    with_token(
+        &http, origin, name, &choice, token, remote_dir, local, &budget,
+    )
+    .await
 }
 
 /// A pasted token, trimmed, when it looks like a personal MCP token.
@@ -789,10 +1098,12 @@ fn shaped(token: &str) -> Result<&str, SignInError> {
 
 /// The token paste once the server is known to be Crystalline: who the token
 /// is, the routing model, and the save.
+#[allow(clippy::too_many_arguments)]
 async fn with_token(
     http: &reqwest::Client,
     origin: String,
     name: Option<&str>,
+    choice: &DomainChoice,
     token: &str,
     remote_dir: &Path,
     local: &[LocalDomain],
@@ -813,9 +1124,18 @@ async fn with_token(
         revocation_endpoint: None,
         connected_at: now,
         mounts: Vec::new(),
+        domains: None,
         from_env: false,
     };
-    let (connected, replaced) = save(remote_dir, record, name, &credential, routing, local)?;
+    let (connected, replaced) = save(
+        remote_dir,
+        record,
+        name,
+        choice,
+        &credential,
+        routing,
+        local,
+    )?;
     retire(replaced, &origin).await;
     Ok(connected)
 }
@@ -1013,6 +1333,7 @@ fn save(
     remote_dir: &Path,
     mut record: SourceRecord,
     name: Option<&str>,
+    choice: &DomainChoice,
     credential: &ServerCredential,
     routing: Option<Value>,
     local: &[LocalDomain],
@@ -1041,12 +1362,20 @@ fn save(
             }
             (None, None) => default_source_name(&record.url, &file.names()),
         };
+        // What was hidden before this connect, so a copy that comes back
+        // can be named.
+        let before = {
+            let mut probe = file.clone();
+            let offers = cached_offers(&probe, remote_dir);
+            assign(&mut probe, local, &offers).0
+        };
+        record.domains = choice.applied(file.find(&record.url).and_then(|s| s.domains.clone()));
         let name = file.upsert(record.clone()).name.clone();
         let mut offers = cached_offers(file, remote_dir);
         if let Some(routing) = &routing {
             offers.insert(name.clone(), remote_domains(routing));
         }
-        let (_, said) = assign(file, local, &offers);
+        let (table, said) = assign(file, local, &offers);
         let mine: Vec<Announcement> = said
             .into_iter()
             .filter(|a| match a {
@@ -1054,12 +1383,40 @@ fn save(
                 | Announcement::ReplacesLocal { source, .. }
                 | Announcement::Skipped { source, .. }
                 | Announcement::LocalShadowed { source, .. } => *source == name,
+                Announcement::Moved { to, from, .. } => *to == name || *from == name,
             })
             .collect();
         let source = file.find(&name).cloned().expect("just saved");
-        Ok((source, mine))
+        let hidden_now: BTreeSet<&str> = table.shadowed.iter().map(|h| h.local.as_str()).collect();
+        let came_back = hidden_copies(&before)
+            .into_iter()
+            .filter(|local| !hidden_now.contains(local.as_str()))
+            .collect();
+        let taken = table.of_source(&name).map(|m| m.local.clone()).collect();
+        let not_chosen = table
+            .skipped
+            .iter()
+            .filter(|s| s.source == name && s.reason == SkipReason::NotChosen)
+            .map(|s| s.remote.clone())
+            .collect();
+        let not_offered = table
+            .not_offered
+            .iter()
+            .filter(|u| u.source == name)
+            .map(|u| u.remote.clone())
+            .collect();
+        Ok((
+            source,
+            mine,
+            Chosen {
+                taken,
+                not_chosen,
+                not_offered,
+                came_back,
+            },
+        ))
     });
-    let (source, announcements) = match updated {
+    let (source, announcements, chosen) = match updated {
         Ok(done) => done,
         Err(e) => {
             let restored = match &previous {
@@ -1110,9 +1467,31 @@ fn save(
             source,
             routing,
             announcements,
+            taken: chosen.taken,
+            not_chosen: chosen.not_chosen,
+            not_offered: chosen.not_offered,
+            came_back: chosen.came_back,
         },
         replaced,
     ))
+}
+
+/// What a connect's list did, for [`Connected`].
+struct Chosen {
+    taken: Vec<String>,
+    not_chosen: Vec<String>,
+    not_offered: Vec<String>,
+    came_back: Vec<String>,
+}
+
+/// The local domains `table` hides as a copy of a mount, by name.
+fn hidden_copies(table: &MountTable) -> BTreeSet<String> {
+    table
+        .shadowed
+        .iter()
+        .filter(|h| h.reason == HiddenReason::Copy)
+        .map(|h| h.local.clone())
+        .collect()
 }
 
 /// The server's routing model for `token`, best effort: a server that
@@ -1314,6 +1693,18 @@ fn sha256(text: &str) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_choice_keeps_replaces_or_clears_the_saved_list() {
+        let saved = Some(vec!["alpha".to_string()]);
+        assert_eq!(DomainChoice::Keep.applied(saved.clone()), saved);
+        assert_eq!(DomainChoice::Keep.applied(None), None);
+        assert_eq!(
+            DomainChoice::Only(vec!["beta".into()]).applied(saved.clone()),
+            Some(vec!["beta".to_string()])
+        );
+        assert_eq!(DomainChoice::All.applied(saved), None);
+    }
+
     /// Time spent before a request leaves less of the step to run, but the
     /// limit a timeout names stays the one the caller set.
     #[test]
@@ -1339,27 +1730,422 @@ mod tests {
     }
 
     #[test]
-    fn a_server_url_becomes_its_origin() {
+    fn a_server_url_becomes_its_base() {
+        for (written, kept) in [
+            ("https://KB.example/", "https://kb.example"),
+            (" https://kb.example:8443 ", "https://kb.example:8443"),
+            (
+                "https://kb.example/crystalline/",
+                "https://kb.example/crystalline",
+            ),
+            (
+                "https://kb.example/crystalline",
+                "https://kb.example/crystalline",
+            ),
+            (
+                "https://kb.example:443/team/kb",
+                "https://kb.example/team/kb",
+            ),
+            (
+                "http://127.0.0.1:7411/crystalline",
+                "http://127.0.0.1:7411/crystalline",
+            ),
+            ("http://127.0.0.1:7411/", "http://127.0.0.1:7411"),
+            ("http://localhost:7411", "http://localhost:7411"),
+            ("http://[::1]:7411", "http://[::1]:7411"),
+        ] {
+            assert_eq!(normalize_server_url(written).unwrap(), kept, "{written}");
+        }
+    }
+
+    #[test]
+    fn a_server_url_with_a_query_a_fragment_or_a_bad_path_is_refused() {
+        for bad in [
+            "https://kb.example/?x=1",
+            "https://kb.example/crystalline#top",
+            "https://kb.example/a/../b",
+            "https://kb.example/a~b",
+            "https://kb.example/Crystalline",
+            "https://kb.example/api",
+        ] {
+            assert!(
+                matches!(normalize_server_url(bad), Err(SignInError::BadUrl(_))),
+                "{bad}"
+            );
+        }
+        assert!(matches!(
+            normalize_server_url("http://kb.example/crystalline"),
+            Err(SignInError::InsecureUrl { .. })
+        ));
+    }
+
+    /// A stand-in serving `/health` and the documents at the paths it is told.
+    async fn documents_at(
+        paths: &'static [&'static str],
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let base = format!("{origin}/crystalline");
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let doc_base = base.clone();
+        let router = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+            let seen = seen.clone();
+            let base = doc_base.clone();
+            async move {
+                let path = uri.path().to_string();
+                seen.lock().unwrap().push(path.clone());
+                if path == "/crystalline/health" {
+                    return (
+                        axum::http::StatusCode::OK,
+                        axum::Json(serde_json::json!({ "status": "ok" })),
+                    );
+                }
+                if !paths.contains(&path.as_str()) {
+                    return (
+                        axum::http::StatusCode::NOT_FOUND,
+                        axum::Json(serde_json::Value::Null),
+                    );
+                }
+                let body = if path.contains("protected-resource") {
+                    serde_json::json!({ "resource": base, "authorization_servers": [base] })
+                } else {
+                    serde_json::json!({
+                        "issuer": base,
+                        "authorization_endpoint": format!("{base}/api/v1/oauth/authorize"),
+                        "token_endpoint": format!("{base}/api/v1/oauth/token"),
+                        "registration_endpoint": format!("{base}/api/v1/oauth/register"),
+                    })
+                };
+                (axum::http::StatusCode::OK, axum::Json(body))
+            }
+        });
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        (base, asked)
+    }
+
+    #[tokio::test]
+    async fn discovery_tries_the_inserted_address_first() {
+        let (base, asked) = documents_at(&[
+            "/.well-known/oauth-protected-resource/crystalline",
+            "/.well-known/oauth-authorization-server/crystalline",
+        ])
+        .await;
+        let found = discover(&client().unwrap(), &base).await.unwrap();
+        let oauth = found.oauth.unwrap();
+        assert_eq!(oauth.issuer, base);
+        assert_eq!(oauth.token_endpoint, format!("{base}/api/v1/oauth/token"));
         assert_eq!(
-            normalize_server_url("https://KB.example/some/path/").unwrap(),
-            "https://kb.example"
+            asked.lock().unwrap().clone(),
+            vec![
+                "/crystalline/health".to_string(),
+                "/.well-known/oauth-protected-resource/crystalline".to_string(),
+                "/.well-known/oauth-authorization-server/crystalline".to_string(),
+            ],
+            "the RFC addresses answer, so the copies inside the prefix are never asked"
         );
+    }
+
+    #[tokio::test]
+    async fn discovery_falls_back_to_the_documents_inside_the_prefix() {
+        let (base, _) = documents_at(&[
+            "/crystalline/.well-known/oauth-protected-resource",
+            "/crystalline/.well-known/oauth-authorization-server",
+        ])
+        .await;
+        let oauth = discover(&client().unwrap(), &base)
+            .await
+            .unwrap()
+            .oauth
+            .unwrap();
+        assert_eq!(oauth.resource, base);
+        assert_eq!(oauth.issuer, base);
+    }
+
+    /// One answer of [`serve_documents`]. In the text, `{base}` is the
+    /// stand-in's base and `{origin}` its origin.
+    #[derive(Clone, Copy, Debug)]
+    enum Doc {
+        /// A 404.
+        Missing,
+        /// A site at the host root that answers every path with a page.
+        Html,
+        /// A site at the host root that redirects every path.
+        Redirect,
+        /// A gateway whose upstream is down.
+        BadGateway,
+        /// A protected-resource document: its resource and its
+        /// authorization server.
+        Resource(&'static str, &'static str),
+        /// Authorization server metadata: its issuer and its token endpoint.
+        Metadata(&'static str, &'static str),
+    }
+
+    const HONEST_RESOURCE: Doc = Doc::Resource("{base}", "{base}");
+    const HONEST_METADATA: Doc = Doc::Metadata("{base}", "{base}/api/v1/oauth/token");
+    const ELSEWHERE: &str = "http://127.0.0.1:1/elsewhere";
+
+    /// What each of the four document addresses of a server under
+    /// `/crystalline` answers.
+    #[derive(Clone, Copy, Debug)]
+    struct Documents {
+        inserted_resource: Doc,
+        inserted_metadata: Doc,
+        inside_resource: Doc,
+        inside_metadata: Doc,
+    }
+
+    impl Documents {
+        /// Honest copies inside the prefix, the inserted addresses as given.
+        fn inserted(resource: Doc, metadata: Doc) -> Documents {
+            Documents {
+                inserted_resource: resource,
+                inserted_metadata: metadata,
+                inside_resource: HONEST_RESOURCE,
+                inside_metadata: HONEST_METADATA,
+            }
+        }
+
+        /// The same answers at both addresses.
+        fn everywhere(resource: Doc, metadata: Doc) -> Documents {
+            Documents {
+                inserted_resource: resource,
+                inserted_metadata: metadata,
+                inside_resource: resource,
+                inside_metadata: metadata,
+            }
+        }
+    }
+
+    /// A stand-in under `/crystalline` answering as `documents` says.
+    async fn serve_documents(
+        documents: Documents,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let base = format!("{origin}/crystalline");
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let (doc_origin, doc_base) = (origin.clone(), base.clone());
+        let router = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+            let seen = seen.clone();
+            let (origin, base) = (doc_origin.clone(), doc_base.clone());
+            async move {
+                let path = uri.path().to_string();
+                seen.lock().unwrap().push(path.clone());
+                let fill = |text: &str| text.replace("{base}", &base).replace("{origin}", &origin);
+                let doc = match path.as_str() {
+                    "/crystalline/health" => {
+                        return axum::Json(json!({ "status": "ok" })).into_response();
+                    }
+                    "/.well-known/oauth-protected-resource/crystalline" => {
+                        documents.inserted_resource
+                    }
+                    "/.well-known/oauth-authorization-server/crystalline" => {
+                        documents.inserted_metadata
+                    }
+                    "/crystalline/.well-known/oauth-protected-resource" => {
+                        documents.inside_resource
+                    }
+                    "/crystalline/.well-known/oauth-authorization-server" => {
+                        documents.inside_metadata
+                    }
+                    _ => Doc::Missing,
+                };
+                match doc {
+                    Doc::Missing => StatusCode::NOT_FOUND.into_response(),
+                    Doc::Html => (
+                        StatusCode::OK,
+                        [("content-type", "text/html")],
+                        "<!doctype html><title>home</title>",
+                    )
+                        .into_response(),
+                    Doc::Redirect => (StatusCode::FOUND, [("location", "/")], "").into_response(),
+                    Doc::BadGateway => StatusCode::BAD_GATEWAY.into_response(),
+                    Doc::Resource(resource, server) => axum::Json(json!({
+                        "resource": fill(resource),
+                        "authorization_servers": [fill(server)],
+                    }))
+                    .into_response(),
+                    Doc::Metadata(issuer, token) => axum::Json(json!({
+                        "issuer": fill(issuer),
+                        "authorization_endpoint": format!("{base}/api/v1/oauth/authorize"),
+                        "token_endpoint": fill(token),
+                        "registration_endpoint": format!("{base}/api/v1/oauth/register"),
+                    }))
+                    .into_response(),
+                }
+            }
+        });
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        (base, asked)
+    }
+
+    /// Discovery against `documents` uses the honest copies inside the
+    /// prefix: the values it returns are ones only they name.
+    async fn uses_the_inside_copy(documents: Documents) {
+        let (base, _) = serve_documents(documents).await;
+        let oauth = discover(&client().unwrap(), &base)
+            .await
+            .unwrap_or_else(|e| panic!("{documents:?}: {e}"))
+            .oauth
+            .unwrap();
+        assert_eq!(oauth.resource, base, "{documents:?}");
+        assert_eq!(oauth.issuer, base, "{documents:?}");
         assert_eq!(
-            normalize_server_url(" https://kb.example:8443 ").unwrap(),
-            "https://kb.example:8443"
+            oauth.token_endpoint,
+            format!("{base}/api/v1/oauth/token"),
+            "{documents:?}"
         );
+    }
+
+    /// Discovery against `documents` is refused.
+    async fn is_refused(documents: Documents) -> SignInError {
+        let (base, _) = serve_documents(documents).await;
+        match discover(&client().unwrap(), &base).await {
+            Ok(found) => panic!("{documents:?}: {found:?}"),
+            Err(refused) => refused,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_inserted_address_that_is_no_usable_document_falls_back_to_the_prefix() {
+        for inserted in [Doc::Html, Doc::Redirect, Doc::BadGateway] {
+            uses_the_inside_copy(Documents::inserted(inserted, inserted)).await;
+        }
+        uses_the_inside_copy(Documents::inserted(
+            Doc::Resource(ELSEWHERE, "{base}"),
+            HONEST_METADATA,
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn another_issuer_at_both_addresses_is_still_refused() {
+        let refused = is_refused(Documents::everywhere(
+            HONEST_RESOURCE,
+            Doc::Metadata(ELSEWHERE, "{base}/api/v1/oauth/token"),
+        ))
+        .await;
+        assert!(
+            matches!(refused, SignInError::InsecureEndpoints { .. }),
+            "{refused:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_document_at_the_host_root_cannot_name_another_authorization_server() {
+        let steered = Doc::Resource("{base}", ELSEWHERE);
+        uses_the_inside_copy(Documents::inserted(steered, HONEST_METADATA)).await;
+        let refused = is_refused(Documents::everywhere(steered, HONEST_METADATA)).await;
+        let base_named = refused.to_string();
+        assert!(
+            base_named.contains("/crystalline") && base_named.contains("outside"),
+            "{base_named}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_document_at_the_host_root_cannot_name_another_token_endpoint() {
+        let steered = Doc::Metadata("{base}", "http://127.0.0.1:1/elsewhere/token");
+        uses_the_inside_copy(Documents::inserted(HONEST_RESOURCE, steered)).await;
+        let refused = is_refused(Documents::everywhere(HONEST_RESOURCE, steered)).await;
+        assert!(refused.to_string().contains("outside"), "{refused}");
+    }
+
+    #[tokio::test]
+    async fn an_endpoint_on_another_path_of_the_same_host_is_refused_under_a_prefix() {
+        for token in [
+            "{origin}/other/token",
+            "{base}/../other/token",
+            "{base}/%2e%2e/other/token",
+            "{base}/./%2E%2E/x",
+            "{origin}/crystallinex/token",
+        ] {
+            let other_path = Doc::Metadata("{base}", token);
+            uses_the_inside_copy(Documents::inserted(HONEST_RESOURCE, other_path)).await;
+            let refused = is_refused(Documents::everywhere(HONEST_RESOURCE, other_path)).await;
+            assert!(
+                refused.to_string().contains("outside"),
+                "{token}: {refused}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_endpoint_under_the_base_is_used_in_its_parsed_form() {
+        let dotted = Doc::Metadata("{base}", "{base}/api/./v1/oauth/token");
+        uses_the_inside_copy(Documents::everywhere(HONEST_RESOURCE, dotted)).await;
+    }
+
+    #[tokio::test]
+    async fn a_root_server_is_asked_exactly_what_0_23_0_asked() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let doc_origin = origin.clone();
+        let router = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+            let seen = seen.clone();
+            let origin = doc_origin.clone();
+            async move {
+                use axum::response::IntoResponse;
+                let path = uri.path().to_string();
+                seen.lock().unwrap().push(path.clone());
+                // The issuer has a path of its own, which 0.23.0 asked
+                // with the document appended and nothing inserted.
+                let issuer = format!("{origin}/issuer");
+                match path.as_str() {
+                    "/health" => axum::Json(json!({ "status": "ok" })).into_response(),
+                    "/.well-known/oauth-protected-resource" => axum::Json(json!({
+                        "resource": origin,
+                        "authorization_servers": [issuer],
+                    }))
+                    .into_response(),
+                    "/issuer/.well-known/oauth-authorization-server" => axum::Json(json!({
+                        "issuer": issuer,
+                        "authorization_endpoint": format!("{origin}/api/v1/oauth/authorize"),
+                        "token_endpoint": format!("{origin}/api/v1/oauth/token"),
+                        "registration_endpoint": format!("{origin}/api/v1/oauth/register"),
+                    }))
+                    .into_response(),
+                    _ => axum::http::StatusCode::NOT_FOUND.into_response(),
+                }
+            }
+        });
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let oauth = discover(&client().unwrap(), &origin)
+            .await
+            .unwrap()
+            .oauth
+            .unwrap();
+        assert_eq!(oauth.issuer, format!("{origin}/issuer"));
         assert_eq!(
-            normalize_server_url("http://127.0.0.1:7411/").unwrap(),
-            "http://127.0.0.1:7411"
+            asked.lock().unwrap().clone(),
+            vec![
+                "/health".to_string(),
+                "/.well-known/oauth-protected-resource".to_string(),
+                "/issuer/.well-known/oauth-authorization-server".to_string(),
+            ]
         );
-        assert_eq!(
-            normalize_server_url("http://localhost:7411").unwrap(),
-            "http://localhost:7411"
-        );
-        assert_eq!(
-            normalize_server_url("http://[::1]:7411").unwrap(),
-            "http://[::1]:7411"
-        );
+    }
+
+    #[test]
+    fn a_backslash_in_a_server_url_is_refused() {
+        for bad in ["https://kb.example\\crystalline", "https://kb.example/a\\b"] {
+            assert!(
+                matches!(normalize_server_url(bad), Err(SignInError::BadUrl(_))),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

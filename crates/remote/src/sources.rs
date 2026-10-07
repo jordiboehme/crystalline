@@ -30,7 +30,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::error::RemoteError;
-use crate::server_token::{CredentialKind, server_key};
+use crate::server_token::{CredentialKind, server_folder, server_key};
 
 /// The file, in `<state_dir>/remote/`.
 pub const SOURCES_FILE: &str = "sources.json";
@@ -46,6 +46,9 @@ pub const LOCAL_SUFFIX: &str = "local";
 pub const REMOTE_URL_ENV: &str = "CRYSTALLINE_REMOTE_URL";
 /// The environment's personal MCP token for [`REMOTE_URL_ENV`].
 pub const REMOTE_TOKEN_ENV: &str = "CRYSTALLINE_REMOTE_TOKEN";
+/// The domains the environment's source takes, by their names on its
+/// server, comma separated. Unset or empty: every domain it offers.
+pub const REMOTE_DOMAINS_ENV: &str = "CRYSTALLINE_REMOTE_DOMAINS";
 
 /// Host labels that name what the machine is rather than whose it is, so a
 /// default source name skips them: `crystalline.acme.com` is `acme`.
@@ -80,7 +83,8 @@ pub struct MountRecord {
 /// One connected server.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SourceRecord {
-    /// The server's origin: scheme, host, optional port, no path, no slash.
+    /// The server's base address: scheme, host, optional port and the path it
+    /// is served under, no trailing slash.
     pub url: String,
     /// Its short name on this machine, used in notes and collision names.
     pub name: String,
@@ -99,21 +103,28 @@ pub struct SourceRecord {
     /// Every name this source handed out, in the order it handed them out.
     #[serde(default)]
     pub mounts: Vec<MountRecord>,
+    /// The domains this source takes, by their names on the server, sorted;
+    /// `None` takes every domain it offers. Set by `connect --domains`,
+    /// kept by a `connect` without it, cleared by `--all-domains`. Absent in
+    /// a file 0.23.0 wrote, which therefore takes all, and never written
+    /// when `None`, so 0.23.0 reads a file this build wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domains: Option<Vec<String>>,
     /// Built from the environment rather than read from the file.
     #[serde(skip)]
     pub from_env: bool,
 }
 
 impl SourceRecord {
-    /// The folder and keychain key for this server.
+    /// The keychain key for this server (see [`server_key`]).
     pub fn key(&self) -> String {
         server_key(&self.url)
     }
 
-    /// `<remote_dir>/<key>`: the credential fallback, the refresh lock and
-    /// the cached answers.
+    /// `<remote_dir>/<folder>`: the credential fallback, the refresh lock and
+    /// the cached answers, in the folder [`server_folder`] names for the key.
     pub fn host_dir(&self, remote_dir: &Path) -> PathBuf {
-        remote_dir.join(self.key())
+        remote_dir.join(server_folder(&self.key()))
     }
 }
 
@@ -136,8 +147,8 @@ impl Default for SourcesFile {
     }
 }
 
-/// `url` as a comparison key: the server key, which folds case, the path and
-/// a trailing slash away.
+/// `url` as a comparison key: the server key, which folds the host's case and
+/// a trailing slash away and keeps the path.
 fn same_server(a: &str, b: &str) -> bool {
     server_key(a) == server_key(b)
 }
@@ -182,6 +193,7 @@ impl SourcesFile {
                 existing.token_endpoint = record.token_endpoint;
                 existing.revocation_endpoint = record.revocation_endpoint;
                 existing.connected_at = record.connected_at;
+                existing.domains = record.domains;
                 &self.sources[at]
             }
             None => {
@@ -344,13 +356,115 @@ pub fn default_source_name(origin: &str, taken: &[String]) -> String {
         .expect("an unbounded count finds a free name")
 }
 
+/// The environment's server address, normalized, or why it cannot be. The
+/// reason never repeats the value: a token pasted into the wrong variable
+/// would otherwise land in the log on every load.
+fn env_url(raw: &str) -> Result<String, String> {
+    use crystalline_core::base::{BaseProblem, PathProblem, PublicBase};
+    let problem = match crate::sign_in::normalize_server_url(raw) {
+        Ok(url) => return Ok(url),
+        Err(problem) => problem,
+    };
+    let reason = if raw.contains('\\') {
+        "it has a backslash, and a server address uses '/' only"
+    } else if let crate::sign_in::SignInError::InsecureUrl { .. } = problem {
+        "plain http is allowed only to this machine"
+    } else {
+        match PublicBase::parse(raw) {
+            Err(BaseProblem::Path(PathProblem::Character(_))) => {
+                "its path may use only lower-case letters, digits, '.', '_' and '-'"
+            }
+            Err(BaseProblem::Path(PathProblem::DotSegment(_))) => {
+                "its path has a '.' or '..' segment, which a browser resolves away"
+            }
+            Err(BaseProblem::Path(PathProblem::Reserved(_))) => {
+                "its path starts with a segment the server answers at itself"
+            }
+            Err(BaseProblem::Path(PathProblem::EmptySegment)) => {
+                "its path has an empty segment (two slashes in a row)"
+            }
+            Err(BaseProblem::Path(PathProblem::QueryOrFragment)) => {
+                "it carries a query or a fragment"
+            }
+            _ => "it is not a usable server address",
+        }
+    };
+    Err(reason.to_string())
+}
+
+/// A `--domains` value or [`REMOTE_DOMAINS_ENV`]: names separated by commas,
+/// each passing the rule every local domain name passes, sorted and without
+/// duplicates. An empty list is refused: a source that takes nothing is a
+/// source to disconnect.
+pub fn parse_domain_list(raw: &str) -> Result<Vec<String>, String> {
+    let mut names = Vec::new();
+    let parts: Vec<&str> = raw.split(',').map(str::trim).collect();
+    if parts.iter().all(|p| p.is_empty()) {
+        return Err("name at least one domain, for example alpha,beta".to_string());
+    }
+    // No refusal repeats the value or a part of it: a token pasted into the
+    // wrong place would otherwise land on the terminal, or in the daemon log
+    // on every load for the environment variable. The position says which
+    // name it is.
+    for (at, part) in parts.into_iter().enumerate() {
+        let position = at + 1;
+        if part.is_empty() {
+            return Err(format!(
+                "name {position} in the list is empty (two commas in a row)"
+            ));
+        }
+        if crystalline_core::config::registration::validate_domain_name(part).is_err() {
+            return Err(format!(
+                "name {position} in the list cannot name a domain: {}",
+                crystalline_core::config::registration::DOMAIN_NAME_RULE
+            ));
+        }
+        names.push(part.to_string());
+    }
+    names.sort();
+    names.dedup();
+    Ok(names)
+}
+
+/// [`REMOTE_DOMAINS_ENV`] as a list, or the warning that leaves the
+/// environment source out. The warning names the variable and the rule and
+/// never the value: it lands in the daemon log on every load, and the value
+/// may be a token pasted into the wrong variable.
+fn env_domains(raw: &str) -> Result<Vec<String>, String> {
+    parse_domain_list(raw).map_err(|e| {
+        format!(
+            "{REMOTE_DOMAINS_ENV}: {e}; the server from {REMOTE_URL_ENV} is left out rather than taking every domain"
+        )
+    })
+}
+
 /// The source the environment adds, when both variables are set. Never
 /// saved; named like any other, past `taken`.
 pub fn env_source(env: impl Fn(&str) -> Option<String>, taken: &[String]) -> Option<SourceRecord> {
-    let url = env(REMOTE_URL_ENV)
-        .map(|v| v.trim().trim_end_matches('/').to_string())
+    let raw = env(REMOTE_URL_ENV)
+        .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())?;
+    let url = match env_url(&raw) {
+        Ok(url) => url,
+        Err(reason) => {
+            tracing::warn!("{REMOTE_URL_ENV}: {reason}; using the value as written");
+            raw.trim_end_matches('/').to_string()
+        }
+    };
     env(REMOTE_TOKEN_ENV).filter(|v| !v.trim().is_empty())?;
+    let domains = match env(REMOTE_DOMAINS_ENV)
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+    {
+        None => None,
+        Some(raw) => match env_domains(&raw) {
+            Ok(list) => Some(list),
+            Err(warning) => {
+                tracing::warn!("{warning}");
+                return None;
+            }
+        },
+    };
     Some(SourceRecord {
         name: default_source_name(&url, taken),
         url,
@@ -360,6 +474,7 @@ pub fn env_source(env: impl Fn(&str) -> Option<String>, taken: &[String]) -> Opt
         revocation_endpoint: None,
         connected_at: Utc::now(),
         mounts: Vec::new(),
+        domains,
         from_env: true,
     })
 }
@@ -377,6 +492,7 @@ mod tests {
             revocation_endpoint: None,
             connected_at: DateTime::from_timestamp(1_800_000_000, 0).unwrap(),
             mounts: Vec::new(),
+            domains: None,
             from_env: false,
         }
     }
@@ -586,11 +702,210 @@ mod tests {
     }
 
     #[test]
-    fn a_host_folder_is_the_server_key_under_the_remote_folder() {
-        let source = record("http://127.0.0.1:7411", "server");
+    fn a_host_folder_is_the_server_folder_under_the_remote_folder() {
+        let root = record("http://127.0.0.1:7411", "server");
         assert_eq!(
-            source.host_dir(Path::new("/state/remote")),
+            root.host_dir(Path::new("/state/remote")),
             Path::new("/state/remote").join("127.0.0.1_7411")
+        );
+        let prefixed = record("https://example.com/crystalline", "example");
+        assert_eq!(
+            prefixed.host_dir(Path::new("/state/remote")),
+            Path::new("/state/remote").join("example.com~crystalline")
+        );
+    }
+
+    #[test]
+    fn two_paths_on_one_host_are_two_sources() {
+        let mut file = SourcesFile::default();
+        file.upsert(record("https://example.com/crystalline", "example"));
+        file.upsert(record("https://example.com/other", "example-2"));
+        assert_eq!(file.sources.len(), 2, "the second never replaces the first");
+        assert_eq!(
+            file.find("https://example.com/crystalline/").unwrap().name,
+            "example"
+        );
+        assert_eq!(
+            file.find("https://example.com/other").unwrap().name,
+            "example-2"
+        );
+        assert!(file.find("https://example.com").is_none());
+    }
+
+    #[test]
+    fn the_default_name_is_the_host_word_whatever_the_path() {
+        assert_eq!(
+            default_source_name("https://kb.acme.com/crystalline", &[]),
+            "acme"
+        );
+    }
+
+    #[test]
+    fn the_environment_source_keeps_its_path() {
+        let env = |name: &str| match name {
+            REMOTE_URL_ENV => Some("https://KB.acme.com/crystalline/".to_string()),
+            REMOTE_TOKEN_ENV => Some("cmt_x".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            env_source(env, &[]).unwrap().url,
+            "https://kb.acme.com/crystalline"
+        );
+    }
+
+    #[test]
+    fn an_environment_url_the_rules_refuse_keeps_its_0_23_0_spelling() {
+        let env = |name: &str| match name {
+            REMOTE_URL_ENV => Some("http://kb.internal:7411/".to_string()),
+            REMOTE_TOKEN_ENV => Some("cmt_x".to_string()),
+            _ => None,
+        };
+        assert_eq!(env_source(env, &[]).unwrap().url, "http://kb.internal:7411");
+    }
+
+    #[test]
+    fn the_environment_warning_never_repeats_the_value() {
+        for value in [
+            "cmt_SECRET1",
+            "https://kb.example/Cmt_SECRET2",
+            "http://kb.internal/cmt_SECRET3",
+            "https://kb.example\\cmt_SECRET4",
+            "https://kb.example/cmt_SECRET5/../x",
+            "https://kb.example/cmt_SECRET6?x=1",
+        ] {
+            let reason = env_url(value).unwrap_err();
+            assert!(!reason.contains("SECRET"), "{value}: {reason}");
+        }
+        assert_eq!(
+            env_url("https://kb.example/crystalline/").unwrap(),
+            "https://kb.example/crystalline"
+        );
+        let reason = env_url("https://kb.example/Crystalline").unwrap_err();
+        assert!(
+            reason.contains("may use only lower-case letters, digits, '.', '_' and '-'"),
+            "{reason}"
+        );
+    }
+
+    /// The domain list is checked like the url: a token pasted into
+    /// `--domains` or the variable is repeated by no refusal and by no
+    /// warning, because a warning lands in the daemon log on every load.
+    #[test]
+    fn a_domain_list_refusal_never_repeats_the_value() {
+        let long = format!("cmt_SECRET3{}", "0".repeat(64));
+        for value in [
+            "alpha,cmt_SECRET1 x".to_string(),
+            "cmt_SECRET2,,beta".to_string(),
+            format!("alpha,{long}"),
+            "https://kb.example/cmt_SECRET4".to_string(),
+            "cmt_SECRET5/../x".to_string(),
+        ] {
+            let reason = parse_domain_list(&value).unwrap_err();
+            assert!(!reason.contains("SECRET"), "{value}: {reason}");
+            let warning = env_domains(&value).unwrap_err();
+            assert!(!warning.contains("SECRET"), "{value}: {warning}");
+            assert!(warning.starts_with(REMOTE_DOMAINS_ENV), "{warning}");
+        }
+        let reason = parse_domain_list("alpha,Not A Name").unwrap_err();
+        assert!(reason.contains("name 2"), "says which name: {reason}");
+        assert!(
+            reason.contains("use letters, digits"),
+            "says the rule: {reason}"
+        );
+        assert_eq!(env_domains("beta, alpha").unwrap(), vec!["alpha", "beta"]);
+    }
+
+    #[test]
+    fn a_domain_list_is_checked_sorted_and_deduplicated() {
+        assert_eq!(
+            parse_domain_list("gamma, alpha,beta,alpha").unwrap(),
+            vec!["alpha", "beta", "gamma"]
+        );
+        for bad in ["", " , ", "alpha,,beta", "Bad Name", "../x"] {
+            assert!(parse_domain_list(bad).is_err(), "{bad:?}");
+        }
+        let err = parse_domain_list("").unwrap_err();
+        assert!(err.contains("at least one"), "{err}");
+    }
+
+    #[test]
+    fn a_sources_file_from_0_23_0_loads_as_all_and_is_written_back_without_a_list() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(SOURCES_FILE),
+            r#"{ "v": 1, "sources": [{ "url": "https://crystalline.acme.com", "name": "acme",
+                 "account": "ada", "kind": "token", "connected_at": "2026-10-05T12:00:00Z",
+                 "mounts": [{ "remote": "open", "local": "open" }] }] }"#,
+        )
+        .unwrap();
+        let file = load_sources(dir.path()).unwrap();
+        assert_eq!(file.sources[0].domains, None, "no field is all");
+        update_sources(dir.path(), |_| Ok(())).unwrap();
+        let written = std::fs::read_to_string(dir.path().join(SOURCES_FILE)).unwrap();
+        assert!(
+            !written.contains("\"domains\""),
+            "no list is invented: {written}"
+        );
+    }
+
+    #[test]
+    fn a_list_round_trips_and_a_reconnect_record_carries_its_list() {
+        let dir = tempfile::tempdir().unwrap();
+        update_sources(dir.path(), |file| {
+            let mut acme = record("https://crystalline.acme.com", "acme");
+            acme.domains = Some(vec!["open".into()]);
+            file.upsert(acme);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            load_sources(dir.path()).unwrap().sources[0].domains,
+            Some(vec!["open".to_string()])
+        );
+        let mut file = load_sources(dir.path()).unwrap();
+        let mut again = record("https://crystalline.acme.com", "acme");
+        again.domains = None;
+        file.upsert(again);
+        assert_eq!(
+            file.sources[0].domains, None,
+            "upsert takes the list the caller decided"
+        );
+    }
+
+    #[test]
+    fn the_environment_list_sets_the_list_of_the_environment_source() {
+        let env = |name: &str| match name {
+            REMOTE_URL_ENV => Some("https://kb.acme.com".to_string()),
+            REMOTE_TOKEN_ENV => Some("cmt_x".to_string()),
+            REMOTE_DOMAINS_ENV => Some("beta,alpha".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            env_source(env, &[]).unwrap().domains,
+            Some(vec!["alpha".to_string(), "beta".to_string()])
+        );
+        let empty = |name: &str| match name {
+            REMOTE_DOMAINS_ENV => Some(String::new()),
+            other => env(other),
+        };
+        assert_eq!(
+            env_source(empty, &[]).unwrap().domains,
+            None,
+            "an empty variable is unset"
+        );
+    }
+
+    #[test]
+    fn a_bad_environment_list_leaves_the_environment_source_out() {
+        let env = |name: &str| match name {
+            REMOTE_URL_ENV => Some("https://kb.acme.com".to_string()),
+            REMOTE_TOKEN_ENV => Some("cmt_x".to_string()),
+            REMOTE_DOMAINS_ENV => Some("alpha,Not A Name".to_string()),
+            _ => None,
+        };
+        assert!(
+            env_source(env, &[]).is_none(),
+            "never all instead of a list it could not read"
         );
     }
 }

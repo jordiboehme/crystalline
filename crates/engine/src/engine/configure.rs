@@ -37,7 +37,7 @@ impl Engine {
                     // safe. Lock order is always file_config then config.
                     let mut file_guard = self.file_config.write().unwrap();
                     let mut file = self.fresh_file_config(&file_guard);
-                    settings::apply(&mut file, key, value)?;
+                    settings::apply_checked(&mut file, &self.overlay, key, value)?;
                     self.persist_config(&file)?;
                     // Recompute the effective config from the freshly saved file
                     // plus the overlay, so an env-overridden key keeps reading its
@@ -61,7 +61,7 @@ impl Engine {
                     // Same write-lock-first discipline and lock order as Set above.
                     let mut file_guard = self.file_config.write().unwrap();
                     let mut file = self.fresh_file_config(&file_guard);
-                    settings::unset(&mut file, key)?;
+                    settings::unset_checked(&mut file, &self.overlay, key)?;
                     self.persist_config(&file)?;
                     let effective = self.overlay.apply(&file);
                     let view = self.setting_view_json(&file, key);

@@ -12,7 +12,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.23.0"
+version = "0.23.1"
 authors = ["Jordi Böhme <jordi@boehme-lopez.de>"]
 edition = "2024"
 license = "MPL-2.0"
@@ -247,6 +247,12 @@ tiktoken-rs = "0.12.0"
 # untouched.
 [profile.dev]
 debug = "line-tables-only"
+
+# Dependencies carry no debug info: our own code keeps line tables for
+# backtraces, and the dependency graph (turso, candle, axum, rmcp) stops
+# writing gigabytes of line tables into every test binary.
+[profile.dev.package."*"]
+debug = false
 
 # Password hashing dominates the account-creating test binaries, and argon2 at
 # opt-level 0 costs about 14x what it does optimised. The test profile inherits

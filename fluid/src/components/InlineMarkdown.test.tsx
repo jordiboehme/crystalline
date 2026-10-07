@@ -43,6 +43,18 @@ describe("InlineMarkdown", () => {
     expect(link.className).toContain("underline");
   });
 
+  it("a fragment link stays on the page it is written on", async () => {
+    window.history.pushState({}, "", "/d/eng/e/notes/a");
+    try {
+      render(<InlineMarkdown source="[top](#observations)" />);
+
+      const link = await screen.findByRole("link", { name: "top" });
+      expect(link.getAttribute("href")).toBe("/d/eng/e/notes/a#observations");
+    } finally {
+      window.history.pushState({}, "", "/");
+    }
+  });
+
   it("leaves plain prose with no markup untouched", async () => {
     render(<InlineMarkdown source="Route here for eng questions." />);
 

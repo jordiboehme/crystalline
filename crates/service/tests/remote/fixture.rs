@@ -49,13 +49,27 @@ pub fn engram(title: &str, permalink: &str, line: &str) -> String {
     )
 }
 
-/// Which doors the instance has.
+/// How the proxy in front of a prefixed instance forwards: `proxy_pass
+/// http://daemon/;` strips the prefix, `proxy_pass http://daemon;` passes it
+/// through. Both keep `Host`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Proxy {
+    Strips,
+    PassesThrough,
+}
+
+/// Which doors the instance has, and the path it is served under.
 #[derive(Clone, Copy, Debug)]
 pub struct Options {
     /// `auth.mcp`.
     pub mcp_auth: bool,
     /// `auth.oauth`.
     pub oauth: bool,
+    /// The path of `service.public_url`; `None` serves at the root with
+    /// `public_url` unset, exactly as before.
+    pub prefix: Option<&'static str>,
+    /// How the front forwards a prefixed request.
+    pub proxy: Proxy,
 }
 
 impl Options {
@@ -63,17 +77,104 @@ impl Options {
     pub const TOKENS: Options = Options {
         mcp_auth: true,
         oauth: false,
+        prefix: None,
+        proxy: Proxy::PassesThrough,
     };
     /// Agents authenticate, and OAuth is served.
     pub const OAUTH: Options = Options {
         mcp_auth: true,
         oauth: true,
+        prefix: None,
+        proxy: Proxy::PassesThrough,
     };
     /// The legacy open tier.
     pub const OPEN: Options = Options {
         mcp_auth: false,
         oauth: false,
+        prefix: None,
+        proxy: Proxy::PassesThrough,
     };
+
+    /// The same doors, under `prefix`, behind a front that forwards `proxy`.
+    pub const fn under(self, prefix: &'static str, proxy: Proxy) -> Options {
+        Options {
+            prefix: Some(prefix),
+            proxy,
+            ..self
+        }
+    }
+}
+
+/// The front a stripping proxy is: `/prefix` and `/prefix/...` reach the
+/// daemon without the prefix, every other path (the two host root OAuth
+/// documents) reaches it unchanged. Written out here rather than borrowed
+/// from the daemon, so a bug in the daemon's own strip cannot hide in the
+/// test's.
+#[derive(Clone)]
+struct StripsPrefix {
+    prefix: &'static str,
+    inner: axum::Router,
+}
+
+impl tower_service::Service<axum::extract::Request> for StripsPrefix {
+    type Response = axum::response::Response;
+    type Error = std::convert::Infallible;
+    type Future = <axum::Router as tower_service::Service<axum::extract::Request>>::Future;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        tower_service::Service::<axum::extract::Request>::poll_ready(&mut self.inner, cx)
+    }
+
+    fn call(&mut self, mut request: axum::extract::Request) -> Self::Future {
+        let path = request.uri().path().to_string();
+        let stripped = if path == self.prefix {
+            Some("/".to_string())
+        } else {
+            path.strip_prefix(&format!("{}/", self.prefix))
+                .map(|rest| format!("/{rest}"))
+        };
+        if let Some(stripped) = stripped {
+            let target = match request.uri().query() {
+                Some(query) => format!("{stripped}?{query}"),
+                None => stripped,
+            };
+            *request.uri_mut() = target.parse().unwrap();
+        }
+        self.inner.call(request)
+    }
+}
+
+/// Record the JSON body of every ctl request that carries a bearer, then pass the request on
+/// unchanged.
+async fn record_ctl(
+    axum::extract::State(log): axum::extract::State<Arc<std::sync::Mutex<Vec<Value>>>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    // A request without a bearer is left alone: the daemon refuses it before
+    // reading the body, and a test pins that.
+    if !request.uri().path().ends_with("/api/v1/ctl")
+        || !request
+            .headers()
+            .contains_key(axum::http::header::AUTHORIZATION)
+    {
+        return next.run(request).await;
+    }
+    let (parts, body) = request.into_parts();
+    let bytes = axum::body::to_bytes(body, 1 << 20)
+        .await
+        .unwrap_or_default();
+    if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
+        log.lock().unwrap().push(value);
+    }
+    next.run(axum::extract::Request::from_parts(
+        parts,
+        axum::body::Body::from(bytes),
+    ))
+    .await
 }
 
 /// The serving task and the switch that shuts it down gracefully.
@@ -110,6 +211,10 @@ pub struct RemoteServer {
     pub collab: Arc<CollabSessions>,
     pub http: reqwest::Client,
     serving: tokio::sync::Mutex<Option<Serving>>,
+    /// The JSON bodies of the ctl requests received, oldest first.
+    ctl_log: Arc<std::sync::Mutex<Vec<Value>>>,
+    /// The path the instance is served under, empty at the root.
+    prefix: &'static str,
     _scratch: ScratchStateDir,
 }
 
@@ -121,6 +226,51 @@ impl RemoteServer {
     /// [`RemoteServer::start`] with extra shared file domains, each holding one
     /// engram `<name>-note` whose fact line names the domain.
     pub async fn start_with(options: Options, extra: &[&str]) -> RemoteServer {
+        // Bound first: a prefixed instance's `public_url` names this address.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (server, router) = RemoteServer::assemble(options, extra, addr).await;
+        let router = match (options.prefix, options.proxy) {
+            (Some(prefix), Proxy::Strips) => axum::Router::new().fallback_service(StripsPrefix {
+                prefix,
+                inner: router,
+            }),
+            _ => router,
+        };
+        *server.serving.lock().await = Some(serve(router, listener));
+        server
+    }
+
+    /// Two instances on one host and port, under `a` and `b`, behind a front
+    /// that strips each prefix (`nest_service` does): the deployment where two
+    /// teams share `example.com`. Each has `service.public_url` with its own
+    /// path. The first holds the serving task.
+    pub async fn start_two_on_one_host(
+        options: Options,
+        a: &'static str,
+        b: &'static str,
+    ) -> (RemoteServer, RemoteServer) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (first, router_a) =
+            RemoteServer::assemble(options.under(a, Proxy::Strips), &[], addr).await;
+        let (second, router_b) =
+            RemoteServer::assemble(options.under(b, Proxy::Strips), &[], addr).await;
+        let front = axum::Router::new()
+            .nest_service(a, router_a)
+            .nest_service(b, router_b);
+        *first.serving.lock().await = Some(serve(front, listener));
+        (first, second)
+    }
+
+    /// Everything but the listener: the instance (serving nothing yet) and
+    /// its router before any front is put around it. `addr` is the address
+    /// the instance will be reachable at.
+    async fn assemble(
+        options: Options,
+        extra: &[&str],
+        addr: SocketAddr,
+    ) -> (RemoteServer, axum::Router) {
         let scratch = ScratchStateDir::acquire();
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
@@ -200,6 +350,9 @@ impl RemoteServer {
         }
         cfg.service = Some(ServiceConfig {
             response_format: Some(ResponseFormat::Json),
+            public_url: options
+                .prefix
+                .map(|prefix| format!("http://{addr}{prefix}")),
             ..ServiceConfig::default()
         });
         cfg.auth = Some(AuthConfig {
@@ -249,9 +402,12 @@ impl RemoteServer {
             None,
         )
         .unwrap();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        RemoteServer {
+        let ctl_log: Arc<std::sync::Mutex<Vec<Value>>> = Arc::default();
+        let router = router.layer(axum::middleware::from_fn_with_state(
+            ctl_log.clone(),
+            record_ctl,
+        ));
+        let server = RemoteServer {
             addr,
             tmp,
             auth,
@@ -261,14 +417,33 @@ impl RemoteServer {
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .unwrap(),
-            serving: tokio::sync::Mutex::new(Some(serve(router, listener))),
+            serving: tokio::sync::Mutex::new(None),
+            ctl_log,
+            prefix: options.prefix.unwrap_or(""),
             _scratch: scratch,
-        }
+        };
+        (server, router)
+    }
+
+    /// The JSON bodies of the ctl requests received since the last
+    /// [`RemoteServer::clear_ctl_log`].
+    pub fn ctl_requests(&self) -> Vec<Value> {
+        self.ctl_log.lock().unwrap().clone()
+    }
+
+    /// Forget the ctl requests recorded so far.
+    pub fn clear_ctl_log(&self) {
+        self.ctl_log.lock().unwrap().clear();
     }
 
     /// The origin a client connects to.
     pub fn origin(&self) -> String {
         format!("http://{}", self.addr)
+    }
+
+    /// The address a client is given: the origin plus the prefix.
+    pub fn base(&self) -> String {
+        format!("{}{}", self.origin(), self.prefix)
     }
 
     /// A live personal MCP token for `account`.
@@ -285,7 +460,7 @@ impl RemoteServer {
     pub async fn ctl(&self, token: Option<&str>, body: Value) -> (u16, Value) {
         let mut request = self
             .http
-            .post(format!("{}/api/v1/ctl", self.origin()))
+            .post(format!("{}/api/v1/ctl", self.base()))
             .header("content-type", "application/json")
             .body(body.to_string());
         if let Some(token) = token {
@@ -322,7 +497,7 @@ impl RemoteServer {
             .unwrap_or_else(|| panic!("no request id in {page}"));
         let login = self
             .http
-            .post(format!("{}/api/v1/auth/login", self.origin()))
+            .post(format!("{}/api/v1/auth/login", self.base()))
             .json(&json!({ "name": account, "password": PASSWORD }))
             .send()
             .await
@@ -343,7 +518,7 @@ impl RemoteServer {
             .http
             .post(format!(
                 "{}/api/v1/oauth/authorizations/{request}",
-                self.origin()
+                self.base()
             ))
             .header("cookie", cookies)
             .header("x-csrf-token", csrf)
@@ -507,7 +682,7 @@ impl RemoteServer {
     pub async fn oauth_pair(&self, account: &str) -> OauthPair {
         let registered: Value = self
             .http
-            .post(format!("{}/api/v1/oauth/register", self.origin()))
+            .post(format!("{}/api/v1/oauth/register", self.base()))
             .json(&json!({ "client_name": "remote test", "redirect_uris": ["http://127.0.0.1/callback"] }))
             .send()
             .await
@@ -519,7 +694,7 @@ impl RemoteServer {
         let redirect = "http://127.0.0.1:9/callback";
         let authorize = format!(
             "{}/api/v1/oauth/authorize?response_type=code&client_id={}&redirect_uri={}&code_challenge={CHALLENGE}&code_challenge_method=S256&state=s1",
-            self.origin(),
+            self.base(),
             encoded(&client_id),
             encoded(redirect),
         );
@@ -531,7 +706,7 @@ impl RemoteServer {
             .to_string();
         let exchanged: Value = self
             .http
-            .post(format!("{}/api/v1/oauth/token", self.origin()))
+            .post(format!("{}/api/v1/oauth/token", self.base()))
             .header("content-type", "application/x-www-form-urlencoded")
             .body(form(&[
                 ("grant_type", "authorization_code"),
@@ -539,7 +714,7 @@ impl RemoteServer {
                 ("redirect_uri", redirect),
                 ("code_verifier", VERIFIER),
                 ("client_id", &client_id),
-                ("resource", &self.origin()),
+                ("resource", &self.base()),
             ]))
             .send()
             .await
@@ -557,7 +732,7 @@ impl RemoteServer {
     /// `POST /api/v1/oauth/revoke` with `pairs` as the form.
     pub async fn revoke(&self, pairs: &[(&str, &str)]) -> reqwest::Response {
         self.http
-            .post(format!("{}/api/v1/oauth/revoke", self.origin()))
+            .post(format!("{}/api/v1/oauth/revoke", self.base()))
             .header("content-type", "application/x-www-form-urlencoded")
             .body(form(pairs))
             .send()

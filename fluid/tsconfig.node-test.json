@@ -26,5 +26,9 @@
     "noUncheckedIndexedAccess": true,
     "exactOptionalPropertyTypes": true
   },
-  "include": ["src/theme/tokens.test.ts", "src/bundleBudget.test.ts"]
+  "include": [
+    "src/theme/tokens.test.ts",
+    "src/bundleBudget.test.ts",
+    "src/basePathRule.test.ts"
+  ]
 }

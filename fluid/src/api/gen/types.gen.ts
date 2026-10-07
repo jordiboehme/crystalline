@@ -2120,8 +2120,8 @@ export type OidcLoginData = {
          * only reachable by its id, so landing anywhere else loses it.
          *
          * Anything [`safe_return_path`] does not accept is dropped rather than
-         * refused, and the sign-in lands on `/`: the person did sign in, and only
-         * the destination was unusable.
+         * refused, and the sign-in lands on the root of the base path (`/` at the
+         * root): the person did sign in, and only the destination was unusable.
          */
         return_to?: string;
     };

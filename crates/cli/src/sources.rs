@@ -154,14 +154,34 @@ async fn reload_daemon() -> Vec<String> {
         .collect()
 }
 
+/// The refusal of a `connect` address. A url whose path the rules refuse
+/// gets the reason, which names the characters a path may use; anything
+/// else gets the plain line, so a word that is no address (it may be a
+/// token typed in the wrong place) is never repeated.
+fn not_a_server_address(url: &str) -> String {
+    const LINE: &str = "that is not a server address";
+    const EXAMPLE: &str = "give one like https://crystalline.acme.com";
+    use crystalline_core::base::{BaseProblem, PublicBase};
+    let token_inside = url.split(['/', '?', '#', '=', '&']).any(looks_like_token);
+    match PublicBase::parse(url) {
+        Err(BaseProblem::Path(problem)) if !token_inside => {
+            format!("{LINE}: {}; {EXAMPLE}", problem.sentence())
+        }
+        _ => format!("{LINE}; {EXAMPLE}"),
+    }
+}
+
 /// `crystalline connect <url> [--name] [--token]`.
 pub async fn connect_server(
     url: String,
     name: Option<String>,
     token: bool,
+    choice: crystalline_remote::DomainChoice,
     json: bool,
 ) -> anyhow::Result<()> {
-    use crystalline_remote::{connect_with_browser, connect_with_token, normalize_server_url};
+    use crystalline_remote::{
+        connect_with_browser_choosing, connect_with_token_choosing, normalize_server_url,
+    };
     // The address first, so a URL that can never work is refused before
     // anyone pastes a token for it; and a value that is no address is never
     // repeated, because it may be a token typed in the wrong place.
@@ -173,9 +193,9 @@ pub async fn connect_server(
     }
     match normalize_server_url(&url) {
         Ok(_) => {}
-        Err(crystalline_remote::SignInError::BadUrl(_)) => anyhow::bail!(
-            "that is not a server address; give one like https://crystalline.acme.com"
-        ),
+        Err(crystalline_remote::SignInError::BadUrl(_)) => {
+            anyhow::bail!(not_a_server_address(&url))
+        }
         Err(other) => return Err(other.into()),
     }
     let loaded = crate::cmd::load(None)?;
@@ -183,11 +203,12 @@ pub async fn connect_server(
     let dir = remote_dir()?;
     let connected = if token {
         let pasted = read_token_from_stdin()?;
-        connect_with_token(&url, name.as_deref(), &pasted, &dir, &local).await?
+        connect_with_token_choosing(&url, name.as_deref(), choice, &pasted, &dir, &local).await?
     } else {
-        connect_with_browser(
+        connect_with_browser_choosing(
             &url,
             name.as_deref(),
+            choice,
             &dir,
             &local,
             |authorize_url| {
@@ -220,6 +241,11 @@ pub async fn connect_server(
                 "url": source.url,
                 "account": source.account,
                 "kind": source.kind.as_str(),
+                "domains": source.domains,
+                "taken": connected.taken,
+                "not_chosen": connected.not_chosen,
+                "not_offered": connected.not_offered,
+                "came_back": connected.came_back,
                 "announcements": connected.announcements.iter().map(ToString::to_string).collect::<Vec<_>>(),
                 "warnings": warnings,
             })
@@ -232,8 +258,26 @@ pub async fn connect_server(
             source.kind.as_str(),
             source.name
         );
+        match connected.taken.as_slice() {
+            [] => println!("it takes no domains yet"),
+            names => println!("it takes {}", names.join(", ")),
+        }
+        match connected.not_chosen.len() {
+            0 => {}
+            1 => println!("it leaves out 1 domain that is not on the list (--json names it)"),
+            n => println!("it leaves out {n} domains that are not on the list (--json names them)"),
+        }
+        for name in &connected.not_offered {
+            println!(
+                "'{name}' is on the list, but the server does not offer it to {} (missing rights, or not there yet); it is taken once the server offers it",
+                source.account
+            );
+        }
         for said in &connected.announcements {
             println!("{said}");
+        }
+        for local in &connected.came_back {
+            println!("the local domain '{local}' is visible again");
         }
         for warning in &warnings {
             eprintln!("{warning}");
@@ -489,6 +533,10 @@ pub fn skipped_note(skipped: &crystalline_remote::Skipped) -> String {
             "left out: '{}' (its name cannot name a domain on this machine)",
             skipped.remote
         ),
+        crystalline_remote::SkipReason::NotChosen => format!(
+            "left out: '{}' (not on the list of domains this machine takes)",
+            skipped.remote
+        ),
     }
 }
 
@@ -543,6 +591,13 @@ pub struct SourceRow {
     pub shadowed: Vec<HiddenRow>,
     /// The domains left out because an earlier source offers them.
     pub skipped: Vec<SkippedRow>,
+    /// The list of domains this source takes, by their names on the server;
+    /// `None` takes all.
+    pub domains: Option<Vec<String>>,
+    /// Offered domains not on the list.
+    pub not_chosen: Vec<String>,
+    /// Listed names the server does not offer.
+    pub not_offered: Vec<String>,
 }
 
 /// The table's part of one source's row: its names and what it hides.
@@ -574,17 +629,30 @@ fn fill_names(row: &mut SourceRow, table: &MountTable) {
     row.skipped = table
         .skipped
         .iter()
-        .filter(|s| s.source == row.name)
+        .filter(|s| s.source == row.name && s.reason != crystalline_remote::SkipReason::NotChosen)
         .map(|s| SkippedRow {
             remote: s.remote.clone(),
             kept_by: s.kept_by.clone(),
             reason: match s.reason {
                 crystalline_remote::SkipReason::SameDomain => "same_domain",
                 crystalline_remote::SkipReason::InvalidName => "invalid_name",
+                crystalline_remote::SkipReason::NotChosen => "not_chosen",
             }
             .to_string(),
             note: skipped_note(s),
         })
+        .collect();
+    row.not_chosen = table
+        .skipped
+        .iter()
+        .filter(|s| s.source == row.name && s.reason == crystalline_remote::SkipReason::NotChosen)
+        .map(|s| s.remote.clone())
+        .collect();
+    row.not_offered = table
+        .not_offered
+        .iter()
+        .filter(|u| u.source == row.name)
+        .map(|u| u.remote.clone())
         .collect();
 }
 
@@ -715,6 +783,7 @@ pub async fn source_rows(cfg: &GlobalConfig) -> Vec<SourceRow> {
                 ..SourceRow::default()
             });
             fill_names(&mut row, &table);
+            row.domains = record.domains.clone();
             row
         })
         .collect();
@@ -770,6 +839,14 @@ pub fn sources_block(rows: &[SourceRow]) -> String {
             "  {} {} as {} ({kind}): {state}",
             row.name, row.url, row.account
         );
+        match &row.domains {
+            None => {
+                let _ = writeln!(out, "    takes every domain it offers");
+            }
+            Some(list) => {
+                let _ = writeln!(out, "    takes only {}", list.join(", "));
+            }
+        }
         if let Some(detail) = &row.error_detail {
             let _ = writeln!(out, "    the server wrote: {detail}");
         }
@@ -905,6 +982,7 @@ mod tests {
                     by: "open".into(),
                 },
             ],
+            not_offered: Vec::new(),
         }
     }
 

@@ -22,6 +22,7 @@ import type { ReactElement, RefObject } from "react";
 import { useCallback, useImperativeHandle } from "react";
 
 import type { EngramDetail } from "../api/engram";
+import { absoluteUrl } from "../base";
 import { engramRoute } from "../paths";
 import { saveBlob } from "./downloads";
 import { useSaid } from "./useSaid";
@@ -97,7 +98,7 @@ export function EngramActions({
         // browser's own origin where it could not.
         const link =
           engram.webUrl ??
-          `${window.location.origin}${engramRoute(engram.domain, engram.permalink)}`;
+          absoluteUrl(engramRoute(engram.domain, engram.permalink));
         await navigator.clipboard.writeText(link);
         say("Link copied");
       } catch {

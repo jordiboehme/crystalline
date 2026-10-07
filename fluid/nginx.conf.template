@@ -7,6 +7,15 @@
 # file is copied under (default.conf) takes over from the stock server block.
 # Only CRYSTALLINE_-prefixed names are substituted (NGINX_ENVSUBST_FILTER in
 # the Dockerfile), so every nginx $variable below survives to nginx itself.
+#
+# CRYSTALLINE_BASE_PATH (empty by default) serves the app under a path such as
+# /crystalline. Every location below sits under it, and an empty value renders
+# exactly the locations this image always had. What only exists under a prefix
+# (the bare prefix, the OAuth documents at the host root, the base tag rewrite)
+# is in nginx/*.conf.template, which 15-crystalline-base-path.sh installs only
+# when the variable is set; the two include globs below match nothing
+# otherwise. The daemon behind this image needs service.public_url with the
+# same path.
 
 server {
     listen 80;
@@ -36,10 +45,14 @@ server {
     # larger directive below; everything else inherits this one.
     client_max_body_size 10m;
 
+    include /etc/nginx/conf.d/crystalline/server*.conf;
+
     # A build emits about a hundred content-hashed chunks under /assets, so a
     # name never survives a change to what is behind it: these can be held for
     # as long as a browser is willing to hold anything.
-    location /assets/ {
+    location ${CRYSTALLINE_BASE_PATH}/assets/ {
+        # The files are on disk without the prefix. A no-op when it is empty.
+        rewrite ^${CRYSTALLINE_BASE_PATH}(/assets/.*)$ $1 break;
         # One header rather than `expires` as well: the two do not merge, and
         # a response carrying two Cache-Control lines is only ever confusing.
         add_header Cache-Control "public, max-age=31536000, immutable";
@@ -49,15 +62,17 @@ server {
     # The one file whose name is not content-hashed. It is what names the
     # current chunks, so a stale cached copy is exactly how a browser ends up
     # asking a new deployment for chunks that no longer exist.
-    location = /index.html {
+    location = ${CRYSTALLINE_BASE_PATH}/index.html {
+        rewrite ^ /index.html break;
         add_header Cache-Control "no-store";
+        include /etc/nginx/conf.d/crystalline/index*.conf;
     }
 
     # The collab WebSocket. Its own block, above /api/, because the Upgrade
     # and Connection headers must be sent here and must NOT be sent on plain
     # API requests. proxy_read_timeout is generous: the daemon pings every
     # 30s, so a healthy socket is never idle longer than that.
-    location /api/v1/collab/ {
+    location ${CRYSTALLINE_BASE_PATH}/api/v1/collab/ {
         # $http_host, the Host header verbatim, and NOT $host: nginx strips the
         # port from $host, while the browser's Origin on this upgrade always
         # carries it. The daemon refuses a collab upgrade whose Origin
@@ -92,7 +107,7 @@ server {
     # blocks in step; the comments on the /api/ block explain every line.
     # crates/service/tests/rest/nginx_body_cap.rs is what notices if this directive
     # drifts from the daemon's constant.
-    location ~ ^/api/v1/domains/[^/]+/archive(/|$) {
+    location ~ ^${CRYSTALLINE_BASE_PATH}/api/v1/domains/[^/]+/archive(/|$) {
         client_max_body_size 64m;
 
         proxy_set_header Host $http_host;
@@ -109,7 +124,7 @@ server {
     }
 
     # The API, forwarded to the Crystalline daemon.
-    location /api/ {
+    location ${CRYSTALLINE_BASE_PATH}/api/ {
         # The Host the browser asked for, verbatim, not the upstream's name.
         # The daemon reads it to decide whether the session cookie needs the
         # Secure flag, and nginx's default here ($proxy_host, literally the
@@ -166,7 +181,12 @@ server {
     # Everything else is a route inside the app, including a deep link such as
     # /d/<domain>/e/<multi/segment/permalink>. No file stands behind those, so
     # they are answered with the app itself and its router takes over.
-    location / {
-        try_files $uri $uri/ /index.html;
+    location ${CRYSTALLINE_BASE_PATH}/ {
+        rewrite ^${CRYSTALLINE_BASE_PATH}(/.*)$ $1 break;
+        # The fallback is the prefixed name, so it lands in the index.html
+        # location above (no-store, and the base tag under a prefix). `$uri/`
+        # is gone: the only folder in the bundle is assets/, which has its own
+        # location, and `/` itself falls through to the same fallback.
+        try_files $uri ${CRYSTALLINE_BASE_PATH}/index.html;
     }
 }

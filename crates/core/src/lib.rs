@@ -17,6 +17,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub mod address;
 pub mod attachment;
+pub mod base;
 pub mod config;
 pub mod emit;
 pub mod engram;

@@ -51,12 +51,20 @@ LABEL org.opencontainers.image.title="Crystalline Fluid" \
 # template for what that means for a DNS change. The filter keeps envsubst to
 # CRYSTALLINE_-prefixed names, so nginx's own $variables in the template reach
 # nginx untouched.
+#
+# CRYSTALLINE_BASE_PATH serves the app under a path such as /crystalline. It
+# is defined (empty) here because envsubst renders only defined names: an
+# undefined one would stay in the config as literal text.
 ENV CRYSTALLINE_UPSTREAM=crystalline:7411 \
+    CRYSTALLINE_BASE_PATH= \
     NGINX_ENVSUBST_FILTER=^CRYSTALLINE_
 
 # The name matters: rendered to /etc/nginx/conf.d/default.conf, it replaces
 # the stock server block the image ships rather than being added beside it.
 COPY nginx.conf.template /etc/nginx/templates/default.conf.template
+COPY nginx/server-base-path.conf.template /etc/nginx/crystalline-base-path/server.conf.template
+COPY nginx/index-base-path.conf.template /etc/nginx/crystalline-base-path/index.conf.template
+COPY --chmod=0755 nginx/15-crystalline-base-path.sh /docker-entrypoint.d/15-crystalline-base-path.sh
 COPY --from=build /app/dist /usr/share/nginx/html
 
 EXPOSE 80
@@ -65,4 +73,4 @@ EXPOSE 80
 # page. Shell form, since this image has one, and busybox wget is already
 # present.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-    CMD wget --spider -q http://127.0.0.1/ || exit 1
+    CMD wget --spider -q http://127.0.0.1${CRYSTALLINE_BASE_PATH}/ || exit 1

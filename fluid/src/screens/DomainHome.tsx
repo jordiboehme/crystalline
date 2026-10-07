@@ -70,6 +70,7 @@ import { fetchMembers, membersKey, sameAccount } from "../api/members";
 import { fetchTags, vocabularyKey } from "../api/vocabulary";
 import type { TagCount } from "../api/vocabulary";
 import { useAuth } from "../auth/AuthContext";
+import { navigateTo } from "../base";
 import { NO_COMMANDS, useRegisterCommands } from "../commands";
 import type { PaletteCommand } from "../commands";
 import { BackupCard } from "../components/BackupCard";
@@ -421,7 +422,7 @@ function DomainPage({
         // press a link that may not even be rendered. Not a write, so it is
         // not withheld while renaming.
         run: () => {
-          window.location.assign(archiveDownloadUrl(domain));
+          navigateTo(archiveDownloadUrl(domain));
         },
       });
       if (!isRenaming) {

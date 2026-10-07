@@ -57,6 +57,7 @@ import {
   sectionUrl,
 } from "../anchors";
 import { attachmentUrl } from "../api/files";
+import { documentHref } from "../base";
 import {
   assetPath,
   decodeTarget,
@@ -549,9 +550,11 @@ function MarkdownAnchor({
     );
   }
   const outward = typeof href === "string" && /^https?:\/\//i.test(href);
+  // Resolved against the page it is on rather than against the base tag, so
+  // `#heading` and `../other` go where the author meant (`documentHref`).
   return (
     <a
-      href={href}
+      href={documentHref(href)}
       className={LINK_CLASSES}
       {...(outward ? { target: "_blank", rel: "noreferrer" } : {})}
     >

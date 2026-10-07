@@ -22,7 +22,7 @@ const PASSWORD = process.env.FLUID_E2E_PASSWORD ?? "smoke-password";
 
 /** Sign in and land on the home screen, the same way the smoke suite does. */
 async function signIn(page: Page): Promise<void> {
-  await page.goto("/");
+  await page.goto("./");
   await expect(page).toHaveURL(/\/login$/);
 
   await page.getByLabel("Name", { exact: true }).fill(USER);
@@ -36,7 +36,7 @@ async function signIn(page: Page): Promise<void> {
 
 test.beforeEach(async ({ page }) => {
   await signIn(page);
-  await page.goto("/profile");
+  await page.goto("profile");
   await expect(
     page.getByRole("heading", { name: "Agent access" }),
   ).toBeVisible();

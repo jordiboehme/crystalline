@@ -382,6 +382,21 @@ describe("the markdown renderer", () => {
     );
   });
 
+  it("a fragment link stays on the page it is written on", async () => {
+    // The anchor resolves against the page address the browser shows, not
+    // against the router's entry, so the test moves the window itself.
+    window.history.pushState({}, "", "/d/eng/e/notes/a");
+    try {
+      await renderMarkdown("[top](#observations)");
+
+      expect(
+        screen.getByRole("link", { name: "top" }).getAttribute("href"),
+      ).toBe("/d/eng/e/notes/a#observations");
+    } finally {
+      window.history.pushState({}, "", "/");
+    }
+  });
+
   it("leaves an ordinary bullet whose first word precedes a link alone", async () => {
     // A word before an element is not a relation: the engine reads one only
     // where a `[[target]]` follows, so a chip here would claim a fact the

@@ -319,13 +319,17 @@ pub fn sources_status(engine: &Arc<Engine>) -> Value {
                     "skipped": table
                         .skipped
                         .iter()
-                        .filter(|k| k.source == s.name)
+                        .filter(|k| {
+                            k.source == s.name
+                                && k.reason != crystalline_remote::SkipReason::NotChosen
+                        })
                         .map(|k| json!({
                             "remote": k.remote,
                             "kept_by": k.kept_by,
                             "reason": match k.reason {
                                 crystalline_remote::SkipReason::SameDomain => "same_domain",
                                 crystalline_remote::SkipReason::InvalidName => "invalid_name",
+                                crystalline_remote::SkipReason::NotChosen => "not_chosen",
                             },
                         }))
                         .collect::<Vec<_>>(),

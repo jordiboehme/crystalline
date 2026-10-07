@@ -16,6 +16,8 @@
 import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
 
+import { documentHref } from "../base";
+
 /** Every tag this renderer is allowed to draw. Everything else unwraps into
  * its own children rather than becoming an element of its own. */
 const ALLOWED_ELEMENTS = ["strong", "em", "code", "a"];
@@ -33,11 +35,12 @@ const components: Components = {
     // The same rule the block renderer's anchor applies to an ordinary link:
     // a target out of the app opens in its own tab, an in-app one navigates
     // in place. There is no wikilink or attachment resolution here - a
-    // routing bullet carries neither - so every link is drawn as written.
+    // routing bullet carries neither - so every link is drawn as written,
+    // resolved against the page rather than the base tag (`documentHref`).
     const outward = typeof href === "string" && /^https?:\/\//i.test(href);
     return (
       <a
-        href={href}
+        href={documentHref(href)}
         className="text-sky-700 underline underline-offset-2 hover:no-underline dark:text-sky-400"
         {...(outward ? { target: "_blank", rel: "noreferrer" } : {})}
       >

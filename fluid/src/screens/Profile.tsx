@@ -82,6 +82,7 @@ import {
   unlinkIdentity,
 } from "../api/sso";
 import { useAuth } from "../auth/AuthContext";
+import { navigateTo } from "../base";
 import {
   BUTTON,
   CONTROL_HEIGHT,
@@ -232,7 +233,7 @@ function SsoIdentityCard({ user }: { user: User }) {
       // The whole page leaves for the provider. Not a fetch: what follows is a
       // redirect out and a redirect back, and only a real navigation can carry
       // somebody to a password field.
-      window.location.assign(started.location);
+      navigateTo(started.location);
     },
     onError: (error: Error) => {
       setNotice({ kind: "problem", text: problemDetail(error) });

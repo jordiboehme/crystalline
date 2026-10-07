@@ -45,7 +45,7 @@ pub use github::auth::{DeviceFlowStart, DevicePoll, GITHUB_CLIENT_ID};
 pub use github::{validate_repo, validate_repo_path};
 pub use mounts::{
     Announcement, Hidden, HiddenReason, LocalDomain, Mount, MountTable, NameMap, OriginIdentity,
-    RemoteDomain, Route, SkipReason, Skipped, ToolShape, assign, translate_address_to,
+    RemoteDomain, Route, SkipReason, Skipped, ToolShape, Unoffered, assign, translate_address_to,
     translate_answer,
 };
 pub use ops::{
@@ -63,11 +63,14 @@ pub use server_client::{
     Health, ONE_DOMAIN_LIMIT, RemoteFailure, form_body, http_client, seconds, settle_refreshes,
     warm_http_client, warm_http_client_within,
 };
-pub use server_token::{CredentialKind, ServerCredential, ServerCredentialStore, server_key};
+pub use server_token::{
+    CredentialKind, ServerCredential, ServerCredentialStore, server_folder, server_key,
+};
 pub use sign_in::{
-    Connected, Disconnected, Revocation, SignInError, connect_with_browser,
-    connect_with_browser_within, connect_with_token, connect_with_token_within, disconnect,
-    disconnect_within, normalize_server_url,
+    Connected, Disconnected, DomainChoice, Revocation, SignInError, connect_with_browser,
+    connect_with_browser_choosing, connect_with_browser_within, connect_with_token,
+    connect_with_token_choosing, connect_with_token_within, disconnect, disconnect_within,
+    normalize_server_url,
 };
 pub use source_cache::{
     Cached, Fetched, HOOK_STATUS_FILE, ROUTING_FILE, STALE_AFTER, cached_offers, fetch_cached,
@@ -77,9 +80,9 @@ pub use source_set::{
     BackgroundRefresh, ConfigStamp, MountNote, MountedRouting, SourceSet, hidden_sentence,
 };
 pub use sources::{
-    LOCAL_SUFFIX, MountRecord, REMOTE_TOKEN_ENV, REMOTE_URL_ENV, SOURCES_FILE, SourceRecord,
-    SourcesFile, default_source_name, env_source, load_sources, remote_dir, update_sources,
-    valid_source_name,
+    LOCAL_SUFFIX, MountRecord, REMOTE_DOMAINS_ENV, REMOTE_TOKEN_ENV, REMOTE_URL_ENV, SOURCES_FILE,
+    SourceRecord, SourcesFile, default_source_name, env_source, load_sources, parse_domain_list,
+    remote_dir, update_sources, valid_source_name,
 };
 pub use text::{ROUTING_BULLET_CHARS, ROUTING_BULLETS_MAX, one_line, routing_bullets};
 pub use token::{

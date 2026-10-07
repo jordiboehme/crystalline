@@ -231,6 +231,7 @@
 import type { QueryClient } from "@tanstack/react-query";
 
 import type { ChangeEvent } from "../api/events";
+import { absoluteUrl } from "../base";
 import { COALESCE_MS } from "../events/ChangeStreamProvider";
 import {
   ambienceOf,
@@ -1289,8 +1290,10 @@ export function createSession(opts: SessionOptions): Session {
     // that normalised spelling. Reading `path` back through `URL` before
     // comparing puts both sides through the same normalisation, so a
     // folder name that needs it does not replace the URL on every
-    // landing.
-    const url = new URL(path, window.location.origin);
+    // landing. The location's pathname carries the base path, so `path`
+    // gets it too before the two are compared; `navigate` takes the
+    // router path as it is.
+    const url = new URL(absoluteUrl(path));
     const normalized = url.pathname + url.search;
     const { pathname, search } = window.location;
     if (pathname + search !== normalized) opts.navigate(path);

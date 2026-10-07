@@ -66,6 +66,7 @@ import {
   graphKey,
 } from "../api/graph";
 import { useAuth } from "../auth/AuthContext";
+import { absoluteUrl } from "../base";
 import { NO_COMMANDS, useRegisterCommands } from "../commands";
 import type { PaletteCommand } from "../commands";
 import { AgentsEye } from "../components/AgentsEye";
@@ -732,7 +733,7 @@ export default function EngramPage() {
               anchors={{
                 pageUrl:
                   engram.webUrl ??
-                  `${window.location.origin}${engramRoute(engram.domain, engram.permalink)}`,
+                  absoluteUrl(engramRoute(engram.domain, engram.permalink)),
               }}
             />
           </article>

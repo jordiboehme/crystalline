@@ -33,6 +33,9 @@ const DEV_API_TARGET =
 
 // https://vite.dev/config/
 export default defineConfig({
+  // Relative asset urls: the server names the base in `<base href>`, so one
+  // build serves at the root and under any path.
+  base: "./",
   plugins: [react(), tailwindcss()],
   define: {
     "import.meta.env.VITE_APP_VERSION": JSON.stringify(version),

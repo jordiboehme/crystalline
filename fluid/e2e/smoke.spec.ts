@@ -31,6 +31,13 @@ const DOMAIN = process.env.FLUID_E2E_DOMAIN ?? "fluid-smoke";
 const PEER = process.env.FLUID_E2E_PEER ?? "peer";
 const PEER_PASSWORD = process.env.FLUID_E2E_PEER_PASSWORD ?? "peer-password";
 
+/**
+ * The path the app is served under: `""` at the root, `/crystalline` in the
+ * run `run-smoke.sh` makes under a path. An API request goes under it, since
+ * the session cookie is scoped to it, and so does the header's home link.
+ */
+const BASE_PATH = process.env.FLUID_E2E_BASE_PATH ?? "";
+
 /** The engram three folders down, whose permalink is a path rather than a word. */
 const DEEP_PERMALINK = "notes/deep/gamma";
 
@@ -56,7 +63,7 @@ async function signIn(
   name: string = USER,
   password: string = PASSWORD,
 ): Promise<void> {
-  await page.goto("/");
+  await page.goto("./");
   await expect(page).toHaveURL(/\/login$/);
 
   await page.getByLabel("Name", { exact: true }).fill(name);
@@ -139,7 +146,7 @@ test("the sidebar collapse control is desktop only", async ({ page }) => {
   // opened first so the control is actually on screen and the assertion
   // exercises the thing it is meant to guard.
   await page.setViewportSize({ width: 390, height: 844 });
-  await page.goto("/");
+  await page.goto("./");
   await page.getByRole("button", { name: "Domains" }).click();
   await expect(page.getByRole("navigation", { name: "Domains" })).toBeVisible();
   await expect(
@@ -155,7 +162,7 @@ test("the sidebar collapse control is desktop only", async ({ page }) => {
 test("the Help menu reaches the Handbook and the shortcut map and gives focus back", async ({
   page,
 }) => {
-  await page.goto("/");
+  await page.goto("./");
   const help = page.getByRole("button", { name: "Help", exact: true });
   await help.click();
   const handbook = page.getByRole("menuitem", {
@@ -231,7 +238,7 @@ for (const share of [false, true]) {
         // handler raced the reload below: a request the old page still had
         // in flight was disposed with the page, and reading its body threw
         // "Response has been disposed".
-        const me = await page.request.get("/api/v1/auth/me");
+        const me = await page.request.get(`${BASE_PATH}/api/v1/auth/me`);
         expect(me.ok()).toBe(true);
         const body = (await me.json()) as {
           user?: { display: string } | null;
@@ -266,7 +273,7 @@ for (const share of [false, true]) {
 test("the Rename dialog opens from the domain page and can be cancelled", async ({
   page,
 }) => {
-  await page.goto(`/d/${DOMAIN}`);
+  await page.goto(`d/${DOMAIN}`);
 
   // "Rename domain" is the launcher; the smoke signs in as the admin
   // `run-smoke.sh` creates through setup, who sees it on every domain here.
@@ -294,7 +301,7 @@ test("the Rename dialog opens from the domain page and can be cancelled", async 
 test("the same rename dialog also opens from the policies card's 'Change name'", async ({
   page,
 }) => {
-  await page.goto(`/d/${DOMAIN}`);
+  await page.goto(`d/${DOMAIN}`);
 
   // A second launcher for the one dialog above, not a second dialog: the
   // accessible name is distinct from the header's own "Rename domain" so
@@ -317,7 +324,7 @@ test("an undeclared MANIFEST section explains itself and can be started", async 
   // Tag aliases is the box with nothing in it. What it says and the example it
   // shows are the server's own registry, which is the half a jsdom test cannot
   // reach: there the payload is a fixture, here it is the daemon.
-  await page.goto(`/d/${DOMAIN}`);
+  await page.goto(`d/${DOMAIN}`);
   const aliases = page.getByRole("region", { name: "Tag aliases" });
   await expect(
     aliases.getByText(/Spellings that fold into one canonical tag/),
@@ -347,7 +354,7 @@ test("an engram renders its mermaid fence as a diagram", async ({ page }) => {
 test("a multi-segment permalink loads from the address bar", async ({
   page,
 }) => {
-  await page.goto(`/d/${DOMAIN}/e/${DEEP_PERMALINK}`);
+  await page.goto(`d/${DOMAIN}/e/${DEEP_PERMALINK}`);
 
   await expect(engramTitle(page)).toHaveText("Deep Gamma Note");
   // The trail is where the address the URL carried is echoed now, one crumb
@@ -359,6 +366,41 @@ test("a multi-segment permalink loads from the address bar", async ({
     .getByRole("navigation", { name: "Breadcrumb" });
   await expect(trail).toContainText("deep");
   await expect(trail.getByText("Deep Gamma Note")).toBeVisible();
+
+  // The base tag must not turn an in-page link into a trip to the home page.
+  const before = new URL(page.url()).pathname;
+  const jump = page.locator("main").getByRole("link", { name: "observations" });
+  await expect(jump).toHaveAttribute("href", `${before}#observations`);
+  await jump.click();
+  expect(new URL(page.url()).pathname).toBe(before);
+  await expect(engramTitle(page)).toHaveText("Deep Gamma Note");
+
+  // Nor may it break a diagram's arrowheads: each edge names its marker by a
+  // fragment, `url(#...)`, which has to resolve inside this page and not
+  // against the base. The marker has to exist in the same SVG, and the
+  // computed style has to point at it rather than at another document.
+  const diagram = page.locator('article svg[id^="mermaid-"]');
+  await expect(diagram).toBeVisible();
+  const markers = await diagram.evaluate((svg) =>
+    Array.from(svg.querySelectorAll("path[marker-end]")).map((path) => {
+      const attribute = path.getAttribute("marker-end") ?? "";
+      const id = /^url\(#(.+)\)$/.exec(attribute)?.[1] ?? "";
+      return {
+        attribute,
+        found:
+          id !== "" &&
+          svg.querySelector(`marker[id="${CSS.escape(id)}"]`) !== null,
+        computed: getComputedStyle(path).markerEnd,
+        id,
+      };
+    }),
+  );
+  expect(markers.length).toBeGreaterThan(0);
+  for (const marker of markers) {
+    expect(marker.found, marker.attribute).toBe(true);
+    expect(marker.computed).not.toBe("none");
+    expect(marker.computed).toBe(`url("#${marker.id}")`);
+  }
 });
 
 test("a search finds an engram by what is in it", async ({ page }) => {
@@ -509,7 +551,7 @@ test("two browsers co-edit one engram and the save lands once", async ({
   // checksum it caught.
   const detail = () =>
     pageA.request
-      .get(`/api/v1/domains/${DOMAIN}/engrams/tide-tables`)
+      .get(`${BASE_PATH}/api/v1/domains/${DOMAIN}/engrams/tide-tables`)
       .then(
         (response) =>
           response.json() as Promise<{ checksum: string; content: string }>,
@@ -632,7 +674,9 @@ test("a domain is registered, filled from an archive and unregistered", async ({
     .poll(
       async () =>
         (
-          await page.request.get(`/api/v1/domains/${RESTORE_DOMAIN}/engrams`)
+          await page.request.get(
+            `${BASE_PATH}/api/v1/domains/${RESTORE_DOMAIN}/engrams`,
+          )
         ).text(),
       { timeout: 30_000 },
     )
@@ -651,8 +695,12 @@ test("a domain is registered, filled from an archive and unregistered", async ({
   await dangerZone.getByRole("button", { name: "Confirm unregister" }).click();
 
   // Nowhere to stay: the address is a wrong address now, so the app leaves.
-  await expect(page).toHaveURL(/\/$/);
-  const domains = await page.request.get("/api/v1/domains");
+  // The home page is the base itself: `/` at the root, the bare base path
+  // under one, since the router renders its basename without a slash.
+  await expect(page).toHaveURL(
+    (url) => url.pathname === (BASE_PATH === "" ? "/" : BASE_PATH),
+  );
+  const domains = await page.request.get(`${BASE_PATH}/api/v1/domains`);
   expect(domains.ok()).toBeTruthy();
   expect(await domains.text()).not.toContain(RESTORE_DOMAIN);
 });
@@ -662,10 +710,13 @@ test("the station launches from the C64 screen and returns to the same page", as
 }) => {
   // Signed in by `beforeEach`.
   const route = `/d/${DOMAIN}/e/${DEEP_PERMALINK}`;
-  await page.goto(route);
-  // The gem: the first element inside the header's home link.
+  // Relative, so the goto stays under the base; `route` keeps its slash for
+  // the address assertions below.
+  await page.goto(route.slice(1));
+  // The gem: the first element inside the header's home link, which the
+  // router renders as the base path itself under a path.
   await page
-    .locator('header a[href="/"] > span')
+    .locator(`header a[href="${BASE_PATH === "" ? "/" : BASE_PATH}"] > span`)
     .first()
     .click({ clickCount: 3 });
   await expect(
