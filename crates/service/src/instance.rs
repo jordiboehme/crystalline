@@ -2249,8 +2249,8 @@ fn daemon_log_sink() -> Option<std::process::Stdio> {
 /// session on unix, a breakaway from the parent's job on Windows) and outlives
 /// every client, by design: it serves the user's state directory and the web
 /// UI to whoever comes next. When this binary lies inside a Claude Desktop
-/// extension folder ([`in_desktop_extension_folder`]) it is
-/// neither: `current_exe` is then the in-place binary inside Claude Desktop's
+/// extension folder ([`in_desktop_extension_folder`]) it is neither:
+/// `current_exe` is then the in-place binary inside Claude Desktop's
 /// own extension folder, and a detached daemon running from it kept that file
 /// locked past Desktop's teardown, which on Windows blocked the packaged host
 /// from updating or relaunching (2026-09-18). So the extension's daemon stays
@@ -2875,10 +2875,6 @@ mod tests {
         );
     }
 
-    /// The spawned daemon's command line: `serve --daemon --autostarted` always,
-    /// `--db` ahead of the subcommand and `--config` after it when given, and
-    /// `--exit-when-idle` only for the extension's daemon, which must not
-    /// outlive Claude Desktop.
     #[test]
     fn the_extension_folder_is_found_on_both_platforms() {
         for inside in [
@@ -2928,6 +2924,10 @@ mod tests {
         );
     }
 
+    /// The spawned daemon's command line: `serve --daemon --autostarted` always,
+    /// `--db` ahead of the subcommand and `--config` after it when given, and
+    /// `--exit-when-idle` only for the extension's daemon, which must not
+    /// outlive Claude Desktop.
     #[test]
     fn daemon_args_add_exit_when_idle_only_for_the_extension() {
         let plain = daemon_args(&SpawnOptions::default(), false);
