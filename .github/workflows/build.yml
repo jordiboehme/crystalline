@@ -650,11 +650,46 @@ jobs:
           & $exe --version
           $sysPath = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment').Path
           if ($sysPath -notlike '*Crystalline\bin*') { throw 'install dir not on the system PATH' }
+          # The daemon task: registered by the installed binary, defined for
+          # the Users group, removed on uninstall. Run once on a best-effort
+          # basis: a hosted runner may have no interactive session for a group
+          # task, so a run that starts no daemon is a warning here and a check
+          # on a real machine before the release.
+          $task = '\Crystalline\Daemon'
+          schtasks /Query /TN $task *> $null
+          if ($LASTEXITCODE -ne 0) { throw "the MSI did not register $task" }
+          # Export-ScheduledTask hands back a .NET string, so the encoding
+          # schtasks would pick for a pipe never comes up.
+          $xml = Export-ScheduledTask -TaskPath '\Crystalline\' -TaskName 'Daemon' -ErrorAction SilentlyContinue
+          if (-not $xml) { throw "the MSI did not register $task" }
+          foreach ($want in @('S-1-5-32-545', '<LogonTrigger>', '<MultipleInstancesPolicy>Parallel', '<ExecutionTimeLimit>PT0S', 'serve --daemon --from-task', 'Crystalline\bin\crystalline.exe')) {
+            if (-not $xml.Contains($want)) { throw "the task definition lacks $want" }
+          }
+          schtasks /Run /TN $task | Out-Null
+          $up = $false
+          for ($i = 0; $i -lt 30; $i++) {
+            & $exe ctl status *> $null
+            if ($LASTEXITCODE -eq 0) { $up = $true; break }
+            Start-Sleep -Milliseconds 500
+          }
+          if ($up) {
+            "the task started a daemon that answers"
+            & $exe ctl shutdown *> $null
+          } else {
+            "::warning::the task did not start a daemon on this runner; the real-machine check covers it"
+          }
+          # A daemon the task started in another session would hold the
+          # binary open, and the quiet uninstall below would then end with a
+          # reboot request instead of removing it. Ending the task stops it.
+          schtasks /End /TN $task *> $null
           $p = Start-Process msiexec -ArgumentList "/x `"$msi`" /qn /norestart" -Wait -PassThru
           if ($p.ExitCode -ne 0) { throw "uninstall failed: $($p.ExitCode)" }
           if (Test-Path $exe) { throw 'crystalline.exe still present after uninstall' }
           $sysPath = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment').Path
           if ($sysPath -like '*Crystalline\bin*') { throw 'PATH entry not removed on uninstall' }
+          schtasks /Query /TN $task *> $null
+          if ($LASTEXITCODE -eq 0) { throw 'the task is still registered after uninstall' }
+          $global:LASTEXITCODE = 0
 
       - name: Upload .msi artifact
         if: matrix.msi

@@ -30,3 +30,4 @@ mod provision;
 #[cfg(unix)]
 mod source_hooks;
 mod version;
+mod wix;
