@@ -11,7 +11,7 @@ use std::sync::mpsc::Receiver;
 use std::sync::{Mutex, Once};
 use std::time::Duration;
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows_sys::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GWLP_USERDATA,
@@ -66,7 +66,7 @@ impl SessionEndWindow {
         wait: Duration,
     ) -> Option<SessionEndWindow> {
         let title = wide(title);
-        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Option<usize>>(1);
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<usize, u32>>(1);
         let hook = Box::new(Hook {
             trigger,
             stopped: Mutex::new(stopped),
@@ -81,13 +81,19 @@ impl SessionEndWindow {
             })
             .ok()?;
         match ready_rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(Some(hwnd)) => Some(SessionEndWindow {
+            Ok(Ok(hwnd)) => Some(SessionEndWindow {
                 hwnd,
                 thread: Some(thread),
             }),
-            _ => {
+            Ok(Err(code)) => {
                 tracing::warn!(
-                    "no clean stop at sign-out: the session-end window could not be created"
+                    "no clean stop at sign-out: the session-end window could not be created (error {code})"
+                );
+                None
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "no clean stop at sign-out: the session-end window did not start within 5s"
                 );
                 None
             }
@@ -101,8 +107,10 @@ impl SessionEndWindow {
 
 impl Drop for SessionEndWindow {
     fn drop(&mut self) {
-        // SAFETY: posting to a window owned by our own thread; a window that
-        // is already gone makes the call fail, which is fine.
+        // SAFETY: posting to the window from whatever thread drops this
+        // handle; PostMessageW may cross threads and only queues the message
+        // for the window's own thread. A window that is already gone makes
+        // the call fail, which is fine.
         unsafe { PostMessageW(self.hwnd(), QUIT_MESSAGE, 0, 0) };
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -115,7 +123,7 @@ static REGISTER: Once = Once::new();
 /// The window thread: register the class once per process, create the
 /// window with the hook as its creation parameter, pump messages until
 /// `WM_QUIT`, then free the hook.
-fn run(title: Vec<u16>, hook: Box<Hook>, ready: std::sync::mpsc::SyncSender<Option<usize>>) {
+fn run(title: Vec<u16>, hook: Box<Hook>, ready: std::sync::mpsc::SyncSender<Result<usize, u32>>) {
     let class = wide(WINDOW_CLASS);
     // SAFETY: a null module name asks for this executable's own handle.
     let instance = unsafe { GetModuleHandleW(std::ptr::null()) };
@@ -128,8 +136,15 @@ fn run(title: Vec<u16>, hook: Box<Hook>, ready: std::sync::mpsc::SyncSender<Opti
             ..Default::default()
         };
         // SAFETY: a fully initialized class description; the class name is
-        // copied by the call. A failure shows as CreateWindowExW failing.
-        unsafe { RegisterClassExW(&wc) };
+        // copied by the call.
+        let atom = unsafe { RegisterClassExW(&wc) };
+        if atom == 0 {
+            // SAFETY: reads this thread's last error, set by the failed call.
+            let code = unsafe { GetLastError() };
+            // Once per process, inside call_once. CreateWindowExW fails next
+            // and says so too.
+            tracing::warn!("the session-end window class could not be registered (error {code})");
+        }
     });
     let hook = Box::into_raw(hook);
     // SAFETY: a registered class, no parent (a top-level window, never
@@ -153,23 +168,40 @@ fn run(title: Vec<u16>, hook: Box<Hook>, ready: std::sync::mpsc::SyncSender<Opti
         )
     };
     if hwnd.is_null() {
-        let _ = ready.send(None);
+        // SAFETY: reads this thread's last error, set by the failed call.
+        let code = unsafe { GetLastError() };
+        let _ = ready.send(Err(code));
         // SAFETY: CreateWindowExW failed, so no window holds the pointer.
         drop(unsafe { Box::from_raw(hook) });
         return;
     }
-    let _ = ready.send(Some(hwnd as usize));
+    let _ = ready.send(Ok(hwnd as usize));
     let mut msg = MSG::default();
-    // SAFETY: the standard loop over this thread's queue; 0 is WM_QUIT and
-    // -1 an error, both end it.
-    while unsafe { GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) } > 0 {
+    // The standard loop over this thread's queue; 0 is WM_QUIT and -1 an
+    // error, both end it.
+    let ended = loop {
+        // SAFETY: a valid out parameter; a null window reads every message
+        // of this thread.
+        let got = unsafe { GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) };
+        if got <= 0 {
+            break got;
+        }
         // SAFETY: a message GetMessageW just filled.
         unsafe { TranslateMessage(&msg) };
         // SAFETY: as above.
         unsafe { DispatchMessageW(&msg) };
+    };
+    if ended < 0 {
+        // SAFETY: reads this thread's last error, set by GetMessageW.
+        let code = unsafe { GetLastError() };
+        tracing::warn!("the session-end window stopped reading messages (error {code})");
+        // SAFETY: destroying our own window on its own thread, so it is gone
+        // before the hook below is freed.
+        unsafe { DestroyWindow(hwnd) };
     }
-    // SAFETY: the window is destroyed (WM_QUIT follows WM_DESTROY), so no
-    // procedure call can read the hook any more.
+    // SAFETY: the window is destroyed (WM_QUIT follows WM_DESTROY, and after
+    // a GetMessageW error the call above destroyed it), so no procedure call
+    // can read the hook any more.
     drop(unsafe { Box::from_raw(hook) });
 }
 
