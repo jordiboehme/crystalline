@@ -2807,7 +2807,7 @@ async fn an_eliciting_discard_is_asked_first_and_round_two_decides() {
     assert_eq!(
         question["message"],
         json!(
-            "Undo 1 unshared change(s) in 'kb'? notes/a.md: the team's version comes back. \
+            "Undo 1 unshared change in 'kb'? notes/a.md: the team's version comes back. \
              Nothing goes to GitHub. Edits made after you looked are undone too. Accept undoes \
              them. Decline keeps your changes."
         ),

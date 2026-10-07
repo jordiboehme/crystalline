@@ -1551,9 +1551,12 @@ async fn an_eliciting_wholesale_overwrite_into_a_live_document_is_refused_naming
         "the call is refused rather than written: {refused}"
     );
     let text = refusal_of(&refused);
-    assert!(
-        text.contains("nothing was written") && text.contains("edit_engram"),
-        "and says what did not happen and what to do instead: {text}"
+    assert_eq!(
+        text,
+        "The engram is open in the editor right now (present: Jordi), so a full replace was \
+         refused and nothing was written. Use edit_engram for a targeted change, or replace it \
+         after they close it.",
+        "it says what did not happen and what to do instead: {text}"
     );
     assert!(
         text.contains("Jordi"),

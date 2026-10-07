@@ -4866,7 +4866,8 @@ fn removal_drafts_clause(preview: &Value) -> String {
         })
         .collect();
     format!(
-        " It also ends {total} private draft(s) ({}). They cannot be brought back.",
+        " It also ends {total} private {} ({}). They cannot be brought back.",
+        if total == 1 { "draft" } else { "drafts" },
         per_actor.join(", ")
     )
 }
@@ -4997,7 +4998,12 @@ const DISCARD_REFUSAL: &str = "The discard was not confirmed, so nothing was dis
 /// nobody asked for. `reviewing` is whether the domain keeps drafts (the
 /// change listing's `mode` is `review`).
 fn discard_question(domain: &str, changes: &[Value], guarded: bool, reviewing: bool) -> String {
-    let mut question = format!("Undo {} unshared change(s) in '{domain}'?", changes.len());
+    let noun = if changes.len() == 1 {
+        "change"
+    } else {
+        "changes"
+    };
+    let mut question = format!("Undo {} unshared {noun} in '{domain}'?", changes.len());
     for c in changes.iter().take(10) {
         let path = c["path"].as_str().unwrap_or_default();
         let what = match c["kind"].as_str().unwrap_or_default() {
@@ -5009,7 +5015,7 @@ fn discard_question(domain: &str, changes: &[Value], guarded: bool, reviewing: b
         question.push_str(&format!(" {path}: {what}."));
     }
     if changes.len() > 10 {
-        question.push_str(&format!(" and {} more.", changes.len() - 10));
+        question.push_str(&format!(" And {} more.", changes.len() - 10));
     }
     if reviewing {
         question.push_str(" Only your own drafts are cleared.");
@@ -5034,17 +5040,16 @@ const RESOLVE_NEEDS_RESOLUTION: &str = "resolve_conflict needs a resolution: pas
 
 /// What an unconfirmed wholesale overwrite tells the model: what is still
 /// standing, and the two ways forward.
-pub const LIVE_OVERWRITE_REFUSAL: &str = "The overwrite was not confirmed, so the live engram was left as its editor holds it; nothing was written. Use edit_engram for a targeted change, or call write_engram again with overwrite=true if the user asks for it.";
-
-/// [`LIVE_OVERWRITE_REFUSAL`] with the names of who is in the document.
+/// The refusal every client gets for a full replace of an engram somebody has
+/// open in the editor, naming who is in there.
 ///
-/// Every client gets this refusal, one that can elicit included: nobody is
-/// asked about replacing somebody's open document, and somebody is in it all
-/// the same. The words are the ones a client without elicitation has always
-/// been given.
+/// Nobody is asked, and `overwrite=true` is refused the same way for as long
+/// as the room is open, so the text names the two ways that work: a targeted
+/// edit, which composes into their document, or the replace once they have
+/// closed it.
 fn live_overwrite_refusal(target: &LiveWriteTarget) -> String {
     format!(
-        "{LIVE_OVERWRITE_REFUSAL} It is open in a live editor right now (present: {}), and this client cannot put the question to them.",
+        "The engram is open in the editor right now (present: {}), so a full replace was refused and nothing was written. Use edit_engram for a targeted change, or replace it after they close it.",
         present_names(&target.present)
     )
 }
@@ -5663,7 +5668,7 @@ mod tests {
         assert_eq!(
             with,
             "Remove the domain 'kb' (4 engrams) from Crystalline? Its files stay on disk. Adding \
-             the folder again brings them back. It also ends 3 private draft(s) (alice 2, bob 1). \
+             the folder again brings them back. It also ends 3 private drafts (alice 2, bob 1). \
              They cannot be brought back. Accept removes it. Decline keeps everything."
         );
 
@@ -5797,24 +5802,24 @@ mod tests {
             .collect();
         assert_eq!(
             discard_question("kb", &changes, false, false),
-            "Undo 12 unshared change(s) in 'kb'? notes/0.md: your new file is deleted. \
+            "Undo 12 unshared changes in 'kb'? notes/0.md: your new file is deleted. \
              notes/1.md: the team's version comes back. notes/2.md: the deleted file comes back. \
              notes/3.md: your new file is deleted. notes/4.md: the team's version comes back. \
              notes/5.md: the deleted file comes back. notes/6.md: your new file is deleted. \
              notes/7.md: the team's version comes back. notes/8.md: the deleted file comes back. \
-             notes/9.md: your new file is deleted. and 2 more. Nothing goes to GitHub. Edits \
+             notes/9.md: your new file is deleted. And 2 more. Nothing goes to GitHub. Edits \
              made after you looked are undone too. Accept undoes them. Decline keeps your \
              changes."
         );
         assert_eq!(
             discard_question("kb", &changes[1..2], true, false),
-            "Undo 1 unshared change(s) in 'kb'? notes/1.md: the team's version comes back. \
+            "Undo 1 unshared change in 'kb'? notes/1.md: the team's version comes back. \
              Nothing goes to GitHub. A file edited after you looked is left as it is. Accept \
              undoes them. Decline keeps your changes."
         );
         assert_eq!(
             discard_question("kb", &changes[..1], false, true),
-            "Undo 1 unshared change(s) in 'kb'? notes/0.md: your new file is deleted. Only your \
+            "Undo 1 unshared change in 'kb'? notes/0.md: your new file is deleted. Only your \
              own drafts are cleared. Nothing goes to GitHub. Edits made after you looked are \
              undone too. Accept undoes them. Decline keeps your changes."
         );
