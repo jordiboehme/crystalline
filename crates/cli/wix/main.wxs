@@ -100,9 +100,10 @@
     <!-- The Windows task \Crystalline\Daemon that starts the daemon for
          whoever signs in, outside any app package (Claude Desktop's bridge
          runs it on demand). The installed binary registers it, so the task
-         names the folder it was really installed to. Both actions are
-         deferred and not impersonated: they run as SYSTEM in the installer
-         service's own session, so no console window reaches the desktop.
+         names the folder it was really installed to. The register and the
+         removal are deferred and not impersonated: they run as SYSTEM in
+         the installer service's own session, so no console window reaches
+         the desktop.
          The register runs after the files are in place, on install, repair
          and modify; the removal runs before the files go, on a real
          uninstall only. A major upgrade also removes the old product with
@@ -112,11 +113,23 @@
          register Windows refuses during an upgrade keeps the old task
          instead of leaving none. A failure in either action is ignored, so
          a task Windows refuses never rolls back the install; doctor reports
-         a missing task and its fix registers one. -->
+         a missing task and its fix registers one. The upgrade guard on the
+         removal is permanent: every later version's cached MSI keeps it, so
+         a later version that drops or renames the task must delete
+         \Crystalline\Daemon itself on its own install. A rollback action
+         undoes the register when a first install fails after it; it is
+         skipped for a repair or an upgrade, so their rollback never deletes
+         a task the machine already had. -->
     <CustomAction Id='RegisterDaemonTask'
         FileKey='CrystallineExe'
         ExeCommand='daemon-task register --all-users'
         Execute='deferred'
+        Impersonate='no'
+        Return='ignore'/>
+    <CustomAction Id='RollbackRegisterDaemonTask'
+        FileKey='CrystallineExe'
+        ExeCommand='daemon-task unregister --all-users'
+        Execute='rollback'
         Impersonate='no'
         Return='ignore'/>
     <CustomAction Id='UnregisterDaemonTask'
@@ -126,6 +139,7 @@
         Impersonate='no'
         Return='ignore'/>
     <InstallExecuteSequence>
+      <Custom Action='RollbackRegisterDaemonTask' Before='RegisterDaemonTask'>NOT Installed AND NOT WIX_UPGRADE_DETECTED AND NOT REMOVE~="ALL"</Custom>
       <Custom Action='RegisterDaemonTask' After='InstallFiles'>NOT REMOVE~="ALL"</Custom>
       <Custom Action='UnregisterDaemonTask' Before='RemoveFiles'>REMOVE~="ALL" AND NOT UPGRADINGPRODUCTCODE</Custom>
     </InstallExecuteSequence>
