@@ -128,10 +128,23 @@ jobs:
           if grep -q 'Authority=Developer ID' <<<"$info"; then
             codesign --verify --strict --verbose=2 --arch arm64 universal/crystalline
             codesign --verify --strict --verbose=2 --arch x86_64 universal/crystalline
+          elif [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "::error::the macOS slices carry no Developer ID signature, and a tag must ship a signed and notarized binary"
+            exit 1
           else
             echo "unsigned dry run: no signature to verify"
           fi
           universal/crystalline --version
+          # The Intel slice runs through Rosetta on this arm runner. The
+          # runner image has carried Rosetta so far; if one does not, the
+          # check is skipped with a note instead of failing the release.
+          # Rosetta is probed by its file, not by running a system binary:
+          # newer macOS ships those without an x86_64 slice.
+          if [ -x /Library/Apple/usr/share/rosetta/rosetta ]; then
+            arch -x86_64 universal/crystalline --version
+          else
+            echo "::warning::Rosetta is not installed on this runner, so the x86_64 slice was not run"
+          fi
 
       - name: Upload the universal binary
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
