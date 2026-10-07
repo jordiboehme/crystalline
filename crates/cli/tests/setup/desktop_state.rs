@@ -223,6 +223,80 @@ fn the_merge_takes_the_config_union_moves_a_virtual_domain_and_renames_the_folde
         before,
         "the merge only read the private folder: no file in it changed, none was added"
     );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a clean merge leaves no problem: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+/// A private file domain whose folder sits inside the private state folder
+/// would move away with the rename, and one whose folder does not exist here
+/// would be a broken registration. Neither is registered; both are named,
+/// and the folder stays. Once this machine registers the name itself, its
+/// registration is kept and the merge goes through.
+#[test]
+fn a_private_domain_with_an_unusable_folder_is_not_registered() {
+    let home = tempfile::tempdir().unwrap();
+    let folder = private_folder(home.path());
+    let inside = folder.join("domains").join("inner");
+    std::fs::create_dir_all(&inside).unwrap();
+    let gone = home.path().join("gone");
+    let mut cfg = GlobalConfig::default();
+    cfg.domains
+        .insert("inner".to_string(), DomainEntry::file(inside.clone()));
+    cfg.domains
+        .insert("gone".to_string(), DomainEntry::file(gone.clone()));
+    crystalline_core::config::save_yaml(&folder.join("config.yaml"), &cfg).unwrap();
+
+    let out = run(
+        home.path(),
+        &["doctor", "--fix", "--merge-desktop-state", "--json"],
+    );
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let merge = &report["merge"];
+    assert_eq!(merge["registered"], serde_json::json!([]), "{merge}");
+    let conflicts = merge["conflicts"].to_string();
+    assert!(
+        conflicts.contains("inside Claude Desktop's private folder"),
+        "{conflicts}"
+    );
+    assert!(conflicts.contains("does not exist here"), "{conflicts}");
+    assert!(
+        folder.exists(),
+        "nothing is renamed while a problem remains"
+    );
+    assert!(
+        !real_config_path(home.path()).exists(),
+        "nothing registered"
+    );
+    assert_eq!(out.status.code(), Some(1));
+
+    // The person moves the files out and registers both names here.
+    let mut real = GlobalConfig::default();
+    for name in ["inner", "gone"] {
+        let own = home.path().join("own").join(name);
+        std::fs::create_dir_all(&own).unwrap();
+        real.domains
+            .insert(name.to_string(), DomainEntry::file(own));
+    }
+    std::fs::create_dir_all(real_config_path(home.path()).parent().unwrap()).unwrap();
+    crystalline_core::config::save_yaml(&real_config_path(home.path()), &real).unwrap();
+    let again = run(
+        home.path(),
+        &["doctor", "--fix", "--merge-desktop-state", "--json"],
+    );
+    let again: Value = serde_json::from_slice(&again.stdout).unwrap();
+    let merge = &again["merge"];
+    assert_eq!(merge["conflicts"], serde_json::json!([]), "{merge}");
+    assert_eq!(
+        merge["kept_this_machine"].as_array().unwrap().len(),
+        2,
+        "{merge}"
+    );
+    assert!(merge["renamed_to"].is_string(), "{merge}");
+    assert!(!folder.exists());
 }
 
 #[test]

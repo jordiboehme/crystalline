@@ -155,6 +155,10 @@ pub struct MergeReport {
     pub registered: Vec<String>,
     /// Names registered on both sides the same way: left as they are.
     pub already_registered: Vec<String>,
+    /// Names whose private registration points at a folder this machine
+    /// cannot use, while this machine registers the name itself: this
+    /// machine's registration is kept, one sentence each.
+    pub kept_this_machine: Vec<String>,
     /// Virtual domains whose private engrams were moved, with how many.
     pub imported: Vec<(String, u64)>,
     /// Virtual domains on both sides, with the private engrams the real side
@@ -176,24 +180,6 @@ impl MergeReport {
             || self.imported.iter().any(|(_, n)| *n > 0)
             || self.renamed_to.is_some()
     }
-
-    /// Fold the report of a further state into this one.
-    pub fn absorb(&mut self, other: MergeReport) {
-        self.folders.extend(other.folders);
-        self.registered.extend(other.registered);
-        self.already_registered.extend(other.already_registered);
-        self.imported.extend(other.imported);
-        self.kept_both.extend(other.kept_both);
-        self.conflicts.extend(other.conflicts);
-        for kept in other.private_kept {
-            if !self.private_kept.contains(&kept) {
-                self.private_kept.push(kept);
-            }
-        }
-        if other.renamed_to.is_some() {
-            self.renamed_to = other.renamed_to;
-        }
-    }
 }
 
 fn same_registration(real: &DomainEntry, private: &DomainEntry) -> bool {
@@ -205,6 +191,45 @@ fn meaning(entry: &DomainEntry) -> String {
         Some(root) if !entry.is_virtual() => format!("the folder {}", root.display()),
         _ => "a virtual domain".to_string(),
     }
+}
+
+/// Why a private file domain's folder cannot be registered here as it
+/// stands, `None` when it can: a folder inside the private state folder
+/// moves away with the rename, and a folder that does not exist here (a
+/// path the package redirected, a drive that is gone) would be a broken
+/// registration.
+fn unusable_root(entry: &DomainEntry, folder: &Path) -> Option<String> {
+    match entry.file_path() {
+        Some(root) if root.starts_with(folder) => Some(format!(
+            "its folder {} is inside Claude Desktop's private folder",
+            root.display()
+        )),
+        Some(root) if !root.is_dir() => {
+            Some(format!("its folder {} does not exist here", root.display()))
+        }
+        Some(_) => None,
+        None => Some("it names no folder".to_string()),
+    }
+}
+
+/// Index a file domain the merge just registered: over the daemon when one
+/// runs, else directly, the two routes `domain add` takes.
+async fn sync_registered(
+    name: &str,
+    root: &Path,
+    real_config: Option<&Path>,
+) -> anyhow::Result<()> {
+    if crystalline_service::use_daemon(None, real_config)
+        && crystalline_service::ctl_if_running(
+            serde_json::json!({ "v": 1, "cmd": "sync", "domain": name, "embed": false }),
+        )
+        .await?
+        .is_some()
+    {
+        return Ok(());
+    }
+    crate::cmd::sync_domain_direct(name, root, real_config, None).await?;
+    Ok(())
 }
 
 /// `crystalline.merged-<day>` beside `folder`, with `-2`, `-3` and so on when
@@ -235,15 +260,18 @@ fn copy_private_state(folder: &Path, scratch: &Path) -> anyhow::Result<(PathBuf,
     Ok((scratch.join("index.db"), scratch.join("config.yaml")))
 }
 
-/// Merge one private state into this machine's real one. Takes the union of
-/// both domain lists, moves the engrams of the private virtual domains,
-/// never overwrites what the real side has and renames the private folder
-/// when no conflict is left. The private folder is only read.
-pub async fn merge(
+/// Merge one private state into this machine's real one, adding what it did
+/// to `report`. Takes the union of both domain lists, moves the engrams of
+/// the private virtual domains, never overwrites what the real side has and
+/// renames the private folder when no conflict is left. The private folder
+/// is only read. On an error, `report` still holds what was done before it,
+/// so a doctor run never hides a registration it already saved.
+pub async fn merge_into(
     state: &DesktopState,
     real_config: Option<&Path>,
     today: chrono::NaiveDate,
-) -> anyhow::Result<MergeReport> {
+    report: &mut MergeReport,
+) -> anyhow::Result<()> {
     if let Some(pid) = state.daemon_alive {
         anyhow::bail!(
             "a Crystalline daemon from {} still runs (pid {pid}); quit Claude Desktop and run the merge again",
@@ -258,35 +286,52 @@ pub async fn merge(
     };
     let loaded = crate::cmd::load(real_config)?;
     let mut file = loaded.file.clone();
-    let mut report = MergeReport {
-        folders: vec![state.folder.clone()],
-        ..MergeReport::default()
-    };
+    report.folders.push(state.folder.clone());
+    let conflicts_before = report.conflicts.len();
+    let mut registered = Vec::new();
     let mut virtuals: Vec<(String, bool)> = Vec::new();
 
     for (name, entry) in &private.domains {
-        match file.domains.get(name) {
-            None if entry.is_virtual() => virtuals.push((name.clone(), false)),
-            None => {
+        let unusable = (!entry.is_virtual())
+            .then(|| unusable_root(entry, &state.folder))
+            .flatten();
+        match (file.domains.get(name), unusable) {
+            (None, _) if entry.is_virtual() => virtuals.push((name.clone(), false)),
+            (None, Some(why)) => report.conflicts.push(format!(
+                "'{name}' in Claude Desktop's state cannot be registered here: {why}. Move its files to a folder of your own, register it with crystalline domain add, then merge again"
+            )),
+            (None, None) => {
                 file.domains.insert(name.clone(), entry.clone());
-                report.registered.push(name.clone());
+                registered.push(name.clone());
             }
-            Some(real) if same_registration(real, entry) => {
+            (Some(real), _) if same_registration(real, entry) => {
                 if entry.is_virtual() {
                     virtuals.push((name.clone(), true));
                 } else {
                     report.already_registered.push(name.clone());
                 }
             }
-            Some(real) => report.conflicts.push(format!(
+            (Some(real), Some(why)) => report.kept_this_machine.push(format!(
+                "'{name}' in Claude Desktop's state cannot be used here ({why}): kept {} as this machine registers it",
+                meaning(real)
+            )),
+            (Some(real), None) => report.conflicts.push(format!(
                 "'{name}' is {} here and {} in Claude Desktop's state; rename one of them with crystalline domain rename, then merge again",
                 meaning(real),
                 meaning(entry)
             )),
         }
     }
-    if !report.registered.is_empty() {
+    if !registered.is_empty() {
         crystalline_core::config::save_yaml(&loaded.path, &file)?;
+        report.registered.extend(registered.iter().cloned());
+        // Indexed as `domain add` indexes a new folder, so the merged
+        // domains answer at once.
+        for name in &registered {
+            if let Some(root) = file.domains[name].file_path() {
+                sync_registered(name, &root, real_config).await?;
+            }
+        }
     }
 
     if !virtuals.is_empty() {
@@ -336,16 +381,16 @@ pub async fn merge(
     }
 
     for kept in ["web-auth.db", "origins", "instance-id"] {
-        if state.folder.join(kept).exists() {
+        if state.folder.join(kept).exists() && !report.private_kept.iter().any(|k| k == kept) {
             report.private_kept.push(kept.to_string());
         }
     }
-    if report.conflicts.is_empty() {
+    if report.conflicts.len() == conflicts_before {
         let target = merged_name(&state.folder, today);
         std::fs::rename(&state.folder, &target)?;
         report.renamed_to = Some(target);
     }
-    Ok(report)
+    Ok(())
 }
 
 #[cfg(test)]

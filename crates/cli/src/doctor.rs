@@ -1462,12 +1462,11 @@ pub async fn run(
         let today = chrono::Local::now().date_naive();
         let mut merged = crate::desktop_state::MergeReport::default();
         for state in &desktop_states {
-            match crate::desktop_state::merge(state, config_override, today).await {
-                Ok(report) => merged.absorb(report),
-                Err(e) => {
-                    merge_error = Some(format!("{e:#}"));
-                    break;
-                }
+            if let Err(e) =
+                crate::desktop_state::merge_into(state, config_override, today, &mut merged).await
+            {
+                merge_error = Some(format!("{e:#}"));
+                break;
             }
         }
         merge = Some(merged);
@@ -3923,6 +3922,9 @@ fn render_merge(out: &mut String, merge: &crate::desktop_state::MergeReport) {
             out,
             "  {name} is already registered here the same way: left as it is"
         );
+    }
+    for line in &merge.kept_this_machine {
+        let _ = writeln!(out, "  {line}");
     }
     for (name, count) in &merge.imported {
         let _ = writeln!(
