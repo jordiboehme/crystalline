@@ -224,14 +224,14 @@ impl Engine {
 
     /// What [`Engine::delete_engram`] would remove, without removing any of it.
     ///
-    /// Written for the confirmation round the MCP layer opens on a peer that
-    /// can put a question to its user: the question has to name what dies, and
-    /// naming it means resolving the identifier first. Every refusal the delete
-    /// itself would raise on the way to the file - an unknown domain, an
-    /// identifier that resolves to nothing or to two things, a read-only
-    /// server, an `expected_checksum` on an attachment - is raised here too, so
-    /// a call that cannot succeed fails before a human is asked to approve it
-    /// rather than after.
+    /// No surface asks before a delete any more: the MCP tool deletes at once,
+    /// and only the engine's own tests call this. It is kept for a caller that
+    /// wants to name what a delete would take before it runs it, which means
+    /// resolving the identifier first. Every refusal the delete itself would
+    /// raise on the way to the file - an unknown domain, an identifier that
+    /// resolves to nothing or to two things, a read-only server, an
+    /// `expected_checksum` on an attachment - is raised here too, so a call
+    /// that cannot succeed fails in the preview rather than after it.
     ///
     /// Two shapes, one per branch of the delete. An `assets/` identifier
     /// previews `{domain, path, size, attachment: true}`; anything else
@@ -268,7 +268,7 @@ impl Engine {
     /// [`Engine::delete_preview`] under the acting scope, the pair
     /// [`Engine::delete_engram_as`] takes.
     ///
-    /// The scope is what keeps round one honest about round two on a domain
+    /// The scope is what keeps the preview honest about the delete on a domain
     /// that reviews changes. An attachment only this caller's own overlay holds
     /// is a file the delete would really remove, so a preview built on the
     /// folder alone would refuse a delete that was going to succeed - and a
