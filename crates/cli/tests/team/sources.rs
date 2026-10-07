@@ -700,3 +700,228 @@ fn a_local_rename_of_a_mount_says_when_the_configuration_does_not_load() {
         "{stderr}"
     );
 }
+
+fn connect_with(server: &CliServer, home: &Path, extra: &[&str]) -> std::process::Output {
+    let mut args = vec![
+        "connect",
+        server.origin.as_str(),
+        "--name",
+        "acme",
+        "--token",
+    ];
+    args.extend_from_slice(extra);
+    bin(home)
+        .args(&args)
+        .write_stdin(format!("{}\n", server.token_for("keeper")))
+        .output()
+        .unwrap()
+}
+
+fn source_json(home: &Path) -> Value {
+    status_json(home)["sources"][0].clone()
+}
+
+#[test]
+fn connect_with_domains_takes_only_those_and_says_what_it_left_out() {
+    let server = CliServer::start_with(&["alpha", "beta"]);
+    let home = tempfile::tempdir().unwrap();
+    let out = connect_with(&server, home.path(), &["--domains", "beta,alpha,ghost"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("takes alpha, beta"), "{text}");
+    assert!(
+        text.contains("leaves out 1 domain that is not on the list"),
+        "{text}"
+    );
+    assert!(
+        text.contains("'ghost' is on the list, but the server does not offer it"),
+        "{text}"
+    );
+    let source = source_json(home.path());
+    assert_eq!(
+        source["domains"],
+        serde_json::json!(["alpha", "beta", "ghost"])
+    );
+    assert_eq!(source["not_offered"], serde_json::json!(["ghost"]));
+    assert_eq!(source["not_chosen"], serde_json::json!(["open"]));
+    assert_eq!(mounts(&source).len(), 2);
+    let status = bin(home.path()).args(["status"]).output().unwrap();
+    let status = String::from_utf8_lossy(&status.stdout);
+    assert!(status.contains("takes only alpha, beta, ghost"), "{status}");
+}
+
+#[test]
+fn connect_json_names_what_it_took_and_left_out() {
+    let server = CliServer::start_with(&["alpha", "beta"]);
+    let home = tempfile::tempdir().unwrap();
+    let out = bin(home.path())
+        .args([
+            "--json",
+            "connect",
+            server.origin.as_str(),
+            "--name",
+            "acme",
+            "--token",
+            "--domains",
+            "alpha,ghost",
+        ])
+        .write_stdin(format!("{}\n", server.token_for("keeper")))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let said: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(said["domains"], serde_json::json!(["alpha", "ghost"]));
+    assert_eq!(said["taken"], serde_json::json!(["alpha"]));
+    assert_eq!(said["not_chosen"], serde_json::json!(["beta", "open"]));
+    assert_eq!(said["not_offered"], serde_json::json!(["ghost"]));
+    assert_eq!(said["came_back"], serde_json::json!([]));
+}
+
+#[test]
+fn a_source_without_a_list_shows_null_and_takes_every_domain() {
+    let server = CliServer::start();
+    let home = tempfile::tempdir().unwrap();
+    connect(&server, home.path(), "acme");
+    let source = source_json(home.path());
+    assert_eq!(source["domains"], Value::Null, "{source}");
+    let status = bin(home.path()).args(["status"]).output().unwrap();
+    let status = String::from_utf8_lossy(&status.stdout);
+    assert!(status.contains("takes every domain it offers"), "{status}");
+}
+
+#[test]
+fn connecting_again_replaces_keeps_or_clears_the_list() {
+    let server = CliServer::start_with(&["alpha", "beta"]);
+    let home = tempfile::tempdir().unwrap();
+    assert!(
+        connect_with(&server, home.path(), &["--domains", "alpha"])
+            .status
+            .success()
+    );
+    assert_eq!(
+        source_json(home.path())["domains"],
+        serde_json::json!(["alpha"])
+    );
+    assert!(connect_with(&server, home.path(), &[]).status.success());
+    assert_eq!(
+        source_json(home.path())["domains"],
+        serde_json::json!(["alpha"]),
+        "a new sign-in never widens it"
+    );
+    assert!(
+        connect_with(&server, home.path(), &["--domains", "beta"])
+            .status
+            .success()
+    );
+    assert_eq!(
+        source_json(home.path())["domains"],
+        serde_json::json!(["beta"]),
+        "replaced"
+    );
+    let out = connect_with(&server, home.path(), &["--all-domains"]);
+    assert!(out.status.success());
+    assert_eq!(
+        source_json(home.path())["domains"],
+        Value::Null,
+        "cleared: takes all again"
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("takes alpha, beta, open"), "{text}");
+}
+
+#[test]
+fn a_bad_domain_list_is_refused_before_signing_in() {
+    let server = CliServer::start();
+    let home = tempfile::tempdir().unwrap();
+    let sources_file = crate::common::isolated_state_dir(home.path())
+        .join("remote")
+        .join("sources.json");
+    for extra in [
+        vec!["--domains", ""],
+        vec!["--domains", "alpha,,beta"],
+        vec!["--domains", "Not A Name"],
+        vec!["--domains", "alpha", "--all-domains"],
+    ] {
+        let out = connect_with(&server, home.path(), &extra);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{extra:?} must be refused");
+        assert!(
+            !stderr.contains("unexpected argument"),
+            "{extra:?}: the flags are known: {stderr}"
+        );
+        assert!(
+            stderr.contains("--domains"),
+            "{extra:?}: the refusal names the flag: {stderr}"
+        );
+        assert!(!sources_file.exists(), "{extra:?}: nothing is saved");
+    }
+}
+
+#[test]
+fn a_local_copy_comes_back_when_the_list_leaves_its_domain_out() {
+    let server = CliServer::start_full(&[], &[("platform", "acme/platform")]);
+    let home = tempfile::tempdir().unwrap();
+    home_with_a_team_copy(home.path());
+    let run = |extra: &[&str]| {
+        let mut args = vec![
+            "connect",
+            server.origin.as_str(),
+            "--name",
+            "acme",
+            "--token",
+        ];
+        args.extend_from_slice(extra);
+        let out = bin_cfg(home.path())
+            .args(&args)
+            .write_stdin(format!("{}\n", server.token_for("keeper")))
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    let first = run(&[]);
+    assert!(!first.contains("is visible again"), "{first}");
+    let again = run(&["--domains", "open"]);
+    assert!(
+        again.contains("the local domain 'team-platform' is visible again"),
+        "{again}"
+    );
+    assert!(again.contains("it takes open"), "{again}");
+}
+
+#[test]
+fn doctor_notes_a_listed_name_the_server_does_not_offer() {
+    let server = CliServer::start();
+    let home = tempfile::tempdir().unwrap();
+    assert!(
+        connect_with(&server, home.path(), &["--domains", "open,ghost"])
+            .status
+            .success()
+    );
+    let out = bin(home.path()).args(["doctor"]).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("note: 'ghost' is on the list"), "{text}");
+    assert!(!text.contains("PROBLEM: 'ghost'"), "a note, not a problem");
+    let out = bin(home.path())
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(report["sources"][0]["problem"].is_null(), "{report}");
+    assert_eq!(
+        report["sources"][0]["not_offered"],
+        serde_json::json!(["ghost"])
+    );
+}

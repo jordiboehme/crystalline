@@ -400,7 +400,7 @@ pub fn parse_domain_list(raw: &str) -> Result<Vec<String>, String> {
     let mut names = Vec::new();
     let parts: Vec<&str> = raw.split(',').map(str::trim).collect();
     if parts.iter().all(|p| p.is_empty()) {
-        return Err("name at least one domain, for example --domains alpha,beta".to_string());
+        return Err("name at least one domain, for example alpha,beta".to_string());
     }
     for part in parts {
         if part.is_empty() {

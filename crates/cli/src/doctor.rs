@@ -4402,6 +4402,15 @@ pub fn render_human(report: &DoctorReport) -> String {
         for skipped in &row.skipped {
             let _ = writeln!(out, "  {}", skipped.note);
         }
+        // A note, never a problem: the name is kept and taken once the
+        // server offers it.
+        for name in &row.not_offered {
+            let _ = writeln!(
+                out,
+                "  note: '{name}' is on the list, but the server does not offer it to {} (missing rights, or not there yet)",
+                row.account
+            );
+        }
         match &source.problem {
             Some(problem) => {
                 let _ = writeln!(out, "  PROBLEM: {problem}");

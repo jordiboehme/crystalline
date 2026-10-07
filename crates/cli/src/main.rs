@@ -141,6 +141,20 @@ enum Command {
         /// taken from the command line.
         #[arg(long, requires = "url")]
         token: bool,
+        /// Take only these domains of the server, by their names there,
+        /// separated by commas (alpha,beta). Connecting again with --domains
+        /// replaces the list; without it the list stays as it is.
+        #[arg(
+            long,
+            value_name = "NAMES",
+            requires = "url",
+            conflicts_with = "all_domains"
+        )]
+        domains: Option<String>,
+        /// Take every domain the server offers again, clearing the list set
+        /// with --domains.
+        #[arg(long, requires = "url")]
+        all_domains: bool,
         /// A word after the URL, refused: a token written there would land
         /// in the shell history and the process list.
         #[arg(hide = true, requires = "url")]
@@ -1830,8 +1844,22 @@ fn main() -> anyhow::Result<()> {
             url: Some(url),
             name,
             token,
+            domains,
+            all_domains,
             stray: None,
-        }) => on_runtime(move || sources::connect_server(url, name, token, cli.json)),
+        }) => {
+            // The list first, so a bad one is refused before any network
+            // call and before anyone pastes a token.
+            let choice = match (domains, all_domains) {
+                (Some(raw), _) => crystalline_remote::DomainChoice::Only(
+                    crystalline_remote::parse_domain_list(&raw)
+                        .map_err(|e| anyhow::anyhow!("--domains: {e}"))?,
+                ),
+                (None, true) => crystalline_remote::DomainChoice::All,
+                (None, false) => crystalline_remote::DomainChoice::Keep,
+            };
+            on_runtime(move || sources::connect_server(url, name, token, choice, cli.json))
+        }
         Some(Command::Connect { .. }) => anyhow::bail!(
             "name what to connect to: crystalline connect <url> for a Crystalline server, or crystalline connect github"
         ),

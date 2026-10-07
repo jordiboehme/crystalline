@@ -43,7 +43,7 @@
 //! No text a server sent reaches a message: an OAuth error is named by its
 //! code only, and only when the code is the plain shape RFC 6749 gives it.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -54,7 +54,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::mounts::{Announcement, LocalDomain, assign};
+use crate::mounts::{Announcement, HiddenReason, LocalDomain, MountTable, SkipReason, assign};
 use crate::server_client::{
     CONNECT_TIMEOUT, ONE_DOMAIN_LIMIT, UNREACHABLE_WORDS, cause, form_body, http_client,
     redirect_sentence, seconds,
@@ -678,6 +678,38 @@ pub struct Connected {
     /// The collisions, replaced local copies and skipped duplicates this
     /// source brought, in the order they were decided.
     pub announcements: Vec<Announcement>,
+    /// The local names of the domains this source serves now.
+    pub taken: Vec<String>,
+    /// The domains it offers that are not on its list, by their names there.
+    pub not_chosen: Vec<String>,
+    /// Listed names its server does not offer to this account right now.
+    pub not_offered: Vec<String>,
+    /// Local domains a mount of any source hid as a copy before this
+    /// connect and nothing hides now.
+    pub came_back: Vec<String>,
+}
+
+/// What a `connect` does with the source's list of domains.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DomainChoice {
+    /// No `--domains` and no `--all-domains`: the saved list stays, so a new
+    /// sign-in never widens it quietly. A new source takes all.
+    Keep,
+    /// `--domains`: the list, already checked by `parse_domain_list`.
+    Only(Vec<String>),
+    /// `--all-domains`: every domain the server offers again.
+    All,
+}
+
+impl DomainChoice {
+    /// The list the source has after this connect, given the one it had.
+    pub fn applied(&self, saved: Option<Vec<String>>) -> Option<Vec<String>> {
+        match self {
+            DomainChoice::Keep => saved,
+            DomainChoice::Only(list) => Some(list.clone()),
+            DomainChoice::All => None,
+        }
+    }
 }
 
 /// Add a server as a source and sign in through the browser. `open_browser`
@@ -725,6 +757,63 @@ where
     F: FnOnce(&str) + Send,
     P: FnOnce(String) -> Option<String> + Send + 'static,
 {
+    browser_inner(
+        input,
+        name,
+        DomainChoice::Keep,
+        remote_dir,
+        local,
+        open_browser,
+        paste_token,
+        wait,
+    )
+    .await
+}
+
+/// [`connect_with_browser`] that also sets the source's list of domains:
+/// [`DomainChoice::Keep`] leaves it as it is.
+pub async fn connect_with_browser_choosing<F, P>(
+    input: &str,
+    name: Option<&str>,
+    choice: DomainChoice,
+    remote_dir: &Path,
+    local: &[LocalDomain],
+    open_browser: F,
+    paste_token: P,
+) -> Result<Connected, SignInError>
+where
+    F: FnOnce(&str) + Send,
+    P: FnOnce(String) -> Option<String> + Send + 'static,
+{
+    browser_inner(
+        input,
+        name,
+        choice,
+        remote_dir,
+        local,
+        open_browser,
+        paste_token,
+        SIGN_IN_WAIT,
+    )
+    .await
+}
+
+/// The browser sign-in, with the choice of domains and the wait.
+#[allow(clippy::too_many_arguments)]
+async fn browser_inner<F, P>(
+    input: &str,
+    name: Option<&str>,
+    choice: DomainChoice,
+    remote_dir: &Path,
+    local: &[LocalDomain],
+    open_browser: F,
+    paste_token: P,
+    wait: Duration,
+) -> Result<Connected, SignInError>
+where
+    F: FnOnce(&str) + Send,
+    P: FnOnce(String) -> Option<String> + Send + 'static,
+{
     let origin = normalize_server_url(input)?;
     check_name(remote_dir, &origin, name)?;
     let http = client()?;
@@ -736,6 +825,7 @@ where
             &http,
             origin,
             name,
+            &choice,
             &token,
             remote_dir,
             local,
@@ -846,7 +936,15 @@ where
             domains: None,
             from_env: false,
         };
-        save(remote_dir, record, name, &credential, routing, local)
+        save(
+            remote_dir,
+            record,
+            name,
+            &choice,
+            &credential,
+            routing,
+            local,
+        )
     }
     .await;
     match finished {
@@ -939,13 +1037,51 @@ pub async fn connect_with_token_within(
     local: &[LocalDomain],
     limit: Duration,
 ) -> Result<Connected, SignInError> {
+    token_inner(
+        input,
+        name,
+        DomainChoice::Keep,
+        token,
+        remote_dir,
+        local,
+        limit,
+    )
+    .await
+}
+
+/// [`connect_with_token`] that also sets the source's list of domains:
+/// [`DomainChoice::Keep`] leaves it as it is.
+pub async fn connect_with_token_choosing(
+    input: &str,
+    name: Option<&str>,
+    choice: DomainChoice,
+    token: &str,
+    remote_dir: &Path,
+    local: &[LocalDomain],
+) -> Result<Connected, SignInError> {
+    token_inner(input, name, choice, token, remote_dir, local, SIGN_IN_LIMIT).await
+}
+
+/// The token sign-in, with the choice of domains and the limit.
+async fn token_inner(
+    input: &str,
+    name: Option<&str>,
+    choice: DomainChoice,
+    token: &str,
+    remote_dir: &Path,
+    local: &[LocalDomain],
+    limit: Duration,
+) -> Result<Connected, SignInError> {
     let origin = normalize_server_url(input)?;
     check_name(remote_dir, &origin, name)?;
     shaped(token)?;
     let http = client()?;
     let budget = Budget::new(limit);
     discover_by(&http, &origin, &budget).await?;
-    with_token(&http, origin, name, token, remote_dir, local, &budget).await
+    with_token(
+        &http, origin, name, &choice, token, remote_dir, local, &budget,
+    )
+    .await
 }
 
 /// A pasted token, trimmed, when it looks like a personal MCP token.
@@ -962,10 +1098,12 @@ fn shaped(token: &str) -> Result<&str, SignInError> {
 
 /// The token paste once the server is known to be Crystalline: who the token
 /// is, the routing model, and the save.
+#[allow(clippy::too_many_arguments)]
 async fn with_token(
     http: &reqwest::Client,
     origin: String,
     name: Option<&str>,
+    choice: &DomainChoice,
     token: &str,
     remote_dir: &Path,
     local: &[LocalDomain],
@@ -989,7 +1127,15 @@ async fn with_token(
         domains: None,
         from_env: false,
     };
-    let (connected, replaced) = save(remote_dir, record, name, &credential, routing, local)?;
+    let (connected, replaced) = save(
+        remote_dir,
+        record,
+        name,
+        choice,
+        &credential,
+        routing,
+        local,
+    )?;
     retire(replaced, &origin).await;
     Ok(connected)
 }
@@ -1187,6 +1333,7 @@ fn save(
     remote_dir: &Path,
     mut record: SourceRecord,
     name: Option<&str>,
+    choice: &DomainChoice,
     credential: &ServerCredential,
     routing: Option<Value>,
     local: &[LocalDomain],
@@ -1215,12 +1362,20 @@ fn save(
             }
             (None, None) => default_source_name(&record.url, &file.names()),
         };
+        // What was hidden before this connect, so a copy that comes back
+        // can be named.
+        let before = {
+            let mut probe = file.clone();
+            let offers = cached_offers(&probe, remote_dir);
+            assign(&mut probe, local, &offers).0
+        };
+        record.domains = choice.applied(file.find(&record.url).and_then(|s| s.domains.clone()));
         let name = file.upsert(record.clone()).name.clone();
         let mut offers = cached_offers(file, remote_dir);
         if let Some(routing) = &routing {
             offers.insert(name.clone(), remote_domains(routing));
         }
-        let (_, said) = assign(file, local, &offers);
+        let (table, said) = assign(file, local, &offers);
         let mine: Vec<Announcement> = said
             .into_iter()
             .filter(|a| match a {
@@ -1232,9 +1387,36 @@ fn save(
             })
             .collect();
         let source = file.find(&name).cloned().expect("just saved");
-        Ok((source, mine))
+        let hidden_now: BTreeSet<&str> = table.shadowed.iter().map(|h| h.local.as_str()).collect();
+        let came_back = hidden_copies(&before)
+            .into_iter()
+            .filter(|local| !hidden_now.contains(local.as_str()))
+            .collect();
+        let taken = table.of_source(&name).map(|m| m.local.clone()).collect();
+        let not_chosen = table
+            .skipped
+            .iter()
+            .filter(|s| s.source == name && s.reason == SkipReason::NotChosen)
+            .map(|s| s.remote.clone())
+            .collect();
+        let not_offered = table
+            .not_offered
+            .iter()
+            .filter(|u| u.source == name)
+            .map(|u| u.remote.clone())
+            .collect();
+        Ok((
+            source,
+            mine,
+            Chosen {
+                taken,
+                not_chosen,
+                not_offered,
+                came_back,
+            },
+        ))
     });
-    let (source, announcements) = match updated {
+    let (source, announcements, chosen) = match updated {
         Ok(done) => done,
         Err(e) => {
             let restored = match &previous {
@@ -1285,9 +1467,31 @@ fn save(
             source,
             routing,
             announcements,
+            taken: chosen.taken,
+            not_chosen: chosen.not_chosen,
+            not_offered: chosen.not_offered,
+            came_back: chosen.came_back,
         },
         replaced,
     ))
+}
+
+/// What a connect's list did, for [`Connected`].
+struct Chosen {
+    taken: Vec<String>,
+    not_chosen: Vec<String>,
+    not_offered: Vec<String>,
+    came_back: Vec<String>,
+}
+
+/// The local domains `table` hides as a copy of a mount, by name.
+fn hidden_copies(table: &MountTable) -> BTreeSet<String> {
+    table
+        .shadowed
+        .iter()
+        .filter(|h| h.reason == HiddenReason::Copy)
+        .map(|h| h.local.clone())
+        .collect()
 }
 
 /// The server's routing model for `token`, best effort: a server that
@@ -1488,6 +1692,18 @@ fn sha256(text: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_choice_keeps_replaces_or_clears_the_saved_list() {
+        let saved = Some(vec!["alpha".to_string()]);
+        assert_eq!(DomainChoice::Keep.applied(saved.clone()), saved);
+        assert_eq!(DomainChoice::Keep.applied(None), None);
+        assert_eq!(
+            DomainChoice::Only(vec!["beta".into()]).applied(saved.clone()),
+            Some(vec!["beta".to_string()])
+        );
+        assert_eq!(DomainChoice::All.applied(saved), None);
+    }
 
     /// Time spent before a request leaves less of the step to run, but the
     /// limit a timeout names stays the one the caller set.

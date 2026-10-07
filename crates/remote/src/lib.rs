@@ -67,9 +67,10 @@ pub use server_token::{
     CredentialKind, ServerCredential, ServerCredentialStore, server_folder, server_key,
 };
 pub use sign_in::{
-    Connected, Disconnected, Revocation, SignInError, connect_with_browser,
-    connect_with_browser_within, connect_with_token, connect_with_token_within, disconnect,
-    disconnect_within, normalize_server_url,
+    Connected, Disconnected, DomainChoice, Revocation, SignInError, connect_with_browser,
+    connect_with_browser_choosing, connect_with_browser_within, connect_with_token,
+    connect_with_token_choosing, connect_with_token_within, disconnect, disconnect_within,
+    normalize_server_url,
 };
 pub use source_cache::{
     Cached, Fetched, HOOK_STATUS_FILE, ROUTING_FILE, STALE_AFTER, cached_offers, fetch_cached,
