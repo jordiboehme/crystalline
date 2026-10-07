@@ -44,6 +44,10 @@ pub use crate::overlay::CHANNEL_ENV;
 /// The Claude Desktop extension channel value.
 pub const MCPB_CHANNEL: &str = "mcpb";
 
+/// The channel the Node launcher of the standard Claude Desktop extension
+/// sets: the binary is the one Homebrew or the MSI installed.
+pub const DESKTOP_CHANNEL: &str = "desktop";
+
 /// Whether `channel` (the `CRYSTALLINE_CHANNEL` value, when set) is the Claude
 /// Desktop extension's marker. Exact match: the manifest sets the literal.
 pub fn channel_is_mcpb(channel: Option<&str>) -> bool {
@@ -52,7 +56,8 @@ pub fn channel_is_mcpb(channel: Option<&str>) -> bool {
 
 /// Whether this process runs as the Claude Desktop extension. Read from the
 /// environment each time; it is cheap and the variable never changes under a
-/// running process.
+/// running process. It only chooses the degraded copy now: the bounded daemon
+/// life follows where the binary lives, not the channel.
 pub fn is_mcpb_channel() -> bool {
     channel_is_mcpb(std::env::var(CHANNEL_ENV).ok().as_deref())
 }
@@ -93,6 +98,8 @@ enum StubCase {
     /// A strictly newer daemon owns the index and this is a plain install:
     /// tell the user to update this installation.
     OutdatedBinary,
+    /// The standard Desktop extension, whose binary is the installed one.
+    OutdatedDesktop,
     /// A live instance owns the index but is not the newer-daemon skew (equal,
     /// older or unparseable version): a plain conflict naming its pid.
     Conflict,
@@ -173,6 +180,8 @@ impl StubStatus {
             Some(daemon) if crate::instance::strictly_newer(daemon, &self.binary_version) => {
                 if channel_is_mcpb(self.channel.as_deref()) {
                     StubCase::OutdatedMcpb
+                } else if self.channel.as_deref() == Some(DESKTOP_CHANNEL) {
+                    StubCase::OutdatedDesktop
                 } else {
                     StubCase::OutdatedBinary
                 }
@@ -196,6 +205,9 @@ impl StubStatus {
         match self.case() {
             StubCase::OutdatedMcpb => format!(
                 "Crystalline is running in degraded mode: this Crystalline extension (v{bin}) is older than the Crystalline daemon (v{daemon}) that owns this machine's knowledge, so no knowledge tools are available this session. Ask the user to download the latest Crystalline extension from https://github.com/jordiboehme/crystalline/releases and install it over the current one, then start a new conversation. Call the status tool for the full details to relay."
+            ),
+            StubCase::OutdatedDesktop => format!(
+                "Crystalline is running in degraded mode: the Crystalline installed on this computer (v{bin}) is older than the Crystalline daemon (v{daemon}) that owns this machine's knowledge, so no knowledge tools are available this session. Ask the user to update it with `brew upgrade crystalline` on a Mac, or by installing the newest MSI from https://github.com/jordiboehme/crystalline/releases on Windows, then restart Claude Desktop. Call the status tool for the full details to relay."
             ),
             StubCase::OutdatedBinary => format!(
                 "Crystalline is running in degraded mode: this crystalline binary (v{bin}) is older than the Crystalline daemon (v{daemon}) that owns this machine's knowledge, so no knowledge tools are available this session. Ask the user to update this Crystalline installation to v{daemon} or newer, then reconnect. Call the status tool for the full details to relay."
@@ -229,6 +241,9 @@ impl StubStatus {
         match self.case() {
             StubCase::OutdatedMcpb =>
                 "Download the latest Crystalline extension (.mcpb) from https://github.com/jordiboehme/crystalline/releases and install it over the current extension, then start a new conversation.".to_string(),
+            StubCase::OutdatedDesktop => format!(
+                "Update Crystalline to v{daemon} or newer (`brew upgrade crystalline`, or the newest MSI from https://github.com/jordiboehme/crystalline/releases), then restart Claude Desktop."
+            ),
             StubCase::OutdatedBinary => format!(
                 "Update this Crystalline installation to v{daemon} or newer, then reconnect."
             ),
@@ -514,6 +529,22 @@ mod tests {
         assert!(!channel_is_mcpb(Some("MCPB")));
         assert!(!channel_is_mcpb(Some("mcpb ")));
         assert!(!channel_is_mcpb(Some("brew")));
+    }
+
+    #[test]
+    fn newer_daemon_on_the_desktop_channel_names_the_installed_binary() {
+        let s = status(Some("0.9.0"), Some(4242), Some(DESKTOP_CHANNEL));
+        let instructions = s.instructions();
+        assert!(
+            instructions.contains("brew upgrade crystalline"),
+            "{instructions}"
+        );
+        assert!(instructions.contains("MSI"), "{instructions}");
+        assert!(
+            !instructions.contains("install it over the current"),
+            "not the extension: {instructions}"
+        );
+        assert!(s.fix().contains("brew upgrade crystalline"));
     }
 
     /// Build a status directly (no lock, no env): unit tests never touch the

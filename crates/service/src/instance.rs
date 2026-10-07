@@ -1869,6 +1869,7 @@ pub async fn attach_after_displacement(displaced: Option<StartOptions>) -> Optio
         displaced.as_ref(),
         current.as_ref().map(Vec::as_slice),
         |name| std::env::var_os(name).is_some_and(|value| !value.is_empty()),
+        std::env::current_exe().is_ok_and(|exe| in_desktop_extension_folder(&exe)),
     );
     let options = match plan {
         SuccessorPlan::Spawn(options) => options,
@@ -1930,11 +1931,15 @@ const UNRECORDED_SUCCESSOR_WAIT: Duration = Duration::from_secs(3);
 ///   database, a domain or the read-only switch may have come from that
 ///   variable, and a successor without it would serve something else.
 /// - Otherwise the recorded options, with every overlay variable of this
-///   process that the predecessor did not apply removed.
+///   process that the predecessor did not apply removed. The bounded life
+///   (`exit_when_idle`) is replayed only when `in_extension` says this binary
+///   itself lies inside a Claude Desktop extension folder: it belongs to where
+///   the binary lives, not to the record.
 pub(crate) fn successor_plan(
     displaced: Option<&StartOptions>,
     current: Result<&[String], &crate::overlay::OverlayError>,
     has_var: impl Fn(&str) -> bool,
+    in_extension: bool,
 ) -> SuccessorPlan {
     let wait = |why: String| SuccessorPlan::Wait {
         why,
@@ -1964,12 +1969,28 @@ pub(crate) fn successor_plan(
         read_only: start.read_only,
         http: start.http.clone(),
         allowed_hosts: start.allowed_hosts.clone(),
-        exit_when_idle: start.exit_when_idle,
+        exit_when_idle: start.exit_when_idle && in_extension,
         env_remove: current
             .iter()
             .filter(|name| !start.env.contains(name))
             .cloned()
             .collect(),
+    })
+}
+
+/// Whether `exe` lies inside a Claude Desktop extension folder: some folder
+/// on its path is named `Claude Extensions` and its parent `Claude`, which
+/// holds on macOS (`~/Library/Application Support/Claude/Claude
+/// Extensions/...`) and on Windows (`%APPDATA%\Claude\Claude Extensions\...`,
+/// and the package's physical `...\LocalCache\Roaming\Claude\Claude
+/// Extensions\...`). A daemon started from such a binary keeps that file in
+/// use, so it stays attached and exits when idle (the 0.18.2 mode). Read from
+/// the path text, split on both separators, ASCII case ignored.
+pub fn in_desktop_extension_folder(exe: &Path) -> bool {
+    let text = exe.to_string_lossy();
+    let parts: Vec<&str> = text.split(['/', '\\']).filter(|p| !p.is_empty()).collect();
+    parts.windows(2).any(|w| {
+        w[0].eq_ignore_ascii_case("Claude") && w[1].eq_ignore_ascii_case("Claude Extensions")
     })
 }
 
@@ -2227,7 +2248,8 @@ fn daemon_log_sink() -> Option<std::process::Stdio> {
 /// Off the Claude Desktop extension the daemon is fully detached (its own
 /// session on unix, a breakaway from the parent's job on Windows) and outlives
 /// every client, by design: it serves the user's state directory and the web
-/// UI to whoever comes next. On the extension (`CRYSTALLINE_CHANNEL=mcpb`) it is
+/// UI to whoever comes next. When this binary lies inside a Claude Desktop
+/// extension folder ([`in_desktop_extension_folder`]) it is
 /// neither: `current_exe` is then the in-place binary inside Claude Desktop's
 /// own extension folder, and a detached daemon running from it kept that file
 /// locked past Desktop's teardown, which on Windows blocked the packaged host
@@ -2256,7 +2278,7 @@ fn daemon_log_sink() -> Option<std::process::Stdio> {
 /// the files the client meant.
 fn spawn_daemon(options: &SpawnOptions) -> anyhow::Result<()> {
     let exe = std::env::current_exe()?;
-    let extension = crate::stub::is_mcpb_channel();
+    let extension = in_desktop_extension_folder(&exe);
     // The daemon works in the state directory (below), so every path it is
     // handed has to name the same file from there as it does here.
     let options = SpawnOptions {
@@ -2264,7 +2286,7 @@ fn spawn_daemon(options: &SpawnOptions) -> anyhow::Result<()> {
         config: options.config.as_deref().map(absolute_for_daemon),
         ..options.clone()
     };
-    let mut cmd = std::process::Command::new(exe);
+    let mut cmd = std::process::Command::new(&exe);
     cmd.args(daemon_args(&options, extension));
     for name in &options.env_remove {
         cmd.env_remove(name);
@@ -2858,6 +2880,55 @@ mod tests {
     /// `--exit-when-idle` only for the extension's daemon, which must not
     /// outlive Claude Desktop.
     #[test]
+    fn the_extension_folder_is_found_on_both_platforms() {
+        for inside in [
+            "/Users/ada/Library/Application Support/Claude/Claude Extensions/local.mcpb.jordi-boehme.crystalline/server/crystalline",
+            r"C:\Users\ada\AppData\Roaming\Claude\Claude Extensions\local.mcpb.jordi-boehme.crystalline\server\crystalline.exe",
+            r"C:\Users\ada\AppData\Local\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Roaming\Claude\Claude Extensions\x\server\crystalline.exe",
+            r"c:\users\ada\appdata\roaming\claude\claude extensions\x\crystalline.exe",
+        ] {
+            assert!(in_desktop_extension_folder(Path::new(inside)), "{inside}");
+        }
+        for outside in [
+            "/opt/homebrew/bin/crystalline",
+            "/usr/local/bin/crystalline",
+            r"C:\Program Files\Crystalline\bin\crystalline.exe",
+            "/Users/ada/Claude Extensions/crystalline",
+            "/Users/ada/Library/Application Support/Claude/crystalline",
+        ] {
+            assert!(
+                !in_desktop_extension_folder(Path::new(outside)),
+                "{outside}"
+            );
+        }
+    }
+
+    fn bounded(start: StartOptions) -> StartOptions {
+        StartOptions {
+            exit_when_idle: true,
+            ..start
+        }
+    }
+
+    #[test]
+    fn a_binary_inside_the_extension_folder_keeps_the_bounded_life() {
+        let start = bounded(StartOptions::default());
+        let plan = successor_plan(Some(&start), Ok(&[]), |_| false, true);
+        assert!(matches!(plan, SuccessorPlan::Spawn(o) if o.exit_when_idle));
+        assert!(daemon_args(&SpawnOptions::default(), true).contains(&"--exit-when-idle".into()));
+    }
+
+    #[test]
+    fn a_successor_from_outside_an_extension_folder_does_not_exit_when_idle() {
+        let start = bounded(StartOptions::default());
+        let plan = successor_plan(Some(&start), Ok(&[]), |_| false, false);
+        assert!(
+            matches!(plan, SuccessorPlan::Spawn(o) if !o.exit_when_idle),
+            "an MSI or Homebrew binary replacing an old extension's daemon starts a long-lived one"
+        );
+    }
+
+    #[test]
     fn daemon_args_add_exit_when_idle_only_for_the_extension() {
         let plain = daemon_args(&SpawnOptions::default(), false);
         assert_eq!(plain, ["serve", "--daemon", "--autostarted"]);
@@ -2904,7 +2975,7 @@ mod tests {
             "runs_in":{"working_dir":"/s","breakaway_refused":false,"exits_when_idle":false}}"#;
         let info: LockInfo = serde_json::from_str(record).expect("a 0.22.0 record parses");
         assert_eq!(info.start, None);
-        match successor_plan(info.start.as_ref(), Ok(&[]), |_| true) {
+        match successor_plan(info.start.as_ref(), Ok(&[]), |_| true, true) {
             SuccessorPlan::Wait { budget, .. } => {
                 assert_eq!(budget, UNRECORDED_SUCCESSOR_WAIT);
                 assert!(budget <= Duration::from_secs(3), "{budget:?}");
@@ -3004,9 +3075,12 @@ mod tests {
             "CRYSTALLINE_SERVICE_HTTP".to_string(),
         ];
         assert_eq!(
-            successor_plan(Some(&start), Ok(&here), |name| here
-                .iter()
-                .any(|h| h == name)),
+            successor_plan(
+                Some(&start),
+                Ok(&here),
+                |name| here.iter().any(|h| h == name),
+                true
+            ),
             SuccessorPlan::Spawn(SpawnOptions {
                 db: Some(PathBuf::from("/srv/team.db")),
                 config: Some(PathBuf::from("/srv/config.yaml")),
@@ -3017,7 +3091,7 @@ mod tests {
                 env_remove: vec!["CRYSTALLINE_SERVICE_HTTP".to_string()],
             })
         );
-        match successor_plan(Some(&start), Ok(&[]), |_| false) {
+        match successor_plan(Some(&start), Ok(&[]), |_| false, true) {
             SuccessorPlan::Wait { why, budget } => {
                 assert!(why.contains("CRYSTALLINE_DATABASE_URL"), "{why}");
                 assert_eq!(budget, SUCCESSOR_WAIT);
@@ -3030,10 +3104,10 @@ mod tests {
             ..start.clone()
         };
         assert!(matches!(
-            successor_plan(Some(&partial), Ok(&[]), |_| true),
+            successor_plan(Some(&partial), Ok(&[]), |_| true, true),
             SuccessorPlan::Wait { .. }
         ));
-        let args = match successor_plan(Some(&start), Ok(&here), |_| true) {
+        let args = match successor_plan(Some(&start), Ok(&here), |_| true, true) {
             SuccessorPlan::Spawn(options) => daemon_args(&options, false),
             other => panic!("{other:?}"),
         };

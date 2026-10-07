@@ -400,8 +400,30 @@ impl Mcp {
         Mcp::spawn_configured(env, read_only, None)
     }
 
+    /// A client whose binary lies inside a Claude Desktop extension folder
+    /// (a link or copy of the real one under `Claude/Claude Extensions/`), the
+    /// only thing that gives its daemon a bounded life. The manifest's
+    /// `CRYSTALLINE_CHANNEL=mcpb` is set too, as the real extension does.
+    fn spawn_in_extension_folder(env: &Env) -> Mcp {
+        let folder = env
+            .dir
+            .join("Claude")
+            .join("Claude Extensions")
+            .join("local.mcpb.test");
+        std::fs::create_dir_all(&folder).unwrap();
+        let inside = folder.join(bin().file_name().unwrap());
+        if std::fs::hard_link(bin(), &inside).is_err() {
+            std::fs::copy(bin(), &inside).unwrap();
+        }
+        Mcp::spawn_from(&inside, env, false, Some(("CRYSTALLINE_CHANNEL", "mcpb")))
+    }
+
     fn spawn_configured(env: &Env, read_only: bool, extra: Option<(&str, &str)>) -> Mcp {
-        let mut cmd = Command::new(bin());
+        Mcp::spawn_from(&bin(), env, read_only, extra)
+    }
+
+    fn spawn_from(exe: &Path, env: &Env, read_only: bool, extra: Option<(&str, &str)>) -> Mcp {
+        let mut cmd = Command::new(exe);
         env.apply(&mut cmd);
         if let Some((key, value)) = extra {
             cmd.env(key, value);
@@ -588,7 +610,7 @@ fn an_extension_started_daemon_leaves_once_its_last_client_is_gone() {
     let env = Env::new("idle");
     env.setup_domain("eng");
 
-    let mut c1 = Mcp::spawn_with_env(&env, "CRYSTALLINE_CHANNEL", "mcpb");
+    let mut c1 = Mcp::spawn_in_extension_folder(&env);
     c1.initialize();
     env.wait_ready();
     let status = status_json(&env);
@@ -648,7 +670,7 @@ fn a_silent_stub_holds_an_extension_started_daemon_past_the_grace() {
     env.setup_domain("eng");
 
     // Spawned, never spoken to: no initialize for longer than the grace.
-    let mut c1 = Mcp::spawn_with_env(&env, "CRYSTALLINE_CHANNEL", "mcpb");
+    let mut c1 = Mcp::spawn_in_extension_folder(&env);
     env.wait_ready();
     std::thread::sleep(Duration::from_secs(7));
     let status = status_json(&env);
