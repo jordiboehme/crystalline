@@ -391,3 +391,19 @@ test("a closed output pipe stops the child quietly", unix, async () => {
   assert.equal(await exited, 1);
   assert.ok(gone(child.pid), "the child is gone");
 });
+
+test("a PATH entry that is not absolute is skipped", () => {
+  assert.deepEqual(shim.candidates("darwin", { PATH: "bin:/usr/bin:./tools:~/bin" }), [
+    "/opt/homebrew/bin/crystalline",
+    "/usr/local/bin/crystalline",
+    "/usr/bin/crystalline",
+  ]);
+  assert.deepEqual(shim.candidates("win32", { Path: "bin;C:\\Tools;.\\x;C:relative" }), ["C:\\Tools\\crystalline.exe"]);
+});
+
+test("a Windows PATH with unbalanced quotes is split on every semicolon", () => {
+  assert.deepEqual(shim.candidates("win32", { Path: 'C:\\Tools;"C:\\Broken;C:\\Other' }), [
+    "C:\\Tools\\crystalline.exe",
+    "C:\\Other\\crystalline.exe",
+  ]);
+});

@@ -37,8 +37,11 @@ const STATUS_TOOL = {
 /**
  * The folders of a Windows PATH. An entry may stand in double quotes, which
  * Windows drops, and a `;` inside the quotes is part of the folder name.
+ * When the quotes do not balance, every `;` splits, and an entry left with a
+ * stray quote is not absolute, so `candidates` skips it.
  */
 function windowsPath(value) {
+  if ((value.match(/"/g) || []).length % 2 !== 0) return value.split(";").filter(Boolean);
   const dirs = [];
   let dir = "";
   let quoted = false;
@@ -53,7 +56,11 @@ function windowsPath(value) {
   return dirs.filter(Boolean);
 }
 
-/** Where to look, in order: the first hit that is Crystalline wins. */
+/**
+ * Where to look, in order: the first hit that is Crystalline wins. A PATH
+ * entry that is not absolute is skipped, so nothing is resolved against
+ * Claude Desktop's working folder.
+ */
 function candidates(platform, env) {
   const list = [];
   if (platform === "win32") {
@@ -63,12 +70,12 @@ function candidates(platform, env) {
       if (root) list.push(path.win32.join(root, "Crystalline", "bin", "crystalline.exe"));
     }
     for (const dir of windowsPath(String(env.PATH || env.Path || ""))) {
-      list.push(path.win32.join(dir, "crystalline.exe"));
+      if (path.win32.isAbsolute(dir)) list.push(path.win32.join(dir, "crystalline.exe"));
     }
   } else {
     list.push("/opt/homebrew/bin/crystalline", "/usr/local/bin/crystalline");
     for (const dir of String(env.PATH || "").split(":")) {
-      if (dir) list.push(path.posix.join(dir, "crystalline"));
+      if (path.posix.isAbsolute(dir)) list.push(path.posix.join(dir, "crystalline"));
     }
   }
   return [...new Set(list)];
