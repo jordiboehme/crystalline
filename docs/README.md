@@ -5,7 +5,7 @@ The [Crystalline Handbook](https://jordiboehme.github.io/crystalline/) is the lo
 | Page | What it covers |
 |---|---|
 | [Claude Code](setup/claude-code.md) | `crystalline install claude-code`: what it wires, its flags and how to undo it |
-| [Claude Desktop](setup/claude-desktop.md) | The one-click extension and the companion skill |
+| [Claude Desktop](setup/claude-desktop.md) | The extension that connects Claude Desktop to Crystalline, and the companion skill |
 | [Codex CLI](setup/codex.md) | `crystalline install codex` and what to do after an upgrade |
 | [GitHub Copilot CLI](setup/copilot.md) | `crystalline install copilot`, where its hooks and skills land, and what to do after an upgrade |
 | [Cursor](setup/cursor.md) | `crystalline install cursor`, the files it writes and its limits |
