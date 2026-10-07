@@ -903,6 +903,177 @@ pub struct NamesDoctor {
     pub error: Option<String>,
 }
 
+/// What Task Scheduler holds for this user (W4 of the 0.24.0 spec).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", content = "name", rename_all = "snake_case")]
+pub enum TaskFinding {
+    Missing,
+    ForOthers(String),
+    Ready(String),
+}
+
+/// The text of every `<tag>` element in `xml`, trimmed. Tag names compare
+/// without case.
+fn element_texts<'a>(xml: &'a str, tag: &str) -> Vec<&'a str> {
+    let lower = xml.to_ascii_lowercase();
+    let open = format!("<{}>", tag.to_ascii_lowercase());
+    let close = format!("</{}>", tag.to_ascii_lowercase());
+    let mut texts = Vec::new();
+    let mut from = 0;
+    while let Some(start) = lower[from..].find(&open).map(|i| from + i + open.len()) {
+        let Some(end) = lower[start..].find(&close).map(|i| start + i) else {
+            break;
+        };
+        texts.push(xml[start..end].trim());
+        from = end + close.len();
+    }
+    texts
+}
+
+/// The `<Principals>` block of a task definition, or the whole text when it
+/// has none. A per-user task names its account in the logon trigger too,
+/// and only the principal says who the task runs for.
+fn principals_block(xml: &str) -> &str {
+    let lower = xml.to_ascii_lowercase();
+    match (lower.find("<principals>"), lower.find("</principals>")) {
+        (Some(start), Some(end)) if start < end => &xml[start..end],
+        _ => xml,
+    }
+}
+
+/// `DOMAIN\name` split into its domain (if any) and its name.
+fn account_parts(account: &str) -> (Option<&str>, &str) {
+    match account.rsplit_once('\\') {
+        Some((domain, name)) => (Some(domain), name),
+        None => (None, account),
+    }
+}
+
+/// Whether two account names are the same account: compared without case,
+/// as Windows compares them, and the name alone when one side carries no
+/// domain.
+fn same_account(a: &str, b: &str) -> bool {
+    let (a_domain, a_name) = account_parts(a);
+    let (b_domain, b_name) = account_parts(b);
+    let names_match = a_name.to_lowercase() == b_name.to_lowercase();
+    match (a_domain, b_domain) {
+        (Some(x), Some(y)) => names_match && x.to_lowercase() == y.to_lowercase(),
+        _ => names_match,
+    }
+}
+
+/// A task runs for this user when its principal is a group (only the MSI
+/// registers one, for the Users group) or this account. The task under this
+/// user's own name (`\Crystalline Daemon for <name>`) is theirs when its
+/// principal is an account at all: Task Scheduler may print the account as
+/// a SID, and a name outside ASCII may not survive the decoding of its
+/// output, but only `doctor --fix` run by this user registers that name.
+pub(crate) fn task_finding(name: Option<&str>, xml: Option<&str>, account: &str) -> TaskFinding {
+    let Some(name) = name else {
+        return TaskFinding::Missing;
+    };
+    let own_name = !account.is_empty()
+        && name.eq_ignore_ascii_case(&crystalline_service::daemon_task::user_task_name(
+            account_parts(account).1,
+        ));
+    let Some(xml) = xml else {
+        return if own_name {
+            TaskFinding::Ready(name.to_string())
+        } else {
+            TaskFinding::ForOthers(name.to_string())
+        };
+    };
+    let principals = principals_block(xml);
+    let for_group = !element_texts(principals, "GroupId").is_empty();
+    let users = element_texts(principals, "UserId");
+    let for_me = !account.is_empty() && users.iter().any(|user| same_account(user, account));
+    if for_group || for_me || (own_name && !users.is_empty()) {
+        TaskFinding::Ready(name.to_string())
+    } else {
+        TaskFinding::ForOthers(name.to_string())
+    }
+}
+
+/// The daemon task as doctor found it and what `--fix` did about it.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct TaskDoctor {
+    pub finding: Option<TaskFinding>,
+    /// The task `--fix` registered for this user.
+    pub registered_now: Option<String>,
+    /// Why `--fix` could not register it.
+    pub error: Option<String>,
+}
+
+/// Whether the task concerns this machine at all: the binary is the one the
+/// MSI installed (under `Program Files\Crystalline\bin`), or Claude Desktop
+/// is installed (a `Packages\Claude_*` folder under `LOCALAPPDATA`). A
+/// Windows user who took the zip or `cargo install` and has no Claude Desktop
+/// needs no task, and a test binary under `target\` must never register one.
+pub(crate) fn task_concerns_this_machine(
+    exe: &Path,
+    program_files: &[std::path::PathBuf],
+    claude_desktop_installed: bool,
+) -> bool {
+    let installed = program_files
+        .iter()
+        .any(|root| exe.starts_with(root.join("Crystalline").join("bin")));
+    installed || claude_desktop_installed
+}
+
+fn claude_desktop_installed() -> bool {
+    std::env::var_os("LOCALAPPDATA")
+        .map(|local| std::path::PathBuf::from(local).join("Packages"))
+        .and_then(|packages| std::fs::read_dir(packages).ok())
+        .is_some_and(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .any(|e| e.file_name().to_string_lossy().starts_with("Claude_"))
+        })
+}
+
+/// Windows only: the task, and with `fix` a task for this user when none
+/// runs for them. `--fix` registers only for the binary the MSI installed,
+/// so the task never points at a copy that may move or go.
+fn check_task(fix: bool) -> Option<TaskDoctor> {
+    use crystalline_service::daemon_task::{self, DaemonTask, Schtasks, TaskPrincipal};
+    if !cfg!(windows) {
+        return None;
+    }
+    let exe = std::env::current_exe().ok()?;
+    let program_files: Vec<std::path::PathBuf> = ["ProgramFiles", "ProgramFiles(x86)"]
+        .iter()
+        .filter_map(std::env::var_os)
+        .map(std::path::PathBuf::from)
+        .collect();
+    if !task_concerns_this_machine(&exe, &program_files, claude_desktop_installed()) {
+        return None;
+    }
+    let installed = task_concerns_this_machine(&exe, &program_files, false);
+    let tasks = Schtasks::for_this_user();
+    let name = tasks.find();
+    let xml = name.as_deref().and_then(daemon_task::registered_xml);
+    let account = daemon_task::current_account();
+    let finding = task_finding(name.as_deref(), xml.as_deref(), &account);
+    let mut report = TaskDoctor {
+        finding: Some(finding.clone()),
+        ..TaskDoctor::default()
+    };
+    if fix && !matches!(finding, TaskFinding::Ready(_)) {
+        if !installed {
+            report.error = Some(
+                "this crystalline is not the one the MSI installed, so --fix registers no task for it. Install the MSI"
+                    .to_string(),
+            );
+        } else {
+            match daemon_task::register(&TaskPrincipal::User { account }, &exe) {
+                Ok(name) => report.registered_now = Some(name),
+                Err(e) => report.error = Some(e),
+            }
+        }
+    }
+    Some(report)
+}
+
 /// The full `doctor` report.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct DoctorReport {
@@ -960,6 +1131,12 @@ pub struct DoctorReport {
     pub fix: bool,
     /// Every connected server; empty when none.
     pub sources: Vec<SourceDoctor>,
+    /// The Windows daemon task. `None` off Windows, and on a Windows machine
+    /// the task does not concern (see `task_concerns_this_machine`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_task: Option<TaskDoctor>,
+    /// Private state folders an old Claude Desktop extension left.
+    pub desktop_states: Vec<crate::desktop_state::DesktopState>,
 }
 
 /// A rename journal waiting in the state directory: a domain rename an
@@ -1138,6 +1315,17 @@ impl DoctorReport {
         // longer works, is one problem each: its domains are unavailable
         // until it answers again.
         n += self.sources.iter().filter(|s| s.problem.is_some()).count();
+        // A task that does not run for this user leaves Claude Desktop with no
+        // way to start the daemon, until `--fix` registers one.
+        if let Some(task) = &self.daemon_task
+            && !matches!(task.finding, Some(TaskFinding::Ready(_)))
+            && task.registered_now.is_none()
+        {
+            n += 1;
+        }
+        // Each private state is knowledge that is not where this machine
+        // reads it, until the merge.
+        n += self.desktop_states.len();
         n
     }
 }
@@ -1337,6 +1525,9 @@ pub async fn run(
         Vec::new()
     };
 
+    let daemon_task = check_task(fix);
+    let desktop_states = crate::desktop_state::scan_here();
+
     Ok(DoctorReport {
         index,
         domains,
@@ -1354,6 +1545,8 @@ pub async fn run(
         rename,
         fix,
         sources,
+        daemon_task,
+        desktop_states,
     })
 }
 
@@ -3954,6 +4147,51 @@ pub fn render_human(report: &DoctorReport) -> String {
     }
     if let Ok(log_path) = config::daemon_log_path() {
         let _ = writeln!(out, "  daemon log: {}", log_path.display());
+    }
+
+    if let Some(task) = &report.daemon_task {
+        let _ = writeln!(out, "daemon task:");
+        match (&task.finding, &task.registered_now, &task.error) {
+            (_, Some(name), _) => {
+                let _ = writeln!(out, "  registered the task {name} for this user");
+            }
+            (Some(TaskFinding::Ready(name)), _, _) => {
+                let _ = writeln!(out, "  ok ({name})");
+            }
+            (Some(TaskFinding::ForOthers(name)), _, error) => {
+                let _ = writeln!(
+                    out,
+                    "  [problem] the task {name} does not run for this user, so Claude Desktop cannot start the daemon. Run crystalline doctor --fix to register one for you"
+                );
+                if let Some(error) = error {
+                    let _ = writeln!(out, "  --fix could not register it: {error}");
+                }
+            }
+            (_, _, error) => {
+                let _ = writeln!(
+                    out,
+                    "  [problem] the task {} is missing, so Claude Desktop cannot start the daemon. Run crystalline doctor --fix to register it for you, or install the newest MSI",
+                    crystalline_service::daemon_task::MACHINE_TASK_NAME
+                );
+                if let Some(error) = error {
+                    let _ = writeln!(out, "  --fix could not register it: {error}");
+                }
+            }
+        }
+    }
+    if !report.desktop_states.is_empty() {
+        let _ = writeln!(out, "claude desktop:");
+        for state in &report.desktop_states {
+            let _ = writeln!(
+                out,
+                "  [problem] {}",
+                crate::desktop_state::describe_line(state)
+            );
+        }
+        let _ = writeln!(
+            out,
+            "  quit Claude Desktop, then run crystalline doctor --fix --merge-desktop-state to merge it into this machine's state (the folder is renamed, never deleted)"
+        );
     }
 
     if let Some(e) = &report.environment {
@@ -7290,5 +7528,191 @@ mod tests {
         let s = &d.stray_copies[0];
         assert_eq!((s.path.as_str(), s.original.as_str()), (S_PATH, O_PATH));
         assert!(s.from_overwrite && s.newer && s.fixable, "{s:?}");
+    }
+
+    // R6: Windows paths, so only the windows-latest leg runs it.
+    #[cfg(windows)]
+    #[test]
+    fn the_task_concerns_only_an_msi_install_or_a_machine_with_claude_desktop() {
+        let pf = [std::path::PathBuf::from(r"C:\Program Files")];
+        let msi = std::path::Path::new(r"C:\Program Files\Crystalline\bin\crystalline.exe");
+        let dev = std::path::Path::new(r"C:\src\crystalline\target\debug\crystalline.exe");
+        assert!(task_concerns_this_machine(msi, &pf, false));
+        assert!(
+            !task_concerns_this_machine(dev, &pf, false),
+            "a test or zip binary without Desktop"
+        );
+        assert!(
+            task_concerns_this_machine(dev, &pf, true),
+            "Desktop is there, so the report matters"
+        );
+    }
+
+    #[test]
+    fn doctor_says_a_task_another_user_owns_does_not_run_for_this_user() {
+        assert_eq!(task_finding(None, None, r"WORK\ada"), TaskFinding::Missing);
+        let group = r"<Principal id='Author'><GroupId>S-1-5-32-545</GroupId></Principal>";
+        assert_eq!(
+            task_finding(Some(r"\Crystalline\Daemon"), Some(group), r"WORK\ada"),
+            TaskFinding::Ready(r"\Crystalline\Daemon".to_string())
+        );
+        let mine = r"<Principal id='Author'><UserId>work\ADA</UserId></Principal>";
+        assert_eq!(
+            task_finding(
+                Some(r"\Crystalline Daemon for ada"),
+                Some(mine),
+                r"WORK\ada"
+            ),
+            TaskFinding::Ready(r"\Crystalline Daemon for ada".to_string()),
+            "account names compare without case"
+        );
+        let other = r"<Principal id='Author'><UserId>WORK\bob</UserId></Principal>";
+        assert_eq!(
+            task_finding(Some(r"\Crystalline\Daemon"), Some(other), r"WORK\ada"),
+            TaskFinding::ForOthers(r"\Crystalline\Daemon".to_string())
+        );
+    }
+
+    /// The definitions this binary registers, read back as Task Scheduler
+    /// prints them (indented, with the account in the trigger as well).
+    #[test]
+    fn doctor_reads_the_principal_of_a_definition_as_schtasks_prints_it() {
+        use crystalline_service::daemon_task::{TaskPrincipal, task_xml};
+        let exe = std::path::Path::new(r"C:\Program Files\Crystalline\bin\crystalline.exe");
+        let machine = task_xml(exe, &TaskPrincipal::AllUsers);
+        assert_eq!(
+            task_finding(Some(r"\Crystalline\Daemon"), Some(&machine), r"WORK\ada"),
+            TaskFinding::Ready(r"\Crystalline\Daemon".to_string())
+        );
+        let own = task_xml(
+            exe,
+            &TaskPrincipal::User {
+                account: r"WORK\ada".to_string(),
+            },
+        );
+        assert_eq!(
+            task_finding(Some(r"\Crystalline\Daemon"), Some(&own), r"WORK\ada"),
+            TaskFinding::Ready(r"\Crystalline\Daemon".to_string())
+        );
+        assert_eq!(
+            task_finding(Some(r"\Crystalline\Daemon"), Some(&own), r"WORK\bob"),
+            TaskFinding::ForOthers(r"\Crystalline\Daemon".to_string())
+        );
+        let spaced = "<Principals>\r\n  <Principal id=\"Author\">\r\n    <UserId>\r\n      WORK\\ada\r\n    </UserId>\r\n  </Principal>\r\n</Principals>";
+        assert_eq!(
+            task_finding(Some(r"\Crystalline\Daemon"), Some(spaced), r"WORK\ada"),
+            TaskFinding::Ready(r"\Crystalline\Daemon".to_string()),
+            "the account is read without the space around it"
+        );
+    }
+
+    /// Only the principal decides who a task runs for. An account named in
+    /// the logon trigger only says when it starts.
+    #[test]
+    fn an_account_in_the_trigger_alone_does_not_make_the_task_run_for_this_user() {
+        let xml = r"<Task><Triggers><LogonTrigger><UserId>WORK\ada</UserId></LogonTrigger></Triggers><Principals><Principal id='Author'><UserId>WORK\bob</UserId></Principal></Principals></Task>";
+        assert_eq!(
+            task_finding(Some(r"\Crystalline\Daemon"), Some(xml), r"WORK\ada"),
+            TaskFinding::ForOthers(r"\Crystalline\Daemon".to_string())
+        );
+    }
+
+    /// A name with letters outside ASCII compares without case too, and an
+    /// account without its domain half still names the same user.
+    #[test]
+    fn doctor_compares_any_account_name_without_case_and_without_a_missing_domain() {
+        let upper = "<Principal><UserId>WORK\\\u{dc}LKER</UserId></Principal>";
+        assert_eq!(
+            task_finding(
+                Some(r"\Crystalline\Daemon"),
+                Some(upper),
+                "WORK\\\u{fc}lker"
+            ),
+            TaskFinding::Ready(r"\Crystalline\Daemon".to_string())
+        );
+        let bare = "<Principal><UserId>ada</UserId></Principal>";
+        assert_eq!(
+            task_finding(Some(r"\Crystalline\Daemon"), Some(bare), r"WORK\ada"),
+            TaskFinding::Ready(r"\Crystalline\Daemon".to_string())
+        );
+        let elsewhere = "<Principal><UserId>HOME\\ada</UserId></Principal>";
+        assert_eq!(
+            task_finding(Some(r"\Crystalline\Daemon"), Some(elsewhere), r"WORK\ada"),
+            TaskFinding::ForOthers(r"\Crystalline\Daemon".to_string()),
+            "two domains are two accounts"
+        );
+    }
+
+    /// The task under this user's own name is theirs even when its account
+    /// does not read back as text this binary can compare: a name outside
+    /// ASCII that the output decoding mangled, a SID, or no definition at
+    /// all. Only `doctor --fix` run by this user registers that name.
+    #[test]
+    fn this_users_own_task_counts_when_its_account_does_not_read_back() {
+        let own = r"\Crystalline Daemon for ada";
+        let mangled = "<Principal><UserId>WORK\\\u{fffd}\u{fffd}da</UserId></Principal>";
+        let sid =
+            "<Principal><UserId>S-1-5-21-1004336348-1177238915-682003330-1001</UserId></Principal>";
+        for xml in [Some(mangled), Some(sid), None] {
+            assert_eq!(
+                task_finding(Some(own), xml, r"WORK\ada"),
+                TaskFinding::Ready(own.to_string()),
+                "{xml:?}"
+            );
+        }
+        assert_eq!(
+            task_finding(Some(r"\Crystalline\Daemon"), Some(mangled), r"WORK\ada"),
+            TaskFinding::ForOthers(r"\Crystalline\Daemon".to_string()),
+            "the machine name carries no user, so its account must match"
+        );
+        let group = "<Principal><GroupId>S-1-5-32-545</GroupId></Principal>";
+        assert_eq!(
+            task_finding(Some(own), Some(group), r"WORK\ada"),
+            TaskFinding::Ready(own.to_string())
+        );
+    }
+
+    #[test]
+    fn a_task_that_does_not_run_for_this_user_is_a_problem_until_fix_registers_one() {
+        let mut report = DoctorReport {
+            daemon_task: Some(TaskDoctor {
+                finding: Some(TaskFinding::Missing),
+                ..TaskDoctor::default()
+            }),
+            ..DoctorReport::default()
+        };
+        assert_eq!(report.remaining_problems(), 1);
+        let out = render_human(&report);
+        assert!(out.contains("daemon task:\n"), "{out}");
+        assert!(out.contains("[problem] the task"), "{out}");
+        assert!(out.contains("crystalline doctor --fix"), "{out}");
+
+        report.daemon_task = Some(TaskDoctor {
+            finding: Some(TaskFinding::Missing),
+            registered_now: Some(r"\Crystalline Daemon for ada".to_string()),
+            error: None,
+        });
+        assert_eq!(report.remaining_problems(), 0);
+        assert!(
+            render_human(&report).contains(r"registered the task \Crystalline Daemon for ada"),
+            "{}",
+            render_human(&report)
+        );
+
+        report.daemon_task = Some(TaskDoctor {
+            finding: Some(TaskFinding::Ready(r"\Crystalline\Daemon".to_string())),
+            ..TaskDoctor::default()
+        });
+        assert_eq!(report.remaining_problems(), 0);
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            json["daemon_task"]["finding"],
+            serde_json::json!({ "state": "ready", "name": r"\Crystalline\Daemon" })
+        );
+
+        report.daemon_task = None;
+        let json = serde_json::to_value(&report).unwrap();
+        assert!(json.get("daemon_task").is_none(), "off Windows: {json}");
+        assert_eq!(json["desktop_states"], serde_json::json!([]));
     }
 }

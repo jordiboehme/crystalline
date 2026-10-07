@@ -15,6 +15,7 @@ mod daemon_env;
 mod remote_server;
 
 mod configure;
+mod desktop_state;
 mod doctor;
 mod doctor_names;
 #[cfg(unix)]

@@ -15,6 +15,7 @@ use crystalline_core::config;
 use crystalline_core::verify::{self, VerifyOptions};
 
 mod cmd;
+mod desktop_state;
 mod doctor;
 mod harness_command;
 mod harness_files;
@@ -2222,6 +2223,10 @@ async fn status_dispatch(
                 // The daemon's own rows, with what this run asked each
                 // server added: the same keys, and more.
                 map.insert("sources".to_string(), serde_json::to_value(&source_rows)?);
+                map.insert(
+                    "desktop_states".to_string(),
+                    serde_json::to_value(desktop_state::scan_here())?,
+                );
             }
             println!("{data}");
         } else {
@@ -2236,6 +2241,9 @@ async fn status_dispatch(
                 data["version"].as_str().unwrap_or("unknown"),
                 format_uptime(data["uptime_secs"].as_u64().unwrap_or(0)),
             );
+            if let Some(line) = desktop_state::status_line(&desktop_state::scan_here()) {
+                println!("{line}");
+            }
             sources::render_sources(&source_rows);
             cmd::render_status(&data, &note);
         }
@@ -2306,8 +2314,8 @@ async fn status_dispatch(
     finish_status(route, &cfg, json, note, &source_rows).await
 }
 
-/// A direct read's `status`: the index's report with the sources added, the
-/// `Sources:` block before the rest in the human form.
+/// A direct read's `status`: the index's report with the sources and any
+/// split Claude Desktop state added, both before the rest in the human form.
 async fn finish_status(
     route: cmd::IndexRoute,
     cfg: &config::GlobalConfig,
@@ -2319,9 +2327,16 @@ async fn finish_status(
     if json {
         if let serde_json::Value::Object(map) = &mut value {
             map.insert("sources".to_string(), serde_json::to_value(source_rows)?);
+            map.insert(
+                "desktop_states".to_string(),
+                serde_json::to_value(desktop_state::scan_here())?,
+            );
         }
         println!("{value}");
     } else {
+        if let Some(line) = desktop_state::status_line(&desktop_state::scan_here()) {
+            println!("{line}");
+        }
         sources::render_sources(source_rows);
         cmd::render_status(&value, daemon_note);
     }

@@ -1527,6 +1527,12 @@ fn is_crystalline_exe_name(name: &str) -> bool {
     own_exe_name().is_some_and(|own| own == name)
 }
 
+/// Whether `pid` is alive and its executable is a Crystalline binary. False
+/// when either cannot be told.
+pub fn process_is_crystalline(pid: u32) -> bool {
+    process_alive(pid) && process_exe_name(pid).is_some_and(|name| is_crystalline_exe_name(&name))
+}
+
 /// Diagnose what owns the index lock. Read-only and side-effect free: it takes
 /// and immediately releases the lock to test it, opens one short-lived socket
 /// connection and reads the record. Nothing is signalled here.
@@ -4745,6 +4751,16 @@ mod tests {
             process_exe_name(0).is_none(),
             "pid 0 is never a real process to identify"
         );
+    }
+
+    /// A live process counts as Crystalline when it runs this binary's own
+    /// file; a pid that cannot be a process never does.
+    #[test]
+    fn process_is_crystalline_knows_this_process_and_not_a_bogus_pid() {
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+        assert!(process_is_crystalline(std::process::id()));
+        assert!(!process_is_crystalline(0));
+        assert!(!process_is_crystalline(u32::MAX - 1));
     }
 
     /// The lock probe: free while nobody holds it, held while ownership
