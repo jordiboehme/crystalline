@@ -5009,7 +5009,7 @@ fn discard_question(domain: &str, changes: &[Value], guarded: bool, reviewing: b
         question.push_str(&format!(" {path}: {what}."));
     }
     if changes.len() > 10 {
-        question.push_str(&format!(" And {} more.", changes.len() - 10));
+        question.push_str(&format!(" and {} more.", changes.len() - 10));
     }
     if reviewing {
         question.push_str(" Only your own drafts are cleared.");
@@ -5802,7 +5802,7 @@ mod tests {
              notes/3.md: your new file is deleted. notes/4.md: the team's version comes back. \
              notes/5.md: the deleted file comes back. notes/6.md: your new file is deleted. \
              notes/7.md: the team's version comes back. notes/8.md: the deleted file comes back. \
-             notes/9.md: your new file is deleted. And 2 more. Nothing goes to GitHub. Edits \
+             notes/9.md: your new file is deleted. and 2 more. Nothing goes to GitHub. Edits \
              made after you looked are undone too. Accept undoes them. Decline keeps your \
              changes."
         );
