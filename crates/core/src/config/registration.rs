@@ -20,6 +20,12 @@ use super::{DomainEntry, NameOrigin};
 /// address; the operating system's own segment limit is larger and separate.
 pub const MAX_DOMAIN_NAME_CHARS: usize = 64;
 
+/// What a domain name may be, as the end of a sentence. A caller that must
+/// not repeat the name (a list that may hold a pasted token) says this alone.
+pub const DOMAIN_NAME_RULE: &str = "use letters, digits, hyphens, underscores and dots \
+     (no leading or trailing dot), 64 characters or fewer, and not a Windows device name \
+     (CON, PRN, AUX, NUL, COM1-COM9, LPT1-LPT9)";
+
 /// Whether `name` may name a NEW domain: every character a Unicode
 /// alphanumeric or one of `-`, `_`, `.`; at most [`MAX_DOMAIN_NAME_CHARS`]
 /// characters; no leading or trailing dot; and not a Windows reserved device
@@ -46,12 +52,7 @@ pub fn validate_domain_name(name: &str) -> Result<(), String> {
     if allowed {
         Ok(())
     } else {
-        Err(format!(
-            "'{name}' cannot name a domain: use letters, digits, hyphens, \
-             underscores and dots (no leading or trailing dot), 64 \
-             characters or fewer, and not a Windows device name (CON, PRN, \
-             AUX, NUL, COM1-COM9, LPT1-LPT9)"
-        ))
+        Err(format!("'{name}' cannot name a domain: {DOMAIN_NAME_RULE}"))
     }
 }
 

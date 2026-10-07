@@ -402,17 +402,40 @@ pub fn parse_domain_list(raw: &str) -> Result<Vec<String>, String> {
     if parts.iter().all(|p| p.is_empty()) {
         return Err("name at least one domain, for example alpha,beta".to_string());
     }
-    for part in parts {
+    // No refusal repeats the value or a part of it: a token pasted into the
+    // wrong place would otherwise land on the terminal, or in the daemon log
+    // on every load for the environment variable. The position says which
+    // name it is.
+    for (at, part) in parts.into_iter().enumerate() {
+        let position = at + 1;
         if part.is_empty() {
-            return Err(format!("'{raw}' has an empty name between two commas"));
+            return Err(format!(
+                "name {position} in the list is empty (two commas in a row)"
+            ));
         }
-        crystalline_core::config::registration::validate_domain_name(part)
-            .map_err(|e| format!("'{part}' cannot name a domain: {e}"))?;
+        if crystalline_core::config::registration::validate_domain_name(part).is_err() {
+            return Err(format!(
+                "name {position} in the list cannot name a domain: {}",
+                crystalline_core::config::registration::DOMAIN_NAME_RULE
+            ));
+        }
         names.push(part.to_string());
     }
     names.sort();
     names.dedup();
     Ok(names)
+}
+
+/// [`REMOTE_DOMAINS_ENV`] as a list, or the warning that leaves the
+/// environment source out. The warning names the variable and the rule and
+/// never the value: it lands in the daemon log on every load, and the value
+/// may be a token pasted into the wrong variable.
+fn env_domains(raw: &str) -> Result<Vec<String>, String> {
+    parse_domain_list(raw).map_err(|e| {
+        format!(
+            "{REMOTE_DOMAINS_ENV}: {e}; the server from {REMOTE_URL_ENV} is left out rather than taking every domain"
+        )
+    })
 }
 
 /// The source the environment adds, when both variables are set. Never
@@ -434,12 +457,10 @@ pub fn env_source(env: impl Fn(&str) -> Option<String>, taken: &[String]) -> Opt
         .filter(|v| !v.is_empty())
     {
         None => None,
-        Some(raw) => match parse_domain_list(&raw) {
+        Some(raw) => match env_domains(&raw) {
             Ok(list) => Some(list),
-            Err(e) => {
-                tracing::warn!(
-                    "{REMOTE_DOMAINS_ENV}: {e}; the server from {REMOTE_URL_ENV} is left out rather than taking every domain"
-                );
+            Err(warning) => {
+                tracing::warn!("{warning}");
                 return None;
             }
         },
@@ -764,6 +785,34 @@ mod tests {
             reason.contains("may use only lower-case letters, digits, '.', '_' and '-'"),
             "{reason}"
         );
+    }
+
+    /// The domain list is checked like the url: a token pasted into
+    /// `--domains` or the variable is repeated by no refusal and by no
+    /// warning, because a warning lands in the daemon log on every load.
+    #[test]
+    fn a_domain_list_refusal_never_repeats_the_value() {
+        let long = format!("cmt_SECRET3{}", "0".repeat(64));
+        for value in [
+            "alpha,cmt_SECRET1 x".to_string(),
+            "cmt_SECRET2,,beta".to_string(),
+            format!("alpha,{long}"),
+            "https://kb.example/cmt_SECRET4".to_string(),
+            "cmt_SECRET5/../x".to_string(),
+        ] {
+            let reason = parse_domain_list(&value).unwrap_err();
+            assert!(!reason.contains("SECRET"), "{value}: {reason}");
+            let warning = env_domains(&value).unwrap_err();
+            assert!(!warning.contains("SECRET"), "{value}: {warning}");
+            assert!(warning.starts_with(REMOTE_DOMAINS_ENV), "{warning}");
+        }
+        let reason = parse_domain_list("alpha,Not A Name").unwrap_err();
+        assert!(reason.contains("name 2"), "says which name: {reason}");
+        assert!(
+            reason.contains("use letters, digits"),
+            "says the rule: {reason}"
+        );
+        assert_eq!(env_domains("beta, alpha").unwrap(), vec!["alpha", "beta"]);
     }
 
     #[test]

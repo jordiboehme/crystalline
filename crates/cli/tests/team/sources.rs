@@ -849,10 +849,16 @@ fn a_bad_domain_list_is_refused_before_signing_in() {
         vec!["--domains", "alpha,,beta"],
         vec!["--domains", "Not A Name"],
         vec!["--domains", "alpha", "--all-domains"],
+        vec!["--domains", "alpha,cmt_SECRET1 x"],
+        vec!["--domains", "alpha,,cmt_SECRET2"],
     ] {
         let out = connect_with(&server, home.path(), &extra);
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(!out.status.success(), "{extra:?} must be refused");
+        assert!(
+            !stderr.contains("SECRET"),
+            "{extra:?}: a pasted token is not repeated: {stderr}"
+        );
         assert!(
             !stderr.contains("unexpected argument"),
             "{extra:?}: the flags are known: {stderr}"
