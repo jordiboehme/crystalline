@@ -43,10 +43,10 @@ fn same_sign_in(open: &SourceRecord, record: &SourceRecord) -> bool {
 
 /// The assignment a refresh writes down: `file` with the environment's
 /// source after it, decided over `offers`, and written back into `file`
-/// without that source. Every domain a list moved is logged, one line per
-/// move (the daemon's refresh is where a listed domain first offered moves,
-/// D17), and answered; the other announcements stay unsaid here, as they
-/// were.
+/// without that source. Answers every domain a list moved, for the caller
+/// to log once the file is saved (the daemon's refresh is where a listed
+/// domain first offered moves, D17); the other announcements stay unsaid
+/// here, as they were.
 fn assign_for_refresh(
     file: &mut SourcesFile,
     env: Option<&SourceRecord>,
@@ -63,14 +63,9 @@ fn assign_for_refresh(
         combined.sources.pop();
     }
     *file = combined;
-    let moved: Vec<Announcement> = said
-        .into_iter()
+    said.into_iter()
         .filter(|a| matches!(a, Announcement::Moved { .. }))
-        .collect();
-    for one in &moved {
-        tracing::info!("{one}");
-    }
-    moved
+        .collect()
 }
 
 /// Open one source's connection on a blocking thread (one bounded keychain
@@ -751,17 +746,21 @@ impl SourceSet {
             update_sources(&dir, |file| {
                 // Read under the sources lock, as the domains stand now.
                 let local = local.read().unwrap_or_else(|e| e.into_inner()).clone();
-                assign_for_refresh(file, env.as_ref(), &local, |combined| {
+                let moved = assign_for_refresh(file, env.as_ref(), &local, |combined| {
                     cached_offers(combined, &dir)
                 });
-                Ok(file.clone())
+                Ok((file.clone(), moved))
             })
         })
         .await;
         // A name is used only once it is written down (decision D13): when
         // the save failed, the table stays as it was.
         match saved {
-            Ok(Ok(file)) => {
+            Ok(Ok((file, moved))) => {
+                // Said once it is written down, one line per move.
+                for one in &moved {
+                    tracing::info!("{one}");
+                }
                 let current = {
                     let mut inner = self.write();
                     let current = inner.generation == generation;
@@ -1198,5 +1197,72 @@ mod tests {
             1,
             "the source was asked once"
         );
+    }
+
+    #[test]
+    fn an_environment_source_that_lists_a_domain_serves_one_name_and_saves_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut acme = plain("acme", None);
+        acme.mounts.push(MountRecord {
+            remote: "platform".into(),
+            local: "platform".into(),
+        });
+        let saved = acme.clone();
+        update_sources(dir.path(), |f| {
+            f.sources.push(saved);
+            Ok(())
+        })
+        .unwrap();
+        let cache = |record: &SourceRecord, domain: RemoteDomain| {
+            crate::write_cached(
+                &record.host_dir(dir.path()),
+                ROUTING_FILE,
+                &crate::Cached {
+                    account: record.account.clone(),
+                    etag: "e".into(),
+                    fetched_at: Utc::now(),
+                    data: serde_json::json!({ "domains": [domain] }),
+                    last_failure: None,
+                },
+            )
+            .unwrap();
+        };
+        cache(&acme, platform("platform"));
+        let env = |name: &str| match name {
+            crate::sources::REMOTE_URL_ENV => Some("https://kb.acme.com".to_string()),
+            REMOTE_TOKEN_ENV => Some("cmt_x".to_string()),
+            crate::sources::REMOTE_DOMAINS_ENV => Some("plat".to_string()),
+            _ => None,
+        };
+        let kb = env_source(env, &["acme".to_string()]).unwrap();
+        cache(&kb, platform("plat"));
+        let set = SourceSet::load(dir.path().to_path_buf(), Vec::new(), env);
+        let served = |set: &SourceSet| {
+            set.table()
+                .mounts
+                .iter()
+                .map(|m| (m.source.clone(), m.local.clone()))
+                .collect::<Vec<_>>()
+        };
+        let first = served(&set);
+        assert_eq!(first, vec![(kb.name.clone(), "platform".to_string())]);
+        set.reload();
+        assert_eq!(served(&set), first, "the name never flips between rebuilds");
+
+        // What the refresh writes down, then the rebuild after it.
+        let moved = update_sources(dir.path(), |file| {
+            Ok(assign_for_refresh(file, Some(&kb), &[], |combined| {
+                cached_offers(combined, dir.path())
+            }))
+        })
+        .unwrap();
+        assert!(moved.is_empty(), "{moved:?}");
+        assert_eq!(
+            load_sources(dir.path()).unwrap().sources[0].mounts,
+            acme.mounts,
+            "sources.json still holds acme's record"
+        );
+        set.reload();
+        assert_eq!(served(&set), first, "nor after a refresh");
     }
 }

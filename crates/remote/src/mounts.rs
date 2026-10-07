@@ -576,80 +576,76 @@ pub fn assign(
             }
         }
     }
-    // A domain a list claims from a source that takes all keeps its local
-    // name: the listing source's record takes the name over (a name of its
-    // own for it is dropped) and the other source's record for it is
-    // dropped, said as a move. Only a list moves a domain, and only away from a
-    // source that takes all; a claim of a source that takes all is its own
-    // established record, and among sources of one kind the other records
-    // stay as they are, only skipped (0.23.0).
+    // A domain a list claims keeps the local name the person knew. The
+    // source that served it is the first one, in connect order and of any
+    // kind, holding a record for it among the sources offering it now. When
+    // that is a source that takes all, the listing source takes its name
+    // over (a name of its own for it is dropped, so it is free again), and
+    // that is said as a move. Every record of a source that takes all is
+    // dropped then, the skipped ones without a word; a source that lists it
+    // too is of the same kind and keeps its record, only skipped (0.23.0).
+    // The environment's source is never written down, so when it is the one
+    // that lists the domain no saved record is dropped or moved: it serves
+    // the domain under the name the serving source holds, at every rebuild,
+    // and that source's record stays, skipped.
     let mut said = Vec::new();
     for (identity, winner, winner_remote) in &claimed {
-        let listed = sources
-            .sources
-            .iter()
-            .find(|s| &s.name == winner)
-            .is_some_and(|s| lists(s, winner_remote));
-        if !listed {
+        let Some(winner_at) = sources.sources.iter().position(|s| &s.name == winner) else {
+            continue;
+        };
+        if !lists(&sources.sources[winner_at], winner_remote) {
             continue;
         }
-        // The first source that takes all with a record for it, in connect
-        // order, is the one that served it (an established mount); a later
-        // one was only skipped, and its name was never seen.
-        let mut served_taken = false;
-        for at in 0..sources.sources.len() {
-            if sources.sources[at].name == *winner {
-                continue;
-            }
-            let Some(old) = remote.get(&sources.sources[at].name).and_then(|offered| {
-                offered
-                    .iter()
-                    .find(|d| d.origin.as_ref().is_some_and(|o| o.same_as(identity)))
-            }) else {
-                continue;
-            };
-            // A source that lists it too is of the same kind: it keeps its
-            // record and is only skipped, as among sources that take all.
-            if lists(&sources.sources[at], &old.name) {
-                continue;
-            }
-            let Some(pos) = sources.sources[at]
-                .mounts
-                .iter()
-                .position(|m| m.remote == old.name)
-            else {
-                continue;
-            };
-            let record = sources.sources[at].mounts.remove(pos);
-            let from = sources.sources[at].name.clone();
-            let to = sources
-                .sources
-                .iter_mut()
-                .find(|s| &s.name == winner)
-                .expect("a claim names a source");
-            // The domain keeps the local name the person knew, the one the
-            // source that takes all served it under. A name the listing
-            // source held of its own for it is dropped, so it is free again.
-            let local = match to.mounts.iter_mut().find(|m| &m.remote == winner_remote) {
-                Some(own) if served_taken => own.local.clone(),
-                Some(own) => {
-                    own.local = record.local.clone();
-                    record.local
-                }
-                None => {
-                    to.mounts.push(MountRecord {
+        // Where `source` holds its record for the domain, if it offers it now.
+        let held = |source: &SourceRecord| -> Option<usize> {
+            let offered = remote.get(&source.name)?;
+            source.mounts.iter().position(|m| {
+                offered.iter().any(|d| {
+                    d.name == m.remote && d.origin.as_ref().is_some_and(|o| o.same_as(identity))
+                })
+            })
+        };
+        let serving = sources
+            .sources
+            .iter()
+            .position(|s| held(s).is_some())
+            .filter(|&at| at != winner_at);
+        let from_env = sources.sources[winner_at].from_env;
+        if let Some(at) = serving {
+            let pos = held(&sources.sources[at]).expect("the serving source holds a record");
+            let old = sources.sources[at].mounts[pos].clone();
+            if !lists(&sources.sources[at], &old.remote) {
+                let to = &mut sources.sources[winner_at];
+                match to.mounts.iter_mut().find(|m| &m.remote == winner_remote) {
+                    Some(own) => own.local = old.local.clone(),
+                    None => to.mounts.push(MountRecord {
                         remote: winner_remote.clone(),
-                        local: record.local.clone(),
-                    });
-                    record.local
+                        local: old.local.clone(),
+                    }),
                 }
+                if !from_env {
+                    said.push(Announcement::Moved {
+                        local: old.local,
+                        from: sources.sources[at].name.clone(),
+                        to: winner.clone(),
+                    });
+                }
+            }
+        }
+        if from_env {
+            continue;
+        }
+        for at in 0..sources.sources.len() {
+            if at == winner_at {
+                continue;
+            }
+            let Some(pos) = held(&sources.sources[at]) else {
+                continue;
             };
-            served_taken = true;
-            said.push(Announcement::Moved {
-                local,
-                from,
-                to: winner.clone(),
-            });
+            let remote_name = sources.sources[at].mounts[pos].remote.clone();
+            if !lists(&sources.sources[at], &remote_name) {
+                sources.sources[at].mounts.remove(pos);
+            }
         }
     }
     let local_names: BTreeSet<String> = local.iter().map(|d| d.name.clone()).collect();
@@ -2143,15 +2139,97 @@ mod tests {
                 local: "platform".into()
             }]
         );
-        for from in ["acme", "beta"] {
-            assert!(
-                said.contains(&Announcement::Moved {
-                    local: "platform".into(),
-                    from: from.into(),
-                    to: "gamma".into()
-                }),
-                "{from}: {said:?}"
-            );
-        }
+        let moves: Vec<&Announcement> = said
+            .iter()
+            .filter(|a| matches!(a, Announcement::Moved { .. }))
+            .collect();
+        assert_eq!(
+            moves,
+            vec![&Announcement::Moved {
+                local: "platform".into(),
+                from: "acme".into(),
+                to: "gamma".into()
+            }],
+            "only the serving source changed; beta's copy was only skipped"
+        );
+    }
+
+    #[test]
+    fn a_listing_source_that_already_serves_the_domain_keeps_its_name() {
+        let mut file = SourcesFile::default();
+        file.sources.push(listing("beta", &["plat"]));
+        file.sources.push(source("acme"));
+        file.sources[0].mounts.push(MountRecord {
+            remote: "plat".into(),
+            local: "plat".into(),
+        });
+        file.sources[1].mounts.push(MountRecord {
+            remote: "platform".into(),
+            local: "platform".into(),
+        });
+        let (table, said) = assign(
+            &mut file,
+            &[],
+            &served(&[
+                ("beta", vec![remote("plat", Some("acme/platform"))]),
+                ("acme", vec![remote("platform", Some("acme/platform"))]),
+            ]),
+        );
+        assert_eq!(
+            names(&table),
+            vec![("beta".into(), "plat".into(), "plat".into())],
+            "beta keeps 'plat'"
+        );
+        assert_eq!(
+            file.sources[0].mounts,
+            vec![MountRecord {
+                remote: "plat".into(),
+                local: "plat".into()
+            }]
+        );
+        assert!(
+            file.sources[1].mounts.is_empty(),
+            "acme's skipped record is dropped"
+        );
+        assert!(
+            !said.iter().any(|a| matches!(a, Announcement::Moved { .. })),
+            "nothing moved: {said:?}"
+        );
+    }
+
+    #[test]
+    fn an_environment_source_that_lists_the_domain_moves_no_saved_record() {
+        let mut file = SourcesFile::default();
+        file.sources.push(source("acme"));
+        file.sources[0].mounts.push(MountRecord {
+            remote: "platform".into(),
+            local: "platform".into(),
+        });
+        let mut env = listing("kb", &["plat"]);
+        env.from_env = true;
+        file.sources.push(env);
+        let offers = served(&[
+            ("acme", vec![remote("platform", Some("acme/platform"))]),
+            ("kb", vec![remote("plat", Some("acme/platform"))]),
+        ]);
+        let (table, said) = assign(&mut file, &[], &offers);
+        assert_eq!(
+            names(&table),
+            vec![("kb".into(), "plat".into(), "platform".into())],
+            "the name the person knew"
+        );
+        assert_eq!(
+            file.sources[0].mounts,
+            vec![MountRecord {
+                remote: "platform".into(),
+                local: "platform".into()
+            }],
+            "the saved record stays, only skipped"
+        );
+        assert_eq!(table.skipped[0].reason, SkipReason::SameDomain);
+        assert!(
+            !said.iter().any(|a| matches!(a, Announcement::Moved { .. })),
+            "{said:?}"
+        );
     }
 }
