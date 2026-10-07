@@ -345,16 +345,52 @@ pub fn default_source_name(origin: &str, taken: &[String]) -> String {
         .expect("an unbounded count finds a free name")
 }
 
+/// The environment's server address, normalized, or why it cannot be. The
+/// reason never repeats the value: a token pasted into the wrong variable
+/// would otherwise land in the log on every load.
+fn env_url(raw: &str) -> Result<String, String> {
+    use crystalline_core::base::{BaseProblem, PathProblem, PublicBase};
+    let problem = match crate::sign_in::normalize_server_url(raw) {
+        Ok(url) => return Ok(url),
+        Err(problem) => problem,
+    };
+    let reason = if raw.contains('\\') {
+        "it has a backslash, and a server address uses '/' only"
+    } else if let crate::sign_in::SignInError::InsecureUrl { .. } = problem {
+        "plain http is allowed only to this machine"
+    } else {
+        match PublicBase::parse(raw) {
+            Err(BaseProblem::Path(PathProblem::Character(_))) => {
+                "its path may use only lower-case letters, digits, '.', '_' and '-'"
+            }
+            Err(BaseProblem::Path(PathProblem::DotSegment(_))) => {
+                "its path has a '.' or '..' segment, which a browser resolves away"
+            }
+            Err(BaseProblem::Path(PathProblem::Reserved(_))) => {
+                "its path starts with a segment the server answers at itself"
+            }
+            Err(BaseProblem::Path(PathProblem::EmptySegment)) => {
+                "its path has an empty segment (two slashes in a row)"
+            }
+            Err(BaseProblem::Path(PathProblem::QueryOrFragment)) => {
+                "it carries a query or a fragment"
+            }
+            _ => "it is not a usable server address",
+        }
+    };
+    Err(reason.to_string())
+}
+
 /// The source the environment adds, when both variables are set. Never
 /// saved; named like any other, past `taken`.
 pub fn env_source(env: impl Fn(&str) -> Option<String>, taken: &[String]) -> Option<SourceRecord> {
     let raw = env(REMOTE_URL_ENV)
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())?;
-    let url = match crate::sign_in::normalize_server_url(&raw) {
+    let url = match env_url(&raw) {
         Ok(url) => url,
-        Err(e) => {
-            tracing::warn!("{REMOTE_URL_ENV}: {e}; using '{raw}' as written");
+        Err(reason) => {
+            tracing::warn!("{REMOTE_URL_ENV}: {reason}; using the value as written");
             raw.trim_end_matches('/').to_string()
         }
     };
@@ -653,5 +689,29 @@ mod tests {
             _ => None,
         };
         assert_eq!(env_source(env, &[]).unwrap().url, "http://kb.internal:7411");
+    }
+
+    #[test]
+    fn the_environment_warning_never_repeats_the_value() {
+        for value in [
+            "cmt_SECRET1",
+            "https://kb.example/Cmt_SECRET2",
+            "http://kb.internal/cmt_SECRET3",
+            "https://kb.example\\cmt_SECRET4",
+            "https://kb.example/cmt_SECRET5/../x",
+            "https://kb.example/cmt_SECRET6?x=1",
+        ] {
+            let reason = env_url(value).unwrap_err();
+            assert!(!reason.contains("SECRET"), "{value}: {reason}");
+        }
+        assert_eq!(
+            env_url("https://kb.example/crystalline/").unwrap(),
+            "https://kb.example/crystalline"
+        );
+        let reason = env_url("https://kb.example/Crystalline").unwrap_err();
+        assert!(
+            reason.contains("may use only lower-case letters, digits, '.', '_' and '-'"),
+            "{reason}"
+        );
     }
 }

@@ -179,6 +179,13 @@ impl std::error::Error for SignInError {}
 /// fragment, and the path follows the rules a server's `service.public_url`
 /// does. `https` anywhere, plain `http` only to this machine.
 pub fn normalize_server_url(input: &str) -> Result<String, SignInError> {
+    // A URL parser reads a backslash as a slash, so `https://host\\kb` would
+    // quietly name the root of `host`.
+    if input.contains('\\') {
+        return Err(SignInError::BadUrl(format!(
+            "'{input}' has a backslash; a server address uses '/' only"
+        )));
+    }
     let url = reqwest::Url::parse(input.trim())
         .map_err(|e| SignInError::BadUrl(format!("'{input}' is not a URL: {e}")))?;
     let host = url
@@ -251,6 +258,51 @@ async fn first_usable(
         }
     }
     send(http.get(last.as_str()), origin, budget).await
+}
+
+/// `value` without one trailing slash.
+fn one_slash_off(value: &str) -> &str {
+    value.strip_suffix('/').unwrap_or(value)
+}
+
+/// Whether a protected-resource document of a server under a prefix names
+/// its `base` as both the resource and the authorization server.
+fn resource_stays_inside(document: &Value, base: &str) -> bool {
+    let names_base = |value: &Value| value.as_str().is_some_and(|v| one_slash_off(v) == base);
+    names_base(&document["resource"]) && names_base(&document["authorization_servers"][0])
+}
+
+/// The metadata members a client uses or stores.
+const METADATA_ENDPOINTS: [&str; 4] = [
+    "authorization_endpoint",
+    "token_endpoint",
+    "registration_endpoint",
+    "revocation_endpoint",
+];
+
+/// Whether the metadata of a server under a prefix names its `base` as the
+/// issuer and keeps every endpoint under it: the three it needs present,
+/// the revocation endpoint when it names one.
+fn metadata_stays_inside(meta: &Value, base: &str) -> bool {
+    let under = format!("{base}/");
+    meta["issuer"]
+        .as_str()
+        .is_some_and(|i| one_slash_off(i) == base)
+        && METADATA_ENDPOINTS
+            .iter()
+            .all(|name| match meta[*name].as_str() {
+                Some(url) => url.starts_with(&under),
+                None => *name == "revocation_endpoint",
+            })
+}
+
+/// The refusal of OAuth documents that lead away from `base`.
+fn outside_base(base: &str) -> SignInError {
+    SignInError::Protocol(format!(
+        "the OAuth documents of {base} name an address outside {base}, so this machine does \
+         not sign in there through the browser; nothing was saved. Paste a personal MCP token \
+         instead: crystalline connect {base} --token"
+    ))
 }
 
 /// Whether `url` may carry a sign-in: https anywhere, plain http only to
@@ -467,6 +519,9 @@ async fn discover_by(
     };
     // A protected-resource document is usable when it names this base as
     // its resource and names an authorization server.
+    // Under a prefix the documents can be answered by whatever else runs on
+    // the host, so every document used must stay inside the base.
+    let prefixed = PublicBase::parse(origin).is_ok_and(|base| !base.path().is_root());
     let resource = first_usable(
         http,
         &document_addresses(origin, PROTECTED_RESOURCE_PATH),
@@ -478,6 +533,7 @@ async fn discover_by(
                 && answer.json()["resource"]
                     .as_str()
                     .is_some_and(|r| r.trim_end_matches('/') == origin)
+                && (!prefixed || resource_stays_inside(answer.json(), origin))
         },
     )
     .await?;
@@ -501,6 +557,9 @@ async fn discover_by(
             "the protected-resource document of {origin} names no resource or authorization server"
         )));
     };
+    if prefixed && !resource_stays_inside(document, origin) {
+        return Err(outside_base(origin));
+    }
     let issuer = issuer.trim_end_matches('/').to_string();
     let insecure = || SignInError::InsecureEndpoints {
         url: origin.to_string(),
@@ -520,6 +579,7 @@ async fn discover_by(
                     .as_str()
                     .map(|i| i.trim_end_matches('/'))
                     == Some(issuer.as_str())
+                && (!prefixed || metadata_stays_inside(answer.json(), origin))
         },
     )
     .await?;
@@ -538,6 +598,9 @@ async fn discover_by(
     // RFC 8414 section 3.3: the metadata names the issuer it was fetched for.
     if meta["issuer"].as_str().map(|i| i.trim_end_matches('/')) != Some(issuer.as_str()) {
         return Err(insecure());
+    }
+    if prefixed && !metadata_stays_inside(meta, origin) {
+        return Err(outside_base(origin));
     }
     let endpoint = |name: &str| {
         let url = meta[name].as_str().ok_or_else(|| {
@@ -1548,84 +1611,120 @@ mod tests {
         assert_eq!(oauth.issuer, base);
     }
 
-    /// How the inserted RFC addresses answer in [`inserted_answers`].
+    /// One answer of [`serve_documents`]. In the text, `{base}` is the
+    /// stand-in's base and `{origin}` its origin.
     #[derive(Clone, Copy, Debug)]
-    enum Inserted {
+    enum Doc {
+        /// A 404.
+        Missing,
         /// A site at the host root that answers every path with a page.
-        HtmlCatchAll,
+        Html,
         /// A site at the host root that redirects every path.
         Redirect,
-        /// A gateway whose upstream for the root is down.
+        /// A gateway whose upstream is down.
         BadGateway,
-        /// A protected-resource document naming another resource.
-        OtherResource,
-        /// Both documents, the metadata naming another issuer, which the
-        /// copies inside the prefix name too.
-        OtherIssuerEverywhere,
+        /// A protected-resource document: its resource and its
+        /// authorization server.
+        Resource(&'static str, &'static str),
+        /// Authorization server metadata: its issuer and its token endpoint.
+        Metadata(&'static str, &'static str),
     }
 
-    /// A stand-in under `/crystalline` whose copies inside the prefix are
-    /// right and whose inserted addresses answer as `inserted` says.
-    async fn inserted_answers(
-        inserted: Inserted,
+    const HONEST_RESOURCE: Doc = Doc::Resource("{base}", "{base}");
+    const HONEST_METADATA: Doc = Doc::Metadata("{base}", "{base}/api/v1/oauth/token");
+    const ELSEWHERE: &str = "http://127.0.0.1:1/elsewhere";
+
+    /// What each of the four document addresses of a server under
+    /// `/crystalline` answers.
+    #[derive(Clone, Copy, Debug)]
+    struct Documents {
+        inserted_resource: Doc,
+        inserted_metadata: Doc,
+        inside_resource: Doc,
+        inside_metadata: Doc,
+    }
+
+    impl Documents {
+        /// Honest copies inside the prefix, the inserted addresses as given.
+        fn inserted(resource: Doc, metadata: Doc) -> Documents {
+            Documents {
+                inserted_resource: resource,
+                inserted_metadata: metadata,
+                inside_resource: HONEST_RESOURCE,
+                inside_metadata: HONEST_METADATA,
+            }
+        }
+
+        /// The same answers at both addresses.
+        fn everywhere(resource: Doc, metadata: Doc) -> Documents {
+            Documents {
+                inserted_resource: resource,
+                inserted_metadata: metadata,
+                inside_resource: resource,
+                inside_metadata: metadata,
+            }
+        }
+    }
+
+    /// A stand-in under `/crystalline` answering as `documents` says.
+    async fn serve_documents(
+        documents: Documents,
     ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use axum::http::StatusCode;
         use axum::response::IntoResponse;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let base = format!("{origin}/crystalline");
         let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = asked.clone();
-        let doc_base = base.clone();
+        let (doc_origin, doc_base) = (origin.clone(), base.clone());
         let router = axum::Router::new().fallback(move |uri: axum::http::Uri| {
             let seen = seen.clone();
-            let base = doc_base.clone();
+            let (origin, base) = (doc_origin.clone(), doc_base.clone());
             async move {
-                use axum::http::StatusCode;
                 let path = uri.path().to_string();
                 seen.lock().unwrap().push(path.clone());
-                let resource = |resource: &str| {
-                    axum::Json(json!({ "resource": resource, "authorization_servers": [base] }))
-                        .into_response()
+                let fill = |text: &str| text.replace("{base}", &base).replace("{origin}", &origin);
+                let doc = match path.as_str() {
+                    "/crystalline/health" => {
+                        return axum::Json(json!({ "status": "ok" })).into_response();
+                    }
+                    "/.well-known/oauth-protected-resource/crystalline" => {
+                        documents.inserted_resource
+                    }
+                    "/.well-known/oauth-authorization-server/crystalline" => {
+                        documents.inserted_metadata
+                    }
+                    "/crystalline/.well-known/oauth-protected-resource" => {
+                        documents.inside_resource
+                    }
+                    "/crystalline/.well-known/oauth-authorization-server" => {
+                        documents.inside_metadata
+                    }
+                    _ => Doc::Missing,
                 };
-                let metadata = |issuer: &str| {
-                    axum::Json(json!({
-                        "issuer": issuer,
+                match doc {
+                    Doc::Missing => StatusCode::NOT_FOUND.into_response(),
+                    Doc::Html => (
+                        StatusCode::OK,
+                        [("content-type", "text/html")],
+                        "<!doctype html><title>home</title>",
+                    )
+                        .into_response(),
+                    Doc::Redirect => (StatusCode::FOUND, [("location", "/")], "").into_response(),
+                    Doc::BadGateway => StatusCode::BAD_GATEWAY.into_response(),
+                    Doc::Resource(resource, server) => axum::Json(json!({
+                        "resource": fill(resource),
+                        "authorization_servers": [fill(server)],
+                    }))
+                    .into_response(),
+                    Doc::Metadata(issuer, token) => axum::Json(json!({
+                        "issuer": fill(issuer),
                         "authorization_endpoint": format!("{base}/api/v1/oauth/authorize"),
-                        "token_endpoint": format!("{base}/api/v1/oauth/token"),
+                        "token_endpoint": fill(token),
                         "registration_endpoint": format!("{base}/api/v1/oauth/register"),
                     }))
-                    .into_response()
-                };
-                let other_issuer = matches!(inserted, Inserted::OtherIssuerEverywhere);
-                match path.as_str() {
-                    "/crystalline/health" => axum::Json(json!({ "status": "ok" })).into_response(),
-                    "/crystalline/.well-known/oauth-protected-resource" => resource(&base),
-                    "/crystalline/.well-known/oauth-authorization-server" if other_issuer => {
-                        metadata("http://127.0.0.1:1/elsewhere")
-                    }
-                    "/crystalline/.well-known/oauth-authorization-server" => metadata(&base),
-                    "/.well-known/oauth-protected-resource/crystalline"
-                    | "/.well-known/oauth-authorization-server/crystalline" => match inserted {
-                        Inserted::HtmlCatchAll => (
-                            StatusCode::OK,
-                            [("content-type", "text/html")],
-                            "<!doctype html><title>home</title>",
-                        )
-                            .into_response(),
-                        Inserted::Redirect => {
-                            (StatusCode::FOUND, [("location", "/")], "").into_response()
-                        }
-                        Inserted::BadGateway => StatusCode::BAD_GATEWAY.into_response(),
-                        Inserted::OtherResource if path.contains("protected-resource") => {
-                            resource("http://127.0.0.1:1/elsewhere")
-                        }
-                        Inserted::OtherResource => metadata(&base),
-                        Inserted::OtherIssuerEverywhere if path.contains("protected-resource") => {
-                            resource(&base)
-                        }
-                        Inserted::OtherIssuerEverywhere => metadata("http://127.0.0.1:1/elsewhere"),
-                    },
-                    _ => StatusCode::NOT_FOUND.into_response(),
+                    .into_response(),
                 }
             }
         });
@@ -1635,48 +1734,94 @@ mod tests {
         (base, asked)
     }
 
-    #[tokio::test]
-    async fn an_inserted_address_that_is_no_usable_document_falls_back_to_the_prefix() {
-        for inserted in [
-            Inserted::HtmlCatchAll,
-            Inserted::Redirect,
-            Inserted::BadGateway,
-            Inserted::OtherResource,
-        ] {
-            let (base, asked) = inserted_answers(inserted).await;
-            let oauth = discover(&client().unwrap(), &base)
-                .await
-                .unwrap_or_else(|e| panic!("{inserted:?}: {e}"))
-                .oauth
-                .unwrap();
-            assert_eq!(oauth.resource, base, "{inserted:?}");
-            assert_eq!(oauth.issuer, base, "{inserted:?}");
-            assert_eq!(
-                oauth.token_endpoint,
-                format!("{base}/api/v1/oauth/token"),
-                "{inserted:?}"
-            );
-            let asked = asked.lock().unwrap().clone();
-            assert!(
-                asked.contains(&"/crystalline/.well-known/oauth-protected-resource".to_string()),
-                "{inserted:?}: {asked:?}"
-            );
+    /// Discovery against `documents` uses the honest copies inside the
+    /// prefix: the values it returns are ones only they name.
+    async fn uses_the_inside_copy(documents: Documents) {
+        let (base, _) = serve_documents(documents).await;
+        let oauth = discover(&client().unwrap(), &base)
+            .await
+            .unwrap_or_else(|e| panic!("{documents:?}: {e}"))
+            .oauth
+            .unwrap();
+        assert_eq!(oauth.resource, base, "{documents:?}");
+        assert_eq!(oauth.issuer, base, "{documents:?}");
+        assert_eq!(
+            oauth.token_endpoint,
+            format!("{base}/api/v1/oauth/token"),
+            "{documents:?}"
+        );
+    }
+
+    /// Discovery against `documents` is refused.
+    async fn is_refused(documents: Documents) -> SignInError {
+        let (base, _) = serve_documents(documents).await;
+        match discover(&client().unwrap(), &base).await {
+            Ok(found) => panic!("{documents:?}: {found:?}"),
+            Err(refused) => refused,
         }
     }
 
     #[tokio::test]
+    async fn an_inserted_address_that_is_no_usable_document_falls_back_to_the_prefix() {
+        for inserted in [Doc::Html, Doc::Redirect, Doc::BadGateway] {
+            uses_the_inside_copy(Documents::inserted(inserted, inserted)).await;
+        }
+        uses_the_inside_copy(Documents::inserted(
+            Doc::Resource(ELSEWHERE, "{base}"),
+            HONEST_METADATA,
+        ))
+        .await;
+    }
+
+    #[tokio::test]
     async fn another_issuer_at_both_addresses_is_still_refused() {
-        let (base, asked) = inserted_answers(Inserted::OtherIssuerEverywhere).await;
-        let refused = discover(&client().unwrap(), &base).await.unwrap_err();
+        let refused = is_refused(Documents::everywhere(
+            HONEST_RESOURCE,
+            Doc::Metadata(ELSEWHERE, "{base}/api/v1/oauth/token"),
+        ))
+        .await;
         assert!(
             matches!(refused, SignInError::InsecureEndpoints { .. }),
             "{refused:?}"
         );
-        let asked = asked.lock().unwrap().clone();
+    }
+
+    #[tokio::test]
+    async fn a_document_at_the_host_root_cannot_name_another_authorization_server() {
+        let steered = Doc::Resource("{base}", ELSEWHERE);
+        uses_the_inside_copy(Documents::inserted(steered, HONEST_METADATA)).await;
+        let refused = is_refused(Documents::everywhere(steered, HONEST_METADATA)).await;
+        let base_named = refused.to_string();
         assert!(
-            asked.contains(&"/crystalline/.well-known/oauth-authorization-server".to_string()),
-            "both addresses were asked: {asked:?}"
+            base_named.contains("/crystalline") && base_named.contains("outside"),
+            "{base_named}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_document_at_the_host_root_cannot_name_another_token_endpoint() {
+        let steered = Doc::Metadata("{base}", "http://127.0.0.1:1/elsewhere/token");
+        uses_the_inside_copy(Documents::inserted(HONEST_RESOURCE, steered)).await;
+        let refused = is_refused(Documents::everywhere(HONEST_RESOURCE, steered)).await;
+        assert!(refused.to_string().contains("outside"), "{refused}");
+    }
+
+    #[tokio::test]
+    async fn an_endpoint_on_another_path_of_the_same_host_is_refused_under_a_prefix() {
+        let other_path = Doc::Metadata("{base}", "{origin}/other/token");
+        uses_the_inside_copy(Documents::inserted(HONEST_RESOURCE, other_path)).await;
+        let refused = is_refused(Documents::everywhere(HONEST_RESOURCE, other_path)).await;
+        assert!(refused.to_string().contains("outside"), "{refused}");
+    }
+
+    #[test]
+    fn a_backslash_in_a_server_url_is_refused() {
+        for bad in ["https://kb.example\\crystalline", "https://kb.example/a\\b"] {
+            assert!(
+                matches!(normalize_server_url(bad), Err(SignInError::BadUrl(_))),
+                "{bad}"
+            );
+        }
     }
 
     #[test]
