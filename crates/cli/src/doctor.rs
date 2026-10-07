@@ -1414,7 +1414,10 @@ impl DoctorReport {
         // reads it, until the merge.
         n += self.desktop_states.len();
         // A name the two sides mean differently waits for the person.
-        n += self.merge.as_ref().map_or(0, |m| m.conflicts.len());
+        n += self
+            .merge
+            .as_ref()
+            .map_or(0, |m| m.conflicts.len() + m.not_moved.len());
         n += usize::from(self.merge_error.is_some());
         n
     }
@@ -1438,6 +1441,11 @@ pub async fn run(
         if db_override.is_some() {
             anyhow::bail!(
                 "--merge-desktop-state merges into this machine's own index: leave out --db"
+            );
+        }
+        if domain_filter.is_some() {
+            anyhow::bail!(
+                "--merge-desktop-state merges every domain of Claude Desktop's state: leave out --domain"
             );
         }
     }
@@ -3906,7 +3914,6 @@ fn is_profile_harness(name: &str) -> bool {
     HarnessKind::from_id(name).is_some_and(|k| !k.profile().is_legacy())
 }
 
-/// Render a report for a human.
 /// What `--merge-desktop-state` did, under `claude desktop:`.
 fn render_merge(out: &mut String, merge: &crate::desktop_state::MergeReport) {
     use std::fmt::Write as _;
@@ -3941,6 +3948,9 @@ fn render_merge(out: &mut String, merge: &crate::desktop_state::MergeReport) {
     for conflict in &merge.conflicts {
         let _ = writeln!(out, "  [problem] {conflict}");
     }
+    for line in &merge.not_moved {
+        let _ = writeln!(out, "  [problem] {line}");
+    }
     if !merge.private_kept.is_empty() {
         let _ = writeln!(
             out,
@@ -3960,6 +3970,7 @@ fn render_merge(out: &mut String, merge: &crate::desktop_state::MergeReport) {
     }
 }
 
+/// Render a report for a human.
 pub fn render_human(report: &DoctorReport) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();

@@ -189,6 +189,11 @@ fn the_merge_takes_the_config_union_moves_a_virtual_domain_and_renames_the_folde
         serde_json::json!([["vnotes", 2]]),
         "{merge}"
     );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("Daemon: bypassed"),
+        "the export from the private copy says nothing: {stderr}"
+    );
     let cfg = real_config(home.path());
     assert!(
         cfg.domains.contains_key("shared"),
@@ -297,6 +302,19 @@ fn a_private_domain_with_an_unusable_folder_is_not_registered() {
     );
     assert!(merge["renamed_to"].is_string(), "{merge}");
     assert!(!folder.exists());
+    let renamed = merge["renamed_to"].as_str().unwrap();
+    let inner = merge["kept_this_machine"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .find(|line| line.contains("'inner'"))
+        .unwrap()
+        .to_string();
+    assert!(
+        inner.contains(&format!("now in {renamed}")),
+        "the files inside the private folder are named where they went: {inner}"
+    );
 }
 
 #[test]
@@ -498,5 +516,150 @@ fn the_merge_refuses_while_a_daemon_from_the_private_folder_runs() {
         text.contains("[problem] a Crystalline daemon from"),
         "the merge's own refusal, not only the scan's line: {text}"
     );
+    assert!(folder.exists());
+}
+
+/// Replace the stored text of one engram in a private index with text the
+/// parser refuses, as an older build might have stored it.
+fn break_engram(index: &Path, domain: &str, permalink: &str) {
+    use crystalline_core::parse_engram;
+    use crystalline_index::{DomainKind, EngramRecord, Store, TursoStore};
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let store = rt.block_on(TursoStore::open(index)).unwrap();
+    let id = rt
+        .block_on(store.upsert_domain(domain, None, DomainKind::Virtual))
+        .unwrap();
+    let rows = rt.block_on(store.all_engram_contents(id)).unwrap();
+    let row = rows.iter().find(|r| r.permalink == permalink).unwrap();
+    let stamp = rt.block_on(store.file_stamps(id)).unwrap()[&row.path].clone();
+    let mut record =
+        EngramRecord::from_engram(&parse_engram(&row.content).unwrap(), &row.path, stamp);
+    record.content = "---\ntitle: [never closed\n---\nbody\n".to_string();
+    rt.block_on(store.upsert_engram(id, &record)).unwrap();
+}
+
+#[test]
+fn an_engram_the_import_cannot_read_keeps_the_folder_and_is_named() {
+    let home = tempfile::tempdir().unwrap();
+    let folder = plant_private_state_with_a_virtual_domain(home.path());
+    break_engram(&folder.join("index.db"), "vnotes", "tide-tables");
+
+    let out = run(
+        home.path(),
+        &["doctor", "--fix", "--merge-desktop-state", "--json"],
+    );
+    let report: Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out.stderr)));
+    let merge = &report["merge"];
+    let not_moved = merge["not_moved"].to_string();
+    assert!(not_moved.contains("vnotes"), "{merge}");
+    assert!(
+        not_moved.contains("tide-tables.md"),
+        "the file is named: {merge}"
+    );
+    assert!(
+        folder.exists(),
+        "the folder stays while an engram was not moved"
+    );
+    assert_eq!(merge["renamed_to"], Value::Null, "{merge}");
+    assert_eq!(merge["kept_both"], serde_json::json!([]), "{merge}");
+    assert_eq!(out.status.code(), Some(1));
+    let text = run(home.path(), &["doctor", "--fix", "--merge-desktop-state"]);
+    let text = String::from_utf8_lossy(&text.stdout);
+    assert!(text.contains("[problem] 'vnotes'"), "{text}");
+    assert!(text.contains("tide-tables.md"), "{text}");
+}
+
+/// A folder this machine already registers under another name is not
+/// registered a second time: the private name is skipped and both names
+/// are said.
+#[test]
+fn the_same_folder_under_another_name_is_skipped() {
+    let home = tempfile::tempdir().unwrap();
+    let folder = plant_private_state(home.path(), &["theirs"]);
+    let root = home.path().join("docs").join("theirs");
+    let mut real = GlobalConfig::default();
+    real.domains
+        .insert("mine".to_string(), DomainEntry::file(root));
+    std::fs::create_dir_all(real_config_path(home.path()).parent().unwrap()).unwrap();
+    crystalline_core::config::save_yaml(&real_config_path(home.path()), &real).unwrap();
+
+    let out = run(
+        home.path(),
+        &["doctor", "--fix", "--merge-desktop-state", "--json"],
+    );
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let merge = &report["merge"];
+    assert_eq!(merge["registered"], serde_json::json!([]), "{merge}");
+    let kept = merge["kept_this_machine"].to_string();
+    assert!(
+        kept.contains("'theirs'") && kept.contains("'mine'"),
+        "{merge}"
+    );
+    let cfg = real_config(home.path());
+    assert!(!cfg.domains.contains_key("theirs"), "never a second name");
+    assert!(
+        !folder.exists(),
+        "nothing was lost, so the folder is renamed"
+    );
+}
+
+/// After a conflict the folder stays, and a second run finds the virtual
+/// domain it moved the first time on both sides. Those engrams are the
+/// first run's own copies, not ones this machine kept against the private
+/// side.
+#[test]
+fn a_second_merge_does_not_count_its_own_moved_engrams_as_kept() {
+    let home = tempfile::tempdir().unwrap();
+    let folder = plant_private_state_with_a_virtual_domain(home.path());
+    let elsewhere = home.path().join("other-shared");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let mut real = GlobalConfig::default();
+    real.domains
+        .insert("shared".to_string(), DomainEntry::file(elsewhere));
+    std::fs::create_dir_all(real_config_path(home.path()).parent().unwrap()).unwrap();
+    crystalline_core::config::save_yaml(&real_config_path(home.path()), &real).unwrap();
+
+    let first = run(
+        home.path(),
+        &["doctor", "--fix", "--merge-desktop-state", "--json"],
+    );
+    let first: Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(
+        first["merge"]["imported"],
+        serde_json::json!([["vnotes", 2]])
+    );
+    assert!(folder.exists(), "a conflict keeps the folder");
+
+    let again = run(
+        home.path(),
+        &["doctor", "--fix", "--merge-desktop-state", "--json"],
+    );
+    let again: Value = serde_json::from_slice(&again.stdout).unwrap();
+    let merge = &again["merge"];
+    assert_eq!(merge["imported"], serde_json::json!([]), "{merge}");
+    assert_eq!(merge["kept_both"], serde_json::json!([]), "{merge}");
+}
+
+#[test]
+fn the_merge_refuses_a_domain_filter() {
+    let home = tempfile::tempdir().unwrap();
+    let folder = plant_private_state(home.path(), &["notes"]);
+    let out = run(
+        home.path(),
+        &[
+            "doctor",
+            "--fix",
+            "--merge-desktop-state",
+            "--domain",
+            "notes",
+        ],
+    );
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("leave out --domain"), "{stderr}");
     assert!(folder.exists());
 }

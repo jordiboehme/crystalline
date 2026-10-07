@@ -825,6 +825,20 @@ async fn open_standalone_finishing(
     db: Option<&Path>,
     config_path: Option<&Path>,
 ) -> anyhow::Result<(Engine, Option<Value>)> {
+    open_standalone_noting(loaded, db_path, want_embeddings, db, config_path, true).await
+}
+
+/// [`open_standalone_finishing`], printing the bypass note only when `note`
+/// is set: a caller that opens a copy of an index on purpose has nothing to
+/// tell the person about the daemon.
+async fn open_standalone_noting(
+    loaded: overlay::LoadedConfig,
+    db_path: &Path,
+    want_embeddings: bool,
+    db: Option<&Path>,
+    config_path: Option<&Path>,
+    note: bool,
+) -> anyhow::Result<(Engine, Option<Value>)> {
     // Postgres has no local file, so naming one in a failure would point at a
     // path nothing lives at.
     let location = if loaded.effective.database().backend
@@ -847,7 +861,7 @@ async fn open_standalone_finishing(
             ))
         })?
         .with_machine_owner_lookup(machine_owner_for_engine());
-    if bypassed {
+    if bypassed && note {
         eprintln!("Daemon: {}", crate::instance::BYPASS_NOTE);
     }
     let finished = finish_leftover_rename_owned(&engine).await;
@@ -1084,6 +1098,22 @@ pub async fn domain_export(
     let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
     let domain = localize_standalone(&engine, domain).await;
     Ok(engine.export_domain(&domain, dest, force, dry_run).await?)
+}
+
+/// [`domain_export`] from an index file that is not this machine's own (a
+/// copy taken on purpose), opened directly and never through the daemon,
+/// without the bypass note an explicit `--db` prints.
+pub async fn domain_export_from_copy(
+    domain: &str,
+    dest: &Path,
+    db: &Path,
+    config_path: &Path,
+) -> anyhow::Result<Value> {
+    let loaded = overlay::load(Some(config_path))?;
+    let (engine, _) =
+        open_standalone_noting(loaded, db, false, Some(db), Some(config_path), false).await?;
+    let domain = localize_standalone(&engine, domain).await;
+    Ok(engine.export_domain(&domain, dest, true, false).await?)
 }
 
 /// What the index still holds for domains nobody registers any more, and,
