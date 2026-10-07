@@ -11,8 +11,8 @@ use crystalline_core::config::{
 };
 use crystalline_index::TursoStore;
 use crystalline_remote::{
-    ForwardedAgent, MountRecord, ROUTING_FILE, SourceSet, connect_with_token, load_sources,
-    update_sources,
+    DomainChoice, ForwardedAgent, MountRecord, ROUTING_FILE, SourceSet, connect_with_token,
+    connect_with_token_choosing, load_sources, update_sources,
 };
 use crystalline_service::params::{ListDomainsParams, ReadParams, WriteParams};
 use crystalline_service::{Engine, EngineError, Scope};
@@ -139,6 +139,26 @@ impl LocalMachine {
         connect_with_token(
             &server.origin(),
             Some(name),
+            &server.token_for(account).await,
+            &self.remote_dir(),
+            &self.engine.local_domains(),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// [`LocalMachine::connect`] with a choice of domains.
+    pub async fn connect_choosing(
+        &self,
+        server: &RemoteServer,
+        name: &str,
+        account: &str,
+        choice: DomainChoice,
+    ) {
+        connect_with_token_choosing(
+            &server.base(),
+            Some(name),
+            choice,
             &server.token_for(account).await,
             &self.remote_dir(),
             &self.engine.local_domains(),

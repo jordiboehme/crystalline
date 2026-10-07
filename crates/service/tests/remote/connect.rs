@@ -9,9 +9,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crystalline_remote::{
-    Announcement, Connection, CredentialKind, LocalDomain, OriginIdentity, Revocation, SignInError,
-    connect_with_browser, connect_with_browser_within, connect_with_token,
-    connect_with_token_within, disconnect, disconnect_within, load_sources, update_sources,
+    Announcement, Connection, CredentialKind, DomainChoice, LocalDomain, OriginIdentity,
+    Revocation, SignInError, connect_with_browser, connect_with_browser_within, connect_with_token,
+    connect_with_token_choosing, connect_with_token_within, disconnect, disconnect_within,
+    load_sources, update_sources,
 };
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -1327,4 +1328,175 @@ async fn a_source_saved_by_0_23_0_still_opens_after_the_upgrade() {
         .await
         .unwrap();
     assert_eq!(data["account"], "keeper");
+}
+
+#[tokio::test]
+async fn connecting_again_with_and_without_domains_replaces_keeps_and_clears_the_list() {
+    let server = RemoteServer::start(Options::TOKENS).await;
+    let token = server.token_for("keeper").await;
+    let dir = tempfile::tempdir().unwrap();
+    let only_open = connect_with_token_choosing(
+        &server.base(),
+        None,
+        DomainChoice::Only(vec!["open".into()]),
+        &token,
+        dir.path(),
+        &[],
+    )
+    .await
+    .unwrap();
+    assert_eq!(only_open.taken, vec!["open".to_string()]);
+    assert_eq!(only_open.not_chosen, vec!["lab", "platform", "team"]);
+
+    let kept = connect_with_token(&server.base(), None, &token, dir.path(), &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        kept.source.domains,
+        Some(vec!["open".to_string()]),
+        "the old entry point keeps the list"
+    );
+    assert_eq!(kept.taken, vec!["open".to_string()]);
+
+    let replaced = connect_with_token_choosing(
+        &server.base(),
+        None,
+        DomainChoice::Only(vec!["lab".into()]),
+        &token,
+        dir.path(),
+        &[],
+    )
+    .await
+    .unwrap();
+    assert_eq!(replaced.source.domains, Some(vec!["lab".to_string()]));
+    assert_eq!(replaced.taken, vec!["lab".to_string()]);
+
+    let all = connect_with_token_choosing(
+        &server.base(),
+        None,
+        DomainChoice::All,
+        &token,
+        dir.path(),
+        &[],
+    )
+    .await
+    .unwrap();
+    assert_eq!(all.source.domains, None);
+    assert_eq!(all.taken.len(), 4);
+    assert_eq!(
+        load_sources(dir.path()).unwrap().sources.len(),
+        1,
+        "one source throughout"
+    );
+}
+
+#[tokio::test]
+async fn a_list_takes_a_domain_from_a_server_that_takes_all_and_says_so() {
+    // Two servers offering the same team domain (`platform` tracks acme/platform on both).
+    let acme = RemoteServer::start(Options::TOKENS).await;
+    let beta = RemoteServer::start(Options::TOKENS).await;
+    let dir = tempfile::tempdir().unwrap();
+    connect_with_token(
+        &acme.base(),
+        Some("acme"),
+        &acme.token_for("keeper").await,
+        dir.path(),
+        &[],
+    )
+    .await
+    .unwrap();
+    let moved = connect_with_token_choosing(
+        &beta.base(),
+        Some("beta"),
+        DomainChoice::Only(vec!["platform".into()]),
+        &beta.token_for("keeper").await,
+        dir.path(),
+        &[],
+    )
+    .await
+    .unwrap();
+    assert!(
+        moved.announcements.contains(&Announcement::Moved {
+            local: "platform".into(),
+            from: "acme".into(),
+            to: "beta".into()
+        }),
+        "{:?}",
+        moved.announcements
+    );
+    assert_eq!(
+        moved.taken,
+        vec!["platform".to_string()],
+        "the local name stays"
+    );
+    let file = load_sources(dir.path()).unwrap();
+    assert!(
+        !file
+            .find("acme")
+            .unwrap()
+            .mounts
+            .iter()
+            .any(|m| m.local == "platform"),
+        "no second record"
+    );
+}
+
+#[tokio::test]
+async fn a_local_copy_comes_back_when_its_domain_leaves_the_list() {
+    let server = RemoteServer::start(Options::TOKENS).await;
+    let token = server.token_for("keeper").await;
+    let dir = tempfile::tempdir().unwrap();
+    let local = [LocalDomain {
+        name: "platform".into(),
+        aliases: Vec::new(),
+        origin: Some(OriginIdentity {
+            forge: "github.com".into(),
+            repository: "acme/platform".into(),
+            path: String::new(),
+            branch: "main".into(),
+        }),
+    }];
+    let first = connect_with_token(&server.base(), None, &token, dir.path(), &local)
+        .await
+        .unwrap();
+    assert!(
+        first
+            .announcements
+            .iter()
+            .any(|a| matches!(a, Announcement::ReplacesLocal { .. }))
+    );
+    let narrowed = connect_with_token_choosing(
+        &server.base(),
+        None,
+        DomainChoice::Only(vec!["open".into()]),
+        &token,
+        dir.path(),
+        &local,
+    )
+    .await
+    .unwrap();
+    assert_eq!(narrowed.came_back, vec!["platform".to_string()]);
+}
+
+#[tokio::test]
+async fn a_0_23_0_sources_file_connects_again_as_all_and_stays_without_a_list() {
+    let server = RemoteServer::start(Options::TOKENS).await;
+    let token = server.token_for("keeper").await;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("sources.json"),
+        serde_json::to_vec_pretty(&json!({ "v": 1, "sources": [{
+            "url": server.origin(), "name": "server", "account": "keeper", "kind": "token",
+            "connected_at": "2026-10-05T12:00:00Z", "mounts": []
+        }]}))
+        .unwrap(),
+    )
+    .unwrap();
+    let again = connect_with_token(&server.base(), None, &token, dir.path(), &[])
+        .await
+        .unwrap();
+    assert_eq!(again.source.name, "server");
+    assert_eq!(again.taken.len(), 4, "no field is all");
+    let written = std::fs::read_to_string(dir.path().join("sources.json")).unwrap();
+    assert!(!written.contains("\"domains\""), "{written}");
 }
