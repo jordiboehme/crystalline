@@ -280,18 +280,33 @@ const METADATA_ENDPOINTS: [&str; 4] = [
     "revocation_endpoint",
 ];
 
+/// `url` as a request would send it, when that is under `base`: the same
+/// origin, and a path that is the base path or below it. Read after the
+/// parser has removed dot segments (`..`, `%2e%2e`), so the check is made on
+/// the address a request goes to, and that address is what gets stored.
+fn under_base(url: &str, base: &PublicBase) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let path = parsed.path();
+    let base_path = base.path().as_str();
+    let inside = path == base_path
+        || path
+            .strip_prefix(base_path)
+            .is_some_and(|rest| rest.starts_with('/'));
+    (parsed.origin().ascii_serialization() == base.origin() && inside).then(|| parsed.to_string())
+}
+
 /// Whether the metadata of a server under a prefix names its `base` as the
 /// issuer and keeps every endpoint under it: the three it needs present,
 /// the revocation endpoint when it names one.
-fn metadata_stays_inside(meta: &Value, base: &str) -> bool {
-    let under = format!("{base}/");
+fn metadata_stays_inside(meta: &Value, base: &PublicBase) -> bool {
+    let base_text = base.to_string();
     meta["issuer"]
         .as_str()
-        .is_some_and(|i| one_slash_off(i) == base)
+        .is_some_and(|i| one_slash_off(i) == base_text)
         && METADATA_ENDPOINTS
             .iter()
             .all(|name| match meta[*name].as_str() {
-                Some(url) => url.starts_with(&under),
+                Some(url) => under_base(url, base).is_some(),
                 None => *name == "revocation_endpoint",
             })
 }
@@ -521,10 +536,16 @@ async fn discover_by(
     // its resource and names an authorization server.
     // Under a prefix the documents can be answered by whatever else runs on
     // the host, so every document used must stay inside the base.
-    let prefixed = PublicBase::parse(origin).is_ok_and(|base| !base.path().is_root());
+    let prefix = PublicBase::parse(origin)
+        .ok()
+        .filter(|base| !base.path().is_root());
+    let prefixed = prefix.is_some();
     let resource = first_usable(
         http,
-        &document_addresses(origin, PROTECTED_RESOURCE_PATH),
+        &match prefix {
+            Some(_) => document_addresses(origin, PROTECTED_RESOURCE_PATH),
+            None => vec![format!("{origin}{PROTECTED_RESOURCE_PATH}")],
+        },
         origin,
         budget,
         |answer| {
@@ -570,7 +591,10 @@ async fn discover_by(
     // Metadata is usable when it names the issuer it was fetched for.
     let meta = first_usable(
         http,
-        &document_addresses(&issuer, AUTHORIZATION_SERVER_PATH),
+        &match prefix {
+            Some(_) => document_addresses(&issuer, AUTHORIZATION_SERVER_PATH),
+            None => vec![format!("{issuer}{AUTHORIZATION_SERVER_PATH}")],
+        },
         origin,
         budget,
         |answer| {
@@ -579,7 +603,9 @@ async fn discover_by(
                     .as_str()
                     .map(|i| i.trim_end_matches('/'))
                     == Some(issuer.as_str())
-                && (!prefixed || metadata_stays_inside(answer.json(), origin))
+                && prefix
+                    .as_ref()
+                    .is_none_or(|base| metadata_stays_inside(answer.json(), base))
         },
     )
     .await?;
@@ -599,9 +625,17 @@ async fn discover_by(
     if meta["issuer"].as_str().map(|i| i.trim_end_matches('/')) != Some(issuer.as_str()) {
         return Err(insecure());
     }
-    if prefixed && !metadata_stays_inside(meta, origin) {
+    if let Some(base) = &prefix
+        && !metadata_stays_inside(meta, base)
+    {
         return Err(outside_base(origin));
     }
+    // Under a prefix an endpoint is stored as a request sends it, which the
+    // check above read; at the root it is stored as written, as in 0.23.0.
+    let as_used = |url: &str| match &prefix {
+        Some(base) => under_base(url, base).ok_or_else(|| outside_base(origin)),
+        None => Ok(url.to_string()),
+    };
     let endpoint = |name: &str| {
         let url = meta[name].as_str().ok_or_else(|| {
             SignInError::Protocol(format!(
@@ -609,13 +643,13 @@ async fn discover_by(
             ))
         })?;
         if is_secure_endpoint(url) {
-            Ok(url.to_string())
+            as_used(url)
         } else {
             Err(insecure())
         }
     };
     let revocation_endpoint = match meta["revocation_endpoint"].as_str() {
-        Some(url) if is_secure_endpoint(url) => Some(url.to_string()),
+        Some(url) if is_secure_endpoint(url) => Some(as_used(url)?),
         Some(_) => return Err(insecure()),
         None => None,
     };
@@ -1808,10 +1842,81 @@ mod tests {
 
     #[tokio::test]
     async fn an_endpoint_on_another_path_of_the_same_host_is_refused_under_a_prefix() {
-        let other_path = Doc::Metadata("{base}", "{origin}/other/token");
-        uses_the_inside_copy(Documents::inserted(HONEST_RESOURCE, other_path)).await;
-        let refused = is_refused(Documents::everywhere(HONEST_RESOURCE, other_path)).await;
-        assert!(refused.to_string().contains("outside"), "{refused}");
+        for token in [
+            "{origin}/other/token",
+            "{base}/../other/token",
+            "{base}/%2e%2e/other/token",
+            "{base}/./%2E%2E/x",
+            "{origin}/crystallinex/token",
+        ] {
+            let other_path = Doc::Metadata("{base}", token);
+            uses_the_inside_copy(Documents::inserted(HONEST_RESOURCE, other_path)).await;
+            let refused = is_refused(Documents::everywhere(HONEST_RESOURCE, other_path)).await;
+            assert!(
+                refused.to_string().contains("outside"),
+                "{token}: {refused}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_endpoint_under_the_base_is_used_in_its_parsed_form() {
+        let dotted = Doc::Metadata("{base}", "{base}/api/./v1/oauth/token");
+        uses_the_inside_copy(Documents::everywhere(HONEST_RESOURCE, dotted)).await;
+    }
+
+    #[tokio::test]
+    async fn a_root_server_is_asked_exactly_what_0_23_0_asked() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let doc_origin = origin.clone();
+        let router = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+            let seen = seen.clone();
+            let origin = doc_origin.clone();
+            async move {
+                use axum::response::IntoResponse;
+                let path = uri.path().to_string();
+                seen.lock().unwrap().push(path.clone());
+                // The issuer has a path of its own, which 0.23.0 asked
+                // with the document appended and nothing inserted.
+                let issuer = format!("{origin}/issuer");
+                match path.as_str() {
+                    "/health" => axum::Json(json!({ "status": "ok" })).into_response(),
+                    "/.well-known/oauth-protected-resource" => axum::Json(json!({
+                        "resource": origin,
+                        "authorization_servers": [issuer],
+                    }))
+                    .into_response(),
+                    "/issuer/.well-known/oauth-authorization-server" => axum::Json(json!({
+                        "issuer": issuer,
+                        "authorization_endpoint": format!("{origin}/api/v1/oauth/authorize"),
+                        "token_endpoint": format!("{origin}/api/v1/oauth/token"),
+                        "registration_endpoint": format!("{origin}/api/v1/oauth/register"),
+                    }))
+                    .into_response(),
+                    _ => axum::http::StatusCode::NOT_FOUND.into_response(),
+                }
+            }
+        });
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let oauth = discover(&client().unwrap(), &origin)
+            .await
+            .unwrap()
+            .oauth
+            .unwrap();
+        assert_eq!(oauth.issuer, format!("{origin}/issuer"));
+        assert_eq!(
+            asked.lock().unwrap().clone(),
+            vec![
+                "/health".to_string(),
+                "/.well-known/oauth-protected-resource".to_string(),
+                "/issuer/.well-known/oauth-authorization-server".to_string(),
+            ]
+        );
     }
 
     #[test]
