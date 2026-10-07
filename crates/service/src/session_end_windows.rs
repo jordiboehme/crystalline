@@ -1,10 +1,10 @@
 //! The hidden top-level window that tells a Windows daemon its session is
-//! ending (D24 and D25 of the 0.24.0 plan). It lives on its own std thread
-//! with a `GetMessageW` loop, never touches the tokio runtime, and reaches
-//! the daemon only through a trigger (`Shared::trigger_shutdown`) and a
-//! channel the daemon fills when its stop is done (`session_end::
-//! notify_stopped`). It is never shown, so nothing flashes and no taskbar
-//! button appears.
+//! ending, so it stops cleanly instead of being ended without a word. It
+//! lives on its own std thread with a `GetMessageW` loop, never touches the
+//! tokio runtime, and reaches the daemon only through a trigger
+//! (`Shared::trigger_shutdown`) and a channel the daemon fills when its stop
+//! is done (`session_end::notify_stopped`). It is never shown, so nothing
+//! flashes and no taskbar button appears.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;

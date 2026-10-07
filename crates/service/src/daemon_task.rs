@@ -156,10 +156,12 @@ fn xml_escape(text: &str) -> String {
         .replace('"', "&quot;")
 }
 
-/// The task definition, as `schtasks /Create /XML` reads it. See D2 of the
-/// 0.24.0 plan for each setting, and `MultipleInstancesPolicy` in particular:
-/// `Parallel`, because the policy is per task and a second user signing in
-/// must get a daemon of their own; the daemon's lock keeps one per user.
+/// The task definition, as `schtasks /Create /XML` reads it: the built-in
+/// Users group by SID (so a translated Windows works) or one account, a
+/// sign-in trigger, no time limit, no battery rule, a start on demand, and
+/// `MultipleInstancesPolicy` `Parallel`, because the policy is per task and
+/// a second user signing in must get a daemon of their own; the daemon's
+/// lock keeps one per user.
 pub fn task_xml(exe: &Path, principal: &TaskPrincipal) -> String {
     let (security, description, trigger, who) = match principal {
         TaskPrincipal::AllUsers => (
@@ -245,7 +247,8 @@ pub fn current_account() -> String {
 }
 
 /// The task names a bridge looks for, in order: the machine task, then this
-/// user's own (D4).
+/// user's own, which `doctor --fix` registers when the machine task is
+/// missing.
 pub fn candidate_names(user: Option<&str>) -> Vec<String> {
     let mut names = vec![MACHINE_TASK_NAME.to_string()];
     if let Some(user) = user.filter(|u| !u.is_empty()) {
@@ -254,8 +257,10 @@ pub fn candidate_names(user: Option<&str>) -> Vec<String> {
     names
 }
 
-/// The names a registration for `principal` may use (D4): the machine name
-/// for every user, only the user's own name for one user.
+/// The names a registration for `principal` may use: the machine name for
+/// every user, only the user's own name for one user. A user's task never
+/// takes the machine name, or every other user's bridge would find it first
+/// and wait for a daemon that never comes for them.
 pub(crate) fn registration_names(principal: &TaskPrincipal, user: Option<&str>) -> Vec<String> {
     match principal {
         TaskPrincipal::AllUsers => vec![MACHINE_TASK_NAME.to_string()],

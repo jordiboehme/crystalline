@@ -593,7 +593,8 @@ fn a_daemon_that_cannot_leave_the_job_says_so() {
     );
 }
 
-/// D24 of the 0.24.0 plan, end to end: a daemon started the way the task
+/// The clean stop at the session end, end to end: Windows ends a windowless
+/// process at sign-out without a word, so a daemon started the way the task
 /// starts it has the hidden window, and WM_ENDSESSION through that window
 /// runs the graceful stop to its end. What this cannot show is that Windows
 /// itself sends the message at a real sign-out; that stays a check on a real

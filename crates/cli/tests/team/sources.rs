@@ -236,7 +236,8 @@ fn github_after_a_flag_says_to_put_it_first() {
     }
 }
 
-/// Re-review R6: the scan looks only at the `connect` command itself.
+/// The scan looks only at the `connect` command itself, never at a word
+/// inside another command.
 #[test]
 fn a_connect_word_inside_another_command_is_not_scanned() {
     let home = tempfile::tempdir().unwrap();
@@ -871,9 +872,9 @@ fn a_bad_domain_list_is_refused_before_signing_in() {
     }
 }
 
-/// Item 7 of the 0.23.1 follow-ups: a refused list stops `connect` before it
-/// asks the server anything. A listener that only counts connections stands
-/// in for the server, so a single request would show.
+/// A refused list stops `connect` before it asks the server anything. A
+/// listener that only counts connections stands in for the server, so a
+/// single request would show.
 #[test]
 fn a_refused_domain_list_never_reaches_the_server() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

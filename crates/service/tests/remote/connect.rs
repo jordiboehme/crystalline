@@ -1227,8 +1227,8 @@ async fn signing_in_through_the_browser_under_a_prefix_saves_the_base() {
     }
 }
 
-/// Item 1 of the 0.23.1 follow-ups: a proxy that forwards only the prefix,
-/// so the two RFC addresses at the host root answer 404. The client falls
+/// A proxy that forwards only the prefix, so the two RFC addresses at the
+/// host root answer 404. The client falls
 /// back to the copies inside the prefix and the browser sign-in completes.
 #[tokio::test]
 async fn signing_in_works_when_the_proxy_hides_the_host_root() {

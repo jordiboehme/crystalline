@@ -903,7 +903,8 @@ pub struct NamesDoctor {
     pub error: Option<String>,
 }
 
-/// What Task Scheduler holds for this user (W4 of the 0.24.0 spec).
+/// What Task Scheduler holds for this user: the task that starts the daemon
+/// at sign-in, outside any app package.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "state", content = "name", rename_all = "snake_case")]
 pub enum TaskFinding {
@@ -7784,7 +7785,7 @@ mod tests {
         assert!(s.from_overwrite && s.newer && s.fixable, "{s:?}");
     }
 
-    // R6: Windows paths, so only the windows-latest leg runs it.
+    // Windows paths, so only the windows-latest leg runs it.
     #[cfg(windows)]
     #[test]
     fn the_task_concerns_only_an_msi_install_or_a_machine_with_claude_desktop() {

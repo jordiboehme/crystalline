@@ -34,7 +34,7 @@ pub(crate) const ENDSESSION_LOGOFF: u32 = 0x8000_0000;
 /// How long the window procedure holds `WM_ENDSESSION` while the daemon
 /// stops. Returning from it is Windows' permission to end the process at
 /// once, and a process without a visible window is ended 5 s after the
-/// message in any case, so the wait stays under that (D25).
+/// message in any case, so the wait stays under that.
 pub const ENDSESSION_WAIT: Duration = Duration::from_secs(4);
 
 /// What the window procedure does with one message.

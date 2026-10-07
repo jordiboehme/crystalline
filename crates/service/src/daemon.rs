@@ -291,10 +291,10 @@ pub async fn run_serve(
     breakaway_refused: bool,
     from_task: bool,
 ) -> anyhow::Result<()> {
-    // A daemon Task Scheduler started (D3 of the 0.24.0 plan): its working
-    // directory is System32, nobody reads its stderr and, as a console
-    // program, it was given a console window. So it drops the window, works
-    // in the state folder like a spawned daemon and logs to daemon.log.
+    // A daemon Task Scheduler started: its working directory is System32,
+    // nobody reads its stderr and, as a console program, it was given a
+    // console window. So it drops the window, works in the state folder like
+    // a spawned daemon and logs to daemon.log.
     let daemon_flag = daemon_flag || from_task;
     let log_file = if from_task {
         prepare_task_start()
@@ -551,9 +551,10 @@ pub async fn run_serve(
 
     // Windows ends a windowless, consoleless process with the user's
     // session and tells it nothing. A hidden window gets the session end and
-    // starts the same graceful stop `ctl shutdown` does (D24 of the 0.24.0
-    // plan). Every detached daemon on Windows has one; a foreground `serve`
-    // keeps its console and Ctrl+C.
+    // starts the same graceful stop `ctl shutdown` does. Every detached
+    // daemon on Windows has one, however it started, because a spawned one
+    // is ended at sign-out in the same silent way as a task-started one; a
+    // foreground `serve` keeps its console and Ctrl+C.
     #[cfg(windows)]
     let _session_end = if daemon_flag {
         let stop = shared.clone();
@@ -3437,10 +3438,11 @@ where
 mod tests {
     use super::*;
 
-    /// Item 4 of the 0.23.1 follow-ups. MCP is the router's fallback, so a
-    /// test that only checks that `/crystalline` reaches MCP passes with or
-    /// without the strip. A fallback that answers the path it saw tells the
-    /// two apart: the bare prefix arrives as `/`, a look-alike unchanged.
+    /// The bare `/crystalline` prefix is stripped. MCP is the router's
+    /// fallback, so a test that only checks that `/crystalline` reaches MCP
+    /// passes with or without the strip. A fallback that answers the path it
+    /// saw tells the two apart: the bare prefix arrives as `/`, a look-alike
+    /// unchanged.
     #[tokio::test]
     async fn the_bare_prefix_reaches_the_fallback_as_the_root() {
         use tower_service::Service;

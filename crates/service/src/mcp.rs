@@ -2553,8 +2553,8 @@ impl McpServer {
     /// caller, gated by [`McpServer::refuse_unwritable`], recorded as the
     /// caller's actor, drawn in an open room as the caller's chip, and inside
     /// a draft when a share link opened one for the caller's holder. Every
-    /// core answers exactly as it answers an MCP call (decision D12): a delete
-    /// or an acknowledgment runs as typed, an overwrite of a live document is
+    /// core answers exactly as it answers an MCP call: a delete or an
+    /// acknowledgment runs as typed, an overwrite of a live document is
     /// refused, a permalink collision is the engine's error. The answer is raw
     /// engine JSON, as the control socket's `tool` answers, never the
     /// session's TOON.
