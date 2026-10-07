@@ -2359,7 +2359,7 @@ fn spawn_daemon(options: &SpawnOptions) -> anyhow::Result<()> {
                 Ok(_) => return Ok(()),
                 Err(e) if breakaway_refusal(&e) => {
                     if let RefusedBreakaway::StartedByTask(name) =
-                        after_refused_breakaway(&*crate::daemon_task::for_this_process())
+                        after_refused_breakaway(&*crate::daemon_task::for_this_process(), &options)
                     {
                         tracing::info!(
                             "Windows refused the breakaway ({e}); the task {name} started the daemon instead"
@@ -2473,9 +2473,10 @@ fn breakaway_refusal(e: &io::Error) -> bool {
     e.raw_os_error() == Some(5)
 }
 
-/// What a spawner does after Windows refused the breakaway (D11 of the 0.24.0
-/// plan): a daemon inside the job dies with the program that owns the job,
-/// so the task starts it instead whenever one is registered and runs.
+/// What a spawner does after Windows refused the breakaway: a daemon inside
+/// the job dies with the program that owns the job, so the task starts it
+/// instead whenever one is registered and runs, and `options` ask for
+/// nothing the task cannot pass on.
 #[cfg(any(windows, test))]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum RefusedBreakaway {
@@ -2483,10 +2484,25 @@ pub(crate) enum RefusedBreakaway {
     InsideTheJob,
 }
 
+/// Whether the task may start the daemon in place of a spawn with
+/// `options` (after their paths are made absolute). The task always runs a
+/// plain `serve --daemon --from-task`, so a spawn that asks for a database,
+/// a config file, read-only mode, an HTTP address, an allowed host, a
+/// bounded life or a cleaned environment keeps its own spawn: otherwise the
+/// client would attach to a daemon that serves something else.
+#[cfg(any(windows, test))]
+fn the_task_can_stand_in(options: &SpawnOptions) -> bool {
+    *options == SpawnOptions::default()
+}
+
 #[cfg(any(windows, test))]
 pub(crate) fn after_refused_breakaway(
     task: &dyn crate::daemon_task::DaemonTask,
+    options: &SpawnOptions,
 ) -> RefusedBreakaway {
+    if !the_task_can_stand_in(options) {
+        return RefusedBreakaway::InsideTheJob;
+    }
     match task.find() {
         Some(name) if task.run(&name).is_ok() => RefusedBreakaway::StartedByTask(name),
         _ => RefusedBreakaway::InsideTheJob,
@@ -3234,25 +3250,82 @@ mod tests {
             run_ok: true,
         };
         assert_eq!(
-            after_refused_breakaway(&task),
+            after_refused_breakaway(&task, &SpawnOptions::default()),
             RefusedBreakaway::StartedByTask(crate::daemon_task::MACHINE_TASK_NAME.to_string())
         );
+    }
+
+    /// The task starts a plain `serve --daemon --from-task`, so it stands in
+    /// only for a spawn that asks for nothing else. Any option the task
+    /// cannot pass keeps the spawn inside the job, which serves what the
+    /// client asked for.
+    #[test]
+    fn the_task_stands_in_only_for_a_spawn_with_default_options() {
+        assert!(the_task_can_stand_in(&SpawnOptions::default()));
+        let asking = [
+            SpawnOptions {
+                db: Some(PathBuf::from("/abs/index.db")),
+                ..SpawnOptions::default()
+            },
+            SpawnOptions {
+                config: Some(PathBuf::from("/abs/config.yaml")),
+                ..SpawnOptions::default()
+            },
+            SpawnOptions {
+                read_only: true,
+                ..SpawnOptions::default()
+            },
+            SpawnOptions {
+                http: Some("127.0.0.1:7412".to_string()),
+                ..SpawnOptions::default()
+            },
+            SpawnOptions {
+                allowed_hosts: vec!["kb.example".to_string()],
+                ..SpawnOptions::default()
+            },
+            SpawnOptions {
+                exit_when_idle: true,
+                ..SpawnOptions::default()
+            },
+            SpawnOptions {
+                env_remove: vec!["CRYSTALLINE_CONFIG".to_string()],
+                ..SpawnOptions::default()
+            },
+        ];
+        let task = Answers {
+            find: Some(crate::daemon_task::MACHINE_TASK_NAME),
+            run_ok: true,
+        };
+        for options in asking {
+            assert!(!the_task_can_stand_in(&options), "{options:?}");
+            assert_eq!(
+                after_refused_breakaway(&task, &options),
+                RefusedBreakaway::InsideTheJob,
+                "{options:?}"
+            );
+        }
     }
 
     #[test]
     fn a_refused_breakaway_stays_inside_the_job_without_a_task() {
         assert_eq!(
-            after_refused_breakaway(&Answers {
-                find: None,
-                run_ok: true
-            }),
+            after_refused_breakaway(
+                &Answers {
+                    find: None,
+                    run_ok: true
+                },
+                &SpawnOptions::default()
+            ),
             RefusedBreakaway::InsideTheJob
         );
         assert_eq!(
-            after_refused_breakaway(&Answers {
-                find: Some("x"),
-                run_ok: false
-            }),
+            after_refused_breakaway(
+                &Answers {
+                    find: Some("x"),
+                    run_ok: false
+                },
+                &SpawnOptions::default()
+            ),
             RefusedBreakaway::InsideTheJob
         );
     }
