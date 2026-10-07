@@ -889,6 +889,8 @@ fn a_refused_domain_list_never_reaches_the_server() {
             .output()
             .unwrap();
         assert!(!out.status.success(), "{extra:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("--domains"), "{extra:?}: {stderr}");
     }
     std::thread::sleep(std::time::Duration::from_millis(200));
     match listener.accept() {
