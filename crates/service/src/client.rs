@@ -255,7 +255,7 @@ pub async fn run_mcp(
             let conn = ensure_daemon(true, db, config_path, read_only).await?;
             conn.into_mcp(harness_gate)
                 .await
-                .map_err(|e| anyhow::anyhow!("daemon MCP handshake failed ({e})"))
+                .map_err(|e| anyhow::Error::new(e).context("daemon MCP handshake failed"))
         });
         (opened, Some(daemon))
     };
@@ -287,7 +287,7 @@ pub async fn run_mcp(
                 let status = crate::stub::StubStatus::for_bridge(format!("{e:#}"), bridge);
                 return serve_degraded_stub(status, primed).await;
             }
-            Err(e) => tracing::warn!("no daemon available ({e}); running embedded"),
+            Err(e) => tracing::warn!("no daemon available ({e:#}); running embedded"),
         }
     }
 

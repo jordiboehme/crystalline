@@ -43,11 +43,12 @@ pub enum BridgeFailure {
 impl BridgeFailure {
     /// The cause of a failed packaged attach: the [`BridgeFailure`] it
     /// carries, or else the failed MCP handshake, which is the only other way
-    /// a packaged attach fails.
+    /// a packaged attach fails. For a handshake only the innermost cause is
+    /// kept: the sentence around it already says the handshake failed.
     pub fn of(e: &anyhow::Error) -> BridgeFailure {
         e.downcast_ref::<BridgeFailure>()
             .cloned()
-            .unwrap_or_else(|| BridgeFailure::HandshakeFailed(format!("{e:#}")))
+            .unwrap_or_else(|| BridgeFailure::HandshakeFailed(e.root_cause().to_string()))
     }
 }
 

@@ -760,10 +760,17 @@ mod tests {
     #[test]
     fn a_failed_handshake_is_its_own_bridge_failure() {
         use crate::daemon_task::BridgeFailure;
-        let handshake = anyhow::anyhow!("daemon MCP handshake failed (broken pipe)");
+        // Built the way `client.rs` builds it, so the stub names only the
+        // cause and not the chain a second time.
+        let handshake = anyhow::Error::new(std::io::Error::other("broken pipe"))
+            .context("daemon MCP handshake failed");
         assert_eq!(
             BridgeFailure::of(&handshake),
-            BridgeFailure::HandshakeFailed("daemon MCP handshake failed (broken pipe)".into())
+            BridgeFailure::HandshakeFailed("broken pipe".into())
+        );
+        assert_eq!(
+            BridgeFailure::of(&handshake).to_string(),
+            "the Crystalline daemon answered, but it did not finish the MCP handshake (broken pipe)"
         );
         let missing = anyhow::Error::new(BridgeFailure::TaskMissing);
         assert_eq!(BridgeFailure::of(&missing), BridgeFailure::TaskMissing);
