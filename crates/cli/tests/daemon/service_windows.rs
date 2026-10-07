@@ -56,12 +56,15 @@ impl Env {
     /// off: it is on at `127.0.0.1:7411` by default and a port is the one thing
     /// a scratch directory cannot isolate, so concurrent daemons here would race
     /// each other and the runner for one real port. No test in this file wants
-    /// an endpoint.
+    /// an endpoint. The task seam answers "no task", so a spawn whose
+    /// breakaway is refused never asks the real Task Scheduler, which on a
+    /// machine with the MSI installed would start the real daemon.
     fn apply(&self, cmd: &mut Command) {
         cmd.env("USERPROFILE", &self.dir)
             .env("APPDATA", self.dir.join("roaming"))
             .env("LOCALAPPDATA", self.dir.join("local"))
-            .env("CRYSTALLINE_SERVICE_HTTP", "false");
+            .env("CRYSTALLINE_SERVICE_HTTP", "false")
+            .env("CRYSTALLINE_TEST_DAEMON_TASK", "missing");
     }
 
     fn state_dir(&self) -> PathBuf {

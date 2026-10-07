@@ -65,7 +65,10 @@ impl Env {
             // `CRYSTALLINE_TEST_TOKEN_STORE_DIR`: it falls back to the file
             // store under this daemon's own isolated state dir rather than
             // a directory of its own.
-            .env("CRYSTALLINE_TEST_NO_KEYCHAIN", "1");
+            .env("CRYSTALLINE_TEST_NO_KEYCHAIN", "1")
+            // The task seam answers "no task", so a refused breakaway on
+            // Windows never asks the real Task Scheduler.
+            .env("CRYSTALLINE_TEST_DAEMON_TASK", "missing");
     }
 
     fn state_dir(&self) -> PathBuf {
