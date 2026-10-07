@@ -329,7 +329,7 @@ fn a_merge_reads_as_plain_sentences() {
         "{text}"
     );
     assert!(
-        text.contains("moved 2 engram(s) of the virtual domain vnotes"),
+        text.contains("moved 2 engrams of the virtual domain vnotes"),
         "{text}"
     );
     assert!(text.contains("renamed the private folder to "), "{text}");

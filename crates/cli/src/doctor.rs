@@ -3915,6 +3915,15 @@ fn is_profile_harness(name: &str) -> bool {
 }
 
 /// What `--merge-desktop-state` did, under `claude desktop:`.
+/// "1 engram" or "N engrams", for the merge lines.
+fn engrams(count: u64) -> String {
+    if count == 1 {
+        "1 engram".to_string()
+    } else {
+        format!("{count} engrams")
+    }
+}
+
 fn render_merge(out: &mut String, merge: &crate::desktop_state::MergeReport) {
     use std::fmt::Write as _;
     if merge.folders.is_empty() {
@@ -3936,13 +3945,15 @@ fn render_merge(out: &mut String, merge: &crate::desktop_state::MergeReport) {
     for (name, count) in &merge.imported {
         let _ = writeln!(
             out,
-            "  moved {count} engram(s) of the virtual domain {name}"
+            "  moved {} of the virtual domain {name}",
+            engrams(*count)
         );
     }
     for (name, count) in &merge.kept_both {
         let _ = writeln!(
             out,
-            "  {name} exists on both sides: kept this machine's copy of {count} engram(s)"
+            "  {name} exists on both sides: kept this machine's copy of {}",
+            engrams(*count)
         );
     }
     for conflict in &merge.conflicts {

@@ -4811,8 +4811,13 @@ fn remove_domain_question(preview: &Value) -> String {
                 Some(count) => format!("and its {count}"),
                 None => "and its engrams".to_string(),
             };
+            let they = if preview["engrams"].as_u64() == Some(1) {
+                "It lives"
+            } else {
+                "They live"
+            };
             format!(
-                "Delete the domain '{domain}' {held}? They live only in the database, so this \
+                "Delete the domain '{domain}' {held}? {they} only in the database, so this \
                  cannot be undone.{drafts} Accept deletes it. Decline keeps everything."
             )
         }
@@ -5026,7 +5031,11 @@ fn discard_question(domain: &str, changes: &[Value], guarded: bool, reviewing: b
     } else {
         " Edits made after you looked are undone too."
     });
-    question.push_str(" Accept undoes them. Decline keeps your changes.");
+    question.push_str(if changes.len() == 1 {
+        " Accept undoes it. Decline keeps your change."
+    } else {
+        " Accept undoes them. Decline keeps your changes."
+    });
     question
 }
 
@@ -5038,8 +5047,6 @@ fn discard_question(domain: &str, changes: &[Value], guarded: bool, reviewing: b
 /// `content` argument merged needs.
 const RESOLVE_NEEDS_RESOLUTION: &str = "resolve_conflict needs a resolution: pass resolution mine (keep your version) or theirs (take the team's version), or resolution merged with the reconciled text in content.";
 
-/// What an unconfirmed wholesale overwrite tells the model: what is still
-/// standing, and the two ways forward.
 /// The refusal every client gets for a full replace of an engram somebody has
 /// open in the editor, naming who is in there.
 ///
@@ -5622,7 +5629,7 @@ mod tests {
                 "virtual",
                 json!(1),
                 false,
-                "Delete the domain 'kb' and its 1 engram? They live only in the database, so \
+                "Delete the domain 'kb' and its 1 engram? It lives only in the database, so \
                  this cannot be undone. Accept deletes it. Decline keeps everything.",
             ),
             (
@@ -5815,13 +5822,13 @@ mod tests {
             discard_question("kb", &changes[1..2], true, false),
             "Undo 1 unshared change in 'kb'? notes/1.md: the team's version comes back. \
              Nothing goes to GitHub. A file edited after you looked is left as it is. Accept \
-             undoes them. Decline keeps your changes."
+             undoes it. Decline keeps your change."
         );
         assert_eq!(
             discard_question("kb", &changes[..1], false, true),
             "Undo 1 unshared change in 'kb'? notes/0.md: your new file is deleted. Only your \
              own drafts are cleared. Nothing goes to GitHub. Edits made after you looked are \
-             undone too. Accept undoes them. Decline keeps your changes."
+             undone too. Accept undoes it. Decline keeps your change."
         );
     }
 

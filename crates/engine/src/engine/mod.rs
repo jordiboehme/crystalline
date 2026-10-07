@@ -1305,7 +1305,7 @@ pub enum ShareActor {
 /// whole point of the type: a domain the index holds no row for has synced
 /// nothing, while a count that could not be read is a number that exists and is
 /// unavailable. Collapsing them into one `None` is how a purge gate fails open,
-/// and it is what leaves a confirmation question quietly missing the figure it
+/// and it is what leaves the removal question quietly missing the figure it
 /// promises.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RemovalCount {

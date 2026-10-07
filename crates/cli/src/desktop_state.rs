@@ -495,9 +495,13 @@ pub async fn merge_into(
             }
             let warnings = strings("warnings");
             if !warnings.is_empty() {
+                let engrams = if warnings.len() == 1 {
+                    "1 engram".to_string()
+                } else {
+                    format!("{} engrams", warnings.len())
+                };
                 report.not_moved.push(format!(
-                    "'{name}': {} engram(s) could not be moved: {}. The folder {} stays, so nothing is lost. Open the engrams named here, fix or remove them in Claude Desktop's state, then run the merge again",
-                    warnings.len(),
+                    "'{name}': {engrams} could not be moved: {}. The folder {} stays, so nothing is lost. Open the engrams named here, fix or remove them in Claude Desktop's state, then run the merge again",
                     warnings.join("; "),
                     shown(&state.folder)
                 ));

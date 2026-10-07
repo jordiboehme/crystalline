@@ -1407,7 +1407,7 @@ impl Engine {
     /// `drafting` is `None` and the folder on disk is the answer it always was.
     ///
     /// The single seam review mode adds to sharing, so the share and the preview
-    /// behind its confirmation question cannot describe two different things.
+    /// Fluid's share dialog shows cannot describe two different things.
     /// Two steps, in this order:
     ///
     /// 1. a pull of the REAL folder, which is the pull `ops::propose` would run
@@ -1909,7 +1909,7 @@ impl Engine {
         // it rather than with a column answering a question nobody asked.
         let provenance = drafting.is_none().then_some(root.as_path());
         let mut plan = origin::share_plan_json(&plan, provenance);
-        // The repository beside the branch, so a confirmation question can say
+        // The repository beside the branch, so Fluid's share dialog can say
         // where a commit goes without a second lookup.
         plan["repo"] = json!(spec.repo);
         Ok(plan)
