@@ -635,13 +635,34 @@ pub async fn try_attach_reporting() -> (Option<Connection>, bool) {
 /// anything, and a one-shot command, which serves no pipe, is no daemon to
 /// attach to.
 pub async fn try_attach_displacing() -> (Option<Connection>, Option<Option<StartOptions>>) {
+    try_attach_displacing_in(crate::runs_in::PackageContext::here()).await
+}
+
+/// [`try_attach_displacing`] for a process that runs where `here` says.
+///
+/// Inside an app package it never displaces, whatever the versions, and it
+/// only ever connects. The facts it acts on can come from a record when the
+/// daemon gives none itself, and inside a package that record can be the
+/// package's private copy, so they decide nothing there but the handshake
+/// line and the warning about an older daemon. A listener that gives no
+/// facts at all (silent, or a 0.23.1 daemon whose `status` failed, with no
+/// usable record beside it) is still a daemon outside the package, so a
+/// packaged client connects to it as it is, with the bare `mcp` line, rather
+/// than running the task for a daemon that is already there.
+pub(crate) async fn try_attach_displacing_in(
+    here: &crate::runs_in::PackageContext,
+) -> (Option<Connection>, Option<Option<StartOptions>>) {
     let Ok(sock) = config::service_sock_path() else {
         return (None, None);
     };
     let Some(facts) = ask_holder_at(&sock).await else {
+        if here.is_packaged() {
+            return (connect_socket_at(&sock, false).await, None);
+        }
         return (None, None);
     };
-    if attach_policy(&facts.version, crystalline_core::VERSION) == AttachPolicy::Displace {
+    if attach_policy_for(&facts.version, crystalline_core::VERSION, here) == AttachPolicy::Displace
+    {
         tracing::info!(
             "displacing crystalline daemon v{} (pid {}) in favor of v{}",
             facts.version,
@@ -670,7 +691,19 @@ pub async fn try_attach_displacing() -> (Option<Connection>, Option<Option<Start
             ),
         }
     }
-    (connect_socket_at(&sock, facts.mcp_line_options).await, None)
+    let conn = connect_socket_at(&sock, facts.mcp_line_options).await;
+    // Said once the attach worked, so a bridge polling for its daemon does
+    // not repeat it on every turn.
+    if conn.is_some()
+        && here.is_packaged()
+        && strictly_newer(crystalline_core::VERSION, &facts.version)
+    {
+        tracing::warn!(
+            "{}",
+            older_daemon_warning(&facts.version, crystalline_core::VERSION)
+        );
+    }
+    (conn, None)
 }
 
 /// Attach to a running daemon exactly as it is: a bare pipe connect. Unlike
@@ -884,6 +917,32 @@ pub fn attach_policy(daemon_version: &str, own_version: &str) -> AttachPolicy {
         (Some(daemon), Some(own)) if daemon < own => AttachPolicy::Displace,
         _ => AttachPolicy::Attach,
     }
+}
+
+/// [`attach_policy`] with where this process runs. Inside an app package a
+/// client never displaces: the daemon it would start in its place would run
+/// from inside the package, with the package's private files, and die with
+/// the app. It attaches to whatever runs, older or not.
+pub fn attach_policy_for(
+    daemon_version: &str,
+    own_version: &str,
+    here: &crate::runs_in::PackageContext,
+) -> AttachPolicy {
+    if here.is_packaged() {
+        return AttachPolicy::Attach;
+    }
+    attach_policy(daemon_version, own_version)
+}
+
+/// The one line a packaged bridge writes when it attaches to an older
+/// daemon. A relayed session has no `status` tool to say it, so it goes to
+/// stderr, which Claude Desktop keeps in its MCP log.
+pub(crate) fn older_daemon_warning(daemon: &str, own: &str) -> String {
+    format!(
+        "the Crystalline daemon is v{daemon} and this binary is v{own}: the update is \
+         installed, but the old daemon still runs. Run `crystalline status` in a terminal \
+         to restart it"
+    )
 }
 
 /// Whether `candidate` is a strictly newer release than `baseline`. Same
@@ -1967,7 +2026,57 @@ pub async fn ensure_daemon(
         read_only,
         ..SpawnOptions::default()
     };
-    ensure_daemon_with(spawn, &options).await
+    if !spawn {
+        return ensure_daemon_with(false, &options).await;
+    }
+    let task = crate::daemon_task::for_this_process();
+    ensure_daemon_in(
+        crate::runs_in::PackageContext::here(),
+        &*task,
+        &options,
+        PACKAGED_TASK_WAIT,
+    )
+    .await
+}
+
+/// How long a packaged bridge waits for the daemon the task starts: the same
+/// window a spawned daemon gets.
+pub const PACKAGED_TASK_WAIT: Duration = Duration::from_secs(15);
+
+/// Attach, or start a daemon, as `here` allows. Outside a package this is
+/// [`ensure_daemon_with`]. Inside one the process never spawns, never takes
+/// the index and writes nothing: it runs `task`, waits up to `wait` for the
+/// daemon to answer on the pipe, and otherwise fails with the
+/// [`crate::daemon_task::BridgeFailure`] that says why.
+pub(crate) async fn ensure_daemon_in(
+    here: &crate::runs_in::PackageContext,
+    task: &dyn crate::daemon_task::DaemonTask,
+    options: &SpawnOptions,
+    wait: Duration,
+) -> anyhow::Result<Connection> {
+    use crate::daemon_task::BridgeFailure;
+    if !here.is_packaged() {
+        return ensure_daemon_with(true, options).await;
+    }
+    if let (Some(conn), _) = try_attach_displacing_in(here).await {
+        return Ok(conn);
+    }
+    let Some(name) = task.find() else {
+        return Err(BridgeFailure::TaskMissing.into());
+    };
+    // `schtasks /Run` returns at once; the brief block before any session
+    // exists is cheaper than a blocking-thread hop.
+    task.run(&name).map_err(BridgeFailure::TaskDidNotStart)?;
+    let deadline = Instant::now() + wait;
+    loop {
+        if let (Some(conn), _) = try_attach_displacing_in(here).await {
+            return Ok(conn);
+        }
+        if Instant::now() >= deadline {
+            return Err(BridgeFailure::NoAnswer.into());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// [`ensure_daemon`] with every option a spawned daemon can be given.
@@ -4948,6 +5057,300 @@ mod tests {
         assert!(
             msg.contains("service.allowed_hosts muthur.lan"),
             "the half that differs is still named: {msg}"
+        );
+    }
+
+    fn packaged() -> crate::runs_in::PackageContext {
+        crate::runs_in::PackageContext::Packaged {
+            full_name: "Claude_1.0.0.0_x64__pzs8sxrjxfjjc".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_packaged_client_never_displaces_even_when_it_is_newer() {
+        assert_eq!(
+            attach_policy_for("0.0.1", "0.24.0", &packaged()),
+            AttachPolicy::Attach
+        );
+        assert_eq!(
+            attach_policy_for("0.24.0", "0.24.0", &packaged()),
+            AttachPolicy::Attach
+        );
+    }
+
+    #[test]
+    fn an_unpackaged_client_still_displaces_an_older_daemon() {
+        let here = crate::runs_in::PackageContext::Unpackaged;
+        assert_eq!(
+            attach_policy_for("0.0.1", "0.24.0", &here),
+            AttachPolicy::Displace
+        );
+        assert_eq!(
+            attach_policy_for("0.25.0", "0.24.0", &here),
+            AttachPolicy::Attach
+        );
+    }
+
+    /// A stand-in for Task Scheduler: `run` starts a scripted daemon on this
+    /// state folder's pipe the first time it is called and counts every call.
+    #[cfg(unix)]
+    struct FakeTask {
+        registered: bool,
+        fails: bool,
+        starts: bool,
+        runs: std::sync::atomic::AtomicUsize,
+        started: std::sync::atomic::AtomicBool,
+    }
+
+    #[cfg(unix)]
+    impl FakeTask {
+        fn new(registered: bool, fails: bool, starts: bool) -> FakeTask {
+            FakeTask {
+                registered,
+                fails,
+                starts,
+                runs: std::sync::atomic::AtomicUsize::new(0),
+                started: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl crate::daemon_task::DaemonTask for FakeTask {
+        fn find(&self) -> Option<String> {
+            self.registered
+                .then(|| crate::daemon_task::MACHINE_TASK_NAME.to_string())
+        }
+        fn run(&self, _name: &str) -> Result<(), String> {
+            use std::sync::atomic::Ordering;
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            if self.fails {
+                return Err("the operator or administrator has refused the request".into());
+            }
+            if self.starts && !self.started.swap(true, Ordering::SeqCst) {
+                let sock = config::service_sock_path().unwrap();
+                let listener = ListenerOptions::new()
+                    .name(socket_name(&sock).unwrap())
+                    .create_tokio()
+                    .unwrap();
+                let facts = serde_json::json!({
+                    "pid": std::process::id(), "version": crystalline_core::VERSION,
+                    "mcp_line_options": true
+                });
+                let (task, _) = scripted_daemon(listener, Some(facts), serde_json::json!({}));
+                std::mem::forget(task);
+            }
+            Ok(())
+        }
+    }
+
+    /// Nothing a packaged client may write exists in the state folder.
+    #[cfg(unix)]
+    fn assert_wrote_nothing(state: &Path) {
+        for name in [
+            "service.lock",
+            "service.json",
+            "daemon.log",
+            "index.db",
+            "instance-id",
+            "tmp",
+        ] {
+            assert!(!state.join(name).exists(), "{name} was written");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_packaged_client_with_a_live_older_daemon_attaches_and_never_displaces() {
+        let home = ScratchHome::new("pkg-attach");
+        let sock = config::service_sock_path().unwrap();
+        let listener = ListenerOptions::new()
+            .name(socket_name(&sock).unwrap())
+            .create_tokio()
+            .unwrap();
+        let facts = serde_json::json!({ "pid": std::process::id(), "version": "0.0.1" });
+        let (server, seen) = scripted_daemon(listener, Some(facts), serde_json::json!({}));
+        let (conn, displaced) = try_attach_displacing_in(&packaged()).await;
+        assert!(conn.is_some(), "the older daemon is attached as it is");
+        assert!(displaced.is_none());
+        assert!(
+            !seen.lock().unwrap().contains(&"shutdown".to_string()),
+            "never asked to leave"
+        );
+        server.abort();
+        drop(home);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_packaged_client_with_no_daemon_runs_the_task_then_attaches() {
+        let home = ScratchHome::new("pkg-task");
+        let task = FakeTask::new(true, false, true);
+        let conn = ensure_daemon_in(
+            &packaged(),
+            &task,
+            &SpawnOptions::default(),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("the task started a daemon and the bridge attached");
+        drop(conn);
+        assert_eq!(task.runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+        drop(home);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_packaged_client_whose_task_is_missing_says_so_and_writes_nothing() {
+        let home = ScratchHome::new("pkg-missing");
+        let state = config::state_dir().unwrap();
+        let task = FakeTask::new(false, false, false);
+        let err = ensure_daemon_in(
+            &packaged(),
+            &task,
+            &SpawnOptions::default(),
+            Duration::from_secs(1),
+        )
+        .await
+        .err()
+        .expect("no daemon and no task");
+        assert_eq!(
+            err.downcast_ref::<crate::daemon_task::BridgeFailure>(),
+            Some(&crate::daemon_task::BridgeFailure::TaskMissing)
+        );
+        assert_wrote_nothing(&state);
+        drop(home);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_packaged_client_whose_task_fails_says_it_did_not_start() {
+        let home = ScratchHome::new("pkg-fail");
+        let task = FakeTask::new(true, true, false);
+        let err = ensure_daemon_in(
+            &packaged(),
+            &task,
+            &SpawnOptions::default(),
+            Duration::from_secs(1),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(matches!(
+            err.downcast_ref::<crate::daemon_task::BridgeFailure>(),
+            Some(crate::daemon_task::BridgeFailure::TaskDidNotStart(detail)) if detail.contains("refused")
+        ));
+        drop(home);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_packaged_client_gives_up_when_no_daemon_answers_in_time() {
+        let home = ScratchHome::new("pkg-silent");
+        let state = config::state_dir().unwrap();
+        let task = FakeTask::new(true, false, false);
+        let started = Instant::now();
+        let err = ensure_daemon_in(
+            &packaged(),
+            &task,
+            &SpawnOptions::default(),
+            Duration::from_millis(400),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(
+            err.downcast_ref::<crate::daemon_task::BridgeFailure>(),
+            Some(&crate::daemon_task::BridgeFailure::NoAnswer)
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "the wait is bounded"
+        );
+        assert_wrote_nothing(&state);
+        drop(home);
+    }
+
+    /// Claude Desktop starts two bridges at once.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_packaged_bridges_with_no_daemon_both_attach_to_one() {
+        let home = ScratchHome::new("pkg-two");
+        let state = config::state_dir().unwrap();
+        let task = std::sync::Arc::new(FakeTask::new(true, false, true));
+        let here = packaged();
+        let options = SpawnOptions::default();
+        let (a, b) = tokio::join!(
+            ensure_daemon_in(&here, &*task, &options, Duration::from_secs(5)),
+            ensure_daemon_in(&here, &*task, &options, Duration::from_secs(5)),
+        );
+        assert!(a.is_ok() && b.is_ok(), "both bridges reach the one daemon");
+        let runs = task.runs.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            (1..=2).contains(&runs),
+            "each bridge runs the task at most once: {runs}"
+        );
+        assert!(task.started.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            !state.join("service.lock").exists(),
+            "neither bridge took the index"
+        );
+        drop(home);
+    }
+
+    /// A listener that gives no facts (it refuses `holder`, its `status`
+    /// names no pid) and no usable record beside it: `ask_holder_at` says
+    /// `None`, but a daemon is there. A packaged bridge connects to it as it
+    /// is and never runs the task.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_packaged_client_connects_to_a_listener_that_gives_no_facts() {
+        let home = ScratchHome::new("pkg-bare");
+        let sock = config::service_sock_path().unwrap();
+        let listener = ListenerOptions::new()
+            .name(socket_name(&sock).unwrap())
+            .create_tokio()
+            .unwrap();
+        let (server, seen) = scripted_daemon(listener, None, serde_json::json!({}));
+        assert!(
+            ask_holder_at(&sock).await.is_none(),
+            "the pipe gives no facts"
+        );
+        let task = FakeTask::new(true, false, false);
+        let conn = ensure_daemon_in(
+            &packaged(),
+            &task,
+            &SpawnOptions::default(),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("the bridge connects to the listener as it is");
+        drop(conn);
+        assert_eq!(
+            task.runs.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no task run"
+        );
+        assert!(
+            !seen.lock().unwrap().contains(&"shutdown".to_string()),
+            "never asked to leave"
+        );
+        server.abort();
+        drop(home);
+    }
+
+    #[test]
+    fn the_older_daemon_warning_names_both_versions_and_the_fix() {
+        let text = older_daemon_warning("0.23.1", "0.24.0");
+        assert!(
+            text.contains("v0.23.1")
+                && text.contains("v0.24.0")
+                && text.contains("crystalline status"),
+            "{text}"
+        );
+        assert!(
+            !text.contains('\u{2014}') && !text.contains('\u{2013}'),
+            "{text}"
         );
     }
 }

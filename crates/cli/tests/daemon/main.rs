@@ -6,6 +6,10 @@
 //! named `<module>::<test>` and an edit upstream relinks one binary here
 //! instead of one per file.
 
+#[path = "../common/mod.rs"]
+mod common;
+
+mod bridge;
 #[cfg(unix)]
 mod mcp_stub;
 #[cfg(unix)]

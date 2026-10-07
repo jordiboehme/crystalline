@@ -213,6 +213,18 @@ pub async fn run_mcp(
     // re-sent on each daemon reconnect and never re-derived daemon-side.
     let harness_gate = resolve_harness_gate(harness);
 
+    // Inside an app package (Claude Desktop's MSIX package on Windows) this
+    // process is only a bridge to the daemon outside: every file it wrote
+    // under AppData would land in the package's private copy. So it never
+    // serves the embedded stack, not even when asked to.
+    let packaged = crate::runs_in::PackageContext::here().is_packaged();
+    if embedded && packaged {
+        tracing::warn!(
+            "--embedded is ignored inside an app package: this process only bridges to the daemon outside"
+        );
+    }
+    let embedded = embedded && !packaged;
+
     // Read the client's first line concurrently with daemon acquisition, so a
     // cold daemon spawns while the client is still composing its opener rather
     // than afterwards.
@@ -266,6 +278,17 @@ pub async fn run_mcp(
         match daemon {
             Ok(stream) => {
                 return pump_stdio(stream, primed, db, config_path, read_only, harness_gate).await;
+            }
+            Err(e) if packaged => {
+                let bridge = e
+                    .downcast_ref::<crate::daemon_task::BridgeFailure>()
+                    .cloned()
+                    .unwrap_or(crate::daemon_task::BridgeFailure::NoAnswer);
+                tracing::warn!(
+                    "this process runs inside an app package and only bridges to the daemon: {bridge}"
+                );
+                let status = crate::stub::StubStatus::for_bridge(format!("{e:#}"), bridge);
+                return serve_degraded_stub(status, primed).await;
             }
             Err(e) => tracing::warn!("no daemon available ({e}); running embedded"),
         }
