@@ -37,7 +37,10 @@ pub(crate) fn plant_private_state(home: &Path, files: &[&str]) -> PathBuf {
 fn run(home: &Path, args: &[&str]) -> std::process::Output {
     let mut cmd = crate::common::crystalline();
     crate::common::isolate(&mut cmd, home);
+    // The task seam answers a ready machine task, so doctor never asks the
+    // real Task Scheduler on a Windows runner.
     cmd.env("CRYSTALLINE_SERVICE_HTTP", "false")
+        .env("CRYSTALLINE_TEST_DAEMON_TASK", "ready")
         .args(args)
         .output()
         .unwrap()
