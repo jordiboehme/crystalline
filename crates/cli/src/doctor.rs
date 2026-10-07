@@ -992,6 +992,35 @@ pub(crate) fn task_finding(name: Option<&str>, xml: Option<&str>, account: &str)
     }
 }
 
+/// The program a task definition starts: the text of its `<Command>`,
+/// without the quotes around it and with the XML escapes undone. `None`
+/// when the definition names none.
+pub(crate) fn task_command(xml: &str) -> Option<std::path::PathBuf> {
+    let text = element_texts(xml, "Command").into_iter().next()?;
+    let text = text
+        .replace("&quot;", "\"")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&");
+    let path = text.trim().trim_matches('"').trim();
+    (!path.is_empty()).then(|| std::path::PathBuf::from(path))
+}
+
+/// A task that runs for this user but starts a binary `exists` cannot find
+/// (it survived an uninstall, or the binary moved) is as good as missing,
+/// so `--fix` registers it again. Arguments and trigger are not checked.
+pub(crate) fn with_command_check(
+    finding: TaskFinding,
+    xml: Option<&str>,
+    exists: impl Fn(&Path) -> bool,
+) -> TaskFinding {
+    match (&finding, xml.and_then(task_command)) {
+        (TaskFinding::Ready(_), Some(command)) if !exists(&command) => TaskFinding::Missing,
+        _ => finding,
+    }
+}
+
 /// The daemon task as doctor found it and what `--fix` did about it.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct TaskDoctor {
@@ -1051,7 +1080,11 @@ fn check_task(fix: bool) -> Option<TaskDoctor> {
     let name = tasks.find();
     let xml = name.as_deref().and_then(daemon_task::registered_xml);
     let account = daemon_task::current_account();
-    let finding = task_finding(name.as_deref(), xml.as_deref(), &account);
+    let finding = with_command_check(
+        task_finding(name.as_deref(), xml.as_deref(), &account),
+        xml.as_deref(),
+        Path::is_file,
+    );
     let mut report = TaskDoctor {
         finding: Some(finding.clone()),
         ..TaskDoctor::default()
@@ -7713,5 +7746,42 @@ mod tests {
         let json = serde_json::to_value(&report).unwrap();
         assert!(json.get("daemon_task").is_none(), "off Windows: {json}");
         assert_eq!(json["desktop_states"], serde_json::json!([]));
+    }
+
+    /// A task that starts a binary which is gone (it survived an uninstall,
+    /// or the binary moved) is as good as missing, so `--fix` registers it
+    /// again. A definition that names no command is left as it was found.
+    #[test]
+    fn a_task_whose_binary_is_gone_counts_as_missing() {
+        use crystalline_service::daemon_task::{TaskPrincipal, task_xml};
+        let exe = r"C:\Program Files\Crystalline & Co\bin\crystalline.exe";
+        let xml = task_xml(std::path::Path::new(exe), &TaskPrincipal::AllUsers);
+        assert_eq!(
+            task_command(&xml).as_deref(),
+            Some(std::path::Path::new(exe)),
+            "quotes and entities are taken off"
+        );
+        let ready = TaskFinding::Ready(r"\Crystalline\Daemon".to_string());
+        assert_eq!(
+            with_command_check(ready.clone(), Some(&xml), |p| p
+                == std::path::Path::new(exe)),
+            ready
+        );
+        assert_eq!(
+            with_command_check(ready.clone(), Some(&xml), |_| false),
+            TaskFinding::Missing
+        );
+        let no_command = "<Principal><GroupId>S-1-5-32-545</GroupId></Principal>";
+        assert_eq!(
+            with_command_check(ready.clone(), Some(no_command), |_| false),
+            ready
+        );
+        assert_eq!(with_command_check(ready.clone(), None, |_| false), ready);
+        let others = TaskFinding::ForOthers(r"\Crystalline\Daemon".to_string());
+        assert_eq!(
+            with_command_check(others.clone(), Some(&xml), |_| false),
+            others,
+            "only a task that runs for this user is checked"
+        );
     }
 }
