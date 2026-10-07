@@ -3390,6 +3390,58 @@ async fn with_oauth_on_the_refusal_points_at_the_resource_metadata() {
     );
 }
 
+/// **At the root the challenge spells the origin as the request did**, as in
+/// 0.23.0: a host in mixed case and a default port stay as they arrived, so
+/// the pointer names the address the document is read at and agrees with the
+/// `resource` that document publishes for the same request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn at_the_root_the_challenge_keeps_the_host_as_the_request_spelled_it() {
+    let (addr, _guard, _store) = serve_with_oauth().await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    for host in ["Knowledge.Example", "kb.example:443"] {
+        let refused = client
+            .post(format!("http://{addr}/"))
+            .header("host", host)
+            .header("x-forwarded-proto", "https")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .body(initialize_body())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), 401, "{host}");
+        let challenge = refused.headers()["www-authenticate"]
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            challenge,
+            format!(
+                "Bearer resource_metadata=\"https://{host}/.well-known/oauth-protected-resource\""
+            ),
+            "the 0.23.0 spelling for {host}"
+        );
+        let document: serde_json::Value = client
+            .get(format!(
+                "http://{addr}/.well-known/oauth-protected-resource"
+            ))
+            .header("host", host)
+            .header("x-forwarded-proto", "https")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let resource = document["resource"].as_str().unwrap();
+        assert_eq!(
+            challenge,
+            format!("Bearer resource_metadata=\"{resource}/.well-known/oauth-protected-resource\""),
+            "the pointer and the document agree for {host}"
+        );
+    }
+}
+
 /// **A followed `auth.oauth` answers the same challenge an explicit one does.**
 ///
 /// The configuration `docs/deployment.md` recommends for a shared instance is

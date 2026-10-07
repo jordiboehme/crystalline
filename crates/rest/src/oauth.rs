@@ -799,10 +799,17 @@ impl RegistrationLimiter {
 /// this one is a well-known document and those three live under the API
 /// mount, and a shared helper is how one of them would silently acquire the
 /// other's prefix.
+///
+/// At the root the value is the 0.23.0 one byte for byte: the origin there is
+/// often derived from the request and kept as it arrived, and parsing it would
+/// lower-case the host and drop a default port, so the pointer would no longer
+/// match the `resource` of the document it names. Under a prefix the base is
+/// `service.public_url` in its canonical spelling already, so the parse
+/// changes nothing but the place of the path.
 pub fn resource_metadata_url(base: &str) -> String {
     match PublicBase::parse(base) {
-        Ok(base) => base.well_known(PROTECTED_RESOURCE_PATH),
-        Err(_) => format!("{base}{PROTECTED_RESOURCE_PATH}"),
+        Ok(parsed) if !parsed.path().is_root() => parsed.well_known(PROTECTED_RESOURCE_PATH),
+        _ => format!("{base}{PROTECTED_RESOURCE_PATH}"),
     }
 }
 
@@ -4196,6 +4203,26 @@ mod tests {
             resource_metadata_url("https://knowledge.example"),
             "https://knowledge.example/.well-known/oauth-protected-resource"
         );
+    }
+
+    /// **At the root the pointer is spelled the way 0.23.0 spelled it.** The
+    /// origin there is derived from the request and kept as it arrived, so
+    /// the pointer must not lower-case the host or drop a default port: it
+    /// would then differ from the `resource` the document publishes for the
+    /// same request.
+    #[test]
+    fn at_the_root_the_resource_metadata_pointer_keeps_the_origin_as_written() {
+        for origin in [
+            "https://Knowledge.Example",
+            "https://kb.example:443",
+            "http://localhost:80",
+        ] {
+            assert_eq!(
+                resource_metadata_url(origin),
+                format!("{origin}/.well-known/oauth-protected-resource"),
+                "{origin}"
+            );
+        }
     }
 
     /// **The rules a redirect uri is stored under, and the rule a presented

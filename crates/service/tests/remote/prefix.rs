@@ -260,13 +260,24 @@ async fn the_challenge_names_the_rfc_9728_address() {
         .await
         .unwrap();
     assert_eq!(refused.status(), 401);
+    let challenge = refused.headers()["www-authenticate"]
+        .to_str()
+        .unwrap()
+        .to_string();
     assert_eq!(
-        refused.headers()["www-authenticate"].to_str().unwrap(),
+        challenge,
         format!(
             "Bearer resource_metadata=\"{}/.well-known/oauth-protected-resource{PREFIX}\"",
             server.origin()
         )
     );
+    // The document the pointer names publishes the base as its `resource`.
+    let pointer = challenge
+        .strip_prefix("Bearer resource_metadata=\"")
+        .and_then(|rest| rest.strip_suffix('"'))
+        .unwrap();
+    let (_, doc) = document(&server, pointer).await;
+    assert_eq!(doc["resource"], server.base(), "{pointer}: {doc}");
     let root = RemoteServer::start(Options::OAUTH).await;
     let refused = root
         .http
