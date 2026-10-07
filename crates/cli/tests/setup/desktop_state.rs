@@ -557,6 +557,10 @@ fn an_engram_the_import_cannot_read_keeps_the_folder_and_is_named() {
     let not_moved = merge["not_moved"].to_string();
     assert!(not_moved.contains("vnotes"), "{merge}");
     assert!(
+        not_moved.contains("fix or remove them") && not_moved.contains("run the merge again"),
+        "the sentence says what to do: {merge}"
+    );
+    assert!(
         not_moved.contains("tide-tables.md"),
         "the file is named: {merge}"
     );
@@ -573,6 +577,55 @@ fn an_engram_the_import_cannot_read_keeps_the_folder_and_is_named() {
     assert!(text.contains("tide-tables.md"), "{text}");
 }
 
+/// A MANIFEST whose frontmatter declares `domain_name: <name>`.
+fn manifest_declaring(name: &str) -> String {
+    format!(
+        "---\ntype: manifest\ntitle: {name}\npermalink: manifest\nstatus: stable\ndomain_name: {name}\n---\n\n# {name}\n"
+    )
+}
+
+/// A different folder whose MANIFEST declares a name this machine already
+/// answers to under another domain is refused: two domains would claim one
+/// canonical name. The folder stays.
+#[test]
+fn a_canonical_name_this_machine_answers_to_is_a_conflict() {
+    let home = tempfile::tempdir().unwrap();
+    let folder = plant_private_state(home.path(), &["other"]);
+    std::fs::write(
+        home.path().join("docs").join("other").join("MANIFEST.md"),
+        manifest_declaring("mine"),
+    )
+    .unwrap();
+    let own = home.path().join("own").join("mine");
+    std::fs::create_dir_all(&own).unwrap();
+    std::fs::write(own.join("MANIFEST.md"), manifest_declaring("mine")).unwrap();
+    let mut real = GlobalConfig::default();
+    real.domains
+        .insert("mine".to_string(), DomainEntry::file(own));
+    std::fs::create_dir_all(real_config_path(home.path()).parent().unwrap()).unwrap();
+    crystalline_core::config::save_yaml(&real_config_path(home.path()), &real).unwrap();
+
+    let out = run(
+        home.path(),
+        &["doctor", "--fix", "--merge-desktop-state", "--json"],
+    );
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let merge = &report["merge"];
+    let conflict = merge["conflicts"][0].as_str().unwrap_or_default();
+    assert!(
+        conflict.contains("'other'") && conflict.contains("'mine'"),
+        "{merge}"
+    );
+    assert_eq!(merge["registered"], serde_json::json!([]), "{merge}");
+    assert_eq!(merge["renamed_to"], Value::Null, "{merge}");
+    assert!(
+        folder.exists(),
+        "nothing is renamed while a conflict remains"
+    );
+    assert!(!real_config(home.path()).domains.contains_key("other"));
+    assert_eq!(out.status.code(), Some(1));
+}
+
 /// A folder this machine already registers under another name is not
 /// registered a second time: the private name is skipped and both names
 /// are said.
@@ -581,6 +634,8 @@ fn the_same_folder_under_another_name_is_skipped() {
     let home = tempfile::tempdir().unwrap();
     let folder = plant_private_state(home.path(), &["theirs"]);
     let root = home.path().join("docs").join("theirs");
+    // As `domain add` leaves it: the MANIFEST declares this machine's name.
+    std::fs::write(root.join("MANIFEST.md"), manifest_declaring("mine")).unwrap();
     let mut real = GlobalConfig::default();
     real.domains
         .insert("mine".to_string(), DomainEntry::file(root));

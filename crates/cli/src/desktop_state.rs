@@ -199,9 +199,15 @@ fn same_registration(real: &DomainEntry, private: &DomainEntry) -> bool {
     real.is_virtual() == private.is_virtual() && canonical_root(real) == canonical_root(private)
 }
 
+/// `path` as a person reads it: without the verbatim prefix a canonical
+/// Windows path carries.
+fn shown(path: &Path) -> std::path::Display<'_> {
+    dunce::simplified(path).display()
+}
+
 fn meaning(entry: &DomainEntry) -> String {
     match entry.file_path() {
-        Some(root) if !entry.is_virtual() => format!("the folder {}", root.display()),
+        Some(root) if !entry.is_virtual() => format!("the folder {}", shown(&root)),
         _ => "a virtual domain".to_string(),
     }
 }
@@ -222,7 +228,7 @@ impl Unusable {
         match self {
             Unusable::Inside(rel) => format!(
                 "its folder {} is inside Claude Desktop's private folder",
-                folder.join(rel).display()
+                shown(&folder.join(rel))
             ),
             Unusable::Missing(why) => why.clone(),
         }
@@ -237,7 +243,7 @@ fn unusable_root(entry: &DomainEntry, canonical_folder: &Path) -> Option<Unusabl
         return Some(Unusable::Inside(rel.to_path_buf()));
     }
     (!root.is_dir())
-        .then(|| Unusable::Missing(format!("its folder {} does not exist here", root.display())))
+        .then(|| Unusable::Missing(format!("its folder {} does not exist here", shown(&root))))
 }
 
 /// Why this machine cannot take a private name it does not register, the
@@ -383,6 +389,20 @@ pub async fn merge_into(
             .then(|| unusable_root(entry, &canonical_folder))
             .flatten();
         let real = file.domains.get(name);
+        // The folder first: one this machine registers under another name is
+        // already here, and its MANIFEST usually declares that other name,
+        // which the name check below would read as a clash.
+        if real.is_none()
+            && !entry.is_virtual()
+            && let Some(other) = canonical_root(entry)
+                .and_then(|root| crate::cmd::existing_file_domain_at(&root, &file))
+        {
+            report.kept_this_machine.push(format!(
+                "'{name}' in Claude Desktop's state is {}, which this machine registers as '{other}': kept '{other}' and skipped '{name}'",
+                meaning(entry)
+            ));
+            continue;
+        }
         if real.is_none()
             && let Some(problem) = name_taken_here(name, entry, &loaded, &table)
         {
@@ -396,17 +416,8 @@ pub async fn merge_into(
                 unusable.why(&state.folder)
             )),
             (None, None) => {
-                let same_folder = canonical_root(entry)
-                    .and_then(|root| crate::cmd::existing_file_domain_at(&root, &file));
-                if let Some(other) = same_folder {
-                    report.kept_this_machine.push(format!(
-                        "'{name}' in Claude Desktop's state is {}, which this machine registers as '{other}': kept '{other}' and skipped '{name}'",
-                        meaning(entry)
-                    ));
-                } else {
-                    file.domains.insert(name.clone(), entry.clone());
-                    registered.push(name.clone());
-                }
+                file.domains.insert(name.clone(), entry.clone());
+                registered.push(name.clone());
             }
             (Some(real), _) if same_registration(real, entry) => {
                 if entry.is_virtual() {
@@ -485,9 +496,10 @@ pub async fn merge_into(
             let warnings = strings("warnings");
             if !warnings.is_empty() {
                 report.not_moved.push(format!(
-                    "'{name}': {} engram(s) could not be moved and stay in Claude Desktop's folder: {}",
+                    "'{name}': {} engram(s) could not be moved: {}. The folder {} stays, so nothing is lost. Open the engrams named here, fix or remove them in Claude Desktop's state, then run the merge again",
                     warnings.len(),
-                    warnings.join("; ")
+                    warnings.join("; "),
+                    shown(&state.folder)
                 ));
             }
             let kept = differing(
@@ -513,9 +525,9 @@ pub async fn merge_into(
         let target = merged_name(&state.folder, today);
         std::fs::rename(&state.folder, &target)?;
         report.renamed_to = Some(target.clone());
-        format!("are now in {}", target.display())
+        format!("are now in {}", shown(&target))
     } else {
-        format!("stay in {}", state.folder.display())
+        format!("stay in {}", shown(&state.folder))
     };
     for (name, real, rel) in inside {
         let place = if rel.as_os_str().is_empty() {
