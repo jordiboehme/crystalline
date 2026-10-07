@@ -964,10 +964,10 @@ fn same_account(a: &str, b: &str) -> bool {
 
 /// A task runs for this user when its principal is a group (only the MSI
 /// registers one, for the Users group) or this account. The task under this
-/// user's own name (`\Crystalline Daemon for <name>`) is theirs when its
-/// principal is an account at all: Task Scheduler may print the account as
-/// a SID, and a name outside ASCII may not survive the decoding of its
-/// output, but only `doctor --fix` run by this user registers that name.
+/// user's own name (`\Crystalline Daemon for <name>`) is always theirs:
+/// Task Scheduler may print the account as a SID, and a name outside ASCII
+/// may not survive the decoding of its output, but only `doctor --fix` run
+/// by this user registers that name.
 pub(crate) fn task_finding(name: Option<&str>, xml: Option<&str>, account: &str) -> TaskFinding {
     let Some(name) = name else {
         return TaskFinding::Missing;
@@ -976,18 +976,16 @@ pub(crate) fn task_finding(name: Option<&str>, xml: Option<&str>, account: &str)
         && name.eq_ignore_ascii_case(&crystalline_service::daemon_task::user_task_name(
             account_parts(account).1,
         ));
-    let Some(xml) = xml else {
-        return if own_name {
-            TaskFinding::Ready(name.to_string())
-        } else {
-            TaskFinding::ForOthers(name.to_string())
-        };
-    };
-    let principals = principals_block(xml);
+    if own_name {
+        return TaskFinding::Ready(name.to_string());
+    }
+    let principals = principals_block(xml.unwrap_or_default());
     let for_group = !element_texts(principals, "GroupId").is_empty();
-    let users = element_texts(principals, "UserId");
-    let for_me = !account.is_empty() && users.iter().any(|user| same_account(user, account));
-    if for_group || for_me || (own_name && !users.is_empty()) {
+    let for_me = !account.is_empty()
+        && element_texts(principals, "UserId")
+            .iter()
+            .any(|user| same_account(user, account));
+    if for_group || for_me {
         TaskFinding::Ready(name.to_string())
     } else {
         TaskFinding::ForOthers(name.to_string())
@@ -7653,7 +7651,8 @@ mod tests {
         let mangled = "<Principal><UserId>WORK\\\u{fffd}\u{fffd}da</UserId></Principal>";
         let sid =
             "<Principal><UserId>S-1-5-21-1004336348-1177238915-682003330-1001</UserId></Principal>";
-        for xml in [Some(mangled), Some(sid), None] {
+        let unreadable = "\u{fffd}\u{fffd}\u{fffd}";
+        for xml in [Some(mangled), Some(sid), Some(unreadable), None] {
             assert_eq!(
                 task_finding(Some(own), xml, r"WORK\ada"),
                 TaskFinding::Ready(own.to_string()),
