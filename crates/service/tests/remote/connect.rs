@@ -1482,6 +1482,14 @@ async fn a_list_takes_a_domain_from_a_server_that_takes_all_and_says_so() {
             .any(|m| m.local == "platform"),
         "no second record"
     );
+    assert!(
+        file.find("beta")
+            .unwrap()
+            .mounts
+            .iter()
+            .any(|m| m.local == "platform"),
+        "the listing source holds the mount now"
+    );
 }
 
 #[tokio::test]
@@ -1519,6 +1527,18 @@ async fn a_local_copy_comes_back_when_its_domain_leaves_the_list() {
     .await
     .unwrap();
     assert_eq!(narrowed.came_back, vec!["platform".to_string()]);
+    assert!(
+        !narrowed.taken.contains(&"platform".to_string()),
+        "the server no longer serves platform"
+    );
+    let file = load_sources(dir.path()).unwrap();
+    assert!(
+        file.sources
+            .iter()
+            .all(|s| s.mounts.iter().all(|m| m.local != "platform")),
+        "no mount hides the local platform any more, so it is visible: {:?}",
+        file.sources
+    );
 }
 
 #[tokio::test]
@@ -1542,4 +1562,7 @@ async fn a_0_23_0_sources_file_connects_again_as_all_and_stays_without_a_list() 
     assert_eq!(again.taken.len(), 4, "no field is all");
     let written = std::fs::read_to_string(dir.path().join("sources.json")).unwrap();
     assert!(!written.contains("\"domains\""), "{written}");
+    assert!(again.source.domains.is_none(), "no list was written");
+    let file = load_sources(dir.path()).unwrap();
+    assert_eq!(file.sources.len(), 1, "the 0.23.0 record is the one source");
 }

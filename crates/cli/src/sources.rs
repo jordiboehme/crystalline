@@ -900,6 +900,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_backslash_is_named_as_the_reason() {
+        let said = not_a_server_address(r"https://kb.example\team");
+        assert!(said.contains("backslash"), "{said}");
+        assert!(said.starts_with("that is not a server address: "), "{said}");
+        let token = not_a_server_address(r"https://kb.example\cmt_0123456789abcdef");
+        assert!(
+            !token.contains("cmt_"),
+            "a token is never repeated: {token}"
+        );
+    }
+
+    #[test]
     fn the_unshared_warning_says_what_to_do_and_why() {
         assert_eq!(
             unshared_warning("platform", "acme", 3),

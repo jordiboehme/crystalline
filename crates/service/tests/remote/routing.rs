@@ -1314,6 +1314,21 @@ async fn a_call_over_all_domains_never_reaches_a_domain_left_out() {
     assert_reached_only_open(&acme, "a recent_activity fan-out");
 
     acme.clear_ctl_log();
+    let context = call(
+        &machine,
+        "build_context",
+        json!({ "anchor": "crystalline://open/open-note" }),
+    )
+    .await
+    .unwrap()
+    .to_string();
+    assert!(
+        !context.contains("lab-note") && !context.contains("three bar"),
+        "{context}"
+    );
+    assert_reached_only_open(&acme, "a build_context fan-out");
+
+    acme.clear_ctl_log();
     let read = call(
         &machine,
         "read_engram",

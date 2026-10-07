@@ -871,6 +871,32 @@ fn a_bad_domain_list_is_refused_before_signing_in() {
     }
 }
 
+/// Item 7 of the 0.23.1 follow-ups: a refused list stops `connect` before it
+/// asks the server anything. A listener that only counts connections stands
+/// in for the server, so a single request would show.
+#[test]
+fn a_refused_domain_list_never_reaches_the_server() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let home = tempfile::tempdir().unwrap();
+    for extra in [vec!["--domains", ""], vec!["--domains", "Not A Name"]] {
+        let mut args = vec!["connect", url.as_str(), "--name", "acme", "--token"];
+        args.extend_from_slice(&extra);
+        let out = bin(home.path())
+            .args(&args)
+            .write_stdin("cmt_unused\n")
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{extra:?}");
+    }
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    match listener.accept() {
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+        other => panic!("connect reached the server: {other:?}"),
+    }
+}
+
 #[test]
 fn a_local_copy_comes_back_when_the_list_leaves_its_domain_out() {
     let server = CliServer::start_full(&[], &[("platform", "acme/platform")]);
