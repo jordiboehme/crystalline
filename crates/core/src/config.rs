@@ -1410,8 +1410,76 @@ fn base() -> Result<impl BaseStrategy, ConfigError> {
     etcetera::choose_base_strategy().map_err(|e| ConfigError::Home(e.to_string()))
 }
 
+/// Whether `path` lies in an app package's private store,
+/// `...\Packages\<family>\LocalCache\Roaming`. Split on both separators, so
+/// a Windows path reads the same on any machine a test runs on, and compared
+/// without regard to ASCII case, as Windows compares paths.
+pub fn names_package_local_cache(path: &Path) -> bool {
+    let text = path.to_string_lossy().to_ascii_lowercase();
+    let parts: Vec<&str> = text.split(['/', '\\']).filter(|p| !p.is_empty()).collect();
+    parts
+        .windows(4)
+        .any(|w| w[0] == "packages" && w[2] == "localcache" && w[3] == "roaming")
+}
+
+/// The roaming root on Windows: `APPDATA` as it is, unless it names an app
+/// package's private store, which is where Claude Desktop's package may
+/// point it. Then, and when it is unset or empty, the known folder
+/// (`known`), so the state folder and the pipe name derived from it match
+/// the ones every process outside the package uses. `None` when neither
+/// answers, and the caller falls back to etcetera.
+pub fn roaming_root(
+    appdata: Option<&std::ffi::OsStr>,
+    known: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    match appdata.filter(|value| !value.is_empty()) {
+        Some(value) if !names_package_local_cache(Path::new(value)) => Some(PathBuf::from(value)),
+        _ => known(),
+    }
+}
+
+/// `FOLDERID_RoamingAppData` from the shell, the call etcetera makes when
+/// `APPDATA` is unset.
+#[cfg(windows)]
+fn known_roaming_folder() -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::Foundation::S_OK;
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{
+        FOLDERID_RoamingAppData, KF_FLAG_DONT_VERIFY, SHGetKnownFolderPath,
+    };
+    let mut raw: windows_sys::core::PWSTR = std::ptr::null_mut();
+    // SAFETY: a known folder id, no token (the current user) and an out
+    // pointer the call fills with a string it allocates.
+    let rc = unsafe {
+        SHGetKnownFolderPath(
+            &FOLDERID_RoamingAppData,
+            KF_FLAG_DONT_VERIFY as u32,
+            std::ptr::null_mut(),
+            &mut raw,
+        )
+    };
+    let path = (rc == S_OK && !raw.is_null()).then(|| {
+        let mut len = 0usize;
+        // SAFETY: the call returned a NUL-terminated wide string.
+        while unsafe { *raw.add(len) } != 0 {
+            len += 1;
+        }
+        // SAFETY: `len` wide chars before the NUL, all initialized.
+        let wide = unsafe { std::slice::from_raw_parts(raw, len) };
+        PathBuf::from(std::ffi::OsString::from_wide(wide))
+    });
+    // SAFETY: frees what the call allocated; a null pointer is a no-op.
+    unsafe { CoTaskMemFree(raw.cast()) };
+    path
+}
+
 /// The application config directory, for example `~/.config/crystalline`.
 pub fn config_dir() -> Result<PathBuf, ConfigError> {
+    #[cfg(windows)]
+    if let Some(root) = roaming_root(std::env::var_os("APPDATA").as_deref(), known_roaming_folder) {
+        return Ok(root.join(APP));
+    }
     Ok(base()?.config_dir().join(APP))
 }
 
@@ -1421,7 +1489,13 @@ pub fn global_config_path() -> Result<PathBuf, ConfigError> {
 }
 
 /// The application state directory, for example `~/.local/state/crystalline`.
+/// Windows has no state directory, so it is the roaming folder, like the
+/// config directory.
 pub fn state_dir() -> Result<PathBuf, ConfigError> {
+    #[cfg(windows)]
+    if let Some(root) = roaming_root(std::env::var_os("APPDATA").as_deref(), known_roaming_folder) {
+        return Ok(root.join(APP));
+    }
     let b = base()?;
     let root = b.state_dir().unwrap_or_else(|| b.data_dir());
     Ok(root.join(APP))
@@ -2165,5 +2239,69 @@ mod tests {
             Some("platform")
         );
         assert_eq!(back, cfg);
+    }
+
+    #[test]
+    fn a_plain_appdata_is_taken_as_it_is() {
+        let known = || -> Option<PathBuf> { panic!("the known folder is not asked") };
+        assert_eq!(
+            roaming_root(
+                Some(std::ffi::OsStr::new(r"C:\Users\ada\AppData\Roaming")),
+                known
+            ),
+            Some(PathBuf::from(r"C:\Users\ada\AppData\Roaming"))
+        );
+        assert_eq!(
+            roaming_root(Some(std::ffi::OsStr::new("/tmp/cq-x/roaming")), || None),
+            Some(PathBuf::from("/tmp/cq-x/roaming")),
+            "a test home's APPDATA is kept"
+        );
+    }
+
+    #[test]
+    fn an_appdata_inside_a_package_local_cache_resolves_from_the_known_folder() {
+        let real = PathBuf::from(r"C:\Users\ada\AppData\Roaming");
+        for private in [
+            r"C:\Users\ada\AppData\Local\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Roaming",
+            r"c:\users\ada\appdata\local\packages\claude_pzs8sxrjxfjjc\localcache\roaming\",
+            "/c/Users/ada/AppData/Local/Packages/X/LocalCache/Roaming",
+        ] {
+            assert_eq!(
+                roaming_root(Some(std::ffi::OsStr::new(private)), || Some(real.clone())),
+                Some(real.clone()),
+                "{private}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_appdata_asks_the_known_folder_and_nothing_at_all_is_none() {
+        let real = PathBuf::from(r"C:\Users\ada\AppData\Roaming");
+        assert_eq!(
+            roaming_root(None, || Some(real.clone())),
+            Some(real.clone())
+        );
+        assert_eq!(
+            roaming_root(Some(std::ffi::OsStr::new("")), || Some(real.clone())),
+            Some(real)
+        );
+        assert_eq!(roaming_root(None, || None), None);
+    }
+
+    #[test]
+    fn only_the_whole_packages_localcache_roaming_shape_is_a_private_store() {
+        assert!(names_package_local_cache(std::path::Path::new(
+            r"D:\u\AppData\Local\Packages\Claude_x\LocalCache\Roaming"
+        )));
+        assert!(!names_package_local_cache(std::path::Path::new(
+            r"D:\u\AppData\Local\Packages\Claude_x\LocalState"
+        )));
+        assert!(
+            !names_package_local_cache(std::path::Path::new(r"D:\Packages\LocalCache\Roaming")),
+            "the package folder name is required"
+        );
+        assert!(!names_package_local_cache(std::path::Path::new(
+            r"D:\u\AppData\Roaming"
+        )));
     }
 }

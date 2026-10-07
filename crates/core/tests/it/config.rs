@@ -384,3 +384,36 @@ fn models_dir_env_override() {
         None => unsafe { std::env::remove_var("CRYSTALLINE_MODELS_DIR") },
     }
 }
+
+#[cfg(windows)]
+#[test]
+fn the_state_and_config_folders_ignore_a_local_cache_appdata() {
+    let _guard = crate::common::HOME_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let previous = std::env::var_os("APPDATA");
+    let local = std::env::var_os("LOCALAPPDATA").expect("Windows sets LOCALAPPDATA");
+    let private = std::path::Path::new(&local)
+        .join("Packages")
+        .join("Claude_pzs8sxrjxfjjc")
+        .join("LocalCache")
+        .join("Roaming");
+    // SAFETY: under HOME_LOCK, restored before any assertion.
+    unsafe { std::env::set_var("APPDATA", &private) };
+    let state = crystalline_core::config::state_dir();
+    let config = crystalline_core::config::config_dir();
+    unsafe {
+        match previous {
+            Some(v) => std::env::set_var("APPDATA", v),
+            None => std::env::remove_var("APPDATA"),
+        }
+    }
+    let state = state.unwrap();
+    assert!(!state.starts_with(&private), "{}", state.display());
+    assert!(state.ends_with("crystalline"));
+    assert_eq!(
+        state,
+        config.unwrap(),
+        "Windows keeps both in one roaming folder"
+    );
+}

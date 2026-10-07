@@ -28,6 +28,11 @@ url = { workspace = true }
 sha2 = { workspace = true }
 anyhow = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+# The roaming folder from the known-folder API (`config::roaming_root`): the
+# same three features etcetera already enables, so nothing new is built.
+windows-sys = { workspace = true, features = ["Win32_System_Com", "Win32_UI_Shell"] }
+
 [dev-dependencies]
 insta = { workspace = true }
 tempfile = { workspace = true }
