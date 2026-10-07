@@ -439,6 +439,46 @@ jobs:
       - name: Bundle size
         run: node scripts/bundle-budget.ts
 
+  # The Claude Desktop launcher and the two bundle manifests. The launcher
+  # is plain Node, so its tests run here on every change rather than only
+  # when a release packs it.
+  mcpb:
+    name: mcpb
+    timeout-minutes: 10
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && needs.changes.outputs.tested != 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The same pin and major as the fluid job.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '26'
+
+      - name: The launcher's tests
+        run: node --test packaging/mcpb/shim/
+
+      - name: Both manifests carry what they must
+        run: bash packaging/mcpb/tests/check-manifests.sh
+
+      # The packer is pinned like the release's. validate checks the schema
+      # and the icon only, never a binary, so the Desktop-only stage gets a
+      # placeholder file.
+      - name: Both bundles validate and the standard one packs
+        shell: bash
+        run: |
+          set -euo pipefail
+          packaging/mcpb/generate-manifest.sh standard 0.0.0 bundle/standard
+          npx --yes @anthropic-ai/mcpb@2.1.2 validate bundle/standard
+          npx --yes @anthropic-ai/mcpb@2.1.2 pack bundle/standard standard.mcpb
+          mkdir -p bundle/desktop-only/server
+          printf 'placeholder\n' > bundle/desktop-only/server/crystalline
+          packaging/mcpb/generate-manifest.sh desktop-only 0.0.0 bundle/desktop-only
+          npx --yes @anthropic-ai/mcpb@2.1.2 validate bundle/desktop-only
+
   # The browser smoke: the built bundle, a real daemon and a real browser. It
   # covers what jsdom cannot (see fluid/e2e/smoke.spec.ts) and is a job of its
   # own because it needs the Rust toolchain as well as Node.
@@ -796,6 +836,7 @@ jobs:
       - fluid
       - fluid-smoke
       - fluid-image
+      - mcpb
       - musl-spike
       - verify-action
       - workflow-lint

@@ -360,6 +360,7 @@ module.exports = {
   stopChild,
   forwardSignals,
   start,
+  extensionVersion,
   main,
 };
 

@@ -84,17 +84,87 @@ jobs:
       APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
       APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
 
+  # One file for both Mac arches: MCPB picks a binary by OS, never by arch,
+  # so the Desktop-only bundle carries a universal Mach-O. The slices come
+  # from build.yml, signed and notarized there. lipo keeps each slice's own
+  # signature, and notarization is recorded per slice, so the signed and
+  # notarized thin binaries make a signed fat one. On a dry run without the
+  # Apple secrets the slices are unsigned and there is nothing to verify.
+  macos-universal:
+    name: universal macOS binary
+    needs: build
+    runs-on: macos-latest
+    steps:
+      - name: Download macos-arm64 artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: crystalline-macos-arm64
+          path: downloads/arm64
+
+      - name: Download macos-intel artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: crystalline-macos-intel
+          path: downloads/intel
+
+      - name: Join the two slices
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar xzf downloads/arm64/*.tar.gz -C downloads/arm64
+          tar xzf downloads/intel/*.tar.gz -C downloads/intel
+          arm=$(find downloads/arm64 -type f -name crystalline | head -n1)
+          intel=$(find downloads/intel -type f -name crystalline | head -n1)
+          mkdir -p universal
+          lipo -create "$arm" "$intel" -output universal/crystalline
+          lipo universal/crystalline -verify_arch arm64 x86_64
+          # An unsigned branch build still carries the linker's ad-hoc
+          # signature on the arm64 slice, so only a Developer ID authority
+          # means the slices were really signed and notarized. The output is
+          # read into a variable first, as build.yml does: a grep -q that
+          # stops reading early could make codesign fail on a closed pipe,
+          # and under pipefail a signed build would then skip the check.
+          info="$(codesign -dvv "$arm" 2>&1 || true)"
+          if grep -q 'Authority=Developer ID' <<<"$info"; then
+            codesign --verify --strict --verbose=2 --arch arm64 universal/crystalline
+            codesign --verify --strict --verbose=2 --arch x86_64 universal/crystalline
+          else
+            echo "unsigned dry run: no signature to verify"
+          fi
+          universal/crystalline --version
+
+      - name: Upload the universal binary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: crystalline-macos-universal
+          path: universal/crystalline
+          if-no-files-found: error
+
   mcpb:
     name: package MCP bundles
-    needs: build
+    needs: [build, macos-universal]
     runs-on: ubuntu-latest
     # No tag guard, unlike publish/images/homebrew below: a workflow_dispatch
-    # dry run packages and validates all five bundles too (four per-arch
-    # plus the universal one), it just has nowhere to upload them.
+    # dry run packages and validates the two bundles too (the standard
+    # launcher extension and the Desktop-only Mac one), it just has nowhere
+    # to upload them.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      # Pinned to the major CI's fluid job uses. No package cache: this job
+      # makes release assets, and a cache a pull request could have written
+      # must never reach them.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '26'
+          package-manager-cache: false
+
+      - name: The launcher's tests and the manifest checks
+        run: |
+          node --test packaging/mcpb/shim/
+          bash packaging/mcpb/tests/check-manifests.sh
 
       - name: Resolve release version
         id: version
@@ -109,36 +179,15 @@ jobs:
             echo "version=$version" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Download macos-arm64 artifact
+      - name: Download the universal macOS binary
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: crystalline-macos-arm64
-          path: downloads/macos-arm64
+          name: crystalline-macos-universal
+          path: downloads/macos-universal
 
-      - name: Download macos-intel artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: crystalline-macos-intel
-          path: downloads/macos-intel
-
-      - name: Download windows-amd64 artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: crystalline-windows-amd64
-          path: downloads/windows-amd64
-
-      - name: Download windows-arm64 artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: crystalline-windows-arm64
-          path: downloads/windows-arm64
-
-      # One shell loop over the four per-arch platforms rather than a
-      # build-style matrix, so the four resulting .mcpb files land in a
-      # single directory and can be uploaded as one combined artifact below,
-      # plus one extra universal bundle staged from binaries the loop already
-      # extracted.
-      - name: Stage bundles, generate manifests and pack
+      # The packer is pinned like every other release tool; bump it
+      # deliberately. validate checks the manifest schema and the icon only.
+      - name: Stage, validate and pack the two bundles
         shell: bash
         env:
           RELEASE_VERSION: ${{ steps.version.outputs.version }}
@@ -146,40 +195,23 @@ jobs:
           set -euo pipefail
           version="$RELEASE_VERSION"
           mkdir -p mcpb-out
-          for platform in macos-arm64 macos-intel windows-amd64 windows-arm64; do
-            download_dir="downloads/$platform"
-            stage="bundle/$platform"
-            mkdir -p "$stage/server"
 
-            if [[ "$platform" == windows-* ]]; then
-              unzip -q "$download_dir"/*.zip -d "$download_dir"
-              bin=$(find "$download_dir" -type f -name 'crystalline.exe' | head -n1)
-              cp "$bin" "$stage/server/crystalline.exe"
-            else
-              tar xzf "$download_dir"/*.tar.gz -C "$download_dir"
-              bin=$(find "$download_dir" -type f -name 'crystalline' | head -n1)
-              cp "$bin" "$stage/server/crystalline"
-              chmod +x "$stage/server/crystalline"
-            fi
-
-            packaging/mcpb/generate-manifest.sh "$platform" "$version" "$stage"
-            # The packer is pinned like every other release tool; bump it deliberately.
-            npx --yes @anthropic-ai/mcpb@2.1.2 validate "$stage"
-            npx --yes @anthropic-ai/mcpb@2.1.2 pack "$stage" "mcpb-out/crystalline-v${version}-${platform}.mcpb"
-          done
-
-          # Universal bundle: macOS arm64 plus windows amd64 in one package,
-          # reusing the binaries the loop above already staged so nothing is
-          # re-extracted from the downloaded archives.
-          stage="bundle/universal"
-          mkdir -p "$stage/server"
-          cp bundle/macos-arm64/server/crystalline "$stage/server/crystalline"
-          chmod +x "$stage/server/crystalline"
-          cp bundle/windows-amd64/server/crystalline.exe "$stage/server/crystalline.exe"
-
-          packaging/mcpb/generate-manifest.sh universal "$version" "$stage"
+          # The standard extension: the Node launcher, no binary. macOS and
+          # Windows. The default download.
+          stage="bundle/standard"
+          packaging/mcpb/generate-manifest.sh standard "$version" "$stage"
           npx --yes @anthropic-ai/mcpb@2.1.2 validate "$stage"
           npx --yes @anthropic-ai/mcpb@2.1.2 pack "$stage" "mcpb-out/crystalline-v${version}.mcpb"
+
+          # The Claude Desktop only extension: macOS, the universal binary
+          # inside, for a Mac without Homebrew.
+          stage="bundle/desktop-only"
+          mkdir -p "$stage/server"
+          cp downloads/macos-universal/crystalline "$stage/server/crystalline"
+          chmod +x "$stage/server/crystalline"
+          packaging/mcpb/generate-manifest.sh desktop-only "$version" "$stage"
+          npx --yes @anthropic-ai/mcpb@2.1.2 validate "$stage"
+          npx --yes @anthropic-ai/mcpb@2.1.2 pack "$stage" "mcpb-out/crystalline-desktop-only-v${version}-macos.mcpb"
 
       - name: Upload mcpb artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -398,16 +430,17 @@ jobs:
           for f in \
             SHA256SUMS \
             "crystalline-fluid-${TAG}.cdx.json" \
-            "crystalline-${TAG}.mcpb"; do
+            "crystalline-${TAG}.mcpb" \
+            "crystalline-desktop-only-${TAG}-macos.mcpb"; do
             [ -f "release/$f" ] || { echo "::error::missing attestation subject release/$f"; missing=1; }
           done
           for p in macos-arm64 macos-intel linux-amd64 linux-arm64 windows-amd64 windows-arm64; do
             [ -f "release/crystalline-${TAG}-${p}.cdx.json" ] || { echo "::error::missing SBOM release/crystalline-${TAG}-${p}.cdx.json"; missing=1; }
           done
-          for f in macos-arm64.tar.gz macos-arm64.mcpb macos-intel.tar.gz macos-intel.mcpb \
+          for f in macos-arm64.tar.gz macos-intel.tar.gz \
             linux-amd64.tar.gz linux-arm64.tar.gz \
-            windows-amd64.zip windows-amd64.msi windows-amd64.mcpb \
-            windows-arm64.zip windows-arm64.msi windows-arm64.mcpb; do
+            windows-amd64.zip windows-amd64.msi \
+            windows-arm64.zip windows-arm64.msi; do
             [ -f "release/crystalline-${TAG}-${f}" ] || { echo "::error::missing attestation subject release/crystalline-${TAG}-${f}"; missing=1; }
           done
           for g in \
@@ -417,7 +450,7 @@ jobs:
             "release/crystalline-${TAG}-*.zip" \
             "release/crystalline-${TAG}-*.msi" \
             'release/crystalline_*.deb' \
-            "release/crystalline-${TAG}*.mcpb"; do
+            "release/crystalline-*${TAG}*.mcpb"; do
             compgen -G "$g" > /dev/null || { echo "::error::no attestation subject matches $g"; missing=1; }
           done
           exit "$missing"
@@ -433,16 +466,16 @@ jobs:
           subject-path: release/*
 
       # Each platform's SBOM, attested against the assets that carry that
-      # platform's binary. The universal .mcpb carries two binaries and gets
-      # both SBOMs.
+      # platform's binary. The Desktop-only bundle carries both macOS slices
+      # and gets both macOS SBOMs. The standard extension carries no binary
+      # and gets none.
       - name: Attest the macos-arm64 SBOM
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           sbom-path: release/crystalline-${{ github.ref_name }}-macos-arm64.cdx.json
           subject-path: |
             release/crystalline-${{ github.ref_name }}-macos-arm64.tar.gz
-            release/crystalline-${{ github.ref_name }}-macos-arm64.mcpb
-            release/crystalline-${{ github.ref_name }}.mcpb
+            release/crystalline-desktop-only-${{ github.ref_name }}-macos.mcpb
 
       - name: Attest the macos-intel SBOM
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
@@ -450,7 +483,7 @@ jobs:
           sbom-path: release/crystalline-${{ github.ref_name }}-macos-intel.cdx.json
           subject-path: |
             release/crystalline-${{ github.ref_name }}-macos-intel.tar.gz
-            release/crystalline-${{ github.ref_name }}-macos-intel.mcpb
+            release/crystalline-desktop-only-${{ github.ref_name }}-macos.mcpb
 
       - name: Attest the linux-amd64 SBOM
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
@@ -475,8 +508,6 @@ jobs:
           subject-path: |
             release/crystalline-${{ github.ref_name }}-windows-amd64.zip
             release/crystalline-${{ github.ref_name }}-windows-amd64.msi
-            release/crystalline-${{ github.ref_name }}-windows-amd64.mcpb
-            release/crystalline-${{ github.ref_name }}.mcpb
 
       - name: Attest the windows-arm64 SBOM
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
@@ -485,7 +516,6 @@ jobs:
           subject-path: |
             release/crystalline-${{ github.ref_name }}-windows-arm64.zip
             release/crystalline-${{ github.ref_name }}-windows-arm64.msi
-            release/crystalline-${{ github.ref_name }}-windows-arm64.mcpb
 
       # Fluid is embedded in every binary, so its SBOM is attested against
       # every asset that carries one. The archive globs name the tag, which
@@ -499,7 +529,7 @@ jobs:
             release/crystalline-${{ github.ref_name }}-*.zip
             release/crystalline-${{ github.ref_name }}-*.msi
             release/crystalline_*.deb
-            release/crystalline-${{ github.ref_name }}*.mcpb
+            release/crystalline-desktop-only-${{ github.ref_name }}-macos.mcpb
 
       - name: Create GitHub Release
         env:

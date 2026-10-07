@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Style lint: rejects em dashes and en dashes in tracked markdown and Rust
-# source, keeping prose and CLI output in the plain-hyphen house style.
+# Style lint: rejects em dashes and en dashes in tracked markdown, Rust,
+# JavaScript, shell and installer sources, keeping prose and CLI output in
+# the plain-hyphen house style.
 #
 # The Oxford comma was banned here until 2026-08-04 and is now allowed, so
 # that check is gone. Existing text was left as written rather than
@@ -16,6 +17,9 @@ fail=0
 # Tracked markdown, Rust and Fluid front-end sources, plus the deployment
 # files (Dockerfiles, compose and workflow YAML, nginx configuration and its
 # templates), which carry as much prose in comments as anything else here.
+# Also the JavaScript (the Claude Desktop launcher in packaging/mcpb/shim
+# and its fixtures, whose text a user reads), the shell scripts, the WiX
+# source of the MSI and the XML fixtures (the daemon task golden).
 #
 # Excluded: build output; vendored third-party files, which must stay
 # byte-identical to their upstream (see evals/skill-training/vendor/README.md);
@@ -24,6 +28,7 @@ fail=0
 # is generated too and is the one lockfile the patterns below can match.
 files=$(git ls-files -- '*.md' '*.rs' '*.ts' '*.tsx' '*.css' '*.html' \
     '*Dockerfile' '*.dockerignore' '*.yml' '*.yaml' '*.conf' '*.template' \
+    '*.js' '*.sh' '*.wxs' '*.xml' \
     | grep -v '/target/' \
     | grep -v '^target/' \
     | grep -v '/node_modules/' \
