@@ -1228,14 +1228,16 @@ async fn signing_in_through_the_browser_under_a_prefix_saves_the_base() {
 
 #[tokio::test]
 async fn a_pasted_token_under_a_prefix_adds_the_source() {
-    let server = RemoteServer::start(Options::TOKENS.under("/crystalline", Proxy::Strips)).await;
-    let token = server.token_for("keeper").await;
-    let dir = tempfile::tempdir().unwrap();
-    let connected = connect_with_token(&server.base(), None, &token, dir.path(), &[])
-        .await
-        .unwrap();
-    assert_eq!(connected.source.url, server.base());
-    assert_eq!(connected.source.account, "keeper");
+    for proxy in [Proxy::Strips, Proxy::PassesThrough] {
+        let server = RemoteServer::start(Options::TOKENS.under("/crystalline", proxy)).await;
+        let token = server.token_for("keeper").await;
+        let dir = tempfile::tempdir().unwrap();
+        let connected = connect_with_token(&server.base(), None, &token, dir.path(), &[])
+            .await
+            .unwrap();
+        assert_eq!(connected.source.url, server.base(), "{proxy:?}");
+        assert_eq!(connected.source.account, "keeper", "{proxy:?}");
+    }
 }
 
 #[tokio::test]
@@ -1263,6 +1265,13 @@ async fn two_paths_on_one_host_are_two_sources_and_the_second_keeps_the_first() 
         "the second connect never retires the first"
     );
     assert_ne!(first.source.key(), second.source.key());
+    let (folder_a, folder_b) = (
+        first.source.host_dir(dir.path()),
+        second.source.host_dir(dir.path()),
+    );
+    assert_ne!(folder_a, folder_b, "two host folders");
+    assert!(folder_a.ends_with(format!("{}~team-a", a.addr.to_string().replace(':', "_"))));
+    assert!(folder_b.ends_with(format!("{}~team-b", b.addr.to_string().replace(':', "_"))));
     assert_ne!(
         crystalline_remote::server_token::server_account(&first.source.key()),
         crystalline_remote::server_token::server_account(&second.source.key()),
