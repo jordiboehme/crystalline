@@ -815,13 +815,17 @@ pub(crate) async fn ask_holder_at(sock: &Path) -> Option<HolderFacts> {
         Probe::Answered(_) => {}
     }
     let record = read_lock_info();
-    if let Probe::Answered(status) = ctl_once(sock, "{\"v\":1,\"cmd\":\"status\"}\n").await
-        && status["ok"] == true
-        && let Some(facts) = facts_from_status(&status["data"], record.as_ref())
-    {
-        return Some(facts);
+    match ctl_once(sock, "{\"v\":1,\"cmd\":\"status\"}\n").await {
+        // The daemon left between the two asks: nothing listens any more.
+        Probe::Unreached => None,
+        Probe::Answered(status)
+            if status["ok"] == true
+                && let Some(facts) = facts_from_status(&status["data"], record.as_ref()) =>
+        {
+            Some(facts)
+        }
+        _ => facts_from_record(record),
     }
-    facts_from_record(record)
 }
 
 /// The facts a record gives about the daemon that answers on the pipe, when
@@ -2035,9 +2039,12 @@ pub(crate) async fn ensure_daemon_with(
     // displacement so this loop re-drives `spawn_daemon` instead of waiting
     // out the budget behind a daemon it just tore down again; bounded to 3
     // re-spawns so a pathological interleaving of respawning bridges cannot
-    // spawn-storm within the 15s budget.
+    // spawn-storm within the 15s budget. The budget is a deadline, not a
+    // count of turns: one attach asks the pipe first, and against a daemon
+    // that answers slowly that ask alone can take seconds.
     let mut respawns = 0u32;
-    for _ in 0..300 {
+    let deadline = Instant::now() + READINESS_BUDGET;
+    while Instant::now() < deadline {
         let (conn, displaced) = try_attach_reporting().await;
         if let Some(conn) = conn {
             return Ok(conn);
@@ -2068,6 +2075,9 @@ pub(crate) async fn ensure_daemon_with(
         "spawned a daemon but it did not become ready within 15s (see daemon.log in the state directory)"
     )
 }
+
+/// How long `ensure_daemon` waits for the daemon it spawned to answer.
+const READINESS_BUDGET: Duration = Duration::from_secs(15);
 
 /// Open the daemon stderr log for appending, starting the file over once it
 /// outgrows 1 MiB. The cap is checked at spawn time and the reset is
@@ -3884,6 +3894,52 @@ mod tests {
         assert_eq!(
             seen.lock().unwrap()[..2],
             ["holder".to_string(), "status".to_string()]
+        );
+        // Only `status` knows this working directory: the record has no
+        // `runs_in`, so this fails if the facts came from the record alone.
+        let facts = ask_holder()
+            .await
+            .expect("status answers for an old daemon");
+        assert_eq!(
+            facts.runs_in.and_then(|r| r.working_dir).as_deref(),
+            Some("/s"),
+            "taken from the status answer"
+        );
+        server.abort();
+        drop(home);
+    }
+
+    /// A daemon refuses `holder` and is gone before the `status` ask can
+    /// reach the pipe. Nothing listens any more, so there is no daemon, and
+    /// a record that names a live pid does not bring one back.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_daemon_gone_between_the_two_asks_is_no_daemon() {
+        let home = ScratchHome::new("pipe-gone");
+        let sock = config::service_sock_path().unwrap();
+        let listener = ListenerOptions::new()
+            .name(socket_name(&sock).unwrap())
+            .create_tokio()
+            .unwrap();
+        let record = serde_json::json!({
+            "pid": std::process::id(), "socket_path": sock.display().to_string(),
+            "version": crystalline_core::VERSION, "started_at": "2026-10-07T00:00:00Z"
+        });
+        std::fs::write(config::service_info_path().unwrap(), record.to_string()).unwrap();
+        let socket_file = sock.clone();
+        let server = tokio::spawn(async move {
+            let Ok(stream) = listener.accept().await else {
+                return;
+            };
+            // Gone before it answers: the listener and its socket file.
+            drop(listener);
+            let _ = std::fs::remove_file(&socket_file);
+            let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            serve_one(stream, log, None, serde_json::json!({})).await;
+        });
+        assert!(
+            ask_holder().await.is_none(),
+            "nothing listens when status is asked, so there is no daemon"
         );
         server.abort();
         drop(home);

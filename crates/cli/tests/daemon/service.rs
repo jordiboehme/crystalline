@@ -5587,6 +5587,34 @@ fn an_autostarted_daemon_works_in_the_state_directory() {
     wait_lock_released(&env);
 }
 
+/// A record that names a dead pid while the daemon still answers on its
+/// pipe: doctor asks the pipe, so it still says where that daemon runs.
+#[test]
+fn doctor_asks_the_pipe_where_the_daemon_runs_whatever_the_record_says() {
+    let env = Env::new("doc-pipe");
+    env.setup_domain("eng");
+    let client = Mcp::spawn(&env);
+    env.wait_ready();
+
+    let mut gone = Command::new("true").spawn().unwrap();
+    let dead = gone.id();
+    gone.wait().unwrap();
+    let mut record = env.lock_record().unwrap();
+    record["pid"] = json!(dead);
+    std::fs::write(env.info_path(), record.to_string()).unwrap();
+
+    let (_, doctor) = env.run(&["doctor"]);
+    assert!(
+        doctor.contains("daemon working directory: "),
+        "the daemon on the pipe is described, not the record: {doctor}"
+    );
+
+    drop(client);
+    let (ok, out) = env.run(&["ctl", "shutdown"]);
+    assert!(ok, "ctl shutdown: {out}");
+    wait_lock_released(&env);
+}
+
 /// The other half of the move: a relative `--db` given to the client still
 /// names the file in the client's directory, not one in the daemon's. Green
 /// before the working directory moved too (the daemon then shared the

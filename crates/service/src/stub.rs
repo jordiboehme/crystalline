@@ -98,10 +98,13 @@ enum StubCase {
 }
 
 impl StubStatus {
-    /// Gather the degraded status: the daemon on the pipe, when one answers;
-    /// otherwise a record, but only while its lock is held and its pid is
-    /// alive, which is a daemon that holds the index and does not answer.
-    /// `reason` is the startup error chain that forced the degraded server.
+    /// Gather the degraded status from what [`crate::instance::ask_holder`]
+    /// says about the pipe: the daemon's own facts when it answers, or, when
+    /// something listens but gives no facts, the live record that names it.
+    /// When nothing listens, a record still counts while its lock is held and
+    /// its pid is alive: a daemon that holds the index and does not answer,
+    /// or a one-shot command, which 0.23.1 named as a conflict too. `reason`
+    /// is the startup error chain that forced the degraded server.
     pub async fn gather(reason: String) -> StubStatus {
         let facts = crate::instance::ask_holder().await;
         let record = crate::instance::read_lock_info();
@@ -116,8 +119,8 @@ impl StubStatus {
     }
 
     /// [`StubStatus::gather`] with everything it reads handed in. A record
-    /// that nobody holds the lock for, or that names a one-shot command or
-    /// a dead pid, explains nothing and is dropped.
+    /// that nobody holds the lock for, or that names a dead pid, explains
+    /// nothing and is dropped.
     pub(crate) fn gather_from(
         reason: String,
         facts: Option<crate::instance::HolderFacts>,
@@ -128,9 +131,7 @@ impl StubStatus {
         let live = match facts {
             Some(facts) => Some((facts.version, facts.pid)),
             None => record
-                .filter(|r| {
-                    lock_held && r.standalone.is_none() && crate::instance::process_alive(r.pid)
-                })
+                .filter(|r| lock_held && crate::instance::process_alive(r.pid))
                 .map(|r| (r.version, r.pid)),
         };
         StubStatus {
@@ -428,6 +429,24 @@ mod tests {
         assert_eq!(
             stale.daemon_version, None,
             "a record nobody holds decides nothing"
+        );
+    }
+
+    /// A one-shot command that holds the index and serves no pipe is the
+    /// plain conflict with its pid, as in 0.23.1, not the generic copy.
+    #[test]
+    fn a_live_one_shot_holder_keeps_the_conflict_copy() {
+        let mut one_shot = record(crystalline_core::VERSION);
+        one_shot.standalone = Some("crystalline domain rename".to_string());
+        let status = StubStatus::gather_from("r".into(), None, Some(one_shot), true, None);
+        assert_eq!(status.daemon_pid, Some(std::process::id()));
+        let instructions = status.instructions();
+        assert!(
+            instructions.contains(&format!(
+                "another Crystalline instance (pid {}) owns this machine's knowledge index",
+                std::process::id()
+            )),
+            "{instructions}"
         );
     }
 

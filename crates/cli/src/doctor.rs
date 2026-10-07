@@ -2549,17 +2549,15 @@ async fn check_service(fix: bool) -> Result<ServiceDoctor> {
         }
         _ => None,
     };
-    // Asked over the pipe when the daemon answers, since a record can be
-    // stale or private; read from the record otherwise, because a wedged
-    // daemon still has one and its working directory, job and package
-    // identity do not change while it runs.
-    let runs_in = if alive {
-        match instance::ask_holder().await {
-            Some(facts) => facts.runs_in,
-            None => info.as_ref().and_then(|i| i.runs_in.clone()),
-        }
-    } else {
-        None
+    // Asked over the pipe whatever the record says, since a record can be
+    // stale or private: a daemon that answers there is the one to describe.
+    // When nothing listens, a live record still describes a daemon that has
+    // lost its pipe, and its working directory, job and package identity do
+    // not change while it runs.
+    let runs_in = match instance::ask_holder().await {
+        Some(facts) => facts.runs_in,
+        None if alive => info.as_ref().and_then(|i| i.runs_in.clone()),
+        None => None,
     };
 
     let mut s = ServiceDoctor {
