@@ -1227,6 +1227,49 @@ async fn signing_in_through_the_browser_under_a_prefix_saves_the_base() {
     }
 }
 
+/// Item 1 of the 0.23.1 follow-ups: a proxy that forwards only the prefix,
+/// so the two RFC addresses at the host root answer 404. The client falls
+/// back to the copies inside the prefix and the browser sign-in completes.
+#[tokio::test]
+async fn signing_in_works_when_the_proxy_hides_the_host_root() {
+    let server = Arc::new(
+        RemoteServer::start(Options::OAUTH.under("/crystalline", Proxy::StripsAndHidesTheHostRoot))
+            .await,
+    );
+    let root = server
+        .http
+        .get(format!(
+            "{}/.well-known/oauth-protected-resource/crystalline",
+            server.origin()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(root.status(), 404, "the proxy really hides the host root");
+    let dir = tempfile::tempdir().unwrap();
+    let connected = connect_with_browser(
+        &server.base(),
+        None,
+        dir.path(),
+        &[],
+        fake_browser(server.clone(), "keeper", "allow"),
+        no_paste,
+    )
+    .await
+    .unwrap();
+    assert_eq!(connected.source.url, server.base());
+    assert_eq!(
+        connected.source.token_endpoint.as_deref(),
+        Some(format!("{}/api/v1/oauth/token", server.base()).as_str())
+    );
+    let data = Connection::open(connected.source.clone(), dir.path())
+        .unwrap()
+        .ctl_data(json!({ "v": 1, "cmd": "status" }))
+        .await
+        .unwrap();
+    assert_eq!(data["account"], "keeper");
+}
+
 #[tokio::test]
 async fn a_pasted_token_under_a_prefix_adds_the_source() {
     for proxy in [Proxy::Strips, Proxy::PassesThrough] {

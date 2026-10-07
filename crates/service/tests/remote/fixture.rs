@@ -19,6 +19,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
+use axum::response::IntoResponse;
 use crystalline_core::config::{
     AuthConfig, DomainEntry, GlobalConfig, OriginConfig, ResponseFormat, ReviewMode, ServiceConfig,
 };
@@ -56,6 +57,10 @@ pub fn engram(title: &str, permalink: &str, line: &str) -> String {
 pub enum Proxy {
     Strips,
     PassesThrough,
+    /// Strips the prefix and forwards nothing outside it: the two host root
+    /// OAuth documents answer 404 at the proxy, the deployment that forgot
+    /// the two root lines.
+    StripsAndHidesTheHostRoot,
 }
 
 /// Which doors the instance has, and the path it is served under.
@@ -114,12 +119,15 @@ impl Options {
 struct StripsPrefix {
     prefix: &'static str,
     inner: axum::Router,
+    hide_root: bool,
 }
 
 impl tower_service::Service<axum::extract::Request> for StripsPrefix {
     type Response = axum::response::Response;
     type Error = std::convert::Infallible;
-    type Future = <axum::Router as tower_service::Service<axum::extract::Request>>::Future;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
 
     fn poll_ready(
         &mut self,
@@ -142,8 +150,10 @@ impl tower_service::Service<axum::extract::Request> for StripsPrefix {
                 None => stripped,
             };
             *request.uri_mut() = target.parse().unwrap();
+        } else if self.hide_root {
+            return Box::pin(async { Ok(axum::http::StatusCode::NOT_FOUND.into_response()) });
         }
-        self.inner.call(request)
+        Box::pin(self.inner.call(request))
     }
 }
 
@@ -231,10 +241,12 @@ impl RemoteServer {
         let addr = listener.local_addr().unwrap();
         let (server, router) = RemoteServer::assemble(options, extra, addr).await;
         let router = match (options.prefix, options.proxy) {
-            (Some(prefix), Proxy::Strips) => axum::Router::new().fallback_service(StripsPrefix {
-                prefix,
-                inner: router,
-            }),
+            (Some(prefix), Proxy::Strips | Proxy::StripsAndHidesTheHostRoot) => axum::Router::new()
+                .fallback_service(StripsPrefix {
+                    prefix,
+                    inner: router,
+                    hide_root: options.proxy == Proxy::StripsAndHidesTheHostRoot,
+                }),
             _ => router,
         };
         *server.serving.lock().await = Some(serve(router, listener));

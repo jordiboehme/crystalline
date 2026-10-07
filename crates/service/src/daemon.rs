@@ -1958,6 +1958,12 @@ pub fn http_router_with_assets<E: rust_embed::RustEmbed + 'static>(
     // are startup-effective, so a running daemon serves the tier it started in.
     let mcp_auth = config.auth_mcp().then(|| auth.clone());
     let base_path = crate::settings::base_path(&config);
+    if ui
+        && let Some(index) = E::get("index.html")
+        && let Some(warning) = crate::ui::untagged_bundle_warning(&index.data, &base_path)
+    {
+        tracing::warn!("{warning}");
+    }
     let (router, service) = http_base(
         engine,
         http_sessions,
@@ -3376,6 +3382,42 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Item 4 of the 0.23.1 follow-ups. MCP is the router's fallback, so a
+    /// test that only checks that `/crystalline` reaches MCP passes with or
+    /// without the strip. A fallback that answers the path it saw tells the
+    /// two apart: the bare prefix arrives as `/`, a look-alike unchanged.
+    #[tokio::test]
+    async fn the_bare_prefix_reaches_the_fallback_as_the_root() {
+        use tower_service::Service;
+        let router = axum::Router::new()
+            .route("/health", axum::routing::get(|| async { "health" }))
+            .fallback(|uri: axum::http::Uri| async move { uri.path().to_string() });
+        let wrapped = under_base_path(
+            router,
+            crystalline_core::base::BasePath::parse("/crystalline").unwrap(),
+        );
+        for (sent, seen) in [
+            ("/crystalline", "/"),
+            ("/crystalline/", "/"),
+            ("/crystalline/health", "health"),
+            ("/crystallinex", "/crystallinex"),
+        ] {
+            let response = wrapped
+                .clone()
+                .call(
+                    axum::http::Request::get(sent)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            assert_eq!(std::str::from_utf8(&body).unwrap(), seen, "{sent}");
+        }
+    }
 
     /// The sign-in settle never spends what the watchdog keeps for the end
     /// of a departure: at most half the deadline, and always the margin

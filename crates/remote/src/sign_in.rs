@@ -286,6 +286,12 @@ const METADATA_ENDPOINTS: [&str; 4] = [
 /// the address a request goes to, and that address is what gets stored.
 fn under_base(url: &str, base: &PublicBase) -> Option<String> {
     let parsed = reqwest::Url::parse(url).ok()?;
+    // A name or a password in front of the host is never part of an
+    // endpoint this server would name, and a client that stored one would
+    // send it on every request.
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return None;
+    }
     let path = parsed.path();
     let base_path = base.path().as_str();
     let inside = path == base_path
@@ -1692,6 +1698,20 @@ fn sha256(text: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_endpoint_with_userinfo_under_a_prefix_is_refused() {
+        let base =
+            crystalline_core::base::PublicBase::parse("https://kb.example/crystalline").unwrap();
+        assert!(under_base("https://kb.example/crystalline/api/v1/oauth/token", &base).is_some());
+        for steering in [
+            "https://user@kb.example/crystalline/api/v1/oauth/token",
+            "https://user:pw@kb.example/crystalline/api/v1/oauth/token",
+            "https://:pw@kb.example/crystalline/api/v1/oauth/token",
+        ] {
+            assert_eq!(under_base(steering, &base), None, "{steering}");
+        }
+    }
 
     #[test]
     fn a_choice_keeps_replaces_or_clears_the_saved_list() {

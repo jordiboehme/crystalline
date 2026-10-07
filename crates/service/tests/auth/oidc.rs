@@ -1046,6 +1046,17 @@ async fn a_full_code_flow_signs_in_and_mints_a_session() {
         cookies.iter().any(|(name, _)| name == "fluid_oidc_state"),
         "the state cookie binds the sign-in to this browser: {cookies:?}"
     );
+    let state = start
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .map(|v| v.to_str().unwrap().to_string())
+        .find(|c| c.starts_with("fluid_oidc_state="))
+        .expect("the state cookie is set");
+    assert!(
+        state.split("; ").any(|part| part == "Path=/"),
+        "a root server scopes the state cookie to exactly Path=/: {state}"
+    );
 
     let bounced = ctx.client.get(&authorize).send().await.unwrap();
     assert_eq!(bounced.status(), 302);

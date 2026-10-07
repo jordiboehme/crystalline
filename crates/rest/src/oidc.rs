@@ -201,6 +201,15 @@ pub struct OidcSettings {
     base_path: BasePath,
 }
 
+/// The startup warning for a callback and `service.public_url` on two
+/// different paths, the one sentence a person reads in the daemon's log, or
+/// `None` when the pair agrees. Kept apart from `resolve` so the sentence is
+/// tested and not only the outcome.
+pub(crate) fn pair_warning(config: &GlobalConfig) -> Option<String> {
+    crate::settings::oidc_pair_problem(config)
+        .map(|problem| format!("single sign-on is off: {problem}"))
+}
+
 impl OidcSettings {
     /// Read the `auth.oidc` block, or `None` when this instance has no
     /// provider configured.
@@ -312,8 +321,8 @@ impl OidcSettings {
         // environment variable or a hand-edited file reaches the config with
         // nobody watching, and a callback under the wrong path is a sign-in
         // that fails at the provider. The sentence names both values.
-        if let Some(problem) = crate::settings::oidc_pair_problem(config) {
-            tracing::warn!("single sign-on is off: {problem}");
+        if let Some(warning) = pair_warning(config) {
+            tracing::warn!("{warning}");
             return None;
         }
         Some(OidcSettings {
@@ -2465,6 +2474,40 @@ mod tests {
                 "{bad} must not resolve into a working provider"
             );
         }
+    }
+
+    #[test]
+    fn the_pair_warning_names_both_values_and_says_sso_is_off() {
+        let mut oidc = complete();
+        oidc.redirect_uri =
+            Some("https://kb.example.test/other/api/v1/auth/oidc/callback".to_string());
+        let mut config = config_with(oidc);
+        config.service = Some(ServiceConfig {
+            public_url: Some("https://kb.example.test/crystalline".to_string()),
+            ..ServiceConfig::default()
+        });
+        let warning = pair_warning(&config).expect("a mismatch warns");
+        assert!(warning.starts_with("single sign-on is off: "), "{warning}");
+        assert!(
+            warning.contains("https://kb.example.test/other/api/v1/auth/oidc/callback"),
+            "{warning}"
+        );
+        assert!(
+            warning.contains("https://kb.example.test/crystalline"),
+            "{warning}"
+        );
+        assert!(OidcSettings::resolve(&config).is_none());
+        let mut matching = config.clone();
+        matching
+            .auth
+            .as_mut()
+            .unwrap()
+            .oidc
+            .as_mut()
+            .unwrap()
+            .redirect_uri =
+            Some("https://kb.example.test/crystalline/api/v1/auth/oidc/callback".to_string());
+        assert_eq!(pair_warning(&matching), None);
     }
 
     /// The callback and `service.public_url` have to name the same path. An
