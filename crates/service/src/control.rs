@@ -4,7 +4,7 @@
 //! one line `{ "v": 1, "ok": true, "data": ... }` or
 //! `{ "v": 1, "ok": false, "error": ... }`. Commands: sync, status, reindex,
 //! file_stamps, collect_orphaned_domains, name_report, fix_local_spellings,
-//! sessions, tool, configure, domain_rename, origin_add,
+//! sessions, holder, tool, configure, domain_rename, origin_add,
 //! origin_update, origin_status,
 //! origin_share, origin_withdraw, origin_changes, origin_discard, origin_resolve,
 //! provision, forget_domain,
@@ -113,6 +113,31 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                 }
                 Err(e) => (envelope_err(e.to_string()), false),
             }
+        }
+        // Who this daemon is, from memory: the record it published plus its
+        // state folder. A client asks this before it attaches, instead of
+        // trusting a `service.json` that may be stale or private, so it must
+        // never touch the store (`status` does).
+        "holder" => {
+            let mut data = match crate::instance::published_record() {
+                Some(record) => serde_json::to_value(record).unwrap_or_else(|_| json!({})),
+                None => json!({
+                    "pid": shared.pid,
+                    "version": crystalline_core::VERSION,
+                    "mcp_line_options": true,
+                }),
+            };
+            // A record published without a serve intent (the `hold-lock`
+            // test command) carries no `runs_in`; read it now instead.
+            if data.get("runs_in").is_none_or(Value::is_null) {
+                data["runs_in"] = json!(crate::runs_in::RunsIn::here());
+            }
+            data["state_dir"] = json!(
+                crystalline_core::config::state_dir()
+                    .ok()
+                    .map(|dir| dir.display().to_string())
+            );
+            (envelope_ok(data), false)
         }
         "sessions" => (
             envelope_ok(json!({
@@ -755,7 +780,7 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
         }
         other => (
             envelope_err(format!(
-                "unknown ctl command '{other}'; expected status, sessions, tool, sync, reindex, \
+                "unknown ctl command '{other}'; expected status, sessions, holder, tool, sync, reindex, \
                  routing_bullets, scaffold_manifest, domain_import, domain_export, \
                  domain_remove, domain_review, domain_rename, retag, collect_orphaned_domains, \
                  name_report, fix_local_spellings, configure, origin_add, origin_update, \
@@ -1020,6 +1045,38 @@ async fn refresh_within(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `holder` answers from memory: who this daemon is, while something
+    /// else holds the store for the whole call.
+    #[tokio::test]
+    async fn holder_answers_who_this_daemon_is_without_the_store() {
+        let store = crystalline_index::TursoStore::open_in_memory()
+            .await
+            .unwrap();
+        let engine = Arc::new(Engine::new(
+            Arc::new(tokio::sync::Mutex::new(store)),
+            crystalline_core::config::GlobalConfig::default(),
+            None,
+            None,
+        ));
+        let shared = Arc::new(Shared::for_test(engine.clone()));
+        // The store is held for the whole call: `holder` must not need it.
+        let store = engine.store();
+        let _held = store.lock().await;
+        let (reply, shutdown) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            handle(&json!({ "v": 1, "cmd": "holder" }), &shared),
+        )
+        .await
+        .expect("holder never waits for the store");
+        assert!(!shutdown);
+        assert_eq!(reply["ok"], true, "{reply}");
+        assert_eq!(reply["data"]["pid"], std::process::id());
+        assert_eq!(reply["data"]["version"], crystalline_core::VERSION);
+        assert_eq!(reply["data"]["mcp_line_options"], true);
+        assert!(reply["data"].get("runs_in").is_some());
+        assert!(reply["data"].get("state_dir").is_some());
+    }
 
     /// The CLI's `domain add eng` beside a running daemon writes the config
     /// file from its own process and then asks the daemon to `sync` `eng`.

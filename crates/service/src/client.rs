@@ -288,7 +288,7 @@ pub async fn run_mcp(
             tracing::error!(
                 "crystalline mcp cannot start ({e:#}); serving a degraded status server"
             );
-            let status = crate::stub::StubStatus::gather(format!("{e:#}"));
+            let status = crate::stub::StubStatus::gather(format!("{e:#}")).await;
             match serve_degraded_stub(status, primed).await {
                 Ok(()) => Ok(()),
                 Err(stub_err) => {

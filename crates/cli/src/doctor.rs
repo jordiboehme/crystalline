@@ -2549,11 +2549,15 @@ async fn check_service(fix: bool) -> Result<ServiceDoctor> {
         }
         _ => None,
     };
-    // Read from the record, not asked over the socket: a daemon's working
-    // directory, job and package identity do not change while it runs, and a
-    // wedged daemon still has a record to read.
+    // Asked over the pipe when the daemon answers, since a record can be
+    // stale or private; read from the record otherwise, because a wedged
+    // daemon still has one and its working directory, job and package
+    // identity do not change while it runs.
     let runs_in = if alive {
-        info.as_ref().and_then(|i| i.runs_in.clone())
+        match instance::ask_holder().await {
+            Some(facts) => facts.runs_in,
+            None => info.as_ref().and_then(|i| i.runs_in.clone()),
+        }
     } else {
         None
     };

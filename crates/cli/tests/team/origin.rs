@@ -1205,48 +1205,7 @@ mod chain {
         /// Bind the socket, write the owner record and answer one command with
         /// `envelope` exactly as given.
         fn serving(tag: &str, envelope: Value) -> Daemon {
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let dir = PathBuf::from("/tmp").join(format!("cq-chain-{tag}-{nanos}"));
-            let state = dir.join("state/crystalline");
-            std::fs::create_dir_all(&state).unwrap();
-            std::fs::create_dir_all(dir.join("config")).unwrap();
-            std::fs::create_dir_all(dir.join("cache")).unwrap();
-
-            let sock = state.join("service.sock");
-            let listener = UnixListener::bind(&sock).unwrap();
-            let record = json!({
-                "pid": std::process::id(),
-                "socket_path": sock.display().to_string(),
-                // This binary's own version: an older one would be displaced
-                // rather than attached to.
-                "version": env!("CARGO_PKG_VERSION"),
-                "started_at": "2026-08-27T00:00:00Z",
-            });
-            std::fs::write(state.join("service.json"), record.to_string()).unwrap();
-
-            let (tx, requests) = channel();
-            std::thread::spawn(move || {
-                let Ok((stream, _)) = listener.accept() else {
-                    return;
-                };
-                let mut reader = BufReader::new(stream.try_clone().unwrap());
-                // The mode line ("ctl") comes first, then the command.
-                let mut mode = String::new();
-                let mut line = String::new();
-                if reader.read_line(&mut mode).is_err() || reader.read_line(&mut line).is_err() {
-                    return;
-                }
-                if let Ok(request) = serde_json::from_str::<Value>(line.trim()) {
-                    let _ = tx.send(request);
-                }
-                let mut write = stream;
-                let _ = writeln!(write, "{envelope}");
-                let _ = write.flush();
-            });
-            Daemon { dir, requests }
+            Daemon::serving_sequence(tag, vec![envelope])
         }
 
         /// Bind the socket, write the owner record and answer each of
@@ -1256,6 +1215,10 @@ mod chain {
         /// (`origin_discard`), where each call is its own `try_attach`.
         /// Requests are recorded in the same order the envelopes answer them,
         /// so `request()` called once per envelope reads them back in order.
+        ///
+        /// The `holder` probe a client sends before it attaches is answered
+        /// with this process as the daemon, at this binary's version, on its
+        /// own connection; it takes no envelope and is not recorded.
         fn serving_sequence(tag: &str, envelopes: Vec<Value>) -> Daemon {
             let nanos = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -1277,9 +1240,15 @@ mod chain {
             });
             std::fs::write(state.join("service.json"), record.to_string()).unwrap();
 
+            let holder = json!({
+                "v": 1,
+                "ok": true,
+                "data": { "pid": std::process::id(), "version": env!("CARGO_PKG_VERSION") },
+            });
             let (tx, requests) = channel();
             std::thread::spawn(move || {
-                for envelope in envelopes {
+                let mut envelopes = envelopes.into_iter().peekable();
+                while envelopes.peek().is_some() {
                     let Ok((stream, _)) = listener.accept() else {
                         return;
                     };
@@ -1290,10 +1259,17 @@ mod chain {
                     {
                         return;
                     }
-                    if let Ok(request) = serde_json::from_str::<Value>(line.trim()) {
+                    let request = serde_json::from_str::<Value>(line.trim()).ok();
+                    let mut write = stream;
+                    if request.as_ref().is_some_and(|r| r["cmd"] == "holder") {
+                        let _ = writeln!(write, "{holder}");
+                        let _ = write.flush();
+                        continue;
+                    }
+                    if let Some(request) = request {
                         let _ = tx.send(request);
                     }
-                    let mut write = stream;
+                    let envelope = envelopes.next().unwrap();
                     let _ = writeln!(write, "{envelope}");
                     let _ = write.flush();
                 }

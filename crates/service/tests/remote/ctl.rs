@@ -83,6 +83,7 @@ async fn every_command_off_the_allow_list_is_refused_remotely() {
         "reindex",
         "sync",
         "sessions",
+        "holder",
         "file_stamps",
         "collect_orphaned_domains",
         "name_report",

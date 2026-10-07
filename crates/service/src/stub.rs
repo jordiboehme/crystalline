@@ -98,19 +98,47 @@ enum StubCase {
 }
 
 impl StubStatus {
-    /// Gather the degraded status from the environment: the owning daemon
-    /// record (kept only when its pid is still alive, so a dead pid never
-    /// masquerades as a conflict) and the install channel. `reason` is the
-    /// startup error chain that forced the degraded server.
-    pub fn gather(reason: String) -> StubStatus {
-        let live = crate::instance::read_lock_info()
-            .filter(|info| crate::instance::process_alive(info.pid));
+    /// Gather the degraded status: the daemon on the pipe, when one answers;
+    /// otherwise a record, but only while its lock is held and its pid is
+    /// alive, which is a daemon that holds the index and does not answer.
+    /// `reason` is the startup error chain that forced the degraded server.
+    pub async fn gather(reason: String) -> StubStatus {
+        let facts = crate::instance::ask_holder().await;
+        let record = crate::instance::read_lock_info();
+        let lock_held = !crate::instance::service_lock_is_free();
+        StubStatus::gather_from(
+            reason,
+            facts,
+            record,
+            lock_held,
+            std::env::var(CHANNEL_ENV).ok(),
+        )
+    }
+
+    /// [`StubStatus::gather`] with everything it reads handed in. A record
+    /// that nobody holds the lock for, or that names a one-shot command or
+    /// a dead pid, explains nothing and is dropped.
+    pub(crate) fn gather_from(
+        reason: String,
+        facts: Option<crate::instance::HolderFacts>,
+        record: Option<crate::instance::LockInfo>,
+        lock_held: bool,
+        channel: Option<String>,
+    ) -> StubStatus {
+        let live = match facts {
+            Some(facts) => Some((facts.version, facts.pid)),
+            None => record
+                .filter(|r| {
+                    lock_held && r.standalone.is_none() && crate::instance::process_alive(r.pid)
+                })
+                .map(|r| (r.version, r.pid)),
+        };
         StubStatus {
             reason,
             binary_version: crystalline_core::VERSION.to_string(),
-            daemon_version: live.as_ref().map(|info| info.version.clone()),
-            daemon_pid: live.as_ref().map(|info| info.pid),
-            channel: std::env::var(CHANNEL_ENV).ok(),
+            daemon_version: live.as_ref().map(|(version, _)| version.clone()),
+            daemon_pid: live.map(|(_, pid)| pid),
+            channel,
         }
     }
 
@@ -359,6 +387,49 @@ impl ServerHandler for DegradedServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn facts(version: &str, pid: u32) -> crate::instance::HolderFacts {
+        crate::instance::HolderFacts {
+            pid,
+            version: version.to_string(),
+            mcp_line_options: true,
+            runs_in: None,
+            start: None,
+            state_dir: None,
+        }
+    }
+
+    fn record(version: &str) -> crate::instance::LockInfo {
+        serde_json::from_value(serde_json::json!({
+            "pid": std::process::id(), "socket_path": "/nowhere",
+            "version": version, "started_at": ""
+        }))
+        .unwrap()
+    }
+
+    /// The daemon on the pipe decides; without one, a record counts only
+    /// while somebody holds its lock.
+    #[test]
+    fn the_pipe_decides_and_a_record_counts_only_while_its_lock_is_held() {
+        let piped = StubStatus::gather_from(
+            "r".into(),
+            Some(facts("0.9.0", 9)),
+            Some(record("0.1.0")),
+            false,
+            None,
+        );
+        assert_eq!(
+            (piped.daemon_version.as_deref(), piped.daemon_pid),
+            (Some("0.9.0"), Some(9))
+        );
+        let held = StubStatus::gather_from("r".into(), None, Some(record("0.9.0")), true, None);
+        assert_eq!(held.daemon_version.as_deref(), Some("0.9.0"));
+        let stale = StubStatus::gather_from("r".into(), None, Some(record("0.9.0")), false, None);
+        assert_eq!(
+            stale.daemon_version, None,
+            "a record nobody holds decides nothing"
+        );
+    }
 
     /// Only the exact marker the mcpb manifest sets names the extension: an
     /// unset, empty or differently spelled channel is some other install.
