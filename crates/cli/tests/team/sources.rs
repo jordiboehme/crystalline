@@ -133,6 +133,27 @@ fn connecting_a_second_server_announces_the_collision_name_and_keeps_the_first()
     );
 }
 
+/// A path the rules refuse is named with its reason, which lists the
+/// characters a path may use; a word that is no address is never repeated.
+#[test]
+fn a_refused_path_says_which_characters_a_path_may_use() {
+    let home = tempfile::tempdir().unwrap();
+    let said = |args: &[&str]| {
+        let out = bin(home.path()).args(args).output().unwrap();
+        assert!(!out.status.success(), "{args:?}");
+        String::from_utf8_lossy(&out.stderr).to_string()
+    };
+    let path = said(&["connect", "https://kb.example/Crystalline"]);
+    assert!(path.contains("that is not a server address"), "{path}");
+    assert!(
+        path.contains("may use only lower-case letters, digits, '.', '_' and '-'"),
+        "{path}"
+    );
+    let word = said(&["connect", "not-an-address"]);
+    assert!(word.contains("that is not a server address"), "{word}");
+    assert!(!word.contains("not-an-address"), "{word}");
+}
+
 /// Ruling F19: a token anywhere on the command line is refused in the same
 /// sentence, and its text is never repeated on either stream.
 #[test]

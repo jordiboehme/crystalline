@@ -229,22 +229,28 @@ fn document_addresses(base: &str, document: &str) -> Vec<String> {
     }
 }
 
-/// The first of `urls` that is not a 404, or the last 404.
-async fn first_found(
+/// The answer to use from `urls`, asked in order: the first that `usable`
+/// accepts, otherwise whatever the last one answers, refusal or failure
+/// included. So an address before the last that answers no usable document
+/// (any status that is not a success, a body that is not the document, a
+/// document for another server, or no answer at all) only moves on to the
+/// next, and every check on the answer used still applies in full.
+async fn first_usable(
     http: &reqwest::Client,
     urls: &[String],
     origin: &str,
     budget: &Budget,
+    usable: impl Fn(&Answer) -> bool,
 ) -> Result<Answer, SignInError> {
-    let mut last = None;
-    for url in urls {
-        let answer = send(http.get(url.as_str()), origin, budget).await?;
-        if answer.status != 404 {
+    let (last, before) = urls.split_last().expect("at least one address");
+    for url in before {
+        if let Ok(answer) = send(http.get(url.as_str()), origin, budget).await
+            && usable(&answer)
+        {
             return Ok(answer);
         }
-        last = Some(answer);
     }
-    Ok(last.expect("at least one address"))
+    send(http.get(last.as_str()), origin, budget).await
 }
 
 /// Whether `url` may carry a sign-in: https anywhere, plain http only to
@@ -459,11 +465,20 @@ async fn discover_by(
         origin: origin.to_string(),
         oauth: None,
     };
-    let resource = first_found(
+    // A protected-resource document is usable when it names this base as
+    // its resource and names an authorization server.
+    let resource = first_usable(
         http,
         &document_addresses(origin, PROTECTED_RESOURCE_PATH),
         origin,
         budget,
+        |answer| {
+            answer.ok()
+                && answer.json()["authorization_servers"][0].is_string()
+                && answer.json()["resource"]
+                    .as_str()
+                    .is_some_and(|r| r.trim_end_matches('/') == origin)
+        },
     )
     .await?;
     // Only "there is no such document" means no browser sign-in; any other
@@ -493,11 +508,19 @@ async fn discover_by(
     if !is_secure_endpoint(&issuer) {
         return Err(insecure());
     }
-    let meta = first_found(
+    // Metadata is usable when it names the issuer it was fetched for.
+    let meta = first_usable(
         http,
         &document_addresses(&issuer, AUTHORIZATION_SERVER_PATH),
         origin,
         budget,
+        |answer| {
+            answer.ok()
+                && answer.json()["issuer"]
+                    .as_str()
+                    .map(|i| i.trim_end_matches('/'))
+                    == Some(issuer.as_str())
+        },
     )
     .await?;
     // An authorization server without metadata offers nothing a browser
@@ -1523,6 +1546,137 @@ mod tests {
             .unwrap();
         assert_eq!(oauth.resource, base);
         assert_eq!(oauth.issuer, base);
+    }
+
+    /// How the inserted RFC addresses answer in [`inserted_answers`].
+    #[derive(Clone, Copy, Debug)]
+    enum Inserted {
+        /// A site at the host root that answers every path with a page.
+        HtmlCatchAll,
+        /// A site at the host root that redirects every path.
+        Redirect,
+        /// A gateway whose upstream for the root is down.
+        BadGateway,
+        /// A protected-resource document naming another resource.
+        OtherResource,
+        /// Both documents, the metadata naming another issuer, which the
+        /// copies inside the prefix name too.
+        OtherIssuerEverywhere,
+    }
+
+    /// A stand-in under `/crystalline` whose copies inside the prefix are
+    /// right and whose inserted addresses answer as `inserted` says.
+    async fn inserted_answers(
+        inserted: Inserted,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use axum::response::IntoResponse;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let base = format!("{origin}/crystalline");
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let doc_base = base.clone();
+        let router = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+            let seen = seen.clone();
+            let base = doc_base.clone();
+            async move {
+                use axum::http::StatusCode;
+                let path = uri.path().to_string();
+                seen.lock().unwrap().push(path.clone());
+                let resource = |resource: &str| {
+                    axum::Json(json!({ "resource": resource, "authorization_servers": [base] }))
+                        .into_response()
+                };
+                let metadata = |issuer: &str| {
+                    axum::Json(json!({
+                        "issuer": issuer,
+                        "authorization_endpoint": format!("{base}/api/v1/oauth/authorize"),
+                        "token_endpoint": format!("{base}/api/v1/oauth/token"),
+                        "registration_endpoint": format!("{base}/api/v1/oauth/register"),
+                    }))
+                    .into_response()
+                };
+                let other_issuer = matches!(inserted, Inserted::OtherIssuerEverywhere);
+                match path.as_str() {
+                    "/crystalline/health" => axum::Json(json!({ "status": "ok" })).into_response(),
+                    "/crystalline/.well-known/oauth-protected-resource" => resource(&base),
+                    "/crystalline/.well-known/oauth-authorization-server" if other_issuer => {
+                        metadata("http://127.0.0.1:1/elsewhere")
+                    }
+                    "/crystalline/.well-known/oauth-authorization-server" => metadata(&base),
+                    "/.well-known/oauth-protected-resource/crystalline"
+                    | "/.well-known/oauth-authorization-server/crystalline" => match inserted {
+                        Inserted::HtmlCatchAll => (
+                            StatusCode::OK,
+                            [("content-type", "text/html")],
+                            "<!doctype html><title>home</title>",
+                        )
+                            .into_response(),
+                        Inserted::Redirect => {
+                            (StatusCode::FOUND, [("location", "/")], "").into_response()
+                        }
+                        Inserted::BadGateway => StatusCode::BAD_GATEWAY.into_response(),
+                        Inserted::OtherResource if path.contains("protected-resource") => {
+                            resource("http://127.0.0.1:1/elsewhere")
+                        }
+                        Inserted::OtherResource => metadata(&base),
+                        Inserted::OtherIssuerEverywhere if path.contains("protected-resource") => {
+                            resource(&base)
+                        }
+                        Inserted::OtherIssuerEverywhere => metadata("http://127.0.0.1:1/elsewhere"),
+                    },
+                    _ => StatusCode::NOT_FOUND.into_response(),
+                }
+            }
+        });
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        (base, asked)
+    }
+
+    #[tokio::test]
+    async fn an_inserted_address_that_is_no_usable_document_falls_back_to_the_prefix() {
+        for inserted in [
+            Inserted::HtmlCatchAll,
+            Inserted::Redirect,
+            Inserted::BadGateway,
+            Inserted::OtherResource,
+        ] {
+            let (base, asked) = inserted_answers(inserted).await;
+            let oauth = discover(&client().unwrap(), &base)
+                .await
+                .unwrap_or_else(|e| panic!("{inserted:?}: {e}"))
+                .oauth
+                .unwrap();
+            assert_eq!(oauth.resource, base, "{inserted:?}");
+            assert_eq!(oauth.issuer, base, "{inserted:?}");
+            assert_eq!(
+                oauth.token_endpoint,
+                format!("{base}/api/v1/oauth/token"),
+                "{inserted:?}"
+            );
+            let asked = asked.lock().unwrap().clone();
+            assert!(
+                asked.contains(&"/crystalline/.well-known/oauth-protected-resource".to_string()),
+                "{inserted:?}: {asked:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn another_issuer_at_both_addresses_is_still_refused() {
+        let (base, asked) = inserted_answers(Inserted::OtherIssuerEverywhere).await;
+        let refused = discover(&client().unwrap(), &base).await.unwrap_err();
+        assert!(
+            matches!(refused, SignInError::InsecureEndpoints { .. }),
+            "{refused:?}"
+        );
+        let asked = asked.lock().unwrap().clone();
+        assert!(
+            asked.contains(&"/crystalline/.well-known/oauth-authorization-server".to_string()),
+            "both addresses were asked: {asked:?}"
+        );
     }
 
     #[test]

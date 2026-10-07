@@ -154,6 +154,23 @@ async fn reload_daemon() -> Vec<String> {
         .collect()
 }
 
+/// The refusal of a `connect` address. A url whose path the rules refuse
+/// gets the reason, which names the characters a path may use; anything
+/// else gets the plain line, so a word that is no address (it may be a
+/// token typed in the wrong place) is never repeated.
+fn not_a_server_address(url: &str) -> String {
+    const LINE: &str = "that is not a server address";
+    const EXAMPLE: &str = "give one like https://crystalline.acme.com";
+    use crystalline_core::base::{BaseProblem, PublicBase};
+    let token_inside = url.split(['/', '?', '#', '=', '&']).any(looks_like_token);
+    match PublicBase::parse(url) {
+        Err(BaseProblem::Path(problem)) if !token_inside => {
+            format!("{LINE}: {}; {EXAMPLE}", problem.sentence())
+        }
+        _ => format!("{LINE}; {EXAMPLE}"),
+    }
+}
+
 /// `crystalline connect <url> [--name] [--token]`.
 pub async fn connect_server(
     url: String,
@@ -173,9 +190,9 @@ pub async fn connect_server(
     }
     match normalize_server_url(&url) {
         Ok(_) => {}
-        Err(crystalline_remote::SignInError::BadUrl(_)) => anyhow::bail!(
-            "that is not a server address; give one like https://crystalline.acme.com"
-        ),
+        Err(crystalline_remote::SignInError::BadUrl(_)) => {
+            anyhow::bail!(not_a_server_address(&url))
+        }
         Err(other) => return Err(other.into()),
     }
     let loaded = crate::cmd::load(None)?;
