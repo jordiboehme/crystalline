@@ -63,7 +63,9 @@ pub use server_client::{
     Health, ONE_DOMAIN_LIMIT, RemoteFailure, form_body, http_client, seconds, settle_refreshes,
     warm_http_client, warm_http_client_within,
 };
-pub use server_token::{CredentialKind, ServerCredential, ServerCredentialStore, server_key};
+pub use server_token::{
+    CredentialKind, ServerCredential, ServerCredentialStore, server_folder, server_key,
+};
 pub use sign_in::{
     Connected, Disconnected, Revocation, SignInError, connect_with_browser,
     connect_with_browser_within, connect_with_token, connect_with_token_within, disconnect,

@@ -159,15 +159,22 @@ impl std::fmt::Debug for ServerCredential {
     }
 }
 
-/// The folder and keychain key for a server origin: the authority, lower
-/// case, with every character that is not a letter, a digit, `.` or `-`
-/// replaced by `_` (so `host:port` and an IPv6 literal become one path
-/// segment on every platform). A key of dots alone, or nothing at all, is `_`,
-/// so no key can ever name a parent folder.
-pub fn server_key(origin: &str) -> String {
-    let rest = origin.split_once("://").map_or(origin, |(_, rest)| rest);
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    let key: String = authority
+/// The keychain key for a server: the authority, lower case, with every
+/// character that is not a letter, a digit, `.` or `-` replaced by `_` (so
+/// `host:port` and an IPv6 literal become one token), then the path of the
+/// base with its slashes kept: `example.com/crystalline`. A server without a
+/// path keeps exactly the 0.23.0 key, so its saved credential and cache are
+/// found after an upgrade. An authority of dots alone, or none, is `_`, and
+/// so is a path segment of dots alone, so no key can ever name a parent
+/// folder.
+pub fn server_key(url: &str) -> String {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let rest = &rest[..rest.find(['?', '#']).unwrap_or(rest.len())];
+    let (authority, path) = match rest.find(['/', '\\']) {
+        Some(at) => (&rest[..at], &rest[at..]),
+        None => (rest, ""),
+    };
+    let mut key: String = authority
         .to_ascii_lowercase()
         .chars()
         .filter(|c| *c != '[' && *c != ']')
@@ -180,10 +187,34 @@ pub fn server_key(origin: &str) -> String {
         })
         .collect();
     if key.trim_matches('.').is_empty() {
-        "_".to_string()
-    } else {
-        key
+        key = "_".to_string();
     }
+    for segment in path.split(['/', '\\']).filter(|s| !s.is_empty()) {
+        let safe: String = segment
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        key.push('/');
+        key.push_str(if safe.trim_matches('.').is_empty() {
+            "_"
+        } else {
+            &safe
+        });
+    }
+    key
+}
+
+/// The folder name for a key: each `/` of the path becomes `~`, which no
+/// prefix may contain, so two servers never share a folder and the name is
+/// one path segment on every platform.
+pub fn server_folder(key: &str) -> String {
+    key.replace('/', "~")
 }
 
 /// The keychain account for a server key.
@@ -461,29 +492,53 @@ mod tests {
     }
 
     #[test]
-    fn server_key_normalizes_hosts_ports_and_ipv6() {
-        assert_eq!(server_key("https://Team.Example.com"), "team.example.com");
-        assert_eq!(server_key("https://kb.example/some/path?x=1"), "kb.example");
-        assert_eq!(server_key("http://127.0.0.1:7411/"), "127.0.0.1_7411");
-        assert_eq!(server_key("http://[::1]:7411"), "__1_7411");
-        assert_eq!(server_key("http://localhost:7411"), "localhost_7411");
+    fn a_root_server_keeps_its_0_23_0_key_account_and_folder() {
+        // Golden values from 0.23.0: a saved source and its keychain entry
+        // must resolve unchanged after the upgrade.
+        for (url, key) in [
+            ("https://Team.Example.com", "team.example.com"),
+            ("https://team.example.com/", "team.example.com"),
+            ("http://127.0.0.1:7411/", "127.0.0.1_7411"),
+            ("http://[::1]:7411", "__1_7411"),
+            ("http://localhost:7411", "localhost_7411"),
+        ] {
+            assert_eq!(server_key(url), key, "{url}");
+            assert_eq!(server_folder(key), key, "{url}");
+            assert_eq!(server_account(key), format!("crystalline-server:{key}"));
+        }
+    }
+
+    #[test]
+    fn two_paths_on_one_host_get_two_keys_two_accounts_and_two_folders() {
+        let a = server_key("https://example.com/crystalline/");
+        let b = server_key("https://example.com/team/kb");
+        assert_eq!(a, "example.com/crystalline");
+        assert_eq!(b, "example.com/team/kb");
+        assert_eq!(
+            server_account(&a),
+            "crystalline-server:example.com/crystalline"
+        );
+        assert_eq!(server_folder(&a), "example.com~crystalline");
+        assert_eq!(server_folder(&b), "example.com~team~kb");
+        assert_ne!(server_key("https://example.com"), a);
     }
 
     #[test]
     fn a_key_can_never_climb_out_of_the_remote_folder() {
-        for hostile in ["http://..", "http://.", "http://", "https://../x"] {
-            let key = server_key(hostile);
+        for hostile in [
+            "http://..",
+            "http://.",
+            "http://",
+            "https://../x",
+            "https://x/../..",
+            "https://x/a\\b",
+        ] {
+            let folder = server_folder(&server_key(hostile));
+            assert!(!folder.is_empty(), "{hostile}");
+            assert!(!folder.trim_matches('.').is_empty(), "{hostile}: {folder}");
             assert!(
-                !key.is_empty(),
-                "{hostile}: an empty key names the parent folder"
-            );
-            assert!(
-                !key.trim_matches('.').is_empty(),
-                "{hostile}: a key of dots alone names a parent folder: {key}"
-            );
-            assert!(
-                !key.contains('/') && !key.contains('\\'),
-                "{hostile}: {key}"
+                !folder.contains('/') && !folder.contains('\\'),
+                "{hostile}: {folder}"
             );
         }
     }

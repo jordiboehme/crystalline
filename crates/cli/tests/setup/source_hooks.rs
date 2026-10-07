@@ -42,7 +42,9 @@ fn connect(server: &CliServer, home: &Path) {
 fn host_dir(server: &CliServer, home: &Path) -> PathBuf {
     isolated_state_dir(home)
         .join("remote")
-        .join(crystalline_remote::server_key(&server.origin))
+        .join(crystalline_remote::server_folder(
+            &crystalline_remote::server_key(&server.origin),
+        ))
 }
 
 fn prompt_system(home: &Path) -> std::process::Output {
@@ -517,7 +519,9 @@ fn session_start_through_a_daemon_with_a_blackholed_source_answers_inside_a_seco
     let routing = env
         .state_dir()
         .join("remote")
-        .join(crystalline_remote::server_key(&blackhole.origin))
+        .join(crystalline_remote::server_folder(
+            &crystalline_remote::server_key(&blackhole.origin),
+        ))
         .join("routing.json");
     let waited = Instant::now();
     loop {

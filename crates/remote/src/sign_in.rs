@@ -49,6 +49,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use chrono::Utc;
+use crystalline_core::base::{BasePath, PublicBase};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -172,8 +173,11 @@ impl std::fmt::Display for SignInError {
 
 impl std::error::Error for SignInError {}
 
-/// The origin of `input`: scheme, host and port, no path and no trailing
-/// slash. `https` anywhere, plain `http` only to this machine.
+/// The base address of `input`: scheme, host, port and the path (one leading
+/// slash, no trailing slash), so `https://example.com/crystalline/` and
+/// `https://example.com/crystalline` are the same server. No query, no
+/// fragment, and the path follows the rules a server's `service.public_url`
+/// does. `https` anywhere, plain `http` only to this machine.
 pub fn normalize_server_url(input: &str) -> Result<String, SignInError> {
     let url = reqwest::Url::parse(input.trim())
         .map_err(|e| SignInError::BadUrl(format!("'{input}' is not a URL: {e}")))?;
@@ -191,10 +195,56 @@ pub fn normalize_server_url(input: &str) -> Result<String, SignInError> {
             )));
         }
     }
-    Ok(match url.port() {
+    let path = BasePath::of_url(input).map_err(|problem| {
+        SignInError::BadUrl(format!(
+            "'{input}' cannot be a server address: {}",
+            problem.sentence()
+        ))
+    })?;
+    let origin = match url.port() {
         Some(port) => format!("{}://{host}:{port}", url.scheme()),
         None => format!("{}://{host}", url.scheme()),
-    })
+    };
+    Ok(format!("{origin}{}", path.as_str()))
+}
+
+/// Where the two OAuth documents live, by specification.
+const PROTECTED_RESOURCE_PATH: &str = "/.well-known/oauth-protected-resource";
+const AUTHORIZATION_SERVER_PATH: &str = "/.well-known/oauth-authorization-server";
+
+/// The addresses of `document` for `base`, in the order to ask them: the RFC
+/// 8414 and RFC 9728 address with the path inserted after the host, then the
+/// copy inside the prefix. One address at the root, where the two are the
+/// same, so a root server is asked exactly what 0.23.0 asked.
+fn document_addresses(base: &str, document: &str) -> Vec<String> {
+    let Ok(parsed) = PublicBase::parse(base) else {
+        return vec![format!("{base}{document}")];
+    };
+    let inserted = parsed.well_known(document);
+    let inside = parsed.join(document);
+    if inserted == inside {
+        vec![inserted]
+    } else {
+        vec![inserted, inside]
+    }
+}
+
+/// The first of `urls` that is not a 404, or the last 404.
+async fn first_found(
+    http: &reqwest::Client,
+    urls: &[String],
+    origin: &str,
+    budget: &Budget,
+) -> Result<Answer, SignInError> {
+    let mut last = None;
+    for url in urls {
+        let answer = send(http.get(url.as_str()), origin, budget).await?;
+        if answer.status != 404 {
+            return Ok(answer);
+        }
+        last = Some(answer);
+    }
+    Ok(last.expect("at least one address"))
 }
 
 /// Whether `url` may carry a sign-in: https anywhere, plain http only to
@@ -382,13 +432,13 @@ pub struct OauthEndpoints {
 /// What a server said about itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Discovered {
-    /// The origin.
+    /// The base address.
     pub origin: String,
     /// Its OAuth endpoints, `None` where `auth.oauth` is off.
     pub oauth: Option<OauthEndpoints>,
 }
 
-/// Check that a Crystalline server answers at `origin`, and read its OAuth
+/// Check that a Crystalline server answers at the base address `origin`, and read its OAuth
 /// metadata when it has any, within [`SIGN_IN_LIMIT`].
 pub async fn discover(http: &reqwest::Client, origin: &str) -> Result<Discovered, SignInError> {
     discover_by(http, origin, &Budget::new(SIGN_IN_LIMIT)).await
@@ -409,8 +459,9 @@ async fn discover_by(
         origin: origin.to_string(),
         oauth: None,
     };
-    let resource = send(
-        http.get(format!("{origin}/.well-known/oauth-protected-resource")),
+    let resource = first_found(
+        http,
+        &document_addresses(origin, PROTECTED_RESOURCE_PATH),
         origin,
         budget,
     )
@@ -442,8 +493,9 @@ async fn discover_by(
     if !is_secure_endpoint(&issuer) {
         return Err(insecure());
     }
-    let meta = send(
-        http.get(format!("{issuer}/.well-known/oauth-authorization-server")),
+    let meta = first_found(
+        http,
+        &document_addresses(&issuer, AUTHORIZATION_SERVER_PATH),
         origin,
         budget,
     )
@@ -1339,27 +1391,138 @@ mod tests {
     }
 
     #[test]
-    fn a_server_url_becomes_its_origin() {
+    fn a_server_url_becomes_its_base() {
+        for (written, kept) in [
+            ("https://KB.example/", "https://kb.example"),
+            (" https://kb.example:8443 ", "https://kb.example:8443"),
+            (
+                "https://kb.example/crystalline/",
+                "https://kb.example/crystalline",
+            ),
+            (
+                "https://kb.example/crystalline",
+                "https://kb.example/crystalline",
+            ),
+            (
+                "https://kb.example:443/team/kb",
+                "https://kb.example/team/kb",
+            ),
+            (
+                "http://127.0.0.1:7411/crystalline",
+                "http://127.0.0.1:7411/crystalline",
+            ),
+            ("http://127.0.0.1:7411/", "http://127.0.0.1:7411"),
+            ("http://localhost:7411", "http://localhost:7411"),
+            ("http://[::1]:7411", "http://[::1]:7411"),
+        ] {
+            assert_eq!(normalize_server_url(written).unwrap(), kept, "{written}");
+        }
+    }
+
+    #[test]
+    fn a_server_url_with_a_query_a_fragment_or_a_bad_path_is_refused() {
+        for bad in [
+            "https://kb.example/?x=1",
+            "https://kb.example/crystalline#top",
+            "https://kb.example/a/../b",
+            "https://kb.example/a~b",
+            "https://kb.example/Crystalline",
+            "https://kb.example/api",
+        ] {
+            assert!(
+                matches!(normalize_server_url(bad), Err(SignInError::BadUrl(_))),
+                "{bad}"
+            );
+        }
+        assert!(matches!(
+            normalize_server_url("http://kb.example/crystalline"),
+            Err(SignInError::InsecureUrl { .. })
+        ));
+    }
+
+    /// A stand-in serving `/health` and the documents at the paths it is told.
+    async fn documents_at(
+        paths: &'static [&'static str],
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let base = format!("{origin}/crystalline");
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let doc_base = base.clone();
+        let router = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+            let seen = seen.clone();
+            let base = doc_base.clone();
+            async move {
+                let path = uri.path().to_string();
+                seen.lock().unwrap().push(path.clone());
+                if path == "/crystalline/health" {
+                    return (
+                        axum::http::StatusCode::OK,
+                        axum::Json(serde_json::json!({ "status": "ok" })),
+                    );
+                }
+                if !paths.contains(&path.as_str()) {
+                    return (
+                        axum::http::StatusCode::NOT_FOUND,
+                        axum::Json(serde_json::Value::Null),
+                    );
+                }
+                let body = if path.contains("protected-resource") {
+                    serde_json::json!({ "resource": base, "authorization_servers": [base] })
+                } else {
+                    serde_json::json!({
+                        "issuer": base,
+                        "authorization_endpoint": format!("{base}/api/v1/oauth/authorize"),
+                        "token_endpoint": format!("{base}/api/v1/oauth/token"),
+                        "registration_endpoint": format!("{base}/api/v1/oauth/register"),
+                    })
+                };
+                (axum::http::StatusCode::OK, axum::Json(body))
+            }
+        });
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        (base, asked)
+    }
+
+    #[tokio::test]
+    async fn discovery_tries_the_inserted_address_first() {
+        let (base, asked) = documents_at(&[
+            "/.well-known/oauth-protected-resource/crystalline",
+            "/.well-known/oauth-authorization-server/crystalline",
+        ])
+        .await;
+        let found = discover(&client().unwrap(), &base).await.unwrap();
+        let oauth = found.oauth.unwrap();
+        assert_eq!(oauth.issuer, base);
+        assert_eq!(oauth.token_endpoint, format!("{base}/api/v1/oauth/token"));
         assert_eq!(
-            normalize_server_url("https://KB.example/some/path/").unwrap(),
-            "https://kb.example"
+            asked.lock().unwrap().clone(),
+            vec![
+                "/crystalline/health".to_string(),
+                "/.well-known/oauth-protected-resource/crystalline".to_string(),
+                "/.well-known/oauth-authorization-server/crystalline".to_string(),
+            ],
+            "the RFC addresses answer, so the copies inside the prefix are never asked"
         );
-        assert_eq!(
-            normalize_server_url(" https://kb.example:8443 ").unwrap(),
-            "https://kb.example:8443"
-        );
-        assert_eq!(
-            normalize_server_url("http://127.0.0.1:7411/").unwrap(),
-            "http://127.0.0.1:7411"
-        );
-        assert_eq!(
-            normalize_server_url("http://localhost:7411").unwrap(),
-            "http://localhost:7411"
-        );
-        assert_eq!(
-            normalize_server_url("http://[::1]:7411").unwrap(),
-            "http://[::1]:7411"
-        );
+    }
+
+    #[tokio::test]
+    async fn discovery_falls_back_to_the_documents_inside_the_prefix() {
+        let (base, _) = documents_at(&[
+            "/crystalline/.well-known/oauth-protected-resource",
+            "/crystalline/.well-known/oauth-authorization-server",
+        ])
+        .await;
+        let oauth = discover(&client().unwrap(), &base)
+            .await
+            .unwrap()
+            .oauth
+            .unwrap();
+        assert_eq!(oauth.resource, base);
+        assert_eq!(oauth.issuer, base);
     }
 
     #[test]

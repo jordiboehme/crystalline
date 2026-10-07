@@ -30,7 +30,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::error::RemoteError;
-use crate::server_token::{CredentialKind, server_key};
+use crate::server_token::{CredentialKind, server_folder, server_key};
 
 /// The file, in `<state_dir>/remote/`.
 pub const SOURCES_FILE: &str = "sources.json";
@@ -80,7 +80,8 @@ pub struct MountRecord {
 /// One connected server.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SourceRecord {
-    /// The server's origin: scheme, host, optional port, no path, no slash.
+    /// The server's base address: scheme, host, optional port and the path it
+    /// is served under, no trailing slash.
     pub url: String,
     /// Its short name on this machine, used in notes and collision names.
     pub name: String,
@@ -105,15 +106,15 @@ pub struct SourceRecord {
 }
 
 impl SourceRecord {
-    /// The folder and keychain key for this server.
+    /// The keychain key for this server (see [`server_key`]).
     pub fn key(&self) -> String {
         server_key(&self.url)
     }
 
-    /// `<remote_dir>/<key>`: the credential fallback, the refresh lock and
-    /// the cached answers.
+    /// `<remote_dir>/<folder>`: the credential fallback, the refresh lock and
+    /// the cached answers, in the folder [`server_folder`] names for the key.
     pub fn host_dir(&self, remote_dir: &Path) -> PathBuf {
-        remote_dir.join(self.key())
+        remote_dir.join(server_folder(&self.key()))
     }
 }
 
@@ -136,8 +137,8 @@ impl Default for SourcesFile {
     }
 }
 
-/// `url` as a comparison key: the server key, which folds case, the path and
-/// a trailing slash away.
+/// `url` as a comparison key: the server key, which folds the host's case and
+/// a trailing slash away and keeps the path.
 fn same_server(a: &str, b: &str) -> bool {
     server_key(a) == server_key(b)
 }
@@ -347,9 +348,16 @@ pub fn default_source_name(origin: &str, taken: &[String]) -> String {
 /// The source the environment adds, when both variables are set. Never
 /// saved; named like any other, past `taken`.
 pub fn env_source(env: impl Fn(&str) -> Option<String>, taken: &[String]) -> Option<SourceRecord> {
-    let url = env(REMOTE_URL_ENV)
-        .map(|v| v.trim().trim_end_matches('/').to_string())
+    let raw = env(REMOTE_URL_ENV)
+        .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())?;
+    let url = match crate::sign_in::normalize_server_url(&raw) {
+        Ok(url) => url,
+        Err(e) => {
+            tracing::warn!("{REMOTE_URL_ENV}: {e}; using '{raw}' as written");
+            raw.trim_end_matches('/').to_string()
+        }
+    };
     env(REMOTE_TOKEN_ENV).filter(|v| !v.trim().is_empty())?;
     Some(SourceRecord {
         name: default_source_name(&url, taken),
@@ -586,11 +594,64 @@ mod tests {
     }
 
     #[test]
-    fn a_host_folder_is_the_server_key_under_the_remote_folder() {
-        let source = record("http://127.0.0.1:7411", "server");
+    fn a_host_folder_is_the_server_folder_under_the_remote_folder() {
+        let root = record("http://127.0.0.1:7411", "server");
         assert_eq!(
-            source.host_dir(Path::new("/state/remote")),
+            root.host_dir(Path::new("/state/remote")),
             Path::new("/state/remote").join("127.0.0.1_7411")
         );
+        let prefixed = record("https://example.com/crystalline", "example");
+        assert_eq!(
+            prefixed.host_dir(Path::new("/state/remote")),
+            Path::new("/state/remote").join("example.com~crystalline")
+        );
+    }
+
+    #[test]
+    fn two_paths_on_one_host_are_two_sources() {
+        let mut file = SourcesFile::default();
+        file.upsert(record("https://example.com/crystalline", "example"));
+        file.upsert(record("https://example.com/other", "example-2"));
+        assert_eq!(file.sources.len(), 2, "the second never replaces the first");
+        assert_eq!(
+            file.find("https://example.com/crystalline/").unwrap().name,
+            "example"
+        );
+        assert_eq!(
+            file.find("https://example.com/other").unwrap().name,
+            "example-2"
+        );
+        assert!(file.find("https://example.com").is_none());
+    }
+
+    #[test]
+    fn the_default_name_is_the_host_word_whatever_the_path() {
+        assert_eq!(
+            default_source_name("https://kb.acme.com/crystalline", &[]),
+            "acme"
+        );
+    }
+
+    #[test]
+    fn the_environment_source_keeps_its_path() {
+        let env = |name: &str| match name {
+            REMOTE_URL_ENV => Some("https://KB.acme.com/crystalline/".to_string()),
+            REMOTE_TOKEN_ENV => Some("cmt_x".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            env_source(env, &[]).unwrap().url,
+            "https://kb.acme.com/crystalline"
+        );
+    }
+
+    #[test]
+    fn an_environment_url_the_rules_refuse_keeps_its_0_23_0_spelling() {
+        let env = |name: &str| match name {
+            REMOTE_URL_ENV => Some("http://kb.internal:7411/".to_string()),
+            REMOTE_TOKEN_ENV => Some("cmt_x".to_string()),
+            _ => None,
+        };
+        assert_eq!(env_source(env, &[]).unwrap().url, "http://kb.internal:7411");
     }
 }

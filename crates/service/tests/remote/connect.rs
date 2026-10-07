@@ -186,7 +186,7 @@ async fn signing_in_through_the_browser_saves_an_oauth_source() {
     let server = Arc::new(RemoteServer::start(Options::OAUTH).await);
     let dir = tempfile::tempdir().unwrap();
     let connected = connect_with_browser(
-        &format!("{}/some/path/", server.origin()),
+        &format!("{}/", server.origin()),
         Some("acme"),
         dir.path(),
         &[],
@@ -196,7 +196,11 @@ async fn signing_in_through_the_browser_saves_an_oauth_source() {
     .await
     .unwrap();
     let source = &connected.source;
-    assert_eq!(source.url, server.origin(), "the origin, no path, no slash");
+    assert_eq!(
+        source.url,
+        server.origin(),
+        "the base address, no trailing slash"
+    );
     assert_eq!(source.name, "acme");
     assert_eq!(source.kind, CredentialKind::Oauth);
     assert_eq!(source.account, "keeper");
@@ -573,9 +577,9 @@ async fn a_save_that_fails_leaves_the_credential_as_it_was() {
     .await
     .unwrap_err();
     assert!(matches!(failure, SignInError::Store(_)), "{failure}");
-    let fresh_dir = dir
-        .path()
-        .join(crystalline_remote::server_key(&fresh.origin()));
+    let fresh_dir = dir.path().join(crystalline_remote::server_folder(
+        &crystalline_remote::server_key(&fresh.origin()),
+    ));
     assert!(!fresh_dir.exists(), "no credential is left behind");
 }
 
@@ -894,7 +898,9 @@ async fn a_browser_that_never_comes_back_saves_nothing() {
     assert!(load_sources(dir.path()).unwrap().sources.is_empty());
     assert!(
         !dir.path()
-            .join(crystalline_remote::server_key(&server.origin()))
+            .join(crystalline_remote::server_folder(
+                &crystalline_remote::server_key(&server.origin())
+            ))
             .exists(),
         "no host folder"
     );
