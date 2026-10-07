@@ -1113,6 +1113,10 @@ fn claude_desktop_installed() -> bool {
         })
 }
 
+/// Why `--fix` registers no task for this binary: it registers only for the
+/// binary in the MSI's default folder.
+const NOT_THE_MSI_BINARY: &str = r"this crystalline is not in Program Files\Crystalline\bin, so --fix registers no task for it. Install the MSI";
+
 /// Windows only: the task, and with `fix` a task for this user when none
 /// runs for them or theirs starts a binary that is gone. `--fix` registers
 /// only for the binary the MSI installed, so the task never points at a
@@ -1143,10 +1147,7 @@ fn check_task(fix: bool) -> Option<TaskDoctor> {
         assess_task(name.as_deref(), xml.as_deref(), &account, Path::is_file);
     if fix && repair == TaskRepair::Register {
         if !installed {
-            report.error = Some(
-                "this crystalline is not the one the MSI installed, so --fix registers no task for it. Install the MSI"
-                    .to_string(),
-            );
+            report.error = Some(NOT_THE_MSI_BINARY.to_string());
         } else {
             match daemon_task::register(&TaskPrincipal::User { account }, &exe) {
                 Ok(name) => report.registered_now = Some(name),
@@ -7783,6 +7784,16 @@ mod tests {
         let s = &d.stray_copies[0];
         assert_eq!((s.path.as_str(), s.original.as_str()), (S_PATH, O_PATH));
         assert!(s.from_overwrite && s.newer && s.fixable, "{s:?}");
+    }
+
+    /// The refusal names the folder `--fix` looks at, so it is true for an
+    /// MSI installed to another folder too.
+    #[test]
+    fn the_fix_refusal_names_the_folder_it_looks_at() {
+        assert_eq!(
+            NOT_THE_MSI_BINARY,
+            r"this crystalline is not in Program Files\Crystalline\bin, so --fix registers no task for it. Install the MSI"
+        );
     }
 
     // Windows paths, so only the windows-latest leg runs it.
