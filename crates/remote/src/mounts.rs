@@ -588,11 +588,13 @@ pub fn assign(
             }
         }
     }
-    // A domain a list claims from another source keeps its local name: the
-    // listing source's record takes the name over and the other source's
-    // record for it is dropped. Only a list moves a domain; a claim of a
-    // source that takes all is its own established record, and the records
-    // of the other sources stay as they are, only skipped (0.23.0).
+    // A domain a list claims from a source that takes all keeps its local
+    // name: the listing source's record takes the name over (unless it
+    // already holds one) and the other source's record for it is dropped,
+    // said as a move. Only a list moves a domain, and only away from a
+    // source that takes all; a claim of a source that takes all is its own
+    // established record, and among sources of one kind the other records
+    // stay as they are, only skipped (0.23.0).
     let mut said = Vec::new();
     for (identity, winner, winner_remote) in &claimed {
         let listed = sources
@@ -614,6 +616,11 @@ pub fn assign(
             }) else {
                 continue;
             };
+            // A source that lists it too is of the same kind: it keeps its
+            // record and is only skipped, as among sources that take all.
+            if lists(&sources.sources[at], &old.name) {
+                continue;
+            }
             let Some(pos) = sources.sources[at]
                 .mounts
                 .iter()
@@ -628,17 +635,24 @@ pub fn assign(
                 .iter_mut()
                 .find(|s| &s.name == winner)
                 .expect("a claim names a source");
-            if !to.mounts.iter().any(|m| &m.remote == winner_remote) {
-                to.mounts.push(MountRecord {
-                    remote: winner_remote.clone(),
-                    local: record.local.clone(),
-                });
-                said.push(Announcement::Moved {
-                    local: record.local,
-                    from,
-                    to: winner.clone(),
-                });
-            }
+            // The local name it is served under from now on: the one the
+            // old record held, unless the listing source already holds a
+            // name of its own for it.
+            let local = match to.mounts.iter().find(|m| &m.remote == winner_remote) {
+                Some(own) => own.local.clone(),
+                None => {
+                    to.mounts.push(MountRecord {
+                        remote: winner_remote.clone(),
+                        local: record.local.clone(),
+                    });
+                    record.local
+                }
+            };
+            said.push(Announcement::Moved {
+                local,
+                from,
+                to: winner.clone(),
+            });
         }
     }
     let mut table = MountTable {
@@ -1962,6 +1976,105 @@ mod tests {
                 ("beta".into(), "scratch".into(), "scratch-beta".into()),
             ],
             "no origin, no collision: a list does not take a virtual domain from another source"
+        );
+    }
+
+    #[test]
+    fn two_listing_sources_that_both_hold_a_record_keep_both_records() {
+        let mut file = SourcesFile::default();
+        file.sources.push(listing("acme", &["platform"]));
+        file.sources.push(listing("beta", &["plat"]));
+        file.sources[0].mounts.push(MountRecord {
+            remote: "platform".into(),
+            local: "platform".into(),
+        });
+        file.sources[1].mounts.push(MountRecord {
+            remote: "plat".into(),
+            local: "plat".into(),
+        });
+        let before = file.clone();
+        let (table, said) = assign(
+            &mut file,
+            &[],
+            &served(&[
+                ("acme", vec![remote("platform", Some("acme/platform"))]),
+                ("beta", vec![remote("plat", Some("acme/platform"))]),
+            ]),
+        );
+        assert_eq!(
+            names(&table),
+            vec![("acme".into(), "platform".into(), "platform".into())]
+        );
+        assert_eq!(
+            file.sources[0].mounts, before.sources[0].mounts,
+            "acme's record stays"
+        );
+        assert_eq!(
+            file.sources[1].mounts, before.sources[1].mounts,
+            "beta's record stays, only skipped"
+        );
+        assert_eq!(
+            table.skipped,
+            vec![Skipped {
+                source: "beta".into(),
+                remote: "plat".into(),
+                kept_by: "acme".into(),
+                reason: SkipReason::SameDomain,
+            }]
+        );
+        assert!(
+            !said.iter().any(|a| matches!(a, Announcement::Moved { .. })),
+            "{said:?}"
+        );
+    }
+
+    #[test]
+    fn a_list_that_already_holds_a_record_says_the_move_when_it_drops_the_take_all_one() {
+        let mut file = SourcesFile::default();
+        file.sources.push(source("acme"));
+        file.sources.push(listing("beta", &["plat"]));
+        file.sources[0].mounts.push(MountRecord {
+            remote: "platform".into(),
+            local: "platform".into(),
+        });
+        file.sources[1].mounts.push(MountRecord {
+            remote: "plat".into(),
+            local: "plat".into(),
+        });
+        let offers = served(&[
+            ("acme", vec![remote("platform", Some("acme/platform"))]),
+            ("beta", vec![remote("plat", Some("acme/platform"))]),
+        ]);
+        let (table, said) = assign(&mut file, &[], &offers);
+        assert_eq!(
+            names(&table),
+            vec![("beta".into(), "plat".into(), "plat".into())]
+        );
+        assert!(
+            file.sources[0].mounts.is_empty(),
+            "the take-all record is dropped"
+        );
+        assert_eq!(
+            file.sources[1].mounts,
+            vec![MountRecord {
+                remote: "plat".into(),
+                local: "plat".into()
+            }]
+        );
+        assert!(
+            said.contains(&Announcement::Moved {
+                local: "plat".into(),
+                from: "acme".into(),
+                to: "beta".into()
+            }),
+            "{said:?}"
+        );
+        let (_, again) = assign(&mut file, &[], &offers);
+        assert!(
+            !again
+                .iter()
+                .any(|a| matches!(a, Announcement::Moved { .. })),
+            "said once"
         );
     }
 }
