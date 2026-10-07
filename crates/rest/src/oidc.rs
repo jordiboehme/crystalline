@@ -1237,7 +1237,8 @@ pub struct LoginQuery {
     #[serde(default)]
     pub link: bool,
     /// Where to send the browser once the sign-in completes: a path on this
-    /// instance, which the callback 302s to instead of `/`.
+    /// instance, which the callback 302s to instead of the root of the base
+    /// path.
     ///
     /// The OAuth consent page is what this exists for. A client sends a
     /// browser to `/authorize?request=<id>`, Fluid finds nobody signed in and
@@ -1365,8 +1366,9 @@ struct StartedSignOn {
                    browser once the sign-in completes - the OAuth consent \
                    page is what it exists for. It must be a path on this \
                    instance, under its base path (starts with `/`, not `//`, \
-                   no backslash, at most 512 printable ASCII characters); \
-                   anything else is dropped and the sign-in lands on the root \
+                   no backslash, no `.` or `..` segment, at most 512 \
+                   printable ASCII characters); anything else is dropped and \
+                   the sign-in lands on the root \
                    of the base path (`/` at the root).",
     responses(
         (

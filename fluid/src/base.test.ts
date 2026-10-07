@@ -76,6 +76,22 @@ describe("documentHrefFrom", () => {
   });
 });
 
+describe("at the root", () => {
+  afterEach(() => {
+    vi.resetModules();
+  });
+
+  it("the router and the API sit at the root of the host", async () => {
+    document.head.querySelector("base")?.remove();
+    vi.resetModules();
+    const mod = await import("./base");
+    expect(mod.BASE_PATH).toBe("");
+    expect(mod.ROUTER_BASENAME).toBe("/");
+    expect(mod.API_BASE).toBe("/api/v1");
+    expect(mod.withBase("/d/x")).toBe("/d/x");
+  });
+});
+
 describe("under a prefix", () => {
   afterEach(() => {
     document.head.querySelector("base")?.remove();

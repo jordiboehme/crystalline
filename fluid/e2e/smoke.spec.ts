@@ -64,7 +64,7 @@ async function signIn(
   password: string = PASSWORD,
 ): Promise<void> {
   await page.goto("./");
-  await expect(page).toHaveURL(/\/login$/);
+  await expect(page).toHaveURL((url) => url.pathname === `${BASE_PATH}/login`);
 
   await page.getByLabel("Name", { exact: true }).fill(name);
   await page.getByLabel("Password", { exact: true }).fill(password);
@@ -373,6 +373,7 @@ test("a multi-segment permalink loads from the address bar", async ({
   await expect(jump).toHaveAttribute("href", `${before}#observations`);
   await jump.click();
   expect(new URL(page.url()).pathname).toBe(before);
+  expect(new URL(page.url()).hash).toBe("#observations");
   await expect(engramTitle(page)).toHaveText("Deep Gamma Note");
 
   // Nor may it break a diagram's arrowheads: each edge names its marker by a

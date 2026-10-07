@@ -2111,7 +2111,8 @@ export type OidcLoginData = {
         link?: boolean;
         /**
          * Where to send the browser once the sign-in completes: a path on this
-         * instance, which the callback 302s to instead of `/`.
+         * instance, which the callback 302s to instead of the root of the base
+         * path.
          *
          * The OAuth consent page is what this exists for. A client sends a
          * browser to `/authorize?request=<id>`, Fluid finds nobody signed in and
