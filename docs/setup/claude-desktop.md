@@ -12,11 +12,11 @@ Do you use only Claude Desktop, and neither Claude Code nor the `crystalline` co
 
 ## Windows
 
-1. Download `crystalline-<version>-windows-amd64.msi` (or `-windows-arm64.msi` on an Arm device) from the [latest release](https://github.com/jordiboehme/crystalline/releases/latest) and run it. Keep the default install folder, `Program Files\Crystalline\bin`. `crystalline doctor` does not recognise a custom folder.
+1. Download `crystalline-<version>-windows-amd64.msi` (or `-windows-arm64.msi` on an Arm device) from the [latest release](https://github.com/jordiboehme/crystalline/releases/latest) and run it.
 2. Download `crystalline-v<version>.mcpb` from the same release.
 3. In Claude Desktop, open Settings > Extensions > Advanced settings > Install Extension... and pick the file.
 
-Claude Desktop runs its extensions inside its own app package. So the extension never runs the Crystalline knowledge stack itself: it connects to the daemon outside the package. The MSI registers a Windows task, `\Crystalline\Daemon`, for all users. It starts the daemon when you sign in. Inside Claude Desktop's package, `crystalline mcp` only connects to that daemon and never starts one itself. If the task is missing (it was deleted, or the MSI could not register it), run `crystalline doctor --fix` in a terminal. It registers a task for your user. The MSI logs only an exit code for these steps, so use `crystalline doctor` to see details.
+Claude Desktop runs its extensions inside its own app package. So the extension never runs the Crystalline knowledge stack itself: it connects to the daemon outside the package. The MSI registers a Windows task, `\Crystalline\Daemon`, for all users. It starts the daemon when you sign in. Inside Claude Desktop's package, `crystalline mcp` only connects to that daemon and never starts one itself. If the task is missing (it was deleted, or the MSI could not register it), run `crystalline doctor --fix` in a terminal. It registers a task for your user, but only for the crystalline the MSI installed in its default folder, `Program Files\Crystalline\bin`. For a copy anywhere else it reports the task but registers none. Install the MSI, or run it again, to get the task. `--fix` works only for that MSI binary, and when the machine-wide task is broken it asks for an administrator instead of fixing it. For details, run `crystalline doctor`.
 
 When you sign out or shut down, the daemon stops cleanly.
 
