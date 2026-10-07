@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::sources::{MountRecord, SourcesFile};
+use crate::sources::{MountRecord, SourceRecord, SourcesFile};
 
 /// What makes two copies of a team domain the same domain: the repository it
 /// tracks, the folder in it and the branch, on one forge.
@@ -143,6 +143,9 @@ pub enum SkipReason {
     /// (`crystalline_core::config::registration::validate_domain_name`), so
     /// it is never a name on this machine.
     InvalidName,
+    /// The source has a list of domains to take, and this is not on it.
+    /// Said nowhere: nobody asked for it.
+    NotChosen,
 }
 
 /// Something about the names worth telling the person.
@@ -185,6 +188,16 @@ pub enum Announcement {
         /// The source that gave the name out first.
         source: String,
     },
+    /// A domain several sources offer moved to the source that lists it,
+    /// keeping its local name (a list wins).
+    Moved {
+        /// Its local name, unchanged.
+        local: String,
+        /// The source that served it.
+        from: String,
+        /// The source that lists it and serves it now.
+        to: String,
+    },
 }
 
 impl std::fmt::Display for Announcement {
@@ -215,6 +228,10 @@ impl std::fmt::Display for Announcement {
                 HiddenReason::Collision,
                 Some(source),
             )),
+            Announcement::Moved { local, from, to } => write!(
+                f,
+                "{to}: '{local}' now comes from {to} instead of {from}, because {to} lists it"
+            ),
         }
     }
 }
@@ -287,6 +304,20 @@ pub struct MountTable {
     /// can have two rows (a collision with one source and a copy on
     /// another), and it is visible again only when every row is gone.
     pub shadowed: Vec<Hidden>,
+    /// Listed names the source's server does not offer, for sources that
+    /// answered.
+    pub not_offered: Vec<Unoffered>,
+}
+
+/// A name on a source's list that its server does not offer to this
+/// account right now: missing rights, or not there yet. Kept on the list,
+/// and mounted once the server offers it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Unoffered {
+    /// The source.
+    pub source: String,
+    /// The listed name.
+    pub remote: String,
 }
 
 /// How a tool reaches domains, for [`MountTable::route`].
@@ -478,18 +509,46 @@ fn valid_offered_name(name: &str) -> bool {
     crystalline_core::config::registration::validate_domain_name(name).is_ok()
 }
 
+/// Whether `source` takes `remote`: no list, or a list that names it.
+fn takes(source: &SourceRecord, remote: &str) -> bool {
+    source
+        .domains
+        .as_ref()
+        .is_none_or(|list| list.iter().any(|d| d == remote))
+}
+
+/// Whether `source` names `remote` in its list.
+fn lists(source: &SourceRecord, remote: &str) -> bool {
+    source
+        .domains
+        .as_ref()
+        .is_some_and(|list| list.iter().any(|d| d == remote))
+}
+
 /// Build the mount table (decision D13). `sources` is updated in place with
 /// every name decided for the first time; persist it afterwards.
 ///
-/// The same domain (same origin) is mounted once: an established mount (one
-/// whose source already handed out a name for it) keeps serving it, and
-/// only among sources offering it for the first time does the one
-/// connected first win. Every other copy is skipped with a note.
+/// A source with a list mounts only the domains it names; the rest are
+/// skipped as [`SkipReason::NotChosen`] without a word, and their records
+/// are dropped. The same domain (same origin) is mounted once. An
+/// established mount (one whose source already handed out a name for it)
+/// keeps serving it among sources of one kind, and only among sources
+/// offering it for the first time does the one connected first win; a
+/// source that lists the domain serves it before one that takes all, and
+/// takes over the local name (F2). Every other copy is skipped with a note.
 pub fn assign(
     sources: &mut SourcesFile,
     local: &[LocalDomain],
     remote: &BTreeMap<String, Vec<RemoteDomain>>,
 ) -> (MountTable, Vec<Announcement>) {
+    // A list drops the records of the domains it leaves out, so their names
+    // are free again and a local copy they hid is visible (F2). A listed
+    // name keeps its record whether or not the server offers it now.
+    for source in sources.sources.iter_mut() {
+        if let Some(list) = &source.domains {
+            source.mounts.retain(|m| list.contains(&m.remote));
+        }
+    }
     let local_names: BTreeSet<String> = local.iter().map(|d| d.name.clone()).collect();
     let mut taken: BTreeSet<String> = local_names.clone();
     for domain in local {
@@ -502,20 +561,83 @@ pub fn assign(
         mount_names.extend(source.mounts.iter().map(|m| m.local.clone()));
     }
     taken.extend(mount_names.iter().cloned());
-    // Established mounts claim their origin first, in connect order, so a
-    // domain never moves to another source on its own.
+    // Who serves a domain several sources offer (same origin), decided
+    // before any name: a source that lists it, before one that takes all (a
+    // list wins); inside each kind an established mount, then the source
+    // connected first. Without lists this is the 0.23.0 order: established
+    // mounts in connect order here, first come in the loop below.
     let mut claimed: Vec<(OriginIdentity, String, String)> = Vec::new();
-    for source in &sources.sources {
-        let Some(offered) = remote.get(&source.name) else {
+    for (listed, established) in [(true, true), (true, false), (false, true)] {
+        for source in &sources.sources {
+            let Some(offered) = remote.get(&source.name) else {
+                continue;
+            };
+            for domain in offered {
+                let Some(identity) = &domain.origin else {
+                    continue;
+                };
+                let has_record = source.mounts.iter().any(|m| m.remote == domain.name);
+                if valid_offered_name(&domain.name)
+                    && takes(source, &domain.name)
+                    && lists(source, &domain.name) == listed
+                    && has_record == established
+                    && !claimed.iter().any(|(id, _, _)| id.same_as(identity))
+                {
+                    claimed.push((identity.clone(), source.name.clone(), domain.name.clone()));
+                }
+            }
+        }
+    }
+    // A domain a list claims from another source keeps its local name: the
+    // listing source's record takes the name over and the other source's
+    // record for it is dropped. Only a list moves a domain; a claim of a
+    // source that takes all is its own established record, and the records
+    // of the other sources stay as they are, only skipped (0.23.0).
+    let mut said = Vec::new();
+    for (identity, winner, winner_remote) in &claimed {
+        let listed = sources
+            .sources
+            .iter()
+            .find(|s| &s.name == winner)
+            .is_some_and(|s| lists(s, winner_remote));
+        if !listed {
             continue;
-        };
-        for domain in offered {
-            if let Some(identity) = &domain.origin
-                && valid_offered_name(&domain.name)
-                && source.mounts.iter().any(|m| m.remote == domain.name)
-                && !claimed.iter().any(|(id, _, _)| id.same_as(identity))
-            {
-                claimed.push((identity.clone(), source.name.clone(), domain.name.clone()));
+        }
+        for at in 0..sources.sources.len() {
+            if sources.sources[at].name == *winner {
+                continue;
+            }
+            let Some(old) = remote.get(&sources.sources[at].name).and_then(|offered| {
+                offered
+                    .iter()
+                    .find(|d| d.origin.as_ref().is_some_and(|o| o.same_as(identity)))
+            }) else {
+                continue;
+            };
+            let Some(pos) = sources.sources[at]
+                .mounts
+                .iter()
+                .position(|m| m.remote == old.name)
+            else {
+                continue;
+            };
+            let record = sources.sources[at].mounts.remove(pos);
+            let from = sources.sources[at].name.clone();
+            let to = sources
+                .sources
+                .iter_mut()
+                .find(|s| &s.name == winner)
+                .expect("a claim names a source");
+            if !to.mounts.iter().any(|m| &m.remote == winner_remote) {
+                to.mounts.push(MountRecord {
+                    remote: winner_remote.clone(),
+                    local: record.local.clone(),
+                });
+                said.push(Announcement::Moved {
+                    local: record.local,
+                    from,
+                    to: winner.clone(),
+                });
             }
         }
     }
@@ -523,14 +645,25 @@ pub fn assign(
         sources: sources.names(),
         ..MountTable::default()
     };
-    let mut said = Vec::new();
     for source in sources.sources.iter_mut() {
         let Some(offered) = remote.get(&source.name) else {
             continue;
         };
         let mut offered = offered.clone();
         offered.sort_by(|a, b| a.name.cmp(&b.name));
+        let offered_names: Vec<String> = offered.iter().map(|d| d.name.clone()).collect();
         for domain in offered {
+            // A domain off the source's list is left out before its name
+            // is even looked at, and said nowhere: nobody asked for it.
+            if !takes(source, &domain.name) {
+                table.skipped.push(Skipped {
+                    source: source.name.clone(),
+                    remote: domain.name.escape_default().to_string(),
+                    kept_by: String::new(),
+                    reason: SkipReason::NotChosen,
+                });
+                continue;
+            }
             // A server chose the name, and it becomes a name on this
             // machine that the hooks print into an agent's context: one
             // that would not pass as a local domain name is never mounted.
@@ -645,6 +778,16 @@ pub fn assign(
                 source: source.name.clone(),
                 bullets: domain.bullets,
             });
+        }
+        if let Some(list) = &source.domains {
+            for name in list {
+                if !offered_names.contains(name) {
+                    table.not_offered.push(Unoffered {
+                        source: source.name.clone(),
+                        remote: name.clone(),
+                    });
+                }
+            }
         }
     }
     (table, said)
@@ -791,6 +934,7 @@ mod tests {
             revocation_endpoint: None,
             connected_at: chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap(),
             mounts: Vec::new(),
+            domains: None,
             from_env: false,
         }
     }
@@ -1506,6 +1650,318 @@ mod tests {
         assert_eq!(
             translate_address_to("crystalline://a.b/x", &map),
             "crystalline://a.b/x"
+        );
+    }
+
+    fn listing(name: &str, list: &[&str]) -> SourceRecord {
+        let mut s = source(name);
+        s.domains = Some(list.iter().map(|d| d.to_string()).collect());
+        s
+    }
+
+    #[test]
+    fn a_list_filters_and_the_rest_is_not_chosen_without_a_word() {
+        let mut file = SourcesFile::default();
+        file.sources.push(listing("acme", &["open"]));
+        let (table, said) = assign(
+            &mut file,
+            &[],
+            &served(&[(
+                "acme",
+                vec![
+                    remote("open", None),
+                    remote("lab", None),
+                    remote("ops", None),
+                ],
+            )]),
+        );
+        assert_eq!(
+            names(&table),
+            vec![("acme".into(), "open".into(), "open".into())]
+        );
+        let left: Vec<(&str, SkipReason)> = table
+            .skipped
+            .iter()
+            .map(|s| (s.remote.as_str(), s.reason))
+            .collect();
+        assert_eq!(
+            left,
+            vec![
+                ("lab", SkipReason::NotChosen),
+                ("ops", SkipReason::NotChosen)
+            ]
+        );
+        assert!(
+            said.is_empty(),
+            "leaving out what nobody asked for is said nowhere: {said:?}"
+        );
+        assert_eq!(
+            file.sources[0].mounts.len(),
+            1,
+            "no name is handed out for an unlisted domain"
+        );
+    }
+
+    #[test]
+    fn an_unlisted_copy_hides_no_local_domain() {
+        let mut file = SourcesFile::default();
+        file.sources.push(listing("acme", &["open"]));
+        let (table, _) = assign(
+            &mut file,
+            &[local("platform", Some("acme/platform"))],
+            &served(&[(
+                "acme",
+                vec![
+                    remote("open", None),
+                    remote("platform", Some("acme/platform")),
+                ],
+            )]),
+        );
+        assert!(table.shadowed.is_empty(), "{:?}", table.shadowed);
+    }
+
+    #[test]
+    fn a_list_beats_an_established_take_all_mount_and_keeps_its_name() {
+        let mut file = SourcesFile::default();
+        file.sources.push(source("acme"));
+        let offers = served(&[
+            ("acme", vec![remote("platform", Some("acme/platform"))]),
+            ("beta", vec![remote("plat", Some("acme/platform"))]),
+        ]);
+        let _ = assign(&mut file, &[], &offers);
+        assert_eq!(
+            file.sources[0].mounts,
+            vec![MountRecord {
+                remote: "platform".into(),
+                local: "platform".into()
+            }]
+        );
+
+        file.sources.push(listing("beta", &["plat"]));
+        let (table, said) = assign(&mut file, &[], &offers);
+        assert_eq!(
+            names(&table),
+            vec![("beta".into(), "plat".into(), "platform".into())],
+            "the local name stays"
+        );
+        assert!(
+            file.sources[0].mounts.is_empty(),
+            "the old source's record is dropped"
+        );
+        assert_eq!(
+            file.sources[1].mounts,
+            vec![MountRecord {
+                remote: "plat".into(),
+                local: "platform".into()
+            }]
+        );
+        let moved = Announcement::Moved {
+            local: "platform".into(),
+            from: "acme".into(),
+            to: "beta".into(),
+        };
+        assert!(said.contains(&moved), "{said:?}");
+        assert_eq!(
+            moved.to_string(),
+            "beta: 'platform' now comes from beta instead of acme, because beta lists it"
+        );
+
+        let (again, said) = assign(&mut file, &[], &offers);
+        assert_eq!(
+            names(&again),
+            names(&table),
+            "nothing moves on its own afterwards"
+        );
+        assert!(!said.iter().any(|a| matches!(a, Announcement::Moved { .. })));
+    }
+
+    #[test]
+    fn two_lists_are_decided_in_connect_order() {
+        let mut file = SourcesFile::default();
+        file.sources.push(listing("acme", &["platform"]));
+        file.sources.push(listing("beta", &["plat"]));
+        let (table, _) = assign(
+            &mut file,
+            &[],
+            &served(&[
+                ("acme", vec![remote("platform", Some("acme/platform"))]),
+                ("beta", vec![remote("plat", Some("acme/platform"))]),
+            ]),
+        );
+        assert_eq!(
+            names(&table),
+            vec![("acme".into(), "platform".into(), "platform".into())]
+        );
+        assert_eq!(table.skipped[0].reason, SkipReason::SameDomain);
+    }
+
+    #[test]
+    fn two_take_all_sources_are_decided_as_before() {
+        let mut file = SourcesFile::default();
+        file.sources.push(source("acme"));
+        file.sources.push(source("beta"));
+        file.sources[1].mounts.push(MountRecord {
+            remote: "plat".into(),
+            local: "plat".into(),
+        });
+        let (table, said) = assign(
+            &mut file,
+            &[],
+            &served(&[
+                ("acme", vec![remote("platform", Some("acme/platform"))]),
+                ("beta", vec![remote("plat", Some("acme/platform"))]),
+            ]),
+        );
+        assert_eq!(
+            names(&table),
+            vec![("beta".into(), "plat".into(), "plat".into())],
+            "an established mount keeps it"
+        );
+        assert!(!said.iter().any(|a| matches!(a, Announcement::Moved { .. })));
+    }
+
+    #[test]
+    fn two_take_all_sources_that_both_hold_a_record_keep_both_records() {
+        let mut file = SourcesFile::default();
+        file.sources.push(source("acme"));
+        file.sources.push(source("beta"));
+        file.sources[0].mounts.push(MountRecord {
+            remote: "platform".into(),
+            local: "platform".into(),
+        });
+        file.sources[1].mounts.push(MountRecord {
+            remote: "plat".into(),
+            local: "plat".into(),
+        });
+        let before = file.clone();
+        let (table, said) = assign(
+            &mut file,
+            &[],
+            &served(&[
+                ("acme", vec![remote("platform", Some("acme/platform"))]),
+                ("beta", vec![remote("plat", Some("acme/platform"))]),
+            ]),
+        );
+        assert_eq!(
+            names(&table),
+            vec![("acme".into(), "platform".into(), "platform".into())],
+            "the first connected keeps it"
+        );
+        assert_eq!(
+            file.sources[0].mounts, before.sources[0].mounts,
+            "acme's record stays"
+        );
+        assert_eq!(
+            file.sources[1].mounts, before.sources[1].mounts,
+            "beta's record stays, only skipped"
+        );
+        assert_eq!(
+            table.skipped,
+            vec![Skipped {
+                source: "beta".into(),
+                remote: "plat".into(),
+                kept_by: "acme".into(),
+                reason: SkipReason::SameDomain,
+            }]
+        );
+        assert!(said.contains(&Announcement::Skipped {
+            source: "beta".into(),
+            remote: "plat".into(),
+            kept_by: "acme".into(),
+        }));
+        assert!(
+            !said.iter().any(|a| matches!(a, Announcement::Moved { .. })),
+            "{said:?}"
+        );
+    }
+
+    #[test]
+    fn removing_a_name_frees_it_and_shows_the_local_copy_again() {
+        let mut file = SourcesFile::default();
+        file.sources.push(source("acme"));
+        let offers = served(&[(
+            "acme",
+            vec![
+                remote("open", None),
+                remote("platform", Some("acme/platform")),
+            ],
+        )]);
+        let locals = [local("platform", Some("acme/platform"))];
+        let (before, _) = assign(&mut file, &locals, &offers);
+        assert_eq!(
+            before.shadowed.len(),
+            1,
+            "the server's copy hides the local one"
+        );
+
+        file.sources[0].domains = Some(vec!["open".into()]);
+        let (after, _) = assign(&mut file, &locals, &offers);
+        assert!(after.shadowed.is_empty(), "the local copy is visible again");
+        assert_eq!(
+            file.sources[0].mounts,
+            vec![MountRecord {
+                remote: "open".into(),
+                local: "open".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn a_listed_name_not_offered_is_kept_and_mounted_once_offered() {
+        let mut file = SourcesFile::default();
+        file.sources.push(listing("acme", &["ops", "open"]));
+        let (table, _) = assign(
+            &mut file,
+            &[],
+            &served(&[("acme", vec![remote("open", None)])]),
+        );
+        assert_eq!(
+            table.not_offered,
+            vec![Unoffered {
+                source: "acme".into(),
+                remote: "ops".into()
+            }]
+        );
+        assert_eq!(
+            file.sources[0].domains,
+            Some(vec!["ops".to_string(), "open".to_string()]),
+            "the list is not touched"
+        );
+        let (later, _) = assign(
+            &mut file,
+            &[],
+            &served(&[("acme", vec![remote("open", None), remote("ops", None)])]),
+        );
+        assert!(later.not_offered.is_empty());
+        assert!(names(&later).contains(&("acme".into(), "ops".into(), "ops".into())));
+
+        let (unknown, _) = assign(&mut file, &[], &BTreeMap::new());
+        assert!(
+            unknown.not_offered.is_empty(),
+            "a source with no answer yet says nothing about what it lacks"
+        );
+    }
+
+    #[test]
+    fn a_virtual_domain_on_a_list_is_mounted_and_one_off_it_is_not() {
+        let mut file = SourcesFile::default();
+        file.sources.push(source("acme"));
+        file.sources.push(listing("beta", &["scratch"]));
+        let (table, _) = assign(
+            &mut file,
+            &[],
+            &served(&[
+                ("acme", vec![remote("scratch", None)]),
+                ("beta", vec![remote("scratch", None), remote("notes", None)]),
+            ]),
+        );
+        assert_eq!(
+            names(&table),
+            vec![
+                ("acme".into(), "scratch".into(), "scratch".into()),
+                ("beta".into(), "scratch".into(), "scratch-beta".into()),
+            ],
+            "no origin, no collision: a list does not take a virtual domain from another source"
         );
     }
 }

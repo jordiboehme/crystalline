@@ -506,6 +506,10 @@ pub fn skipped_note(skipped: &crystalline_remote::Skipped) -> String {
             "left out: '{}' (its name cannot name a domain on this machine)",
             skipped.remote
         ),
+        crystalline_remote::SkipReason::NotChosen => format!(
+            "left out: '{}' (not on the list of domains this machine takes)",
+            skipped.remote
+        ),
     }
 }
 
@@ -591,13 +595,14 @@ fn fill_names(row: &mut SourceRow, table: &MountTable) {
     row.skipped = table
         .skipped
         .iter()
-        .filter(|s| s.source == row.name)
+        .filter(|s| s.source == row.name && s.reason != crystalline_remote::SkipReason::NotChosen)
         .map(|s| SkippedRow {
             remote: s.remote.clone(),
             kept_by: s.kept_by.clone(),
             reason: match s.reason {
                 crystalline_remote::SkipReason::SameDomain => "same_domain",
                 crystalline_remote::SkipReason::InvalidName => "invalid_name",
+                crystalline_remote::SkipReason::NotChosen => "not_chosen",
             }
             .to_string(),
             note: skipped_note(s),
@@ -922,6 +927,7 @@ mod tests {
                     by: "open".into(),
                 },
             ],
+            not_offered: Vec::new(),
         }
     }
 

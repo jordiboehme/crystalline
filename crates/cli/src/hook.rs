@@ -1736,6 +1736,7 @@ mod tests {
                 remote: "jordi".into(),
                 local: "jordi-acme".into(),
             }],
+            domains: None,
             from_env: false,
         });
         crystalline_remote::update_sources(dir.path(), |f| {

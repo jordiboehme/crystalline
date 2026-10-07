@@ -156,12 +156,13 @@ const RESERVED_VARS: &[&str] = &[
     // reserve it here or every mcpb session logs a spurious warning.
     CHANNEL_ENV,
     // A connected server from the environment (`crystalline_remote::env_source`):
-    // its URL and a personal MCP token for it. Read straight from the
+    // its URL, a personal MCP token for it and the list of domains it takes. Read straight from the
     // environment, never through the settings registry, and sharing the
     // `CRYSTALLINE_REMOTE_` prefix with `remote.deadline_ms`'s own variable,
     // so reserved here or every container that sets them logs a warning.
     "CRYSTALLINE_REMOTE_URL",
     "CRYSTALLINE_REMOTE_TOKEN",
+    "CRYSTALLINE_REMOTE_DOMAINS",
     // The first admin from the environment (`first_admin` in the service
     // crate): a name and a password, each plain or as a `_FILE` path for a
     // Docker secret. Read straight from the environment, never through the
@@ -1627,6 +1628,7 @@ mod tests {
     fn the_remote_source_variables_are_reserved_and_the_deadline_is_a_setting() {
         assert!(is_reserved("CRYSTALLINE_REMOTE_URL"));
         assert!(is_reserved("CRYSTALLINE_REMOTE_TOKEN"));
+        assert!(is_reserved("CRYSTALLINE_REMOTE_DOMAINS"));
         let ov = overlay(&[("CRYSTALLINE_REMOTE_DEADLINE_MS", "700")]).unwrap();
         assert_eq!(ov.apply(&GlobalConfig::default()).remote_deadline_ms(), 700);
     }

@@ -130,6 +130,7 @@ fn seed_source_as(
                 local: local.to_string(),
             })
             .collect(),
+        domains: None,
         from_env: false,
     };
     let saved = record.clone();
@@ -889,6 +890,7 @@ fn seed_named(
                 local: d.to_string(),
             })
             .collect(),
+        domains: None,
         from_env: false,
     };
     let host = record.host_dir(remote_dir);

@@ -843,6 +843,7 @@ where
             revocation_endpoint: oauth.revocation_endpoint.clone(),
             connected_at: now,
             mounts: Vec::new(),
+            domains: None,
             from_env: false,
         };
         save(remote_dir, record, name, &credential, routing, local)
@@ -985,6 +986,7 @@ async fn with_token(
         revocation_endpoint: None,
         connected_at: now,
         mounts: Vec::new(),
+        domains: None,
         from_env: false,
     };
     let (connected, replaced) = save(remote_dir, record, name, &credential, routing, local)?;
@@ -1226,6 +1228,7 @@ fn save(
                 | Announcement::ReplacesLocal { source, .. }
                 | Announcement::Skipped { source, .. }
                 | Announcement::LocalShadowed { source, .. } => *source == name,
+                Announcement::Moved { to, from, .. } => *to == name || *from == name,
             })
             .collect();
         let source = file.find(&name).cloned().expect("just saved");

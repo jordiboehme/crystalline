@@ -46,6 +46,9 @@ pub const LOCAL_SUFFIX: &str = "local";
 pub const REMOTE_URL_ENV: &str = "CRYSTALLINE_REMOTE_URL";
 /// The environment's personal MCP token for [`REMOTE_URL_ENV`].
 pub const REMOTE_TOKEN_ENV: &str = "CRYSTALLINE_REMOTE_TOKEN";
+/// The domains the environment's source takes, by their names on its
+/// server, comma separated. Unset or empty: every domain it offers.
+pub const REMOTE_DOMAINS_ENV: &str = "CRYSTALLINE_REMOTE_DOMAINS";
 
 /// Host labels that name what the machine is rather than whose it is, so a
 /// default source name skips them: `crystalline.acme.com` is `acme`.
@@ -100,6 +103,13 @@ pub struct SourceRecord {
     /// Every name this source handed out, in the order it handed them out.
     #[serde(default)]
     pub mounts: Vec<MountRecord>,
+    /// The domains this source takes, by their names on the server, sorted;
+    /// `None` takes every domain it offers. Set by `connect --domains`,
+    /// kept by a `connect` without it, cleared by `--all-domains`. Absent in
+    /// a file 0.23.0 wrote, which therefore takes all, and never written
+    /// when `None`, so 0.23.0 reads a file this build wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domains: Option<Vec<String>>,
     /// Built from the environment rather than read from the file.
     #[serde(skip)]
     pub from_env: bool,
@@ -183,6 +193,7 @@ impl SourcesFile {
                 existing.token_endpoint = record.token_endpoint;
                 existing.revocation_endpoint = record.revocation_endpoint;
                 existing.connected_at = record.connected_at;
+                existing.domains = record.domains;
                 &self.sources[at]
             }
             None => {
@@ -381,6 +392,29 @@ fn env_url(raw: &str) -> Result<String, String> {
     Err(reason.to_string())
 }
 
+/// A `--domains` value or [`REMOTE_DOMAINS_ENV`]: names separated by commas,
+/// each passing the rule every local domain name passes, sorted and without
+/// duplicates. An empty list is refused: a source that takes nothing is a
+/// source to disconnect.
+pub fn parse_domain_list(raw: &str) -> Result<Vec<String>, String> {
+    let mut names = Vec::new();
+    let parts: Vec<&str> = raw.split(',').map(str::trim).collect();
+    if parts.iter().all(|p| p.is_empty()) {
+        return Err("name at least one domain, for example --domains alpha,beta".to_string());
+    }
+    for part in parts {
+        if part.is_empty() {
+            return Err(format!("'{raw}' has an empty name between two commas"));
+        }
+        crystalline_core::config::registration::validate_domain_name(part)
+            .map_err(|e| format!("'{part}' cannot name a domain: {e}"))?;
+        names.push(part.to_string());
+    }
+    names.sort();
+    names.dedup();
+    Ok(names)
+}
+
 /// The source the environment adds, when both variables are set. Never
 /// saved; named like any other, past `taken`.
 pub fn env_source(env: impl Fn(&str) -> Option<String>, taken: &[String]) -> Option<SourceRecord> {
@@ -395,6 +429,21 @@ pub fn env_source(env: impl Fn(&str) -> Option<String>, taken: &[String]) -> Opt
         }
     };
     env(REMOTE_TOKEN_ENV).filter(|v| !v.trim().is_empty())?;
+    let domains = match env(REMOTE_DOMAINS_ENV)
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+    {
+        None => None,
+        Some(raw) => match parse_domain_list(&raw) {
+            Ok(list) => Some(list),
+            Err(e) => {
+                tracing::warn!(
+                    "{REMOTE_DOMAINS_ENV}: {e}; the server from {REMOTE_URL_ENV} is left out rather than taking every domain"
+                );
+                return None;
+            }
+        },
+    };
     Some(SourceRecord {
         name: default_source_name(&url, taken),
         url,
@@ -404,6 +453,7 @@ pub fn env_source(env: impl Fn(&str) -> Option<String>, taken: &[String]) -> Opt
         revocation_endpoint: None,
         connected_at: Utc::now(),
         mounts: Vec::new(),
+        domains,
         from_env: true,
     })
 }
@@ -421,6 +471,7 @@ mod tests {
             revocation_endpoint: None,
             connected_at: DateTime::from_timestamp(1_800_000_000, 0).unwrap(),
             mounts: Vec::new(),
+            domains: None,
             from_env: false,
         }
     }
@@ -712,6 +763,100 @@ mod tests {
         assert!(
             reason.contains("may use only lower-case letters, digits, '.', '_' and '-'"),
             "{reason}"
+        );
+    }
+
+    #[test]
+    fn a_domain_list_is_checked_sorted_and_deduplicated() {
+        assert_eq!(
+            parse_domain_list("gamma, alpha,beta,alpha").unwrap(),
+            vec!["alpha", "beta", "gamma"]
+        );
+        for bad in ["", " , ", "alpha,,beta", "Bad Name", "../x"] {
+            assert!(parse_domain_list(bad).is_err(), "{bad:?}");
+        }
+        let err = parse_domain_list("").unwrap_err();
+        assert!(err.contains("at least one"), "{err}");
+    }
+
+    #[test]
+    fn a_sources_file_from_0_23_0_loads_as_all_and_is_written_back_without_a_list() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(SOURCES_FILE),
+            r#"{ "v": 1, "sources": [{ "url": "https://crystalline.acme.com", "name": "acme",
+                 "account": "ada", "kind": "token", "connected_at": "2026-10-05T12:00:00Z",
+                 "mounts": [{ "remote": "open", "local": "open" }] }] }"#,
+        )
+        .unwrap();
+        let file = load_sources(dir.path()).unwrap();
+        assert_eq!(file.sources[0].domains, None, "no field is all");
+        update_sources(dir.path(), |_| Ok(())).unwrap();
+        let written = std::fs::read_to_string(dir.path().join(SOURCES_FILE)).unwrap();
+        assert!(
+            !written.contains("\"domains\""),
+            "no list is invented: {written}"
+        );
+    }
+
+    #[test]
+    fn a_list_round_trips_and_a_reconnect_record_carries_its_list() {
+        let dir = tempfile::tempdir().unwrap();
+        update_sources(dir.path(), |file| {
+            let mut acme = record("https://crystalline.acme.com", "acme");
+            acme.domains = Some(vec!["open".into()]);
+            file.upsert(acme);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            load_sources(dir.path()).unwrap().sources[0].domains,
+            Some(vec!["open".to_string()])
+        );
+        let mut file = load_sources(dir.path()).unwrap();
+        let mut again = record("https://crystalline.acme.com", "acme");
+        again.domains = None;
+        file.upsert(again);
+        assert_eq!(
+            file.sources[0].domains, None,
+            "upsert takes the list the caller decided"
+        );
+    }
+
+    #[test]
+    fn the_environment_list_sets_the_list_of_the_environment_source() {
+        let env = |name: &str| match name {
+            REMOTE_URL_ENV => Some("https://kb.acme.com".to_string()),
+            REMOTE_TOKEN_ENV => Some("cmt_x".to_string()),
+            REMOTE_DOMAINS_ENV => Some("beta,alpha".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            env_source(env, &[]).unwrap().domains,
+            Some(vec!["alpha".to_string(), "beta".to_string()])
+        );
+        let empty = |name: &str| match name {
+            REMOTE_DOMAINS_ENV => Some(String::new()),
+            other => env(other),
+        };
+        assert_eq!(
+            env_source(empty, &[]).unwrap().domains,
+            None,
+            "an empty variable is unset"
+        );
+    }
+
+    #[test]
+    fn a_bad_environment_list_leaves_the_environment_source_out() {
+        let env = |name: &str| match name {
+            REMOTE_URL_ENV => Some("https://kb.acme.com".to_string()),
+            REMOTE_TOKEN_ENV => Some("cmt_x".to_string()),
+            REMOTE_DOMAINS_ENV => Some("alpha,Not A Name".to_string()),
+            _ => None,
+        };
+        assert!(
+            env_source(env, &[]).is_none(),
+            "never all instead of a list it could not read"
         );
     }
 }

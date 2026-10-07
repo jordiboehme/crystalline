@@ -978,6 +978,7 @@ mod tests {
             revocation_endpoint: None,
             connected_at: Utc::now(),
             mounts: Vec::new(),
+            domains: None,
             from_env: false,
         };
         let saved = record.clone();

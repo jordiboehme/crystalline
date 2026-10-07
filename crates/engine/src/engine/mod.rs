@@ -9791,6 +9791,7 @@ mod hidden_copy_tests {
                     remote: "notes".to_string(),
                     local: "notes".to_string(),
                 }],
+                domains: None,
                 from_env: false,
             });
             Ok(())

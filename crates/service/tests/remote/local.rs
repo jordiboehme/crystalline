@@ -1006,6 +1006,7 @@ fn seed_offer(
                 local: d.to_string(),
             })
             .collect(),
+        domains: None,
         from_env: false,
     };
     let host = record.host_dir(remote_dir);
