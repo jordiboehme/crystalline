@@ -34,15 +34,36 @@ const STATUS_TOOL = {
   annotations: { title: "Crystalline status", readOnlyHint: true, openWorldHint: false },
 };
 
+/**
+ * The folders of a Windows PATH. An entry may stand in double quotes, which
+ * Windows drops, and a `;` inside the quotes is part of the folder name.
+ */
+function windowsPath(value) {
+  const dirs = [];
+  let dir = "";
+  let quoted = false;
+  for (const char of value) {
+    if (char === '"') quoted = !quoted;
+    else if (char === ";" && !quoted) {
+      dirs.push(dir);
+      dir = "";
+    } else dir += char;
+  }
+  dirs.push(dir);
+  return dirs.filter(Boolean);
+}
+
 /** Where to look, in order: the first hit that is Crystalline wins. */
 function candidates(platform, env) {
   const list = [];
   if (platform === "win32") {
-    for (const root of [env.ProgramFiles, env["ProgramFiles(x86)"]]) {
+    // ProgramW6432 names the 64-bit Program Files even when this Node is a
+    // 32-bit process, where ProgramFiles points at the (x86) folder.
+    for (const root of [env.ProgramW6432, env.ProgramFiles, env["ProgramFiles(x86)"]]) {
       if (root) list.push(path.win32.join(root, "Crystalline", "bin", "crystalline.exe"));
     }
-    for (const dir of String(env.PATH || env.Path || "").split(";")) {
-      if (dir) list.push(path.win32.join(dir, "crystalline.exe"));
+    for (const dir of windowsPath(String(env.PATH || env.Path || ""))) {
+      list.push(path.win32.join(dir, "crystalline.exe"));
     }
   } else {
     list.push("/opt/homebrew/bin/crystalline", "/usr/local/bin/crystalline");
@@ -141,23 +162,30 @@ function failure(id, code, message) {
   return { jsonrpc: "2.0", id, error: { code, message } };
 }
 
-/** The stub's answer to one message, or null for a notification. */
+/**
+ * The stub's answer to one message, or null for a notification and for a
+ * response (a message with an id but no method), which is never answered.
+ */
 function stubAnswer(message, note) {
   if (!message || typeof message !== "object" || message.id === undefined || message.id === null) {
     return null;
   }
+  if (typeof message.method !== "string") return null;
   const { id, method } = message;
   const params = message.params && typeof message.params === "object" ? message.params : {};
   const meta = params._meta && typeof params._meta === "object" ? params._meta : {};
-  const modern = meta[VERSION_KEY] === ERA;
+  // Revisions are ISO dates, so a string compare orders them. A revision
+  // after the era keeps the era's rules, as in the Rust server.
+  const asked = meta[VERSION_KEY];
+  const modern = typeof asked === "string" && asked >= ERA;
   const ok = (result) => ({ jsonrpc: "2.0", id, result });
   const listed = (result) =>
     ok(modern ? Object.assign({ resultType: "complete", ttlMs: 0, cacheScope: LIST_SCOPE }, result) : result);
   const serverInfo = { name: "crystalline", version: note.extensionVersion };
   switch (method) {
     case "initialize": {
-      const asked = params.protocolVersion;
-      const answered = SERVED_VERSIONS.includes(asked) && asked !== ERA ? asked : NEWEST_WITH_INITIALIZE;
+      const wanted = params.protocolVersion;
+      const answered = SERVED_VERSIONS.includes(wanted) && wanted < ERA ? wanted : NEWEST_WITH_INITIALIZE;
       return ok({ protocolVersion: answered, capabilities: { tools: {} }, serverInfo, instructions: note.instructions });
     }
     case "server/discover":
@@ -209,17 +237,48 @@ function serveStub(note, input, output) {
   lines.on("close", () => output.end());
 }
 
+const KILL_GRACE_MS = 2000;
+const FORWARDED_SIGNALS = ["SIGTERM", "SIGINT", "SIGHUP"];
+
+/**
+ * Ask the child to stop with `signal`, and kill it for good when it is still
+ * there after `graceMs`. The timer never keeps this process alive.
+ */
+function stopChild(child, signal = "SIGTERM", graceMs = KILL_GRACE_MS) {
+  child.kill(signal);
+  const timer = setTimeout(() => {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+  }, graceMs);
+  timer.unref();
+}
+
+/**
+ * Pass a stop signal this process gets on to the child. This process then
+ * stays until the child has gone, so its last output is still relayed.
+ * Windows has none of these signals to forward, so nothing is set up there.
+ */
+function forwardSignals(child, target = process, platform = process.platform, graceMs = KILL_GRACE_MS) {
+  if (platform === "win32") return;
+  for (const signal of FORWARDED_SIGNALS) {
+    target.on(signal, () => stopChild(child, signal, graceMs));
+  }
+}
+
 /**
  * Relay stdio byte for byte. When `input` ends, the child's stdin closes and
- * the child gets 5 s to leave before it is killed; `exit` gets its code.
+ * the child gets 5 s to leave before it is stopped; `exit` gets its code.
+ * When `output` fails (Claude Desktop closed the pipe), the child is stopped
+ * and the relay ends quietly.
  */
 function relay(child, input, output, errors, exit) {
   child.stdin.on("error", () => {});
+  output.on("error", () => stopChild(child));
+  errors.on("error", () => {});
   input.pipe(child.stdin);
   child.stdout.pipe(output);
   child.stderr.pipe(errors);
   input.on("end", () => {
-    const timer = setTimeout(() => child.kill(), 5000);
+    const timer = setTimeout(() => stopChild(child), 5000);
     timer.unref();
   });
   child.on("close", (code) => exit(code === null ? 1 : code));
@@ -259,9 +318,12 @@ function extensionVersion() {
 }
 
 function main() {
+  // A write after Claude Desktop closed the pipe fails with EPIPE: end
+  // quietly instead of with a stack trace.
+  process.stdout.on("error", () => {});
   const outcome = findBinary({ platform: process.platform, env: process.env, isFile, runVersion });
   if (outcome.kind === "ok") {
-    start(outcome.path, ["mcp"], Object.assign({}, process.env, { CRYSTALLINE_CHANNEL: "desktop" }), {
+    const child = start(outcome.path, ["mcp"], Object.assign({}, process.env, { CRYSTALLINE_CHANNEL: "desktop" }), {
       input: process.stdin,
       output: process.stdout,
       errors: process.stderr,
@@ -269,6 +331,7 @@ function main() {
       // may still sit in its buffer: flush it before the process ends.
       exit: (code) => process.stdout.write("", () => process.exit(code)),
     });
+    forwardSignals(child);
     return;
   }
   const note = notice(outcome, process.platform, extensionVersion());
@@ -287,6 +350,8 @@ module.exports = {
   stubAnswer,
   serveStub,
   relay,
+  stopChild,
+  forwardSignals,
   start,
   main,
 };

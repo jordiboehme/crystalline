@@ -287,3 +287,107 @@ test("a binary that cannot start is reported once and exits with 1", async () =>
   assert.deepEqual(codes, [1]);
   assert.match(Buffer.concat(err).toString(), /could not start/);
 });
+
+test("Windows strips quotes from PATH entries and looks at ProgramW6432 first", () => {
+  const env = {
+    ProgramW6432: "C:\\Program Files",
+    ProgramFiles: "C:\\Program Files (x86)",
+    "ProgramFiles(x86)": "C:\\Program Files (x86)",
+    Path: '"C:\\My Tools;2";C:\\Tools;""',
+  };
+  assert.deepEqual(shim.candidates("win32", env), [
+    "C:\\Program Files\\Crystalline\\bin\\crystalline.exe",
+    "C:\\Program Files (x86)\\Crystalline\\bin\\crystalline.exe",
+    "C:\\My Tools;2\\crystalline.exe",
+    "C:\\Tools\\crystalline.exe",
+  ]);
+  assert.deepEqual(shim.candidates("win32", { Path: '"C:\\Quoted Dir";C:\\Tools' }), [
+    "C:\\Quoted Dir\\crystalline.exe",
+    "C:\\Tools\\crystalline.exe",
+  ]);
+});
+
+test("a version check that exits non-zero is not Crystalline", unix, () => {
+  assert.equal(shim.runVersion(path.join(__dirname, "fixtures", "failing-version.js")), null);
+});
+
+test("a version check whose first line is something else is not Crystalline", unix, () => {
+  const line = shim.runVersion(path.join(__dirname, "fixtures", "garbage-version.js"));
+  assert.equal(line, "usage: crystalline [-x] file");
+  assert.equal(shim.parseVersion(line), null);
+});
+
+test("a JSON-RPC response sent to the stub is not answered", () => {
+  assert.equal(shim.stubAnswer({ jsonrpc: "2.0", id: 1, result: {} }, note), null);
+  assert.equal(shim.stubAnswer({ jsonrpc: "2.0", id: 2, error: { code: -1, message: "x" } }, note), null);
+  assert.equal(shim.stubAnswer({ jsonrpc: "2.0", id: 3, method: 7 }, note), null);
+});
+
+test("a revision after the era keeps the era's rules", () => {
+  const later = { "io.modelcontextprotocol/protocolVersion": "2027-01-01" };
+  const listed = shim.stubAnswer({ jsonrpc: "2.0", id: 1, method: "tools/list", params: { _meta: later } }, note);
+  assert.equal(listed.result.resultType, "complete");
+  assert.equal(listed.result.ttlMs, 0);
+  assert.equal(shim.stubAnswer({ jsonrpc: "2.0", id: 2, method: "ping", params: { _meta: later } }, note).error.code, -32601);
+  const older = { "io.modelcontextprotocol/protocolVersion": "2025-11-25" };
+  assert.deepEqual(shim.stubAnswer({ jsonrpc: "2.0", id: 3, method: "ping", params: { _meta: older } }, note).result, {});
+});
+
+const { EventEmitter } = require("node:events");
+const gone = (pid) => {
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (_) {
+    return true;
+  }
+};
+const relayed = (fixture) => {
+  const io = { input: new PassThrough(), output: new PassThrough(), errors: new PassThrough() };
+  io.output.resume();
+  io.errors.resume();
+  let child;
+  const exited = new Promise((resolve) => {
+    child = shim.start(process.execPath, [path.join(__dirname, "fixtures", fixture)], process.env, {
+      ...io,
+      exit: resolve,
+    });
+  });
+  return { child, exited, io };
+};
+
+test("a forwarded stop signal ends the relayed child", unix, async () => {
+  const { child, exited } = relayed("echo-child.js");
+  const signals = new EventEmitter();
+  shim.forwardSignals(child, signals, "darwin", 200);
+  await new Promise((resolve) => child.stderr.once("data", resolve));
+  signals.emit("SIGTERM");
+  assert.equal(await exited, 1);
+  assert.ok(gone(child.pid), "the child is gone");
+});
+
+test("a child that ignores the stop signal is killed after the grace period", unix, async () => {
+  const { child, exited } = relayed("stubborn-child.js");
+  await new Promise((resolve) => child.stdout.once("data", resolve));
+  const began = Date.now();
+  shim.stopChild(child, "SIGTERM", 200);
+  assert.equal(await exited, 1);
+  assert.equal(child.signalCode, "SIGKILL");
+  assert.ok(Date.now() - began < 2000);
+  assert.ok(gone(child.pid), "the child is gone");
+});
+
+test("no signal is forwarded on Windows", () => {
+  const signals = new EventEmitter();
+  shim.forwardSignals({ kill: () => assert.fail("no kill") }, signals, "win32");
+  assert.equal(signals.listenerCount("SIGTERM"), 0);
+});
+
+test("a closed output pipe stops the child quietly", unix, async () => {
+  const { child, exited, io } = relayed("stubborn-child.js");
+  await new Promise((resolve) => child.stdout.once("data", resolve));
+  const pipeError = Object.assign(new Error("write EPIPE"), { code: "EPIPE" });
+  io.output.destroy(pipeError);
+  assert.equal(await exited, 1);
+  assert.ok(gone(child.pid), "the child is gone");
+});
