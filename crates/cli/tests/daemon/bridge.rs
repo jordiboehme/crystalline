@@ -188,9 +188,20 @@ fn a_packaged_bridge_runs_the_task_and_serves_the_daemon() {
         "the daemon's tools, not the stub: {names:?}"
     );
     bridge.finish();
+    // The daemon came from the task, not from the bridge. Only the bridge's
+    // own spawn (`spawn_daemon`) opens daemon.log for the child it starts;
+    // the task seam starts the daemon with its output discarded, as Task
+    // Scheduler does. So a daemon.log here means the bridge spawned it.
+    let log = crate::common::isolated_state_dir(home.path()).join("daemon.log");
+    let spawned_by_bridge = log.exists();
     let mut stop = Command::new(assert_cmd::cargo::cargo_bin("crystalline"));
     for (name, value) in crate::common::isolation_env(home.path()) {
         stop.env(name, value);
     }
     let _ = stop.args(["ctl", "shutdown"]).output();
+    assert!(
+        !spawned_by_bridge,
+        "the bridge spawned the daemon itself ({} exists)",
+        log.display()
+    );
 }

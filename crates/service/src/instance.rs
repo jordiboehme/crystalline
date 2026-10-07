@@ -649,6 +649,8 @@ pub async fn try_attach_displacing() -> (Option<Connection>, Option<Option<Start
 /// usable record beside it) is still a daemon outside the package, so a
 /// packaged client connects to it as it is, with the bare `mcp` line, rather
 /// than running the task for a daemon that is already there.
+/// The cost: a hung daemon that still holds the pipe is attached as it is,
+/// so the session hangs instead of getting the stub.
 pub(crate) async fn try_attach_displacing_in(
     here: &crate::runs_in::PackageContext,
 ) -> (Option<Connection>, Option<Option<StartOptions>>) {

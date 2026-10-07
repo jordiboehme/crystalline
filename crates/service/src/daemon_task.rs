@@ -36,6 +36,19 @@ pub enum BridgeFailure {
     TaskMissing,
     TaskDidNotStart(String),
     NoAnswer,
+    /// A daemon answered on the pipe, but the MCP handshake with it failed.
+    HandshakeFailed(String),
+}
+
+impl BridgeFailure {
+    /// The cause of a failed packaged attach: the [`BridgeFailure`] it
+    /// carries, or else the failed MCP handshake, which is the only other way
+    /// a packaged attach fails.
+    pub fn of(e: &anyhow::Error) -> BridgeFailure {
+        e.downcast_ref::<BridgeFailure>()
+            .cloned()
+            .unwrap_or_else(|| BridgeFailure::HandshakeFailed(format!("{e:#}")))
+    }
 }
 
 impl std::fmt::Display for BridgeFailure {
@@ -53,7 +66,12 @@ impl std::fmt::Display for BridgeFailure {
             }
             BridgeFailure::NoAnswer => write!(
                 f,
-                "the Windows task {MACHINE_TASK_NAME} started, but no Crystalline daemon answered within 15 s"
+                "the Windows task {MACHINE_TASK_NAME} started, but no Crystalline daemon answered within {} s",
+                crate::instance::PACKAGED_TASK_WAIT.as_secs()
+            ),
+            BridgeFailure::HandshakeFailed(detail) => write!(
+                f,
+                "the Crystalline daemon answered, but it did not finish the MCP handshake ({detail})"
             ),
         }
     }

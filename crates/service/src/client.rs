@@ -280,10 +280,7 @@ pub async fn run_mcp(
                 return pump_stdio(stream, primed, db, config_path, read_only, harness_gate).await;
             }
             Err(e) if packaged => {
-                let bridge = e
-                    .downcast_ref::<crate::daemon_task::BridgeFailure>()
-                    .cloned()
-                    .unwrap_or(crate::daemon_task::BridgeFailure::NoAnswer);
+                let bridge = crate::daemon_task::BridgeFailure::of(&e);
                 tracing::warn!(
                     "this process runs inside an app package and only bridges to the daemon: {bridge}"
                 );

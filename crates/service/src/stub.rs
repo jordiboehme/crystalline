@@ -192,6 +192,7 @@ impl StubStatus {
         let daemon = self.daemon_version.as_deref().unwrap_or_default();
         let pid = self.daemon_pid.unwrap_or_default();
         let reason = &self.reason;
+        let wait = crate::instance::PACKAGED_TASK_WAIT.as_secs();
         match self.case() {
             StubCase::OutdatedMcpb => format!(
                 "Crystalline is running in degraded mode: this Crystalline extension (v{bin}) is older than the Crystalline daemon (v{daemon}) that owns this machine's knowledge, so no knowledge tools are available this session. Ask the user to download the latest Crystalline extension from https://github.com/jordiboehme/crystalline/releases and install it over the current one, then start a new conversation. Call the status tool for the full details to relay."
@@ -212,7 +213,10 @@ impl StubStatus {
                 "Crystalline is running in degraded mode: the Windows task {MACHINE_TASK_NAME} that starts the Crystalline daemon did not start ({detail}), so no knowledge tools are available this session. Ask the user to run `crystalline doctor` in a terminal, which says why, then restart Claude Desktop. Call the status tool for the full details to relay."
             ),
             StubCase::Bridge(BridgeFailure::NoAnswer) => format!(
-                "Crystalline is running in degraded mode: the Windows task {MACHINE_TASK_NAME} started, but no Crystalline daemon answered within 15 s, so no knowledge tools are available this session. Ask the user to run `crystalline status` in a terminal and to look at daemon.log in the Crystalline state folder, then restart Claude Desktop. Call the status tool for the full details to relay."
+                "Crystalline is running in degraded mode: the Windows task {MACHINE_TASK_NAME} started, but no Crystalline daemon answered within {wait} s, so no knowledge tools are available this session. Ask the user to run `crystalline status` in a terminal and to look at daemon.log in the Crystalline state folder, then restart Claude Desktop. Call the status tool for the full details to relay."
+            ),
+            StubCase::Bridge(BridgeFailure::HandshakeFailed(detail)) => format!(
+                "Crystalline is running in degraded mode: the Crystalline daemon answered, but it did not finish the MCP handshake ({detail}), so no knowledge tools are available this session. Ask the user to run `crystalline status` in a terminal, then restart Claude Desktop. Call the status tool for the full details to relay."
             ),
         }
     }
@@ -241,6 +245,8 @@ impl StubStatus {
             ),
             StubCase::Bridge(BridgeFailure::NoAnswer) =>
                 "Run `crystalline status` in a terminal and check daemon.log in the Crystalline state folder, then restart Claude Desktop.".to_string(),
+            StubCase::Bridge(BridgeFailure::HandshakeFailed(_)) =>
+                "Run `crystalline status` in a terminal, then restart Claude Desktop.".to_string(),
         }
     }
 
@@ -269,6 +275,7 @@ impl StubStatus {
                 BridgeFailure::TaskMissing => "task_missing",
                 BridgeFailure::TaskDidNotStart(_) => "task_did_not_start",
                 BridgeFailure::NoAnswer => "no_answer",
+                BridgeFailure::HandshakeFailed(_) => "handshake_failed",
             };
             map.insert("bridge".to_string(), Value::String(key.to_string()));
         }
@@ -719,7 +726,25 @@ mod tests {
         assert!(silent.fix().contains("crystalline status"));
         assert_eq!(silent.tool_payload()["bridge"], "no_answer");
 
-        for s in [missing, failed, silent] {
+        let refused = StubStatus::for_bridge(
+            "r".into(),
+            BridgeFailure::HandshakeFailed("connection reset".into()),
+        );
+        assert!(
+            refused
+                .instructions()
+                .contains("did not finish the MCP handshake (connection reset)"),
+            "{}",
+            refused.instructions()
+        );
+        assert!(
+            !refused.instructions().contains("Windows task"),
+            "the task is not the cause"
+        );
+        assert!(refused.fix().contains("crystalline status"));
+        assert_eq!(refused.tool_payload()["bridge"], "handshake_failed");
+
+        for s in [missing, failed, silent, refused] {
             for text in [s.instructions(), s.fix(), s.tool_payload().to_string()] {
                 assert!(
                     !text.contains('\u{2014}') && !text.contains('\u{2013}'),
@@ -727,5 +752,41 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A packaged attach that failed without a [`BridgeFailure`] failed in
+    /// the MCP handshake, never in the task: the stub must not say the task
+    /// started.
+    #[test]
+    fn a_failed_handshake_is_its_own_bridge_failure() {
+        use crate::daemon_task::BridgeFailure;
+        let handshake = anyhow::anyhow!("daemon MCP handshake failed (broken pipe)");
+        assert_eq!(
+            BridgeFailure::of(&handshake),
+            BridgeFailure::HandshakeFailed("daemon MCP handshake failed (broken pipe)".into())
+        );
+        let missing = anyhow::Error::new(BridgeFailure::TaskMissing);
+        assert_eq!(BridgeFailure::of(&missing), BridgeFailure::TaskMissing);
+        let silent = anyhow::Error::new(BridgeFailure::NoAnswer);
+        assert_eq!(BridgeFailure::of(&silent), BridgeFailure::NoAnswer);
+    }
+
+    #[test]
+    fn the_no_answer_copy_names_the_real_wait() {
+        let wait = format!("within {} s", crate::instance::PACKAGED_TASK_WAIT.as_secs());
+        let silent =
+            StubStatus::for_bridge("r".into(), crate::daemon_task::BridgeFailure::NoAnswer);
+        assert!(
+            silent.instructions().contains(&wait),
+            "{}",
+            silent.instructions()
+        );
+        assert!(
+            crate::daemon_task::BridgeFailure::NoAnswer
+                .to_string()
+                .contains(&wait),
+            "{}",
+            crate::daemon_task::BridgeFailure::NoAnswer
+        );
     }
 }
