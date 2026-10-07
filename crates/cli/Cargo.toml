@@ -113,5 +113,7 @@ fs4 = { workspace = true }
 
 # The job test in tests/daemon/service_windows.rs puts its own process in a
 # job that forbids breakaway, to see the daemon's refusal path end to end.
+# The session-end test there finds the daemon's hidden window and sends it
+# WM_ENDSESSION.
 [target.'cfg(windows)'.dev-dependencies]
-windows-sys = { workspace = true, features = ["Win32_Security", "Win32_System_JobObjects"] }
+windows-sys = { workspace = true, features = ["Win32_Security", "Win32_System_JobObjects", "Win32_UI_WindowsAndMessaging"] }

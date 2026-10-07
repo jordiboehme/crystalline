@@ -589,3 +589,103 @@ fn a_daemon_that_cannot_leave_the_job_says_so() {
         "doctor warns: {doctor}"
     );
 }
+
+/// D24 of the 0.24.0 plan, end to end: a daemon started the way the task
+/// starts it has the hidden window, and WM_ENDSESSION through that window
+/// runs the graceful stop to its end. What this cannot show is that Windows
+/// itself sends the message at a real sign-out; that stays a check on a real
+/// machine.
+#[test]
+fn a_task_started_daemon_stops_cleanly_when_the_session_ends() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        ENDSESSION_LOGOFF, FindWindowW, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_ENDSESSION,
+    };
+
+    let env = Env::new("win-session-end");
+    let mut serve = Command::new(bin());
+    env.apply(&mut serve);
+    serve
+        .env_remove("RUST_LOG")
+        .env("CRYSTALLINE_TEST_NO_KEYCHAIN", "1")
+        .args(["serve", "--from-task"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut daemon = Reap(serve.spawn().unwrap());
+    let state = env.state_dir();
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let class: Vec<u16> = "CrystallineSessionEnd".encode_utf16().chain([0]).collect();
+    let title: Vec<u16> = format!("Crystalline daemon {}", daemon.0.id())
+        .encode_utf16()
+        .chain([0])
+        .collect();
+    let hwnd = loop {
+        // SAFETY: two NUL-terminated wide strings that live for the call.
+        let found = unsafe { FindWindowW(class.as_ptr(), title.as_ptr()) };
+        if !found.is_null() && env.info_path().is_file() {
+            break found;
+        }
+        assert!(
+            daemon.0.try_wait().unwrap().is_none(),
+            "the daemon left before its window appeared"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "the daemon's window never appeared"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+
+    let mut result = 0usize;
+    let started = Instant::now();
+    // SAFETY: a window handle FindWindowW just returned; the call waits at
+    // most 8 s and returns early if the daemon's thread is gone.
+    unsafe {
+        SendMessageTimeoutW(
+            hwnd,
+            WM_ENDSESSION,
+            1,
+            ENDSESSION_LOGOFF as isize,
+            SMTO_ABORTIFHUNG,
+            8000,
+            &mut result,
+        )
+    };
+    let exit = loop {
+        if let Some(status) = daemon.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "the daemon did not leave"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "inside the session-end budget: {:?}",
+        started.elapsed()
+    );
+    assert!(exit.success(), "a clean exit: {exit:?}");
+    let log = std::fs::read_to_string(state.join("daemon.log")).unwrap();
+    assert!(log.contains("stopping (Windows sign-out)"), "{log}");
+    assert!(
+        log.contains("shutdown: removing the record, the socket and the lock file"),
+        "{log}"
+    );
+    assert!(
+        !log.contains("shutdown did not finish"),
+        "the watchdog was not needed: {log}"
+    );
+    assert!(!env.info_path().exists(), "the record is gone");
+    let lock = state.join("service.lock");
+    if lock.exists() {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock)
+            .unwrap();
+        fs4::FileExt::try_lock(&file).expect("the lock was released");
+    }
+}

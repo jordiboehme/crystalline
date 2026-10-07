@@ -549,6 +549,24 @@ pub async fn run_serve(
         drop(sessions_rx);
     }
 
+    // Windows ends a windowless, consoleless process with the user's
+    // session and tells it nothing. A hidden window gets the session end and
+    // starts the same graceful stop `ctl shutdown` does (D24 of the 0.24.0
+    // plan). Every detached daemon on Windows has one; a foreground `serve`
+    // keeps its console and Ctrl+C.
+    #[cfg(windows)]
+    let _session_end = if daemon_flag {
+        let stop = shared.clone();
+        crate::session_end_windows::SessionEndWindow::start(
+            &crate::session_end_windows::window_title(std::process::id()),
+            Box::new(move |reason| stop.trigger_shutdown(reason)),
+            crate::session_end::stopped_receiver(),
+            crate::session_end::ENDSESSION_WAIT,
+        )
+    } else {
+        None
+    };
+
     // The one-time first-run setup token, drawn once per serve process and only
     // when it could still be spent. Two things have to be true: the bind is one
     // somebody else can reach (on loopback the wizard is authorized by the peer
@@ -999,6 +1017,9 @@ impl Departure {
         if let Some(line) = farewell {
             eprintln!("{line}");
         }
+        // A window procedure holding WM_ENDSESSION may now let Windows end
+        // the session: nothing of the index is in use any more.
+        crate::session_end::notify_stopped();
         exit_now();
     }
 }

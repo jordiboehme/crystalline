@@ -89,7 +89,15 @@ rust-embed = { workspace = true, optional = true }
 libc = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_System_Console"] }
+# The clean stop on sign-out and shutdown (session_end_windows): a hidden
+# top-level window. RegisterClassExW and WNDCLASSEXW are behind
+# Win32_Graphics_Gdi in windows-sys 0.61.2.
+windows-sys = { workspace = true, features = [
+    "Win32_Graphics_Gdi",
+    "Win32_System_Console",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [dev-dependencies]
 # This package, with its test seam on: an integration test is its own crate, so
