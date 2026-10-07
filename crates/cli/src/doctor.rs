@@ -3962,12 +3962,29 @@ fn render_merge(out: &mut String, merge: &crate::desktop_state::MergeReport) {
     for line in &merge.not_moved {
         let _ = writeln!(out, "  [problem] {line}");
     }
-    if !merge.private_kept.is_empty() {
+    for name in &merge.origins_copied {
         let _ = writeln!(
             out,
-            "  kept this machine's {}; the private copies stay in the renamed folder. Team edits made through the extension that were not pushed yet: push them from the old extension before you remove it",
+            "  copied the team state of {name} from Claude Desktop's state, so it updates and shares as before"
+        );
+    }
+    if !merge.private_kept.is_empty() {
+        let place = if merge.renamed_to.is_some() {
+            "the renamed folder"
+        } else {
+            "Claude Desktop's private folder"
+        };
+        let _ = writeln!(
+            out,
+            "  kept this machine's {} as they are; the private copies stay in {place}",
             merge.private_kept.join(", ")
         );
+        if merge.private_kept.iter().any(|k| k == "origins") {
+            let _ = writeln!(
+                out,
+                "  team edits you did not share yet are still in the domain's folder: share them as usual with crystalline origin share, and get new team changes with crystalline origin update"
+            );
+        }
     }
     if let Some(to) = &merge.renamed_to {
         let _ = writeln!(

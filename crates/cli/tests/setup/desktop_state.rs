@@ -718,3 +718,182 @@ fn the_merge_refuses_a_domain_filter() {
     assert!(stderr.contains("leave out --domain"), "{stderr}");
     assert!(folder.exists());
 }
+
+/// A private state holding one team domain, `brand`: its folder under
+/// `home`, its origin block in the private config and its team state
+/// (`origins/brand`) in the private folder, the way an old extension leaves
+/// it. The real config turns GitHub on, so `origin status` answers here.
+fn plant_private_team_domain(home: &Path) -> PathBuf {
+    let folder = private_folder(home);
+    let root = home.join("docs").join("brand");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("MANIFEST.md"), "# Manifest\n").unwrap();
+    std::fs::write(root.join("a.md"), "# Team\n\nHello.\n").unwrap();
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(
+        folder.join("config.yaml"),
+        format!(
+            "domains:\n  brand:\n    path: {}\n    origin:\n      repo: acme/brand-knowledge\n      branch: main\ngithub:\n  enabled: true\n",
+            serde_json::to_string(&root).unwrap()
+        ),
+    )
+    .unwrap();
+    let origin = folder.join("origins").join("brand");
+    std::fs::create_dir_all(origin.join("base")).unwrap();
+    std::fs::write(origin.join("base").join("a.md"), "# Team\n\nHello.\n").unwrap();
+    std::fs::write(
+        origin.join("state.json"),
+        r#"{"version":1,"repo":"acme/brand-knowledge","branch":"main","base_commit":"abc123","ref_etag":null,"last_checked":null,"files":{"a.md":{"sha256":"c3c11220a2499569be3fefd408a950e49125ad33d587a26dadbcb210127098fc","size":15}},"proposals":[],"history":[],"conflicts":[]}"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(real_config_path(home).parent().unwrap()).unwrap();
+    std::fs::write(real_config_path(home), "github:\n  enabled: true\n").unwrap();
+    folder
+}
+
+fn real_origins(home: &Path) -> PathBuf {
+    crate::common::isolated_state_dir(home).join("origins")
+}
+
+/// A team domain only the old extension knew comes over with its team
+/// state: the merge copies `origins/<name>` (the private copy stays in the
+/// renamed folder), so the real side can report, update and share it.
+#[test]
+fn a_team_domain_comes_over_with_its_team_state() {
+    let home = tempfile::tempdir().unwrap();
+    let folder = plant_private_team_domain(home.path());
+    let out = run(
+        home.path(),
+        &["doctor", "--fix", "--merge-desktop-state", "--json"],
+    );
+    let report: Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out.stderr)));
+    let merge = &report["merge"];
+    assert_eq!(merge["conflicts"], serde_json::json!([]), "{merge}");
+    assert_eq!(merge["registered"], serde_json::json!(["brand"]), "{merge}");
+
+    let mut cmd = crate::common::crystalline();
+    crate::common::isolate(&mut cmd, home.path());
+    let status = cmd
+        .env("CRYSTALLINE_SERVICE_HTTP", "false")
+        .env_remove("CRYSTALLINE_GITHUB_TOKEN")
+        .args(["--json", "origin", "status", "--domain", "brand"])
+        .output()
+        .unwrap();
+    let status: Value = serde_json::from_slice(&status.stdout).unwrap_or_else(|e| {
+        panic!(
+            "{e}: {} {}",
+            String::from_utf8_lossy(&status.stdout),
+            String::from_utf8_lossy(&status.stderr)
+        )
+    });
+    assert_eq!(status["errors"], serde_json::json!([]), "{status}");
+    assert_eq!(status["domains"][0]["domain"], "brand", "{status}");
+    assert_eq!(status["domains"][0]["base_commit"], "abc123", "{status}");
+
+    assert_eq!(
+        merge["origins_copied"],
+        serde_json::json!(["brand"]),
+        "{merge}"
+    );
+    let renamed = PathBuf::from(merge["renamed_to"].as_str().unwrap());
+    assert!(!folder.exists());
+    assert_eq!(
+        snapshot(&renamed.join("origins").join("brand")),
+        snapshot(&real_origins(home.path()).join("brand")),
+        "copied, and the private copy stays where the rename put it"
+    );
+    let text = run(home.path(), &["doctor"]);
+    let text = String::from_utf8_lossy(&text.stdout);
+    assert!(!text.contains("no origin state on disk"), "{text}");
+}
+
+/// This machine already holds team state under the name (left from an
+/// earlier domain): it is never overwritten, so the domain is not
+/// registered and the folder stays.
+#[test]
+fn team_state_this_machine_already_has_is_never_overwritten() {
+    let home = tempfile::tempdir().unwrap();
+    let folder = plant_private_team_domain(home.path());
+    let real = real_origins(home.path()).join("brand");
+    std::fs::create_dir_all(&real).unwrap();
+    let other = std::fs::read_to_string(folder.join("origins/brand/state.json"))
+        .unwrap()
+        .replace("abc123", "def456");
+    std::fs::write(real.join("state.json"), &other).unwrap();
+    let out = run(
+        home.path(),
+        &["doctor", "--fix", "--merge-desktop-state", "--json"],
+    );
+    let report: Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out.stderr)));
+    let merge = &report["merge"];
+    assert_eq!(merge["registered"], serde_json::json!([]), "{merge}");
+    let conflict = merge["conflicts"][0].as_str().unwrap();
+    assert!(conflict.contains("'brand'"), "{conflict}");
+    assert!(conflict.contains("team state"), "{conflict}");
+    assert_eq!(
+        std::fs::read_to_string(real.join("state.json")).unwrap(),
+        other
+    );
+    assert!(
+        folder.exists(),
+        "nothing is renamed while a problem remains"
+    );
+    assert!(!real_config(home.path()).domains.contains_key("brand"));
+    assert_eq!(out.status.code(), Some(1));
+}
+
+/// A copy that fails registers nothing and leaves the folder where it is.
+#[test]
+fn a_team_state_that_cannot_be_copied_keeps_the_domain_out() {
+    let home = tempfile::tempdir().unwrap();
+    let folder = plant_private_team_domain(home.path());
+    // A file where the origins folder belongs: no copy can land. GitHub
+    // stays off here, so doctor does not look for a token in that folder.
+    std::fs::write(real_config_path(home.path()), "domains: {}\n").unwrap();
+    let origins = real_origins(home.path());
+    std::fs::create_dir_all(origins.parent().unwrap()).unwrap();
+    std::fs::write(&origins, "not a folder").unwrap();
+    let out = run(
+        home.path(),
+        &["doctor", "--fix", "--merge-desktop-state", "--json"],
+    );
+    let report: Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out.stderr)));
+    let merge = &report["merge"];
+    assert_eq!(merge["registered"], serde_json::json!([]), "{merge}");
+    let conflict = merge["conflicts"][0].as_str().unwrap();
+    assert!(conflict.contains("could not be copied"), "{conflict}");
+    assert!(
+        folder.exists(),
+        "nothing is renamed while a problem remains"
+    );
+    assert!(
+        folder
+            .join("origins")
+            .join("brand")
+            .join("state.json")
+            .is_file()
+    );
+    assert!(!real_config(home.path()).domains.contains_key("brand"));
+    assert_eq!(out.status.code(), Some(1));
+}
+
+#[test]
+fn a_merged_team_domain_reads_as_plain_sentences() {
+    let home = tempfile::tempdir().unwrap();
+    plant_private_team_domain(home.path());
+    let out = run(home.path(), &["doctor", "--fix", "--merge-desktop-state"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("copied the team state of brand from Claude Desktop's state"),
+        "{text}"
+    );
+    assert!(
+        text.contains("the private copies stay in the renamed folder"),
+        "{text}"
+    );
+    assert!(text.contains("crystalline origin share"), "{text}");
+    assert!(!text.contains("old extension"), "{text}");
+}

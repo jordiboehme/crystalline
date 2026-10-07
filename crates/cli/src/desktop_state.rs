@@ -175,6 +175,10 @@ pub struct MergeReport {
     /// naming the files and why. While any remains the folder is not
     /// renamed.
     pub not_moved: Vec<String>,
+    /// Team domains newly registered here whose team state
+    /// (`origins/<name>`) was copied from the private folder. The private
+    /// copy stays where it was.
+    pub origins_copied: Vec<String>,
     /// Private files kept as they are and named for the person.
     pub private_kept: Vec<String>,
     /// Where the private folder went.
@@ -185,6 +189,7 @@ impl MergeReport {
     /// Whether the merge wrote anything on the real side or moved the folder.
     pub fn changed_something(&self) -> bool {
         !self.registered.is_empty()
+            || !self.origins_copied.is_empty()
             || self.imported.iter().any(|(_, n)| *n > 0)
             || self.renamed_to.is_some()
     }
@@ -334,6 +339,85 @@ pub(crate) fn merged_name(folder: &Path, today: chrono::NaiveDate) -> PathBuf {
     candidate
 }
 
+/// Copy the folder `from` to `to`, which must not exist yet. Only files
+/// and folders: anything else fails the copy rather than being left out.
+fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::create_dir(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        let target = to.join(entry.file_name());
+        if kind.is_dir() {
+            copy_tree(&entry.path(), &target)?;
+        } else if kind.is_file() {
+            std::fs::copy(entry.path(), &target)?;
+        } else {
+            return Err(std::io::Error::other(format!(
+                "{} is neither a file nor a folder",
+                shown(&entry.path())
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Bring the team state of the private team domain `name` to this machine:
+/// copy `<folder>/origins/<name>` into `origins`, never over a state this
+/// machine already has. The copy goes to a staging folder first and is
+/// renamed into place, so a failed copy leaves nothing half written. `Ok`
+/// carries the new folder, `None` when the private side has no team state
+/// for the name. `Err` is the sentence that says why the domain stays out.
+fn carry_team_state(
+    name: &str,
+    folder: &Path,
+    origins: Result<PathBuf, String>,
+) -> Result<Option<PathBuf>, String> {
+    let from = folder.join("origins").join(name);
+    if !from.is_dir() {
+        return Ok(None);
+    }
+    let origins = origins.map_err(|e| {
+        format!(
+            "'{name}' in Claude Desktop's state is a team domain, and its team state could not be copied here ({e}), so it was not registered. Fix that, then merge again"
+        )
+    })?;
+    let to = origins.join(name);
+    let taken = || {
+        format!(
+            "'{name}' in Claude Desktop's state is a team domain, but this machine already has team state under that name in {}, and the merge never overwrites it. Move that folder away if no domain here uses it, then merge again",
+            shown(&to)
+        )
+    };
+    if to.exists() {
+        return Err(taken());
+    }
+    let staging = origins.join(format!(".{name}.merging-{}", std::process::id()));
+    let copied = std::fs::create_dir_all(&origins)
+        .and_then(|()| copy_tree(&from, &staging))
+        .and_then(|()| {
+            if to.exists() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    taken(),
+                ));
+            }
+            std::fs::rename(&staging, &to)
+        });
+    match copied {
+        Ok(()) => Ok(Some(to)),
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            if e.kind() == std::io::ErrorKind::AlreadyExists && to.exists() {
+                return Err(taken());
+            }
+            Err(format!(
+                "'{name}' in Claude Desktop's state is a team domain, and its team state could not be copied to {} ({e}), so it was not registered. Fix that, then merge again",
+                shown(&to)
+            ))
+        }
+    }
+}
+
 /// Copy the private index (and its write-ahead files) and its `config.yaml`
 /// into `scratch`, so the export opens copies only: the original index is
 /// never migrated and nothing in the private folder is opened for writing.
@@ -379,6 +463,9 @@ pub async fn merge_into(
     let problems_before = report.conflicts.len() + report.not_moved.len();
     let canonical_folder = canonical(&state.folder);
     let mut registered = Vec::new();
+    // Team state copied for `registered`, removed again if the config
+    // cannot be saved, so a later merge does not find it in the way.
+    let mut carried: Vec<(String, PathBuf)> = Vec::new();
     let mut virtuals: Vec<(String, bool)> = Vec::new();
     // Names whose files sit inside the private folder while this machine
     // registers the name: said once the rename has decided where they are.
@@ -416,6 +503,20 @@ pub async fn merge_into(
                 unusable.why(&state.folder)
             )),
             (None, None) => {
+                // A team domain is of no use here without its team state:
+                // copied first, and the domain stays out when it cannot be.
+                if entry.origin.is_some() {
+                    let origins =
+                        crystalline_core::config::origins_state_dir().map_err(|e| e.to_string());
+                    match carry_team_state(name, &state.folder, origins) {
+                        Ok(Some(to)) => carried.push((name.clone(), to)),
+                        Ok(None) => {}
+                        Err(why) => {
+                            report.conflicts.push(why);
+                            continue;
+                        }
+                    }
+                }
                 file.domains.insert(name.clone(), entry.clone());
                 registered.push(name.clone());
             }
@@ -442,8 +543,16 @@ pub async fn merge_into(
         }
     }
     if !registered.is_empty() {
-        crystalline_core::config::save_yaml(&loaded.path, &file)?;
+        if let Err(e) = crystalline_core::config::save_yaml(&loaded.path, &file) {
+            for (_, to) in &carried {
+                let _ = std::fs::remove_dir_all(to);
+            }
+            return Err(e.into());
+        }
         report.registered.extend(registered.iter().cloned());
+        report
+            .origins_copied
+            .extend(carried.into_iter().map(|(name, _)| name));
         // Indexed as `domain add` indexes a new folder, so the merged
         // domains answer at once.
         for name in &registered {
