@@ -4,7 +4,7 @@ Two scripts for the contradiction check (V302).
 
 - `parity.py` writes the logits fixtures `crates/index/tests/fixtures/nli-parity-<id>.json`
   from Python transformers, float32, one pair per forward pass. The Rust test
-  `crates/index/tests/nli_model.rs` checks the candle loader against them to
+  `crates/index/tests/it/it/nli_model.rs` checks the candle loader against them to
   1e-4 behind `CRYSTALLINE_TEST_NLI=1`. Needs `torch`, `transformers`,
   `sentencepiece` and `protobuf`.
 - `evaluate.py` reads a dump from `evals/scale/run.sh --stage nli` and the

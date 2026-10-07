@@ -3398,7 +3398,7 @@ mod tests {
     /// `crystalline_core::config::state_dir()` through these, and cargo runs
     /// test functions from this file on multiple threads, so every test takes
     /// this lock for its duration to avoid observing another's env var state.
-    /// The same pattern `crates/core/tests/config.rs` uses for
+    /// The same pattern `crates/core/tests/it/config.rs` uses for
     /// `CRYSTALLINE_MODELS_DIR`.
     static STATE_DIR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 

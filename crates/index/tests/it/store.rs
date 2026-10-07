@@ -9717,14 +9717,14 @@ parity!(
 #[test]
 fn every_engram_reading_sql_carries_an_actor_predicate() {
     let files: &[(&str, &str)] = &[
-        ("turso/mod.rs", include_str!("../src/turso/mod.rs")),
-        ("postgres/mod.rs", include_str!("../src/postgres/mod.rs")),
-        ("turso/search.rs", include_str!("../src/turso/search.rs")),
+        ("turso/mod.rs", include_str!("../../src/turso/mod.rs")),
+        ("postgres/mod.rs", include_str!("../../src/postgres/mod.rs")),
+        ("turso/search.rs", include_str!("../../src/turso/search.rs")),
         (
             "postgres/search.rs",
-            include_str!("../src/postgres/search.rs"),
+            include_str!("../../src/postgres/search.rs"),
         ),
-        ("store.rs", include_str!("../src/store.rs")),
+        ("store.rs", include_str!("../../src/store.rs")),
     ];
     let census = census_engram_statements(files);
     assert!(

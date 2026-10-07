@@ -411,18 +411,21 @@ fn missing_manifest_resolves_to_nothing() {
 #[test]
 fn every_name_a_notice_interpolates_is_backticked() {
     const SOURCES: [(&str, &str); 4] = [
-        ("provision/mod.rs", include_str!("../src/provision/mod.rs")),
+        (
+            "provision/mod.rs",
+            include_str!("../../src/provision/mod.rs"),
+        ),
         (
             "provision/model.rs",
-            include_str!("../src/provision/model.rs"),
+            include_str!("../../src/provision/model.rs"),
         ),
         (
             "provision/reconcile.rs",
-            include_str!("../src/provision/reconcile.rs"),
+            include_str!("../../src/provision/reconcile.rs"),
         ),
         (
             "provision/translate.rs",
-            include_str!("../src/provision/translate.rs"),
+            include_str!("../../src/provision/translate.rs"),
         ),
     ];
     // Not prose: a path segment, a struct field holding one, a JSON body, and

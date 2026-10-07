@@ -1,8 +1,6 @@
 //! Manifest section extraction and routing bullets.
 
-mod common;
-
-use common::{fixtures_dir, read};
+use crate::common::{fixtures_dir, read};
 use crystalline_core::manifest::{
     ArtifactType, DOMAIN_NAME_KEY, GeneratedIndexes, Manifest, PolicyKey, PolicyKind, PolicyRole,
     ProblemKind, SHARING_KEY, Sharing, TagAliasProblemKind, append_tag_alias, domain_name_at,

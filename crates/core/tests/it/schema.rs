@@ -1,8 +1,6 @@
 //! Picoschema parsing, validation, selection, inference and drift.
 
-mod common;
-
-use common::{fixtures_dir, read};
+use crate::common::{fixtures_dir, read};
 use crystalline_core::parse_engram;
 use crystalline_core::schema::{
     FieldType, IssueSeverity, ScalarType, Schema, SchemaIssueKind, ValidationMode, diff, infer,

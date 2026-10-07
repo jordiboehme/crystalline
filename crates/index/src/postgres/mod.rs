@@ -83,7 +83,7 @@ mod search;
 /// submodule, so without this the registry would hold a second copy of each
 /// statement, and a copy is a thing that can be right about SQL nobody runs.
 /// [`DEFAULT_MIN_SIMILARITY`] is re-exported the same way, for the same
-/// reason: the cross-backend parity test in `tests/store.rs` reads it rather
+/// reason: the cross-backend parity test in `tests/it/store.rs` reads it rather
 /// than holding a second copy of the number.
 #[doc(hidden)]
 pub use search::{

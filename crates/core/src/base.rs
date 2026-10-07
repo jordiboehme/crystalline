@@ -11,7 +11,7 @@ use std::fmt;
 /// so behind a stripping proxy a prefix `/api` would strip the request for
 /// `/api/v1/...` a second time. A new route goes under an existing first
 /// segment, so an upgrade never makes a prefix in use invalid.
-/// `crates/core/tests/base_routes.rs` checks Fluid's route table against it.
+/// `crates/core/tests/it/it/base_routes.rs` checks Fluid's route table against it.
 pub const RESERVED_FIRST_SEGMENTS: [&str; 17] = [
     "api",
     "assets",

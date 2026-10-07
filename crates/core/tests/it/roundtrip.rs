@@ -2,9 +2,7 @@
 //! lossless reconstruction for every valid file and typed errors for the
 //! encoding and YAML failure fixtures.
 
-mod common;
-
-use common::{md_files, read, stem};
+use crate::common::{md_files, read, stem};
 use crystalline_core::parse::ParseError;
 use crystalline_core::{emit_engram, parse_engram, parse_engram_lossless};
 

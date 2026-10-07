@@ -1,7 +1,7 @@
 //! Offline mock-server tests for the GitHub device flow, GHES endpoint
 //! derivation and token validation in `github::auth`. Every test spins up a
 //! throwaway axum server on an ephemeral localhost port, mirroring
-//! `tests/github_client.rs`, so the suite never touches the real network and
+//! `tests/it/github_client.rs`, so the suite never touches the real network and
 //! never touches the real OS keychain.
 
 use std::sync::{Arc, Mutex};
@@ -19,7 +19,7 @@ use crystalline_remote::github::auth::{
 use tokio::net::TcpListener;
 
 /// Starts `router` on an ephemeral localhost port and returns its base url,
-/// same pattern as `tests/github_client.rs`.
+/// same pattern as `tests/it/github_client.rs`.
 async fn spawn(router: Router) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

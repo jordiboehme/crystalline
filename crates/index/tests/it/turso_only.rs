@@ -163,7 +163,7 @@ async fn a_checkpoint_after_every_read_helper_is_never_busy() {
 /// caught the spill this project has already paid for once.
 #[test]
 fn a_body_projection_never_reaches_an_unbounded_sorter() {
-    let src = include_str!("../src/turso/search.rs");
+    let src = include_str!("../../src/turso/search.rs");
     let lines: Vec<&str> = src.lines().collect();
     let mut projections = 0;
     for (n, line) in lines.iter().enumerate() {
@@ -204,8 +204,8 @@ fn a_body_projection_never_reaches_an_unbounded_sorter() {
 #[test]
 fn the_inbound_reference_query_selects_no_body() {
     for (file, src) in [
-        ("turso/mod.rs", include_str!("../src/turso/mod.rs")),
-        ("postgres/mod.rs", include_str!("../src/postgres/mod.rs")),
+        ("turso/mod.rs", include_str!("../../src/turso/mod.rs")),
+        ("postgres/mod.rs", include_str!("../../src/postgres/mod.rs")),
     ] {
         let Some(start) = src.find("async fn inbound_page") else {
             panic!("{file} carries no inbound_page to guard");

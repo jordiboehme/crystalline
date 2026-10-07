@@ -13,18 +13,14 @@
 #![cfg(unix)]
 
 use std::path::Path;
-use std::sync::Mutex;
 
+use crate::common::HOME_LOCK;
 use crystalline_core::manifest::ArtifactType;
 use crystalline_core::provision::receipt::sha256_hex;
 use crystalline_core::{
     ActionStatus, DesiredFile, DesiredPayload, DesiredSet, DomainArtifacts, HarnessKind,
     HarnessState, McpOutcome, McpRunner, desired_set, reconcile_harness, scan_domain,
 };
-
-/// Serializes every `HOME`-mutating test in this binary, so a concurrent test
-/// never observes a half-set environment.
-static HOME_LOCK: Mutex<()> = Mutex::new(());
 
 /// A runner that must never be called: this test provisions no MCP servers.
 struct NoMcp;

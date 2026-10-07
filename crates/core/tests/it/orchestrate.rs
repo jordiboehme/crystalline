@@ -4,7 +4,7 @@
 //! wired together against a real receipt file and a temp `HOME`.
 //!
 //! Unix only: several tests redirect `HOME` to a scratch directory, the same
-//! env-isolation technique `tests/reconcile.rs` uses (a shared lock plus
+//! env-isolation technique `tests/it/reconcile.rs` uses (a shared lock plus
 //! preserve-and-restore), since `apply`'s file reconcile resolves a harness's
 //! config directory from `HOME`. `apply`/`status` calls that never touch a
 //! harness (an empty harness list, or a check that stops before reconciling)
@@ -14,8 +14,8 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::path::Path;
-use std::sync::Mutex;
 
+use crate::common::HOME_LOCK;
 use crystalline_core::HarnessKind;
 use crystalline_core::config::{DomainEntry, GlobalConfig};
 use crystalline_core::provision::reconcile::{ActionStatus, McpOutcome, McpRunner};
@@ -27,9 +27,6 @@ use crystalline_core::provision::{self, Decision};
 fn no_env() -> HashSet<&'static str> {
     HashSet::new()
 }
-
-/// Serializes every `HOME`-mutating test in this binary.
-static HOME_LOCK: Mutex<()> = Mutex::new(());
 
 // --- fixture helpers ---------------------------------------------------------
 

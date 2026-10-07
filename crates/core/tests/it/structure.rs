@@ -1,8 +1,6 @@
 //! Structural assertions on parsed fixtures plus a few snapshot checks.
 
-mod common;
-
-use common::{fixtures_dir, read};
+use crate::common::{fixtures_dir, read};
 use crystalline_core::parse_engram;
 
 fn parse_fixture(rel: &str) -> crystalline_core::Engram {

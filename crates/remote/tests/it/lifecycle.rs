@@ -17,8 +17,6 @@
 //! never panics on an injected fault (a garbage-collected base commit, a
 //! forced truncation).
 
-mod mock;
-
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -39,7 +37,7 @@ use crystalline_remote::state::{
     read_conflict_files,
 };
 
-use mock::{MockProvider, sha256_hex};
+use crate::mock::{MockProvider, sha256_hex};
 
 /// The origin every scenario tracks: one repository, the whole repository as
 /// the domain (no subpath) and a `main` branch.
@@ -3765,21 +3763,27 @@ async fn domain_removal_drops_the_mirror() {
 /// installed across the whole test, since both
 /// `crystalline_core::config::origin_state_dir` and `resolve_source_roots`
 /// (which recomputes it) must resolve to the same scratch state directory.
-/// This is the only test in this binary that mutates process environment, so
-/// there is no other env-mutating test to serialize against.
+/// Holds `crate::common::HOME_LOCK` for its whole life, since the suites
+/// share one process under the `cargo test` fallback.
 struct EnvGuard {
     home: Option<std::ffi::OsString>,
     xdg_state: Option<std::ffi::OsString>,
+    _lock: std::sync::MutexGuard<'static, ()>,
 }
 
 impl EnvGuard {
     fn install(home: &Path) -> EnvGuard {
+        let lock = crate::common::HOME_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let guard = EnvGuard {
             home: std::env::var_os("HOME"),
             xdg_state: std::env::var_os("XDG_STATE_HOME"),
+            _lock: lock,
         };
-        // SAFETY: no other test in this binary reads or writes HOME or
-        // XDG_STATE_HOME, and the guard restores both on drop.
+        // SAFETY: every test of this binary that writes HOME or
+        // XDG_STATE_HOME holds `crate::common::HOME_LOCK`, and the guard
+        // restores both on drop before it lets the lock go.
         unsafe {
             std::env::set_var("HOME", home);
             std::env::set_var("XDG_STATE_HOME", home.join("state"));
@@ -3790,7 +3794,7 @@ impl EnvGuard {
 
 impl Drop for EnvGuard {
     fn drop(&mut self) {
-        // SAFETY: see `install` - this binary has no concurrent env access.
+        // SAFETY: see `install` - the lock field is released only after this body runs.
         unsafe {
             match &self.home {
                 Some(v) => std::env::set_var("HOME", v),
@@ -9674,7 +9678,7 @@ async fn updating_the_living_proposal_re_attributes_it_only_when_a_login_is_know
 /// deliberate act someone will have to review.
 #[test]
 fn ops_signatures_carry_no_identity_types() {
-    let ops = include_str!("../src/ops.rs");
+    let ops = include_str!("../../src/ops.rs");
     for name in ["ShareActor", "TokenIdentity", "Caller"] {
         assert!(!ops.contains(name), "{name} leaked into ops.rs");
     }

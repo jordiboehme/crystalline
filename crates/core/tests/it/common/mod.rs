@@ -33,3 +33,8 @@ pub fn read(path: &Path) -> String {
 pub fn stem(path: &Path) -> String {
     path.file_stem().unwrap().to_string_lossy().into_owned()
 }
+
+/// Held by every test that points `HOME` (or `COPILOT_HOME`) at a scratch
+/// directory. `orchestrate` and `reconcile` each had a lock of their own when
+/// they were two binaries; in one process two locks would let them race.
+pub static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

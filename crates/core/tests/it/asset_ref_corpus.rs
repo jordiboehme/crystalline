@@ -16,7 +16,7 @@ struct Case {
 
 #[test]
 fn the_scanner_agrees_with_the_shared_corpus() {
-    let raw = include_str!("fixtures/asset_ref_corpus.json");
+    let raw = include_str!("../fixtures/asset_ref_corpus.json");
     let cases: Vec<Case> = serde_json::from_str(raw).expect("corpus parses");
     assert!(cases.len() >= 16, "corpus lost cases");
     for case in cases {

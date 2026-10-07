@@ -38,7 +38,7 @@ const SNIPPET_LEAD: usize = 200;
 /// clear it, the weakest (E1) at 0.8194. Must stay equal to
 /// `crate::postgres::search::DEFAULT_MIN_SIMILARITY`; parity is pinned by
 /// `both_backends_default_the_same_minimum_similarity` in
-/// `crates/index/tests/store.rs`.
+/// `crates/index/tests/it/store.rs`.
 pub const DEFAULT_MIN_SIMILARITY: f32 = 0.78;
 /// How many nearest chunks the vector scan considers before the cutoff and paging.
 const SEMANTIC_TOPK: usize = 100;

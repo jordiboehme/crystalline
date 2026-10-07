@@ -8,7 +8,7 @@
 //! all, and only a second sync cleared them.
 //!
 //! The parity of the pass itself (both database backends) lives in
-//! `crates/index/tests/store.rs`; what these tests pin is the wiring - that the
+//! `crates/index/tests/it/store.rs`; what these tests pin is the wiring - that the
 //! sweep actually runs it, and that a domain skipped or failed is not handed to
 //! it.
 

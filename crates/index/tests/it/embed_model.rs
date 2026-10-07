@@ -232,7 +232,7 @@ async fn the_vendored_modernbert_reproduces_the_onnx_reference_vectors() {
         vector: Vec<f32>,
     }
     let fixture: Fixture =
-        serde_json::from_str(include_str!("fixtures/granite-parity.json")).unwrap();
+        serde_json::from_str(include_str!("../fixtures/granite-parity.json")).unwrap();
     let provider = provider_from_config(&local_config()).await.unwrap();
 
     let mut single = Vec::new();

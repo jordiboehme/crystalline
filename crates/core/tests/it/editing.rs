@@ -1,10 +1,8 @@
 //! Surgical editor tests: section editing (including the subsection-preserved
 //! regression), frontmatter field edits and the `generated` provenance touch.
 
-mod common;
-
+use crate::common::{fixtures_dir, read};
 use chrono::{DateTime, FixedOffset};
-use common::{fixtures_dir, read};
 use crystalline_core::emit::{
     append_body, insert_after_section, insert_after_section_reporting, insert_before_section,
     prepend_body, remove_frontmatter_field, replace_section, replace_section_reporting,

@@ -3,7 +3,7 @@
 One instance per sandbox: a ThreadingHTTPServer on an ephemeral
 localhost port over an in-memory commit graph (commits as maps of
 repo-relative path to bytes, with parent links), mirroring the endpoint
-shapes GitHubProvider consumes (crates/remote/tests/github_client.rs is
+shapes GitHubProvider consumes (crates/remote/tests/it/it/github_client.rs is
 the contract reference). The write side works for real against the same
 graph, so a share produces a genuine commit and pull request a later
 status poll or update can observe. Every request is logged for scoring;

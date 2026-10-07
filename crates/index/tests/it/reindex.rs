@@ -795,7 +795,7 @@ parity!(
 /// complain.
 #[test]
 fn end_rebuild_is_called_inside_the_applys_transaction() {
-    const SYNC_SRC: &str = include_str!("../src/sync.rs");
+    const SYNC_SRC: &str = include_str!("../../src/sync.rs");
     let start = SYNC_SRC
         .find("pub async fn apply_scan_with_slab")
         .expect("apply_scan_with_slab is where the rebuild marker is cleared");
