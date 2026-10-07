@@ -514,6 +514,14 @@ jobs:
       - name: Run the browser smoke
         run: bash fluid/e2e/run-smoke.sh
 
+      # The same journeys with the daemon under a path prefix, against the UI
+      # it serves itself: the base tag, the router basename and every address
+      # outside the router are what this run checks.
+      - name: Run the browser smoke under a path
+        run: bash fluid/e2e/run-smoke.sh
+        env:
+          FLUID_E2E_BASE_PATH: /crystalline
+
       - name: Upload the failure traces
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

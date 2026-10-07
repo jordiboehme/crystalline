@@ -22,6 +22,14 @@ import { defineConfig, devices } from "@playwright/test";
 const PORT = Number(process.env.FLUID_PREVIEW_PORT ?? "4173");
 const BASE_URL = `http://127.0.0.1:${String(PORT)}`;
 
+/**
+ * Where the browser goes. Unset, `vite preview` on PORT. Set by run-smoke.sh
+ * for the run under a path prefix: the daemon's own embedded UI at
+ * `http://<daemon>/crystalline/`, with no preview server, because the base tag
+ * the server writes at serve time is what that run exists to check.
+ */
+const EMBEDDED_URL = process.env.FLUID_E2E_BASE_URL;
+
 export default defineConfig({
   testDir: "./e2e",
   // One browser, one worker: the suite shares one daemon holding one fixture
@@ -36,23 +44,27 @@ export default defineConfig({
   expect: { timeout: 15_000 },
   reporter: [["list"]],
   use: {
-    baseURL: BASE_URL,
+    baseURL: EMBEDDED_URL ?? BASE_URL,
     trace: "retain-on-failure",
   },
   projects: [{ name: "chromium", use: { ...devices["Desktop Chrome"] } }],
-  webServer: {
-    // The built bundle, served the way it is served in production: no dev
-    // server, no source transforms, no HMR client.
-    //
-    // The host is named rather than left to `localhost`, which is two
-    // addresses: on a machine that resolves it to ::1 first, `vite preview`
-    // listens there alone and every probe of 127.0.0.1 is refused. Pinning it
-    // to the address the tests use makes the two the same one.
-    command: `pnpm exec vite preview --host 127.0.0.1 --port ${String(PORT)} --strictPort`,
-    url: BASE_URL,
-    reuseExistingServer: !process.env.CI,
-    timeout: 60_000,
-    stdout: "pipe",
-    stderr: "pipe",
-  },
+  // No preview server for the run against the embedded UI. Spread rather
+  // than `webServer: undefined`, which exactOptionalPropertyTypes refuses.
+  ...(EMBEDDED_URL === undefined && {
+    webServer: {
+      // The built bundle, served the way it is served in production: no dev
+      // server, no source transforms, no HMR client.
+      //
+      // The host is named rather than left to `localhost`, which is two
+      // addresses: on a machine that resolves it to ::1 first, `vite preview`
+      // listens there alone and every probe of 127.0.0.1 is refused. Pinning
+      // it to the address the tests use makes the two the same one.
+      command: `pnpm exec vite preview --host 127.0.0.1 --port ${String(PORT)} --strictPort`,
+      url: BASE_URL,
+      reuseExistingServer: !process.env.CI,
+      timeout: 60_000,
+      stdout: "pipe",
+      stderr: "pipe",
+    },
+  }),
 });

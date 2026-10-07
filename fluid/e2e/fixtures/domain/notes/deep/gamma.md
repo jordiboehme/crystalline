@@ -16,6 +16,15 @@ description: An engram three folders down, so its permalink has segments.
 Three folders down from the domain root, so its permalink is a path rather
 than a word: `notes/deep/gamma`. A link to it survives only if every segment
 is encoded on its own and the slashes stay slashes.
+Jump to the [observations](#observations).
+
+The diagram below is here so the browser smoke has arrowheads to check on a
+deep page: each one is a marker the path names by its fragment.
+
+```mermaid
+flowchart LR
+    A[Domain root] --> B[notes] --> C[deep] --> D[gamma]
+```
 
 ## Observations
 
