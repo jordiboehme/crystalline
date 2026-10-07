@@ -240,6 +240,7 @@ fn a_task_started_daemon_works_in_its_state_folder_and_logs_there() {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+    let pid = daemon.id();
     if status.is_some() {
         let _ = run(&["ctl", "shutdown"]).output();
     } else {
@@ -247,6 +248,16 @@ fn a_task_started_daemon_works_in_its_state_folder_and_logs_there() {
     }
     let _ = daemon.wait();
     let status = status.expect("the task-started daemon answers");
+    assert_eq!(
+        status["pid"],
+        json!(pid),
+        "the daemon the task started answers: {status}"
+    );
+    assert_eq!(
+        status["started_by"],
+        json!("autostart"),
+        "recorded as an autostart, with no new start mode: {status}"
+    );
     // Both sides canonical: macOS resolves /tmp to /private/tmp, and Windows
     // answers a canonical path with the \\?\ prefix.
     assert_eq!(

@@ -134,7 +134,9 @@ pub enum TaskPrincipal {
 
 /// Read and run for every user, full control for SYSTEM and the
 /// administrators: so a standard user may start a task an administrator
-/// registered.
+/// registered. Only the machine task carries it: a user's own task keeps
+/// Task Scheduler's default, which leaves its creator full rights, so that
+/// user can replace it (`doctor --fix`) or delete it.
 pub const TASK_SDDL: &str = "D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGX;;;BU)";
 
 fn xml_escape(text: &str) -> String {
@@ -149,8 +151,9 @@ fn xml_escape(text: &str) -> String {
 /// `Parallel`, because the policy is per task and a second user signing in
 /// must get a daemon of their own; the daemon's lock keeps one per user.
 pub fn task_xml(exe: &Path, principal: &TaskPrincipal) -> String {
-    let (description, trigger, who) = match principal {
+    let (security, description, trigger, who) = match principal {
         TaskPrincipal::AllUsers => (
+            format!("    <SecurityDescriptor>{TASK_SDDL}</SecurityDescriptor>\n"),
             "Starts the Crystalline daemon for whoever signs in, outside any app package.",
             "    <LogonTrigger>\n      <Enabled>true</Enabled>\n    </LogonTrigger>\n".to_string(),
             "    <Principal id=\"Author\">\n      <GroupId>S-1-5-32-545</GroupId>\n      \
@@ -160,6 +163,7 @@ pub fn task_xml(exe: &Path, principal: &TaskPrincipal) -> String {
         TaskPrincipal::User { account } => {
             let account = xml_escape(account);
             (
+                String::new(),
                 "Starts the Crystalline daemon for this user when they sign in, outside any app package.",
                 format!(
                     "    <LogonTrigger>\n      <Enabled>true</Enabled>\n      \
@@ -178,8 +182,7 @@ pub fn task_xml(exe: &Path, principal: &TaskPrincipal) -> String {
         r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.3" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
-    <SecurityDescriptor>{TASK_SDDL}</SecurityDescriptor>
-    <Author>Crystalline</Author>
+{security}    <Author>Crystalline</Author>
     <Description>{description}</Description>
   </RegistrationInfo>
   <Triggers>
@@ -289,12 +292,24 @@ pub(crate) fn register_with(
     Err(last)
 }
 
+/// `file` in `System32` under `system_root` (`%SystemRoot%`), or in
+/// `C:\Windows\System32` when that is unset.
+fn in_system32(system_root: Option<&std::ffi::OsStr>, file: &str) -> PathBuf {
+    match system_root.filter(|r| !r.is_empty()) {
+        Some(root) => Path::new(root).join("System32").join(file),
+        None => PathBuf::from(format!(r"C:\Windows\System32\{file}")),
+    }
+}
+
 /// `schtasks.exe` from the system folder, never whatever `PATH` finds first.
 pub(crate) fn schtasks_exe_in(system_root: Option<&std::ffi::OsStr>) -> PathBuf {
-    match system_root.filter(|r| !r.is_empty()) {
-        Some(root) => Path::new(root).join("System32").join("schtasks.exe"),
-        None => PathBuf::from(r"C:\Windows\System32\schtasks.exe"),
-    }
+    in_system32(system_root, "schtasks.exe")
+}
+
+/// The folder Task Scheduler keeps each task's definition in, one file per
+/// task named as the task (`System32\Tasks`).
+pub(crate) fn tasks_folder_in(system_root: Option<&std::ffi::OsStr>) -> PathBuf {
+    in_system32(system_root, "Tasks")
 }
 
 /// Run `schtasks.exe` with `args`: its standard output, or the reason it
@@ -355,14 +370,42 @@ impl DaemonTask for Schtasks {
     }
 }
 
+/// Write `bytes` to a file at `path` that this call creates: never through a
+/// file or a link that is already there.
+pub(crate) fn write_new_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(bytes)
+}
+
+/// Write the task definition to a new file in `dir` under a random name and
+/// answer its path. The MSI runs `register` as SYSTEM, so the name must not
+/// be guessable and the file must be new: otherwise another user could put
+/// their own definition where `schtasks /Create` reads it.
+pub(crate) fn write_task_file(dir: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
+    let mut random = [0u8; 16];
+    getrandom::fill(&mut random).map_err(|e| e.to_string())?;
+    let suffix: String = random.iter().map(|b| format!("{b:02x}")).collect();
+    let file = dir.join(format!("crystalline-daemon-task-{suffix}.xml"));
+    if let Err(e) = write_new_file(&file, bytes) {
+        if e.kind() != std::io::ErrorKind::AlreadyExists {
+            let _ = std::fs::remove_file(&file);
+        }
+        return Err(e.to_string());
+    }
+    Ok(file)
+}
+
 /// Register the task for `principal`, starting `exe`. Answers the name it
 /// was registered under.
 pub fn register(principal: &TaskPrincipal, exe: &Path) -> Result<String, String> {
-    let file = std::env::temp_dir().join(format!(
-        "crystalline-daemon-task-{}.xml",
-        std::process::id()
-    ));
-    std::fs::write(&file, utf16_with_bom(&task_xml(exe, principal))).map_err(|e| e.to_string())?;
+    let file = write_task_file(
+        &std::env::temp_dir(),
+        &utf16_with_bom(&task_xml(exe, principal)),
+    )?;
     let names = registration_names(principal, std::env::var("USERNAME").ok().as_deref());
     let result = register_with(&names, |name| {
         schtasks(&[
@@ -403,46 +446,139 @@ pub(crate) fn per_user_task_names(listing: &str) -> Vec<String> {
     names
 }
 
-/// The names an unregistration for `principal` removes. For one user, only
-/// their own task. For every user (the MSI's uninstall), the machine task
-/// and every per-user task in `listing`: a task `doctor --fix` registered
-/// must not outlive the binary it starts, or a bridge would still find it.
-pub(crate) fn unregistration_names(
-    principal: &TaskPrincipal,
-    user: Option<&str>,
-    listing: Option<&str>,
+/// The per-user tasks among the file names in Task Scheduler's tasks
+/// folder (see [`tasks_folder_in`]): each root-level file is one task, named
+/// exactly as the task, so a user name with any letters reads back as it is.
+pub(crate) fn per_user_task_names_in_folder(
+    files: impl IntoIterator<Item = std::ffi::OsString>,
 ) -> Vec<String> {
-    let mut names = registration_names(principal, user);
-    if *principal == TaskPrincipal::AllUsers {
-        names.extend(per_user_task_names(listing.unwrap_or_default()));
+    let prefix = user_task_name("");
+    let prefix = prefix.trim_start_matches('\\');
+    let mut names: Vec<String> = Vec::new();
+    for file in files {
+        let Some(file) = file.to_str() else {
+            continue;
+        };
+        let is_user_task = file
+            .strip_prefix(prefix)
+            .is_some_and(|user| !user.trim().is_empty());
+        let name = format!("\\{file}");
+        if is_user_task && !names.contains(&name) {
+            names.push(name);
+        }
     }
     names
 }
 
+/// The names an unregistration for `principal` removes. For one user, only
+/// their own task. For every user (the MSI's uninstall), the machine task
+/// and every per-user task in `per_user`: a task `doctor --fix` registered
+/// must not outlive the binary it starts, or a bridge would still find it.
+pub(crate) fn unregistration_names(
+    principal: &TaskPrincipal,
+    user: Option<&str>,
+    per_user: &[String],
+) -> Vec<String> {
+    let mut names = registration_names(principal, user);
+    if *principal == TaskPrincipal::AllUsers {
+        for name in per_user {
+            if !names.contains(name) {
+                names.push(name.clone());
+            }
+        }
+    }
+    names
+}
+
+/// What an unregistration did: the tasks it removed and, for each one Task
+/// Scheduler would not remove, the reason it gave.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Removal {
+    pub removed: Vec<String>,
+    pub refused: Vec<(String, String)>,
+}
+
+impl Removal {
+    /// The removed tasks, or an error that names every refusal.
+    pub fn into_result(self) -> Result<Vec<String>, String> {
+        if self.refused.is_empty() {
+            return Ok(self.removed);
+        }
+        let refusals: Vec<String> = self
+            .refused
+            .iter()
+            .map(|(name, why)| format!("could not remove the task {name} ({why})"))
+            .collect();
+        Err(refusals.join("; "))
+    }
+}
+
+/// Delete each of `names` that `exists` finds, with `delete`. A task that is
+/// not there is skipped, not an error: an install older than 0.24.0
+/// registered none.
+pub(crate) fn unregister_with(
+    names: &[String],
+    mut exists: impl FnMut(&str) -> bool,
+    mut delete: impl FnMut(&str) -> Result<(), String>,
+) -> Removal {
+    let mut removal = Removal::default();
+    for name in names {
+        if !exists(name) {
+            continue;
+        }
+        match delete(name) {
+            Ok(()) => removal.removed.push(name.clone()),
+            Err(why) => removal.refused.push((name.clone(), why)),
+        }
+    }
+    removal
+}
+
+/// The per-user tasks on this machine, for the uninstall: from the file names
+/// in the tasks folder, which keep every letter of a user name, or from
+/// `schtasks /Query` when that folder cannot be read.
+fn listed_per_user_tasks() -> Vec<String> {
+    let folder = tasks_folder_in(std::env::var_os("SystemRoot").as_deref());
+    if let Ok(entries) = std::fs::read_dir(&folder) {
+        return per_user_task_names_in_folder(
+            entries
+                .flatten()
+                .filter(|entry| entry.file_type().is_ok_and(|t| t.is_file()))
+                .map(|entry| entry.file_name()),
+        );
+    }
+    schtasks(&[
+        "/Query".as_ref(),
+        "/FO".as_ref(),
+        "CSV".as_ref(),
+        "/NH".as_ref(),
+    ])
+    .map(|listing| per_user_task_names(&listing))
+    .unwrap_or_default()
+}
+
 /// Remove the task(s) for `principal`: for every user, the machine task and
-/// each user's own; for one user, only theirs. A task that is not there is
-/// no error: an install older than 0.24.0 registered none.
-pub fn unregister(principal: &TaskPrincipal) -> Result<(), String> {
-    let listing = match principal {
-        TaskPrincipal::AllUsers => schtasks(&[
-            "/Query".as_ref(),
-            "/FO".as_ref(),
-            "CSV".as_ref(),
-            "/NH".as_ref(),
-        ])
-        .ok(),
-        TaskPrincipal::User { .. } => None,
+/// each user's own; for one user, only theirs. Says what it removed and
+/// every removal Task Scheduler refused.
+pub fn unregister(principal: &TaskPrincipal) -> Removal {
+    let per_user = match principal {
+        TaskPrincipal::AllUsers if cfg!(windows) => listed_per_user_tasks(),
+        _ => Vec::new(),
     };
     let user = std::env::var("USERNAME").ok();
-    for name in unregistration_names(principal, user.as_deref(), listing.as_deref()) {
-        let _ = schtasks(&[
-            "/Delete".as_ref(),
-            "/TN".as_ref(),
-            name.as_ref(),
-            "/F".as_ref(),
-        ]);
-    }
-    Ok(())
+    unregister_with(
+        &unregistration_names(principal, user.as_deref(), &per_user),
+        |name| schtasks(&["/Query".as_ref(), "/TN".as_ref(), name.as_ref()]).is_ok(),
+        |name| {
+            schtasks(&[
+                "/Delete".as_ref(),
+                "/TN".as_ref(),
+                name.as_ref(),
+                "/F".as_ref(),
+            ])
+            .map(|_| ())
+        },
+    )
 }
 
 /// The definition of a registered task, as Task Scheduler holds it now.
@@ -652,8 +788,9 @@ mod tests {
     fn an_uninstall_removes_the_machine_task_and_every_per_user_task() {
         let listing = "\"\\Crystalline Daemon for ada\",\"N/A\",\"Ready\"\r\n\
             \"\\Crystalline Daemon for bob\",\"N/A\",\"Ready\"\r\n";
+        let listed = per_user_task_names(listing);
         assert_eq!(
-            unregistration_names(&TaskPrincipal::AllUsers, Some("ada"), Some(listing)),
+            unregistration_names(&TaskPrincipal::AllUsers, Some("ada"), &listed),
             [
                 MACHINE_TASK_NAME.to_string(),
                 r"\Crystalline Daemon for ada".to_string(),
@@ -661,7 +798,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            unregistration_names(&TaskPrincipal::AllUsers, None, None),
+            unregistration_names(&TaskPrincipal::AllUsers, None, &[]),
             [MACHINE_TASK_NAME.to_string()],
             "a listing that failed still removes the machine task"
         );
@@ -669,9 +806,115 @@ mod tests {
             account: r"WORK\ada".to_string(),
         };
         assert_eq!(
-            unregistration_names(&user, Some("ada"), Some(listing)),
+            unregistration_names(&user, Some("ada"), &listed),
             [r"\Crystalline Daemon for ada".to_string()],
             "one user removes only their own task"
         );
+    }
+
+    #[test]
+    fn a_user_task_carries_no_security_descriptor() {
+        let xml = task_xml(
+            std::path::Path::new(EXE),
+            &TaskPrincipal::User {
+                account: r"WORK\ada".to_string(),
+            },
+        );
+        assert!(
+            !xml.contains("<SecurityDescriptor>"),
+            "the default keeps the creator's full rights, so the user can replace or delete it: {xml}"
+        );
+        assert!(xml.contains("  <RegistrationInfo>\n    <Author>Crystalline</Author>\n"));
+    }
+
+    #[test]
+    fn an_uninstall_reads_per_user_names_from_the_tasks_folder() {
+        let files = [
+            "Crystalline Daemon for ada",
+            "Crystalline Daemon for J\u{f6}rg",
+            "Crystalline Daemon for ",
+            "Crystalline",
+            "Adobe Acrobat Update Task",
+            "Crystalline Daemon for ada",
+        ]
+        .map(std::ffi::OsString::from);
+        assert_eq!(
+            per_user_task_names_in_folder(files),
+            [
+                r"\Crystalline Daemon for ada".to_string(),
+                "\\Crystalline Daemon for J\u{f6}rg".to_string(),
+            ],
+            "each per-user task once, a non-ASCII name exactly as it is"
+        );
+        assert_eq!(
+            tasks_folder_in(Some(std::ffi::OsStr::new(r"C:\Windows"))),
+            std::path::Path::new(r"C:\Windows")
+                .join("System32")
+                .join("Tasks")
+        );
+    }
+
+    #[test]
+    fn an_uninstall_removes_only_what_is_there_and_names_each_refusal() {
+        let names = [
+            MACHINE_TASK_NAME.to_string(),
+            r"\Crystalline Daemon for ada".to_string(),
+            r"\Crystalline Daemon for bob".to_string(),
+        ];
+        let mut deleted = Vec::new();
+        let removal = unregister_with(
+            &names,
+            |name| name != r"\Crystalline Daemon for ada",
+            |name| {
+                deleted.push(name.to_string());
+                if name.ends_with("bob") {
+                    Err("ERROR: Access is denied.".to_string())
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert_eq!(
+            deleted,
+            [
+                MACHINE_TASK_NAME.to_string(),
+                r"\Crystalline Daemon for bob".to_string()
+            ],
+            "a task that is not there is not deleted"
+        );
+        assert_eq!(removal.removed, [MACHINE_TASK_NAME.to_string()]);
+        assert_eq!(
+            removal.refused,
+            [(
+                r"\Crystalline Daemon for bob".to_string(),
+                "ERROR: Access is denied.".to_string()
+            )]
+        );
+        let said = removal.into_result().unwrap_err();
+        assert!(
+            said.contains(r"\Crystalline Daemon for bob") && said.contains("Access is denied"),
+            "{said}"
+        );
+        let nothing = unregister_with(&names, |_| false, |_| panic!("nothing to delete"));
+        assert_eq!(
+            nothing.into_result(),
+            Ok(Vec::new()),
+            "nothing there is no error"
+        );
+    }
+
+    #[test]
+    fn the_task_file_is_always_a_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = write_task_file(dir.path(), b"one").unwrap();
+        let second = write_task_file(dir.path(), b"two").unwrap();
+        assert_ne!(first, second, "a fresh random name each time");
+        assert_eq!(first.parent(), Some(dir.path()));
+        assert_eq!(std::fs::read(&first).unwrap(), b"one");
+        assert!(
+            write_new_file(&first, b"swap").is_err(),
+            "a file already at the path is never written through"
+        );
+        assert_eq!(std::fs::read(&first).unwrap(), b"one");
     }
 }

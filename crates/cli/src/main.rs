@@ -4538,17 +4538,6 @@ async fn domain_rename_dispatch(
     Ok(())
 }
 
-/// Logging for every command that does not install its own: stderr only,
-/// since stdout carries `prompt system`'s routing block, hook output and data
-/// a caller parses, and filtered by `RUST_LOG` with a default of `warn`.
-///
-/// `serve` and `mcp` are left alone (`serve` is the only command that calls
-/// `crystalline_service::run_serve`, in the `Command::Serve` dispatch arm):
-/// each installs its own subscriber (`info` and `warn` by default), and the
-/// first subscriber installed is the one that stays, so installing one here
-/// would cap the daemon's log and switch its `RUST_LOG` off. A lifecycle
-/// hook logs only when `RUST_LOG` asks for it: a hook with nothing to say
-/// must say nothing on either stream.
 #[derive(Subcommand, Debug)]
 enum DaemonTaskAction {
     /// Register the task, replacing one of the same name.
@@ -4591,8 +4580,14 @@ fn daemon_task_command(action: DaemonTaskAction) -> anyhow::Result<()> {
             println!("registered the task {name}");
         }
         DaemonTaskAction::Unregister { all_users } => {
-            daemon_task::unregister(&principal(all_users)).map_err(anyhow::Error::msg)?;
-            println!("removed the daemon task");
+            let removal = daemon_task::unregister(&principal(all_users));
+            for name in &removal.removed {
+                println!("removed the task {name}");
+            }
+            let removed = removal.into_result().map_err(anyhow::Error::msg)?;
+            if removed.is_empty() {
+                println!("no daemon task to remove");
+            }
         }
         DaemonTaskAction::Show { all_users } => {
             print!(
@@ -4604,6 +4599,17 @@ fn daemon_task_command(action: DaemonTaskAction) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Logging for every command that does not install its own: stderr only,
+/// since stdout carries `prompt system`'s routing block, hook output and data
+/// a caller parses, and filtered by `RUST_LOG` with a default of `warn`.
+///
+/// `serve` and `mcp` are left alone (`serve` is the only command that calls
+/// `crystalline_service::run_serve`, in the `Command::Serve` dispatch arm):
+/// each installs its own subscriber (`info` and `warn` by default), and the
+/// first subscriber installed is the one that stays, so installing one here
+/// would cap the daemon's log and switch its `RUST_LOG` off. A lifecycle
+/// hook logs only when `RUST_LOG` asks for it: a hook with nothing to say
+/// must say nothing on either stream.
 fn init_cli_tracing(command: Option<&Command>) {
     use tracing_subscriber::EnvFilter;
     let filter = match command {
