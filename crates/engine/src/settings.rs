@@ -2321,6 +2321,14 @@ pub const OIDC_CALLBACK_PATH: &str = "/api/v1/auth/oidc/callback";
 /// an address the browser never reaches).
 pub fn oidc_redirect_uri_problem(value: &str) -> Option<String> {
     let key = "auth.oidc.redirect_uri";
+    // First: a url parser reads a backslash as '/', so the prefix and the
+    // dot-segment checks below would read another path than the one written.
+    if value.contains('\\') {
+        return Some(format!(
+            "{key} cannot be '{value}': {}",
+            PathProblem::Backslash.sentence()
+        ));
+    }
     let Ok(url) = url::Url::parse(value.trim()) else {
         return Some(format!(
             "{key} must be an absolute url, for example \
@@ -3656,6 +3664,9 @@ mod tests {
             ("https://kb.example/a%20b", "lower-case letters"),
             ("https://kb.example/api", "cannot start with 'api'"),
             ("https://kb.example/d/team", "cannot start with 'd'"),
+            // A url parser reads it as '/', so this would land on the root.
+            ("https://kb.example\\kb", "backslash"),
+            ("https://kb.example/kb\\team", "backslash"),
         ] {
             let mut cfg = GlobalConfig::default();
             let err = apply(&mut cfg, "service.public_url", bad)
@@ -4622,6 +4633,20 @@ mod tests {
             ),
             ("/api/v1/auth/oidc/callback", "absolute"),
             ("not a url at all", "absolute"),
+            // A url parser reads it as '/', which would hide a prefix or a
+            // dot segment from the checks below it.
+            (
+                "https://kb.example.test\\kb/api/v1/auth/oidc/callback",
+                "backslash",
+            ),
+            (
+                "https://kb.example.test/kb\\..\\x/api/v1/auth/oidc/callback",
+                "backslash",
+            ),
+            (
+                "https://kb.example.test\\api\\v1\\auth\\oidc\\callback",
+                "backslash",
+            ),
         ];
         for (bad, phrase) in cases {
             let mut cfg = GlobalConfig::default();

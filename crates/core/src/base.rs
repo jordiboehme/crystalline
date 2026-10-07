@@ -46,6 +46,8 @@ pub enum PathProblem {
     Reserved(String),
     /// A query or a fragment after the path.
     QueryOrFragment,
+    /// A backslash anywhere in the address, which a url parser reads as `/`.
+    Backslash,
 }
 
 impl PathProblem {
@@ -66,6 +68,10 @@ impl PathProblem {
                  so a proxy that strips the path would send those requests to the wrong place"
             ),
             PathProblem::QueryOrFragment => "it carries a query or a fragment".to_string(),
+            PathProblem::Backslash => {
+                "it has a backslash, which a url parser reads as '/'; an address uses '/' only"
+                    .to_string()
+            }
         }
     }
 }
@@ -116,8 +122,14 @@ impl BasePath {
 
     /// The path of an absolute url, read from the text as written: a parser
     /// would resolve `..` and percent-encode what this has to refuse.
+    ///
+    /// A backslash anywhere is refused first: a parser reads it as `/`, so
+    /// `https://host\kb` would otherwise be read here as the root of `host`.
     pub fn of_url(url: &str) -> Result<BasePath, PathProblem> {
         let url = url.trim();
+        if url.contains('\\') {
+            return Err(PathProblem::Backslash);
+        }
         let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
         let path_at = after_scheme
             .find(['/', '?', '#'])
@@ -376,6 +388,35 @@ mod tests {
         );
         assert!(BasePath::of_url("https://x.example").unwrap().is_root());
         assert!(BasePath::of_url("https://x.example/").unwrap().is_root());
+    }
+
+    /// A url parser reads `\` as `/`, so `https://host\kb` would quietly be
+    /// the root of `host` and `https://host/a\..\b` would slip a dot segment
+    /// past the check. The server and the client refuse it alike.
+    #[test]
+    fn a_backslash_is_refused_wherever_it_stands() {
+        for value in [
+            "https://x.example\\kb",
+            "https://x.example/kb\\team",
+            "https://x.example/a\\..\\b",
+            "https://x.example\\",
+        ] {
+            assert_eq!(
+                BasePath::of_url(value),
+                Err(PathProblem::Backslash),
+                "{value}"
+            );
+            assert_eq!(
+                PublicBase::parse(value),
+                Err(BaseProblem::Path(PathProblem::Backslash)),
+                "{value}"
+            );
+        }
+        assert!(
+            PathProblem::Backslash.sentence().contains("backslash"),
+            "{}",
+            PathProblem::Backslash.sentence()
+        );
     }
 
     #[test]
