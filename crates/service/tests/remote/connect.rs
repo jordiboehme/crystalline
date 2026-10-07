@@ -16,7 +16,7 @@ use crystalline_remote::{
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
-use crate::fixture::{Options, RemoteServer};
+use crate::fixture::{Options, Proxy, RemoteServer};
 
 /// A short limit for the servers that never answer.
 const LIMIT: Duration = Duration::from_millis(300);
@@ -1174,4 +1174,148 @@ async fn a_silent_connection_to_the_loopback_port_does_not_hold_the_sign_in() {
     .await
     .unwrap();
     assert_eq!(connected.source.account, "keeper");
+}
+
+#[tokio::test]
+async fn signing_in_through_the_browser_under_a_prefix_saves_the_base() {
+    for proxy in [Proxy::Strips, Proxy::PassesThrough] {
+        let server =
+            Arc::new(RemoteServer::start(Options::OAUTH.under("/crystalline", proxy)).await);
+        let dir = tempfile::tempdir().unwrap();
+        let connected = connect_with_browser(
+            &format!("{}/", server.base()),
+            None,
+            dir.path(),
+            &[],
+            fake_browser(server.clone(), "keeper", "allow"),
+            no_paste,
+        )
+        .await
+        .unwrap();
+        let source = &connected.source;
+        assert_eq!(
+            source.url,
+            server.base(),
+            "{proxy:?}: the base, no trailing slash"
+        );
+        assert_eq!(
+            source.token_endpoint.as_deref(),
+            Some(format!("{}/api/v1/oauth/token", server.base()).as_str()),
+            "{proxy:?}"
+        );
+        assert_eq!(
+            source.revocation_endpoint.as_deref(),
+            Some(format!("{}/api/v1/oauth/revoke", server.base()).as_str()),
+            "{proxy:?}"
+        );
+        assert!(
+            source.host_dir(dir.path()).ends_with(format!(
+                "{}~crystalline",
+                server.addr.to_string().replace(':', "_")
+            )),
+            "{proxy:?}: {:?}",
+            source.host_dir(dir.path())
+        );
+        assert!(source.host_dir(dir.path()).join("credential.json").exists());
+        let data = Connection::open(source.clone(), dir.path())
+            .unwrap()
+            .ctl_data(json!({ "v": 1, "cmd": "status" }))
+            .await
+            .unwrap();
+        assert_eq!(data["account"], "keeper", "{proxy:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_pasted_token_under_a_prefix_adds_the_source() {
+    let server = RemoteServer::start(Options::TOKENS.under("/crystalline", Proxy::Strips)).await;
+    let token = server.token_for("keeper").await;
+    let dir = tempfile::tempdir().unwrap();
+    let connected = connect_with_token(&server.base(), None, &token, dir.path(), &[])
+        .await
+        .unwrap();
+    assert_eq!(connected.source.url, server.base());
+    assert_eq!(connected.source.account, "keeper");
+}
+
+#[tokio::test]
+async fn two_paths_on_one_host_are_two_sources_and_the_second_keeps_the_first() {
+    let (a, b) = RemoteServer::start_two_on_one_host(Options::TOKENS, "/team-a", "/team-b").await;
+    let dir = tempfile::tempdir().unwrap();
+    let token_a = a.token_for("keeper").await;
+    let token_b = b.token_for("keeper").await;
+    let first = connect_with_token(&a.base(), None, &token_a, dir.path(), &[])
+        .await
+        .unwrap();
+    let second = connect_with_token(&b.base(), None, &token_b, dir.path(), &[])
+        .await
+        .unwrap();
+    assert_eq!(first.source.url, a.base());
+    assert_eq!(second.source.url, b.base());
+    assert_eq!(
+        (first.source.name.as_str(), second.source.name.as_str()),
+        ("server", "server-2")
+    );
+    let saved = load_sources(dir.path()).unwrap();
+    assert_eq!(
+        saved.sources.len(),
+        2,
+        "the second connect never retires the first"
+    );
+    assert_ne!(first.source.key(), second.source.key());
+    assert_ne!(
+        crystalline_remote::server_token::server_account(&first.source.key()),
+        crystalline_remote::server_token::server_account(&second.source.key()),
+        "two keychain entries"
+    );
+    for source in [&first.source, &second.source] {
+        assert!(
+            source.host_dir(dir.path()).join("credential.json").exists(),
+            "{}",
+            source.url
+        );
+        let data = Connection::open(source.clone(), dir.path())
+            .unwrap()
+            .ctl_data(json!({ "v": 1, "cmd": "status" }))
+            .await
+            .unwrap();
+        assert_eq!(data["account"], "keeper");
+    }
+}
+
+#[tokio::test]
+async fn a_source_saved_by_0_23_0_still_opens_after_the_upgrade() {
+    let server = RemoteServer::start(Options::TOKENS).await;
+    let token = server.token_for("keeper").await;
+    let dir = tempfile::tempdir().unwrap();
+    // The two files exactly as 0.23.0 wrote them for a root server: the
+    // record's url is the origin and the folder is the bare server key.
+    let folder = dir.path().join(server.addr.to_string().replace(':', "_"));
+    std::fs::create_dir_all(&folder).unwrap();
+    crystalline_remote::ServerCredentialStore::file(&folder)
+        .save(&crystalline_remote::ServerCredential::token(
+            token,
+            server.origin(),
+            "keeper".into(),
+            chrono::Utc::now(),
+        ))
+        .unwrap();
+    std::fs::write(
+        dir.path().join("sources.json"),
+        serde_json::to_vec_pretty(&json!({ "v": 1, "sources": [{
+            "url": server.origin(), "name": "server", "account": "keeper", "kind": "token",
+            "connected_at": "2026-10-05T12:00:00Z", "mounts": []
+        }]}))
+        .unwrap(),
+    )
+    .unwrap();
+    let file = load_sources(dir.path()).unwrap();
+    let source = file.find("server").unwrap().clone();
+    assert_eq!(source.host_dir(dir.path()), folder, "the 0.23.0 folder");
+    let data = Connection::open(source, dir.path())
+        .unwrap()
+        .ctl_data(json!({ "v": 1, "cmd": "status" }))
+        .await
+        .unwrap();
+    assert_eq!(data["account"], "keeper");
 }

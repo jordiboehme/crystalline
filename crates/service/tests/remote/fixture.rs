@@ -194,10 +194,52 @@ impl RemoteServer {
     /// [`RemoteServer::start`] with extra shared file domains, each holding one
     /// engram `<name>-note` whose fact line names the domain.
     pub async fn start_with(options: Options, extra: &[&str]) -> RemoteServer {
-        let scratch = ScratchStateDir::acquire();
         // Bound first: a prefixed instance's `public_url` names this address.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let (server, router) = RemoteServer::assemble(options, extra, addr).await;
+        let router = match (options.prefix, options.proxy) {
+            (Some(prefix), Proxy::Strips) => axum::Router::new().fallback_service(StripsPrefix {
+                prefix,
+                inner: router,
+            }),
+            _ => router,
+        };
+        *server.serving.lock().await = Some(serve(router, listener));
+        server
+    }
+
+    /// Two instances on one host and port, under `a` and `b`, behind a front
+    /// that strips each prefix (`nest_service` does): the deployment where two
+    /// teams share `example.com`. Each has `service.public_url` with its own
+    /// path. The first holds the serving task.
+    pub async fn start_two_on_one_host(
+        options: Options,
+        a: &'static str,
+        b: &'static str,
+    ) -> (RemoteServer, RemoteServer) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (first, router_a) =
+            RemoteServer::assemble(options.under(a, Proxy::Strips), &[], addr).await;
+        let (second, router_b) =
+            RemoteServer::assemble(options.under(b, Proxy::Strips), &[], addr).await;
+        let front = axum::Router::new()
+            .nest_service(a, router_a)
+            .nest_service(b, router_b);
+        *first.serving.lock().await = Some(serve(front, listener));
+        (first, second)
+    }
+
+    /// Everything but the listener: the instance (serving nothing yet) and
+    /// its router before any front is put around it. `addr` is the address
+    /// the instance will be reachable at.
+    async fn assemble(
+        options: Options,
+        extra: &[&str],
+        addr: SocketAddr,
+    ) -> (RemoteServer, axum::Router) {
+        let scratch = ScratchStateDir::acquire();
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
         let mut cfg = GlobalConfig::default();
@@ -328,14 +370,7 @@ impl RemoteServer {
             None,
         )
         .unwrap();
-        let router = match (options.prefix, options.proxy) {
-            (Some(prefix), Proxy::Strips) => axum::Router::new().fallback_service(StripsPrefix {
-                prefix,
-                inner: router,
-            }),
-            _ => router,
-        };
-        RemoteServer {
+        let server = RemoteServer {
             addr,
             tmp,
             auth,
@@ -345,10 +380,11 @@ impl RemoteServer {
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .unwrap(),
-            serving: tokio::sync::Mutex::new(Some(serve(router, listener))),
+            serving: tokio::sync::Mutex::new(None),
             prefix: options.prefix.unwrap_or(""),
             _scratch: scratch,
-        }
+        };
+        (server, router)
     }
 
     /// The origin a client connects to.
