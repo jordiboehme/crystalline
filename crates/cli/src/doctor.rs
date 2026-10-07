@@ -1217,8 +1217,14 @@ pub struct DoctorReport {
     /// the task does not concern (see `task_concerns_this_machine`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daemon_task: Option<TaskDoctor>,
-    /// Private state folders an old Claude Desktop extension left.
+    /// Private state folders an old Claude Desktop extension left. After a
+    /// merge, the ones still there.
     pub desktop_states: Vec<crate::desktop_state::DesktopState>,
+    /// What `--merge-desktop-state` did. `None` without that flag.
+    pub merge: Option<crate::desktop_state::MergeReport>,
+    /// Why `--merge-desktop-state` stopped, such as a daemon from the
+    /// private folder that still runs.
+    pub merge_error: Option<String>,
 }
 
 /// A rename journal waiting in the state directory: a domain rename an
@@ -1407,6 +1413,9 @@ impl DoctorReport {
         // Each private state is knowledge that is not where this machine
         // reads it, until the merge.
         n += self.desktop_states.len();
+        // A name the two sides mean differently waits for the person.
+        n += self.merge.as_ref().map_or(0, |m| m.conflicts.len());
+        n += usize::from(self.merge_error.is_some());
         n
     }
 }
@@ -1416,15 +1425,24 @@ pub async fn run(
     domain_filter: Option<&str>,
     fix: bool,
     discard_rename: bool,
+    merge_desktop_state: bool,
     config_override: Option<&Path>,
     db_override: Option<&Path>,
 ) -> Result<DoctorReport> {
-    // The single load chokepoint: the effective config drives every target and
-    // the db factory. The whole `LoadedConfig` stays in scope so a later
-    // milestone can surface the environment overlay in the report.
-    let loaded = cmd::load(config_override)?;
-    let cfg = &loaded.effective;
-    let targets = select_domains(cfg, domain_filter)?;
+    if merge_desktop_state {
+        if crystalline_service::runs_in::PackageContext::here().is_packaged() {
+            anyhow::bail!(
+                "--merge-desktop-state runs only outside Claude Desktop: run it in a terminal, with Claude Desktop closed"
+            );
+        }
+        if db_override.is_some() {
+            anyhow::bail!(
+                "--merge-desktop-state merges into this machine's own index: leave out --db"
+            );
+        }
+    }
+    // A domain filter nobody registers fails before anything is fixed.
+    select_domains(&cmd::load(config_override)?.effective, domain_filter)?;
     let db = cmd::db_path(db_override)?;
 
     // Ahead of the store, deliberately. A wedged daemon holds the index
@@ -1432,6 +1450,37 @@ pub async fn run(
     // fail with a locking error before `--fix` ever got the chance to dislodge
     // the process causing it - the one state where doctor matters most.
     let service = check_service(fix).await?;
+
+    // The merge comes next, for the reason the collection below gives: the
+    // import opens the real index itself (or asks the daemon), so doctor must
+    // not hold its own handle yet. Running first also lets every later check
+    // see the merged domains.
+    let mut desktop_states = crate::desktop_state::scan_here();
+    let mut merge = None;
+    let mut merge_error = None;
+    if merge_desktop_state {
+        let today = chrono::Local::now().date_naive();
+        let mut merged = crate::desktop_state::MergeReport::default();
+        for state in &desktop_states {
+            match crate::desktop_state::merge(state, config_override, today).await {
+                Ok(report) => merged.absorb(report),
+                Err(e) => {
+                    merge_error = Some(format!("{e:#}"));
+                    break;
+                }
+            }
+        }
+        merge = Some(merged);
+        desktop_states = crate::desktop_state::scan_here();
+    }
+
+    // The single load chokepoint, after the merge so it sees what the merge
+    // registered: the effective config drives every target and the db
+    // factory. The whole `LoadedConfig` stays in scope so a later milestone
+    // can surface the environment overlay in the report.
+    let loaded = cmd::load(config_override)?;
+    let cfg = &loaded.effective;
+    let targets = select_domains(cfg, domain_filter)?;
 
     // Ahead of doctor's own store, and deliberately: the collection needs the
     // index too, and it asks the daemon first or opens the file itself. Doing
@@ -1607,7 +1656,6 @@ pub async fn run(
     };
 
     let daemon_task = check_task(fix);
-    let desktop_states = crate::desktop_state::scan_here();
 
     Ok(DoctorReport {
         index,
@@ -1628,6 +1676,8 @@ pub async fn run(
         sources,
         daemon_task,
         desktop_states,
+        merge,
+        merge_error,
     })
 }
 
@@ -3858,6 +3908,56 @@ fn is_profile_harness(name: &str) -> bool {
 }
 
 /// Render a report for a human.
+/// What `--merge-desktop-state` did, under `claude desktop:`.
+fn render_merge(out: &mut String, merge: &crate::desktop_state::MergeReport) {
+    use std::fmt::Write as _;
+    if merge.folders.is_empty() {
+        let _ = writeln!(out, "  no private Claude Desktop state to merge");
+        return;
+    }
+    for name in &merge.registered {
+        let _ = writeln!(out, "  registered {name} from Claude Desktop's state");
+    }
+    for name in &merge.already_registered {
+        let _ = writeln!(
+            out,
+            "  {name} is already registered here the same way: left as it is"
+        );
+    }
+    for (name, count) in &merge.imported {
+        let _ = writeln!(
+            out,
+            "  moved {count} engram(s) of the virtual domain {name}"
+        );
+    }
+    for (name, count) in &merge.kept_both {
+        let _ = writeln!(
+            out,
+            "  {name} exists on both sides: kept this machine's copy of {count} engram(s)"
+        );
+    }
+    for conflict in &merge.conflicts {
+        let _ = writeln!(out, "  [problem] {conflict}");
+    }
+    if !merge.private_kept.is_empty() {
+        let _ = writeln!(
+            out,
+            "  kept this machine's {}; the private copies stay in the renamed folder. Team edits made through the extension that were not pushed yet: push them from the old extension before you remove it",
+            merge.private_kept.join(", ")
+        );
+    }
+    if let Some(to) = &merge.renamed_to {
+        let _ = writeln!(
+            out,
+            "  renamed the private folder to {} (nothing was deleted)",
+            to.display()
+        );
+    }
+    if !merge.changed_something() {
+        let _ = writeln!(out, "  the merge changed nothing");
+    }
+}
+
 pub fn render_human(report: &DoctorReport) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
@@ -4280,7 +4380,7 @@ pub fn render_human(report: &DoctorReport) -> String {
             }
         }
     }
-    if !report.desktop_states.is_empty() {
+    if !report.desktop_states.is_empty() || report.merge.is_some() {
         let _ = writeln!(out, "claude desktop:");
         for state in &report.desktop_states {
             let _ = writeln!(
@@ -4289,10 +4389,22 @@ pub fn render_human(report: &DoctorReport) -> String {
                 crate::desktop_state::describe_line(state)
             );
         }
-        let _ = writeln!(
-            out,
-            "  quit Claude Desktop, then run crystalline doctor --fix --merge-desktop-state to merge it into this machine's state (the folder is renamed, never deleted)"
-        );
+        // A merge stopped before its first folder has nothing to say but
+        // the reason it stopped.
+        if let Some(merge) = &report.merge
+            && (report.merge_error.is_none() || !merge.folders.is_empty())
+        {
+            render_merge(&mut out, merge);
+        }
+        if let Some(e) = &report.merge_error {
+            let _ = writeln!(out, "  [problem] {e}");
+        }
+        if report.merge.is_none() {
+            let _ = writeln!(
+                out,
+                "  quit Claude Desktop, then run crystalline doctor --fix --merge-desktop-state to merge it into this machine's state (the folder is renamed, never deleted)"
+            );
+        }
     }
 
     if let Some(e) = &report.environment {

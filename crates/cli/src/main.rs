@@ -339,6 +339,11 @@ enum Command {
         /// --fix: the report names what is half moved first.
         #[arg(long)]
         discard_rename: bool,
+        /// With --fix: merge the private Crystalline state an old Claude
+        /// Desktop extension left inside Claude Desktop's package into this
+        /// machine's state. The folder is renamed afterwards, never deleted.
+        #[arg(long, requires = "fix")]
+        merge_desktop_state: bool,
         /// Load the global config from this file instead of the default path.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -1951,8 +1956,19 @@ fn main() -> anyhow::Result<()> {
             domain,
             fix,
             discard_rename,
+            merge_desktop_state,
             config,
-        }) => on_runtime(move || run_doctor(domain, fix, discard_rename, config, cli.db, cli.json)),
+        }) => on_runtime(move || {
+            run_doctor(
+                domain,
+                fix,
+                discard_rename,
+                merge_desktop_state,
+                config,
+                cli.db,
+                cli.json,
+            )
+        }),
         Some(Command::Healthcheck { addr }) => cmd::healthcheck(&addr),
         Some(Command::HoldLock { secs, standalone }) => hold_lock(secs, standalone.as_deref()),
         Some(Command::DaemonTask { action }) => daemon_task_command(action),
@@ -3417,6 +3433,7 @@ async fn run_doctor(
     domain: Option<String>,
     fix: bool,
     discard_rename: bool,
+    merge_desktop_state: bool,
     config: Option<PathBuf>,
     db: Option<PathBuf>,
     json: bool,
@@ -3425,6 +3442,7 @@ async fn run_doctor(
         domain.as_deref(),
         fix,
         discard_rename,
+        merge_desktop_state,
         config.as_deref(),
         db.as_deref(),
     )

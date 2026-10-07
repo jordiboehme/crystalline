@@ -80,6 +80,9 @@ similar = { workspace = true }
 chrono = { workspace = true }
 walkdir = { workspace = true }
 dunce = { workspace = true }
+# `doctor --merge-desktop-state` exports a private index from a copy in a
+# temporary folder, so the original is never opened.
+tempfile = { workspace = true }
 # Logs go to stderr only (stdout carries the routing block, hook output and
 # data a caller parses), filtered by RUST_LOG with a default of warn; a
 # lifecycle hook logs only when RUST_LOG is set, so a hook with nothing to
