@@ -1146,6 +1146,38 @@ async fn a_callback_is_single_use_and_bound_to_its_browser() {
     assert_eq!(ctx.get(&callback, &cookies).await.status(), 401);
 }
 
+/// **A state cookie of another instance does not hide this browser's own.**
+/// A second instance on the same host under an overlapping path sends its own
+/// `fluid_oidc_state` beside this one; in either order the callback finds the
+/// state it handed out.
+#[tokio::test]
+async fn a_state_cookie_of_another_instance_does_not_hide_this_one() {
+    let idp = FakeIdp::start().await;
+    let ctx = RestCtx::with_oidc(&idp.issuer()).await;
+    for stranger_first in [true, false] {
+        let start = ctx.get(&ctx.url("/auth/oidc/login"), &[]).await;
+        let mut cookies = cookies_from(&start);
+        let stranger = (
+            "fluid_oidc_state".to_string(),
+            "a-state-of-another-instance".to_string(),
+        );
+        if stranger_first {
+            cookies.insert(0, stranger);
+        } else {
+            cookies.push(stranger);
+        }
+        let bounced = ctx.client.get(location(&start)).send().await.unwrap();
+        let done = ctx.get(&location(&bounced), &cookies).await;
+        assert_eq!(done.status(), 302, "stranger first: {stranger_first}");
+        assert!(
+            cookies_from(&done)
+                .iter()
+                .any(|(name, value)| name == "fluid_session" && !value.is_empty()),
+            "a session was issued, stranger first: {stranger_first}"
+        );
+    }
+}
+
 /// A callback whose state names no sign-in this process started is refused
 /// before anything is exchanged.
 #[tokio::test]

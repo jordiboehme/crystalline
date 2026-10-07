@@ -1725,12 +1725,10 @@ pub async fn callback(
     headers: HeaderMap,
     ApiQuery(query): ApiQuery<CallbackQuery>,
 ) -> Result<Response, ApiError> {
-    // Read before removing: `CookieJar::remove` takes the cookie out of this
-    // jar's own view as well as sending the deletion, so the value has to be
-    // in hand first.
-    let bound = jar
-        .get(STATE_COOKIE)
-        .map(|cookie| cookie.value().to_string());
+    // Read before removing, and every value: another instance on the same
+    // host under an overlapping path sends its own state cookie beside this
+    // one, and the callback matches the state against each of them.
+    let bound = super::auth::cookie_values(&headers, STATE_COOKIE);
     // Whatever happens next, this browser's pending sign-in is over: the
     // deletion goes out even when the flow failed, so a stale state cannot be
     // presented twice.
@@ -1769,7 +1767,7 @@ pub async fn callback(
 /// request because the record is the only place it was ever trusted.
 async fn finish(
     state: &RestState,
-    bound: Option<String>,
+    bound: Vec<String>,
     query: CallbackQuery,
 ) -> Result<(OidcClaims, Option<String>), ApiError> {
     let client = state.oidc.as_ref().ok_or_else(sso_is_off)?;
@@ -1798,9 +1796,9 @@ async fn finish(
     // Both halves, and in this order: the cookie proves the browser is the one
     // that started a sign-in, the record proves the state is one this process
     // generated and has not already spent.
-    let cookie_matches = bound.as_deref().is_some_and(|bound| {
-        super::auth::constant_time_eq(bound.as_bytes(), returned_state.as_bytes())
-    });
+    let cookie_matches = bound
+        .iter()
+        .any(|bound| super::auth::constant_time_eq(bound.as_bytes(), returned_state.as_bytes()));
     if !cookie_matches {
         return Err(state_mismatch(
             "state does not match the browser's cookie",

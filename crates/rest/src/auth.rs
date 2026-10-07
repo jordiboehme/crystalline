@@ -605,14 +605,14 @@ pub(crate) async fn resolve(state: &RestState, headers: &HeaderMap) -> Result<Id
             anonymous: false,
         });
     }
-    if let Some(cookie) = CookieJar::from_headers(headers).get(SESSION_COOKIE)
-        && let Some((user, csrf)) = state.auth.session_user(cookie.value()).await?
-    {
-        return Ok(Identity {
-            user: Some(user),
-            csrf: Some(csrf),
-            anonymous: false,
-        });
+    for presented in cookie_values(headers, SESSION_COOKIE) {
+        if let Some((user, csrf)) = state.auth.session_user(&presented).await? {
+            return Ok(Identity {
+                user: Some(user),
+                csrf: Some(csrf),
+                anonymous: false,
+            });
+        }
     }
     Ok(Identity {
         user: None,
@@ -653,10 +653,33 @@ pub(crate) async fn resolve_quiet(
             .await?
             .filter(|user| !user.disabled));
     }
-    match CookieJar::from_headers(headers).get(SESSION_COOKIE) {
-        Some(cookie) => Ok(state.auth.session_user_quiet(cookie.value()).await?),
-        None => Ok(None),
+    for presented in cookie_values(headers, SESSION_COOKIE) {
+        if let Some(user) = state.auth.session_user_quiet(&presented).await? {
+            return Ok(Some(user));
+        }
     }
+    Ok(None)
+}
+
+/// Every value a cookie called `name` arrived with, in the order the `Cookie`
+/// headers list them.
+///
+/// `CookieJar` keeps one cookie per name, the last one listed. Two instances
+/// on one host whose cookie paths overlap (a root instance beside a prefixed
+/// one, or `/team` beside `/team/kb`) both put a cookie of that name on the
+/// same request, and the browser lists the longest path first, which is this
+/// instance's. So every reader tries each value in this order and takes the
+/// first one that resolves. At the root one value arrives and nothing changes.
+pub(crate) fn cookie_values(headers: &HeaderMap, name: &str) -> Vec<String> {
+    headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';'))
+        .filter_map(|cookie| Cookie::parse_encoded(cookie.to_owned()).ok())
+        .filter(|cookie| cookie.name() == name)
+        .map(|cookie| cookie.value().to_string())
+        .collect()
 }
 
 /// The CSRF token a header-mode identity's mutating requests must echo.
@@ -680,13 +703,15 @@ async fn header_mode_csrf(
     headers: &HeaderMap,
     user: &User,
 ) -> Result<Option<String>, ApiError> {
-    let from_cookie = match CookieJar::from_headers(headers).get(SESSION_COOKIE) {
-        Some(cookie) => match state.auth.session_user(cookie.value()).await? {
-            Some((session_user, csrf)) if session_user.name == user.name => Some(csrf),
-            _ => None,
-        },
-        None => None,
-    };
+    let mut from_cookie = None;
+    for presented in cookie_values(headers, SESSION_COOKIE) {
+        if let Some((session_user, csrf)) = state.auth.session_user(&presented).await?
+            && session_user.name == user.name
+        {
+            from_cookie = Some(csrf);
+            break;
+        }
+    }
     match from_cookie {
         Some(csrf) => Ok(Some(csrf)),
         None => Ok(state.auth.newest_session_csrf(&user.name).await?),
@@ -1370,8 +1395,10 @@ pub(super) async fn issue_session_with_csrf(
     // live beside the new one. A session fixation attack works by planting a
     // token the victim then logs in under, so the token that was presented is
     // exactly the one that must not survive a successful login.
-    if let Some(presented) = jar.get(SESSION_COOKIE) {
-        state.auth.delete_session(presented.value()).await?;
+    // Every presented value: one that belongs to another instance on the same
+    // host names no session here, so deleting it changes nothing.
+    for presented in cookie_values(headers, SESSION_COOKIE) {
+        state.auth.delete_session(&presented).await?;
     }
     let session = state
         .auth
@@ -1899,10 +1926,13 @@ fn setup_store_error(e: anyhow::Error) -> ApiError {
 )]
 pub async fn logout(
     State(state): State<RestState>,
+    headers: HeaderMap,
     jar: CookieJar,
 ) -> Result<(CookieJar, NoStore, axum::Json<LogoutResponse>), ApiError> {
-    if let Some(cookie) = jar.get(SESSION_COOKIE) {
-        state.auth.delete_session(cookie.value()).await?;
+    // Every presented value, for the reason `cookie_values` gives: a value of
+    // another instance names no session here.
+    for presented in cookie_values(&headers, SESSION_COOKIE) {
+        state.auth.delete_session(&presented).await?;
     }
     // The removal has to carry the same path the cookie was set with (the
     // base path), or the browser keeps the original and only shadows it.
@@ -1996,12 +2026,12 @@ pub async fn me(
     // trusted-header path reads its token by identity, an account holding any
     // live session arrives with `csrf` already set - and a foreign cookie
     // presented beside the header would otherwise be left live.
-    if let Some(user) = &identity.user
-        && let Some(presented) = jar.get(SESSION_COOKIE).map(|c| c.value().to_string())
-    {
-        let owner = state.auth.session_owner(&presented).await?;
-        if owner.as_deref() != Some(user.name.as_str()) {
-            state.auth.delete_session(&presented).await?;
+    if let Some(user) = &identity.user {
+        for presented in cookie_values(&headers, SESSION_COOKIE) {
+            let owner = state.auth.session_owner(&presented).await?;
+            if owner.as_deref() != Some(user.name.as_str()) {
+                state.auth.delete_session(&presented).await?;
+            }
         }
     }
     // A trusted-header identity arrives with an account and no session (a
@@ -2226,6 +2256,26 @@ mod tests {
     use super::*;
     use crate::overlay::EnvOverlay;
     use crate::settings::{apply, change_note, oauth_effective, unset};
+
+    #[test]
+    fn cookie_values_lists_every_value_of_a_name_in_header_order() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            header::COOKIE,
+            "fluid_session=mine; theme=dark; fluid_session=other"
+                .parse()
+                .unwrap(),
+        );
+        headers.append(header::COOKIE, "fluid_session=third".parse().unwrap());
+        assert_eq!(
+            cookie_values(&headers, SESSION_COOKIE),
+            ["mine", "other", "third"]
+        );
+        let mut root = HeaderMap::new();
+        root.insert(header::COOKIE, "fluid_session=only".parse().unwrap());
+        assert_eq!(cookie_values(&root, SESSION_COOKIE), ["only"]);
+        assert!(cookie_values(&HeaderMap::new(), SESSION_COOKIE).is_empty());
+    }
 
     async fn store() -> (tempfile::TempDir, AuthStore) {
         let dir = tempfile::tempdir().unwrap();

@@ -438,6 +438,85 @@ async fn cookies_carry_the_prefix_as_their_path() {
     }
 }
 
+/// **A second `fluid_session` of another instance does not hide this one's.**
+/// A root instance on the same host, or a nested prefix, puts its own cookie
+/// on the same request. Whichever order the browser lists them in, the
+/// session that resolves here is the one used, and its CSRF token is the one
+/// a write must echo.
+#[tokio::test]
+async fn a_session_cookie_of_another_instance_does_not_hide_this_one() {
+    let server = RemoteServer::start(Options::TOKENS.under(PREFIX, Proxy::PassesThrough)).await;
+    let stranger = "fluid_session=a-session-of-another-instance";
+    for real_first in [true, false] {
+        let login = server
+            .http
+            .post(format!("{}/api/v1/auth/login", server.base()))
+            .json(&json!({ "name": "keeper", "password": crate::fixture::PASSWORD }))
+            .send()
+            .await
+            .unwrap();
+        let real = login
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .find(|c| c.starts_with("fluid_session="))
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        let csrf = login.json::<Value>().await.unwrap()["csrf"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let cookie = if real_first {
+            format!("{real}; {stranger}")
+        } else {
+            format!("{stranger}; {real}")
+        };
+        let me: Value = server
+            .http
+            .get(format!("{}/api/v1/auth/me", server.base()))
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(me["user"]["name"], "keeper", "{cookie}: {me}");
+        assert_eq!(me["csrf"], csrf.as_str(), "{cookie}: {me}");
+        let logout = server
+            .http
+            .post(format!("{}/api/v1/auth/logout", server.base()))
+            .header("cookie", &cookie)
+            .header("x-csrf-token", &csrf)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            logout.status(),
+            200,
+            "{cookie}: the write binds to the resolved session"
+        );
+        let me: Value = server
+            .http
+            .get(format!("{}/api/v1/auth/me", server.base()))
+            .header("cookie", &real)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(
+            me["user"].is_null(),
+            "{cookie}: the logout ended the real session: {me}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn web_url_carries_the_prefix() {
     let server = RemoteServer::start(Options::TOKENS.under(PREFIX, Proxy::PassesThrough)).await;
