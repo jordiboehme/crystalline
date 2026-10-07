@@ -179,6 +179,9 @@ pub struct MergeReport {
     /// (`origins/<name>`) was copied from the private folder. The private
     /// copy stays where it was.
     pub origins_copied: Vec<String>,
+    /// Whether this machine has team domains turned on (`github.enabled`).
+    /// A team domain that came over updates and shares only once it is.
+    pub github_enabled: bool,
     /// Private files kept as they are and named for the person.
     pub private_kept: Vec<String>,
     /// Where the private folder went.
@@ -458,6 +461,7 @@ pub async fn merge_into(
     };
     let loaded = crate::cmd::load(real_config)?;
     let table = crate::cmd::build_name_table(&loaded);
+    report.github_enabled = loaded.effective.github_enabled();
     let mut file = loaded.file.clone();
     report.folders.push(state.folder.clone());
     let problems_before = report.conflicts.len() + report.not_moved.len();

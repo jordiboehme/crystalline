@@ -34,7 +34,7 @@ Extensions before 0.24.0 carried their own Crystalline. Restart Claude Desktop a
 
     crystalline doctor --fix --merge-desktop-state
 
-It adds the domains it registers to yours and moves database-backed domains that exist only there. It never overwrites or deletes anything. It renames the folder to `crystalline.merged-<date>` only when everything was merged. A domain name that means two different things on the two sides is reported, and then nothing is renamed until you sort it out. A team domain comes over with its team state, so it updates and shares as before. Team edits you did not share yet are still there: share them as usual after the merge.
+It adds the domains it registers to yours and moves database-backed domains that exist only there. It never overwrites or deletes anything. It renames the folder to `crystalline.merged-<date>` only when everything was merged. A domain name that means two different things on the two sides is reported, and then nothing is renamed until you sort it out. A team domain comes over with its team state. Team edits you did not share yet are still there: share them as usual after the merge. If team domains are turned off on this computer, turn them on first with `crystalline config set github.enabled true`.
 
 ## The companion skill
 

@@ -3964,11 +3964,19 @@ fn render_merge(out: &mut String, merge: &crate::desktop_state::MergeReport) {
     for line in &merge.not_moved {
         let _ = writeln!(out, "  [problem] {line}");
     }
+    const TURN_ON: &str = "crystalline config set github.enabled true";
     for name in &merge.origins_copied {
-        let _ = writeln!(
-            out,
-            "  copied the team state of {name} from Claude Desktop's state, so it updates and shares as before"
-        );
+        if merge.github_enabled {
+            let _ = writeln!(
+                out,
+                "  copied the team state of {name} from Claude Desktop's state, so it updates and shares as before"
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "  copied the team state of {name} from Claude Desktop's state. Team domains are turned off here: run {TURN_ON} to update and share it"
+            );
+        }
     }
     if !merge.private_kept.is_empty() {
         let place = if merge.renamed_to.is_some() {
@@ -3982,9 +3990,14 @@ fn render_merge(out: &mut String, merge: &crate::desktop_state::MergeReport) {
             merge.private_kept.join(", ")
         );
         if merge.private_kept.iter().any(|k| k == "origins") {
+            let first = if merge.github_enabled {
+                String::new()
+            } else {
+                format!("run {TURN_ON}, then ")
+            };
             let _ = writeln!(
                 out,
-                "  team edits you did not share yet are still in the domain's folder: share them as usual with crystalline origin share, and get new team changes with crystalline origin update"
+                "  team edits you did not share yet are still in the domain's folder: {first}share them with crystalline origin share, and get new team changes with crystalline origin update"
             );
         }
     }

@@ -897,3 +897,23 @@ fn a_merged_team_domain_reads_as_plain_sentences() {
     assert!(text.contains("crystalline origin share"), "{text}");
     assert!(!text.contains("old extension"), "{text}");
 }
+
+/// With team domains turned off here, the report says how to turn them on
+/// instead of promising that the domain shares as before.
+#[test]
+fn a_merged_team_domain_says_to_turn_team_domains_on() {
+    let home = tempfile::tempdir().unwrap();
+    plant_private_team_domain(home.path());
+    std::fs::write(real_config_path(home.path()), "domains: {}\n").unwrap();
+    let out = run(home.path(), &["doctor", "--fix", "--merge-desktop-state"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("copied the team state of brand from Claude Desktop's state. Team domains are turned off here: run crystalline config set github.enabled true"),
+        "{text}"
+    );
+    assert!(!text.contains("shares as before"), "{text}");
+    assert!(
+        text.contains("run crystalline config set github.enabled true, then share them"),
+        "{text}"
+    );
+}
