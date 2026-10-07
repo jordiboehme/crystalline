@@ -1,7 +1,7 @@
 //! End-to-end coverage for the salience ranking prior in hybrid search: a
 //! numeric `salience` frontmatter field lifts an engram's score by a bounded,
 //! additive amount and can never filter a result out. No network: uses the
-//! deterministic `FakeProvider` pattern mirrored from `tests/embed.rs`.
+//! deterministic `FakeProvider` pattern mirrored from `tests/it/embed.rs`.
 
 use std::path::Path;
 
@@ -11,7 +11,7 @@ use crystalline_index::{
     run_embedding_pass, sync_domain_with,
 };
 
-// --- fake provider (mirrored from tests/embed.rs) -----------------------------
+// --- fake provider (mirrored from tests/it/embed.rs) -----------------------------
 
 /// A deterministic, network-free provider. It hashes each word into one of eight
 /// buckets and L2-normalizes, so texts that share vocabulary get similar
@@ -65,7 +65,7 @@ impl EmbeddingProvider for FakeProvider {
     }
 }
 
-// --- helpers (mirrored from tests/embed.rs) -----------------------------------
+// --- helpers (mirrored from tests/it/embed.rs) -----------------------------------
 
 fn write(dir: &Path, rel: &str, content: &str) {
     let path = dir.join(rel);

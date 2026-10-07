@@ -3,7 +3,7 @@
 //! ordered by engram id, and nothing for a model that never embedded here.
 //!
 //! The `FakeProvider` harness, the `write`/`engram`/`sync_and_embed` helpers
-//! and the `parity!` backend runner are mirrored from `tests/retired.rs`
+//! and the `parity!` backend runner are mirrored from `tests/it/retired.rs`
 //! (Turso always, Postgres when `CRYSTALLINE_TEST_POSTGRES_URL` is set).
 
 use std::path::Path;
@@ -14,7 +14,7 @@ use crystalline_index::{
     Store, TursoStore, run_embedding_pass, sync_domain_with,
 };
 
-// --- fake provider (mirrored from tests/retired.rs) ---------------------------
+// --- fake provider (mirrored from tests/it/retired.rs) ---------------------------
 
 /// A deterministic, network-free provider. It hashes each word into one of eight
 /// buckets and L2-normalizes, so texts that share vocabulary get similar
@@ -68,7 +68,7 @@ impl EmbeddingProvider for FakeProvider {
     }
 }
 
-// --- helpers (mirrored from tests/retired.rs) ---------------------------------
+// --- helpers (mirrored from tests/it/retired.rs) ---------------------------------
 
 fn write(dir: &Path, rel: &str, content: &str) {
     let path = dir.join(rel);
@@ -123,7 +123,7 @@ async fn embed_all_by_hand(store: &dyn Store, model: &str, dims: usize) {
     store.store_embeddings(&rows, model).await.unwrap();
 }
 
-// --- backend runner (mirrored from tests/retired.rs) --------------------------
+// --- backend runner (mirrored from tests/it/retired.rs) --------------------------
 
 #[cfg(feature = "postgres")]
 fn pg_url() -> Option<String> {

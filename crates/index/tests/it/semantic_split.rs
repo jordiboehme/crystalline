@@ -11,8 +11,8 @@
 //! rank, every column the hydrate carries still arrives, and ties are broken the
 //! same way on every run and on both backends.
 //!
-//! Mirrors the FakeProvider harness from `tests/retired.rs` and the parity
-//! runner from `tests/store.rs` (Turso always, Postgres when
+//! Mirrors the FakeProvider harness from `tests/it/retired.rs` and the parity
+//! runner from `tests/it/store.rs` (Turso always, Postgres when
 //! `CRYSTALLINE_TEST_POSTGRES_URL` is set).
 
 use std::path::Path;
@@ -23,7 +23,7 @@ use crystalline_index::{
     run_embedding_pass, sync_domain_with,
 };
 
-// --- fake provider (mirrored from tests/retired.rs) ---------------------------
+// --- fake provider (mirrored from tests/it/retired.rs) ---------------------------
 
 /// A deterministic, network-free provider. It hashes each word into one of eight
 /// buckets and L2-normalizes, so texts that share vocabulary get similar
@@ -109,7 +109,7 @@ fn semantic_query(text: &str, provider: &FakeProvider) -> SearchQuery {
         query_embedding: Some(embed_one(text)),
         active_model: Some(provider.model_id().to_string()),
         // Keep every candidate: this is a ranking and hydration test, not a
-        // cutoff test, and the cutoff is covered in tests/embed.rs.
+        // cutoff test, and the cutoff is covered in tests/it/embed.rs.
         min_similarity: Some(0.0),
         limit: 20,
         page: 1,
@@ -117,7 +117,7 @@ fn semantic_query(text: &str, provider: &FakeProvider) -> SearchQuery {
     }
 }
 
-// --- backend runner (mirrored from tests/store.rs) -----------------------------
+// --- backend runner (mirrored from tests/it/store.rs) -----------------------------
 
 #[cfg(feature = "postgres")]
 fn pg_url() -> Option<String> {

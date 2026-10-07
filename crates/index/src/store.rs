@@ -214,7 +214,7 @@ pub(crate) enum ReferenceCandidates<'a> {
 /// to the bind placeholder, which is the one argument: `?1` for turso, `$1` for
 /// postgres. Built here rather than inline in the four trait methods so the
 /// plan guards - `the_reference_resolve_pass_seeks_the_title_index` in
-/// `turso/mod.rs` and the registry in `tests/plans.rs` - explain the statement
+/// `turso/mod.rs` and the registry in `tests/it/plans.rs` - explain the statement
 /// the stores actually issue. The pass runs on every sync of every domain and
 /// is O(dangling references), so each of its four arms has to be an index seek;
 /// a hand-copied literal in a test is what let the title arm lose its index

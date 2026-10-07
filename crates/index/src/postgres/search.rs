@@ -657,7 +657,7 @@ pub fn filter_only_sql(
 /// The turso twin of this builder is `crate::turso::search::lexical_candidate_sql`,
 /// with the same signature; the two texts differ only in the dialect of the
 /// fragments the caller hands in. Built here rather than inline so the plan
-/// registry in `tests/plans.rs` explains the statement this store issues rather
+/// registry in `tests/it/plans.rs` explains the statement this store issues rather
 /// than a copy of it.
 #[doc(hidden)]
 pub fn lexical_candidate_sql(

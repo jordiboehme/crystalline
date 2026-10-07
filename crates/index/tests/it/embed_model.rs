@@ -4,7 +4,7 @@
 //! single-threaded so the tests do not race on the first-download file lock:
 //!
 //! ```text
-//! cargo test -p crystalline-index --test embed_model -- --ignored --nocapture --test-threads=1
+//! cargo test -p crystalline-index --test it -- embed_model:: --ignored --nocapture --test-threads=1
 //! ```
 
 #![cfg(feature = "local-embeddings")]

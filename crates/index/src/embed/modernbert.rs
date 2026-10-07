@@ -49,7 +49,7 @@
 //! Removal condition: the day a candle release carries both pull requests,
 //! delete this file and its `mod` line, point `local.rs` at
 //! `candle_transformers::models::modernbert::{Config, ModernBert}` and run the
-//! parity test in `crates/index/tests/it/it/embed_model.rs` by hand to confirm the
+//! parity test in `crates/index/tests/it/embed_model.rs` by hand to confirm the
 //! vectors did not move.
 //!
 //! Upstream documentation, unchanged:

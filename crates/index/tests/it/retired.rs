@@ -2,8 +2,8 @@
 //! search modes (hybrid, lexical, semantic), on both backends. The fade is a
 //! soft multiplicative reorder, never a filter: a retired engram's score drops
 //! but it is always still returned. Mirrors the copy-helper convention from
-//! `tests/salience.rs` (the FakeProvider embedding harness) and the parity
-//! runner from `tests/store.rs` (Turso always, Postgres when
+//! `tests/it/salience.rs` (the FakeProvider embedding harness) and the parity
+//! runner from `tests/it/store.rs` (Turso always, Postgres when
 //! `CRYSTALLINE_TEST_POSTGRES_URL` is set).
 
 use std::path::Path;
@@ -14,7 +14,7 @@ use crystalline_index::{
     TursoStore, retired_factor, run_embedding_pass, sync_domain, sync_domain_with,
 };
 
-// --- fake provider (mirrored from tests/salience.rs) --------------------------
+// --- fake provider (mirrored from tests/it/salience.rs) --------------------------
 
 /// A deterministic, network-free provider. It hashes each word into one of eight
 /// buckets and L2-normalizes, so texts that share vocabulary get similar
@@ -68,7 +68,7 @@ impl EmbeddingProvider for FakeProvider {
     }
 }
 
-// --- helpers (mirrored from tests/salience.rs; `engram` extended with a
+// --- helpers (mirrored from tests/it/salience.rs; `engram` extended with a
 // `status` parameter, since salience.rs's version hardcodes `status: current`) -
 
 fn write(dir: &Path, rel: &str, content: &str) {
@@ -94,7 +94,7 @@ async fn sync_and_embed(store: &dyn Store, name: &str, root: &Path, provider: &F
         .unwrap();
 }
 
-// --- backend runner (mirrored from tests/store.rs) -----------------------------
+// --- backend runner (mirrored from tests/it/store.rs) -----------------------------
 
 #[cfg(feature = "postgres")]
 fn pg_url() -> Option<String> {

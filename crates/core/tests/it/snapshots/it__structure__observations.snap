@@ -1,5 +1,5 @@
 ---
-source: crates/core/tests/it/it/structure.rs
+source: crates/core/tests/it/structure.rs
 expression: e
 ---
 frontmatter:

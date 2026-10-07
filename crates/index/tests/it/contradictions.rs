@@ -4,7 +4,7 @@
 //! scored engram keeps its scores until a rescore replaces them.
 //!
 //! The `FakeProvider` harness, the `write`/`engram`/`sync_and_embed` helpers
-//! and the `parity!` backend runner are mirrored from `tests/lead_vectors.rs`
+//! and the `parity!` backend runner are mirrored from `tests/it/lead_vectors.rs`
 //! (Turso always, Postgres when `CRYSTALLINE_TEST_POSTGRES_URL` is set).
 
 use std::collections::HashSet;
@@ -16,7 +16,7 @@ use crystalline_index::{
     ObservationVector, Result, ScoredPair, Store, TursoStore, run_embedding_pass, sync_domain_with,
 };
 
-// --- fake provider (mirrored from tests/lead_vectors.rs) ----------------------
+// --- fake provider (mirrored from tests/it/lead_vectors.rs) ----------------------
 
 /// A deterministic, network-free provider. It hashes each word into one of eight
 /// buckets and L2-normalizes, so texts that share vocabulary get similar
@@ -70,7 +70,7 @@ impl EmbeddingProvider for FakeProvider {
     }
 }
 
-// --- helpers (mirrored from tests/lead_vectors.rs) ----------------------------
+// --- helpers (mirrored from tests/it/lead_vectors.rs) ----------------------------
 
 fn write(dir: &Path, rel: &str, content: &str) {
     let path = dir.join(rel);
@@ -95,7 +95,7 @@ async fn sync_and_embed(store: &dyn Store, name: &str, root: &Path, provider: &F
         .unwrap();
 }
 
-// --- backend runner (mirrored from tests/lead_vectors.rs) ---------------------
+// --- backend runner (mirrored from tests/it/lead_vectors.rs) ---------------------
 
 #[cfg(feature = "postgres")]
 fn pg_url() -> Option<String> {

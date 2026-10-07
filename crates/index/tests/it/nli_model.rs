@@ -14,7 +14,7 @@
 //!
 //! ```text
 //! CRYSTALLINE_TEST_NLI=1 CRYSTALLINE_MODELS_DIR=/path/to/scratch/models \
-//!   cargo nextest run --cargo-profile release -p crystalline-index --test nli_model --no-capture -j 1
+//!   cargo nextest run --cargo-profile release -p crystalline-index --test it --no-capture -E 'test(/^nli_model::/)' -j 1
 //! ```
 
 #![cfg(feature = "local-embeddings")]

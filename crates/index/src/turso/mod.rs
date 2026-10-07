@@ -21,7 +21,7 @@
 mod migrations;
 mod search;
 
-/// The search statements the plan registry (`tests/plans.rs`) reads, reachable
+/// The search statements the plan registry (`tests/it/plans.rs`) reads, reachable
 /// from outside the crate and from nowhere else in it. `search` is a private
 /// submodule, so without this the registry would hold a second copy of each
 /// statement, and a copy is a thing that can be right about SQL nobody runs.
@@ -377,7 +377,7 @@ impl TursoStore {
     }
 
     /// Drop one index by name. Test scaffolding for the plan registry's
-    /// red-first leg (`tests/plans.rs`), which proves the guard has teeth by
+    /// red-first leg (`tests/it/plans.rs`), which proves the guard has teeth by
     /// taking an index away and watching the plan turn into a scan. Nothing
     /// ships calling this: the schema is the migrations' business.
     #[doc(hidden)]
@@ -992,7 +992,7 @@ fn resolve_pending_sql(table: &str) -> String {
 
 // --- the hot statements ------------------------------------------------------
 //
-// Named here rather than written inline in their methods so `tests/plans.rs`
+// Named here rather than written inline in their methods so `tests/it/plans.rs`
 // can explain the statement this store issues rather than a copy of it. Every
 // one of them is in the registry there, and a rewrite that costs one its index
 // fails with the name of the function that issues it. Nothing else about them
@@ -4024,7 +4024,7 @@ mod tests {
     /// The resolve pass seeks the title index on the arm that needs it.
     ///
     /// The in-source twin of the registry's two `resolve_pending_*` entries
-    /// (`tests/plans.rs`), kept rather than folded into it: the registry asks
+    /// (`tests/it/plans.rs`), kept rather than folded into it: the registry asks
     /// the general question - does any arm of this statement scan a guarded
     /// table - and this asks the specific one, which index each arm seeks, by
     /// name. A statement can lose the title index to a rewrite that still has

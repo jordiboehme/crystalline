@@ -47,7 +47,7 @@ fn write_manifest(dir: &Path, bullets: &str) {
     std::fs::write(dir.join("MANIFEST.md"), source).unwrap();
 }
 
-/// The harbor domain fixture from `tests/provision.rs`: a `tide-tables` skill
+/// The harbor domain fixture from `tests/it/provision.rs`: a `tide-tables` skill
 /// (`SKILL.md` plus `scripts/chart.sh`), a `charts/plot-route.md` command, a
 /// `quartermaster.md` agent and a `lighthouse.json` mcp - four file artifacts
 /// and one mcp.

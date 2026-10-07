@@ -1167,7 +1167,7 @@ async fn the_lexical_candidate_scan_is_never_sorted_unbounded() {
 /// What is asserted here is the keys, one spelling per order, because the
 /// bound itself is pinned from the source by
 /// `a_body_projection_never_reaches_an_unbounded_sorter` in
-/// `tests/turso_only.rs`, which reads the `LIMIT` off the same line as the
+/// `tests/it/turso_only.rs`, which reads the `LIMIT` off the same line as the
 /// `ORDER BY`. Asserting it again on a string this builder always emits would
 /// pin the builder's own `format!` rather than a property. What is left for
 /// this test is what turso does with those keys: no `GROUP BY`, which is the
@@ -1262,7 +1262,7 @@ mod postgres_plans {
     use crystalline_index::PostgresStore;
     use serde_json::Value;
 
-    /// Mirrored from `tests/store.rs`, like every other standalone suite here:
+    /// Mirrored from `tests/it/store.rs`, like every other standalone suite here:
     /// lifting the helpers into a shared module would touch five suites for one
     /// test.
     fn pg_url() -> Option<String> {

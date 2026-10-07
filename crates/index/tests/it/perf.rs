@@ -82,7 +82,7 @@ fn corpus_rel(i: usize) -> String {
 /// Perf evidence for the path-targeted watcher pass: a one-file targeted sync
 /// versus a full warm sync over a 5000-file domain. Not asserted (numbers vary
 /// by machine), just recorded. Run with
-/// `cargo test -p crystalline-index --test perf --release -- --ignored --nocapture`.
+/// `cargo test -p crystalline-index --test it --release -- perf:: --ignored --nocapture`.
 #[tokio::test]
 #[ignore = "perf evidence: run manually with --ignored --nocapture"]
 async fn targeted_one_file_versus_full_warm_sync_at_5k() {
