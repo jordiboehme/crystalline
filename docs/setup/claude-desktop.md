@@ -16,7 +16,7 @@ Do you use only Claude Desktop, and neither Claude Code nor the `crystalline` co
 2. Download `crystalline-v<version>.mcpb` from the same release.
 3. In Claude Desktop, open Settings > Extensions > Advanced settings > Install Extension... and pick the file.
 
-Claude Desktop runs its extensions inside its own app package. So the extension never runs the Crystalline knowledge stack itself: it connects to the daemon outside the package. The MSI registers a Windows task, `\Crystalline\Daemon`, for all users. It starts the daemon when you sign in. Inside Claude Desktop's package, `crystalline mcp` only connects to that daemon and never starts one itself. If the task is missing (it was deleted, or the MSI could not register it), run `crystalline doctor --fix` in a terminal. It registers a task for your user, but only for the crystalline the MSI installed in its default folder, `Program Files\Crystalline\bin`. For a copy anywhere else it reports the task but registers none. Install the MSI, or run it again, to get the task. `--fix` works only for that MSI binary, and when the machine-wide task is broken it asks for an administrator instead of fixing it. For details, run `crystalline doctor`.
+Claude Desktop runs its extensions inside its own app package. So the extension never runs the Crystalline knowledge stack itself: it connects to the daemon outside the package. The MSI registers a Windows task, `\Crystalline\Daemon`, for all users. It starts the daemon when you sign in. Inside Claude Desktop's package, `crystalline mcp` only connects to that daemon and never starts one itself. If the task is missing (it was deleted, or the MSI could not register it), run `crystalline doctor --fix` in a terminal. It registers a task for your user, but only for the crystalline the MSI installed in its default folder, `Program Files\Crystalline\bin`. For a copy anywhere else it reports the task and registers none. Install the MSI, or run it again, to get the task. When the machine-wide task is broken, `--fix` asks for an administrator instead of fixing it. For details, run `crystalline doctor`.
 
 When you sign out or shut down, the daemon stops cleanly.
 
@@ -30,7 +30,7 @@ The extension looks for Crystalline in the usual places: the two Homebrew folder
 
 ## Moving from an older extension on Windows
 
-Extensions before 0.24.0 carried their own Crystalline. On Windows that one could keep a second state inside Claude Desktop's package (`%LOCALAPPDATA%\Packages\Claude_...\LocalCache\Roaming\crystalline`). `crystalline doctor` tells you when there is one: how many domains it registers, how big its index is and when it last changed. To merge it into your normal state, quit Claude Desktop and run:
+Extensions before 0.24.0 carried their own Crystalline. Restart Claude Desktop after you update the extension. Until then it can still use the old extension's Crystalline. On Windows that one could keep a second state inside Claude Desktop's package (`%LOCALAPPDATA%\Packages\Claude_...\LocalCache\Roaming\crystalline`). `crystalline doctor` tells you when there is one: how many domains it registers, how big its index is and when it last changed. To merge it into your normal state, quit Claude Desktop and run:
 
     crystalline doctor --fix --merge-desktop-state
 
