@@ -4417,6 +4417,10 @@ fn merged_layer_blocks_repair(number: u64) -> RemoteError {
 /// ([`merged_layer_blocks_repair`]) comes before the first call, and the pull
 /// that consumes the merge is what unblocks it.
 ///
+/// A Withdrawn or Declined record leaves the chain for history here, and its
+/// branch is queued for [`retire_branches`] in the same step, so a branch is
+/// deleted on the forge whichever operation finished the repair.
+///
 /// A chain with NO hole in it takes a shorter path, and taking it matters as
 /// much as the long one. Every member is still a member there; what came
 /// apart is only where a branch stands, which is what a cascade that died
@@ -4569,6 +4573,14 @@ async fn repair_chain(
     // a share's supersede step records a declined proposal: the chain is what
     // is being repaired, and a hole that stayed behind in `proposals` would
     // have the next repair walk it all over again.
+    //
+    // Each one's branch is queued here too, before the record leaves the chain
+    // (where its pull requests belong is read off its place in the chain).
+    // This is the one step every settle passes through: a withdrawal whose
+    // repair died after the status flip never reaches its own queue call, and
+    // the repair the next share or withdraw finishes is what settles it.
+    // `queue_retired` keeps an entry that is already there, so the
+    // withdrawal's own call after a repair that did finish changes nothing.
     let settled: Vec<Proposal> = state
         .proposals
         .iter()
@@ -4581,6 +4593,15 @@ async fn repair_chain(
         .cloned()
         .collect();
     if !settled.is_empty() {
+        for record in &settled {
+            let why = if record.status == ProposalStatus::Withdrawn {
+                RetireWhy::Withdrawn
+            } else {
+                RetireWhy::Declined
+            };
+            let onto = merged_into(state, record.number);
+            queue_retired(state, record, why, onto);
+        }
         state.proposals.retain(|p| {
             !matches!(
                 p.status,
@@ -4868,9 +4889,11 @@ pub async fn withdraw(
         report.repaired |= outcome.repaired;
         report.restacked = outcome.restacked.or(report.restacked);
 
-        // Queued the moment the repair is durable and before the revert, so a
-        // revert that fails cannot lose the branch; the pass at the end deletes
-        // it once nothing uses it, or the next pull does.
+        // `repair_chain` queued this branch when it settled the record; this
+        // call keeps that entry and is here for the record a repair did not
+        // settle. Before the revert either way, so a revert that fails cannot
+        // lose the branch; the pass at the end deletes it once nothing uses
+        // it, or the next pull does.
         let onto = withdrawn_onto(&state, &below);
         queue_retired(&mut state, &proposal, RetireWhy::Withdrawn, onto);
         state.save(state_dir)?;
