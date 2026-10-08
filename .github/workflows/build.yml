@@ -646,9 +646,14 @@ jobs:
         shell: pwsh
         run: |
           $msi = (Get-Item dist/*.msi).FullName
+          function Show-MsiFailure($log) {
+            Get-Content $log -Tail 50
+            Select-String -Path $log -Pattern 'Return value 3' -Context 40,3 | ForEach-Object { $_.Context.PreContext; $_.Line; $_.Context.PostContext; '-----' }
+            Select-String -Path $log -Pattern 'Error \d{4}|error code|CustomAction .* returned actual error|Product: Crystalline -- ' | Select-Object -First 40
+          }
           $log = Join-Path $env:RUNNER_TEMP 'msi-install.log'
           $p = Start-Process msiexec -ArgumentList "/i `"$msi`" /qn /norestart /L*v `"$log`"" -Wait -PassThru
-          if ($p.ExitCode -ne 0) { Get-Content $log -Tail 50; throw "install failed: $($p.ExitCode)" }
+          if ($p.ExitCode -ne 0) { Show-MsiFailure $log; throw "install failed: $($p.ExitCode)" }
           $exe = 'C:\Program Files\Crystalline\bin\crystalline.exe'
           if (-not (Test-Path $exe)) { throw 'crystalline.exe missing after install' }
           & $exe --version
@@ -784,7 +789,7 @@ jobs:
           }
           $removeLog = Join-Path $env:RUNNER_TEMP 'msi-uninstall.log'
           $p = Start-Process msiexec -ArgumentList "/x `"$msi`" /qn /norestart /L*v `"$removeLog`"" -Wait -PassThru
-          if ($p.ExitCode -ne 0) { Get-Content $removeLog -Tail 50; throw "uninstall failed: $($p.ExitCode) (3010 means a file stayed in use)" }
+          if ($p.ExitCode -ne 0) { Show-MsiFailure $removeLog; throw "uninstall failed: $($p.ExitCode) (3010 means a file stayed in use)" }
           if (-not (Select-String -Path $removeLog -Pattern 'ActionStart\(Name=EndDaemonTasks' -Quiet)) { throw 'the uninstall did not run EndDaemonTasks' }
           if (Test-Path $exe) { throw 'crystalline.exe still present after uninstall' }
           $sysPath = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment').Path
@@ -812,6 +817,11 @@ jobs:
             "::warning::this build is $built, not newer than 0.24.1, so there is nothing to upgrade from; the upgrade test runs on a release tag"
             exit 0
           }
+          function Show-MsiFailure($log) {
+            Get-Content $log -Tail 50
+            Select-String -Path $log -Pattern 'Return value 3' -Context 40,3 | ForEach-Object { $_.Context.PreContext; $_.Line; $_.Context.PostContext; '-----' }
+            Select-String -Path $log -Pattern 'Error \d{4}|error code|CustomAction .* returned actual error|Product: Crystalline -- ' | Select-Object -First 40
+          }
           $old = Join-Path $env:RUNNER_TEMP "crystalline-v0.24.1-$env:LEG_PLATFORM.msi"
           Invoke-WebRequest -Uri "https://github.com/$env:GITHUB_REPOSITORY/releases/download/v0.24.1/crystalline-v0.24.1-$env:LEG_PLATFORM.msi" -OutFile $old
           $new = (Get-Item dist/*.msi).FullName
@@ -822,8 +832,9 @@ jobs:
             $p = Start-Process msiexec -ArgumentList "/i `"$msi`" /qn /norestart /L*v `"$log`"" -Wait -PassThru
             $p.ExitCode
           }
-          $code = & $install $old (Join-Path $env:RUNNER_TEMP 'msi-install-0.24.1.log')
-          if ($code -notin 0, 3010) { throw "the v0.24.1 install failed: $code" }
+          $oldLog = Join-Path $env:RUNNER_TEMP 'msi-install-0.24.1.log'
+          $code = & $install $old $oldLog
+          if ($code -notin 0, 3010) { Show-MsiFailure $oldLog; throw "the v0.24.1 install failed: $code" }
           $was = & $exe --version
           if ("$was" -notlike '*0.24.1*') { throw "v0.24.1 did not install: $was" }
           schtasks /Query /TN $task *> $null
@@ -840,7 +851,7 @@ jobs:
           if (-not $oldUp) { throw 'the v0.24.1 task started no daemon that answers' }
           $upgradeLog = Join-Path $env:RUNNER_TEMP 'msi-upgrade.log'
           $code = & $install $new $upgradeLog
-          if ($code -notin 0, 3010) { Get-Content $upgradeLog -Tail 50; throw "the upgrade failed: $code" }
+          if ($code -notin 0, 3010) { Show-MsiFailure $upgradeLog; throw "the upgrade failed: $code" }
           if (-not (Select-String -Path $upgradeLog -Pattern 'ActionStart\(Name=EndDaemonTasks' -Quiet)) { throw 'the upgrade did not run EndDaemonTasks' }
           $is = & $exe --version
           if ("$is" -notlike "*$built*") { throw "after the upgrade $exe is $is, not $built" }
@@ -863,11 +874,22 @@ jobs:
           "the upgraded task started a v$($status.version) daemon that answers"
           & $exe ctl shutdown *> $null
           schtasks /End /TN $task *> $null
-          $p = Start-Process msiexec -ArgumentList "/x `"$new`" /qn /norestart" -Wait -PassThru
-          if ($p.ExitCode -notin 0, 3010) { throw "the uninstall after the upgrade failed: $($p.ExitCode)" }
+          $afterLog = Join-Path $env:RUNNER_TEMP 'msi-uninstall-after-upgrade.log'
+          $p = Start-Process msiexec -ArgumentList "/x `"$new`" /qn /norestart /L*v `"$afterLog`"" -Wait -PassThru
+          if ($p.ExitCode -notin 0, 3010) { Show-MsiFailure $afterLog; throw "the uninstall after the upgrade failed: $($p.ExitCode)" }
           schtasks /Query /TN $task *> $null
           if ($LASTEXITCODE -eq 0) { throw 'the task is still registered after the uninstall' }
           $global:LASTEXITCODE = 0
+
+      # The verbose msiexec logs (UTF-16, uploaded as written) of the smoke
+      # and upgrade steps, even when one of them failed.
+      - name: Upload the MSI logs
+        if: always() && matrix.msi
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: msi-logs-${{ matrix.platform }}
+          path: ${{ runner.temp }}/msi-*.log
+          if-no-files-found: warn
 
       # The definition as Task Scheduler stores it, from the smoke test and
       # the upgrade test, uploaded even when a check failed.
