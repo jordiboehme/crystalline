@@ -783,7 +783,7 @@ pub struct HolderFacts {
     pub state_dir: Option<String>,
     /// The config file the daemon loaded, canonical
     /// ([`crate::shaping::canonical_config_path`]). `None` from a daemon
-    /// older than 0.24.1, which means unknown.
+    /// older than 0.24.2, which means unknown.
     #[serde(default)]
     pub config_path: Option<String>,
     /// What the daemon bound its HTTP endpoint to, read from the `http` key

@@ -971,12 +971,13 @@ fn same_account(a: &str, b: &str) -> bool {
 
 /// A task runs for this user when its principal is a group (only the MSI
 /// registers one, for the Users group) or this account, and is taken to
-/// when its principal cannot be read at all. The task under this user's own
-/// name with their SID (`\Crystalline Daemon for <name> (<SID>)`) is always
-/// theirs: only this account can register a name that carries its SID.
-/// Task Scheduler may print the account as a SID, and a name outside ASCII
-/// may not survive the decoding of its output. The 0.24.0 name without the
-/// SID is judged by its principal like any other.
+/// when its principal cannot be read at all. A principal that is this
+/// account's SID is this account too. The task under this user's own name
+/// with their SID (`\Crystalline Daemon for <name> (<SID>)`) is taken as
+/// theirs, as the bridge takes it: Task Scheduler may print the account as
+/// a SID, and a name outside ASCII may not survive the decoding of its
+/// output. The 0.24.0 name without the SID is judged by its principal like
+/// any other.
 pub(crate) fn task_finding(
     name: Option<&str>,
     xml: Option<&str>,
@@ -1005,7 +1006,8 @@ pub(crate) fn task_finding(
     let groups = element_texts(principals, "GroupId");
     let users = element_texts(principals, "UserId");
     let unreadable = groups.is_empty() && users.is_empty();
-    let for_me = !account.is_empty() && users.iter().any(|user| same_account(user, account));
+    let for_me = (!account.is_empty() && users.iter().any(|user| same_account(user, account)))
+        || sid.is_some_and(|sid| users.iter().any(|user| user.eq_ignore_ascii_case(sid)));
     if unreadable || !groups.is_empty() || for_me {
         TaskFinding::Ready(name.to_string())
     } else {
@@ -1213,6 +1215,7 @@ fn check_task(fix: bool) -> Option<TaskDoctor> {
     }
     let moved = match task_fix(&report, repair) {
         TaskFix::Nothing => daemon_task::Moved::Nothing,
+        // The real schtasks, past the DaemonTask seam: no seam stands for a delete.
         TaskFix::RemoveOld => daemon_task::remove_legacy_for_this_user(),
         TaskFix::Register if !installed => {
             report.error = Some(NOT_THE_MSI_BINARY.to_string());
@@ -4554,10 +4557,23 @@ pub fn render_human(report: &DoctorReport) -> String {
                 "  [problem] --fix could not remove the task {old}, which has the name from Crystalline 0.24.0 ({why})"
             );
         } else if let Some(old) = &task.old_name {
-            let _ = writeln!(
-                out,
-                "  [warning] the task {old} has the name from Crystalline 0.24.0. Run crystalline doctor --fix to give it a name with this account's SID"
+            // Beside a ready machine task --fix only removes it (task_fix).
+            let machine_ready = matches!(
+                (&task.finding, &task.gone_command),
+                (Some(TaskFinding::Ready(name)), None) if is_machine_task(name)
             );
+            let _ = if machine_ready {
+                writeln!(
+                    out,
+                    "  [warning] the task {old} has the name from Crystalline 0.24.0. The task {} starts the daemon for this user, so run crystalline doctor --fix to remove it",
+                    crystalline_service::daemon_task::MACHINE_TASK_NAME
+                )
+            } else {
+                writeln!(
+                    out,
+                    "  [warning] the task {old} has the name from Crystalline 0.24.0. Run crystalline doctor --fix to give it a name with this account's SID"
+                )
+            };
             // The match above says --fix's error only for a problem.
             if matches!(
                 (&task.finding, &task.gone_command, &task.registered_now),
@@ -8244,6 +8260,58 @@ mod tests {
         );
         assert!(!out.contains("registered the task"), "{out}");
         assert!(!out.contains("[warning]"), "{out}");
+
+        let before = DoctorReport {
+            daemon_task: Some(doctor(
+                TaskFinding::Ready(MACHINE_TASK_NAME.to_string()),
+                Some(&old),
+            )),
+            ..DoctorReport::default()
+        };
+        let out = render_human(&before);
+        assert!(
+            out.contains(&format!(
+                "  [warning] the task {old} has the name from Crystalline 0.24.0. The task {MACHINE_TASK_NAME} starts the daemon for this user, so run crystalline doctor --fix to remove it\n"
+            )),
+            "{out}"
+        );
+    }
+
+    /// This user's 0.24.0-named task read back with the account's SID as
+    /// principal runs for this user, as the bridge finds it: a warning about
+    /// the name only, never a problem.
+    #[test]
+    fn the_old_name_with_this_accounts_sid_as_principal_is_this_users() {
+        let old = crystalline_service::daemon_task::legacy_user_task_name("ada");
+        let xml = format!(
+            "<Task><Principals><Principal id=\"Author\"><UserId>{ADA_SID}</UserId></Principal></Principals></Task>"
+        );
+        let (task, repair) = assess_task(
+            Some(old.as_str()),
+            Some(xml.as_str()),
+            r"WORK\ada",
+            Some(ADA_SID),
+            |_: &Path| true,
+        );
+        assert_eq!(task.finding, Some(TaskFinding::Ready(old.clone())));
+        assert_eq!(repair, TaskRepair::Nothing);
+        assert_eq!(
+            task_finding(Some(old.as_str()), Some(xml.as_str()), r"WORK\ada", None),
+            TaskFinding::ForOthers(old.clone()),
+            "without this account's SID the principal is not known as ours"
+        );
+        let report = DoctorReport {
+            daemon_task: Some(TaskDoctor {
+                old_name: Some(old.clone()),
+                ..task
+            }),
+            ..DoctorReport::default()
+        };
+        assert_eq!(report.remaining_problems(), 0);
+        let out = render_human(&report);
+        assert!(out.contains(&format!("  ok ({old})\n")), "{out}");
+        assert!(out.contains("[warning] the task"), "{out}");
+        assert!(!out.contains("[problem]"), "{out}");
     }
 
     /// The 0.24.0 name is a warning, never a problem: the task still works.
