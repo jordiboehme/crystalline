@@ -12,8 +12,9 @@
 //! against the configured one, plus the cached model directories with sizes,
 //! marking any the config does not use as stale (visible between a config
 //! change and the next daemon start, which prunes them on a writable
-//! instance running a local model); the lock folders hf-hub left for a model
-//! that is no longer cached, which `--fix` removes; (g) when `github.enabled`, whether this
+//! instance running a local model), and the lock folders hf-hub left for a
+//! model that is no longer cached, which `--fix` removes; (g) when
+//! `github.enabled`, whether this
 //! machine is connected to GitHub and, per team domain, whether its local
 //! origin state is present and its base snapshot still matches what was
 //! recorded (`verify_base`); (h) which `CRYSTALLINE_*` environment variables
@@ -3832,13 +3833,6 @@ fn live_device(block: Option<&serde_json::Value>, probed: Option<String>) -> Opt
         .or(probed)
 }
 
-/// The contradictions row: the profile and its model from config, whether the
-/// model's weights are in the cache (filesystem only, no index read - plan
-/// correction 15, so this runs the same under a running daemon as without
-/// one), and NLI checkpoints no profile uses now. `daemon_status` is `ctl
-/// status`'s answer when a daemon served this run's file stamps; its
-/// `pending_pairs`, `failing_pairs`, `last_error`, `load_failed`,
-/// `load_retry`, `read_only`, `embedding_pending`, `embedding_model`,
 /// The model cache's stale lock folders, removed with `fix` unless the
 /// instance is read-only. `None` when the cache has none or cannot be named.
 fn check_model_locks(fix: bool, read_only: bool) -> Option<ModelLocksDoctor> {
@@ -3858,6 +3852,13 @@ fn check_model_locks(fix: bool, read_only: bool) -> Option<ModelLocksDoctor> {
     Some(ModelLocksDoctor { stale, removed })
 }
 
+/// The contradictions row: the profile and its model from config, whether the
+/// model's weights are in the cache (filesystem only, no index read - plan
+/// correction 15, so this runs the same under a running daemon as without
+/// one), and NLI checkpoints no profile uses now. `daemon_status` is `ctl
+/// status`'s answer when a daemon served this run's file stamps; its
+/// `pending_pairs`, `failing_pairs`, `last_error`, `load_failed`,
+/// `load_retry`, `read_only`, `embedding_pending`, `embedding_model`,
 /// `line_floor`, `line_floor_missing`, `lines_embedded` and `lines_eligible`
 /// are read from there and never recomputed (lesson 36) - a direct read has
 /// no worker, so the counts and flags stay null/false, the same shape
@@ -7089,9 +7090,6 @@ mod tests {
         assert!(!out.contains("crystalline config set"), "{out}");
     }
 
-    /// V302: a remote embedding model has no measured line floor, so doctor
-    /// names the reason from the config (a daemon's answer is not needed) and
-    /// the row says the check does not run.
     #[test]
     fn a_lock_folder_left_by_a_removed_model_is_listed_and_fix_removes_it() {
         let _guard = MODELS_DIR_ENV_LOCK.lock().unwrap();
@@ -7152,6 +7150,9 @@ mod tests {
         );
     }
 
+    /// V302: a remote embedding model has no measured line floor, so doctor
+    /// names the reason from the config (a daemon's answer is not needed) and
+    /// the row says the check does not run.
     #[test]
     fn contradiction_summary_names_a_missing_line_floor_from_the_config() {
         let _guard = MODELS_DIR_ENV_LOCK.lock().unwrap();

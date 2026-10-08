@@ -700,7 +700,10 @@ pub fn prune_model_cache(models_dir: &Path, keep: &[&str]) -> Result<Vec<(String
             Ok(()) => {
                 // hf-hub's lock folder for the model goes with it, or it stays
                 // behind as a folder of empty lock files nothing uses.
-                remove_lock_dir(models_dir, &repo);
+                // A lock held right now is a download in flight: its folder stays.
+                if !lock_held(&models_dir.join(LOCKS_DIR).join(hub_dir_name(&repo))) {
+                    remove_lock_dir(models_dir, &repo);
+                }
                 tracing::info!(
                     repo = %repo,
                     bytes,
@@ -789,7 +792,9 @@ pub fn remove_stale_model_lock_dirs(models_dir: &Path) -> Vec<String> {
 }
 
 /// Whether any lock file in `dir` is locked by somebody right now. A file that
-/// cannot be opened says nothing either way and counts as not held.
+/// cannot be opened says nothing either way and counts as not held. Listing
+/// takes a momentary exclusive lock with `try_lock` on each file that is free,
+/// released again when the handle drops.
 fn lock_held(dir: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return false;
@@ -1037,6 +1042,22 @@ mod tests {
             "the pruned model's lock folder went with it"
         );
         assert!(kept.is_dir());
+    }
+
+    #[test]
+    fn pruning_keeps_the_lock_folder_of_a_download_in_flight() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let granite = "ibm-granite/granite-embedding-97m-multilingual-r2";
+        hub_dir(root, granite, &[7u8; 8]);
+        hub_dir(root, "BAAI/bge-small-en-v1.5", &[3u8; 8]);
+        let dir = lock_dir(root, "BAAI/bge-small-en-v1.5");
+        let held = std::fs::File::create(dir.join("other.lock")).unwrap();
+        held.lock().unwrap();
+
+        prune_model_cache(root, &[granite]).unwrap();
+        assert!(dir.is_dir(), "a held lock keeps its folder");
+        drop(held);
     }
 
     #[test]

@@ -64,7 +64,10 @@ impl Env {
             .env("APPDATA", self.dir.join("roaming"))
             .env("LOCALAPPDATA", self.dir.join("local"))
             .env("CRYSTALLINE_SERVICE_HTTP", "false")
-            .env("CRYSTALLINE_TEST_DAEMON_TASK", "missing");
+            .env("CRYSTALLINE_TEST_DAEMON_TASK", "missing")
+            // A models cache named in the developer's shell must not be
+            // reached by `doctor --fix`.
+            .env_remove("CRYSTALLINE_MODELS_DIR");
     }
 
     fn state_dir(&self) -> PathBuf {
