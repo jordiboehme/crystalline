@@ -322,6 +322,12 @@ pub async fn run_serve(
     // the overlay over the file. A bad known variable aborts startup here with
     // a message naming it.
     let loaded = overlay::load(config_path.as_deref())?;
+    // The operator's own setup token, checked before anything binds so a
+    // token under the floor stops the start with a sentence naming the
+    // variable. Never printed or logged.
+    let configured_setup =
+        configured_setup_token(|k| std::env::var(k).ok(), |p| std::fs::read_to_string(p))
+            .map_err(anyhow::Error::msg)?;
     let read_only = read_only || loaded.effective.read_only();
     let db_path = resolve_db(db.as_deref())?;
     let http_addr = resolve_http(http_flag.as_deref(), &loaded.effective);
@@ -590,7 +596,7 @@ pub async fn run_serve(
     // sentence that never carries the password.
     let created_admin = crate::first_admin::seed_from_environment(accounts_db.as_deref()).await?;
     let setup_token = match http_addr.as_deref() {
-        Some(addr) => setup_token_for(addr, accounts_db.as_deref()).await,
+        Some(addr) => setup_token_for(addr, accounts_db.as_deref(), configured_setup).await,
         None => None,
     };
 
@@ -611,9 +617,15 @@ pub async fn run_serve(
             if let Some(line) = oauth_without_a_consent_page(&loaded.effective) {
                 eprintln!("crystalline warning: {line}");
             }
-            if let Some(token) = &setup_token {
-                for line in setup_token_lines(&setup_address(&loaded.effective, addr), token) {
-                    eprintln!("{line}");
+            if let Some(drawn) = &setup_token {
+                let at = setup_address(&loaded.effective, addr);
+                match drawn.shown() {
+                    Some(shown) => {
+                        for line in setup_token_lines(&at, shown) {
+                            eprintln!("{line}");
+                        }
+                    }
+                    None => eprintln!("{}", configured_setup_line(&at, drawn.var())),
                 }
             }
         }
@@ -632,13 +644,20 @@ pub async fn run_serve(
         if let Some(line) = &created_admin {
             tracing::info!("{line}");
         }
-        if let (Some(addr), Some(token)) = (&http_addr, &setup_token) {
+        if let (Some(addr), Some(drawn)) = (&http_addr, &setup_token) {
             // Daemonized, so there is no terminal reading the banner: the same two
             // lines go to the daemon log instead, once. Without them a backgrounded
             // non-loopback serve would offer a first-run wizard nobody can get
-            // through and no way to find out why.
-            for line in setup_token_lines(&setup_address(&loaded.effective, addr), token) {
-                tracing::info!("{line}");
+            // through and no way to find out why. A token the operator set is
+            // named by its variable only.
+            let at = setup_address(&loaded.effective, addr);
+            match drawn.shown() {
+                Some(shown) => {
+                    for line in setup_token_lines(&at, shown) {
+                        tracing::info!("{line}");
+                    }
+                }
+                None => tracing::info!("{}", configured_setup_line(&at, drawn.var())),
             }
         }
     }
@@ -804,7 +823,7 @@ pub async fn run_serve(
         // end on it so the drain `run_http` waits for is never held open by
         // a browser; see `rest::RestState::with_shutdown`.
         let streams_rx = shared.watch();
-        let token = setup_token.clone();
+        let token = setup_token.as_ref().map(|t| t.value().to_string());
         tokio::spawn(async move {
             // Three failure classes, three sentences, because the remedy
             // differs: the endpoint never came up at all, the address was
@@ -1505,16 +1524,107 @@ async fn run_http(
 /// 32 hex characters is 128 bits from the same OS CSPRNG the session tokens
 /// are drawn from - a one-shot secret a human retypes off a terminal, not a
 /// stored credential.
-async fn setup_token_for(addr: &str, accounts: Option<&Path>) -> Option<String> {
+///
+/// A token the operator set ([`configured_setup_token`]) is handed out under
+/// the same two conditions in place of a minted one.
+async fn setup_token_for(
+    addr: &str,
+    accounts: Option<&Path>,
+    configured: Option<SetupToken>,
+) -> Option<SetupToken> {
     if bind_is_loopback(addr) {
         return None;
     }
     if an_account_already_exists(accounts).await {
         return None;
     }
+    if let Some(configured) = configured {
+        return Some(configured);
+    }
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).expect("the OS CSPRNG is available");
-    Some(crystalline_index::hex_lower(&bytes))
+    Some(SetupToken::Minted(crystalline_index::hex_lower(&bytes)))
+}
+
+/// The variable an operator sets the first-run setup token with, plain or as
+/// `CRYSTALLINE_SETUP_TOKEN_FILE` for a Docker secret.
+const SETUP_TOKEN_ENV: &str = "CRYSTALLINE_SETUP_TOKEN";
+
+/// The shortest setup token an operator may set: the 128 bits a minted one
+/// carries, written as hex.
+const MIN_SETUP_TOKEN_CHARS: usize = 32;
+
+/// A first-run setup token: one this process minted, which it prints once,
+/// or one the operator set, which it never prints or logs.
+#[derive(Clone, PartialEq, Eq)]
+enum SetupToken {
+    Minted(String),
+    Configured { value: String, var: String },
+}
+
+/// Never prints the value, whichever kind it is.
+impl std::fmt::Debug for SetupToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SetupToken::Minted(_) => f.write_str("SetupToken::Minted(<redacted>)"),
+            SetupToken::Configured { var, .. } => {
+                write!(f, "SetupToken::Configured({var}, <redacted>)")
+            }
+        }
+    }
+}
+
+impl SetupToken {
+    /// What the setup route compares against.
+    fn value(&self) -> &str {
+        match self {
+            SetupToken::Minted(value) | SetupToken::Configured { value, .. } => value,
+        }
+    }
+
+    /// The value to print at startup: a minted token only.
+    fn shown(&self) -> Option<&str> {
+        match self {
+            SetupToken::Minted(value) => Some(value),
+            SetupToken::Configured { .. } => None,
+        }
+    }
+
+    /// The variable a configured token came from.
+    fn var(&self) -> &str {
+        match self {
+            SetupToken::Minted(_) => "",
+            SetupToken::Configured { var, .. } => var,
+        }
+    }
+}
+
+/// The setup token the operator set with [`SETUP_TOKEN_ENV`] or its file
+/// form, read with the shared secret rules. `Ok(None)` when neither is set.
+/// A token under [`MIN_SETUP_TOKEN_CHARS`] characters is refused naming the
+/// variable and the minimum, never the value.
+fn configured_setup_token(
+    var: impl Fn(&str) -> Option<String>,
+    read: impl Fn(&Path) -> std::io::Result<String>,
+) -> Result<Option<SetupToken>, String> {
+    let Some(source) = crystalline_core::secret_env::secret_source(SETUP_TOKEN_ENV, &var)? else {
+        return Ok(None);
+    };
+    let var = source.var().to_string();
+    let value = source.resolve(&read)?;
+    if value.chars().count() < MIN_SETUP_TOKEN_CHARS {
+        return Err(format!(
+            "{var} is shorter than {MIN_SETUP_TOKEN_CHARS} characters; set one with at least {MIN_SETUP_TOKEN_CHARS}"
+        ));
+    }
+    Ok(Some(SetupToken::Configured { value, var }))
+}
+
+/// The line a serve process says when the operator set the setup token: the
+/// address and the variable, never the value. Built here, like
+/// [`setup_token_lines`], so no output call spells the secret.
+fn configured_setup_line(at: &str, var: &str) -> String {
+    format!("first-run setup (create the first admin at {at}) takes the setup token from {var}")
 }
 
 /// Whether this instance already has an account, asked of the accounts database
@@ -4738,6 +4848,132 @@ mod tests {
         );
     }
 
+    /// The value `setup_token_for` hands the HTTP surface, with no operator
+    /// token set: the minted one.
+    async fn minted(addr: &str, accounts: Option<&Path>) -> Option<String> {
+        setup_token_for(addr, accounts, None)
+            .await
+            .map(|t| t.value().to_string())
+    }
+
+    fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: std::collections::HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |k| map.get(k).cloned()
+    }
+
+    fn no_files(_: &Path) -> std::io::Result<String> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no such file",
+        ))
+    }
+
+    const LONG: &str = "0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn the_setup_token_is_read_plain_and_from_a_file() {
+        assert_eq!(configured_setup_token(env(&[]), no_files).unwrap(), None);
+        let plain = configured_setup_token(env(&[("CRYSTALLINE_SETUP_TOKEN", LONG)]), no_files)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (plain.value(), plain.var()),
+            (LONG, "CRYSTALLINE_SETUP_TOKEN")
+        );
+        let file = configured_setup_token(
+            env(&[("CRYSTALLINE_SETUP_TOKEN_FILE", "/run/secrets/setup")]),
+            |p: &Path| {
+                assert_eq!(p, Path::new("/run/secrets/setup"));
+                Ok(format!("{LONG}\r\n"))
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            (file.value(), file.var()),
+            (LONG, "CRYSTALLINE_SETUP_TOKEN_FILE")
+        );
+        let both = configured_setup_token(
+            env(&[
+                ("CRYSTALLINE_SETUP_TOKEN", LONG),
+                ("CRYSTALLINE_SETUP_TOKEN_FILE", "/run/secrets/setup"),
+            ]),
+            no_files,
+        )
+        .unwrap_err();
+        assert_eq!(
+            both,
+            "CRYSTALLINE_SETUP_TOKEN and CRYSTALLINE_SETUP_TOKEN_FILE are both set; keep one"
+        );
+    }
+
+    #[test]
+    fn a_setup_token_under_thirty_two_characters_is_refused_naming_the_variable() {
+        let short = &LONG[..31];
+        let err = configured_setup_token(env(&[("CRYSTALLINE_SETUP_TOKEN", short)]), no_files)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            "CRYSTALLINE_SETUP_TOKEN is shorter than 32 characters; set one with at least 32"
+        );
+        assert!(!err.contains(short), "the value is never repeated: {err}");
+        let err = configured_setup_token(
+            env(&[("CRYSTALLINE_SETUP_TOKEN_FILE", "/s")]),
+            |_: &Path| Ok("short\n".to_string()),
+        )
+        .unwrap_err();
+        assert!(
+            err.starts_with("CRYSTALLINE_SETUP_TOKEN_FILE is shorter than 32"),
+            "{err}"
+        );
+    }
+
+    /// A set token is used where a minted one would be, and only there: a
+    /// loopback bind needs none, an instance with an account has no setup
+    /// left. It is never printed, so it is not a minted one.
+    #[tokio::test]
+    async fn a_configured_setup_token_is_used_instead_of_a_minted_one() {
+        let configured =
+            || configured_setup_token(env(&[("CRYSTALLINE_SETUP_TOKEN", LONG)]), no_files).unwrap();
+        let (dir, accounts) = accounts_db(false).await;
+        let token = setup_token_for("0.0.0.0:7411", Some(&accounts), configured())
+            .await
+            .unwrap();
+        assert_eq!(token.value(), LONG);
+        assert_eq!(token.shown(), None, "a set token is never printed");
+        assert!(
+            setup_token_for("127.0.0.1:7411", Some(&accounts), configured())
+                .await
+                .is_none()
+        );
+        drop(dir);
+        let (dir, accounts) = accounts_db(true).await;
+        assert!(
+            setup_token_for("0.0.0.0:7411", Some(&accounts), configured())
+                .await
+                .is_none(),
+            "it stops working once the first admin exists"
+        );
+        drop(dir);
+        let minted = setup_token_for("0.0.0.0:7411", None, None).await.unwrap();
+        assert_eq!(
+            minted.shown(),
+            Some(minted.value()),
+            "a minted token is printed once"
+        );
+    }
+
+    #[test]
+    fn the_configured_setup_line_names_the_variable_only() {
+        assert_eq!(
+            configured_setup_line("http://0.0.0.0:7411", "CRYSTALLINE_SETUP_TOKEN_FILE"),
+            "first-run setup (create the first admin at http://0.0.0.0:7411) takes the setup token from CRYSTALLINE_SETUP_TOKEN_FILE"
+        );
+    }
+
     /// A reachable bind on an instance with no account yet is the case the
     /// whole feature exists for: the token is minted, and the accounts database
     /// that does not exist yet is the normal first-run state rather than a
@@ -4759,14 +4995,14 @@ mod tests {
             "[2001:db8::1]:7411",
             "fluid.example:7411",
         ] {
-            let token = setup_token_for(addr, Some(&accounts))
+            let token = minted(addr, Some(&accounts))
                 .await
                 .unwrap_or_else(|| panic!("{addr} is reachable from elsewhere and needs a token"));
             assert_is_a_setup_token(&token);
         }
         assert_ne!(
-            setup_token_for("0.0.0.0:7411", Some(&accounts)).await,
-            setup_token_for("0.0.0.0:7411", Some(&accounts)).await,
+            minted("0.0.0.0:7411", Some(&accounts)).await,
+            minted("0.0.0.0:7411", Some(&accounts)).await,
             "drawn fresh every time, so one serve process's token is its own"
         );
         drop(dir);
@@ -4786,7 +5022,7 @@ mod tests {
             "fluid.example:7411",
         ] {
             assert_eq!(
-                setup_token_for(addr, Some(&accounts)).await,
+                minted(addr, Some(&accounts)).await,
                 None,
                 "{addr} serves an instance whose first-run setup is closed for good"
             );
@@ -4809,7 +5045,7 @@ mod tests {
                 "localhost:7411",
             ] {
                 assert_eq!(
-                    setup_token_for(addr, Some(&accounts)).await,
+                    minted(addr, Some(&accounts)).await,
                     None,
                     "{addr} can only be reached from this machine"
                 );
@@ -4839,13 +5075,13 @@ mod tests {
             crate::rest::AuthStore::open(&accounts).await.is_err(),
             "a directory at the database path is a database that cannot be opened"
         );
-        let token = setup_token_for("0.0.0.0:7411", Some(&accounts))
+        let token = minted("0.0.0.0:7411", Some(&accounts))
             .await
             .expect("a database that cannot be read must not withhold the first-run secret");
         assert_is_a_setup_token(&token);
         // The same fail-open answer with no path to ask at all, which is what a
         // machine with no resolvable state directory hands in.
-        let token = setup_token_for("0.0.0.0:7411", None)
+        let token = minted("0.0.0.0:7411", None)
             .await
             .expect("no accounts path to ask is not an answer of 'an account exists'");
         assert_is_a_setup_token(&token);

@@ -35,6 +35,7 @@ pub mod prompt;
 pub mod provision;
 pub mod relink;
 pub mod schema;
+pub mod secret_env;
 pub mod similarity;
 pub mod skills;
 pub mod tags;

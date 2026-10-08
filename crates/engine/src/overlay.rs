@@ -180,6 +180,11 @@ pub const RESERVED_VARS: &[&str] = &[
     "CRYSTALLINE_ADMIN_NAME_FILE",
     "CRYSTALLINE_ADMIN_PASSWORD",
     "CRYSTALLINE_ADMIN_PASSWORD_FILE",
+    // The operator's own first-run setup token (`setup_token` in the service
+    // crate's daemon), plain or as a `_FILE` path. Read by `serve` only,
+    // because its length floor is a serve rule, so reserved here.
+    "CRYSTALLINE_SETUP_TOKEN",
+    "CRYSTALLINE_SETUP_TOKEN_FILE",
 ];
 
 /// An error parsing the environment overlay. The message names the offending
@@ -225,6 +230,10 @@ pub struct EnvOverlay {
     /// The config file path from [`CONFIG_PATH_ENV`], tilde-expanded. `None`
     /// when the variable is absent or empty.
     config_path: Option<PathBuf>,
+    /// The secrets that came from a `_FILE` variable, as (plain variable,
+    /// file variable). [`EnvOverlay::active_overrides`] names the file
+    /// variable for these, because that is the one set in the environment.
+    file_sourced: Vec<(String, String)>,
 }
 
 /// The settings pairs with every credential value replaced, for `Debug`. An
@@ -261,6 +270,7 @@ impl std::fmt::Debug for EnvOverlay {
                 &self.github_token.as_ref().map(|_| "<redacted>"),
             )
             .field("config_path", &self.config_path)
+            .field("file_sourced", &self.file_sourced)
             .finish()
     }
 }
@@ -299,10 +309,30 @@ impl EnvOverlay {
     /// [`GITHUB_TOKEN_ENV`], when present and non-empty, is captured as
     /// [`EnvOverlay::github_token`]; an empty value reads as unset, the same
     /// as every setting variable.
+    ///
+    /// Each of the three file-backed secrets may also come from a file named
+    /// by its `_FILE` form; see [`EnvOverlay::from_vars_reading`].
     pub fn from_vars<I>(vars: I) -> Result<EnvOverlay, OverlayError>
     where
         I: IntoIterator<Item = (String, String)>,
     {
+        EnvOverlay::from_vars_reading(vars, |path| std::fs::read_to_string(path))
+    }
+
+    /// [`EnvOverlay::from_vars`] with the file reader injected, the seam the
+    /// `_FILE` tests use. The three file-backed secrets
+    /// ([`crystalline_core::secret_env::FILE_BACKED`]) are resolved first:
+    /// a file form becomes the plain variable carrying the file's content,
+    /// both forms set or an unreadable file fails the load naming the
+    /// variable, and every later step sees only plain variables.
+    pub fn from_vars_reading<I>(
+        vars: I,
+        read: impl Fn(&Path) -> std::io::Result<String>,
+    ) -> Result<EnvOverlay, OverlayError>
+    where
+        I: IntoIterator<Item = (String, String)>,
+    {
+        let (vars, file_sourced) = resolve_file_secrets(vars.into_iter().collect(), &read)?;
         let mut settings = Vec::new();
         let mut config_path = None;
         let mut github_token = None;
@@ -405,6 +435,7 @@ impl EnvOverlay {
             domains,
             github_token,
             config_path,
+            file_sourced,
         })
     }
 
@@ -516,7 +547,7 @@ impl EnvOverlay {
                 } else {
                     value.clone()
                 };
-                (env_var_for(key), key.clone(), display)
+                (self.shown_var(env_var_for(key)), key.clone(), display)
             })
             .collect();
         for (name, env_domain) in &self.domains {
@@ -529,13 +560,61 @@ impl EnvOverlay {
         }
         if self.github_token.is_some() {
             out.push((
-                GITHUB_TOKEN_ENV.to_string(),
+                self.shown_var(GITHUB_TOKEN_ENV.to_string()),
                 "github.token".to_string(),
                 "(set)".to_string(),
             ));
         }
         out
     }
+
+    /// The variable to name for `plain`: its `_FILE` form when the value
+    /// came from a file.
+    fn shown_var(&self, plain: String) -> String {
+        self.file_sourced
+            .iter()
+            .find(|(p, _)| *p == plain)
+            .map(|(_, file)| file.clone())
+            .unwrap_or(plain)
+    }
+}
+
+/// Name and value pairs, the shape [`resolve_file_secrets`] takes and returns.
+type VarPairs = Vec<(String, String)>;
+
+/// Resolves the `_FILE` forms of the file-backed secrets
+/// ([`crystalline_core::secret_env::FILE_BACKED`]) over the collected
+/// variables. Returns the variables with both forms of each of the three
+/// replaced by the plain variable carrying the resolved value, plus the
+/// (plain, file variable) pairs that came from a file.
+fn resolve_file_secrets(
+    vars: VarPairs,
+    read: &impl Fn(&Path) -> std::io::Result<String>,
+) -> Result<(VarPairs, VarPairs), OverlayError> {
+    use crystalline_core::secret_env::{FILE_BACKED, file_var, secret_source};
+
+    let lookup: HashMap<String, String> = vars.iter().cloned().collect();
+    let var = |k: &str| lookup.get(k).cloned();
+    let mut resolved = Vec::new();
+    let mut file_sourced = Vec::new();
+    for plain in FILE_BACKED {
+        let Some(source) = secret_source(plain, &var).map_err(OverlayError)? else {
+            continue;
+        };
+        if source.from_file() {
+            file_sourced.push((plain.to_string(), source.var().to_string()));
+        }
+        let value = source.resolve(read).map_err(OverlayError)?;
+        resolved.push((plain.to_string(), value));
+    }
+    let consumed = |name: &str| {
+        FILE_BACKED
+            .iter()
+            .any(|plain| name == *plain || name == file_var(plain))
+    };
+    let mut out: Vec<(String, String)> = vars.into_iter().filter(|(n, _)| !consumed(n)).collect();
+    out.extend(resolved);
+    Ok((out, file_sourced))
 }
 
 /// Resolves the collected `CRYSTALLINE_DOMAIN_*` variables into the overlay's
@@ -1646,5 +1725,157 @@ mod tests {
         assert!(is_reserved("CRYSTALLINE_REMOTE_DOMAINS"));
         let ov = overlay(&[("CRYSTALLINE_REMOTE_DEADLINE_MS", "700")]).unwrap();
         assert_eq!(ov.apply(&GlobalConfig::default()).remote_deadline_ms(), 700);
+    }
+
+    /// A map file reader, so no overlay test touches the disk.
+    fn reading(files: &[(&str, &str)]) -> impl Fn(&Path) -> std::io::Result<String> + use<> {
+        let map: HashMap<PathBuf, String> = files
+            .iter()
+            .map(|(k, v)| (PathBuf::from(k), v.to_string()))
+            .collect();
+        move |p| {
+            map.get(p)
+                .cloned()
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"))
+        }
+    }
+
+    fn overlay_reading(
+        pairs: &[(&str, &str)],
+        files: &[(&str, &str)],
+    ) -> Result<EnvOverlay, OverlayError> {
+        EnvOverlay::from_vars_reading(
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<Vec<_>>(),
+            reading(files),
+        )
+    }
+
+    #[test]
+    fn the_github_token_reads_plain_and_from_a_file() {
+        let plain = overlay_reading(&[("CRYSTALLINE_GITHUB_TOKEN", "ghp_plain")], &[]).unwrap();
+        assert_eq!(plain.github_token(), Some("ghp_plain"));
+
+        let file = overlay_reading(
+            &[("CRYSTALLINE_GITHUB_TOKEN_FILE", "/run/secrets/gh")],
+            &[("/run/secrets/gh", "ghp_file\r\n")],
+        )
+        .unwrap();
+        assert_eq!(file.github_token(), Some("ghp_file"));
+        let (var, key, shown) = file
+            .active_overrides()
+            .into_iter()
+            .find(|(_, key, _)| key == "github.token")
+            .unwrap();
+        assert_eq!(
+            (var.as_str(), key.as_str(), shown.as_str()),
+            ("CRYSTALLINE_GITHUB_TOKEN_FILE", "github.token", "(set)"),
+            "the variable that is actually set is the one named"
+        );
+        assert!(!format!("{file:?}").contains("ghp_file"));
+    }
+
+    #[test]
+    fn the_oidc_client_secret_reads_plain_and_from_a_file() {
+        let plain =
+            overlay_reading(&[("CRYSTALLINE_AUTH_OIDC_CLIENT_SECRET", "s3cret")], &[]).unwrap();
+        let effective = plain.apply(&GlobalConfig::default());
+        assert_eq!(
+            effective
+                .auth
+                .as_ref()
+                .unwrap()
+                .oidc
+                .as_ref()
+                .unwrap()
+                .client_secret
+                .as_deref(),
+            Some("s3cret")
+        );
+
+        let file = overlay_reading(
+            &[(
+                "CRYSTALLINE_AUTH_OIDC_CLIENT_SECRET_FILE",
+                "/run/secrets/oidc",
+            )],
+            &[("/run/secrets/oidc", "s3cret-from-file\n")],
+        )
+        .unwrap();
+        let effective = file.apply(&GlobalConfig::default());
+        assert_eq!(
+            effective
+                .auth
+                .as_ref()
+                .unwrap()
+                .oidc
+                .as_ref()
+                .unwrap()
+                .client_secret
+                .as_deref(),
+            Some("s3cret-from-file")
+        );
+        let (var, _, shown) = file
+            .active_overrides()
+            .into_iter()
+            .find(|(_, key, _)| key == "auth.oidc.client_secret")
+            .unwrap();
+        assert_eq!(var, "CRYSTALLINE_AUTH_OIDC_CLIENT_SECRET_FILE");
+        assert_eq!(shown, settings::SECRET_DISPLAY);
+    }
+
+    #[test]
+    fn the_remote_token_file_form_is_checked_at_load() {
+        // The remote crate reads the value through `process_var`; the load
+        // only refuses a bad pair or an unreadable file.
+        assert!(
+            overlay_reading(
+                &[("CRYSTALLINE_REMOTE_TOKEN_FILE", "/run/secrets/cmt")],
+                &[("/run/secrets/cmt", "cmt_x")],
+            )
+            .is_ok()
+        );
+        let err = overlay_reading(&[("CRYSTALLINE_REMOTE_TOKEN_FILE", "/nope")], &[])
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "CRYSTALLINE_REMOTE_TOKEN_FILE names /nope, which cannot be read (no such file)"
+        );
+    }
+
+    #[test]
+    fn each_secret_in_both_forms_is_refused_naming_both() {
+        for plain in crystalline_core::secret_env::FILE_BACKED {
+            let file = crystalline_core::secret_env::file_var(plain);
+            let err = overlay_reading(
+                &[(plain, "value-one"), (file.as_str(), "/run/secrets/x")],
+                &[("/run/secrets/x", "value-two")],
+            )
+            .unwrap_err()
+            .to_string();
+            assert_eq!(err, format!("{plain} and {file} are both set; keep one"));
+            assert!(!err.contains("value-"), "{err}");
+        }
+    }
+
+    #[test]
+    fn the_file_backed_names_match_this_crates_own() {
+        let oidc = settings::registry()
+            .iter()
+            .find(|s| s.key == "auth.oidc.client_secret")
+            .unwrap()
+            .env_var();
+        let backed = crystalline_core::secret_env::FILE_BACKED;
+        assert!(backed.contains(&oidc.as_str()));
+        assert!(backed.contains(&GITHUB_TOKEN_ENV));
+        assert!(backed.contains(&"CRYSTALLINE_REMOTE_TOKEN"));
+    }
+
+    #[test]
+    fn the_setup_token_variables_are_reserved() {
+        assert!(is_reserved("CRYSTALLINE_SETUP_TOKEN"));
+        assert!(is_reserved("CRYSTALLINE_SETUP_TOKEN_FILE"));
     }
 }

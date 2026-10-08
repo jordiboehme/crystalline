@@ -38,6 +38,7 @@ pub async fn run(command: UsersCommand, json: bool) -> Result<()> {
             email,
             role,
             password_stdin,
+            password_file,
             mcp_token,
         } => {
             // The login name as typed makes the better default display name:
@@ -52,7 +53,7 @@ pub async fn run(command: UsersCommand, json: bool) -> Result<()> {
                     .await
                     .map(Some),
                 None => {
-                    let password = read_password(password_stdin)?;
+                    let password = read_password(password_stdin, password_file.as_deref())?;
                     store
                         .add_user(&name, &display, email.as_deref(), role, &password)
                         .await
@@ -110,7 +111,7 @@ pub async fn run(command: UsersCommand, json: bool) -> Result<()> {
             name,
             password_stdin,
         } => {
-            let password = read_password(password_stdin)?;
+            let password = read_password(password_stdin, None)?;
             store.set_password(&name, &password).await?;
             println!(
                 "Changed the password for '{}' and signed out its sessions.",
@@ -501,16 +502,20 @@ fn print_users(users: &[User], passwordless: &std::collections::HashSet<String>)
     );
 }
 
-/// Collect the password: from stdin under `--password-stdin`, otherwise by
-/// asking at the terminal.
+/// Collect the password: from a file under `--password-file`, from stdin
+/// under `--password-stdin`, otherwise by asking at the terminal.
 ///
 /// There is no hidden-input dependency in this workspace and the brief did not
 /// want one added, so the typed password is echoed - the prompt says so rather
 /// than letting anyone assume otherwise. A non-terminal run without
-/// `--password-stdin` refuses instead of hanging on a pipe that will never
-/// carry an answer.
-fn read_password(from_stdin: bool) -> Result<String> {
-    let password = if from_stdin {
+/// `--password-stdin` or `--password-file` refuses instead of hanging on a
+/// pipe that will never carry an answer.
+fn read_password(from_stdin: bool, from_file: Option<&std::path::Path>) -> Result<String> {
+    let password = if let Some(path) = from_file {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("reading the password from {}", path.display()))?;
+        crystalline_core::secret_env::trim_one_line_break(&text).to_string()
+    } else if from_stdin {
         let mut buf = String::new();
         std::io::stdin()
             .read_to_string(&mut buf)
@@ -528,7 +533,7 @@ fn read_password(from_stdin: bool) -> Result<String> {
         password.to_string()
     } else {
         if !std::io::stdin().is_terminal() {
-            bail!("not a terminal; pass --password-stdin to read the password from stdin");
+            bail!("not a terminal; pass --password-stdin or --password-file to give the password");
         }
         print!("Password (visible while typing): ");
         std::io::stdout().flush()?;

@@ -376,7 +376,7 @@ pub async fn run_prompt(harness: Option<String>) {
         .ok()
         .and_then(|dir| crystalline_remote::load_sources(&dir).ok())
         .is_some_and(|file| !file.sources.is_empty())
-        || crystalline_remote::env_source(|n| std::env::var(n).ok(), &[]).is_some();
+        || crystalline_remote::env_source(crystalline_core::secret_env::process_var, &[]).is_some();
     if !config.recall_enabled() || (config.domains.is_empty() && !has_sources) {
         return;
     }

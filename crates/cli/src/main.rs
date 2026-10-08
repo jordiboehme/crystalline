@@ -980,12 +980,17 @@ enum UsersCommand {
         role: RoleArg,
         /// Read the password from stdin instead of prompting, for scripts and
         /// container provisioning. A single trailing newline is stripped.
-        #[arg(long, conflicts_with = "mcp_token")]
+        #[arg(long, conflicts_with_all = ["mcp_token", "password_file"])]
         password_stdin: bool,
+        /// Read the password from this file instead of prompting, for a
+        /// Docker secret or a provisioning script. One trailing line break
+        /// is dropped.
+        #[arg(long, value_name = "PATH", conflicts_with_all = ["mcp_token", "password_stdin"])]
+        password_file: Option<PathBuf>,
         /// Create the account with no password and issue one personal MCP
         /// token with this label, in one step: an account for an agent. The
         /// token is printed once.
-        #[arg(long, value_name = "LABEL", conflicts_with = "password_stdin")]
+        #[arg(long, value_name = "LABEL", conflicts_with_all = ["password_stdin", "password_file"])]
         mcp_token: Option<String>,
     },
     /// List every account with its role and whether it is disabled.
@@ -5124,9 +5129,11 @@ fn mounted_part(
     let Ok(dir) = crystalline_remote::remote_dir() else {
         return empty;
     };
-    let set = crystalline_remote::SourceSet::load(dir, sources::local_domains_of(cfg), |n| {
-        std::env::var(n).ok()
-    });
+    let set = crystalline_remote::SourceSet::load(
+        dir,
+        sources::local_domains_of(cfg),
+        crystalline_core::secret_env::process_var,
+    );
     if set.is_empty() {
         return empty;
     }

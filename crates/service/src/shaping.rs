@@ -20,6 +20,7 @@ use crate::instance::{HolderFacts, HttpBinding};
 const SHAPING_NAMES: &[&str] = &[
     crate::overlay::CONFIG_PATH_ENV,
     crate::overlay::GITHUB_TOKEN_ENV,
+    "CRYSTALLINE_GITHUB_TOKEN_FILE",
     "CRYSTALLINE_MODELS_DIR",
     "CRYSTALLINE_HEARTBEAT_SECS",
     "CRYSTALLINE_STALE_SECS",
@@ -27,6 +28,9 @@ const SHAPING_NAMES: &[&str] = &[
     "CRYSTALLINE_ADMIN_NAME_FILE",
     "CRYSTALLINE_ADMIN_PASSWORD",
     "CRYSTALLINE_ADMIN_PASSWORD_FILE",
+    "CRYSTALLINE_AUTH_OIDC_CLIENT_SECRET_FILE",
+    "CRYSTALLINE_SETUP_TOKEN",
+    "CRYSTALLINE_SETUP_TOKEN_FILE",
 ];
 
 /// Every name under these prefixes is shaping: env-defined domains and the

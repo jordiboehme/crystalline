@@ -563,7 +563,11 @@ pub struct Connection {
 impl Connection {
     /// Open `source` over this process's environment.
     pub fn open(source: SourceRecord, remote_dir: &Path) -> Result<Connection, RemoteFailure> {
-        Connection::open_with(source, remote_dir, |name| std::env::var(name).ok())
+        Connection::open_with(
+            source,
+            remote_dir,
+            crystalline_core::secret_env::process_var,
+        )
     }
 
     /// Open `source`, loading its credential. No network yet. Blocking (one

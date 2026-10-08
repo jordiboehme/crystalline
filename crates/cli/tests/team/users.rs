@@ -1058,3 +1058,76 @@ fn mcp_token_and_password_stdin_cannot_be_combined() {
         "nothing was created: {listed}"
     );
 }
+
+/// `--password-file` reads a Docker secret or a provisioning script's file:
+/// one trailing line break goes, CRLF or LF. It cannot be combined with
+/// `--password-stdin`, and a file that cannot be read is named.
+#[test]
+fn users_add_reads_the_password_from_a_file() {
+    let home = tempfile::tempdir().unwrap();
+    let secret = home.path().join("admin-password.txt");
+    std::fs::write(&secret, "s3cret\r\n").unwrap();
+    let path = secret.to_str().unwrap();
+
+    users_ok(
+        home.path(),
+        &["add", "ada", "--role", "admin", "--password-file", path],
+        None,
+    );
+    let out = users_ok(home.path(), &["list"], None);
+    assert!(out.contains("ada") && out.contains("admin"), "{out}");
+
+    let err = users_err(
+        home.path(),
+        &["add", "bob", "--password-file", path, "--password-stdin"],
+        Some("hunter2\n"),
+    );
+    assert!(err.contains("cannot be used with"), "{err}");
+
+    let missing = home.path().join("no-such-file");
+    let err = users_err(
+        home.path(),
+        &["add", "bob", "--password-file", missing.to_str().unwrap()],
+        None,
+    );
+    assert!(err.contains("no-such-file"), "the path is named: {err}");
+
+    let empty = home.path().join("empty.txt");
+    std::fs::write(&empty, "\n").unwrap();
+    let err = users_err(
+        home.path(),
+        &["add", "bob", "--password-file", empty.to_str().unwrap()],
+        None,
+    );
+    assert!(err.contains("the password is empty"), "{err}");
+
+    // The password is the file's content without its line ending. Read back
+    // on unix only, where `find_auth_db` is compiled.
+    #[cfg(unix)]
+    {
+        let db = find_auth_db(home.path()).expect("the accounts database exists");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let store = crystalline_service::rest::AuthStore::open(&db)
+                .await
+                .unwrap();
+            assert!(
+                store
+                    .verify_password("ada", "s3cret")
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(
+                store
+                    .verify_password("ada", "s3cret\r\n")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        });
+    }
+}
