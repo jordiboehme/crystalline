@@ -250,6 +250,16 @@ pub fn record_start_options(options: StartOptions) {
     let _ = START_OPTIONS.set(options);
 }
 
+/// The config file this daemon loaded, canonical, for the `holder` answer.
+/// `None` before `run_serve` recorded its start options (and in a test that
+/// drives the ctl handler without a daemon).
+pub(crate) fn holder_config_path() -> Option<String> {
+    START_OPTIONS
+        .get()
+        .and_then(|options| options.config.as_deref())
+        .map(|config| crate::shaping::canonical_config_path(Path::new(config)))
+}
+
 pub use crate::serving::{
     HttpBinding, ServeIntent, StartMode, loopback_connect_addr, record_serve_intent, serve_intent,
 };
@@ -771,6 +781,16 @@ pub struct HolderFacts {
     pub start: Option<StartOptions>,
     #[serde(default)]
     pub state_dir: Option<String>,
+    /// The config file the daemon loaded, canonical
+    /// ([`crate::shaping::canonical_config_path`]). `None` from a daemon
+    /// older than 0.24.1, which means unknown.
+    #[serde(default)]
+    pub config_path: Option<String>,
+    /// What the daemon bound its HTTP endpoint to, read from the `http` key
+    /// of its published record. `None` and [`HttpBinding::Unrecorded`] both
+    /// mean unknown.
+    #[serde(default)]
+    pub http: Option<HttpBinding>,
 }
 
 /// What one ctl request over the pipe got back.
@@ -875,6 +895,8 @@ fn facts_from_record(record: Option<LockInfo>) -> Option<HolderFacts> {
         runs_in: record.runs_in,
         start: record.start,
         state_dir: None,
+        config_path: None,
+        http: Some(record.http),
     })
 }
 
@@ -896,6 +918,8 @@ pub(crate) fn facts_from_status(
         runs_in: serde_json::from_value(status["runs_in"].clone()).unwrap_or(None),
         start: same.and_then(|r| r.start.clone()),
         state_dir: None,
+        config_path: None,
+        http: same.map(|r| r.http.clone()),
     })
 }
 
@@ -2358,13 +2382,22 @@ fn spawn_daemon(options: &SpawnOptions) -> anyhow::Result<()> {
             match cmd.spawn() {
                 Ok(_) => return Ok(()),
                 Err(e) if breakaway_refusal(&e) => {
-                    if let RefusedBreakaway::StartedByTask(name) =
-                        after_refused_breakaway(&*crate::daemon_task::for_this_process(), &options)
-                    {
+                    let shaping = crate::shaping::shaping_set_here();
+                    if let RefusedBreakaway::StartedByTask(name) = after_refused_breakaway(
+                        &*crate::daemon_task::for_this_process(),
+                        &options,
+                        &shaping,
+                    ) {
                         tracing::info!(
                             "Windows refused the breakaway ({e}); the task {name} started the daemon instead"
                         );
                         return Ok(());
+                    }
+                    if !shaping.is_empty() {
+                        tracing::info!(
+                            "{} would not reach a daemon the task starts, so this client starts it inside the job",
+                            shaping.join(", ")
+                        );
                     }
                     tracing::warn!(
                         "Windows refused the breakaway ({e}); {}",
@@ -2485,22 +2518,26 @@ pub(crate) enum RefusedBreakaway {
 }
 
 /// Whether the task may start the daemon in place of a spawn with
-/// `options` (after their paths are made absolute). The task always runs a
-/// plain `serve --daemon --from-task`, so a spawn that asks for a database,
-/// a config file, read-only mode, an HTTP address, an allowed host, a
-/// bounded life or a cleaned environment keeps its own spawn: otherwise the
-/// client would attach to a daemon that serves something else.
+/// `options` (after their paths are made absolute) while the shaping
+/// variables `shaping` are set here. The task always runs a plain `serve
+/// --daemon --from-task` with Task Scheduler's environment, so a spawn that
+/// asks for a database, a config file, read-only mode, an HTTP address, an
+/// allowed host, a bounded life or a cleaned environment keeps its own
+/// spawn, and so does one whose environment carries a variable that shapes
+/// the daemon ([`crate::shaping`]): otherwise the client would attach to a
+/// daemon that serves something else.
 #[cfg(any(windows, test))]
-fn the_task_can_stand_in(options: &SpawnOptions) -> bool {
-    *options == SpawnOptions::default()
+fn the_task_can_stand_in(options: &SpawnOptions, shaping: &[String]) -> bool {
+    *options == SpawnOptions::default() && shaping.is_empty()
 }
 
 #[cfg(any(windows, test))]
 pub(crate) fn after_refused_breakaway(
     task: &dyn crate::daemon_task::DaemonTask,
     options: &SpawnOptions,
+    shaping: &[String],
 ) -> RefusedBreakaway {
-    if !the_task_can_stand_in(options) {
+    if !the_task_can_stand_in(options, shaping) {
         return RefusedBreakaway::InsideTheJob;
     }
     match task.find() {
@@ -3250,8 +3287,57 @@ mod tests {
             run_ok: true,
         };
         assert_eq!(
-            after_refused_breakaway(&task, &SpawnOptions::default()),
+            after_refused_breakaway(&task, &SpawnOptions::default(), &[]),
             RefusedBreakaway::StartedByTask(crate::daemon_task::MACHINE_TASK_NAME.to_string())
+        );
+    }
+
+    /// The task runs with Task Scheduler's environment, so a shaping variable
+    /// set here would never reach the daemon it starts: the spawn stays
+    /// inside the job instead, with each variable on its own.
+    #[test]
+    fn a_shaping_variable_keeps_the_spawn_inside_the_job() {
+        let task = Answers {
+            find: Some(crate::daemon_task::MACHINE_TASK_NAME),
+            run_ok: true,
+        };
+        let names = crate::settings::registry()
+            .iter()
+            .map(|spec| spec.env_var())
+            .chain(
+                [
+                    "CRYSTALLINE_CONFIG",
+                    "CRYSTALLINE_MODELS_DIR",
+                    "CRYSTALLINE_GITHUB_TOKEN",
+                    "CRYSTALLINE_DOMAIN_NOTES",
+                    "CRYSTALLINE_REMOTE_URL",
+                    "CRYSTALLINE_ADMIN_NAME",
+                ]
+                .map(str::to_string),
+            );
+        for name in names {
+            let set = crate::shaping::shaping_set_in([(name.clone().into(), "x".into())]);
+            assert_eq!(set, std::slice::from_ref(&name), "{name} is shaping");
+            assert!(
+                !the_task_can_stand_in(&SpawnOptions::default(), &set),
+                "{name}"
+            );
+            assert_eq!(
+                after_refused_breakaway(&task, &SpawnOptions::default(), &set),
+                RefusedBreakaway::InsideTheJob,
+                "{name}"
+            );
+        }
+        let client_only = crate::shaping::shaping_set_in([
+            ("CRYSTALLINE_TEST_DAEMON_TASK".into(), "serve".into()),
+            ("CRYSTALLINE_CHANNEL".into(), "desktop".into()),
+            ("CRYSTALLINE_SERVICE_HTTP".into(), "".into()),
+        ]);
+        assert!(client_only.is_empty());
+        assert_eq!(
+            after_refused_breakaway(&task, &SpawnOptions::default(), &client_only),
+            RefusedBreakaway::StartedByTask(crate::daemon_task::MACHINE_TASK_NAME.to_string()),
+            "client-only variables and empty values do not stop the task"
         );
     }
 
@@ -3261,7 +3347,7 @@ mod tests {
     /// client asked for.
     #[test]
     fn the_task_stands_in_only_for_a_spawn_with_default_options() {
-        assert!(the_task_can_stand_in(&SpawnOptions::default()));
+        assert!(the_task_can_stand_in(&SpawnOptions::default(), &[]));
         let asking = [
             SpawnOptions {
                 db: Some(PathBuf::from("/abs/index.db")),
@@ -3297,9 +3383,9 @@ mod tests {
             run_ok: true,
         };
         for options in asking {
-            assert!(!the_task_can_stand_in(&options), "{options:?}");
+            assert!(!the_task_can_stand_in(&options, &[]), "{options:?}");
             assert_eq!(
-                after_refused_breakaway(&task, &options),
+                after_refused_breakaway(&task, &options, &[]),
                 RefusedBreakaway::InsideTheJob,
                 "{options:?}"
             );
@@ -3314,7 +3400,8 @@ mod tests {
                     find: None,
                     run_ok: true
                 },
-                &SpawnOptions::default()
+                &SpawnOptions::default(),
+                &[]
             ),
             RefusedBreakaway::InsideTheJob
         );
@@ -3324,7 +3411,8 @@ mod tests {
                     find: Some("x"),
                     run_ok: false
                 },
-                &SpawnOptions::default()
+                &SpawnOptions::default(),
+                &[]
             ),
             RefusedBreakaway::InsideTheJob
         );

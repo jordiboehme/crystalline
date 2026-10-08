@@ -2228,7 +2228,20 @@ async fn status_dispatch(
         && let Some(data) =
             crystalline_service::ctl_if_running(json!({ "v": 1, "cmd": "status" })).await?
     {
-        let config_error = cmd::load(config.as_deref()).err().map(|e| e.to_string());
+        let loaded = cmd::load(config.as_deref());
+        let config_error = loaded.as_ref().err().map(|e| e.to_string());
+        // What this shell would have started against what the daemon says
+        // it serves: one line per difference a variable set here explains.
+        let mismatches = match (crystalline_service::instance::ask_holder().await, &loaded) {
+            (Some(facts), Ok(loaded)) => crystalline_service::shaping::config_mismatches(
+                &facts,
+                &crystalline_service::shaping::ClientView::of(
+                    loaded,
+                    crystalline_service::shaping::shaping_set_here(),
+                ),
+            ),
+            _ => Vec::new(),
+        };
         sources::with_daemon_failures(&mut source_rows, &data["sources"]);
         if json {
             let mut data = data;
@@ -2243,6 +2256,10 @@ async fn status_dispatch(
                     "desktop_states".to_string(),
                     serde_json::to_value(desktop_state::scan_here())?,
                 );
+                map.insert(
+                    "config_mismatch".to_string(),
+                    serde_json::to_value(&mismatches)?,
+                );
             }
             println!("{data}");
         } else {
@@ -2250,6 +2267,9 @@ async fn status_dispatch(
                 eprintln!(
                     "note: the daemon answered, but this machine's configuration did not load: {err}"
                 );
+            }
+            for mismatch in &mismatches {
+                eprintln!("note: {}", mismatch.line());
             }
             let note = format!(
                 "running (pid {}, v{}, up {})",

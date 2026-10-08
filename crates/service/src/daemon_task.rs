@@ -11,8 +11,10 @@ use std::path::{Path, PathBuf};
 pub const MACHINE_TASK_NAME: &str = r"\Crystalline\Daemon";
 
 /// The debug-build seam standing in for Task Scheduler: `missing` (no task),
-/// `fail` (the run is refused) or `serve` (the run starts this binary's own
-/// daemon). A release build never reads it.
+/// `fail` (the run is refused), `serve` (the run starts this binary's own
+/// daemon) or `system` (as `serve`, but the started daemon gets none of the
+/// shaping variables set here, as a daemon Task Scheduler starts). A release
+/// build never reads it.
 pub const TEST_DAEMON_TASK_ENV: &str = "CRYSTALLINE_TEST_DAEMON_TASK";
 
 /// The per-user task `doctor --fix` registers: in the root folder, where a
@@ -116,7 +118,7 @@ impl DaemonTask for Seam {
     fn run(&self, _name: &str) -> Result<(), String> {
         match self.0.as_str() {
             "fail" => Err("the test task was refused".to_string()),
-            "serve" => {
+            "serve" | "system" => {
                 let exe = std::env::current_exe().map_err(|e| e.to_string())?;
                 let mut cmd = std::process::Command::new(exe);
                 cmd.args(["serve", "--daemon", "--autostarted"])
@@ -125,6 +127,11 @@ impl DaemonTask for Seam {
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null());
+                if self.0 == "system" {
+                    for name in crate::shaping::shaping_set_here() {
+                        cmd.env_remove(name);
+                    }
+                }
                 cmd.spawn().map(|_| ()).map_err(|e| e.to_string())
             }
             other => Err(format!("unknown {TEST_DAEMON_TASK_ENV} value '{other}'")),

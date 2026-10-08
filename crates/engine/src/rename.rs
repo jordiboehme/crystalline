@@ -345,7 +345,7 @@ pub fn discard_pending_rename(state_dir: &Path) -> io::Result<()> {
 /// equal to itself before and after the file is written. A relative path
 /// that does not exist (a Postgres `host:port/db` location among them) is
 /// kept as given.
-pub(crate) fn canonical_text(path: &Path) -> String {
+pub fn canonical_text(path: &Path) -> String {
     canonical_path(path).display().to_string()
 }
 

@@ -329,6 +329,11 @@ pub struct ServiceDoctor {
     /// recorded one (none running, or one older than 0.21.1), or `--fix`
     /// dislodged it.
     pub runs_in: Option<crystalline_service::runs_in::RunsIn>,
+    /// The ways the running daemon differs from what this shell would have
+    /// started, each explained by a variable set here
+    /// ([`crystalline_service::shaping::config_mismatches`]). Warnings only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub config_mismatch: Vec<crystalline_service::shaping::ConfigMismatch>,
 }
 
 impl ServiceDoctor {
@@ -337,6 +342,7 @@ impl ServiceDoctor {
     fn mark_dislodged(&mut self) {
         self.daemon_dislodged = true;
         self.runs_in = None;
+        self.config_mismatch.clear();
     }
 }
 
@@ -1452,14 +1458,24 @@ pub async fn run(
         }
     }
     // A domain filter nobody registers fails before anything is fixed.
-    select_domains(&cmd::load(config_override)?.effective, domain_filter)?;
+    let early = cmd::load(config_override)?;
+    select_domains(&early.effective, domain_filter)?;
     let db = cmd::db_path(db_override)?;
+    // What this shell would have started, compared with the daemon's own
+    // facts. Only without an override: a --config or --db names files, not
+    // a variable, so no line would explain a difference.
+    let client = (config_override.is_none() && db_override.is_none()).then(|| {
+        crystalline_service::shaping::ClientView::of(
+            &early,
+            crystalline_service::shaping::shaping_set_here(),
+        )
+    });
 
     // Ahead of the store, deliberately. A wedged daemon holds the index
     // database as well as the service lock, so opening the store first would
     // fail with a locking error before `--fix` ever got the chance to dislodge
     // the process causing it - the one state where doctor matters most.
-    let service = check_service(fix).await?;
+    let service = check_service(fix, client.as_ref()).await?;
 
     // The merge comes next, for the reason the collection below gives: the
     // import opens the real index itself (or asks the daemon), so doctor must
@@ -2836,7 +2852,10 @@ fn stale_lock_holder_desc(pid: Option<u32>) -> String {
     }
 }
 
-async fn check_service(fix: bool) -> Result<ServiceDoctor> {
+async fn check_service(
+    fix: bool,
+    client: Option<&crystalline_service::shaping::ClientView>,
+) -> Result<ServiceDoctor> {
     // The record's primary home is `service.json`; a still-present pre-split
     // daemon's record sitting in the lock file itself counts as present too
     // (see `instance::read_lock_info`'s legacy fallback), so an upgraded
@@ -2887,7 +2906,14 @@ async fn check_service(fix: bool) -> Result<ServiceDoctor> {
     // When nothing listens, a live record still describes a daemon that has
     // lost its pipe, and its working directory, job and package identity do
     // not change while it runs.
-    let runs_in = match instance::ask_holder().await {
+    let facts = instance::ask_holder().await;
+    let config_mismatch = match (&facts, client) {
+        (Some(facts), Some(client)) => {
+            crystalline_service::shaping::config_mismatches(facts, client)
+        }
+        _ => Vec::new(),
+    };
+    let runs_in = match facts {
         Some(facts) => facts.runs_in,
         None if alive => info.as_ref().and_then(|i| i.runs_in.clone()),
         None => None,
@@ -2905,6 +2931,7 @@ async fn check_service(fix: bool) -> Result<ServiceDoctor> {
         daemon_dislodged: false,
         holder_unknown,
         runs_in,
+        config_mismatch,
     };
 
     if fix {
@@ -4370,6 +4397,7 @@ pub fn render_human(report: &DoctorReport) -> String {
         && !s.daemon_unresponsive
         && s.holder_unknown.is_none()
         && warnings.is_empty()
+        && s.config_mismatch.is_empty()
     {
         let _ = writeln!(out, "  ok");
     }
@@ -4381,6 +4409,9 @@ pub fn render_human(report: &DoctorReport) -> String {
     }
     for warning in &warnings {
         let _ = writeln!(out, "  [warning] {warning}");
+    }
+    for mismatch in &s.config_mismatch {
+        let _ = writeln!(out, "  [warning] {}", mismatch.line());
     }
     if let Ok(log_path) = config::daemon_log_path() {
         let _ = writeln!(out, "  daemon log: {}", log_path.display());
@@ -5543,6 +5574,41 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    /// A mismatch the daemon's facts show is a warning in the service
+    /// section, never a problem, so doctor's exit code is unchanged.
+    #[test]
+    fn a_config_mismatch_is_a_warning_in_the_service_section() {
+        let mismatch = crystalline_service::shaping::ConfigMismatch {
+            variable: "CRYSTALLINE_SERVICE_HTTP".to_string(),
+            daemon: "no HTTP endpoint".to_string(),
+            here: "127.0.0.1:7499".to_string(),
+        };
+        let report = DoctorReport {
+            service: ServiceDoctor {
+                config_mismatch: vec![mismatch.clone()],
+                ..ServiceDoctor::default()
+            },
+            ..DoctorReport::default()
+        };
+        let out = render_human(&report);
+        assert!(
+            out.contains(&format!("  [warning] {}\n", mismatch.line())),
+            "{out}"
+        );
+        assert!(
+            !out.contains("service:\n  ok\n"),
+            "a section with a warning does not say ok: {out}"
+        );
+        assert_eq!(report.remaining_problems(), 0);
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            json["service"]["config_mismatch"][0]["variable"],
+            "CRYSTALLINE_SERVICE_HTTP"
+        );
+        let clean = serde_json::to_value(DoctorReport::default()).unwrap();
+        assert!(clean["service"].get("config_mismatch").is_none(), "{clean}");
     }
 
     /// A rebuild marker that outlived the run that set it: the finding names

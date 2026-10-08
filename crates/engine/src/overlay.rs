@@ -110,13 +110,14 @@ pub const PARK_BLOCKING_ENV: &str = "CRYSTALLINE_TEST_PARK_BLOCKING_SECS";
 /// a blocking thread instead of loading; see `held_nli_load` in the engine.
 pub const NLI_LOAD_HOLD_ENV: &str = "CRYSTALLINE_TEST_NLI_LOAD_HOLD_SECS";
 
+/// Public so the service crate's shaping set can check every entry is classified.
 /// Variables that live outside the settings registry and are read elsewhere.
 /// They are skipped silently rather than warned about, so a legitimate
 /// deployment does not get a spurious warning for a variable Crystalline
 /// itself documents. [`GITHUB_TOKEN_ENV`] is handled separately in
 /// [`EnvOverlay::from_vars`], not through this list, since it becomes real
 /// overlay state rather than being ignored.
-const RESERVED_VARS: &[&str] = &[
+pub const RESERVED_VARS: &[&str] = &[
     "CRYSTALLINE_MODELS_DIR",
     // `crystalline_index::device`: `off` keeps the embedding model and the
     // NLI model on the CPU on an Apple Silicon Mac. Read when a model loads,

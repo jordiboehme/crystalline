@@ -466,6 +466,8 @@ mod tests {
             runs_in: None,
             start: None,
             state_dir: None,
+            config_path: None,
+            http: None,
         }
     }
 

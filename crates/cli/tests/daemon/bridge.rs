@@ -39,6 +39,11 @@ struct Bridge {
 
 impl Bridge {
     fn start(home: &Path, task: &str) -> Bridge {
+        Bridge::start_with(home, task, &[])
+    }
+
+    /// As [`Bridge::start`], with `extra` set last, so it wins.
+    fn start_with(home: &Path, task: &str, extra: &[(&str, &str)]) -> Bridge {
         let mut cmd = Command::new(assert_cmd::cargo::cargo_bin("crystalline"));
         for (name, value) in crate::common::isolation_env(home) {
             cmd.env(name, value);
@@ -50,8 +55,11 @@ impl Bridge {
                 "Claude_1.0.0.0_x64__pzs8sxrjxfjjc",
             )
             .env("CRYSTALLINE_TEST_DAEMON_TASK", task)
-            .env("CRYSTALLINE_CHANNEL", "desktop")
-            .arg("mcp")
+            .env("CRYSTALLINE_CHANNEL", "desktop");
+        for (name, value) in extra {
+            cmd.env(name, value);
+        }
+        cmd.arg("mcp")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
@@ -267,4 +275,74 @@ fn a_task_started_daemon_works_in_its_state_folder_and_logs_there() {
     );
     let log = std::fs::read_to_string(state.join("daemon.log")).unwrap();
     assert!(!log.is_empty(), "it logs to daemon.log");
+}
+
+/// The config file a child isolated by `isolation_env` reads.
+fn isolated_config_path(home: &Path) -> PathBuf {
+    let dir = if cfg!(windows) {
+        home.join("roaming")
+    } else {
+        home.join("config")
+    };
+    dir.join("crystalline").join("config.yaml")
+}
+
+/// A daemon the sign-in task starts reads the system environment: the
+/// `system` seam starts it without this shell's shaping variables. `status`
+/// from a shell that sets one names it; a shell that sets none says nothing.
+#[test]
+fn status_names_the_variable_a_task_started_daemon_did_not_get() {
+    let home = short_home();
+    // HTTP off in the file: the seam strips the variable, and a daemon on
+    // the default port would race every other test for 7411.
+    let config = isolated_config_path(home.path());
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(&config, "service:\n  http: false\n").unwrap();
+    let mut bridge = Bridge::start_with(
+        home.path(),
+        "system",
+        &[("CRYSTALLINE_SERVICE_HTTP", "127.0.0.1:7499")],
+    );
+    let opened = bridge.open();
+    assert_eq!(
+        opened["result"]["serverInfo"]["name"], "crystalline",
+        "{opened}"
+    );
+    let run = |extra: &[(&str, &str)], args: &[&str]| {
+        let mut cmd = Command::new(assert_cmd::cargo::cargo_bin("crystalline"));
+        for (name, value) in crate::common::isolation_env(home.path()) {
+            cmd.env(name, value);
+        }
+        cmd.env_remove("RUST_LOG")
+            .env_remove("CRYSTALLINE_SERVICE_HTTP");
+        // A shaping variable the runner set would explain a difference too.
+        for name in crystalline_service::shaping::shaping_set_here() {
+            cmd.env_remove(name);
+        }
+        for (name, value) in extra {
+            cmd.env(name, value);
+        }
+        cmd.args(args).output().unwrap()
+    };
+    let shell = [("CRYSTALLINE_SERVICE_HTTP", "127.0.0.1:7499")];
+    let with_variable = run(&shell, &["status"]);
+    let as_json = run(&shell, &["status", "--json"]);
+    let without = run(&[], &["status"]);
+    bridge.finish();
+    let _ = run(&[], &["ctl", "shutdown"]);
+
+    let said = String::from_utf8_lossy(&with_variable.stderr);
+    assert!(
+        said.contains("note: The daemon serves no HTTP endpoint, not 127.0.0.1:7499 from CRYSTALLINE_SERVICE_HTTP: a daemon the sign-in task started reads the system environment. Set CRYSTALLINE_SERVICE_HTTP as a user environment variable, or stop the daemon (`crystalline ctl shutdown`) and start it from this shell."),
+        "{said}"
+    );
+    let json: Value = serde_json::from_slice(&as_json.stdout).unwrap();
+    assert_eq!(
+        json["config_mismatch"][0]["variable"], "CRYSTALLINE_SERVICE_HTTP",
+        "{json}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&without.stderr).contains("The daemon serves"),
+        "nothing set here, nothing said"
+    );
 }

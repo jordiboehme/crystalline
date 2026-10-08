@@ -3175,7 +3175,7 @@ fn is_hidden(name: &str) -> bool {
 /// is what makes the UI zero-config. `serve --http off` wins over everything, and
 /// `service.http: false` (or `CRYSTALLINE_SERVICE_HTTP=false`) is the config-file
 /// opt-out; every other spelling names an address or asks for the default one.
-fn resolve_http(flag: Option<&str>, config: &GlobalConfig) -> Option<String> {
+pub(crate) fn resolve_http(flag: Option<&str>, config: &GlobalConfig) -> Option<String> {
     if let Some(f) = flag {
         let f = f.trim();
         return match f {
