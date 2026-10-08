@@ -652,6 +652,24 @@ jobs:
           $exe = 'C:\Program Files\Crystalline\bin\crystalline.exe'
           if (-not (Test-Path $exe)) { throw 'crystalline.exe missing after install' }
           & $exe --version
+          # The order in the MSI itself: EndDaemonTasks after
+          # InstallInitialize and ahead of RemoveExistingProducts (the old
+          # product's removal on an upgrade) and RemoveFiles (an uninstall).
+          $installer = New-Object -ComObject WindowsInstaller.Installer
+          $db = $installer.GetType().InvokeMember('OpenDatabase', 'InvokeMethod', $null, $installer, @($msi, 0))
+          $view = $db.GetType().InvokeMember('OpenView', 'InvokeMethod', $null, $db, @('SELECT `Action`, `Sequence` FROM `InstallExecuteSequence`'))
+          $view.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $view, $null) | Out-Null
+          $sequence = @{}
+          while ($record = $view.GetType().InvokeMember('Fetch', 'InvokeMethod', $null, $view, $null)) {
+            $name = $record.GetType().InvokeMember('StringData', 'GetProperty', $null, $record, @(1))
+            $sequence[$name] = $record.GetType().InvokeMember('IntegerData', 'GetProperty', $null, $record, @(2))
+          }
+          $view.GetType().InvokeMember('Close', 'InvokeMethod', $null, $view, $null) | Out-Null
+          $end = $sequence['EndDaemonTasks']
+          "InstallInitialize $($sequence['InstallInitialize']), EndDaemonTasks $end, RemoveExistingProducts $($sequence['RemoveExistingProducts']), RemoveFiles $($sequence['RemoveFiles'])"
+          if (-not ($end -gt $sequence['InstallInitialize'] -and $end -lt $sequence['RemoveExistingProducts'] -and $end -lt $sequence['RemoveFiles'])) {
+            throw 'EndDaemonTasks does not run between InstallInitialize and RemoveExistingProducts'
+          }
           $sysPath = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment').Path
           if ($sysPath -notlike '*Crystalline\bin*') { throw 'install dir not on the system PATH' }
           # The daemon task: registered by the installed binary, defined for
@@ -667,7 +685,7 @@ jobs:
           $xml = Export-ScheduledTask -TaskPath '\Crystalline\' -TaskName 'Daemon' -ErrorAction SilentlyContinue
           # Kept as an artifact whatever the checks below say: the shape Task
           # Scheduler really stores is what the next debugging needs.
-          if ($xml) { $xml | Set-Content -Path (Join-Path $env:RUNNER_TEMP 'daemon-task-export.xml') -Encoding utf8 }
+          if ($xml) { $xml | Set-Content -Path (Join-Path $env:RUNNER_TEMP 'daemon-task-export.xml') -Encoding Unicode }
           if (-not $xml) { throw "the MSI did not register $task" }
           # Read as XML, not as text: Task Scheduler writes the definition back
           # in its own form, so a substring of what was registered may not be
@@ -759,17 +777,15 @@ jobs:
             Start-Sleep -Milliseconds 500
           }
           if ($up) {
+            # Left running: the uninstall below must end it itself.
             "the task started a daemon that answers"
-            & $exe ctl shutdown *> $null
           } else {
             "::warning::the task did not start a daemon on this runner; the real-machine check covers it"
           }
-          # A daemon the task started in another session would hold the
-          # binary open, and the quiet uninstall below would then end with a
-          # reboot request instead of removing it. Ending the task stops it.
-          schtasks /End /TN $task *> $null
-          $p = Start-Process msiexec -ArgumentList "/x `"$msi`" /qn /norestart" -Wait -PassThru
-          if ($p.ExitCode -ne 0) { throw "uninstall failed: $($p.ExitCode)" }
+          $removeLog = Join-Path $env:RUNNER_TEMP 'msi-uninstall.log'
+          $p = Start-Process msiexec -ArgumentList "/x `"$msi`" /qn /norestart /L*v `"$removeLog`"" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { Get-Content $removeLog -Tail 50; throw "uninstall failed: $($p.ExitCode) (3010 means a file stayed in use)" }
+          if (-not (Select-String -Path $removeLog -Pattern 'ActionStart\(Name=EndDaemonTasks' -Quiet)) { throw 'the uninstall did not run EndDaemonTasks' }
           if (Test-Path $exe) { throw 'crystalline.exe still present after uninstall' }
           $sysPath = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment').Path
           if ($sysPath -like '*Crystalline\bin*') { throw 'PATH entry not removed on uninstall' }
@@ -807,20 +823,31 @@ jobs:
             $p.ExitCode
           }
           $code = & $install $old (Join-Path $env:RUNNER_TEMP 'msi-install-0.24.1.log')
-          if ($code -ne 0) { throw "the v0.24.1 install failed: $code" }
+          if ($code -notin 0, 3010) { throw "the v0.24.1 install failed: $code" }
           $was = & $exe --version
           if ("$was" -notlike '*0.24.1*') { throw "v0.24.1 did not install: $was" }
           schtasks /Query /TN $task *> $null
           if ($LASTEXITCODE -ne 0) { throw 'v0.24.1 registered no task' }
+          # A v0.24.1 daemon from the task holds the old crystalline.exe
+          # open; the new MSI must end it before the old product goes.
+          schtasks /Run /TN $task | Out-Null
+          $oldUp = $false
+          for ($i = 0; $i -lt 30; $i++) {
+            & $exe ctl status *> $null
+            if ($LASTEXITCODE -eq 0) { $oldUp = $true; break }
+            Start-Sleep -Milliseconds 500
+          }
+          if (-not $oldUp) { throw 'the v0.24.1 task started no daemon that answers' }
           $upgradeLog = Join-Path $env:RUNNER_TEMP 'msi-upgrade.log'
           $code = & $install $new $upgradeLog
-          if ($code -ne 0) { Get-Content $upgradeLog -Tail 50; throw "the upgrade failed: $code" }
+          if ($code -notin 0, 3010) { Get-Content $upgradeLog -Tail 50; throw "the upgrade failed: $code" }
+          if (-not (Select-String -Path $upgradeLog -Pattern 'ActionStart\(Name=EndDaemonTasks' -Quiet)) { throw 'the upgrade did not run EndDaemonTasks' }
           $is = & $exe --version
           if ("$is" -notlike "*$built*") { throw "after the upgrade $exe is $is, not $built" }
           $t = Get-ScheduledTask -TaskPath '\Crystalline\' -TaskName 'Daemon' -ErrorAction SilentlyContinue
           if (-not $t) { throw 'the task is gone after the upgrade' }
           Export-ScheduledTask -TaskPath '\Crystalline\' -TaskName 'Daemon' |
-            Set-Content -Path (Join-Path $env:RUNNER_TEMP 'daemon-task-export-after-upgrade.xml') -Encoding utf8
+            Set-Content -Path (Join-Path $env:RUNNER_TEMP 'daemon-task-export-after-upgrade.xml') -Encoding Unicode
           $action = @($t.Actions)[0]
           if ($action.Execute.Trim('"') -ne $exe) { throw "after the upgrade the task starts $($action.Execute), not $exe" }
           if ($action.Arguments -notlike '*serve --daemon --from-task*') { throw "after the upgrade the task runs $($action.Arguments)" }
@@ -837,7 +864,7 @@ jobs:
           & $exe ctl shutdown *> $null
           schtasks /End /TN $task *> $null
           $p = Start-Process msiexec -ArgumentList "/x `"$new`" /qn /norestart" -Wait -PassThru
-          if ($p.ExitCode -ne 0) { throw "the uninstall after the upgrade failed: $($p.ExitCode)" }
+          if ($p.ExitCode -notin 0, 3010) { throw "the uninstall after the upgrade failed: $($p.ExitCode)" }
           schtasks /Query /TN $task *> $null
           if ($LASTEXITCODE -eq 0) { throw 'the task is still registered after the uninstall' }
           $global:LASTEXITCODE = 0

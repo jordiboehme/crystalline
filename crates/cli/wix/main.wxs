@@ -138,7 +138,31 @@
         Execute='deferred'
         Impersonate='no'
         Return='ignore'/>
+    <!-- Before any file is replaced or removed, end every running
+         Crystalline task instance: the machine task and each per-user task
+         (\Crystalline Daemon for *). A daemon a task started holds
+         crystalline.exe open, and in another user's session the quiet
+         install could not replace it. On a major upgrade the old product
+         goes at RemoveExistingProducts, right after InstallInitialize, so
+         the action runs before it. The new crystalline.exe is not
+         installed yet at that point and the old one may know no such
+         command, so Windows PowerShell does it; the script is
+         end-daemon-tasks.ps1 beside this file, base64-encoded so formatted
+         text never reads a bracket in it (crates/cli/tests/setup/wix.rs
+         checks the two match). schtasks /End stops a daemon hard, without
+         its clean shutdown, and only a daemon a task started: one started
+         another way in another session is left to Restart Manager. The
+         bridge starts the task again on its next request, and the logon
+         trigger at the next sign-in. Runs as SYSTEM, which sees every
+         user's task; a failure never stops the install. -->
+    <CustomAction Id='EndDaemonTasks'
+        Directory='TARGETDIR'
+        ExeCommand='"[System64Folder]WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand JABzAGMAaAB0AGEAcwBrAHMAIAA9ACAASgBvAGkAbgAtAFAAYQB0AGgAIAAkAGUAbgB2ADoAUwB5AHMAdABlAG0AUgBvAG8AdAAgACcAUwB5AHMAdABlAG0AMwAyAFwAcwBjAGgAdABhAHMAawBzAC4AZQB4AGUAJwAKAEcAZQB0AC0AUwBjAGgAZQBkAHUAbABlAGQAVABhAHMAawAgAC0ARQByAHIAbwByAEEAYwB0AGkAbwBuACAAUwBpAGwAZQBuAHQAbAB5AEMAbwBuAHQAaQBuAHUAZQAgAHwACgAgACAAIAAgAFcAaABlAHIAZQAtAE8AYgBqAGUAYwB0ACAAewAKACAAIAAgACAAIAAgACAAIAAoACQAXwAuAFQAYQBzAGsAUABhAHQAaAAgAC0AZQBxACAAJwBcAEMAcgB5AHMAdABhAGwAbABpAG4AZQBcACcAIAAtAGEAbgBkACAAJABfAC4AVABhAHMAawBOAGEAbQBlACAALQBlAHEAIAAnAEQAYQBlAG0AbwBuACcAKQAgAC0AbwByAAoAIAAgACAAIAAgACAAIAAgACgAJABfAC4AVABhAHMAawBQAGEAdABoACAALQBlAHEAIAAnAFwAJwAgAC0AYQBuAGQAIAAkAF8ALgBUAGEAcwBrAE4AYQBtAGUAIAAtAGwAaQBrAGUAIAAnAEMAcgB5AHMAdABhAGwAbABpAG4AZQAgAEQAYQBlAG0AbwBuACAAZgBvAHIAIAAqACcAKQAKACAAIAAgACAAfQAgAHwACgAgACAAIAAgAEYAbwByAEUAYQBjAGgALQBPAGIAagBlAGMAdAAgAHsAIAAmACAAJABzAGMAaAB0AGEAcwBrAHMAIAAvAEUAbgBkACAALwBUAE4AIAAoACQAXwAuAFQAYQBzAGsAUABhAHQAaAAgACsAIAAkAF8ALgBUAGEAcwBrAE4AYQBtAGUAKQAgAH0ACgBlAHgAaQB0ACAAMAAKAA=='
+        Execute='deferred'
+        Impersonate='no'
+        Return='ignore'/>
     <InstallExecuteSequence>
+      <Custom Action='EndDaemonTasks' Before='RemoveExistingProducts'>Installed OR WIX_UPGRADE_DETECTED</Custom>
       <Custom Action='RollbackRegisterDaemonTask' Before='RegisterDaemonTask'>NOT Installed AND NOT WIX_UPGRADE_DETECTED AND NOT REMOVE~="ALL"</Custom>
       <Custom Action='RegisterDaemonTask' After='InstallFiles'>NOT REMOVE~="ALL"</Custom>
       <Custom Action='UnregisterDaemonTask' Before='RemoveFiles'>REMOVE~="ALL" AND NOT UPGRADINGPRODUCTCODE</Custom>

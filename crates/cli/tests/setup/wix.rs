@@ -13,6 +13,64 @@ const REGISTER: &str =
 // one. The old product's cached MSI decides this, so the condition shipped
 // now governs every later upgrade.
 const UNREGISTER: &str = "<Custom Action='UnregisterDaemonTask' Before='RemoveFiles'>REMOVE~=\"ALL\" AND NOT UPGRADINGPRODUCTCODE</Custom>";
+const END: &str = "<Custom Action='EndDaemonTasks' Before='RemoveExistingProducts'>Installed OR WIX_UPGRADE_DETECTED</Custom>";
+const END_SCRIPT: &str = include_str!("../../wix/end-daemon-tasks.ps1");
+
+/// Standard base64, as PowerShell's -EncodedCommand reads it.
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(ALPHABET[((n >> (18 - 6 * i)) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// The action runs the checked-in script as it is: Windows PowerShell from
+/// the system folder, the script base64-encoded so MSI's formatted text
+/// never reads a bracket in it as a property.
+#[test]
+fn the_msi_ends_running_daemon_tasks_with_the_checked_in_script() {
+    let utf16: Vec<u8> = END_SCRIPT
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    let command = format!(
+        "ExeCommand='\"[System64Folder]WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {}'",
+        base64(&utf16)
+    );
+    assert!(
+        WXS.contains(&command),
+        "main.wxs must run end-daemon-tasks.ps1 exactly; the ExeCommand is:\n{command}"
+    );
+    assert!(WXS.contains("<CustomAction Id='EndDaemonTasks'"));
+    assert!(
+        WXS.contains("Directory='TARGETDIR'"),
+        "a Type 34 action: no file of this product"
+    );
+    for needle in [
+        r"'\Crystalline\'",
+        "'Daemon'",
+        r"'\'",
+        "'Crystalline Daemon for *'",
+        "/End /TN",
+        "exit 0",
+    ] {
+        assert!(END_SCRIPT.contains(needle), "the script lacks {needle}");
+    }
+}
 
 #[test]
 fn the_msi_registers_the_task_after_the_files_and_removes_it_before_them() {
@@ -35,16 +93,16 @@ fn the_msi_registers_the_task_after_the_files_and_removes_it_before_them() {
         3,
         "all three run the installed binary"
     );
-    assert_eq!(WXS.matches("Execute='deferred'").count(), 2);
+    assert_eq!(WXS.matches("Execute='deferred'").count(), 3);
     assert_eq!(WXS.matches("Execute='rollback'").count(), 1);
     assert_eq!(
         WXS.matches("Impersonate='no'").count(),
-        3,
-        "all three run as the installer, elevated"
+        4,
+        "all four run as the installer, elevated"
     );
     assert_eq!(
         WXS.matches("Return='ignore'").count(),
-        3,
+        4,
         "a task Windows refuses must never roll back the install"
     );
     assert!(
@@ -66,7 +124,7 @@ fn the_msi_registers_the_task_after_the_files_and_removes_it_before_them() {
 }
 
 #[test]
-fn the_msi_schedules_all_three_inside_the_install_execute_sequence() {
+fn the_msi_schedules_all_four_inside_the_install_execute_sequence() {
     let open = "<InstallExecuteSequence>";
     let close = "</InstallExecuteSequence>";
     assert_eq!(WXS.matches(open).count(), 1);
@@ -86,6 +144,7 @@ fn the_msi_schedules_all_three_inside_the_install_execute_sequence() {
     let rollback = at(ROLLBACK);
     let register = at(REGISTER);
     at(UNREGISTER);
+    at(END);
     assert!(
         rollback < register,
         "the rollback is written before the register it undoes"
