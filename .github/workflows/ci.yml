@@ -543,7 +543,7 @@ jobs:
         run: cargo build -p crystalline --locked
 
       - name: Install the browser
-        run: pnpm exec playwright install --with-deps chromium
+        run: pnpm exec playwright install --with-deps chromium webkit
         working-directory: fluid
 
       # Stands up the daemon on a scratch state directory with the fixture

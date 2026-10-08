@@ -30,4 +30,15 @@ describe("mermaidConfig", () => {
       arrowheadColor: "#64748b",
     });
   });
+
+  test("labels are SVG text, wide enough not to break an identifier", () => {
+    // HTML labels sit in a foreignObject sized from a measurement Safari
+    // takes before its page zoom, so under zoom the text overflows its node.
+    // SVG text scales with the node it sits in.
+    for (const scheme of [false, true]) {
+      const config = mermaidConfig(scheme);
+      expect(config.htmlLabels).toBe(false);
+      expect(config.flowchart?.wrappingWidth).toBe(2000);
+    }
+  });
 });

@@ -21,7 +21,9 @@
  * * `confirming`/`onConfirmingChange`, for a parent that arms the
  *   confirmation from somewhere else entirely, which is what the domain
  *   page's command palette row does. Left out, the control owns the flag
- *   itself and nothing about a caller that never passes it changes;
+ *   itself and nothing about a caller that never passes it changes. A
+ *   `disabledReason` wins over a parent's flag: the confirmation is never
+ *   drawn for a disabled action;
  * * `hideTrigger`, for a caller whose own control IS the trigger - the domain
  *   policies card's select, which arms this by being changed. The confirm and
  *   the Keep press are then the whole control, and the focus that goes back
@@ -123,7 +125,10 @@ export function DestructiveAction({
   const confirmName = confirmAriaLabel ?? confirmLabel;
   const reasonId = useId();
   const fieldId = useId();
-  const open = confirming ?? ownConfirming;
+  // A disabled action never shows its second step, not even when a parent
+  // holds `confirming` true: the door is shut, and a panel behind a shut door
+  // would offer a press the trigger itself refuses.
+  const open = (confirming ?? ownConfirming) && disabledReason === undefined;
 
   function setOpen(next: boolean) {
     // The parent hears about it either way; only an uncontrolled caller's
