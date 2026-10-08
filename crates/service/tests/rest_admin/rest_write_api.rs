@@ -16,6 +16,8 @@ use crystalline_service::engine::RenameStep;
 use crystalline_service::rest::{AuthStore, Role};
 use tokio::sync::Mutex;
 
+const OFF_RECORD: &str = "---\ntype: engram\ntitle: Gamma\npermalink: gamma\ntags:\n  - eng\nstatus: weird\n---\n\n# Gamma\n\nNo date.\n";
+const OVERRIDES: &str = "verify:\n  rules:\n    T001: warning\n    T002: off\n";
 const ALPHA: &str = "---\ntype: engram\ntitle: Alpha\npermalink: alpha\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# Alpha\n\nA rule about alpha.\n";
 
 /// What a write-test server varies.
@@ -2432,6 +2434,60 @@ async fn validate_reports_findings_without_writing() {
         ALPHA,
         "a dry run writes nothing"
     );
+}
+
+/// The dry run holds a document named into a domain to that domain's
+/// overrides; one named into no registered domain runs every rule at its
+/// default.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn validate_applies_the_named_domains_rule_overrides() {
+    let fx = serve(Options::default()).await;
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+    std::fs::write(fx._tmp.path().join("eng/.crystalline.yaml"), OVERRIDES).unwrap();
+
+    let findings = |body: serde_json::Value| -> Vec<(String, String)> {
+        body["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| {
+                (
+                    f["rule"].as_str().unwrap().to_string(),
+                    f["severity"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    };
+
+    let resp = as_session(fx.addr, reqwest::Method::POST, "/api/v1/validate", &editor)
+        .json(&serde_json::json!({ "domain": "eng", "path": "gamma.md", "content": OFF_RECORD }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let found = findings(resp.json().await.unwrap());
+    assert!(
+        found.iter().any(|(r, s)| r == "T001" && s == "warning"),
+        "{found:?}"
+    );
+    assert!(
+        found.iter().all(|(r, s)| r != "T001" || s == "warning"),
+        "{found:?}"
+    );
+    assert!(found.iter().all(|(r, _)| r != "T002"), "{found:?}");
+
+    // No domain: the defaults, T001 an error and T002 reported.
+    let resp = as_session(fx.addr, reqwest::Method::POST, "/api/v1/validate", &editor)
+        .json(&serde_json::json!({ "content": OFF_RECORD }))
+        .send()
+        .await
+        .unwrap();
+    let found = findings(resp.json().await.unwrap());
+    assert!(
+        found.iter().any(|(r, s)| r == "T001" && s == "error"),
+        "{found:?}"
+    );
+    assert!(found.iter().any(|(r, _)| r == "T002"), "{found:?}");
 }
 
 /// The trusted-header mode, end to end on a write: a proxy identity is

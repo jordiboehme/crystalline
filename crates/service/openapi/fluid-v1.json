@@ -8761,7 +8761,7 @@
           "engrams"
         ],
         "summary": "Pre-save validation: the findings a save would raise, without writing.",
-        "description": "Runs verify's format (`E`) and temporal (`T`) rule families over the document text, the same families `crystalline verify` runs for a single document. Link, manifest, schema and quality rules need a whole domain for context and are not run here.\n\n`T006` (missing write provenance) is dropped, so a fresh unsaved document is not nagged about a field the save is about to stamp.\n\nRefused like every other write on this surface - editor role, read-only answered first - even though nothing is ever written.",
+        "description": "Runs verify's format (`E`) and temporal (`T`) rule families over the document text, the same families `crystalline verify` runs for a single document. Link, manifest, schema and quality rules need a whole domain for context and are not run here.\n\n`T006` (missing write provenance) is dropped, so a fresh unsaved document is not nagged about a field the save is about to stamp. A document named into a registered domain is held to that domain's `.crystalline.yaml` rule overrides: `off` drops a rule, a severity re-ranks it.\n\nRefused like every other write on this surface - editor role, read-only answered first - even though nothing is ever written.",
         "operationId": "validate_document",
         "requestBody": {
           "content": {

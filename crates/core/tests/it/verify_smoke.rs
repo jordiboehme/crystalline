@@ -329,6 +329,43 @@ fn a_config_file_that_does_not_parse_is_one_m108_warning() {
 }
 
 #[test]
+fn a_value_that_is_not_a_word_is_one_m108_and_the_other_overrides_apply() {
+    let dir = tempdir().unwrap();
+    // No `## When to Use`: M101, a warning by default, fires unless the
+    // override beside the two bad values turns it off.
+    write(
+        dir.path(),
+        "MANIFEST.md",
+        "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\n---\n\n## Scope\n\n- Gardening facts\n",
+    );
+    write(
+        dir.path(),
+        ".crystalline.yaml",
+        "verify:\n  rules:\n    E007: 1\n    E001: false\n    M101: off\n",
+    );
+
+    let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+    assert!(
+        report.issues.iter().all(|i| i.rule != "M101"),
+        "the valid override still applies: {:#?}",
+        report.issues
+    );
+    let m108: Vec<_> = report.issues.iter().filter(|i| i.rule == "M108").collect();
+    let messages: Vec<&str> = m108.iter().map(|i| i.message.as_str()).collect();
+    assert_eq!(m108.len(), 2, "{messages:#?}");
+    assert!(messages.contains(&"E007: the value must be a word such as off, warning or error"));
+    assert!(messages.contains(&"E001: the value must be a word such as off, warning or error"));
+    assert!(
+        messages.iter().all(|m| !m.contains("does not parse")),
+        "the file parsed: {messages:#?}"
+    );
+    for issue in &m108 {
+        let fix = issue.fix.as_deref().unwrap_or("");
+        assert!(!fix.contains("YAML"), "no YAML-syntax hint here: {fix}");
+    }
+}
+
+#[test]
 fn strict_promotes_m108_and_a_typo_no_longer_skips_the_promotion() {
     let dir = tempdir().unwrap();
     // No `## When to Use`: M101, a Warning-default rule, fires.

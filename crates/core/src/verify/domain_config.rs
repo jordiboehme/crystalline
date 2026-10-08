@@ -65,7 +65,8 @@ pub fn load_domain_config(root: &Path) -> DomainConfigLoad {
 }
 
 /// The problems inside a config that parsed: one per rule override whose
-/// value is not a severity word, naming the rule and the word.
+/// value is not a severity word, naming the rule and the word, and one per
+/// override whose value is not a word at all, naming the rule.
 pub fn config_problems(config: &DomainConfig) -> Vec<ConfigProblem> {
     let Some(verify) = &config.verify else {
         return Vec::new();
@@ -81,5 +82,9 @@ pub fn config_problems(config: &DomainConfig) -> Vec<ConfigProblem> {
             ),
             fix: Some("use off, error, warning or info for each rule".to_string()),
         })
+        .chain(verify.not_words.iter().map(|rule| ConfigProblem {
+            message: format!("{rule}: the value must be a word such as off, warning or error"),
+            fix: Some("use off, error, warning or info for each rule".to_string()),
+        }))
         .collect()
 }

@@ -24,6 +24,9 @@ use tokio::sync::Mutex;
 use std::ffi::OsString;
 use std::path::Path;
 
+const OFF_RECORD: &str = "---\ntype: engram\ntitle: Gamma\npermalink: gamma\ntags:\n  - eng\nstatus: weird\n---\n\n# Gamma\n\nNo date.\n";
+const OVERRIDES: &str = "verify:\n  rules:\n    T001: warning\n    T002: off\n";
+
 struct Harness {
     _tmp: tempfile::TempDir,
     engine: Arc<Engine>,
@@ -1542,6 +1545,39 @@ async fn write_read_overwrite_and_domain_errors() {
     .unwrap_err();
     assert!(err.contains("not registered"), "{err}");
     assert!(err.contains("eng"), "{err}");
+}
+
+/// The MCP tool honours `.crystalline.yaml` overrides like `crystalline
+/// verify`: T002 off, T001 ranked a warning.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn validate_engrams_honours_the_domains_rule_overrides() {
+    let h = Harness::new(&["eng"]).await;
+    std::fs::write(h.root.join("eng/gamma.md"), OFF_RECORD).unwrap();
+    std::fs::write(h.root.join("eng/.crystalline.yaml"), OVERRIDES).unwrap();
+    h.engine.sync(None).await.unwrap();
+    let (client, _server) = h.connect().await;
+
+    let out = call(
+        client.peer(),
+        "validate_engrams",
+        json!({ "domain": "eng" }),
+    )
+    .await
+    .unwrap();
+    let issues = out["issues"].as_array().unwrap();
+    assert!(
+        issues
+            .iter()
+            .any(|i| i["kind"] == "T001" && i["severity"] == "warning"),
+        "{out}"
+    );
+    assert!(
+        issues
+            .iter()
+            .all(|i| i["kind"] != "T001" || i["severity"] == "warning"),
+        "{out}"
+    );
+    assert!(issues.iter().all(|i| i["kind"] != "T002"), "{out}");
 }
 
 /// Issue 91 end to end: an agent rewrites a MANIFEST's routing section with
