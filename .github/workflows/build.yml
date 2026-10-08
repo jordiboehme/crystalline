@@ -662,8 +662,24 @@ jobs:
           # schtasks would pick for a pipe never comes up.
           $xml = Export-ScheduledTask -TaskPath '\Crystalline\' -TaskName 'Daemon' -ErrorAction SilentlyContinue
           if (-not $xml) { throw "the MSI did not register $task" }
-          foreach ($want in @('S-1-5-32-545', '<LogonTrigger>', '<MultipleInstancesPolicy>Parallel', '<ExecutionTimeLimit>PT0S', 'serve --daemon --from-task', 'Crystalline\bin\crystalline.exe')) {
-            if (-not $xml.Contains($want)) { throw "the task definition lacks $want" }
+          # Read as XML, not as text: Task Scheduler writes the definition back
+          # in its own form, so a substring of what was registered may not be
+          # in what it exports.
+          [xml]$doc = $xml
+          $ns = @{ t = 'http://schemas.microsoft.com/windows/2004/02/mit/task' }
+          $one = { param($path) (Select-Xml -Xml $doc -XPath $path -Namespace $ns | Select-Object -First 1).Node }
+          $checks = [ordered]@{
+            'a logon trigger'              = { [bool](& $one '//t:Triggers/t:LogonTrigger') }
+            'the Users group'              = { (& $one '//t:Principal/t:GroupId').InnerText -in @('S-1-5-32-545', 'BUILTIN\Users', 'Users') }
+            'parallel instances'           = { (& $one '//t:MultipleInstancesPolicy').InnerText -eq 'Parallel' }
+            'no time limit'                = { (& $one '//t:ExecutionTimeLimit').InnerText -eq 'PT0S' }
+            'serve --daemon --from-task'   = { (& $one '//t:Exec/t:Arguments').InnerText -eq 'serve --daemon --from-task' }
+            'the installed crystalline.exe' = { (& $one '//t:Exec/t:Command').InnerText -like '*Crystalline\bin\crystalline.exe*' }
+          }
+          $missing = @($checks.Keys | Where-Object { -not (& $checks[$_]) })
+          if ($missing.Count -gt 0) {
+            $xml
+            throw "the task definition lacks: $($missing -join ', ')"
           }
           schtasks /Run /TN $task | Out-Null
           $up = $false
