@@ -1043,9 +1043,14 @@ pub struct TaskDoctor {
     /// This user's task under the name 0.24.0 gave it, without the SID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub old_name: Option<String>,
-    /// The 0.24.0-named task `--fix` removed after it registered the new one.
+    /// The 0.24.0-named task `--fix` removed, after it registered the new
+    /// one or because the machine task is ready.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub moved_old: Option<String>,
+    /// Why Task Scheduler would not remove the 0.24.0-named task: a fix that
+    /// did not finish.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_refused: Option<String>,
 }
 
 impl TaskDoctor {
@@ -1053,7 +1058,7 @@ impl TaskDoctor {
     fn is_problem(&self) -> bool {
         let ready =
             matches!(self.finding, Some(TaskFinding::Ready(_))) && self.gone_command.is_none();
-        !ready && self.registered_now.is_none()
+        (!ready && self.registered_now.is_none()) || self.old_refused.is_some()
     }
 }
 
@@ -1067,6 +1072,34 @@ pub(crate) enum TaskRepair {
     /// Only an administrator can help: the machine task is found first by
     /// every bridge, so a per-user task beside it would never run.
     Administrator,
+}
+
+/// What `--fix` does, from the task doctor found, its repair and this
+/// user's 0.24.0-named task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TaskFix {
+    Nothing,
+    /// Register this user's task under the name with the SID, then remove
+    /// the 0.24.0-named one if there is one.
+    Register,
+    /// Only remove the 0.24.0-named task: the machine task is ready and
+    /// every bridge finds it first.
+    RemoveOld,
+}
+
+/// What `--fix` does about `task` with `repair`. An old-named task beside a
+/// ready machine task is redundant, so it is removed and nothing is
+/// registered; without a ready machine task it is moved to the new name.
+pub(crate) fn task_fix(task: &TaskDoctor, repair: TaskRepair) -> TaskFix {
+    match repair {
+        TaskRepair::Register => TaskFix::Register,
+        TaskRepair::Administrator => TaskFix::Nothing,
+        TaskRepair::Nothing if task.old_name.is_none() => TaskFix::Nothing,
+        TaskRepair::Nothing => match &task.finding {
+            Some(TaskFinding::Ready(name)) if is_machine_task(name) => TaskFix::RemoveOld,
+            _ => TaskFix::Register,
+        },
+    }
 }
 
 fn is_machine_task(name: &str) -> bool {
@@ -1143,7 +1176,9 @@ const NOT_THE_MSI_BINARY: &str = r"this crystalline is not in Program Files\Crys
 /// runs for them or theirs starts a binary that is gone. `--fix` registers
 /// only for the binary the MSI installed, so the task never points at a
 /// copy that may move or go, and never beside a machine task, which every
-/// bridge finds first.
+/// bridge finds first. This user's task under the 0.24.0 name is removed
+/// when the machine task is ready, and otherwise moved to the name with the
+/// SID ([`task_fix`]).
 fn check_task(fix: bool) -> Option<TaskDoctor> {
     use crystalline_service::daemon_task;
     if !cfg!(windows) {
@@ -1173,27 +1208,34 @@ fn check_task(fix: bool) -> Option<TaskDoctor> {
         Path::is_file,
     );
     report.old_name = tasks.legacy();
-    // A task under the 0.24.0 name is moved to the name with the SID: the
-    // new one is registered first, the old one removed after.
-    let register = repair == TaskRepair::Register
-        || (repair == TaskRepair::Nothing && report.old_name.is_some());
-    if fix && register {
-        if !installed {
+    if !fix {
+        return Some(report);
+    }
+    let moved = match task_fix(&report, repair) {
+        TaskFix::Nothing => daemon_task::Moved::Nothing,
+        TaskFix::RemoveOld => daemon_task::remove_legacy_for_this_user(),
+        TaskFix::Register if !installed => {
             report.error = Some(NOT_THE_MSI_BINARY.to_string());
-        } else {
-            match daemon_task::register_for_this_user(&exe) {
-                Ok((name, moved)) => {
-                    report.registered_now = Some(name);
-                    match moved {
-                        daemon_task::Moved::Nothing => {}
-                        daemon_task::Moved::Removed(old) => report.moved_old = Some(old),
-                        daemon_task::Moved::Refused { task, why } => {
-                            report.error = Some(format!("could not remove the task {task} ({why})"))
-                        }
-                    }
-                }
-                Err(e) => report.error = Some(e),
+            daemon_task::Moved::Nothing
+        }
+        // The new name is registered first, the old one removed after.
+        TaskFix::Register => match daemon_task::register_for_this_user(&exe) {
+            Ok((name, moved)) => {
+                report.registered_now = Some(name);
+                moved
             }
+            Err(e) => {
+                report.error = Some(e);
+                daemon_task::Moved::Nothing
+            }
+        },
+    };
+    match moved {
+        daemon_task::Moved::Nothing => {}
+        daemon_task::Moved::Removed(old) => report.moved_old = Some(old),
+        daemon_task::Moved::Refused { task, why } => {
+            report.old_name = Some(task);
+            report.old_refused = Some(why);
         }
     }
     Some(report)
@@ -4505,6 +4547,11 @@ pub fn render_human(report: &DoctorReport) -> String {
             let _ = writeln!(
                 out,
                 "  removed the task {old}, which had the name from Crystalline 0.24.0"
+            );
+        } else if let (Some(old), Some(why)) = (&task.old_name, &task.old_refused) {
+            let _ = writeln!(
+                out,
+                "  [problem] --fix could not remove the task {old}, which has the name from Crystalline 0.24.0 ({why})"
             );
         } else if let Some(old) = &task.old_name {
             let _ = writeln!(
@@ -8097,6 +8144,107 @@ mod tests {
     }
 
     const ADA_SID: &str = "S-1-5-21-1004336348-1177238915-682003330-1001";
+
+    /// A refused delete of the old task, after the new one was registered,
+    /// is said with its reason and is a fix that did not finish.
+    #[test]
+    fn a_refused_removal_of_the_old_task_is_said_and_counts_as_a_problem() {
+        let old = crystalline_service::daemon_task::legacy_user_task_name("ada");
+        let new = crystalline_service::daemon_task::user_task_name("ada", ADA_SID);
+        let report = DoctorReport {
+            daemon_task: Some(TaskDoctor {
+                finding: Some(TaskFinding::Ready(old.clone())),
+                old_name: Some(old.clone()),
+                registered_now: Some(new.clone()),
+                old_refused: Some("ERROR: Access is denied.".to_string()),
+                ..TaskDoctor::default()
+            }),
+            ..DoctorReport::default()
+        };
+        assert_eq!(report.remaining_problems(), 1);
+        let out = render_human(&report);
+        assert!(
+            out.contains(&format!("  registered the task {new} for this user\n")),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "  [problem] --fix could not remove the task {old}, which has the name from Crystalline 0.24.0 (ERROR: Access is denied.)\n"
+            )),
+            "{out}"
+        );
+        assert!(!out.contains("[warning] the task"), "{out}");
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            json["daemon_task"]["old_refused"],
+            serde_json::json!("ERROR: Access is denied.")
+        );
+    }
+
+    /// Beside a ready machine task, which every bridge finds first, the old
+    /// per-user task is only removed. Without one it is moved to the name
+    /// with the SID.
+    #[test]
+    fn beside_a_ready_machine_task_fix_only_removes_the_old_task() {
+        use crystalline_service::daemon_task::MACHINE_TASK_NAME;
+        let old = crystalline_service::daemon_task::legacy_user_task_name("ada");
+        let doctor = |finding: TaskFinding, old_name: Option<&str>| TaskDoctor {
+            finding: Some(finding),
+            old_name: old_name.map(str::to_string),
+            ..TaskDoctor::default()
+        };
+        let machine = TaskFinding::Ready(MACHINE_TASK_NAME.to_string());
+        assert_eq!(
+            task_fix(&doctor(machine.clone(), Some(&old)), TaskRepair::Nothing),
+            TaskFix::RemoveOld
+        );
+        assert_eq!(
+            task_fix(&doctor(machine.clone(), None), TaskRepair::Nothing),
+            TaskFix::Nothing
+        );
+        assert_eq!(
+            task_fix(
+                &doctor(TaskFinding::Ready(old.clone()), Some(&old)),
+                TaskRepair::Nothing
+            ),
+            TaskFix::Register,
+            "no machine task: the old one is moved"
+        );
+        assert_eq!(
+            task_fix(&doctor(TaskFinding::Missing, None), TaskRepair::Register),
+            TaskFix::Register
+        );
+        assert_eq!(
+            task_fix(
+                &doctor(machine.clone(), Some(&old)),
+                TaskRepair::Administrator
+            ),
+            TaskFix::Nothing,
+            "a broken machine task is for an administrator"
+        );
+
+        let report = DoctorReport {
+            daemon_task: Some(TaskDoctor {
+                moved_old: Some(old.clone()),
+                ..doctor(machine, Some(&old))
+            }),
+            ..DoctorReport::default()
+        };
+        assert_eq!(report.remaining_problems(), 0);
+        let out = render_human(&report);
+        assert!(
+            out.contains(&format!("  ok ({MACHINE_TASK_NAME})\n")),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "  removed the task {old}, which had the name from Crystalline 0.24.0\n"
+            )),
+            "{out}"
+        );
+        assert!(!out.contains("registered the task"), "{out}");
+        assert!(!out.contains("[warning]"), "{out}");
+    }
 
     /// The 0.24.0 name is a warning, never a problem: the task still works.
     /// After `--fix` the move is said.

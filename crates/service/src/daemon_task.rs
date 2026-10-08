@@ -484,7 +484,8 @@ pub enum Moved {
 }
 
 /// Remove this user's 0.24.0-named task. Only a caller that has just
-/// registered the new name calls this.
+/// registered the new name, or that found the machine task ready, calls
+/// this.
 pub(crate) fn move_legacy_with(
     me: &ThisUser,
     exists: impl FnMut(&str) -> bool,
@@ -706,6 +707,13 @@ pub fn register(principal: &TaskPrincipal, exe: &Path) -> Result<String, String>
     });
     let _ = std::fs::remove_file(&file);
     result
+}
+
+/// Remove this user's 0.24.0-named task and register nothing: for when the
+/// machine task is ready, which every bridge finds first, so a per-user
+/// task beside it would never run.
+pub fn remove_legacy_for_this_user() -> Moved {
+    move_legacy_with(&ThisUser::here(), task_exists, registered_xml, delete_task)
 }
 
 /// Register the current user's own task, then move away the one 0.24.0
