@@ -43,7 +43,7 @@ case "$bundle" in
         mcp_args='["${__dirname}/server/shim.js"]'
         env_fragment=""
         platforms_json='"darwin", "win32"'
-        lead="This extension connects Claude Desktop to the Crystalline you installed with Homebrew (macOS) or the MSI (Windows); install that first."
+        lead="This extension connects Claude Desktop to the Crystalline you installed with Homebrew (macOS) or the MSI (Windows). Install Crystalline first."
         ;;
     desktop-only)
         server_type="binary"
@@ -57,7 +57,7 @@ case "$bundle" in
       }'
         platforms_json='"darwin"'
         display_name="Crystalline (Claude Desktop only)"
-        lead="This macOS extension carries Crystalline inside, for a Mac without Homebrew. With Homebrew, take the standard extension instead."
+        lead="This macOS extension carries Crystalline inside, for people who use only Claude Desktop. If you also use Claude Code or the crystalline command, install Crystalline with Homebrew and take the standard extension."
         ;;
     *)
         echo "error: unknown bundle '$bundle'" >&2

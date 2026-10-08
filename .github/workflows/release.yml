@@ -217,7 +217,7 @@ jobs:
           npx --yes @anthropic-ai/mcpb@2.1.2 pack "$stage" "mcpb-out/crystalline-v${version}.mcpb"
 
           # The Claude Desktop only extension: macOS, the universal binary
-          # inside, for a Mac without Homebrew.
+          # inside, for people who use only Claude Desktop.
           stage="bundle/desktop-only"
           mkdir -p "$stage/server"
           cp downloads/macos-universal/crystalline "$stage/server/crystalline"
