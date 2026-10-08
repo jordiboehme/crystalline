@@ -1981,3 +1981,58 @@ both_backends!(
     deleting_an_engram_unbinds_the_links_to_it_in_every_domain,
     delete_unbinds_inbound_references
 );
+
+/// A link and a relation from `ops` into `notes`. Unregistering `notes` the
+/// way `remove_domain` does leaves both of them pending in `ops`, never bound
+/// to an engram id the cleared domain no longer holds.
+async fn unregister_unbinds_inbound_references(store: Arc<Mutex<dyn Store>>) {
+    // A removal persists the config, so it gets a file of its own under a
+    // temp folder rather than the machine's global one.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = GlobalConfig::default();
+    for name in ["notes", "ops"] {
+        cfg.domains
+            .insert(name.to_string(), DomainEntry::virtual_domain());
+    }
+    let config_path = tmp.path().join("config.yaml");
+    crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+    let engine = Engine::new(store.clone(), cfg, None, Some(config_path))
+        .with_state_dir(tmp.path().join("state"));
+    engine
+        .write_engram(&write_params("Target Note", "the engram ops points at"))
+        .await
+        .unwrap();
+    engine
+        .write_engram(&WriteParams {
+            domain: "ops".to_string(),
+            ..write_params(
+                "Runbook",
+                "the steps follow [[notes:Target Note]]\n\n- relates_to [[notes:Target Note]]",
+            )
+        })
+        .await
+        .unwrap();
+    assert!(
+        pending_targets(&store, "ops").await.is_empty(),
+        "bound before"
+    );
+
+    engine
+        .unregister_domain("notes", &Scope::Unrestricted, true, &[])
+        .await
+        .unwrap();
+
+    let pending = pending_targets(&store, "ops").await;
+    assert!(
+        pending.len() >= 2,
+        "the link and the relation in 'ops' read as pending: {pending:?}"
+    );
+    assert!(
+        pending.iter().all(|t| t.ends_with("Target Note")),
+        "ops: {pending:?}"
+    );
+}
+both_backends!(
+    unregistering_a_domain_unbinds_the_links_into_it,
+    unregister_unbinds_inbound_references
+);

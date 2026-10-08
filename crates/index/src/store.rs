@@ -2360,7 +2360,9 @@ pub trait Store: Send + Sync {
     /// would keep resolving references to a domain nobody registers and would
     /// hold the spelling against the next domain that claims it.
     ///
-    /// It also clears the domain's contradiction pairs and line rows.
+    /// It also clears the domain's contradiction pairs and line rows, and
+    /// unbinds (`to_id = NULL`) every link and relation row in another domain
+    /// that named one of its engrams, so those references read as pending.
     ///
     /// A reindex does not use this, and deliberately: `--full` re-reads and
     /// re-upserts instead, so rows a reader is using are never absent between

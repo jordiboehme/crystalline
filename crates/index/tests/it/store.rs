@@ -9734,9 +9734,10 @@ fn every_engram_reading_sql_carries_an_actor_predicate() {
         census.failures.join("\n")
     );
     assert_eq!(
-        census.sites, 166,
+        census.sites, 170,
         "the engram statement census moved; every new one needs a predicate or a waiver. \
-         67 per backend in mod.rs (the guarded compare of `upsert_engram_checked` is the \
+         69 per backend in mod.rs (the two unbinding statements of `clear_domain` are the \
+         newest, waived below; before them the guarded compare of `upsert_engram_checked` is the \
          newest, on the base row; before it the two `EXISTS` probes of the contradiction \
          pair write, waived by id; before them the emptiness probe of \
          `drop_empty_domain_row`, waived because a draft keeps the row too; before it the URL half \
@@ -9760,9 +9761,11 @@ fn every_engram_reading_sql_carries_an_actor_predicate() {
          that the reference now points at nothing"
     );
     assert_eq!(
-        census.waived, 24,
+        census.waived, 28,
         "the waiver list is meant to be short and deliberate; a new one needs its reason read. \
-         Twelve per backend: the two `EXISTS` probes of `replace_contradictions`' pair \
+         Fourteen per backend: the two statements of `clear_domain` that unbind the references \
+         from other domains into the rows about to go, `-- actor: all` because the clear takes \
+         every actor's rows, the two `EXISTS` probes of `replace_contradictions`' pair \
          write, `-- actor: by id` because both ids are base rows (drafts are never \
          scored), the emptiness probe of `drop_empty_domain_row`, where any \
          actor's row keeps the domain, the six statements of `clear_domain` - the sixth is the one that \

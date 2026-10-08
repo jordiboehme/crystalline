@@ -781,6 +781,36 @@ pub fn registry() -> Vec<HotStatement> {
             turso_must_seek: &["idx_relation_to"],
             postgres_must_seek: &["idx_relation_to"],
         },
+        // Unbinding the references into a domain being cleared: the engram
+        // ids through the domain index, then one `to_id` seek per id.
+        HotStatement {
+            issued_by: "Store::clear_domain (inbound links)",
+            turso: || crystalline_index::turso::CLEAR_DOMAIN_UNBIND_INBOUND_LINKS_SQL.to_string(),
+            postgres: || {
+                crystalline_index::postgres::CLEAR_DOMAIN_UNBIND_INBOUND_LINKS_SQL.to_string()
+            },
+            literals: &["1"],
+            literals_pg: None,
+            scan_expected: &[],
+            scan_expected_pg: None,
+            turso_must_seek: &["idx_link_to"],
+            postgres_must_seek: &[],
+        },
+        HotStatement {
+            issued_by: "Store::clear_domain (inbound relations)",
+            turso: || {
+                crystalline_index::turso::CLEAR_DOMAIN_UNBIND_INBOUND_RELATIONS_SQL.to_string()
+            },
+            postgres: || {
+                crystalline_index::postgres::CLEAR_DOMAIN_UNBIND_INBOUND_RELATIONS_SQL.to_string()
+            },
+            literals: &["1"],
+            literals_pg: None,
+            scan_expected: &[],
+            scan_expected_pg: None,
+            turso_must_seek: &["idx_relation_to"],
+            postgres_must_seek: &[],
+        },
         // The contradiction check's per-domain off switch: each delete seeks
         // the domain index of its table, as `clear_domain`'s do.
         HotStatement {

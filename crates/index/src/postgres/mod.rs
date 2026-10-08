@@ -1070,6 +1070,22 @@ pub const UNBIND_INBOUND_LINKS_SQL: &str = "UPDATE link SET to_id = NULL WHERE t
 #[doc(hidden)]
 pub const UNBIND_INBOUND_RELATIONS_SQL: &str = "UPDATE relation SET to_id = NULL WHERE to_id = $1";
 
+/// The wikilinks from other domains that name an engram of a domain being
+/// cleared, unbound by [`Store::clear_domain`] before the engram rows go.
+/// See the turso twin.
+// -- actor: all - the clear takes every actor's engram rows in the domain,
+// so every reference that named one of them is unbound, a draft's too.
+#[doc(hidden)]
+pub const CLEAR_DOMAIN_UNBIND_INBOUND_LINKS_SQL: &str =
+    "UPDATE link SET to_id = NULL WHERE to_id IN (SELECT id FROM engram WHERE domain_id = $1)";
+
+/// The relation twin, through `idx_relation_to`.
+// -- actor: all - the clear takes every actor's engram rows in the domain,
+// so every reference that named one of them is unbound, a draft's too.
+#[doc(hidden)]
+pub const CLEAR_DOMAIN_UNBIND_INBOUND_RELATIONS_SQL: &str =
+    "UPDATE relation SET to_id = NULL WHERE to_id IN (SELECT id FROM engram WHERE domain_id = $1)";
+
 /// The read behind [`Store::scored_pair_count`], through
 /// `idx_contradiction_pair_model`: unlike [`CONTRADICTION_PAIRS_SCORED_SQL`],
 /// this names no domain, so it cannot seek `idx_contradiction_pair_domain`,
@@ -1774,6 +1790,12 @@ impl Store for PostgresStore {
             "DELETE FROM observation WHERE engram_id IN (SELECT id FROM engram WHERE domain_id=$1)",
             "DELETE FROM relation WHERE domain_id=$1",
             "DELETE FROM link WHERE domain_id=$1",
+            // Every reference from another domain that named one of these
+            // engrams goes back to pending before the rows go, in whatever
+            // transaction the caller holds, as `delete_engram` does: a `to_id`
+            // naming a row nobody holds would read as resolved forever. See the turso twin.
+            CLEAR_DOMAIN_UNBIND_INBOUND_LINKS_SQL,
+            CLEAR_DOMAIN_UNBIND_INBOUND_RELATIONS_SQL,
             // -- actor: all - the bodies of every row about to go, named
             // through them since `engram_content` has no domain of its own.
             "DELETE FROM engram_content WHERE engram_id IN \
