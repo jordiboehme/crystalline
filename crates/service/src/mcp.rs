@@ -2948,7 +2948,7 @@ impl McpServer {
     #[tool(
         name = "configure",
         title = "Configure Crystalline",
-        description = "View and adjust Crystalline's settings, like an app's preferences page: call with no arguments to see them, set to change them (for example github.enabled to turn on team collaboration) and connect to link your GitHub account with a short code you confirm in the browser. With a token it accepts a personal access token instead. Connecting works before or after enabling; only team domains need github.enabled turned on.",
+        description = "View and adjust Crystalline's settings, like an app's preferences page: call with no arguments to see them, set to change them (for example github.enabled to turn on team collaboration) and connect to link your GitHub account with a short code you confirm in the browser. With a token it accepts a personal access token instead. Connecting works before or after enabling; only team domains need github.enabled turned on. The instance's network, database and sign-in are not listed here: the operator sets them with the crystalline CLI.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -2980,6 +2980,18 @@ impl McpServer {
             || p.host.is_some();
         if changes && let Some(refusal) = self.refuse_instance_change(&self.scope_of(&ctx)) {
             return refuse(refusal);
+        }
+        // The instance's network, database and sign-in are the operator's,
+        // changed only with the crystalline CLI. One operator key refuses
+        // the whole call before anything in it is applied, the connect
+        // fields included, and the refusal names neither the key's value nor
+        // its current setting.
+        if p.set
+            .keys()
+            .chain(p.unset.iter())
+            .any(|key| crate::settings::is_operator_key(key))
+        {
+            return refuse(crate::settings::OPERATOR_SETTING_REFUSAL);
         }
 
         if p.token.is_some() || p.connect.is_some() {
@@ -3922,6 +3934,13 @@ impl McpServer {
     async fn apply_settings(&self, p: &ConfigureParams) -> Result<(), ErrorData> {
         let mut applied: Vec<String> = Vec::new();
         for (key, value) in &p.set {
+            if !crate::settings::is_known_key(key) {
+                return Err(applied_failure(
+                    &applied,
+                    key,
+                    crate::settings::unknown_agent_key(key).into(),
+                ));
+            }
             match self
                 .engine
                 .configure(&ConfigureAction::Set {
@@ -3935,6 +3954,13 @@ impl McpServer {
             }
         }
         for key in &p.unset {
+            if !crate::settings::is_known_key(key) {
+                return Err(applied_failure(
+                    &applied,
+                    key,
+                    crate::settings::unknown_agent_key(key).into(),
+                ));
+            }
             match self
                 .engine
                 .configure(&ConfigureAction::Unset { key: key.clone() })

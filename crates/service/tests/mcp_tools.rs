@@ -6737,3 +6737,108 @@ async fn a_crlf_engram_reads_as_lf_over_mcp_and_its_checksum_guards_an_edit() {
     assert!(!on_disk.contains('\r'), "{on_disk:?}");
     assert!(on_disk.contains("Edited over MCP."), "{on_disk:?}");
 }
+
+/// The settings page an agent sees names no operator key: not in a `key`
+/// field, not in a doc line, not in the unknown-key error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configure_lists_no_operator_setting() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    let operator: Vec<&str> = crystalline_service::settings::registry()
+        .iter()
+        .filter(|s| s.operator_only)
+        .map(|s| s.key)
+        .collect();
+    assert_eq!(operator.len(), 25);
+
+    let out = call(peer, "configure", json!({})).await.unwrap();
+    let keys: Vec<&str> = out["settings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["key"].as_str().unwrap())
+        .collect();
+    assert_eq!(keys.len(), 18, "{keys:?}");
+    assert!(keys.contains(&"github.enabled") && keys.contains(&"search.salience_weight"));
+    assert!(
+        keys.contains(&"service.response_format"),
+        "the one service key an agent keeps: {keys:?}"
+    );
+    let text = out.to_string();
+    for key in &operator {
+        assert!(!keys.contains(key), "{key} is listed");
+        assert!(
+            !text.contains(key),
+            "{key} is named somewhere in the page: {text}"
+        );
+    }
+
+    let unknown = call(peer, "configure", json!({ "set": { "zzz.bogus": "x" } }))
+        .await
+        .unwrap_err();
+    assert!(unknown.contains("github.enabled"), "{unknown}");
+    for key in &operator {
+        assert!(!unknown.contains(key), "{key} leaked into {unknown}");
+    }
+}
+
+/// A set or an unset of an operator key is refused with one sentence that
+/// carries no value, and a call that mixes an operator key with an ordinary
+/// one applies nothing at all. An ordinary key alone still sets.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configure_refuses_an_operator_setting_and_applies_nothing() {
+    let h = Harness::new(&["eng"]).await;
+    let config_path = h.root.join("config.yaml");
+    let before = std::fs::read_to_string(&config_path).unwrap();
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    for args in [
+        json!({ "set": { "service.http": "0.0.0.0:7411" } }),
+        json!({ "unset": ["auth.mcp"] }),
+        json!({ "set": { "search.salience_weight": "0.25", "auth.oidc.client_secret": "mk-secret-4c1d" } }),
+        json!({ "set": { "database.url": "postgres://mk-user-4c1d@mk-host-4c1d/db" }, "unset": ["recall.limit"] }),
+        json!({ "set": { "github.api_url": "https://mk-ghes-4c1d.invalid/api/v3" }, "connect": "github" }),
+    ] {
+        let result = call_result(peer, "configure", args.clone()).await;
+        assert_eq!(result.is_error, Some(true), "{args}");
+        let text = result_text(&result);
+        assert_eq!(
+            text, "This setting is changed only with the crystalline CLI.",
+            "{args}"
+        );
+        assert!(!text.contains("mk-") && !text.contains("0.25") && !text.contains("0.0.0.0"));
+    }
+    assert_eq!(
+        std::fs::read_to_string(&config_path).unwrap(),
+        before,
+        "nothing was written"
+    );
+
+    let weight = |out: &Value| {
+        out["settings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["key"] == "search.salience_weight")
+            .unwrap()
+            .clone()
+    };
+    let out = call(peer, "configure", json!({})).await.unwrap();
+    assert_eq!(
+        weight(&out)["source"],
+        json!("default"),
+        "the ordinary key in the mixed call did not land"
+    );
+
+    let out = call(
+        peer,
+        "configure",
+        json!({ "set": { "search.salience_weight": "0.25" } }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(weight(&out)["value"], json!("0.25"));
+}

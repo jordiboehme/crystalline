@@ -13,8 +13,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
 use crystalline_core::config::{
-    AuthConfig, DomainEntry, GitHubConfig, GlobalConfig, OriginConfig, ResponseFormat,
-    ServiceConfig,
+    AuthConfig, DatabaseBackend, DatabaseConfig, DomainEntry, GitHubConfig, GlobalConfig,
+    OidcConfig, OriginConfig, ResponseFormat, ServiceConfig,
 };
 use crystalline_index::TursoStore;
 use crystalline_remote::state::OriginState;
@@ -30,6 +30,15 @@ const ALPHA: &str = "---\ntype: engram\ntitle: Alpha\npermalink: alpha\ntags:\n 
 /// whatever a domain holds here is user content that no refresh would bring
 /// back - which is what makes it the sharp case for the reserved-name screen.
 const LOG: &str = "# Log\n\n- 2026-01-01 the domain was opened\n";
+
+const MARK_DB_URL: &str = "postgres://mk-db-user-7f3a:mk-db-pass-7f3a@mk-db-host-7f3a/mk";
+const MARK_API_URL: &str = "https://mk-ghes-7f3a.invalid/api/v3";
+const MARK_OAUTH_CLIENT: &str = "mk-oauth-client-7f3a";
+const MARK_OIDC_ISSUER: &str = "https://mk-issuer-7f3a.invalid";
+const MARK_OIDC_CLIENT: &str = "mk-oidc-client-7f3a";
+const MARK_OIDC_SECRET: &str = "mk-oidc-secret-7f3a";
+const MARK_OIDC_NAME: &str = "Mk Sign In 7f3a";
+const MARK_HOST: &str = "mk-host-7f3a.invalid";
 
 /// What an admin-test server varies.
 #[derive(Default)]
@@ -61,6 +70,11 @@ struct Options {
     /// where GitHub is switched off or nobody is connected - the two states
     /// the sync endpoints answer differently.
     origin_domain: bool,
+    /// Put a marker value on the operator keys that are inert in this
+    /// fixture (the database url, the GitHub api url and app id, the OIDC
+    /// issuer, client id, secret and label, the allowed hosts), so the guard
+    /// test can look for them in every response.
+    operator_markers: bool,
 }
 
 struct Fixture {
@@ -112,6 +126,23 @@ async fn serve(opts: Options) -> Fixture {
     std::fs::write(dir.join("log.md"), LOG).unwrap();
     cfg.domains
         .insert("eng".to_string(), DomainEntry::file(dir));
+    if opts.operator_markers {
+        cfg.database = Some(DatabaseConfig {
+            backend: DatabaseBackend::Postgres,
+            url: Some(MARK_DB_URL.to_string()),
+        });
+        let github = cfg.github.get_or_insert_with(GitHubConfig::default);
+        github.api_url = Some(MARK_API_URL.to_string());
+        github.oauth_client_id = Some(MARK_OAUTH_CLIENT.to_string());
+        let auth = cfg.auth.get_or_insert_with(AuthConfig::default);
+        auth.oidc = Some(OidcConfig {
+            issuer: Some(MARK_OIDC_ISSUER.to_string()),
+            client_id: Some(MARK_OIDC_CLIENT.to_string()),
+            client_secret: Some(MARK_OIDC_SECRET.to_string()),
+            name: Some(MARK_OIDC_NAME.to_string()),
+            ..OidcConfig::default()
+        });
+    }
     if opts.origin_domain {
         let team = root.join("kb");
         std::fs::create_dir_all(&team).unwrap();
@@ -144,6 +175,7 @@ async fn serve(opts: Options) -> Fixture {
     cfg.service = Some(ServiceConfig {
         response_format: Some(ResponseFormat::Json),
         read_only: Some(opts.read_only),
+        allowed_hosts: opts.operator_markers.then(|| vec![MARK_HOST.to_string()]),
         ..ServiceConfig::default()
     });
     let config_path = root.join("config.yaml");
@@ -5093,4 +5125,130 @@ async fn import_resolves_the_domain_before_it_decompresses() {
         unknown.status(),
         "a non-admin must see the same answer whether the domain exists or not"
     );
+}
+
+/// Every JSON field name in `value`, at any depth.
+fn field_names(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (name, inner) in map {
+                out.push(name.clone());
+                field_names(inner, out);
+            }
+        }
+        serde_json::Value::Array(items) => items.iter().for_each(|v| field_names(v, out)),
+        _ => {}
+    }
+}
+
+/// **No REST response lists or reads back an operator setting.**
+///
+/// The operator keys are changed only with the crystalline CLI; MCP
+/// `configure` hides them, and this pins that the JSON API never grew a
+/// route that shows them. Derived behaviour is not exposure: the sign-in
+/// button's label comes from `auth.oidc.name` and must still reach
+/// `/auth/providers`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_rest_response_carries_an_operator_setting() {
+    let fx = serve(Options {
+        operator_markers: true,
+        ..Options::default()
+    })
+    .await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+
+    const READS: &[&str] = &[
+        "/api/v1/openapi.json",
+        "/api/v1/auth/me",
+        "/api/v1/auth/providers",
+        "/api/v1/me/identity-links",
+        "/api/v1/domains",
+        "/api/v1/domains/eng/manifest",
+        "/api/v1/domains/eng/engrams",
+        "/api/v1/domains/eng/tree",
+        "/api/v1/sync",
+        "/api/v1/search?q=alpha",
+        "/api/v1/vocabulary",
+        "/api/v1/context?q=alpha",
+        "/api/v1/activity",
+        "/api/v1/graph",
+        "/api/v1/evolve",
+        "/api/v1/users",
+        "/api/v1/settings/github",
+        "/api/v1/github/domain-name?repo=acme/kb",
+        "/api/v1/me/github-identity",
+        "/api/v1/me/mcp-tokens",
+        "/api/v1/me/oauth-grants",
+    ];
+    // A stream, two redirects into the identity provider and the OAuth
+    // consent redirect: none of them answers with a JSON body to read.
+    const SKIPPED: &[&str] = &[
+        "GET /api/v1/events",
+        "GET /api/v1/auth/oidc/login",
+        "GET /api/v1/auth/oidc/callback",
+        "GET /api/v1/oauth/authorize",
+    ];
+    for op in crate::support::MOUNTED_OPERATIONS
+        .iter()
+        .filter(|op| op.starts_with("GET ") && !op.contains('{'))
+    {
+        if SKIPPED.contains(op) {
+            continue;
+        }
+        let path = op.trim_start_matches("GET ");
+        assert!(
+            READS.iter().any(|r| r.split('?').next() == Some(path)),
+            "{op} is a new read: add it to READS so the operator-setting guard covers it"
+        );
+    }
+
+    let operator_keys: Vec<&str> = crystalline_service::settings::registry()
+        .iter()
+        .filter(|s| s.operator_only)
+        .map(|s| s.key)
+        .collect();
+    let hidden = [
+        MARK_DB_URL,
+        "mk-db-pass-7f3a",
+        "mk-ghes-7f3a",
+        MARK_OAUTH_CLIENT,
+        "mk-issuer-7f3a",
+        MARK_OIDC_CLIENT,
+        MARK_OIDC_SECRET,
+        MARK_HOST,
+    ];
+    for path in READS {
+        let body = as_session(fx.addr, reqwest::Method::GET, path, &admin)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        for marker in hidden {
+            assert!(!body.contains(marker), "{path} carries {marker}: {body}");
+        }
+        if *path == "/api/v1/auth/providers" {
+            assert!(
+                body.contains(MARK_OIDC_NAME),
+                "the sign-in label is derived behaviour and stays: {body}"
+            );
+        } else {
+            assert!(!body.contains(MARK_OIDC_NAME), "{path}: {body}");
+        }
+        if *path == "/api/v1/openapi.json" {
+            continue;
+        }
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) else {
+            continue;
+        };
+        let mut names = Vec::new();
+        field_names(&json, &mut names);
+        for name in &names {
+            assert!(
+                !operator_keys.contains(&name.as_str()) && name != "settings",
+                "{path} has a field {name}: {body}"
+            );
+        }
+    }
 }

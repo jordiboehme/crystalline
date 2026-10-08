@@ -2948,6 +2948,42 @@ async fn instance_state_changes_over_mcp_are_admin_only() {
     );
 }
 
+/// **An admin's agent over HTTP is refused an operator setting too.**
+///
+/// The admin role decides who may change this instance's ordinary settings;
+/// the network, the database and sign-in are the operator's, set with the
+/// crystalline CLI on the server. A call that mixes one with an ordinary
+/// key applies neither, and the refusal carries no value.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_admin_over_http_cannot_change_an_operator_setting() {
+    let ctx = mcp_ctx(true).await;
+    let config_path = ctx.tmp.path().join("config.yaml");
+    let before = std::fs::read_to_string(&config_path).unwrap();
+    let boss = ctx.token_for("boss").await;
+    let session = McpTestSession::open(&ctx.addr, Some(&boss)).await;
+
+    let refused = session
+        .call_tool(
+            "configure",
+            serde_json::json!({ "set": { "auth.mcp": "false", "recall.limit": "7" } }),
+        )
+        .await;
+    refusal_is_readable(&refused, "an operator setting refusal");
+    assert_eq!(
+        payload_of(&refused)["result"]["content"][0]["text"],
+        serde_json::json!("This setting is changed only with the crystalline CLI."),
+        "{refused}"
+    );
+    assert_eq!(std::fs::read_to_string(&config_path).unwrap(), before);
+    assert!(ctx.engine.auth_mcp(), "token checks stay on");
+
+    let shown = session.call_tool("configure", serde_json::json!({})).await;
+    assert!(
+        !shown.contains("auth.mcp"),
+        "and the key is not listed:\n{shown}"
+    );
+}
+
 /// **The open tier keeps exactly the instance-state powers it had.**
 ///
 /// The carve-out that keeps a default install unchanged: with `auth.mcp` off

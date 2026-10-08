@@ -564,8 +564,8 @@ pub struct ConfigureParams {
     #[serde(default)]
     pub token: Option<String>,
     /// A GitHub Enterprise Server host for this connect only, for example
-    /// github.example.com. Durable GitHub Enterprise Server setup is `set
-    /// github.api_url`.
+    /// github.example.com. It is never saved; a lasting GitHub Enterprise
+    /// Server setup is the operator's, with the crystalline CLI.
     #[serde(default)]
     pub host: Option<String>,
     /// With connect: github, abandon a pending sign-in and start a fresh
