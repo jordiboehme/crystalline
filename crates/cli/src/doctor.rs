@@ -4072,6 +4072,12 @@ fn render_merge(out: &mut String, merge: &crate::desktop_state::MergeReport) {
     for name in &merge.registered {
         let _ = writeln!(out, "  registered {name} from Claude Desktop's state");
     }
+    for key in &merge.github_carried {
+        let _ = writeln!(
+            out,
+            "  carried the setting {key} from Claude Desktop's state"
+        );
+    }
     for name in &merge.already_registered {
         let _ = writeln!(
             out,

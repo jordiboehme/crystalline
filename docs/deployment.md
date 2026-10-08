@@ -47,7 +47,7 @@ flowchart LR
     B[Browser] -->|HTTP :7411| D
 ```
 
-**Moving from an older extension.** Up to 0.23.1 the extension carried its own binary. On Windows that one could leave a second state inside Claude Desktop's package. `crystalline doctor` and `crystalline status` report it, and `crystalline doctor --fix --merge-desktop-state`, run with Claude Desktop closed, merges it: the union of both domain lists and the database-backed domains that exist only there. It never overwrites or deletes anything, and it renames the folder to `crystalline.merged-<date>` only when everything was merged.
+**Moving from an older extension.** Up to 0.23.1 the extension carried its own binary. On Windows that one could leave a second state inside Claude Desktop's package. `crystalline doctor` and `crystalline status` report it, and `crystalline doctor --fix --merge-desktop-state`, run with Claude Desktop closed, merges it: the union of both domain lists and the database-backed domains that exist only there. It also takes over the `github` settings, such as `github.enabled`, that only Claude Desktop's config had, and names each one. A setting this machine already has is never changed. It never overwrites or deletes anything, and it renames the folder to `crystalline.merged-<date>` only when everything was merged.
 
 ## Team server
 

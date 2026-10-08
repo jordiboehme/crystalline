@@ -751,6 +751,26 @@ fn plant_private_team_domain(home: &Path) -> PathBuf {
     folder
 }
 
+/// A MANIFEST for the `notes` folder `plant_private_state` made, so the
+/// merge registers and indexes it like any other domain.
+fn write_notes_manifest(home: &Path) {
+    std::fs::write(
+        home.join("docs").join("notes").join("MANIFEST.md"),
+        crystalline_core::manifest_template("notes", "2026-01-01"),
+    )
+    .unwrap();
+}
+
+/// Take the github block out of the private config `plant_private_team_domain`
+/// wrote, so team domains stay off here after the merge.
+fn drop_private_github(home: &Path) {
+    let config = private_folder(home).join("config.yaml");
+    let text = std::fs::read_to_string(&config)
+        .unwrap()
+        .replace("github:\n  enabled: true\n", "");
+    std::fs::write(&config, text).unwrap();
+}
+
 fn real_origins(home: &Path) -> PathBuf {
     crate::common::isolated_state_dir(home).join("origins")
 }
@@ -849,6 +869,7 @@ fn team_state_this_machine_already_has_is_never_overwritten() {
 fn a_team_state_that_cannot_be_copied_keeps_the_domain_out() {
     let home = tempfile::tempdir().unwrap();
     let folder = plant_private_team_domain(home.path());
+    drop_private_github(home.path());
     // A file where the origins folder belongs: no copy can land. GitHub
     // stays off here, so doctor does not look for a token in that folder.
     std::fs::write(real_config_path(home.path()), "domains: {}\n").unwrap();
@@ -898,12 +919,14 @@ fn a_merged_team_domain_reads_as_plain_sentences() {
     assert!(!text.contains("old extension"), "{text}");
 }
 
-/// With team domains turned off here, the report says how to turn them on
-/// instead of promising that the domain shares as before.
+/// With team domains turned off here and not set in Claude Desktop's state
+/// either, the report says how to turn them on instead of promising that the
+/// domain shares as before.
 #[test]
 fn a_merged_team_domain_says_to_turn_team_domains_on() {
     let home = tempfile::tempdir().unwrap();
     plant_private_team_domain(home.path());
+    drop_private_github(home.path());
     std::fs::write(real_config_path(home.path()), "domains: {}\n").unwrap();
     let out = run(home.path(), &["doctor", "--fix", "--merge-desktop-state"]);
     let text = String::from_utf8_lossy(&out.stdout);
@@ -916,4 +939,97 @@ fn a_merged_team_domain_says_to_turn_team_domains_on() {
         text.contains("run crystalline config set github.enabled true, then share them"),
         "{text}"
     );
+}
+
+/// The github settings only the old extension's config had come over by
+/// name; a key this machine sets stays; no value is printed.
+#[test]
+fn the_merge_carries_the_github_settings_this_machine_does_not_set() {
+    let home = tempfile::tempdir().unwrap();
+    let folder = plant_private_state(home.path(), &["notes"]);
+    write_notes_manifest(home.path());
+    let mut private: GlobalConfig =
+        crystalline_core::config::load_yaml(&folder.join("config.yaml")).unwrap();
+    private.github = Some(crystalline_core::config::GitHubConfig {
+        enabled: Some(true),
+        poll_secs: Some(120),
+        api_url: Some("https://ghe.example.com/api/v3".to_string()),
+        oauth_client_id: Some("Iv1.0123456789abcdef".to_string()),
+        ..Default::default()
+    });
+    crystalline_core::config::save_yaml(&folder.join("config.yaml"), &private).unwrap();
+    std::fs::remove_file(folder.join("index.db")).unwrap();
+    std::fs::create_dir_all(real_config_path(home.path()).parent().unwrap()).unwrap();
+    std::fs::write(real_config_path(home.path()), "github:\n  poll_secs: 600\n").unwrap();
+
+    let out = run(
+        home.path(),
+        &["doctor", "--fix", "--merge-desktop-state", "--json"],
+    );
+    let report: Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out.stderr)));
+    assert_eq!(report["merge_error"], Value::Null, "{report}");
+    let merge = &report["merge"];
+    assert_eq!(
+        merge["github_carried"],
+        serde_json::json!(["github.enabled", "github.api_url", "github.oauth_client_id"]),
+        "{merge}"
+    );
+    let github = real_config(home.path()).github.unwrap();
+    assert_eq!(github.enabled, Some(true));
+    assert_eq!(github.poll_secs, Some(600), "never overwritten");
+    assert_eq!(
+        github.api_url.as_deref(),
+        Some("https://ghe.example.com/api/v3")
+    );
+    assert_eq!(
+        github.oauth_client_id.as_deref(),
+        Some("Iv1.0123456789abcdef")
+    );
+}
+
+#[test]
+fn a_carried_setting_is_named_and_its_value_is_not_printed() {
+    let home = tempfile::tempdir().unwrap();
+    let folder = plant_private_state(home.path(), &["notes"]);
+    write_notes_manifest(home.path());
+    std::fs::remove_file(folder.join("index.db")).unwrap();
+    let mut private: GlobalConfig =
+        crystalline_core::config::load_yaml(&folder.join("config.yaml")).unwrap();
+    private.github = Some(crystalline_core::config::GitHubConfig {
+        oauth_client_id: Some("Iv1.0123456789abcdef".to_string()),
+        ..Default::default()
+    });
+    crystalline_core::config::save_yaml(&folder.join("config.yaml"), &private).unwrap();
+    let out = run(home.path(), &["doctor", "--fix", "--merge-desktop-state"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !text.contains("[problem]"),
+        "the merge went through: {text}"
+    );
+    assert!(
+        text.contains("  carried the setting github.oauth_client_id from Claude Desktop's state\n"),
+        "{text}"
+    );
+    assert!(!text.contains("Iv1.0123456789abcdef"), "{text}");
+}
+
+/// A carried github.enabled turns team domains on, so the report says the
+/// team domain shares as before and gives no hint to turn them on.
+#[test]
+fn a_merged_team_domain_with_github_carried_shares_as_before() {
+    let home = tempfile::tempdir().unwrap();
+    plant_private_team_domain(home.path());
+    std::fs::write(real_config_path(home.path()), "domains: {}\n").unwrap();
+    let out = run(home.path(), &["doctor", "--fix", "--merge-desktop-state"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("carried the setting github.enabled from Claude Desktop's state"),
+        "{text}"
+    );
+    assert!(
+        text.contains("copied the team state of brand from Claude Desktop's state, so it updates and shares as before"),
+        "{text}"
+    );
+    assert!(!text.contains("Team domains are turned off here"), "{text}");
 }

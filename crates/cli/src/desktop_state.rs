@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use crystalline_core::config::registration::canonical_root;
-use crystalline_core::config::{DomainEntry, GlobalConfig};
+use crystalline_core::config::{DomainEntry, GitHubConfig, GlobalConfig};
 use serde::Serialize;
 
 /// One private state folder and what it holds.
@@ -182,6 +182,9 @@ pub struct MergeReport {
     /// Whether this machine has team domains turned on (`github.enabled`).
     /// A team domain that came over updates and shares only once it is.
     pub github_enabled: bool,
+    /// The `github` settings copied from the private config, by name. Never
+    /// a value.
+    pub github_carried: Vec<String>,
     /// Private files kept as they are and named for the person.
     pub private_kept: Vec<String>,
     /// Where the private folder went.
@@ -193,6 +196,7 @@ impl MergeReport {
     pub fn changed_something(&self) -> bool {
         !self.registered.is_empty()
             || !self.origins_copied.is_empty()
+            || !self.github_carried.is_empty()
             || self.imported.iter().any(|(_, n)| *n > 0)
             || self.renamed_to.is_some()
     }
@@ -205,6 +209,67 @@ fn canonical(folder: &Path) -> PathBuf {
 
 fn same_registration(real: &DomainEntry, private: &DomainEntry) -> bool {
     real.is_virtual() == private.is_virtual() && canonical_root(real) == canonical_root(private)
+}
+
+/// Copy each `github` key `private` sets and `real` does not into `real`,
+/// never over a key `real` sets. Answers the dotted names of the keys it
+/// copied, never a value.
+pub(crate) fn carry_github(real: &mut GlobalConfig, private: &GlobalConfig) -> Vec<String> {
+    let Some(from) = private.github.clone() else {
+        return Vec::new();
+    };
+    // Every field by name, so a new github key cannot be left out.
+    let GitHubConfig {
+        enabled,
+        poll_secs,
+        stacks,
+        share_identity,
+        agent_identity,
+        api_url,
+        oauth_client_id,
+    } = from;
+    fn take<T>(to: &mut Option<T>, from: Option<T>, key: &str, carried: &mut Vec<String>) {
+        if to.is_none()
+            && let Some(value) = from
+        {
+            *to = Some(value);
+            carried.push(key.to_string());
+        }
+    }
+    let had_block = real.github.is_some();
+    let to = real.github.get_or_insert_with(GitHubConfig::default);
+    let mut carried = Vec::new();
+    take(&mut to.enabled, enabled, "github.enabled", &mut carried);
+    take(
+        &mut to.poll_secs,
+        poll_secs,
+        "github.poll_secs",
+        &mut carried,
+    );
+    take(&mut to.stacks, stacks, "github.stacks", &mut carried);
+    take(
+        &mut to.share_identity,
+        share_identity,
+        "github.share_identity",
+        &mut carried,
+    );
+    take(
+        &mut to.agent_identity,
+        agent_identity,
+        "github.agent_identity",
+        &mut carried,
+    );
+    take(&mut to.api_url, api_url, "github.api_url", &mut carried);
+    take(
+        &mut to.oauth_client_id,
+        oauth_client_id,
+        "github.oauth_client_id",
+        &mut carried,
+    );
+    if !had_block && carried.is_empty() {
+        real.github = None;
+    }
+    carried
 }
 
 /// `path` as a person reads it: without the verbatim prefix a canonical
@@ -546,7 +611,11 @@ pub async fn merge_into(
             )),
         }
     }
-    if !registered.is_empty() {
+    // The github settings only the old extension's config had: copied key
+    // by key, never over a key this machine sets. Saved with the
+    // registrations, before any virtual domain is registered below.
+    let github_carried = carry_github(&mut file, &private);
+    if !registered.is_empty() || !github_carried.is_empty() {
         if let Err(e) = crystalline_core::config::save_yaml(&loaded.path, &file) {
             for (_, to) in &carried {
                 let _ = std::fs::remove_dir_all(to);
@@ -557,6 +626,11 @@ pub async fn merge_into(
         report
             .origins_copied
             .extend(carried.into_iter().map(|(name, _)| name));
+        report.github_carried.extend(github_carried);
+        // A carried github.enabled turns team domains on here, unless the
+        // environment says otherwise: asked again, so the report does not
+        // tell the person to turn on what is now on.
+        report.github_enabled = loaded.overlay.apply(&file).github_enabled();
         // Indexed as `domain add` indexes a new folder, so the merged
         // domains answer at once.
         for name in &registered {
@@ -662,6 +736,80 @@ pub async fn merge_into(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each key the old extension's config set and this machine's does not
+    /// comes over; a key set here never changes. The report gets names that
+    /// are settings keys, never a value.
+    #[test]
+    fn the_github_block_is_carried_key_by_key_and_never_over_a_key_set_here() {
+        use crystalline_core::config::GitHubConfig;
+        let private = GlobalConfig {
+            github: Some(GitHubConfig {
+                enabled: Some(true),
+                poll_secs: Some(120),
+                stacks: Some(false),
+                share_identity: Some("personal".to_string()),
+                agent_identity: Some("share-bot".to_string()),
+                api_url: Some("https://ghe.example.com/api/v3".to_string()),
+                oauth_client_id: Some("Iv1.0123456789abcdef".to_string()),
+            }),
+            ..GlobalConfig::default()
+        };
+        let mut real = GlobalConfig {
+            github: Some(GitHubConfig {
+                enabled: Some(false),
+                poll_secs: Some(600),
+                ..GitHubConfig::default()
+            }),
+            ..GlobalConfig::default()
+        };
+        let carried = carry_github(&mut real, &private);
+        assert_eq!(
+            carried,
+            [
+                "github.stacks",
+                "github.share_identity",
+                "github.agent_identity",
+                "github.api_url",
+                "github.oauth_client_id"
+            ]
+        );
+        let github = real.github.clone().unwrap();
+        assert_eq!(
+            github.enabled,
+            Some(false),
+            "a key set here is never overwritten"
+        );
+        assert_eq!(github.poll_secs, Some(600));
+        assert_eq!(
+            github.api_url.as_deref(),
+            Some("https://ghe.example.com/api/v3")
+        );
+        assert_eq!(
+            github.oauth_client_id.as_deref(),
+            Some("Iv1.0123456789abcdef")
+        );
+
+        let mut fresh = GlobalConfig::default();
+        let all = carry_github(&mut fresh, &private);
+        assert_eq!(all.len(), 7, "every key of the block: {all:?}");
+        for key in &all {
+            assert!(
+                crystalline_service::settings::registry()
+                    .iter()
+                    .any(|s| s.key == key),
+                "{key} is a settings key"
+            );
+        }
+        assert_eq!(fresh.github, private.github);
+
+        let mut untouched = GlobalConfig::default();
+        assert!(carry_github(&mut untouched, &GlobalConfig::default()).is_empty());
+        assert!(
+            untouched.github.is_none(),
+            "no empty block is written for nothing"
+        );
+    }
 
     #[test]
     fn the_status_line_names_the_folder_and_what_is_in_it() {
