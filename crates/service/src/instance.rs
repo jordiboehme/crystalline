@@ -2114,8 +2114,18 @@ pub(crate) async fn ensure_daemon_in(
     if let (Some(conn), _) = try_attach_displacing_in(here).await {
         return Ok(conn);
     }
-    let Some(name) = task.find() else {
-        return Err(BridgeFailure::TaskMissing.into());
+    let name = match task.find() {
+        Ok(Some(name)) => name,
+        Ok(None) => return Err(BridgeFailure::TaskMissing.into()),
+        // Task Scheduler would not say: the bridge cannot run what it cannot
+        // see, and says Windows' words.
+        Err(refused) => {
+            return Err(BridgeFailure::TaskDidNotStart {
+                task: refused.task,
+                detail: refused.detail,
+            }
+            .into());
+        }
     };
     // `schtasks /Run` returns at once; the brief block before any session
     // exists is cheaper than a blocking-thread hop.
@@ -2541,7 +2551,7 @@ pub(crate) fn after_refused_breakaway(
         return RefusedBreakaway::InsideTheJob;
     }
     match task.find() {
-        Some(name) if task.run(&name).is_ok() => RefusedBreakaway::StartedByTask(name),
+        Ok(Some(name)) if task.run(&name).is_ok() => RefusedBreakaway::StartedByTask(name),
         _ => RefusedBreakaway::InsideTheJob,
     }
 }
@@ -3268,8 +3278,8 @@ mod tests {
     }
 
     impl crate::daemon_task::DaemonTask for Answers {
-        fn find(&self) -> Option<String> {
-            self.find.map(str::to_string)
+        fn find(&self) -> Result<Option<String>, crate::daemon_task::Refused> {
+            Ok(self.find.map(str::to_string))
         }
         fn run(&self, _name: &str) -> Result<(), String> {
             if self.run_ok {
@@ -3390,6 +3400,29 @@ mod tests {
                 "{options:?}"
             );
         }
+    }
+
+    /// Task Scheduler refuses to say whether the task is there.
+    struct RefusingTask;
+
+    impl crate::daemon_task::DaemonTask for RefusingTask {
+        fn find(&self) -> Result<Option<String>, crate::daemon_task::Refused> {
+            Err(crate::daemon_task::Refused {
+                task: crate::daemon_task::MACHINE_TASK_NAME.to_string(),
+                detail: "ERROR: Access is denied.".to_string(),
+            })
+        }
+        fn run(&self, name: &str) -> Result<(), String> {
+            panic!("ran {name} after a refused query")
+        }
+    }
+
+    #[test]
+    fn a_refused_query_keeps_the_spawn_inside_the_job() {
+        assert_eq!(
+            after_refused_breakaway(&RefusingTask, &SpawnOptions::default(), &[]),
+            RefusedBreakaway::InsideTheJob
+        );
     }
 
     #[test]
@@ -5467,8 +5500,8 @@ mod tests {
 
     #[cfg(unix)]
     impl crate::daemon_task::DaemonTask for FakeTask {
-        fn find(&self) -> Option<String> {
-            self.registered.then(|| self.name.clone())
+        fn find(&self) -> Result<Option<String>, crate::daemon_task::Refused> {
+            Ok(self.registered.then(|| self.name.clone()))
         }
         fn run(&self, _name: &str) -> Result<(), String> {
             use std::sync::atomic::Ordering;
@@ -5566,6 +5599,31 @@ mod tests {
         assert_eq!(
             err.downcast_ref::<crate::daemon_task::BridgeFailure>(),
             Some(&crate::daemon_task::BridgeFailure::TaskMissing)
+        );
+        assert_wrote_nothing(&state);
+        drop(home);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_packaged_client_whose_task_query_is_refused_says_it_did_not_start() {
+        let home = ScratchHome::new("pkg-refused");
+        let state = config::state_dir().unwrap();
+        let err = ensure_daemon_in(
+            &packaged(),
+            &RefusingTask,
+            &SpawnOptions::default(),
+            Duration::from_secs(1),
+        )
+        .await
+        .err()
+        .expect("no daemon and a refused query");
+        assert_eq!(
+            err.downcast_ref::<crate::daemon_task::BridgeFailure>(),
+            Some(&crate::daemon_task::BridgeFailure::TaskDidNotStart {
+                task: crate::daemon_task::MACHINE_TASK_NAME.to_string(),
+                detail: "ERROR: Access is denied.".to_string(),
+            })
         );
         assert_wrote_nothing(&state);
         drop(home);

@@ -176,6 +176,21 @@ fn a_packaged_bridge_whose_task_fails_says_it_did_not_start() {
 }
 
 #[test]
+fn a_packaged_bridge_whose_task_query_is_refused_says_why() {
+    let home = short_home();
+    let mut bridge = Bridge::start(home.path(), "refused");
+    let opened = bridge.open();
+    let instructions = opened["result"]["instructions"].as_str().unwrap();
+    assert!(instructions.contains("did not start"), "{instructions}");
+    assert!(
+        instructions.contains("the test query was refused"),
+        "{instructions}"
+    );
+    assert_eq!(status_payload(&mut bridge)["bridge"], "task_did_not_start");
+    bridge.finish();
+}
+
+#[test]
 fn a_packaged_bridge_runs_the_task_and_serves_the_daemon() {
     let home = short_home();
     let mut bridge = Bridge::start(home.path(), "serve");

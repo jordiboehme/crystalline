@@ -917,6 +917,8 @@ pub enum TaskFinding {
     Missing,
     ForOthers(String),
     Ready(String),
+    /// Task Scheduler refused the query for this task name.
+    Refused(String),
 }
 
 /// The text of every `<tag>` element in `xml`, trimmed. Tag names compare
@@ -1053,6 +1055,9 @@ pub struct TaskDoctor {
     /// did not finish.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub old_refused: Option<String>,
+    /// Windows' words when Task Scheduler refused the query.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused: Option<String>,
 }
 
 impl TaskDoctor {
@@ -1200,15 +1205,26 @@ fn check_task(fix: bool) -> Option<TaskDoctor> {
     // (`CRYSTALLINE_TEST_DAEMON_TASK`) stands in for Task Scheduler here too.
     let tasks = daemon_task::for_this_process();
     let me = daemon_task::ThisUser::here();
-    let name = tasks.find();
+    let found = tasks.find();
+    let name = found.clone().ok().flatten();
     let xml = name.as_deref().and_then(|name| tasks.definition(name));
-    let (mut report, repair) = assess_task(
-        name.as_deref(),
-        xml.as_deref(),
-        &me.account,
-        me.sid.as_deref(),
-        Path::is_file,
-    );
+    let (mut report, repair) = match found {
+        Err(refused) => (
+            TaskDoctor {
+                finding: Some(TaskFinding::Refused(refused.task)),
+                refused: Some(refused.detail),
+                ..TaskDoctor::default()
+            },
+            TaskRepair::Nothing,
+        ),
+        Ok(_) => assess_task(
+            name.as_deref(),
+            xml.as_deref(),
+            &me.account,
+            me.sid.as_deref(),
+            Path::is_file,
+        ),
+    };
     report.old_name = tasks.legacy();
     if !fix {
         return Some(report);
@@ -4536,6 +4552,13 @@ pub fn render_human(report: &DoctorReport) -> String {
                     "  [problem] the task {name} does not run for this user, so Claude Desktop cannot start the daemon. Run crystalline doctor --fix to register one for you"
                 );
                 fix_error(&mut out);
+            }
+            (Some(TaskFinding::Refused(name)), _, _) => {
+                let _ = writeln!(
+                    out,
+                    "  [problem] Task Scheduler refused to say whether the task {name} exists ({}), so doctor cannot tell whether Claude Desktop can start the daemon. Ask an administrator to check the task.",
+                    task.refused.as_deref().unwrap_or("no reason given")
+                );
             }
             (Some(TaskFinding::Missing) | None, _, _) => {
                 let _ = writeln!(
@@ -8635,5 +8658,32 @@ mod tests {
             )),
             "{out}"
         );
+    }
+
+    #[test]
+    fn a_refused_task_query_is_a_problem_that_names_windows_words() {
+        use crystalline_service::daemon_task::MACHINE_TASK_NAME;
+        let report = DoctorReport {
+            daemon_task: Some(TaskDoctor {
+                finding: Some(TaskFinding::Refused(MACHINE_TASK_NAME.to_string())),
+                refused: Some("ERROR: Access is denied.".to_string()),
+                ..TaskDoctor::default()
+            }),
+            ..DoctorReport::default()
+        };
+        assert_eq!(report.remaining_problems(), 1);
+        let out = render_human(&report);
+        assert!(
+            out.contains(&format!(
+                "  [problem] Task Scheduler refused to say whether the task {MACHINE_TASK_NAME} exists (ERROR: Access is denied.), so doctor cannot tell whether Claude Desktop can start the daemon. Ask an administrator to check the task.\n"
+            )),
+            "{out}"
+        );
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            json["daemon_task"]["finding"],
+            serde_json::json!({ "state": "refused", "name": MACHINE_TASK_NAME })
+        );
+        assert_eq!(json["daemon_task"]["refused"], "ERROR: Access is denied.");
     }
 }

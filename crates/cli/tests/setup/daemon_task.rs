@@ -62,3 +62,20 @@ fn doctor_reports_a_task_with_the_old_name_and_fix_says_why_it_stays() {
     );
     assert_eq!(fixed["daemon_task"]["old_name"], json!(old));
 }
+
+#[test]
+fn doctor_reports_a_refused_task_query_as_a_problem() {
+    let home = tempfile::tempdir().unwrap();
+    let out = doctor(home.path(), "refused", &["--json"]);
+    let report: Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out.stderr)));
+    assert_eq!(
+        report["daemon_task"]["finding"],
+        json!({ "state": "refused", "name": r"\Crystalline\Daemon" })
+    );
+    assert_eq!(
+        report["daemon_task"]["refused"],
+        "the test query was refused"
+    );
+    assert_eq!(out.status.code(), Some(1));
+}

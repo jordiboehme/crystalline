@@ -14,8 +14,8 @@ pub const MACHINE_TASK_NAME: &str = r"\Crystalline\Daemon";
 /// `fail` (the run is refused), `serve` (the run starts this binary's own
 /// daemon), `system` (as `serve`, but the started daemon gets none of the
 /// shaping variables set here, as a daemon Task Scheduler starts) or
-/// `legacy` (this user's task is there under the 0.24.0 name). A release
-/// build never reads it.
+/// `legacy` (this user's task is there under the 0.24.0 name) or `refused`
+/// (Task Scheduler refuses the query). A release build never reads it.
 pub const TEST_DAEMON_TASK_ENV: &str = "CRYSTALLINE_TEST_DAEMON_TASK";
 
 /// The per-user task `doctor --fix` and `daemon-task register` register:
@@ -37,8 +37,10 @@ pub fn legacy_user_task_name(user: &str) -> String {
 /// Task Scheduler, as the bridge needs it. A trait so a test stands in for
 /// the real `schtasks.exe`.
 pub trait DaemonTask: Send + Sync {
-    /// The name of a registered task this process may run, if any.
-    fn find(&self) -> Option<String>;
+    /// The name of a registered task this process may run: `Ok(None)` when
+    /// none is there, `Err` when Task Scheduler refused a query and nothing
+    /// else was found.
+    fn find(&self) -> Result<Option<String>, Refused>;
     /// Start the task now.
     fn run(&self, name: &str) -> Result<(), String>;
     /// The definition of the task `name`, as Task Scheduler holds it now.
@@ -128,11 +130,15 @@ struct Seam(String);
 
 #[cfg(debug_assertions)]
 impl DaemonTask for Seam {
-    fn find(&self) -> Option<String> {
+    fn find(&self) -> Result<Option<String>, Refused> {
         match self.0.as_str() {
-            "missing" => None,
-            "legacy" => Some(legacy_user_task_name(&ThisUser::here().name)),
-            _ => Some(MACHINE_TASK_NAME.to_string()),
+            "missing" => Ok(None),
+            "refused" => Err(Refused {
+                task: MACHINE_TASK_NAME.to_string(),
+                detail: "the test query was refused".to_string(),
+            }),
+            "legacy" => Ok(Some(legacy_user_task_name(&ThisUser::here().name))),
+            _ => Ok(Some(MACHINE_TASK_NAME.to_string())),
         }
     }
     fn legacy(&self) -> Option<String> {
@@ -458,18 +464,31 @@ pub(crate) fn legacy_with(
 }
 
 /// The first of `me`'s candidate names that is registered and may be run:
-/// the 0.24.0 name only when it is this account's own.
+/// the 0.24.0 name only when it is this account's own. The first refused
+/// query is the error when no name is found.
 pub(crate) fn find_with(
     me: &ThisUser,
-    mut exists: impl FnMut(&str) -> bool,
+    mut query: impl FnMut(&str) -> Query,
     mut definition: impl FnMut(&str) -> Option<String>,
-) -> Option<String> {
+) -> Result<Option<String>, Refused> {
     let legacy = me.legacy_name();
-    candidate_names(me).into_iter().find(|name| {
-        exists(name)
-            && (legacy.as_ref() != Some(name)
-                || definition(name).is_some_and(|xml| runs_as(&xml, me)))
-    })
+    let mut refused = None;
+    for name in candidate_names(me) {
+        match query(&name) {
+            Query::Absent => {}
+            Query::Refused(detail) => {
+                refused.get_or_insert(Refused { task: name, detail });
+            }
+            Query::Present => {
+                if legacy.as_ref() != Some(&name)
+                    || definition(&name).is_some_and(|xml| runs_as(&xml, me))
+                {
+                    return Ok(Some(name));
+                }
+            }
+        }
+    }
+    refused.map_or(Ok(None), Err)
 }
 
 /// What moving the 0.24.0-named task did.
@@ -604,9 +623,99 @@ fn schtasks(args: &[&std::ffi::OsStr]) -> Result<String, String> {
     }
 }
 
-/// Whether Task Scheduler has a task named `name`.
+/// What `schtasks /Query /TN <name>` said about one task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Query {
+    Present,
+    /// Windows said it cannot find the task or its folder.
+    Absent,
+    /// Any other failure, in Windows' words: the task may be there.
+    Refused(String),
+}
+
+/// A task query Task Scheduler refused: the name asked about and Windows'
+/// words.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refused {
+    pub task: String,
+    pub detail: String,
+}
+
+/// The English words for a missing file and a missing path, the fallback
+/// when the system's own words do not match.
+const NOT_FOUND_ENGLISH: &[&str] = &[
+    "cannot find the file specified",
+    "cannot find the path specified",
+];
+
+/// Windows' words, in this system's language, for error 2 (a missing task)
+/// and error 3 (a missing task folder): `io::Error` formats them through
+/// `FormatMessageW`, the text `schtasks` prints.
+fn not_found_texts() -> Vec<String> {
+    [2, 3]
+        .into_iter()
+        .map(|code| {
+            let text = std::io::Error::from_raw_os_error(code).to_string();
+            text.split(" (os error")
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        })
+        .filter(|text| !text.is_empty())
+        .collect()
+}
+
+/// `text` reduced to its ASCII letters and digits, lowercased. `schtasks`
+/// writes in the console's code page, which this binary decodes as UTF-8,
+/// so a letter outside ASCII arrives as U+FFFD: compared this way, the
+/// system's own words still match what `schtasks` printed.
+fn ascii_letters(text: &str) -> String {
+    text.chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// The outcome of a query from what `schtasks` returned and the words that
+/// mean "not there". A needle with fewer than 8 ASCII letters left (a
+/// language written in another script) is skipped, so it can never match
+/// everything; the English fallback still applies.
+pub(crate) fn query_outcome(result: Result<String, String>, not_found: &[String]) -> Query {
+    match result {
+        Ok(_) => Query::Present,
+        Err(said) => {
+            let reduced = ascii_letters(&said);
+            let absent = not_found
+                .iter()
+                .map(|text| ascii_letters(text))
+                .filter(|needle| needle.len() >= 8)
+                .chain(NOT_FOUND_ENGLISH.iter().map(|text| ascii_letters(text)))
+                .any(|needle| reduced.contains(&needle));
+            if absent {
+                Query::Absent
+            } else {
+                Query::Refused(said)
+            }
+        }
+    }
+}
+
+/// Ask Task Scheduler about the task `name`. Off Windows there is none.
+pub(crate) fn query_task(name: &str) -> Query {
+    if !cfg!(windows) {
+        return Query::Absent;
+    }
+    query_outcome(
+        schtasks(&["/Query".as_ref(), "/TN".as_ref(), name.as_ref()]),
+        &not_found_texts(),
+    )
+}
+
+/// Whether Task Scheduler has a task named `name`. A refused query is not a
+/// yes.
 fn task_exists(name: &str) -> bool {
-    schtasks(&["/Query".as_ref(), "/TN".as_ref(), name.as_ref()]).is_ok()
+    query_task(name) == Query::Present
 }
 
 /// Delete the task `name`.
@@ -634,8 +743,8 @@ impl Schtasks {
 }
 
 impl DaemonTask for Schtasks {
-    fn find(&self) -> Option<String> {
-        find_with(&self.me, task_exists, registered_xml)
+    fn find(&self) -> Result<Option<String>, Refused> {
+        find_with(&self.me, query_task, registered_xml)
     }
 
     fn run(&self, name: &str) -> Result<(), String> {
@@ -835,22 +944,24 @@ impl Removal {
     }
 }
 
-/// Delete each of `names` that `exists` finds, with `delete`. A task that is
+/// Delete each of `names` that `query` finds, with `delete`. A task that is
 /// not there is skipped, not an error: an install older than 0.24.0
-/// registered none.
+/// registered none. A query Task Scheduler refused is reported with its
+/// words, because the task may well be there.
 pub(crate) fn unregister_with(
     names: &[String],
-    mut exists: impl FnMut(&str) -> bool,
+    mut query: impl FnMut(&str) -> Query,
     mut delete: impl FnMut(&str) -> Result<(), String>,
 ) -> Removal {
     let mut removal = Removal::default();
     for name in names {
-        if !exists(name) {
-            continue;
-        }
-        match delete(name) {
-            Ok(()) => removal.removed.push(name.clone()),
-            Err(why) => removal.refused.push((name.clone(), why)),
+        match query(name) {
+            Query::Absent => {}
+            Query::Refused(why) => removal.refused.push((name.clone(), why)),
+            Query::Present => match delete(name) {
+                Ok(()) => removal.removed.push(name.clone()),
+                Err(why) => removal.refused.push((name.clone(), why)),
+            },
         }
     }
     removal
@@ -891,7 +1002,7 @@ pub fn unregister(principal: &TaskPrincipal) -> Removal {
     let names = unregistration_names(principal, &me, &per_user, |name| {
         registered_xml(name).is_some_and(|xml| runs_as(&xml, &me))
     });
-    unregister_with(&names, task_exists, delete_task)
+    unregister_with(&names, query_task, delete_task)
 }
 
 /// The definition of a registered task, as Task Scheduler holds it now.
@@ -991,10 +1102,17 @@ mod tests {
         for local_bob in ["S-1-5-21-7-8-9-1001", r"PC1\bob", "bob"] {
             let xml = principal_xml(local_bob);
             let exists = |name: &str| name == old;
+            let query = |name: &str| {
+                if name == old {
+                    Query::Present
+                } else {
+                    Query::Absent
+                }
+            };
             let definition = |name: &str| (name == old).then(|| xml.clone());
             assert_eq!(
-                find_with(&corp_bob, exists, definition),
-                None,
+                find_with(&corp_bob, query, definition),
+                Ok(None),
                 "{local_bob}"
             );
             assert_eq!(
@@ -1031,10 +1149,17 @@ mod tests {
         for own in ["S-1-5-21-1-2-3-1104", r"corp\BOB"] {
             let xml = principal_xml(own);
             let exists = |name: &str| name == old;
+            let query = |name: &str| {
+                if name == old {
+                    Query::Present
+                } else {
+                    Query::Absent
+                }
+            };
             let definition = |name: &str| (name == old).then(|| xml.clone());
             assert_eq!(
-                find_with(&corp_bob, exists, definition),
-                Some(old.clone()),
+                find_with(&corp_bob, query, definition),
+                Ok(Some(old.clone())),
                 "{own}"
             );
             assert_eq!(
@@ -1396,11 +1521,18 @@ mod tests {
             MACHINE_TASK_NAME.to_string(),
             r"\Crystalline Daemon for ada".to_string(),
             r"\Crystalline Daemon for bob".to_string(),
+            r"\Crystalline Daemon for eve".to_string(),
         ];
         let mut deleted = Vec::new();
         let removal = unregister_with(
             &names,
-            |name| name != r"\Crystalline Daemon for ada",
+            |name| match name {
+                r"\Crystalline Daemon for ada" => Query::Absent,
+                r"\Crystalline Daemon for eve" => {
+                    Query::Refused("ERROR: Access is denied.".to_string())
+                }
+                _ => Query::Present,
+            },
             |name| {
                 deleted.push(name.to_string());
                 if name.ends_with("bob") {
@@ -1416,27 +1548,145 @@ mod tests {
                 MACHINE_TASK_NAME.to_string(),
                 r"\Crystalline Daemon for bob".to_string()
             ],
-            "a task that is not there is not deleted"
+            "a task that is not there, or that could not be asked about, is not deleted"
         );
         assert_eq!(removal.removed, [MACHINE_TASK_NAME.to_string()]);
         assert_eq!(
             removal.refused,
-            [(
-                r"\Crystalline Daemon for bob".to_string(),
-                "ERROR: Access is denied.".to_string()
-            )]
+            [
+                (
+                    r"\Crystalline Daemon for bob".to_string(),
+                    "ERROR: Access is denied.".to_string()
+                ),
+                (
+                    r"\Crystalline Daemon for eve".to_string(),
+                    "ERROR: Access is denied.".to_string()
+                ),
+            ],
+            "a refused query is reported, not skipped"
         );
         let said = removal.into_result().unwrap_err();
         assert!(
-            said.contains(r"\Crystalline Daemon for bob") && said.contains("Access is denied"),
+            said.contains(r"\Crystalline Daemon for eve") && said.contains("Access is denied"),
             "{said}"
         );
-        let nothing = unregister_with(&names, |_| false, |_| panic!("nothing to delete"));
+        let nothing = unregister_with(&names, |_| Query::Absent, |_| panic!("nothing to delete"));
         assert_eq!(
             nothing.into_result(),
             Ok(Vec::new()),
             "nothing there is no error"
         );
+    }
+
+    #[test]
+    fn a_task_query_is_present_absent_or_refused_in_any_language() {
+        let english = [
+            "The system cannot find the file specified.".to_string(),
+            "The system cannot find the path specified.".to_string(),
+        ];
+        assert_eq!(
+            query_outcome(Ok("Folder: \\".to_string()), &english),
+            Query::Present
+        );
+        assert_eq!(
+            query_outcome(
+                Err("ERROR: The system cannot find the file specified.".to_string()),
+                &english
+            ),
+            Query::Absent
+        );
+        assert_eq!(
+            query_outcome(
+                Err("ERROR: The system cannot find the path specified.".to_string()),
+                &english
+            ),
+            Query::Absent,
+            "no \\Crystalline folder on a machine without the MSI"
+        );
+        let german = [
+            "Das System kann die angegebene Datei nicht finden.".to_string(),
+            "Das System kann den angegebenen Pfad nicht finden.".to_string(),
+        ];
+        assert_eq!(
+            query_outcome(
+                Err("FEHLER: Das System kann die angegebene Datei nicht finden.".to_string()),
+                &german
+            ),
+            Query::Absent
+        );
+        assert_eq!(
+            query_outcome(Err("FEHLER: Zugriff verweigert".to_string()), &german),
+            Query::Refused("FEHLER: Zugriff verweigert".to_string())
+        );
+        assert_eq!(
+            query_outcome(Err("ERROR: Access is denied.".to_string()), &[]),
+            Query::Refused("ERROR: Access is denied.".to_string()),
+            "the English fallback knows only not-found"
+        );
+        assert_eq!(
+            query_outcome(
+                Err("ERROR: The system cannot find the file specified.".to_string()),
+                &[]
+            ),
+            Query::Absent,
+            "the English fallback works without the system's own words"
+        );
+        // French as `schtasks` prints it in an OEM code page, decoded as
+        // lossy UTF-8: the accented letters arrive as U+FFFD.
+        let french = ["Le fichier sp\u{e9}cifi\u{e9} est introuvable.".to_string()];
+        assert_eq!(
+            query_outcome(
+                Err("ERREUR\u{a0}: Le fichier sp\u{fffd}cifi\u{fffd} est introuvable.".to_string()),
+                &french
+            ),
+            Query::Absent
+        );
+        // A needle in another script reduces to nothing and must not match
+        // every refusal.
+        let russian =
+            ["\u{41d}\u{435} \u{443}\u{434}\u{430}\u{435}\u{442}\u{441}\u{44f}".to_string()];
+        assert_eq!(
+            query_outcome(
+                Err("\u{41e}\u{428}\u{418}\u{411}\u{41a}\u{410}: access".to_string()),
+                &russian
+            ),
+            Query::Refused("\u{41e}\u{428}\u{418}\u{411}\u{41a}\u{410}: access".to_string())
+        );
+    }
+
+    /// A refusal is said only when nothing usable was found: a later name
+    /// that is there still wins.
+    #[test]
+    fn find_reports_a_refused_query_only_when_nothing_else_is_there() {
+        let me = ada();
+        let refused_machine = |name: &str| {
+            if name == MACHINE_TASK_NAME {
+                Query::Refused("ERROR: Access is denied.".to_string())
+            } else {
+                Query::Absent
+            }
+        };
+        assert_eq!(
+            find_with(&me, refused_machine, |_| None),
+            Err(Refused {
+                task: MACHINE_TASK_NAME.to_string(),
+                detail: "ERROR: Access is denied.".to_string()
+            })
+        );
+        let own = user_task_name("ada", ADA_SID);
+        assert_eq!(
+            find_with(
+                &me,
+                |name: &str| if name == own {
+                    Query::Present
+                } else {
+                    refused_machine(name)
+                },
+                |_| None
+            ),
+            Ok(Some(own.clone()))
+        );
+        assert_eq!(find_with(&me, |_| Query::Absent, |_| None), Ok(None));
     }
 
     #[test]
