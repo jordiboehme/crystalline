@@ -346,6 +346,21 @@ function main() {
   serveStub(note, process.stdin, process.stdout);
 }
 
+/**
+ * Whether `argv1` names this file, through symlinks too. Claude Desktop's
+ * built-in Node runs an extension through a host script that sets
+ * process.argv[1] to the entry and loads it with import(), so require.main
+ * is the host, not this file.
+ */
+function isEntry(argv1, filename) {
+  if (!argv1) return false;
+  try {
+    return fs.realpathSync(path.resolve(argv1)) === fs.realpathSync(filename);
+  } catch (_) {
+    return false;
+  }
+}
+
 module.exports = {
   MINIMUM,
   candidates,
@@ -362,8 +377,9 @@ module.exports = {
   start,
   extensionVersion,
   main,
+  isEntry,
 };
 
-if (require.main === module) {
+if (require.main === module || isEntry(process.argv[1], __filename)) {
   main();
 }
