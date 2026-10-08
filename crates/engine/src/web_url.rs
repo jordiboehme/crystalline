@@ -12,7 +12,7 @@
 //!   payload carries `web_url`;
 //! - **unresolved** - a page exists but this caller's address for it could not
 //!   be worked out, so the payload carries [`UNRESOLVED_NOTE`] instead, which
-//!   names the setting that fixes it;
+//!   says the operator fixes it with the crystalline CLI;
 //! - **no page** - nothing here serves the web UI, so there is nothing to
 //!   point at and neither key appears. Silence, rather than a note telling
 //!   somebody to configure a page they never asked for.
@@ -29,9 +29,10 @@ use serde_json::{Value, json};
 
 use crate::serving::{HttpBinding, loopback_connect_addr};
 
-/// The one sentence an unresolved outcome carries, naming the setting that
-/// answers it. Said once per response, never per row.
-pub const UNRESOLVED_NOTE: &str = "no web address could be worked out for this caller: set service.public_url to the address people open Fluid at";
+/// The one sentence an unresolved outcome carries, saying who fixes it (the
+/// operator, with the crystalline CLI) without naming the operator key, since
+/// it reaches agents. Said once per response, never per row.
+pub const UNRESOLVED_NOTE: &str = "no web address could be worked out for this caller: the operator sets the address people open Fluid at with the crystalline CLI";
 
 /// Exactly what JavaScript's `encodeURIComponent` leaves alone: the
 /// alphanumerics and `- _ . ! ~ * ' ( )`. Fluid encodes with that function,
@@ -295,6 +296,23 @@ mod tests {
                 case["permalink"].as_str().unwrap(),
             );
             assert_eq!(built, case["web_url"].as_str().unwrap(), "{case}");
+        }
+    }
+
+    /// The note reaches agents (MCP results, remote mounts) and REST
+    /// callers, so it names no operator key: the address is the operator's,
+    /// set with the crystalline CLI.
+    #[test]
+    fn the_unresolved_note_names_no_operator_setting() {
+        assert_eq!(
+            UNRESOLVED_NOTE,
+            "no web address could be worked out for this caller: the operator sets the address people open Fluid at with the crystalline CLI"
+        );
+        for spec in crate::settings::registry()
+            .iter()
+            .filter(|s| s.operator_only)
+        {
+            assert!(!UNRESOLVED_NOTE.contains(spec.key), "{}", spec.key);
         }
     }
 

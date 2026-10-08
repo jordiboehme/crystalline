@@ -39,6 +39,10 @@ const MARK_OIDC_CLIENT: &str = "mk-oidc-client-7f3a";
 const MARK_OIDC_SECRET: &str = "mk-oidc-secret-7f3a";
 const MARK_OIDC_NAME: &str = "Mk Sign In 7f3a";
 const MARK_HOST: &str = "mk-host-7f3a.invalid";
+const MARK_PUBLIC_URL: &str = "https://mk-public-7f3a.invalid";
+const MARK_TRUSTED_HEADER: &str = "x-mk-user-7f3a";
+const MARK_REDIRECT_URI: &str = "https://mk-redirect-7f3a.invalid/api/v1/auth/oidc/callback";
+const MARK_OIDC_SCOPES: &str = "openid mk-scope-7f3a";
 
 /// What an admin-test server varies.
 #[derive(Default)]
@@ -72,7 +76,8 @@ struct Options {
     origin_domain: bool,
     /// Put a marker value on the operator keys that are inert in this
     /// fixture (the database url, the GitHub api url and app id, the OIDC
-    /// issuer, client id, secret and label, the allowed hosts), so the guard
+    /// issuer, client id, secret, label, scopes and redirect address, the
+    /// trusted header, the public url and the allowed hosts), so the guard
     /// test can look for them in every response.
     operator_markers: bool,
 }
@@ -140,8 +145,13 @@ async fn serve(opts: Options) -> Fixture {
             client_id: Some(MARK_OIDC_CLIENT.to_string()),
             client_secret: Some(MARK_OIDC_SECRET.to_string()),
             name: Some(MARK_OIDC_NAME.to_string()),
+            scopes: Some(MARK_OIDC_SCOPES.to_string()),
+            redirect_uri: Some(MARK_REDIRECT_URI.to_string()),
             ..OidcConfig::default()
         });
+        // No client in this test sends the header, so trusting it changes
+        // nothing about who the requests below are.
+        auth.trusted_header = Some(MARK_TRUSTED_HEADER.to_string());
     }
     if opts.origin_domain {
         let team = root.join("kb");
@@ -176,6 +186,7 @@ async fn serve(opts: Options) -> Fixture {
         response_format: Some(ResponseFormat::Json),
         read_only: Some(opts.read_only),
         allowed_hosts: opts.operator_markers.then(|| vec![MARK_HOST.to_string()]),
+        public_url: opts.operator_markers.then(|| MARK_PUBLIC_URL.to_string()),
         ..ServiceConfig::default()
     });
     let config_path = root.join("config.yaml");
@@ -5169,9 +5180,9 @@ async fn no_rest_response_carries_an_operator_setting() {
         "/api/v1/sync",
         "/api/v1/search?q=alpha",
         "/api/v1/vocabulary",
-        "/api/v1/context?q=alpha",
+        "/api/v1/context?anchor=crystalline://eng/alpha",
         "/api/v1/activity",
-        "/api/v1/graph",
+        "/api/v1/graph?anchor=crystalline://eng/alpha",
         "/api/v1/evolve",
         "/api/v1/users",
         "/api/v1/settings/github",
@@ -5180,6 +5191,10 @@ async fn no_rest_response_carries_an_operator_setting() {
         "/api/v1/me/mcp-tokens",
         "/api/v1/me/oauth-grants",
     ];
+    // GitHub is off in this fixture, so these two answer 409 with a sentence
+    // saying so; every other read must answer 2xx, so an error body cannot
+    // stand in for the route's real answer.
+    const REFUSED: &[&str] = &["/api/v1/sync", "/api/v1/github/domain-name?repo=acme/kb"];
     // A stream, two redirects into the identity provider and the OAuth
     // consent redirect: none of them answers with a JSON body to read.
     const SKIPPED: &[&str] = &[
@@ -5216,15 +5231,25 @@ async fn no_rest_response_carries_an_operator_setting() {
         MARK_OIDC_CLIENT,
         MARK_OIDC_SECRET,
         MARK_HOST,
+        "mk-public-7f3a",
+        MARK_TRUSTED_HEADER,
+        "mk-redirect-7f3a",
+        "mk-scope-7f3a",
     ];
     for path in READS {
-        let body = as_session(fx.addr, reqwest::Method::GET, path, &admin)
+        let resp = as_session(fx.addr, reqwest::Method::GET, path, &admin)
             .send()
             .await
-            .unwrap()
-            .text()
-            .await
             .unwrap();
+        let status = resp.status();
+        let body = resp.text().await.unwrap();
+        // An error body would pass the marker checks without the route's
+        // real answer ever being read.
+        if REFUSED.contains(path) {
+            assert_eq!(status, reqwest::StatusCode::CONFLICT, "{path}: {body}");
+        } else {
+            assert!(status.is_success(), "{path} answered {status}: {body}");
+        }
         for marker in hidden {
             assert!(!body.contains(marker), "{path} carries {marker}: {body}");
         }
