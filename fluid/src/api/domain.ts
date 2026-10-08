@@ -219,6 +219,12 @@ export interface ManifestView {
   /** The markdown as written; empty when the MANIFEST carries nothing. */
   markdown: string;
   /**
+   * True when the domain has no MANIFEST yet: the markdown is empty and the
+   * checksum is the empty text's, so a save under it creates the file. False
+   * from a daemon that predates the field, which answered such a domain 404.
+   */
+  missing: boolean;
+  /**
    * The features the server read out of it, or null when the server sent
    * none: an older daemon answers the markdown alone, and the page draws
    * the document without the panels rather than panels that say nothing.
@@ -354,6 +360,7 @@ export async function fetchManifest(domain: string): Promise<ManifestView> {
   const record = asObject(payload);
   return {
     markdown: asString(record?.markdown) ?? "",
+    missing: record?.missing === true,
     sections: readManifestSections(record?.sections),
   };
 }
@@ -361,6 +368,12 @@ export async function fetchManifest(domain: string): Promise<ManifestView> {
 /** A manifest with the version token an edit of it needs. */
 export interface ManifestDetail {
   markdown: string;
+  /**
+   * True when the domain has no MANIFEST yet: the markdown is empty and the
+   * checksum is the empty text's, so a save under it creates the file. False
+   * from a daemon that predates the field, which answered such a domain 404.
+   */
+  missing: boolean;
   /** sha256 of the markdown, the manifest save's If-Match token. */
   checksum: string | null;
   /**
@@ -396,6 +409,7 @@ export async function fetchManifestDetail(
   return {
     markdown: asString(record?.markdown) ?? "",
     checksum: asString(record?.checksum),
+    missing: record?.missing === true,
     sections: readManifestSections(record?.sections),
   };
 }
@@ -418,6 +432,7 @@ export async function saveManifest(
   return {
     markdown: asString(record?.markdown) ?? markdown,
     checksum: asString(record?.checksum),
+    missing: record?.missing === true,
     sections: readManifestSections(record?.sections),
   };
 }

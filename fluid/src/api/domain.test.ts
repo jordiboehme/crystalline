@@ -118,6 +118,7 @@ describe("a manifest detail", () => {
     expect(detail).toEqual({
       markdown: "# eng",
       checksum: "abc123",
+      missing: false,
       sections: null,
     });
   });

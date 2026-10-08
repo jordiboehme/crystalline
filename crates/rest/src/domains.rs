@@ -298,7 +298,10 @@ pub async fn tree(
                    absent.\n\n`starters` and `starter_document` come from \
                    the core registry rather than from this document, so a \
                    client can show what a MANIFEST CAN say whether or not \
-                   this one says any of it.",
+                   this one says any of it.\n\nA domain with no MANIFEST \
+                   yet answers 200 with `missing: true`, empty markdown and \
+                   the checksum of the empty text; a `PUT` carrying that \
+                   checksum creates it.",
     params(
         ("domain" = String, Path, description = "The registered domain."),
         (
@@ -327,6 +330,7 @@ pub async fn tree(
                 "domain": "eng",
                 "markdown": "---\ntitle: eng\n---\n\n## Scope\n\n- Everything about eng\n\n## When to Use\n\n- Route here for eng questions.\n",
                 "checksum": "3f8a1c05e2",
+                "missing": false,
                 "sections": {
                     "scope": ["Everything about eng"],
                     "when_to_use": ["Route here for eng questions."],
@@ -368,7 +372,7 @@ pub async fn tree(
         ),
         (
             status = 404,
-            description = "No such domain, or the domain carries no MANIFEST yet.",
+            description = "No such domain.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -384,8 +388,11 @@ pub async fn manifest(
     // so a caller who may not see the domain may not read it either, and is
     // told what a caller asking for a domain nobody registered is told.
     require_domain_read(&state, &identity, &domain).await?;
-    let markdown = state.engine.manifest_markdown(&domain).await?;
-    let checksum = manifest_checksum(&markdown);
+    // A domain with no MANIFEST yet answers like any other: empty markdown,
+    // the empty text's checksum and `missing: true`, so the editor can offer
+    // the starter document and its save creates the file.
+    let source = state.engine.manifest_source(&domain).await?;
+    let checksum = manifest_checksum(&source.markdown);
     let tag = versioned_etag(&checksum);
     if if_none_match_matches(&headers, &tag) {
         let etag = HeaderValue::from_str(&format!("\"{tag}\""))
@@ -401,7 +408,13 @@ pub async fn manifest(
         )
             .into_response());
     }
-    let mut resp = manifest_response(&domain, markdown, StatusCode::OK, None)?;
+    let mut resp = manifest_response(
+        &domain,
+        source.markdown,
+        source.missing,
+        StatusCode::OK,
+        None,
+    )?;
     resp.headers_mut()
         .insert(CACHE_CONTROL, HeaderValue::from_static(REVALIDATE));
     Ok(resp)
@@ -424,6 +437,11 @@ pub struct ManifestResponse {
     /// sha256 of the markdown, the token a later `PUT` carries in `If-Match`.
     #[schema(example = "3f8a1c05e2")]
     pub checksum: String,
+    /// True when the domain has no MANIFEST yet. `markdown` is then empty,
+    /// `checksum` is the checksum of the empty text, and a `PUT` carrying it
+    /// as `If-Match` creates the MANIFEST.
+    #[schema(example = false)]
+    pub missing: bool,
     /// The features read out of the markdown.
     pub sections: ManifestSections,
 }
@@ -781,7 +799,9 @@ pub struct SaveManifestBody {
                    when the token is stale (carrying the version the server \
                    holds now), 200 once it lands. A read-only instance \
                    answers 403 ahead of the precondition check, so it is \
-                   never 428.",
+                   never 428. A MANIFEST that is not there yet is created by \
+                   a save whose `If-Match` is the checksum the read answered \
+                   for it, the checksum of the empty text.",
     params(
         ("domain" = String, Path, description = "The registered domain."),
         (
@@ -807,6 +827,7 @@ pub struct SaveManifestBody {
                 "domain": "eng",
                 "markdown": "---\ntitle: eng\n---\n\n## Scope\n\n- Everything about eng\n\n## When to Use\n\n- Route here for eng questions.\n",
                 "checksum": "3f8a1c05e2",
+                "missing": false,
                 "sections": {
                     "scope": ["Everything about eng"],
                     "when_to_use": ["Route here for eng questions."],
@@ -855,8 +876,7 @@ pub struct SaveManifestBody {
         ),
         (
             status = 404,
-            description = "No such domain, or the domain carries no MANIFEST \
-                           yet.",
+            description = "No such domain.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -926,13 +946,16 @@ pub async fn save_manifest(
         Ok(_) => manifest_response(
             &domain,
             crystalline_core::to_lf(&body.markdown).into_owned(),
+            false,
             StatusCode::OK,
             None,
         ),
         // The same stale-edit translation `engrams::save` makes, repeated
         // rather than shared for the same reason.
         Err(EngineError::Conflict(message)) if message.starts_with(STALE_EDIT) => {
-            let current = state.engine.manifest_markdown(&domain).await?;
+            // Read through `manifest_source`, so a stale token on a MANIFEST
+            // that is still missing is a 412 against the empty text, not a 404.
+            let current = state.engine.manifest_source(&domain).await?.markdown;
             let checksum = manifest_checksum(&current);
             Ok(precondition_failed(
                 message,
@@ -993,6 +1016,7 @@ pub struct SetPoliciesBody(pub std::collections::BTreeMap<String, String>);
                 "domain": "kb",
                 "markdown": "---\ntitle: kb\nsharing: direct\n---\n\n## Scope\n\n- Everything about kb\n\n## When to Use\n\n- Route here for kb questions.\n",
                 "checksum": "3f8a1c05e2",
+                "missing": false,
                 "sections": {
                     "scope": ["Everything about kb"],
                     "when_to_use": ["Route here for kb questions."],
@@ -1081,7 +1105,7 @@ pub async fn set_domain_policies(
     // Said only when it is true: an ordinary domain's answer is the GET shape
     // exactly.
     let extra = (written["draft"] == Value::Bool(true)).then_some(("draft", Value::Bool(true)));
-    manifest_response(&domain, markdown, StatusCode::OK, extra)
+    manifest_response(&domain, markdown, false, StatusCode::OK, extra)
 }
 
 /// The prefix every refused compare-and-swap opens with, wherever the
@@ -1107,6 +1131,7 @@ const STALE_EDIT: &str = "stale edit";
 fn manifest_response(
     domain: &str,
     markdown: String,
+    missing: bool,
     status: StatusCode,
     extra: Option<(&str, Value)>,
 ) -> Result<Response, ApiError> {
@@ -1121,6 +1146,7 @@ fn manifest_response(
         domain: domain.to_string(),
         markdown,
         checksum,
+        missing,
         sections,
     };
     let mut resp = match extra {

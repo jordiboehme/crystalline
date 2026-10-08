@@ -2310,6 +2310,89 @@ async fn the_manifest_round_trip_holds_for_a_virtual_domain() {
     assert_eq!(saved_body["markdown"].as_str().unwrap(), edited);
 }
 
+/// A domain with no MANIFEST.md answers 200 with `missing: true`, empty
+/// markdown, the empty text's checksum and the starter document named for
+/// the domain; a PUT under that checksum creates the file. The admin gate
+/// still holds on the create.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_missing_manifest_reads_as_missing_and_a_put_creates_it() {
+    let _serialized = crate::support::maintenance_guard().await;
+    let fx = serve(Options::default()).await;
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    let path = fx._tmp.path().join("eng/MANIFEST.md");
+    std::fs::remove_file(&path).unwrap();
+
+    let read = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/eng/manifest",
+        &editor,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(read.status(), 200, "a missing MANIFEST is not a 404");
+    let body: serde_json::Value = read.json().await.unwrap();
+    assert_eq!(body["missing"], true, "{body}");
+    assert_eq!(body["markdown"], "");
+    let empty = crate::support::sha256_hex(b"");
+    assert_eq!(body["checksum"], empty.as_str());
+    let starter = body["sections"]["starter_document"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        starter.contains("domain_name: eng\n"),
+        "the seed declares the registered name, so no adoption renames anything: {starter}"
+    );
+
+    let refused = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/manifest",
+        &editor,
+    )
+    .header("if-match", format!("\"{empty}\""))
+    .json(&serde_json::json!({ "markdown": starter }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        refused.status(),
+        403,
+        "an editor still may not save the MANIFEST"
+    );
+    assert!(!path.exists());
+
+    let created = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/manifest",
+        &admin,
+    )
+    .header("if-match", format!("\"{empty}\""))
+    .json(&serde_json::json!({ "markdown": starter }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(created.status(), 200, "{}", created.text().await.unwrap());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), starter);
+
+    let again = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/eng/manifest",
+        &editor,
+    )
+    .send()
+    .await
+    .unwrap();
+    let body: serde_json::Value = again.json().await.unwrap();
+    assert_eq!(body["missing"], false, "{body}");
+    assert_eq!(body["markdown"], starter.as_str());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn validate_reports_findings_without_writing() {
     let fx = serve(Options::default()).await;

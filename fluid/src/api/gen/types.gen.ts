@@ -755,6 +755,12 @@ export type ManifestResponse = {
      */
     markdown: string;
     /**
+     * True when the domain has no MANIFEST yet. `markdown` is then empty,
+     * `checksum` is the checksum of the empty text, and a `PUT` carrying it
+     * as `If-Match` creates the MANIFEST.
+     */
+    missing: boolean;
+    /**
      * The features read out of the markdown.
      */
     sections: ManifestSections;
@@ -3632,7 +3638,7 @@ export type GetDomainManifestErrors = {
      */
     403: ProblemDetail;
     /**
-     * No such domain, or the domain carries no MANIFEST yet.
+     * No such domain.
      */
     404: ProblemDetail;
 };
@@ -3726,7 +3732,7 @@ export type SaveDomainManifestErrors = {
      */
     403: ProblemDetail;
     /**
-     * No such domain, or the domain carries no MANIFEST yet.
+     * No such domain.
      */
     404: ProblemDetail;
     /**

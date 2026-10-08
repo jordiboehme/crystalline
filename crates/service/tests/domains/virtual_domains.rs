@@ -1171,6 +1171,47 @@ both_backends!(
     virtual_manifest_markdown
 );
 
+/// A virtual domain with no MANIFEST row reads as missing, and the first save
+/// under the empty text's checksum creates the row, which then routes.
+async fn virtual_manifest_create(store: Arc<Mutex<dyn Store>>) {
+    let engine = virtual_engine(store);
+
+    let source = engine.manifest_source("notes").await.unwrap();
+    assert!(source.missing);
+    assert_eq!(source.markdown, "");
+
+    let manifest = "---\ntype: manifest\ntitle: Notes\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Notes\n\n## Scope\n\n- notes\n\n## When to Use\n\n- Route here for created notes\n";
+    let stale = engine.save_manifest("notes", manifest, "beef").await;
+    assert!(
+        matches!(&stale, Err(EngineError::Conflict(m)) if m.starts_with("stale edit")),
+        "{stale:?}"
+    );
+
+    let empty = crate::support::sha256_hex(b"");
+    engine
+        .save_manifest("notes", manifest, &empty)
+        .await
+        .unwrap();
+    let read = engine.manifest_markdown("notes").await.unwrap();
+    assert_eq!(read, manifest);
+    assert!(
+        engine
+            .routing_text()
+            .contains("Route here for created notes"),
+        "the created MANIFEST routes"
+    );
+
+    let again = engine.save_manifest("notes", manifest, &empty).await;
+    assert!(
+        matches!(&again, Err(EngineError::Conflict(m)) if m.starts_with("stale edit")),
+        "a second create is a stale edit: {again:?}"
+    );
+}
+both_backends!(
+    a_virtual_manifest_is_created_by_its_first_save,
+    virtual_manifest_create
+);
+
 // --- path identifier ---------------------------------------------------------
 
 async fn virtual_path_identifier(store: Arc<Mutex<dyn Store>>) {

@@ -338,6 +338,28 @@ impl Engine {
         }
     }
 
+    /// [`Engine::manifest_markdown`] for the editor: a domain that carries no
+    /// MANIFEST yet answers `missing: true` with empty markdown instead of a
+    /// `NotFound`, on file and virtual domains alike. An unregistered domain
+    /// still errors with the registered set named.
+    ///
+    /// Built on `manifest_markdown` because its only `NotFound`s are the two
+    /// "no MANIFEST yet" answers; `content_source` fails with
+    /// `UnknownDomain`, never `NotFound`.
+    pub async fn manifest_source(&self, domain: &str) -> Result<ManifestSource> {
+        match self.manifest_markdown(domain).await {
+            Ok(markdown) => Ok(ManifestSource {
+                markdown,
+                missing: false,
+            }),
+            Err(EngineError::NotFound(_)) => Ok(ManifestSource {
+                markdown: String::new(),
+                missing: true,
+            }),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Save a domain's MANIFEST markdown verbatim, guarded by the checksum of
     /// the version the caller read - the manifest counterpart of
     /// [`Engine::save_engram`], through the same `expected_checksum` seam and
@@ -350,6 +372,12 @@ impl Engine {
     /// `routing_text` at request time, so a file-domain save has nothing in
     /// the cache to refresh. Calling it unconditionally keeps this call site
     /// correct without the caller needing to know which kind answered.
+    ///
+    /// A MANIFEST that is not there yet reads as the empty text (see
+    /// [`Engine::manifest_source`]), so a save whose `expected_checksum` is
+    /// the checksum of the empty text creates it: the file for a file
+    /// domain, the `MANIFEST.md` row for a virtual one. Any other token is a
+    /// stale edit, and so is a second create with the empty token.
     pub async fn save_manifest(
         &self,
         domain: &str,
@@ -378,7 +406,7 @@ impl Engine {
             ));
         }
 
-        let rel = match self.content_source(domain)? {
+        let (rel, created) = match self.content_source(domain)? {
             ContentSource::File { root } => {
                 let path = root.join("MANIFEST.md");
                 // The same compare-then-write section `save_engram` holds, for
@@ -386,14 +414,12 @@ impl Engine {
                 // their token fresh. See `Engine::write_lock`.
                 let lock = self.write_lock(&path);
                 let _guard = lock.lock().await;
+                // A MANIFEST that is not there reads as the empty text, so
+                // the token a client was handed for it is the checksum of
+                // nothing, and a save carrying it creates the file.
                 let current = match std::fs::read_to_string(&path) {
-                    Ok(source) => source,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        return Err(EngineError::NotFound(format!(
-                            "domain '{domain}' has no MANIFEST.md at {}",
-                            path.display()
-                        )));
-                    }
+                    Ok(source) => Some(source),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
                     Err(source) => {
                         return Err(EngineError::Io {
                             path: path.display().to_string(),
@@ -401,7 +427,7 @@ impl Engine {
                         });
                     }
                 };
-                let found = sha256_hex(current.as_bytes());
+                let found = sha256_hex(current.as_deref().unwrap_or("").as_bytes());
                 if found != expected_checksum {
                     return Err(EngineError::Conflict(stale_edit_message(
                         expected_checksum,
@@ -415,30 +441,62 @@ impl Engine {
                     .await?;
                 self.reindex_file(&*store, domain_id, &root, "MANIFEST.md")
                     .await?;
-                "MANIFEST.md".to_string()
+                ("MANIFEST.md".to_string(), current.is_none())
             }
             ContentSource::Virtual => {
+                // One store guard from the lookup to the write, so two creates
+                // in this process cannot both find the row absent.
                 let store = self.store.lock().await;
-                let desc = store
-                    .find_engram(domain, "manifest")
-                    .await?
-                    .ok_or_else(|| {
-                        EngineError::NotFound(format!(
-                            "domain '{domain}' has no MANIFEST engram yet"
-                        ))
-                    })?;
-                let stamp = virtual_stamp(markdown);
-                self.index_markdown(
-                    &*store,
-                    desc.domain_id,
-                    &desc.path,
-                    markdown,
-                    stamp,
-                    Some(expected_checksum),
-                    true,
-                )
-                .await?;
-                desc.path
+                match store.find_engram(domain, "manifest").await? {
+                    Some(desc) => {
+                        let stamp = virtual_stamp(markdown);
+                        self.index_markdown(
+                            &*store,
+                            desc.domain_id,
+                            &desc.path,
+                            markdown,
+                            stamp,
+                            Some(expected_checksum),
+                            true,
+                        )
+                        .await?;
+                        (desc.path, false)
+                    }
+                    None => {
+                        let domain_id = store
+                            .upsert_domain(domain, None, DomainKind::Virtual)
+                            .await?;
+                        // A row at the path under another permalink is a
+                        // MANIFEST all the same: comparing against its text
+                        // keeps a create from overwriting it unguarded.
+                        let current = store
+                            .engram_content(domain_id, "MANIFEST.md")
+                            .await?
+                            .unwrap_or_default();
+                        let found = sha256_hex(current.as_bytes());
+                        if found != expected_checksum {
+                            return Err(EngineError::Conflict(stale_edit_message(
+                                expected_checksum,
+                                &found,
+                            )));
+                        }
+                        let stamp = virtual_stamp(markdown);
+                        // No expected checksum: there is no row for the
+                        // store's compare and swap to compare against, and the
+                        // guard above already did the comparison.
+                        self.index_markdown(
+                            &*store,
+                            domain_id,
+                            "MANIFEST.md",
+                            markdown,
+                            stamp,
+                            None,
+                            true,
+                        )
+                        .await?;
+                        ("MANIFEST.md".to_string(), true)
+                    }
+                }
             }
         };
 
@@ -462,7 +520,11 @@ impl Engine {
             domain: domain.to_string(),
             permalink,
             path: rel,
-            kind: ChangeKind::Modified,
+            kind: if created {
+                ChangeKind::Added
+            } else {
+                ChangeKind::Modified
+            },
             from: None,
             checksum: Some(sha256_hex(markdown.as_bytes())),
             actor: None,

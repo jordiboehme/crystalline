@@ -638,6 +638,21 @@ pub struct EngramText {
     pub checksum: String,
 }
 
+/// A domain's MANIFEST source as the editor reads it: the markdown, or the
+/// fact that the domain has none yet.
+///
+/// `missing` rather than an error, because a domain without a MANIFEST is
+/// the one an admin opens the editor to fix. A missing MANIFEST reads as the
+/// empty text, so its save token is the checksum of nothing and a save
+/// carrying that token creates it ([`Engine::save_manifest`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestSource {
+    /// The markdown as stored, frontmatter included; empty when `missing`.
+    pub markdown: String,
+    /// True when the domain has no MANIFEST yet.
+    pub missing: bool,
+}
+
 /// A stage-boundary progress callback for a long connect:
 /// (step, total steps, message). Sync and cheap by contract; the MCP
 /// layer bridges it onto async notifications through a channel.

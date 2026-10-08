@@ -125,6 +125,8 @@ export function DomainPoliciesCard({
       // this card's rows come from rather than being read back.
       queryClient.setQueryData<ManifestView>(manifestKey(domain), {
         markdown: written.markdown,
+        // A policy is written into a MANIFEST that is there.
+        missing: false,
         sections: written.sections,
       });
       // The editor's own copy carries a checksum this write moved, and the
