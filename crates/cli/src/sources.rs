@@ -417,6 +417,10 @@ pub fn open_in_browser(url: &str) {
 
 /// `crystalline disconnect <name|url>`.
 pub async fn disconnect_server(target: String, json: bool) -> anyhow::Result<()> {
+    // The overlay load first, like every other command: a refused environment
+    // (both forms of a secret set) surfaces here instead of reading as unset
+    // below.
+    crate::cmd::load(None)?;
     let dir = remote_dir()?;
     let Some(gone) = crystalline_remote::disconnect(&dir, &target).await? else {
         let taken = crystalline_remote::load_sources(&dir)

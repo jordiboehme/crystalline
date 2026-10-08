@@ -1602,7 +1602,8 @@ impl SetupToken {
 /// The setup token the operator set with [`SETUP_TOKEN_ENV`] or its file
 /// form, read with the shared secret rules. `Ok(None)` when neither is set.
 /// A token under [`MIN_SETUP_TOKEN_CHARS`] characters is refused naming the
-/// variable and the minimum, never the value.
+/// variable and the minimum, never the value; so is one of only whitespace,
+/// which would pass the floor and then never match a request.
 fn configured_setup_token(
     var: impl Fn(&str) -> Option<String>,
     read: impl Fn(&Path) -> std::io::Result<String>,
@@ -1612,6 +1613,9 @@ fn configured_setup_token(
     };
     let var = source.var().to_string();
     let value = source.resolve(&read)?;
+    if value.trim().is_empty() {
+        return Err(format!("{var} is empty; set a real token"));
+    }
     if value.chars().count() < MIN_SETUP_TOKEN_CHARS {
         return Err(format!(
             "{var} is shorter than {MIN_SETUP_TOKEN_CHARS} characters; set one with at least {MIN_SETUP_TOKEN_CHARS}"
@@ -4928,6 +4932,23 @@ mod tests {
         assert!(
             err.starts_with("CRYSTALLINE_SETUP_TOKEN_FILE is shorter than 32"),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn a_whitespace_only_setup_token_is_refused_naming_the_variable() {
+        let blank = " ".repeat(40);
+        let err = configured_setup_token(env(&[("CRYSTALLINE_SETUP_TOKEN", &blank)]), no_files)
+            .unwrap_err();
+        assert_eq!(err, "CRYSTALLINE_SETUP_TOKEN is empty; set a real token");
+        let err = configured_setup_token(
+            env(&[("CRYSTALLINE_SETUP_TOKEN_FILE", "/s")]),
+            |_: &Path| Ok(format!("{blank}\n")),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "CRYSTALLINE_SETUP_TOKEN_FILE is empty; set a real token"
         );
     }
 

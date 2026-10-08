@@ -128,8 +128,9 @@ pub fn read_secret(
 
 /// The value of `name`, with the file form resolved for a [`FILE_BACKED`]
 /// variable. A refused pair or an unreadable file reads as unset here: the
-/// environment overlay refuses both at every start, so a process that got
-/// this far has neither.
+/// environment overlay refuses both at every start, and every command that
+/// reads the variable loads the overlay first (`disconnect` included), so a
+/// process that got this far has neither.
 pub fn resolved_var(
     name: &str,
     var: &impl Fn(&str) -> Option<String>,
