@@ -155,7 +155,8 @@ fn same_server(a: &str, b: &str) -> bool {
 
 impl SourcesFile {
     /// The source named `name_or_url`: by its name, or by its URL in any
-    /// spelling of the same origin.
+    /// spelling of the same base (host case and one trailing slash do not
+    /// matter, the path does).
     pub fn find(&self, name_or_url: &str) -> Option<&SourceRecord> {
         self.sources.iter().find(|s| {
             s.name == name_or_url

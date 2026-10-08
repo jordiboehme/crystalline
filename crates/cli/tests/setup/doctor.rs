@@ -1159,6 +1159,8 @@ fn apply_home(cmd: &mut Command, home: &Path) {
         // already resolves to under the isolated `XDG_STATE_HOME` above,
         // rather than redirecting to a directory of its own.
         .env("CRYSTALLINE_TEST_NO_KEYCHAIN", "1")
+        // The task seam, so doctor never asks the real Task Scheduler.
+        .env("CRYSTALLINE_TEST_DAEMON_TASK", "missing")
         // A developer machine's own Copilot home must never leak into the
         // harnesses section's path resolution.
         .env_remove("COPILOT_HOME");

@@ -17,7 +17,7 @@
 //! still spread files across pages, so [`GitHubProvider::compare`] follows
 //! `page` for as long as a page comes back full; in the documented case that
 //! costs at most one harmless extra request, and it is the shape covered by
-//! the pagination test in `tests/github_client.rs`.
+//! the pagination test in `tests/it/github_client.rs`.
 
 pub mod auth;
 mod types;

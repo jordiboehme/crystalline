@@ -370,21 +370,20 @@ impl Engine {
         parse_ack_value(raw).map(Some)
     }
 
-    /// What an `evolve_ack` confirmation round names: `{domain, permalink}` for
-    /// the engram the assignment would land on.
+    /// The engram an `evolve_ack` assignment would land on, `{domain,
+    /// permalink}`, without writing it.
     ///
-    /// Shaped after [`Engine::delete_preview`] and there for the same reason: a
-    /// question is only worth putting to a user about a call that can run.
-    /// Read-only is checked first and the identifier is resolved next, so a
-    /// server that never writes, a domain nobody registered and an identifier
-    /// nobody has each fail in round one - rather than collecting a yes and
-    /// reporting the miss in round two, against a name the user already
-    /// approved.
+    /// Nothing calls it today: an `evolve_ack` assignment is written without a
+    /// question. It is kept, shaped after [`Engine::delete_preview`], for a
+    /// caller that wants to name the target before the write. Read-only is
+    /// checked first and the identifier is resolved next, so a server that
+    /// never writes, a domain nobody registered and an identifier nobody has
+    /// each fail here rather than in the write.
     ///
     /// It resolves and nothing else. The `expected_checksum` comparison and the
     /// "is that acknowledgment even there" test both read what the file holds,
-    /// the file can change between the rounds, and both already run in the
-    /// round that writes; repeating them here would buy a guarantee that does
+    /// the file can change between this call and the write, and both already
+    /// run in the write; repeating them here would buy a guarantee that does
     /// not survive the gap.
     pub async fn ack_preview(&self, p: &EditParams) -> Result<Value> {
         if self.read_only {

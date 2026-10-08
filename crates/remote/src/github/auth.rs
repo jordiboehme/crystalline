@@ -381,7 +381,7 @@ mod tests {
     // poll, which makes the assertion the interval SEQUENCE itself: no wall
     // clock, no socket and no dependency on how loaded the machine is. The
     // HTTP side of a poll is covered separately by the `poll_device_flow_once`
-    // tests in `tests/github_auth.rs`.
+    // tests in `tests/it/github_auth.rs`.
 
     #[tokio::test(start_paused = true)]
     async fn the_flow_polls_at_the_start_interval_until_a_token_arrives() {

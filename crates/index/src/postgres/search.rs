@@ -43,7 +43,7 @@ const SNIPPET_LEAD: usize = 200;
 /// clear it, the weakest (E1) at 0.8194. Must stay equal to
 /// `crate::turso::search::DEFAULT_MIN_SIMILARITY`; parity is pinned by
 /// `both_backends_default_the_same_minimum_similarity` in
-/// `crates/index/tests/store.rs`.
+/// `crates/index/tests/it/store.rs`.
 pub const DEFAULT_MIN_SIMILARITY: f32 = 0.78;
 /// How many nearest chunks the vector scan considers before the cutoff and paging.
 const SEMANTIC_TOPK: usize = 100;
@@ -657,7 +657,7 @@ pub fn filter_only_sql(
 /// The turso twin of this builder is `crate::turso::search::lexical_candidate_sql`,
 /// with the same signature; the two texts differ only in the dialect of the
 /// fragments the caller hands in. Built here rather than inline so the plan
-/// registry in `tests/plans.rs` explains the statement this store issues rather
+/// registry in `tests/it/plans.rs` explains the statement this store issues rather
 /// than a copy of it.
 #[doc(hidden)]
 pub fn lexical_candidate_sql(

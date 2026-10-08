@@ -24,7 +24,7 @@ describe("folders (M3 C6, C8)", () => {
   it("slugs a path exactly as the server's slugify does", () => {
     // Mutation caught: no lowercasing, runs not collapsed, segments not
     // trimmed, empty segments kept, `.md` kept. The first five vectors are
-    // the Rust `slugify` tests (crates/core/tests/address.rs); the loop pins
+    // the Rust `slugify` tests (crates/core/tests/it/address.rs); the loop pins
     // parity with Fluid's own port, so the two cannot drift apart.
     expect(slugPath("Astronomy/Phobos Orbit.md")).toBe(
       "astronomy/phobos-orbit",

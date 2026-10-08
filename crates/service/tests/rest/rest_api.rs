@@ -633,7 +633,10 @@ async fn login_sets_cookie_and_me_identifies() {
     let raw = set_cookie(&resp).expect("login sets the session cookie");
     assert!(raw.contains("HttpOnly"), "cookie must be HttpOnly: {raw}");
     assert!(raw.contains("SameSite=Lax"), "cookie must be Lax: {raw}");
-    assert!(raw.contains("Path=/"), "cookie must cover the API: {raw}");
+    assert!(
+        raw.split("; ").any(|part| part == "Path=/"),
+        "a root server's session cookie covers exactly Path=/: {raw}"
+    );
     assert!(
         !raw.contains("Secure"),
         "a loopback request gets a cookie usable over plain http: {raw}"

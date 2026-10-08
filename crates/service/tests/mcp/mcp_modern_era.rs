@@ -1068,13 +1068,12 @@ async fn a_handshake_declaring_the_era_is_served_as_a_legacy_session() {
     );
 }
 
-// --- the confirmation round (SEP-2322 MRTR) ---------------------------------
+// --- a delete never asks ------------------------------------------------------
 //
-// `delete_engram` is the first tool that answers a round of its own. The gate
-// is two-sided and both sides are proved here: the peer must be on this era
-// *and* must have declared that it can put a question to its user. A peer
-// failing either half is served exactly what 0.15.0 served it, which is the
-// contrast the last two tests carry.
+// Only `remove_domain` and `discard_changes` put a question to the person
+// (SEP-2322 MRTR). Everywhere else the agent's call is the go-ahead, so a
+// delete runs on the first call for every peer: one that can elicit, one that
+// cannot and a legacy one alike.
 
 /// The arguments that delete the engram the helper below writes.
 fn delete_doomed(responses: Option<Value>) -> Value {
@@ -1120,126 +1119,52 @@ async fn doomed_engram(h: &Harness) -> (Wire, std::path::PathBuf) {
     (wire, path)
 }
 
-/// Round one: an eliciting modern peer is asked before anything is deleted.
-///
-/// The whole point is the negative half of the assertion - the file is still
-/// there when the question comes back - because an `input_required` result
-/// that had already deleted the engram would be a confirmation in name only.
+/// An eliciting modern peer is never asked about a delete: the agent's call is
+/// the go-ahead, so the engram goes on the first call and no question comes
+/// back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_modern_eliciting_delete_gets_a_confirmation_question_first() {
+async fn an_eliciting_delete_runs_in_round_one_with_no_question() {
     let h = Harness::new().await;
     let (mut wire, path) = doomed_engram(&h).await;
-
-    let asked = wire
-        .call(eliciting(2, "tools/call", delete_doomed(None)))
-        .await;
-    let result = &asked["result"];
-    assert_eq!(
-        result["resultType"],
-        json!("input_required"),
-        "the call answers with a round rather than a deletion: {asked}"
-    );
-
-    let question = &result["inputRequests"]["confirm"];
-    assert_eq!(
-        question["method"],
-        json!("elicitation/create"),
-        "the round is an elicitation keyed `confirm`: {asked}"
-    );
-    let schema = &question["params"]["requestedSchema"];
-    assert_eq!(
-        schema["properties"]["confirm"]["type"],
-        json!("boolean"),
-        "one boolean property: {asked}"
-    );
-    assert_eq!(
-        schema["required"],
-        json!(["confirm"]),
-        "and it is required: {asked}"
-    );
-
-    let message = question["params"]["message"].as_str().unwrap_or_default();
-    assert!(
-        message.contains("eng/doomed"),
-        "the question names what dies: {message}"
-    );
-    assert!(
-        message.contains("cannot be undone"),
-        "and says so plainly: {message}"
-    );
-
-    assert!(
-        path.exists(),
-        "round one deletes nothing: {}",
-        path.display()
-    );
-}
-
-/// Round two with a yes: the same call, now carrying the answer, deletes.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_confirmed_delete_round_two_deletes() {
-    let h = Harness::new().await;
-    let (mut wire, path) = doomed_engram(&h).await;
-
-    let asked = wire
-        .call(eliciting(2, "tools/call", delete_doomed(None)))
-        .await;
-    assert_eq!(asked["result"]["resultType"], json!("input_required"));
 
     let done = wire
-        .call(eliciting(
-            3,
-            "tools/call",
-            delete_doomed(Some(answer("accept", true))),
-        ))
+        .call(eliciting(2, "tools/call", delete_doomed(None)))
         .await;
     assert!(
         done["error"].is_null() && done["result"]["isError"] != json!(true),
-        "the confirmed round deletes: {done}"
+        "the delete runs on the first call: {done}"
     );
     assert_eq!(
         done["result"]["resultType"],
         json!("complete"),
-        "and it is an ordinary complete result: {done}"
+        "an ordinary complete result, not a question: {done}"
+    );
+    assert!(
+        done["result"]["inputRequests"].is_null(),
+        "nothing is asked: {done}"
     );
     assert!(!path.exists(), "the engram is gone: {}", path.display());
 }
 
-/// Round two with a no: the call refuses and the engram survives.
+/// An answer an eliciting peer sends along unasked is not read: a stale
+/// decline beside the call does not stop the delete.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_declined_delete_round_two_deletes_nothing() {
+async fn a_stale_decline_beside_an_eliciting_delete_is_not_read() {
     let h = Harness::new().await;
     let (mut wire, path) = doomed_engram(&h).await;
 
-    let asked = wire
-        .call(eliciting(2, "tools/call", delete_doomed(None)))
-        .await;
-    assert_eq!(asked["result"]["resultType"], json!("input_required"));
-
-    let refused = wire
+    let done = wire
         .call(eliciting(
-            3,
+            2,
             "tools/call",
             delete_doomed(Some(answer("decline", false))),
         ))
         .await;
-    assert_eq!(
-        refused["result"]["isError"],
-        json!(true),
-        "a decline is a refusal the model can read: {refused}"
-    );
-    let text = refused["result"]["content"][0]["text"]
-        .as_str()
-        .unwrap_or_default();
     assert!(
-        text.contains("nothing was deleted"),
-        "and it says what did not happen: {text}"
+        done["error"].is_null() && done["result"]["isError"] != json!(true),
+        "the decline nobody asked for changes nothing: {done}"
     );
-    assert!(
-        path.exists(),
-        "the engram survives a decline: {}",
-        path.display()
-    );
+    assert!(!path.exists(), "the engram is gone: {}", path.display());
 }
 
 /// A modern peer that declared no elicitation capability gets 0.15.0's
@@ -1322,15 +1247,14 @@ async fn a_legacy_peer_deletes_immediately_with_no_input_required() {
     assert!(!path.exists(), "the engram is gone: {}", path.display());
 }
 
-/// **A peer outside the gate is not half-served: its answers are not read at
+/// **A peer that cannot elicit is not half-served: its answers are not read at
 /// all.**
 ///
-/// Both excluded shapes can put an `inputResponses` object on the wire - the
-/// field is ordinary `tools/call` parameters at every revision rmcp parses - so
-/// "the gate is two-sided" has a second, quieter half worth pinning: a peer the
-/// gate excludes is served exactly what 0.15.0 served it, and a decline it was
-/// never asked for changes nothing. The alternative shape, reading the answer
-/// whenever one is present, would let a client that cannot be asked veto its own
+/// Both shapes can put an `inputResponses` object on the wire - the field is
+/// ordinary `tools/call` parameters at every revision rmcp parses - and a
+/// decline nobody asked for changes nothing, exactly as it changes nothing for
+/// an eliciting peer (`a_stale_decline_beside_an_eliciting_delete_is_not_read`).
+/// Reading the answer whenever one is present would let a client veto its own
 /// calls, which is a different contract than the one shipped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn answers_from_a_gate_excluded_peer_are_ignored() {
@@ -1411,13 +1335,6 @@ async fn answers_from_a_gate_excluded_peer_are_ignored() {
 /// **An eliciting peer keeps every delete a legacy peer has**, including the
 /// one this verb exists as an escape hatch for: a stray file above the
 /// attachment ceiling, which the walker skips and so never gives a row.
-///
-/// Round one has to succeed before a user can be asked anything, so a preview
-/// that refused an over-cap file would not merely lose the byte count - it
-/// would refuse the delete outright, and only for the clients that ask before
-/// destroying. The whole round trip is driven here rather than the question
-/// alone, because "asks, then cannot act" would be the same regression one
-/// step later.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_eliciting_peer_can_still_delete_an_over_cap_attachment() {
     let h = Harness::new().await;
@@ -1433,27 +1350,15 @@ async fn an_eliciting_peer_can_still_delete_an_over_cap_attachment() {
         "arguments": { "domain": "eng", "identifier": "assets/big.png" },
     });
 
-    let asked = wire.open(eliciting(1, "tools/call", call.clone())).await;
-    assert_eq!(
-        asked["result"]["resultType"],
-        json!("input_required"),
-        "the oversized file is previewable, so it is asked about: {asked}"
-    );
-    let message = asked["result"]["inputRequests"]["confirm"]["params"]["message"]
-        .as_str()
-        .unwrap_or_default();
-    assert!(
-        message.contains("assets/big.png") && message.contains(&format!("{over_cap} bytes")),
-        "the question names the file and its real size: {message}"
-    );
-    assert!(stray.exists(), "round one deletes nothing");
-
-    let mut confirmed = call;
-    confirmed["inputResponses"] = answer("accept", true);
-    let done = wire.call(eliciting(2, "tools/call", confirmed)).await;
+    let done = wire.open(eliciting(1, "tools/call", call)).await;
     assert!(
         done["error"].is_null() && done["result"]["isError"] != json!(true),
-        "and the confirmed round removes it: {done}"
+        "the oversized file is removed on the first call: {done}"
+    );
+    assert_ne!(
+        done["result"]["resultType"],
+        json!("input_required"),
+        "{done}"
     );
     assert!(
         !stray.exists(),
@@ -1462,17 +1367,11 @@ async fn an_eliciting_peer_can_still_delete_an_over_cap_attachment() {
     );
 }
 
-/// **The confirmation round exists on the HTTP wire too, not only over stdio.**
-///
-/// Every other test of the round drives the duplex stdio transport, where the
-/// capability reaches the handler through rmcp's metadata latch. Nothing arms
-/// that latch on the streamable-HTTP path, so a request there is classified from
-/// its own `_meta` on each call - a genuinely different route to
-/// `client_capabilities`, and the one a remote client actually takes. Pinned
-/// here so a deployment behind a load balancer is known to ask before it
-/// destroys rather than assumed to.
+/// **The same over the HTTP wire**, where a request is classified from its own
+/// `_meta` on each call: an eliciting delete there runs on the first call too,
+/// with no session and no question.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_eliciting_peer_gets_a_question_over_http() {
+async fn an_eliciting_delete_over_http_runs_in_round_one() {
     let h = Harness::new().await;
     let addr = h.http().await;
 
@@ -1501,51 +1400,36 @@ async fn an_eliciting_peer_gets_a_question_over_http() {
     let raw = eliciting_post(addr, 2, "tools/call", delete_doomed(None)).await;
     assert!(
         raw.starts_with("HTTP/1.1 200 OK"),
-        "the round is served:\n{}",
+        "the call is served:\n{}",
         head_of(&raw)
     );
+    let done = payload(&raw);
     assert!(
-        !has_session_header(&raw),
-        "and it needs no session to carry it:\n{}",
-        head_of(&raw)
+        done["error"].is_null() && done["result"]["isError"] != json!(true),
+        "{done}"
     );
-    let asked = payload(&raw);
-    assert_eq!(
-        asked["result"]["resultType"],
+    assert_ne!(
+        done["result"]["resultType"],
         json!("input_required"),
-        "the call answers with a round rather than a deletion: {asked}"
+        "nothing is asked: {done}"
     );
-    let message = asked["result"]["inputRequests"]["confirm"]["params"]["message"]
-        .as_str()
-        .unwrap_or_default();
-    assert!(
-        message.contains("eng/doomed"),
-        "the question names what dies: {message}"
-    );
-    assert!(
-        path.exists(),
-        "round one deletes nothing: {}",
-        path.display()
-    );
+    assert!(!path.exists(), "the engram is gone: {}", path.display());
 }
 
 // --- acknowledgments, recorded and taken back -------------------------------
 //
-// `set_frontmatter` on `evolve_ack` is the second act that asks first: it
-// silences a finding, or resurfaces one, on the user's behalf. The gate is the
-// same two-sided one the delete tests prove, and it arms for this one key
-// only - every other `edit_engram` operation runs on the first call, whatever
-// the peer.
+// `set_frontmatter` on `evolve_ack` silences a finding, or resurfaces one, on
+// the user's behalf. It runs on the first call like every other `edit_engram`
+// operation, whatever the peer.
 
 /// One `edit_engram` call assigning `value` to `evolve_ack` on `acked`.
-fn ack_call(value: &str, responses: Option<Value>) -> Value {
-    ack_call_on("acked", value, responses)
+fn ack_call(value: &str) -> Value {
+    ack_call_on("acked", value)
 }
 
-/// The same call aimed at `identifier`, for the tests that care what round one
-/// resolves before it asks.
-fn ack_call_on(identifier: &str, value: &str, responses: Option<Value>) -> Value {
-    let mut params = json!({
+/// The same call aimed at `identifier`.
+fn ack_call_on(identifier: &str, value: &str) -> Value {
+    json!({
         "name": "edit_engram",
         "arguments": {
             "domain": "eng",
@@ -1554,11 +1438,7 @@ fn ack_call_on(identifier: &str, value: &str, responses: Option<Value>) -> Value
             "key": "evolve_ack",
             "value": value,
         },
-    });
-    if let Some(responses) = responses {
-        params["inputResponses"] = responses;
-    }
-    params
+    })
 }
 
 /// The engine payload a tool result carries, as JSON.
@@ -1595,62 +1475,44 @@ async fn acked_engram(h: &Harness) -> (Wire, std::path::PathBuf) {
     (wire, path)
 }
 
-/// Round one of a record: the peer is asked, and nothing is written yet.
-///
-/// The call names the engram by its title, so the question can only carry the
-/// permalink if round one resolved the engram before asking - which is the
-/// point: a user confirms the engram the write would land on, not the string
-/// the model typed.
+/// An eliciting peer records an acknowledgment on the first call: the agent's
+/// call is the go-ahead, so nothing is asked and the entry lands at once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_eliciting_ack_gets_a_confirmation_question() {
+async fn an_eliciting_ack_lands_in_round_one() {
     let h = Harness::new().await;
     let (mut wire, path) = acked_engram(&h).await;
 
-    let asked = wire
+    let done = wire
         .call(eliciting(
             2,
             "tools/call",
-            ack_call_on("Acked", "V101 lineage citation, keep", None),
+            ack_call_on("Acked", "V101 lineage citation, keep"),
         ))
         .await;
-    let result = &asked["result"];
+    assert!(
+        done["error"].is_null() && done["result"]["isError"] != json!(true),
+        "the acknowledgment runs on the first call: {done}"
+    );
     assert_eq!(
-        result["resultType"],
-        json!("input_required"),
-        "the call answers with a round rather than an acknowledgment: {asked}"
+        done["result"]["resultType"],
+        json!("complete"),
+        "an ordinary complete result, not a question: {done}"
     );
-    let question = &result["inputRequests"]["confirm"];
-    assert_eq!(question["method"], json!("elicitation/create"), "{asked}");
-
-    let message = question["params"]["message"].as_str().unwrap_or_default();
-    assert!(
-        message.contains("Acknowledge V101"),
-        "the question names the rule: {message}"
-    );
-    assert!(
-        message.contains("'acked'") && message.contains("'eng'"),
-        "and the engram it lands on, by resolved permalink: {message}"
-    );
-    assert!(
-        message.contains("lineage citation, keep"),
-        "and the note it would record: {message}"
-    );
+    let entry = &payload_of(&done)["evolve_ack"];
+    assert_eq!(entry["rule"], json!("V101"), "{done}");
+    assert_eq!(entry["note"], json!("lineage citation, keep"), "{done}");
 
     let on_disk = std::fs::read_to_string(&path).unwrap();
     assert!(
-        !on_disk.contains("evolve_ack"),
-        "round one records nothing: {on_disk}"
+        on_disk.contains("evolve_ack") && on_disk.contains("V101"),
+        "and it is in the frontmatter: {on_disk}"
     );
 }
 
-/// Round one resolves before it asks: a call naming an engram nobody has fails
-/// in round one rather than putting a question about it to the user.
-///
-/// The seam this closes is a user confirming an acknowledgment against a
-/// mistyped identifier and only round two reporting that there was nothing
-/// there - a yes given to a question that was never answerable.
+/// A call naming an engram nobody has errors on the first call, naming what
+/// could not be found.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_eliciting_ack_round_one_resolves_before_asking() {
+async fn an_eliciting_ack_of_an_unknown_engram_errors_naming_it() {
     let h = Harness::new().await;
     let (mut wire, _path) = acked_engram(&h).await;
 
@@ -1658,17 +1520,17 @@ async fn an_eliciting_ack_round_one_resolves_before_asking() {
         .call(eliciting(
             2,
             "tools/call",
-            ack_call_on("no-such-engram", "V101 lineage citation, keep", None),
+            ack_call_on("no-such-engram", "V101 lineage citation, keep"),
         ))
         .await;
     assert_ne!(
         answered["result"]["resultType"],
         json!("input_required"),
-        "an unresolvable identifier is never put to a user: {answered}"
+        "nothing is asked: {answered}"
     );
     assert!(
         !answered["error"].is_null(),
-        "it errors in round one instead: {answered}"
+        "it errors instead: {answered}"
     );
     let message = answered["error"]["message"].as_str().unwrap_or_default();
     assert!(
@@ -1677,41 +1539,15 @@ async fn an_eliciting_ack_round_one_resolves_before_asking() {
     );
 }
 
-/// The same for a take-back, which resolves on the same path.
+/// The whole take-back on an eliciting peer: acknowledge, then remove, each on
+/// its first call, and the receipt names the rule it resurfaced.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_eliciting_unack_round_one_resolves_before_asking() {
-    let h = Harness::new().await;
-    let (mut wire, _path) = acked_engram(&h).await;
-
-    let answered = wire
-        .call(eliciting(
-            2,
-            "tools/call",
-            ack_call_on("no-such-engram", "remove V101", None),
-        ))
-        .await;
-    assert_ne!(
-        answered["result"]["resultType"],
-        json!("input_required"),
-        "an unresolvable identifier is never put to a user: {answered}"
-    );
-    assert!(
-        !answered["error"].is_null(),
-        "it errors in round one instead: {answered}"
-    );
-}
-
-/// The whole take-back: acknowledge, then confirm a removal, and the receipt
-/// names the rule it resurfaced.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_confirmed_unack_removes_and_reports_evolve_ack_removed() {
+async fn an_eliciting_unack_removes_in_round_one_and_reports_evolve_ack_removed() {
     let h = Harness::new().await;
     let (mut wire, path) = acked_engram(&h).await;
 
-    // Recorded by a peer that cannot be asked, so the removal is the only
-    // round in play.
     let recorded = wire
-        .call(modern(2, "tools/call", ack_call("V101 keep it", None)))
+        .call(eliciting(2, "tools/call", ack_call("V101 keep it")))
         .await;
     assert!(
         recorded["error"].is_null() && recorded["result"]["isError"] != json!(true),
@@ -1722,40 +1558,17 @@ async fn a_confirmed_unack_removes_and_reports_evolve_ack_removed() {
         "it is in the file"
     );
 
-    let asked = wire
-        .call(eliciting(3, "tools/call", ack_call("remove V101", None)))
-        .await;
-    assert_eq!(
-        asked["result"]["resultType"],
-        json!("input_required"),
-        "a take-back is asked about too: {asked}"
-    );
-    let message = asked["result"]["inputRequests"]["confirm"]["params"]["message"]
-        .as_str()
-        .unwrap_or_default();
-    assert!(
-        message.contains("Remove the V101 acknowledgment"),
-        "the question names what goes: {message}"
-    );
-    assert!(
-        message.contains("resurfaces"),
-        "and what comes back: {message}"
-    );
-    assert!(
-        std::fs::read_to_string(&path).unwrap().contains("V101"),
-        "round one removes nothing"
-    );
-
     let done = wire
-        .call(eliciting(
-            4,
-            "tools/call",
-            ack_call("remove V101", Some(answer("accept", true))),
-        ))
+        .call(eliciting(3, "tools/call", ack_call("remove V101")))
         .await;
     assert!(
         done["error"].is_null() && done["result"]["isError"] != json!(true),
-        "the confirmed round removes it: {done}"
+        "the take-back runs on the first call: {done}"
+    );
+    assert_ne!(
+        done["result"]["resultType"],
+        json!("input_required"),
+        "{done}"
     );
     assert_eq!(
         payload_of(&done)["evolve_ack_removed"],
@@ -1770,148 +1583,23 @@ async fn a_confirmed_unack_removes_and_reports_evolve_ack_removed() {
     );
 }
 
-/// Round two of a record with a yes: the entry lands, receipt and file alike.
-///
-/// The take-back has had its whole round trip pinned since it shipped; the
-/// record only ever had its question and its refusal, so the one path that
-/// actually writes on a confirmed round was covered by inference.
+/// **A removal of an acknowledgment that is no longer there fails loudly,
+/// naming the rule**, rather than succeeding quietly on an engram that does
+/// not carry the entry.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_confirmed_ack_record_lands_on_round_two() {
+async fn a_removal_of_an_ack_that_is_gone_errors_naming_the_rule() {
     let h = Harness::new().await;
     let (mut wire, path) = acked_engram(&h).await;
 
-    let asked = wire
-        .call(eliciting(
-            2,
-            "tools/call",
-            ack_call("V101 lineage citation, keep", None),
-        ))
-        .await;
-    assert_eq!(asked["result"]["resultType"], json!("input_required"));
-    assert!(
-        !std::fs::read_to_string(&path)
-            .unwrap()
-            .contains("evolve_ack"),
-        "round one records nothing"
-    );
-
-    let done = wire
-        .call(eliciting(
-            3,
-            "tools/call",
-            ack_call("V101 lineage citation, keep", Some(answer("accept", true))),
-        ))
-        .await;
-    assert!(
-        done["error"].is_null() && done["result"]["isError"] != json!(true),
-        "the confirmed round records: {done}"
-    );
-    assert_eq!(
-        done["result"]["resultType"],
-        json!("complete"),
-        "and it is an ordinary complete result: {done}"
-    );
-    let entry = &payload_of(&done)["evolve_ack"];
-    assert_eq!(entry["rule"], json!("V101"), "{done}");
-    assert_eq!(entry["note"], json!("lineage citation, keep"), "{done}");
-
-    let on_disk = std::fs::read_to_string(&path).unwrap();
-    assert!(
-        on_disk.contains("evolve_ack") && on_disk.contains("V101"),
-        "and it is in the frontmatter: {on_disk}"
-    );
-}
-
-/// Round two of a record with a no: nothing is written, byte for byte, and the
-/// refusal says which half of the verb did not happen.
-///
-/// The two refusals are worded apart on purpose - a declined record leaves
-/// nothing behind, a declined removal leaves the entry standing - so this
-/// asserts the record's wording rather than merely that something was refused.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_declined_ack_record_changes_nothing() {
-    let h = Harness::new().await;
-    let (mut wire, path) = acked_engram(&h).await;
-    let before = std::fs::read(&path).unwrap();
-
-    let asked = wire
-        .call(eliciting(
-            2,
-            "tools/call",
-            ack_call("V101 lineage citation, keep", None),
-        ))
-        .await;
-    assert_eq!(asked["result"]["resultType"], json!("input_required"));
-
-    let refused = wire
-        .call(eliciting(
-            3,
-            "tools/call",
-            ack_call(
-                "V101 lineage citation, keep",
-                Some(answer("decline", false)),
-            ),
-        ))
-        .await;
-    assert_eq!(
-        refused["result"]["isError"],
-        json!(true),
-        "a decline is a refusal the model can read: {refused}"
-    );
-    let text = refused["result"]["content"][0]["text"]
-        .as_str()
-        .unwrap_or_default();
-    assert!(
-        text.contains("nothing was recorded"),
-        "and it says what did not happen, in the record's own words: {text}"
-    );
-    assert_eq!(
-        std::fs::read(&path).unwrap(),
-        before,
-        "the engram is untouched byte for byte: {}",
-        path.display()
-    );
-}
-
-/// **A yes to a removal whose acknowledgment vanished between the rounds fails
-/// loudly, naming the rule.**
-///
-/// The confirmation round is not a transaction: round one resolves the engram
-/// and asks, round two acts on whatever the file holds by then. Something else -
-/// another agent, a Fluid tab, a CLI run - can take the acknowledgment away
-/// while the user is being asked, and the honest outcome is the engine's own
-/// "nothing to remove", carrying the rule id so the model can tell which
-/// acknowledgment it was. What must not happen is the round silently succeeding
-/// on an engram that no longer carries the entry.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_confirmed_removal_of_a_vanished_ack_errors_naming_the_rule() {
-    let h = Harness::new().await;
-    let (mut wire, path) = acked_engram(&h).await;
-
-    // Recorded by a peer that cannot be asked, so only the removal has rounds.
     let recorded = wire
-        .call(modern(2, "tools/call", ack_call("V101 keep it", None)))
+        .call(eliciting(2, "tools/call", ack_call("V101 keep it")))
         .await;
     assert!(
         recorded["error"].is_null() && recorded["result"]["isError"] != json!(true),
         "the acknowledgment lands: {recorded}"
     );
-
-    let asked = wire
-        .call(eliciting(3, "tools/call", ack_call("remove V101", None)))
-        .await;
-    assert_eq!(
-        asked["result"]["resultType"],
-        json!("input_required"),
-        "round one resolves the engram and asks: {asked}"
-    );
-
-    // Out of band, while the user is being asked: the acknowledgment goes. A
-    // modern non-eliciting take-back is the shortest stand-in for the other
-    // agent or Fluid tab that would do it, and it rewrites the file the way any
-    // real removal does rather than leaving a half-edited one behind.
     let removed = wire
-        .call(modern(4, "tools/call", ack_call("remove V101", None)))
+        .call(eliciting(3, "tools/call", ack_call("remove V101")))
         .await;
     assert_eq!(
         payload_of(&removed)["evolve_ack_removed"],
@@ -1921,69 +1609,24 @@ async fn a_confirmed_removal_of_a_vanished_ack_errors_naming_the_rule() {
     let before = std::fs::read(&path).unwrap();
 
     let answered = wire
-        .call(eliciting(
-            5,
-            "tools/call",
-            ack_call("remove V101", Some(answer("accept", true))),
-        ))
+        .call(eliciting(4, "tools/call", ack_call("remove V101")))
         .await;
-    assert_ne!(
-        answered["result"]["resultType"],
-        json!("input_required"),
-        "the answered round does not ask again: {answered}"
-    );
     assert!(
         !answered["error"].is_null(),
         "a removal with nothing to remove is an error, not a quiet success: {answered}"
     );
     let message = answered["error"]["message"].as_str().unwrap_or_default();
-    assert!(
-        message.contains("V101"),
-        "and it names the rule the user said yes about: {message}"
-    );
+    assert!(message.contains("V101"), "and it names the rule: {message}");
     assert_eq!(
         std::fs::read(&path).unwrap(),
         before,
-        "the file is untouched by the failed round: {}",
+        "the file is untouched by the failed call: {}",
         path.display()
     );
 }
 
-/// A declined take-back leaves the acknowledgment exactly where it was.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_declined_unack_keeps_the_acknowledgment() {
-    let h = Harness::new().await;
-    let (mut wire, path) = acked_engram(&h).await;
-
-    wire.call(modern(2, "tools/call", ack_call("V101 keep it", None)))
-        .await;
-    let refused = wire
-        .call(eliciting(
-            3,
-            "tools/call",
-            ack_call("remove V101", Some(answer("decline", false))),
-        ))
-        .await;
-    assert_eq!(
-        refused["result"]["isError"],
-        json!(true),
-        "a decline is a refusal the model can read: {refused}"
-    );
-    let text = refused["result"]["content"][0]["text"]
-        .as_str()
-        .unwrap_or_default();
-    assert!(
-        text.contains("still there"),
-        "and it says what did not happen: {text}"
-    );
-    assert!(
-        std::fs::read_to_string(&path).unwrap().contains("V101"),
-        "the acknowledgment survives"
-    );
-}
-
-/// Every other `edit_engram` operation is untouched: an eliciting peer editing
-/// a different frontmatter key is served on the first call, with no round.
+/// Every other `edit_engram` operation runs on the first call too: an
+/// eliciting peer editing a different frontmatter key is never asked.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_eliciting_peer_edits_every_other_key_immediately() {
     let h = Harness::new().await;
@@ -2008,7 +1651,7 @@ async fn an_eliciting_peer_edits_every_other_key_immediately() {
     assert_ne!(
         done["result"]["resultType"],
         json!("input_required"),
-        "only the acknowledgment key asks: {done}"
+        "no edit asks: {done}"
     );
     assert!(
         std::fs::read_to_string(&path)
@@ -2061,7 +1704,7 @@ async fn a_legacy_peer_acks_immediately() {
         .call(request(
             3,
             "tools/call",
-            ack_call("V101 lineage citation, keep", None),
+            ack_call("V101 lineage citation, keep"),
         ))
         .await;
     assert!(
@@ -2081,7 +1724,7 @@ async fn a_legacy_peer_acks_immediately() {
 
     // And the take-back is open to it too, prose-guided rather than asked.
     let removed = wire
-        .call(request(4, "tools/call", ack_call("remove V101", None)))
+        .call(request(4, "tools/call", ack_call("remove V101")))
         .await;
     assert_eq!(
         payload_of(&removed)["evolve_ack_removed"],
@@ -2096,14 +1739,10 @@ async fn a_legacy_peer_acks_immediately() {
     );
 }
 
-// --- a permalink collision, resolved rather than reported -------------------
+// --- a permalink collision, reported ------------------------------------------
 //
-// `write_engram` is the third tool that answers a round, and the first whose
-// question is not a yes-or-no: the engine's collision error names a real
-// choice, so an eliciting peer is offered it as a single-select rather than
-// handed the error and left to reconstruct `overwrite=true` from prose. The
-// gate is the same two-sided one the delete round proves, plus a third
-// condition of its own - the call did not already ask for an overwrite.
+// A collision is the engine's error for every peer, eliciting or not: it names
+// the argument that would replace the engram, and the agent decides.
 
 /// The body the first write lands, and the body every collision tries to land
 /// over it. Different bytes, so "did the overwrite happen" is readable off
@@ -2112,8 +1751,8 @@ const FIRST_BODY: &str = "The first body.";
 const SECOND_BODY: &str = "The second body.";
 
 /// One `write_engram` call landing `content` under the title `Taken`, with an
-/// optional explicit overwrite and an optional answer to the round.
-fn write_taken(content: &str, overwrite: bool, responses: Option<Value>) -> Value {
+/// optional explicit overwrite.
+fn write_taken(content: &str, overwrite: bool) -> Value {
     let mut arguments = json!({
         "domain": "eng",
         "title": "Taken",
@@ -2122,16 +1761,7 @@ fn write_taken(content: &str, overwrite: bool, responses: Option<Value>) -> Valu
     if overwrite {
         arguments["overwrite"] = json!(true);
     }
-    let mut params = json!({ "name": "write_engram", "arguments": arguments });
-    if let Some(responses) = responses {
-        params["inputResponses"] = responses;
-    }
-    params
-}
-
-/// The client's answer to the `resolution` question, as an `ElicitResult`.
-fn resolution(action: &str, choice: &str) -> Value {
-    json!({ "resolution": { "action": action, "content": { "resolution": choice } } })
+    json!({ "name": "write_engram", "arguments": arguments })
 }
 
 /// Open a modern connection by writing the engram every collision below lands
@@ -2142,11 +1772,7 @@ fn resolution(action: &str, choice: &str) -> Value {
 async fn taken_engram(h: &Harness) -> (Wire, std::path::PathBuf) {
     let mut wire = h.stdio().await;
     let written = wire
-        .open(modern(
-            1,
-            "tools/call",
-            write_taken(FIRST_BODY, false, None),
-        ))
+        .open(modern(1, "tools/call", write_taken(FIRST_BODY, false)))
         .await;
     assert!(
         written["error"].is_null() && written["result"]["isError"] != json!(true),
@@ -2157,274 +1783,45 @@ async fn taken_engram(h: &Harness) -> (Wire, std::path::PathBuf) {
     (wire, path)
 }
 
-/// Round one: the collision comes back as a choice, and nothing is written.
+/// An eliciting peer gets the same bare collision error every other peer
+/// gets: no choice is offered, the error names the argument that would
+/// replace the engram, and nothing is written.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_collision_on_an_eliciting_peer_offers_overwrite_or_cancel() {
+async fn a_collision_on_an_eliciting_peer_gets_the_bare_error() {
     let h = Harness::new().await;
     let (mut wire, path) = taken_engram(&h).await;
     let before = std::fs::read(&path).unwrap();
 
-    let asked = wire
-        .call(eliciting(
-            2,
-            "tools/call",
-            write_taken(SECOND_BODY, false, None),
-        ))
-        .await;
-    let result = &asked["result"];
-    assert_eq!(
-        result["resultType"],
-        json!("input_required"),
-        "the call answers with a round rather than the bare error: {asked}"
-    );
-
-    let question = &result["inputRequests"]["resolution"];
-    assert_eq!(
-        question["method"],
-        json!("elicitation/create"),
-        "the round is an elicitation keyed `resolution`: {asked}"
-    );
-    let schema = &question["params"]["requestedSchema"];
-    assert_eq!(
-        schema["required"],
-        json!(["resolution"]),
-        "and the one property is required: {asked}"
-    );
-    let property = &schema["properties"]["resolution"];
-    assert_eq!(property["type"], json!("string"), "a string enum: {asked}");
-    let options: Vec<&str> = property["oneOf"]
-        .as_array()
-        .expect("a titled single-select carries oneOf")
-        .iter()
-        .map(|option| option["const"].as_str().unwrap_or_default())
-        .collect();
-    assert_eq!(
-        options,
-        vec!["overwrite", "cancel"],
-        "exactly the two choices, in that order: {asked}"
-    );
-    for option in property["oneOf"].as_array().unwrap() {
-        let title = option["title"].as_str().unwrap_or_default();
-        assert!(
-            !title.is_empty(),
-            "each option is titled for a human to read: {asked}"
-        );
-    }
-
-    let message = question["params"]["message"].as_str().unwrap_or_default();
-    assert!(
-        message.contains("'Taken'"),
-        "the question names the title that would land: {message}"
-    );
-    assert!(
-        message.contains("'taken'"),
-        "and the permalink it would land at: {message}"
-    );
-    assert!(
-        message.contains("'eng'"),
-        "and the domain it collides in: {message}"
-    );
-    assert!(
-        message.contains("Overwrite it, or cancel?"),
-        "and puts the choice plainly: {message}"
-    );
-
-    assert_eq!(
-        std::fs::read(&path).unwrap(),
-        before,
-        "round one writes nothing: {}",
-        path.display()
-    );
-}
-
-/// Round two with `overwrite`: the same call replaces the existing engram.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn choosing_overwrite_replaces_the_engram() {
-    let h = Harness::new().await;
-    let (mut wire, path) = taken_engram(&h).await;
-
-    let asked = wire
-        .call(eliciting(
-            2,
-            "tools/call",
-            write_taken(SECOND_BODY, false, None),
-        ))
-        .await;
-    assert_eq!(asked["result"]["resultType"], json!("input_required"));
-
-    let done = wire
-        .call(eliciting(
-            3,
-            "tools/call",
-            write_taken(SECOND_BODY, false, Some(resolution("accept", "overwrite"))),
-        ))
-        .await;
-    assert!(
-        done["error"].is_null() && done["result"]["isError"] != json!(true),
-        "the resolved round writes: {done}"
-    );
-    assert_eq!(
-        done["result"]["resultType"],
-        json!("complete"),
-        "and it is an ordinary complete result: {done}"
-    );
-
-    let on_disk = std::fs::read_to_string(&path).unwrap();
-    assert!(
-        on_disk.contains(SECOND_BODY) && !on_disk.contains(FIRST_BODY),
-        "the new body replaced the old one: {on_disk}"
-    );
-}
-
-/// Round two with `cancel`: the call refuses and the engram is untouched, byte
-/// for byte. A decline - the other way a client says no - is the same answer.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn choosing_cancel_leaves_the_engram() {
-    let h = Harness::new().await;
-    let (mut wire, path) = taken_engram(&h).await;
-    let before = std::fs::read(&path).unwrap();
-
-    let asked = wire
-        .call(eliciting(
-            2,
-            "tools/call",
-            write_taken(SECOND_BODY, false, None),
-        ))
-        .await;
-    assert_eq!(asked["result"]["resultType"], json!("input_required"));
-
     let refused = wire
-        .call(eliciting(
-            3,
-            "tools/call",
-            write_taken(SECOND_BODY, false, Some(resolution("accept", "cancel"))),
-        ))
+        .call(eliciting(2, "tools/call", write_taken(SECOND_BODY, false)))
         .await;
-    assert_eq!(
-        refused["result"]["isError"],
-        json!(true),
-        "a cancel is a refusal the model can read: {refused}"
-    );
-    let text = refused["result"]["content"][0]["text"]
-        .as_str()
-        .unwrap_or_default();
     assert!(
-        text.contains("the existing engram was left in place; nothing was written"),
-        "and it says what did not happen: {text}"
+        refused["result"].is_null(),
+        "no round and no result, the error: {refused}"
+    );
+    let message = refused["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("already exists in domain")
+            && message.contains("pass overwrite=true to replace"),
+        "the collision is reported with its hint: {refused}"
     );
     assert_eq!(
         std::fs::read(&path).unwrap(),
         before,
-        "the engram survives a cancel byte for byte: {}",
-        path.display()
-    );
-
-    // A declined question never carries a choice at all, and must read as a no
-    // rather than as a missing answer that reopens round one.
-    let declined = wire
-        .call(eliciting(
-            4,
-            "tools/call",
-            write_taken(SECOND_BODY, false, Some(resolution("decline", ""))),
-        ))
-        .await;
-    assert_eq!(
-        declined["result"]["isError"],
-        json!(true),
-        "a decline refuses too: {declined}"
-    );
-    assert_eq!(
-        std::fs::read(&path).unwrap(),
-        before,
-        "and writes nothing either"
-    );
-}
-
-/// **A cancel is a cancel even when the thing it was about is gone.**
-///
-/// The collision is discovered by attempting the write, so the shape that
-/// suggests itself reads the answer off the engine's failure - and that shape
-/// has a hole exactly here. Between the two rounds something else removes the
-/// engram in the way; the round-two call no longer collides, so there is no
-/// error to read the "cancel" off, and the write the user refused lands as an
-/// ordinary success. Nothing about the wire says this went wrong, which is why
-/// it is pinned rather than reasoned about: the handler reads the refusal
-/// before it calls the engine, and this is the test that fails if it stops.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_cancel_still_refuses_when_the_collision_vanished_between_rounds() {
-    let h = Harness::new().await;
-    let (mut wire, path) = taken_engram(&h).await;
-
-    let asked = wire
-        .call(eliciting(
-            2,
-            "tools/call",
-            write_taken(SECOND_BODY, false, None),
-        ))
-        .await;
-    assert_eq!(asked["result"]["resultType"], json!("input_required"));
-
-    // Out of band, while the user is being asked: something else takes the
-    // engram away. A modern non-eliciting delete is the shortest stand-in for
-    // the other agent, Fluid tab or CLI invocation that would do it, and it
-    // clears the index row as well as the file - a bare unlink would leave the
-    // row behind and the collision would simply persist, which would make this
-    // test pass without ever reaching the case it is about.
-    let deleted = wire
-        .call(modern(
-            3,
-            "tools/call",
-            json!({
-                "name": "delete_engram",
-                "arguments": { "domain": "eng", "identifier": "taken" },
-            }),
-        ))
-        .await;
-    assert!(
-        deleted["error"].is_null() && deleted["result"]["isError"] != json!(true),
-        "the engram in the way is removed: {deleted}"
-    );
-    assert!(!path.exists(), "the collision is genuinely gone");
-
-    let refused = wire
-        .call(eliciting(
-            4,
-            "tools/call",
-            write_taken(SECOND_BODY, false, Some(resolution("accept", "cancel"))),
-        ))
-        .await;
-    assert_eq!(
-        refused["result"]["isError"],
-        json!(true),
-        "the cancel still refuses, collision or no collision: {refused}"
-    );
-    let text = refused["result"]["content"][0]["text"]
-        .as_str()
-        .unwrap_or_default();
-    assert!(
-        text.contains("the existing engram was left in place; nothing was written"),
-        "with the same refusal: {text}"
-    );
-    assert!(
-        !path.exists(),
-        "and the write the user cancelled did not happen after all: {}",
+        "nothing is written: {}",
         path.display()
     );
 }
 
-/// An eliciting peer that already asked for an overwrite is not asked again:
-/// the caller answered the question before it was put.
+/// An eliciting peer that passes `overwrite` replaces the engram on the first
+/// call, which is the one way a collision is settled.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_explicit_overwrite_never_elicits() {
     let h = Harness::new().await;
     let (mut wire, path) = taken_engram(&h).await;
 
     let done = wire
-        .call(eliciting(
-            2,
-            "tools/call",
-            write_taken(SECOND_BODY, true, None),
-        ))
+        .call(eliciting(2, "tools/call", write_taken(SECOND_BODY, true)))
         .await;
     assert!(
         done["error"].is_null() && done["result"]["isError"] != json!(true),
@@ -2452,11 +1849,7 @@ async fn a_modern_peer_without_elicitation_gets_the_bare_collision_error() {
     let before = std::fs::read(&path).unwrap();
 
     let refused = wire
-        .call(modern(
-            2,
-            "tools/call",
-            write_taken(SECOND_BODY, false, None),
-        ))
+        .call(modern(2, "tools/call", write_taken(SECOND_BODY, false)))
         .await;
     let message = refused["error"]["message"].as_str().unwrap_or_default();
     assert!(
@@ -2492,11 +1885,7 @@ async fn a_legacy_collision_still_errors_with_the_overwrite_hint() {
     assert_eq!(handshake["result"]["protocolVersion"], json!(LEGACY));
 
     let written = wire
-        .call(request(
-            2,
-            "tools/call",
-            write_taken(FIRST_BODY, false, None),
-        ))
+        .call(request(2, "tools/call", write_taken(FIRST_BODY, false)))
         .await;
     assert!(
         written["error"].is_null() && written["result"]["isError"] != json!(true),
@@ -2506,11 +1895,7 @@ async fn a_legacy_collision_still_errors_with_the_overwrite_hint() {
     let before = std::fs::read(&path).unwrap();
 
     let refused = wire
-        .call(request(
-            3,
-            "tools/call",
-            write_taken(SECOND_BODY, false, None),
-        ))
+        .call(request(3, "tools/call", write_taken(SECOND_BODY, false)))
         .await;
     let message = refused["error"]["message"].as_str().unwrap_or_default();
     assert!(
@@ -2529,16 +1914,12 @@ async fn a_legacy_collision_still_errors_with_the_overwrite_hint() {
     );
 }
 
-// --- the share confirmation round (SEP-2322 MRTR) ---------------------------
+// --- a share never asks ------------------------------------------------------
 //
-// `share_changes` publishes to a place the user cannot take it back from
-// unilaterally - a repository their team reviews - so the eliciting peer is
-// asked what would be published before anything is. The gate is the same
-// two-sided one `delete_engram` carries, and the same contrast legs prove
-// both halves: a modern peer that declared no elicitation capability, and a
-// legacy peer, are served exactly one round.
+// The agent's call to `share_changes` is the go-ahead, so every peer shares on
+// the first call: one that can elicit, one that cannot and a legacy one.
 
-/// A share call's params, optionally carrying a round 2 answer.
+/// A share call's params, optionally carrying an answer nobody asked for.
 fn share_kb(responses: Option<Value>) -> Value {
     let mut params = json!({
         "name": "share_changes",
@@ -2567,27 +1948,14 @@ fn edit_kb(h: &Harness) {
     write_kb_engram(h, "notes/a.md", "Alpha", "notes/a", "alpha, refined");
 }
 
-/// Edit one engram and put the domain's first proposal on the mock forge
-/// through the real two-round flow, on a fresh eliciting connection. Returns
-/// the open wire (ids 1 and 2 are spent), the proposal's number and its
-/// branch, which is what a test needs to amend the branch behind the agent's
-/// back.
+/// Edit one engram and put the domain's first proposal on the mock forge with
+/// one eliciting call on a fresh connection. Returns the open wire (id 1 is
+/// spent), the proposal's number and its branch, which is what a test needs
+/// to amend the branch behind the agent's back.
 async fn first_shared_proposal(h: &Harness) -> (Wire, u64, String) {
     edit_kb(h);
     let mut wire = h.stdio().await;
-    let asked = wire.open(eliciting(1, "tools/call", share_kb(None))).await;
-    assert_eq!(
-        asked["result"]["resultType"],
-        json!("input_required"),
-        "{asked}"
-    );
-    let done = wire
-        .call(eliciting(
-            2,
-            "tools/call",
-            share_kb(Some(answer("accept", true))),
-        ))
-        .await;
+    let done = wire.open(eliciting(1, "tools/call", share_kb(None))).await;
     assert!(
         done["error"].is_null() && done["result"]["isError"] != json!(true),
         "{done}"
@@ -2602,170 +1970,56 @@ async fn first_shared_proposal(h: &Harness) -> (Wire, u64, String) {
     )
 }
 
-/// Round one: the question names the action and the files, and the forge sees
-/// no proposal at all.
-///
-/// The negative half is the point, as it is for the delete round: an
-/// `input_required` answered after the proposal was already opened would be a
-/// confirmation of something the team can already see.
+/// An eliciting peer shares on the first call: the agent's call is the
+/// go-ahead, so no question comes back and the proposal is open on the forge
+/// by the time the call answers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_eliciting_share_is_asked_before_anything_is_shared() {
+async fn an_eliciting_share_shares_in_round_one() {
     let (h, mock) = Harness::team().await;
     edit_kb(&h);
     let mut wire = h.stdio().await;
 
-    let asked = wire.open(eliciting(1, "tools/call", share_kb(None))).await;
-    let result = &asked["result"];
-    assert_eq!(result["resultType"], json!("input_required"), "{asked}");
-    let message = result["inputRequests"]["confirm"]["params"]["message"]
-        .as_str()
-        .unwrap_or_default();
-    assert!(message.contains("Open a new proposal"), "{message}");
-    assert!(message.contains("notes/a.md"), "names the file: {message}");
-    // Every `create_` prefix, not just `create_proposal:`: a round that
-    // uploaded blobs, built a tree or cut a branch and then asked would have
-    // published most of the share already.
+    let done = wire.open(eliciting(1, "tools/call", share_kb(None))).await;
     assert!(
-        !mock.calls().iter().any(|c| c.starts_with("create_")),
-        "round one shares nothing: {:?}",
+        done["error"].is_null() && done["result"]["isError"] != json!(true),
+        "{done}"
+    );
+    assert_eq!(
+        done["result"]["resultType"],
+        json!("complete"),
+        "an ordinary complete result, not a question: {done}"
+    );
+    let body: Value =
+        serde_json::from_str(done["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(body["outcome"], "proposed", "{body}");
+    assert!(
+        mock.calls()
+            .iter()
+            .any(|c| c.starts_with("create_proposal:")),
+        "the proposal is open on the forge: {:?}",
         mock.calls()
     );
 }
 
-/// A share carrying a file selection is asked about the selection, never
-/// about the whole delta.
-///
-/// The question is the user's one chance to see what leaves this machine, so
-/// naming files the call would not carry would be worse than naming none: a
-/// yes would then have been given to a share that was never planned. The
-/// preview behind the question runs the same filter the share runs, which is
-/// what makes the two the same share.
+/// On a stacking forge a second eliciting share opens its layer on the first
+/// call, against the branch below it and grouped into a stack: a second pull
+/// request, based on the layer below it rather than on the trunk, and a
+/// `create_stack` linking the two.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_eliciting_share_asks_about_the_selection_rather_than_the_whole_delta() {
-    let (h, _mock) = Harness::team().await;
-    edit_kb(&h);
-    write_kb_engram(&h, "notes/b.md", "Beta", "notes/b", "beta");
-    let mut wire = h.stdio().await;
-
-    let asked = wire
-        .open(eliciting(
-            1,
-            "tools/call",
-            json!({
-                "name": "share_changes",
-                "arguments": { "domain": "kb", "files": ["notes/b.md"] },
-            }),
-        ))
-        .await;
-    let message = asked["result"]["inputRequests"]["confirm"]["params"]["message"]
-        .as_str()
-        .unwrap_or_default();
-    assert!(
-        message.contains("notes/b.md"),
-        "the chosen file is named: {message}"
-    );
-    assert!(
-        !message.contains("notes/a.md"),
-        "and the one left behind is not: {message}"
-    );
-}
-
-/// Round two with a yes shares, and the next round one names the update.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_confirmed_share_round_two_shares_and_an_update_names_the_proposal() {
-    let (h, _mock) = Harness::team().await;
-    let (mut wire, number, _branch) = first_shared_proposal(&h).await;
-
-    // A second edited share's round 1 names the update rather than a create.
-    write_kb_engram(&h, "notes/b.md", "Beta", "notes/b", "beta");
-    let asked = wire.call(eliciting(3, "tools/call", share_kb(None))).await;
-    let message = asked["result"]["inputRequests"]["confirm"]["params"]["message"]
-        .as_str()
-        .unwrap_or_default();
-    assert!(
-        message.contains(&format!("Update open proposal #{number}")),
-        "{message}"
-    );
-}
-
-/// The same round one on a forge that stacks: the question names the layer
-/// the new proposal would land on, and the forge is still untouched.
-///
-/// This is the stacked model's own version of the assertion above, and it is
-/// worth its own test because the two differ in what the user is agreeing to.
-/// An update moves a proposal reviewers are already looking at; a stack opens
-/// a second one on top of it. A gate that let the stacked plan through
-/// unasked would publish a pull request the user never saw a word about,
-/// which is precisely what `share_plan_needs_confirmation` fails safe on.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_eliciting_share_on_a_stacking_forge_is_asked_before_the_layer_is_opened() {
-    let (h, mock) = Harness::team().await;
-    // On before the first share, so the capability answer this domain caches
-    // is the stacked one from the start.
-    mock.enable_stacks();
-    let (mut wire, number, _branch) = first_shared_proposal(&h).await;
-
-    // Everything the forge was told while the first proposal was legitimately
-    // opened, so the silence asserted below is about this round alone.
-    let before = mock.calls().len();
-
-    write_kb_engram(&h, "notes/b.md", "Beta", "notes/b", "beta");
-    let asked = wire.call(eliciting(3, "tools/call", share_kb(None))).await;
-    assert_eq!(
-        asked["result"]["resultType"],
-        json!("input_required"),
-        "a stacked share is confirmed too, not waved through: {asked}"
-    );
-    let message = asked["result"]["inputRequests"]["confirm"]["params"]["message"]
-        .as_str()
-        .unwrap_or_default();
-    assert!(
-        message.contains(&format!("Stack a new proposal on top of #{number}")),
-        "the question names the layer it lands on: {message}"
-    );
-    assert!(
-        message.contains("notes/b.md"),
-        "and the file it carries: {message}"
-    );
-
-    assert!(
-        !mock.calls()[before..]
-            .iter()
-            .any(|c| c.starts_with("create_")),
-        "round one opens no layer: {:?}",
-        &mock.calls()[before..]
-    );
-}
-
-/// And the yes that follows: round two on a stacking forge publishes the
-/// layer, opened against the branch below it and grouped into a stack.
-///
-/// The round-one test above proves the question is asked; this proves what
-/// the answer buys, over the wire rather than in the remote crate's own
-/// harness - a second pull request, based on the layer below it rather than
-/// on the trunk, and a `create_stack` linking the two.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_confirmed_stacked_share_opens_the_layer_on_the_one_below_it() {
+async fn an_eliciting_stacked_share_opens_the_layer_on_the_one_below_it() {
     let (h, mock) = Harness::team().await;
     mock.enable_stacks();
     let (mut wire, first, first_branch) = first_shared_proposal(&h).await;
 
     write_kb_engram(&h, "notes/b.md", "Beta", "notes/b", "beta");
-    let asked = wire.call(eliciting(3, "tools/call", share_kb(None))).await;
-    assert_eq!(
-        asked["result"]["resultType"],
-        json!("input_required"),
-        "{asked}"
-    );
-    let done = wire
-        .call(eliciting(
-            4,
-            "tools/call",
-            share_kb(Some(answer("accept", true))),
-        ))
-        .await;
+    let done = wire.call(eliciting(2, "tools/call", share_kb(None))).await;
     assert!(
         done["error"].is_null() && done["result"]["isError"] != json!(true),
+        "{done}"
+    );
+    assert_ne!(
+        done["result"]["resultType"],
+        json!("input_required"),
         "{done}"
     );
     let body: Value =
@@ -2808,33 +2062,16 @@ async fn a_confirmed_stacked_share_opens_the_layer_on_the_one_below_it() {
     assert_eq!(members, vec![first, second]);
 }
 
-/// Round two with a yes on an *update* lands on the open proposal rather than
-/// opening a second one.
-///
-/// The confirmed create is proved above; this is the other half, and it is
-/// the half the description promises hardest ("same proposal number, same
-/// URL, it never opens a duplicate"), so the number is asserted rather than
-/// just the outcome word.
+/// A second eliciting share on a forge that does not stack lands on the open
+/// proposal in one call rather than opening a second one: same number, never
+/// a duplicate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_confirmed_update_round_two_lands_on_the_same_proposal() {
+async fn a_second_eliciting_share_updates_the_same_proposal() {
     let (h, mock) = Harness::team().await;
     let (mut wire, number, _branch) = first_shared_proposal(&h).await;
 
     write_kb_engram(&h, "notes/b.md", "Beta", "notes/b", "beta");
-    let asked = wire.call(eliciting(3, "tools/call", share_kb(None))).await;
-    assert_eq!(
-        asked["result"]["resultType"],
-        json!("input_required"),
-        "an update is confirmed too, not waved through: {asked}"
-    );
-
-    let done = wire
-        .call(eliciting(
-            4,
-            "tools/call",
-            share_kb(Some(answer("accept", true))),
-        ))
-        .await;
+    let done = wire.call(eliciting(2, "tools/call", share_kb(None))).await;
     assert!(
         done["error"].is_null() && done["result"]["isError"] != json!(true),
         "{done}"
@@ -2856,12 +2093,9 @@ async fn a_confirmed_update_round_two_lands_on_the_same_proposal() {
     );
 }
 
-/// A diverged proposal is reported in round one rather than asked about.
-///
-/// There is nothing to confirm: the share cannot proceed at all until the
-/// user settles the review on GitHub or withdraws, so putting a yes/no
-/// question in front of them would offer a choice neither answer to changes
-/// anything. The guidance that names both ways out has to survive the round.
+/// A diverged proposal is reported on the first call: the share cannot
+/// proceed at all until the user settles the review on GitHub or withdraws,
+/// and the guidance that names both ways out reaches the caller.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_diverged_proposal_answers_round_one_with_guidance() {
     let (h, mock) = Harness::team().await;
@@ -2909,86 +2143,34 @@ async fn a_diverged_proposal_answers_round_one_with_guidance() {
     );
 }
 
-/// Round two with a no refuses, and the forge is never written to.
+/// An answer an eliciting peer sends along unasked is not read: a stale
+/// decline beside the call does not stop the share.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_declined_share_refuses_with_no_provider_writes() {
+async fn a_stale_decline_beside_an_eliciting_share_is_not_read() {
     let (h, mock) = Harness::team().await;
     edit_kb(&h);
     let mut wire = h.stdio().await;
-    let _ = wire.open(eliciting(1, "tools/call", share_kb(None))).await;
 
-    let refused = wire
-        .call(eliciting(
-            2,
+    let done = wire
+        .open(eliciting(
+            1,
             "tools/call",
             share_kb(Some(answer("decline", false))),
         ))
         .await;
-    assert_eq!(refused["result"]["isError"], json!(true), "{refused}");
     assert!(
-        refused["result"]["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("nothing was shared"),
-        "and it says what did not happen, exactly as the delete refusal does: {refused}"
+        done["error"].is_null() && done["result"]["isError"] != json!(true),
+        "the decline nobody asked for changes nothing: {done}"
     );
+    let body: Value =
+        serde_json::from_str(done["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(body["outcome"], "proposed", "{body}");
     assert!(
-        !mock.calls().iter().any(|c| c.starts_with("create_")),
-        "a decline uploads no blob, builds no tree, cuts no branch and opens \
-         no proposal: {:?}",
         mock.calls()
-    );
-}
-
-/// The same no on the *update* path, which the create-path test above cannot
-/// speak for: a declined update has an open proposal standing behind it, so
-/// "nothing happened" has to mean the forge was not written to AND the record
-/// still describes the proposal the reviewer is looking at.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_declined_update_leaves_the_open_proposal_exactly_as_it_was() {
-    let (h, mock) = Harness::team().await;
-    let (mut wire, number, _branch) = first_shared_proposal(&h).await;
-    let state_path = h.root.join("origins").join("kb").join("state.json");
-
-    write_kb_engram(&h, "notes/b.md", "Beta", "notes/b", "beta");
-    let asked = wire.call(eliciting(3, "tools/call", share_kb(None))).await;
-    assert_eq!(
-        asked["result"]["resultType"],
-        json!("input_required"),
-        "round one asks about the update: {asked}"
-    );
-    // Snapshotted after round one, so the subject is what the DECLINE changed:
-    // round one previews, and a preview legitimately pulls and saves.
-    let before = std::fs::read_to_string(&state_path).unwrap();
-    let calls_before = mock.calls().len();
-
-    let refused = wire
-        .call(eliciting(
-            4,
-            "tools/call",
-            share_kb(Some(answer("decline", false))),
-        ))
-        .await;
-    assert_eq!(refused["result"]["isError"], json!(true), "{refused}");
-    assert!(
-        refused["result"]["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("nothing was shared"),
-        "{refused}"
-    );
-
-    let during = &mock.calls()[calls_before..];
-    assert!(
-        !during
             .iter()
-            .any(|c| c.starts_with("create_") || c.starts_with("update_")),
-        "a declined update pushes no commit and patches no proposal: {during:?}"
-    );
-    assert_eq!(
-        std::fs::read_to_string(&state_path).unwrap(),
-        before,
-        "and proposal #{number}'s record is byte for byte what it was"
+            .any(|c| c.starts_with("create_proposal:")),
+        "{:?}",
+        mock.calls()
     );
 }
 
@@ -3060,89 +2242,48 @@ async fn nothing_to_share_answers_round_one_without_a_question() {
     assert_eq!(body["outcome"], "nothing_to_share", "{body}");
 }
 
-/// The same round over streamable HTTP, which reaches the modern dispatch by
-/// a different route than stdio does.
+/// The same over streamable HTTP, which reaches the modern dispatch by a
+/// different route than stdio does: one call, shared.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_share_round_runs_over_http_too() {
+async fn an_eliciting_share_over_http_shares_in_one_call() {
     let (h, _mock) = Harness::team().await;
     edit_kb(&h);
     let addr = h.http().await;
     let raw = eliciting_post(addr, 1, "tools/call", share_kb(None)).await;
     assert!(raw.starts_with("HTTP/1.1 200 OK"), "{}", head_of(&raw));
-    let answered = payload(&raw);
-    assert_eq!(
-        answered["result"]["resultType"],
+    let done = payload(&raw);
+    assert_ne!(
+        done["result"]["resultType"],
         json!("input_required"),
-        "{answered}"
+        "{done}"
     );
+    let body: Value =
+        serde_json::from_str(done["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(body["outcome"], "proposed", "{body}");
 }
 
-// --- direct domains: the round says the commit goes straight to the branch --
+// --- direct domains: the commit goes straight to the branch ------------------
 //
 // A domain whose MANIFEST declares `sharing: direct` publishes with no review
-// at all, so the question has to say so: a yes given to "open a proposal" is
-// not a yes given to "the team sees this on the branch at once". The legs
-// below are the share round's own legs, run against that policy.
+// at all. The legs below are the share's own legs, run against that policy.
 
+/// An eliciting peer on a direct domain commits on the first call, exactly as
+/// it proposes on the first call elsewhere.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_eliciting_direct_share_is_asked_with_no_review_and_writes_nothing() {
+async fn an_eliciting_direct_share_commits_in_one_call() {
     let (h, mock) = Harness::team_with_manifest(KB_MANIFEST_DIRECT).await;
     edit_kb(&h);
     let mut wire = h.stdio().await;
-    let asked = wire.open(eliciting(1, "tools/call", share_kb(None))).await;
-    let result = &asked["result"];
-    assert_eq!(result["resultType"], json!("input_required"), "{asked}");
-    let message = result["inputRequests"]["confirm"]["params"]["message"]
-        .as_str()
-        .unwrap_or_default();
-    assert!(
-        message.starts_with("Commit straight to branch 'main' of team/knowledge, with no review?"),
-        "{message}"
+    let done = wire.open(eliciting(1, "tools/call", share_kb(None))).await;
+    assert_ne!(
+        done["result"]["resultType"],
+        json!("input_required"),
+        "{done}"
     );
-    assert!(message.contains("notes/a.md"), "{message}");
-    assert!(
-        !mock.calls().iter().any(|c| c.starts_with("create_")),
-        "round one commits nothing: {:?}",
-        mock.calls()
-    );
-
-    let done = wire
-        .call(eliciting(
-            2,
-            "tools/call",
-            share_kb(Some(answer("accept", true))),
-        ))
-        .await;
     let body: Value =
         serde_json::from_str(done["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(body["outcome"], "committed", "{body}");
     assert_eq!(mock.branch_commit("main").as_deref(), body["sha"].as_str());
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_declined_direct_share_commits_nothing() {
-    let (h, mock) = Harness::team_with_manifest(KB_MANIFEST_DIRECT).await;
-    edit_kb(&h);
-    let mut wire = h.stdio().await;
-    let _ = wire.open(eliciting(1, "tools/call", share_kb(None))).await;
-    let head = mock.branch_commit("main").unwrap();
-    let refused = wire
-        .call(eliciting(
-            2,
-            "tools/call",
-            share_kb(Some(answer("decline", false))),
-        ))
-        .await;
-    assert_eq!(refused["result"]["isError"], json!(true), "{refused}");
-    assert!(
-        !mock
-            .calls()
-            .iter()
-            .any(|c| c.starts_with("create_") || c.starts_with("update_branch")),
-        "{:?}",
-        mock.calls()
-    );
-    assert_eq!(mock.branch_commit("main").unwrap(), head);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3183,27 +2324,6 @@ async fn a_blocked_direct_share_answers_round_one_without_a_question() {
     let body: Value =
         serde_json::from_str(done["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(body["outcome"], "proposal_open", "{body}");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_direct_share_round_runs_over_http_too() {
-    let (h, _mock) = Harness::team_with_manifest(KB_MANIFEST_DIRECT).await;
-    edit_kb(&h);
-    let addr = h.http().await;
-    let raw = eliciting_post(addr, 1, "tools/call", share_kb(None)).await;
-    assert!(raw.starts_with("HTTP/1.1 200 OK"), "{}", head_of(&raw));
-    let answered = payload(&raw);
-    assert_eq!(
-        answered["result"]["resultType"],
-        json!("input_required"),
-        "{answered}"
-    );
-    assert!(
-        answered["result"]["inputRequests"]["confirm"]["params"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("with no review")
-    );
 }
 
 /// A peer that cannot be asked commits in one call, exactly as it proposes in
@@ -3300,10 +2420,9 @@ async fn a_personal_stdio_share_without_an_owner_connection_teaches_the_fix() {
     );
 }
 
-/// **Strictness surfaces in round one.** An eliciting peer is asked before a
-/// share, and a question about a proposal this instance would then refuse to
-/// open is a question it cannot honour - so the preview resolves the same
-/// identity the confirmed call would and answers the refusal instead.
+/// **An eliciting peer meets the same refusal on the first call**: the share
+/// resolves the identity it would publish as before anything else, and a
+/// missing owner connection is taught rather than asked about.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_personal_share_refuses_in_round_one_rather_than_asking() {
     let (mut h, _mock) = Harness::team().await;
@@ -3314,7 +2433,7 @@ async fn a_personal_share_refuses_in_round_one_rather_than_asking() {
     let refused = wire.open(eliciting(1, "tools/call", share_kb(None))).await;
     assert!(
         refused["result"]["resultType"] != json!("input_required"),
-        "no question it could not honour: {refused}"
+        "nothing is asked: {refused}"
     );
     assert_eq!(refused["error"]["code"], json!(-32602), "{refused}");
     assert_eq!(
@@ -3347,7 +2466,7 @@ async fn a_personal_http_share_without_an_agent_identity_names_the_setting() {
     );
 }
 
-// --- the conflict resolution round ------------------------------------------
+// --- resolving a conflict ----------------------------------------------------
 
 /// Manufacture one conflict in the team domain: edit locally, advance the
 /// origin with a different edit of the same engram, pull.
@@ -3376,83 +2495,56 @@ async fn conflicted_kb(h: &Harness, mock: &MockProvider) -> String {
     conflicts[0]["path"].as_str().unwrap().to_string()
 }
 
-fn resolve_kb(path: &str, resolution: Option<&str>, responses: Option<Value>) -> Value {
+fn resolve_kb(path: &str, resolution: Option<&str>) -> Value {
     let mut arguments = json!({ "domain": "kb", "path": path });
     if let Some(resolution) = resolution {
         arguments["resolution"] = json!(resolution);
     }
-    let mut params = json!({ "name": "resolve_conflict", "arguments": arguments });
-    if let Some(responses) = responses {
-        params["inputResponses"] = responses;
-    }
-    params
+    json!({ "name": "resolve_conflict", "arguments": arguments })
 }
 
-/// The client's enum answer to the `resolution` question.
-fn resolution_answer(action: &str, choice: &str) -> Value {
-    json!({ "resolution": { "action": action, "content": { "resolution": choice } } })
-}
-
+/// An eliciting peer that names no resolution is refused like every other
+/// peer, in words that name the argument to pass: no choice is offered, and
+/// the conflict stays open.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_eliciting_resolve_without_a_resolution_is_offered_the_choice() {
+async fn an_eliciting_resolve_without_a_resolution_refuses_naming_the_argument() {
     let (h, mock) = Harness::team().await;
     let path = conflicted_kb(&h, &mock).await;
     let mut wire = h.stdio().await;
 
-    let asked = wire
-        .open(eliciting(1, "tools/call", resolve_kb(&path, None, None)))
+    let refused = wire
+        .open(eliciting(1, "tools/call", resolve_kb(&path, None)))
         .await;
-    let result = &asked["result"];
-    assert_eq!(result["resultType"], json!("input_required"), "{asked}");
-    let question = &result["inputRequests"]["resolution"];
-    let schema = &question["params"]["requestedSchema"];
-    assert_eq!(schema["required"], json!(["resolution"]), "{asked}");
-    // A titled single-select is rendered as `oneOf` rather than a flat `enum`,
-    // the same shape the collision question already ships.
-    let property = &schema["properties"]["resolution"];
-    let options: Vec<&str> = property["oneOf"]
-        .as_array()
-        .expect("a titled single-select carries oneOf")
-        .iter()
-        .map(|option| option["const"].as_str().unwrap_or_default())
-        .collect();
-    assert_eq!(options, vec!["mine", "theirs"], "{asked}");
-    let message = question["params"]["message"].as_str().unwrap_or_default();
-    assert!(message.contains(&path), "names the path: {message}");
-    assert!(message.contains("local (mine)"), "{message}");
-    assert!(message.contains("upstream (theirs)"), "{message}");
-    assert!(
-        message.contains("my local edit"),
-        "previews my side: {message}"
+    assert_ne!(
+        refused["result"]["resultType"],
+        json!("input_required"),
+        "nothing is asked: {refused}"
     );
-    assert!(
-        message.contains("the team's edit"),
-        "previews theirs: {message}"
+    assert_eq!(refused["result"]["isError"], json!(true), "{refused}");
+    assert_eq!(
+        refused["result"]["content"][0]["text"],
+        json!(
+            "resolve_conflict needs a resolution: pass resolution mine (keep your version) or \
+             theirs (take the team's version), or resolution merged with the reconciled text \
+             in content."
+        ),
+        "{refused}"
     );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_chosen_resolution_round_two_applies_it() {
-    let (h, mock) = Harness::team().await;
-    let path = conflicted_kb(&h, &mock).await;
-    let mut wire = h.stdio().await;
-    let _ = wire
-        .open(eliciting(1, "tools/call", resolve_kb(&path, None, None)))
-        .await;
-
-    let done = wire
-        .call(eliciting(
-            2,
-            "tools/call",
-            resolve_kb(&path, None, Some(resolution_answer("accept", "theirs"))),
-        ))
-        .await;
-    assert!(
-        done["error"].is_null() && done["result"]["isError"] != json!(true),
-        "{done}"
+    let status = h
+        .engine
+        .origin_status(
+            Some("kb"),
+            false,
+            false,
+            &crystalline_service::Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        status["domains"][0]["conflicts"].as_array().unwrap().len(),
+        1,
+        "the conflict is still open"
     );
-    let text = std::fs::read_to_string(h.root.join("kb").join(&path)).unwrap();
-    assert!(text.contains("the team's edit"), "theirs won: {text}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3461,7 +2553,7 @@ async fn a_non_eliciting_resolve_without_a_resolution_refuses_naming_the_three()
     let path = conflicted_kb(&h, &mock).await;
     let mut wire = h.stdio().await;
     let refused = wire
-        .open(modern(1, "tools/call", resolve_kb(&path, None, None)))
+        .open(modern(1, "tools/call", resolve_kb(&path, None)))
         .await;
     assert_eq!(refused["result"]["isError"], json!(true), "{refused}");
     let text = refused["result"]["content"][0]["text"].as_str().unwrap();
@@ -3491,11 +2583,7 @@ async fn an_explicit_resolution_stays_single_round_for_everyone() {
     let path = conflicted_kb(&h, &mock).await;
     let mut wire = h.stdio().await;
     let done = wire
-        .open(eliciting(
-            1,
-            "tools/call",
-            resolve_kb(&path, Some("mine"), None),
-        ))
+        .open(eliciting(1, "tools/call", resolve_kb(&path, Some("mine"))))
         .await;
     assert_ne!(
         done["result"]["resultType"],
@@ -3527,28 +2615,21 @@ async fn a_conflicted_share_answers_round_one_with_the_pending_count() {
     assert_eq!(body["count"], json!(1), "{body}");
 }
 
-// --- withdraw_proposal, and its own confirmation round -----------------------
+// --- withdraw_proposal never asks --------------------------------------------
 //
-// Withdrawing closes a pull request the team is looking at, and a `revert`
-// rewrites the working tree besides, so the eliciting peer is asked the same
-// way `share_changes` asks. The gate is the same two-sided one: a peer that
-// declared no elicitation capability is served exactly one round, unchanged.
+// Withdrawing closes a pull request the team is looking at. The agent's call
+// is the go-ahead, so every peer withdraws on the first call.
 
-/// A withdraw call's params, optionally naming a layer and carrying a round 2
-/// answer.
-fn withdraw_kb(proposal: Option<u64>, responses: Option<Value>) -> Value {
+/// A withdraw call's params, optionally naming a layer.
+fn withdraw_kb(proposal: Option<u64>) -> Value {
     let mut arguments = json!({ "domain": "kb" });
     if let Some(number) = proposal {
         arguments["proposal"] = json!(number);
     }
-    let mut params = json!({
+    json!({
         "name": "withdraw_proposal",
         "arguments": arguments,
-    });
-    if let Some(responses) = responses {
-        params["inputResponses"] = responses;
-    }
-    params
+    })
 }
 
 /// The peer that cannot be asked keeps today's behaviour: one round, and the
@@ -3561,9 +2642,7 @@ async fn withdraw_proposal_closes_the_open_proposal_single_round() {
     let shared = wire.open(modern(1, "tools/call", share_kb(None))).await;
     assert!(shared["error"].is_null(), "{shared}");
 
-    let done = wire
-        .call(modern(2, "tools/call", withdraw_kb(None, None)))
-        .await;
+    let done = wire.call(modern(2, "tools/call", withdraw_kb(None))).await;
     assert_ne!(
         done["result"]["resultType"],
         json!("input_required"),
@@ -3583,13 +2662,11 @@ async fn withdraw_proposal_closes_the_open_proposal_single_round() {
     );
 }
 
-/// Round one names the proposal and closes nothing; round two closes it.
-///
-/// The negative half is the point, as it is for the share and delete rounds:
-/// an `input_required` answered after the pull request was already closed
-/// would be a confirmation of something the team can already see.
+/// An eliciting peer withdraws on the first call: the agent's call is the
+/// go-ahead, so no question comes back and the pull request is closed by the
+/// time the call answers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_eliciting_withdrawal_is_asked_before_the_proposal_is_closed() {
+async fn an_eliciting_withdrawal_closes_the_proposal_in_round_one() {
     let (h, mock) = Harness::team().await;
     edit_kb(&h);
     let mut wire = h.stdio().await;
@@ -3598,40 +2675,17 @@ async fn an_eliciting_withdrawal_is_asked_before_the_proposal_is_closed() {
         serde_json::from_str(shared["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
     let number = body["number"].as_u64().unwrap();
 
-    let asked = wire
-        .call(eliciting(2, "tools/call", withdraw_kb(None, None)))
-        .await;
-    assert_eq!(
-        asked["result"]["resultType"],
-        json!("input_required"),
-        "{asked}"
-    );
-    let message = asked["result"]["inputRequests"]["confirm"]["params"]["message"]
-        .as_str()
-        .unwrap_or_default();
-    assert!(
-        message.contains(&format!("Withdraws proposal #{number}")),
-        "the question names the layer it would close: {message}"
-    );
-    assert!(
-        !mock
-            .calls()
-            .iter()
-            .any(|c| c.starts_with("close_proposal:")),
-        "round one closes nothing: {:?}",
-        mock.calls()
-    );
-
     let done = wire
-        .call(eliciting(
-            3,
-            "tools/call",
-            withdraw_kb(None, Some(answer("accept", true))),
-        ))
+        .call(eliciting(2, "tools/call", withdraw_kb(None)))
         .await;
     assert!(
         done["error"].is_null() && done["result"]["isError"] != json!(true),
         "{done}"
+    );
+    assert_eq!(
+        done["result"]["resultType"],
+        json!("complete"),
+        "an ordinary complete result, not a question: {done}"
     );
     let body: Value =
         serde_json::from_str(done["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
@@ -3642,7 +2696,7 @@ async fn an_eliciting_withdrawal_is_asked_before_the_proposal_is_closed() {
         mock.calls()
             .iter()
             .any(|c| c.starts_with("close_proposal:")),
-        "and round two does close it: {:?}",
+        "the pull request is closed: {:?}",
         mock.calls()
     );
 }
@@ -3659,7 +2713,7 @@ async fn an_eliciting_withdrawal_of_an_unknown_number_is_refused_rather_than_ask
     assert!(shared["error"].is_null(), "{shared}");
 
     let refused = wire
-        .call(eliciting(2, "tools/call", withdraw_kb(Some(99), None)))
+        .call(eliciting(2, "tools/call", withdraw_kb(Some(99))))
         .await;
     assert!(
         refused["result"]["resultType"] != json!("input_required"),
@@ -3686,9 +2740,9 @@ async fn an_eliciting_withdrawal_of_an_unknown_number_is_refused_rather_than_ask
 }
 // --- discard_changes, and its own confirmation round -------------------------
 //
-// A discard rewrites the working tree, so the eliciting peer is asked the way
-// a delete asks; the gate is the same two-sided one, and a peer that declared
-// no elicitation is served one round.
+// A discard rewrites the working tree, so the eliciting peer is asked first,
+// with the box checked by default; a peer that declared no elicitation is
+// served one round.
 
 /// A discard call's params, optionally carrying a round 2 answer.
 fn discard_kb(paths: &[&str], responses: Option<Value>) -> Value {
@@ -3729,6 +2783,9 @@ async fn a_modern_peer_without_elicitation_discards_in_one_round() {
     );
 }
 
+/// `discard_changes` still asks, in the words that say what each path gets
+/// and what each button does, with the box checked by default; a no keeps
+/// everything and a yes puts the team's copy back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_eliciting_discard_is_asked_first_and_round_two_decides() {
     let (h, _mock) = Harness::team().await;
@@ -3746,13 +2803,20 @@ async fn an_eliciting_discard_is_asked_first_and_round_two_decides() {
         json!("input_required"),
         "{asked}"
     );
-    let message = asked["result"]["inputRequests"]["confirm"]["params"]["message"]
-        .as_str()
-        .unwrap_or_default();
-    assert!(message.contains("Discard 1 change in 'kb'?"), "{message}");
-    assert!(
-        message.contains("notes/a.md (modified: the team's copy comes back)"),
-        "{message}"
+    let question = &asked["result"]["inputRequests"]["confirm"]["params"];
+    assert_eq!(
+        question["message"],
+        json!(
+            "Undo 1 unshared change in 'kb'? notes/a.md: the team's version comes back. \
+             Nothing goes to GitHub. Edits made after you looked are undone too. Accept undoes \
+             it. Decline keeps your change."
+        ),
+        "{asked}"
+    );
+    assert_eq!(
+        question["requestedSchema"]["properties"]["confirm"]["default"],
+        json!(true),
+        "the box is checked by default: {asked}"
     );
     assert!(
         std::fs::read_to_string(h.root.join("kb/notes/a.md"))
@@ -4108,9 +3172,9 @@ fn remove_eng(responses: Option<Value>) -> Value {
     params
 }
 
-/// Round one: an eliciting peer is asked before the domain is unregistered,
-/// and the question says which domain, what kind it is and how much knowledge
-/// is in it - the three things somebody needs in order to answer.
+/// Round one: an eliciting peer is asked before the domain is removed, in the
+/// words that put the action and the domain first and close with what each
+/// button does, and the box is checked by default.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_modern_eliciting_removal_asks_before_it_unregisters() {
     let h = Harness::new().await;
@@ -4134,23 +3198,27 @@ async fn a_modern_eliciting_removal_asks_before_it_unregisters() {
     assert_eq!(
         result["resultType"],
         json!("input_required"),
-        "the call answers with a round rather than an unregistration: {asked}"
+        "the call answers with a round rather than a removal: {asked}"
     );
-    let message = result["inputRequests"]["confirm"]["params"]["message"]
-        .as_str()
-        .unwrap_or_default();
-    assert!(message.contains("eng"), "the question names it: {message}");
-    assert!(
-        message.contains("file"),
-        "and says what kind it is: {message}"
+    let question = &result["inputRequests"]["confirm"]["params"];
+    assert_eq!(
+        question["message"],
+        json!(
+            "Remove the domain 'eng' (2 engrams) from Crystalline? Its files stay on disk. \
+             Adding the folder again brings them back. Accept removes it. Decline keeps \
+             everything."
+        ),
+        "{asked}"
     );
-    assert!(
-        message.contains('2'),
-        "and how many engrams are in it (the MANIFEST and the write): {message}"
-    );
-    assert!(
-        message.contains("stay"),
-        "and that a file domain's files are left alone: {message}"
+    assert_eq!(
+        question["requestedSchema"]["properties"]["confirm"],
+        json!({
+            "type": "boolean",
+            "title": "Yes, go ahead",
+            "description": "Leave this checked and choose Accept to go ahead.",
+            "default": true,
+        }),
+        "{asked}"
     );
 
     let listed = h
@@ -4164,6 +3232,48 @@ async fn a_modern_eliciting_removal_asks_before_it_unregisters() {
     assert!(
         listed.to_string().contains("eng"),
         "round one unregisters nothing: {listed}"
+    );
+}
+
+/// An accept whose content leaves the box out is a yes: a client that honours
+/// the default and sends back only what the person changed has said go ahead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_accept_with_empty_content_removes_the_domain() {
+    let h = Harness::new().await;
+    let mut wire = h.stdio().await;
+    let asked = wire
+        .open(eliciting(1, "tools/call", remove_eng(None)))
+        .await;
+    assert_eq!(asked["result"]["resultType"], json!("input_required"));
+
+    let done = wire
+        .call(eliciting(
+            2,
+            "tools/call",
+            remove_eng(Some(
+                json!({ "confirm": { "action": "accept", "content": {} } }),
+            )),
+        ))
+        .await;
+    assert!(
+        done["error"].is_null() && done["result"]["isError"] != json!(true),
+        "the accept removes: {done}"
+    );
+    let listed = h
+        .engine
+        .list_domains(
+            &crystalline_service::params::ListDomainsParams::default(),
+            &crystalline_service::Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert!(
+        !listed.to_string().contains("\"eng\""),
+        "and the domain is gone: {listed}"
+    );
+    assert!(
+        h.root.join("eng").join("MANIFEST.md").exists(),
+        "with its files left on disk"
     );
 }
 
@@ -5012,7 +4122,7 @@ async fn a_link_that_opens_nothing_is_said_out_loud_rather_than_read_past() {
 // A plain create whose permalink an engram in ANOTHER folder answers to has no
 // overwrite behind it: an overwrite replaces an engram where it lives and
 // would be refused too. So the engine says so at once, without the collision
-// marker, and an eliciting peer is never asked "overwrite or cancel?".
+// marker, and no peer is offered an overwrite.
 
 const ACROSS_REFUSAL: &str = "permalink 'taken' in domain 'eng' belongs to 'archive/taken.md' in folder 'archive', not in the domain root. A new engram cannot take the permalink of another engram: pick another title or folder, or change that engram in place with edit_engram";
 
@@ -5037,11 +4147,7 @@ async fn a_create_across_folders_on_an_eliciting_peer_is_refused_without_a_round
     let before = std::fs::read(&path).unwrap();
     let mut wire = h.stdio().await;
     let refused = wire
-        .open(eliciting(
-            1,
-            "tools/call",
-            write_taken(SECOND_BODY, false, None),
-        ))
+        .open(eliciting(1, "tools/call", write_taken(SECOND_BODY, false)))
         .await;
     assert_ne!(
         refused["result"]["resultType"],
@@ -5067,11 +4173,7 @@ async fn a_create_across_folders_without_elicitation_gets_the_refusal_not_the_hi
     let before = std::fs::read(&path).unwrap();
     let mut wire = h.stdio().await;
     let refused = wire
-        .open(modern(
-            1,
-            "tools/call",
-            write_taken(SECOND_BODY, false, None),
-        ))
+        .open(modern(1, "tools/call", write_taken(SECOND_BODY, false)))
         .await;
     let message = refused["error"]["message"].as_str().unwrap_or_default();
     assert_eq!(message, ACROSS_REFUSAL, "{refused}");

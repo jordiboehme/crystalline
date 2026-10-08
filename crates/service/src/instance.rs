@@ -302,14 +302,6 @@ impl HarnessGate {
     }
 }
 
-/// Whether the daemon this process is about to hand its handshake to has
-/// declared that it parses handshake options. A record that is missing,
-/// unreadable or written by a daemon that predates the field all read as
-/// `false`, which is the safe direction.
-fn daemon_parses_mcp_line_options() -> bool {
-    read_lock_info().is_some_and(|info| info.mcp_line_options)
-}
-
 /// The `mcp` handshake line for a resolved gate. Bare `mcp` unless there is
 /// something to say **and** the daemon has declared it can hear it. A verified
 /// gate sends `skills=off`, byte-identical to what a 0.22.0 bridge sent, and a
@@ -331,6 +323,11 @@ fn mcp_mode_line(gate: HarnessGate, daemon_parses_options: bool) -> String {
 /// A connected client stream, before the handshake line is written.
 pub struct Connection {
     stream: IpcStream,
+    /// Whether the daemon behind this connection declared that it parses
+    /// handshake options (`HolderFacts::mcp_line_options`). False for a
+    /// connection made without asking, which sends the bare line: the safe
+    /// direction.
+    mcp_line_options: bool,
 }
 
 impl Connection {
@@ -347,14 +344,15 @@ impl Connection {
     /// cannot drift across a reconnect.
     ///
     /// **The extended line is only sent to a daemon that declared it parses
-    /// one**, through [`LockInfo::mcp_line_options`]. An older daemon compares
+    /// one**, declared over the pipe, through `holder`
+    /// ([`HolderFacts::mcp_line_options`]). An older daemon compares
     /// the whole line against `"mcp"` and drops anything else, and a failed
     /// displacement can leave one running (`try_attach_reporting` attaches to
     /// a daemon that would not shut down), so the fallback is the bare line,
     /// which resolves to "serve" - the safe direction, and exactly today's
     /// behaviour.
     pub async fn into_mcp(self, gate: HarnessGate) -> io::Result<IpcStream> {
-        let line = mcp_mode_line(gate, daemon_parses_mcp_line_options());
+        let line = mcp_mode_line(gate, self.mcp_line_options);
         self.handshake(line.as_bytes()).await
     }
 
@@ -457,6 +455,7 @@ impl Ownership {
             // Recorded by `run_serve` only; `hold-lock` records none.
             start: START_OPTIONS.get().cloned(),
         };
+        let _ = PUBLISHED.set(info.clone());
         self.write_record(&info)
     }
 
@@ -626,82 +625,278 @@ pub async fn try_attach_reporting() -> (Option<Connection>, bool) {
 }
 
 /// As [`try_attach_reporting`], but a displacement hands back what the
-/// displaced daemon's record said about how it was started (the outer
-/// `Some`; the inner value is `None` for a record older than 0.22.1). The
-/// record is gone once the old daemon has left, so this first read is the
-/// only chance to see it.
+/// displaced daemon said about how it was started (the outer `Some`; the
+/// inner value is `None` for a daemon older than 0.22.1). The daemon is gone
+/// once it has left, so this first ask is the only chance to hear it.
+///
+/// The pipe is asked first and the record is not read here: a stale record
+/// (its daemon was killed before it removed it) or a private one (written
+/// inside an app package, which only that package sees) never decides
+/// anything, and a one-shot command, which serves no pipe, is no daemon to
+/// attach to.
 pub async fn try_attach_displacing() -> (Option<Connection>, Option<Option<StartOptions>>) {
-    let Some(info) = read_lock_info() else {
+    try_attach_displacing_in(crate::runs_in::PackageContext::here()).await
+}
+
+/// [`try_attach_displacing`] for a process that runs where `here` says.
+///
+/// Inside an app package it never displaces, whatever the versions, and it
+/// only ever connects. The facts it acts on can come from a record when the
+/// daemon gives none itself, and inside a package that record can be the
+/// package's private copy, so they decide nothing there but the handshake
+/// line and the warning about an older daemon. A listener that gives no
+/// facts at all (silent, or a 0.23.1 daemon whose `status` failed, with no
+/// usable record beside it) is still a daemon outside the package, so a
+/// packaged client connects to it as it is, with the bare `mcp` line, rather
+/// than running the task for a daemon that is already there.
+/// The cost: a hung daemon that still holds the pipe is attached as it is,
+/// so the session hangs instead of getting the stub.
+pub(crate) async fn try_attach_displacing_in(
+    here: &crate::runs_in::PackageContext,
+) -> (Option<Connection>, Option<Option<StartOptions>>) {
+    let Ok(sock) = config::service_sock_path() else {
         return (None, None);
     };
-    // A one-shot command holding the state directory is no daemon: nothing
-    // to attach to and, whatever its version, nothing to displace.
-    if !process_alive(info.pid) || info.standalone.is_some() {
+    let Some(facts) = ask_holder_at(&sock).await else {
+        if here.is_packaged() {
+            return (connect_socket_at(&sock, false).await, None);
+        }
         return (None, None);
-    }
-    if attach_policy(&info.version, crystalline_core::VERSION) == AttachPolicy::Displace {
-        let Some(sock) = config::service_sock_path().ok() else {
-            return (None, None);
-        };
+    };
+    if attach_policy_for(&facts.version, crystalline_core::VERSION, here) == AttachPolicy::Displace
+    {
         tracing::info!(
             "displacing crystalline daemon v{} (pid {}) in favor of v{}",
-            info.version,
-            info.pid,
+            facts.version,
+            facts.pid,
             crystalline_core::VERSION
         );
-        if displace(&sock, info.pid).await {
-            return (None, Some(info.start));
+        if displace(&sock, facts.pid).await {
+            return (None, Some(facts.start));
         }
         // The old daemon is still running: `displace` either could not verify
         // it as a Crystalline process and so never signalled it, or not even
         // the hard signal ended it. Another client may also have finished the
         // takeover in the meantime (its bridge respawns a daemon the moment
-        // the old one leaves), so re-read the record: a different pid means
-        // the socket already belongs to the successor and attaching is right.
-        // Otherwise the connect below reaches whatever still answers on the
-        // socket, if anything, rather than contending for the index.
-        match read_lock_info() {
-            Some(now) if now.pid != info.pid => {}
-            _ => {
-                tracing::warn!(
-                    "daemon v{} (pid {}) is still running after the shutdown ask and could not be stopped; leaving it in place",
-                    info.version,
-                    info.pid
-                );
+        // the old one leaves), so ask the pipe again: a different pid means
+        // the socket already belongs to the successor and attaching to it is
+        // right. Otherwise the connect below reaches whatever still answers
+        // on the socket, if anything, rather than contending for the index.
+        match ask_holder_at(&sock).await {
+            Some(now) if now.pid != facts.pid => {
+                return (connect_socket_at(&sock, now.mcp_line_options).await, None);
             }
+            _ => tracing::warn!(
+                "daemon v{} (pid {}) is still running after the shutdown ask and could not be stopped; leaving it in place",
+                facts.version,
+                facts.pid
+            ),
         }
     }
-    (connect_socket().await, None)
+    let conn = connect_socket_at(&sock, facts.mcp_line_options).await;
+    // Said once the attach worked, so a bridge polling for its daemon does
+    // not repeat it on every turn.
+    if conn.is_some()
+        && here.is_packaged()
+        && strictly_newer(crystalline_core::VERSION, &facts.version)
+    {
+        tracing::warn!(
+            "{}",
+            older_daemon_warning(&facts.version, crystalline_core::VERSION)
+        );
+    }
+    (conn, None)
 }
 
-/// Attach to a running daemon exactly as it is: read the lock record, check
-/// the pid, connect. Unlike [`try_attach`] it never displaces an older daemon
-/// and never waits on one leaving, so the whole call is a file read, a pid
-/// check and a connect - microseconds when no daemon runs, and never the six
-/// seconds a graceful takeover can cost.
+/// Attach to a running daemon exactly as it is: a bare pipe connect. Unlike
+/// [`try_attach`] it reads no record, asks no facts, never displaces an older
+/// daemon and never waits on one leaving, so the whole call is one connect -
+/// microseconds when no daemon runs, and never the six seconds a graceful
+/// takeover can cost.
 ///
 /// That is what a per-prompt hook needs: it runs in front of a person's
 /// prompt, it has a one-second budget for the whole exchange, and a takeover
 /// is `crystalline mcp`'s to do at the next session start, where seconds are
 /// affordable and a respawn follows. A daemon older than this binary answers
 /// `tool search_engrams` the same way, so attaching as-is costs nothing but
-/// the version's own behaviour.
+/// the version's own behaviour. A connection made this way sends the bare
+/// `mcp` line, should it ever be turned into a session.
 pub async fn try_attach_passive() -> Option<Connection> {
-    let info = read_lock_info()?;
-    if !process_alive(info.pid) || info.standalone.is_some() {
-        return None;
-    }
     connect_socket().await
 }
 
-/// Connect to the daemon socket at its configured path.
+/// Connect to the daemon socket at its configured path, without asking who
+/// holds it.
 async fn connect_socket() -> Option<Connection> {
     let sock = config::service_sock_path().ok()?;
-    let name = socket_name(&sock).ok()?;
-    match IpcStream::connect(name).await {
-        Ok(stream) => Some(Connection { stream }),
-        Err(_) => None,
+    connect_socket_at(&sock, false).await
+}
+
+/// Connect to the daemon socket at `sock`, carrying what its holder declared
+/// about the handshake line.
+async fn connect_socket_at(sock: &Path, mcp_line_options: bool) -> Option<Connection> {
+    let name = socket_name(sock).ok()?;
+    IpcStream::connect(name)
+        .await
+        .ok()
+        .map(|stream| Connection {
+            stream,
+            mcp_line_options,
+        })
+}
+
+/// The record this process published, kept for `ctl holder`.
+static PUBLISHED: std::sync::OnceLock<LockInfo> = std::sync::OnceLock::new();
+
+/// The record this daemon published, `None` before `publish` ran (and in a
+/// test that drives the ctl handler without a daemon).
+pub(crate) fn published_record() -> Option<LockInfo> {
+    PUBLISHED.get().cloned()
+}
+
+/// What the daemon on the pipe says about itself: the facts a client used to
+/// read from `service.json`. Asked over the pipe, because a record can be
+/// stale (its daemon was killed before it removed it) or private (written by
+/// a process inside an app package, which only that package sees), and a
+/// record like that must never decide an attach.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HolderFacts {
+    pub pid: u32,
+    pub version: String,
+    #[serde(default)]
+    pub mcp_line_options: bool,
+    #[serde(default)]
+    pub runs_in: Option<crate::runs_in::RunsIn>,
+    #[serde(default)]
+    pub start: Option<StartOptions>,
+    #[serde(default)]
+    pub state_dir: Option<String>,
+}
+
+/// What one ctl request over the pipe got back.
+enum Probe {
+    /// Nothing listens on the pipe: no daemon.
+    Unreached,
+    /// A listener took the connection and gave no usable line in time: it
+    /// closed, wrote something that is not JSON, or said nothing within
+    /// [`HOLDER_PROBE_TIMEOUT`]. Something serves the pipe all the same.
+    Silent,
+    /// The one-line answer.
+    Answered(serde_json::Value),
+}
+
+/// One ctl request and its one-line answer over the pipe at `sock`, bounded
+/// by [`HOLDER_PROBE_TIMEOUT`].
+async fn ctl_once(sock: &Path, request: &str) -> Probe {
+    use tokio::io::AsyncBufReadExt;
+    let Ok(name) = socket_name(sock) else {
+        return Probe::Unreached;
+    };
+    let deadline = Instant::now() + HOLDER_PROBE_TIMEOUT;
+    let stream = match tokio::time::timeout_at(deadline.into(), IpcStream::connect(name)).await {
+        Ok(Ok(stream)) => stream,
+        _ => return Probe::Unreached,
+    };
+    let exchange = async {
+        let stream = Connection {
+            stream,
+            mcp_line_options: false,
+        }
+        .into_ctl()
+        .await
+        .ok()?;
+        let (read, mut write) = tokio::io::split(stream);
+        write.write_all(request.as_bytes()).await.ok()?;
+        write.flush().await.ok()?;
+        let mut line = String::new();
+        tokio::io::BufReader::new(read)
+            .read_line(&mut line)
+            .await
+            .ok()?;
+        serde_json::from_str::<serde_json::Value>(line.trim()).ok()
+    };
+    match tokio::time::timeout_at(deadline.into(), exchange).await {
+        Ok(Some(answer)) => Probe::Answered(answer),
+        _ => Probe::Silent,
     }
+}
+
+/// The daemon on this state folder's pipe, asked: `holder` first, and for a
+/// daemon older than 0.24.0, which does not know it, `status`. `None` when
+/// nothing listens, which is "no daemon" whatever any record says.
+///
+/// A listener that answers neither with facts is still a daemon (a 0.23.1
+/// daemon whose status report failed or is stuck behind a sync, or one
+/// dying mid-exchange). Then the record says who it is, as before pipe-first
+/// discovery, but only a record that names a live pid and no one-shot
+/// command.
+pub async fn ask_holder() -> Option<HolderFacts> {
+    let sock = config::service_sock_path().ok()?;
+    ask_holder_at(&sock).await
+}
+
+/// [`ask_holder`] for the pipe at `sock`.
+pub(crate) async fn ask_holder_at(sock: &Path) -> Option<HolderFacts> {
+    match ctl_once(sock, "{\"v\":1,\"cmd\":\"holder\"}\n").await {
+        Probe::Unreached => return None,
+        Probe::Answered(answer) if answer["ok"] == true => {
+            if let Ok(facts) = serde_json::from_value(answer["data"].clone()) {
+                return Some(facts);
+            }
+        }
+        // A daemon that did not answer `holder` in time will not answer
+        // `status` either, which takes its store.
+        Probe::Silent => return facts_from_record(read_lock_info()),
+        Probe::Answered(_) => {}
+    }
+    let record = read_lock_info();
+    match ctl_once(sock, "{\"v\":1,\"cmd\":\"status\"}\n").await {
+        // The daemon left between the two asks: nothing listens any more.
+        Probe::Unreached => None,
+        Probe::Answered(status)
+            if status["ok"] == true
+                && let Some(facts) = facts_from_status(&status["data"], record.as_ref()) =>
+        {
+            Some(facts)
+        }
+        _ => facts_from_record(record),
+    }
+}
+
+/// The facts a record gives about the daemon that answers on the pipe, when
+/// the daemon gave none itself: only from a record that names a live pid and
+/// is no one-shot command's.
+fn facts_from_record(record: Option<LockInfo>) -> Option<HolderFacts> {
+    let record = record.filter(|r| r.standalone.is_none() && process_alive(r.pid))?;
+    Some(HolderFacts {
+        pid: record.pid,
+        version: record.version,
+        mcp_line_options: record.mcp_line_options,
+        runs_in: record.runs_in,
+        start: record.start,
+        state_dir: None,
+    })
+}
+
+/// The facts of a 0.23.1 daemon from its `status` answer. `status` carries
+/// no handshake options and no start options, so those come from the record,
+/// and only from a record that names the pid that answered: any other
+/// record describes some other process.
+pub(crate) fn facts_from_status(
+    status: &serde_json::Value,
+    record: Option<&LockInfo>,
+) -> Option<HolderFacts> {
+    let pid = u32::try_from(status["pid"].as_u64()?).ok()?;
+    let version = status["version"].as_str()?.to_string();
+    let same = record.filter(|r| r.pid == pid);
+    Some(HolderFacts {
+        pid,
+        version,
+        mcp_line_options: same.is_some_and(|r| r.mcp_line_options),
+        runs_in: serde_json::from_value(status["runs_in"].clone()).unwrap_or(None),
+        start: same.and_then(|r| r.start.clone()),
+        state_dir: None,
+    })
 }
 
 /// What a client should do about a running daemon, given both versions.
@@ -724,6 +919,32 @@ pub fn attach_policy(daemon_version: &str, own_version: &str) -> AttachPolicy {
         (Some(daemon), Some(own)) if daemon < own => AttachPolicy::Displace,
         _ => AttachPolicy::Attach,
     }
+}
+
+/// [`attach_policy`] with where this process runs. Inside an app package a
+/// client never displaces: the daemon it would start in its place would run
+/// from inside the package, with the package's private files, and die with
+/// the app. It attaches to whatever runs, older or not.
+pub fn attach_policy_for(
+    daemon_version: &str,
+    own_version: &str,
+    here: &crate::runs_in::PackageContext,
+) -> AttachPolicy {
+    if here.is_packaged() {
+        return AttachPolicy::Attach;
+    }
+    attach_policy(daemon_version, own_version)
+}
+
+/// The one line a packaged bridge writes when it attaches to an older
+/// daemon. A relayed session has no `status` tool to say it, so it goes to
+/// stderr, which Claude Desktop keeps in its MCP log.
+pub(crate) fn older_daemon_warning(daemon: &str, own: &str) -> String {
+    format!(
+        "the Crystalline daemon is v{daemon} and this binary is v{own}: the update is \
+         installed, but the old daemon still runs. Run `crystalline status` in a terminal \
+         to restart it"
+    )
 }
 
 /// Whether `candidate` is a strictly newer release than `baseline`. Same
@@ -894,7 +1115,13 @@ async fn ask_to_shut_down(sock: &Path) -> bool {
     let Ok(stream) = IpcStream::connect(name).await else {
         return false;
     };
-    let Ok(mut stream) = (Connection { stream }).into_ctl().await else {
+    let Ok(mut stream) = (Connection {
+        stream,
+        mcp_line_options: false,
+    })
+    .into_ctl()
+    .await
+    else {
         return false;
     };
     if stream
@@ -1171,7 +1398,13 @@ async fn probe_socket_responds() -> bool {
     let exchange = async {
         let name = socket_name(&sock).ok()?;
         let stream = IpcStream::connect(name).await.ok()?;
-        let mut stream = Connection { stream }.into_ctl().await.ok()?;
+        let mut stream = Connection {
+            stream,
+            mcp_line_options: false,
+        }
+        .into_ctl()
+        .await
+        .ok()?;
         stream
             .write_all(b"{\"v\":1,\"cmd\":\"sessions\"}\n")
             .await
@@ -1292,6 +1525,12 @@ fn is_crystalline_exe_name(name: &str) -> bool {
         return true;
     }
     own_exe_name().is_some_and(|own| own == name)
+}
+
+/// Whether `pid` is alive and its executable is a Crystalline binary. False
+/// when either cannot be told.
+pub fn process_is_crystalline(pid: u32) -> bool {
+    process_alive(pid) && process_exe_name(pid).is_some_and(|name| is_crystalline_exe_name(&name))
 }
 
 /// Diagnose what owns the index lock. Read-only and side-effect free: it takes
@@ -1636,6 +1875,7 @@ pub async fn attach_after_displacement(displaced: Option<StartOptions>) -> Optio
         displaced.as_ref(),
         current.as_ref().map(Vec::as_slice),
         |name| std::env::var_os(name).is_some_and(|value| !value.is_empty()),
+        std::env::current_exe().is_ok_and(|exe| in_desktop_extension_folder(&exe)),
     );
     let options = match plan {
         SuccessorPlan::Spawn(options) => options,
@@ -1697,11 +1937,15 @@ const UNRECORDED_SUCCESSOR_WAIT: Duration = Duration::from_secs(3);
 ///   database, a domain or the read-only switch may have come from that
 ///   variable, and a successor without it would serve something else.
 /// - Otherwise the recorded options, with every overlay variable of this
-///   process that the predecessor did not apply removed.
+///   process that the predecessor did not apply removed. The bounded life
+///   (`exit_when_idle`) is replayed only when `in_extension` says this binary
+///   itself lies inside a Claude Desktop extension folder: it belongs to where
+///   the binary lives, not to the record.
 pub(crate) fn successor_plan(
     displaced: Option<&StartOptions>,
     current: Result<&[String], &crate::overlay::OverlayError>,
     has_var: impl Fn(&str) -> bool,
+    in_extension: bool,
 ) -> SuccessorPlan {
     let wait = |why: String| SuccessorPlan::Wait {
         why,
@@ -1731,12 +1975,28 @@ pub(crate) fn successor_plan(
         read_only: start.read_only,
         http: start.http.clone(),
         allowed_hosts: start.allowed_hosts.clone(),
-        exit_when_idle: start.exit_when_idle,
+        exit_when_idle: start.exit_when_idle && in_extension,
         env_remove: current
             .iter()
             .filter(|name| !start.env.contains(name))
             .cloned()
             .collect(),
+    })
+}
+
+/// Whether `exe` lies inside a Claude Desktop extension folder: some folder
+/// on its path is named `Claude Extensions` and its parent `Claude`, which
+/// holds on macOS (`~/Library/Application Support/Claude/Claude
+/// Extensions/...`) and on Windows (`%APPDATA%\Claude\Claude Extensions\...`,
+/// and the package's physical `...\LocalCache\Roaming\Claude\Claude
+/// Extensions\...`). A daemon started from such a binary keeps that file in
+/// use, so it stays attached and exits when idle (the 0.18.2 mode). Read from
+/// the path text, split on both separators, ASCII case ignored.
+pub fn in_desktop_extension_folder(exe: &Path) -> bool {
+    let text = exe.to_string_lossy();
+    let parts: Vec<&str> = text.split(['/', '\\']).filter(|p| !p.is_empty()).collect();
+    parts.windows(2).any(|w| {
+        w[0].eq_ignore_ascii_case("Claude") && w[1].eq_ignore_ascii_case("Claude Extensions")
     })
 }
 
@@ -1795,7 +2055,61 @@ pub async fn ensure_daemon(
         read_only,
         ..SpawnOptions::default()
     };
-    ensure_daemon_with(spawn, &options).await
+    if !spawn {
+        return ensure_daemon_with(false, &options).await;
+    }
+    let task = crate::daemon_task::for_this_process();
+    ensure_daemon_in(
+        crate::runs_in::PackageContext::here(),
+        &*task,
+        &options,
+        PACKAGED_TASK_WAIT,
+    )
+    .await
+}
+
+/// How long a packaged bridge waits for the daemon the task starts: the same
+/// window a spawned daemon gets.
+pub const PACKAGED_TASK_WAIT: Duration = Duration::from_secs(15);
+
+/// Attach, or start a daemon, as `here` allows. Outside a package this is
+/// [`ensure_daemon_with`]. Inside one the process never spawns, never takes
+/// the index and writes nothing: it runs `task`, waits up to `wait` for the
+/// daemon to answer on the pipe, and otherwise fails with the
+/// [`crate::daemon_task::BridgeFailure`] that says why.
+pub(crate) async fn ensure_daemon_in(
+    here: &crate::runs_in::PackageContext,
+    task: &dyn crate::daemon_task::DaemonTask,
+    options: &SpawnOptions,
+    wait: Duration,
+) -> anyhow::Result<Connection> {
+    use crate::daemon_task::BridgeFailure;
+    if !here.is_packaged() {
+        return ensure_daemon_with(true, options).await;
+    }
+    if let (Some(conn), _) = try_attach_displacing_in(here).await {
+        return Ok(conn);
+    }
+    let Some(name) = task.find() else {
+        return Err(BridgeFailure::TaskMissing.into());
+    };
+    // `schtasks /Run` returns at once; the brief block before any session
+    // exists is cheaper than a blocking-thread hop.
+    task.run(&name)
+        .map_err(|detail| BridgeFailure::TaskDidNotStart {
+            task: name.clone(),
+            detail,
+        })?;
+    let deadline = Instant::now() + wait;
+    loop {
+        if let (Some(conn), _) = try_attach_displacing_in(here).await {
+            return Ok(conn);
+        }
+        if Instant::now() >= deadline {
+            return Err(BridgeFailure::NoAnswer { task: name }.into());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// [`ensure_daemon`] with every option a spawned daemon can be given.
@@ -1867,9 +2181,12 @@ pub(crate) async fn ensure_daemon_with(
     // displacement so this loop re-drives `spawn_daemon` instead of waiting
     // out the budget behind a daemon it just tore down again; bounded to 3
     // re-spawns so a pathological interleaving of respawning bridges cannot
-    // spawn-storm within the 15s budget.
+    // spawn-storm within the 15s budget. The budget is a deadline, not a
+    // count of turns: one attach asks the pipe first, and against a daemon
+    // that answers slowly that ask alone can take seconds.
     let mut respawns = 0u32;
-    for _ in 0..300 {
+    let deadline = Instant::now() + READINESS_BUDGET;
+    while Instant::now() < deadline {
         let (conn, displaced) = try_attach_reporting().await;
         if let Some(conn) = conn {
             return Ok(conn);
@@ -1901,13 +2218,17 @@ pub(crate) async fn ensure_daemon_with(
     )
 }
 
-/// Open the daemon stderr log for appending, starting the file over once it
-/// outgrows 1 MiB. The cap is checked at spawn time and the reset is
-/// best-effort (a live holder can defeat the removal on Windows), so it bounds
-/// growth across spawns, not within one daemon's lifetime. `None` (and a null
-/// stderr) when the state dir or the file cannot be prepared: logging must
-/// never be the reason a daemon fails to spawn.
-fn daemon_log_sink() -> Option<std::process::Stdio> {
+/// How long `ensure_daemon` waits for the daemon it spawned to answer.
+const READINESS_BUDGET: Duration = Duration::from_secs(15);
+
+/// The daemon log, opened for appending, and started over once it outgrows
+/// 1 MiB. The cap is checked when the file is opened (at spawn time, or when
+/// a task-started daemon starts) and the reset is best-effort (a live holder
+/// can defeat the removal on Windows), so it bounds growth across starts,
+/// not within one daemon's lifetime. `None` when the state dir or the file
+/// cannot be prepared: logging must never be the reason a daemon fails to
+/// start.
+pub(crate) fn daemon_log_file() -> Option<File> {
     let path = config::daemon_log_path().ok()?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).ok()?;
@@ -1918,12 +2239,17 @@ fn daemon_log_sink() -> Option<std::process::Stdio> {
     {
         let _ = std::fs::remove_file(&path);
     }
-    let file = OpenOptions::new()
+    OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)
-        .ok()?;
-    Some(file.into())
+        .ok()
+}
+
+/// The spawned daemon's stderr: [`daemon_log_file`], or a null stderr when
+/// it cannot be opened.
+fn daemon_log_sink() -> Option<std::process::Stdio> {
+    daemon_log_file().map(Into::into)
 }
 
 /// Spawn `current_exe serve --daemon`, forwarding `--read-only` when this
@@ -1932,8 +2258,9 @@ fn daemon_log_sink() -> Option<std::process::Stdio> {
 /// Off the Claude Desktop extension the daemon is fully detached (its own
 /// session on unix, a breakaway from the parent's job on Windows) and outlives
 /// every client, by design: it serves the user's state directory and the web
-/// UI to whoever comes next. On the extension (`CRYSTALLINE_CHANNEL=mcpb`) it is
-/// neither: `current_exe` is then the in-place binary inside Claude Desktop's
+/// UI to whoever comes next. When this binary lies inside a Claude Desktop
+/// extension folder ([`in_desktop_extension_folder`]) it is neither:
+/// `current_exe` is then the in-place binary inside Claude Desktop's
 /// own extension folder, and a detached daemon running from it kept that file
 /// locked past Desktop's teardown, which on Windows blocked the packaged host
 /// from updating or relaunching (2026-09-18). So the extension's daemon stays
@@ -1961,7 +2288,7 @@ fn daemon_log_sink() -> Option<std::process::Stdio> {
 /// the files the client meant.
 fn spawn_daemon(options: &SpawnOptions) -> anyhow::Result<()> {
     let exe = std::env::current_exe()?;
-    let extension = crate::stub::is_mcpb_channel();
+    let extension = in_desktop_extension_folder(&exe);
     // The daemon works in the state directory (below), so every path it is
     // handed has to name the same file from there as it does here.
     let options = SpawnOptions {
@@ -1969,7 +2296,7 @@ fn spawn_daemon(options: &SpawnOptions) -> anyhow::Result<()> {
         config: options.config.as_deref().map(absolute_for_daemon),
         ..options.clone()
     };
-    let mut cmd = std::process::Command::new(exe);
+    let mut cmd = std::process::Command::new(&exe);
     cmd.args(daemon_args(&options, extension));
     for name in &options.env_remove {
         cmd.env_remove(name);
@@ -2031,6 +2358,14 @@ fn spawn_daemon(options: &SpawnOptions) -> anyhow::Result<()> {
             match cmd.spawn() {
                 Ok(_) => return Ok(()),
                 Err(e) if breakaway_refusal(&e) => {
+                    if let RefusedBreakaway::StartedByTask(name) =
+                        after_refused_breakaway(&*crate::daemon_task::for_this_process(), &options)
+                    {
+                        tracing::info!(
+                            "Windows refused the breakaway ({e}); the task {name} started the daemon instead"
+                        );
+                        return Ok(());
+                    }
                     tracing::warn!(
                         "Windows refused the breakaway ({e}); {}",
                         crate::runs_in::BREAKAWAY_REFUSED_WARNING
@@ -2136,6 +2471,42 @@ fn daemon_working_dir(state_dir: anyhow::Result<PathBuf>) -> anyhow::Result<Path
 #[cfg(any(windows, test))]
 fn breakaway_refusal(e: &io::Error) -> bool {
     e.raw_os_error() == Some(5)
+}
+
+/// What a spawner does after Windows refused the breakaway: a daemon inside
+/// the job dies with the program that owns the job, so the task starts it
+/// instead whenever one is registered and runs, and `options` ask for
+/// nothing the task cannot pass on.
+#[cfg(any(windows, test))]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RefusedBreakaway {
+    StartedByTask(String),
+    InsideTheJob,
+}
+
+/// Whether the task may start the daemon in place of a spawn with
+/// `options` (after their paths are made absolute). The task always runs a
+/// plain `serve --daemon --from-task`, so a spawn that asks for a database,
+/// a config file, read-only mode, an HTTP address, an allowed host, a
+/// bounded life or a cleaned environment keeps its own spawn: otherwise the
+/// client would attach to a daemon that serves something else.
+#[cfg(any(windows, test))]
+fn the_task_can_stand_in(options: &SpawnOptions) -> bool {
+    *options == SpawnOptions::default()
+}
+
+#[cfg(any(windows, test))]
+pub(crate) fn after_refused_breakaway(
+    task: &dyn crate::daemon_task::DaemonTask,
+    options: &SpawnOptions,
+) -> RefusedBreakaway {
+    if !the_task_can_stand_in(options) {
+        return RefusedBreakaway::InsideTheJob;
+    }
+    match task.find() {
+        Some(name) if task.run(&name).is_ok() => RefusedBreakaway::StartedByTask(name),
+        _ => RefusedBreakaway::InsideTheJob,
+    }
 }
 
 /// The exit code a `crystalline serve` uses when it could not take the index
@@ -2530,6 +2901,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_extension_folder_is_found_on_both_platforms() {
+        for inside in [
+            "/Users/ada/Library/Application Support/Claude/Claude Extensions/local.mcpb.jordi-boehme.crystalline/server/crystalline",
+            r"C:\Users\ada\AppData\Roaming\Claude\Claude Extensions\local.mcpb.jordi-boehme.crystalline\server\crystalline.exe",
+            r"C:\Users\ada\AppData\Local\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Roaming\Claude\Claude Extensions\x\server\crystalline.exe",
+            r"c:\users\ada\appdata\roaming\claude\claude extensions\x\crystalline.exe",
+        ] {
+            assert!(in_desktop_extension_folder(Path::new(inside)), "{inside}");
+        }
+        for outside in [
+            "/opt/homebrew/bin/crystalline",
+            "/usr/local/bin/crystalline",
+            r"C:\Program Files\Crystalline\bin\crystalline.exe",
+            "/Users/ada/Claude Extensions/crystalline",
+            "/Users/ada/Library/Application Support/Claude/crystalline",
+        ] {
+            assert!(
+                !in_desktop_extension_folder(Path::new(outside)),
+                "{outside}"
+            );
+        }
+    }
+
+    fn bounded(start: StartOptions) -> StartOptions {
+        StartOptions {
+            exit_when_idle: true,
+            ..start
+        }
+    }
+
+    #[test]
+    fn a_binary_inside_the_extension_folder_keeps_the_bounded_life() {
+        let start = bounded(StartOptions::default());
+        let plan = successor_plan(Some(&start), Ok(&[]), |_| false, true);
+        assert!(matches!(plan, SuccessorPlan::Spawn(o) if o.exit_when_idle));
+        assert!(daemon_args(&SpawnOptions::default(), true).contains(&"--exit-when-idle".into()));
+    }
+
+    #[test]
+    fn a_successor_from_outside_an_extension_folder_does_not_exit_when_idle() {
+        let start = bounded(StartOptions::default());
+        let plan = successor_plan(Some(&start), Ok(&[]), |_| false, false);
+        assert!(
+            matches!(plan, SuccessorPlan::Spawn(o) if !o.exit_when_idle),
+            "an MSI or Homebrew binary replacing an old extension's daemon starts a long-lived one"
+        );
+    }
+
     /// The spawned daemon's command line: `serve --daemon --autostarted` always,
     /// `--db` ahead of the subcommand and `--config` after it when given, and
     /// `--exit-when-idle` only for the extension's daemon, which must not
@@ -2581,7 +3001,7 @@ mod tests {
             "runs_in":{"working_dir":"/s","breakaway_refused":false,"exits_when_idle":false}}"#;
         let info: LockInfo = serde_json::from_str(record).expect("a 0.22.0 record parses");
         assert_eq!(info.start, None);
-        match successor_plan(info.start.as_ref(), Ok(&[]), |_| true) {
+        match successor_plan(info.start.as_ref(), Ok(&[]), |_| true, true) {
             SuccessorPlan::Wait { budget, .. } => {
                 assert_eq!(budget, UNRECORDED_SUCCESSOR_WAIT);
                 assert!(budget <= Duration::from_secs(3), "{budget:?}");
@@ -2681,9 +3101,12 @@ mod tests {
             "CRYSTALLINE_SERVICE_HTTP".to_string(),
         ];
         assert_eq!(
-            successor_plan(Some(&start), Ok(&here), |name| here
-                .iter()
-                .any(|h| h == name)),
+            successor_plan(
+                Some(&start),
+                Ok(&here),
+                |name| here.iter().any(|h| h == name),
+                true
+            ),
             SuccessorPlan::Spawn(SpawnOptions {
                 db: Some(PathBuf::from("/srv/team.db")),
                 config: Some(PathBuf::from("/srv/config.yaml")),
@@ -2694,7 +3117,7 @@ mod tests {
                 env_remove: vec!["CRYSTALLINE_SERVICE_HTTP".to_string()],
             })
         );
-        match successor_plan(Some(&start), Ok(&[]), |_| false) {
+        match successor_plan(Some(&start), Ok(&[]), |_| false, true) {
             SuccessorPlan::Wait { why, budget } => {
                 assert!(why.contains("CRYSTALLINE_DATABASE_URL"), "{why}");
                 assert_eq!(budget, SUCCESSOR_WAIT);
@@ -2707,10 +3130,10 @@ mod tests {
             ..start.clone()
         };
         assert!(matches!(
-            successor_plan(Some(&partial), Ok(&[]), |_| true),
+            successor_plan(Some(&partial), Ok(&[]), |_| true, true),
             SuccessorPlan::Wait { .. }
         ));
-        let args = match successor_plan(Some(&start), Ok(&here), |_| true) {
+        let args = match successor_plan(Some(&start), Ok(&here), |_| true, true) {
             SuccessorPlan::Spawn(options) => daemon_args(&options, false),
             other => panic!("{other:?}"),
         };
@@ -2800,6 +3223,111 @@ mod tests {
         assert!(breakaway_refusal(&io::Error::from_raw_os_error(5)));
         assert!(!breakaway_refusal(&io::Error::from_raw_os_error(2)));
         assert!(!breakaway_refusal(&io::Error::other("no")));
+    }
+
+    struct Answers {
+        find: Option<&'static str>,
+        run_ok: bool,
+    }
+
+    impl crate::daemon_task::DaemonTask for Answers {
+        fn find(&self) -> Option<String> {
+            self.find.map(str::to_string)
+        }
+        fn run(&self, _name: &str) -> Result<(), String> {
+            if self.run_ok {
+                Ok(())
+            } else {
+                Err("refused".to_string())
+            }
+        }
+    }
+
+    #[test]
+    fn a_refused_breakaway_uses_the_task_when_one_runs() {
+        let task = Answers {
+            find: Some(crate::daemon_task::MACHINE_TASK_NAME),
+            run_ok: true,
+        };
+        assert_eq!(
+            after_refused_breakaway(&task, &SpawnOptions::default()),
+            RefusedBreakaway::StartedByTask(crate::daemon_task::MACHINE_TASK_NAME.to_string())
+        );
+    }
+
+    /// The task starts a plain `serve --daemon --from-task`, so it stands in
+    /// only for a spawn that asks for nothing else. Any option the task
+    /// cannot pass keeps the spawn inside the job, which serves what the
+    /// client asked for.
+    #[test]
+    fn the_task_stands_in_only_for_a_spawn_with_default_options() {
+        assert!(the_task_can_stand_in(&SpawnOptions::default()));
+        let asking = [
+            SpawnOptions {
+                db: Some(PathBuf::from("/abs/index.db")),
+                ..SpawnOptions::default()
+            },
+            SpawnOptions {
+                config: Some(PathBuf::from("/abs/config.yaml")),
+                ..SpawnOptions::default()
+            },
+            SpawnOptions {
+                read_only: true,
+                ..SpawnOptions::default()
+            },
+            SpawnOptions {
+                http: Some("127.0.0.1:7412".to_string()),
+                ..SpawnOptions::default()
+            },
+            SpawnOptions {
+                allowed_hosts: vec!["kb.example".to_string()],
+                ..SpawnOptions::default()
+            },
+            SpawnOptions {
+                exit_when_idle: true,
+                ..SpawnOptions::default()
+            },
+            SpawnOptions {
+                env_remove: vec!["CRYSTALLINE_CONFIG".to_string()],
+                ..SpawnOptions::default()
+            },
+        ];
+        let task = Answers {
+            find: Some(crate::daemon_task::MACHINE_TASK_NAME),
+            run_ok: true,
+        };
+        for options in asking {
+            assert!(!the_task_can_stand_in(&options), "{options:?}");
+            assert_eq!(
+                after_refused_breakaway(&task, &options),
+                RefusedBreakaway::InsideTheJob,
+                "{options:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refused_breakaway_stays_inside_the_job_without_a_task() {
+        assert_eq!(
+            after_refused_breakaway(
+                &Answers {
+                    find: None,
+                    run_ok: true
+                },
+                &SpawnOptions::default()
+            ),
+            RefusedBreakaway::InsideTheJob
+        );
+        assert_eq!(
+            after_refused_breakaway(
+                &Answers {
+                    find: Some("x"),
+                    run_ok: false
+                },
+                &SpawnOptions::default()
+            ),
+            RefusedBreakaway::InsideTheJob
+        );
     }
 
     // --- the words a locked index is refused in -----------------------------
@@ -3398,7 +3926,7 @@ mod tests {
     /// `crystalline_core::config::state_dir()` through these, and cargo runs
     /// test functions from this file on multiple threads, so every test takes
     /// this lock for its duration to avoid observing another's env var state.
-    /// The same pattern `crates/core/tests/config.rs` uses for
+    /// The same pattern `crates/core/tests/it/config.rs` uses for
     /// `CRYSTALLINE_MODELS_DIR`.
     static STATE_DIR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -3545,10 +4073,330 @@ mod tests {
         );
     }
 
-    /// An old-version lock record whose pid is a real, killable child: the
-    /// Displace arm shuts it down, the pid goes away and the call reports a
-    /// completed displacement with no connection, exactly the case
-    /// `ensure_daemon`'s readiness poll must react to by re-spawning.
+    /// A scripted daemon on `listener` for the pipe-first tests. Every
+    /// connection reads its mode line. A `ctl` connection answers `holder`
+    /// with `holder` (or, when that is `None`, the refusal a 0.23.1 daemon
+    /// gives), `status` with `status`, `shutdown` with an acknowledgement,
+    /// and records each request. An `mcp` connection records `mcp` and is
+    /// held open for a moment, like a session.
+    #[cfg(unix)]
+    fn scripted_daemon(
+        listener: IpcListener,
+        holder: Option<serde_json::Value>,
+        status: serde_json::Value,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let task = tokio::spawn(async move {
+            // One task per connection, as the daemon serves them: a session a
+            // client holds open must never keep the next client's probe waiting.
+            while let Ok(stream) = listener.accept().await {
+                let log = log.clone();
+                let holder = holder.clone();
+                let status = status.clone();
+                tokio::spawn(serve_one(stream, log, holder, status));
+            }
+        });
+        (task, seen)
+    }
+
+    /// One connection of [`scripted_daemon`].
+    #[cfg(unix)]
+    async fn serve_one(
+        mut stream: IpcStream,
+        log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        holder: Option<serde_json::Value>,
+        status: serde_json::Value,
+    ) {
+        use tokio::io::AsyncBufReadExt;
+        let Ok(mode) = read_mode_line(&mut stream).await else {
+            return;
+        };
+        if mode.starts_with("mcp") {
+            log.lock().unwrap().push("mcp".to_string());
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            return;
+        }
+        let (read, mut write) = tokio::io::split(stream);
+        let mut lines = tokio::io::BufReader::new(read).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let request: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
+            let cmd = request["cmd"].as_str().unwrap_or("").to_string();
+            log.lock().unwrap().push(cmd.clone());
+            let reply = match (cmd.as_str(), &holder) {
+                ("holder", Some(facts)) => {
+                    serde_json::json!({ "v": 1, "ok": true, "data": facts })
+                }
+                ("holder", None) => serde_json::json!({
+                    "v": 1, "ok": false,
+                    "error": "unknown ctl command 'holder'; expected status, sessions, tool"
+                }),
+                ("status", _) => serde_json::json!({ "v": 1, "ok": true, "data": status }),
+                _ => serde_json::json!({ "v": 1, "ok": true, "data": { "stopping": true } }),
+            };
+            let mut out = reply.to_string();
+            out.push('\n');
+            if write.write_all(out.as_bytes()).await.is_err() {
+                break;
+            }
+            let _ = write.flush().await;
+        }
+    }
+
+    /// A pid that is certainly dead: a child that already exited and was
+    /// reaped.
+    #[cfg(unix)]
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pipe_first_attaches_although_the_record_names_a_dead_pid() {
+        let home = ScratchHome::new("pipe-dead-record");
+        let sock = config::service_sock_path().unwrap();
+        let listener = ListenerOptions::new()
+            .name(socket_name(&sock).unwrap())
+            .create_tokio()
+            .unwrap();
+        let stale = serde_json::json!({
+            "pid": dead_pid(), "socket_path": sock.display().to_string(),
+            "version": crystalline_core::VERSION, "started_at": "2026-10-07T00:00:00Z"
+        });
+        std::fs::write(config::service_info_path().unwrap(), stale.to_string()).unwrap();
+        let facts = serde_json::json!({
+            "pid": std::process::id(), "version": crystalline_core::VERSION,
+            "mcp_line_options": true
+        });
+        let (server, seen) = scripted_daemon(listener, Some(facts), serde_json::json!({}));
+
+        let (conn, displaced) = try_attach_reporting().await;
+        let conn = conn.expect("the pipe answered, so the stale record decides nothing");
+        assert!(!displaced);
+        assert!(
+            conn.mcp_line_options,
+            "the holder said it parses handshake options"
+        );
+        assert_eq!(
+            seen.lock().unwrap().first().map(String::as_str),
+            Some("holder")
+        );
+        drop(conn);
+        server.abort();
+        drop(home);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pipe_first_attaches_with_no_record_at_all() {
+        let home = ScratchHome::new("pipe-no-record");
+        let sock = config::service_sock_path().unwrap();
+        let listener = ListenerOptions::new()
+            .name(socket_name(&sock).unwrap())
+            .create_tokio()
+            .unwrap();
+        let facts =
+            serde_json::json!({ "pid": std::process::id(), "version": crystalline_core::VERSION });
+        let (server, _) = scripted_daemon(listener, Some(facts), serde_json::json!({}));
+        assert!(!config::service_info_path().unwrap().exists());
+        assert!(try_attach().await.is_some());
+        assert!(
+            try_attach_passive().await.is_some(),
+            "the hook path is a bare pipe connect"
+        );
+        server.abort();
+        drop(home);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_0_23_1_daemon_without_holder_is_attached_through_status() {
+        let home = ScratchHome::new("pipe-old-daemon");
+        let sock = config::service_sock_path().unwrap();
+        let listener = ListenerOptions::new()
+            .name(socket_name(&sock).unwrap())
+            .create_tokio()
+            .unwrap();
+        let record = serde_json::json!({
+            "pid": std::process::id(), "socket_path": sock.display().to_string(),
+            "version": crystalline_core::VERSION, "started_at": "2026-10-07T00:00:00Z",
+            "mcp_line_options": true
+        });
+        std::fs::write(config::service_info_path().unwrap(), record.to_string()).unwrap();
+        let status = serde_json::json!({
+            "pid": std::process::id(), "version": crystalline_core::VERSION,
+            "runs_in": { "working_dir": "/s", "breakaway_refused": false, "exits_when_idle": false }
+        });
+        let (server, seen) = scripted_daemon(listener, None, status);
+        let conn = try_attach()
+            .await
+            .expect("status answers for an old daemon");
+        assert!(
+            conn.mcp_line_options,
+            "taken from the record, which names the same pid"
+        );
+        assert_eq!(
+            seen.lock().unwrap()[..2],
+            ["holder".to_string(), "status".to_string()]
+        );
+        // Only `status` knows this working directory: the record has no
+        // `runs_in`, so this fails if the facts came from the record alone.
+        let facts = ask_holder()
+            .await
+            .expect("status answers for an old daemon");
+        assert_eq!(
+            facts.runs_in.and_then(|r| r.working_dir).as_deref(),
+            Some("/s"),
+            "taken from the status answer"
+        );
+        server.abort();
+        drop(home);
+    }
+
+    /// A daemon refuses `holder` and is gone before the `status` ask can
+    /// reach the pipe. Nothing listens any more, so there is no daemon, and
+    /// a record that names a live pid does not bring one back.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_daemon_gone_between_the_two_asks_is_no_daemon() {
+        let home = ScratchHome::new("pipe-gone");
+        let sock = config::service_sock_path().unwrap();
+        let listener = ListenerOptions::new()
+            .name(socket_name(&sock).unwrap())
+            .create_tokio()
+            .unwrap();
+        let record = serde_json::json!({
+            "pid": std::process::id(), "socket_path": sock.display().to_string(),
+            "version": crystalline_core::VERSION, "started_at": "2026-10-07T00:00:00Z"
+        });
+        std::fs::write(config::service_info_path().unwrap(), record.to_string()).unwrap();
+        let socket_file = sock.clone();
+        let server = tokio::spawn(async move {
+            let Ok(stream) = listener.accept().await else {
+                return;
+            };
+            // Gone before it answers: the listener and its socket file.
+            drop(listener);
+            let _ = std::fs::remove_file(&socket_file);
+            let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            serve_one(stream, log, None, serde_json::json!({})).await;
+        });
+        assert!(
+            ask_holder().await.is_none(),
+            "nothing listens when status is asked, so there is no daemon"
+        );
+        server.abort();
+        drop(home);
+    }
+
+    /// A daemon answers on the pipe, refuses `holder` and gives a `status`
+    /// without its pid (a 0.23.1 daemon whose store failed the status
+    /// report). The pipe proves a daemon, so the record, which names a live
+    /// pid, says who it is, as it did before pipe-first discovery.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_daemon_that_answers_without_facts_is_taken_from_its_record() {
+        let home = ScratchHome::new("pipe-no-facts");
+        let sock = config::service_sock_path().unwrap();
+        let listener = ListenerOptions::new()
+            .name(socket_name(&sock).unwrap())
+            .create_tokio()
+            .unwrap();
+        let record = serde_json::json!({
+            "pid": std::process::id(), "socket_path": sock.display().to_string(),
+            "version": crystalline_core::VERSION, "started_at": "2026-10-07T00:00:00Z",
+            "mcp_line_options": true
+        });
+        std::fs::write(config::service_info_path().unwrap(), record.to_string()).unwrap();
+        let (server, seen) = scripted_daemon(listener, None, serde_json::json!({}));
+        let conn = try_attach()
+            .await
+            .expect("something answers on the pipe, so a daemon is there");
+        assert!(conn.mcp_line_options, "taken from the record");
+        assert_eq!(
+            seen.lock().unwrap()[..2],
+            ["holder".to_string(), "status".to_string()]
+        );
+        server.abort();
+        drop(home);
+    }
+
+    /// A listener that takes the connection and closes it unanswered (a
+    /// daemon dying mid-exchange) is still a daemon on the pipe: the record
+    /// that names a live pid says who it is, and the client attaches as it
+    /// did before pipe-first discovery. A record naming a dead pid does not.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_listener_that_closes_unanswered_is_taken_from_a_live_record() {
+        let home = ScratchHome::new("pipe-closes");
+        let sock = config::service_sock_path().unwrap();
+        let listener = ListenerOptions::new()
+            .name(socket_name(&sock).unwrap())
+            .create_tokio()
+            .unwrap();
+        let server = tokio::spawn(async move {
+            while let Ok(stream) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        let record = |pid: u32| {
+            serde_json::json!({
+                "pid": pid, "socket_path": sock.display().to_string(),
+                "version": crystalline_core::VERSION, "started_at": "2026-10-07T00:00:00Z"
+            })
+            .to_string()
+        };
+        let info = config::service_info_path().unwrap();
+        std::fs::write(&info, record(std::process::id())).unwrap();
+        let started = Instant::now();
+        let facts = ask_holder().await.expect("the live record names it");
+        assert_eq!(facts.pid, std::process::id());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a closed connection is no wait: {:?}",
+            started.elapsed()
+        );
+        std::fs::write(&info, record(dead_pid())).unwrap();
+        assert!(
+            ask_holder().await.is_none(),
+            "a record naming a dead pid explains nothing"
+        );
+        server.abort();
+        drop(home);
+    }
+
+    #[test]
+    fn facts_from_status_take_the_record_only_for_the_same_pid() {
+        let status = serde_json::json!({ "pid": 4242, "version": "0.23.1" });
+        let mut record: LockInfo = serde_json::from_str(
+            r#"{"pid":4242,"socket_path":"s","version":"0.23.1","started_at":"",
+                "mcp_line_options":true,"start":{"read_only":true}}"#,
+        )
+        .unwrap();
+        let same = facts_from_status(&status, Some(&record)).unwrap();
+        assert!(same.mcp_line_options);
+        assert_eq!(same.start.map(|s| s.read_only), Some(true));
+        record.pid = 7;
+        let other = facts_from_status(&status, Some(&record)).unwrap();
+        assert!(
+            !other.mcp_line_options,
+            "another pid's record says nothing about this daemon"
+        );
+        assert!(other.start.is_none());
+        assert!(facts_from_status(&serde_json::json!({ "version": "x" }), None).is_none());
+    }
+
+    /// A holder that answers at an old version, with a real, killable child
+    /// as its pid: the Displace arm asks it to shut down, the pid goes away
+    /// and the call reports a completed displacement with no connection,
+    /// exactly the case `ensure_daemon`'s readiness poll must react to by
+    /// re-spawning. The `service.json` written beside it decides nothing.
     #[cfg(unix)]
     #[tokio::test]
     async fn try_attach_reporting_reports_a_completed_displacement() {
@@ -3581,14 +4429,8 @@ mod tests {
         };
         std::fs::write(&info_path, serde_json::to_string(&info).unwrap()).unwrap();
 
-        let server = tokio::spawn(async move {
-            let mut stream = listener.accept().await.unwrap();
-            let _ = read_mode_line(&mut stream).await;
-            let mut sink = [0u8; 256];
-            let _ = stream.read(&mut sink).await;
-            stream.write_all(b"{\"ok\":true}\n").await.unwrap();
-            stream.flush().await.unwrap();
-        });
+        let facts = serde_json::json!({ "pid": pid, "version": "0.0.1" });
+        let (server, seen) = scripted_daemon(listener, Some(facts), serde_json::json!({}));
         let killer = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(300)).await;
             let _ = child.kill();
@@ -3601,16 +4443,77 @@ mod tests {
             "the displaced daemon's socket is gone; nothing to attach to yet"
         );
         assert!(displaced, "the Displace arm ran and the pid went away");
+        assert!(seen.lock().unwrap().contains(&"shutdown".to_string()));
 
-        server.await.unwrap();
+        server.abort();
         killer.await.unwrap();
         drop(home);
     }
 
-    /// A lock record at this binary's own version never reaches the Displace
-    /// arm, so a live stub socket just attaches and reports no displacement.
-    /// The lock's pid is this test process itself (always alive), which
-    /// stands in for a live daemon without spawning a child.
+    /// Nothing listens on the pipe, and the record names a live, verified
+    /// Crystalline process at an older version that ignores `SIGTERM`. A
+    /// record-first attach took that record at its word: it entered the
+    /// Displace arm, signalled the process, waited out the term step and
+    /// reported a displacement. Pipe first, nothing answered, so there is no
+    /// daemon: the call returns at once and the process is never touched.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn nothing_on_the_pipe_is_no_daemon_whatever_the_record_says() {
+        use std::os::unix::process::CommandExt;
+
+        let home = ScratchHome::new("pipe-silent");
+        let mut stand_in = std::process::Command::new(std::env::current_exe().unwrap());
+        stand_in
+            .args([
+                "instance::tests::displace_stand_in",
+                "--exact",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .env(STAND_IN_ENV, "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        // SAFETY: `signal` is async-signal-safe, which is all `pre_exec`
+        // requires. An ignored disposition survives the exec.
+        unsafe {
+            stand_in.pre_exec(|| {
+                libc::signal(libc::SIGTERM, libc::SIG_IGN);
+                Ok(())
+            });
+        }
+        let mut child = stand_in.spawn().unwrap();
+        let pid = child.id();
+        let older = serde_json::json!({
+            "pid": pid, "socket_path": config::service_sock_path().unwrap().display().to_string(),
+            "version": "0.0.1", "started_at": "2026-10-07T00:00:00Z"
+        });
+        std::fs::write(config::service_info_path().unwrap(), older.to_string()).unwrap();
+
+        let started = Instant::now();
+        let (conn, displaced) = try_attach_displacing().await;
+        let elapsed = started.elapsed();
+        let untouched = child.try_wait().unwrap().is_none();
+        let _ = child.kill();
+        let _ = child.wait();
+        drop(home);
+
+        assert!(conn.is_none(), "nothing listens, so nothing attaches");
+        assert!(
+            displaced.is_none(),
+            "a record alone is no daemon and nothing is displaced"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "no displace budget is spent: {elapsed:?}"
+        );
+        assert!(untouched, "the process the record names is never signalled");
+    }
+
+    /// A holder at this binary's own version never reaches the Displace arm,
+    /// so a live stub socket just attaches and reports no displacement. The
+    /// holder's pid is this test process itself (always alive), which stands
+    /// in for a live daemon without spawning a child.
     #[cfg(unix)]
     #[tokio::test]
     async fn try_attach_reporting_does_not_report_when_attaching() {
@@ -3635,9 +4538,10 @@ mod tests {
         };
         std::fs::write(&info_path, serde_json::to_string(&info).unwrap()).unwrap();
 
-        let server = tokio::spawn(async move {
-            let _ = listener.accept().await;
+        let facts = serde_json::json!({
+            "pid": std::process::id(), "version": crystalline_core::VERSION
         });
+        let (server, _) = scripted_daemon(listener, Some(facts), serde_json::json!({}));
 
         let (conn, displaced) = try_attach_reporting().await;
         assert!(
@@ -3647,7 +4551,7 @@ mod tests {
         assert!(!displaced, "attaching never runs the Displace arm");
 
         drop(conn);
-        server.await.unwrap();
+        server.abort();
         drop(home);
     }
 
@@ -3924,6 +4828,19 @@ mod tests {
             process_exe_name(0).is_none(),
             "pid 0 is never a real process to identify"
         );
+    }
+
+    /// A live process counts as Crystalline when it runs this binary's own
+    /// file; a pid that cannot be a process never does.
+    #[test]
+    fn process_is_crystalline_knows_this_process_and_not_a_bogus_pid() {
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+        assert!(process_is_crystalline(std::process::id()));
+        assert!(!process_is_crystalline(0));
+        // Positive as a `pid_t`, so it names one process and never a
+        // process group, and above macOS's pid limit; on Linux it could be
+        // live, but not a Crystalline process.
+        assert!(!process_is_crystalline(4_000_000));
     }
 
     /// The lock probe: free while nobody holds it, held while ownership
@@ -4394,6 +5311,310 @@ mod tests {
         assert!(
             msg.contains("service.allowed_hosts muthur.lan"),
             "the half that differs is still named: {msg}"
+        );
+    }
+
+    fn packaged() -> crate::runs_in::PackageContext {
+        crate::runs_in::PackageContext::Packaged {
+            full_name: "Claude_1.0.0.0_x64__pzs8sxrjxfjjc".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_packaged_client_never_displaces_even_when_it_is_newer() {
+        assert_eq!(
+            attach_policy_for("0.0.1", "0.24.0", &packaged()),
+            AttachPolicy::Attach
+        );
+        assert_eq!(
+            attach_policy_for("0.24.0", "0.24.0", &packaged()),
+            AttachPolicy::Attach
+        );
+    }
+
+    #[test]
+    fn an_unpackaged_client_still_displaces_an_older_daemon() {
+        let here = crate::runs_in::PackageContext::Unpackaged;
+        assert_eq!(
+            attach_policy_for("0.0.1", "0.24.0", &here),
+            AttachPolicy::Displace
+        );
+        assert_eq!(
+            attach_policy_for("0.25.0", "0.24.0", &here),
+            AttachPolicy::Attach
+        );
+    }
+
+    /// A stand-in for Task Scheduler: `run` starts a scripted daemon on this
+    /// state folder's pipe the first time it is called and counts every call.
+    #[cfg(unix)]
+    struct FakeTask {
+        name: String,
+        registered: bool,
+        fails: bool,
+        starts: bool,
+        runs: std::sync::atomic::AtomicUsize,
+        started: std::sync::atomic::AtomicBool,
+    }
+
+    #[cfg(unix)]
+    impl FakeTask {
+        fn new(registered: bool, fails: bool, starts: bool) -> FakeTask {
+            FakeTask {
+                name: crate::daemon_task::MACHINE_TASK_NAME.to_string(),
+                registered,
+                fails,
+                starts,
+                runs: std::sync::atomic::AtomicUsize::new(0),
+                started: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        /// The same task under the per-user name `doctor --fix` registers.
+        fn for_user(mut self, user: &str) -> FakeTask {
+            self.name = crate::daemon_task::user_task_name(user);
+            self
+        }
+    }
+
+    #[cfg(unix)]
+    impl crate::daemon_task::DaemonTask for FakeTask {
+        fn find(&self) -> Option<String> {
+            self.registered.then(|| self.name.clone())
+        }
+        fn run(&self, _name: &str) -> Result<(), String> {
+            use std::sync::atomic::Ordering;
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            if self.fails {
+                return Err("the operator or administrator has refused the request".into());
+            }
+            if self.starts && !self.started.swap(true, Ordering::SeqCst) {
+                let sock = config::service_sock_path().unwrap();
+                let listener = ListenerOptions::new()
+                    .name(socket_name(&sock).unwrap())
+                    .create_tokio()
+                    .unwrap();
+                let facts = serde_json::json!({
+                    "pid": std::process::id(), "version": crystalline_core::VERSION,
+                    "mcp_line_options": true
+                });
+                let (task, _) = scripted_daemon(listener, Some(facts), serde_json::json!({}));
+                std::mem::forget(task);
+            }
+            Ok(())
+        }
+    }
+
+    /// Nothing a packaged client may write exists in the state folder.
+    #[cfg(unix)]
+    fn assert_wrote_nothing(state: &Path) {
+        for name in [
+            "service.lock",
+            "service.json",
+            "daemon.log",
+            "index.db",
+            "instance-id",
+            "tmp",
+        ] {
+            assert!(!state.join(name).exists(), "{name} was written");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_packaged_client_with_a_live_older_daemon_attaches_and_never_displaces() {
+        let home = ScratchHome::new("pkg-attach");
+        let sock = config::service_sock_path().unwrap();
+        let listener = ListenerOptions::new()
+            .name(socket_name(&sock).unwrap())
+            .create_tokio()
+            .unwrap();
+        let facts = serde_json::json!({ "pid": std::process::id(), "version": "0.0.1" });
+        let (server, seen) = scripted_daemon(listener, Some(facts), serde_json::json!({}));
+        let (conn, displaced) = try_attach_displacing_in(&packaged()).await;
+        assert!(conn.is_some(), "the older daemon is attached as it is");
+        assert!(displaced.is_none());
+        assert!(
+            !seen.lock().unwrap().contains(&"shutdown".to_string()),
+            "never asked to leave"
+        );
+        server.abort();
+        drop(home);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_packaged_client_with_no_daemon_runs_the_task_then_attaches() {
+        let home = ScratchHome::new("pkg-task");
+        let task = FakeTask::new(true, false, true);
+        let conn = ensure_daemon_in(
+            &packaged(),
+            &task,
+            &SpawnOptions::default(),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("the task started a daemon and the bridge attached");
+        drop(conn);
+        assert_eq!(task.runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+        drop(home);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_packaged_client_whose_task_is_missing_says_so_and_writes_nothing() {
+        let home = ScratchHome::new("pkg-missing");
+        let state = config::state_dir().unwrap();
+        let task = FakeTask::new(false, false, false);
+        let err = ensure_daemon_in(
+            &packaged(),
+            &task,
+            &SpawnOptions::default(),
+            Duration::from_secs(1),
+        )
+        .await
+        .err()
+        .expect("no daemon and no task");
+        assert_eq!(
+            err.downcast_ref::<crate::daemon_task::BridgeFailure>(),
+            Some(&crate::daemon_task::BridgeFailure::TaskMissing)
+        );
+        assert_wrote_nothing(&state);
+        drop(home);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_packaged_client_whose_task_fails_says_it_did_not_start() {
+        let home = ScratchHome::new("pkg-fail");
+        let task = FakeTask::new(true, true, false).for_user("ada");
+        let err = ensure_daemon_in(
+            &packaged(),
+            &task,
+            &SpawnOptions::default(),
+            Duration::from_secs(1),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(matches!(
+            err.downcast_ref::<crate::daemon_task::BridgeFailure>(),
+            Some(crate::daemon_task::BridgeFailure::TaskDidNotStart { task, detail })
+                if detail.contains("refused") && task == r"\Crystalline Daemon for ada"
+        ));
+        drop(home);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_packaged_client_gives_up_when_no_daemon_answers_in_time() {
+        let home = ScratchHome::new("pkg-silent");
+        let state = config::state_dir().unwrap();
+        let task = FakeTask::new(true, false, false).for_user("ada");
+        let started = Instant::now();
+        let err = ensure_daemon_in(
+            &packaged(),
+            &task,
+            &SpawnOptions::default(),
+            Duration::from_millis(400),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(
+            err.downcast_ref::<crate::daemon_task::BridgeFailure>(),
+            Some(&crate::daemon_task::BridgeFailure::NoAnswer {
+                task: r"\Crystalline Daemon for ada".to_string()
+            })
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "the wait is bounded"
+        );
+        assert_wrote_nothing(&state);
+        drop(home);
+    }
+
+    /// Claude Desktop starts two bridges at once.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_packaged_bridges_with_no_daemon_both_attach_to_one() {
+        let home = ScratchHome::new("pkg-two");
+        let state = config::state_dir().unwrap();
+        let task = std::sync::Arc::new(FakeTask::new(true, false, true));
+        let here = packaged();
+        let options = SpawnOptions::default();
+        let (a, b) = tokio::join!(
+            ensure_daemon_in(&here, &*task, &options, Duration::from_secs(5)),
+            ensure_daemon_in(&here, &*task, &options, Duration::from_secs(5)),
+        );
+        assert!(a.is_ok() && b.is_ok(), "both bridges reach the one daemon");
+        let runs = task.runs.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            (1..=2).contains(&runs),
+            "each bridge runs the task at most once: {runs}"
+        );
+        assert!(task.started.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            !state.join("service.lock").exists(),
+            "neither bridge took the index"
+        );
+        drop(home);
+    }
+
+    /// A listener that gives no facts (it refuses `holder`, its `status`
+    /// names no pid) and no usable record beside it: `ask_holder_at` says
+    /// `None`, but a daemon is there. A packaged bridge connects to it as it
+    /// is and never runs the task.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_packaged_client_connects_to_a_listener_that_gives_no_facts() {
+        let home = ScratchHome::new("pkg-bare");
+        let sock = config::service_sock_path().unwrap();
+        let listener = ListenerOptions::new()
+            .name(socket_name(&sock).unwrap())
+            .create_tokio()
+            .unwrap();
+        let (server, seen) = scripted_daemon(listener, None, serde_json::json!({}));
+        assert!(
+            ask_holder_at(&sock).await.is_none(),
+            "the pipe gives no facts"
+        );
+        let task = FakeTask::new(true, false, false);
+        let conn = ensure_daemon_in(
+            &packaged(),
+            &task,
+            &SpawnOptions::default(),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("the bridge connects to the listener as it is");
+        drop(conn);
+        assert_eq!(
+            task.runs.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no task run"
+        );
+        assert!(
+            !seen.lock().unwrap().contains(&"shutdown".to_string()),
+            "never asked to leave"
+        );
+        server.abort();
+        drop(home);
+    }
+
+    #[test]
+    fn the_older_daemon_warning_names_both_versions_and_the_fix() {
+        let text = older_daemon_warning("0.23.1", "0.24.0");
+        assert!(
+            text.contains("v0.23.1")
+                && text.contains("v0.24.0")
+                && text.contains("crystalline status"),
+            "{text}"
+        );
+        assert!(
+            !text.contains('\u{2014}') && !text.contains('\u{2013}'),
+            "{text}"
         );
     }
 }

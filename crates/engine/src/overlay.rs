@@ -132,6 +132,13 @@ const RESERVED_VARS: &[&str] = &[
     // it here or every run that uses it logs a spurious warning - the same
     // reason the postgres line above it is here.
     "CRYSTALLINE_TEST_TOKEN_STORE_DIR",
+    // The two debug-build seams of the packaged bridge
+    // (`crystalline_service::runs_in::TEST_PACKAGE_ENV` and
+    // `crystalline_service::daemon_task::TEST_DAEMON_TASK_ENV`), read straight
+    // from the environment by the service crate, so reserved here or every
+    // test run that sets them logs a warning.
+    "CRYSTALLINE_TEST_PACKAGE",
+    "CRYSTALLINE_TEST_DAEMON_TASK",
     // `crystalline_remote::token`'s boolean kill switch
     // (`refuse_real_keychain`): set, it refuses the real OS keychain
     // backend everywhere in that module and falls back to the file store at
@@ -1064,6 +1071,11 @@ mod tests {
             ("CRYSTALLINE_TEST_POSTGRES_URL", "postgres://db/test"),
             (CHANNEL_ENV, "mcpb"),
             ("CRYSTALLINE_ACCELERATION", "off"),
+            (
+                "CRYSTALLINE_TEST_PACKAGE",
+                "Claude_1.0.0.0_x64__pzs8sxrjxfjjc",
+            ),
+            ("CRYSTALLINE_TEST_DAEMON_TASK", "missing"),
         ])
         .unwrap();
         assert!(
@@ -1071,6 +1083,8 @@ mod tests {
             "reserved variables must not become setting overrides"
         );
         assert!(is_reserved("CRYSTALLINE_ACCELERATION"));
+        assert!(is_reserved("CRYSTALLINE_TEST_PACKAGE"));
+        assert!(is_reserved("CRYSTALLINE_TEST_DAEMON_TASK"));
     }
 
     #[test]

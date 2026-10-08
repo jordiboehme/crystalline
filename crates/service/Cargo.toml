@@ -55,7 +55,7 @@ rmcp = { workspace = true, features = [
     "client",
     "macros",
     # The elicitation surface a confirmation round is built from (SEP-2322
-    # MRTR): `delete_engram` and the two edit verbs answer `input_required`
+    # MRTR): `remove_domain` and `discard_changes` answer `input_required`
     # with one form question rather than acting straight away, whenever the
     # peer is on 2026-07-28 and declared it can put a question to its user.
     # Not `request-state`: these flows are stateless, the client's answer is
@@ -89,7 +89,15 @@ rust-embed = { workspace = true, optional = true }
 libc = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true }
+# The clean stop on sign-out and shutdown (session_end_windows): a hidden
+# top-level window. RegisterClassExW and WNDCLASSEXW are behind
+# Win32_Graphics_Gdi in windows-sys 0.61.2.
+windows-sys = { workspace = true, features = [
+    "Win32_Graphics_Gdi",
+    "Win32_System_Console",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [dev-dependencies]
 # This package, with its test seam on: an integration test is its own crate, so

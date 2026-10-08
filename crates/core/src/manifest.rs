@@ -649,7 +649,7 @@ impl PolicyKind {
 /// One MANIFEST configuration key, as the domain policies card and the doctor
 /// read it. Every policy key has exactly one entry here, and the standing
 /// rule is that a key joins this registry and the card in the same change:
-/// the guard test in crates/core/tests/manifest.rs fails on a `pub const
+/// the guard test in crates/core/tests/it/manifest.rs fails on a `pub const
 /// *_KEY` this list does not name, and the card draws its rows from this
 /// list, so a key never has to be drawn by hand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -723,7 +723,7 @@ pub fn policy_registry() -> &'static [PolicyKey] {
 ///
 /// Beside the parser rather than in the web app, for the reason the policy
 /// registry is: an example shown to a person is a promise about what the
-/// parser accepts, and the guard test in crates/core/tests/manifest.rs parses
+/// parser accepts, and the guard test in crates/core/tests/it/manifest.rs parses
 /// every one of these back into the declaration it advertises, so a change to
 /// the grammar that forgets the example fails a test instead of shipping a
 /// wrong screenshot.

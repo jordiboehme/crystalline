@@ -156,6 +156,26 @@ pub fn index_response<E: RustEmbed>(base: &BasePath) -> Response {
     response
 }
 
+/// The one startup warning for a prefixed server whose embedded bundle has no
+/// root base tag: the shell would then load its assets from the root of the
+/// host, outside the prefix, and nothing would say why the page is blank.
+/// `None` at the root and for a bundle that carries the tag.
+pub fn untagged_bundle_warning(index: &[u8], base: &BasePath) -> Option<String> {
+    if base.is_root() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(index);
+    if text.contains(BASE_TAG) {
+        return None;
+    }
+    Some(format!(
+        "the embedded web UI has no {BASE_TAG} tag, so under {} it loads its files from \
+         the root of the host and the page stays blank; rebuild the binary from a Fluid \
+         bundle that carries the tag",
+        base.as_str()
+    ))
+}
+
 /// The entry point with its base tag naming `base`, validated by a hash of
 /// what is actually sent. A bundle without the tag is served as it is: it
 /// predates the tag, and a shell that loads from the root is still a page
@@ -370,4 +390,25 @@ fn etag_header(etag: &str) -> (HeaderName, HeaderValue) {
         header::ETAG,
         HeaderValue::from_str(etag).unwrap_or_else(|_| HeaderValue::from_static("\"\"")),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_bundle_without_the_base_tag_warns_once_under_a_prefix() {
+        let prefix = BasePath::parse("/crystalline").unwrap();
+        let tagless = b"<!doctype html><html><head></head><body></body></html>";
+        let warning = untagged_bundle_warning(tagless, &prefix).expect("warns");
+        assert!(warning.contains("/crystalline"), "{warning}");
+        assert!(warning.contains("<base href=\"/\" />"), "{warning}");
+        let tagged = format!("<html><head>{BASE_TAG}</head></html>");
+        assert_eq!(untagged_bundle_warning(tagged.as_bytes(), &prefix), None);
+        assert_eq!(
+            untagged_bundle_warning(tagless, &BasePath::root()),
+            None,
+            "at the root a bundle without the tag is served as built"
+        );
+    }
 }

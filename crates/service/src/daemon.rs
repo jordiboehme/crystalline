@@ -250,6 +250,21 @@ impl Shared {
     }
 }
 
+/// See `run_serve`'s `from_task`. Answers the daemon log to write to.
+fn prepare_task_start() -> Option<std::fs::File> {
+    #[cfg(windows)]
+    // SAFETY: detaches this process from the console it was given; nothing
+    // here holds a handle to that console.
+    unsafe {
+        windows_sys::Win32::System::Console::FreeConsole();
+    }
+    if let Ok(dir) = config::state_dir() {
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::env::set_current_dir(&dir);
+    }
+    crate::instance::daemon_log_file()
+}
+
 /// Run the daemon: `crystalline serve [--daemon] [--http <addr>] [--read-only]
 /// [--take-over]`. The HTTP endpoint is on at [`DEFAULT_HTTP_ADDR`] unless it was
 /// turned off, so `--http` moves it or closes it rather than opening it; see
@@ -259,7 +274,8 @@ impl Shared {
 /// [`IDLE_EXIT_GRACE`] past its last socket session, the Claude Desktop
 /// extension's shape; see `spawn_daemon`. `breakaway_refused` says the
 /// spawner could not start this daemon outside its own job; see
-/// [`crate::runs_in`].
+/// [`crate::runs_in`]. `from_task` says Task Scheduler started it (the
+/// hidden `serve --from-task`); it implies `daemon_flag`.
 // The daemon's startup switches are flat on purpose, one clap flag each.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_serve(
@@ -273,16 +289,33 @@ pub async fn run_serve(
     take_over: bool,
     exit_when_idle: bool,
     breakaway_refused: bool,
+    from_task: bool,
 ) -> anyhow::Result<()> {
+    // A daemon Task Scheduler started: its working directory is System32,
+    // nobody reads its stderr and, as a console program, it was given a
+    // console window. So it drops the window, works in the state folder like
+    // a spawned daemon and logs to daemon.log.
+    let daemon_flag = daemon_flag || from_task;
+    let log_file = if from_task {
+        prepare_task_start()
+    } else {
+        None
+    };
     // RUST_LOG filters the daemon's log (the tracing `EnvFilter` syntax),
     // `info` when it is unset or does not parse.
-    let _ = tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .try_init();
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let _ = match log_file {
+        Some(file) => tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(file))
+            .with_env_filter(filter)
+            .try_init(),
+        None => tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .with_env_filter(filter)
+            .try_init(),
+    };
 
     // The single load chokepoint: parse the environment overlay, resolve the
     // config path (flag, then CRYSTALLINE_CONFIG, then the default) and layer
@@ -515,6 +548,25 @@ pub async fn run_serve(
     } else {
         drop(sessions_rx);
     }
+
+    // Windows ends a windowless, consoleless process with the user's
+    // session and tells it nothing. A hidden window gets the session end and
+    // starts the same graceful stop `ctl shutdown` does. Every detached
+    // daemon on Windows has one, however it started, because a spawned one
+    // is ended at sign-out in the same silent way as a task-started one; a
+    // foreground `serve` keeps its console and Ctrl+C.
+    #[cfg(windows)]
+    let _session_end = if daemon_flag {
+        let stop = shared.clone();
+        crate::session_end_windows::SessionEndWindow::start(
+            &crate::session_end_windows::window_title(std::process::id()),
+            Box::new(move |reason| stop.trigger_shutdown(reason)),
+            crate::session_end::stopped_receiver(),
+            crate::session_end::ENDSESSION_WAIT,
+        )
+    } else {
+        None
+    };
 
     // The one-time first-run setup token, drawn once per serve process and only
     // when it could still be spent. Two things have to be true: the bind is one
@@ -966,6 +1018,9 @@ impl Departure {
         if let Some(line) = farewell {
             eprintln!("{line}");
         }
+        // A window procedure holding WM_ENDSESSION may now let Windows end
+        // the session: nothing of the index is in use any more.
+        crate::session_end::notify_stopped();
         exit_now();
     }
 }
@@ -1958,6 +2013,12 @@ pub fn http_router_with_assets<E: rust_embed::RustEmbed + 'static>(
     // are startup-effective, so a running daemon serves the tier it started in.
     let mcp_auth = config.auth_mcp().then(|| auth.clone());
     let base_path = crate::settings::base_path(&config);
+    if ui
+        && let Some(index) = E::get("index.html")
+        && let Some(warning) = crate::ui::untagged_bundle_warning(&index.data, &base_path)
+    {
+        tracing::warn!("{warning}");
+    }
     let (router, service) = http_base(
         engine,
         http_sessions,
@@ -3376,6 +3437,43 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bare `/crystalline` prefix is stripped. MCP is the router's
+    /// fallback, so a test that only checks that `/crystalline` reaches MCP
+    /// passes with or without the strip. A fallback that answers the path it
+    /// saw tells the two apart: the bare prefix arrives as `/`, a look-alike
+    /// unchanged.
+    #[tokio::test]
+    async fn the_bare_prefix_reaches_the_fallback_as_the_root() {
+        use tower_service::Service;
+        let router = axum::Router::new()
+            .route("/health", axum::routing::get(|| async { "health" }))
+            .fallback(|uri: axum::http::Uri| async move { uri.path().to_string() });
+        let wrapped = under_base_path(
+            router,
+            crystalline_core::base::BasePath::parse("/crystalline").unwrap(),
+        );
+        for (sent, seen) in [
+            ("/crystalline", "/"),
+            ("/crystalline/", "/"),
+            ("/crystalline/health", "health"),
+            ("/crystallinex", "/crystallinex"),
+        ] {
+            let response = wrapped
+                .clone()
+                .call(
+                    axum::http::Request::get(sent)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            assert_eq!(std::str::from_utf8(&body).unwrap(), seen, "{sent}");
+        }
+    }
 
     /// The sign-in settle never spends what the watchdog keeps for the end
     /// of a departure: at most half the deadline, and always the margin

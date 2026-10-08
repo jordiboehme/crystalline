@@ -54,7 +54,7 @@ pub use store::{
     StoredEngram, TagAlias, TagCount, Vocabulary, WorkClaim, is_current_status, is_retired_status,
     lookup_in_domain, merge_vocabularies, parse_metadata_filters, retired_factor, salience_prior,
 };
-/// The shared statement builders, reachable from `tests/plans.rs` and from
+/// The shared statement builders, reachable from `tests/it/plans.rs` and from
 /// nothing else.
 ///
 /// `mod store` is private, and the hot-statement registry lives in an

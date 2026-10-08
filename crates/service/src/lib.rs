@@ -12,6 +12,7 @@
 pub mod client;
 pub mod control;
 pub mod daemon;
+pub mod daemon_task;
 mod first_admin;
 pub mod instance;
 pub use crystalline_identity::join;
@@ -20,6 +21,9 @@ pub mod mcp_gate;
 pub mod remote_ctl;
 pub mod route;
 pub mod runs_in;
+mod session_end;
+#[cfg(windows)]
+mod session_end_windows;
 pub use crystalline_identity::scope;
 pub use crystalline_rest as rest;
 pub mod stub;
@@ -47,11 +51,11 @@ pub const EVOLVE_TOOL_NAME: &str = "evolve_engrams";
 
 pub use client::{
     adopt_domain_names_direct, collect_orphaned_domains, configure, ctl_if_running,
-    ctl_if_running_passive, ctl_required, discard_rename_journal, domain_export, domain_import,
-    domain_remove, domain_rename, domain_review, machine_rename_owner, name_report, origin_add,
-    origin_changes, origin_discard, origin_resolve, origin_share, origin_status, origin_update,
-    origin_withdraw, run_mcp, run_tool, scaffold_virtual_manifest, tags_retag, use_daemon,
-    virtual_routing_bullets,
+    ctl_if_running_passive, ctl_required, discard_rename_journal, domain_export,
+    domain_export_from_copy, domain_import, domain_remove, domain_rename, domain_review,
+    machine_rename_owner, name_report, origin_add, origin_changes, origin_discard, origin_resolve,
+    origin_share, origin_status, origin_update, origin_withdraw, run_mcp, run_tool,
+    scaffold_virtual_manifest, tags_retag, use_daemon, virtual_routing_bullets,
 };
 pub use crystalline_engine::engine::{
     ConvergenceReport, Engine, EngineError, OVERLAY_NEEDS_IDENTITY, REVIEW_NO_STACKING, RenameStep,

@@ -15,6 +15,7 @@ use crystalline_core::config;
 use crystalline_core::verify::{self, VerifyOptions};
 
 mod cmd;
+mod desktop_state;
 mod doctor;
 mod harness_command;
 mod harness_files;
@@ -338,6 +339,11 @@ enum Command {
         /// --fix: the report names what is half moved first.
         #[arg(long)]
         discard_rename: bool,
+        /// With --fix: merge the private Crystalline state an old Claude
+        /// Desktop extension left inside Claude Desktop's package into this
+        /// machine's state. The folder is renamed afterwards, never deleted.
+        #[arg(long, requires = "fix")]
+        merge_desktop_state: bool,
         /// Load the global config from this file instead of the default path.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -367,6 +373,14 @@ enum Command {
         /// time is up, as that command does when it finishes.
         #[arg(long)]
         standalone: Option<String>,
+    },
+    /// Windows: register, remove or print the Task Scheduler task that
+    /// starts the daemon outside any app package. The MSI runs it; `doctor
+    /// --fix` uses the same code for one user.
+    #[command(name = "daemon-task", hide = true)]
+    DaemonTask {
+        #[command(subcommand)]
+        action: DaemonTaskAction,
     },
     /// Run the single-instance daemon: watch domains, embed and serve MCP and ctl
     /// over the socket, plus MCP, the JSON API and the web UI over HTTP at
@@ -399,6 +413,11 @@ enum Command {
         /// runs inside that job. Reported by `crystalline doctor`.
         #[arg(long, hide = true)]
         breakaway_refused: bool,
+        /// Started by the Windows task \Crystalline\Daemon: work in the state
+        /// folder, log to daemon.log and drop the console window. Implies
+        /// --daemon. Hidden: only the task passes it.
+        #[arg(long, hide = true)]
+        from_task: bool,
         /// Serve the content API read-only: the five content-mutating tools are
         /// hidden and refused, while sync, watching and embedding still run.
         /// Overrides service.read_only when set; the mode is fixed for the
@@ -1937,10 +1956,22 @@ fn main() -> anyhow::Result<()> {
             domain,
             fix,
             discard_rename,
+            merge_desktop_state,
             config,
-        }) => on_runtime(move || run_doctor(domain, fix, discard_rename, config, cli.db, cli.json)),
+        }) => on_runtime(move || {
+            run_doctor(
+                domain,
+                fix,
+                discard_rename,
+                merge_desktop_state,
+                config,
+                cli.db,
+                cli.json,
+            )
+        }),
         Some(Command::Healthcheck { addr }) => cmd::healthcheck(&addr),
         Some(Command::HoldLock { secs, standalone }) => hold_lock(secs, standalone.as_deref()),
+        Some(Command::DaemonTask { action }) => daemon_task_command(action),
         Some(Command::Serve {
             http,
             allowed_host,
@@ -1948,10 +1979,15 @@ fn main() -> anyhow::Result<()> {
             autostarted,
             exit_when_idle,
             breakaway_refused,
+            from_task,
             read_only,
             take_over,
             config,
         }) => {
+            // A task-started daemon is recorded as an autostart, like any
+            // daemon a client spawned: no new start mode an old reader would
+            // fail to parse.
+            let autostarted = autostarted || from_task;
             // Point this process's temp location at the daemon's own scratch
             // directory before the runtime starts. It has to happen here, on the
             // only thread this process has so far: setting an environment
@@ -1975,6 +2011,7 @@ fn main() -> anyhow::Result<()> {
                     take_over,
                     exit_when_idle,
                     breakaway_refused,
+                    from_task,
                 )
             }) {
                 Ok(()) => Ok(()),
@@ -2202,6 +2239,10 @@ async fn status_dispatch(
                 // The daemon's own rows, with what this run asked each
                 // server added: the same keys, and more.
                 map.insert("sources".to_string(), serde_json::to_value(&source_rows)?);
+                map.insert(
+                    "desktop_states".to_string(),
+                    serde_json::to_value(desktop_state::scan_here())?,
+                );
             }
             println!("{data}");
         } else {
@@ -2216,6 +2257,9 @@ async fn status_dispatch(
                 data["version"].as_str().unwrap_or("unknown"),
                 format_uptime(data["uptime_secs"].as_u64().unwrap_or(0)),
             );
+            if let Some(line) = desktop_state::status_line(&desktop_state::scan_here()) {
+                println!("{line}");
+            }
             sources::render_sources(&source_rows);
             cmd::render_status(&data, &note);
         }
@@ -2286,8 +2330,8 @@ async fn status_dispatch(
     finish_status(route, &cfg, json, note, &source_rows).await
 }
 
-/// A direct read's `status`: the index's report with the sources added, the
-/// `Sources:` block before the rest in the human form.
+/// A direct read's `status`: the index's report with the sources and any
+/// split Claude Desktop state added, both before the rest in the human form.
 async fn finish_status(
     route: cmd::IndexRoute,
     cfg: &config::GlobalConfig,
@@ -2299,9 +2343,16 @@ async fn finish_status(
     if json {
         if let serde_json::Value::Object(map) = &mut value {
             map.insert("sources".to_string(), serde_json::to_value(source_rows)?);
+            map.insert(
+                "desktop_states".to_string(),
+                serde_json::to_value(desktop_state::scan_here())?,
+            );
         }
         println!("{value}");
     } else {
+        if let Some(line) = desktop_state::status_line(&desktop_state::scan_here()) {
+            println!("{line}");
+        }
         sources::render_sources(source_rows);
         cmd::render_status(&value, daemon_note);
     }
@@ -3382,6 +3433,7 @@ async fn run_doctor(
     domain: Option<String>,
     fix: bool,
     discard_rename: bool,
+    merge_desktop_state: bool,
     config: Option<PathBuf>,
     db: Option<PathBuf>,
     json: bool,
@@ -3390,6 +3442,7 @@ async fn run_doctor(
         domain.as_deref(),
         fix,
         discard_rename,
+        merge_desktop_state,
         config.as_deref(),
         db.as_deref(),
     )
@@ -4515,6 +4568,67 @@ async fn domain_rename_dispatch(
         crystalline_service::domain_rename(&domain, &new, local, db.as_deref(), config.as_deref())
             .await?;
     cmd::print_domain_rename(&report, local, json);
+    Ok(())
+}
+
+#[derive(Subcommand, Debug)]
+enum DaemonTaskAction {
+    /// Register the task, replacing one of the same name.
+    Register {
+        /// For every user (the MSI), instead of the current user.
+        #[arg(long)]
+        all_users: bool,
+    },
+    /// Remove the task. A task that is not there is no error.
+    Unregister {
+        /// The task for every user and also each user's own task (the MSI's
+        /// uninstall), instead of the current user's task.
+        #[arg(long)]
+        all_users: bool,
+    },
+    /// Print the definition this binary would register.
+    Show {
+        /// For every user (the MSI), instead of the current user.
+        #[arg(long)]
+        all_users: bool,
+    },
+}
+
+fn daemon_task_command(action: DaemonTaskAction) -> anyhow::Result<()> {
+    use crystalline_service::daemon_task::{self, TaskPrincipal};
+    let principal = |all_users: bool| {
+        if all_users {
+            TaskPrincipal::AllUsers
+        } else {
+            TaskPrincipal::User {
+                account: daemon_task::current_account(),
+            }
+        }
+    };
+    match action {
+        DaemonTaskAction::Register { all_users } => {
+            let exe = std::env::current_exe()?;
+            let name =
+                daemon_task::register(&principal(all_users), &exe).map_err(anyhow::Error::msg)?;
+            println!("registered the task {name}");
+        }
+        DaemonTaskAction::Unregister { all_users } => {
+            let removal = daemon_task::unregister(&principal(all_users));
+            for name in &removal.removed {
+                println!("removed the task {name}");
+            }
+            let removed = removal.into_result().map_err(anyhow::Error::msg)?;
+            if removed.is_empty() {
+                println!("no daemon task to remove");
+            }
+        }
+        DaemonTaskAction::Show { all_users } => {
+            print!(
+                "{}",
+                daemon_task::task_xml(&std::env::current_exe()?, &principal(all_users))
+            );
+        }
+    }
     Ok(())
 }
 

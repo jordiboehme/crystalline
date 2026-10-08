@@ -281,8 +281,10 @@ async fn a_remote_edit_lands_in_the_open_room_and_an_overwrite_is_refused() {
     assert_eq!(reply["ok"], false, "{reply}");
     let refusal = reply["error"].as_str().unwrap();
     assert!(
-        refusal.starts_with("The overwrite was not confirmed") && refusal.contains("Ada"),
-        "the no-question path of MCP: {refusal}"
+        refusal.starts_with("The engram is open in the editor right now")
+            && refusal.contains("Ada")
+            && refusal.contains("a full replace was refused"),
+        "the same refusal an MCP call gets: {refusal}"
     );
 }
 

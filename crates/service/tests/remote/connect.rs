@@ -1227,6 +1227,49 @@ async fn signing_in_through_the_browser_under_a_prefix_saves_the_base() {
     }
 }
 
+/// A proxy that forwards only the prefix, so the two RFC addresses at the
+/// host root answer 404. The client falls
+/// back to the copies inside the prefix and the browser sign-in completes.
+#[tokio::test]
+async fn signing_in_works_when_the_proxy_hides_the_host_root() {
+    let server = Arc::new(
+        RemoteServer::start(Options::OAUTH.under("/crystalline", Proxy::StripsAndHidesTheHostRoot))
+            .await,
+    );
+    let root = server
+        .http
+        .get(format!(
+            "{}/.well-known/oauth-protected-resource/crystalline",
+            server.origin()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(root.status(), 404, "the proxy really hides the host root");
+    let dir = tempfile::tempdir().unwrap();
+    let connected = connect_with_browser(
+        &server.base(),
+        None,
+        dir.path(),
+        &[],
+        fake_browser(server.clone(), "keeper", "allow"),
+        no_paste,
+    )
+    .await
+    .unwrap();
+    assert_eq!(connected.source.url, server.base());
+    assert_eq!(
+        connected.source.token_endpoint.as_deref(),
+        Some(format!("{}/api/v1/oauth/token", server.base()).as_str())
+    );
+    let data = Connection::open(connected.source.clone(), dir.path())
+        .unwrap()
+        .ctl_data(json!({ "v": 1, "cmd": "status" }))
+        .await
+        .unwrap();
+    assert_eq!(data["account"], "keeper");
+}
+
 #[tokio::test]
 async fn a_pasted_token_under_a_prefix_adds_the_source() {
     for proxy in [Proxy::Strips, Proxy::PassesThrough] {
@@ -1439,6 +1482,14 @@ async fn a_list_takes_a_domain_from_a_server_that_takes_all_and_says_so() {
             .any(|m| m.local == "platform"),
         "no second record"
     );
+    assert!(
+        file.find("beta")
+            .unwrap()
+            .mounts
+            .iter()
+            .any(|m| m.local == "platform"),
+        "the listing source holds the mount now"
+    );
 }
 
 #[tokio::test]
@@ -1476,6 +1527,18 @@ async fn a_local_copy_comes_back_when_its_domain_leaves_the_list() {
     .await
     .unwrap();
     assert_eq!(narrowed.came_back, vec!["platform".to_string()]);
+    assert!(
+        !narrowed.taken.contains(&"platform".to_string()),
+        "the server no longer serves platform"
+    );
+    let file = load_sources(dir.path()).unwrap();
+    assert!(
+        file.sources
+            .iter()
+            .all(|s| s.mounts.iter().all(|m| m.local != "platform")),
+        "no mount hides the local platform any more, so it is visible: {:?}",
+        file.sources
+    );
 }
 
 #[tokio::test]
@@ -1499,4 +1562,7 @@ async fn a_0_23_0_sources_file_connects_again_as_all_and_stays_without_a_list() 
     assert_eq!(again.taken.len(), 4, "no field is all");
     let written = std::fs::read_to_string(dir.path().join("sources.json")).unwrap();
     assert!(!written.contains("\"domains\""), "{written}");
+    assert!(again.source.domains.is_none(), "no list was written");
+    let file = load_sources(dir.path()).unwrap();
+    assert_eq!(file.sources.len(), 1, "the 0.23.0 record is the one source");
 }

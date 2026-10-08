@@ -1305,7 +1305,7 @@ pub enum ShareActor {
 /// whole point of the type: a domain the index holds no row for has synced
 /// nothing, while a count that could not be read is a number that exists and is
 /// unavailable. Collapsing them into one `None` is how a purge gate fails open,
-/// and it is what leaves a confirmation question quietly missing the figure it
+/// and it is what leaves the removal question quietly missing the figure it
 /// promises.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RemovalCount {
@@ -1345,11 +1345,11 @@ impl RemovalCount {
 /// surface, which is what makes serving the plan a read rather than a loophole.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PreviewCredential {
-    /// The share's own, or the share's own refusal. A caller about to ASK
-    /// whether to go ahead needs the answer the confirmed call would give, so a
-    /// question is never put about a share this instance would then refuse -
-    /// the MCP confirmation round (spec section 3, propose_preview's
-    /// write-class refusal probes ride along).
+    /// The share's own, or the share's own refusal: the answer the share
+    /// itself would give, so a preview never promises a share this instance
+    /// would then refuse (the preview's write-class refusal probes ride
+    /// along). No surface asks before a share with it any more; the engine's
+    /// tests use it, and it stays for a caller that wants the exact answer.
     ActingIdentity,
     /// The instance credential where the acting identity holds no personal
     /// token: the read-scope plan of spec section 6, which is what lets a

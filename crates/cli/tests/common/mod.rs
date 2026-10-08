@@ -53,7 +53,14 @@ pub fn fixtures_dir() -> PathBuf {
 /// array now gets the credential seam for free, which is the only way any
 /// of the four call sites above stop touching the real keychain from a
 /// test: none of them takes a `--token-store-dir` flag of its own.
-pub fn isolation_env(home: &Path) -> [(&'static str, PathBuf); 8] {
+///
+/// `CRYSTALLINE_TEST_DAEMON_TASK=missing` is the debug build's stand-in for
+/// Task Scheduler (`crystalline_service::daemon_task::for_this_process`).
+/// Without it a Windows child whose daemon spawn is refused its breakaway
+/// asks the real Task Scheduler, and on a machine with the MSI installed it
+/// starts the real daemon for the real user. A test that wants another
+/// answer sets the variable after [`isolate`], which wins.
+pub fn isolation_env(home: &Path) -> [(&'static str, PathBuf); 9] {
     [
         ("HOME", home.to_path_buf()),
         ("XDG_CONFIG_HOME", home.join("config")),
@@ -63,6 +70,7 @@ pub fn isolation_env(home: &Path) -> [(&'static str, PathBuf); 8] {
         ("APPDATA", home.join("roaming")),
         ("LOCALAPPDATA", home.join("local")),
         ("CRYSTALLINE_TEST_NO_KEYCHAIN", PathBuf::from("1")),
+        ("CRYSTALLINE_TEST_DAEMON_TASK", PathBuf::from("missing")),
     ]
 }
 

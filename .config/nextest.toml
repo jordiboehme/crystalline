@@ -16,7 +16,7 @@ max-threads = 4
 
 [[profile.default.overrides]]
 filter = '''
-    (package(crystalline-remote) & (binary(github_client) | binary(github_auth)))
+    (package(crystalline-remote) & binary(it) & test(/^(github_client|github_auth)::/))
     | (package(crystalline-service) & (
         binary(collab_ws)
         | (binary(rest_admin) & test(/^(rest_admin_api|rest_draft_links|rest_write_api)::/))
@@ -29,7 +29,7 @@ test-group = 'forge-wire'
 
 # Keeps a hung test from wedging the whole run: the sandboxed environments
 # this repo is developed in can stall the loopback-binding suites
-# (crates/remote/tests/github_client.rs and github_auth.rs bind
+# (crates/remote/tests/it/github_client.rs and it/github_auth.rs bind
 # 127.0.0.1:0), and without a terminate-after nextest waits forever.
 [profile.default]
 slow-timeout = { period = "120s", terminate-after = 2 }
@@ -45,7 +45,7 @@ leak-timeout = "500ms"
 # past the 240s the default override allows, killing tests that were only slow.
 # They still terminate, so a genuine hang cannot wedge the run.
 [[profile.default.overrides]]
-filter = 'binary(github_auth) or binary(github_client)'
+filter = 'package(crystalline-remote) & binary(it) & test(/^(github_client|github_auth)::/)'
 slow-timeout = { period = "120s", terminate-after = 10 }
 
 # The same environmental stall, observed on two more loopback users during
@@ -65,7 +65,7 @@ slow-timeout = { period = "120s", terminate-after = 10 }
 # ceiling. Without the variable both tests return at once, so the longer
 # ceiling costs nothing elsewhere.
 [[profile.default.overrides]]
-filter = 'package(crystalline-index) & binary(nli_model)'
+filter = 'package(crystalline-index) & binary(it) & test(/^nli_model::/)'
 slow-timeout = { period = "120s", terminate-after = 15 }
 
 # The CI profile: the default one, plus one retry.

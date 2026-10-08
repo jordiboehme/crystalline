@@ -1314,6 +1314,39 @@ async fn a_call_over_all_domains_never_reaches_a_domain_left_out() {
     assert_reached_only_open(&acme, "a recent_activity fan-out");
 
     acme.clear_ctl_log();
+    let context = call(
+        &machine,
+        "build_context",
+        json!({ "anchor": "crystalline://open/open-note" }),
+    )
+    .await
+    .unwrap()
+    .to_string();
+    assert!(context.contains("open-note"), "{context}");
+    assert!(
+        !context.contains("lab-note") && !context.contains("three bar"),
+        "{context}"
+    );
+    assert_reached_only_open(&acme, "a build_context on a listed domain");
+
+    acme.clear_ctl_log();
+    let filtered = call(
+        &machine,
+        "build_context",
+        json!({ "anchor": "crystalline://open/open-note", "domains": ["lab"] }),
+    )
+    .await;
+    // The anchor names `open` and the filter names `lab`, which this machine
+    // does not have from acme: the call is refused here, as a mix of domains.
+    let refusal = filtered.unwrap_err().to_string();
+    assert!(refusal.contains("'lab'"), "{refusal}");
+    assert!(
+        acme.ctl_requests().is_empty(),
+        "a filter naming an unlisted domain sends the server nothing: {:?}",
+        acme.ctl_requests()
+    );
+
+    acme.clear_ctl_log();
     let read = call(
         &machine,
         "read_engram",

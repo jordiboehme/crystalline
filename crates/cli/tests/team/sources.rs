@@ -236,7 +236,8 @@ fn github_after_a_flag_says_to_put_it_first() {
     }
 }
 
-/// Re-review R6: the scan looks only at the `connect` command itself.
+/// The scan looks only at the `connect` command itself, never at a word
+/// inside another command.
 #[test]
 fn a_connect_word_inside_another_command_is_not_scanned() {
     let home = tempfile::tempdir().unwrap();
@@ -868,6 +869,34 @@ fn a_bad_domain_list_is_refused_before_signing_in() {
             "{extra:?}: the refusal names the flag: {stderr}"
         );
         assert!(!sources_file.exists(), "{extra:?}: nothing is saved");
+    }
+}
+
+/// A refused list stops `connect` before it asks the server anything. A
+/// listener that only counts connections stands in for the server, so a
+/// single request would show.
+#[test]
+fn a_refused_domain_list_never_reaches_the_server() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let home = tempfile::tempdir().unwrap();
+    for extra in [vec!["--domains", ""], vec!["--domains", "Not A Name"]] {
+        let mut args = vec!["connect", url.as_str(), "--name", "acme", "--token"];
+        args.extend_from_slice(&extra);
+        let out = bin(home.path())
+            .args(&args)
+            .write_stdin("cmt_unused\n")
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{extra:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("--domains"), "{extra:?}: {stderr}");
+    }
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    match listener.accept() {
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+        other => panic!("connect reached the server: {other:?}"),
     }
 }
 

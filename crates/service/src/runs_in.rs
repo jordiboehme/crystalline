@@ -217,6 +217,58 @@ fn job_and_package() -> (Option<bool>, Option<bool>, Option<String>) {
     (in_job, job_allows_breakaway, package_full_name())
 }
 
+/// The debug-build seam that makes this process believe it runs inside an
+/// app package, for the tests of the bridge rules on any OS. A release build
+/// never reads it.
+pub const TEST_PACKAGE_ENV: &str = "CRYSTALLINE_TEST_PACKAGE";
+
+/// Whether this process runs inside an app package (Claude Desktop's MSIX
+/// package on Windows). Read once. Inside one, `crystalline mcp` is only a
+/// bridge to the daemon outside: see `instance::ensure_daemon_in`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PackageContext {
+    Unpackaged,
+    Packaged { full_name: String },
+}
+
+static CONTEXT: OnceLock<PackageContext> = OnceLock::new();
+
+impl PackageContext {
+    /// This process's context, read on the first call.
+    pub fn here() -> &'static PackageContext {
+        CONTEXT.get_or_init(|| {
+            let seam = if cfg!(debug_assertions) {
+                std::env::var(TEST_PACKAGE_ENV).ok()
+            } else {
+                None
+            };
+            PackageContext::resolve(seam, real_package_full_name())
+        })
+    }
+
+    pub fn is_packaged(&self) -> bool {
+        matches!(self, PackageContext::Packaged { .. })
+    }
+
+    /// The seam when it is set and not empty, otherwise the real package.
+    pub(crate) fn resolve(seam: Option<String>, real: Option<String>) -> PackageContext {
+        match seam.filter(|s| !s.is_empty()).or(real) {
+            Some(full_name) => PackageContext::Packaged { full_name },
+            None => PackageContext::Unpackaged,
+        }
+    }
+}
+
+#[cfg(windows)]
+fn real_package_full_name() -> Option<String> {
+    package_full_name()
+}
+
+#[cfg(not(windows))]
+fn real_package_full_name() -> Option<String> {
+    None
+}
+
 /// The package full name this process runs under, `None` without one.
 #[cfg(windows)]
 fn package_full_name() -> Option<String> {
@@ -405,5 +457,30 @@ mod tests {
             ),
             (None, None, None)
         );
+    }
+
+    #[test]
+    fn the_test_seam_wins_and_an_empty_one_is_unset() {
+        assert_eq!(
+            PackageContext::resolve(None, None),
+            PackageContext::Unpackaged
+        );
+        assert_eq!(
+            PackageContext::resolve(None, Some("Claude_1_x64__pzs8sxrjxfjjc".into())),
+            PackageContext::Packaged {
+                full_name: "Claude_1_x64__pzs8sxrjxfjjc".into()
+            }
+        );
+        assert_eq!(
+            PackageContext::resolve(Some("Claude_test".into()), None),
+            PackageContext::Packaged {
+                full_name: "Claude_test".into()
+            }
+        );
+        assert_eq!(
+            PackageContext::resolve(Some(String::new()), None),
+            PackageContext::Unpackaged
+        );
+        assert!(!PackageContext::Unpackaged.is_packaged());
     }
 }

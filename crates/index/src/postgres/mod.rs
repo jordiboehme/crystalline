@@ -78,12 +78,12 @@
 mod migrations;
 mod search;
 
-/// The search statements the plan registry (`tests/plans.rs`) reads, reachable
+/// The search statements the plan registry (`tests/it/plans.rs`) reads, reachable
 /// from outside the crate and from nowhere else in it. `search` is a private
 /// submodule, so without this the registry would hold a second copy of each
 /// statement, and a copy is a thing that can be right about SQL nobody runs.
 /// [`DEFAULT_MIN_SIMILARITY`] is re-exported the same way, for the same
-/// reason: the cross-backend parity test in `tests/store.rs` reads it rather
+/// reason: the cross-backend parity test in `tests/it/store.rs` reads it rather
 /// than holding a second copy of the number.
 #[doc(hidden)]
 pub use search::{
@@ -392,7 +392,7 @@ impl PostgresStore {
     /// `EXPLAIN (FORMAT JSON)` for one statement, with `enable_seqscan` off for
     /// the duration, as the parsed first row.
     ///
-    /// Test scaffolding for the plan registry (`tests/plans.rs`). All three
+    /// Test scaffolding for the plan registry (`tests/it/plans.rs`). All three
     /// statements run on ONE acquired connection, which is the whole reason
     /// this is a method rather than three calls: `SET` is per session, the
     /// store hands out pooled connections, and a `SET` on one connection with
@@ -990,7 +990,7 @@ async fn delete_children(conn: &mut PgConnection, engram_id: i64) -> Result<()> 
 
 // --- the hot statements ------------------------------------------------------
 //
-// Named here rather than written inline in their methods so `tests/plans.rs`
+// Named here rather than written inline in their methods so `tests/it/plans.rs`
 // can explain the statement this store issues rather than a copy of it. Every
 // one of them is in the registry there, and a rewrite that costs one its index
 // fails with the name of the function that issues it. Nothing else about them

@@ -26,6 +26,7 @@ import { expect, test } from "@playwright/test";
 
 /** The admin `run-smoke.sh` creates, who owns the private domain. */
 const USER = process.env.FLUID_E2E_USER ?? "smoke";
+const BASE_PATH = process.env.FLUID_E2E_BASE_PATH ?? "";
 const PASSWORD = process.env.FLUID_E2E_PASSWORD ?? "smoke-password";
 
 /** The account this journey invites. */
@@ -58,7 +59,7 @@ async function signIn(
   password: string,
 ): Promise<void> {
   await page.goto("./");
-  await expect(page).toHaveURL(/\/login$/);
+  await expect(page).toHaveURL((url) => url.pathname === `${BASE_PATH}/login`);
 
   await page.getByLabel("Name", { exact: true }).fill(name);
   await page.getByLabel("Password", { exact: true }).fill(password);

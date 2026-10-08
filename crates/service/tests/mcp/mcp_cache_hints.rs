@@ -189,6 +189,7 @@ async fn degraded_results(lease: &PeerLease, version: &str) -> Vec<(&'static str
         daemon_version: None,
         daemon_pid: None,
         channel: None,
+        bridge: None,
     });
     let tools = server
         .list_tools(None, context_at(lease, version))

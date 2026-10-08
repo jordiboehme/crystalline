@@ -10,7 +10,7 @@
 //! Unix only: `install_receipt_path`/`receipt_path`/a harness's artifact
 //! base all resolve from `HOME`/`XDG_STATE_HOME`, so every test here
 //! redirects them to a scratch directory, the same shared-lock,
-//! preserve-and-restore technique `crates/core/tests/orchestrate.rs` uses
+//! preserve-and-restore technique `crates/core/tests/it/orchestrate.rs` uses
 //! for the same reason.
 #![cfg(unix)]
 

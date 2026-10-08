@@ -2444,6 +2444,11 @@ pub fn oidc_pair_problem(config: &GlobalConfig) -> Option<String> {
 /// environment). A refused write changes nothing. The environment overlay
 /// keeps plain [`apply`], so two variables never refuse each other by the
 /// order they arrive in; `OidcSettings::resolve` checks the pair at startup.
+///
+/// The refusal cites the effective value of each key, which may come from the
+/// environment rather than the file: when `CRYSTALLINE_SERVICE_PUBLIC_URL` is
+/// set, a `config set auth.oidc.redirect_uri` is checked against that value
+/// and its sentence names it, because it is what the running server uses.
 pub fn apply_checked(
     file: &mut GlobalConfig,
     overlay: &EnvOverlay,

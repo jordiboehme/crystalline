@@ -617,7 +617,7 @@ WHERE to_domain IS NOT NULL AND to_id IS NOT NULL
 // `idx_contradiction_pair_domain` carries the pair columns after the seek
 // key so it also serves the read's `ORDER BY engram_a, engram_b`; on
 // `(domain_id, model)` alone the planner scans the primary key for the
-// order instead, which `tests/plans.rs` rejects.
+// order instead, which `tests/it/plans.rs` rejects.
 //
 // `idx_contradiction_pair_model` serves `Store::scored_pair_count`'s
 // `WHERE model=?1`, which names no domain: `idx_contradiction_pair_domain`

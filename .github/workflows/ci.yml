@@ -439,6 +439,46 @@ jobs:
       - name: Bundle size
         run: node scripts/bundle-budget.ts
 
+  # The Claude Desktop launcher and the two bundle manifests. The launcher
+  # is plain Node, so its tests run here on every change rather than only
+  # when a release packs it.
+  mcpb:
+    name: mcpb
+    timeout-minutes: 10
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && needs.changes.outputs.tested != 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The same pin and major as the fluid job.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '26'
+
+      - name: The launcher's tests
+        run: node --test packaging/mcpb/shim/
+
+      - name: Both manifests carry what they must
+        run: bash packaging/mcpb/tests/check-manifests.sh
+
+      # The packer is pinned like the release's. validate checks the schema
+      # and the icon only, never a binary, so the Desktop-only stage gets a
+      # placeholder file.
+      - name: Both bundles validate and the standard one packs
+        shell: bash
+        run: |
+          set -euo pipefail
+          packaging/mcpb/generate-manifest.sh standard 0.0.0 bundle/standard
+          npx --yes @anthropic-ai/mcpb@2.1.2 validate bundle/standard
+          npx --yes @anthropic-ai/mcpb@2.1.2 pack bundle/standard standard.mcpb
+          mkdir -p bundle/desktop-only/server
+          printf 'placeholder\n' > bundle/desktop-only/server/crystalline
+          packaging/mcpb/generate-manifest.sh desktop-only 0.0.0 bundle/desktop-only
+          npx --yes @anthropic-ai/mcpb@2.1.2 validate bundle/desktop-only
+
   # The browser smoke: the built bundle, a real daemon and a real browser. It
   # covers what jsdom cannot (see fluid/e2e/smoke.spec.ts) and is a job of its
   # own because it needs the Rust toolchain as well as Node.
@@ -572,17 +612,33 @@ jobs:
 
       - name: The app answers under a path
         run: |
+          set -euo pipefail
           docker run -d --name fluid-base -e CRYSTALLINE_UPSTREAM=127.0.0.1:7411 -e CRYSTALLINE_BASE_PATH=/crystalline crystalline-fluid:ci
-          sleep 3
-          status=0
-          docker exec fluid-base wget --spider -q http://127.0.0.1/crystalline/ || status=$?
-          docker rm -f fluid-base
-          exit $status
+          trap 'docker rm -f fluid-base >/dev/null 2>&1 || true' EXIT
+          for _ in $(seq 1 30); do
+            if docker exec fluid-base wget --spider -q http://127.0.0.1/crystalline/; then
+              echo "the app answers under /crystalline"
+              exit 0
+            fi
+            sleep 0.5
+          done
+          docker logs fluid-base
+          echo "::error::the app did not answer under /crystalline within 15 s"
+          exit 1
 
-      - name: A base path that cannot be a prefix stops the container
+      - name: A base path that cannot be a prefix stops the container with its sentence
         run: |
-          if docker run --rm -e CRYSTALLINE_UPSTREAM=127.0.0.1:7411 -e CRYSTALLINE_BASE_PATH=crystalline/ crystalline-fluid:ci nginx -t; then
-            echo "a bad CRYSTALLINE_BASE_PATH was accepted" >&2
+          set -uo pipefail
+          # The step shell runs with -e, so the expected failure is caught here.
+          status=0
+          out=$(docker run --rm -e CRYSTALLINE_UPSTREAM=127.0.0.1:7411 -e CRYSTALLINE_BASE_PATH=crystalline/ crystalline-fluid:ci nginx -t 2>&1) || status=$?
+          printf '%s\n' "$out"
+          if [ "$status" -eq 0 ]; then
+            echo "::error::a bad CRYSTALLINE_BASE_PATH was accepted"
+            exit 1
+          fi
+          if ! printf '%s\n' "$out" | grep -q 'CRYSTALLINE_BASE_PATH must look like /crystalline'; then
+            echo "::error::the container stopped, but not with the base path sentence"
             exit 1
           fi
 
@@ -594,6 +650,43 @@ jobs:
             test -d /usr/share/nginx/html/assets
             ls /usr/share/nginx/html/assets | head -n 3
           '
+
+      # docs/deployment.md strips /crystalline with `uri strip_prefix`, and
+      # the bare /crystalline has to reach the daemon as /. Checked with a real
+      # Caddy, the second site standing in for the daemon and answering the
+      # path it got.
+      - name: The Caddy example strips the bare path to the root
+        run: |
+          set -euo pipefail
+          cat > Caddyfile <<'CADDY'
+          {
+            admin off
+            auto_https off
+          }
+          :8080 {
+            @crystalline path /crystalline /crystalline/*
+            handle @crystalline {
+              uri strip_prefix /crystalline
+              reverse_proxy 127.0.0.1:7411
+            }
+          }
+          :7411 {
+            respond "{http.request.uri.path}"
+          }
+          CADDY
+          docker run -d --name caddy-check --network host -v "$PWD/Caddyfile:/etc/caddy/Caddyfile:ro" caddy:2.11.7-alpine@sha256:d8542f48d34a9cf4e4c11a478865229840e87e4c96ea3f439101f31a5d35f75f
+          trap 'docker rm -f caddy-check >/dev/null 2>&1 || true' EXIT
+          for _ in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:8080/crystalline/health >/dev/null 2>&1 && break
+            sleep 0.5
+          done
+          for pair in "/crystalline:/" "/crystalline/:/" "/crystalline/health:/health" "/crystalline/api/v1/x:/api/v1/x"; do
+            asked="${pair%%:*}"
+            want="${pair#*:}"
+            got=$(curl -fsS "http://127.0.0.1:8080${asked}")
+            echo "$asked -> $got"
+            [ "$got" = "$want" ] || { echo "::error::$asked reached the daemon as '$got', not '$want'"; exit 1; }
+          done
 
   style:
     name: style
@@ -796,6 +889,7 @@ jobs:
       - fluid
       - fluid-smoke
       - fluid-image
+      - mcpb
       - musl-spike
       - verify-action
       - workflow-lint

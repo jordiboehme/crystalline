@@ -15,6 +15,7 @@ mod daemon_env;
 mod remote_server;
 
 mod configure;
+mod desktop_state;
 mod doctor;
 mod doctor_names;
 #[cfg(unix)]
@@ -29,3 +30,4 @@ mod provision;
 #[cfg(unix)]
 mod source_hooks;
 mod version;
+mod wix;

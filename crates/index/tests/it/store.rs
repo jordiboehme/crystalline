@@ -1,0 +1,10289 @@
+//! Cross-backend behavioral parity suite for the store, sync engine and search
+//! planner.
+//!
+//! Every test body is a pure function of a `&dyn Store`, so the same assertions
+//! run against both backends. Turso (in-memory) always runs. Postgres runs when
+//! `CRYSTALLINE_TEST_POSTGRES_URL` is set (each test gets its own schema via
+//! `search_path`, dropped afterwards); when it is unset the Postgres leg is
+//! skipped with a one-time note and the suite stays green. Backend-specific
+//! assertions (Turso schema version, the query-plan index seek, the on-disk file)
+//! live in `turso_only.rs`.
+
+use std::collections::HashMap;
+use std::path::Path;
+
+use crystalline_index::{
+    AttachmentRow, DomainId, DomainKind, EMBED_PAGE_SIZE, EdgeKind, EmbeddingCoverage,
+    EmbeddingRow, EngramId, EngramRecord, FileStamp, FilterOp, HostClaim, InboundPage,
+    InboundQuery, IndexError, MetadataFilter, NamedCount, NewChunk, RecentFilter, SearchMode,
+    SearchOrder, SearchQuery, Store, TursoStore, Vocabulary, resolve_forward_refs, sync_domain,
+};
+
+fn write(dir: &Path, rel: &str, content: &str) {
+    let path = dir.join(rel);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(path, content).unwrap();
+}
+
+/// A minimal engram markdown block.
+fn engram(title: &str, permalink: &str, ftype: &str, extra_fm: &str, body: &str) -> String {
+    format!(
+        "---\ntype: {ftype}\ntitle: {title}\npermalink: {permalink}\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\n{extra_fm}---\n\n# {title}\n\n{body}\n"
+    )
+}
+
+/// A minimal engram record with an explicit content and checksum, built without
+/// parsing so the store methods can be exercised directly on both backends. The
+/// `sha` is the CAS token stored in the stamp.
+fn record(path: &str, permalink: &str, content: &str, sha: &str) -> EngramRecord {
+    EngramRecord {
+        path: path.to_string(),
+        permalink: permalink.to_string(),
+        title: "Title".to_string(),
+        engram_type: "engram".to_string(),
+        status: "current".to_string(),
+        recorded_at: Some("2026-01-01".to_string()),
+        valid_from: None,
+        valid_to: None,
+        timestamp: None,
+        description: None,
+        content: content.to_string(),
+        metadata: serde_json::json!({}),
+        tags: Vec::new(),
+        observations: Vec::new(),
+        relations: Vec::new(),
+        links: Vec::new(),
+        stamp: FileStamp {
+            mtime: 0,
+            size: content.len() as u64,
+            sha256: sha.to_string(),
+        },
+        actor: String::new(),
+        tombstone: false,
+    }
+}
+
+// --- backend runner ----------------------------------------------------------
+
+#[cfg(feature = "postgres")]
+fn pg_url() -> Option<String> {
+    use std::sync::Once;
+    static NOTE: Once = Once::new();
+    match std::env::var("CRYSTALLINE_TEST_POSTGRES_URL") {
+        Ok(u) if !u.is_empty() => Some(u),
+        _ => {
+            NOTE.call_once(|| {
+                eprintln!(
+                    "note: skipping the postgres parity leg (CRYSTALLINE_TEST_POSTGRES_URL is unset); turso only"
+                )
+            });
+            None
+        }
+    }
+}
+
+/// A distinct schema name per test invocation. The pid keeps runs apart, the
+/// counter keeps tests within a run apart; both stay well under Postgres's
+/// 63-byte identifier limit.
+/// A hash salt keeps a recycled pid from adopting a schema a panicking run left behind.
+#[cfg(feature = "postgres")]
+fn unique_schema() -> String {
+    use std::hash::{BuildHasher, RandomState};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "ct_{}_{}_{:x}",
+        std::process::id(),
+        n,
+        RandomState::new().hash_one(n)
+    )
+}
+
+/// Run a parity body against Turso (always) and Postgres (when configured),
+/// giving each backend a fresh, isolated store.
+macro_rules! parity {
+    ($name:ident, $body:path) => {
+        #[tokio::test]
+        async fn $name() {
+            {
+                let store = TursoStore::open_in_memory().await.unwrap();
+                $body(&store).await;
+            }
+            #[cfg(feature = "postgres")]
+            {
+                if let Some(url) = pg_url() {
+                    let schema = unique_schema();
+                    let store = crystalline_index::PostgresStore::open_in_schema(&url, &schema)
+                        .await
+                        .expect("open the postgres test schema");
+                    $body(&store).await;
+                    store
+                        .drop_schema()
+                        .await
+                        .expect("drop the postgres test schema");
+                }
+            }
+        }
+    };
+}
+
+// --- parity bodies -----------------------------------------------------------
+
+async fn full_sync_counts(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "MANIFEST.md",
+        &engram(
+            "Manifest",
+            "manifest",
+            "manifest",
+            "",
+            "## Scope\n\n- covers things\n\n## When to Use\n\n- when routing\n",
+        ),
+    );
+    write(
+        root,
+        "alpha.md",
+        &engram(
+            "Alpha",
+            "alpha",
+            "engram",
+            "",
+            "- [fact] the sky is blue #color (observed)\n\n- relates_to [[Beta]]\n\nProse mentions [[Beta]] once.\n",
+        ),
+    );
+    write(
+        root,
+        "notes/beta.md",
+        &engram("Beta", "beta", "engram", "", "Beta body content.\n"),
+    );
+
+    let report = sync_domain(store, "eng", root).await.unwrap();
+    assert_eq!(report.added, 3, "three files added");
+    assert_eq!(report.updated, 0);
+    assert_eq!(report.failed.len(), 0, "no failures: {:?}", report.failed);
+    assert!(
+        report.relations_resolved >= 1,
+        "Alpha->Beta relation resolved"
+    );
+    assert!(
+        report.links_resolved >= 1,
+        "Alpha's prose [[Beta]] resolved"
+    );
+
+    let stats = store.domain_stats().await.unwrap();
+    assert_eq!(stats.len(), 1);
+    let s = &stats[0];
+    assert_eq!(s.engrams, 3);
+    assert_eq!(s.observations, 1);
+    assert_eq!(s.relations, 1);
+    assert_eq!(s.unresolved_relations, 0);
+    assert_eq!(s.links, 1, "one prose wikilink");
+    assert_eq!(s.unresolved_links, 0, "the prose wikilink resolved");
+    assert!(s.last_sync.is_some());
+
+    // The resolved prose wikilink is a `links_to` edge in graph traversal.
+    let alpha = store.lookup_id("eng", "alpha").await.unwrap().unwrap();
+    let slice = store.neighbors(&[alpha], 1, None).await.unwrap();
+    assert!(
+        slice
+            .edges
+            .iter()
+            .any(|e| e.kind == EdgeKind::Link && e.rel_type == "links_to"),
+        "Alpha has a links_to edge to Beta"
+    );
+}
+parity!(
+    full_sync_counts_engrams_observations_relations,
+    full_sync_counts
+);
+
+/// A MANIFEST body with a `## Provisioning` section declaring `decl`, so the
+/// exclusion tests can point sync at a real domain root.
+fn provisioning_manifest(decl: &str) -> String {
+    engram(
+        "Manifest",
+        "manifest",
+        "manifest",
+        "",
+        &format!(
+            "## Scope\n\n- covers the harbor\n\n## When to Use\n\n- when routing\n\n## Provisioning\n\n{decl}\n"
+        ),
+    )
+}
+
+async fn in_root_artifact_folder_is_not_indexed(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "MANIFEST.md",
+        &provisioning_manifest("- skills: skills"),
+    );
+    // A well-formed engram under the declared folder: it would index cleanly if
+    // it were not excluded, so its absence proves the exclusion, not a failure.
+    write(
+        root,
+        "skills/tide-tables/SKILL.md",
+        &engram(
+            "Tide Tables",
+            "skills/tide-tables/skill",
+            "engram",
+            "",
+            "how to read the harbor tidetableterm\n",
+        ),
+    );
+    write(
+        root,
+        "notes/harbor-log.md",
+        &engram(
+            "Harbor Log",
+            "notes/harbor-log",
+            "engram",
+            "",
+            "the tide came in twice today harborlogterm\n",
+        ),
+    );
+    // A near-miss sibling whose name merely starts with `skills` is a normal
+    // folder: exclusion matches whole path components, not string prefixes.
+    write(
+        root,
+        "skills-tables/berth-notes.md",
+        &engram(
+            "Berth Notes",
+            "skills-tables/berth-notes",
+            "engram",
+            "",
+            "berth three is shallow at low tide nearmissterm\n",
+        ),
+    );
+
+    let report = sync_domain(store, "harbor", root).await.unwrap();
+    assert_eq!(
+        report.added, 3,
+        "manifest, harbor-log and berth-notes added, the skill excluded: {report:?}"
+    );
+
+    let stats = store.domain_stats().await.unwrap();
+    assert_eq!(stats[0].engrams, 3);
+
+    let skill = store
+        .search(&SearchQuery::text("tidetableterm"))
+        .await
+        .unwrap();
+    assert_eq!(skill.total, 0, "the artifact folder is not indexed");
+    let log = store
+        .search(&SearchQuery::text("harborlogterm"))
+        .await
+        .unwrap();
+    assert_eq!(log.total, 1, "the sibling engram is indexed");
+    let near = store
+        .search(&SearchQuery::text("nearmissterm"))
+        .await
+        .unwrap();
+    assert_eq!(near.total, 1, "the skills-prefixed sibling is indexed");
+}
+parity!(
+    in_root_artifact_folder_excluded_from_index,
+    in_root_artifact_folder_is_not_indexed
+);
+
+async fn out_of_root_decl_excludes_nothing(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // The decl climbs out of the root, so the in-root `skills/` folder is a
+    // normal folder and its engrams stay indexed.
+    write(
+        root,
+        "MANIFEST.md",
+        &provisioning_manifest("- skills: ../skills"),
+    );
+    write(
+        root,
+        "skills/tide-tables/SKILL.md",
+        &engram(
+            "Tide Tables",
+            "skills/tide-tables/skill",
+            "engram",
+            "",
+            "how to read the harbor tidetableterm\n",
+        ),
+    );
+    write(
+        root,
+        "notes/harbor-log.md",
+        &engram(
+            "Harbor Log",
+            "notes/harbor-log",
+            "engram",
+            "",
+            "the tide came in twice today harborlogterm\n",
+        ),
+    );
+
+    let report = sync_domain(store, "harbor", root).await.unwrap();
+    assert_eq!(
+        report.added, 3,
+        "an out-of-root decl excludes nothing in-root: {report:?}"
+    );
+    let skill = store
+        .search(&SearchQuery::text("tidetableterm"))
+        .await
+        .unwrap();
+    assert_eq!(skill.total, 1, "the in-root folder is still indexed");
+}
+parity!(
+    out_of_root_decl_excludes_nothing_in_root,
+    out_of_root_decl_excludes_nothing
+);
+
+async fn warm_sync_unchanged(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "a.md", &engram("A", "a", "engram", "", "body a\n"));
+    write(root, "b.md", &engram("B", "b", "engram", "", "body b\n"));
+    sync_domain(store, "d", root).await.unwrap();
+    let warm = sync_domain(store, "d", root).await.unwrap();
+    assert_eq!(warm.added, 0);
+    assert_eq!(warm.updated, 0);
+    assert_eq!(warm.unchanged, 2);
+}
+parity!(warm_sync_reports_all_unchanged, warm_sync_unchanged);
+
+async fn edit_then_sync(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "a.md",
+        &engram("A", "a", "engram", "", "original body\n"),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+
+    // Rewrite with different content and bump the mtime past the prefilter.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    write(
+        root,
+        "a.md",
+        &engram("A", "a", "engram", "", "revised body\n"),
+    );
+    let report = sync_domain(store, "d", root).await.unwrap();
+    assert_eq!(report.updated, 1);
+    assert_eq!(report.added, 0);
+
+    let page = store.search(&SearchQuery::text("revised")).await.unwrap();
+    assert_eq!(page.total, 1);
+}
+parity!(edit_then_sync_updates, edit_then_sync);
+
+async fn delete_then_sync(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "a.md", &engram("A", "a", "engram", "", "body a\n"));
+    write(root, "b.md", &engram("B", "b", "engram", "", "body b\n"));
+    sync_domain(store, "d", root).await.unwrap();
+
+    std::fs::remove_file(root.join("b.md")).unwrap();
+    let report = sync_domain(store, "d", root).await.unwrap();
+    assert_eq!(report.deleted, 1);
+    let stats = store.domain_stats().await.unwrap();
+    assert_eq!(stats[0].engrams, 1);
+}
+parity!(delete_then_sync_removes, delete_then_sync);
+
+async fn move_is_rename(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // No explicit permalink, so it is derived from the path.
+    let body = "unique_marker_token in the body\n";
+    write(
+        root,
+        "old/name.md",
+        &format!(
+            "---\ntype: engram\ntitle: Mover\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n{body}"
+        ),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    assert!(store.lookup_id("d", "old/name").await.unwrap().is_some());
+
+    // Move the file: identical bytes at a new path.
+    std::fs::create_dir_all(root.join("new")).unwrap();
+    std::fs::rename(root.join("old/name.md"), root.join("new/name.md")).unwrap();
+    let report = sync_domain(store, "d", root).await.unwrap();
+    assert_eq!(report.moved, 1, "classified as a move");
+    assert_eq!(report.added, 0, "not reparsed as an add");
+    assert_eq!(report.updated, 0, "not reparsed as an update");
+    assert_eq!(report.deleted, 0, "not treated as a delete");
+
+    // The engram kept its content and moved to the new path-derived permalink.
+    assert!(store.lookup_id("d", "old/name").await.unwrap().is_none());
+    assert!(store.lookup_id("d", "new/name").await.unwrap().is_some());
+    let page = store
+        .search(&SearchQuery::text("unique_marker_token"))
+        .await
+        .unwrap();
+    assert_eq!(page.total, 1, "content preserved through the move");
+}
+parity!(move_is_rename_without_reparse, move_is_rename);
+
+/// `readdress_engram` sets the path and the permalink it is handed, keeping the
+/// row's id, including the permalink-only rename where the path stays put.
+async fn readdress_keeps_the_id(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "projects/velog/alpha.md",
+        &engram("Alpha", "velog/alpha", "engram", "", "the alpha body\n"),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+    let before = store.lookup_id("d", "velog/alpha").await.unwrap().unwrap();
+
+    // In place: the path stays, the permalink moves to the path's own.
+    store
+        .readdress_engram(
+            domain,
+            "projects/velog/alpha.md",
+            "projects/velog/alpha.md",
+            "projects/velog/alpha",
+        )
+        .await
+        .unwrap();
+    assert!(store.lookup_id("d", "velog/alpha").await.unwrap().is_none());
+    assert_eq!(
+        store.lookup_id("d", "projects/velog/alpha").await.unwrap(),
+        Some(before),
+        "the permalink-only rename keeps the id"
+    );
+
+    // And a path move naming a permalink unrelated to the path.
+    store
+        .readdress_engram(
+            domain,
+            "projects/velog/alpha.md",
+            "archive/alpha.md",
+            "kept/alpha",
+        )
+        .await
+        .unwrap();
+    let rows = store.list_engrams("d", None, None).await.unwrap();
+    let row = rows.iter().find(|r| r.path == "archive/alpha.md").unwrap();
+    assert_eq!(row.permalink, "kept/alpha");
+    assert_eq!(
+        store.lookup_id("d", "kept/alpha").await.unwrap(),
+        Some(before)
+    );
+}
+parity!(readdress_sets_path_and_permalink, readdress_keeps_the_id);
+
+async fn forward_reference_resolves(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "a.md",
+        &engram("A", "a", "engram", "", "- depends_on [[target-b]]\n"),
+    );
+    let first = sync_domain(store, "d", root).await.unwrap();
+    assert_eq!(first.relations_resolved, 0, "target absent, unresolved");
+    assert_eq!(
+        store.domain_stats().await.unwrap()[0].unresolved_relations,
+        1
+    );
+
+    // The target appears in a later sync.
+    write(
+        root,
+        "b.md",
+        &engram("B", "target-b", "engram", "", "body b\n"),
+    );
+    let second = sync_domain(store, "d", root).await.unwrap();
+    assert_eq!(second.relations_resolved, 1, "now resolved");
+    assert_eq!(
+        store.domain_stats().await.unwrap()[0].unresolved_relations,
+        0
+    );
+}
+parity!(
+    forward_reference_resolves_on_later_sync,
+    forward_reference_resolves
+);
+
+/// The twin of `forward_reference_resolves` for the title-match path: the
+/// reference names its target by title, not permalink, and must resolve on the
+/// later sync when the target appears. This exercises the `lower(e.title)`
+/// branch of `resolve_pending_relations` (and the index behind it), which the
+/// permalink case never touches.
+async fn forward_reference_resolves_by_title(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // `[[Target Beta]]` matches neither a permalink nor anything present yet, so
+    // it stays unresolved until an engram whose title is "Target Beta" arrives.
+    write(
+        root,
+        "a.md",
+        &engram("A", "a", "engram", "", "- depends_on [[Target Beta]]\n"),
+    );
+    let first = sync_domain(store, "d", root).await.unwrap();
+    assert_eq!(first.relations_resolved, 0, "target absent, unresolved");
+    assert_eq!(
+        store.domain_stats().await.unwrap()[0].unresolved_relations,
+        1
+    );
+
+    // The target appears with a permalink that does NOT match the reference
+    // text, so only the title match can resolve it.
+    write(
+        root,
+        "b.md",
+        &engram("Target Beta", "beta-perma", "engram", "", "body b\n"),
+    );
+    let second = sync_domain(store, "d", root).await.unwrap();
+    assert_eq!(
+        second.relations_resolved, 1,
+        "resolved by title on the later sync"
+    );
+    assert_eq!(
+        store.domain_stats().await.unwrap()[0].unresolved_relations,
+        0
+    );
+}
+parity!(
+    forward_reference_resolves_by_title_on_later_sync,
+    forward_reference_resolves_by_title
+);
+
+/// `reference_match`'s title-match arm with two candidates: two engrams share
+/// a title, so a `[[Same Title]]` reference has more than one row it could
+/// bind to. `alpha-target.md` (permalink `alpha-target`) is synced alone
+/// first, so it gets the lower id; `Zulu-target.md` (permalink
+/// `zulu-target`) arrives in a later sync alongside the reference itself, so
+/// it gets the higher id.
+///
+/// The fixture is built so the candidate orderings disagree, which is the
+/// point: byte order over the path picks `Zulu-target.md` (`'Z'` is `0x5A`,
+/// `'a'` is `0x61`), a locale collation picks `alpha-target.md`, and the id
+/// order the tie-break is pinned to picks `alpha-target.md` too - but for a
+/// reason a locale cannot supply, since the id is an integer no collation
+/// touches. So this asserts the tie lands on the lower id on BOTH backends,
+/// which is what makes the two answers the same answer whatever the database's
+/// locale is and whatever order the rows physically sit in.
+///
+/// It was written for a path tie-break and rebaselined when that key cost the
+/// title arm its index on turso (a bare `ORDER BY e.path` is satisfiable from
+/// `idx_engram_path_actor`, so the planner abandoned `idx_engram_title_lower`
+/// and scanned the domain once per dangling reference). The property under
+/// test did not change: a tie is decided by the address, not by the layout.
+async fn reference_match_tie_break_prefers_the_lower_id(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    write(
+        root,
+        "alpha-target.md",
+        &engram("Same Title", "alpha-target", "engram", "", "alpha body\n"),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+
+    write(
+        root,
+        "Zulu-target.md",
+        &engram("Same Title", "zulu-target", "engram", "", "zulu body\n"),
+    );
+    write(
+        root,
+        "source.md",
+        &engram(
+            "Source",
+            "source",
+            "engram",
+            "",
+            "- depends_on [[Same Title]]\n",
+        ),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+
+    let alpha_target = store.lookup_id("d", "alpha-target").await.unwrap().unwrap();
+    let zulu_target = store.lookup_id("d", "zulu-target").await.unwrap().unwrap();
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+
+    let alpha_page = store
+        .inbound_page(&InboundQuery {
+            engram_id: alpha_target,
+            domain_id: domain,
+            permalink: "alpha-target",
+            title: "Same Title",
+            q: None,
+            rel: None,
+            exclude_domains: &[],
+            page: 1,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+    let zulu_page = store
+        .inbound_page(&InboundQuery {
+            engram_id: zulu_target,
+            domain_id: domain,
+            permalink: "zulu-target",
+            title: "Same Title",
+            q: None,
+            rel: None,
+            exclude_domains: &[],
+            page: 1,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        alpha_page.total, 1,
+        "the reference binds to the lower id, alpha-target.md: {alpha_page:?}"
+    );
+    assert_eq!(
+        zulu_page.total, 0,
+        "not to the byte order winner, Zulu-target.md: {zulu_page:?}"
+    );
+}
+parity!(
+    reference_resolves_to_the_same_row_on_both_backends,
+    reference_match_tie_break_prefers_the_lower_id
+);
+
+/// Every domain row answers to its own name through `domain_spelling`, which is
+/// what keeps resolution by local name independent of the engine: the store
+/// records the spelling itself when it records the domain. An upsert of a name
+/// it already knows adds nothing, and a wipe that takes the table away gets the
+/// spelling back from the next upsert of the domain.
+async fn a_new_domain_row_is_its_own_spelling(store: &dyn Store) {
+    let eng = store
+        .upsert_domain("eng", Some("/tmp/eng"), DomainKind::File)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.domain_spellings().await.unwrap(),
+        vec![("eng".to_string(), eng)],
+        "the new row is its own spelling"
+    );
+
+    let again = store
+        .upsert_domain("eng", Some("/tmp/eng2"), DomainKind::File)
+        .await
+        .unwrap();
+    assert_eq!(again, eng, "the same name keeps its id");
+    assert_eq!(
+        store.domain_spellings().await.unwrap(),
+        vec![("eng".to_string(), eng)],
+        "a second upsert of the same name adds no second spelling"
+    );
+
+    let notes = store
+        .upsert_domain("notes", None, DomainKind::Virtual)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.domain_spellings().await.unwrap(),
+        vec![("eng".to_string(), eng), ("notes".to_string(), notes)],
+        "a virtual domain is its own spelling too, and the read is sorted"
+    );
+
+    store.wipe().await.unwrap();
+    assert!(
+        store.domain_spellings().await.unwrap().is_empty(),
+        "a wipe clears the spellings with the domains they point at"
+    );
+    let eng = store
+        .upsert_domain("eng", Some("/tmp/eng"), DomainKind::File)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.domain_spellings().await.unwrap(),
+        vec![("eng".to_string(), eng)],
+        "and the sync that re-creates the row restores its own name"
+    );
+}
+parity!(
+    a_new_domain_row_is_its_own_spelling_on_both_backends,
+    a_new_domain_row_is_its_own_spelling
+);
+
+/// A reference that names its target domain by a spelling other than the
+/// domain's local name - a canonical name or an alias - resolves once that
+/// spelling is recorded. Before it is, `eng` names no domain at all, so the
+/// link stays pending (the fallback reading of the whole bracket text as a
+/// permalink in `ops` finds nothing either); after it, the resolve pass reads
+/// the target domain through the spelling table and lands on the runbook.
+async fn a_reference_spelled_by_an_extra_spelling_resolves(store: &dyn Store) {
+    let eng_dir = tempfile::tempdir().unwrap();
+    let ops_dir = tempfile::tempdir().unwrap();
+    write(
+        eng_dir.path(),
+        "runbook.md",
+        &engram("Runbook", "runbook", "engram", "", "runbook body\n"),
+    );
+    write(
+        ops_dir.path(),
+        "source.md",
+        &engram(
+            "Source",
+            "source",
+            "engram",
+            "",
+            "See [[eng:runbook]] before paging.\n",
+        ),
+    );
+    sync_domain(store, "eng-knowledge", eng_dir.path())
+        .await
+        .unwrap();
+    let synced = sync_domain(store, "ops", ops_dir.path()).await.unwrap();
+    assert_eq!(
+        synced.links_resolved, 0,
+        "`eng` is nobody's spelling yet, so the link stays pending"
+    );
+
+    let eng = store.domain_id("eng-knowledge").await.unwrap().unwrap();
+    let ops = store.domain_id("ops").await.unwrap().unwrap();
+    store
+        .replace_domain_spellings(&[
+            ("eng".to_string(), eng),
+            ("eng-knowledge".to_string(), eng),
+            ("ops".to_string(), ops),
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store.resolve_pending_links(ops).await.unwrap(),
+        1,
+        "the extra spelling reaches the domain the link means"
+    );
+    let source = store.lookup_id("ops", "source").await.unwrap().unwrap();
+    let runbook = store
+        .lookup_id("eng-knowledge", "runbook")
+        .await
+        .unwrap()
+        .unwrap();
+    let slice = store.neighbors(&[source], 1, None).await.unwrap();
+    assert!(
+        slice.nodes.iter().any(|n| n.id == runbook),
+        "the resolved link is an edge to the runbook: {slice:?}"
+    );
+}
+parity!(
+    a_reference_spelled_by_an_extra_spelling_resolves_on_both_backends,
+    a_reference_spelled_by_an_extra_spelling_resolves
+);
+
+/// `clear_domain` is the store path behind `domain remove` and the orphan
+/// sweep, and it keeps the domain row by design, so the declared cascade never
+/// fires on either backend. The extra spellings go with the clear anyway: a
+/// removed domain's canonical name or alias left behind would still resolve to
+/// it and would keep that spelling from any domain registered under it later.
+/// Its own name stays, because the row stays and every row answers to its name.
+async fn a_removed_domain_takes_its_spellings_along(store: &dyn Store) {
+    let gone = store
+        .upsert_domain("gone", Some("/tmp/gone"), DomainKind::File)
+        .await
+        .unwrap();
+    let kept = store
+        .upsert_domain("kept", Some("/tmp/kept"), DomainKind::File)
+        .await
+        .unwrap();
+    store
+        .replace_domain_spellings(&[
+            ("gone-canonical".to_string(), gone),
+            ("gone-former".to_string(), gone),
+            ("kept-former".to_string(), kept),
+        ])
+        .await
+        .unwrap();
+
+    store.clear_domain(gone).await.unwrap();
+
+    assert_eq!(
+        store.domain_spellings().await.unwrap(),
+        vec![
+            ("gone".to_string(), gone),
+            ("kept".to_string(), kept),
+            ("kept-former".to_string(), kept),
+        ],
+        "the cleared domain keeps only its own name; the other domain keeps all of its spellings"
+    );
+}
+parity!(
+    a_removed_domain_takes_its_spellings_along_on_both_backends,
+    a_removed_domain_takes_its_spellings_along
+);
+
+/// The spelling table is replaced from the name table, and the answer is every
+/// spelling whose mapping moved: added, removed or pointing at another domain.
+/// Each domain's own name stays through every replace, listed or not.
+async fn replace_reports_added_removed_and_remapped_spellings(store: &dyn Store) {
+    let a = store
+        .upsert_domain("a", Some("/tmp/a"), DomainKind::File)
+        .await
+        .unwrap();
+    let b = store
+        .upsert_domain("b", Some("/tmp/b"), DomainKind::File)
+        .await
+        .unwrap();
+
+    let changed = store
+        .replace_domain_spellings(&[("x".to_string(), a), ("y".to_string(), b)])
+        .await
+        .unwrap();
+    assert_eq!(
+        changed,
+        vec!["x".to_string(), "y".to_string()],
+        "both added"
+    );
+    assert_eq!(
+        store.domain_spellings().await.unwrap(),
+        vec![
+            ("a".to_string(), a),
+            ("b".to_string(), b),
+            ("x".to_string(), a),
+            ("y".to_string(), b),
+        ]
+    );
+
+    let changed = store
+        .replace_domain_spellings(&[("x".to_string(), b)])
+        .await
+        .unwrap();
+    assert_eq!(
+        changed,
+        vec!["x".to_string(), "y".to_string()],
+        "x now points at b and y is gone"
+    );
+    assert_eq!(
+        store.domain_spellings().await.unwrap(),
+        vec![
+            ("a".to_string(), a),
+            ("b".to_string(), b),
+            ("x".to_string(), b),
+        ],
+        "the own names stay although the list left them out"
+    );
+
+    let changed = store
+        .replace_domain_spellings(&[("x".to_string(), b)])
+        .await
+        .unwrap();
+    assert!(changed.is_empty(), "the same list again changes nothing");
+
+    assert!(
+        store
+            .replace_domain_spellings(&[("x".to_string(), a), ("x".to_string(), b)])
+            .await
+            .is_err(),
+        "one spelling for two domains is refused"
+    );
+    assert!(
+        store
+            .replace_domain_spellings(&[("z".to_string(), DomainId(9999))])
+            .await
+            .is_err(),
+        "a spelling for a domain row that does not exist is refused"
+    );
+    assert_eq!(
+        store.domain_spellings().await.unwrap(),
+        vec![
+            ("a".to_string(), a),
+            ("b".to_string(), b),
+            ("x".to_string(), b),
+        ],
+        "a refused replace leaves the table as it was"
+    );
+}
+parity!(
+    replace_reports_added_removed_and_remapped_spellings_on_both_backends,
+    replace_reports_added_removed_and_remapped_spellings
+);
+
+/// The spelling writes open their own transaction, so a caller already inside
+/// one is refused rather than having its work committed early by the inner
+/// commit. The caller's transaction is still there to roll back.
+async fn spelling_writes_refuse_to_nest_in_a_transaction(store: &dyn Store) {
+    let a = store
+        .upsert_domain("a", Some("/tmp/a"), DomainKind::File)
+        .await
+        .unwrap();
+    store.begin().await.unwrap();
+    // Refused because a transaction is already open, and for nothing else:
+    // each backend says so in its own words, both of them naming it.
+    let refused_for_nesting = |what: &str, result: crystalline_index::Result<()>| {
+        let err = result.expect_err(what).to_string().to_lowercase();
+        assert!(
+            err.contains("transaction"),
+            "{what} is refused for the open transaction: {err}"
+        );
+    };
+    refused_for_nesting(
+        "replace_domain_spellings",
+        store
+            .replace_domain_spellings(&[("x".to_string(), a)])
+            .await
+            .map(|_| ()),
+    );
+    refused_for_nesting(
+        "reset_references_to_spellings",
+        store
+            .reset_references_to_spellings(&["x".to_string()])
+            .await
+            .map(|_| ()),
+    );
+    refused_for_nesting(
+        "rename_domain_row",
+        store.rename_domain_row("a", "b").await.map(|_| ()),
+    );
+    store.rollback().await.unwrap();
+    assert_eq!(
+        store.domain_spellings().await.unwrap(),
+        vec![("a".to_string(), a)]
+    );
+    assert_eq!(store.domain_id("a").await.unwrap(), Some(a));
+}
+parity!(
+    spelling_writes_refuse_to_nest_in_a_transaction_on_both_backends,
+    spelling_writes_refuse_to_nest_in_a_transaction
+);
+
+/// Instances that share one Postgres index each replace the spellings of the
+/// domains they list and nothing else: a replace from one instance never
+/// deletes the canonical names or aliases another instance recorded.
+async fn a_replace_leaves_unlisted_domains_alone(store: &dyn Store) {
+    let a = store
+        .upsert_domain("a", Some("/tmp/a"), DomainKind::File)
+        .await
+        .unwrap();
+    let b = store
+        .upsert_domain("b", Some("/tmp/b"), DomainKind::File)
+        .await
+        .unwrap();
+    store
+        .replace_domain_spellings(&[("a".to_string(), a), ("a-former".to_string(), a)])
+        .await
+        .unwrap();
+    let changed = store
+        .replace_domain_spellings(&[("b".to_string(), b), ("b-former".to_string(), b)])
+        .await
+        .unwrap();
+    assert_eq!(changed, vec!["b-former".to_string()]);
+    assert_eq!(
+        store.domain_spellings().await.unwrap(),
+        vec![
+            ("a".to_string(), a),
+            ("a-former".to_string(), a),
+            ("b".to_string(), b),
+            ("b-former".to_string(), b),
+        ],
+        "the replace for b left a's former name alone"
+    );
+}
+parity!(
+    a_replace_leaves_unlisted_domains_alone_on_both_backends,
+    a_replace_leaves_unlisted_domains_alone
+);
+
+/// Push a name table into the store the way the engine does: every spelling
+/// mapped to the row of the local name it resolves to.
+async fn push_name_table(
+    store: &dyn Store,
+    inputs: &[crystalline_core::names::NameInput],
+) -> (crystalline_core::names::NameTable, Vec<String>) {
+    let table = crystalline_core::names::NameTable::build(inputs);
+    let mut rows = Vec::new();
+    for (spelling, local) in table.spellings() {
+        let id = store.domain_id(&local).await.unwrap().unwrap();
+        rows.push((spelling, id));
+    }
+    let changed = store.replace_domain_spellings(&rows).await.unwrap();
+    (table, changed)
+}
+
+/// What the spelling table resolves must be what the name table resolves,
+/// spelling for spelling: every spelling the name table answers maps to the
+/// row of that local name, and nothing else is in the table.
+async fn assert_sql_matches(store: &dyn Store, table: &crystalline_core::names::NameTable) {
+    let mut expected = Vec::new();
+    for (spelling, local) in table.spellings() {
+        expected.push((spelling, store.domain_id(&local).await.unwrap().unwrap()));
+    }
+    assert_eq!(
+        store.domain_spellings().await.unwrap(),
+        expected,
+        "the spelling table resolves exactly what the name table resolves"
+    );
+}
+
+fn name_input(
+    local: &str,
+    canonical: Option<&str>,
+    aliases: &[&str],
+) -> crystalline_core::names::NameInput {
+    crystalline_core::names::NameInput {
+        local: local.to_string(),
+        canonical: canonical.map(str::to_string),
+        aliases: aliases.iter().map(|a| a.to_string()).collect(),
+    }
+}
+
+/// The name table's precedence, held by SQL. Local names always win, a
+/// canonical name another domain is registered under is shadowed, a canonical
+/// two domains claim resolves nowhere, and an alias gives way to a local name.
+/// The last is the case the upsert alone gets wrong: an alias recorded first
+/// keeps its spelling when a domain is registered under it later, because the
+/// upsert leaves a held spelling alone. The replace puts the local name first,
+/// and a link that went to the alias's domain goes to the new domain once its
+/// reference is reset and resolved again.
+async fn the_spelling_table_follows_the_name_table_precedence(store: &dyn Store) {
+    let ops_dir = tempfile::tempdir().unwrap();
+    write(
+        ops_dir.path(),
+        "runbook.md",
+        &engram("Runbook", "runbook", "engram", "", "the ops runbook\n"),
+    );
+    write(
+        ops_dir.path(),
+        "source.md",
+        &engram("Source", "source", "engram", "", "See [[x:runbook]].\n"),
+    );
+    let ek_dir = tempfile::tempdir().unwrap();
+    write(
+        ek_dir.path(),
+        "a.md",
+        &engram("A", "a", "engram", "", "body\n"),
+    );
+    sync_domain(store, "eng-knowledge", ek_dir.path())
+        .await
+        .unwrap();
+    sync_domain(store, "ops", ops_dir.path()).await.unwrap();
+    for name in ["platform", "a1", "a2"] {
+        store
+            .upsert_domain(name, Some("/tmp/n"), DomainKind::File)
+            .await
+            .unwrap();
+    }
+    let mut inputs = vec![
+        name_input("eng-knowledge", Some("eng"), &["old-eng"]),
+        name_input("ops", Some("platform"), &["x"]),
+        name_input("platform", None, &[]),
+        name_input("a1", Some("shared"), &[]),
+        name_input("a2", Some("shared"), &[]),
+    ];
+    let (table, _) = push_name_table(store, &inputs).await;
+    assert_sql_matches(store, &table).await;
+    let spellings = store.domain_spellings().await.unwrap();
+    assert!(
+        !spellings.iter().any(|(s, _)| s == "shared"),
+        "a contested canonical resolves nowhere: {spellings:?}"
+    );
+    let platform = store.domain_id("platform").await.unwrap().unwrap();
+    assert!(
+        spellings.contains(&("platform".to_string(), platform)),
+        "a shadowed canonical stays with the domain registered under it"
+    );
+    let ops = store.domain_id("ops").await.unwrap().unwrap();
+    assert_eq!(
+        store.resolve_pending_links(ops).await.unwrap(),
+        1,
+        "pending at sync time, when `x` named no domain; bound now that it is an alias of ops"
+    );
+    let source = store.lookup_id("ops", "source").await.unwrap().unwrap();
+    let ops_runbook = store.lookup_id("ops", "runbook").await.unwrap().unwrap();
+    let slice = store.neighbors(&[source], 1, None).await.unwrap();
+    assert!(
+        slice.nodes.iter().any(|n| n.id == ops_runbook),
+        "the link reaches the ops runbook: {slice:?}"
+    );
+
+    // A domain registered under `x` later: the upsert records its own name
+    // only where the spelling is free, and `x` is not.
+    let x_dir = tempfile::tempdir().unwrap();
+    write(
+        x_dir.path(),
+        "runbook.md",
+        &engram("Runbook", "runbook", "engram", "", "the x runbook\n"),
+    );
+    sync_domain(store, "x", x_dir.path()).await.unwrap();
+    inputs.push(name_input("x", None, &[]));
+    let (table, changed) = push_name_table(store, &inputs).await;
+    assert_eq!(table.resolve("x"), Some("x"), "the name table: local wins");
+    assert_eq!(changed, vec!["x".to_string()]);
+    assert_sql_matches(store, &table).await;
+
+    assert_eq!(
+        store.reset_references_to_spellings(&changed).await.unwrap(),
+        1
+    );
+    assert_eq!(store.resolve_pending_links(ops).await.unwrap(), 1);
+    let x_runbook = store.lookup_id("x", "runbook").await.unwrap().unwrap();
+    let slice = store.neighbors(&[source], 1, None).await.unwrap();
+    assert!(
+        slice.nodes.iter().any(|n| n.id == x_runbook)
+            && !slice.nodes.iter().any(|n| n.id == ops_runbook),
+        "the link now reaches the domain registered under `x`: {slice:?}"
+    );
+}
+parity!(
+    the_spelling_table_follows_the_name_table_precedence_on_both_backends,
+    the_spelling_table_follows_the_name_table_precedence
+);
+
+/// A domain's own name wins over an alias recorded for a different domain,
+/// even when that domain is not in the list: local names always win, whoever
+/// recorded the alias.
+async fn a_local_name_beats_an_alias_recorded_for_an_unlisted_domain(store: &dyn Store) {
+    let a = store
+        .upsert_domain("a", Some("/tmp/a"), DomainKind::File)
+        .await
+        .unwrap();
+    store
+        .replace_domain_spellings(&[("a".to_string(), a), ("c".to_string(), a)])
+        .await
+        .unwrap();
+    let c = store
+        .upsert_domain("c", Some("/tmp/c"), DomainKind::File)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.domain_spellings().await.unwrap(),
+        vec![("a".to_string(), a), ("c".to_string(), a)],
+        "the upsert leaves a held spelling where it is"
+    );
+    let changed = store
+        .replace_domain_spellings(&[("c-former".to_string(), c)])
+        .await
+        .unwrap();
+    assert_eq!(changed, vec!["c".to_string(), "c-former".to_string()]);
+    assert_eq!(
+        store.domain_spellings().await.unwrap(),
+        vec![
+            ("a".to_string(), a),
+            ("c".to_string(), c),
+            ("c-former".to_string(), c),
+        ],
+    );
+    let changed = store
+        .replace_domain_spellings(&[("a".to_string(), a), ("c".to_string(), a)])
+        .await
+        .unwrap();
+    assert!(
+        changed.is_empty(),
+        "an alias on another domain's own name never takes it: {changed:?}"
+    );
+    assert_eq!(
+        store.domain_spellings().await.unwrap(),
+        vec![
+            ("a".to_string(), a),
+            ("c".to_string(), c),
+            ("c-former".to_string(), c),
+        ],
+    );
+}
+parity!(
+    a_local_name_beats_an_alias_recorded_for_an_unlisted_domain_on_both_backends,
+    a_local_name_beats_an_alias_recorded_for_an_unlisted_domain
+);
+
+/// Resetting a spelling unbinds every reference that names it, so the next
+/// resolve pass binds it again through whatever the spelling means now.
+async fn resetting_a_spelling_unbinds_its_references(store: &dyn Store) {
+    let eng_dir = tempfile::tempdir().unwrap();
+    let ops_dir = tempfile::tempdir().unwrap();
+    write(
+        eng_dir.path(),
+        "runbook.md",
+        &engram("Runbook", "runbook", "engram", "", "runbook body\n"),
+    );
+    write(
+        ops_dir.path(),
+        "source.md",
+        &engram("Source", "source", "engram", "", "See [[x:runbook]].\n"),
+    );
+    sync_domain(store, "eng-knowledge", eng_dir.path())
+        .await
+        .unwrap();
+    sync_domain(store, "ops", ops_dir.path()).await.unwrap();
+    let eng = store.domain_id("eng-knowledge").await.unwrap().unwrap();
+    let ops = store.domain_id("ops").await.unwrap().unwrap();
+    store
+        .replace_domain_spellings(&[("x".to_string(), eng)])
+        .await
+        .unwrap();
+    assert_eq!(store.resolve_pending_links(ops).await.unwrap(), 1);
+
+    assert_eq!(
+        store.reset_references_to_spellings(&[]).await.unwrap(),
+        0,
+        "no spellings, nothing to reset"
+    );
+    assert_eq!(
+        store
+            .reset_references_to_spellings(&["y".to_string()])
+            .await
+            .unwrap(),
+        0,
+        "a spelling nobody wrote resets nothing"
+    );
+    assert_eq!(
+        store
+            .reset_references_to_spellings(&["x".to_string()])
+            .await
+            .unwrap(),
+        1
+    );
+    let source = store.lookup_id("ops", "source").await.unwrap().unwrap();
+    let out = store.outbound_refs(source, None).await.unwrap();
+    assert_eq!(out.len(), 1);
+    assert!(!out[0].resolved, "the link is unbound: {out:?}");
+    assert_eq!(
+        store
+            .reset_references_to_spellings(&["x".to_string()])
+            .await
+            .unwrap(),
+        0,
+        "an unbound reference is not counted twice"
+    );
+    assert_eq!(
+        store.resolve_pending_links(ops).await.unwrap(),
+        1,
+        "the next pass binds it again"
+    );
+    assert!(store.outbound_refs(source, None).await.unwrap()[0].resolved);
+}
+parity!(
+    resetting_a_spelling_unbinds_its_references_on_both_backends,
+    resetting_a_spelling_unbinds_its_references
+);
+
+// --- an explicit domain prefix resolves only in that domain -----------------
+
+/// The engram a source's references are bound to, as `(domain, permalink)`,
+/// or `None` when nothing is bound. Every source in these fixtures carries one
+/// target, written once as a relation and once as a prose link, so the one
+/// neighbor that is not the source itself is that target. The two resolution
+/// flags must agree, since both tables are bound by the same rule.
+async fn bound_target(store: &dyn Store, source: EngramId) -> Option<(String, String)> {
+    bound_target_as(store, source, None).await
+}
+
+/// [`bound_target`] for a source read in `actor`'s view: the stored verdict,
+/// and the target among what that actor sees.
+async fn bound_target_as(
+    store: &dyn Store,
+    source: EngramId,
+    actor: Option<&str>,
+) -> Option<(String, String)> {
+    let refs = store.outbound_refs(source, None).await.unwrap();
+    assert_eq!(refs.len(), 2, "one relation and one link: {refs:?}");
+    assert_eq!(
+        refs[0].resolved, refs[1].resolved,
+        "the relation and the link agree: {refs:?}"
+    );
+    let slice = store.neighbors(&[source], 1, actor).await.unwrap();
+    let targets: Vec<(String, String)> = slice
+        .nodes
+        .iter()
+        .filter(|n| n.id != source)
+        .map(|n| (n.domain.clone(), n.permalink.clone()))
+        .collect();
+    assert!(targets.len() <= 1, "one target at most: {targets:?}");
+    assert_eq!(
+        refs[0].resolved,
+        !targets.is_empty(),
+        "a resolved reference is an edge, an unresolved one is none: {refs:?} {targets:?}"
+    );
+    targets.into_iter().next()
+}
+
+/// A source engram whose only references are `[[inner]]`, once as a relation
+/// bullet and once in prose.
+fn source_engram(title: &str, permalink: &str, inner: &str) -> String {
+    engram(
+        title,
+        permalink,
+        "engram",
+        "",
+        &format!("- relates_to [[{inner}]]\n\nSee [[{inner}]] here.\n"),
+    )
+}
+
+/// The reported case. `[[ops:Runbook]]` names a domain nobody registered, and
+/// the home domain holds an engram called Runbook. An explicit prefix resolves
+/// only in the domain it names, so the reference stays unresolved: binding it
+/// to the home Runbook would draw an edge and a backlink the author never
+/// wrote. A typo in the prefix is the same case.
+async fn an_unknown_prefix_does_not_fall_back_to_home(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "runbook.md",
+        &engram("Runbook", "runbook", "engram", "", "runbook body\n"),
+    );
+    write(
+        dir.path(),
+        "unknown.md",
+        &source_engram("Unknown", "unknown", "ops:Runbook"),
+    );
+    write(
+        dir.path(),
+        "typo.md",
+        &source_engram("Typo", "typo", "hmoe:runbook"),
+    );
+    let report = sync_domain(store, "home", dir.path()).await.unwrap();
+    assert_eq!(report.links_resolved, 0, "{report:?}");
+    assert_eq!(report.relations_resolved, 0, "{report:?}");
+
+    for permalink in ["unknown", "typo"] {
+        let source = store.lookup_id("home", permalink).await.unwrap().unwrap();
+        assert_eq!(
+            bound_target(store, source).await,
+            None,
+            "`{permalink}` names no domain, so it binds nothing at home"
+        );
+    }
+}
+parity!(
+    an_unknown_prefix_does_not_fall_back_to_home_on_both_backends,
+    an_unknown_prefix_does_not_fall_back_to_home
+);
+
+/// Spellings are exact: `Home` is not a spelling of the domain `home`, so
+/// `[[Home:Runbook]]` names no domain and stays unresolved, even inside
+/// `home` itself, where a Runbook exists.
+async fn a_wrong_case_home_prefix_stays_unresolved(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        "runbook.md",
+        &engram("Runbook", "runbook", "engram", "", "runbook body\n"),
+    );
+    write(
+        dir.path(),
+        "upper.md",
+        &source_engram("Upper", "upper", "Home:Runbook"),
+    );
+    write(
+        dir.path(),
+        "exact.md",
+        &source_engram("Exact", "exact", "home:Runbook"),
+    );
+    sync_domain(store, "home", dir.path()).await.unwrap();
+
+    let upper = store.lookup_id("home", "upper").await.unwrap().unwrap();
+    assert_eq!(bound_target(store, upper).await, None);
+    let exact = store.lookup_id("home", "exact").await.unwrap().unwrap();
+    assert_eq!(
+        bound_target(store, exact).await,
+        Some(("home".to_string(), "runbook".to_string())),
+        "the exact spelling of the home domain still resolves there"
+    );
+}
+parity!(
+    a_wrong_case_home_prefix_stays_unresolved_on_both_backends,
+    a_wrong_case_home_prefix_stays_unresolved
+);
+
+/// A prefix that names no domain is not a prefix: the whole bracket text is
+/// tried at home. With both `Foo` and `typo:Foo` at home, `[[typo:Foo]]` lands
+/// on `typo:Foo`, never on `Foo`. A prefix that does name a domain never takes
+/// that road, even when home holds a title that matches the whole text.
+async fn the_whole_bracket_text_still_resolves_at_home(store: &dyn Store) {
+    let home = tempfile::tempdir().unwrap();
+    let eng = tempfile::tempdir().unwrap();
+    write(
+        eng.path(),
+        "runbook.md",
+        &engram("Runbook", "runbook", "engram", "", "runbook body\n"),
+    );
+    write(
+        home.path(),
+        "foo.md",
+        &engram("Foo", "foo", "engram", "", "foo body\n"),
+    );
+    write(
+        home.path(),
+        "typo-foo.md",
+        &engram("typo:Foo", "typo-foo", "engram", "", "colon title\n"),
+    );
+    write(
+        home.path(),
+        "eng-overview.md",
+        &engram(
+            "eng:Overview",
+            "eng-overview",
+            "engram",
+            "",
+            "colon title\n",
+        ),
+    );
+    write(
+        home.path(),
+        "raw.md",
+        &source_engram("Raw", "raw", "typo:Foo"),
+    );
+    write(
+        home.path(),
+        "known.md",
+        &source_engram("Known", "known", "eng:Overview"),
+    );
+    sync_domain(store, "eng", eng.path()).await.unwrap();
+    sync_domain(store, "home", home.path()).await.unwrap();
+
+    let raw = store.lookup_id("home", "raw").await.unwrap().unwrap();
+    assert_eq!(
+        bound_target(store, raw).await,
+        Some(("home".to_string(), "typo-foo".to_string())),
+        "the whole text at home, not the bare target"
+    );
+    let known = store.lookup_id("home", "known").await.unwrap().unwrap();
+    assert_eq!(
+        bound_target(store, known).await,
+        None,
+        "`eng` is a domain without an Overview: a broken cross-domain link"
+    );
+}
+parity!(
+    the_whole_bracket_text_still_resolves_at_home_on_both_backends,
+    the_whole_bracket_text_still_resolves_at_home
+);
+
+/// An unknown prefix that later gains a meaning heals. Registering `ops`
+/// gives the pending link a domain to resolve in; a spelling added for a
+/// domain moves a link that was bound through the whole bracket text at home
+/// once the reset unbinds it.
+async fn a_prefix_that_gains_a_meaning_heals_the_link(store: &dyn Store) {
+    let home = tempfile::tempdir().unwrap();
+    let ops = tempfile::tempdir().unwrap();
+    let eng = tempfile::tempdir().unwrap();
+    write(
+        home.path(),
+        "runbook.md",
+        &engram("Runbook", "runbook", "engram", "", "home runbook\n"),
+    );
+    write(
+        home.path(),
+        "x-runbook.md",
+        &engram("x:Runbook", "x-runbook", "engram", "", "colon title\n"),
+    );
+    write(
+        home.path(),
+        "pending.md",
+        &source_engram("Pending", "pending", "ops:Runbook"),
+    );
+    write(
+        home.path(),
+        "colon.md",
+        &source_engram("Colon", "colon", "x:Runbook"),
+    );
+    write(
+        ops.path(),
+        "runbook.md",
+        &engram("Runbook", "runbook", "engram", "", "ops runbook\n"),
+    );
+    write(
+        eng.path(),
+        "runbook.md",
+        &engram("Runbook", "runbook", "engram", "", "eng runbook\n"),
+    );
+    sync_domain(store, "home", home.path()).await.unwrap();
+    let home_id = store.domain_id("home").await.unwrap().unwrap();
+    let pending = store.lookup_id("home", "pending").await.unwrap().unwrap();
+    let colon = store.lookup_id("home", "colon").await.unwrap().unwrap();
+    assert_eq!(bound_target(store, pending).await, None);
+    assert_eq!(
+        bound_target(store, colon).await,
+        Some(("home".to_string(), "x-runbook".to_string()))
+    );
+
+    // `ops` is registered: its own name is its spelling, and the next pass
+    // over home binds the pending link there.
+    sync_domain(store, "ops", ops.path()).await.unwrap();
+    store.resolve_pending_relations(home_id).await.unwrap();
+    store.resolve_pending_links(home_id).await.unwrap();
+    assert_eq!(
+        bound_target(store, pending).await,
+        Some(("ops".to_string(), "runbook".to_string()))
+    );
+
+    // `x` becomes an alias of `eng`: the reset unbinds the colon-title link and
+    // the pass binds it in the domain it now names.
+    sync_domain(store, "eng", eng.path()).await.unwrap();
+    let eng_id = store.domain_id("eng").await.unwrap().unwrap();
+    let ops_id = store.domain_id("ops").await.unwrap().unwrap();
+    let changed = store
+        .replace_domain_spellings(&[
+            ("eng".to_string(), eng_id),
+            ("x".to_string(), eng_id),
+            ("home".to_string(), home_id),
+            ("ops".to_string(), ops_id),
+        ])
+        .await
+        .unwrap();
+    assert!(changed.contains(&"x".to_string()), "{changed:?}");
+    assert_eq!(
+        store.reset_references_to_spellings(&changed).await.unwrap(),
+        2
+    );
+    store.resolve_pending_relations(home_id).await.unwrap();
+    store.resolve_pending_links(home_id).await.unwrap();
+    assert_eq!(
+        bound_target(store, colon).await,
+        Some(("eng".to_string(), "runbook".to_string()))
+    );
+}
+parity!(
+    a_prefix_that_gains_a_meaning_heals_the_link_on_both_backends,
+    a_prefix_that_gains_a_meaning_heals_the_link
+);
+
+/// The pass after a registration binds the pending rows spelled with the new
+/// domain's names, in whichever domain they sit, and nothing else: a pending
+/// row spelled with another domain's name waits for its own domain's pass.
+async fn resolving_by_spelling_binds_only_those_rows(store: &dyn Store) {
+    let home = tempfile::tempdir().unwrap();
+    let ops = tempfile::tempdir().unwrap();
+    let eng = tempfile::tempdir().unwrap();
+    write(
+        home.path(),
+        "to-ops.md",
+        &source_engram("To Ops", "to-ops", "ops:Runbook"),
+    );
+    write(
+        home.path(),
+        "to-eng.md",
+        &source_engram("To Eng", "to-eng", "eng:Runbook"),
+    );
+    for dir in [&ops, &eng] {
+        write(
+            dir.path(),
+            "runbook.md",
+            &engram("Runbook", "runbook", "engram", "", "body\n"),
+        );
+    }
+    sync_domain(store, "home", home.path()).await.unwrap();
+    sync_domain(store, "ops", ops.path()).await.unwrap();
+    sync_domain(store, "eng", eng.path()).await.unwrap();
+    let to_ops = store.lookup_id("home", "to-ops").await.unwrap().unwrap();
+    let to_eng = store.lookup_id("home", "to-eng").await.unwrap().unwrap();
+    assert_eq!(
+        bound_target(store, to_ops).await,
+        None,
+        "home was synced first"
+    );
+
+    assert_eq!(store.resolve_references_to_spellings(&[]).await.unwrap(), 0);
+    assert_eq!(
+        store
+            .resolve_references_to_spellings(&["ops".to_string()])
+            .await
+            .unwrap(),
+        2,
+        "the relation and the link spelled `ops`"
+    );
+    assert_eq!(
+        bound_target(store, to_ops).await,
+        Some(("ops".to_string(), "runbook".to_string()))
+    );
+    assert_eq!(
+        bound_target(store, to_eng).await,
+        None,
+        "a row spelled `eng` is not this pass's"
+    );
+    assert_eq!(
+        store
+            .resolve_references_to_spellings(&["ops".to_string()])
+            .await
+            .unwrap(),
+        0,
+        "a bound row is not counted twice"
+    );
+}
+parity!(
+    resolving_by_spelling_binds_only_those_rows_on_both_backends,
+    resolving_by_spelling_binds_only_those_rows
+);
+
+/// A record for an engram that lands without a resolve pass of its own, as a
+/// base write's row does before the cross-domain bind runs.
+fn titled_record(path: &str, permalink: &str, title: &str) -> EngramRecord {
+    EngramRecord {
+        title: title.to_string(),
+        ..record(path, permalink, &format!("# {title}\n"), "sha")
+    }
+}
+
+async fn ids(store: &dyn Store, names: &[&str]) -> Vec<DomainId> {
+    let mut out = Vec::new();
+    for name in names {
+        out.push(store.domain_id(name).await.unwrap().unwrap());
+    }
+    out
+}
+
+/// Item 13: a base write in `ops` binds the pending rows in other domains that
+/// name it, counted per domain, and leaves `ops`'s own rows to its own pass.
+async fn resolve_references_to_binds_only_other_domains_and_counts_per_domain(store: &dyn Store) {
+    let (home, side, ops) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    write(
+        home.path(),
+        "to-ops.md",
+        &source_engram("To Ops", "to-ops", "ops:runbook"),
+    );
+    write(
+        side.path(),
+        "also.md",
+        &source_engram("Also", "also", "ops:runbook"),
+    );
+    write(
+        ops.path(),
+        "own.md",
+        &source_engram("Own", "own", "ops:runbook"),
+    );
+    for (name, dir) in [("home", &home), ("side", &side), ("ops", &ops)] {
+        sync_domain(store, name, dir.path()).await.unwrap();
+    }
+    let found = ids(store, &["home", "side", "ops"]).await;
+    let (home_id, side_id, ops_id) = (found[0], found[1], found[2]);
+    store
+        .upsert_engram(ops_id, &titled_record("runbook.md", "runbook", "Runbook"))
+        .await
+        .unwrap();
+
+    let bound = store
+        .resolve_references_to(
+            ops_id,
+            &["ops".to_string()],
+            &["runbook".to_string(), "Runbook".to_string()],
+        )
+        .await
+        .unwrap();
+    let mut want = vec![(home_id, 2), (side_id, 2)];
+    want.sort_by_key(|(id, _)| id.0);
+    assert_eq!(bound, want, "the relation and the link, per domain");
+    let to_ops = store.lookup_id("home", "to-ops").await.unwrap().unwrap();
+    assert_eq!(
+        bound_target(store, to_ops).await,
+        Some(("ops".to_string(), "runbook".to_string()))
+    );
+    let own = store.lookup_id("ops", "own").await.unwrap().unwrap();
+    assert_eq!(
+        bound_target(store, own).await,
+        None,
+        "ops's own rows are its own pass's"
+    );
+    assert!(
+        store
+            .resolve_references_to(ops_id, &["ops".to_string()], &["runbook".to_string()])
+            .await
+            .unwrap()
+            .is_empty(),
+        "a bound row is not counted twice"
+    );
+}
+parity!(
+    resolve_references_to_binds_only_other_domains_and_counts_per_domain_on_both_backends,
+    resolve_references_to_binds_only_other_domains_and_counts_per_domain
+);
+
+/// The title arm binds too, in any letter case (Review Focus 4).
+async fn resolve_references_to_binds_by_title_too(store: &dyn Store) {
+    let (home, ops) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    write(
+        home.path(),
+        "a.md",
+        &source_engram("A", "a", "ops:Restart runbook"),
+    );
+    write(
+        home.path(),
+        "b.md",
+        &source_engram("B", "b", "ops:restart RUNBOOK"),
+    );
+    sync_domain(store, "home", home.path()).await.unwrap();
+    sync_domain(store, "ops", ops.path()).await.unwrap();
+    let found = ids(store, &["home", "ops"]).await;
+    let (home_id, ops_id) = (found[0], found[1]);
+    store
+        .upsert_engram(
+            ops_id,
+            &titled_record("restart-runbook.md", "restart-runbook", "Restart runbook"),
+        )
+        .await
+        .unwrap();
+    let bound = store
+        .resolve_references_to(
+            ops_id,
+            &["ops".to_string()],
+            &["restart-runbook".to_string(), "Restart runbook".to_string()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(bound, vec![(home_id, 4)]);
+    for permalink in ["a", "b"] {
+        let source = store.lookup_id("home", permalink).await.unwrap().unwrap();
+        assert_eq!(
+            bound_target(store, source).await,
+            Some(("ops".to_string(), "restart-runbook".to_string())),
+            "{permalink}"
+        );
+    }
+}
+parity!(
+    resolve_references_to_binds_by_title_too_on_both_backends,
+    resolve_references_to_binds_by_title_too
+);
+
+async fn resolve_references_to_leaves_other_targets_pending(store: &dyn Store) {
+    let (home, ops) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    write(
+        home.path(),
+        "to-runbook.md",
+        &source_engram("To Runbook", "to-runbook", "ops:runbook"),
+    );
+    write(
+        home.path(),
+        "to-other.md",
+        &source_engram("To Other", "to-other", "ops:other"),
+    );
+    sync_domain(store, "home", home.path()).await.unwrap();
+    sync_domain(store, "ops", ops.path()).await.unwrap();
+    let found = ids(store, &["home", "ops"]).await;
+    let (home_id, ops_id) = (found[0], found[1]);
+    for (path, permalink, title) in [
+        ("runbook.md", "runbook", "Runbook"),
+        ("other.md", "other", "Other"),
+    ] {
+        store
+            .upsert_engram(ops_id, &titled_record(path, permalink, title))
+            .await
+            .unwrap();
+    }
+    let bound = store
+        .resolve_references_to(
+            ops_id,
+            &["ops".to_string()],
+            &["runbook".to_string(), "Runbook".to_string()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(bound, vec![(home_id, 2)]);
+    let other = store.lookup_id("home", "to-other").await.unwrap().unwrap();
+    assert_eq!(
+        bound_target(store, other).await,
+        None,
+        "not this write's target"
+    );
+}
+parity!(
+    resolve_references_to_leaves_other_targets_pending_on_both_backends,
+    resolve_references_to_leaves_other_targets_pending
+);
+
+/// A core [`crystalline_core::LinkResolver`] over the same engrams and the
+/// same spelling table the store holds, so the index verdict can be compared
+/// with `core::address::resolve`, the rule verify follows. `viewer` reads one
+/// actor's drafts over the base, their own row first, as the index's view does.
+struct SpelledLookup {
+    /// spelling -> local domain name
+    spellings: HashMap<String, String>,
+    /// (local domain, permalink, title, actor); an empty actor is a base row
+    engrams: Vec<(String, String, String, String)>,
+    viewer: Option<String>,
+}
+
+impl SpelledLookup {
+    fn find(
+        &self,
+        domain: &str,
+        matches: impl Fn(&str, &str) -> bool,
+    ) -> Option<crystalline_core::ResolvedRef> {
+        let local = self
+            .spellings
+            .get(domain)
+            .map(String::as_str)
+            .unwrap_or(domain);
+        let visible = |actor: &str| actor.is_empty() || Some(actor) == self.viewer.as_deref();
+        let mut hits: Vec<&(String, String, String, String)> = self
+            .engrams
+            .iter()
+            .filter(|(d, p, t, a)| d == local && visible(a) && matches(p, t))
+            .collect();
+        hits.sort_by_key(|(_, _, _, a)| a.is_empty());
+        hits.first()
+            .map(|(d, p, _, _)| crystalline_core::ResolvedRef {
+                domain: d.clone(),
+                permalink: p.clone(),
+            })
+    }
+}
+
+impl crystalline_core::LinkResolver for SpelledLookup {
+    fn by_permalink(&self, domain: &str, permalink: &str) -> Option<crystalline_core::ResolvedRef> {
+        self.find(domain, |p, _| p == permalink)
+    }
+
+    fn by_title(&self, domain: &str, title: &str) -> Option<crystalline_core::ResolvedRef> {
+        self.find(domain, |_, t| t.to_lowercase() == title.to_lowercase())
+    }
+
+    fn is_domain(&self, name: &str) -> bool {
+        self.spellings.contains_key(name)
+    }
+}
+
+/// What `core::address::resolve` names for `inner` written in `home`.
+fn core_verdict(lookup: &SpelledLookup, inner: &str) -> Option<(String, String)> {
+    match crystalline_core::address::resolve(
+        &crystalline_core::LinkTarget::parse(inner),
+        "home",
+        lookup,
+    ) {
+        crystalline_core::Resolution::Resolved(r) => Some((r.domain, r.permalink)),
+        _ => None,
+    }
+}
+
+/// The index and verify answer the same for every reference: for a table of
+/// bracket texts written in `home`, the engram the store binds equals the one
+/// `crystalline_core::address::resolve` names, down to which engram it is.
+///
+/// The spellings come from a real name table: `eng-knowledge` declares the
+/// canonical name `engineering` and the alias `eng`; `a1` and `a2` both
+/// declare `shared`, so that canonical name is contested and names no domain;
+/// `ops2` declares `platform`, which is shadowed by the domain registered
+/// under that local name. The same table runs once more for references in
+/// alice's drafts, read in her view, where her own draft may answer.
+async fn the_index_resolves_every_reference_the_way_core_does(store: &dyn Store) {
+    let dirs: HashMap<&str, tempfile::TempDir> =
+        ["home", "eng-knowledge", "a1", "a2", "platform", "ops2"]
+            .into_iter()
+            .map(|d| (d, tempfile::tempdir().unwrap()))
+            .collect();
+    let base: Vec<(&str, &str, &str)> = vec![
+        ("home", "foo", "Foo"),
+        ("home", "runbook", "Runbook"),
+        ("home", "typo-foo", "typo:Foo"),
+        ("home", "eng-overview", "eng:Overview"),
+        ("home", "shared-runbook", "shared:Runbook"),
+        ("eng-knowledge", "runbook", "Runbook"),
+        ("eng-knowledge", "foo", "Foo"),
+        ("a1", "runbook", "Runbook"),
+        ("a2", "runbook", "Runbook"),
+        ("platform", "runbook", "Runbook"),
+        ("ops2", "runbook", "Runbook"),
+        ("ops2", "guide", "Guide"),
+    ];
+    for (domain, permalink, title) in &base {
+        write(
+            dirs[domain].path(),
+            &format!("{permalink}.md"),
+            &engram(title, permalink, "engram", "", "body\n"),
+        );
+    }
+    let cases = [
+        "ops:Runbook",
+        "osp:runbook",
+        "Home:Runbook",
+        "HOME:foo",
+        "home:Runbook",
+        "home:foo",
+        "eng:Runbook",
+        "engineering:runbook",
+        "eng-knowledge:Foo",
+        "Eng:Runbook",
+        "eng:Missing",
+        "eng:Overview",
+        "typo:Foo",
+        "Foo",
+        "runbook",
+        "Missing",
+        // A contested canonical name names no domain: the whole text at home.
+        "shared:Runbook",
+        "shared:Foo",
+        "a1:Runbook",
+        // A shadowed canonical name is the local name of another domain.
+        "platform:Runbook",
+        "platform:Guide",
+        "ops2:Guide",
+    ];
+    for (i, inner) in cases.iter().enumerate() {
+        write(
+            dirs["home"].path(),
+            &format!("src-{i}.md"),
+            &source_engram(&format!("Src {i}"), &format!("src-{i}"), inner),
+        );
+    }
+    for name in ["eng-knowledge", "a1", "a2", "platform", "ops2", "home"] {
+        sync_domain(store, name, dirs[name].path()).await.unwrap();
+    }
+    let (table, changed) = push_name_table(
+        store,
+        &[
+            name_input("home", None, &[]),
+            name_input("eng-knowledge", Some("engineering"), &["eng"]),
+            name_input("a1", Some("shared"), &[]),
+            name_input("a2", Some("shared"), &[]),
+            name_input("platform", None, &[]),
+            name_input("ops2", Some("platform"), &[]),
+        ],
+    )
+    .await;
+    assert_eq!(table.resolve("shared"), None, "contested");
+    assert_eq!(table.resolve("platform"), Some("platform"), "shadowed");
+    let home_id = store.domain_id("home").await.unwrap().unwrap();
+    store.reset_references_to_spellings(&changed).await.unwrap();
+    store.resolve_pending_relations(home_id).await.unwrap();
+    store.resolve_pending_links(home_id).await.unwrap();
+
+    let mut lookup = SpelledLookup {
+        spellings: table.spellings().into_iter().collect(),
+        engrams: base
+            .iter()
+            .map(|(d, p, t)| (d.to_string(), p.to_string(), t.to_string(), String::new()))
+            .collect(),
+        viewer: None,
+    };
+    for (i, inner) in cases.iter().enumerate() {
+        let source = store
+            .lookup_id("home", &format!("src-{i}"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            bound_target(store, source).await,
+            core_verdict(&lookup, inner),
+            "[[{inner}]]: the index and core disagree"
+        );
+    }
+
+    // Alice's drafts: a colon title only she has, and one draft source per
+    // case, bound in her view the way a draft write binds them.
+    let draft = |title: &str, permalink: &str, body: &str| {
+        let text = engram(title, permalink, "engram", "", body);
+        crystalline_index::EngramRecord::from_engram(
+            &crystalline_core::parse_engram(&text).unwrap(),
+            &format!("{permalink}.md"),
+            FileStamp {
+                mtime: 0,
+                size: text.len() as u64,
+                sha256: "0".repeat(64),
+            },
+        )
+    };
+    store
+        .upsert_overlay(home_id, "alice", &draft("typo:Bar", "typo-bar", "body\n"))
+        .await
+        .unwrap();
+    lookup.engrams.push((
+        "home".to_string(),
+        "typo-bar".to_string(),
+        "typo:Bar".to_string(),
+        "alice".to_string(),
+    ));
+    lookup.viewer = Some("alice".to_string());
+    let mut drafted = Vec::new();
+    for inner in cases.iter().copied().chain(["typo:Bar", "home:typo:Bar"]) {
+        let i = drafted.len();
+        let text_body = format!("- relates_to [[{inner}]]\n\nSee [[{inner}]] here.\n");
+        let id = store
+            .upsert_overlay(
+                home_id,
+                "alice",
+                &draft(&format!("Draft {i}"), &format!("draft-{i}"), &text_body),
+            )
+            .await
+            .unwrap();
+        drafted.push((inner, id));
+    }
+    store
+        .reresolve_actor_references(home_id, "alice")
+        .await
+        .unwrap();
+    for (inner, id) in drafted {
+        assert_eq!(
+            bound_target_as(store, id, Some("alice")).await,
+            core_verdict(&lookup, inner),
+            "[[{inner}]] in alice's draft: the index and core disagree"
+        );
+    }
+}
+parity!(
+    the_index_resolves_every_reference_the_way_core_does_on_both_backends,
+    the_index_resolves_every_reference_the_way_core_does
+);
+
+/// A row rename moves the name in place: the id stays, so every engram and
+/// every bound reference stays attached, and the own spelling follows. The
+/// stored `to_domain` text is left as written: the old name stays behind as an
+/// alias spelling of the same row, so a reference spelled with it keeps
+/// resolving, and so does one written after the rename.
+async fn renaming_a_row_keeps_its_id_and_keeps_the_old_name_as_an_alias(store: &dyn Store) {
+    let eng_dir = tempfile::tempdir().unwrap();
+    let ops_dir = tempfile::tempdir().unwrap();
+    write(
+        eng_dir.path(),
+        "runbook.md",
+        &engram("Runbook", "runbook", "engram", "", "runbook body\n"),
+    );
+    write(
+        ops_dir.path(),
+        "source.md",
+        &engram(
+            "Source",
+            "source",
+            "engram",
+            "",
+            "See [[eng:runbook]].\n\n- relates_to [[eng:runbook]]\n",
+        ),
+    );
+    write(
+        ops_dir.path(),
+        "runbook.md",
+        &engram("Runbook", "runbook", "engram", "", "the ops runbook\n"),
+    );
+    let dev_dir = tempfile::tempdir().unwrap();
+    write(
+        dev_dir.path(),
+        "pointer.md",
+        &engram(
+            "Pointer",
+            "pointer",
+            "engram",
+            "",
+            "See [[platform:runbook]].\n",
+        ),
+    );
+    sync_domain(store, "eng", eng_dir.path()).await.unwrap();
+    sync_domain(store, "ops", ops_dir.path()).await.unwrap();
+    sync_domain(store, "dev", dev_dir.path()).await.unwrap();
+    let eng = store.domain_id("eng").await.unwrap().unwrap();
+    let ops = store.domain_id("ops").await.unwrap().unwrap();
+    let dev = store.domain_id("dev").await.unwrap().unwrap();
+    // `platform` is an alias of ops until eng takes it as its local name, and
+    // dev's link binds through it to the ops runbook.
+    store
+        .replace_domain_spellings(&[("platform".to_string(), ops)])
+        .await
+        .unwrap();
+    assert_eq!(store.resolve_pending_links(dev).await.unwrap(), 1);
+    let pointer = store.lookup_id("dev", "pointer").await.unwrap().unwrap();
+    let ops_runbook = store.lookup_id("ops", "runbook").await.unwrap().unwrap();
+    let eng_runbook = store.lookup_id("eng", "runbook").await.unwrap().unwrap();
+    let reached =
+        |slice: &crystalline_index::GraphSlice, id| slice.nodes.iter().any(|n| n.id == id);
+    assert!(reached(
+        &store.neighbors(&[pointer], 1, None).await.unwrap(),
+        ops_runbook
+    ));
+
+    store.rename_domain_row("eng", "platform").await.unwrap();
+    assert_eq!(store.domain_id("platform").await.unwrap(), Some(eng));
+    assert_eq!(store.domain_id("eng").await.unwrap(), None);
+    assert_eq!(
+        store.domain_spellings().await.unwrap(),
+        vec![
+            ("dev".to_string(), dev),
+            ("eng".to_string(), eng),
+            ("ops".to_string(), ops),
+            ("platform".to_string(), eng),
+        ],
+        "the own spelling moved with the row and took the name from the alias, \
+         and the old name stayed behind as an alias of the same row"
+    );
+    assert!(
+        !store.outbound_refs(pointer, None).await.unwrap()[0].resolved,
+        "a reference bound through the spelling the row took is unbound"
+    );
+    assert_eq!(store.resolve_pending_links(dev).await.unwrap(), 1);
+    let slice = store.neighbors(&[pointer], 1, None).await.unwrap();
+    assert!(
+        reached(&slice, eng_runbook) && !reached(&slice, ops_runbook),
+        "and binds again to the renamed domain: {slice:?}"
+    );
+    let source = store.lookup_id("ops", "source").await.unwrap().unwrap();
+    let out = store.outbound_refs(source, None).await.unwrap();
+    assert_eq!(out.len(), 2, "{out:?}");
+    assert!(
+        out.iter()
+            .all(|r| r.to_domain.as_deref() == Some("eng") && r.resolved),
+        "the relation and the link still say `eng` as written and stay bound: {out:?}"
+    );
+    let slice = store.neighbors(&[source], 1, None).await.unwrap();
+    assert!(
+        reached(&slice, eng_runbook) && !reached(&slice, ops_runbook),
+        "and they still reach the renamed domain's runbook: {slice:?}"
+    );
+
+    // A reference written after the rename, spelled with the old name, binds
+    // through the alias to the renamed row.
+    write(
+        dev_dir.path(),
+        "later.md",
+        &engram("Later", "later", "engram", "", "See [[eng:runbook]].\n"),
+    );
+    sync_domain(store, "dev", dev_dir.path()).await.unwrap();
+    store.resolve_pending_links(dev).await.unwrap();
+    let later = store.lookup_id("dev", "later").await.unwrap().unwrap();
+    let out = store.outbound_refs(later, None).await.unwrap();
+    assert!(
+        out.len() == 1 && out[0].resolved,
+        "a new `eng:` reference resolves through the alias: {out:?}"
+    );
+    assert!(reached(
+        &store.neighbors(&[later], 1, None).await.unwrap(),
+        eng_runbook
+    ));
+    assert!(
+        store
+            .lookup_id("platform", "runbook")
+            .await
+            .unwrap()
+            .is_some(),
+        "the engrams came along with the id"
+    );
+
+    store
+        .rename_domain_row("eng", "platform")
+        .await
+        .expect("a second identical call is fine");
+    assert_eq!(store.domain_id("platform").await.unwrap(), Some(eng));
+    store
+        .rename_domain_row("never", "seen")
+        .await
+        .expect("no row under either name is nothing to rename");
+    assert_eq!(store.domain_id("seen").await.unwrap(), None);
+
+    let err = store
+        .rename_domain_row("ops", "platform")
+        .await
+        .expect_err("renaming onto another row's name is refused");
+    let text = err.to_string();
+    assert!(
+        text.contains("`ops`") && text.contains("`platform`"),
+        "the error names both rows: {text}"
+    );
+    assert_eq!(store.domain_id("ops").await.unwrap(), Some(ops));
+}
+parity!(
+    renaming_a_row_keeps_its_id_and_keeps_the_old_name_as_an_alias_on_both_backends,
+    renaming_a_row_keeps_its_id_and_keeps_the_old_name_as_an_alias
+);
+
+/// An empty domain row goes with everything that hangs off it - its spellings,
+/// its tag aliases and its host lock - and the name is free for the next
+/// registration or rename. A row that still holds anything, even one actor's
+/// draft or one attachment, stays, and so does every other row.
+async fn dropping_an_empty_domain_row(store: &dyn Store) {
+    let gone = store
+        .upsert_domain("gone", Some("/tmp/gone"), DomainKind::File)
+        .await
+        .unwrap();
+    let keep = store
+        .upsert_domain("keep", Some("/tmp/keep"), DomainKind::File)
+        .await
+        .unwrap();
+    store
+        .replace_tag_aliases(gone, &[("old".to_string(), "new".to_string())])
+        .await
+        .unwrap();
+    store
+        .claim_domain_host(
+            gone,
+            "instance-a",
+            "a",
+            "2026-09-26T10:00:00+00:00",
+            "2026-09-26T09:00:00+00:00",
+            false,
+        )
+        .await
+        .unwrap();
+    store
+        .replace_domain_spellings(&[
+            ("gone".to_string(), gone),
+            ("gone-alias".to_string(), gone),
+            ("keep".to_string(), keep),
+        ])
+        .await
+        .unwrap();
+
+    assert!(
+        store.drop_empty_domain_row("gone").await.unwrap(),
+        "an empty row is dropped"
+    );
+    assert_eq!(store.domain_id("gone").await.unwrap(), None);
+    assert_eq!(
+        store.domain_spellings().await.unwrap(),
+        vec![("keep".to_string(), keep)],
+        "every spelling of the row went with it"
+    );
+    assert_eq!(
+        store.domain_names().await.unwrap(),
+        vec!["keep".to_string()]
+    );
+    assert!(
+        !store.drop_empty_domain_row("gone").await.unwrap(),
+        "no row under the name is nothing to drop"
+    );
+
+    // The name is free again: a rename onto it works, and a fresh
+    // registration gets a clean row.
+    store.rename_domain_row("keep", "gone").await.unwrap();
+    assert_eq!(store.domain_id("gone").await.unwrap(), Some(keep));
+
+    // One actor's draft is a row, so the domain is not empty.
+    let drafted = store
+        .upsert_domain("drafted", Some("/tmp/drafted"), DomainKind::File)
+        .await
+        .unwrap();
+    let mut draft = record("a.md", "a", "draft", "sha-a");
+    draft.actor = "alice".to_string();
+    store.upsert_engram(drafted, &draft).await.unwrap();
+    assert!(
+        !store.drop_empty_domain_row("drafted").await.unwrap(),
+        "a row holding a draft stays"
+    );
+    assert_eq!(store.domain_id("drafted").await.unwrap(), Some(drafted));
+
+    // A base engram keeps it too.
+    let full = store
+        .upsert_domain("full", None, DomainKind::Virtual)
+        .await
+        .unwrap();
+    store
+        .upsert_engram(full, &record("b.md", "b", "base", "sha-b"))
+        .await
+        .unwrap();
+    assert!(!store.drop_empty_domain_row("full").await.unwrap());
+    assert_eq!(store.domain_id("full").await.unwrap(), Some(full));
+
+    // And so does one attachment.
+    let assets = store
+        .upsert_domain("assets", Some("/tmp/assets"), DomainKind::File)
+        .await
+        .unwrap();
+    store
+        .upsert_attachment(
+            assets,
+            &AttachmentRow {
+                path: "assets/x.png".to_string(),
+                sha256: "abc".to_string(),
+                mime: "image/png".to_string(),
+                size: 3,
+                modified: "2026-09-26T10:00:00+00:00".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!store.drop_empty_domain_row("assets").await.unwrap());
+    assert_eq!(store.domain_id("assets").await.unwrap(), Some(assets));
+
+    // A new registration under a dropped name holds no host lock of the
+    // row before it.
+    let first = store
+        .upsert_domain("fresh", Some("/tmp/fresh"), DomainKind::File)
+        .await
+        .unwrap();
+    store
+        .claim_domain_host(
+            first,
+            "instance-a",
+            "a",
+            "2026-09-26T10:00:00+00:00",
+            "2026-09-26T09:00:00+00:00",
+            false,
+        )
+        .await
+        .unwrap();
+    assert!(store.drop_empty_domain_row("fresh").await.unwrap());
+    let second = store
+        .upsert_domain("fresh", Some("/tmp/fresh"), DomainKind::File)
+        .await
+        .unwrap();
+    assert_eq!(store.domain_host(second).await.unwrap(), None);
+}
+parity!(
+    dropping_an_empty_domain_row_on_both_backends,
+    dropping_an_empty_domain_row
+);
+
+/// Names compare byte for byte, so a rename that only changes case is a real
+/// rename, and the old spelling stays behind as an alias like any other.
+async fn a_case_only_row_rename_works(store: &dyn Store) {
+    let id = store
+        .upsert_domain("Eng", Some("/tmp/eng"), DomainKind::File)
+        .await
+        .unwrap();
+    store.rename_domain_row("Eng", "eng").await.unwrap();
+    assert_eq!(store.domain_id("eng").await.unwrap(), Some(id));
+    assert_eq!(store.domain_id("Eng").await.unwrap(), None);
+    assert_eq!(
+        store.domain_spellings().await.unwrap(),
+        vec![("Eng".to_string(), id), ("eng".to_string(), id)]
+    );
+}
+parity!(
+    a_case_only_row_rename_works_on_both_backends,
+    a_case_only_row_rename_works
+);
+
+/// The engrams a rename has to respell: every base engram whose relations or
+/// links name one of the spellings, plus every one whose text holds a
+/// `crystalline://` URL on one of them, since no edge table records a URL. A
+/// longer name that merely starts with the spelling is not a match.
+async fn engrams_referencing_domains_lists_sources(store: &dyn Store) {
+    let ops_dir = tempfile::tempdir().unwrap();
+    let dev_dir = tempfile::tempdir().unwrap();
+    write(
+        ops_dir.path(),
+        "a.md",
+        &engram("A", "a", "engram", "", "See [[eng:x]].\n"),
+    );
+    write(
+        ops_dir.path(),
+        "b.md",
+        &engram("B", "b", "engram", "", "Read crystalline://eng/y first.\n"),
+    );
+    write(
+        dev_dir.path(),
+        "c.md",
+        &engram("C", "c", "engram", "", "Nothing here.\n"),
+    );
+    write(
+        dev_dir.path(),
+        "d.md",
+        &engram(
+            "D",
+            "d",
+            "engram",
+            "",
+            "See [[eng-other:z]] and crystalline://eng-other/z.\n",
+        ),
+    );
+    sync_domain(store, "ops", ops_dir.path()).await.unwrap();
+    sync_domain(store, "dev", dev_dir.path()).await.unwrap();
+
+    assert_eq!(
+        store
+            .engrams_referencing_domains(&["eng".to_string()])
+            .await
+            .unwrap(),
+        vec![
+            ("ops".to_string(), "a.md".to_string()),
+            ("ops".to_string(), "b.md".to_string()),
+        ]
+    );
+    assert!(
+        store
+            .engrams_referencing_domains(&[])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+parity!(
+    engrams_referencing_domains_lists_sources_on_both_backends,
+    engrams_referencing_domains_lists_sources
+);
+
+/// One domain's references spelled by one of the given names, with the line
+/// and the bracket text as written, for the sweep's local-spelling finding.
+async fn spelled_references_lists_one_domains_references(store: &dyn Store) {
+    let ops_dir = tempfile::tempdir().unwrap();
+    let dev_dir = tempfile::tempdir().unwrap();
+    // Body line 1 of this helper's engram is file line 13.
+    write(
+        ops_dir.path(),
+        "a.md",
+        &engram(
+            "A",
+            "a",
+            "engram",
+            "",
+            "See [[eng-knowledge:runbook]] and [[other:z]].\n\n- relates_to [[eng-knowledge:guide]]\n",
+        ),
+    );
+    write(
+        dev_dir.path(),
+        "b.md",
+        &engram("B", "b", "engram", "", "See [[eng-knowledge:runbook]].\n"),
+    );
+    sync_domain(store, "ops", ops_dir.path()).await.unwrap();
+    sync_domain(store, "dev", dev_dir.path()).await.unwrap();
+    let ops = store.domain_id("ops").await.unwrap().unwrap();
+    let a = store.lookup_id("ops", "a").await.unwrap().unwrap();
+
+    let refs = store
+        .spelled_references(ops, &["eng-knowledge".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(
+        refs,
+        vec![
+            crystalline_index::SpelledRef {
+                from: a,
+                line: 13,
+                spelling: "eng-knowledge".to_string(),
+                raw: "eng-knowledge:runbook".to_string(),
+            },
+            crystalline_index::SpelledRef {
+                from: a,
+                line: 15,
+                spelling: "eng-knowledge".to_string(),
+                raw: "eng-knowledge:guide".to_string(),
+            },
+        ]
+    );
+    assert!(store.spelled_references(ops, &[]).await.unwrap().is_empty());
+}
+parity!(
+    spelled_references_lists_one_domains_references_on_both_backends,
+    spelled_references_lists_one_domains_references
+);
+
+/// The prose-wikilink twin of `forward_reference_resolves`: a bare `[[Gamma]]`
+/// mentioned in prose (no relation type) stays unresolved until its target
+/// appears, then resolves on the later sync into a `links_to` graph edge. This
+/// is the whole point of M1: prose wikilinks were indexed but never resolved,
+/// so they never joined graph traversal.
+async fn link_two_pass_resolution(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // A prose mention only, no `- rel_type [[...]]` bullet, so this exercises
+    // the link table, not the relation table.
+    write(
+        root,
+        "a.md",
+        &engram("A", "a", "engram", "", "See [[Gamma]] for the details.\n"),
+    );
+    let first = sync_domain(store, "d", root).await.unwrap();
+    assert_eq!(first.links_resolved, 0, "target absent, link unresolved");
+    assert_eq!(first.relations_resolved, 0, "no relation bullets");
+    let stats = store.domain_stats().await.unwrap();
+    assert_eq!(stats[0].links, 1, "the prose wikilink is indexed");
+    assert_eq!(stats[0].unresolved_links, 1, "and still unresolved");
+
+    // The target appears in a later sync. Its title matches the wikilink text
+    // (its permalink deliberately does not), so the title branch resolves it.
+    write(
+        root,
+        "gamma.md",
+        &engram("Gamma", "gamma-perma", "engram", "", "gamma body\n"),
+    );
+    let second = sync_domain(store, "d", root).await.unwrap();
+    assert_eq!(second.links_resolved, 1, "now resolved");
+    assert_eq!(
+        store.domain_stats().await.unwrap()[0].unresolved_links,
+        0,
+        "no pending links remain"
+    );
+
+    // The resolved wikilink is a `links_to` edge from A to Gamma.
+    let a = store.lookup_id("d", "a").await.unwrap().unwrap();
+    let slice = store.neighbors(&[a], 1, None).await.unwrap();
+    assert!(
+        slice
+            .edges
+            .iter()
+            .any(|e| e.kind == EdgeKind::Link && e.rel_type == "links_to"),
+        "A has a links_to edge to Gamma"
+    );
+    let perms: Vec<&str> = slice.nodes.iter().map(|n| n.permalink.as_str()).collect();
+    assert!(perms.contains(&"gamma-perma"), "traversal reaches Gamma");
+}
+parity!(
+    prose_wikilink_resolves_on_later_sync,
+    link_two_pass_resolution
+);
+
+/// A run over several domains settles its forward references before it
+/// finishes. Domain `a` is indexed first and carries both a relation and a
+/// prose wikilink into domain `b`, which does not exist yet - not the engram,
+/// not even the domain row - so `a`'s own resolution batch cannot match either
+/// one. Indexing `b` afterwards does not help `a` either: resolution is scoped
+/// to the domain being applied. Until the final pass existed, both references
+/// read as unresolved for the rest of the run, and the fix for an agent seeing
+/// `"resolved": false` on a link that is not broken was to sync a second time.
+///
+/// The references are written in the cross-domain `[[b:...]]` form on purpose.
+/// A bare `[[B Note]]` resolves only inside the writing domain (the match
+/// scopes to `to_domain`'s row and falls back to the source domain when it is
+/// absent), so it could never reach `b` at all and would pin nothing here.
+async fn late_cross_domain_resolution(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let a_root = dir.path().join("a");
+    let b_root = dir.path().join("b");
+    std::fs::create_dir_all(&a_root).unwrap();
+    std::fs::create_dir_all(&b_root).unwrap();
+    write(
+        &a_root,
+        "a.md",
+        &engram(
+            "A",
+            "a",
+            "engram",
+            "",
+            "- depends_on [[b:B Note]]\n\nProse mentions [[b:B Note]] too.\n",
+        ),
+    );
+    write(
+        &b_root,
+        "b.md",
+        &engram("B Note", "b-note", "engram", "", "body b\n"),
+    );
+
+    // The loop of a multi-domain driver: `a` first, while `b` is unknown - a
+    // driver upserts each domain row as it reaches it, so `b` has no row at all
+    // while `a` is being applied, which is exactly the state that defeats the
+    // per-domain batch.
+    let a_report = sync_domain(store, "a", &a_root).await.unwrap();
+    let b_report = sync_domain(store, "b", &b_root).await.unwrap();
+    // Both rows exist now, so these resolve the ids the driver already held.
+    let a_id = store
+        .upsert_domain("a", Some(&a_root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+    let b_id = store
+        .upsert_domain("b", Some(&b_root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+    assert_eq!(
+        (a_report.relations_resolved, a_report.links_resolved),
+        (0, 0),
+        "a's own batch cannot see into b"
+    );
+
+    // The tail of the same driver, after every domain of the run is indexed.
+    // The driver carries one structure pairing each applied domain with its own
+    // report, so a count can never land on the wrong report.
+    let mut applied = vec![(a_id, a_report), (b_id, b_report)];
+    let totals = resolve_forward_refs(store, &mut applied).await.unwrap();
+    assert_eq!(totals, (1, 1), "the run totals name the late resolutions");
+    assert_eq!(
+        (
+            applied[0].1.relations_resolved_late,
+            applied[0].1.links_resolved_late
+        ),
+        (1, 1),
+        "and they are reported against the domain that carried them"
+    );
+    assert_eq!(
+        (
+            applied[1].1.relations_resolved_late,
+            applied[1].1.links_resolved_late
+        ),
+        (0, 0),
+        "b had no forward references of its own"
+    );
+
+    let stats = store.domain_stats().await.unwrap();
+    let a_stats = stats.iter().find(|d| d.name == "a").expect("domain a");
+    assert_eq!(
+        (a_stats.unresolved_relations, a_stats.unresolved_links),
+        (0, 0),
+        "nothing is left unresolved when the first sync finishes"
+    );
+
+    // The resolved reference is a real edge, not just a filled column.
+    let a = store.lookup_id("a", "a").await.unwrap().unwrap();
+    let slice = store.neighbors(&[a], 1, None).await.unwrap();
+    let perms: Vec<&str> = slice.nodes.iter().map(|n| n.permalink.as_str()).collect();
+    assert!(perms.contains(&"b-note"), "traversal reaches b's engram");
+
+    // The pass is idempotent: a second run over a settled index resolves
+    // nothing and does not double-count.
+    let again = resolve_forward_refs(store, &mut applied).await.unwrap();
+    assert_eq!(again, (0, 0), "nothing left to resolve");
+}
+parity!(
+    a_multi_domain_run_resolves_forward_references_before_it_finishes,
+    late_cross_domain_resolution
+);
+
+/// A single-domain run needs no final pass: its own batch already resolved
+/// everything this run indexed, so the pass short-circuits, leaves the late
+/// counters at zero and does not re-run the statement.
+async fn single_domain_run_skips_the_late_pass(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "a.md",
+        &engram("A", "a", "engram", "", "- depends_on [[b]]\n"),
+    );
+    write(root, "b.md", &engram("B", "b", "engram", "", "body b\n"));
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+    let report = sync_domain(store, "d", root).await.unwrap();
+    assert_eq!(report.relations_resolved, 1, "resolved in its own batch");
+
+    let mut applied = vec![(domain, report)];
+    let totals = resolve_forward_refs(store, &mut applied).await.unwrap();
+    assert_eq!(totals, (0, 0));
+    assert_eq!(
+        (
+            applied[0].1.relations_resolved_late,
+            applied[0].1.links_resolved_late
+        ),
+        (0, 0),
+        "the late counters stay at zero on a single-domain run"
+    );
+}
+parity!(
+    a_single_domain_run_skips_the_late_pass,
+    single_domain_run_skips_the_late_pass
+);
+
+/// `outbound_refs` reports every relation and prose link leaving an engram, in
+/// source-line order, each flagged with whether it currently resolves. A
+/// relation and a prose link to a present target resolve; a relation to a
+/// missing target and a cross-domain link into an unregistered domain do not. An
+/// engram with no outbound references reports none.
+async fn outbound_refs_status(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "target.md",
+        &engram("Target", "target", "engram", "", "target body\n"),
+    );
+    // Two relation bullets then two prose links, on ascending lines: a resolving
+    // relation, a dangling relation, a resolving prose link and a dangling
+    // cross-domain prose link.
+    write(
+        root,
+        "source.md",
+        &engram(
+            "Source",
+            "source",
+            "engram",
+            "",
+            "- depends_on [[Target]]\n- blocks [[Missing]]\n\nProse links [[Target]] inline.\n\nMore prose [[other:Ghost]] here.\n",
+        ),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+
+    let source = store.lookup_id("d", "source").await.unwrap().unwrap();
+    let refs = store.outbound_refs(source, None).await.unwrap();
+    let shape: Vec<_> = refs
+        .iter()
+        .map(|r| {
+            (
+                r.line,
+                r.kind,
+                r.rel_type.as_deref(),
+                r.to_target.as_str(),
+                r.to_domain.as_deref(),
+                r.resolved,
+            )
+        })
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            (
+                13,
+                EdgeKind::Relation,
+                Some("depends_on"),
+                "Target",
+                None,
+                true
+            ),
+            (
+                14,
+                EdgeKind::Relation,
+                Some("blocks"),
+                "Missing",
+                None,
+                false
+            ),
+            (16, EdgeKind::Link, None, "Target", None, true),
+            (18, EdgeKind::Link, None, "Ghost", Some("other"), false),
+        ],
+        "outbound refs are line-ordered and carry resolution flags: {refs:?}"
+    );
+
+    // The target itself has no outbound references.
+    let target = store.lookup_id("d", "target").await.unwrap().unwrap();
+    assert!(
+        store.outbound_refs(target, None).await.unwrap().is_empty(),
+        "an engram with no relations or links reports none"
+    );
+}
+parity!(outbound_refs_report_resolution_status, outbound_refs_status);
+
+/// `inbound_refs` reports a relation-kind and a link-kind reference pointing at
+/// an engram, each carrying the correct `kind`. This guards the kind
+/// discriminator decoding identically on both backends: a bare integer literal
+/// does not decode as `i64` on Postgres, so the column must be cast.
+///
+/// It also guards the ordering, which `read_engram` truncates to the first five
+/// refs: both sort keys are text, so the fixture plants a capitalized source
+/// path (`Capital.md`) and a capitalized source domain (`Zed`), each of which
+/// sorts first byte-wise and last under a locale collation. Without the
+/// Postgres side pinning both keys to `COLLATE "C"` the two backends hand a
+/// caller a different order, and with a cap, a different set.
+async fn inbound_refs_kinds(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "hub.md",
+        &engram("Hub", "hub", "engram", "", "the hub body\n"),
+    );
+    // A relation bullet pointing at Hub, and a separate engram whose prose links
+    // to Hub. After resolution both are inbound references, of different kinds.
+    write(
+        root,
+        "rel.md",
+        &engram("Rel", "rel", "engram", "", "- cites [[Hub]]\n"),
+    );
+    write(
+        root,
+        "link.md",
+        &engram(
+            "Link",
+            "link",
+            "engram",
+            "",
+            "See [[Hub]] for the details.\n",
+        ),
+    );
+    // A capitalized path in the same domain: byte-wise it sorts before both
+    // lowercase paths, under a locale collation it sorts after them.
+    write(
+        root,
+        "Capital.md",
+        &engram("Capital", "capital", "engram", "", "- cites [[Hub]]\n"),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+
+    // A capitalized second domain pointing across at Hub, so the domain key is
+    // exercised the same way: `Zed` sorts before `d` byte-wise and after it
+    // under a locale collation.
+    let other_dir = tempfile::tempdir().unwrap();
+    let other = other_dir.path();
+    write(
+        other,
+        "cross.md",
+        &engram("Cross", "cross", "engram", "", "- cites [[d:Hub]]\n"),
+    );
+    sync_domain(store, "Zed", other).await.unwrap();
+
+    let hub = store.lookup_id("d", "hub").await.unwrap().unwrap();
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+    let refs = store.inbound_refs(hub, domain, "hub", "Hub").await.unwrap();
+
+    assert_eq!(
+        refs.len(),
+        4,
+        "two relations, one link and one cross-domain relation point at Hub: {refs:?}"
+    );
+    // Ordered by source domain then path, byte-wise on both backends, so a
+    // capped sample is deterministic.
+    assert_eq!(
+        refs.iter()
+            .map(|r| (r.src_domain.as_str(), r.src_path.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("Zed", "cross.md"),
+            ("d", "Capital.md"),
+            ("d", "link.md"),
+            ("d", "rel.md"),
+        ],
+        "inbound refs are ordered by (domain, path) in byte order: {refs:?}"
+    );
+    let relation = refs
+        .iter()
+        .find(|r| r.src_path == "rel.md")
+        .expect("the relation linker is present");
+    assert_eq!(
+        relation.kind,
+        EdgeKind::Relation,
+        "the relation bullet is a relation-kind inbound ref: {refs:?}"
+    );
+    let link = refs
+        .iter()
+        .find(|r| r.src_path == "link.md")
+        .expect("the prose linker is present");
+    assert_eq!(
+        link.kind,
+        EdgeKind::Link,
+        "the prose wikilink is a link-kind inbound ref: {refs:?}"
+    );
+    // Whether the reference named a domain in its brackets rides along, because
+    // the caller that rewrites bracket text has to tell `[[Hub]]` from
+    // `[[d:Hub]]`: the text on disk differs, and the target text alone is the
+    // same string in both.
+    assert_eq!(
+        refs.iter()
+            .find(|r| r.src_path == "cross.md")
+            .and_then(|r| r.to_domain.clone()),
+        Some("d".to_string()),
+        "a prefixed reference reports the domain it named: {refs:?}"
+    );
+    assert!(
+        refs.iter()
+            .filter(|r| r.src_domain == "d")
+            .all(|r| r.to_domain.is_none()),
+        "and a bare one reports none: {refs:?}"
+    );
+}
+parity!(inbound_refs_report_ref_kinds, inbound_refs_kinds);
+
+/// `engrams_mentioning` finds the engrams whose content holds an address
+/// verbatim - the `crystalline://` URLs no edge table records - in byte order
+/// on both backends, case-sensitively and with `%` and `_` read literally.
+async fn engrams_mentioning_finds(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let url = "crystalline://d/notes/hub";
+    write(
+        root,
+        "hub.md",
+        &engram("Hub", "notes/hub", "engram", "", "the hub body\n"),
+    );
+    write(
+        root,
+        "Capital.md",
+        &engram(
+            "Capital",
+            "capital",
+            "engram",
+            "",
+            &format!("See {url}#setup for it.\n"),
+        ),
+    );
+    write(
+        root,
+        "plain.md",
+        &engram("Plain", "plain", "engram", "", &format!("Anchor {url}\n")),
+    );
+    write(
+        root,
+        "upper.md",
+        &engram(
+            "Upper",
+            "upper",
+            "engram",
+            "",
+            "CRYSTALLINE://D/NOTES/HUB is not the address\n",
+        ),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let other_dir = tempfile::tempdir().unwrap();
+    write(
+        other_dir.path(),
+        "far.md",
+        &engram("Far", "far", "engram", "", &format!("From afar: {url}\n")),
+    );
+    sync_domain(store, "Zed", other_dir.path()).await.unwrap();
+
+    let found = store.engrams_mentioning(url).await.unwrap();
+    assert_eq!(
+        found
+            .iter()
+            .map(|m| (m.domain.as_str(), m.path.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("Zed", "far.md"), ("d", "Capital.md"), ("d", "plain.md")],
+        "every verbatim mention, byte-ordered by domain then path: {found:?}"
+    );
+    assert!(
+        store
+            .engrams_mentioning("crystalline://d/notes/h_b")
+            .await
+            .unwrap()
+            .is_empty(),
+        "an underscore is literal, never a wildcard"
+    );
+    assert!(store.engrams_mentioning("").await.unwrap().is_empty());
+}
+parity!(
+    engrams_mentioning_finds_verbatim_addresses,
+    engrams_mentioning_finds
+);
+
+/// A hub with seven references pointing at it from two domains, for the
+/// `inbound_page` tests: four `cites`, two `part_of` and one prose wikilink.
+///
+/// The titles are chosen so byte order and locale order disagree twice over -
+/// `beta small` sorts last byte-wise and third under a locale collation, and
+/// `Alpha 100%` sorts before `Alpha 1005` byte-wise and after it wherever
+/// punctuation is weighted last - so an ordering that lost `COLLATE "C"` on
+/// either backend is visible rather than merely different. Returns the hub's
+/// ids.
+async fn hub_fixture(store: &dyn Store) -> (EngramId, DomainId) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "hub.md",
+        &engram("Hub", "hub", "engram", "", "the hub body\n"),
+    );
+    for (path, title, permalink, body) in [
+        ("alpha.md", "Alpha 100%", "alpha", "- cites [[Hub]]\n"),
+        ("alpha2.md", "Alpha 1005", "alpha2", "- cites [[Hub]]\n"),
+        ("beta.md", "Beta", "beta", "- part_of [[Hub]]\n"),
+        ("Capital.md", "Capital", "capital", "- cites [[Hub]]\n"),
+        (
+            "notes/gamma.md",
+            "Gamma",
+            "notes/gamma",
+            "See [[Hub]] for the details.\n",
+        ),
+        ("small.md", "beta small", "small", "- part_of [[Hub]]\n"),
+    ] {
+        write(root, path, &engram(title, permalink, "engram", "", body));
+    }
+    sync_domain(store, "d", root).await.unwrap();
+
+    // A second domain pointing across, so a hit carries the domain it came
+    // from rather than assuming one.
+    let other_dir = tempfile::tempdir().unwrap();
+    let other = other_dir.path();
+    write(
+        other,
+        "cross.md",
+        &engram("Cross", "cross", "engram", "", "- cites [[d:Hub]]\n"),
+    );
+    sync_domain(store, "Zed", other).await.unwrap();
+
+    let hub = store.lookup_id("d", "hub").await.unwrap().unwrap();
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+    // The temp directories are dropped here on purpose: every assertion runs
+    // against indexed rows, and nothing below reads a file.
+    (hub, domain)
+}
+
+/// The query naming the fixture hub, with no filters and a page of ten.
+fn hub_query(hub: EngramId, domain: DomainId) -> InboundQuery<'static> {
+    InboundQuery {
+        engram_id: hub,
+        domain_id: domain,
+        permalink: "hub",
+        title: "Hub",
+        q: None,
+        rel: None,
+        exclude_domains: &[],
+        page: 1,
+        limit: 10,
+    }
+}
+
+/// The titles of a page, in the order it returned them.
+fn hit_titles(page: &InboundPage) -> Vec<&str> {
+    page.hits.iter().map(|h| h.title.as_str()).collect()
+}
+
+/// `inbound_page` answers one page of the references pointing at an engram,
+/// ordered byte-wise by title, with an exact total and a per-relation summary
+/// that counts every reference rather than the page.
+async fn inbound_page_orders_and_summarizes(store: &dyn Store) {
+    let (hub, domain) = hub_fixture(store).await;
+
+    let page = store.inbound_page(&hub_query(hub, domain)).await.unwrap();
+
+    assert_eq!(page.total, 7, "seven references point at the hub: {page:?}");
+    assert_eq!(
+        hit_titles(&page),
+        vec![
+            "Alpha 100%",
+            "Alpha 1005",
+            "Beta",
+            "Capital",
+            "Cross",
+            "Gamma",
+            "beta small",
+        ],
+        "hits are ordered by title in byte order: {page:?}"
+    );
+    assert_eq!(
+        page.types
+            .iter()
+            .map(|t| (t.name.as_str(), t.count))
+            .collect::<Vec<_>>(),
+        vec![("cites", 4), ("part_of", 2), ("links_to", 1)],
+        "the summary counts every relation type, most-used first: {page:?}"
+    );
+    // A prose wikilink is `links_to`, the word the graph edges and the sweep
+    // already use for one.
+    let gamma = page
+        .hits
+        .iter()
+        .find(|h| h.title == "Gamma")
+        .expect("the prose linker is on the page");
+    assert_eq!(gamma.rel, "links_to", "{page:?}");
+    assert_eq!(gamma.permalink, "notes/gamma", "{page:?}");
+    assert_eq!(gamma.path, "notes/gamma.md", "{page:?}");
+    assert_eq!(gamma.domain, "d", "{page:?}");
+    let cross = page
+        .hits
+        .iter()
+        .find(|h| h.title == "Cross")
+        .expect("the cross-domain linker is on the page");
+    assert_eq!(cross.domain, "Zed", "{page:?}");
+    assert_eq!(cross.rel, "cites", "{page:?}");
+}
+parity!(
+    inbound_page_orders_by_title_and_summarizes_types,
+    inbound_page_orders_and_summarizes
+);
+
+/// Paging slices that one order without changing what it is a page of: the
+/// total and the summary describe the whole set on every page.
+async fn inbound_page_pages(store: &dyn Store) {
+    let (hub, domain) = hub_fixture(store).await;
+
+    let first = store
+        .inbound_page(&InboundQuery {
+            limit: 3,
+            ..hub_query(hub, domain)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        hit_titles(&first),
+        vec!["Alpha 100%", "Alpha 1005", "Beta"],
+        "{first:?}"
+    );
+    assert_eq!(first.total, 7, "{first:?}");
+
+    let second = store
+        .inbound_page(&InboundQuery {
+            page: 2,
+            limit: 3,
+            ..hub_query(hub, domain)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        hit_titles(&second),
+        vec!["Capital", "Cross", "Gamma"],
+        "the second page continues the first: {second:?}"
+    );
+    assert_eq!(second.total, 7, "the total is of the set, not the page");
+    assert_eq!(
+        second.types.len(),
+        3,
+        "the summary rides every page: {second:?}"
+    );
+
+    let last = store
+        .inbound_page(&InboundQuery {
+            page: 3,
+            limit: 3,
+            ..hub_query(hub, domain)
+        })
+        .await
+        .unwrap();
+    assert_eq!(hit_titles(&last), vec!["beta small"], "{last:?}");
+
+    let past_the_end = store
+        .inbound_page(&InboundQuery {
+            page: 9,
+            limit: 3,
+            ..hub_query(hub, domain)
+        })
+        .await
+        .unwrap();
+    assert!(
+        past_the_end.hits.is_empty(),
+        "a page past the end is empty rather than an error: {past_the_end:?}"
+    );
+    assert_eq!(past_the_end.total, 7, "{past_the_end:?}");
+}
+parity!(inbound_page_pages_the_same_order, inbound_page_pages);
+
+/// `rel` narrows to one relation type and `q` matches the referencing engram's
+/// title or path, case-insensitively. Both keep the total exact and neither
+/// touches the summary.
+async fn inbound_page_filters(store: &dyn Store) {
+    let (hub, domain) = hub_fixture(store).await;
+
+    let cites = store
+        .inbound_page(&InboundQuery {
+            rel: Some("cites"),
+            ..hub_query(hub, domain)
+        })
+        .await
+        .unwrap();
+    assert_eq!(cites.total, 4, "{cites:?}");
+    assert_eq!(
+        hit_titles(&cites),
+        vec!["Alpha 100%", "Alpha 1005", "Capital", "Cross"],
+        "{cites:?}"
+    );
+    assert_eq!(
+        cites.types.len(),
+        3,
+        "the summary is of every reference, not of the filtered ones: {cites:?}"
+    );
+
+    let prose = store
+        .inbound_page(&InboundQuery {
+            rel: Some("links_to"),
+            ..hub_query(hub, domain)
+        })
+        .await
+        .unwrap();
+    assert_eq!(hit_titles(&prose), vec!["Gamma"], "{prose:?}");
+
+    let by_title = store
+        .inbound_page(&InboundQuery {
+            q: Some("BETA"),
+            ..hub_query(hub, domain)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        hit_titles(&by_title),
+        vec!["Beta", "beta small"],
+        "q matches the title case-insensitively: {by_title:?}"
+    );
+    assert_eq!(by_title.total, 2, "{by_title:?}");
+
+    let by_path = store
+        .inbound_page(&InboundQuery {
+            q: Some("notes/"),
+            ..hub_query(hub, domain)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        hit_titles(&by_path),
+        vec!["Gamma"],
+        "q matches the path too: {by_path:?}"
+    );
+
+    let both = store
+        .inbound_page(&InboundQuery {
+            q: Some("alpha"),
+            rel: Some("cites"),
+            ..hub_query(hub, domain)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        hit_titles(&both),
+        vec!["Alpha 100%", "Alpha 1005"],
+        "the two filters compose: {both:?}"
+    );
+
+    let nothing = store
+        .inbound_page(&InboundQuery {
+            q: Some("nobody"),
+            ..hub_query(hub, domain)
+        })
+        .await
+        .unwrap();
+    assert_eq!(nothing.total, 0, "{nothing:?}");
+    assert!(nothing.hits.is_empty(), "{nothing:?}");
+    assert_eq!(
+        nothing.types.len(),
+        3,
+        "a filter that matches nothing still reports what is there: {nothing:?}"
+    );
+}
+parity!(inbound_page_filters_by_rel_and_text, inbound_page_filters);
+
+/// A page size or page number no `i64` can hold is arithmetic, not a licence.
+///
+/// `usize::MAX as i64` is `-1`, and a negative bound means three different wrong
+/// answers depending on the backend: SQLite reads a negative `LIMIT` as no limit
+/// and returns the whole set, Postgres refuses a negative `LIMIT` or `OFFSET`
+/// outright, and a wrapped offset silently serves page one under any page
+/// number. All three are pinned here, on both backends, because the numbers come
+/// from a query string.
+async fn inbound_page_absurd_bounds(store: &dyn Store) {
+    let (hub, domain) = hub_fixture(store).await;
+
+    // A page size past `i64`: bounded, and bounded by the set rather than
+    // unbounded by a wrapped negative.
+    let huge_limit = store
+        .inbound_page(&InboundQuery {
+            limit: usize::MAX,
+            ..hub_query(hub, domain)
+        })
+        .await
+        .expect("an absurd page size is arithmetic, not an error");
+    assert_eq!(huge_limit.total, 7, "{huge_limit:?}");
+    assert_eq!(
+        huge_limit.hits.len(),
+        7,
+        "the whole set is seven rows, so a page bigger than it holds seven: {huge_limit:?}"
+    );
+
+    // A page number past `i64`, whose offset would wrap: an empty page carrying
+    // the true total, never the first page's rows.
+    let huge_page = store
+        .inbound_page(&InboundQuery {
+            page: usize::MAX,
+            ..hub_query(hub, domain)
+        })
+        .await
+        .expect("an absurd page number is arithmetic, not an error");
+    assert!(
+        huge_page.hits.is_empty(),
+        "a page past the end is empty rather than page one: {huge_page:?}"
+    );
+    assert_eq!(huge_page.total, 7, "{huge_page:?}");
+
+    // Both at once, which is where the multiplication overflows.
+    let both = store
+        .inbound_page(&InboundQuery {
+            page: usize::MAX,
+            limit: usize::MAX,
+            ..hub_query(hub, domain)
+        })
+        .await
+        .expect("both at once is arithmetic too");
+    assert!(both.hits.is_empty(), "{both:?}");
+    assert_eq!(both.total, 7, "{both:?}");
+}
+parity!(
+    inbound_page_clamps_absurd_bounds,
+    inbound_page_absurd_bounds
+);
+
+/// A `%` in `q` is a percent sign, not a wildcard: the fixture holds both
+/// `Alpha 100%` and `Alpha 1005`, and an unescaped pattern would return both.
+async fn inbound_page_escapes(store: &dyn Store) {
+    let (hub, domain) = hub_fixture(store).await;
+
+    let literal = store
+        .inbound_page(&InboundQuery {
+            q: Some("100%"),
+            ..hub_query(hub, domain)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        hit_titles(&literal),
+        vec!["Alpha 100%"],
+        "the wildcard is escaped: {literal:?}"
+    );
+
+    let underscore = store
+        .inbound_page(&InboundQuery {
+            q: Some("alpha_"),
+            ..hub_query(hub, domain)
+        })
+        .await
+        .unwrap();
+    assert!(
+        underscore.hits.is_empty(),
+        "`_` is a literal underscore, which no title carries: {underscore:?}"
+    );
+}
+parity!(inbound_page_escapes_like_wildcards, inbound_page_escapes);
+
+/// An engram nothing points at reports an empty page rather than an error, and
+/// says so in the summary too.
+async fn inbound_page_empty(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "lonely.md",
+        &engram("Lonely", "lonely", "engram", "", "nobody points here\n"),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let lonely = store.lookup_id("d", "lonely").await.unwrap().unwrap();
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+
+    let page = store
+        .inbound_page(&InboundQuery {
+            permalink: "lonely",
+            title: "Lonely",
+            ..hub_query(lonely, domain)
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(page.total, 0, "{page:?}");
+    assert!(page.hits.is_empty(), "{page:?}");
+    assert!(page.types.is_empty(), "{page:?}");
+}
+parity!(
+    inbound_page_reports_nothing_pointing_here,
+    inbound_page_empty
+);
+
+/// `exclude_domains` takes a domain out of all three answers at once: the page,
+/// the total and the per-relation summary. A reader who may not see `Zed`
+/// learns nothing about it - not the row, and not a count that would only make
+/// sense if the row existed.
+async fn inbound_page_excludes_domains(store: &dyn Store) {
+    let (hub, domain) = hub_fixture(store).await;
+    let hidden = vec!["Zed".to_string()];
+
+    let page = store
+        .inbound_page(&InboundQuery {
+            exclude_domains: &hidden,
+            ..hub_query(hub, domain)
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        !page.hits.iter().any(|h| h.domain == "Zed"),
+        "the hidden domain's referrer is off the page: {page:?}"
+    );
+    assert!(
+        !hit_titles(&page).contains(&"Cross"),
+        "and it is the cross-domain one that went: {page:?}"
+    );
+    assert_eq!(page.total, 6, "the total counts what it showed: {page:?}");
+    assert_eq!(
+        page.types
+            .iter()
+            .map(|t| (t.name.as_str(), t.count))
+            .collect::<Vec<_>>(),
+        vec![("cites", 3), ("part_of", 2), ("links_to", 1)],
+        "the summary drops the hidden reference too: {page:?}"
+    );
+
+    // The exclusion narrows and nothing else: a reader-chosen filter still
+    // applies on top of it, over the same reduced set.
+    let filtered = store
+        .inbound_page(&InboundQuery {
+            rel: Some("cites"),
+            exclude_domains: &hidden,
+            ..hub_query(hub, domain)
+        })
+        .await
+        .unwrap();
+    assert_eq!(filtered.total, 3, "{filtered:?}");
+    assert!(
+        !filtered.hits.iter().any(|h| h.domain == "Zed"),
+        "{filtered:?}"
+    );
+
+    // A name nobody registered excludes nothing, so the unfiltered answer is
+    // the one the empty exclusion gives.
+    let unrelated = vec!["ghost".to_string()];
+    let same = store
+        .inbound_page(&InboundQuery {
+            exclude_domains: &unrelated,
+            ..hub_query(hub, domain)
+        })
+        .await
+        .unwrap();
+    let all = store.inbound_page(&hub_query(hub, domain)).await.unwrap();
+    assert_eq!(same.total, all.total, "{same:?}");
+    assert_eq!(hit_titles(&same), hit_titles(&all), "{same:?}");
+}
+parity!(
+    inbound_page_hides_the_domains_it_is_told_to,
+    inbound_page_excludes_domains
+);
+
+/// `unresolved_refs` reports every dangling relation and prose link in a domain,
+/// and nothing else: a relation that resolves never appears, a reference in
+/// another domain never leaks in and a domain with no engrams reports none. Each
+/// row carries the relation type (`links_to` for a prose link), the
+/// `[[domain:...]]` prefix when the reference named one and the target text
+/// exactly as it was written, case and inner spacing intact, because the sweep
+/// quotes it verbatim for the repair. Ordered by source path then line, so
+/// relation and link rows interleave rather than arriving as two blocks, and two
+/// calls return the same queue.
+async fn unresolved_refs_dangling(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "target.md",
+        &engram("Target", "target", "engram", "", "target body\n"),
+    );
+    // A resolving relation, then a dangling one whose target keeps a capital and
+    // a double space, then a dangling prose link and a dangling prose link into a
+    // domain that was never registered.
+    write(
+        root,
+        "alpha.md",
+        &engram(
+            "Alpha",
+            "alpha",
+            "engram",
+            "",
+            "- depends_on [[Target]]\n- blocks [[Old  Deploy Pipeline]]\n\nProse about [[Ghost Title]] here.\n\nMore prose [[ghosts:Remote Thing]] here.\n",
+        ),
+    );
+    // A dangling relation carrying a domain prefix, in a file that sorts after
+    // alpha.md so the ordering is observable.
+    write(
+        root,
+        "beta.md",
+        &engram(
+            "Beta",
+            "beta",
+            "engram",
+            "",
+            "- supersedes [[archive:Old Note]]\n",
+        ),
+    );
+    // A capitalized path, which sorts first byte-wise and last under a locale
+    // collation. This is the row that catches the two backends disagreeing about
+    // text ordering.
+    write(
+        root,
+        "Capital.md",
+        &engram("Capital", "capital", "engram", "", "- cites [[Absent]]\n"),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+
+    // A second domain with its own dangling reference, so a missing domain
+    // filter would show up as an extra row.
+    let other_dir = tempfile::tempdir().unwrap();
+    let other = other_dir.path();
+    write(
+        other,
+        "solo.md",
+        &engram("Solo", "solo", "engram", "", "- cites [[Nowhere]]\n"),
+    );
+    sync_domain(store, "o", other).await.unwrap();
+
+    let d = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+    let alpha = store.lookup_id("d", "alpha").await.unwrap().unwrap();
+    let beta = store.lookup_id("d", "beta").await.unwrap().unwrap();
+    let capital = store.lookup_id("d", "capital").await.unwrap().unwrap();
+    let refs = store.unresolved_refs(d, None).await.unwrap();
+
+    let name = |id: EngramId| {
+        if id == alpha {
+            "alpha"
+        } else if id == beta {
+            "beta"
+        } else if id == capital {
+            "capital"
+        } else {
+            "unexpected"
+        }
+    };
+    let shape: Vec<_> = refs
+        .iter()
+        .map(|r| {
+            (
+                name(r.from),
+                r.kind,
+                r.rel_type.as_str(),
+                r.target_domain.as_deref(),
+                r.target.as_str(),
+                // The bracket text as written, read back off `to_raw` rather
+                // than rebuilt: an ordinal drift onto the neighbouring source
+                // path would pass every other assertion in the tree and score
+                // V102's repair against a file name.
+                r.raw.as_str(),
+                r.line,
+            )
+        })
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            // Capital.md first: text sorts byte-wise on both backends, so an
+            // uppercase path precedes every lowercase one.
+            (
+                "capital",
+                EdgeKind::Relation,
+                "cites",
+                None,
+                "Absent",
+                "Absent",
+                Some(13)
+            ),
+            (
+                "alpha",
+                EdgeKind::Relation,
+                "blocks",
+                None,
+                "Old  Deploy Pipeline",
+                "Old  Deploy Pipeline",
+                Some(14)
+            ),
+            (
+                "alpha",
+                EdgeKind::Link,
+                "links_to",
+                None,
+                "Ghost Title",
+                "Ghost Title",
+                Some(16)
+            ),
+            (
+                "alpha",
+                EdgeKind::Link,
+                "links_to",
+                Some("ghosts"),
+                "Remote Thing",
+                "ghosts:Remote Thing",
+                Some(18)
+            ),
+            (
+                "beta",
+                EdgeKind::Relation,
+                "supersedes",
+                Some("archive"),
+                "Old Note",
+                "archive:Old Note",
+                Some(13)
+            ),
+        ],
+        "unresolved refs are ordered by (path, line) and carry the target and the \
+         whole bracket text verbatim: {refs:?}"
+    );
+    assert!(
+        !refs.iter().any(|r| r.target == "Target"),
+        "the relation that resolves is not an unresolved ref: {refs:?}"
+    );
+
+    // Deterministic: the same call over the same corpus returns the same queue.
+    let again = store.unresolved_refs(d, None).await.unwrap();
+    assert_eq!(again, refs, "two calls return the same order");
+
+    // Scoped to one domain, and a domain with no engrams reports none.
+    let o = store
+        .upsert_domain("o", Some(&other.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+    let other_refs = store.unresolved_refs(o, None).await.unwrap();
+    assert_eq!(
+        other_refs
+            .iter()
+            .map(|r| r.target.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Nowhere"],
+        "the second domain reports only its own dangling reference: {other_refs:?}"
+    );
+    let empty = store
+        .upsert_domain("empty", None, DomainKind::Virtual)
+        .await
+        .unwrap();
+    assert!(
+        store.unresolved_refs(empty, None).await.unwrap().is_empty(),
+        "a domain with no engrams has no unresolved references"
+    );
+}
+parity!(
+    unresolved_refs_report_dangling_targets,
+    unresolved_refs_dangling
+);
+
+async fn duplicate_permalink_fails(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "one.md",
+        &engram("One", "shared", "engram", "", "body one\n"),
+    );
+    write(
+        root,
+        "two.md",
+        &engram("Two", "shared", "engram", "", "body two\n"),
+    );
+    let report = sync_domain(store, "d", root).await.unwrap();
+    assert_eq!(report.added, 1, "one wins");
+    assert_eq!(
+        report.failed.len(),
+        1,
+        "the other fails: {:?}",
+        report.failed
+    );
+    assert!(report.failed[0].1.contains("permalink"));
+}
+parity!(
+    duplicate_permalink_is_collected_as_failure,
+    duplicate_permalink_fails
+);
+
+async fn search_finds_across_fields(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "title.md",
+        &engram(
+            "Photosynthesis basics",
+            "title-hit",
+            "engram",
+            "",
+            "generic body\n",
+        ),
+    );
+    write(
+        root,
+        "content.md",
+        &engram(
+            "Generic",
+            "content-hit",
+            "engram",
+            "",
+            "the mitochondria is the powerhouse\n",
+        ),
+    );
+    write(
+        root,
+        "obs.md",
+        &engram(
+            "Generic two",
+            "obs-hit",
+            "engram",
+            "",
+            "- [fact] tardigrades survive vacuum #biology\n",
+        ),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+
+    let by_title = store
+        .search(&SearchQuery::text("photosynthesis"))
+        .await
+        .unwrap();
+    assert_eq!(by_title.items[0].permalink, "title-hit");
+
+    let by_content = store
+        .search(&SearchQuery::text("mitochondria"))
+        .await
+        .unwrap();
+    assert_eq!(by_content.items[0].permalink, "content-hit");
+
+    let by_obs = store
+        .search(&SearchQuery::text("tardigrades"))
+        .await
+        .unwrap();
+    assert_eq!(by_obs.items[0].permalink, "obs-hit");
+    match by_obs.items[0].kind {
+        crystalline_index::HitKind::Observation { line } => assert!(line > 0),
+        crystalline_index::HitKind::Engram => panic!("expected an observation-level hit"),
+    }
+}
+parity!(
+    search_finds_by_title_content_and_observation,
+    search_finds_across_fields
+);
+
+async fn non_numeric_salience_search(store: &dyn Store) {
+    // A hand-edited `salience: high` must never break search: `Candidate.salience`
+    // is documented as `None` when the frontmatter value is absent or non-numeric,
+    // so a non-numeric value should read as no salience prior, not error out the
+    // query. Regression test for the Postgres `(metadata ->> 'salience')::double
+    // precision` cast, which raised `22P02 invalid input syntax for type double
+    // precision` on any non-numeric salience in the corpus and broke lexical,
+    // filter-only, semantic and hybrid search across the whole backend.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "numeric.md",
+        &engram(
+            "Numeric salience",
+            "numeric-salience",
+            "engram",
+            "salience: 8\n",
+            "gizmoquartz is mentioned in this engram.\n",
+        ),
+    );
+    write(
+        root,
+        "nonnumeric.md",
+        &engram(
+            "Non-numeric salience",
+            "nonnumeric-salience",
+            "engram",
+            "salience: high\n",
+            "gizmoquartz is mentioned in this engram too.\n",
+        ),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+
+    // The search must succeed (not error) and find both engrams, the numeric-
+    // salience one and the non-numeric one alike.
+    let page = store
+        .search(&SearchQuery::text("gizmoquartz"))
+        .await
+        .unwrap();
+    assert_eq!(
+        page.total, 2,
+        "both engrams match despite one non-numeric salience"
+    );
+    let perms: std::collections::HashSet<_> =
+        page.items.iter().map(|h| h.permalink.clone()).collect();
+    assert!(perms.contains("numeric-salience"));
+    assert!(perms.contains("nonnumeric-salience"));
+}
+parity!(
+    non_numeric_salience_does_not_break_search,
+    non_numeric_salience_search
+);
+
+async fn search_hits_carry_tags(store: &dyn Store) {
+    // Every search hit teaches the querying agent the engram's tags: alphabetical
+    // and folded to lowercase, an empty vec when untagged, present on filter-only
+    // and observation-kind hits alike (keyed by the engram id either way).
+    //
+    // "Alphabetical" means byte order on both backends, which is why the tagged
+    // engram carries both `multi-word` and `multi_word`: a locale collation
+    // weighs `_` below `-` and would list them the other way round, so this pair
+    // catches an unpinned tag sort even though every tag here is lowercase.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // A tagged engram whose title matches: an engram-kind text hit.
+    write(
+        root,
+        "photo.md",
+        "---\ntype: engram\ntitle: Photosynthesis primer\npermalink: photo\ntags:\n  - Zebra\n  - apple\n  - multi_word\n  - multi-word\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Photosynthesis primer\n\ngeneric body\n",
+    );
+    // An untagged engram whose title also matches: an empty tag vec.
+    write(
+        root,
+        "plain.md",
+        "---\ntype: engram\ntitle: Photosynthesis appendix\npermalink: plain\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Photosynthesis appendix\n\ngeneric body\n",
+    );
+    // A tagged engram whose only match is in an observation carrying its own
+    // hashtag: an observation-kind hit that must still carry the engram's
+    // frontmatter tags, not the observation hashtag.
+    write(
+        root,
+        "obs.md",
+        "---\ntype: engram\ntitle: Generic two\npermalink: obs\ntags:\n  - gamma\n  - beta\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Generic two\n\n- [fact] tardigrades survive vacuum #delta\n",
+    );
+    sync_domain(store, "d", root).await.unwrap();
+
+    // A text search: the tagged engram lists its tags alphabetically and folded,
+    // the untagged engram carries an empty vec. Both are engram-kind title hits.
+    let text = store
+        .search(&SearchQuery::text("photosynthesis"))
+        .await
+        .unwrap();
+    assert_eq!(text.total, 2);
+    let photo = text
+        .items
+        .iter()
+        .find(|h| h.permalink == "photo")
+        .expect("the photo hit is present");
+    assert_eq!(
+        photo.tags,
+        vec![
+            "apple".to_string(),
+            "multi-word".to_string(),
+            "multi_word".to_string(),
+            "zebra".to_string(),
+        ],
+        "frontmatter tags, byte-order alphabetical and folded to lowercase"
+    );
+    let plain = text
+        .items
+        .iter()
+        .find(|h| h.permalink == "plain")
+        .expect("the plain hit is present");
+    assert!(
+        plain.tags.is_empty(),
+        "an untagged engram carries an empty tag vec"
+    );
+
+    // A filter-only search (no query text) carries tags too.
+    let filtered = store
+        .search(&SearchQuery {
+            tags: Some(vec!["apple".into()]),
+            limit: 10,
+            page: 1,
+            ..SearchQuery::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(filtered.total, 1);
+    assert_eq!(filtered.items[0].permalink, "photo");
+    assert_eq!(
+        filtered.items[0].tags,
+        vec![
+            "apple".to_string(),
+            "multi-word".to_string(),
+            "multi_word".to_string(),
+            "zebra".to_string(),
+        ]
+    );
+
+    // An observation-kind hit carries its engram's frontmatter tags, not the
+    // observation's own #delta hashtag.
+    let by_obs = store
+        .search(&SearchQuery::text("tardigrades"))
+        .await
+        .unwrap();
+    assert_eq!(by_obs.items[0].permalink, "obs");
+    match by_obs.items[0].kind {
+        crystalline_index::HitKind::Observation { line } => assert!(line > 0),
+        crystalline_index::HitKind::Engram => panic!("expected an observation-level hit"),
+    }
+    assert_eq!(
+        by_obs.items[0].tags,
+        vec!["beta".to_string(), "gamma".to_string()],
+        "the engram's frontmatter tags, never the #delta observation hashtag"
+    );
+}
+parity!(search_hits_carry_their_engram_tags, search_hits_carry_tags);
+
+async fn search_applies_filters(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "a.md",
+        "---\ntype: decision\ntitle: Decision A\npermalink: dec-a\ntags:\n  - arch\n  - keep\nstatus: current\nrecorded_at: 2026-01-01\nevent_date: \"2026-03-15\"\n---\n\nbody\n",
+    );
+    write(
+        root,
+        "b.md",
+        "---\ntype: guide\ntitle: Guide B\npermalink: guide-b\ntags:\n  - arch\nstatus: draft\nrecorded_at: 2026-02-01\nevent_date: \"2026-09-01\"\n---\n\nbody\n",
+    );
+    sync_domain(store, "d", root).await.unwrap();
+
+    let by_type = store
+        .search(&SearchQuery {
+            engram_type: Some("decision".into()),
+            limit: 10,
+            page: 1,
+            ..SearchQuery::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(by_type.total, 1);
+    assert_eq!(by_type.items[0].permalink, "dec-a");
+
+    let by_status = store
+        .search(&SearchQuery {
+            status: Some("draft".into()),
+            limit: 10,
+            page: 1,
+            ..SearchQuery::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(by_status.total, 1);
+    assert_eq!(by_status.items[0].permalink, "guide-b");
+
+    let by_tag = store
+        .search(&SearchQuery {
+            tags: Some(vec!["keep".into()]),
+            limit: 10,
+            page: 1,
+            ..SearchQuery::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(by_tag.total, 1);
+    assert_eq!(by_tag.items[0].permalink, "dec-a");
+
+    // $between on a custom date field: json_extract on Turso, metadata->> on
+    // Postgres, both ISO-string comparisons, parsed from the JSON wire form.
+    let wire = serde_json::json!({ "event_date": { "$between": ["2026-01-01", "2026-06-01"] } });
+    let filters = crystalline_index::parse_metadata_filters(&wire).unwrap();
+    assert_eq!(
+        filters,
+        vec![MetadataFilter {
+            key: "event_date".into(),
+            op: FilterOp::Between("2026-01-01".into(), "2026-06-01".into()),
+        }]
+    );
+    let by_between = store
+        .search(&SearchQuery {
+            metadata_filters: filters,
+            limit: 10,
+            page: 1,
+            ..SearchQuery::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(by_between.total, 1, "only the March event is in range");
+    assert_eq!(by_between.items[0].permalink, "dec-a");
+}
+parity!(
+    search_applies_type_status_tag_and_metadata_filters,
+    search_applies_filters
+);
+
+/// The two backends' semantic-search floors are re-derived together
+/// (`research/2026-09-22-granite-thresholds.md`) and must never drift apart.
+#[cfg(feature = "postgres")]
+#[test]
+fn both_backends_default_the_same_minimum_similarity() {
+    assert_eq!(
+        crystalline_index::turso::DEFAULT_MIN_SIMILARITY,
+        crystalline_index::postgres::DEFAULT_MIN_SIMILARITY
+    );
+}
+
+// --- tag alias map -----------------------------------------------------------
+
+/// A minimal engram carrying an explicit tag set on its frontmatter.
+fn tagged_engram(title: &str, permalink: &str, tags: &[&str]) -> String {
+    let tag_lines: String = tags.iter().map(|t| format!("  - {t}\n")).collect();
+    format!(
+        "---\ntype: engram\ntitle: {title}\npermalink: {permalink}\ntags:\n{tag_lines}status: current\nrecorded_at: 2026-01-01\n---\n\n# {title}\n\nbody\n"
+    )
+}
+
+/// A MANIFEST whose body carries the given trailing section text (a
+/// `## Tag Aliases` block, or empty for none), so the sync's alias refresh has a
+/// real MANIFEST to read.
+fn manifest_with_aliases(trailing: &str) -> String {
+    format!(
+        "---\ntype: manifest\ntitle: Manifest\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Manifest\n\n## Scope\n\n- covers things\n\n## When to Use\n\n- when routing\n\n{trailing}"
+    )
+}
+
+/// Run a tags-field filter search and return the hit permalinks, sorted.
+async fn tag_filter_perms(
+    store: &dyn Store,
+    tags: &[&str],
+    domains: Option<Vec<String>>,
+) -> Vec<String> {
+    let page = store
+        .search(&SearchQuery {
+            tags: Some(tags.iter().map(|t| t.to_string()).collect()),
+            domains,
+            limit: 50,
+            page: 1,
+            ..SearchQuery::default()
+        })
+        .await
+        .unwrap();
+    let mut perms: Vec<String> = page.items.iter().map(|h| h.permalink.clone()).collect();
+    perms.sort();
+    perms
+}
+
+/// Run a metadata-filter search and return the hit permalinks, sorted.
+async fn meta_filter_perms(store: &dyn Store, filters: Vec<MetadataFilter>) -> Vec<String> {
+    let page = store
+        .search(&SearchQuery {
+            metadata_filters: filters,
+            limit: 50,
+            page: 1,
+            ..SearchQuery::default()
+        })
+        .await
+        .unwrap();
+    let mut perms: Vec<String> = page.items.iter().map(|h| h.permalink.clone()).collect();
+    perms.sort();
+    perms
+}
+
+/// The domain id for a name, via the idempotent upsert (a resync returns the
+/// same id), so a test can inject alias rows against a synced domain.
+async fn domain_id(store: &dyn Store, name: &str, root: &Path) -> DomainId {
+    store
+        .upsert_domain(name, Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap()
+}
+
+async fn replace_tag_aliases_roundtrip(store: &dyn Store) {
+    let a = store
+        .upsert_domain("a", Some("/k/a"), DomainKind::File)
+        .await
+        .unwrap();
+    let b = store
+        .upsert_domain("b", Some("/k/b"), DomainKind::File)
+        .await
+        .unwrap();
+
+    // The `multi_word`/`multi-word` pair is deliberate: a locale collation weighs
+    // `_` below `-` and would order those two aliases the other way round, so
+    // this fixture catches an unpinned text sort on the Postgres side even though
+    // every alias here is already lowercase.
+    let pairs_a = vec![
+        ("old".to_string(), "new".to_string()),
+        ("legacy".to_string(), "modern".to_string()),
+        ("multi_word".to_string(), "multi-word".to_string()),
+        ("multi-word".to_string(), "multiword".to_string()),
+    ];
+    store.replace_tag_aliases(a, &pairs_a).await.unwrap();
+    // Idempotent: replacing again with the same pairs leaves the same rows.
+    store.replace_tag_aliases(a, &pairs_a).await.unwrap();
+
+    // A scoped read is sorted by alias then canonical, in byte order.
+    assert_eq!(
+        store.tag_aliases(Some(&["a".to_string()])).await.unwrap(),
+        vec![
+            ("legacy".to_string(), "modern".to_string()),
+            ("multi-word".to_string(), "multiword".to_string()),
+            ("multi_word".to_string(), "multi-word".to_string()),
+            ("old".to_string(), "new".to_string()),
+        ]
+    );
+
+    // A second domain's map is separate; the union read merges both and dedupes
+    // the shared `old -> new` pair.
+    store
+        .replace_tag_aliases(b, &[("old".to_string(), "new".to_string())])
+        .await
+        .unwrap();
+    assert_eq!(
+        store.tag_aliases(None).await.unwrap(),
+        vec![
+            ("legacy".to_string(), "modern".to_string()),
+            ("multi-word".to_string(), "multiword".to_string()),
+            ("multi_word".to_string(), "multi-word".to_string()),
+            ("old".to_string(), "new".to_string()),
+        ]
+    );
+
+    // Replacing with an empty slice clears just that domain's rows.
+    store.replace_tag_aliases(a, &[]).await.unwrap();
+    assert!(
+        store
+            .tag_aliases(Some(&["a".to_string()]))
+            .await
+            .unwrap()
+            .is_empty(),
+        "domain a is cleared"
+    );
+    assert_eq!(
+        store.tag_aliases(Some(&["b".to_string()])).await.unwrap(),
+        vec![("old".to_string(), "new".to_string())],
+        "domain b is untouched"
+    );
+}
+parity!(
+    replace_tag_aliases_is_idempotent_and_readable,
+    replace_tag_aliases_roundtrip
+);
+
+async fn search_expands_both_directions(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "modern.md",
+        &tagged_engram("Modern", "modern", &["modern"]),
+    );
+    write(
+        root,
+        "legacy.md",
+        &tagged_engram("Legacy", "legacy", &["legacy"]),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let d = domain_id(store, "d", root).await;
+    store
+        .replace_tag_aliases(d, &[("legacy".into(), "modern".into())])
+        .await
+        .unwrap();
+
+    let want = vec!["legacy".to_string(), "modern".to_string()];
+    // Searching the alias spelling reaches the canonical-tagged engram.
+    assert_eq!(tag_filter_perms(store, &["legacy"], None).await, want);
+    // Searching the canonical spelling reaches the alias-tagged engram.
+    assert_eq!(tag_filter_perms(store, &["modern"], None).await, want);
+    // A case-different query still folds and expands.
+    assert_eq!(tag_filter_perms(store, &["LEGACY"], None).await, want);
+}
+parity!(
+    search_tags_filter_expands_alias_both_directions,
+    search_expands_both_directions
+);
+
+async fn search_sibling_aliases(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "beta.md", &tagged_engram("Beta", "beta", &["b"]));
+    write(
+        root,
+        "other.md",
+        &tagged_engram("Other", "other", &["unrelated"]),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let d = domain_id(store, "d", root).await;
+    // a and b are siblings: both alias onto the shared canonical c.
+    store
+        .replace_tag_aliases(d, &[("a".into(), "c".into()), ("b".into(), "c".into())])
+        .await
+        .unwrap();
+
+    // Searching `a` reaches sibling `b`'s engram through the shared canonical,
+    // and never touches the unrelated engram.
+    assert_eq!(
+        tag_filter_perms(store, &["a"], None).await,
+        vec!["beta".to_string()]
+    );
+}
+parity!(search_expands_sibling_aliases, search_sibling_aliases);
+
+async fn search_single_hop_no_chain(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "ea.md", &tagged_engram("EA", "e-a", &["a"]));
+    write(root, "eb.md", &tagged_engram("EB", "e-b", &["b"]));
+    write(root, "ec.md", &tagged_engram("EC", "e-c", &["c"]));
+    sync_domain(store, "d", root).await.unwrap();
+    let d = domain_id(store, "d", root).await;
+    // A chain a -> b -> c: expansion is a single hop only.
+    store
+        .replace_tag_aliases(d, &[("a".into(), "b".into()), ("b".into(), "c".into())])
+        .await
+        .unwrap();
+
+    // `a` reaches a and b but never chains through to c.
+    let hits = tag_filter_perms(store, &["a"], None).await;
+    assert_eq!(hits, vec!["e-a".to_string(), "e-b".to_string()]);
+    assert!(
+        !hits.contains(&"e-c".to_string()),
+        "single hop must not chain onto c: {hits:?}"
+    );
+}
+parity!(search_alias_single_hop_no_chain, search_single_hop_no_chain);
+
+async fn search_union_all_domain_sweep(store: &dyn Store) {
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    write(dir_a.path(), "p.md", &tagged_engram("P", "ep", &["p"]));
+    write(dir_b.path(), "q.md", &tagged_engram("Q", "eq", &["q"]));
+    sync_domain(store, "a", dir_a.path()).await.unwrap();
+    sync_domain(store, "b", dir_b.path()).await.unwrap();
+    let a = domain_id(store, "a", dir_a.path()).await;
+    let b = domain_id(store, "b", dir_b.path()).await;
+    // The same alias `x` maps onto a different canonical in each domain.
+    store
+        .replace_tag_aliases(a, &[("x".into(), "p".into())])
+        .await
+        .unwrap();
+    store
+        .replace_tag_aliases(b, &[("x".into(), "q".into())])
+        .await
+        .unwrap();
+
+    // An all-domain search unions both maps, so x reaches both p and q.
+    assert_eq!(
+        tag_filter_perms(store, &["x"], None).await,
+        vec!["ep".to_string(), "eq".to_string()]
+    );
+}
+parity!(
+    search_alias_union_all_domain_sweep,
+    search_union_all_domain_sweep
+);
+
+async fn search_respects_domain_scope(store: &dyn Store) {
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    // Both domains hold an engram tagged with the canonical `acanon`.
+    write(dir_a.path(), "a.md", &tagged_engram("A", "ea", &["acanon"]));
+    write(dir_b.path(), "b.md", &tagged_engram("B", "eb", &["acanon"]));
+    sync_domain(store, "a", dir_a.path()).await.unwrap();
+    sync_domain(store, "b", dir_b.path()).await.unwrap();
+    let a = domain_id(store, "a", dir_a.path()).await;
+    // Only domain A declares `shared -> acanon`; B declares nothing.
+    store
+        .replace_tag_aliases(a, &[("shared".into(), "acanon".into())])
+        .await
+        .unwrap();
+
+    // Scoped to A, `shared` expands through A's map onto acanon and finds ea.
+    assert_eq!(
+        tag_filter_perms(store, &["shared"], Some(vec!["a".into()])).await,
+        vec!["ea".to_string()]
+    );
+    // Scoped to B, B has no map, so `shared` matches nothing: A's map is never
+    // used for a B-scoped search even though B holds an `acanon`-tagged engram.
+    assert!(
+        tag_filter_perms(store, &["shared"], Some(vec!["b".into()]))
+            .await
+            .is_empty(),
+        "a B-scoped search must not use A's alias map"
+    );
+}
+parity!(
+    search_alias_respects_domain_scope,
+    search_respects_domain_scope
+);
+
+async fn metadata_tags_arm_expands(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "modern.md",
+        &tagged_engram("Modern", "modern", &["modern"]),
+    );
+    write(
+        root,
+        "legacy.md",
+        &tagged_engram("Legacy", "legacy", &["legacy"]),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let d = domain_id(store, "d", root).await;
+    store
+        .replace_tag_aliases(d, &[("legacy".into(), "modern".into())])
+        .await
+        .unwrap();
+
+    let want = vec!["legacy".to_string(), "modern".to_string()];
+    // The Eq form `{ "tags": "legacy" }` expands to the whole class.
+    let eq = crystalline_index::parse_metadata_filters(&serde_json::json!({ "tags": "legacy" }))
+        .unwrap();
+    assert_eq!(meta_filter_perms(store, eq).await, want);
+    // The In form `{ "tags": { "$in": ["modern"] } }` expands the same class.
+    let in_op = crystalline_index::parse_metadata_filters(
+        &serde_json::json!({ "tags": { "$in": ["modern"] } }),
+    )
+    .unwrap();
+    assert_eq!(meta_filter_perms(store, in_op).await, want);
+}
+parity!(metadata_filter_tags_arm_expands, metadata_tags_arm_expands);
+
+async fn numeric_tags_metadata_filter_folds(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // An engram whose only tag is the bare number 42: YAML parses it as an
+    // integer, which the engram parser stores as the string "42".
+    write(
+        root,
+        "answer.md",
+        &tagged_engram("Answer", "answer", &["42"]),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+
+    // A `tags` Eq filter carrying the JSON NUMBER 42 (not a string) is stringified
+    // and folded to "42" by fold_tag_value, so it matches the engram identically
+    // on both backends. Pins the stringify-and-fold behavior.
+    let eq = crystalline_index::parse_metadata_filters(&serde_json::json!({ "tags": 42 })).unwrap();
+    assert_eq!(
+        meta_filter_perms(store, eq).await,
+        vec!["answer".to_string()]
+    );
+}
+parity!(
+    numeric_tags_metadata_filter_folds_on_both_backends,
+    numeric_tags_metadata_filter_folds
+);
+
+async fn tags_require_all_survives_expansion(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "both.md",
+        &tagged_engram("Both", "both", &["modern", "keep"]),
+    );
+    write(
+        root,
+        "onlymodern.md",
+        &tagged_engram("OnlyModern", "only-modern", &["modern"]),
+    );
+    write(
+        root,
+        "onlykeep.md",
+        &tagged_engram("OnlyKeep", "only-keep", &["keep"]),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let d = domain_id(store, "d", root).await;
+    store
+        .replace_tag_aliases(d, &[("legacy".into(), "modern".into())])
+        .await
+        .unwrap();
+
+    // Require both `legacy` (expands to {legacy, modern}) and `keep`. Only the
+    // engram carrying a modern-class tag AND keep qualifies: expansion widens the
+    // first predicate, but the AND across the two requested tags is preserved.
+    assert_eq!(
+        tag_filter_perms(store, &["legacy", "keep"], None).await,
+        vec!["both".to_string()]
+    );
+}
+parity!(
+    tags_require_all_survives_alias_expansion,
+    tags_require_all_survives_expansion
+);
+
+async fn sync_populates_and_clears(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    // A MANIFEST declaring one alias: the sync folds and stores it.
+    write(
+        root,
+        "MANIFEST.md",
+        &manifest_with_aliases("## Tag Aliases\n\n- old -> new\n"),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    assert_eq!(
+        store.tag_aliases(Some(&["d".to_string()])).await.unwrap(),
+        vec![("old".to_string(), "new".to_string())],
+        "the sync populated the alias from the MANIFEST"
+    );
+
+    // A resync follows a changed section, replacing the whole map.
+    write(
+        root,
+        "MANIFEST.md",
+        &manifest_with_aliases("## Tag Aliases\n\n- alpha -> beta\n"),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    assert_eq!(
+        store.tag_aliases(Some(&["d".to_string()])).await.unwrap(),
+        vec![("alpha".to_string(), "beta".to_string())],
+        "the resync replaced the map with the new declaration"
+    );
+
+    // Removing the section clears the rows on the next sync.
+    write(root, "MANIFEST.md", &manifest_with_aliases(""));
+    sync_domain(store, "d", root).await.unwrap();
+    assert!(
+        store
+            .tag_aliases(Some(&["d".to_string()]))
+            .await
+            .unwrap()
+            .is_empty(),
+        "removing the section cleared the alias map"
+    );
+}
+parity!(
+    sync_populates_and_clears_tag_aliases,
+    sync_populates_and_clears
+);
+
+async fn vocabulary_reports_its_aliases(store: &dyn Store) {
+    let d1 = store
+        .upsert_domain("d1", Some("/k/d1"), DomainKind::File)
+        .await
+        .unwrap();
+    let d2 = store
+        .upsert_domain("d2", Some("/k/d2"), DomainKind::File)
+        .await
+        .unwrap();
+    store
+        .replace_tag_aliases(d1, &[("old".into(), "new".into())])
+        .await
+        .unwrap();
+    store
+        .replace_tag_aliases(
+            d2,
+            &[("old".into(), "new".into()), ("foo".into(), "bar".into())],
+        )
+        .await
+        .unwrap();
+
+    let pairs = |v: &Vocabulary| -> Vec<(String, String)> {
+        v.aliases
+            .iter()
+            .map(|a| (a.alias.clone(), a.canonical.clone()))
+            .collect()
+    };
+
+    // Scoped: just d1's alias.
+    let scoped = store.vocabulary(Some("d1"), None).await.unwrap();
+    assert_eq!(pairs(&scoped), vec![("old".to_string(), "new".to_string())]);
+
+    // All-domain: the union, deduped across the shared `old -> new` and sorted
+    // by alias then canonical.
+    let all = store.vocabulary(None, None).await.unwrap();
+    assert_eq!(
+        pairs(&all),
+        vec![
+            ("foo".to_string(), "bar".to_string()),
+            ("old".to_string(), "new".to_string()),
+        ]
+    );
+}
+parity!(vocabulary_reports_aliases, vocabulary_reports_its_aliases);
+
+async fn canonical_temporal_filter(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // Unbounded (valid): no valid_to.
+    write(
+        root,
+        "always.md",
+        &engram("Always", "always", "engram", "", "body\n"),
+    );
+    // Expired: valid_to before today.
+    write(
+        root,
+        "past.md",
+        &engram("Past", "past", "engram", "valid_to: 2026-01-01\n", "body\n"),
+    );
+    // Future window still open.
+    write(
+        root,
+        "future.md",
+        &engram(
+            "Future",
+            "future",
+            "engram",
+            "valid_to: 2027-01-01\n",
+            "body\n",
+        ),
+    );
+    // Not current status.
+    write(
+        root,
+        "draft.md",
+        "---\ntype: engram\ntitle: Draft\npermalink: draft\ntags:\n  - t\nstatus: draft\nrecorded_at: 2026-01-01\n---\n\nbody\n",
+    );
+    sync_domain(store, "d", root).await.unwrap();
+
+    let page = store
+        .search(&SearchQuery {
+            current_only: true,
+            today: Some("2026-07-02".into()),
+            limit: 10,
+            page: 1,
+            ..SearchQuery::default()
+        })
+        .await
+        .unwrap();
+    let mut perms: Vec<String> = page.items.iter().map(|h| h.permalink.clone()).collect();
+    perms.sort();
+    assert_eq!(perms, vec!["always".to_string(), "future".to_string()]);
+}
+parity!(
+    canonical_temporal_filter_returns_only_currently_valid,
+    canonical_temporal_filter
+);
+
+async fn status_class_folds_stable_and_current(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let with_status = |title: &str, permalink: &str, status: &str| {
+        format!(
+            "---\ntype: engram\ntitle: {title}\npermalink: {permalink}\ntags:\n  - t\nstatus: {status}\nrecorded_at: 2026-01-01\n---\n\n# {title}\n\nbody\n"
+        )
+    };
+    write(root, "new.md", &with_status("New", "new", "stable"));
+    write(root, "old.md", &with_status("Old", "old", "current"));
+    write(root, "draft.md", &with_status("Draft", "draft", "draft"));
+    sync_domain(store, "d", root).await.unwrap();
+
+    let hits = |page: crystalline_index::Page<crystalline_index::SearchHit>| {
+        let mut perms: Vec<String> = page.items.iter().map(|h| h.permalink.clone()).collect();
+        perms.sort();
+        perms
+    };
+    let query = |status: Option<&str>, current_only: bool| SearchQuery {
+        status: status.map(str::to_string),
+        current_only,
+        today: Some("2026-07-02".into()),
+        limit: 10,
+        page: 1,
+        ..SearchQuery::default()
+    };
+
+    // Both directions of the equivalence class see both spellings.
+    let by_stable = store.search(&query(Some("stable"), false)).await.unwrap();
+    assert_eq!(hits(by_stable), vec!["new".to_string(), "old".to_string()]);
+    let by_current = store.search(&query(Some("current"), false)).await.unwrap();
+    assert_eq!(hits(by_current), vec!["new".to_string(), "old".to_string()]);
+
+    // Any other status stays an exact match.
+    let by_draft = store.search(&query(Some("draft"), false)).await.unwrap();
+    assert_eq!(hits(by_draft), vec!["draft".to_string()]);
+
+    // The as-of filter covers the class too.
+    let as_of = store.search(&query(None, true)).await.unwrap();
+    assert_eq!(hits(as_of), vec!["new".to_string(), "old".to_string()]);
+}
+parity!(
+    status_filter_treats_stable_and_current_as_one_class,
+    status_class_folds_stable_and_current
+);
+
+async fn search_pages(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    for i in 0..7 {
+        write(
+            root,
+            &format!("e{i}.md"),
+            &engram(
+                &format!("Engram {i}"),
+                &format!("e{i}"),
+                "engram",
+                "",
+                "shared_term here\n",
+            ),
+        );
+    }
+    sync_domain(store, "d", root).await.unwrap();
+
+    let page1 = store
+        .search(&SearchQuery {
+            text: Some("shared_term".into()),
+            limit: 3,
+            page: 1,
+            ..SearchQuery::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(page1.total, 7);
+    assert_eq!(page1.items.len(), 3);
+
+    let page3 = store
+        .search(&SearchQuery {
+            text: Some("shared_term".into()),
+            limit: 3,
+            page: 3,
+            ..SearchQuery::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(page3.items.len(), 1, "7 items, page 3 of size 3 has 1");
+
+    // The filter-only path (no query text) pages in SQL instead, ordered by
+    // recorded_at then the path. Both keys are text and every fixture shares a
+    // date, so the path tie-break alone decides who lands on the page:
+    // `Zeta.md` sorts before `e0.md` byte-wise and after `e6.md` under a locale
+    // collation, which would silently change the first page on Postgres. The
+    // capital lives in the file name rather than in the permalink alone,
+    // because the path is the key the tie-break reads.
+    write(
+        root,
+        "Zeta.md",
+        &engram("Zeta", "Zeta", "engram", "", "shared_term here\n"),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let filtered = store
+        .search(&SearchQuery {
+            limit: 2,
+            page: 1,
+            ..SearchQuery::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(filtered.total, 8);
+    assert_eq!(
+        filtered
+            .items
+            .iter()
+            .map(|h| h.permalink.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Zeta", "e0"],
+        "the filter-only page is ordered by path in byte order"
+    );
+}
+parity!(search_paginates, search_pages);
+
+/// A filter-only listing - the one the domain page and every folder view page
+/// through - comes back newest recorded first, and an engram carrying no
+/// `recorded_at` comes LAST on either backend.
+///
+/// The date is the sort key and a missing one is a real state on disk: the
+/// field is required of a written engram, and a file may still be missing it.
+/// The two backends disagree about a NULL sort key by default - SQLite puts it
+/// last under `DESC`, Postgres puts it first - so a domain page opening on the
+/// newest engrams would lead with the one engram nobody dated on Postgres and
+/// end with it on Turso. The order is pinned in the statement rather than
+/// inherited from the dialect, and it is pinned across the page boundary too,
+/// because the sort decides which rows land on a page at all.
+async fn filter_only_orders_undated_last(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // Written out of date order, so nothing about the answer can come from the
+    // order the files were indexed in.
+    write(
+        root,
+        "jan.md",
+        "---\ntype: engram\ntitle: Jan\npermalink: jan\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nb\n",
+    );
+    write(
+        root,
+        "mar.md",
+        "---\ntype: engram\ntitle: Mar\npermalink: mar\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-03-01\n---\n\nb\n",
+    );
+    write(
+        root,
+        "feb.md",
+        "---\ntype: engram\ntitle: Feb\npermalink: feb\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-02-01\n---\n\nb\n",
+    );
+    write(
+        root,
+        "undated.md",
+        "---\ntype: engram\ntitle: Undated\npermalink: undated\ntags:\n  - t\nstatus: current\n---\n\nb\n",
+    );
+    sync_domain(store, "eng", root).await.unwrap();
+
+    let page = store
+        .search(&SearchQuery {
+            domains: Some(vec!["eng".to_string()]),
+            limit: 10,
+            page: 1,
+            ..SearchQuery::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(page.total, 4);
+    assert_eq!(
+        page.items
+            .iter()
+            .map(|h| h.permalink.as_str())
+            .collect::<Vec<_>>(),
+        vec!["mar", "feb", "jan", "undated"],
+        "newest recorded first, and the undated engram last"
+    );
+
+    // The same order across a page boundary: the undated engram is on the last
+    // page rather than on the first.
+    let second = store
+        .search(&SearchQuery {
+            domains: Some(vec!["eng".to_string()]),
+            limit: 2,
+            page: 2,
+            ..SearchQuery::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        second
+            .items
+            .iter()
+            .map(|h| h.permalink.as_str())
+            .collect::<Vec<_>>(),
+        vec!["jan", "undated"],
+        "page two of two"
+    );
+}
+parity!(
+    a_filter_only_listing_orders_undated_last,
+    filter_only_orders_undated_last
+);
+
+/// The four orders a filter-only listing can be asked for, on the rows the
+/// test above uses: newest or oldest recorded first, the undated engram last
+/// in BOTH directions, and by name either way, where name is the path in
+/// byte order. Pinned across a page boundary for the reversed orders too,
+/// because the sort decides which rows land on a page at all.
+async fn filter_only_orders_by_the_readers_choice(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "jan.md",
+        "---\ntype: engram\ntitle: Jan\npermalink: jan\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nb\n",
+    );
+    write(
+        root,
+        "mar.md",
+        "---\ntype: engram\ntitle: Mar\npermalink: mar\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-03-01\n---\n\nb\n",
+    );
+    write(
+        root,
+        "feb.md",
+        "---\ntype: engram\ntitle: Feb\npermalink: feb\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-02-01\n---\n\nb\n",
+    );
+    write(
+        root,
+        "undated.md",
+        "---\ntype: engram\ntitle: Undated\npermalink: undated\ntags:\n  - t\nstatus: current\n---\n\nb\n",
+    );
+    sync_domain(store, "eng", root).await.unwrap();
+
+    async fn permalinks(
+        store: &dyn Store,
+        order: SearchOrder,
+        limit: usize,
+        page: usize,
+    ) -> Vec<String> {
+        store
+            .search(&SearchQuery {
+                domains: Some(vec!["eng".to_string()]),
+                order,
+                limit,
+                page,
+                ..SearchQuery::default()
+            })
+            .await
+            .unwrap()
+            .items
+            .iter()
+            .map(|h| h.permalink.clone())
+            .collect()
+    }
+
+    assert_eq!(
+        SearchOrder::default(),
+        SearchOrder::RecordedDesc,
+        "the default is the order the domain page opened on before the choice existed"
+    );
+    assert_eq!(
+        permalinks(store, SearchOrder::RecordedDesc, 10, 1).await,
+        ["mar", "feb", "jan", "undated"],
+        "newest first, undated last"
+    );
+    assert_eq!(
+        permalinks(store, SearchOrder::RecordedAsc, 10, 1).await,
+        ["jan", "feb", "mar", "undated"],
+        "oldest first, and the undated engram is still last"
+    );
+    assert_eq!(
+        permalinks(store, SearchOrder::PathAsc, 10, 1).await,
+        ["feb", "jan", "mar", "undated"],
+        "by name, which is the path in byte order"
+    );
+    assert_eq!(
+        permalinks(store, SearchOrder::PathDesc, 10, 1).await,
+        ["undated", "mar", "jan", "feb"],
+        "by name, reversed"
+    );
+    assert_eq!(
+        permalinks(store, SearchOrder::RecordedAsc, 2, 2).await,
+        ["mar", "undated"],
+        "page two of two, oldest first"
+    );
+    assert_eq!(
+        permalinks(store, SearchOrder::PathDesc, 3, 2).await,
+        ["feb"],
+        "page two of two, by name reversed"
+    );
+}
+parity!(
+    a_filter_only_listing_orders_by_the_readers_choice,
+    filter_only_orders_by_the_readers_choice
+);
+
+async fn neighbors_cross_domain(store: &dyn Store) {
+    // domain2 holds the cross-domain target C.
+    let d2 = tempfile::tempdir().unwrap();
+    write(
+        d2.path(),
+        "c.md",
+        &engram("C", "c", "engram", "", "gamma body\n"),
+    );
+    // domain1 holds A -> B (same domain) and B -> domain2:C (cross-domain).
+    let d1 = tempfile::tempdir().unwrap();
+    write(
+        d1.path(),
+        "a.md",
+        &engram("A", "a", "engram", "", "- relates_to [[b]]\n"),
+    );
+    write(
+        d1.path(),
+        "b.md",
+        &engram("B", "b", "engram", "", "- relates_to [[domain2:c]]\n"),
+    );
+
+    // Sync the target domain first so the cross-domain ref resolves.
+    sync_domain(store, "domain2", d2.path()).await.unwrap();
+    let r1 = sync_domain(store, "domain1", d1.path()).await.unwrap();
+    assert_eq!(r1.relations_resolved, 2, "A->B and B->C both resolve");
+
+    let a = store.lookup_id("domain1", "a").await.unwrap().unwrap();
+
+    let d1_slice = store.neighbors(&[a], 1, None).await.unwrap();
+    let perms1: Vec<&str> = d1_slice
+        .nodes
+        .iter()
+        .map(|n| n.permalink.as_str())
+        .collect();
+    assert!(perms1.contains(&"a"));
+    assert!(perms1.contains(&"b"), "depth 1 reaches B");
+    assert!(!perms1.contains(&"c"), "depth 1 does not reach C");
+
+    let d2_slice = store.neighbors(&[a], 2, None).await.unwrap();
+    let perms2: Vec<&str> = d2_slice
+        .nodes
+        .iter()
+        .map(|n| n.permalink.as_str())
+        .collect();
+    assert!(perms2.contains(&"c"), "depth 2 reaches cross-domain C");
+    let has_cross = d2_slice
+        .nodes
+        .iter()
+        .any(|n| n.permalink == "c" && n.domain == "domain2");
+    assert!(has_cross, "C is labeled with its own domain");
+    assert!(d2_slice.edges.len() >= 2, "A-B and B-C edges present");
+}
+parity!(neighbors_depth_and_cross_domain, neighbors_cross_domain);
+
+async fn neighbors_carries_salience(store: &dyn Store) {
+    // The seed relates to three targets: numeric salience, no salience, and a
+    // hand-edited non-numeric salience. `neighbors` must carry each target's
+    // raw salience through onto its `GraphNode` (the later ranking pass reads
+    // it there rather than issuing a second query); the numeric target is the
+    // only one that should read as anything other than neutral. Absent and
+    // non-numeric salience are both neutral but not byte-identical across
+    // backends (Turso's CAST yields `Some(0.0)`, Postgres's jsonb_typeof guard
+    // yields `None`), so both must be asserted as neutral, never as exact
+    // `None`.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "seed.md",
+        &engram(
+            "Seed",
+            "seed",
+            "engram",
+            "",
+            "- relates_to [[numeric]]\n- relates_to [[none]]\n- relates_to [[nonnumeric]]\n",
+        ),
+    );
+    write(
+        root,
+        "numeric.md",
+        &engram("Numeric", "numeric", "engram", "salience: 8\n", "body\n"),
+    );
+    write(
+        root,
+        "none.md",
+        &engram("None", "none", "engram", "", "body\n"),
+    );
+    write(
+        root,
+        "nonnumeric.md",
+        &engram(
+            "Nonnumeric",
+            "nonnumeric",
+            "engram",
+            "salience: high\n",
+            "body\n",
+        ),
+    );
+
+    let report = sync_domain(store, "d", root).await.unwrap();
+    assert_eq!(report.relations_resolved, 3, "all three relations resolve");
+
+    let seed = store.lookup_id("d", "seed").await.unwrap().unwrap();
+    let slice = store.neighbors(&[seed], 1, None).await.unwrap();
+
+    let numeric = slice
+        .nodes
+        .iter()
+        .find(|n| n.permalink == "numeric")
+        .expect("numeric target present");
+    assert_eq!(numeric.salience, Some(8.0));
+
+    let none = slice
+        .nodes
+        .iter()
+        .find(|n| n.permalink == "none")
+        .expect("no-salience target present");
+    assert!(
+        none.salience.is_none_or(|s| s <= 0.0),
+        "absent salience is neutral, not a lift"
+    );
+
+    let nonnumeric = slice
+        .nodes
+        .iter()
+        .find(|n| n.permalink == "nonnumeric")
+        .expect("non-numeric target present");
+    assert!(
+        nonnumeric.salience.is_none_or(|s| s <= 0.0),
+        "non-numeric salience is neutral, not a lift or an error"
+    );
+}
+parity!(neighbors_carries_salience_prior, neighbors_carries_salience);
+
+async fn neighbors_carries_status(store: &dyn Store) {
+    // The seed relates to two targets: current and superseded status.
+    // `neighbors` must carry each target's exact frontmatter status through
+    // onto its `GraphNode` verbatim (the later ranking pass reads it there to
+    // fade retired-status neighbors rather than issuing a second query).
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "seed.md",
+        &engram(
+            "Seed",
+            "seed",
+            "engram",
+            "",
+            "- relates_to [[current-target]]\n- relates_to [[superseded-target]]\n",
+        ),
+    );
+    write(
+        root,
+        "current.md",
+        &engram("Current", "current-target", "engram", "", "body\n"),
+    );
+    write(
+        root,
+        "superseded.md",
+        "---\ntype: engram\ntitle: Superseded\npermalink: superseded-target\ntags:\n  - t\nstatus: superseded\nrecorded_at: 2026-01-01\n---\n\nbody\n",
+    );
+
+    let report = sync_domain(store, "d", root).await.unwrap();
+    assert_eq!(report.relations_resolved, 2, "both relations resolve");
+
+    let seed = store.lookup_id("d", "seed").await.unwrap().unwrap();
+    let slice = store.neighbors(&[seed], 1, None).await.unwrap();
+
+    let current = slice
+        .nodes
+        .iter()
+        .find(|n| n.permalink == "current-target")
+        .expect("current target present");
+    assert_eq!(current.status, "current");
+
+    let superseded = slice
+        .nodes
+        .iter()
+        .find(|n| n.permalink == "superseded-target")
+        .expect("superseded target present");
+    assert_eq!(superseded.status, "superseded");
+}
+parity!(neighbors_carries_status_prior, neighbors_carries_status);
+
+/// `recent` returns the newest first, and separates engrams recorded on the same
+/// day by permalink alone. That tie-break is a text sort under a `LIMIT`, so the
+/// fixture gives two same-day engrams a capitalized and a lowercase permalink:
+/// `Zeta` sorts first byte-wise and last under a locale collation, so an
+/// unpinned Postgres sort would not merely reorder the page, it would return a
+/// different engram at `limit: 1`.
+///
+/// An engram carrying no `recorded_at` comes last on either backend, the same
+/// rule the filter-only listing holds to. It is a real state on disk - the
+/// field is required of a written engram and a file may still be missing it -
+/// and the two dialects disagree about a NULL sort key by default: SQLite puts
+/// it last under `DESC`, Postgres puts it first. A recency answer that leads
+/// with the one engram nobody dated is wrong on both.
+async fn recent_newest_first(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "old.md", &engram("Old", "old", "engram", "", "b\n"));
+    write(
+        root,
+        "new.md",
+        "---\ntype: engram\ntitle: New\npermalink: new\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-06-01\n---\n\nb\n",
+    );
+    write(
+        root,
+        "zeta.md",
+        "---\ntype: engram\ntitle: Zeta\npermalink: Zeta\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-06-01\n---\n\nb\n",
+    );
+    write(
+        root,
+        "undated.md",
+        "---\ntype: engram\ntitle: Undated\npermalink: undated\ntags:\n  - t\nstatus: current\n---\n\nb\n",
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let recent = store
+        .recent(&RecentFilter {
+            limit: 10,
+            ..RecentFilter::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        recent
+            .iter()
+            .map(|e| e.permalink.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Zeta", "new", "old", "undated"],
+        "2026-06-01 before 2026-01-01, same-day ties broken by permalink in byte \
+         order, and the undated engram last on either backend"
+    );
+
+    // The tie-break decides what a capped read sees at all.
+    let capped = store
+        .recent(&RecentFilter {
+            limit: 1,
+            ..RecentFilter::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        capped
+            .iter()
+            .map(|e| e.permalink.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Zeta"],
+        "the first of the two same-day engrams in byte order"
+    );
+}
+parity!(recent_returns_newest_first, recent_newest_first);
+
+async fn vocabulary_counts(store: &dyn Store) {
+    // Two domains with distinct frontmatter tags, observation tags, observation
+    // categories and relation types, so every facet of the vocabulary is
+    // exercised and the domain filter can be checked against the all-domain
+    // sweep. Alpha carries a frontmatter-only `legacy` tag (engrams 1,
+    // observations 0) and an observation-only `urgent` tag (engrams 0,
+    // observations 1) so a swap of the two tag counts in the backend aggregation
+    // is caught; Beta reuses `database`; Gamma lives in a second domain.
+    let eng = tempfile::tempdir().unwrap();
+    write(
+        eng.path(),
+        "alpha.md",
+        "---\ntype: engram\ntitle: Alpha\npermalink: alpha\ntags:\n  - database\n  - api\n  - legacy\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Alpha\n\n- [decision] chose postgres #database\n\n- [pattern] api uses rest #api #urgent\n\n- depends_on [[Beta]]\n",
+    );
+    write(
+        eng.path(),
+        "beta.md",
+        "---\ntype: engram\ntitle: Beta\npermalink: beta\ntags:\n  - database\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Beta\n\n- [decision] indexed the table #database\n\n- relates_to [[Alpha]]\n",
+    );
+    sync_domain(store, "eng", eng.path()).await.unwrap();
+
+    let ops = tempfile::tempdir().unwrap();
+    write(
+        ops.path(),
+        "gamma.md",
+        "---\ntype: engram\ntitle: Gamma\npermalink: gamma\ntags:\n  - deploy\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Gamma\n\n- [gotcha] watch the rollout #deploy\n\n- depends_on [[Alpha]]\n",
+    );
+    sync_domain(store, "ops", ops.path()).await.unwrap();
+
+    let tag_shape = |v: &Vocabulary| -> Vec<(String, i64, i64)> {
+        v.tags
+            .iter()
+            .map(|t| (t.name.clone(), t.engrams, t.observations))
+            .collect()
+    };
+    let named_shape = |rows: &[NamedCount]| -> Vec<(String, i64)> {
+        rows.iter().map(|n| (n.name.clone(), n.count)).collect()
+    };
+
+    // The all-domain sweep merges the engram-tag and observation-tag counts per
+    // tag and orders by total usage descending then name. `database` leads with
+    // two engrams and two observations; `api` and `deploy` tie and sort by name;
+    // `legacy` (1, 0) and `urgent` (0, 1) have unequal counts, so a swapped
+    // engram/observation assignment in the backend would fail here.
+    let all = store.vocabulary(None, None).await.unwrap();
+    assert_eq!(
+        tag_shape(&all),
+        vec![
+            ("database".to_string(), 2, 2),
+            ("api".to_string(), 1, 1),
+            ("deploy".to_string(), 1, 1),
+            ("legacy".to_string(), 1, 0),
+            ("urgent".to_string(), 0, 1),
+        ],
+        "tags merge engram and observation counts, most-used first then name: {:?}",
+        all.tags
+    );
+    assert_eq!(
+        named_shape(&all.categories),
+        vec![
+            ("decision".to_string(), 2),
+            ("gotcha".to_string(), 1),
+            ("pattern".to_string(), 1),
+        ],
+        "categories count observations and sort by count then name: {:?}",
+        all.categories
+    );
+    assert_eq!(
+        named_shape(&all.relation_types),
+        vec![("depends_on".to_string(), 2), ("relates_to".to_string(), 1),],
+        "relation types are counted across both domains: {:?}",
+        all.relation_types
+    );
+
+    // The domain filter narrows every facet to one domain's engrams. The eng
+    // domain keeps the unequal-count `legacy` (1, 0) and `urgent` (0, 1) tags and
+    // still excludes the ops `deploy` tag.
+    let eng_vocab = store.vocabulary(Some("eng"), None).await.unwrap();
+    assert_eq!(
+        tag_shape(&eng_vocab),
+        vec![
+            ("database".to_string(), 2, 2),
+            ("api".to_string(), 1, 1),
+            ("legacy".to_string(), 1, 0),
+            ("urgent".to_string(), 0, 1),
+        ],
+        "the eng domain excludes the ops deploy tag: {:?}",
+        eng_vocab.tags
+    );
+    assert_eq!(
+        named_shape(&eng_vocab.relation_types),
+        vec![("depends_on".to_string(), 1), ("relates_to".to_string(), 1),],
+        "eng relation types tie at one and sort by name: {:?}",
+        eng_vocab.relation_types
+    );
+
+    // Merging every domain's own sweep is the all-domain sweep, name for name
+    // and count for count. That is what a caller who may not read every domain
+    // assembles, and it must not be able to order or count itself differently
+    // from the single query.
+    let ops_vocab = store.vocabulary(Some("ops"), None).await.unwrap();
+    assert_eq!(
+        crystalline_index::merge_vocabularies(vec![eng_vocab.clone(), ops_vocab]),
+        all,
+        "the merge of the per-domain sweeps is the all-domain sweep"
+    );
+
+    // An unknown domain yields empty vectors rather than an error.
+    let missing = store.vocabulary(Some("nope"), None).await.unwrap();
+    assert!(
+        missing.tags.is_empty()
+            && missing.categories.is_empty()
+            && missing.relation_types.is_empty(),
+        "an unknown domain has an empty vocabulary: {missing:?}"
+    );
+}
+parity!(vocabulary_reports_usage_counts, vocabulary_counts);
+
+async fn vocabulary_types_and_statuses(store: &dyn Store) {
+    // Three engrams in one domain spell out both new aggregates: the types read
+    // `note, note, decision` and the statuses `stable, draft, stable`, so each
+    // list has one clear winner and one runner-up. A second domain adds a
+    // `guide` typed engram that is `deprecated`, which gives the domain filter
+    // something to exclude and proves a retired status is reported as written
+    // rather than folded away or dropped.
+    let eng = tempfile::tempdir().unwrap();
+    write(
+        eng.path(),
+        "alpha.md",
+        "---\ntype: note\ntitle: Alpha\npermalink: alpha\ntags:\n  - t\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# Alpha\n\nbody\n",
+    );
+    write(
+        eng.path(),
+        "beta.md",
+        "---\ntype: note\ntitle: Beta\npermalink: beta\ntags:\n  - t\nstatus: draft\nrecorded_at: 2026-01-01\n---\n\n# Beta\n\nbody\n",
+    );
+    write(
+        eng.path(),
+        "gamma.md",
+        "---\ntype: decision\ntitle: Gamma\npermalink: gamma\ntags:\n  - t\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# Gamma\n\nbody\n",
+    );
+    sync_domain(store, "eng", eng.path()).await.unwrap();
+
+    let ops = tempfile::tempdir().unwrap();
+    write(
+        ops.path(),
+        "delta.md",
+        "---\ntype: guide\ntitle: Delta\npermalink: delta\ntags:\n  - t\nstatus: deprecated\nrecorded_at: 2026-01-01\n---\n\n# Delta\n\nbody\n",
+    );
+    sync_domain(store, "ops", ops.path()).await.unwrap();
+
+    let named_shape = |rows: &[NamedCount]| -> Vec<(String, i64)> {
+        rows.iter().map(|n| (n.name.clone(), n.count)).collect()
+    };
+
+    // The all-domain sweep counts every engram row and orders by count
+    // descending then name, so the three singletons sort alphabetically behind
+    // the pair.
+    let all = store.vocabulary(None, None).await.unwrap();
+    assert_eq!(
+        named_shape(&all.types),
+        vec![
+            ("note".to_string(), 2),
+            ("decision".to_string(), 1),
+            ("guide".to_string(), 1),
+        ],
+        "types count engrams and sort by count then name: {:?}",
+        all.types
+    );
+    assert_eq!(
+        named_shape(&all.statuses),
+        vec![
+            ("stable".to_string(), 2),
+            ("deprecated".to_string(), 1),
+            ("draft".to_string(), 1),
+        ],
+        "statuses are reported as written, retirement included: {:?}",
+        all.statuses
+    );
+
+    // The domain filter narrows both lists to one domain's engrams.
+    let scoped = store.vocabulary(Some("eng"), None).await.unwrap();
+    assert_eq!(
+        named_shape(&scoped.types),
+        vec![("note".to_string(), 2), ("decision".to_string(), 1)],
+        "the eng domain excludes the ops guide: {:?}",
+        scoped.types
+    );
+    assert_eq!(
+        named_shape(&scoped.statuses),
+        vec![("stable".to_string(), 2), ("draft".to_string(), 1)],
+        "and excludes the ops deprecated status: {:?}",
+        scoped.statuses
+    );
+
+    // An unknown domain yields empty vectors here too, matching the other lists.
+    let missing = store.vocabulary(Some("nope"), None).await.unwrap();
+    assert!(
+        missing.types.is_empty() && missing.statuses.is_empty(),
+        "an unknown domain is written in no types or statuses: {missing:?}"
+    );
+}
+parity!(
+    vocabulary_reports_types_and_statuses,
+    vocabulary_types_and_statuses
+);
+
+async fn tag_identity_folds(store: &dyn Store) {
+    // Two engrams carry the same tag in different cases on their frontmatter,
+    // plus an observation hashtag in a third case. Tag identity is case-folded
+    // at intern time, so all three land on one lowercase `topic` row.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "alpha.md",
+        "---\ntype: engram\ntitle: Alpha\npermalink: alpha\ntags:\n  - Foo\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Alpha\n\n- [decision] chose it #FOO\n",
+    );
+    write(
+        root,
+        "beta.md",
+        "---\ntype: engram\ntitle: Beta\npermalink: beta\ntags:\n  - foo\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Beta\n\nbody\n",
+    );
+    sync_domain(store, "d", root).await.unwrap();
+
+    // One folded tag row: two engrams (Foo, foo) and one observation (#FOO).
+    let vocab = store.vocabulary(Some("d"), None).await.unwrap();
+    let shape: Vec<(String, i64, i64)> = vocab
+        .tags
+        .iter()
+        .map(|t| (t.name.clone(), t.engrams, t.observations))
+        .collect();
+    assert_eq!(
+        shape,
+        vec![("foo".to_string(), 2, 1)],
+        "Foo/foo/#FOO fold to one lowercase tag row: {:?}",
+        vocab.tags
+    );
+
+    // A search tag filter folds too, so either case of the query hits both.
+    for query in ["Foo", "foo", "FOO"] {
+        let hits = store
+            .search(&SearchQuery {
+                tags: Some(vec![query.to_string()]),
+                limit: 10,
+                page: 1,
+                ..SearchQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.total, 2,
+            "tag filter {query:?} folds and matches both engrams"
+        );
+    }
+
+    // The metadata_filters `tags` arm folds identically, for both $eq and $in,
+    // so a mixed-case value still hits the lowercase-interned tag.
+    for wire in [
+        serde_json::json!({ "tags": { "$eq": "Foo" } }),
+        serde_json::json!({ "tags": { "$in": ["FOO"] } }),
+    ] {
+        let filters = crystalline_index::parse_metadata_filters(&wire).unwrap();
+        let hits = store
+            .search(&SearchQuery {
+                metadata_filters: filters,
+                limit: 10,
+                page: 1,
+                ..SearchQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.total, 2,
+            "metadata tags filter {wire} folds and matches both engrams"
+        );
+    }
+}
+parity!(tag_identity_folds_case, tag_identity_folds);
+
+async fn engrams_with_tag_finds_both_places(store: &dyn Store) {
+    // Alpha carries `topic` on its frontmatter, Beta only on an observation,
+    // Gamma (a second domain) carries a different-cased `Topic` on frontmatter,
+    // and Delta carries no such tag. The lookup finds every tagged engram
+    // (folded), ordered by domain then path, and the domain filter scopes it.
+    //
+    // Both sort keys are text, so the fixture plants a capitalized path
+    // (`Zeta.md`) and a capitalized domain (`Zed`): each sorts first byte-wise
+    // and last under a locale collation, so an unpinned Postgres sort would hand
+    // back the same engrams in a different order.
+    let eng = tempfile::tempdir().unwrap();
+    write(
+        eng.path(),
+        "alpha.md",
+        "---\ntype: engram\ntitle: Alpha\npermalink: alpha\ntags:\n  - topic\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nbody\n",
+    );
+    write(
+        eng.path(),
+        "beta.md",
+        "---\ntype: engram\ntitle: Beta\npermalink: beta\ntags:\n  - other\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Beta\n\n- [decision] tagged here #topic\n",
+    );
+    write(
+        eng.path(),
+        "delta.md",
+        "---\ntype: engram\ntitle: Delta\npermalink: delta\ntags:\n  - other\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nbody\n",
+    );
+    write(
+        eng.path(),
+        "Zeta.md",
+        "---\ntype: engram\ntitle: Zeta\npermalink: zeta\ntags:\n  - topic\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nbody\n",
+    );
+    sync_domain(store, "eng", eng.path()).await.unwrap();
+
+    let zed = tempfile::tempdir().unwrap();
+    write(
+        zed.path(),
+        "note.md",
+        "---\ntype: engram\ntitle: Note\npermalink: note\ntags:\n  - topic\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nbody\n",
+    );
+    sync_domain(store, "Zed", zed.path()).await.unwrap();
+
+    let ops = tempfile::tempdir().unwrap();
+    write(
+        ops.path(),
+        "gamma.md",
+        "---\ntype: engram\ntitle: Gamma\npermalink: gamma\ntags:\n  - Topic\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nbody\n",
+    );
+    sync_domain(store, "ops", ops.path()).await.unwrap();
+
+    // All domains: five engrams carry the folded `topic`, ordered by domain then
+    // path in byte order, so the capitalized domain and the capitalized path
+    // both come first.
+    let all = store.engrams_with_tag("topic", None).await.unwrap();
+    let shape: Vec<(&str, &str)> = all
+        .iter()
+        .map(|d| (d.domain.as_str(), d.permalink.as_str()))
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            ("Zed", "note"),
+            ("eng", "zeta"),
+            ("eng", "alpha"),
+            ("eng", "beta"),
+            ("ops", "gamma"),
+        ],
+        "found on frontmatter and observations, both cases, ordered by domain then path"
+    );
+
+    // A mixed-case query folds identically.
+    let upper = store.engrams_with_tag("Topic", None).await.unwrap();
+    assert_eq!(upper.len(), 5, "the query tag folds too");
+
+    // The domain filter scopes the result to one domain.
+    let scoped = store.engrams_with_tag("topic", Some("ops")).await.unwrap();
+    let scoped_shape: Vec<&str> = scoped.iter().map(|d| d.permalink.as_str()).collect();
+    assert_eq!(scoped_shape, vec!["gamma"]);
+}
+parity!(
+    engrams_with_tag_finds_frontmatter_and_observations,
+    engrams_with_tag_finds_both_places
+);
+
+/// The three descriptor lookups agree on a text ordering across both backends.
+///
+/// `list_engrams` is ordered by path, `find_engram_any` by domain then path and
+/// `find_engram` by path under a `LIMIT 1`, so on that last one the ordering is
+/// the entire answer: a title shared by two engrams resolves to whichever path
+/// sorts first. Every fixture path and domain here mixes case on purpose - a
+/// capitalized name sorts first byte-wise and last under a locale collation, so
+/// each of these three would answer differently on Postgres without its text
+/// sort keys pinned to `COLLATE "C"`.
+async fn descriptor_lookups_order_by_bytes(store: &dyn Store) {
+    let eng = tempfile::tempdir().unwrap();
+    write(
+        eng.path(),
+        "Zeta.md",
+        &engram("Shared Title", "zeta", "engram", "", "body\n"),
+    );
+    write(
+        eng.path(),
+        "alpha.md",
+        &engram("Shared Title", "alpha", "engram", "", "body\n"),
+    );
+    write(
+        eng.path(),
+        "beta.md",
+        &engram("Beta", "beta", "note", "", "body\n"),
+    );
+    sync_domain(store, "eng", eng.path()).await.unwrap();
+
+    let zed = tempfile::tempdir().unwrap();
+    write(
+        zed.path(),
+        "note.md",
+        &engram("Shared Title", "note", "engram", "", "body\n"),
+    );
+    sync_domain(store, "Zed", zed.path()).await.unwrap();
+
+    // Ordered by path: the capitalized one first.
+    let listed = store.list_engrams("eng", None, None).await.unwrap();
+    assert_eq!(
+        listed.iter().map(|d| d.path.as_str()).collect::<Vec<_>>(),
+        vec!["Zeta.md", "alpha.md", "beta.md"],
+        "list_engrams orders by path in byte order"
+    );
+    // The type filter narrows the same ordered listing.
+    let typed = store
+        .list_engrams("eng", None, Some("engram"))
+        .await
+        .unwrap();
+    assert_eq!(
+        typed.iter().map(|d| d.path.as_str()).collect::<Vec<_>>(),
+        vec!["Zeta.md", "alpha.md"],
+        "the type filter keeps the byte ordering"
+    );
+
+    // Ordered by domain then path across every domain.
+    let any = store.find_engram_any("Shared Title").await.unwrap();
+    assert_eq!(
+        any.iter()
+            .map(|d| (d.domain.as_str(), d.path.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("Zed", "note.md"), ("eng", "Zeta.md"), ("eng", "alpha.md"),],
+        "find_engram_any orders by domain then path in byte order"
+    );
+
+    // One domain, two engrams under the same title: the ordering picks the
+    // single answer, so this is the sharpest case of the three.
+    let found = store
+        .find_engram("eng", "Shared Title")
+        .await
+        .unwrap()
+        .expect("a title match is found");
+    assert_eq!(
+        found.path, "Zeta.md",
+        "the lowest path in byte order wins the title tie"
+    );
+}
+parity!(
+    descriptor_lookups_order_by_byte_value,
+    descriptor_lookups_order_by_bytes
+);
+
+/// The name list and the counted stats describe the same set of domains, in the
+/// same byte order.
+///
+/// `domain_names` exists so the serving screen - which asks on every read which
+/// domains the index holds - does not pay for `domain_stats`' six correlated
+/// counting scans per domain to learn a name. Two answers for one question is
+/// how they drift, so this pins them together; the mixed case is here because a
+/// Postgres locale collation would order the two differently without the
+/// explicit `COLLATE "C"`.
+async fn names_and_stats_describe_the_same_domains(store: &dyn Store) {
+    assert!(
+        store.domain_names().await.unwrap().is_empty(),
+        "an empty index holds no domain names"
+    );
+    for name in ["Zed", "eng", "alpha"] {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "a.md", &engram("A", "a", "engram", "", "b\n"));
+        sync_domain(store, name, dir.path()).await.unwrap();
+    }
+    assert_eq!(
+        store.domain_names().await.unwrap(),
+        vec!["Zed".to_string(), "alpha".to_string(), "eng".to_string()],
+        "sorted in byte order, so a capitalized name comes first"
+    );
+    let mut counted: Vec<String> = store
+        .domain_stats()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|d| d.name)
+        .collect();
+    counted.sort();
+    assert_eq!(
+        counted,
+        store.domain_names().await.unwrap(),
+        "the cheap answer names exactly the domains the counted one does"
+    );
+}
+parity!(
+    domain_names_matches_domain_stats,
+    names_and_stats_describe_the_same_domains
+);
+
+async fn wipe_clears(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "a.md", &engram("A", "a", "engram", "", "b\n"));
+    sync_domain(store, "d", root).await.unwrap();
+    assert_eq!(store.domain_stats().await.unwrap()[0].engrams, 1);
+    store.wipe().await.unwrap();
+    assert!(store.domain_stats().await.unwrap().is_empty());
+    let page = store.search(&SearchQuery::text("b")).await.unwrap();
+    assert_eq!(page.total, 0);
+}
+parity!(wipe_clears_everything, wipe_clears);
+
+async fn store_info_reports_candidate_scan(store: &dyn Store) {
+    // Both backends run the LIKE-candidate scan, so hybrid ranking and every
+    // search test match. The Turso-only schema version lives in turso_only.rs.
+    let info = store.store_info().await.unwrap();
+    assert_eq!(info.fts_mode, crystalline_index::FtsMode::CandidateScan);
+}
+parity!(
+    store_info_reports_candidate_scan_fallback,
+    store_info_reports_candidate_scan
+);
+
+async fn title_and_permalink_modes(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "a.md",
+        &engram(
+            "Distinct Title Word",
+            "alpha-slug",
+            "engram",
+            "",
+            "the body says beta\n",
+        ),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+
+    // Title mode ignores a term that is only in the body.
+    let title_miss = store
+        .search(&SearchQuery {
+            text: Some("beta".into()),
+            mode: SearchMode::Title,
+            limit: 10,
+            page: 1,
+            ..SearchQuery::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(title_miss.total, 0);
+
+    let perma = store
+        .search(&SearchQuery {
+            text: Some("alpha-slug".into()),
+            mode: SearchMode::Permalink,
+            limit: 10,
+            page: 1,
+            ..SearchQuery::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(perma.total, 1);
+}
+parity!(title_and_permalink_search_modes, title_and_permalink_modes);
+
+async fn cas_guarded_upsert(store: &dyn Store) {
+    // A virtual domain (no path) holds one engram written straight through the
+    // store, no filesystem involved.
+    let did = store
+        .upsert_domain("v", None, DomainKind::Virtual)
+        .await
+        .unwrap();
+    store
+        .upsert_engram_checked(did, &record("n.md", "n", "v1", "sha-v1"), None)
+        .await
+        .unwrap();
+
+    // A checked write with the matching expected sha succeeds and advances the
+    // stored sha.
+    store
+        .upsert_engram_checked(did, &record("n.md", "n", "v2", "sha-v2"), Some("sha-v1"))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.engram_content(did, "n.md").await.unwrap().as_deref(),
+        Some("v2")
+    );
+
+    // A checked write with a stale expected sha is refused as StaleEdit and does
+    // not clobber the stored content.
+    let err = store
+        .upsert_engram_checked(did, &record("n.md", "n", "v3", "sha-v3"), Some("sha-v1"))
+        .await
+        .unwrap_err();
+    match err {
+        IndexError::StaleEdit { expected, found } => {
+            assert_eq!(expected, "sha-v1");
+            assert_eq!(found, "sha-v2");
+        }
+        other => panic!("expected StaleEdit, got {other:?}"),
+    }
+    assert_eq!(
+        store.engram_content(did, "n.md").await.unwrap().as_deref(),
+        Some("v2"),
+        "stale edit must not overwrite"
+    );
+
+    // A first write at a brand-new path with an expected sha still succeeds
+    // (nothing stored to compare against).
+    store
+        .upsert_engram_checked(
+            did,
+            &record("fresh.md", "fresh", "hi", "sha-f"),
+            Some("anything"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .engram_content(did, "fresh.md")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("hi")
+    );
+}
+parity!(cas_guarded_upsert_detects_stale_edits, cas_guarded_upsert);
+
+async fn content_roundtrip(store: &dyn Store) {
+    let did = store
+        .upsert_domain("v", None, DomainKind::Virtual)
+        .await
+        .unwrap();
+    store
+        .upsert_engram(did, &record("a.md", "a", "alpha body", "sha-a"))
+        .await
+        .unwrap();
+    store
+        .upsert_engram(did, &record("notes/b.md", "b", "beta body", "sha-b"))
+        .await
+        .unwrap();
+
+    // engram_content returns the stored content, or None for an absent path.
+    assert_eq!(
+        store.engram_content(did, "a.md").await.unwrap().as_deref(),
+        Some("alpha body")
+    );
+    assert!(
+        store
+            .engram_content(did, "missing.md")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // all_engram_contents streams the whole domain, ordered by path, with the
+    // permalink, content and checksum needed to export it verbatim.
+    let all = store.all_engram_contents(did).await.unwrap();
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[0].path, "a.md");
+    assert_eq!(all[0].permalink, "a");
+    assert_eq!(all[0].content, "alpha body");
+    assert_eq!(all[0].sha256, "sha-a");
+    assert_eq!(all[1].path, "notes/b.md");
+}
+parity!(content_roundtrips_through_the_store, content_roundtrip);
+
+async fn clear_domain_is_scoped(store: &dyn Store) {
+    let keep = store
+        .upsert_domain("keep", None, DomainKind::Virtual)
+        .await
+        .unwrap();
+    let gone = store
+        .upsert_domain("gone", None, DomainKind::Virtual)
+        .await
+        .unwrap();
+    store
+        .upsert_engram(keep, &record("k.md", "k", "keepterm body", "sha-k"))
+        .await
+        .unwrap();
+    store
+        .upsert_engram(gone, &record("g.md", "g", "goneterm body", "sha-g"))
+        .await
+        .unwrap();
+
+    // Clearing one domain leaves the other, and the domain rows themselves,
+    // untouched.
+    store.clear_domain(gone).await.unwrap();
+    assert!(store.all_engram_contents(gone).await.unwrap().is_empty());
+    assert_eq!(store.all_engram_contents(keep).await.unwrap().len(), 1);
+    assert_eq!(
+        store.domain_stats().await.unwrap().len(),
+        2,
+        "clear_domain keeps the domain rows"
+    );
+
+    // The kept domain's engram is still searchable; the cleared one's is gone.
+    let kept = store.search(&SearchQuery::text("keepterm")).await.unwrap();
+    assert_eq!(kept.total, 1);
+    let cleared = store.search(&SearchQuery::text("goneterm")).await.unwrap();
+    assert_eq!(cleared.total, 0);
+}
+parity!(clear_domain_scopes_to_one_domain, clear_domain_is_scoped);
+
+// --- host locks (shared-database collaboration) ------------------------------
+
+async fn host_claim_and_contest(store: &dyn Store) {
+    // The lock FKs to a real domain row, so register a file domain first. Two
+    // instances are simulated by two instance-id strings against one store,
+    // exactly the single-writer-per-domain rule the daemon relies on. Times are
+    // fixed-width ISO strings, compared lexically like every temporal column.
+    let did = store
+        .upsert_domain("eng", Some("/k/eng"), DomainKind::File)
+        .await
+        .unwrap();
+
+    // No lock yet.
+    assert!(store.domain_host(did).await.unwrap().is_none());
+
+    // First claim on an unheld lock: instance A acquires.
+    let a_at = "2026-07-03T10:00:00+00:00";
+    let stale_before = "2026-07-03T09:59:00+00:00"; // nothing is stale relative to this
+    let claim = store
+        .claim_domain_host(did, "inst-a", "node-a", a_at, stale_before, false)
+        .await
+        .unwrap();
+    assert_eq!(claim, HostClaim::Acquired);
+    let host = store.domain_host(did).await.unwrap().unwrap();
+    assert_eq!(host.instance_id, "inst-a");
+    assert_eq!(host.label, "node-a");
+    assert_eq!(host.heartbeat_at, a_at);
+
+    // Contested claim: B tries while A's heartbeat is fresh and no takeover is
+    // asked, so B is refused and A keeps the lock unchanged.
+    let b_at = "2026-07-03T10:00:20+00:00";
+    let stale_fresh = "2026-07-03T09:59:30+00:00"; // A's 10:00:00 is after this: fresh
+    match store
+        .claim_domain_host(did, "inst-b", "node-b", b_at, stale_fresh, false)
+        .await
+        .unwrap()
+    {
+        HostClaim::HeldByOther(h) => {
+            assert_eq!(h.instance_id, "inst-a");
+            assert_eq!(h.heartbeat_at, a_at);
+        }
+        HostClaim::Acquired => panic!("B must not acquire a domain A holds with a fresh heartbeat"),
+    }
+    assert_eq!(
+        store.domain_host(did).await.unwrap().unwrap().instance_id,
+        "inst-a",
+        "A still holds it after a refused contest"
+    );
+
+    // domain_stats surfaces the kind and the current host.
+    let stats = store.domain_stats().await.unwrap();
+    let s = stats.iter().find(|d| d.name == "eng").unwrap();
+    assert_eq!(s.kind, DomainKind::File);
+    assert_eq!(s.host_instance_id.as_deref(), Some("inst-a"));
+    assert_eq!(s.host_heartbeat_at.as_deref(), Some(a_at));
+}
+parity!(host_claim_acquires_and_contests, host_claim_and_contest);
+
+async fn host_renew_takeover_release(store: &dyn Store) {
+    let did = store
+        .upsert_domain("eng", Some("/k/eng"), DomainKind::File)
+        .await
+        .unwrap();
+    let a_at = "2026-07-03T10:00:00+00:00";
+    let stale_before = "2026-07-03T09:59:00+00:00";
+    store
+        .claim_domain_host(did, "inst-a", "node-a", a_at, stale_before, false)
+        .await
+        .unwrap();
+
+    // Renew: the holder refreshes its heartbeat; a stranger's renew is a no-op.
+    let a_beat = "2026-07-03T10:00:25+00:00";
+    assert!(
+        store
+            .renew_domain_host(did, "inst-a", a_beat)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store.domain_host(did).await.unwrap().unwrap().heartbeat_at,
+        a_beat
+    );
+    assert!(
+        !store
+            .renew_domain_host(did, "inst-b", a_beat)
+            .await
+            .unwrap(),
+        "a non-holder renew updates nothing"
+    );
+
+    // Stale takeover: B claims with a stale_before after A's last heartbeat, so
+    // A reads as stale and B acquires without a takeover flag.
+    let b_at = "2026-07-03T10:05:00+00:00";
+    let stale_past = "2026-07-03T10:04:00+00:00"; // A's 10:00:25 is before this: stale
+    let claim = store
+        .claim_domain_host(did, "inst-b", "node-b", b_at, stale_past, false)
+        .await
+        .unwrap();
+    assert_eq!(claim, HostClaim::Acquired);
+    assert_eq!(
+        store.domain_host(did).await.unwrap().unwrap().instance_id,
+        "inst-b"
+    );
+
+    // Explicit takeover: A forces the claim back even though B is fresh.
+    let a2_at = "2026-07-03T10:05:10+00:00";
+    let stale_fresh = "2026-07-03T10:04:59+00:00"; // B's 10:05:00 is fresh vs this
+    let claim = store
+        .claim_domain_host(did, "inst-a", "node-a", a2_at, stale_fresh, true)
+        .await
+        .unwrap();
+    assert_eq!(claim, HostClaim::Acquired);
+    assert_eq!(
+        store.domain_host(did).await.unwrap().unwrap().instance_id,
+        "inst-a"
+    );
+
+    // A same-holder re-claim is idempotent and refreshes the heartbeat.
+    let a3_at = "2026-07-03T10:05:20+00:00";
+    let claim = store
+        .claim_domain_host(did, "inst-a", "node-a", a3_at, stale_fresh, false)
+        .await
+        .unwrap();
+    assert_eq!(claim, HostClaim::Acquired);
+    assert_eq!(
+        store.domain_host(did).await.unwrap().unwrap().heartbeat_at,
+        a3_at
+    );
+
+    // Release: a non-holder's release leaves the lock; the holder's clears it.
+    store.release_domain_host(did, "inst-b").await.unwrap();
+    assert!(
+        store.domain_host(did).await.unwrap().is_some(),
+        "a non-holder release does not clear the lock"
+    );
+    store.release_domain_host(did, "inst-a").await.unwrap();
+    assert!(
+        store.domain_host(did).await.unwrap().is_none(),
+        "the holder's release clears the lock"
+    );
+}
+parity!(
+    host_renews_takes_over_and_releases,
+    host_renew_takeover_release
+);
+
+async fn seed_ids_stable(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "a.md", &engram("A", "a", "engram", "", "b\n"));
+    sync_domain(store, "d", root).await.unwrap();
+    let id1 = store.lookup_id("d", "a").await.unwrap();
+    let id2 = store.lookup_id("d", "a").await.unwrap();
+    assert_eq!(id1, id2);
+    assert!(matches!(id1, Some(EngramId(_))));
+}
+parity!(seed_ids_are_stable_across_lookups, seed_ids_stable);
+
+// --- embedding column width -------------------------------------------------
+
+/// A deterministic, network-free embedding: hashes each word into one of
+/// `dims` buckets and L2-normalizes, so texts sharing vocabulary get similar
+/// vectors. Parameterized on `dims` so the same corpus can stand in for a
+/// narrow remote provider and for the local default width in the same test.
+fn embed_one(text: &str, dims: usize) -> Vec<f32> {
+    let mut v = vec![0f32; dims];
+    for tok in text
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty())
+    {
+        let mut h: u64 = 0;
+        for byte in tok.to_lowercase().bytes() {
+            h = h.wrapping_mul(31).wrapping_add(byte as u64);
+        }
+        v[(h % dims as u64) as usize] += 1.0;
+    }
+    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm == 0.0 {
+        let mut z = vec![0f32; dims];
+        z[0] = 1.0;
+        return z;
+    }
+    v.iter().map(|x| x / norm).collect()
+}
+
+fn semantic_query(text: &str, dims: usize, model: &str) -> SearchQuery {
+    SearchQuery {
+        text: Some(text.to_string()),
+        mode: SearchMode::Semantic,
+        query_embedding: Some(embed_one(text, dims)),
+        active_model: Some(model.to_string()),
+        min_similarity: Some(0.0),
+        limit: 10,
+        page: 1,
+        ..SearchQuery::default()
+    }
+}
+
+/// The `chunk.embedding` column follows the active provider's width rather
+/// than being fixed at whatever the initial migration picked. A narrow
+/// (8-dim) provider stores and searches fine even though the Postgres column
+/// starts at 384; switching to a 384-dim provider resizes it back, also
+/// without error. A dims change already invalidates every stored vector
+/// through the existing staleness machinery (mixed dims already refuse
+/// semantic search and already mark chunks pending re-embedding), so the
+/// resize rides that invalidation rather than adding a new failure mode. On
+/// Turso this is unchanged behavior (its blob column was never width
+/// enforced); the point of running it here is that the same body now passes
+/// on Postgres too.
+async fn embedding_width_follows_provider(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "db.md",
+        &engram(
+            "Databases",
+            "databases",
+            "engram",
+            "",
+            "postgres postgres index index query query",
+        ),
+    );
+    write(
+        root,
+        "cook.md",
+        &engram(
+            "Cooking",
+            "cooking",
+            "engram",
+            "",
+            "recipe recipe kitchen kitchen food food",
+        ),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+
+    // A narrow provider stores fine even though the column starts at 384: no
+    // error surfaces on either backend.
+    let jobs = store
+        .chunks_needing_embedding("narrow-8", None, EMBED_PAGE_SIZE, None)
+        .await
+        .unwrap();
+    assert!(!jobs.is_empty(), "chunks await embedding after sync");
+    let pending = jobs.len();
+    let rows: Vec<EmbeddingRow> = jobs
+        .iter()
+        .map(|j| EmbeddingRow {
+            chunk_id: j.chunk_id,
+            embedding: embed_one(&j.text, 8),
+            dims: 8,
+        })
+        .collect();
+    store.store_embeddings(&rows, "narrow-8").await.unwrap();
+
+    let narrow_hits = store
+        .search(&semantic_query("postgres index query", 8, "narrow-8"))
+        .await
+        .unwrap();
+    assert_eq!(
+        narrow_hits.items[0].permalink, "databases",
+        "8-dim embeddings rank correctly once the column narrows"
+    );
+
+    // A 384-dim provider resizes the column back and stores fine too. The
+    // model swap makes every chunk pending again, dims aside.
+    let jobs = store
+        .chunks_needing_embedding("wide-384", None, EMBED_PAGE_SIZE, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        jobs.len(),
+        pending,
+        "the model swap makes every chunk pending again"
+    );
+    let rows: Vec<EmbeddingRow> = jobs
+        .iter()
+        .map(|j| EmbeddingRow {
+            chunk_id: j.chunk_id,
+            embedding: embed_one(&j.text, 384),
+            dims: 384,
+        })
+        .collect();
+    store.store_embeddings(&rows, "wide-384").await.unwrap();
+
+    let wide_hits = store
+        .search(&semantic_query("postgres index query", 384, "wide-384"))
+        .await
+        .unwrap();
+    assert_eq!(
+        wide_hits.items[0].permalink, "databases",
+        "384-dim embeddings rank correctly once the column widens back"
+    );
+    assert!(
+        store
+            .chunks_needing_embedding("wide-384", None, EMBED_PAGE_SIZE, None)
+            .await
+            .unwrap()
+            .is_empty(),
+        "nothing left pending for the active model"
+    );
+}
+parity!(
+    embedding_column_width_follows_provider_dims,
+    embedding_width_follows_provider
+);
+
+/// A width flip (a `store_embeddings` call at a new `dims`) drives
+/// `ensure_embedding_width`'s `ALTER TABLE ... TYPE vector({dims})`, which
+/// changes the `chunk.embedding` column's typmod. `replace_chunks`' carry
+/// SELECT is the only statement in the Postgres module that returns that raw
+/// column, so it is the one statement exposed to the "cached plan must not
+/// change result type" hazard when a pooled connection's cached plan predates
+/// the DDL (see the module doc in `postgres/mod.rs`). This syncs once to seed
+/// chunks and warm the carry SELECT's plan, flips the width and re-syncs an
+/// edit (re-running the carry SELECT against the resized column), then flips
+/// the width a second time and re-syncs again, giving the hazard two
+/// independent chances to surface on whichever connection the pool hands
+/// back. Every step must succeed and coverage must stay internally
+/// consistent throughout; on Turso this is unchanged behavior; the point of
+/// running it here is that Postgres now survives it too.
+async fn width_flip_survives_replace_chunks(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "a.md",
+        &engram("A", "a", "engram", "", "alpha alpha alpha body one"),
+    );
+    write(
+        root,
+        "b.md",
+        &engram("B", "b", "engram", "", "beta beta beta body two"),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+
+    // First width: 8 dims. Embeds every chunk, driving ensure_embedding_width's
+    // ALTER for the first time.
+    let jobs = store
+        .chunks_needing_embedding("m8", None, EMBED_PAGE_SIZE, None)
+        .await
+        .unwrap();
+    assert!(
+        !jobs.is_empty(),
+        "chunks await embedding after the first sync"
+    );
+    let rows: Vec<EmbeddingRow> = jobs
+        .iter()
+        .map(|j| EmbeddingRow {
+            chunk_id: j.chunk_id,
+            embedding: embed_one(&j.text, 8),
+            dims: 8,
+        })
+        .collect();
+    store.store_embeddings(&rows, "m8").await.unwrap();
+    let cov = store.embedding_coverage().await.unwrap();
+    assert_eq!(
+        cov.embedded_chunks, cov.total_chunks,
+        "everything embedded at 8 dims"
+    );
+
+    // Edit and re-sync: replace_chunks now runs its carry SELECT against the
+    // just-resized (8-dim) embedding column, on whatever connection the pool
+    // hands back for this transaction.
+    write(
+        root,
+        "a.md",
+        &engram("A", "a", "engram", "", "alpha alpha alpha body one edited"),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let cov = store.embedding_coverage().await.unwrap();
+    assert!(
+        cov.embedded_chunks <= cov.total_chunks,
+        "coverage stays consistent after the first width flip"
+    );
+
+    // Second width: 16 dims, driving a second ALTER, then re-sync once more so
+    // the carry SELECT runs again against a column that just changed shape a
+    // second time.
+    let jobs = store
+        .chunks_needing_embedding("m16", None, EMBED_PAGE_SIZE, None)
+        .await
+        .unwrap();
+    let rows: Vec<EmbeddingRow> = jobs
+        .iter()
+        .map(|j| EmbeddingRow {
+            chunk_id: j.chunk_id,
+            embedding: embed_one(&j.text, 16),
+            dims: 16,
+        })
+        .collect();
+    store.store_embeddings(&rows, "m16").await.unwrap();
+
+    write(
+        root,
+        "b.md",
+        &engram("B", "b", "engram", "", "beta beta beta body two edited"),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+
+    let cov = store.embedding_coverage().await.unwrap();
+    assert!(cov.total_chunks > 0, "chunks remain after both width flips");
+    assert!(
+        cov.embedded_chunks <= cov.total_chunks,
+        "coverage stays consistent after the second width flip"
+    );
+}
+parity!(
+    width_flips_keep_replace_chunks_healthy,
+    width_flip_survives_replace_chunks
+);
+
+/// `store_embeddings` writes the whole batch or nothing. A row whose embedding
+/// length contradicts its declared dims aborts the call, and because the batch is
+/// validated up front and written inside one transaction, no earlier row stays
+/// committed. Before the transactional write the first row's UPDATE committed
+/// before the bad row aborted, leaving a chunk embedded.
+async fn store_embeddings_mid_batch_mismatch_leaves_nothing(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "a.md",
+        &engram("A", "a", "engram", "", "alpha alpha alpha body one"),
+    );
+    write(
+        root,
+        "b.md",
+        &engram("B", "b", "engram", "", "beta beta beta body two"),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+
+    let jobs = store
+        .chunks_needing_embedding("m8", None, EMBED_PAGE_SIZE, None)
+        .await
+        .unwrap();
+    assert!(
+        jobs.len() >= 2,
+        "need at least two chunks to exercise a mid-batch failure, got {}",
+        jobs.len()
+    );
+
+    // First row valid, a later row's embedding length contradicts its declared
+    // dims. The whole call must fail and leave nothing embedded.
+    let rows = vec![
+        EmbeddingRow {
+            chunk_id: jobs[0].chunk_id,
+            embedding: vec![0.1f32; 8],
+            dims: 8,
+        },
+        EmbeddingRow {
+            chunk_id: jobs[1].chunk_id,
+            embedding: vec![0.1f32; 7],
+            dims: 8,
+        },
+    ];
+    let result = store.store_embeddings(&rows, "m8").await;
+    assert!(
+        result.is_err(),
+        "a mid-batch dims mismatch must fail the call"
+    );
+
+    let coverage = store.embedding_coverage().await.unwrap();
+    assert_eq!(
+        coverage.embedded_chunks, 0,
+        "no chunk stays embedded after the batch fails"
+    );
+}
+parity!(
+    store_embeddings_is_atomic_on_mid_batch_dims_mismatch,
+    store_embeddings_mid_batch_mismatch_leaves_nothing
+);
+
+// --- T1: embedding coverage cache invalidation -------------------------------
+//
+// The store caches the `EmbeddingCoverage` snapshot behind interior mutability
+// so `effective_mode` and the search staleness gate share one source of truth.
+// Every mutator that can change a chunk's embedding state must drop that
+// snapshot. The invalidation set derived from the `Store` trait is
+// `store_embeddings`, `replace_chunks`, `delete_engram`, `clear_domain`, `wipe`
+// and `rollback`. `upsert_engram`, `upsert_engram_checked` and `rename_engram`
+// never touch the chunk table, so they are deliberately not invalidators. Each
+// test warms the cache, mutates, then asserts the snapshot agrees with an
+// uncached recomputation, so a missing invalidation surfaces as a stale snapshot.
+
+/// The coverage facts recomputed WITHOUT the cache: `chunks_needing_embedding`
+/// never reads it. A model that embedded nothing needs every chunk, so its
+/// pending count is the total chunk count; the active model's pending count is
+/// the total minus the chunks it embedded, so total minus that pending count is
+/// the embedded count. Returns `(total_chunks, embedded_chunks)` as an
+/// independent ground truth for a store whose only embeddings use `model`.
+async fn recomputed_coverage(store: &dyn Store, model: &str) -> (usize, usize) {
+    let total = store
+        .chunks_needing_embedding("no-model-ever-embedded-this", None, EMBED_PAGE_SIZE, None)
+        .await
+        .unwrap()
+        .len();
+    let pending = store
+        .chunks_needing_embedding(model, None, EMBED_PAGE_SIZE, None)
+        .await
+        .unwrap()
+        .len();
+    (total, total - pending)
+}
+
+/// Assert the (possibly cached) coverage snapshot equals the uncached
+/// recomputation. Assumes every embedded chunk was embedded with `model`.
+async fn assert_snapshot_matches(store: &dyn Store, model: &str) {
+    let cov = store.embedding_coverage().await.unwrap();
+    let (total, embedded) = recomputed_coverage(store, model).await;
+    assert_eq!(
+        cov.total_chunks, total,
+        "total_chunks must match the uncached recount"
+    );
+    assert_eq!(
+        cov.embedded_chunks, embedded,
+        "embedded_chunks must match the uncached recount"
+    );
+}
+
+/// Seed a virtual domain with two engrams, one chunk each, nothing embedded.
+/// Returns the domain id for the mutators that address a domain directly.
+async fn seed_two_chunks(store: &dyn Store) -> DomainId {
+    let did = store
+        .upsert_domain("v", None, DomainKind::Virtual)
+        .await
+        .unwrap();
+    store
+        .upsert_engram(did, &record("a.md", "a", "alpha body", "sha-a"))
+        .await
+        .unwrap();
+    store
+        .upsert_engram(did, &record("b.md", "b", "beta body", "sha-b"))
+        .await
+        .unwrap();
+    let a = store.lookup_id("v", "a").await.unwrap().unwrap();
+    let b = store.lookup_id("v", "b").await.unwrap().unwrap();
+    store
+        .replace_chunks(
+            a,
+            &[NewChunk {
+                seq: 0,
+                text: "alpha body".into(),
+                text_hash: "hash-a".into(),
+            }],
+        )
+        .await
+        .unwrap();
+    store
+        .replace_chunks(
+            b,
+            &[NewChunk {
+                seq: 0,
+                text: "beta body".into(),
+                text_hash: "hash-b".into(),
+            }],
+        )
+        .await
+        .unwrap();
+    did
+}
+
+/// Embed every currently-pending chunk with `model` at width 8.
+async fn embed_all(store: &dyn Store, model: &str) {
+    let jobs = store
+        .chunks_needing_embedding(model, None, EMBED_PAGE_SIZE, None)
+        .await
+        .unwrap();
+    let rows: Vec<EmbeddingRow> = jobs
+        .iter()
+        .map(|j| EmbeddingRow {
+            chunk_id: j.chunk_id,
+            embedding: vec![0.1f32; 8],
+            dims: 8,
+        })
+        .collect();
+    store.store_embeddings(&rows, model).await.unwrap();
+}
+
+async fn coverage_cache_invalidated_by_store_embeddings(store: &dyn Store) {
+    seed_two_chunks(store).await;
+    // Warm the snapshot while nothing is embedded.
+    let warm = store.embedding_coverage().await.unwrap();
+    assert_eq!(warm.total_chunks, 2);
+    assert_eq!(warm.embedded_chunks, 0, "nothing embedded yet");
+    // store_embeddings embeds every chunk; a surviving snapshot would still
+    // report zero embedded.
+    embed_all(store, "m8").await;
+    assert_snapshot_matches(store, "m8").await;
+    let cov = store.embedding_coverage().await.unwrap();
+    assert_eq!(
+        cov.embedded_chunks, 2,
+        "both chunks embedded after the mutator"
+    );
+}
+parity!(
+    coverage_cache_invalidates_on_store_embeddings,
+    coverage_cache_invalidated_by_store_embeddings
+);
+
+async fn coverage_cache_invalidated_by_replace_chunks(store: &dyn Store) {
+    seed_two_chunks(store).await;
+    embed_all(store, "m8").await;
+    let warm = store.embedding_coverage().await.unwrap();
+    assert_eq!(warm.embedded_chunks, 2);
+    // Replacing A's chunk with a differently fingerprinted one drops A's carried
+    // embedding, so one fewer chunk is embedded.
+    let a = store.lookup_id("v", "a").await.unwrap().unwrap();
+    store
+        .replace_chunks(
+            a,
+            &[NewChunk {
+                seq: 0,
+                text: "rewritten alpha".into(),
+                text_hash: "hash-a-v2".into(),
+            }],
+        )
+        .await
+        .unwrap();
+    assert_snapshot_matches(store, "m8").await;
+    let cov = store.embedding_coverage().await.unwrap();
+    assert_eq!(cov.embedded_chunks, 1, "A's embedding dropped, B's remains");
+    assert_eq!(cov.total_chunks, 2, "still two chunks total");
+}
+parity!(
+    coverage_cache_invalidates_on_replace_chunks,
+    coverage_cache_invalidated_by_replace_chunks
+);
+
+async fn coverage_cache_invalidated_by_delete_engram(store: &dyn Store) {
+    let did = seed_two_chunks(store).await;
+    embed_all(store, "m8").await;
+    let warm = store.embedding_coverage().await.unwrap();
+    assert_eq!(warm.total_chunks, 2);
+    assert_eq!(warm.embedded_chunks, 2);
+    store.delete_engram(did, "a.md").await.unwrap();
+    assert_snapshot_matches(store, "m8").await;
+    let cov = store.embedding_coverage().await.unwrap();
+    assert_eq!(cov.total_chunks, 1, "A's chunk removed");
+    assert_eq!(cov.embedded_chunks, 1);
+}
+parity!(
+    coverage_cache_invalidates_on_delete_engram,
+    coverage_cache_invalidated_by_delete_engram
+);
+
+async fn coverage_cache_invalidated_by_clear_domain(store: &dyn Store) {
+    let did = seed_two_chunks(store).await;
+    embed_all(store, "m8").await;
+    let warm = store.embedding_coverage().await.unwrap();
+    assert_eq!(warm.embedded_chunks, 2);
+    store.clear_domain(did).await.unwrap();
+    assert_snapshot_matches(store, "m8").await;
+    let cov = store.embedding_coverage().await.unwrap();
+    assert_eq!(
+        cov.total_chunks, 0,
+        "clearing the domain removed every chunk"
+    );
+    assert_eq!(cov.embedded_chunks, 0);
+    assert!(cov.models.is_empty());
+}
+parity!(
+    coverage_cache_invalidates_on_clear_domain,
+    coverage_cache_invalidated_by_clear_domain
+);
+
+async fn coverage_cache_invalidated_by_wipe(store: &dyn Store) {
+    seed_two_chunks(store).await;
+    embed_all(store, "m8").await;
+    let warm = store.embedding_coverage().await.unwrap();
+    assert_eq!(warm.embedded_chunks, 2);
+    store.wipe().await.unwrap();
+    assert_snapshot_matches(store, "m8").await;
+    let cov = store.embedding_coverage().await.unwrap();
+    assert_eq!(
+        cov,
+        EmbeddingCoverage::default(),
+        "wipe empties the snapshot"
+    );
+}
+parity!(
+    coverage_cache_invalidates_on_wipe,
+    coverage_cache_invalidated_by_wipe
+);
+
+async fn coverage_cache_invalidated_by_rollback(store: &dyn Store) {
+    let did = seed_two_chunks(store).await;
+    // Warm outside any transaction: two chunks, none embedded.
+    let base = store.embedding_coverage().await.unwrap();
+    assert_eq!(base.total_chunks, 2);
+    // Add a third chunk inside a transaction and observe it mid-transaction,
+    // which recomputes and re-caches the uncommitted count, then roll back.
+    store.begin().await.unwrap();
+    store
+        .upsert_engram(did, &record("c.md", "c", "gamma body", "sha-c"))
+        .await
+        .unwrap();
+    let c = store.lookup_id("v", "c").await.unwrap().unwrap();
+    store
+        .replace_chunks(
+            c,
+            &[NewChunk {
+                seq: 0,
+                text: "gamma body".into(),
+                text_hash: "hash-c".into(),
+            }],
+        )
+        .await
+        .unwrap();
+    let mid = store.embedding_coverage().await.unwrap();
+    assert_eq!(mid.total_chunks, 3, "sees its own uncommitted chunk");
+    store.rollback().await.unwrap();
+    // The uncommitted chunk is gone; the mid-transaction snapshot must not
+    // survive the rollback.
+    let after = store.embedding_coverage().await.unwrap();
+    assert_eq!(after.total_chunks, 2, "rollback dropped the stale snapshot");
+}
+parity!(
+    coverage_cache_invalidates_on_rollback,
+    coverage_cache_invalidated_by_rollback
+);
+
+/// The staleness label must stay byte-identical after the check consumes the
+/// cached coverage snapshot instead of its own aggregate scan: a same-width model
+/// swap names the stored model, reports zero embedded for the active model and
+/// counts every chunk. Mirrors `model_swap_returns_stale_embeddings_error` in
+/// `embed.rs` across both backends.
+async fn stale_embeddings_names_stored_model(store: &dyn Store) {
+    seed_two_chunks(store).await;
+    embed_all(store, "m8").await;
+    let query = SearchQuery {
+        text: Some("alpha".into()),
+        mode: SearchMode::Semantic,
+        query_embedding: Some(vec![0.1f32; 8]),
+        active_model: Some("other-model".into()),
+        limit: 10,
+        page: 1,
+        ..SearchQuery::default()
+    };
+    let err = store.search(&query).await.unwrap_err();
+    match err {
+        IndexError::StaleEmbeddings {
+            stored_model,
+            active_model,
+            embedded,
+            total,
+        } => {
+            assert_eq!(stored_model, "m8");
+            assert_eq!(active_model, "other-model");
+            assert_eq!(embedded, 0, "nothing embedded for the active model");
+            assert_eq!(total, 2, "every chunk counted");
+        }
+        other => panic!("expected StaleEmbeddings, got {other:?}"),
+    }
+}
+parity!(
+    stale_embeddings_reports_stored_model_on_swap,
+    stale_embeddings_names_stored_model
+);
+
+/// Clearing the vectors of every model but the active one. Seeded directly:
+/// an ordinary pass overwrites an old vector in place, so this state is
+/// reached by a scoped pass or a half-finished swap rather than by a full one.
+async fn prune_embeddings_keeps_only_the_active_model(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "a.md",
+        &engram("A", "a", "engram", "", "alpha alpha alpha"),
+    );
+    write(
+        root,
+        "b.md",
+        &engram("B", "b", "engram", "", "beta beta beta"),
+    );
+    write(
+        root,
+        "c.md",
+        &engram("C", "c", "engram", "", "gamma gamma gamma"),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+
+    // Every chunk under the old model.
+    let jobs = store
+        .chunks_needing_embedding("bge-small-en-v1.5", None, EMBED_PAGE_SIZE, None)
+        .await
+        .unwrap();
+    assert!(jobs.len() >= 3, "each engram chunked");
+    let total = jobs.len();
+    let rows: Vec<EmbeddingRow> = jobs
+        .iter()
+        .map(|j| EmbeddingRow {
+            chunk_id: j.chunk_id,
+            embedding: embed_one(&j.text, 384),
+            dims: 384,
+        })
+        .collect();
+    store
+        .store_embeddings(&rows, "bge-small-en-v1.5")
+        .await
+        .unwrap();
+    // One of them re-embedded under the new model, so the index holds both.
+    store
+        .store_embeddings(&rows[..1], "granite-embedding-97m-multilingual-r2")
+        .await
+        .unwrap();
+    let before = store.embedding_coverage().await.unwrap();
+    assert_eq!(before.embedded_for("bge-small-en-v1.5"), total - 1);
+    assert_eq!(
+        before.embedded_for("granite-embedding-97m-multilingual-r2"),
+        1
+    );
+
+    let pruned = store
+        .prune_embeddings_except("granite-embedding-97m-multilingual-r2")
+        .await
+        .unwrap();
+    assert_eq!(pruned, total - 1, "every chunk of another model is cleared");
+
+    let after = store.embedding_coverage().await.unwrap();
+    assert_eq!(after.embedded_for("bge-small-en-v1.5"), 0);
+    assert_eq!(
+        after.embedded_for("granite-embedding-97m-multilingual-r2"),
+        1
+    );
+    assert_eq!(
+        after.total_chunks, before.total_chunks,
+        "no chunk row was deleted"
+    );
+    assert_eq!(
+        after.models.len(),
+        1,
+        "the old model is gone from the breakdown: {:?}",
+        after.models
+    );
+    // The cleared chunks are back in the backlog rather than lost.
+    let pending = store
+        .chunks_needing_embedding(
+            "granite-embedding-97m-multilingual-r2",
+            None,
+            EMBED_PAGE_SIZE,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(pending.len(), total - 1);
+
+    // Idempotent, and a model with nothing else beside it prunes nothing.
+    assert_eq!(
+        store
+            .prune_embeddings_except("granite-embedding-97m-multilingual-r2")
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+/// The lead vectors a receipt's neighbours and `V301` read are per model, so
+/// an index holding only the old model's vectors has none for the new one.
+async fn lead_vectors_are_empty_for_a_model_with_no_vectors(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "a.md",
+        &engram("A", "a", "engram", "", "alpha alpha alpha"),
+    );
+    write(
+        root,
+        "b.md",
+        &engram("B", "b", "engram", "", "beta beta beta"),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let jobs = store
+        .chunks_needing_embedding("bge-small-en-v1.5", None, EMBED_PAGE_SIZE, None)
+        .await
+        .unwrap();
+    let rows: Vec<EmbeddingRow> = jobs
+        .iter()
+        .map(|j| EmbeddingRow {
+            chunk_id: j.chunk_id,
+            embedding: embed_one(&j.text, 384),
+            dims: 384,
+        })
+        .collect();
+    store
+        .store_embeddings(&rows, "bge-small-en-v1.5")
+        .await
+        .unwrap();
+
+    // `domain_id` rather than `upsert_domain`: a read that is answering a
+    // question must not register a domain on the way (store.rs:1681).
+    let domain = store.domain_id("d").await.unwrap().expect("synced above");
+    // `lead_vectors` takes the actor dimension as its third argument since the
+    // identity wave (store.rs:2079-2084); `None` is the base rows alone, which
+    // is what this pins.
+    assert_eq!(
+        store
+            .lead_vectors(domain, "bge-small-en-v1.5", None)
+            .await
+            .unwrap()
+            .len(),
+        2,
+        "the old model has a lead vector per engram"
+    );
+    assert!(
+        store
+            .lead_vectors(domain, "granite-embedding-97m-multilingual-r2", None)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the model the install just moved to has none until it re-embeds"
+    );
+}
+parity!(
+    prune_embeddings_clears_every_other_model,
+    prune_embeddings_keeps_only_the_active_model
+);
+parity!(
+    lead_vectors_follow_the_active_model,
+    lead_vectors_are_empty_for_a_model_with_no_vectors
+);
+
+/// Models routinely double-encode nested tool arguments, sending the
+/// `metadata_filters` object as a JSON string. The wire parser accepts
+/// that form by parsing the string first; everything else non-object
+/// still fails with the plain must-be-an-object error.
+#[test]
+fn metadata_filters_accept_a_json_encoded_object() {
+    let object_form = serde_json::json!({
+        "valid_from": { "$lte": "2025-03-15" },
+        "valid_to": { "$gt": "2025-03-15" }
+    });
+    let expected = crystalline_index::parse_metadata_filters(&object_form).unwrap();
+
+    let string_form = serde_json::json!(
+        "{\"valid_from\": {\"$lte\": \"2025-03-15\"}, \"valid_to\": {\"$gt\": \"2025-03-15\"}}"
+    );
+    let parsed = crystalline_index::parse_metadata_filters(&string_form).unwrap();
+    assert_eq!(parsed, expected);
+
+    for wrong in [
+        serde_json::json!("not json at all"),
+        serde_json::json!("[\"an\", \"array\"]"),
+        serde_json::json!(42),
+    ] {
+        let err = crystalline_index::parse_metadata_filters(&wrong).unwrap_err();
+        assert!(
+            err.to_string().contains("must be an object"),
+            "unexpected error for {wrong}: {err}"
+        );
+    }
+}
+
+/// The lexical candidate cap bounds how many LIKE matches the prefilter loads
+/// and ranks. Production uses `LEXICAL_CANDIDATE_CAP`; this drives the same code
+/// with a tiny injected cap over a corpus that exceeds it, so the boundary is
+/// exercised on a handful of engrams. The cut is by engram id, so which engrams
+/// land in the capped set is not asserted (the scan walks in filesystem order);
+/// what is asserted is that the cap holds, that the survivors are ranked
+/// correctly among themselves and that paging through them is consistent.
+async fn lexical_candidate_cap(store: &dyn Store) {
+    const CORPUS: usize = 12;
+    const CAP: usize = 5;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // Engram n mentions the term n+1 times, so a hit's score is recoverable from
+    // its permalink and any correctly ranked page is strictly descending in n.
+    for n in 0..CORPUS {
+        let body = std::iter::repeat_n("widgetterm", n + 1)
+            .collect::<Vec<_>>()
+            .join(" ");
+        write(
+            root,
+            &format!("e{n:02}.md"),
+            &engram(
+                &format!("Engram {n:02}"),
+                &format!("e{n:02}"),
+                "engram",
+                "",
+                &body,
+            ),
+        );
+    }
+    sync_domain(store, "d", root).await.unwrap();
+
+    /// The mention count encoded in a permalink like `e07`.
+    fn rank_key(permalink: &str) -> usize {
+        permalink.trim_start_matches('e').parse::<usize>().unwrap()
+    }
+
+    // Uncapped: every match is a candidate and the most-mentioning engram leads.
+    let all = store
+        .search(&SearchQuery {
+            limit: CORPUS,
+            ..SearchQuery::text("widgetterm")
+        })
+        .await
+        .unwrap();
+    assert_eq!(all.total, CORPUS, "no cap reached at the production value");
+    assert_eq!(all.items[0].permalink, format!("e{:02}", CORPUS - 1));
+
+    // Capped: the total and the returned set both stop at the cap.
+    let capped = store
+        .search_with_candidate_cap(
+            &SearchQuery {
+                limit: CORPUS,
+                ..SearchQuery::text("widgetterm")
+            },
+            CAP,
+        )
+        .await
+        .unwrap();
+    assert_eq!(capped.total, CAP, "the cap bounds the reported total");
+    assert_eq!(capped.items.len(), CAP);
+
+    // Ranking within the capped set is still by score, best first.
+    let keys: Vec<usize> = capped
+        .items
+        .iter()
+        .map(|h| rank_key(&h.permalink))
+        .collect();
+    assert!(
+        keys.windows(2).all(|w| w[0] > w[1]),
+        "the capped page is not ranked best first: {keys:?}"
+    );
+    assert!(
+        capped.items.windows(2).all(|w| w[0].score >= w[1].score),
+        "scores are not descending"
+    );
+
+    // The cut is deterministic: the same query yields the same candidates.
+    let again = store
+        .search_with_candidate_cap(
+            &SearchQuery {
+                limit: CORPUS,
+                ..SearchQuery::text("widgetterm")
+            },
+            CAP,
+        )
+        .await
+        .unwrap();
+    let again_keys: Vec<usize> = again.items.iter().map(|h| rank_key(&h.permalink)).collect();
+    assert_eq!(again_keys, keys, "the capped candidate set is not stable");
+
+    // Paging through the capped set walks the same ranking, page by page.
+    let mut paged: Vec<usize> = Vec::new();
+    for page in 1..=3 {
+        let p = store
+            .search_with_candidate_cap(
+                &SearchQuery {
+                    limit: 2,
+                    page,
+                    ..SearchQuery::text("widgetterm")
+                },
+                CAP,
+            )
+            .await
+            .unwrap();
+        assert_eq!(p.total, CAP, "every page reports the capped total");
+        paged.extend(p.items.iter().map(|h| rank_key(&h.permalink)));
+    }
+    assert_eq!(paged, keys, "paging does not reproduce the capped ranking");
+}
+parity!(
+    lexical_candidate_cap_bounds_and_ranks,
+    lexical_candidate_cap
+);
+
+/// A folder filter on a search is a folder filter, not a string prefix.
+///
+/// `notes/` selects `notes/beta.md` and `notes/deep/gamma.md` and refuses
+/// `notes-misc/delta.md`, which is the whole reason the prefix carries its
+/// trailing slash. The `%` and `_` folders are the second half of the contract:
+/// a folder name is a literal, so `50%/` must not reach `50x/` and `a_b/` must
+/// not reach `axb/`. Each decoy exists precisely so an unescaped LIKE pattern
+/// fails this test rather than passing it quietly.
+async fn folder_prefix_filter(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    for (path, permalink) in [
+        ("alpha.md", "alpha"),
+        ("notes/beta.md", "notes/beta"),
+        ("notes/deep/gamma.md", "notes/deep/gamma"),
+        ("notes-misc/delta.md", "notes-misc/delta"),
+        ("50%/pct.md", "50pct/pct"),
+        ("50x/other.md", "50x/other"),
+        ("a_b/under.md", "a_b/under"),
+        ("axb/other.md", "axb/other"),
+    ] {
+        write(
+            root,
+            path,
+            &engram(permalink, permalink, "engram", "", "sharedbodyterm\n"),
+        );
+    }
+    sync_domain(store, "eng", root).await.unwrap();
+
+    // The filter-only path: every engram under `notes/`, and nothing whose
+    // path merely starts with those five letters.
+    let under = |prefix: Option<&str>| SearchQuery {
+        domains: Some(vec!["eng".to_string()]),
+        path_prefix: prefix.map(str::to_string),
+        limit: 50,
+        page: 1,
+        ..SearchQuery::default()
+    };
+    let notes = store.search(&under(Some("notes/"))).await.unwrap();
+    assert_eq!(
+        notes
+            .items
+            .iter()
+            .map(|h| h.permalink.as_str())
+            .collect::<Vec<_>>(),
+        vec!["notes/beta", "notes/deep/gamma"],
+        "a folder filter takes the folder and its descendants, never a sibling \
+         whose name merely starts the same way"
+    );
+    assert_eq!(notes.total, 2, "the total counts the filtered set exactly");
+
+    // No prefix is the whole domain, which is what an absent `path` means.
+    let all = store.search(&under(None)).await.unwrap();
+    assert_eq!(all.total, 8, "an absent folder filter selects everything");
+    let empty = store.search(&under(Some(""))).await.unwrap();
+    assert_eq!(empty.total, 8, "an empty folder filter selects everything");
+
+    // The wildcard characters are literals: each of these has a decoy sibling
+    // that an unescaped pattern would sweep in.
+    let pct = store.search(&under(Some("50%/"))).await.unwrap();
+    assert_eq!(
+        pct.items
+            .iter()
+            .map(|h| h.permalink.as_str())
+            .collect::<Vec<_>>(),
+        vec!["50pct/pct"],
+        "a folder named 50% is a folder, not a wildcard"
+    );
+    let under_score = store.search(&under(Some("a_b/"))).await.unwrap();
+    assert_eq!(
+        under_score
+            .items
+            .iter()
+            .map(|h| h.permalink.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a_b/under"],
+        "a folder named a_b is a folder, not a single-character wildcard"
+    );
+
+    // Paging under the filter: the total stays the filtered total rather than
+    // the domain's, which is what a client pages against.
+    let page_two = store
+        .search(&SearchQuery {
+            limit: 1,
+            page: 2,
+            ..under(Some("notes/"))
+        })
+        .await
+        .unwrap();
+    assert_eq!(page_two.total, 2, "the count query carries the same filter");
+    assert_eq!(page_two.items.len(), 1, "and the page is one row of it");
+
+    // The filter is a scalar filter, so it narrows a text search too rather
+    // than only the filter-only listing.
+    let text = store
+        .search(&SearchQuery {
+            text: Some("sharedbodyterm".to_string()),
+            ..under(Some("notes/"))
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        text.items
+            .iter()
+            .map(|h| h.permalink.as_str())
+            .collect::<Vec<_>>(),
+        vec!["notes/beta", "notes/deep/gamma"],
+        "a text search under a folder stays under it"
+    );
+}
+parity!(
+    search_filters_by_folder_segment_not_string_prefix,
+    folder_prefix_filter
+);
+
+/// `browse_level` bounds a tree level without hiding the tree.
+///
+/// The row page is capped and says so through `total`, while the folder list
+/// is derived separately and stays complete: a reader whose level was
+/// truncated can still descend into every folder under it. The count runs
+/// under the same depth filter as the page, so the two never disagree.
+async fn browse_level_bounds(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    for path in [
+        "a.md",
+        "b.md",
+        "c.md",
+        "notes/n1.md",
+        "notes/n2.md",
+        "notes-misc/m.md",
+        "deep/inner/x.md",
+        "50%/p.md",
+        "50x/q.md",
+    ] {
+        let permalink = path.trim_end_matches(".md");
+        write(
+            root,
+            path,
+            &engram(permalink, permalink, "engram", "", "b\n"),
+        );
+    }
+    sync_domain(store, "eng", root).await.unwrap();
+
+    // A capped root level: two of the three root engrams, the count of all
+    // three, and every folder regardless of the cap.
+    let capped = store.browse_level("eng", None, 1, 2).await.unwrap();
+    assert_eq!(
+        capped
+            .engrams
+            .iter()
+            .map(|d| d.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a.md", "b.md"],
+        "the level is capped at the limit, ordered by path in byte order"
+    );
+    assert_eq!(
+        capped.total, 3,
+        "the count is the level's own, under the same depth filter as the page"
+    );
+    assert_eq!(
+        capped.folders,
+        vec!["50%", "50x", "deep", "notes", "notes-misc"],
+        "every folder is listed even though the rows were cut"
+    );
+
+    // Depth counts segments below the prefix: 2 reaches one folder further
+    // down but not two.
+    let deeper = store.browse_level("eng", None, 2, 50).await.unwrap();
+    assert_eq!(
+        deeper.total, 8,
+        "depth 2 counts everything but the two-folder-deep engram: {:?}",
+        deeper.engrams
+    );
+    assert!(
+        !deeper.engrams.iter().any(|d| d.path == "deep/inner/x.md"),
+        "depth 2 does not reach a third level"
+    );
+
+    // Descending: the prefix is segment-safe here too, and a level with no
+    // subfolders says so with an empty list rather than by omission.
+    let notes = store
+        .browse_level("eng", Some("notes/"), 1, 50)
+        .await
+        .unwrap();
+    assert_eq!(
+        notes
+            .engrams
+            .iter()
+            .map(|d| d.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["notes/n1.md", "notes/n2.md"],
+        "notes-misc is a sibling of notes, not a child"
+    );
+    assert_eq!(notes.total, 2);
+    assert!(notes.folders.is_empty(), "a leaf folder has no children");
+
+    // A caller that leaves the trailing slash off gets the same folder rather
+    // than a string prefix, and never a folder with no name.
+    let slashless = store
+        .browse_level("eng", Some("notes"), 1, 50)
+        .await
+        .unwrap();
+    assert_eq!(slashless, notes, "the trailing slash is added, not trusted");
+
+    // A folder whose name carries a LIKE wildcard is a folder: `50x/` is a
+    // sibling an unescaped pattern would have swept in.
+    let pct = store
+        .browse_level("eng", Some("50%/"), 1, 50)
+        .await
+        .unwrap();
+    assert_eq!(
+        pct.engrams
+            .iter()
+            .map(|d| d.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["50%/p.md"],
+        "a folder named 50% is browsed literally"
+    );
+
+    // A prefix nothing lives under is an empty level, not an error.
+    let nothing = store
+        .browse_level("eng", Some("nothing/"), 1, 50)
+        .await
+        .unwrap();
+    assert_eq!(nothing.total, 0);
+    assert!(nothing.engrams.is_empty() && nothing.folders.is_empty());
+
+    // A flat domain: every engram at the root and no folders at all.
+    let flat_dir = tempfile::tempdir().unwrap();
+    write(
+        flat_dir.path(),
+        "one.md",
+        &engram("One", "one", "engram", "", "b\n"),
+    );
+    sync_domain(store, "flat", flat_dir.path()).await.unwrap();
+    let flat = store.browse_level("flat", None, 1, 50).await.unwrap();
+    assert_eq!(flat.total, 1);
+    assert!(flat.folders.is_empty(), "a flat domain has no folders");
+
+    // An empty domain answers an empty level rather than nothing at all.
+    let empty_dir = tempfile::tempdir().unwrap();
+    sync_domain(store, "empty", empty_dir.path()).await.unwrap();
+    let empty = store.browse_level("empty", None, 1, 50).await.unwrap();
+    assert_eq!(empty.total, 0);
+    assert!(empty.engrams.is_empty() && empty.folders.is_empty());
+}
+parity!(browse_level_caps_rows_but_not_folders, browse_level_bounds);
+
+/// Every path filter folds case, and both backends fold it the same way.
+///
+/// SQLite-family `LIKE` is ASCII-case-insensitive while Postgres `LIKE` is
+/// case-sensitive, so a folder filter of `notes` used to take `Notes/b.md` on
+/// turso and miss it on postgres. The three surfaces that carry such a filter -
+/// `list_engrams`, `browse_level` and the search planner - now lower both sides
+/// in SQL, so the two backends answer alike.
+///
+/// **The fold is ASCII-exact and Unicode-approximate.** SQLite's `lower()` is
+/// ASCII-only while Postgres follows the database collation, so `Notes/` and
+/// `notes/` fold identically on both while a non-ASCII case pair may fold on
+/// one and not the other. Every case pair here is ASCII on purpose; this is not
+/// a promise about `Ünter/` versus `ünter/`.
+///
+/// **The rows are upserted into a virtual domain rather than synced from
+/// disk**, because macOS's default filesystem is case-insensitive: writing
+/// `notes/a.md` and `Notes/b.md` under one temp dir produces a single folder
+/// and the case variant this test is about would never reach the store.
+///
+/// `Notes/deep/e.md` is not decoration. It is the row that catches a PARTIAL
+/// fold: with only the under-prefix clause folded, it passes
+/// `lower(e.path) LIKE 'notes/%'` and also passes the unfolded
+/// `e.path NOT LIKE 'notes/%/%'` (which no case variant matches), so a
+/// two-level-deep engram would surface in a one-level listing - a leak that
+/// does not exist while neither side is folded.
+async fn path_filters_fold_case(store: &dyn Store) {
+    let did = store
+        .upsert_domain("eng", None, DomainKind::Virtual)
+        .await
+        .unwrap();
+    for (path, permalink) in [
+        ("notes/a.md", "a"),
+        ("Notes/b.md", "b"),
+        ("notes/deep/c.md", "c"),
+        ("Notes/deep/e.md", "e"),
+        ("other/d.md", "d"),
+    ] {
+        store
+            .upsert_engram(
+                did,
+                &record(
+                    path,
+                    permalink,
+                    "shared body term",
+                    &format!("sha-{permalink}"),
+                ),
+            )
+            .await
+            .unwrap();
+    }
+
+    // `list_engrams` takes both spellings of the folder and still refuses a
+    // path that is merely a different folder.
+    let listed = store
+        .list_engrams("eng", Some("notes"), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        listed.iter().map(|d| d.path.as_str()).collect::<Vec<_>>(),
+        vec![
+            "Notes/b.md",
+            "Notes/deep/e.md",
+            "notes/a.md",
+            "notes/deep/c.md"
+        ],
+        "a prefix filter takes every case spelling of the folder, in byte order, \
+         and nothing outside it"
+    );
+
+    // The one-level listing under `notes/`: the shallow engrams from both
+    // spellings, the folder derived from both, and neither two-level engram.
+    let level = store
+        .browse_level("eng", Some("notes"), 1, 50)
+        .await
+        .unwrap();
+    assert_eq!(
+        level
+            .engrams
+            .iter()
+            .map(|d| d.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Notes/b.md", "notes/a.md"],
+        "one level under the folder, both spellings"
+    );
+    assert_eq!(level.total, 2, "the count runs under the same depth filter");
+    assert!(
+        !level.engrams.iter().any(|d| d.path.contains("/deep/")),
+        "the depth cut folds too, so no case variant slips two levels deep into \
+         a one-level listing: {:?}",
+        level.engrams
+    );
+    assert_eq!(
+        level.folders,
+        vec!["deep"],
+        "the subfolder is derived from both spellings and collapses to one name"
+    );
+
+    // Folding merges case-variant folders in the FILTER, never in the derived
+    // folder names: browsing the root still reports each folder's own spelling.
+    let root = store.browse_level("eng", None, 1, 50).await.unwrap();
+    assert_eq!(
+        root.folders,
+        vec!["Notes", "notes", "other"],
+        "two case-variant folders stay two folder rows"
+    );
+
+    // The search planner's folder filter, filter-only and lexical alike.
+    let under = |text: Option<&str>| SearchQuery {
+        text: text.map(str::to_string),
+        domains: Some(vec!["eng".to_string()]),
+        path_prefix: Some("notes/".to_string()),
+        limit: 50,
+        page: 1,
+        ..SearchQuery::default()
+    };
+    for text in [None, Some("term")] {
+        let hits = store.search(&under(text)).await.unwrap();
+        let mut found: Vec<&str> = hits.items.iter().map(|h| h.permalink.as_str()).collect();
+        found.sort();
+        assert_eq!(
+            found,
+            vec!["a", "b", "c", "e"],
+            "a folder-scoped search takes both spellings and stops at the folder \
+             (text: {text:?})"
+        );
+    }
+}
+parity!(
+    path_filters_fold_case_on_both_backends,
+    path_filters_fold_case
+);
+
+// --- attachments -------------------------------------------------------------
+
+/// A metadata row for a binary asset under the domain's `assets/` folder.
+fn attachment(path: &str, sha: &str, mime: &str, size: u64) -> AttachmentRow {
+    AttachmentRow {
+        path: path.to_string(),
+        sha256: sha.to_string(),
+        mime: mime.to_string(),
+        size,
+        modified: "2026-08-18T09:00:00+00:00".to_string(),
+    }
+}
+
+async fn attachment_metadata_roundtrip(store: &dyn Store) {
+    let did = store
+        .upsert_domain("eng", Some("/k/eng"), DomainKind::File)
+        .await
+        .unwrap();
+
+    // Every field survives the round trip verbatim.
+    let row = attachment("assets/shot.png", "aa11", "image/png", 4096);
+    store.upsert_attachment(did, &row).await.unwrap();
+    assert_eq!(
+        store
+            .get_attachment(did, "assets/shot.png")
+            .await
+            .unwrap()
+            .unwrap(),
+        row
+    );
+    assert!(
+        store
+            .get_attachment(did, "assets/missing.png")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // A second upsert on the same path replaces the row rather than adding one:
+    // this is the shape the sync walker relies on to refresh a rewritten file.
+    let refreshed = attachment("assets/shot.png", "bb22", "image/png", 8192);
+    store.upsert_attachment(did, &refreshed).await.unwrap();
+    let got = store
+        .get_attachment(did, "assets/shot.png")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(got, refreshed);
+    assert_eq!(
+        store.list_attachments(did).await.unwrap().len(),
+        1,
+        "an upsert on an existing path keeps a single row"
+    );
+
+    // A second domain's rows never leak into the first's listing.
+    let other = store
+        .upsert_domain("ops", Some("/k/ops"), DomainKind::File)
+        .await
+        .unwrap();
+    store
+        .upsert_attachment(other, &attachment("assets/a.png", "cc33", "image/png", 1))
+        .await
+        .unwrap();
+
+    // Bytewise ordering: `B` (0x42) sorts before `a` (0x61) before `b` (0x62).
+    // A locale-collated Postgres would return a.png, b.png, B.png instead, so
+    // this is the assertion that pins both backends to one order.
+    for path in ["assets/b.png", "assets/B.png", "assets/a.png"] {
+        store
+            .upsert_attachment(did, &attachment(path, "dd44", "image/png", 2))
+            .await
+            .unwrap();
+    }
+    let paths: Vec<String> = store
+        .list_attachments(did)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.path)
+        .collect();
+    assert_eq!(
+        paths,
+        vec![
+            "assets/B.png".to_string(),
+            "assets/a.png".to_string(),
+            "assets/b.png".to_string(),
+            "assets/shot.png".to_string(),
+        ]
+    );
+
+    // Delete reports whether a row was there, and takes the blob with it.
+    store
+        .write_attachment_blob(did, "assets/shot.png", b"bytes")
+        .await
+        .unwrap();
+    assert!(
+        store
+            .delete_attachment(did, "assets/shot.png")
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .get_attachment(did, "assets/shot.png")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .read_attachment_blob(did, "assets/shot.png")
+            .await
+            .unwrap()
+            .is_none(),
+        "deleting the row takes its blob with it"
+    );
+    assert!(
+        !store
+            .delete_attachment(did, "assets/shot.png")
+            .await
+            .unwrap(),
+        "a second delete reports no row"
+    );
+
+    // The other domain is untouched by all of it.
+    assert_eq!(store.list_attachments(other).await.unwrap().len(), 1);
+}
+parity!(
+    attachment_metadata_roundtrips_and_sorts_bytewise,
+    attachment_metadata_roundtrip
+);
+
+async fn attachment_blob_roundtrip(store: &dyn Store) {
+    let did = store
+        .upsert_domain("eng", Some("/k/eng"), DomainKind::File)
+        .await
+        .unwrap();
+
+    // A row with no blob written yet reads back as None rather than as empty
+    // bytes: a file domain keeps its bytes on disk and never writes one.
+    store
+        .upsert_attachment(
+            did,
+            &attachment("assets/on-disk.png", "aa11", "image/png", 3),
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .read_attachment_blob(did, "assets/on-disk.png")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .read_attachment_blob(did, "assets/nothing.png")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // 1 MiB of non-UTF-8 bytes: the byte column must be a blob, not text.
+    let bytes: Vec<u8> = (0..1024 * 1024).map(|i| (i % 256) as u8).collect();
+    assert!(String::from_utf8(bytes.clone()).is_err());
+    store
+        .upsert_attachment(
+            did,
+            &attachment(
+                "assets/big.pdf",
+                "bb22",
+                "application/pdf",
+                bytes.len() as u64,
+            ),
+        )
+        .await
+        .unwrap();
+    store
+        .write_attachment_blob(did, "assets/big.pdf", &bytes)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .read_attachment_blob(did, "assets/big.pdf")
+            .await
+            .unwrap()
+            .unwrap(),
+        bytes
+    );
+
+    // A second write replaces the content in place.
+    store
+        .write_attachment_blob(did, "assets/big.pdf", b"short")
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .read_attachment_blob(did, "assets/big.pdf")
+            .await
+            .unwrap()
+            .unwrap(),
+        b"short".to_vec()
+    );
+
+    // Writing a blob for a path with no metadata row is a constraint error, not
+    // an orphan blob: the row is what names the mime type and the size.
+    let err = store
+        .write_attachment_blob(did, "assets/orphan.pdf", b"x")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, IndexError::Constraint(_)),
+        "an orphan blob write is a constraint error, got {err:?}"
+    );
+}
+parity!(attachment_blobs_roundtrip, attachment_blob_roundtrip);
+
+async fn clear_domain_clears_attachments(store: &dyn Store) {
+    // The live unregister path (`Engine::unregister_domain`) resolves the id
+    // with `upsert_domain` and then calls `clear_domain`, reporting
+    // `index_cleared`. Attachments have to go with everything else, or a
+    // virtual domain's blob bytes outlive the domain with no walker left to
+    // reap them, and a same-named re-registration reuses the id and reads the
+    // previous domain's rows as its own.
+    let did = store
+        .upsert_domain("eng", Some("/k/eng"), DomainKind::File)
+        .await
+        .unwrap();
+    let keep = store
+        .upsert_domain("ops", Some("/k/ops"), DomainKind::File)
+        .await
+        .unwrap();
+
+    for path in ["assets/shot.png", "assets/deck.pdf"] {
+        store
+            .upsert_attachment(did, &attachment(path, "aa11", "image/png", 4))
+            .await
+            .unwrap();
+    }
+    store
+        .write_attachment_blob(did, "assets/deck.pdf", b"pdf bytes")
+        .await
+        .unwrap();
+    store
+        .upsert_attachment(
+            keep,
+            &attachment("assets/other.png", "bb22", "image/png", 5),
+        )
+        .await
+        .unwrap();
+
+    store.clear_domain(did).await.unwrap();
+
+    assert!(
+        store.list_attachments(did).await.unwrap().is_empty(),
+        "clear_domain leaves no attachment metadata behind"
+    );
+    assert!(
+        store
+            .read_attachment_blob(did, "assets/deck.pdf")
+            .await
+            .unwrap()
+            .is_none(),
+        "clear_domain takes the blob bytes with the row"
+    );
+    assert_eq!(
+        store.list_attachments(keep).await.unwrap().len(),
+        1,
+        "another domain's attachments survive"
+    );
+
+    // Re-registering the same name reuses the id, so a cleared domain must come
+    // back empty rather than inheriting what the previous registration held.
+    let again = store
+        .upsert_domain("eng", Some("/k/eng"), DomainKind::File)
+        .await
+        .unwrap();
+    assert_eq!(again, did, "the same name resolves to the same domain id");
+    assert!(store.list_attachments(again).await.unwrap().is_empty());
+    store
+        .upsert_attachment(
+            again,
+            &attachment("assets/fresh.png", "cc33", "image/png", 6),
+        )
+        .await
+        .unwrap();
+    let paths: Vec<String> = store
+        .list_attachments(again)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.path)
+        .collect();
+    assert_eq!(paths, vec!["assets/fresh.png".to_string()]);
+}
+parity!(
+    clear_domain_takes_attachments_with_it,
+    clear_domain_clears_attachments
+);
+
+/// Issue #65 at the index: an engram whose own title's first word ends in a
+/// colon.
+///
+/// `[[Log: Weekly Garden Notes]]` splits like `[[domain:Target]]`, because the
+/// parser is domain-agnostic and nothing inside the brackets says which it is.
+/// Resolution is where the registry can settle it: a prefix no domain answers
+/// to means the whole bracket text is a title at home. A prefix that does name
+/// a domain is untouched, and an unregistered prefix matching nothing at home
+/// stays unresolved rather than being softened into a hit.
+async fn colon_title_resolution(store: &dyn Store) {
+    let other_dir = tempfile::tempdir().unwrap();
+    let other = other_dir.path();
+    write(
+        other,
+        "runbook.md",
+        &engram("Runbook", "runbook", "engram", "", "how to restart\n"),
+    );
+    sync_domain(store, "ops", other).await.unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // The title is quoted, because a bare `title: Log: Weekly Garden Notes` is
+    // not YAML at all - which is a small reminder of why the colon is a
+    // problem worth solving rather than forbidding.
+    write(
+        root,
+        "log-weekly.md",
+        "---\ntype: engram\ntitle: 'Log: Weekly Garden Notes'\npermalink: log-weekly\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Log: Weekly Garden Notes\n\nWhat the garden did this week.\n",
+    );
+    write(
+        root,
+        "alpha.md",
+        &engram(
+            "Alpha",
+            "alpha",
+            "engram",
+            "",
+            "- superseded_by [[Log: Weekly Garden Notes]]\n- cites [[ops:Runbook]]\n- blocks [[Ledger: Nobody Wrote This]]\n\nProse about [[Log: Weekly Garden Notes]] here.\n",
+        ),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+
+    let alpha = store.lookup_id("d", "alpha").await.unwrap().unwrap();
+    let refs = store.outbound_refs(alpha, None).await.unwrap();
+    let shape: Vec<_> = refs
+        .iter()
+        .map(|r| (r.to_domain.as_deref(), r.to_target.as_str(), r.resolved))
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            // Nothing is registered as `Log`, so the whole bracket text is the
+            // title of the engram beside it.
+            (Some("Log"), "Weekly Garden Notes", true),
+            // `ops` is a domain, so the prefix keeps its meaning.
+            (Some("ops"), "Runbook", true),
+            // `Ledger` is no domain either, and no engram here is titled
+            // `Ledger: Nobody Wrote This`. A second reading is a second
+            // question, not a softer answer.
+            (Some("Ledger"), "Nobody Wrote This", false),
+            // The prose wikilink is the same target through the other table.
+            (Some("Log"), "Weekly Garden Notes", true),
+        ]
+    );
+}
+parity!(
+    a_colon_in_a_title_resolves_at_home_on_both_backends,
+    colon_title_resolution
+);
+
+// --- the registration stamp --------------------------------------------------
+
+/// The `last_registered` stamp: a domain the configuration still names is
+/// marked as seen, restamping moves the mark forward, a domain nobody stamped
+/// reads as `None`, and the value travels on `domain_stats`.
+///
+/// `None` is the load-bearing case. It means "never stamped", not "stamped
+/// long ago": a domain row written before the column existed, or one written
+/// by a sync that ran before the first stamping sweep, carries no evidence
+/// about its age at all. A caller that ages the stamp must leave such a row
+/// alone rather than treat it as infinitely old.
+async fn registration_stamp(store: &dyn Store) {
+    let _ = store
+        .upsert_domain("alpha", None, DomainKind::Virtual)
+        .await
+        .unwrap();
+    let _ = store
+        .upsert_domain("beta", None, DomainKind::Virtual)
+        .await
+        .unwrap();
+    let _ = store
+        .upsert_domain("gamma", None, DomainKind::Virtual)
+        .await
+        .unwrap();
+
+    // Fresh rows are unstamped: nobody has said they were registered yet.
+    let stamp = |stats: &Vec<crystalline_index::DomainStats>, name: &str| {
+        stats
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("{name} is in domain_stats"))
+            .last_registered
+            .clone()
+    };
+    let stats = store.domain_stats().await.unwrap();
+    assert_eq!(stamp(&stats, "alpha"), None, "a fresh row is unstamped");
+    assert_eq!(stamp(&stats, "beta"), None);
+    assert_eq!(stamp(&stats, "gamma"), None);
+
+    // Stamping names two of the three. Times are fixed-width RFC 3339 strings,
+    // the same convention `last_sync` uses, so they compare lexically.
+    store
+        .stamp_registered(&["alpha", "beta"], "2026-09-01T00:00:00Z")
+        .await
+        .unwrap();
+    let stats = store.domain_stats().await.unwrap();
+    assert_eq!(
+        stamp(&stats, "alpha").as_deref(),
+        Some("2026-09-01T00:00:00Z"),
+        "the stamp travels on domain_stats"
+    );
+    assert_eq!(
+        stamp(&stats, "beta").as_deref(),
+        Some("2026-09-01T00:00:00Z")
+    );
+    assert_eq!(
+        stamp(&stats, "gamma"),
+        None,
+        "a domain nobody stamped stays unstamped: never seen, not seen long ago"
+    );
+
+    // Stamping again moves the mark forward for the named domains only.
+    store
+        .stamp_registered(&["alpha"], "2026-09-08T12:00:00Z")
+        .await
+        .unwrap();
+    let stats = store.domain_stats().await.unwrap();
+    assert_eq!(
+        stamp(&stats, "alpha").as_deref(),
+        Some("2026-09-08T12:00:00Z"),
+        "restamping moves the mark forward"
+    );
+    assert_eq!(
+        stamp(&stats, "beta").as_deref(),
+        Some("2026-09-01T00:00:00Z"),
+        "a domain the second call did not name keeps its earlier stamp"
+    );
+
+    // An empty set is a no-op, not a syntax error: a configuration that
+    // registers nothing is a configuration, and the sweep still runs.
+    store
+        .stamp_registered(&[], "2026-09-09T00:00:00Z")
+        .await
+        .unwrap();
+    let stats = store.domain_stats().await.unwrap();
+    assert_eq!(
+        stamp(&stats, "alpha").as_deref(),
+        Some("2026-09-08T12:00:00Z"),
+        "an empty stamp set changes nothing"
+    );
+
+    // A name with no row is a silent no-op: the configuration may register a
+    // domain that has never been synced, and stamping must not invent a row.
+    store
+        .stamp_registered(&["never-synced", "gamma"], "2026-09-09T00:00:00Z")
+        .await
+        .unwrap();
+    let stats = store.domain_stats().await.unwrap();
+    assert_eq!(stats.len(), 3, "stamping an unknown name creates no row");
+    assert_eq!(
+        stamp(&stats, "gamma").as_deref(),
+        Some("2026-09-09T00:00:00Z"),
+        "the known name beside it was still stamped"
+    );
+}
+parity!(
+    registration_stamp_records_when_a_domain_was_last_seen,
+    registration_stamp
+);
+
+// --- the actor dimension -----------------------------------------------------
+
+/// The body `sync_domain` stores for the fixture engram below: what the parser
+/// keeps of the file, heading and all.
+const BASE_BODY: &str = "\n# A\n\nbase body\n\n";
+
+/// An overlay row is a full engram row belonging to one actor, sitting beside
+/// the base row at the same path, and nothing that reads the base sees it.
+///
+/// This is the whole contract of the actor dimension in one body: a draft
+/// round-trips through the overlay verbs whole, it is addressed by actor so a
+/// second actor asking the same question gets nothing, and every base-facing
+/// read - content, listing, browse, stats, stamps, resolution, export, search -
+/// answers exactly what it answered before the draft existed. The file stamps
+/// are the sharpest of those: the sync driver derives deletes by subtracting
+/// the walk from that snapshot, so a draft leaking into it would be proposed as
+/// a deletion on every single sync.
+async fn overlay_rows_shadow_nothing(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "a.md", &engram("A", "a", "engram", "", "base body\n"));
+    sync_domain(store, "d", root).await.unwrap();
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+    let base_id = store
+        .lookup_id("d", "a")
+        .await
+        .unwrap()
+        .expect("a base row");
+
+    // An empty actor is the base row's own name, so it is not an overlay and
+    // the verb refuses it rather than writing over the base.
+    let draft = record("a.md", "a", "draft body\n", "dddd");
+    assert!(
+        store.upsert_overlay(domain, "", &draft).await.is_err(),
+        "the empty actor names the base row, so it is not a draft key"
+    );
+
+    let draft_id = store.upsert_overlay(domain, "alice", &draft).await.unwrap();
+    assert_ne!(
+        draft_id, base_id,
+        "a draft is a row of its own, not an edit of the base row"
+    );
+
+    // Nothing that reads the base has changed.
+    assert_eq!(
+        store
+            .engram_content(domain, "a.md")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(BASE_BODY),
+        "the base content is what the files on disk say it is"
+    );
+    assert_eq!(
+        store.list_engrams("d", None, None).await.unwrap().len(),
+        1,
+        "the listing holds the base row alone"
+    );
+    assert_eq!(
+        store.browse_level("d", None, 1, 50).await.unwrap().total,
+        1,
+        "and the browse level counts the same one"
+    );
+    let stats = store.domain_stats().await.unwrap();
+    assert_eq!(
+        stats.iter().find(|s| s.name == "d").unwrap().engrams,
+        1,
+        "a domain holding a draft is not a domain holding two engrams"
+    );
+    let stamps = store.file_stamps(domain).await.unwrap();
+    assert_eq!(
+        stamps.len(),
+        1,
+        "the stamp snapshot names only what is on disk, or every sync would \
+         propose the draft as a deletion"
+    );
+    assert_eq!(
+        store.lookup_id("d", "a").await.unwrap(),
+        Some(base_id),
+        "resolution still lands on the base row"
+    );
+    assert_eq!(
+        store.find_engram("d", "a").await.unwrap().map(|d| d.id),
+        Some(base_id)
+    );
+    assert_eq!(
+        store.find_engram_any("a").await.unwrap().len(),
+        1,
+        "and the cross-domain lookup finds one answer, not two"
+    );
+    let exported = store.all_engram_contents(domain).await.unwrap();
+    assert_eq!(
+        exported
+            .iter()
+            .map(|e| e.content.as_str())
+            .collect::<Vec<_>>(),
+        vec![BASE_BODY],
+        "an export writes the domain back as its files, drafts excluded"
+    );
+    let hits = store.search(&SearchQuery::text("draft")).await.unwrap();
+    assert_eq!(hits.total, 0, "a draft is not in the base search either");
+
+    // And the draft itself round-trips, for its own actor only.
+    let mine = store
+        .overlay_entry(domain, "alice", "a.md")
+        .await
+        .unwrap()
+        .expect("alice sees her own draft");
+    assert_eq!(mine.content, "draft body\n");
+    assert_eq!(mine.path, "a.md");
+    assert_eq!(mine.permalink, "a");
+    assert_eq!(mine.actor, "alice");
+    assert!(!mine.tombstone, "an ordinary draft is not a tombstone");
+    assert!(
+        store
+            .overlay_entry(domain, "bob", "a.md")
+            .await
+            .unwrap()
+            .is_none(),
+        "and nobody else's"
+    );
+    assert_eq!(
+        store.overlay_entries(domain, "alice").await.unwrap().len(),
+        1
+    );
+    assert!(
+        store
+            .overlay_entries(domain, "bob")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store.overlay_counts(domain).await.unwrap(),
+        vec![("alice".to_string(), 1)],
+        "the per-actor count names who holds drafts here and how many"
+    );
+
+    // A second write at the same path replaces the draft rather than adding one.
+    let second = record("a.md", "a", "later draft\n", "eeee");
+    let again = store
+        .upsert_overlay(domain, "alice", &second)
+        .await
+        .unwrap();
+    assert_eq!(again, draft_id, "one row per actor per path");
+    assert_eq!(
+        store
+            .overlay_entry(domain, "alice", "a.md")
+            .await
+            .unwrap()
+            .unwrap()
+            .content,
+        "later draft\n"
+    );
+
+    // A second actor holds a draft at the same path without disturbing hers.
+    store
+        .upsert_overlay(domain, "bob", &record("a.md", "a", "bob's\n", "bbbb"))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.overlay_counts(domain).await.unwrap(),
+        vec![("alice".to_string(), 1), ("bob".to_string(), 1)],
+        "two actors, one path, one row each"
+    );
+
+    // Clearing is per actor and idempotent, and the base row is untouched.
+    assert!(
+        store
+            .clear_overlay_entry(domain, "alice", "a.md")
+            .await
+            .unwrap(),
+        "clearing a draft that exists reports that it did"
+    );
+    assert!(
+        !store
+            .clear_overlay_entry(domain, "alice", "a.md")
+            .await
+            .unwrap(),
+        "and clearing it again reports that there was nothing to clear"
+    );
+    assert!(
+        store
+            .overlay_entry(domain, "bob", "a.md")
+            .await
+            .unwrap()
+            .is_some(),
+        "the other actor's draft is still there"
+    );
+    assert_eq!(
+        store
+            .engram_content(domain, "a.md")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(BASE_BODY),
+        "and the base row never moved"
+    );
+}
+parity!(
+    overlay_rows_shadow_nothing_until_asked_and_round_trip,
+    overlay_rows_shadow_nothing
+);
+
+/// A tombstone is an overlay row like any other, carrying the flag instead of a
+/// replacement body.
+///
+/// It has to be a row rather than an absence for the same reason a draft does:
+/// it belongs to one actor, it survives a forced resync, and the journal that
+/// mirrors it needs something to mirror. What it must never do is reach the
+/// base - the file on disk is still there, so every base read still answers
+/// with it.
+async fn a_tombstone_is_a_row(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "a.md", &engram("A", "a", "engram", "", "base body\n"));
+    sync_domain(store, "d", root).await.unwrap();
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+
+    let mut stone = record("a.md", "a", "", "");
+    stone.tombstone = true;
+    store.upsert_overlay(domain, "alice", &stone).await.unwrap();
+
+    let entry = store
+        .overlay_entry(domain, "alice", "a.md")
+        .await
+        .unwrap()
+        .expect("the tombstone is a row, so it is found");
+    assert!(entry.tombstone, "and it says what it is");
+    assert_eq!(entry.actor, "alice");
+    assert_eq!(
+        store.overlay_entries(domain, "alice").await.unwrap().len(),
+        1,
+        "a tombstone is one of an actor's overlay entries"
+    );
+    assert_eq!(
+        store.overlay_counts(domain).await.unwrap(),
+        vec![("alice".to_string(), 1)],
+        "and it counts as one"
+    );
+
+    assert_eq!(
+        store
+            .engram_content(domain, "a.md")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(BASE_BODY),
+        "the file on disk is still there, so the base still answers with it"
+    );
+    assert_eq!(
+        store.list_engrams("d", None, None).await.unwrap().len(),
+        1,
+        "and the base listing is one row, not two and not zero"
+    );
+    assert_eq!(
+        store.file_stamps(domain).await.unwrap().len(),
+        1,
+        "the stamp snapshot is what is on disk, tombstone or no tombstone"
+    );
+
+    // Turning a tombstone back into a draft is one more write at the same key.
+    store
+        .upsert_overlay(domain, "alice", &record("a.md", "a", "back\n", "aaaa"))
+        .await
+        .unwrap();
+    let entry = store
+        .overlay_entry(domain, "alice", "a.md")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !entry.tombstone,
+        "the flag clears with the row that carried it"
+    );
+    assert_eq!(entry.content, "back\n");
+}
+parity!(a_tombstone_is_an_overlay_row_too, a_tombstone_is_a_row);
+
+/// Asking which domain a name is, without registering one on the way.
+///
+/// Every other route to a `DomainId` is `upsert_domain`, which writes. A read
+/// that has to count somebody's drafts - a status call, a removal's question -
+/// cannot spend a write to ask, least of all on a read-only instance, so this
+/// is the read-only form: the id of a domain the index already holds, and
+/// `None` for a name it has never been told about, with the table left exactly
+/// as it was either way.
+async fn domain_id_is_a_read(store: &dyn Store) {
+    let registered = store
+        .upsert_domain("eng", Some("/k/eng"), DomainKind::File)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.domain_id("eng").await.unwrap(),
+        Some(registered),
+        "a registered domain answers with the id every write verb resolved"
+    );
+    assert_eq!(
+        store.domain_id("nobody-registered-this").await.unwrap(),
+        None,
+        "a name the index has never held is absent rather than an error"
+    );
+    assert_eq!(
+        store.domain_names().await.unwrap(),
+        vec!["eng".to_string()],
+        "and asking after an unregistered name registered nothing"
+    );
+}
+parity!(
+    domain_id_answers_without_registering_anything,
+    domain_id_is_a_read
+);
+
+/// A draft of `path`, parsed from markdown the way a write verb parses what it
+/// was handed, so a draft row carries the observations, tags and chunks-worth
+/// of text a base row carries.
+async fn draft(
+    store: &dyn Store,
+    domain: DomainId,
+    actor: &str,
+    path: &str,
+    markdown: &str,
+) -> EngramId {
+    let parsed = crystalline_core::parse_engram(markdown).unwrap();
+    let record = EngramRecord::from_engram(
+        &parsed,
+        path,
+        FileStamp {
+            mtime: 0,
+            size: markdown.len() as u64,
+            sha256: format!("{actor}-{path}"),
+        },
+    );
+    store.upsert_overlay(domain, actor, &record).await.unwrap()
+}
+
+/// The `(permalink, title)` of every hit, sorted, which is what an assertion
+/// about who sees which row is actually about.
+fn rows(page: &crystalline_index::Page<crystalline_index::SearchHit>) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = page
+        .items
+        .iter()
+        .map(|h| (h.permalink.clone(), h.title.clone()))
+        .collect();
+    out.sort();
+    out
+}
+
+/// A search names whose rows it wants, and gets the base rows plus that actor's
+/// own drafts, with a draft standing in for the base row it replaces.
+///
+/// Three claims, and all three are the actor predicate rather than anything
+/// downstream. A draft at a path no file holds is a hit of its own. A draft
+/// over a base row is the hit, once, with the draft's own title - one engram,
+/// one answer. And another actor's draft is nowhere in it: bob's rewrite of
+/// the field notes never reaches alice, and neither reaches a search that names
+/// no actor at all, which is what every unauthenticated reader and every
+/// pre-overlay caller gets.
+///
+/// The lexical, filter-only and semantic legs each ask through a different
+/// candidate query, so all three are asserted: a predicate that landed on one
+/// of them would leak through the other two.
+async fn search_across_the_actor_dimension(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "plan.md",
+        &engram(
+            "Rollout plan",
+            "plan",
+            "engram",
+            "",
+            "- [decision] the audit gates the rollout #t\n",
+        ),
+    );
+    write(
+        root,
+        "notes.md",
+        &engram(
+            "Field notes",
+            "notes",
+            "engram",
+            "",
+            "- [fact] the audit notebook stays open #t\n",
+        ),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+
+    let alice_plan = draft(
+        store,
+        domain,
+        "alice",
+        "plan.md",
+        &engram(
+            "Rollout plan, revised",
+            "plan",
+            "engram",
+            "",
+            "- [decision] the audit gates nothing any more #t\n",
+        ),
+    )
+    .await;
+    let alice_fresh = draft(
+        store,
+        domain,
+        "alice",
+        "fresh.md",
+        &engram(
+            "Fresh idea",
+            "fresh",
+            "engram",
+            "",
+            "- [idea] an audit of the audit itself #t\n",
+        ),
+    )
+    .await;
+    let bob_notes = draft(
+        store,
+        domain,
+        "bob",
+        "notes.md",
+        &engram(
+            "Bob's notes",
+            "notes",
+            "engram",
+            "",
+            "- [fact] the audit notebook, bob's own copy #t\n",
+        ),
+    )
+    .await;
+
+    let base = vec![
+        ("notes".to_string(), "Field notes".to_string()),
+        ("plan".to_string(), "Rollout plan".to_string()),
+    ];
+    let alices = vec![
+        ("fresh".to_string(), "Fresh idea".to_string()),
+        ("notes".to_string(), "Field notes".to_string()),
+        ("plan".to_string(), "Rollout plan, revised".to_string()),
+    ];
+    let bobs = vec![
+        ("notes".to_string(), "Bob's notes".to_string()),
+        ("plan".to_string(), "Rollout plan".to_string()),
+    ];
+
+    // The lexical leg.
+    let lexical = |actor: Option<&str>| SearchQuery {
+        text: Some("audit".to_string()),
+        actor: actor.map(str::to_string),
+        limit: 50,
+        page: 1,
+        ..SearchQuery::default()
+    };
+    for (actor, want) in [
+        (None, &base),
+        (Some("alice"), &alices),
+        (Some("bob"), &bobs),
+        // An actor holding nothing sees exactly what the files say, which is
+        // also the answer for every account that never drafted here.
+        (Some("carol"), &base),
+    ] {
+        let page = store.search(&lexical(actor)).await.unwrap();
+        assert_eq!(rows(&page), *want, "the lexical leg, as {actor:?}");
+        assert_eq!(page.total, want.len(), "and its total, as {actor:?}");
+    }
+
+    // The filter-only leg: no text at all, so a different statement answers.
+    let filtered = |actor: Option<&str>| SearchQuery {
+        engram_type: Some("engram".to_string()),
+        actor: actor.map(str::to_string),
+        limit: 50,
+        page: 1,
+        ..SearchQuery::default()
+    };
+    for (actor, want) in [
+        (None, &base),
+        (Some("alice"), &alices),
+        (Some("bob"), &bobs),
+        (Some("carol"), &base),
+    ] {
+        let page = store.search(&filtered(actor)).await.unwrap();
+        assert_eq!(rows(&page), *want, "the filter-only leg, as {actor:?}");
+        assert_eq!(page.total, want.len(), "and its total, as {actor:?}");
+    }
+
+    // The semantic leg. A draft's chunks are written exactly as a base row's,
+    // keyed to the draft's own id, so the vector scan reaches them and the
+    // predicate is the only thing deciding whose rows come back.
+    for (id, text) in [
+        (alice_plan, "the audit gates nothing any more"),
+        (alice_fresh, "an audit of the audit itself"),
+        (bob_notes, "the audit notebook, bob's own copy"),
+    ] {
+        store
+            .replace_chunks(
+                id,
+                &[NewChunk {
+                    seq: 0,
+                    text: text.to_string(),
+                    text_hash: format!("hash-{}", id.0),
+                }],
+            )
+            .await
+            .unwrap();
+    }
+    let jobs = store
+        .chunks_needing_embedding("m8", None, EMBED_PAGE_SIZE, None)
+        .await
+        .unwrap();
+    let embedded: Vec<EmbeddingRow> = jobs
+        .iter()
+        .map(|j| EmbeddingRow {
+            chunk_id: j.chunk_id,
+            embedding: embed_one(&j.text, 8),
+            dims: 8,
+        })
+        .collect();
+    store.store_embeddings(&embedded, "m8").await.unwrap();
+
+    for (actor, want) in [
+        (None, &base),
+        (Some("alice"), &alices),
+        (Some("bob"), &bobs),
+        (Some("carol"), &base),
+    ] {
+        let page = store
+            .search(&SearchQuery {
+                actor: actor.map(str::to_string),
+                limit: 50,
+                ..semantic_query("audit", 8, "m8")
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows(&page), *want, "the semantic leg, as {actor:?}");
+    }
+}
+parity!(
+    search_serves_base_plus_own_overlay_with_shadowing,
+    search_across_the_actor_dimension
+);
+
+/// A path its author has deleted is absent from that author's own search and
+/// present in everybody else's.
+///
+/// A tombstone is a full row carrying the base row's text, so it would match
+/// the same query the base row matches; a candidate leg that forgot to exclude
+/// it would answer a deletion with the deleted engram. And it has to shadow the
+/// base row while doing so, which is the half a `tombstone = 0` in the wrong
+/// place gets backwards: filter tombstones inside the anti-join and the
+/// deletion becomes invisible, with the base row showing through as though
+/// nobody had deleted anything.
+async fn a_tombstoned_path_leaves_its_authors_search(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "a.md",
+        &engram(
+            "Ledger",
+            "a",
+            "engram",
+            "",
+            "- [fact] the ledger reconciles nightly #t\n",
+        ),
+    );
+    write(
+        root,
+        "b.md",
+        &engram(
+            "Ledger appendix",
+            "b",
+            "engram",
+            "",
+            "- [fact] the ledger appendix lists the exceptions #t\n",
+        ),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+
+    // The tombstone the engine writes: the base row's own text, its path as its
+    // permalink, and the flag. The text is what makes this sharp - it matches
+    // the query as well as the base row does.
+    let mut stone = record(
+        "a.md",
+        "a.md",
+        "- [fact] the ledger reconciles nightly #t\n",
+        "alice-a",
+    );
+    stone.title = "Ledger".to_string();
+    stone.tombstone = true;
+    store.upsert_overlay(domain, "alice", &stone).await.unwrap();
+
+    let both = vec![
+        ("a".to_string(), "Ledger".to_string()),
+        ("b".to_string(), "Ledger appendix".to_string()),
+    ];
+    let without_a = vec![("b".to_string(), "Ledger appendix".to_string())];
+
+    for (actor, want) in [
+        (None, &both),
+        (Some("alice"), &without_a),
+        (Some("bob"), &both),
+    ] {
+        let lexical = store
+            .search(&SearchQuery {
+                text: Some("ledger".to_string()),
+                actor: actor.map(str::to_string),
+                limit: 50,
+                page: 1,
+                ..SearchQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows(&lexical), *want, "the lexical leg, as {actor:?}");
+        assert_eq!(lexical.total, want.len(), "and its total, as {actor:?}");
+
+        let filtered = store
+            .search(&SearchQuery {
+                engram_type: Some("engram".to_string()),
+                actor: actor.map(str::to_string),
+                limit: 50,
+                page: 1,
+                ..SearchQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows(&filtered), *want, "the filter-only leg, as {actor:?}");
+        assert_eq!(filtered.total, want.len(), "and its total, as {actor:?}");
+    }
+}
+parity!(
+    a_tombstoned_path_is_absent_for_its_author_and_present_for_base,
+    a_tombstoned_path_leaves_its_authors_search
+);
+
+/// The lead vectors `V301` compares are one actor's view of the domain, never
+/// everybody's rows at once.
+///
+/// The sweep asks for meaning, so the rows it measures have to be the rows that
+/// reader sees: their own draft where they hold one, the team's file where they
+/// do not, and nothing at all at a path they have deleted. `None` is the base
+/// dimension alone, byte for byte the answer this method gave before the actor
+/// was a parameter, which is what an unauthenticated sweep and every
+/// pre-overlay caller gets.
+///
+/// Asserted as id sets rather than as vectors: the vector is the payload, the
+/// row set is the claim.
+async fn lead_vectors_across_the_actor_dimension(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "plan.md",
+        &engram(
+            "Rollout plan",
+            "plan",
+            "engram",
+            "",
+            "- [decision] the audit gates the rollout #t\n",
+        ),
+    );
+    write(
+        root,
+        "notes.md",
+        &engram(
+            "Field notes",
+            "notes",
+            "engram",
+            "",
+            "- [fact] the audit notebook stays open #t\n",
+        ),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+    let base: HashMap<String, EngramId> = store
+        .list_engrams("d", None, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|d| (d.path, d.id))
+        .collect();
+
+    let alice_plan = draft(
+        store,
+        domain,
+        "alice",
+        "plan.md",
+        &engram(
+            "Rollout plan, revised",
+            "plan",
+            "engram",
+            "",
+            "- [decision] the audit gates nothing any more #t\n",
+        ),
+    )
+    .await;
+    let alice_fresh = draft(
+        store,
+        domain,
+        "alice",
+        "fresh.md",
+        &engram(
+            "Fresh idea",
+            "fresh",
+            "engram",
+            "",
+            "- [idea] an audit of the audit itself #t\n",
+        ),
+    )
+    .await;
+    let bob_notes = draft(
+        store,
+        domain,
+        "bob",
+        "notes.md",
+        &engram(
+            "Bob's notes",
+            "notes",
+            "engram",
+            "",
+            "- [fact] the audit notebook, bob's own copy #t\n",
+        ),
+    )
+    .await;
+    // Alice deleted the field notes. The tombstone carries the base row's own
+    // text, so a screen that only excluded the row would still hand the sweep
+    // the base row's meaning at a path she says is gone.
+    let mut stone = record(
+        "notes.md",
+        "notes.md",
+        "- [fact] the audit notebook stays open #t\n",
+        "alice-notes",
+    );
+    stone.title = "Field notes".to_string();
+    stone.tombstone = true;
+    let alice_stone = store.upsert_overlay(domain, "alice", &stone).await.unwrap();
+
+    // Every row gets a lead chunk and an embedding, the tombstone included, so
+    // nothing below is quiet for want of a vector.
+    for (id, text) in [
+        (base["plan.md"], "the audit gates the rollout"),
+        (base["notes.md"], "the audit notebook stays open"),
+        (alice_plan, "the audit gates nothing any more"),
+        (alice_fresh, "an audit of the audit itself"),
+        (bob_notes, "the audit notebook, bob's own copy"),
+        (alice_stone, "the audit notebook stays open"),
+    ] {
+        store
+            .replace_chunks(
+                id,
+                &[NewChunk {
+                    seq: 0,
+                    text: text.to_string(),
+                    text_hash: format!("hash-{}", id.0),
+                }],
+            )
+            .await
+            .unwrap();
+    }
+    let jobs = store
+        .chunks_needing_embedding("m8", None, EMBED_PAGE_SIZE, None)
+        .await
+        .unwrap();
+    let embedded: Vec<EmbeddingRow> = jobs
+        .iter()
+        .map(|j| EmbeddingRow {
+            chunk_id: j.chunk_id,
+            embedding: embed_one(&j.text, 8),
+            dims: 8,
+        })
+        .collect();
+    store.store_embeddings(&embedded, "m8").await.unwrap();
+
+    let ids = |vectors: Vec<crystalline_index::LeadVector>| {
+        let mut out: Vec<i64> = vectors.into_iter().map(|lv| lv.engram_id.0).collect();
+        out.sort();
+        out
+    };
+    let sorted = |v: Vec<EngramId>| {
+        let mut out: Vec<i64> = v.into_iter().map(|id| id.0).collect();
+        out.sort();
+        out
+    };
+
+    for (actor, want) in [
+        (None, sorted(vec![base["plan.md"], base["notes.md"]])),
+        // Her draft stands in for the plan, her fresh idea joins, and the path
+        // she deleted contributes nothing - not the base row and not the
+        // tombstone's inherited text.
+        (Some("alice"), sorted(vec![alice_plan, alice_fresh])),
+        (Some("bob"), sorted(vec![bob_notes, base["plan.md"]])),
+        // An account that drafted nothing here reads the files, like nobody.
+        (
+            Some("carol"),
+            sorted(vec![base["plan.md"], base["notes.md"]]),
+        ),
+    ] {
+        let got = store.lead_vectors(domain, "m8", actor).await.unwrap();
+        assert_eq!(ids(got), want, "the lead vectors, as {actor:?}");
+    }
+
+    // The vectors themselves still arrive intact, and they are the drafted
+    // text rather than the file's.
+    let alices = store
+        .lead_vectors(domain, "m8", Some("alice"))
+        .await
+        .unwrap();
+    let revised = alices
+        .iter()
+        .find(|lv| lv.engram_id == alice_plan)
+        .expect("her draft of the plan carries a vector");
+    assert_eq!(revised.dims, 8);
+    assert_eq!(
+        revised.vector,
+        embed_one("the audit gates nothing any more", 8),
+        "the vector is the one her draft's lead chunk was embedded as"
+    );
+}
+parity!(
+    lead_vectors_answer_the_actors_shadowed_view,
+    lead_vectors_across_the_actor_dimension
+);
+
+/// The graph a reader walks is their own view of the domain: their drafts'
+/// edges, the team's edges everywhere they hold no draft, and nothing of
+/// anybody else's.
+///
+/// Both ends of every edge are screened, not just the node hydrate, because an
+/// edge reaching INTO a draft is as far outside that reader's graph as one
+/// leaving it - and a frontier that walked it would push the draft's id into
+/// the visited set and pull base engrams into the neighbourhood through
+/// somebody else's private draft.
+///
+/// `None` is the base graph alone, the answer this traversal gave before the
+/// dimension existed, which is what every unauthenticated reader gets.
+async fn neighbors_across_the_actor_dimension(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "plan.md",
+        &engram(
+            "Rollout plan",
+            "plan",
+            "engram",
+            "",
+            "- relates_to [[notes]]\n",
+        ),
+    );
+    write(
+        root,
+        "notes.md",
+        &engram("Field notes", "notes", "engram", "", "plain\n"),
+    );
+    write(
+        root,
+        "audit.md",
+        &engram("Audit", "audit", "engram", "", "plain\n"),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+    let base_plan = store.lookup_id("d", "plan").await.unwrap().unwrap();
+    let base_notes = store.lookup_id("d", "notes").await.unwrap().unwrap();
+
+    // Her draft of the plan points somewhere else than the file does, so the
+    // base edge and the drafted edge are distinguishable rather than equal.
+    let alice_plan = draft(
+        store,
+        domain,
+        "alice",
+        "plan.md",
+        &engram(
+            "Rollout plan, revised",
+            "plan",
+            "engram",
+            "",
+            "- relates_to [[audit]]\n",
+        ),
+    )
+    .await;
+    let alice_fresh = draft(
+        store,
+        domain,
+        "alice",
+        "fresh.md",
+        &engram(
+            "Fresh idea",
+            "fresh",
+            "engram",
+            "",
+            "- relates_to [[notes]]\n",
+        ),
+    )
+    .await;
+    let bob_own = draft(
+        store,
+        domain,
+        "bob",
+        "bobs.md",
+        &engram(
+            "Bob's own",
+            "bobs",
+            "engram",
+            "",
+            "- relates_to [[notes]]\n",
+        ),
+    )
+    .await;
+    // Setup, not assertion: a draft's references settle onto real ids exactly
+    // as a base row's do, and without this every edge below would be skipped
+    // for a reason that has nothing to do with the actor.
+    store.resolve_pending_relations(domain).await.unwrap();
+    store.resolve_pending_links(domain).await.unwrap();
+
+    /// The slice as `(node permalinks, edges as permalink pairs)`, both sorted.
+    fn shape(slice: &crystalline_index::GraphSlice) -> (Vec<String>, Vec<(String, String)>) {
+        let by_id: HashMap<i64, String> = slice
+            .nodes
+            .iter()
+            .map(|n| (n.id.0, n.permalink.clone()))
+            .collect();
+        let mut names: Vec<String> = by_id.values().cloned().collect();
+        names.sort();
+        let mut edges: Vec<(String, String)> = slice
+            .edges
+            .iter()
+            .map(|e| {
+                (
+                    by_id
+                        .get(&e.from.0)
+                        .cloned()
+                        .unwrap_or_else(|| format!("no node {}", e.from.0)),
+                    by_id
+                        .get(&e.to.0)
+                        .cloned()
+                        .unwrap_or_else(|| format!("no node {}", e.to.0)),
+                )
+            })
+            .collect();
+        edges.sort();
+        (names, edges)
+    }
+
+    let plan_to_notes = (
+        vec!["notes".to_string(), "plan".to_string()],
+        vec![("plan".to_string(), "notes".to_string())],
+    );
+    // Seeded at the plan, from each end of the dimension.
+    assert_eq!(
+        shape(&store.neighbors(&[base_plan], 1, None).await.unwrap()),
+        plan_to_notes,
+        "the base graph is what the files say, for a reader who names no actor"
+    );
+    assert_eq!(
+        shape(&store.neighbors(&[base_plan], 1, Some("bob")).await.unwrap()),
+        plan_to_notes,
+        "and for an actor who holds no draft at that path"
+    );
+    assert_eq!(
+        shape(
+            &store
+                .neighbors(&[alice_plan], 1, Some("alice"))
+                .await
+                .unwrap()
+        ),
+        (
+            vec!["audit".to_string(), "plan".to_string()],
+            vec![("plan".to_string(), "audit".to_string())]
+        ),
+        "her own draft's edge is the edge she walks, not the file's"
+    );
+
+    // Seeded at the other end, which is the half a screen on one endpoint
+    // alone gets wrong.
+    assert_eq!(
+        shape(&store.neighbors(&[base_notes], 1, None).await.unwrap()),
+        plan_to_notes,
+        "nobody's draft points at the field notes as far as the files know"
+    );
+    assert_eq!(
+        shape(
+            &store
+                .neighbors(&[base_notes], 1, Some("alice"))
+                .await
+                .unwrap()
+        ),
+        (
+            vec!["fresh".to_string(), "notes".to_string()],
+            vec![("fresh".to_string(), "notes".to_string())]
+        ),
+        "her draft-only engram reaches the notes, and the plan she is drafting \
+         over does not: her view of that path is her own draft, which points \
+         elsewhere"
+    );
+    assert_eq!(
+        shape(
+            &store
+                .neighbors(&[base_notes], 1, Some("bob"))
+                .await
+                .unwrap()
+        ),
+        (
+            vec!["bobs".to_string(), "notes".to_string(), "plan".to_string()],
+            vec![
+                ("bobs".to_string(), "notes".to_string()),
+                ("plan".to_string(), "notes".to_string())
+            ]
+        ),
+        "bob walks his own draft and the team's plan, and never hers"
+    );
+    assert!(
+        !shape(
+            &store
+                .neighbors(&[base_notes], 2, Some("bob"))
+                .await
+                .unwrap()
+        )
+        .0
+        .contains(&"fresh".to_string()),
+        "and no depth reaches another actor's draft"
+    );
+    let _ = (alice_fresh, bob_own);
+
+    // A path its author deleted is not in that author's graph, so an edge into
+    // it is never walked and leaves no node behind.
+    let mut stone = record("audit.md", "audit.md", "plain\n", "alice-audit");
+    stone.title = "Audit".to_string();
+    stone.tombstone = true;
+    store.upsert_overlay(domain, "alice", &stone).await.unwrap();
+    assert_eq!(
+        shape(
+            &store
+                .neighbors(&[alice_plan], 1, Some("alice"))
+                .await
+                .unwrap()
+        ),
+        (vec!["plan".to_string()], Vec::new()),
+        "her draft stands alone once she has deleted what it points at"
+    );
+    assert_eq!(
+        shape(&store.neighbors(&[base_plan], 1, None).await.unwrap()),
+        plan_to_notes,
+        "and the team's graph never moved"
+    );
+}
+parity!(
+    neighbors_answer_the_actors_shadowed_graph,
+    neighbors_across_the_actor_dimension
+);
+
+// --- the author's own drafts as reference targets ----------------------------
+
+/// Whether one reference row bound to one particular candidate, read from
+/// outside the store's own SQL.
+///
+/// The graph frontier keys on the STORED `to_id` (`r.to_id IN (<seeds>)`)
+/// while the target hop redirects onto whatever the reader's view holds at
+/// that row's path, so seeding at a candidate and asking whether the edge
+/// comes back is the one way a test can tell which of two rows at the same
+/// address a reference actually named. Only meaningful about a reference that
+/// is bound at all - an unresolved row reaches its author's draft through the
+/// other arm - so every caller below asserts `resolved` off
+/// [`Store::outbound_refs`] with no actor first, which reads the stored column
+/// and nothing else.
+async fn binds_to(store: &dyn Store, from: EngramId, actor: Option<&str>, to: EngramId) -> bool {
+    store
+        .neighbors(&[to], 1, actor)
+        .await
+        .unwrap()
+        .edges
+        .iter()
+        .any(|e| e.from == from)
+}
+
+/// Whether every reference leaving an engram is bound to something, asked of
+/// the stored column alone.
+async fn all_bound(store: &dyn Store, from: EngramId) -> bool {
+    let refs = store.outbound_refs(from, None).await.unwrap();
+    !refs.is_empty() && refs.iter().all(|r| r.resolved)
+}
+
+/// A draft's own references resolve against its author's view: their drafts
+/// first, then the team's files.
+///
+/// The preference is the whole of it, and it is two mechanisms rather than
+/// one. Alice is drafting over `plan.md`, so `[[plan]]` written in another of
+/// her drafts means the page she is reading - her own - and not the one the
+/// folder still holds: her row stands at that path and the base row behind it
+/// is not a candidate at all. And where both ARE candidates, because her
+/// draft-only page answers to the same title as a team page at another path,
+/// hers is the one that wins - which is the ordering the screen alone cannot
+/// say. Bob is drafting nothing, so both readings mean the team's row for him,
+/// and the team's own engrams never reach either draft.
+async fn drafts_prefer_their_authors_rows(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "plan.md",
+        &engram("Rollout plan", "plan", "engram", "", "plain\n"),
+    );
+    write(
+        root,
+        "notes.md",
+        &engram("Field Notes", "notes", "engram", "", "plain\n"),
+    );
+    write(
+        root,
+        "charter.md",
+        &engram(
+            "Charter",
+            "charter",
+            "engram",
+            "",
+            "- relates_to [[plan]]\n",
+        ),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+    let base_plan = store.lookup_id("d", "plan").await.unwrap().unwrap();
+    let base_notes = store.lookup_id("d", "notes").await.unwrap().unwrap();
+    let charter = store.lookup_id("d", "charter").await.unwrap().unwrap();
+
+    let alice_plan = draft(
+        store,
+        domain,
+        "alice",
+        "plan.md",
+        &engram("Rollout plan, revised", "plan", "engram", "", "plain\n"),
+    )
+    .await;
+    // A page of her own at a path no file holds, answering to the SAME title
+    // the team's field notes answer to. Both are candidates in her view, so
+    // which of the two a title reading lands on is the preference and nothing
+    // else.
+    let alice_notes = draft(
+        store,
+        domain,
+        "alice",
+        "her-notes.md",
+        &engram("Field Notes", "her-notes", "engram", "", "plain\n"),
+    )
+    .await;
+    let alice_fresh = draft(
+        store,
+        domain,
+        "alice",
+        "fresh.md",
+        &engram(
+            "Fresh idea",
+            "fresh",
+            "engram",
+            "",
+            "- relates_to [[plan]]\n- cites [[Field Notes]]\n",
+        ),
+    )
+    .await;
+    let bob_own = draft(
+        store,
+        domain,
+        "bob",
+        "bobs.md",
+        &engram(
+            "Bob's own",
+            "bobs",
+            "engram",
+            "",
+            "- relates_to [[plan]]\n- cites [[Field Notes]]\n",
+        ),
+    )
+    .await;
+
+    // Each author's rows, resolved in that author's view - which is what the
+    // overlay write path does for the row it has just written.
+    assert!(
+        store
+            .reresolve_actor_references(domain, "alice")
+            .await
+            .unwrap()
+            > 0
+    );
+    assert!(
+        store
+            .reresolve_actor_references(domain, "bob")
+            .await
+            .unwrap()
+            > 0
+    );
+
+    assert!(
+        all_bound(store, alice_fresh).await,
+        "her reference is bound to something"
+    );
+    assert!(
+        binds_to(store, alice_fresh, Some("alice"), alice_plan).await,
+        "and the something is her own draft of the plan, not the file she is redrafting"
+    );
+    assert!(
+        !binds_to(store, alice_fresh, Some("alice"), base_plan).await,
+        "the base row at that address is the fallback, and she did not fall back to it"
+    );
+    assert!(
+        binds_to(store, alice_fresh, Some("alice"), alice_notes).await,
+        "and where her page and the team's answer to one title, hers is the one \
+         her own draft means"
+    );
+    assert!(
+        !binds_to(store, alice_fresh, Some("alice"), base_notes).await,
+        "the team's page at that title is the fallback and she did not fall back \
+         to it either"
+    );
+
+    assert!(
+        all_bound(store, bob_own).await,
+        "his references are bound too"
+    );
+    assert!(
+        binds_to(store, bob_own, Some("bob"), base_plan).await,
+        "to the team's row, because he holds none of his own at that path"
+    );
+    assert!(
+        binds_to(store, bob_own, Some("bob"), base_notes).await,
+        "and to the team's field notes, because hers are hers"
+    );
+
+    assert!(
+        binds_to(store, charter, None, base_plan).await,
+        "and the team's own charter points where it always did"
+    );
+
+    // An empty actor is the base row's key, so a pass that took one would be
+    // the whole dimension's one forbidden write read backwards.
+    assert!(matches!(
+        store.reresolve_actor_references(domain, "").await,
+        Err(IndexError::Constraint(_))
+    ));
+}
+parity!(
+    a_drafts_reference_binds_the_authors_own_row_before_the_base,
+    drafts_prefer_their_authors_rows
+);
+
+/// A path its author has deleted answers nothing they write.
+///
+/// A tombstone is a row saying an engram is gone, so it is never a candidate,
+/// and the base row it deletes is gone for that author too. Their reference
+/// stays unbound rather than falling through to the row they deleted, which
+/// would be the deletion undone by a link.
+async fn a_tombstoned_path_answers_nothing(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "plan.md",
+        &engram("Rollout plan", "plan", "engram", "", "plain\n"),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+    let base_plan = store.lookup_id("d", "plan").await.unwrap().unwrap();
+
+    let mut stone = record("plan.md", "plan.md", "plain\n", "alice-plan");
+    stone.title = "Rollout plan".to_string();
+    stone.tombstone = true;
+    store.upsert_overlay(domain, "alice", &stone).await.unwrap();
+
+    let alice_fresh = draft(
+        store,
+        domain,
+        "alice",
+        "fresh.md",
+        &engram(
+            "Fresh idea",
+            "fresh",
+            "engram",
+            "",
+            "- relates_to [[plan]]\n",
+        ),
+    )
+    .await;
+    let bob_own = draft(
+        store,
+        domain,
+        "bob",
+        "bobs.md",
+        &engram("Bob's own", "bobs", "engram", "", "- relates_to [[plan]]\n"),
+    )
+    .await;
+    store
+        .reresolve_actor_references(domain, "alice")
+        .await
+        .unwrap();
+    store
+        .reresolve_actor_references(domain, "bob")
+        .await
+        .unwrap();
+
+    assert!(
+        !all_bound(store, alice_fresh).await,
+        "her link names a page she has deleted, so it names nothing"
+    );
+    assert!(
+        all_bound(store, bob_own).await,
+        "and his names the page the team still holds"
+    );
+    assert!(
+        binds_to(store, bob_own, Some("bob"), base_plan).await,
+        "which is the base row, exactly as before anybody drafted a deletion"
+    );
+}
+parity!(
+    a_drafts_reference_never_binds_a_path_its_author_tombstoned,
+    a_tombstoned_path_answers_nothing
+);
+
+/// Every reading the resolver tries, tried inside the author's view: the
+/// target as a permalink, as a title, and - when the prefix names no domain -
+/// the whole bracket text as a permalink and then as a title at home.
+///
+/// The colon form is the one that matters most here, because it is the form
+/// the sweep's own draft pass never covered: `[[Log: Weekly]]` splits like
+/// `[[domain:Target]]` and only the registry settles it, so a draft-only page
+/// with that title is reachable from its author's other draft exactly as a
+/// base page with that title is reachable from the base.
+async fn draft_targets_answer_every_form(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "seed.md",
+        &engram("Seed", "seed", "engram", "", "plain\n"),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+
+    // A draft-only page whose title carries a colon, and a second one that
+    // does not, so the plain title arm and the whole-bracket arm are told
+    // apart rather than covered by one answer.
+    draft(
+        store,
+        domain,
+        "alice",
+        "log-weekly.md",
+        "---\ntype: engram\ntitle: 'Log: Weekly'\npermalink: log-weekly\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Log: Weekly\n\nWhat the week did.\n",
+    )
+    .await;
+    draft(
+        store,
+        domain,
+        "alice",
+        "notes.md",
+        &engram("Field Notes", "field-notes", "engram", "", "plain\n"),
+    )
+    .await;
+    // The whole-bracket-as-a-permalink arm, which needs a permalink that
+    // carries the colon itself. Written as a record rather than parsed,
+    // because nothing that slugifies a title produces one.
+    let mut odd = record("odd.md", "Ledger: Ledgers", "plain\n", "alice-odd");
+    odd.title = "Something else".to_string();
+    store.upsert_overlay(domain, "alice", &odd).await.unwrap();
+
+    let alice_fresh = draft(
+        store,
+        domain,
+        "alice",
+        "fresh.md",
+        &engram(
+            "Fresh idea",
+            "fresh",
+            "engram",
+            "",
+            "- a [[log-weekly]]\n- b [[Field Notes]]\n- c [[Log: Weekly]]\n- d [[Ledger: Ledgers]]\n",
+        ),
+    )
+    .await;
+    store
+        .reresolve_actor_references(domain, "alice")
+        .await
+        .unwrap();
+
+    let shape: Vec<(String, bool)> = store
+        .outbound_refs(alice_fresh, None)
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| (r.to_target.clone(), r.resolved))
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            ("log-weekly".to_string(), true),
+            ("Field Notes".to_string(), true),
+            ("Weekly".to_string(), true),
+            ("Ledgers".to_string(), true),
+        ],
+        "all four readings answer inside her own view"
+    );
+
+    // And none of them answers anybody else: the pages are hers alone.
+    let bob_own = draft(
+        store,
+        domain,
+        "bob",
+        "bobs.md",
+        &engram(
+            "Bob's own",
+            "bobs",
+            "engram",
+            "",
+            "- a [[log-weekly]]\n- b [[Field Notes]]\n- c [[Log: Weekly]]\n- d [[Ledger: Ledgers]]\n",
+        ),
+    )
+    .await;
+    store
+        .reresolve_actor_references(domain, "bob")
+        .await
+        .unwrap();
+    assert!(
+        store
+            .outbound_refs(bob_own, None)
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| !r.resolved),
+        "her drafts are no reference target of his, in any of the four forms"
+    );
+}
+parity!(
+    a_drafts_reference_binds_by_title_and_by_the_colon_form_inside_the_view,
+    draft_targets_answer_every_form
+);
+
+/// One graph slice as `(node permalinks with the draft marker, edges as
+/// permalink pairs)`, both sorted: what a reader would see drawn, with no
+/// opaque id in it.
+fn drawn(slice: &crystalline_index::GraphSlice) -> (Vec<String>, Vec<(String, String)>) {
+    let by_id: HashMap<i64, String> = slice
+        .nodes
+        .iter()
+        .map(|n| {
+            let mark = if n.actor.is_empty() { "" } else { "*" };
+            (n.id.0, format!("{}{mark}", n.permalink))
+        })
+        .collect();
+    let mut names: Vec<String> = by_id.values().cloned().collect();
+    names.sort();
+    let mut edges: Vec<(String, String)> = slice
+        .edges
+        .iter()
+        .map(|e| {
+            let name = |id: i64| {
+                by_id
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_else(|| format!("no node {id}"))
+            };
+            (name(e.from.0), name(e.to.0))
+        })
+        .collect();
+    edges.sort();
+    (names, edges)
+}
+
+/// A base edge is read at the reader's own address map: it lands on their
+/// draft of the target when they hold one.
+///
+/// The edge itself is the team's, written in a file neither reader has
+/// touched. What differs is where it arrives, and it arrives at whatever each
+/// reader holds at the target's path: her draft for her, the file for everyone
+/// else.
+async fn base_edges_land_on_the_readers_row(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "plan.md",
+        &engram("Rollout plan", "plan", "engram", "", "plain\n"),
+    );
+    write(
+        root,
+        "charter.md",
+        &engram(
+            "Charter",
+            "charter",
+            "engram",
+            "",
+            "- relates_to [[plan]]\n",
+        ),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+    let charter = store.lookup_id("d", "charter").await.unwrap().unwrap();
+
+    draft(
+        store,
+        domain,
+        "alice",
+        "plan.md",
+        &engram("Rollout plan, revised", "plan", "engram", "", "plain\n"),
+    )
+    .await;
+
+    let base = (
+        vec!["charter".to_string(), "plan".to_string()],
+        vec![("charter".to_string(), "plan".to_string())],
+    );
+    assert_eq!(
+        drawn(&store.neighbors(&[charter], 1, None).await.unwrap()),
+        base,
+        "the team's graph is the team's files, and no draft is marked in it"
+    );
+    assert_eq!(
+        drawn(&store.neighbors(&[charter], 1, Some("bob")).await.unwrap()),
+        base,
+        "and it is what a reader drafting nothing there walks"
+    );
+    assert_eq!(
+        drawn(&store.neighbors(&[charter], 1, Some("alice")).await.unwrap()),
+        (
+            vec!["charter".to_string(), "plan*".to_string()],
+            vec![("charter".to_string(), "plan*".to_string())]
+        ),
+        "she follows the team's own link into the page she is drafting, marked hers"
+    );
+}
+parity!(
+    neighbors_redirect_a_base_edge_onto_the_readers_draft_at_the_same_path,
+    base_edges_land_on_the_readers_row
+);
+
+/// A base edge into a path the reader has deleted arrives nowhere for them.
+///
+/// The other end of the same address map: their deletion is a deletion, so the
+/// edge has no target in their view and is not drawn at all - rather than
+/// drawn into a page they have said is gone.
+async fn base_edges_stop_at_a_readers_deletion(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "plan.md",
+        &engram("Rollout plan", "plan", "engram", "", "plain\n"),
+    );
+    write(
+        root,
+        "charter.md",
+        &engram(
+            "Charter",
+            "charter",
+            "engram",
+            "",
+            "- relates_to [[plan]]\n",
+        ),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+    let charter = store.lookup_id("d", "charter").await.unwrap().unwrap();
+
+    let mut stone = record("plan.md", "plan.md", "plain\n", "alice-plan");
+    stone.title = "Rollout plan".to_string();
+    stone.tombstone = true;
+    store.upsert_overlay(domain, "alice", &stone).await.unwrap();
+
+    assert_eq!(
+        drawn(&store.neighbors(&[charter], 1, Some("alice")).await.unwrap()),
+        (vec!["charter".to_string()], Vec::new()),
+        "the charter stands alone for her: it points at a page she has deleted"
+    );
+    assert_eq!(
+        drawn(&store.neighbors(&[charter], 1, Some("bob")).await.unwrap()),
+        (
+            vec!["charter".to_string(), "plan".to_string()],
+            vec![("charter".to_string(), "plan".to_string())]
+        ),
+        "and her deletion is hers: nobody else's graph moved"
+    );
+}
+parity!(
+    neighbors_drop_a_base_edge_into_a_path_the_reader_tombstoned,
+    base_edges_stop_at_a_readers_deletion
+);
+
+/// A base link nobody could answer is answered by the reader's own draft.
+///
+/// The team's charter names a page that does not exist. Alice writes it, as a
+/// draft: for her the link now lands, and the traversal walks it, because her
+/// view is a view of the same domain rather than a second graph beside it.
+/// For everybody else the link still dangles.
+async fn unresolved_base_edges_reach_the_readers_draft(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "charter.md",
+        &engram(
+            "Charter",
+            "charter",
+            "engram",
+            "",
+            "- relates_to [[Nobody Wrote This]]\n\nAnd [[Nobody Wrote This]] in prose.\n",
+        ),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+    let charter = store.lookup_id("d", "charter").await.unwrap().unwrap();
+
+    draft(
+        store,
+        domain,
+        "alice",
+        "wrote-it.md",
+        &engram("Nobody Wrote This", "wrote-it", "engram", "", "plain\n"),
+    )
+    .await;
+
+    assert_eq!(
+        drawn(&store.neighbors(&[charter], 1, Some("alice")).await.unwrap()),
+        (
+            vec!["charter".to_string(), "wrote-it*".to_string()],
+            vec![
+                ("charter".to_string(), "wrote-it*".to_string()),
+                ("charter".to_string(), "wrote-it*".to_string()),
+            ]
+        ),
+        "the relation and the prose link both arrive at the page she wrote"
+    );
+    for reader in [None, Some("bob")] {
+        assert_eq!(
+            drawn(&store.neighbors(&[charter], 1, reader).await.unwrap()),
+            (vec!["charter".to_string()], Vec::new()),
+            "and for {reader:?} the charter still names a page nobody wrote"
+        );
+    }
+}
+parity!(
+    neighbors_walk_an_unresolved_base_edge_onto_the_readers_own_draft,
+    unresolved_base_edges_reach_the_readers_draft
+);
+
+/// The team's own graph is the team's own graph, whatever anybody is drafting.
+///
+/// Two domains with byte-identical files, one of them full of drafts. A
+/// traversal that names no actor answers the same slice over both, node for
+/// node and edge for edge, and every node comes back with an empty `actor` -
+/// which is what makes every statement's `None` arm the statement that was
+/// there before this dimension existed.
+async fn a_draftless_reader_sees_the_files(store: &dyn Store) {
+    let files = |root: &Path| {
+        write(
+            root,
+            "plan.md",
+            &engram("Rollout plan", "plan", "engram", "", "plain\n"),
+        );
+        write(
+            root,
+            "charter.md",
+            &engram(
+                "Charter",
+                "charter",
+                "engram",
+                "",
+                "- relates_to [[plan]]\n- cites [[Nobody Wrote This]]\n",
+            ),
+        );
+    };
+    let quiet_dir = tempfile::tempdir().unwrap();
+    files(quiet_dir.path());
+    sync_domain(store, "quiet", quiet_dir.path()).await.unwrap();
+
+    let busy_dir = tempfile::tempdir().unwrap();
+    files(busy_dir.path());
+    sync_domain(store, "busy", busy_dir.path()).await.unwrap();
+    let busy = store
+        .upsert_domain(
+            "busy",
+            Some(&busy_dir.path().to_string_lossy()),
+            DomainKind::File,
+        )
+        .await
+        .unwrap();
+
+    // Every shape of draft at once: over a base row, at a path no file holds,
+    // a deletion, and a page that answers the charter's dangling link.
+    draft(
+        store,
+        busy,
+        "alice",
+        "plan.md",
+        &engram(
+            "Rollout plan, revised",
+            "plan",
+            "engram",
+            "",
+            "- relates_to [[Nobody Wrote This]]\n",
+        ),
+    )
+    .await;
+    draft(
+        store,
+        busy,
+        "alice",
+        "wrote-it.md",
+        &engram(
+            "Nobody Wrote This",
+            "wrote-it",
+            "engram",
+            "",
+            "- relates_to [[plan]]\n",
+        ),
+    )
+    .await;
+    let mut stone = record("charter.md", "charter.md", "plain\n", "bob-charter");
+    stone.title = "Charter".to_string();
+    stone.tombstone = true;
+    store.upsert_overlay(busy, "bob", &stone).await.unwrap();
+    store
+        .reresolve_actor_references(busy, "alice")
+        .await
+        .unwrap();
+
+    async fn seeds(store: &dyn Store, domain: &str) -> Vec<EngramId> {
+        vec![
+            store.lookup_id(domain, "charter").await.unwrap().unwrap(),
+            store.lookup_id(domain, "plan").await.unwrap().unwrap(),
+        ]
+    }
+    let quiet_slice = store
+        .neighbors(&seeds(store, "quiet").await, 2, None)
+        .await
+        .unwrap();
+    let busy_slice = store
+        .neighbors(&seeds(store, "busy").await, 2, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        drawn(&quiet_slice),
+        drawn(&busy_slice),
+        "a domain full of drafts answers a reader who names no actor exactly as \
+         one with none does"
+    );
+    assert!(
+        busy_slice.nodes.iter().all(|n| n.actor.is_empty()),
+        "and every node in it is the team's own row"
+    );
+}
+parity!(
+    neighbors_with_no_actor_are_unchanged_by_every_draft_in_the_store,
+    a_draftless_reader_sees_the_files
+);
+
+/// Both reference reports answer the reader rather than the domain: a link
+/// into a path they deleted dangles for them, a dangling link their own draft
+/// answers lands for them, and a reader who names no actor gets neither
+/// reading.
+async fn reference_reports_answer_the_view(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "plan.md",
+        &engram("Rollout plan", "plan", "engram", "", "plain\n"),
+    );
+    write(
+        root,
+        "charter.md",
+        &engram(
+            "Charter",
+            "charter",
+            "engram",
+            "",
+            "- relates_to [[plan]]\n- cites [[Nobody Wrote This]]\n",
+        ),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+    let charter = store.lookup_id("d", "charter").await.unwrap().unwrap();
+
+    let mut stone = record("plan.md", "plan.md", "plain\n", "alice-plan");
+    stone.title = "Rollout plan".to_string();
+    stone.tombstone = true;
+    store.upsert_overlay(domain, "alice", &stone).await.unwrap();
+    draft(
+        store,
+        domain,
+        "alice",
+        "wrote-it.md",
+        &engram(
+            "Nobody Wrote This",
+            "wrote-it",
+            "engram",
+            "",
+            "- relates_to [[Still Nobody]]\n",
+        ),
+    )
+    .await;
+    store
+        .reresolve_actor_references(domain, "alice")
+        .await
+        .unwrap();
+
+    let verdicts = |refs: Vec<crystalline_index::OutboundRef>| -> Vec<(String, bool)> {
+        refs.into_iter()
+            .map(|r| (r.to_target, r.resolved))
+            .collect()
+    };
+    assert_eq!(
+        verdicts(store.outbound_refs(charter, None).await.unwrap()),
+        vec![
+            ("plan".to_string(), true),
+            ("Nobody Wrote This".to_string(), false)
+        ],
+        "the team's own reading of the team's own page"
+    );
+    assert_eq!(
+        verdicts(store.outbound_refs(charter, Some("bob")).await.unwrap()),
+        vec![
+            ("plan".to_string(), true),
+            ("Nobody Wrote This".to_string(), false)
+        ],
+        "and a reader drafting nothing reads it the same way"
+    );
+    assert_eq!(
+        verdicts(store.outbound_refs(charter, Some("alice")).await.unwrap()),
+        vec![
+            ("plan".to_string(), false),
+            ("Nobody Wrote This".to_string(), true)
+        ],
+        "hers is the other way round on both: she deleted the one and wrote the other"
+    );
+
+    let dangling = |refs: Vec<crystalline_index::UnresolvedRef>| -> Vec<String> {
+        refs.into_iter().map(|r| r.target).collect()
+    };
+    assert_eq!(
+        dangling(store.unresolved_refs(domain, None).await.unwrap()),
+        vec!["Nobody Wrote This".to_string()],
+        "the domain's own queue is what its files leave dangling"
+    );
+    assert_eq!(
+        dangling(store.unresolved_refs(domain, Some("bob")).await.unwrap()),
+        vec!["Nobody Wrote This".to_string()],
+        "and a reader holding no draft reads that queue"
+    );
+    assert_eq!(
+        dangling(store.unresolved_refs(domain, Some("alice")).await.unwrap()),
+        vec!["plan".to_string(), "Still Nobody".to_string()],
+        "hers holds what her deletion broke and what her own draft leaves \
+         dangling, and not the link she answered"
+    );
+}
+parity!(
+    outbound_and_unresolved_refs_answer_the_actors_view,
+    reference_reports_answer_the_view
+);
+
+/// Re-resolving one actor's references is two halves of one sentence: what
+/// dangles is unbound, and what is pending is bound in that actor's view.
+///
+/// The case it exists for is a draft that goes away. Her `fresh.md` pointed at
+/// her draft of the plan; dropping that draft leaves the reference naming a
+/// row nobody holds, and the pass puts it back onto the team's own row at the
+/// same address - which is what she is reading there now.
+async fn reresolution_follows_the_row(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "plan.md",
+        &engram("Rollout plan", "plan", "engram", "", "plain\n"),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+    let base_plan = store.lookup_id("d", "plan").await.unwrap().unwrap();
+
+    let alice_plan = draft(
+        store,
+        domain,
+        "alice",
+        "plan.md",
+        &engram("Rollout plan, revised", "plan", "engram", "", "plain\n"),
+    )
+    .await;
+    let alice_fresh = draft(
+        store,
+        domain,
+        "alice",
+        "fresh.md",
+        &engram(
+            "Fresh idea",
+            "fresh",
+            "engram",
+            "",
+            "- relates_to [[plan]]\n",
+        ),
+    )
+    .await;
+    store
+        .reresolve_actor_references(domain, "alice")
+        .await
+        .unwrap();
+    assert!(
+        binds_to(store, alice_fresh, Some("alice"), alice_plan).await,
+        "it starts out naming her own draft"
+    );
+
+    store
+        .clear_overlay_entry(domain, "alice", "plan.md")
+        .await
+        .unwrap();
+    assert!(
+        store
+            .reresolve_actor_references(domain, "alice")
+            .await
+            .unwrap()
+            > 0,
+        "the pass reports the reference it bound"
+    );
+    assert!(
+        all_bound(store, alice_fresh).await,
+        "her link is bound again"
+    );
+    assert!(
+        binds_to(store, alice_fresh, Some("alice"), base_plan).await,
+        "and it names the team's row, which is the page she reads there now"
+    );
+}
+parity!(
+    reresolving_an_actors_references_unbinds_what_dangles_and_binds_what_is_pending,
+    reresolution_follows_the_row
+);
+
+/// The vocabulary is the team's everywhere a person is shown it, and the
+/// reader's own only where a finding is about what they wrote.
+///
+/// Alice's draft replaces the team's page at that path, so in her view the tag
+/// the team agreed on is not there and the one she is trying out is - which is
+/// what makes a drift finding about her draft honest. Asked with no actor, the
+/// same six scans answer what the domain's own files say, whoever is drafting.
+async fn vocabulary_across_the_actor_dimension(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "plan.md",
+        "---\ntype: engram\ntitle: Rollout plan\npermalink: plan\ntags:\n  - database\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# Rollout plan\n\n- [decision] the team agreed #database\n- shipped_with [[nowhere]]\n",
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+
+    draft(
+        store,
+        domain,
+        "alice",
+        "plan.md",
+        "---\ntype: guide\ntitle: Rollout plan\npermalink: plan\ntags:\n  - data-base\nstatus: draft\nrecorded_at: 2026-01-01\n---\n\n# Rollout plan\n\n- [ruling] she is trying a word out #data-base\n- supersedes [[nowhere]]\n",
+    )
+    .await;
+
+    let names =
+        |counts: &[NamedCount]| -> Vec<String> { counts.iter().map(|c| c.name.clone()).collect() };
+    let tags = |counts: &[crystalline_index::TagCount]| -> Vec<String> {
+        counts.iter().map(|c| c.name.clone()).collect()
+    };
+    let team = store.vocabulary(Some("d"), None).await.unwrap();
+    assert_eq!(tags(&team.tags), vec!["database".to_string()]);
+    assert_eq!(names(&team.categories), vec!["decision".to_string()]);
+    assert_eq!(
+        names(&team.relation_types),
+        vec!["shipped_with".to_string()]
+    );
+    assert_eq!(names(&team.types), vec!["engram".to_string()]);
+    assert_eq!(names(&team.statuses), vec!["stable".to_string()]);
+
+    let hers = store.vocabulary(Some("d"), Some("alice")).await.unwrap();
+    assert_eq!(tags(&hers.tags), vec!["data-base".to_string()]);
+    assert_eq!(names(&hers.categories), vec!["ruling".to_string()]);
+    assert_eq!(names(&hers.relation_types), vec!["supersedes".to_string()]);
+    assert_eq!(names(&hers.types), vec!["guide".to_string()]);
+    assert_eq!(names(&hers.statuses), vec!["draft".to_string()]);
+
+    let bobs = store.vocabulary(Some("d"), Some("bob")).await.unwrap();
+    assert_eq!(
+        tags(&bobs.tags),
+        tags(&team.tags),
+        "and a reader drafting nothing reads the team's list"
+    );
+}
+parity!(
+    vocabulary_reads_the_actors_view_when_asked_and_the_teams_when_not,
+    vocabulary_across_the_actor_dimension
+);
+
+/// Every statement that reads the `engram` table says which actor's rows it
+/// means, or says in as many words that it means all of them.
+///
+/// A source scan rather than a behavioural assertion, because the failure this
+/// guards against is one a new statement introduces, not one an existing test
+/// exercises: the moment a read forgets the predicate, an actor's private draft
+/// leaks into somebody else's answer, and no existing test would notice because
+/// no existing test has a draft in it. Two cases are allowed and there is no
+/// third. Either the statement carries the base predicate (`actor = ''`, or a
+/// bound actor for the overlay verbs), or it carries a `-- actor: all` waiver
+/// saying in one line why it means every actor's rows.
+///
+/// `engram_tag` is not this table and is skipped: it has no actor column, and a
+/// predicate on it would not compile in either dialect. Writes are scanned
+/// alongside reads, because a `DELETE` that forgets the predicate destroys a
+/// draft rather than merely leaking one.
+///
+/// **What this scan structurally cannot see, and what covers it instead.** A
+/// draft's `relation`, `link`, `observation`, `engram_tag` and `chunk` rows are
+/// written exactly as a base row's, so a statement that stops at one of those
+/// tables reaches a draft's children without ever naming `engram` - and this
+/// scan would never know. Every such statement that feeds a base-facing answer
+/// has been given a join onto `engram` for exactly that reason, which is what
+/// puts it back inside this census (the graph frontier in both `search.rs`,
+/// `domain_stats`' four edge counts, and `vocabulary`'s unscoped branches and
+/// its relation-type scan). The behavioural counterpart is
+/// `a_draft_never_reaches_a_base_count_or_the_base_graph`, which gives a draft
+/// child rows of every kind and then asks those surfaces; a new statement over
+/// a child table alone needs that test extended, not this one.
+#[test]
+fn every_engram_reading_sql_carries_an_actor_predicate() {
+    let files: &[(&str, &str)] = &[
+        ("turso/mod.rs", include_str!("../../src/turso/mod.rs")),
+        ("postgres/mod.rs", include_str!("../../src/postgres/mod.rs")),
+        ("turso/search.rs", include_str!("../../src/turso/search.rs")),
+        (
+            "postgres/search.rs",
+            include_str!("../../src/postgres/search.rs"),
+        ),
+        ("store.rs", include_str!("../../src/store.rs")),
+    ];
+    let census = census_engram_statements(files);
+    assert!(
+        census.failures.is_empty(),
+        "these statements read the engram table without saying whose rows they mean, \
+         and carry no waiver either:\n{}",
+        census.failures.join("\n")
+    );
+    assert_eq!(
+        census.sites, 166,
+        "the engram statement census moved; every new one needs a predicate or a waiver. \
+         67 per backend in mod.rs (the guarded compare of `upsert_engram_checked` is the \
+         newest, on the base row; before it the two `EXISTS` probes of the contradiction \
+         pair write, waived by id; before them the emptiness probe of \
+         `drop_empty_domain_row`, waived because a draft keeps the row too; before it the URL half \
+         of `engrams_referencing_domains`, the move's `readdress_engram` and \
+         `engrams_mentioning`, all three on the base rows), 9 per backend in search.rs, 14 in the shared \
+         statement builders in store.rs: the reference-resolution expression's four \
+         arms, the three engram hops of each of the two graph frontiers, the two \
+         arms of the edge half of `engrams_referencing_domains` and the two arms of \
+         `spelled_references`, all four on the base rows. Those \
+         six used to be six per backend in search.rs: one copy of each frontier \
+         now, not one per dialect. One per \
+         backend in search.rs is the anti-join inside `actor_screen_on`, which asks \
+         whether the reader holds a row of their own at a base row's path - one site \
+         however many statements compose the screen. Two shapes carry no screen of \
+         their own on purpose, each sitting inside a screened statement and passing \
+         on the screen that statement carries: the `tgt` hop of the graph frontier \
+         (now in store.rs) and of the outbound verdict reads the row a reference was \
+         bound to for its address alone, with the screen on the `dst` beside it, and \
+         the dangling probe in `reresolve_actor_references` asks whether ANY row \
+         still stands at a `to_id`, since whose the vanished row was does not change \
+         that the reference now points at nothing"
+    );
+    assert_eq!(
+        census.waived, 24,
+        "the waiver list is meant to be short and deliberate; a new one needs its reason read. \
+         Twelve per backend: the two `EXISTS` probes of `replace_contradictions`' pair \
+         write, `-- actor: by id` because both ids are base rows (drafts are never \
+         scored), the emptiness probe of `drop_empty_domain_row`, where any \
+         actor's row keeps the domain, the six statements of `clear_domain` - the sixth is the one that \
+         takes the bodies out of `engram_content`, which names the rows about to go because \
+         that table has no domain of its own - the id-scoped delete inside `delete_engram` \
+         and `chunks_needing_embedding`'s domain scope, all `-- actor: all`, plus \
+         `clear_overlay_entry`'s delete, which is `-- actor: by id` because the id it \
+         names was resolved by an actor-scoped lookup two statements above"
+    );
+}
+
+/// The census above, proved on a source it is handed rather than on the one it
+/// guards: a statement whose own predicate is deleted is caught even when a
+/// neighbouring statement still carries one.
+///
+/// This is the property the line-window version did not have. Measured over
+/// the real sources at the time it was written, breaking each of the 140
+/// predicate-carrying lines one at a time, the window caught 48 and missed 92:
+/// six adjacent `domain_stats` counts, four `inbound_refs` arms and six
+/// `vocabulary` branches each passed on a neighbour's predicate from inside the
+/// same fourteen lines. Scoping the search to the statement's own parentheses
+/// catches all 140. The fixture below is that shape in miniature, so the
+/// property is checked rather than remembered.
+#[test]
+fn the_census_reads_each_statement_alone() {
+    const INTACT: &str = "\
+fn stats() {
+    let sql = \"SELECT \\
+         (SELECT count(*) FROM engram e WHERE e.domain_id=d.id AND e.actor = ''), \\
+         (SELECT count(*) FROM engram e WHERE e.domain_id=d.id AND e.actor = '' AND e.tombstone=0)\";
+}
+";
+    let intact = census_engram_statements(&[("fixture.rs", INTACT)]);
+    assert_eq!(intact.sites, 2, "two statements, two sites");
+    assert!(
+        intact.failures.is_empty(),
+        "both carry their own predicate: {:?}",
+        intact.failures
+    );
+
+    let broken = INTACT.replacen("e.domain_id=d.id AND e.actor = ''", "e.domain_id=d.id", 1);
+    let broken = census_engram_statements(&[("fixture.rs", &broken)]);
+    assert_eq!(
+        broken.failures.len(),
+        1,
+        "the statement whose predicate went is named, and its neighbour's does \
+         not stand in for it: {:?}",
+        broken.failures
+    );
+
+    // And a composed statement still passes on the fragment its own function
+    // builds, which is the one place the window is still consulted.
+    const COMPOSED: &str = "\
+fn listing() {
+    where_clauses.insert(0, \"e.actor = ''\".to_string());
+    let where_sql = format!(\"WHERE {}\", where_clauses.join(\" AND \"));
+    let sql = format!(\"SELECT e.id FROM engram e JOIN domain d ON d.id=e.domain_id {where_sql}\");
+}
+";
+    let composed = census_engram_statements(&[("fixture.rs", COMPOSED)]);
+    assert!(
+        composed.failures.is_empty(),
+        "a statement interpolating a fragment reads the lines around it: {:?}",
+        composed.failures
+    );
+}
+
+/// What [`census_engram_statements`] found.
+struct Census {
+    /// Every statement naming the `engram` table.
+    sites: usize,
+    /// How many of them answered with a waiver rather than a predicate.
+    waived: usize,
+    /// The ones that answered with neither, as `file:line: text`.
+    failures: Vec<String>,
+}
+
+/// The predicate in each of the spellings the two dialects and the bound forms
+/// use.
+const ACTOR_PREDICATES: &[&str] = &[
+    "actor = ''",
+    "actor=''",
+    "actor = ?",
+    "actor=?",
+    "actor = $",
+    "actor=$",
+    "actor=excluded",
+    // The overlay counts ask for every actor but the base one, which is as
+    // much a statement about whose rows it means as the base predicate is.
+    "actor <> ''",
+    // An insert says whose row it writes through the conflict target it names,
+    // which is the actor-aware unique index.
+    "ON CONFLICT(domain_id, path, actor)",
+    // A search candidate leg names its rows through the composed screen each
+    // backend's `actor_screen` builds: the base predicate verbatim when the
+    // search names no actor, and the shadowing form - this actor's own drafts
+    // minus tombstones, plus every base row they hold no row at - when it names
+    // one. The screen's own source is a site in this census too, and it is the
+    // one that carries the bound `actor =` spellings for both dialects.
+    "{actor_screen}",
+    // The graph frontier screens TWO ends of the `engram` table in one
+    // statement - the row an edge leaves and the row it reaches - so it names
+    // two composed screens rather than one, and the node hydrate that follows
+    // names a third. All three are built by the same `actor_screen` the search
+    // legs use, through its alias-taking form.
+    "{src_screen}",
+    "{dst_screen}",
+    "{node_screen}",
+];
+
+/// The two waiver tokens, each saying in one line why a statement means rows
+/// it does not screen: every actor's, or the one row an actor-scoped lookup
+/// already named by its id.
+const ACTOR_WAIVERS: &[&str] = &["-- actor: all", "-- actor: by id"];
+
+/// How far around a composed statement its fragment's predicate may sit, and
+/// how far around any statement its waiver may. Both are declared in the
+/// function that builds the statement rather than inside it, which is why these
+/// two questions still read a window where the predicate question does not.
+const ACTOR_WINDOW: usize = 14;
+
+/// Walk every statement that names the `engram` table and ask, of each one
+/// ALONE, whether it says whose rows it means.
+///
+/// **The unit is the statement, not a line window.** A site's scope runs from
+/// the innermost parenthesis still open before it to the one that closes it -
+/// so a subquery is its own scope and six counts in one `SELECT` are six
+/// scopes - bounded by the `;`, `{` or `}` that ends the Rust statement when no
+/// parenthesis is open. Parentheses inside a string literal count, because that
+/// is where the SQL is; `;`, `{` and `}` count only outside one, because a
+/// format placeholder is not a block.
+///
+/// Two questions still read a window of [`ACTOR_WINDOW`] lines, and both are
+/// about text that is deliberately declared beside a statement rather than
+/// inside it: a waiver, which is a comment a person wrote and whose count this
+/// census pins; and the predicate of a statement that interpolates a fragment
+/// (`{where_sql}`), where the fragment is built a few lines above. Deleting
+/// that fragment's predicate is still caught, because nothing in the window
+/// carries one afterwards.
+fn census_engram_statements(files: &[(&str, &str)]) -> Census {
+    let mut census = Census {
+        sites: 0,
+        waived: 0,
+        failures: Vec::new(),
+    };
+    for (file, src) in files {
+        let inside = string_mask(src);
+        let lines: Vec<&str> = src.lines().collect();
+        for (at, _) in src.match_indices("FROM engram").chain(
+            src.match_indices("JOIN engram")
+                .chain(src.match_indices("INTO engram"))
+                .chain(src.match_indices("UPDATE engram")),
+        ) {
+            // `engram_tag` and `engram_id` are not this table.
+            if src[at + "FROM engram".len()..].starts_with('_') {
+                continue;
+            }
+            let line_no = src[..at].matches('\n').count();
+            if lines[line_no].trim_start().starts_with("//") {
+                continue;
+            }
+            census.sites += 1;
+            let scope = statement_scope(src, &inside, at);
+            if ACTOR_PREDICATES.iter().any(|p| scope.contains(p)) {
+                continue;
+            }
+            let lo = line_no.saturating_sub(ACTOR_WINDOW);
+            let hi = (line_no + ACTOR_WINDOW + 1).min(lines.len());
+            let window = lines[lo..hi].join("\n");
+            // A composed statement carries a placeholder where its predicate
+            // would be, and the fragment behind it is built in the same
+            // function.
+            if scope.contains('{') && ACTOR_PREDICATES.iter().any(|p| window.contains(p)) {
+                continue;
+            }
+            if ACTOR_WAIVERS.iter().any(|w| window.contains(w)) {
+                census.waived += 1;
+                continue;
+            }
+            census
+                .failures
+                .push(format!("{file}:{}: {}", line_no + 1, lines[line_no].trim()));
+        }
+    }
+    census
+}
+
+/// Which bytes of a Rust source sit inside a string literal, so the scan can
+/// tell a format placeholder from a block and an SQL parenthesis from a call's.
+fn string_mask(src: &str) -> Vec<bool> {
+    let bytes = src.as_bytes();
+    let mut inside = vec![false; bytes.len()];
+    let (mut i, mut in_string, mut in_comment) = (0usize, false, false);
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_comment {
+            if c == b'\n' {
+                in_comment = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_string {
+            inside[i] = true;
+            if c == b'\\' {
+                if i + 1 < bytes.len() {
+                    inside[i + 1] = true;
+                }
+                i += 2;
+                continue;
+            }
+            if c == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if c == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            in_comment = true;
+            i += 2;
+            continue;
+        }
+        if c == b'"' {
+            in_string = true;
+            inside[i] = true;
+        }
+        i += 1;
+    }
+    inside
+}
+
+/// The statement a site stands in: see [`census_engram_statements`] for the
+/// rule and why it is the rule.
+fn statement_scope<'a>(src: &'a str, inside: &[bool], at: usize) -> &'a str {
+    let bytes = src.as_bytes();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for i in (0..at).rev() {
+        let c = bytes[i];
+        if !inside[i] && matches!(c, b';' | b'{' | b'}') {
+            start = i + 1;
+            break;
+        }
+        if c == b')' {
+            depth += 1;
+        } else if c == b'(' {
+            if depth == 0 {
+                start = i + 1;
+                break;
+            }
+            depth -= 1;
+        }
+    }
+    let mut depth = 0usize;
+    let mut end = src.len();
+    for (i, c) in bytes.iter().enumerate().skip(at) {
+        if !inside[i] && matches!(c, b';' | b'{' | b'}') && depth == 0 {
+            end = i;
+            break;
+        }
+        if *c == b'(' {
+            depth += 1;
+        } else if *c == b')' {
+            if depth == 0 {
+                end = i;
+                break;
+            }
+            depth -= 1;
+        }
+    }
+    &src[start..end]
+}
+
+/// A draft's child rows never reach a base-facing answer, even where the
+/// statement that would have to screen them never names the `engram` table.
+///
+/// `upsert_row` writes a draft's relations, links, observations, tags and
+/// chunks exactly as a base row's - that is what makes an overlay entry a full
+/// engram row rather than a second shape - so every one of those child rows is
+/// reachable from a statement that joins `relation`, `link`, `observation` or
+/// `engram_tag` and stops there. The source scan cannot see those statements at
+/// all, which is precisely why this one is behavioural: it gives a draft
+/// relation bullets, prose links, an observation with a category, a tag of its
+/// own and a type and status nobody else uses, and then asks every base-facing
+/// surface that counts or traverses them.
+///
+/// The graph is the sharpest of the three. The draft's edges resolve like any
+/// other row's (`resolve_pending_relations` scopes by domain, not by actor), so
+/// an unscreened frontier walks them, pushes the draft's id into the visited
+/// set, and the node hydrate - which does carry the predicate - then drops the
+/// node: an edge naming an id with no node, plus base engrams pulled into the
+/// neighbourhood through somebody else's private draft.
+async fn a_draft_reaches_no_base_answer_through_its_children(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "a.md",
+        &engram("A", "a", "engram", "", "- relates_to [[b]]\n"),
+    );
+    write(root, "b.md", &engram("B", "b", "engram", "", "plain\n"));
+    sync_domain(store, "d", root).await.unwrap();
+    let domain = store
+        .upsert_domain("d", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+    let a = store.lookup_id("d", "a").await.unwrap().unwrap();
+    let b = store.lookup_id("d", "b").await.unwrap().unwrap();
+
+    let base_stats = || async {
+        store
+            .domain_stats()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.name == "d")
+            .unwrap()
+    };
+    let before = base_stats().await;
+    let vocab_before = store.vocabulary(None, None).await.unwrap();
+    let scoped_before = store.vocabulary(Some("d"), None).await.unwrap();
+    let graph_before = store.neighbors(&[a], 2, None).await.unwrap();
+
+    // One draft, carrying every kind of child row a base row can carry: a
+    // relation and a prose link that both resolve onto base engrams, an
+    // observation in a category of its own, its own tag, and a type and status
+    // nobody else in the index uses.
+    let draft_body = "- [secretly] a private note #draftonly\n\n\
+                      - refers_privately [[b]]\n\n\
+                      and a prose link to [[b]] as well\n";
+    let parsed =
+        crystalline_core::parse_engram(&engram("Draft", "draft-only", "draftkind", "", draft_body))
+            .unwrap();
+    let mut draft = EngramRecord::from_engram(
+        &parsed,
+        "a.md",
+        FileStamp {
+            mtime: 0,
+            size: 0,
+            sha256: "draft".to_string(),
+        },
+    );
+    draft.status = "draftstatus".to_string();
+    store.upsert_overlay(domain, "alice", &draft).await.unwrap();
+    // Resolution runs over the whole domain, so the draft's references settle
+    // onto real ids exactly as a base row's do. This is the setup, not the
+    // assertion: without it the edges would be unresolved and the graph would
+    // skip them for a reason that has nothing to do with the actor.
+    store.resolve_pending_relations(domain).await.unwrap();
+    store.resolve_pending_links(domain).await.unwrap();
+
+    // The counts beside the two that were already predicated.
+    let after = base_stats().await;
+    assert_eq!(
+        (
+            after.engrams,
+            after.observations,
+            after.relations,
+            after.links,
+            after.unresolved_relations,
+            after.unresolved_links
+        ),
+        (
+            before.engrams,
+            before.observations,
+            before.relations,
+            before.links,
+            before.unresolved_relations,
+            before.unresolved_links
+        ),
+        "a domain holding a draft reports the counts it reported without one, \
+         edges included: `engrams: 0` beside `relations: 1` is not a domain state"
+    );
+
+    // The vocabulary, scoped and unscoped. A draft's tag, category, relation
+    // type, engram type and status are names, not just numbers.
+    for (label, vocab, before) in [
+        (
+            "all domains",
+            store.vocabulary(None, None).await.unwrap(),
+            vocab_before,
+        ),
+        (
+            "one domain",
+            store.vocabulary(Some("d"), None).await.unwrap(),
+            scoped_before,
+        ),
+    ] {
+        let names = |v: &Vocabulary| {
+            (
+                v.tags.iter().map(|t| t.name.clone()).collect::<Vec<_>>(),
+                v.categories
+                    .iter()
+                    .map(|c| c.name.clone())
+                    .collect::<Vec<_>>(),
+                v.relation_types
+                    .iter()
+                    .map(|r| r.name.clone())
+                    .collect::<Vec<_>>(),
+                v.types.iter().map(|t| t.name.clone()).collect::<Vec<_>>(),
+                v.statuses
+                    .iter()
+                    .map(|s| s.name.clone())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(
+            names(&vocab),
+            names(&before),
+            "the {label} vocabulary is what the domain's files are written in, \
+             and names nothing out of a draft"
+        );
+    }
+
+    // The graph. The seeds are base rows, so nothing the traversal returns may
+    // name the draft - and every edge it does return must have a node.
+    let graph = store.neighbors(&[a], 2, None).await.unwrap();
+    assert_eq!(
+        graph.edges.len(),
+        graph_before.edges.len(),
+        "the frontier walked no edge it did not walk before the draft existed"
+    );
+    assert_eq!(graph.nodes.len(), graph_before.nodes.len());
+    let node_ids: Vec<i64> = graph.nodes.iter().map(|n| n.id.0).collect();
+    for edge in &graph.edges {
+        assert!(
+            node_ids.contains(&edge.from.0) && node_ids.contains(&edge.to.0),
+            "every edge names nodes the slice carries; an edge with a missing \
+             node is a draft the hydrate dropped after the frontier walked it: \
+             {edge:?} among {node_ids:?}"
+        );
+    }
+    // And the same from the other end: seeding on the draft's target must not
+    // drag the draft in either.
+    let from_b = store.neighbors(&[b], 2, None).await.unwrap();
+    let from_b_ids: Vec<i64> = from_b.nodes.iter().map(|n| n.id.0).collect();
+    for edge in &from_b.edges {
+        assert!(
+            from_b_ids.contains(&edge.from.0) && from_b_ids.contains(&edge.to.0),
+            "an edge into a draft is an edge out of the base graph: {edge:?}"
+        );
+    }
+}
+parity!(
+    a_draft_never_reaches_a_base_count_or_the_base_graph,
+    a_draft_reaches_no_base_answer_through_its_children
+);
+
+/// The shared domain-scoped lookup resolves by permalink and by title only.
+/// A file path never resolves, with or without `.md` and in any case: the
+/// miss names the permalink the identifier's slug is. Only a permalink is
+/// offered - a title hit on the slug is no hint - and an identifier whose
+/// slug is empty or is the identifier itself gets none (#111).
+async fn lookup_in_domain_resolves_by_permalink_and_title_and_hints_the_slug(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "guides/Agent Workflow Guide.md",
+        &engram(
+            "Workflow",
+            "guides/agent-workflow-guide",
+            "engram",
+            "",
+            "one\ntwo\nthree\n",
+        ),
+    );
+    write(
+        root,
+        "notes/meeting.md",
+        &engram("Standup", "standup", "engram", "", "one\n"),
+    );
+    write(
+        root,
+        "plan.md",
+        &engram("roadmap", "plan-2026", "engram", "", "two\n"),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+
+    let lookup = |identifier: &'static str| async move {
+        crystalline_index::lookup_in_domain(store, "d", identifier)
+            .await
+            .unwrap()
+    };
+    for identifier in ["guides/agent-workflow-guide", "WORKFLOW", "standup"] {
+        assert!(
+            matches!(
+                lookup(identifier).await,
+                crystalline_index::DomainLookup::Found(_)
+            ),
+            "{identifier}"
+        );
+    }
+    let missing = |suggest: Option<&str>| crystalline_index::DomainLookup::Missing {
+        suggest: suggest.map(str::to_string),
+    };
+    for identifier in [
+        "guides/Agent Workflow Guide",
+        "guides/Agent Workflow Guide.md",
+        "guides/agent workflow guide",
+        "guides/agent-workflow-guide.md",
+    ] {
+        assert_eq!(
+            lookup(identifier).await,
+            missing(Some("guides/agent-workflow-guide")),
+            "{identifier}"
+        );
+    }
+    // The file's path is no identifier and names no permalink: `standup` is
+    // not what `notes/meeting` slugifies to.
+    for identifier in ["notes/meeting", "notes/meeting.md"] {
+        assert_eq!(lookup(identifier).await, missing(None), "{identifier}");
+    }
+    // `roadmap` is a TITLE, not a permalink: a title hit on the slug is no hint.
+    assert_eq!(lookup("Roadmap.md").await, missing(None));
+    // `.md` alone slugifies to nothing, and `nope` to itself.
+    assert_eq!(lookup(".md").await, missing(None));
+    assert_eq!(lookup("nope").await, missing(None));
+}
+
+parity!(
+    lookup_in_domain_resolves_by_permalink_and_title_and_hints_the_slug_on_both_backends,
+    lookup_in_domain_resolves_by_permalink_and_title_and_hints_the_slug
+);

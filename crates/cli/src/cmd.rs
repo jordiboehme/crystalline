@@ -530,7 +530,7 @@ fn write_back_manifest_name_if_needed(entry: &DomainEntry, root: &Path, name: &s
 /// adopts the existing registration - whatever name it holds - rather than
 /// adding a second one over the same files. Never a write-back candidate
 /// (see [`domain_add_register`]'s doc comment), so only the name is needed.
-fn existing_file_domain_at(canonical: &Path, cfg: &GlobalConfig) -> Option<String> {
+pub(crate) fn existing_file_domain_at(canonical: &Path, cfg: &GlobalConfig) -> Option<String> {
     cfg.domains.iter().find_map(|(name, entry)| {
         (canonical_root(entry).as_deref() == Some(canonical)).then(|| name.clone())
     })
@@ -551,7 +551,7 @@ fn existing_file_domain_at(canonical: &Path, cfg: &GlobalConfig) -> Option<Strin
 /// lives in the database, which this path never opens - an empty
 /// `virtual_names` map into [`crystalline_core::names::config_name_inputs`],
 /// same as [`domain_list`]'s own no-index case.
-fn build_name_table(loaded: &crystalline_service::LoadedConfig) -> NameTable {
+pub(crate) fn build_name_table(loaded: &crystalline_service::LoadedConfig) -> NameTable {
     let empty = std::collections::BTreeMap::new();
     let mut inputs: Vec<NameInput> = Vec::new();
     for cfg in [&loaded.file, &loaded.effective] {

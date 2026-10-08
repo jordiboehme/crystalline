@@ -22,6 +22,7 @@ fn mcpb_skew_status() -> StubStatus {
         daemon_version: Some("99.0.0".to_string()),
         daemon_pid: Some(4242),
         channel: Some("mcpb".to_string()),
+        bridge: None,
     }
 }
 

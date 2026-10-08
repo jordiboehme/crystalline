@@ -92,7 +92,7 @@ fn write(dir: &Path, rel: &str, content: &str) {
 
 /// Write a harbor-shaped MANIFEST declaring a `## Provisioning` section from
 /// `bullets` (already `- `-prefixed lines, one per artifact type) - the same
-/// shape `crates/core/tests/provision.rs` uses, with the temporal metadata a
+/// shape `crates/core/tests/it/provision.rs` uses, with the temporal metadata a
 /// full `domain add` (not just a bare parse) expects.
 fn write_manifest(dir: &Path, bullets: &str) {
     std::fs::create_dir_all(dir).unwrap();
@@ -106,7 +106,7 @@ fn write_manifest(dir: &Path, bullets: &str) {
     std::fs::write(dir.join("MANIFEST.md"), source).unwrap();
 }
 
-/// Build the harbor domain fixture from `crates/core/tests/provision.rs`'s
+/// Build the harbor domain fixture from `crates/core/tests/it/provision.rs`'s
 /// M4 brief: a `tide-tables` skill (`SKILL.md` plus `scripts/chart.sh`), a
 /// `charts/plot-route.md` command, a `quartermaster.md` agent and a
 /// `lighthouse.json` mcp.

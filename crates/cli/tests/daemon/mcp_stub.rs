@@ -74,7 +74,10 @@ impl Env {
             // derived from any base directory above, so anything that
             // reached a credential store here would otherwise ask the real
             // login keychain.
-            .env("CRYSTALLINE_TEST_NO_KEYCHAIN", "1");
+            .env("CRYSTALLINE_TEST_NO_KEYCHAIN", "1")
+            // And the task seam answers "no task", so a refused breakaway on
+            // Windows never asks the real Task Scheduler.
+            .env("CRYSTALLINE_TEST_DAEMON_TASK", "missing");
     }
 
     fn info_path(&self) -> PathBuf {

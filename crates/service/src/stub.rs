@@ -37,11 +37,16 @@ use rmcp::service::RequestContext;
 use rmcp::{RoleServer, ServerHandler};
 use serde_json::Value;
 
+use crate::daemon_task::{BridgeFailure, MACHINE_TASK_NAME};
 use crate::mcp::CacheHinted;
 
 pub use crate::overlay::CHANNEL_ENV;
 /// The Claude Desktop extension channel value.
 pub const MCPB_CHANNEL: &str = "mcpb";
+
+/// The channel the Node launcher of the standard Claude Desktop extension
+/// sets: the binary is the one Homebrew or the MSI installed.
+pub const DESKTOP_CHANNEL: &str = "desktop";
 
 /// Whether `channel` (the `CRYSTALLINE_CHANNEL` value, when set) is the Claude
 /// Desktop extension's marker. Exact match: the manifest sets the literal.
@@ -51,7 +56,8 @@ pub fn channel_is_mcpb(channel: Option<&str>) -> bool {
 
 /// Whether this process runs as the Claude Desktop extension. Read from the
 /// environment each time; it is cheap and the variable never changes under a
-/// running process.
+/// running process. It only chooses the degraded copy now: the bounded daemon
+/// life follows where the binary lives, not the channel.
 pub fn is_mcpb_channel() -> bool {
     channel_is_mcpb(std::env::var(CHANNEL_ENV).ok().as_deref())
 }
@@ -77,6 +83,9 @@ pub struct StubStatus {
     pub daemon_pid: Option<u32>,
     /// The install channel from `CRYSTALLINE_CHANNEL`, when set.
     pub channel: Option<String>,
+    /// Why a bridge inside an app package has no daemon, when that is the
+    /// failure. Set, it decides the copy before anything else.
+    pub bridge: Option<BridgeFailure>,
 }
 
 /// Which explanatory copy the degraded server renders, chosen once from the
@@ -89,28 +98,74 @@ enum StubCase {
     /// A strictly newer daemon owns the index and this is a plain install:
     /// tell the user to update this installation.
     OutdatedBinary,
+    /// The standard Desktop extension, whose binary is the installed one.
+    OutdatedDesktop,
     /// A live instance owns the index but is not the newer-daemon skew (equal,
     /// older or unparseable version): a plain conflict naming its pid.
     Conflict,
     /// No live record explains the failure: surface the raw startup error and
     /// point at daemon.log.
     Other,
+    /// A bridge inside an app package has no daemon outside to relay to.
+    Bridge(BridgeFailure),
 }
 
 impl StubStatus {
-    /// Gather the degraded status from the environment: the owning daemon
-    /// record (kept only when its pid is still alive, so a dead pid never
-    /// masquerades as a conflict) and the install channel. `reason` is the
-    /// startup error chain that forced the degraded server.
-    pub fn gather(reason: String) -> StubStatus {
-        let live = crate::instance::read_lock_info()
-            .filter(|info| crate::instance::process_alive(info.pid));
+    /// Gather the degraded status from what [`crate::instance::ask_holder`]
+    /// says about the pipe: the daemon's own facts when it answers, or, when
+    /// something listens but gives no facts, the live record that names it.
+    /// When nothing listens, a record still counts while its lock is held and
+    /// its pid is alive: a daemon that holds the index and does not answer,
+    /// or a one-shot command, which 0.23.1 named as a conflict too. `reason`
+    /// is the startup error chain that forced the degraded server.
+    pub async fn gather(reason: String) -> StubStatus {
+        let facts = crate::instance::ask_holder().await;
+        let record = crate::instance::read_lock_info();
+        let lock_held = !crate::instance::service_lock_is_free();
+        StubStatus::gather_from(
+            reason,
+            facts,
+            record,
+            lock_held,
+            std::env::var(CHANNEL_ENV).ok(),
+        )
+    }
+
+    /// [`StubStatus::gather`] with everything it reads handed in. A record
+    /// that nobody holds the lock for, or that names a dead pid, explains
+    /// nothing and is dropped.
+    pub(crate) fn gather_from(
+        reason: String,
+        facts: Option<crate::instance::HolderFacts>,
+        record: Option<crate::instance::LockInfo>,
+        lock_held: bool,
+        channel: Option<String>,
+    ) -> StubStatus {
+        let live = match facts {
+            Some(facts) => Some((facts.version, facts.pid)),
+            None => record
+                .filter(|r| lock_held && crate::instance::process_alive(r.pid))
+                .map(|r| (r.version, r.pid)),
+        };
         StubStatus {
             reason,
             binary_version: crystalline_core::VERSION.to_string(),
-            daemon_version: live.as_ref().map(|info| info.version.clone()),
-            daemon_pid: live.as_ref().map(|info| info.pid),
+            daemon_version: live.as_ref().map(|(version, _)| version.clone()),
+            daemon_pid: live.map(|(_, pid)| pid),
+            channel,
+            bridge: None,
+        }
+    }
+
+    /// The degraded status of a packaged bridge that has no daemon.
+    pub fn for_bridge(reason: String, bridge: BridgeFailure) -> StubStatus {
+        StubStatus {
+            reason,
+            binary_version: crystalline_core::VERSION.to_string(),
+            daemon_version: None,
+            daemon_pid: None,
             channel: std::env::var(CHANNEL_ENV).ok(),
+            bridge: Some(bridge),
         }
     }
 
@@ -118,10 +173,15 @@ impl StubStatus {
     /// this binary is the upgrade skew (extension vs plain install by channel);
     /// any other live record is a plain conflict; no live record is generic.
     fn case(&self) -> StubCase {
+        if let Some(bridge) = &self.bridge {
+            return StubCase::Bridge(bridge.clone());
+        }
         match &self.daemon_version {
             Some(daemon) if crate::instance::strictly_newer(daemon, &self.binary_version) => {
                 if channel_is_mcpb(self.channel.as_deref()) {
                     StubCase::OutdatedMcpb
+                } else if self.channel.as_deref() == Some(DESKTOP_CHANNEL) {
+                    StubCase::OutdatedDesktop
                 } else {
                     StubCase::OutdatedBinary
                 }
@@ -141,9 +201,13 @@ impl StubStatus {
         let daemon = self.daemon_version.as_deref().unwrap_or_default();
         let pid = self.daemon_pid.unwrap_or_default();
         let reason = &self.reason;
+        let wait = crate::instance::PACKAGED_TASK_WAIT.as_secs();
         match self.case() {
             StubCase::OutdatedMcpb => format!(
                 "Crystalline is running in degraded mode: this Crystalline extension (v{bin}) is older than the Crystalline daemon (v{daemon}) that owns this machine's knowledge, so no knowledge tools are available this session. Ask the user to download the latest Crystalline extension from https://github.com/jordiboehme/crystalline/releases and install it over the current one, then start a new conversation. Call the status tool for the full details to relay."
+            ),
+            StubCase::OutdatedDesktop => format!(
+                "Crystalline is running in degraded mode: the Crystalline installed on this computer (v{bin}) is older than the Crystalline daemon (v{daemon}) that owns this machine's knowledge, so no knowledge tools are available this session. Ask the user to update it with `brew upgrade crystalline` on a Mac, or by installing the newest MSI from https://github.com/jordiboehme/crystalline/releases on Windows, then restart Claude Desktop. Call the status tool for the full details to relay."
             ),
             StubCase::OutdatedBinary => format!(
                 "Crystalline is running in degraded mode: this crystalline binary (v{bin}) is older than the Crystalline daemon (v{daemon}) that owns this machine's knowledge, so no knowledge tools are available this session. Ask the user to update this Crystalline installation to v{daemon} or newer, then reconnect. Call the status tool for the full details to relay."
@@ -153,6 +217,18 @@ impl StubStatus {
             ),
             StubCase::Other => format!(
                 "Crystalline is running in degraded mode: it failed to start ({reason}), so no knowledge tools are available this session. Ask the user to check daemon.log in the Crystalline state directory. Call the status tool for the full details to relay."
+            ),
+            StubCase::Bridge(BridgeFailure::TaskMissing) => format!(
+                "Crystalline is running in degraded mode: Claude Desktop runs Crystalline inside its own app package, so the Crystalline daemon has to start outside it, from the Windows task {MACHINE_TASK_NAME}, and that task is missing. No knowledge tools are available this session. Ask the user to run `crystalline doctor --fix` in a terminal, which registers the task, or to install the newest MSI from https://github.com/jordiboehme/crystalline/releases, then restart Claude Desktop. Call the status tool for the full details to relay."
+            ),
+            StubCase::Bridge(BridgeFailure::TaskDidNotStart { task, detail }) => format!(
+                "Crystalline is running in degraded mode: the Windows task {task} that starts the Crystalline daemon did not start ({detail}), so no knowledge tools are available this session. Ask the user to run `crystalline doctor` in a terminal, which says why, then restart Claude Desktop. Call the status tool for the full details to relay."
+            ),
+            StubCase::Bridge(BridgeFailure::NoAnswer { task }) => format!(
+                "Crystalline is running in degraded mode: the Windows task {task} started, but no Crystalline daemon answered within {wait} s, so no knowledge tools are available this session. Ask the user to run `crystalline status` in a terminal and to look at daemon.log in the Crystalline state folder, then restart Claude Desktop. Call the status tool for the full details to relay."
+            ),
+            StubCase::Bridge(BridgeFailure::HandshakeFailed(detail)) => format!(
+                "Crystalline is running in degraded mode: the Crystalline daemon answered, but it did not finish the MCP handshake ({detail}), so no knowledge tools are available this session. Ask the user to run `crystalline status` in a terminal, then restart Claude Desktop. Call the status tool for the full details to relay."
             ),
         }
     }
@@ -165,6 +241,9 @@ impl StubStatus {
         match self.case() {
             StubCase::OutdatedMcpb =>
                 "Download the latest Crystalline extension (.mcpb) from https://github.com/jordiboehme/crystalline/releases and install it over the current extension, then start a new conversation.".to_string(),
+            StubCase::OutdatedDesktop => format!(
+                "Update Crystalline to v{daemon} or newer (`brew upgrade crystalline`, or the newest MSI from https://github.com/jordiboehme/crystalline/releases), then restart Claude Desktop."
+            ),
             StubCase::OutdatedBinary => format!(
                 "Update this Crystalline installation to v{daemon} or newer, then reconnect."
             ),
@@ -173,6 +252,16 @@ impl StubStatus {
             ),
             StubCase::Other =>
                 "Check daemon.log in the Crystalline state directory for the startup error, then reconnect.".to_string(),
+            StubCase::Bridge(BridgeFailure::TaskMissing) => format!(
+                "Run `crystalline doctor --fix` in a terminal (it registers the task {MACHINE_TASK_NAME}), or install the newest MSI from https://github.com/jordiboehme/crystalline/releases, then restart Claude Desktop."
+            ),
+            StubCase::Bridge(BridgeFailure::TaskDidNotStart { task, .. }) => format!(
+                "Run `crystalline doctor` in a terminal to see why the task {task} did not start, then restart Claude Desktop."
+            ),
+            StubCase::Bridge(BridgeFailure::NoAnswer { .. }) =>
+                "Run `crystalline status` in a terminal and check daemon.log in the Crystalline state folder, then restart Claude Desktop.".to_string(),
+            StubCase::Bridge(BridgeFailure::HandshakeFailed(_)) =>
+                "Run `crystalline status` in a terminal, then restart Claude Desktop.".to_string(),
         }
     }
 
@@ -195,6 +284,15 @@ impl StubStatus {
         }
         if let Some(channel) = &self.channel {
             map.insert("channel".to_string(), Value::String(channel.clone()));
+        }
+        if let Some(bridge) = &self.bridge {
+            let key = match bridge {
+                BridgeFailure::TaskMissing => "task_missing",
+                BridgeFailure::TaskDidNotStart { .. } => "task_did_not_start",
+                BridgeFailure::NoAnswer { .. } => "no_answer",
+                BridgeFailure::HandshakeFailed(_) => "handshake_failed",
+            };
+            map.insert("bridge".to_string(), Value::String(key.to_string()));
         }
         map.insert("fix".to_string(), Value::String(self.fix()));
         Value::Object(map)
@@ -360,6 +458,67 @@ impl ServerHandler for DegradedServer {
 mod tests {
     use super::*;
 
+    fn facts(version: &str, pid: u32) -> crate::instance::HolderFacts {
+        crate::instance::HolderFacts {
+            pid,
+            version: version.to_string(),
+            mcp_line_options: true,
+            runs_in: None,
+            start: None,
+            state_dir: None,
+        }
+    }
+
+    fn record(version: &str) -> crate::instance::LockInfo {
+        serde_json::from_value(serde_json::json!({
+            "pid": std::process::id(), "socket_path": "/nowhere",
+            "version": version, "started_at": ""
+        }))
+        .unwrap()
+    }
+
+    /// The daemon on the pipe decides; without one, a record counts only
+    /// while somebody holds its lock.
+    #[test]
+    fn the_pipe_decides_and_a_record_counts_only_while_its_lock_is_held() {
+        let piped = StubStatus::gather_from(
+            "r".into(),
+            Some(facts("0.9.0", 9)),
+            Some(record("0.1.0")),
+            false,
+            None,
+        );
+        assert_eq!(
+            (piped.daemon_version.as_deref(), piped.daemon_pid),
+            (Some("0.9.0"), Some(9))
+        );
+        let held = StubStatus::gather_from("r".into(), None, Some(record("0.9.0")), true, None);
+        assert_eq!(held.daemon_version.as_deref(), Some("0.9.0"));
+        let stale = StubStatus::gather_from("r".into(), None, Some(record("0.9.0")), false, None);
+        assert_eq!(
+            stale.daemon_version, None,
+            "a record nobody holds decides nothing"
+        );
+    }
+
+    /// A one-shot command that holds the index and serves no pipe is the
+    /// plain conflict with its pid, as in 0.23.1, not the generic copy.
+    #[test]
+    fn a_live_one_shot_holder_keeps_the_conflict_copy() {
+        let mut one_shot = record(crystalline_core::VERSION);
+        one_shot.standalone = Some("crystalline domain rename".to_string());
+        let status = StubStatus::gather_from("r".into(), None, Some(one_shot), true, None);
+        assert_eq!(status.daemon_pid, Some(std::process::id()));
+        let instructions = status.instructions();
+        assert!(
+            instructions.contains(&format!(
+                "another Crystalline instance (pid {}) owns this machine's knowledge index",
+                std::process::id()
+            )),
+            "{instructions}"
+        );
+    }
+
     /// Only the exact marker the mcpb manifest sets names the extension: an
     /// unset, empty or differently spelled channel is some other install.
     #[test]
@@ -370,6 +529,22 @@ mod tests {
         assert!(!channel_is_mcpb(Some("MCPB")));
         assert!(!channel_is_mcpb(Some("mcpb ")));
         assert!(!channel_is_mcpb(Some("brew")));
+    }
+
+    #[test]
+    fn newer_daemon_on_the_desktop_channel_names_the_installed_binary() {
+        let s = status(Some("0.9.0"), Some(4242), Some(DESKTOP_CHANNEL));
+        let instructions = s.instructions();
+        assert!(
+            instructions.contains("brew upgrade crystalline"),
+            "{instructions}"
+        );
+        assert!(instructions.contains("MSI"), "{instructions}");
+        assert!(
+            !instructions.contains("install it over the current"),
+            "not the extension: {instructions}"
+        );
+        assert!(s.fix().contains("brew upgrade crystalline"));
     }
 
     /// Build a status directly (no lock, no env): unit tests never touch the
@@ -386,6 +561,7 @@ mod tests {
             daemon_version: daemon_version.map(str::to_string),
             daemon_pid,
             channel: channel.map(str::to_string),
+            bridge: None,
         }
     }
 
@@ -549,5 +725,131 @@ mod tests {
                 assert!(!text.contains('\u{2013}'), "en dash in:\n{text}");
             }
         }
+    }
+
+    #[test]
+    fn each_bridge_failure_names_its_cause_and_its_fix() {
+        use crate::daemon_task::BridgeFailure;
+        let missing = StubStatus::for_bridge("r".into(), BridgeFailure::TaskMissing);
+        assert!(
+            missing.instructions().contains(r"\Crystalline\Daemon"),
+            "{}",
+            missing.instructions()
+        );
+        assert!(missing.instructions().contains("is missing"));
+        assert!(missing.fix().contains("crystalline doctor --fix"));
+        assert_eq!(missing.tool_payload()["bridge"], "task_missing");
+
+        let user_task = r"\Crystalline Daemon for ada";
+        let failed = StubStatus::for_bridge(
+            "r".into(),
+            BridgeFailure::TaskDidNotStart {
+                task: user_task.into(),
+                detail: "access is denied".into(),
+            },
+        );
+        assert!(
+            failed.instructions().contains(&format!(
+                "{user_task} that starts the Crystalline daemon did not start (access is denied)"
+            )),
+            "{}",
+            failed.instructions()
+        );
+        assert!(failed.fix().contains("crystalline doctor"));
+        assert!(failed.fix().contains(user_task), "{}", failed.fix());
+        assert!(!failed.instructions().contains(r"\Crystalline\Daemon"));
+        assert_eq!(failed.tool_payload()["bridge"], "task_did_not_start");
+
+        let silent = StubStatus::for_bridge(
+            "r".into(),
+            BridgeFailure::NoAnswer {
+                task: user_task.into(),
+            },
+        );
+        assert!(silent.instructions().contains("within 15 s"));
+        assert!(
+            silent
+                .instructions()
+                .contains(&format!("the Windows task {user_task} started")),
+            "{}",
+            silent.instructions()
+        );
+        assert!(silent.fix().contains("crystalline status"));
+        assert_eq!(silent.tool_payload()["bridge"], "no_answer");
+
+        let refused = StubStatus::for_bridge(
+            "r".into(),
+            BridgeFailure::HandshakeFailed("connection reset".into()),
+        );
+        assert!(
+            refused
+                .instructions()
+                .contains("did not finish the MCP handshake (connection reset)"),
+            "{}",
+            refused.instructions()
+        );
+        assert!(
+            !refused.instructions().contains("Windows task"),
+            "the task is not the cause"
+        );
+        assert!(refused.fix().contains("crystalline status"));
+        assert_eq!(refused.tool_payload()["bridge"], "handshake_failed");
+
+        for s in [missing, failed, silent, refused] {
+            for text in [s.instructions(), s.fix(), s.tool_payload().to_string()] {
+                assert!(
+                    !text.contains('\u{2014}') && !text.contains('\u{2013}'),
+                    "{text}"
+                );
+            }
+        }
+    }
+
+    /// A packaged attach that failed without a [`BridgeFailure`] failed in
+    /// the MCP handshake, never in the task: the stub must not say the task
+    /// started.
+    #[test]
+    fn a_failed_handshake_is_its_own_bridge_failure() {
+        use crate::daemon_task::BridgeFailure;
+        // Built the way `client.rs` builds it, so the stub names only the
+        // cause and not the chain a second time.
+        let handshake = anyhow::Error::new(std::io::Error::other("broken pipe"))
+            .context("daemon MCP handshake failed");
+        assert_eq!(
+            BridgeFailure::of(&handshake),
+            BridgeFailure::HandshakeFailed("broken pipe".into())
+        );
+        assert_eq!(
+            BridgeFailure::of(&handshake).to_string(),
+            "the Crystalline daemon answered, but it did not finish the MCP handshake (broken pipe)"
+        );
+        let missing = anyhow::Error::new(BridgeFailure::TaskMissing);
+        assert_eq!(BridgeFailure::of(&missing), BridgeFailure::TaskMissing);
+        let no_answer = BridgeFailure::NoAnswer {
+            task: crate::daemon_task::MACHINE_TASK_NAME.into(),
+        };
+        let silent = anyhow::Error::new(no_answer.clone());
+        assert_eq!(BridgeFailure::of(&silent), no_answer);
+    }
+
+    #[test]
+    fn the_no_answer_copy_names_the_real_wait() {
+        let wait = format!("within {} s", crate::instance::PACKAGED_TASK_WAIT.as_secs());
+        let no_answer = crate::daemon_task::BridgeFailure::NoAnswer {
+            task: crate::daemon_task::user_task_name("ada"),
+        };
+        let silent = StubStatus::for_bridge("r".into(), no_answer.clone());
+        assert!(
+            silent.instructions().contains(&wait),
+            "{}",
+            silent.instructions()
+        );
+        assert!(no_answer.to_string().contains(&wait), "{no_answer}");
+        assert!(
+            no_answer
+                .to_string()
+                .contains(r"the Windows task \Crystalline Daemon for ada started"),
+            "{no_answer}"
+        );
     }
 }

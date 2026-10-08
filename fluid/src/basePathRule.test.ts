@@ -37,8 +37,21 @@ describe("the base path lint rule", () => {
     'window.open("/d/x", "_blank");',
     "const link = `${window.location.origin}/d/x`;",
     "const o = location.origin;",
+    'window.location.replace("/login");',
+    "location.replace(next);",
+    'window.location.href = "/login";',
+    'location.href = "/d/x";',
+    'open("/d/x");',
+    'globalThis.open("/d/x");',
+    'new WebSocket("/collab/x");',
+    "new WebSocket(`/collab/${id}`);",
+    'new EventSource("/events");',
+    "new EventSource(`/events/${id}`);",
   ])("refuses %s", (code) => {
-    expect(messages(code)).toContain(BASE_PATH_MESSAGE);
+    // no-restricted-globals puts its own sentence in front of the message.
+    expect(messages(code).some((m) => m.endsWith(BASE_PATH_MESSAGE))).toBe(
+      true,
+    );
   });
 
   it.each([
@@ -46,6 +59,11 @@ describe("the base path lint rule", () => {
     'const b = "/d/x";',
     "const c = API_BASE + '/domains';",
     "const p = window.location.pathname;",
+    "const href = window.location.href;",
+    "function open(x: number) { return x > 0; }\nopen(3);",
+    "new WebSocket(collabSocketUrl(target));",
+    "new EventSource(url, { withCredentials: true });",
+    "new WebSocket(`${proto}//${host}/x`);",
   ])("allows %s", (code) => {
     expect(messages(code)).toEqual([]);
   });

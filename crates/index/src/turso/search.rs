@@ -38,7 +38,7 @@ const SNIPPET_LEAD: usize = 200;
 /// clear it, the weakest (E1) at 0.8194. Must stay equal to
 /// `crate::postgres::search::DEFAULT_MIN_SIMILARITY`; parity is pinned by
 /// `both_backends_default_the_same_minimum_similarity` in
-/// `crates/index/tests/store.rs`.
+/// `crates/index/tests/it/store.rs`.
 pub const DEFAULT_MIN_SIMILARITY: f32 = 0.78;
 /// How many nearest chunks the vector scan considers before the cutoff and paging.
 const SEMANTIC_TOPK: usize = 100;
@@ -637,7 +637,7 @@ fn order_keys(order: SearchOrder) -> &'static str {
 /// bounded-sorter optimization and holds only `limit + offset` records, so
 /// the wide projection costs one page of bodies rather than the whole match
 /// set. Adding a `GROUP BY` here would remove that bound, and
-/// `tests/turso_only.rs` scans this statement for exactly that, which is why
+/// `tests/it/turso_only.rs` scans this statement for exactly that, which is why
 /// the `ORDER BY` and the `LIMIT` share one line. Built here rather than
 /// inline so the plan registry explains the statement this store issues
 /// rather than a copy of it.
@@ -669,7 +669,7 @@ pub fn filter_only_sql(
 /// turso keep `candidate_cap` records rather than the match set. Both
 /// properties are pinned by `EXPLAIN QUERY PLAN` beside this builder
 /// ([`the_lexical_candidate_scan_stays_index_ordered_under_a_folder_filter`])
-/// and by a source scan in `tests/turso_only.rs`. Keep the bound and keep the
+/// and by a source scan in `tests/it/turso_only.rs`. Keep the bound and keep the
 /// order: any other ordering here, or a `GROUP BY`, would spill every matched
 /// body to disk.
 ///
@@ -1707,7 +1707,7 @@ mod tests {
     /// **The statement is the shipped one**, built by `lexical_candidate_sql`
     /// out of the actor screen and the filters `build_scalar_filters` produces,
     /// with only the term group written out here. Its predecessor lived in
-    /// `tests/turso_only.rs` and copied the statement by hand, which meant it
+    /// `tests/it/turso_only.rs` and copied the statement by hand, which meant it
     /// went on explaining a query without the actor screen long after the
     /// shipped one had grown one.
     #[tokio::test]

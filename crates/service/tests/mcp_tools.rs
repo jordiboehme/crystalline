@@ -809,10 +809,10 @@ async fn tool_descriptions_teach_that_working_in_an_open_document_is_seen() {
 }
 
 /// And that replacing one wholesale is not something an agent does quietly:
-/// `write_engram` teaches the confirm, and names the verb to reach for when the
+/// `write_engram` teaches the refusal, and names the verb to reach for when the
 /// change is a targeted one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn tool_descriptions_teach_that_a_wholesale_overwrite_asks_first() {
+async fn tool_descriptions_teach_that_a_wholesale_overwrite_is_refused() {
     let h = Harness::new(&["eng"]).await;
     let (client, _server) = h.connect().await;
     let tools = client.peer().list_tools(Default::default()).await.unwrap();
@@ -827,12 +827,12 @@ async fn tool_descriptions_teach_that_a_wholesale_overwrite_asks_first() {
         .unwrap_or("")
         .to_lowercase();
     assert!(
-        text.contains("asks them first"),
-        "write_engram teaches that an overwrite of an open document is asked about: {text}"
+        text.contains("an overwrite of a live document is refused and names who is in there"),
+        "write_engram teaches that an overwrite of an open document is refused: {text}"
     );
     assert!(
-        text.contains("landed live"),
-        "and what the receipt says when it lands in their document: {text}"
+        !text.contains("asks them first"),
+        "and no longer that anybody is asked: {text}"
     );
     assert!(
         text.contains("edit_engram"),

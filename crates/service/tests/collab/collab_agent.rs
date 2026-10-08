@@ -1350,19 +1350,18 @@ async fn an_agent_whose_state_was_taken_away_publishes_itself_again() {
     );
 }
 
-// --- the wholesale overwrite, asked about before it lands -------------------
+// --- the wholesale overwrite of a live document, refused ---------------------
 //
 // An edit COMPOSES into somebody's open document; a `write_engram` carrying
 // overwrite=true REPLACES it, and replacing work a person can see on screen
 // and has not saved is the one thing an agent may not do quietly. So the call
-// asks first, through the era's own round, and a client with no way to put the
-// question to anybody is refused rather than served the replacement.
+// is refused for every client, one that can elicit included, and the refusal
+// names who is in there and the verb to use instead.
 //
-// Driven over the wire rather than through the engine, because the round IS
-// the wire's: the question travels back as an `input_required` result and the
-// answer arrives beside the original arguments on the next call. The fixtures
-// below are copied from `mcp_modern_era.rs` for the reason the module header
-// already gives - integration test crates share no helpers.
+// Driven over the wire rather than through the engine, because the refusal is
+// the MCP layer's. The fixtures below are copied from `mcp_modern_era.rs` for
+// the reason the module header already gives - integration test crates share
+// no helpers.
 
 /// The revision these rounds are served at.
 const ERA: &str = "2026-07-28";
@@ -1473,10 +1472,9 @@ fn refusal_of(answer: &Value) -> String {
 /// The body every wholesale overwrite below tries to land over the document.
 const REPLACEMENT: &str = "A wholesale replacement.";
 
-/// One `write_engram` call replacing `alpha` wholesale, with an optional
-/// answer to the round.
-fn overwrite_alpha(responses: Option<Value>) -> Value {
-    let mut params = json!({
+/// One `write_engram` call replacing `alpha` wholesale.
+fn overwrite_alpha() -> Value {
+    json!({
         "name": "write_engram",
         "arguments": {
             "domain": "eng",
@@ -1484,33 +1482,20 @@ fn overwrite_alpha(responses: Option<Value>) -> Value {
             "content": REPLACEMENT,
             "overwrite": true,
         },
-    });
-    if let Some(responses) = responses {
-        params["inputResponses"] = responses;
-    }
-    params
+    })
 }
 
 /// The same capture WITHOUT `overwrite`: the shape an agent sends when it does
 /// not know the permalink is taken.
-fn capture_alpha(responses: Option<Value>) -> Value {
-    let mut params = json!({
+fn capture_alpha() -> Value {
+    json!({
         "name": "write_engram",
         "arguments": {
             "domain": "eng",
             "title": "Alpha",
             "content": REPLACEMENT,
         },
-    });
-    if let Some(responses) = responses {
-        params["inputResponses"] = responses;
-    }
-    params
-}
-
-/// The client's answer to the `confirm` question, as an `ElicitResult`.
-fn answer(action: &str, confirm: bool) -> Value {
-    json!({ "confirm": { "action": action, "content": { "confirm": confirm } } })
+    })
 }
 
 /// A room over `alpha` with one person in it who has typed a line nobody has
@@ -1536,15 +1521,15 @@ async fn a_person_typing_in_alpha() -> (
     (tmp, engine, sessions, joined, doc, scratch)
 }
 
-/// **The brief's first test.** A wholesale overwrite of a document somebody
-/// has open answers the question instead of the write, and the question names
-/// who is in there.
+/// A wholesale overwrite of a document somebody has open is refused for a
+/// client that can elicit too: nobody is asked, the refusal names who is in
+/// there and the verb to use instead, and nothing is replaced.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_wholesale_overwrite_into_a_live_document_asks_first_naming_who_is_present() {
+async fn an_eliciting_wholesale_overwrite_into_a_live_document_is_refused_naming_who_is_present() {
     let (tmp, engine, _sessions, joined, doc, _scratch) = a_person_typing_in_alpha().await;
     let mut wire = Wire::to(engine.clone());
 
-    // Opened through the era's own onboarding call, so the round below runs on
+    // Opened through the era's own onboarding call, so the call below runs on
     // a connection that never handshook.
     let discovered = wire.open(modern(1, "server/discover", json!({}))).await;
     assert!(
@@ -1552,38 +1537,32 @@ async fn a_wholesale_overwrite_into_a_live_document_asks_first_naming_who_is_pre
         "the connection is open at the era: {discovered}"
     );
 
-    let asked = wire
-        .call(eliciting(2, "tools/call", overwrite_alpha(None)))
+    let refused = wire
+        .call(eliciting(2, "tools/call", overwrite_alpha()))
         .await;
-    let result = &asked["result"];
-    assert_eq!(
-        result["resultType"],
+    assert_ne!(
+        refused["result"]["resultType"],
         json!("input_required"),
-        "the call answers with a round rather than a replacement: {asked}"
+        "nothing is asked: {refused}"
     );
-
-    let question = &result["inputRequests"]["confirm"];
     assert_eq!(
-        question["method"],
-        json!("elicitation/create"),
-        "the round is an elicitation keyed `confirm`: {asked}"
+        refused["result"]["isError"],
+        json!(true),
+        "the call is refused rather than written: {refused}"
     );
-    let message = question["params"]["message"].as_str().unwrap_or_default();
-    assert!(
-        message.contains("live editor"),
-        "the question says the document is open: {message}"
+    let text = refusal_of(&refused);
+    assert_eq!(
+        text,
+        "The engram is open in the editor right now (present: Jordi), so a full replace was \
+         refused and nothing was written. Use edit_engram for a targeted change, or replace it \
+         after they close it.",
+        "it says what did not happen and what to do instead: {text}"
     );
     assert!(
-        message.contains("Jordi"),
-        "and names who is in there: {message}"
-    );
-    assert!(
-        message.contains("alpha"),
-        "and which engram it is about: {message}"
+        text.contains("Jordi"),
+        "and who is in the document it would have replaced: {text}"
     );
 
-    // Round one replaces nothing: not the file, and not the document the
-    // person is looking at.
     let on_disk = std::fs::read_to_string(tmp.path().join("eng/alpha.md")).unwrap();
     assert_eq!(on_disk, ALPHA, "the file is untouched: {on_disk:?}");
     resync(&joined, &doc).await;
@@ -1594,113 +1573,54 @@ async fn a_wholesale_overwrite_into_a_live_document_asks_first_naming_who_is_pre
     );
 }
 
-/// A capture that did not pass `overwrite` into a live document asks ONE
-/// question, and the answer to it lands.
-///
-/// Both questions apply here: the permalink is taken, and a room is open over
-/// it. The collision round used to be asked first and the live round second,
-/// so the person was asked twice about one act in two different wordings - and
-/// a client that sends only the newest answer, rather than accumulating them,
-/// answered the second question, found `overwrite` unset again and was asked
-/// the first one back. This is the two-round sequence with nothing carried
-/// forward: one question, one answer, one write.
+/// A capture that did not pass `overwrite` into a live document is refused
+/// the same way: the permalink is taken and a room is open over it, and no
+/// question is put about either.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_capture_into_a_live_document_asks_one_question_and_the_answer_lands() {
+async fn an_eliciting_capture_into_a_live_document_is_refused_too() {
     let (tmp, engine, _sessions, joined, doc, _scratch) = a_person_typing_in_alpha().await;
     let mut wire = Wire::to(engine.clone());
 
-    let asked = wire
-        .open(eliciting(1, "tools/call", capture_alpha(None)))
-        .await;
-    let result = &asked["result"];
-    assert_eq!(
-        result["resultType"],
-        json!("input_required"),
-        "round one asks rather than writing: {asked}"
-    );
-    assert!(
-        result["inputRequests"]["confirm"].is_null(),
-        "and it is not the confirm key, which a second round would have to \
-         carry beside the answer below: {asked}"
-    );
-    let question = &result["inputRequests"]["resolution"];
-    let message = question["params"]["message"].as_str().unwrap_or_default();
-    assert!(
-        message.contains("already exists"),
-        "the one question says the engram is there: {message}"
-    );
-    assert!(
-        message.contains("live editor") && message.contains("Jordi"),
-        "and that somebody is in it, by name: {message}"
-    );
-
-    // Round two carries the answer to that question and NOTHING else - no
-    // `confirm` beside it, which is exactly the client behaviour the old
-    // ordering could not terminate under.
-    let done = wire
-        .call(eliciting(
-            2,
-            "tools/call",
-            capture_alpha(Some(json!({
-                "resolution": { "action": "accept", "content": { "resolution": "overwrite" } }
-            }))),
-        ))
-        .await;
+    let refused = wire.open(eliciting(1, "tools/call", capture_alpha())).await;
     assert_ne!(
-        done["result"]["resultType"],
+        refused["result"]["resultType"],
         json!("input_required"),
-        "round two writes rather than asking again: {done}"
+        "nothing is asked: {refused}"
     );
-    let receipt = payload_of(&done);
-    assert_eq!(
-        receipt["landed"],
-        json!("live"),
-        "and it landed in the document: {receipt}"
+    assert_eq!(refused["result"]["isError"], json!(true), "{refused}");
+    let text = refusal_of(&refused);
+    assert!(
+        text.contains("nothing was written") && text.contains("Jordi"),
+        "the refusal names who is in there: {text}"
     );
 
-    resync(&joined, &doc).await;
-    let live = client_text(&doc);
-    assert!(
-        live.contains(REPLACEMENT),
-        "which is where the person sees it: {live:?}"
-    );
     let on_disk = std::fs::read_to_string(tmp.path().join("eng/alpha.md")).unwrap();
-    assert_eq!(
-        on_disk, ALPHA,
-        "and nothing was written behind the room's back: {on_disk:?}"
+    assert_eq!(on_disk, ALPHA, "the file is untouched: {on_disk:?}");
+    resync(&joined, &doc).await;
+    assert!(
+        !client_text(&doc).contains(REPLACEMENT),
+        "and the document is untouched"
     );
 }
 
-/// **The brief's second test.** The same call carrying a yes lands the
-/// replacement in the document rather than over it: the room keeps the
-/// document it has, the person's session is still what writes it down, and the
-/// file is not touched behind their back.
+/// An overwrite the engine is handed directly (no MCP call reaches it while a
+/// room is open) lands the replacement in the document rather than over it:
+/// the room keeps the document it has, the person's session is still what
+/// writes it down, and the file is not touched behind their back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_confirmed_overwrite_replaces_the_text_and_keeps_history() {
+async fn an_engine_overwrite_replaces_the_text_and_keeps_history() {
     let (tmp, engine, _sessions, joined, doc, _scratch) = a_person_typing_in_alpha().await;
-    let mut wire = Wire::to(engine.clone());
 
-    let asked = wire
-        .open(eliciting(1, "tools/call", overwrite_alpha(None)))
-        .await;
-    assert_eq!(
-        asked["result"]["resultType"],
-        json!("input_required"),
-        "round one asks: {asked}"
-    );
-
-    let done = wire
-        .call(eliciting(
-            2,
-            "tools/call",
-            overwrite_alpha(Some(answer("accept", true))),
-        ))
-        .await;
-    assert!(
-        done["error"].is_null() && done["result"]["isError"] != json!(true),
-        "the confirmed round writes: {done}"
-    );
-    let receipt = payload_of(&done);
+    let receipt = engine
+        .write_engram_present(
+            &wholesale_capture("Alpha", REPLACEMENT, true),
+            None,
+            &crystalline_service::Scope::Unrestricted,
+            None,
+            None,
+        )
+        .await
+        .expect("the capture lands");
     assert_eq!(
         receipt["landed"],
         json!("live"),
@@ -1740,9 +1660,9 @@ async fn a_confirmed_overwrite_replaces_the_text_and_keeps_history() {
     );
 }
 
-/// **The brief's third test.** A targeted change is never asked about. It
+/// **The brief's third test.** A targeted change is never refused. It
 /// composes with what the person typed instead of replacing it, which is the
-/// whole reason the question exists for one verb and not the other.
+/// whole reason the refusal exists for one verb and not the other.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_targeted_edit_never_asks() {
     let (_tmp, engine, _sessions, joined, doc, _scratch) = a_person_typing_in_alpha().await;
@@ -1786,17 +1706,15 @@ async fn a_targeted_edit_never_asks() {
     );
 }
 
-/// **The brief's fourth test.** A client that cannot put the question to
-/// anybody is refused, not served the replacement: an overwrite nobody can be
-/// asked about would be somebody's unsaved work gone with no way to know.
+/// **The brief's fourth test.** A client without elicitation is refused, not
+/// served the replacement, exactly as one with it is: an overwrite of an open
+/// document would be somebody's unsaved work gone with no way to know.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_client_without_elicitation_is_refused_not_stomped() {
     let (tmp, engine, _sessions, joined, doc, _scratch) = a_person_typing_in_alpha().await;
     let mut wire = Wire::to(engine.clone());
 
-    let refused = wire
-        .open(modern(1, "tools/call", overwrite_alpha(None)))
-        .await;
+    let refused = wire.open(modern(1, "tools/call", overwrite_alpha())).await;
     assert_eq!(
         refused["result"]["isError"],
         json!(true),
@@ -1888,14 +1806,14 @@ async fn a_wholesale_overwrite_in_a_reviewing_domain_lands_in_the_draft_room() {
     assert_eq!(on_disk, ALPHA, "the reviewed file stands: {on_disk:?}");
 }
 
-/// Issue 112, spec item 7: the question an overwrite puts and the write it
-/// asks about resolve ONE landing. Bob works inside ada's draft of a page
+/// Issue 112, spec item 7: the check an overwrite is refused on and the write
+/// it guards resolve ONE landing. Bob works inside ada's draft of a page
 /// whose file name is not its title's slug, and ada has that page open. The
 /// preview has to screen the file the write lands in, not the slug path the
 /// title spells: screening `beta.md` would refuse the join, answer `None`,
-/// and the write would then compose into ada's open page without asking.
+/// and the write would then compose into ada's open page unrefused.
 #[tokio::test]
-async fn a_joined_overwrite_of_a_title_named_page_asks_about_the_room_the_write_lands_in() {
+async fn a_joined_overwrite_of_a_title_named_page_screens_the_room_the_write_lands_in() {
     let (tmp, engine, _scratch) = engine_fixture(true).await;
     std::fs::write(
         tmp.path().join("eng/Beta Notes.md"),
@@ -1925,7 +1843,7 @@ async fn a_joined_overwrite_of_a_title_named_page_asks_about_the_room_the_write_
     let target = engine
         .live_write_target(&capture, &bob, Some(&join), None)
         .await
-        .expect("the preview finds ada's open page, so the question is put");
+        .expect("the preview finds ada's open page, so the overwrite is refused");
     assert_eq!(target.permalink, "beta");
 
     let receipt = engine
@@ -1941,10 +1859,9 @@ async fn a_joined_overwrite_of_a_title_named_page_asks_about_the_room_the_write_
     );
 }
 
-/// **Ruling from review.** The refusal a client that cannot be asked gets is
-/// the same one at the legacy era, which is what nearly every client in the
-/// field still speaks: the gate is era AND capability, so a handshake at
-/// 2025-11-25 reaches it however loudly the client declares elicitation.
+/// **Ruling from review.** The refusal is the same one at the legacy era,
+/// which is what nearly every client in the field still speaks, however
+/// loudly the client declares elicitation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_legacy_peer_is_refused_the_wholesale_overwrite_too() {
     let (tmp, engine, _sessions, joined, doc, _scratch) = a_person_typing_in_alpha().await;
@@ -1967,9 +1884,7 @@ async fn a_legacy_peer_is_refused_the_wholesale_overwrite_too() {
         "the session is the legacy one: {handshake}"
     );
 
-    let refused = wire
-        .call(request(2, "tools/call", overwrite_alpha(None)))
-        .await;
+    let refused = wire.call(request(2, "tools/call", overwrite_alpha())).await;
     assert_eq!(
         refused["result"]["isError"],
         json!(true),

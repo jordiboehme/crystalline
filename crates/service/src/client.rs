@@ -213,6 +213,18 @@ pub async fn run_mcp(
     // re-sent on each daemon reconnect and never re-derived daemon-side.
     let harness_gate = resolve_harness_gate(harness);
 
+    // Inside an app package (Claude Desktop's MSIX package on Windows) this
+    // process is only a bridge to the daemon outside: every file it wrote
+    // under AppData would land in the package's private copy. So it never
+    // serves the embedded stack, not even when asked to.
+    let packaged = crate::runs_in::PackageContext::here().is_packaged();
+    if embedded && packaged {
+        tracing::warn!(
+            "--embedded is ignored inside an app package: this process only bridges to the daemon outside"
+        );
+    }
+    let embedded = embedded && !packaged;
+
     // Read the client's first line concurrently with daemon acquisition, so a
     // cold daemon spawns while the client is still composing its opener rather
     // than afterwards.
@@ -243,7 +255,7 @@ pub async fn run_mcp(
             let conn = ensure_daemon(true, db, config_path, read_only).await?;
             conn.into_mcp(harness_gate)
                 .await
-                .map_err(|e| anyhow::anyhow!("daemon MCP handshake failed ({e})"))
+                .map_err(|e| anyhow::Error::new(e).context("daemon MCP handshake failed"))
         });
         (opened, Some(daemon))
     };
@@ -267,7 +279,15 @@ pub async fn run_mcp(
             Ok(stream) => {
                 return pump_stdio(stream, primed, db, config_path, read_only, harness_gate).await;
             }
-            Err(e) => tracing::warn!("no daemon available ({e}); running embedded"),
+            Err(e) if packaged => {
+                let bridge = crate::daemon_task::BridgeFailure::of(&e);
+                tracing::warn!(
+                    "this process runs inside an app package and only bridges to the daemon: {bridge}"
+                );
+                let status = crate::stub::StubStatus::for_bridge(format!("{e:#}"), bridge);
+                return serve_degraded_stub(status, primed).await;
+            }
+            Err(e) => tracing::warn!("no daemon available ({e:#}); running embedded"),
         }
     }
 
@@ -288,7 +308,7 @@ pub async fn run_mcp(
             tracing::error!(
                 "crystalline mcp cannot start ({e:#}); serving a degraded status server"
             );
-            let status = crate::stub::StubStatus::gather(format!("{e:#}"));
+            let status = crate::stub::StubStatus::gather(format!("{e:#}")).await;
             match serve_degraded_stub(status, primed).await {
                 Ok(()) => Ok(()),
                 Err(stub_err) => {
@@ -805,6 +825,20 @@ async fn open_standalone_finishing(
     db: Option<&Path>,
     config_path: Option<&Path>,
 ) -> anyhow::Result<(Engine, Option<Value>)> {
+    open_standalone_noting(loaded, db_path, want_embeddings, db, config_path, true).await
+}
+
+/// [`open_standalone_finishing`], printing the bypass note only when `note`
+/// is set: a caller that opens a copy of an index on purpose has nothing to
+/// tell the person about the daemon.
+async fn open_standalone_noting(
+    loaded: overlay::LoadedConfig,
+    db_path: &Path,
+    want_embeddings: bool,
+    db: Option<&Path>,
+    config_path: Option<&Path>,
+    note: bool,
+) -> anyhow::Result<(Engine, Option<Value>)> {
     // Postgres has no local file, so naming one in a failure would point at a
     // path nothing lives at.
     let location = if loaded.effective.database().backend
@@ -827,7 +861,7 @@ async fn open_standalone_finishing(
             ))
         })?
         .with_machine_owner_lookup(machine_owner_for_engine());
-    if bypassed {
+    if bypassed && note {
         eprintln!("Daemon: {}", crate::instance::BYPASS_NOTE);
     }
     let finished = finish_leftover_rename_owned(&engine).await;
@@ -1064,6 +1098,22 @@ pub async fn domain_export(
     let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
     let domain = localize_standalone(&engine, domain).await;
     Ok(engine.export_domain(&domain, dest, force, dry_run).await?)
+}
+
+/// [`domain_export`] from an index file that is not this machine's own (a
+/// copy taken on purpose), opened directly and never through the daemon,
+/// without the bypass note an explicit `--db` prints.
+pub async fn domain_export_from_copy(
+    domain: &str,
+    dest: &Path,
+    db: &Path,
+    config_path: &Path,
+) -> anyhow::Result<Value> {
+    let loaded = overlay::load(Some(config_path))?;
+    let (engine, _) =
+        open_standalone_noting(loaded, db, false, Some(db), Some(config_path), false).await?;
+    let domain = localize_standalone(&engine, domain).await;
+    Ok(engine.export_domain(&domain, dest, true, false).await?)
 }
 
 /// What the index still holds for domains nobody registers any more, and,
