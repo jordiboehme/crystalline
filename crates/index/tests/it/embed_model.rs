@@ -1,10 +1,16 @@
-//! Real-model tests for the local granite provider. These download the model
-//! (about 220 MB on a cold cache), so they are `#[ignore]`d and run only in the
-//! dedicated cached CI job (and locally by the implementer). Run
-//! single-threaded so the tests do not race on the first-download file lock:
+//! Real-model tests for the local granite provider. They download the model
+//! (about 220 MB on a cold cache), so they are `#[ignore]`d; no CI job runs
+//! them, they are run by hand.
+//!
+//! `CRYSTALLINE_MODELS_DIR` must point at a directory of its own, and the
+//! tests refuse to run without it: the default is the user's real model
+//! cache, where a running daemon prunes models its setting does not name
+//! (possibly mid-test) and 220 MB would land unasked. Run them
+//! single-threaded so they do not race on the first-download file lock:
 //!
 //! ```text
-//! cargo test -p crystalline-index --test it -- embed_model:: --ignored --nocapture --test-threads=1
+//! CRYSTALLINE_MODELS_DIR=/path/to/scratch/models \
+//!   cargo test -p crystalline-index --test it -- embed_model:: --ignored --nocapture --test-threads=1
 //! ```
 
 #![cfg(feature = "local-embeddings")]
@@ -41,9 +47,22 @@ fn local_config() -> EmbeddingsConfig {
     }
 }
 
+/// Refuses to run against the user's real model cache: every test here
+/// downloads into whatever `CRYSTALLINE_MODELS_DIR` names, and without it that
+/// is `~/.cache/crystalline/models`. Asked first in every test, before any
+/// download can start.
+fn require_dedicated_models_dir() {
+    assert!(
+        crystalline_core::config::models_dir_is_user_provided(),
+        "the embed_model tests need CRYSTALLINE_MODELS_DIR set to a directory of its own: \
+         the default is your real model cache, which a running daemon prunes"
+    );
+}
+
 #[tokio::test]
 #[ignore = "downloads the real granite model"]
 async fn model_download_reports_path_and_size() {
+    require_dedicated_models_dir();
     let dl = download_local_model(&local_config()).await.unwrap();
     eprintln!(
         "model download: {} ({:.1} MB)",
@@ -57,6 +76,7 @@ async fn model_download_reports_path_and_size() {
 #[tokio::test]
 #[ignore = "downloads the real granite model"]
 async fn semantic_query_without_term_overlap_ranks_related_engram_top_three() {
+    require_dedicated_models_dir();
     let cfg = local_config();
     let provider = provider_from_config(&cfg).await.unwrap();
     assert_eq!(
@@ -188,6 +208,7 @@ async fn semantic_query_without_term_overlap_ranks_related_engram_top_three() {
 #[tokio::test]
 #[ignore = "downloads the real granite model"]
 async fn a_german_statement_is_closer_to_its_english_twin_than_to_an_unrelated_one() {
+    require_dedicated_models_dir();
     let provider = provider_from_config(&local_config()).await.unwrap();
     let vectors = provider
         .embed(&[
@@ -215,6 +236,7 @@ async fn a_german_statement_is_closer_to_its_english_twin_than_to_an_unrelated_o
 #[tokio::test]
 #[ignore = "downloads the real granite model"]
 async fn the_vendored_modernbert_reproduces_the_onnx_reference_vectors() {
+    require_dedicated_models_dir();
     #[derive(serde::Deserialize)]
     struct Fixture {
         tolerance: Tolerance,

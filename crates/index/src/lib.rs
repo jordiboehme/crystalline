@@ -38,7 +38,8 @@ pub use embed::{
     ModelDownload, SnapshotChoice, cached_model_dirs, choose_snapshot, chunk_engram,
     configured_model_id, download_local_model, hub_dir_name, local_model, lookup_local_model,
     older_snapshot_warning, order_jobs_for_batching, provider_from_config, prune_model_cache,
-    retire_older_snapshots, run_embedding_pass, run_embedding_pass_with_page, update_local_model,
+    remove_stale_model_lock_dirs, retire_older_snapshots, run_embedding_pass,
+    run_embedding_pass_with_page, stale_model_lock_dirs, update_local_model,
 };
 pub use error::{IndexError, Result, SCHEMA_TOO_NEW_OPENING, is_schema_too_new_text};
 pub use factory::{open_store, store_location};

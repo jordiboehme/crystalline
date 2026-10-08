@@ -12,7 +12,8 @@
 //! against the configured one, plus the cached model directories with sizes,
 //! marking any the config does not use as stale (visible between a config
 //! change and the next daemon start, which prunes them on a writable
-//! instance running a local model); (g) when `github.enabled`, whether this
+//! instance running a local model); the lock folders hf-hub left for a model
+//! that is no longer cached, which `--fix` removes; (g) when `github.enabled`, whether this
 //! machine is connected to GitHub and, per team domain, whether its local
 //! origin state is present and its base snapshot still matches what was
 //! recorded (`verify_base`); (h) which `CRYSTALLINE_*` environment variables
@@ -1274,6 +1275,17 @@ fn check_task(fix: bool) -> Option<TaskDoctor> {
     Some(report)
 }
 
+/// Lock folders hf-hub left in the model cache for a model that is not cached
+/// any more (see [`crystalline_index::stale_model_lock_dirs`]). Never a
+/// problem: `remaining_problems` does not count it, as for stale weights.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ModelLocksDoctor {
+    /// The repository ids whose lock folder is left behind, sorted.
+    pub stale: Vec<String>,
+    /// The ones `--fix` removed.
+    pub removed: Vec<String>,
+}
+
 /// The full `doctor` report.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct DoctorReport {
@@ -1299,6 +1311,11 @@ pub struct DoctorReport {
     /// (plan correction 15: doctor never reads the index for this). Never a
     /// problem: `remaining_problems` is unchanged by it.
     pub contradictions: Option<serde_json::Value>,
+    /// Lock folders in the model cache whose model is gone. `None` when there
+    /// are none. Read from the filesystem alone, so it is there whatever route
+    /// the index took.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_locks: Option<ModelLocksDoctor>,
     /// The device the local embedding model runs on: the running daemon's
     /// own answer when one served this run and has the model loaded (so a
     /// load-time or runtime fallback to the CPU shows with its reason),
@@ -1774,6 +1791,8 @@ pub async fn run(
         probed_device.filter(|_| contradictions_on),
     ));
 
+    let model_locks = check_model_locks(fix, cfg.read_only());
+
     let harnesses = check_harnesses();
 
     let provisioning = check_provisioning(cfg, &loaded.overlay, &targets)?;
@@ -1800,6 +1819,7 @@ pub async fn run(
         github,
         embeddings,
         contradictions,
+        model_locks,
         embedding_device,
         harnesses,
         provisioning,
@@ -3819,6 +3839,25 @@ fn live_device(block: Option<&serde_json::Value>, probed: Option<String>) -> Opt
 /// status`'s answer when a daemon served this run's file stamps; its
 /// `pending_pairs`, `failing_pairs`, `last_error`, `load_failed`,
 /// `load_retry`, `read_only`, `embedding_pending`, `embedding_model`,
+/// The model cache's stale lock folders, removed with `fix` unless the
+/// instance is read-only. `None` when the cache has none or cannot be named.
+fn check_model_locks(fix: bool, read_only: bool) -> Option<ModelLocksDoctor> {
+    let dir = config::models_dir().ok()?;
+    let stale: Vec<String> = crystalline_index::stale_model_lock_dirs(&dir)
+        .into_iter()
+        .map(|(repo, _)| repo)
+        .collect();
+    if stale.is_empty() {
+        return None;
+    }
+    let removed = if fix && !read_only {
+        crystalline_index::remove_stale_model_lock_dirs(&dir)
+    } else {
+        Vec::new()
+    };
+    Some(ModelLocksDoctor { stale, removed })
+}
+
 /// `line_floor`, `line_floor_missing`, `lines_embedded` and `lines_eligible`
 /// are read from there and never recomputed (lesson 36) - a direct read has
 /// no worker, so the counts and flags stay null/false, the same shape
@@ -4913,6 +4952,21 @@ pub fn render_human(report: &DoctorReport) -> String {
         }
     }
 
+    if let Some(locks) = &report.model_locks {
+        if locks.removed.is_empty() {
+            let _ = writeln!(
+                out,
+                "model cache: lock folders of models that are not cached any more: {} (crystalline doctor --fix removes them)",
+                locks.stale.join(", ")
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "model cache: removed the lock folders of models that are not cached any more: {}",
+                locks.removed.join(", ")
+            );
+        }
+    }
     if let Some(harnesses) = &report.harnesses {
         let _ = writeln!(out, "harnesses:");
         for h in harnesses {
@@ -7038,6 +7092,66 @@ mod tests {
     /// V302: a remote embedding model has no measured line floor, so doctor
     /// names the reason from the config (a daemon's answer is not needed) and
     /// the row says the check does not run.
+    #[test]
+    fn a_lock_folder_left_by_a_removed_model_is_listed_and_fix_removes_it() {
+        let _guard = MODELS_DIR_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = ModelsDirOverride::set(tmp.path());
+        let locks = tmp
+            .path()
+            .join(".locks")
+            .join(crystalline_index::hub_dir_name("BAAI/bge-small-en-v1.5"));
+        std::fs::create_dir_all(&locks).unwrap();
+        std::fs::write(locks.join("abc.lock"), b"").unwrap();
+
+        let found = check_model_locks(false, false).expect("the folder is reported");
+        assert_eq!(found.stale, ["BAAI/bge-small-en-v1.5"]);
+        assert!(found.removed.is_empty());
+        assert!(locks.is_dir(), "without --fix nothing is removed");
+
+        let read_only = check_model_locks(true, true).unwrap();
+        assert!(
+            read_only.removed.is_empty(),
+            "a read-only instance removes nothing"
+        );
+        assert!(locks.is_dir());
+
+        let fixed = check_model_locks(true, false).unwrap();
+        assert_eq!(fixed.removed, ["BAAI/bge-small-en-v1.5"]);
+        assert!(!locks.exists());
+        assert!(
+            check_model_locks(false, false).is_none(),
+            "nothing is left to report"
+        );
+    }
+
+    #[test]
+    fn the_model_lock_line_names_the_folders_and_is_never_a_problem() {
+        let mut report = DoctorReport {
+            model_locks: Some(ModelLocksDoctor {
+                stale: vec!["BAAI/bge-small-en-v1.5".to_string()],
+                removed: Vec::new(),
+            }),
+            ..DoctorReport::default()
+        };
+        let out = render_human(&report);
+        assert!(
+            out.contains("model cache: lock folders of models that are not cached any more: BAAI/bge-small-en-v1.5 (crystalline doctor --fix removes them)"),
+            "{out}"
+        );
+        assert_eq!(report.remaining_problems(), 0);
+
+        report.model_locks = Some(ModelLocksDoctor {
+            stale: vec!["BAAI/bge-small-en-v1.5".to_string()],
+            removed: vec!["BAAI/bge-small-en-v1.5".to_string()],
+        });
+        let out = render_human(&report);
+        assert!(
+            out.contains("model cache: removed the lock folders of models that are not cached any more: BAAI/bge-small-en-v1.5"),
+            "{out}"
+        );
+    }
+
     #[test]
     fn contradiction_summary_names_a_missing_line_floor_from_the_config() {
         let _guard = MODELS_DIR_ENV_LOCK.lock().unwrap();
