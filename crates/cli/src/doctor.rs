@@ -1097,8 +1097,11 @@ pub(crate) enum TaskFix {
 /// What `--fix` does about `task` with `repair`. An old-named task beside a
 /// ready machine task is redundant, so it is removed and nothing is
 /// registered; without a ready machine task it is moved to the new name.
+/// A refused query is repaired as a missing task: register this user's
+/// own, which also moves an old-named one.
 pub(crate) fn task_fix(task: &TaskDoctor, repair: TaskRepair) -> TaskFix {
     match repair {
+        _ if matches!(task.finding, Some(TaskFinding::Refused(_))) => TaskFix::Register,
         TaskRepair::Register => TaskFix::Register,
         TaskRepair::Administrator => TaskFix::Nothing,
         TaskRepair::Nothing if task.old_name.is_none() => TaskFix::Nothing,
@@ -1107,6 +1110,24 @@ pub(crate) fn task_fix(task: &TaskDoctor, repair: TaskRepair) -> TaskFix {
             _ => TaskFix::Register,
         },
     }
+}
+
+/// The report for a task query Task Scheduler refused, and what `--fix`
+/// may do about it: what it does for a missing task. The not-found words
+/// are in the system's default language and `schtasks` speaks the user's
+/// display language, so where the two differ a missing task reads as
+/// refused.
+pub(crate) fn refused_task(
+    refused: crystalline_service::daemon_task::Refused,
+) -> (TaskDoctor, TaskRepair) {
+    (
+        TaskDoctor {
+            finding: Some(TaskFinding::Refused(refused.task)),
+            refused: Some(refused.detail),
+            ..TaskDoctor::default()
+        },
+        TaskRepair::Register,
+    )
 }
 
 fn is_machine_task(name: &str) -> bool {
@@ -1209,14 +1230,7 @@ fn check_task(fix: bool) -> Option<TaskDoctor> {
     let name = found.clone().ok().flatten();
     let xml = name.as_deref().and_then(|name| tasks.definition(name));
     let (mut report, repair) = match found {
-        Err(refused) => (
-            TaskDoctor {
-                finding: Some(TaskFinding::Refused(refused.task)),
-                refused: Some(refused.detail),
-                ..TaskDoctor::default()
-            },
-            TaskRepair::Nothing,
-        ),
+        Err(refused) => refused_task(refused),
         Ok(_) => assess_task(
             name.as_deref(),
             xml.as_deref(),
@@ -4521,6 +4535,13 @@ pub fn render_human(report: &DoctorReport) -> String {
             }
         };
         match (&task.finding, &task.gone_command, &task.registered_now) {
+            (Some(TaskFinding::Refused(name)), _, Some(new)) => {
+                let _ = writeln!(
+                    out,
+                    "  registered the task {new} for this user. Task Scheduler had refused to say whether the task {name} exists ({})",
+                    task.refused.as_deref().unwrap_or("no reason given")
+                );
+            }
             (_, _, Some(name)) => {
                 let _ = writeln!(out, "  registered the task {name} for this user");
             }
@@ -4559,6 +4580,7 @@ pub fn render_human(report: &DoctorReport) -> String {
                     "  [problem] Task Scheduler refused to say whether the task {name} exists ({}), so doctor cannot tell whether Claude Desktop can start the daemon. Ask an administrator to check the task.",
                     task.refused.as_deref().unwrap_or("no reason given")
                 );
+                fix_error(&mut out);
             }
             (Some(TaskFinding::Missing) | None, _, _) => {
                 let _ = writeln!(
@@ -8685,5 +8707,88 @@ mod tests {
             serde_json::json!({ "state": "refused", "name": MACHINE_TASK_NAME })
         );
         assert_eq!(json["daemon_task"]["refused"], "ERROR: Access is denied.");
+    }
+
+    /// A missing task may read as refused (the not-found words are the
+    /// system's default language, `schtasks` speaks the user's), so `--fix`
+    /// tries the repair it makes for a missing task.
+    #[test]
+    fn a_refused_task_query_is_repaired_like_a_missing_task() {
+        use crystalline_service::daemon_task::{MACHINE_TASK_NAME, Refused};
+        let (report, repair) = refused_task(Refused {
+            task: MACHINE_TASK_NAME.to_string(),
+            detail: "FEHLER: Das System kann die angegebene Datei nicht finden.".to_string(),
+        });
+        assert_eq!(
+            report.finding,
+            Some(TaskFinding::Refused(MACHINE_TASK_NAME.to_string()))
+        );
+        assert_eq!(
+            report.refused.as_deref(),
+            Some("FEHLER: Das System kann die angegebene Datei nicht finden.")
+        );
+        assert_eq!(task_fix(&report, repair), TaskFix::Register);
+        let old = crystalline_service::daemon_task::legacy_user_task_name("ada");
+        for repair in [
+            TaskRepair::Nothing,
+            TaskRepair::Register,
+            TaskRepair::Administrator,
+        ] {
+            assert_eq!(
+                task_fix(
+                    &TaskDoctor {
+                        old_name: Some(old.clone()),
+                        ..report.clone()
+                    },
+                    repair
+                ),
+                TaskFix::Register,
+                "a refused finding always tries the register, an old name or not ({repair:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fix_after_a_refused_query_still_shows_windows_words() {
+        use crystalline_service::daemon_task::MACHINE_TASK_NAME;
+        const OWN_TASK: &str = r"\Crystalline Daemon for ada (S-1-5-21-1-2-3-1001)";
+        let refused = || TaskDoctor {
+            finding: Some(TaskFinding::Refused(MACHINE_TASK_NAME.to_string())),
+            refused: Some("ERROR: Access is denied.".to_string()),
+            ..TaskDoctor::default()
+        };
+        let report = |task: TaskDoctor| DoctorReport {
+            daemon_task: Some(task),
+            ..DoctorReport::default()
+        };
+
+        let registered = report(TaskDoctor {
+            registered_now: Some(OWN_TASK.to_string()),
+            ..refused()
+        });
+        let out = render_human(&registered);
+        assert!(
+            out.contains(&format!("registered the task {OWN_TASK} for this user")),
+            "{out}"
+        );
+        assert!(out.contains("(ERROR: Access is denied.)"), "{out}");
+        assert_eq!(registered.remaining_problems(), 0);
+
+        let failed = report(TaskDoctor {
+            error: Some("ERROR: Access is denied to register.".to_string()),
+            ..refused()
+        });
+        let out = render_human(&failed);
+        assert!(
+            out.contains(&format!(
+                "  [problem] Task Scheduler refused to say whether the task {MACHINE_TASK_NAME} exists (ERROR: Access is denied.)"
+            )),
+            "{out}"
+        );
+        assert!(
+            out.contains("--fix could not register it: ERROR: Access is denied to register."),
+            "{out}"
+        );
+        assert_eq!(failed.remaining_problems(), 1);
     }
 }

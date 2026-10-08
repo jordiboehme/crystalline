@@ -78,4 +78,20 @@ fn doctor_reports_a_refused_task_query_as_a_problem() {
         "the test query was refused"
     );
     assert_eq!(out.status.code(), Some(1));
+
+    // --fix tries the repair it makes for a missing task; a test binary is
+    // not the MSI's, so it says why it registered none.
+    let fixed = doctor(home.path(), "refused", &["--fix", "--json"]);
+    let fixed: Value = serde_json::from_slice(&fixed.stdout).unwrap();
+    assert!(
+        fixed["daemon_task"]["error"]
+            .as_str()
+            .unwrap()
+            .contains(r"Program Files\Crystalline\bin"),
+        "{fixed}"
+    );
+    assert_eq!(
+        fixed["daemon_task"]["refused"],
+        "the test query was refused"
+    );
 }

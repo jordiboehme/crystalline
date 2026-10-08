@@ -648,9 +648,12 @@ const NOT_FOUND_ENGLISH: &[&str] = &[
     "cannot find the path specified",
 ];
 
-/// Windows' words, in this system's language, for error 2 (a missing task)
-/// and error 3 (a missing task folder): `io::Error` formats them through
-/// `FormatMessageW`, the text `schtasks` prints.
+/// Windows' words, in the system's default language, for error 2 (a
+/// missing task) and error 3 (a missing task folder): `io::Error` formats
+/// them through `FormatMessageW` with the system default language, while
+/// `schtasks` prints in the user's display language. A user whose display
+/// language differs gets `Refused` for a missing task unless the English
+/// fallback matches; `doctor --fix` then still tries to register the task.
 fn not_found_texts() -> Vec<String> {
     [2, 3]
         .into_iter()
@@ -938,7 +941,7 @@ impl Removal {
         let refusals: Vec<String> = self
             .refused
             .iter()
-            .map(|(name, why)| format!("could not remove the task {name} ({why})"))
+            .map(|(name, why)| format!("could not check or remove the task {name} ({why})"))
             .collect();
         Err(refusals.join("; "))
     }
