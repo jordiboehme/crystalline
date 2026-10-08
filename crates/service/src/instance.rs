@@ -1410,6 +1410,73 @@ pub fn service_lock_is_free() -> bool {
     lock_is_free(&lock_path).unwrap_or(false)
 }
 
+/// The service lock, held by a process that does not own the index: `doctor
+/// --fix` takes it while it removes the files a dead daemon left, so a daemon
+/// that starts meanwhile waits in [`acquire_ownership`]'s retry loop instead of
+/// publishing a record that is deleted under it a moment later.
+///
+/// Dropping it lets the lock go and leaves the file;
+/// [`ServiceLockHold::release_removing_file`] removes the file first.
+pub struct ServiceLockHold {
+    file: File,
+    path: PathBuf,
+    existed: bool,
+}
+
+impl ServiceLockHold {
+    /// Removes `service.lock` while it is still held, then lets the lock go.
+    /// True when the file was there before the hold took it, so the caller
+    /// can say it removed a leftover rather than one it created itself.
+    ///
+    /// Removing a held lock file is safe: [`acquire_ownership`] opens the path
+    /// afresh on every attempt and checks that the file it locked is still the
+    /// one at the path ([`locked_file_is_current`]).
+    pub fn release_removing_file(self) -> bool {
+        let ServiceLockHold {
+            file,
+            path,
+            existed,
+        } = self;
+        let removed = std::fs::remove_file(&path).is_ok();
+        drop(file);
+        removed && existed
+    }
+}
+
+/// Takes the service lock without waiting. `None` when something holds it,
+/// and, conservatively, when the state directory cannot be resolved or the
+/// lock file cannot be opened: a caller never treats that as license to
+/// delete anything.
+///
+/// The file is created when it is missing, as [`acquire_ownership`] does: a
+/// stale `service.json` can stand with no `service.lock` beside it, and a
+/// lock nobody holds on a file nobody has opened keeps nobody out.
+pub fn hold_service_lock() -> Option<ServiceLockHold> {
+    let dir = config::state_dir().ok()?;
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = config::service_lock_path().ok()?;
+    let existed = path.is_file();
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .ok()?;
+    if FileExt::try_lock(&file).is_err() {
+        return None;
+    }
+    if !locked_file_is_current(&file, &path) {
+        let _ = FileExt::unlock(&file);
+        return None;
+    }
+    Some(ServiceLockHold {
+        file,
+        path,
+        existed,
+    })
+}
+
 /// Ask the daemon socket for a trivial `ctl` answer, bounded by
 /// [`HOLDER_PROBE_TIMEOUT`]. `sessions` is the cheapest real command: it reads
 /// in-memory counters and touches neither the store nor the routing cache, so
@@ -4986,6 +5053,46 @@ mod tests {
             lock_is_free(&lock_path).unwrap(),
             "the lock frees when ownership drops"
         );
+        drop(home);
+    }
+
+    /// doctor's hold keeps a starting daemon out for as long as it lasts, and
+    /// is never taken from a daemon that owns the index.
+    #[test]
+    fn a_held_service_lock_keeps_ownership_out_until_it_is_released() {
+        let home = ScratchHome::new("hold-lock");
+        let lock_path = config::service_lock_path().unwrap();
+
+        let ownership = acquire_ownership().unwrap();
+        assert!(
+            hold_service_lock().is_none(),
+            "a lock a daemon holds is never held by anyone else"
+        );
+        drop(ownership);
+        assert!(!lock_path.exists(), "the owner removes its lock file");
+
+        let hold = hold_service_lock().expect("a free lock can be held");
+        let refused = acquire_ownership()
+            .err()
+            .expect("ownership waits on the hold");
+        assert!(
+            refused.downcast_ref::<LockHeld>().is_some(),
+            "a starting daemon is told the lock is held: {refused:#}"
+        );
+        assert!(
+            !hold.release_removing_file(),
+            "the file was created by the hold, so it was not a leftover"
+        );
+        assert!(!lock_path.exists(), "the release removes service.lock");
+
+        // A leftover lock file is reported as removed.
+        std::fs::write(&lock_path, b"").unwrap();
+        let hold = hold_service_lock().expect("a leftover lock file is free");
+        assert!(hold.release_removing_file());
+        assert!(!lock_path.exists());
+
+        let ownership = acquire_ownership().expect("ownership is takeable once the hold is gone");
+        drop(ownership);
         drop(home);
     }
 

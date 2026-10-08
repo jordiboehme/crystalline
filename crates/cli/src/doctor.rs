@@ -3079,28 +3079,34 @@ async fn check_service(
                 Err(e) => s.holder_unknown = Some(e.to_string()),
             }
         }
-        // Re-probed right before the delete, not trusted from the diagnosis
-        // above: `diagnose_holder`'s socket probe alone can take up to
-        // `HOLDER_PROBE_TIMEOUT`, and a daemon starting up in that window
-        // would take the lock after this run decided it was free but before
-        // it acted on that verdict - the exact "delete a lock a starting
-        // daemon holds" shape the 2026-09-23 incident's doctor produced. A
-        // lock that is held now is reported as recovered rather than
-        // removed, the same treatment `daemon_unresponsive`'s `NotNeeded`
-        // case gets above.
-        if s.lock_stale && !instance::service_lock_is_free() {
-            s.lock_stale = false;
-        }
-        if s.lock_stale {
-            let info_removed = std::fs::remove_file(&info_path).is_ok();
-            let legacy_removed = std::fs::remove_file(&legacy_path).is_ok();
-            s.lock_removed = info_removed || legacy_removed;
-        }
-        if s.socket_orphaned && !instance::service_lock_is_free() {
-            s.socket_orphaned = false;
-        }
-        if s.socket_orphaned {
-            s.socket_removed = std::fs::remove_file(&sock_path).is_ok();
+        // One hold of the service lock across every removal below, not a
+        // probe before each: the diagnosis above can take up to
+        // `HOLDER_PROBE_TIMEOUT`, and a daemon that started in that window,
+        // or starts while this deletes, would otherwise have its fresh record
+        // and its lock file deleted under it (the 2026-09-23 incident's
+        // shape). Held, a starting daemon waits in its own retry loop. A lock
+        // that is held now is reported as recovered rather than removed, the
+        // same treatment `daemon_unresponsive`'s `NotNeeded` case gets above.
+        if s.lock_stale || s.socket_orphaned {
+            match instance::hold_service_lock() {
+                Some(hold) => {
+                    let info_removed = s.lock_stale && std::fs::remove_file(&info_path).is_ok();
+                    if s.socket_orphaned {
+                        s.socket_removed = std::fs::remove_file(&sock_path).is_ok();
+                    }
+                    // Last, while still held. A free service.lock with no
+                    // daemon is itself a leftover, and when only the socket
+                    // was the finding, the hold created this file.
+                    let lock_file_removed = hold.release_removing_file();
+                    if s.lock_stale {
+                        s.lock_removed = info_removed || lock_file_removed;
+                    }
+                }
+                None => {
+                    s.lock_stale = false;
+                    s.socket_orphaned = false;
+                }
+            }
         }
     }
     Ok(s)
