@@ -349,7 +349,7 @@ pub fn canonical_text(path: &Path) -> String {
     canonical_path(path).display().to_string()
 }
 
-fn canonical_path(path: &Path) -> PathBuf {
+pub(crate) fn canonical_path(path: &Path) -> PathBuf {
     if let Ok(canonical) = std::fs::canonicalize(path) {
         return canonical;
     }

@@ -987,6 +987,64 @@ async fn a_grandfathered_name_is_re_added_without_error() {
     assert_eq!(report["adopted"], true, "{report}");
 }
 
+/// A name registered at another folder is refused before anything touches the
+/// disk: neither an explicit folder nor the default `<domains_root>/<name>`
+/// is created.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_add_creates_no_folder() {
+    let (tmp, engine) = engine().await;
+
+    let elsewhere = tmp.path().join("elsewhere");
+    let err = engine
+        .domain_add_local(Some("eng"), Some(elsewhere.to_str().unwrap()))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("already registered at a different folder"),
+        "{err}"
+    );
+    assert!(!elsewhere.exists(), "the refused folder was never created");
+
+    let err = engine
+        .domain_add_local(Some("eng"), None)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("already registered at a different folder"),
+        "{err}"
+    );
+    assert!(
+        !tmp.path().join("domains-root").join("eng").exists(),
+        "the default folder was never created either"
+    );
+}
+
+/// A name another process registered in the file after this engine read its
+/// snapshot is refused under the file guard, never overwritten.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_virtual_add_re_checks_the_file_under_its_guard() {
+    let (tmp, engine) = engine().await;
+    let config_path = tmp.path().join("config.yaml");
+    let dir = tmp.path().join("notes");
+    std::fs::create_dir_all(&dir).unwrap();
+    // On disk only: the engine's in-memory configuration does not hold it.
+    let mut file: GlobalConfig = crystalline_core::config::load_yaml(&config_path).unwrap();
+    file.domains
+        .insert("notes".to_string(), DomainEntry::file(dir.clone()));
+    crystalline_core::config::save_yaml(&config_path, &file).unwrap();
+
+    let err = engine.domain_add_virtual("notes").await.unwrap_err();
+    assert!(err.to_string().contains("is a file domain"), "{err}");
+    let after: GlobalConfig = crystalline_core::config::load_yaml(&config_path).unwrap();
+    assert!(
+        !after.domains["notes"].is_virtual(),
+        "the file entry still stands: {:?}",
+        after.domains["notes"]
+    );
+}
+
 /// validate_engrams reads the domain's `.crystalline.yaml` through the same
 /// loader `crystalline verify` does, so a typo there is reported the same way.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

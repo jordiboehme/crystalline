@@ -3843,6 +3843,23 @@ where
     }
 }
 
+/// `--private` on a domain that was already registered: an existing domain
+/// is not this command's to close, and making a shared domain private is its
+/// own verb. Called before anything is printed. With `--json` the refusal is
+/// the one object on stdout, `{"ok": false, "error": ...}` (the shape of the
+/// daemon's ctl replies), and the process exits 1; without it the message is
+/// returned as the command's error.
+fn refuse_private_on_adopted(name: &str, owner: &str, json: bool) -> anyhow::Error {
+    let message = format!(
+        "domain '{name}' was already registered, so --private changed nothing; close an existing domain with: crystalline domain visibility {name} private --owner {owner}"
+    );
+    if json {
+        println!("{}", serde_json::json!({ "ok": false, "error": message }));
+        std::process::exit(1);
+    }
+    anyhow::anyhow!(message)
+}
+
 fn run_domain(command: DomainCommand, db: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
     match command {
         DomainCommand::Init { path, name } => cmd::domain_init(&path, name.as_deref(), json),
@@ -3885,17 +3902,14 @@ fn run_domain(command: DomainCommand, db: Option<PathBuf>, json: bool) -> anyhow
                 db,
                 no_sync,
                 json,
+                closing.as_deref(),
             )
             .await?;
             if let Some(owner) = closing {
-                // An adopted registration is somebody's existing domain, not a
-                // new one this command may close: making a shared domain
-                // private is its own decision, with its own verb.
-                if adopted {
-                    anyhow::bail!(
-                        "domain '{chosen_name}' was already registered, so --private changed nothing; close an existing domain with: crystalline domain visibility {chosen_name} private --owner {owner}"
-                    );
-                }
+                // The dispatch refused `--private` on an adopted registration
+                // before it printed anything; a domain that reaches this
+                // point is new.
+                debug_assert!(!adopted);
                 // The name is re-resolved against the config the registration
                 // just wrote rather than trusted as typed, which is what the
                 // REST path does by reading the engine's own report: a name
@@ -4272,6 +4286,9 @@ async fn mcp_dispatch(
 /// registered is what this function returns, not necessarily `name` as
 /// given. `--virtual` always needs a name, since there is no folder to
 /// derive one from.
+///
+/// `private_owner` is `--private`'s owner: an adopted registration is refused
+/// with it before anything is printed.
 #[allow(clippy::too_many_arguments)]
 async fn domain_add_dispatch(
     name: Option<String>,
@@ -4283,6 +4300,7 @@ async fn domain_add_dispatch(
     db: Option<PathBuf>,
     no_sync: bool,
     json: bool,
+    private_owner: Option<&str>,
 ) -> anyhow::Result<(String, bool)> {
     if let Some(origin_spec) = origin {
         return domain_add_origin_dispatch(
@@ -4295,6 +4313,7 @@ async fn domain_add_dispatch(
             config,
             db,
             json,
+            private_owner,
         )
         .await;
     }
@@ -4314,6 +4333,11 @@ async fn domain_add_dispatch(
             )
         })?;
         let (markdown, adopted) = cmd::domain_add_register_virtual(&name, config.as_deref())?;
+        if let Some(owner) = private_owner
+            && adopted
+        {
+            return Err(refuse_private_on_adopted(&name, owner, json));
+        }
         let scaffold = crystalline_service::scaffold_virtual_manifest(
             &name,
             &markdown,
@@ -4333,6 +4357,13 @@ async fn domain_add_dispatch(
     // needs a pre-scaffolded MANIFEST.md.
     let (chosen_name, abs, adopted, shadowed) =
         cmd::domain_add_register(name.as_deref(), path.as_deref(), config.as_deref())?;
+    // Before the `--no-sync` print and before the sync, so a refused
+    // `--private` prints nothing and indexes nothing.
+    if let Some(owner) = private_owner
+        && adopted
+    {
+        return Err(refuse_private_on_adopted(&chosen_name, owner, json));
+    }
     if no_sync {
         cmd::print_domain_add_no_sync(&chosen_name, &abs, adopted, shadowed.as_deref(), json);
         return Ok((chosen_name, adopted));
@@ -4395,6 +4426,7 @@ async fn domain_add_origin_dispatch(
     config: Option<PathBuf>,
     db: Option<PathBuf>,
     json: bool,
+    private_owner: Option<&str>,
 ) -> anyhow::Result<(String, bool)> {
     if is_virtual {
         anyhow::bail!("`domain add --origin` cannot be combined with --virtual");
@@ -4435,15 +4467,22 @@ async fn domain_add_origin_dispatch(
         config.as_deref(),
     )
     .await?;
-    cmd::print_origin_add(&repo, &data, json);
     let chosen_name = data["domain"].as_str().unwrap_or_default().to_string();
     let already_registered = snapshot.contains_key(&chosen_name);
     // Adopted when the name was already registered before this call (a
     // shared origin-less domain connected in place) or the engine answers a
     // retry with `already_connected`: either way `--private`'s caller must
-    // refuse rather than close an existing domain.
+    // refuse rather than close an existing domain, and refuse before the
+    // connect report is printed.
     let already_connected = data["already_connected"].as_bool().unwrap_or(false);
-    Ok((chosen_name, already_registered || already_connected))
+    let adopted = already_registered || already_connected;
+    if let Some(owner) = private_owner
+        && adopted
+    {
+        return Err(refuse_private_on_adopted(&chosen_name, owner, json));
+    }
+    cmd::print_origin_add(&repo, &data, json);
+    Ok((chosen_name, adopted))
 }
 
 /// `domain remove`: the engine's own unregistration, over the daemon when one
