@@ -127,11 +127,29 @@ pub struct ConfigMismatch {
 }
 
 impl ConfigMismatch {
+    /// The line for this platform: see [`ConfigMismatch::line_for`].
     pub fn line(&self) -> String {
-        format!(
-            "The daemon serves {}, not {} from {}: a daemon the sign-in task started reads the system environment. Set {} as a user environment variable, or stop the daemon (`crystalline ctl shutdown`) and start it from this shell.",
-            self.daemon, self.here, self.variable, self.variable
-        )
+        self.line_for(cfg!(windows))
+    }
+
+    /// The line a person reads. On Windows the daemon a client could not
+    /// shape is the one the sign-in task started, which reads the system
+    /// environment, so the line names the task and the user environment
+    /// variable. Elsewhere there is no such task, so the line says only that
+    /// the daemon was started without this shell's environment. A parameter
+    /// rather than a `cfg`, so both wordings are tested on every platform.
+    pub fn line_for(&self, windows: bool) -> String {
+        if windows {
+            format!(
+                "The daemon serves {}, not {} from {}: a daemon the sign-in task started reads the system environment. Set {} as a user environment variable, or stop the daemon (`crystalline ctl shutdown`) and start it from this shell.",
+                self.daemon, self.here, self.variable, self.variable
+            )
+        } else {
+            format!(
+                "The daemon serves {}, not {} from {}: the daemon was started without this shell's environment. Stop it (`crystalline ctl shutdown`) and start it from this shell, or set {} where it starts.",
+                self.daemon, self.here, self.variable, self.variable
+            )
+        }
     }
 }
 
@@ -303,6 +321,7 @@ mod tests {
     }
 
     const LINE_HTTP: &str = "The daemon serves no HTTP endpoint, not 127.0.0.1:7499 from CRYSTALLINE_SERVICE_HTTP: a daemon the sign-in task started reads the system environment. Set CRYSTALLINE_SERVICE_HTTP as a user environment variable, or stop the daemon (`crystalline ctl shutdown`) and start it from this shell.";
+    const LINE_HTTP_ELSEWHERE: &str = "The daemon serves no HTTP endpoint, not 127.0.0.1:7499 from CRYSTALLINE_SERVICE_HTTP: the daemon was started without this shell's environment. Stop it (`crystalline ctl shutdown`) and start it from this shell, or set CRYSTALLINE_SERVICE_HTTP where it starts.";
 
     #[test]
     fn a_difference_a_variable_set_here_explains_is_one_line() {
@@ -320,7 +339,17 @@ mod tests {
         );
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(found[0].variable, "CRYSTALLINE_SERVICE_HTTP");
-        assert_eq!(found[0].line(), LINE_HTTP);
+        assert_eq!(found[0].line_for(true), LINE_HTTP);
+        assert_eq!(found[0].line_for(false), LINE_HTTP_ELSEWHERE);
+        assert_eq!(
+            found[0].line(),
+            if cfg!(windows) {
+                LINE_HTTP
+            } else {
+                LINE_HTTP_ELSEWHERE
+            },
+            "the platform picks the wording"
+        );
 
         let config = mismatches_with(
             &facts(
@@ -335,8 +364,12 @@ mod tests {
             false,
         );
         assert_eq!(
-            config[0].line(),
+            config[0].line_for(true),
             "The daemon serves /home/ada/.config/crystalline/config.yaml, not /work/team.yaml from CRYSTALLINE_CONFIG: a daemon the sign-in task started reads the system environment. Set CRYSTALLINE_CONFIG as a user environment variable, or stop the daemon (`crystalline ctl shutdown`) and start it from this shell."
+        );
+        assert_eq!(
+            config[0].line_for(false),
+            "The daemon serves /home/ada/.config/crystalline/config.yaml, not /work/team.yaml from CRYSTALLINE_CONFIG: the daemon was started without this shell's environment. Stop it (`crystalline ctl shutdown`) and start it from this shell, or set CRYSTALLINE_CONFIG where it starts."
         );
     }
 

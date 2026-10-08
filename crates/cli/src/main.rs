@@ -3869,14 +3869,44 @@ where
 /// daemon's ctl replies), and the process exits 1; without it the message is
 /// returned as the command's error.
 fn refuse_private_on_adopted(name: &str, owner: &str, json: bool) -> anyhow::Error {
-    let message = format!(
-        "domain '{name}' was already registered, so --private changed nothing; close an existing domain with: crystalline domain visibility {name} private --owner {owner}"
-    );
+    let message = private_on_adopted_message(name, owner);
     if json {
         println!("{}", serde_json::json!({ "ok": false, "error": message }));
         std::process::exit(1);
     }
     anyhow::anyhow!(message)
+}
+
+/// `--private` on a domain `domain add --origin` adopted: whether the name
+/// was taken is only known once the engine has chosen it, which is after the
+/// connect ran, so the domain IS connected by now and the refusal must not
+/// read as if nothing happened. The connect report comes first: printed as
+/// usual without `--json`, then the refusal as the command's error; with
+/// `--json` the one object on stdout is `{"ok": false, "error": ...,
+/// "connected": <the report>}` and the process exits 1.
+fn refuse_private_after_connect(
+    repo: &str,
+    name: &str,
+    owner: &str,
+    data: &serde_json::Value,
+    json: bool,
+) -> anyhow::Error {
+    let message = private_on_adopted_message(name, owner);
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({ "ok": false, "error": message, "connected": data })
+        );
+        std::process::exit(1);
+    }
+    cmd::print_origin_add(repo, data, false);
+    anyhow::anyhow!(message)
+}
+
+fn private_on_adopted_message(name: &str, owner: &str) -> String {
+    format!(
+        "domain '{name}' was already registered, so --private changed nothing; close an existing domain with: crystalline domain visibility {name} private --owner {owner}"
+    )
 }
 
 fn run_domain(command: DomainCommand, db: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
@@ -4491,14 +4521,20 @@ async fn domain_add_origin_dispatch(
     // Adopted when the name was already registered before this call (a
     // shared origin-less domain connected in place) or the engine answers a
     // retry with `already_connected`: either way `--private`'s caller must
-    // refuse rather than close an existing domain, and refuse before the
-    // connect report is printed.
+    // refuse rather than close an existing domain. The connect has run by
+    // now, so the refusal carries its report.
     let already_connected = data["already_connected"].as_bool().unwrap_or(false);
     let adopted = already_registered || already_connected;
     if let Some(owner) = private_owner
         && adopted
     {
-        return Err(refuse_private_on_adopted(&chosen_name, owner, json));
+        return Err(refuse_private_after_connect(
+            &repo,
+            &chosen_name,
+            owner,
+            &data,
+            json,
+        ));
     }
     cmd::print_origin_add(&repo, &data, json);
     Ok((chosen_name, adopted))

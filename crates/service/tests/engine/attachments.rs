@@ -2161,6 +2161,28 @@ async fn a_tombstoned_base_attachment_reads_absent_for_the_actor_and_present_for
         .await
         .unwrap();
     assert_eq!(bytes, PNG, "and bob's file was never in question");
+
+    // Alice's tombstone is hers alone: bob, who deleted nothing, can still
+    // act on the file, and his delete lands as his own draft.
+    let p = DeleteParams {
+        identifier: "assets/deck.png".to_string(),
+        domain: "rev-gone".to_string(),
+        expected_checksum: None,
+    };
+    let his = engine.delete_engram_as(&p, None, &bob()).await.unwrap();
+    assert_eq!(his["deleted"], serde_json::json!(true), "{his}");
+    assert_eq!(his["draft"], serde_json::json!(true), "{his}");
+    assert!(
+        state
+            .join("overlays/rev-gone/bob/files/assets/deck.png.tombstone")
+            .is_file(),
+        "his deletion is a sidecar in his own overlay"
+    );
+    assert_eq!(
+        std::fs::read(review_dir.join("assets/deck.png")).unwrap(),
+        PNG,
+        "and the reviewed file is still untouched"
+    );
 }
 
 /// **A file only its own actor ever held leaves no marker behind.**

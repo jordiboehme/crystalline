@@ -601,10 +601,27 @@ fn resolve_file_secrets(
         let Some(source) = secret_source(plain, &var).map_err(OverlayError)? else {
             continue;
         };
-        if source.from_file() {
-            file_sourced.push((plain.to_string(), source.var().to_string()));
+        // The path the file form names, kept for the empty-file refusal.
+        let file_path = source.from_file().then(|| {
+            (
+                source.var().to_string(),
+                var(source.var()).unwrap_or_default(),
+            )
+        });
+        if let Some((file_var, _)) = &file_path {
+            file_sourced.push((plain.to_string(), file_var.clone()));
         }
         let value = source.resolve(read).map_err(OverlayError)?;
+        // A file that holds nothing but its line break would read as unset
+        // without a word, while the setup token and the admin pair refuse
+        // it: refuse it here too, naming the variable and the path.
+        if let Some((file_var, path)) = file_path
+            && value.is_empty()
+        {
+            return Err(OverlayError(format!(
+                "{file_var} names {path}, which is empty"
+            )));
+        }
         resolved.push((plain.to_string(), value));
     }
     let consumed = |name: &str| {
@@ -1902,6 +1919,22 @@ mod tests {
         assert_eq!(
             err,
             "CRYSTALLINE_REMOTE_TOKEN_FILE names /nope, which cannot be read (no such file)"
+        );
+    }
+
+    #[test]
+    fn an_empty_secret_file_is_refused_naming_the_variable_and_the_path() {
+        // Only the line break the trim drops: a file that holds no secret
+        // must not make the token read as unset without a word.
+        let err = overlay_reading(
+            &[("CRYSTALLINE_GITHUB_TOKEN_FILE", "/run/secrets/gh")],
+            &[("/run/secrets/gh", "\n")],
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            err,
+            "CRYSTALLINE_GITHUB_TOKEN_FILE names /run/secrets/gh, which is empty"
         );
     }
 

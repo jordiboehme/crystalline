@@ -1212,6 +1212,36 @@ both_backends!(
     virtual_manifest_create
 );
 
+/// A virtual MANIFEST row at `MANIFEST.md` whose permalink is not `manifest`
+/// is the domain's MANIFEST all the same: the read finds it by path, the way
+/// the save compares against it, so the editor is handed its text and the
+/// checksum a save then accepts. Before, the read answered missing with the
+/// empty checksum while the save compared against the row, and every save
+/// was a stale edit.
+async fn virtual_manifest_under_another_permalink(store: Arc<Mutex<dyn Store>>) {
+    let engine = virtual_engine(store);
+    let manifest = "---\ntype: manifest\ntitle: Notes\npermalink: routing\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Notes\n\n## Scope\n\n- notes\n\n## When to Use\n\n- Route here for notes\n";
+    engine
+        .scaffold_virtual_manifest("notes", manifest)
+        .await
+        .unwrap();
+
+    let source = engine.manifest_source("notes").await.unwrap();
+    assert!(!source.missing, "the row at MANIFEST.md is the MANIFEST");
+    assert_eq!(source.markdown, manifest);
+
+    let edited = manifest.replace("- Route here for notes", "- Route here for edited notes");
+    engine
+        .save_manifest("notes", &edited, &sha_hex(&source.markdown))
+        .await
+        .unwrap();
+    assert_eq!(engine.manifest_markdown("notes").await.unwrap(), edited);
+}
+both_backends!(
+    a_virtual_manifest_under_another_permalink_reads_and_saves,
+    virtual_manifest_under_another_permalink
+);
+
 // --- path identifier ---------------------------------------------------------
 
 async fn virtual_path_identifier(store: Arc<Mutex<dyn Store>>) {

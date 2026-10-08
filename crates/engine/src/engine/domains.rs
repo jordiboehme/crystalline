@@ -329,7 +329,15 @@ impl Engine {
                 let store = self.store.lock().await;
                 let content = match store.find_engram(domain, "manifest").await? {
                     Some(d) => store.engram_content(d.domain_id, &d.path).await?,
-                    None => None,
+                    // A row at the path under another permalink is the
+                    // MANIFEST all the same, and it is the row
+                    // `save_manifest` compares against: read it the same
+                    // way, so the editor is handed the checksum a save
+                    // accepts rather than the empty text's.
+                    None => match store.domain_id(domain).await? {
+                        Some(domain_id) => store.engram_content(domain_id, "MANIFEST.md").await?,
+                        None => None,
+                    },
                 };
                 content.ok_or_else(|| {
                     EngineError::NotFound(format!("domain '{domain}' has no MANIFEST engram yet"))

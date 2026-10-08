@@ -347,10 +347,13 @@ fn status_names_the_variable_a_task_started_daemon_did_not_get() {
     let _ = run(&[], &["ctl", "shutdown"]);
 
     let said = String::from_utf8_lossy(&with_variable.stderr);
-    assert!(
-        said.contains("note: The daemon serves no HTTP endpoint, not 127.0.0.1:7499 from CRYSTALLINE_SERVICE_HTTP: a daemon the sign-in task started reads the system environment. Set CRYSTALLINE_SERVICE_HTTP as a user environment variable, or stop the daemon (`crystalline ctl shutdown`) and start it from this shell."),
-        "{said}"
-    );
+    // The sign-in task is Windows' own; elsewhere the line names no task.
+    let expected = if cfg!(windows) {
+        "note: The daemon serves no HTTP endpoint, not 127.0.0.1:7499 from CRYSTALLINE_SERVICE_HTTP: a daemon the sign-in task started reads the system environment. Set CRYSTALLINE_SERVICE_HTTP as a user environment variable, or stop the daemon (`crystalline ctl shutdown`) and start it from this shell."
+    } else {
+        "note: The daemon serves no HTTP endpoint, not 127.0.0.1:7499 from CRYSTALLINE_SERVICE_HTTP: the daemon was started without this shell's environment. Stop it (`crystalline ctl shutdown`) and start it from this shell, or set CRYSTALLINE_SERVICE_HTTP where it starts."
+    };
+    assert!(said.contains(expected), "{said}");
     let json: Value = serde_json::from_slice(&as_json.stdout).unwrap();
     assert_eq!(
         json["config_mismatch"][0]["variable"], "CRYSTALLINE_SERVICE_HTTP",

@@ -185,6 +185,11 @@ pub struct MergeReport {
     /// The `github` settings copied from the private config, by name. Never
     /// a value.
     pub github_carried: Vec<String>,
+    /// The value of `github.api_url` when it was carried. Not a secret,
+    /// and it is the GitHub the token will be sent to, so the person sees
+    /// it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub github_api_url: Option<String>,
     /// Private files kept as they are and named for the person.
     pub private_kept: Vec<String>,
     /// Where the private folder went.
@@ -626,6 +631,9 @@ pub async fn merge_into(
         report
             .origins_copied
             .extend(carried.into_iter().map(|(name, _)| name));
+        if github_carried.iter().any(|key| key == "github.api_url") {
+            report.github_api_url = file.github.as_ref().and_then(|g| g.api_url.clone());
+        }
         report.github_carried.extend(github_carried);
         // A carried github.enabled turns team domains on here, unless the
         // environment says otherwise: asked again, so the report does not

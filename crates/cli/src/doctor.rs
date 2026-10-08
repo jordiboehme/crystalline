@@ -4120,9 +4120,15 @@ fn render_merge(out: &mut String, merge: &crate::desktop_state::MergeReport) {
         let _ = writeln!(out, "  registered {name} from Claude Desktop's state");
     }
     for key in &merge.github_carried {
+        // The API address is shown, never another value: it is not a
+        // secret, and it names the GitHub the token will be sent to.
+        let value = match merge.github_api_url.as_deref() {
+            Some(url) if key == "github.api_url" => format!(" ({url})"),
+            _ => String::new(),
+        };
         let _ = writeln!(
             out,
-            "  carried the setting {key} from Claude Desktop's state"
+            "  carried the setting {key}{value} from Claude Desktop's state"
         );
     }
     for name in &merge.already_registered {

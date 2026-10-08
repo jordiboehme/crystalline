@@ -1039,9 +1039,47 @@ fn domain_add_origin_with_no_name_adopting_an_origin_less_domain_refuses_private
     .arg(&db)
     .assert()
     .failure()
+    // The connect did happen, so the report says so before the refusal: a
+    // bare refusal would read as if nothing had changed.
+    .stdout(predicates::str::contains(
+        "Connected team domain 'kb' to acme/kb",
+    ))
     .stderr(predicates::str::contains(
         "domain 'kb' was already registered, so --private changed nothing",
     ));
+
+    // With --json the refusal is still the one object on stdout, and it
+    // carries the connect report it followed.
+    let mut cmd = bin();
+    isolate(&mut cmd, home.path());
+    let out = cmd
+        .args([
+            "domain",
+            "add",
+            "--origin",
+            "acme/kb",
+            "--private",
+            "--owner",
+            "ada",
+            "--json",
+            "--config",
+        ])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let reply: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(reply["ok"], false, "{reply}");
+    assert!(
+        reply["error"]
+            .as_str()
+            .unwrap()
+            .contains("--private changed nothing"),
+        "{reply}"
+    );
+    assert_eq!(reply["connected"]["domain"], "kb", "{reply}");
 
     // A real connect ran: the MANIFEST was asked for before the name was
     // chosen, on the branch the repository calls its default, and the

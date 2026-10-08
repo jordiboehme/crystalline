@@ -975,6 +975,10 @@ fn the_merge_carries_the_github_settings_this_machine_does_not_set() {
         serde_json::json!(["github.enabled", "github.api_url", "github.oauth_client_id"]),
         "{merge}"
     );
+    assert_eq!(
+        merge["github_api_url"], "https://ghe.example.com/api/v3",
+        "the carried API address is shown: {merge}"
+    );
     let github = real_config(home.path()).github.unwrap();
     assert_eq!(github.enabled, Some(true));
     assert_eq!(github.poll_secs, Some(600), "never overwritten");
@@ -998,6 +1002,7 @@ fn a_carried_setting_is_named_and_its_value_is_not_printed() {
         crystalline_core::config::load_yaml(&folder.join("config.yaml")).unwrap();
     private.github = Some(crystalline_core::config::GitHubConfig {
         oauth_client_id: Some("Iv1.0123456789abcdef".to_string()),
+        api_url: Some("https://github.acme.example/api/v3".to_string()),
         ..Default::default()
     });
     crystalline_core::config::save_yaml(&folder.join("config.yaml"), &private).unwrap();
@@ -1012,6 +1017,12 @@ fn a_carried_setting_is_named_and_its_value_is_not_printed() {
         "{text}"
     );
     assert!(!text.contains("Iv1.0123456789abcdef"), "{text}");
+    // The API address is not a secret, and it is where the token will be
+    // sent, so it is shown.
+    assert!(
+        text.contains("  carried the setting github.api_url (https://github.acme.example/api/v3) from Claude Desktop's state\n"),
+        "{text}"
+    );
 }
 
 /// A carried github.enabled turns team domains on, so the report says the
