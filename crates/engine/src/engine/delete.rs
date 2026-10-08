@@ -186,12 +186,28 @@ impl Engine {
             })?;
         }
         let store = self.store.lock().await;
-        store.delete_engram(desc.domain_id, &desc.path).await?;
-        // Deleting a MANIFEST removes its `## Tag Aliases` declarations, so clear
-        // the domain's derived alias rows: the content is already gone, so the
-        // refresh folds to no pairs and replaces the rows with nothing.
-        if desc.path == "MANIFEST.md" {
-            crystalline_index::refresh_tag_aliases(&*store, desc.domain_id).await?;
+        // One transaction for the index half of a delete: the rows, the
+        // unbinding of every reference that named them and, for a MANIFEST,
+        // its alias rows land together or not at all.
+        store.begin().await?;
+        let removed = async {
+            store.delete_engram(desc.domain_id, &desc.path).await?;
+            // Deleting a MANIFEST removes its `## Tag Aliases` declarations, so
+            // clear the domain's derived alias rows: the content is already
+            // gone, so the refresh folds to no pairs and replaces the rows
+            // with nothing.
+            if desc.path == "MANIFEST.md" {
+                crystalline_index::refresh_tag_aliases(&*store, desc.domain_id).await?;
+            }
+            Ok::<(), EngineError>(())
+        }
+        .await;
+        match removed {
+            Ok(()) => store.commit().await?,
+            Err(e) => {
+                let _ = store.rollback().await;
+                return Err(e);
+            }
         }
         drop(store);
         self.announce(Change::Engram(EngramChanged {

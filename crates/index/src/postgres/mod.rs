@@ -1061,6 +1061,15 @@ pub const DELETE_ENGRAM_CONTRADICTIONS_SQL: &str =
 pub const DELETE_ENGRAM_CONTRADICTION_PAIRS_SQL: &str =
     "DELETE FROM contradiction_pair WHERE engram_a=$1 OR engram_b=$1";
 
+/// The wikilinks that name one engram, unbound by [`Store::delete_engram`]
+/// through `idx_link_to`. See the turso twin.
+#[doc(hidden)]
+pub const UNBIND_INBOUND_LINKS_SQL: &str = "UPDATE link SET to_id = NULL WHERE to_id = $1";
+
+/// The relation twin, through `idx_relation_to`.
+#[doc(hidden)]
+pub const UNBIND_INBOUND_RELATIONS_SQL: &str = "UPDATE relation SET to_id = NULL WHERE to_id = $1";
+
 /// The read behind [`Store::scored_pair_count`], through
 /// `idx_contradiction_pair_model`: unlike [`CONTRADICTION_PAIRS_SCORED_SQL`],
 /// this names no domain, so it cannot seek `idx_contradiction_pair_domain`,
@@ -1817,6 +1826,15 @@ impl Store for PostgresStore {
                     .map_err(IndexError::from)?;
             }
             delete_children(&mut *c, id).await?;
+            // Every reference that named this engram goes back to pending in
+            // the same transaction. See the turso twin.
+            for sql in [UNBIND_INBOUND_LINKS_SQL, UNBIND_INBOUND_RELATIONS_SQL] {
+                sqlx::query(sql)
+                    .bind(id)
+                    .execute(&mut *c)
+                    .await
+                    .map_err(IndexError::from)?;
+            }
             sqlx::query("DELETE FROM chunk WHERE engram_id=$1")
                 .bind(id)
                 .execute(&mut *c)

@@ -1848,3 +1848,136 @@ async fn a_read_only_instance_on_its_own_index_still_reparses() {
     assert_eq!(generation, crystalline_core::PARSE_GENERATION);
     assert_eq!(purge, 1);
 }
+
+// --- inbound references on delete ---------------------------------------------
+
+/// An engine over two virtual domains, `notes` and `ops`, so a reference can
+/// cross from one to the other.
+fn two_virtual_domains(store: Arc<Mutex<dyn Store>>) -> Engine {
+    let mut cfg = GlobalConfig::default();
+    for name in ["notes", "ops"] {
+        cfg.domains
+            .insert(name.to_string(), DomainEntry::virtual_domain());
+    }
+    Engine::new(store, cfg, None, None)
+}
+
+/// The targets of a domain's pending references, judged by the stored
+/// `to_id` (`unresolved_refs` with no actor is the domain's own queue).
+async fn pending_targets(store: &Arc<Mutex<dyn Store>>, domain: &str) -> Vec<String> {
+    let store = store.lock().await;
+    let id = store
+        .domain_id(domain)
+        .await
+        .unwrap()
+        .expect("the domain has an index row");
+    store
+        .unresolved_refs(id, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.target)
+        .collect()
+}
+
+/// One engram linked from its own domain and from another, by a prose link
+/// and a relation. Deleting it leaves every one of those references pending,
+/// in both domains; restoring it binds them all again, and so does a new
+/// engram written at the same address after a second delete.
+async fn delete_unbinds_inbound_references(store: Arc<Mutex<dyn Store>>) {
+    let engine = two_virtual_domains(store.clone());
+
+    let target = engine
+        .write_engram(&write_params(
+            "Target Note",
+            "the engram both domains point at",
+        ))
+        .await
+        .unwrap();
+    let path = target["path"].as_str().unwrap().to_string();
+    engine
+        .write_engram(&write_params(
+            "Neighbour",
+            "see [[Target Note]] for the details\n\n- relates_to [[Target Note]]",
+        ))
+        .await
+        .unwrap();
+    engine
+        .write_engram(&WriteParams {
+            domain: "ops".to_string(),
+            ..write_params(
+                "Runbook",
+                "the steps follow [[notes:Target Note]]\n\n- relates_to [[notes:Target Note]]",
+            )
+        })
+        .await
+        .unwrap();
+    assert!(
+        pending_targets(&store, "notes").await.is_empty(),
+        "bound before"
+    );
+    assert!(
+        pending_targets(&store, "ops").await.is_empty(),
+        "bound before"
+    );
+
+    let read = engine
+        .read_engram(
+            &ReadParams {
+                identifier: "target-note".to_string(),
+                domain: Some("notes".to_string()),
+                share_link: None,
+            },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    let content = read["content"].as_str().unwrap().to_string();
+    let delete = DeleteParams {
+        identifier: "target-note".to_string(),
+        domain: "notes".to_string(),
+        expected_checksum: None,
+    };
+    engine.delete_engram(&delete).await.unwrap();
+
+    // Pending in both domains, never bound to an id nobody holds.
+    for domain in ["notes", "ops"] {
+        let pending = pending_targets(&store, domain).await;
+        assert!(
+            pending.len() >= 2,
+            "the link and the relation in '{domain}' read as pending: {pending:?}"
+        );
+        assert!(
+            pending.iter().all(|t| t.ends_with("Target Note")),
+            "{domain}: {pending:?}"
+        );
+    }
+
+    // A restore binds both domains again.
+    engine
+        .restore_engram("notes", &path, &content, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert!(
+        pending_targets(&store, "notes").await.is_empty(),
+        "rebound in its own domain"
+    );
+    assert!(
+        pending_targets(&store, "ops").await.is_empty(),
+        "rebound across domains"
+    );
+
+    // So does a new engram at the same address after another delete.
+    engine.delete_engram(&delete).await.unwrap();
+    assert!(!pending_targets(&store, "ops").await.is_empty());
+    engine
+        .write_engram(&write_params("Target Note", "written again"))
+        .await
+        .unwrap();
+    assert!(pending_targets(&store, "notes").await.is_empty());
+    assert!(pending_targets(&store, "ops").await.is_empty());
+}
+both_backends!(
+    deleting_an_engram_unbinds_the_links_to_it_in_every_domain,
+    delete_unbinds_inbound_references
+);

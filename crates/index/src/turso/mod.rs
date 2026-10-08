@@ -1063,6 +1063,17 @@ pub const DELETE_ENGRAM_CONTRADICTIONS_SQL: &str =
 pub const DELETE_ENGRAM_CONTRADICTION_PAIRS_SQL: &str =
     "DELETE FROM contradiction_pair WHERE engram_a=?1 OR engram_b=?1";
 
+/// The wikilinks that name one engram, unbound by [`Store::delete_engram`]
+/// through `idx_link_to`: a row in any domain that pointed at the deleted
+/// engram reads as pending again, and the next write at that address binds
+/// it once more through the ordinary resolve passes.
+#[doc(hidden)]
+pub const UNBIND_INBOUND_LINKS_SQL: &str = "UPDATE link SET to_id = NULL WHERE to_id = ?1";
+
+/// The relation twin of [`UNBIND_INBOUND_LINKS_SQL`], through `idx_relation_to`.
+#[doc(hidden)]
+pub const UNBIND_INBOUND_RELATIONS_SQL: &str = "UPDATE relation SET to_id = NULL WHERE to_id = ?1";
+
 /// The read behind [`Store::scored_pair_count`], through
 /// `idx_contradiction_pair_model`: unlike [`CONTRADICTION_PAIRS_SCORED_SQL`],
 /// this names no domain, so it cannot seek `idx_contradiction_pair_domain`,
@@ -1826,6 +1837,12 @@ impl Store for TursoStore {
                 self.conn.execute(sql, vec![Value::Integer(id)]).await?;
             }
             self.delete_children(id).await?;
+            // Every reference that named this engram, from any domain and any
+            // actor, goes back to pending in the same transaction: a `to_id`
+            // naming a row nobody holds would read as resolved forever.
+            for sql in [UNBIND_INBOUND_LINKS_SQL, UNBIND_INBOUND_RELATIONS_SQL] {
+                self.conn.execute(sql, vec![Value::Integer(id)]).await?;
+            }
             self.conn
                 .execute(
                     "DELETE FROM chunk WHERE engram_id=?1",

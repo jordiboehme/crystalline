@@ -2369,6 +2369,12 @@ pub trait Store: Send + Sync {
     async fn clear_domain(&self, domain: DomainId) -> Result<()>;
 
     /// Delete the engram at a domain-relative path and all its child rows.
+    ///
+    /// Every link and relation row that named the deleted engram, in any
+    /// domain and for any actor, is unbound (`to_id = NULL`) in the same
+    /// statements, so it reads as pending until a write at that address binds
+    /// it again. Opens no transaction of its own: the sync driver calls this
+    /// inside one, and the engine's delete wraps its call in one.
     async fn delete_engram(&self, domain: DomainId, path: &str) -> Result<()>;
 
     /// Move an engram from one path to another without reparsing. The permalink
