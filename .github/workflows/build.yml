@@ -623,11 +623,15 @@ jobs:
           RELEASE_VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          # MSI ProductVersion is numeric major.minor.patch: strip the v
-          # prefix and any prerelease suffix (a dry run's v0.0.0-dev becomes
-          # the placeholder 0.0.0 and is never published).
+          # MSI ProductVersion is numeric major.minor.patch. A tag build uses
+          # the tag. A dry run (v0.0.0-dev) uses the workspace version from
+          # Cargo.toml, so its MSI can upgrade the last release in the
+          # upgrade test. A dry run's MSI is never published.
           msi_version="${RELEASE_VERSION#v}"
           msi_version="${msi_version%%-*}"
+          if [ "$msi_version" = "0.0.0" ]; then
+            msi_version=$(sed -n 's/^version = "\([0-9.]*\)"$/\1/p' Cargo.toml | head -n 1)
+          fi
           cargo wix -p crystalline \
             --no-build --nocapture \
             --target "$LEG_TARGET" \
@@ -661,6 +665,9 @@ jobs:
           # Export-ScheduledTask hands back a .NET string, so the encoding
           # schtasks would pick for a pipe never comes up.
           $xml = Export-ScheduledTask -TaskPath '\Crystalline\' -TaskName 'Daemon' -ErrorAction SilentlyContinue
+          # Kept as an artifact whatever the checks below say: the shape Task
+          # Scheduler really stores is what the next debugging needs.
+          if ($xml) { $xml | Set-Content -Path (Join-Path $env:RUNNER_TEMP 'daemon-task-export.xml') -Encoding utf8 }
           if (-not $xml) { throw "the MSI did not register $task" }
           # Read as XML, not as text: Task Scheduler writes the definition back
           # in its own form, so a substring of what was registered may not be
@@ -681,6 +688,69 @@ jobs:
             $xml
             throw "the task definition lacks: $($missing -join ', ')"
           }
+          # The same facts through Task Scheduler's own object model, which
+          # drops no default the way the export does.
+          $t = Get-ScheduledTask -TaskPath '\Crystalline\' -TaskName 'Daemon'
+          "principal: GroupId=$($t.Principal.GroupId) UserId=$($t.Principal.UserId) RunLevel=$($t.Principal.RunLevel)"
+          $action = @($t.Actions)[0]
+          $typed = [ordered]@{
+            'Settings.MultipleInstances is Parallel'                = { "$($t.Settings.MultipleInstances)" -in @('Parallel', '0') }
+            'Settings.ExecutionTimeLimit is PT0S'                   = { $t.Settings.ExecutionTimeLimit -eq 'PT0S' }
+            'a MSFT_TaskLogonTrigger'                               = { @($t.Triggers | Where-Object { $_.CimClass.CimClassName -eq 'MSFT_TaskLogonTrigger' }).Count -ge 1 }
+            'Actions.Execute ends in Crystalline\bin\crystalline.exe' = { $action.Execute.Trim('"') -like '*\Crystalline\bin\crystalline.exe' }
+            'Actions.Arguments has serve --daemon --from-task'      = { $action.Arguments -like '*serve --daemon --from-task*' }
+          }
+          $failed = @($typed.Keys | Where-Object { -not (& $typed[$_]) })
+          if ($failed.Count -gt 0) {
+            $t | Format-List *
+            $t.Settings | Format-List *
+            $t.Actions | Format-List *
+            throw "the registered task fails: $($failed -join ', ')"
+          }
+          # Who may run it, read back through the COM API: the descriptor the
+          # definition carries is applied by Task Scheduler or not, and only
+          # this shows which. 0xF asks for the SACL too, which needs a
+          # privilege the runner may not hold; 4 is the DACL alone.
+          $scheduler = New-Object -ComObject 'Schedule.Service'
+          $scheduler.Connect()
+          $registered = $scheduler.GetFolder('\Crystalline').GetTask('Daemon')
+          try { $sddl = $registered.GetSecurityDescriptor(0xF) } catch { $sddl = $registered.GetSecurityDescriptor(4) }
+          "security descriptor: $sddl"
+          $sd = New-Object System.Security.AccessControl.RawSecurityDescriptor($sddl)
+          $usersCanRun = $false
+          foreach ($ace in $sd.DiscretionaryAcl) {
+            if ("$($ace.AceType)" -ne 'AccessAllowed' -or $ace.SecurityIdentifier.Value -ne 'S-1-5-32-545') { continue }
+            $mask = [BitConverter]::ToUInt32([BitConverter]::GetBytes([int32]$ace.AccessMask), 0)
+            # Generic read and execute (GRGX), or the file rights Task
+            # Scheduler may map them to (FRFX).
+            foreach ($rights in @([uint32]2684354560, [uint32]1179817)) {
+              if (($mask -band $rights) -eq $rights) { $usersCanRun = $true }
+            }
+          }
+          if (-not $usersCanRun) { throw "the task's security descriptor gives the Users group no read and execute right: $sddl" }
+          # A task under the name 0.24.0 gave this user's task moves to the
+          # name with the SID: daemon-task register adds the new one, then
+          # removes the old one, which runs as this account.
+          $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+          $oldUserTask = "\Crystalline Daemon for $env:USERNAME"
+          $newUserTask = "\Crystalline Daemon for $env:USERNAME ($sid)"
+          $definition = Join-Path $env:RUNNER_TEMP 'old-user-task.xml'
+          & $exe daemon-task show | Set-Content -Path $definition -Encoding Unicode
+          schtasks /Create /TN $oldUserTask /XML $definition /F | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "could not plant $oldUserTask" }
+          $said = & $exe daemon-task register
+          if ($LASTEXITCODE -ne 0) { throw "daemon-task register failed: $said" }
+          $said
+          schtasks /Query /TN $newUserTask *> $null
+          if ($LASTEXITCODE -ne 0) { throw "$newUserTask was not registered" }
+          schtasks /Query /TN $oldUserTask *> $null
+          if ($LASTEXITCODE -eq 0) { throw "$oldUserTask is still there after the move" }
+          if (-not ($said -match 'removed the task')) { throw "register did not say it removed $oldUserTask" }
+          & $exe daemon-task unregister
+          if ($LASTEXITCODE -ne 0) { throw 'daemon-task unregister failed' }
+          schtasks /Query /TN $newUserTask *> $null
+          if ($LASTEXITCODE -eq 0) { throw "$newUserTask is still there after daemon-task unregister" }
+          $global:LASTEXITCODE = 0
           schtasks /Run /TN $task | Out-Null
           $up = $false
           for ($i = 0; $i -lt 30; $i++) {
@@ -706,6 +776,81 @@ jobs:
           schtasks /Query /TN $task *> $null
           if ($LASTEXITCODE -eq 0) { throw 'the task is still registered after uninstall' }
           $global:LASTEXITCODE = 0
+
+      # Install v0.24.1 from its release, then this build over it: the task
+      # must survive the major upgrade, start the new binary and start a
+      # daemon of the new version. The smoke test above uninstalled, so this
+      # starts from a clean machine.
+      - name: Upgrade test of the .msi from v0.24.1
+        if: matrix.msi
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # The built version is the tag, or on a dry run (v0.0.0-dev) the
+          # workspace version from Cargo.toml: the same version "Build .msi
+          # package" gave the MSI and the one crystalline --version prints.
+          $built = $env:RELEASE_VERSION.TrimStart('v').Split('-')[0]
+          if ($built -eq '0.0.0') { $built = (Select-String -Path Cargo.toml -Pattern '^version = "([0-9.]+)"$' | Select-Object -First 1).Matches[0].Groups[1].Value }
+          if ([version]$built -le [version]'0.24.1') {
+            "::warning::this build is $built, not newer than 0.24.1, so there is nothing to upgrade from; the upgrade test runs on a release tag"
+            exit 0
+          }
+          $old = Join-Path $env:RUNNER_TEMP "crystalline-v0.24.1-$env:LEG_PLATFORM.msi"
+          Invoke-WebRequest -Uri "https://github.com/$env:GITHUB_REPOSITORY/releases/download/v0.24.1/crystalline-v0.24.1-$env:LEG_PLATFORM.msi" -OutFile $old
+          $new = (Get-Item dist/*.msi).FullName
+          $exe = 'C:\Program Files\Crystalline\bin\crystalline.exe'
+          $task = '\Crystalline\Daemon'
+          $install = {
+            param($msi, $log)
+            $p = Start-Process msiexec -ArgumentList "/i `"$msi`" /qn /norestart /L*v `"$log`"" -Wait -PassThru
+            $p.ExitCode
+          }
+          $code = & $install $old (Join-Path $env:RUNNER_TEMP 'msi-install-0.24.1.log')
+          if ($code -ne 0) { throw "the v0.24.1 install failed: $code" }
+          $was = & $exe --version
+          if ("$was" -notlike '*0.24.1*') { throw "v0.24.1 did not install: $was" }
+          schtasks /Query /TN $task *> $null
+          if ($LASTEXITCODE -ne 0) { throw 'v0.24.1 registered no task' }
+          $upgradeLog = Join-Path $env:RUNNER_TEMP 'msi-upgrade.log'
+          $code = & $install $new $upgradeLog
+          if ($code -ne 0) { Get-Content $upgradeLog -Tail 50; throw "the upgrade failed: $code" }
+          $is = & $exe --version
+          if ("$is" -notlike "*$built*") { throw "after the upgrade $exe is $is, not $built" }
+          $t = Get-ScheduledTask -TaskPath '\Crystalline\' -TaskName 'Daemon' -ErrorAction SilentlyContinue
+          if (-not $t) { throw 'the task is gone after the upgrade' }
+          Export-ScheduledTask -TaskPath '\Crystalline\' -TaskName 'Daemon' |
+            Set-Content -Path (Join-Path $env:RUNNER_TEMP 'daemon-task-export-after-upgrade.xml') -Encoding utf8
+          $action = @($t.Actions)[0]
+          if ($action.Execute.Trim('"') -ne $exe) { throw "after the upgrade the task starts $($action.Execute), not $exe" }
+          if ($action.Arguments -notlike '*serve --daemon --from-task*') { throw "after the upgrade the task runs $($action.Arguments)" }
+          schtasks /Run /TN $task | Out-Null
+          $status = $null
+          for ($i = 0; $i -lt 30; $i++) {
+            $out = & $exe ctl status --json 2>$null
+            if ($LASTEXITCODE -eq 0) { $status = $out | ConvertFrom-Json; break }
+            Start-Sleep -Milliseconds 500
+          }
+          if (-not $status) { throw 'after the upgrade the task started no daemon that answers' }
+          if ("$($status.version)" -notlike "$built*") { throw "the task's daemon is v$($status.version), not $built" }
+          "the upgraded task started a v$($status.version) daemon that answers"
+          & $exe ctl shutdown *> $null
+          schtasks /End /TN $task *> $null
+          $p = Start-Process msiexec -ArgumentList "/x `"$new`" /qn /norestart" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "the uninstall after the upgrade failed: $($p.ExitCode)" }
+          schtasks /Query /TN $task *> $null
+          if ($LASTEXITCODE -eq 0) { throw 'the task is still registered after the uninstall' }
+          $global:LASTEXITCODE = 0
+
+      # The definition as Task Scheduler stores it, from the smoke test and
+      # the upgrade test, uploaded even when a check failed.
+      - name: Upload the daemon task export
+        if: always() && matrix.msi
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: daemon-task-export-${{ matrix.platform }}
+          path: ${{ runner.temp }}/daemon-task-export*.xml
+          if-no-files-found: warn
 
       - name: Upload .msi artifact
         if: matrix.msi
