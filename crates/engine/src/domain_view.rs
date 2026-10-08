@@ -1979,9 +1979,8 @@ impl<'a> DomainView<'a> {
     /// **This one does read the file**, because a row carries a checksum and a
     /// checksum is a fact about bytes. It is the listing's builder for that
     /// reason and nothing else's: a read hashes the bytes it is about to return
-    /// ([`DomainView::own_attachment`]) and a size question is answered by a
-    /// stat ([`DomainView::attachment_delete_size`]), so neither of them comes
-    /// through here.
+    /// ([`DomainView::own_attachment`]) and the delete asks the file's
+    /// metadata, so neither of them comes through here.
     fn overlay_attachment_row(
         &self,
         state_dir: &Path,
@@ -2010,36 +2009,6 @@ impl<'a> DomainView<'a> {
             return Ok((bytes, row));
         }
         self.engine.attachment_read(&self.domain, path).await
-    }
-
-    /// What deleting one attachment would take away, for a preview that must
-    /// never be stricter than the act it previews.
-    ///
-    /// The same three-way answer [`DomainView::attachment_bytes`] gives, which
-    /// is what keeps that rule true in review mode: a draft-only file the
-    /// delete would remove has a size here rather than a miss, and a path this
-    /// actor has already deleted is a miss here rather than the folder's size.
-    pub(crate) async fn attachment_delete_size(&self, path: &str) -> Result<u64> {
-        match self.own_held(path)? {
-            Some(crate::overlay_files::Held::Bytes) => {
-                let state_dir = self.files_state_dir()?;
-                let actor = self.actor.as_deref().unwrap_or_default();
-                // A stat, never a read - see [`crate::overlay_files::size`].
-                // The path was there a moment ago and can be gone now, which is
-                // the race the folder arm answers by falling through to the
-                // recorded row; there is no row here, so a file that vanished
-                // under the preview is a miss.
-                crate::overlay_files::size(&state_dir, &self.domain, actor, path)
-                    .map_err(|e| self.files_io(path, e))?
-                    .ok_or_else(|| {
-                        EngineError::NotFound(crate::engine::missing_attachment(&self.domain, path))
-                    })
-            }
-            Some(crate::overlay_files::Held::Tombstone) => Err(EngineError::NotFound(
-                crate::engine::missing_attachment(&self.domain, path),
-            )),
-            _ => self.engine.attachment_delete_size(&self.domain, path).await,
-        }
     }
 
     /// What this actor holds at `path` in the files overlay, or [`None`] on the

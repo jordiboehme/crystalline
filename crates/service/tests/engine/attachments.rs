@@ -1560,7 +1560,7 @@ async fn delete_engram_deletes_an_attachment_on_either_domain_kind() {
         crystalline_service::maintenance::record_run(&[domain.to_string()]);
 
         let v = engine
-            .delete_engram(&crystalline_service::params::DeleteParams {
+            .delete_engram(&DeleteParams {
                 identifier: path.to_string(),
                 domain: domain.to_string(),
                 expected_checksum: None,
@@ -1590,7 +1590,7 @@ async fn delete_engram_deletes_an_attachment_on_either_domain_kind() {
 
     // A path nothing holds is a 404's worth of not-found, not a silent success.
     let err = engine
-        .delete_engram(&crystalline_service::params::DeleteParams {
+        .delete_engram(&DeleteParams {
             identifier: "assets/never-there.png".to_string(),
             domain: "folded-eng".to_string(),
             expected_checksum: None,
@@ -1612,7 +1612,7 @@ async fn an_attachment_delete_refuses_an_expected_checksum() {
         .unwrap();
 
     let err = engine
-        .delete_engram(&crystalline_service::params::DeleteParams {
+        .delete_engram(&DeleteParams {
             identifier: "assets/deck.png".to_string(),
             domain: "guard-eng".to_string(),
             expected_checksum: Some("0".repeat(64)),
@@ -1628,7 +1628,7 @@ async fn an_attachment_delete_refuses_an_expected_checksum() {
 
     // The reserved folder decides, whatever its spelling and whatever leads it.
     engine
-        .delete_engram(&crystalline_service::params::DeleteParams {
+        .delete_engram(&DeleteParams {
             identifier: "./Assets/deck.png".to_string(),
             domain: "guard-eng".to_string(),
             expected_checksum: None,
@@ -1638,18 +1638,17 @@ async fn an_attachment_delete_refuses_an_expected_checksum() {
     assert!(!root.join("assets/deck.png").exists());
 }
 
-// --- the delete preview -----------------------------------------------------
+// --- the delete and the attachments it leaves -------------------------------
 //
-// `Engine::delete_preview` answers "what would this delete take with it"
-// without taking any of it, which is what the MCP confirmation round asks
-// before it acts. Its attachment list is the part with real logic in it: the
-// same referent count the cross-domain move uses, screened against what the
-// domain actually holds.
+// Deleting an engram removes its markdown and its rows and nothing else; an
+// attachment it referenced stays where it is, and the orphaned-attachment
+// finding is what names it afterwards. The `assets/` branch deletes one file.
 
-/// The preview names the attachments this engram is the last referent of, and
-/// nothing else: not one another engram still uses, and not one nothing holds.
+/// Deleting an engram leaves every attachment it referenced in place: the one
+/// only it used, the one a peer still uses, and nothing is invented for the
+/// reference to a file the domain never held.
 #[tokio::test]
-async fn a_delete_preview_names_only_the_attachments_this_engram_is_the_last_referent_of() {
+async fn deleting_an_engram_leaves_every_attachment_it_referenced_in_place() {
     let (_tmp, engine, root, _scratch) = named_fixture("preview-eng", "preview-scratch").await;
     engine
         .restore_engram(
@@ -1681,8 +1680,8 @@ async fn a_delete_preview_names_only_the_attachments_this_engram_is_the_last_ref
             .unwrap();
     }
 
-    let preview = engine
-        .delete_preview(&crystalline_service::params::DeleteParams {
+    let receipt = engine
+        .delete_engram(&DeleteParams {
             identifier: "note".to_string(),
             domain: "preview-eng".to_string(),
             expected_checksum: None,
@@ -1690,59 +1689,37 @@ async fn a_delete_preview_names_only_the_attachments_this_engram_is_the_last_ref
         .await
         .unwrap();
 
-    assert_eq!(preview["domain"], "preview-eng", "{preview}");
-    assert_eq!(preview["permalink"], "note", "{preview}");
-    assert_eq!(preview["title"], "Note", "{preview}");
-    assert_eq!(preview["path"], "note.md", "{preview}");
+    assert_eq!(receipt["deleted"], true, "{receipt}");
+    assert_eq!(receipt["permalink"], "note", "{receipt}");
+    assert_eq!(receipt["path"], "note.md", "{receipt}");
+    assert!(!root.join("note.md").exists(), "the markdown went");
     assert!(
-        preview["attachments"].is_array(),
-        "a domain this far inside MAX_PREVIEW_SCAN_ENGRAMS is enumerated, so the \
-         field is a list rather than the null that says nobody looked: {preview}"
+        root.join("assets/solo.png").is_file(),
+        "the file only it used stays"
     );
-    assert_eq!(
-        preview["attachments"],
-        serde_json::json!(["assets/solo.png"]),
-        "one referent left for solo, two for both, and gone is not stored: {preview}"
+    assert!(
+        root.join("assets/both.png").is_file(),
+        "the shared file stays"
     );
-
-    // A preview previews. Everything it named is still exactly where it was.
-    assert!(root.join("note.md").exists());
     assert_eq!(
         engine.attachment_list("preview-eng").await.unwrap().len(),
         2,
-        "no attachment was touched"
+        "no attachment row went with the engram"
     );
 }
 
-/// The `assets/` branch previews the attachment itself, refuses the checksum
-/// the delete refuses, and reports a miss as a miss rather than asking the
-/// user to confirm deleting nothing.
+/// The `assets/` branch refuses the checksum the engram branch takes, reports
+/// a miss as a miss, and deletes the file it names.
 #[tokio::test]
-async fn a_delete_preview_of_an_attachment_reports_its_size() {
-    let (_tmp, engine, _root, _scratch) = named_fixture("size-eng", "size-scratch").await;
+async fn an_attachment_delete_refuses_a_checksum_and_a_miss_and_removes_the_file() {
+    let (_tmp, engine, root, _scratch) = named_fixture("size-eng", "size-scratch").await;
     engine
         .attachment_write("size-eng", "assets/deck.png", PNG.to_vec())
         .await
         .unwrap();
 
-    let preview = engine
-        .delete_preview(&crystalline_service::params::DeleteParams {
-            identifier: "assets/deck.png".to_string(),
-            domain: "size-eng".to_string(),
-            expected_checksum: None,
-        })
-        .await
-        .unwrap();
-    assert_eq!(preview["attachment"], true, "{preview}");
-    assert_eq!(preview["path"], "assets/deck.png", "{preview}");
-    assert_eq!(preview["size"], PNG.len(), "{preview}");
-    assert!(
-        preview.get("permalink").is_none(),
-        "no engram was involved: {preview}"
-    );
-
     let refused = engine
-        .delete_preview(&crystalline_service::params::DeleteParams {
+        .delete_engram(&DeleteParams {
             identifier: "assets/deck.png".to_string(),
             domain: "size-eng".to_string(),
             expected_checksum: Some("0".repeat(64)),
@@ -1750,9 +1727,13 @@ async fn a_delete_preview_of_an_attachment_reports_its_size() {
         .await
         .unwrap_err();
     assert!(matches!(refused, EngineError::Invalid(_)), "{refused}");
+    assert!(
+        root.join("assets/deck.png").is_file(),
+        "a refused delete deletes nothing"
+    );
 
     let missing = engine
-        .delete_preview(&crystalline_service::params::DeleteParams {
+        .delete_engram(&DeleteParams {
             identifier: "assets/never-there.png".to_string(),
             domain: "size-eng".to_string(),
             expected_checksum: None,
@@ -1761,26 +1742,29 @@ async fn a_delete_preview_of_an_attachment_reports_its_size() {
         .unwrap_err();
     assert!(matches!(missing, EngineError::NotFound(_)), "{missing}");
 
+    let receipt = engine
+        .delete_engram(&DeleteParams {
+            identifier: "assets/deck.png".to_string(),
+            domain: "size-eng".to_string(),
+            expected_checksum: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(receipt["attachment"], true, "{receipt}");
+    assert_eq!(receipt["path"], "assets/deck.png", "{receipt}");
+    assert_eq!(receipt["deleted"], true, "{receipt}");
     assert!(
-        engine
-            .attachment_read("size-eng", "assets/deck.png")
-            .await
-            .is_ok(),
-        "a preview deletes nothing"
+        receipt.get("permalink").is_none(),
+        "no engram was involved: {receipt}"
     );
+    assert!(!root.join("assets/deck.png").exists());
 }
 
-/// **A preview must never be stricter than the act it previews.**
-///
-/// `attachment_delete` reads no bytes and succeeds when either half of the
-/// pair is there, so the preview has to succeed everywhere the delete would.
-/// The half-present case is the reachable one on a file domain: a
-/// hand-edited domain (or a `git pull` that dropped a file) leaves the row
-/// standing over nothing, and the delete still removes the row. Built on the
-/// byte read instead, round one would refuse and an eliciting peer would lose
-/// a delete a legacy peer still gets.
+/// A hand-edited domain (or a `git pull` that dropped a file) leaves the row
+/// standing over nothing. The delete still removes the row: it reads no bytes
+/// and succeeds when either half of the pair is there.
 #[tokio::test]
-async fn a_delete_preview_is_never_stricter_than_the_delete_it_previews() {
+async fn a_half_present_attachment_still_deletes() {
     let (_tmp, engine, root, _scratch) = named_fixture("strict-eng", "strict-scratch").await;
     engine
         .attachment_write("strict-eng", "assets/deck.png", PNG.to_vec())
@@ -1794,27 +1778,11 @@ async fn a_delete_preview_is_never_stricter_than_the_delete_it_previews() {
             .attachment_read("strict-eng", "assets/deck.png")
             .await
             .is_err(),
-        "the read this preview used to be built on refuses here"
+        "the byte read refuses here"
     );
 
-    let preview = engine
-        .delete_preview(&crystalline_service::params::DeleteParams {
-            identifier: "assets/deck.png".to_string(),
-            domain: "strict-eng".to_string(),
-            expected_checksum: None,
-        })
-        .await
-        .unwrap();
-    assert_eq!(preview["attachment"], true, "{preview}");
-    assert_eq!(
-        preview["size"],
-        PNG.len(),
-        "the standing row is where the number comes from: {preview}"
-    );
-
-    // And the delete the preview promised still goes through.
     engine
-        .delete_engram(&crystalline_service::params::DeleteParams {
+        .delete_engram(&DeleteParams {
             identifier: "assets/deck.png".to_string(),
             domain: "strict-eng".to_string(),
             expected_checksum: None,
@@ -2177,21 +2145,6 @@ async fn a_tombstoned_base_attachment_reads_absent_for_the_actor_and_present_for
         .unwrap();
     assert_eq!(bytes, PNG, "bob still reads it");
 
-    // And the preview of a delete answers the same three ways, which is what
-    // keeps it from being stricter - or laxer - than the act it previews.
-    let p = DeleteParams {
-        identifier: "assets/deck.png".to_string(),
-        domain: "rev-gone".to_string(),
-        expected_checksum: None,
-    };
-    let preview = engine.delete_preview_as(&p, &bob()).await.unwrap();
-    assert_eq!(preview["size"], serde_json::json!(PNG.len()));
-    let miss = engine.delete_preview_as(&p, &alice()).await.unwrap_err();
-    assert!(
-        matches!(miss, EngineError::NotFound(_)),
-        "alice has nothing left to delete there: {miss:?}"
-    );
-
     // And the delete agrees with the read and the size it stands beside: a
     // second one is a miss, not a second deletion, exactly as it is on a
     // domain that takes changes directly.
@@ -2350,18 +2303,6 @@ async fn a_direct_domains_attachment_verbs_are_byte_identical_through_the_view()
             .unwrap(),
         "and the two reads are one read"
     );
-    let p = DeleteParams {
-        identifier: "assets/two.png".to_string(),
-        domain: "plain-direct".to_string(),
-        expected_checksum: None,
-    };
-    assert_eq!(
-        engine.delete_preview(&p).await.unwrap(),
-        engine
-            .delete_preview_as(&p, &Scope::Unrestricted)
-            .await
-            .unwrap()
-    );
     assert!(
         !engine
             .attachment_delete_as("plain-direct", "assets/two.png", &Scope::Unrestricted)
@@ -2405,9 +2346,8 @@ async fn delete_engram_on_an_assets_path_in_review_mode_lands_as_a_draft_deletio
     let (_tmp, engine, review_dir, _direct, _state, _scratch) =
         review_fixture("rev-verb", "plain-verb").await;
 
-    // Round one first: a preview must never be stricter than the act it
-    // previews, and a file only alice holds is one the delete would really
-    // remove.
+    // A file only alice holds is one her delete really removes, and one bob
+    // has nothing of, so his delete of it is a miss.
     engine
         .attachment_write_as("rev-verb", "assets/mine.png", PNG.to_vec(), &alice())
         .await
@@ -2417,12 +2357,20 @@ async fn delete_engram_on_an_assets_path_in_review_mode_lands_as_a_draft_deletio
         domain: "rev-verb".to_string(),
         expected_checksum: None,
     };
-    let preview = engine.delete_preview_as(&mine, &alice()).await.unwrap();
-    assert_eq!(preview["size"], serde_json::json!(PNG.len()));
+    let miss = engine
+        .delete_engram_as(&mine, None, &bob())
+        .await
+        .unwrap_err();
     assert!(
-        engine.delete_preview_as(&mine, &bob()).await.is_err(),
-        "and bob is previewing nothing, because he holds nothing there"
+        matches!(miss, EngineError::NotFound(_)),
+        "bob holds nothing there: {miss:?}"
     );
+    let own = engine
+        .delete_engram_as(&mine, None, &alice())
+        .await
+        .unwrap();
+    assert_eq!(own["deleted"], serde_json::json!(true), "{own}");
+    assert_eq!(own["draft"], serde_json::json!(true), "{own}");
 
     let receipt = engine
         .delete_engram_as(
@@ -2581,23 +2529,15 @@ async fn a_move_out_of_a_reviewing_domain_is_refused_before_any_attachment_is_ca
     assert!(!direct_dir.join("alpha.md").exists());
 }
 
-/// **What a delete of a draft file would take away is read off the file's
-/// metadata, never out of its bytes.**
+/// **A draft file whose bytes this process cannot read still deletes.**
 ///
-/// The size question is a stat question, and asking it by reading the whole
-/// file is both a wasted read and a stricter answer than the act it previews:
-/// a file whose bytes this process cannot read still has a size, and deleting
-/// it would still take that many bytes away. Pinned by taking the read
-/// permission away and leaving the metadata: the preview answers and the read
-/// does not.
-///
-/// Unix only - the permission bits are the discriminator, and Windows has no
-/// equivalent that leaves `metadata` working. Skipped in the one environment
-/// where the bits do not bind (a run as root), with a note rather than a
-/// silent pass.
+/// The delete asks the file's metadata, never its bytes, so taking the read
+/// permission away changes nothing about it. Unix only - the permission bits
+/// are the discriminator. Skipped where the bits do not bind (a run as root),
+/// with a note rather than a silent pass.
 #[cfg(unix)]
 #[tokio::test]
-async fn the_size_of_a_draft_file_is_read_from_its_metadata_and_never_from_its_bytes() {
+async fn a_draft_file_whose_bytes_cannot_be_read_still_deletes() {
     use std::os::unix::fs::PermissionsExt;
 
     let (_tmp, engine, _review_dir, _direct, state, _scratch) =
@@ -2614,34 +2554,21 @@ async fn the_size_of_a_draft_file_is_read_from_its_metadata_and_never_from_its_b
             "skipped: this process reads a mode-000 file, so the permission bits cannot \
              discriminate here (a run as root)"
         );
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
         return;
     }
-
-    let preview = engine
-        .delete_preview_as(
-            &DeleteParams {
-                identifier: "assets/locked.png".to_string(),
-                domain: "rev-stat".to_string(),
-                expected_checksum: None,
-            },
-            &alice(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        preview["size"],
-        serde_json::json!(PNG.len()),
-        "the preview answers from the file's own metadata: {preview}"
-    );
-
-    // The read is the one that needs the bytes, and it is the one that fails.
     assert!(
         engine
             .attachment_read_as("rev-stat", "assets/locked.png", &alice())
             .await
             .is_err(),
-        "the bytes really are unreadable, so the preview above read none"
+        "the bytes really are unreadable"
     );
 
-    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let draft = engine
+        .attachment_delete_as("rev-stat", "assets/locked.png", &alice())
+        .await
+        .unwrap();
+    assert!(draft, "the delete landed in alice's overlay");
+    assert!(!file.exists(), "and the unreadable file went");
 }

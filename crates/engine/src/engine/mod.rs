@@ -162,28 +162,6 @@ pub const EVOLVE_MAX_LIMIT: usize = 100;
 /// screenful of rows.
 const MAX_INBOUND_LIMIT: usize = 100;
 
-/// The largest domain [`Engine::delete_preview`] enumerates sole-referent
-/// attachments on.
-///
-/// The enumeration is a full-domain read, and the cost is worth naming exactly:
-/// [`Engine::sole_referent_attachments`] lists every engram in the domain and
-/// loads the text of each one that could hold a reference, so asking "what does
-/// this delete orphan" on a domain of fifty thousand engrams reads fifty
-/// thousand engrams - to build a question, before anything is deleted. The
-/// scan stops early only when every candidate is already accounted for, which a
-/// domain that shares none of them never reaches.
-///
-/// So the bound caps **when** the enumeration runs, never what the delete does.
-/// Past it the question says the attachments were not enumerated instead of
-/// naming them, and [`Engine::delete_engram`] behaves exactly as it always has:
-/// it removes the markdown and the rows and leaves every file alone, on a
-/// domain of five hundred engrams and on a domain of fifty thousand alike.
-///
-/// Five hundred is the same shape of number as [`TREE_LEVEL_CAP`] and picked
-/// the same way: past any archive a person curates by hand, and small enough
-/// that the read behind the question stays a fraction of a second.
-pub const MAX_PREVIEW_SCAN_ENGRAMS: usize = 500;
-
 /// The fixed instruction every `evolve_engrams` response carries. It states the
 /// authority the queue does and does not have, so an agent working it never
 /// treats detection as permission to rewrite the archive.
@@ -6718,25 +6696,14 @@ fn receipt_permalink(found: Result<Option<String>>, fallback: String) -> String 
     }
 }
 
-/// Whether a domain holding `engrams` engrams is inside
-/// [`MAX_PREVIEW_SCAN_ENGRAMS`].
-///
-/// A line of arithmetic with its own name so the boundary is pinned by a test
-/// rather than by a reading: exactly the bound still enumerates, one past it
-/// does not.
-fn count_within_preview_bound(engrams: usize) -> bool {
-    engrams <= MAX_PREVIEW_SCAN_ENGRAMS
-}
-
 /// Every attachment one engram's own text points at: the `assets/` references
 /// in its body plus the one an `analyzes` claim in its frontmatter names,
 /// deduplicated and in reference order.
 ///
-/// The one enumeration of "what does this engram use", shared by the
-/// cross-domain move (which has to carry them) and by
-/// [`Engine::delete_preview`] (which has to name the ones the delete leaves
-/// behind). Text that will not parse is read as a body on its own rather than
-/// dropped, because a reference in unparseable text is still a reference.
+/// The one enumeration of "what does this engram use", which the cross-domain
+/// move uses to carry them. Text that will not parse is read as a body on its
+/// own rather than dropped, because a reference in unparseable text is still a
+/// reference.
 fn referenced_asset_paths(content: &str) -> Vec<String> {
     let parsed = parse_engram(content).ok();
     let body = parsed
@@ -8588,19 +8555,6 @@ mod attachment_carry_tests {
         let counted: HashSet<String> = std::iter::once(candidates[0].clone()).collect();
         assert_eq!(resolve_shared(Ok(counted.clone()), &candidates), counted);
         assert!(resolve_shared(Ok(HashSet::new()), &candidates).is_empty());
-    }
-
-    /// The bound the delete preview enumerates under, pinned at the edge:
-    /// exactly [`MAX_PREVIEW_SCAN_ENGRAMS`] engrams still gets the full
-    /// enumeration, one more does not. The number itself may move; which side
-    /// of it each count falls on must not drift by an off-by-one.
-    #[test]
-    fn the_preview_scan_bound_includes_its_own_number() {
-        assert!(count_within_preview_bound(0));
-        assert!(count_within_preview_bound(1));
-        assert!(count_within_preview_bound(MAX_PREVIEW_SCAN_ENGRAMS));
-        assert!(!count_within_preview_bound(MAX_PREVIEW_SCAN_ENGRAMS + 1));
-        assert!(!count_within_preview_bound(50_000));
     }
 
     #[test]

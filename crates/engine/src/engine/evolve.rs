@@ -370,32 +370,6 @@ impl Engine {
         parse_ack_value(raw).map(Some)
     }
 
-    /// The engram an `evolve_ack` assignment would land on, `{domain,
-    /// permalink}`, without writing it.
-    ///
-    /// Nothing calls it today: an `evolve_ack` assignment is written without a
-    /// question. It is kept, shaped after [`Engine::delete_preview`], for a
-    /// caller that wants to name the target before the write. Read-only is
-    /// checked first and the identifier is resolved next, so a server that
-    /// never writes, a domain nobody registered and an identifier nobody has
-    /// each fail here rather than in the write.
-    ///
-    /// It resolves and nothing else. The `expected_checksum` comparison and the
-    /// "is that acknowledgment even there" test both read what the file holds,
-    /// the file can change between this call and the write, and both already
-    /// run in the write; repeating them here would buy a guarantee that does
-    /// not survive the gap.
-    pub async fn ack_preview(&self, p: &EditParams) -> Result<Value> {
-        if self.read_only {
-            return Err(EngineError::ReadOnly);
-        }
-        let (desc, _) = self.resolve_in(&p.identifier, &p.domain).await?;
-        Ok(json!({
-            "domain": desc.domain,
-            "permalink": desc.permalink,
-        }))
-    }
-
     /// The acknowledgment an `evolve_ack` assignment is asking for, completed
     /// with the scope only the sweep can supply, or `None` when this edit is
     /// not one.
