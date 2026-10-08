@@ -724,7 +724,11 @@ fn resolve_env_domains(
 /// `owner/repo[/subpath][@branch]`, into an [`OriginConfig`]. An optional
 /// `@branch` is split off the last `@` (an empty branch is an error), then the
 /// `owner/repo[/subpath]` remainder is parsed the same way the CLI `--origin`
-/// flag is. `poll_secs` is left unset: an env-origin domain defers to the
+/// flag is, and checked with the same shared rules every other surface
+/// applies ([`crystalline_remote::validate_repo`] and
+/// [`crystalline_remote::validate_repo_path`]): a repository name GitHub
+/// cannot have, or a subpath with a `..`, `.` or empty segment, a backslash
+/// or a `%`, fails the load. `poll_secs` is left unset: an env-origin domain defers to the
 /// global `github.poll_secs`.
 fn parse_env_origin(value: &str) -> Result<OriginConfig, String> {
     let (repo_spec, branch) = match value.rsplit_once('@') {
@@ -735,6 +739,10 @@ fn parse_env_origin(value: &str) -> Result<OriginConfig, String> {
         None => (value, None),
     };
     let (repo, subpath) = origin::parse_origin_spec(repo_spec)?;
+    crystalline_remote::validate_repo(&repo).map_err(|e| e.to_string())?;
+    if let Some(path) = subpath.as_deref() {
+        crystalline_remote::validate_repo_path(path).map_err(|e| e.to_string())?;
+    }
     Ok(OriginConfig {
         repo,
         path: subpath,
@@ -1461,6 +1469,58 @@ mod tests {
             "{err}"
         );
         assert!(err.to_string().contains("branch"), "{err}");
+    }
+
+    /// A subpath that climbs out of the repository is refused at load,
+    /// naming the variable, the way `domain add --origin`, `add_domain` and
+    /// the JSON API refuse it.
+    #[test]
+    fn an_origin_with_a_traversal_path_is_rejected_naming_the_variable() {
+        for value in [
+            "acme/monorepo/../../etc",
+            "acme/monorepo/teams/../../secrets@main",
+            "acme/monorepo/teams//brand",
+            "acme/monorepo/teams\\brand",
+            "acme/monorepo/%2e%2e/x",
+        ] {
+            let err = overlay(&[
+                ("CRYSTALLINE_DOMAIN_TEAM", "/k/team"),
+                ("CRYSTALLINE_DOMAIN_TEAM_ORIGIN", value),
+            ])
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.starts_with("invalid environment variable CRYSTALLINE_DOMAIN_TEAM_ORIGIN: "),
+                "{value}: {err}"
+            );
+            assert!(
+                err.contains("is not a valid path within the repository"),
+                "{value}: {err}"
+            );
+        }
+    }
+
+    /// A repository name GitHub cannot have is refused at load too.
+    #[test]
+    fn an_origin_with_an_invalid_repository_name_is_rejected_naming_the_variable() {
+        for value in [
+            "acme/brand knowledge",
+            "acme/..",
+            "ac me/brand",
+            "acme/br%61nd@main",
+        ] {
+            let err = overlay(&[
+                ("CRYSTALLINE_DOMAIN_TEAM", "/k/team"),
+                ("CRYSTALLINE_DOMAIN_TEAM_ORIGIN", value),
+            ])
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.starts_with("invalid environment variable CRYSTALLINE_DOMAIN_TEAM_ORIGIN: "),
+                "{value}: {err}"
+            );
+            assert!(err.contains("is not a valid repository"), "{value}: {err}");
+        }
     }
 
     #[test]
