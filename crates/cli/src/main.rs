@@ -4628,9 +4628,26 @@ fn daemon_task_command(action: DaemonTaskAction) -> anyhow::Result<()> {
     match action {
         DaemonTaskAction::Register { all_users } => {
             let exe = std::env::current_exe()?;
-            let name =
-                daemon_task::register(&principal(all_users), &exe).map_err(anyhow::Error::msg)?;
-            println!("registered the task {name}");
+            if all_users {
+                let name =
+                    daemon_task::register(&principal(true), &exe).map_err(anyhow::Error::msg)?;
+                println!("registered the task {name}");
+            } else {
+                let (name, moved) =
+                    daemon_task::register_for_this_user(&exe).map_err(anyhow::Error::msg)?;
+                println!("registered the task {name}");
+                match moved {
+                    daemon_task::Moved::Nothing => {}
+                    daemon_task::Moved::Removed(old) => {
+                        println!(
+                            "removed the task {old}, which had the name from Crystalline 0.24.0"
+                        )
+                    }
+                    daemon_task::Moved::Refused { task, why } => anyhow::bail!(
+                        "could not remove the task {task}, which had the name from Crystalline 0.24.0 ({why})"
+                    ),
+                }
+            }
         }
         DaemonTaskAction::Unregister { all_users } => {
             let removal = daemon_task::unregister(&principal(all_users));

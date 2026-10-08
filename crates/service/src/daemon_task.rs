@@ -12,15 +12,25 @@ pub const MACHINE_TASK_NAME: &str = r"\Crystalline\Daemon";
 
 /// The debug-build seam standing in for Task Scheduler: `missing` (no task),
 /// `fail` (the run is refused), `serve` (the run starts this binary's own
-/// daemon) or `system` (as `serve`, but the started daemon gets none of the
-/// shaping variables set here, as a daemon Task Scheduler starts). A release
+/// daemon), `system` (as `serve`, but the started daemon gets none of the
+/// shaping variables set here, as a daemon Task Scheduler starts) or
+/// `legacy` (this user's task is there under the 0.24.0 name). A release
 /// build never reads it.
 pub const TEST_DAEMON_TASK_ENV: &str = "CRYSTALLINE_TEST_DAEMON_TASK";
 
-/// The per-user task `doctor --fix` registers: in the root folder, where a
-/// standard user may create a task for themself, and never under the machine
-/// name.
-pub fn user_task_name(user: &str) -> String {
+/// The per-user task `doctor --fix` and `daemon-task register` register:
+/// in the root folder, where a standard user may create a task for
+/// themself, never under the machine name, and named for the user and
+/// their SID, so two accounts that share a user name (a local `bob` and
+/// `CORP\bob`) never share one name.
+pub fn user_task_name(user: &str, sid: &str) -> String {
+    format!(r"\Crystalline Daemon for {user} ({sid})")
+}
+
+/// The name 0.24.0 gave the per-user task, without the SID. Found, run,
+/// moved and removed only when its definition runs as this account
+/// ([`runs_as`]); another account's task under it is left alone.
+pub fn legacy_user_task_name(user: &str) -> String {
     format!(r"\Crystalline Daemon for {user}")
 }
 
@@ -35,6 +45,12 @@ pub trait DaemonTask: Send + Sync {
     /// `None` when it cannot be read, and always for a stand-in, so a test
     /// never reads the real Task Scheduler through it.
     fn definition(&self, _name: &str) -> Option<String> {
+        None
+    }
+    /// This user's task under the 0.24.0 name, when it is there and runs
+    /// as this account: `doctor` reports it and `--fix` moves it. `None`
+    /// for a stand-in that has none.
+    fn legacy(&self) -> Option<String> {
         None
     }
 }
@@ -113,7 +129,14 @@ struct Seam(String);
 #[cfg(debug_assertions)]
 impl DaemonTask for Seam {
     fn find(&self) -> Option<String> {
-        (self.0 != "missing").then(|| MACHINE_TASK_NAME.to_string())
+        match self.0.as_str() {
+            "missing" => None,
+            "legacy" => Some(legacy_user_task_name(&ThisUser::here().name)),
+            _ => Some(MACHINE_TASK_NAME.to_string()),
+        }
+    }
+    fn legacy(&self) -> Option<String> {
+        (self.0 == "legacy").then(|| legacy_user_task_name(&ThisUser::here().name))
     }
     fn run(&self, _name: &str) -> Result<(), String> {
         match self.0.as_str() {
@@ -253,29 +276,242 @@ pub fn current_account() -> String {
     }
 }
 
-/// The task names a bridge looks for, in order: the machine task, then this
-/// user's own, which `doctor --fix` registers when the machine task is
-/// missing.
-pub fn candidate_names(user: Option<&str>) -> Vec<String> {
-    let mut names = vec![MACHINE_TASK_NAME.to_string()];
-    if let Some(user) = user.filter(|u| !u.is_empty()) {
-        names.push(user_task_name(user));
+/// Who this process runs as, for the per-user task: the user name Windows
+/// sets (`USERNAME`), the account (`DOMAIN\name`, [`current_account`]) and
+/// its SID ([`current_sid`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ThisUser {
+    pub name: String,
+    pub account: String,
+    pub sid: Option<String>,
+}
+
+impl ThisUser {
+    pub fn here() -> ThisUser {
+        ThisUser {
+            name: std::env::var("USERNAME").unwrap_or_default(),
+            account: current_account(),
+            sid: current_sid(),
+        }
     }
+
+    fn legacy_name(&self) -> Option<String> {
+        (!self.name.is_empty()).then(|| legacy_user_task_name(&self.name))
+    }
+}
+
+/// This account's SID as text (`S-1-5-21-...`), read from the process
+/// token: the account [`current_account`] names. `None` off Windows and
+/// when the token cannot be read.
+pub fn current_sid() -> Option<String> {
+    #[cfg(windows)]
+    {
+        token_user_sid()
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+#[cfg(windows)]
+fn token_user_sid() -> Option<String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LocalFree};
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    let mut token: HANDLE = std::ptr::null_mut();
+    // SAFETY: this process's pseudo handle and an out pointer for the token.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return None;
+    }
+    let mut needed = 0u32;
+    // SAFETY: a size query: no buffer, the size is written to `needed`.
+    unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed) };
+    // Whole u64 words, so the buffer is aligned for TOKEN_USER.
+    let mut buffer = vec![0u64; (needed as usize).div_ceil(8).max(1)];
+    // SAFETY: a buffer of at least `needed` bytes, aligned for TOKEN_USER.
+    let filled = unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            buffer.as_mut_ptr().cast(),
+            (buffer.len() * 8) as u32,
+            &mut needed,
+        )
+    };
+    // SAFETY: the token opened above, closed once.
+    unsafe { CloseHandle(token) };
+    if filled == 0 {
+        return None;
+    }
+    // SAFETY: the call filled the buffer with a TOKEN_USER, whose SID points
+    // into the same buffer, which lives to the end of this function.
+    let user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
+    let mut text: windows_sys::core::PWSTR = std::ptr::null_mut();
+    // SAFETY: a valid SID and an out pointer the call fills with a string it
+    // allocates with LocalAlloc.
+    if unsafe { ConvertSidToStringSidW(user.User.Sid, &mut text) } == 0 || text.is_null() {
+        return None;
+    }
+    let mut len = 0usize;
+    // SAFETY: the call returned a NUL-terminated wide string.
+    while unsafe { *text.add(len) } != 0 {
+        len += 1;
+    }
+    // SAFETY: `len` wide chars before the NUL, all initialized.
+    let sid = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, len) });
+    // SAFETY: frees what ConvertSidToStringSidW allocated.
+    unsafe { LocalFree(text.cast()) };
+    Some(sid)
+}
+
+/// The task names a bridge looks for, in order: the machine task, then this
+/// user's own under its name with the SID, then under the 0.24.0 name.
+pub fn candidate_names(me: &ThisUser) -> Vec<String> {
+    let mut names = vec![MACHINE_TASK_NAME.to_string()];
+    if let Some(sid) = me.sid.as_deref().filter(|_| !me.name.is_empty()) {
+        names.push(user_task_name(&me.name, sid));
+    }
+    names.extend(me.legacy_name());
     names
 }
 
 /// The names a registration for `principal` may use: the machine name for
-/// every user, only the user's own name for one user. A user's task never
-/// takes the machine name, or every other user's bridge would find it first
-/// and wait for a daemon that never comes for them.
-pub(crate) fn registration_names(principal: &TaskPrincipal, user: Option<&str>) -> Vec<String> {
+/// every user, only the user's own name with their SID for one user. A
+/// user's task never takes the machine name, or every other user's bridge
+/// would find it first and wait for a daemon that never comes for them.
+pub(crate) fn registration_names(principal: &TaskPrincipal, me: &ThisUser) -> Vec<String> {
     match principal {
         TaskPrincipal::AllUsers => vec![MACHINE_TASK_NAME.to_string()],
-        TaskPrincipal::User { .. } => user
-            .filter(|u| !u.is_empty())
-            .map(|u| vec![user_task_name(u)])
+        TaskPrincipal::User { .. } => me
+            .sid
+            .as_deref()
+            .filter(|_| !me.name.is_empty())
+            .map(|sid| vec![user_task_name(&me.name, sid)])
             .unwrap_or_default(),
     }
+}
+
+/// The `<UserId>` texts inside the `<Principals>` block of `xml`, trimmed.
+/// The logon trigger's `<UserId>` is outside it and never counts. Tags
+/// compare without case; ASCII lowercasing keeps every byte offset.
+fn principal_user_ids(xml: &str) -> Vec<&str> {
+    let lower = xml.to_ascii_lowercase();
+    let (Some(start), Some(end)) = (lower.find("<principals>"), lower.find("</principals>")) else {
+        return Vec::new();
+    };
+    if start >= end {
+        return Vec::new();
+    }
+    let (block, lower_block) = (&xml[start..end], &lower[start..end]);
+    let mut ids = Vec::new();
+    let mut from = 0;
+    while let Some(open) = lower_block[from..]
+        .find("<userid>")
+        .map(|i| from + i + "<userid>".len())
+    {
+        let Some(close) = lower_block[open..].find("</userid>").map(|i| open + i) else {
+            break;
+        };
+        ids.push(block[open..close].trim());
+        from = close + "</userid>".len();
+    }
+    ids
+}
+
+/// Whether `a` and `b` are the same `DOMAIN\name`: both carry a domain and
+/// both halves match without case. A bare name proves nothing: a local
+/// `bob` and `CORP\bob` share it.
+fn same_qualified_account(a: &str, b: &str) -> bool {
+    match (a.rsplit_once('\\'), b.rsplit_once('\\')) {
+        (Some((a_domain, a_name)), Some((b_domain, b_name))) => {
+            !a_domain.is_empty()
+                && a_domain.to_lowercase() == b_domain.to_lowercase()
+                && a_name.to_lowercase() == b_name.to_lowercase()
+        }
+        _ => false,
+    }
+}
+
+/// Whether the task defined by `xml` runs as `me`: its principal names this
+/// account's SID or its full `DOMAIN\name`. Anything less, an unreadable
+/// definition included, is not ours.
+pub(crate) fn runs_as(xml: &str, me: &ThisUser) -> bool {
+    principal_user_ids(xml).into_iter().any(|id| {
+        me.sid
+            .as_deref()
+            .is_some_and(|sid| id.eq_ignore_ascii_case(sid))
+            || same_qualified_account(id, &me.account)
+    })
+}
+
+/// This user's 0.24.0-named task, when `exists` finds it and its
+/// `definition` runs as `me`.
+pub(crate) fn legacy_with(
+    me: &ThisUser,
+    mut exists: impl FnMut(&str) -> bool,
+    mut definition: impl FnMut(&str) -> Option<String>,
+) -> Option<String> {
+    let legacy = me.legacy_name()?;
+    (exists(&legacy) && definition(&legacy).is_some_and(|xml| runs_as(&xml, me))).then_some(legacy)
+}
+
+/// The first of `me`'s candidate names that is registered and may be run:
+/// the 0.24.0 name only when it is this account's own.
+pub(crate) fn find_with(
+    me: &ThisUser,
+    mut exists: impl FnMut(&str) -> bool,
+    mut definition: impl FnMut(&str) -> Option<String>,
+) -> Option<String> {
+    let legacy = me.legacy_name();
+    candidate_names(me).into_iter().find(|name| {
+        exists(name)
+            && (legacy.as_ref() != Some(name)
+                || definition(name).is_some_and(|xml| runs_as(&xml, me)))
+    })
+}
+
+/// What moving the 0.24.0-named task did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Moved {
+    /// There was none of this user's.
+    Nothing,
+    /// Removed, after the new name was registered.
+    Removed(String),
+    /// Task Scheduler would not remove it; the new task exists all the same.
+    Refused { task: String, why: String },
+}
+
+/// Remove this user's 0.24.0-named task. Only a caller that has just
+/// registered the new name calls this.
+pub(crate) fn move_legacy_with(
+    me: &ThisUser,
+    exists: impl FnMut(&str) -> bool,
+    definition: impl FnMut(&str) -> Option<String>,
+    mut delete: impl FnMut(&str) -> Result<(), String>,
+) -> Moved {
+    match legacy_with(me, exists, definition) {
+        None => Moved::Nothing,
+        Some(task) => match delete(&task) {
+            Ok(()) => Moved::Removed(task),
+            Err(why) => Moved::Refused { task, why },
+        },
+    }
+}
+
+/// Register this user's task under its new name, then remove the old one if
+/// it is this user's: in that order, so a refused registration never leaves
+/// the user without a task.
+pub(crate) fn replace_legacy_with(
+    me: &ThisUser,
+    register: impl FnOnce() -> Result<String, String>,
+    exists: impl FnMut(&str) -> bool,
+    definition: impl FnMut(&str) -> Option<String>,
+    delete: impl FnMut(&str) -> Result<(), String>,
+) -> Result<(String, Moved), String> {
+    let name = register()?;
+    Ok((name, move_legacy_with(me, exists, definition, delete)))
 }
 
 /// `schtasks` output as text: UTF-16LE when it starts with a byte order mark
@@ -367,24 +603,38 @@ fn schtasks(args: &[&std::ffi::OsStr]) -> Result<String, String> {
     }
 }
 
+/// Whether Task Scheduler has a task named `name`.
+fn task_exists(name: &str) -> bool {
+    schtasks(&["/Query".as_ref(), "/TN".as_ref(), name.as_ref()]).is_ok()
+}
+
+/// Delete the task `name`.
+fn delete_task(name: &str) -> Result<(), String> {
+    schtasks(&[
+        "/Delete".as_ref(),
+        "/TN".as_ref(),
+        name.as_ref(),
+        "/F".as_ref(),
+    ])
+    .map(|_| ())
+}
+
 /// The real Task Scheduler, through `schtasks.exe`.
 pub struct Schtasks {
-    pub user: Option<String>,
+    pub me: ThisUser,
 }
 
 impl Schtasks {
     pub fn for_this_user() -> Schtasks {
         Schtasks {
-            user: std::env::var("USERNAME").ok(),
+            me: ThisUser::here(),
         }
     }
 }
 
 impl DaemonTask for Schtasks {
     fn find(&self) -> Option<String> {
-        candidate_names(self.user.as_deref())
-            .into_iter()
-            .find(|name| schtasks(&["/Query".as_ref(), "/TN".as_ref(), name.as_ref()]).is_ok())
+        find_with(&self.me, task_exists, registered_xml)
     }
 
     fn run(&self, name: &str) -> Result<(), String> {
@@ -393,6 +643,10 @@ impl DaemonTask for Schtasks {
 
     fn definition(&self, name: &str) -> Option<String> {
         registered_xml(name)
+    }
+
+    fn legacy(&self) -> Option<String> {
+        legacy_with(&self.me, task_exists, registered_xml)
     }
 }
 
@@ -428,11 +682,17 @@ pub(crate) fn write_task_file(dir: &Path, bytes: &[u8]) -> Result<PathBuf, Strin
 /// Register the task for `principal`, starting `exe`. Answers the name it
 /// was registered under.
 pub fn register(principal: &TaskPrincipal, exe: &Path) -> Result<String, String> {
+    let names = registration_names(principal, &ThisUser::here());
+    if names.is_empty() {
+        return Err(
+            "this account's user name or SID could not be read, so its task has no name"
+                .to_string(),
+        );
+    }
     let file = write_task_file(
         &std::env::temp_dir(),
         &utf16_with_bom(&task_xml(exe, principal)),
     )?;
-    let names = registration_names(principal, std::env::var("USERNAME").ok().as_deref());
     let result = register_with(&names, |name| {
         schtasks(&[
             "/Create".as_ref(),
@@ -448,11 +708,28 @@ pub fn register(principal: &TaskPrincipal, exe: &Path) -> Result<String, String>
     result
 }
 
+/// Register the current user's own task, then move away the one 0.24.0
+/// registered under the name without the SID, when it is this account's.
+pub fn register_for_this_user(exe: &Path) -> Result<(String, Moved), String> {
+    let me = ThisUser::here();
+    let principal = TaskPrincipal::User {
+        account: me.account.clone(),
+    };
+    replace_legacy_with(
+        &me,
+        || register(&principal, exe),
+        task_exists,
+        registered_xml,
+        delete_task,
+    )
+}
+
 /// The per-user tasks in a `schtasks /Query /FO CSV /NH` listing: every
-/// `\Crystalline Daemon for <user>` in the root folder, each once. The task
+/// `\Crystalline Daemon for <user>` and `\Crystalline Daemon for <user>
+/// (<SID>)` in the root folder, each once. The task
 /// name is the first quoted field of a row; any other line is skipped.
 pub(crate) fn per_user_task_names(listing: &str) -> Vec<String> {
-    let prefix = user_task_name("");
+    let prefix = legacy_user_task_name("");
     let mut names: Vec<String> = Vec::new();
     for line in listing.lines() {
         let Some(name) = line
@@ -473,12 +750,14 @@ pub(crate) fn per_user_task_names(listing: &str) -> Vec<String> {
 }
 
 /// The per-user tasks among the file names in Task Scheduler's tasks
-/// folder (see [`tasks_folder_in`]): each root-level file is one task, named
-/// exactly as the task, so a user name with any letters reads back as it is.
+/// folder (see [`tasks_folder_in`]), every `\Crystalline Daemon for <user>`
+/// and `\Crystalline Daemon for <user> (<SID>)`: each root-level file is one
+/// task, named exactly as the task, so a user name with any letters reads
+/// back as it is.
 pub(crate) fn per_user_task_names_in_folder(
     files: impl IntoIterator<Item = std::ffi::OsString>,
 ) -> Vec<String> {
-    let prefix = user_task_name("");
+    let prefix = legacy_user_task_name("");
     let prefix = prefix.trim_start_matches('\\');
     let mut names: Vec<String> = Vec::new();
     for file in files {
@@ -496,20 +775,29 @@ pub(crate) fn per_user_task_names_in_folder(
     names
 }
 
-/// The names an unregistration for `principal` removes. For one user, only
-/// their own task. For every user (the MSI's uninstall), the machine task
-/// and every per-user task in `per_user`: a task `doctor --fix` registered
-/// must not outlive the binary it starts, or a bridge would still find it.
+/// The names an unregistration for `principal` removes. For one user, their
+/// own task, and the 0.24.0-named one only when `legacy_is_mine` says it
+/// runs as them. For every user (the MSI's uninstall), the machine task and
+/// every per-user task in `per_user`, both name forms: a task `doctor
+/// --fix` registered must not outlive the binary it starts.
 pub(crate) fn unregistration_names(
     principal: &TaskPrincipal,
-    user: Option<&str>,
+    me: &ThisUser,
     per_user: &[String],
+    mut legacy_is_mine: impl FnMut(&str) -> bool,
 ) -> Vec<String> {
-    let mut names = registration_names(principal, user);
-    if *principal == TaskPrincipal::AllUsers {
-        for name in per_user {
-            if !names.contains(name) {
-                names.push(name.clone());
+    let mut names = registration_names(principal, me);
+    match principal {
+        TaskPrincipal::AllUsers => {
+            for name in per_user {
+                if !names.contains(name) {
+                    names.push(name.clone());
+                }
+            }
+        }
+        TaskPrincipal::User { .. } => {
+            if let Some(legacy) = me.legacy_name().filter(|name| legacy_is_mine(name)) {
+                names.push(legacy);
             }
         }
     }
@@ -591,20 +879,11 @@ pub fn unregister(principal: &TaskPrincipal) -> Removal {
         TaskPrincipal::AllUsers if cfg!(windows) => listed_per_user_tasks(),
         _ => Vec::new(),
     };
-    let user = std::env::var("USERNAME").ok();
-    unregister_with(
-        &unregistration_names(principal, user.as_deref(), &per_user),
-        |name| schtasks(&["/Query".as_ref(), "/TN".as_ref(), name.as_ref()]).is_ok(),
-        |name| {
-            schtasks(&[
-                "/Delete".as_ref(),
-                "/TN".as_ref(),
-                name.as_ref(),
-                "/F".as_ref(),
-            ])
-            .map(|_| ())
-        },
-    )
+    let me = ThisUser::here();
+    let names = unregistration_names(principal, &me, &per_user, |name| {
+        registered_xml(name).is_some_and(|xml| runs_as(&xml, &me))
+    });
+    unregister_with(&names, task_exists, delete_task)
 }
 
 /// The definition of a registered task, as Task Scheduler holds it now.
@@ -623,6 +902,210 @@ mod tests {
     use super::*;
 
     const EXE: &str = r"C:\Program Files\Crystalline\bin\crystalline.exe";
+
+    const ADA_SID: &str = "S-1-5-21-1004336348-1177238915-682003330-1001";
+
+    fn ada() -> ThisUser {
+        ThisUser {
+            name: "ada".to_string(),
+            account: r"WORK\ada".to_string(),
+            sid: Some(ADA_SID.to_string()),
+        }
+    }
+
+    /// A definition as `schtasks /Query /XML` prints a per-user task, with
+    /// `user_id` as principal and in the trigger.
+    fn principal_xml(user_id: &str) -> String {
+        format!(
+            "<Task><Triggers><LogonTrigger><UserId>{user_id}</UserId></LogonTrigger></Triggers>\
+             <Principals><Principal id=\"Author\"><UserId>{user_id}</UserId>\
+             <LogonType>InteractiveToken</LogonType></Principal></Principals></Task>"
+        )
+    }
+
+    #[test]
+    fn a_user_task_is_named_for_the_user_and_their_sid() {
+        assert_eq!(
+            user_task_name("ada", ADA_SID),
+            format!(r"\Crystalline Daemon for ada ({ADA_SID})")
+        );
+        assert_eq!(legacy_user_task_name("ada"), r"\Crystalline Daemon for ada");
+        assert!(
+            user_task_name("ada", ADA_SID).starts_with(&legacy_user_task_name("")),
+            "one prefix finds both forms for the uninstall"
+        );
+    }
+
+    #[test]
+    fn only_a_sid_or_the_whole_account_proves_a_task_runs_as_this_user() {
+        let me = ada();
+        assert!(runs_as(&principal_xml(ADA_SID), &me));
+        assert!(
+            runs_as(&principal_xml(r"work\ADA"), &me),
+            "case is no difference"
+        );
+        assert!(
+            !runs_as(&principal_xml("ada"), &me),
+            "a bare name may be another account's"
+        );
+        assert!(
+            !runs_as(&principal_xml(r"PC1\ada"), &me),
+            "another domain is another account"
+        );
+        assert!(!runs_as(&principal_xml("S-1-5-21-9-9-9-1001"), &me));
+        assert!(
+            !runs_as(
+                "<Task><Triggers><LogonTrigger><UserId>WORK\\ada</UserId></LogonTrigger></Triggers>\
+                 <Principals><Principal><GroupId>S-1-5-32-545</GroupId></Principal></Principals></Task>",
+                &me
+            ),
+            "the trigger says when it starts, not who it runs as"
+        );
+        assert!(!runs_as("\u{fffd}\u{fffd}", &me), "unreadable is not ours");
+        let no_sid = ThisUser { sid: None, ..ada() };
+        assert!(!runs_as(&principal_xml(ADA_SID), &no_sid));
+    }
+
+    /// Two accounts share the user name bob: the local bob and CORP\bob.
+    /// Only one `\Crystalline Daemon for bob` can exist. When it is the
+    /// local bob's, CORP\bob never finds, runs, moves, rewrites or deletes it.
+    #[test]
+    fn another_account_with_the_same_user_name_keeps_its_old_task() {
+        let corp_bob = ThisUser {
+            name: "bob".to_string(),
+            account: r"CORP\bob".to_string(),
+            sid: Some("S-1-5-21-1-2-3-1104".to_string()),
+        };
+        let old = legacy_user_task_name("bob");
+        let principal = TaskPrincipal::User {
+            account: corp_bob.account.clone(),
+        };
+        for local_bob in ["S-1-5-21-7-8-9-1001", r"PC1\bob", "bob"] {
+            let xml = principal_xml(local_bob);
+            let exists = |name: &str| name == old;
+            let definition = |name: &str| (name == old).then(|| xml.clone());
+            assert_eq!(
+                find_with(&corp_bob, exists, definition),
+                None,
+                "{local_bob}"
+            );
+            assert_eq!(
+                legacy_with(&corp_bob, exists, definition),
+                None,
+                "{local_bob}"
+            );
+            assert_eq!(
+                move_legacy_with(&corp_bob, exists, definition, |name| panic!(
+                    "deleted {name}"
+                )),
+                Moved::Nothing,
+                "{local_bob}"
+            );
+            assert_eq!(
+                replace_legacy_with(
+                    &corp_bob,
+                    || Ok(user_task_name("bob", "S-1-5-21-1-2-3-1104")),
+                    exists,
+                    definition,
+                    |name| panic!("deleted {name}"),
+                ),
+                Ok((user_task_name("bob", "S-1-5-21-1-2-3-1104"), Moved::Nothing)),
+                "the new name carries CORP\\bob's SID, so the local bob's task is never rewritten"
+            );
+            assert_eq!(
+                unregistration_names(&principal, &corp_bob, &[], |name| {
+                    legacy_with(&corp_bob, exists, definition).as_deref() == Some(name)
+                }),
+                [user_task_name("bob", "S-1-5-21-1-2-3-1104")],
+                "{local_bob}"
+            );
+        }
+        for own in ["S-1-5-21-1-2-3-1104", r"corp\BOB"] {
+            let xml = principal_xml(own);
+            let exists = |name: &str| name == old;
+            let definition = |name: &str| (name == old).then(|| xml.clone());
+            assert_eq!(
+                find_with(&corp_bob, exists, definition),
+                Some(old.clone()),
+                "{own}"
+            );
+            assert_eq!(
+                unregistration_names(&principal, &corp_bob, &[], |name| {
+                    legacy_with(&corp_bob, exists, definition).as_deref() == Some(name)
+                }),
+                [user_task_name("bob", "S-1-5-21-1-2-3-1104"), old.clone()],
+                "{own}"
+            );
+        }
+    }
+
+    /// The new name first, the old one after: a refused registration never
+    /// leaves the user without a task, and a refused delete is said.
+    #[test]
+    fn the_old_task_goes_only_after_the_new_one_is_registered() {
+        let me = ada();
+        let old = legacy_user_task_name("ada");
+        let new = user_task_name("ada", ADA_SID);
+        let xml = principal_xml(r"WORK\ada");
+        let exists = |name: &str| name == old;
+        let definition = |name: &str| (name == old).then(|| xml.clone());
+        assert_eq!(
+            replace_legacy_with(
+                &me,
+                || Err("ERROR: Access is denied.".to_string()),
+                exists,
+                definition,
+                |name| panic!("deleted {name} before a new task existed"),
+            ),
+            Err("ERROR: Access is denied.".to_string())
+        );
+        let order = std::cell::RefCell::new(Vec::new());
+        let done = replace_legacy_with(
+            &me,
+            || {
+                order.borrow_mut().push("register".to_string());
+                Ok(new.clone())
+            },
+            exists,
+            definition,
+            |name| {
+                order.borrow_mut().push(format!("delete {name}"));
+                Ok(())
+            },
+        );
+        assert_eq!(done, Ok((new.clone(), Moved::Removed(old.clone()))));
+        assert_eq!(
+            *order.borrow(),
+            ["register".to_string(), format!("delete {old}")]
+        );
+        assert_eq!(
+            replace_legacy_with(
+                &me,
+                || Ok(new.clone()),
+                exists,
+                definition,
+                |_| { Err("ERROR: Access is denied.".to_string()) }
+            ),
+            Ok((
+                new.clone(),
+                Moved::Refused {
+                    task: old.clone(),
+                    why: "ERROR: Access is denied.".to_string()
+                }
+            ))
+        );
+        assert_eq!(
+            replace_legacy_with(
+                &me,
+                || Ok(new.clone()),
+                |_| false,
+                definition,
+                |name| { panic!("deleted {name}") }
+            ),
+            Ok((new, Moved::Nothing)),
+            "no old task, nothing to move"
+        );
+    }
 
     #[test]
     fn the_machine_task_matches_the_checked_in_definition() {
@@ -707,41 +1190,54 @@ mod tests {
 
     #[test]
     fn the_bridge_looks_for_the_machine_task_then_the_user_task() {
-        assert_eq!(candidate_names(None), [MACHINE_TASK_NAME.to_string()]);
         assert_eq!(
-            candidate_names(Some("ada")),
+            candidate_names(&ThisUser::default()),
+            [MACHINE_TASK_NAME.to_string()]
+        );
+        assert_eq!(
+            candidate_names(&ada()),
             [
                 MACHINE_TASK_NAME.to_string(),
-                r"\Crystalline Daemon for ada".to_string()
+                user_task_name("ada", ADA_SID),
+                legacy_user_task_name("ada"),
             ]
+        );
+        let no_sid = ThisUser { sid: None, ..ada() };
+        assert_eq!(
+            candidate_names(&no_sid),
+            [MACHINE_TASK_NAME.to_string(), legacy_user_task_name("ada")]
         );
     }
 
     #[test]
     fn a_user_task_never_takes_the_machine_name() {
         assert_eq!(
-            registration_names(&TaskPrincipal::AllUsers, Some("ada")),
+            registration_names(&TaskPrincipal::AllUsers, &ada()),
             [MACHINE_TASK_NAME.to_string()]
         );
         let user = TaskPrincipal::User {
             account: r"WORK\ada".to_string(),
         };
         assert_eq!(
-            registration_names(&user, Some("ada")),
-            [r"\Crystalline Daemon for ada".to_string()]
+            registration_names(&user, &ada()),
+            [user_task_name("ada", ADA_SID)]
         );
         assert!(
-            registration_names(&user, None).is_empty(),
+            registration_names(&user, &ThisUser::default()).is_empty(),
             "no user name, no user task"
         );
+        assert!(
+            registration_names(&user, &ThisUser { sid: None, ..ada() }).is_empty(),
+            "no SID, no user task name"
+        );
         let mut tried = Vec::new();
-        let got = register_with(&registration_names(&user, Some("ada")), |name| {
+        let got = register_with(&registration_names(&user, &ada()), |name| {
             tried.push(name.to_string());
             Ok(())
         });
-        assert_eq!(got.as_deref(), Ok(r"\Crystalline Daemon for ada"));
-        assert_eq!(tried, [r"\Crystalline Daemon for ada".to_string()]);
-        let refused = register_with(&registration_names(&user, Some("ada")), |_| {
+        assert_eq!(got.as_deref(), Ok(user_task_name("ada", ADA_SID).as_str()));
+        assert_eq!(tried, [user_task_name("ada", ADA_SID)]);
+        let refused = register_with(&registration_names(&user, &ada()), |_| {
             Err("ERROR: Access is denied.".to_string())
         });
         assert_eq!(
@@ -793,6 +1289,7 @@ mod tests {
         let listing = "\r\n\
             \"\\Crystalline\\Daemon\",\"N/A\",\"Ready\"\r\n\
             \"\\Crystalline Daemon for ada\",\"N/A\",\"Ready\"\r\n\
+            \"\\Crystalline Daemon for ada (S-1-5-21-1-2-3-1001)\",\"N/A\",\"Ready\"\r\n\
             \"\\Crystalline Daemon for Bob Smith\",\"N/A\",\"Running\"\r\n\
             \"\\Crystalline Daemon for ada\",\"N/A\",\"Ready\"\r\n\
             \"\\Other\\Crystalline Daemon for eve\",\"N/A\",\"Ready\"\r\n\
@@ -803,6 +1300,7 @@ mod tests {
             per_user_task_names(listing),
             [
                 r"\Crystalline Daemon for ada".to_string(),
+                r"\Crystalline Daemon for ada (S-1-5-21-1-2-3-1001)".to_string(),
                 r"\Crystalline Daemon for Bob Smith".to_string(),
             ],
             "root folder only, each name once, never the machine task"
@@ -816,7 +1314,7 @@ mod tests {
             \"\\Crystalline Daemon for bob\",\"N/A\",\"Ready\"\r\n";
         let listed = per_user_task_names(listing);
         assert_eq!(
-            unregistration_names(&TaskPrincipal::AllUsers, Some("ada"), &listed),
+            unregistration_names(&TaskPrincipal::AllUsers, &ada(), &listed, |_| false),
             [
                 MACHINE_TASK_NAME.to_string(),
                 r"\Crystalline Daemon for ada".to_string(),
@@ -824,7 +1322,9 @@ mod tests {
             ]
         );
         assert_eq!(
-            unregistration_names(&TaskPrincipal::AllUsers, None, &[]),
+            unregistration_names(&TaskPrincipal::AllUsers, &ThisUser::default(), &[], |_| {
+                false
+            }),
             [MACHINE_TASK_NAME.to_string()],
             "a listing that failed still removes the machine task"
         );
@@ -832,8 +1332,8 @@ mod tests {
             account: r"WORK\ada".to_string(),
         };
         assert_eq!(
-            unregistration_names(&user, Some("ada"), &listed),
-            [r"\Crystalline Daemon for ada".to_string()],
+            unregistration_names(&user, &ada(), &listed, |_| false),
+            [user_task_name("ada", ADA_SID)],
             "one user removes only their own task"
         );
     }
@@ -857,6 +1357,7 @@ mod tests {
     fn an_uninstall_reads_per_user_names_from_the_tasks_folder() {
         let files = [
             "Crystalline Daemon for ada",
+            "Crystalline Daemon for ada (S-1-5-21-1-2-3-1001)",
             "Crystalline Daemon for J\u{f6}rg",
             "Crystalline Daemon for ",
             "Crystalline",
@@ -868,6 +1369,7 @@ mod tests {
             per_user_task_names_in_folder(files),
             [
                 r"\Crystalline Daemon for ada".to_string(),
+                r"\Crystalline Daemon for ada (S-1-5-21-1-2-3-1001)".to_string(),
                 "\\Crystalline Daemon for J\u{f6}rg".to_string(),
             ],
             "each per-user task once, a non-ASCII name exactly as it is"

@@ -971,19 +971,28 @@ fn same_account(a: &str, b: &str) -> bool {
 
 /// A task runs for this user when its principal is a group (only the MSI
 /// registers one, for the Users group) or this account, and is taken to
-/// when its principal cannot be read at all. The task under this
-/// user's own name (`\Crystalline Daemon for <name>`) is always theirs:
+/// when its principal cannot be read at all. The task under this user's own
+/// name with their SID (`\Crystalline Daemon for <name> (<SID>)`) is always
+/// theirs: only this account can register a name that carries its SID.
 /// Task Scheduler may print the account as a SID, and a name outside ASCII
-/// may not survive the decoding of its output, but only `doctor --fix` run
-/// by this user registers that name.
-pub(crate) fn task_finding(name: Option<&str>, xml: Option<&str>, account: &str) -> TaskFinding {
+/// may not survive the decoding of its output. The 0.24.0 name without the
+/// SID is judged by its principal like any other.
+pub(crate) fn task_finding(
+    name: Option<&str>,
+    xml: Option<&str>,
+    account: &str,
+    sid: Option<&str>,
+) -> TaskFinding {
     let Some(name) = name else {
         return TaskFinding::Missing;
     };
     let own_name = !account.is_empty()
-        && name.eq_ignore_ascii_case(&crystalline_service::daemon_task::user_task_name(
-            account_parts(account).1,
-        ));
+        && sid.is_some_and(|sid| {
+            name.eq_ignore_ascii_case(&crystalline_service::daemon_task::user_task_name(
+                account_parts(account).1,
+                sid,
+            ))
+        });
     if own_name {
         return TaskFinding::Ready(name.to_string());
     }
@@ -1031,6 +1040,12 @@ pub struct TaskDoctor {
     pub registered_now: Option<String>,
     /// Why `--fix` could not register it.
     pub error: Option<String>,
+    /// This user's task under the name 0.24.0 gave it, without the SID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_name: Option<String>,
+    /// The 0.24.0-named task `--fix` removed after it registered the new one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moved_old: Option<String>,
 }
 
 impl TaskDoctor {
@@ -1066,9 +1081,10 @@ pub(crate) fn assess_task(
     name: Option<&str>,
     xml: Option<&str>,
     account: &str,
+    sid: Option<&str>,
     exists: impl Fn(&Path) -> bool,
 ) -> (TaskDoctor, TaskRepair) {
-    let finding = task_finding(name, xml, account);
+    let finding = task_finding(name, xml, account, sid);
     let gone_command = match finding {
         TaskFinding::Ready(_) => xml
             .and_then(task_command)
@@ -1129,7 +1145,7 @@ const NOT_THE_MSI_BINARY: &str = r"this crystalline is not in Program Files\Crys
 /// copy that may move or go, and never beside a machine task, which every
 /// bridge finds first.
 fn check_task(fix: bool) -> Option<TaskDoctor> {
-    use crystalline_service::daemon_task::{self, TaskPrincipal};
+    use crystalline_service::daemon_task;
     if !cfg!(windows) {
         return None;
     }
@@ -1146,17 +1162,36 @@ fn check_task(fix: bool) -> Option<TaskDoctor> {
     // The runner every bridge uses, so a debug build's test seam
     // (`CRYSTALLINE_TEST_DAEMON_TASK`) stands in for Task Scheduler here too.
     let tasks = daemon_task::for_this_process();
+    let me = daemon_task::ThisUser::here();
     let name = tasks.find();
     let xml = name.as_deref().and_then(|name| tasks.definition(name));
-    let account = daemon_task::current_account();
-    let (mut report, repair) =
-        assess_task(name.as_deref(), xml.as_deref(), &account, Path::is_file);
-    if fix && repair == TaskRepair::Register {
+    let (mut report, repair) = assess_task(
+        name.as_deref(),
+        xml.as_deref(),
+        &me.account,
+        me.sid.as_deref(),
+        Path::is_file,
+    );
+    report.old_name = tasks.legacy();
+    // A task under the 0.24.0 name is moved to the name with the SID: the
+    // new one is registered first, the old one removed after.
+    let register = repair == TaskRepair::Register
+        || (repair == TaskRepair::Nothing && report.old_name.is_some());
+    if fix && register {
         if !installed {
             report.error = Some(NOT_THE_MSI_BINARY.to_string());
         } else {
-            match daemon_task::register(&TaskPrincipal::User { account }, &exe) {
-                Ok(name) => report.registered_now = Some(name),
+            match daemon_task::register_for_this_user(&exe) {
+                Ok((name, moved)) => {
+                    report.registered_now = Some(name);
+                    match moved {
+                        daemon_task::Moved::Nothing => {}
+                        daemon_task::Moved::Removed(old) => report.moved_old = Some(old),
+                        daemon_task::Moved::Refused { task, why } => {
+                            report.error = Some(format!("could not remove the task {task} ({why})"))
+                        }
+                    }
+                }
                 Err(e) => report.error = Some(e),
             }
         }
@@ -4463,6 +4498,24 @@ pub fn render_human(report: &DoctorReport) -> String {
                     "  [problem] the task {} is missing, so Claude Desktop cannot start the daemon. Run crystalline doctor --fix to register it for you, or install the newest MSI",
                     crystalline_service::daemon_task::MACHINE_TASK_NAME
                 );
+                fix_error(&mut out);
+            }
+        }
+        if let Some(old) = &task.moved_old {
+            let _ = writeln!(
+                out,
+                "  removed the task {old}, which had the name from Crystalline 0.24.0"
+            );
+        } else if let Some(old) = &task.old_name {
+            let _ = writeln!(
+                out,
+                "  [warning] the task {old} has the name from Crystalline 0.24.0. Run crystalline doctor --fix to give it a name with this account's SID"
+            );
+            // The match above says --fix's error only for a problem.
+            if matches!(
+                (&task.finding, &task.gone_command, &task.registered_now),
+                (Some(TaskFinding::Ready(_)), None, None)
+            ) {
                 fix_error(&mut out);
             }
         }
@@ -7895,10 +7948,13 @@ mod tests {
 
     #[test]
     fn doctor_says_a_task_another_user_owns_does_not_run_for_this_user() {
-        assert_eq!(task_finding(None, None, r"WORK\ada"), TaskFinding::Missing);
+        assert_eq!(
+            task_finding(None, None, r"WORK\ada", None),
+            TaskFinding::Missing
+        );
         let group = r"<Principal id='Author'><GroupId>S-1-5-32-545</GroupId></Principal>";
         assert_eq!(
-            task_finding(Some(r"\Crystalline\Daemon"), Some(group), r"WORK\ada"),
+            task_finding(Some(r"\Crystalline\Daemon"), Some(group), r"WORK\ada", None),
             TaskFinding::Ready(r"\Crystalline\Daemon".to_string())
         );
         let mine = r"<Principal id='Author'><UserId>work\ADA</UserId></Principal>";
@@ -7906,14 +7962,15 @@ mod tests {
             task_finding(
                 Some(r"\Crystalline Daemon for ada"),
                 Some(mine),
-                r"WORK\ada"
+                r"WORK\ada",
+                None
             ),
             TaskFinding::Ready(r"\Crystalline Daemon for ada".to_string()),
             "account names compare without case"
         );
         let other = r"<Principal id='Author'><UserId>WORK\bob</UserId></Principal>";
         assert_eq!(
-            task_finding(Some(r"\Crystalline\Daemon"), Some(other), r"WORK\ada"),
+            task_finding(Some(r"\Crystalline\Daemon"), Some(other), r"WORK\ada", None),
             TaskFinding::ForOthers(r"\Crystalline\Daemon".to_string())
         );
     }
@@ -7926,7 +7983,12 @@ mod tests {
         let exe = std::path::Path::new(r"C:\Program Files\Crystalline\bin\crystalline.exe");
         let machine = task_xml(exe, &TaskPrincipal::AllUsers);
         assert_eq!(
-            task_finding(Some(r"\Crystalline\Daemon"), Some(&machine), r"WORK\ada"),
+            task_finding(
+                Some(r"\Crystalline\Daemon"),
+                Some(&machine),
+                r"WORK\ada",
+                None
+            ),
             TaskFinding::Ready(r"\Crystalline\Daemon".to_string())
         );
         let own = task_xml(
@@ -7936,16 +7998,21 @@ mod tests {
             },
         );
         assert_eq!(
-            task_finding(Some(r"\Crystalline\Daemon"), Some(&own), r"WORK\ada"),
+            task_finding(Some(r"\Crystalline\Daemon"), Some(&own), r"WORK\ada", None),
             TaskFinding::Ready(r"\Crystalline\Daemon".to_string())
         );
         assert_eq!(
-            task_finding(Some(r"\Crystalline\Daemon"), Some(&own), r"WORK\bob"),
+            task_finding(Some(r"\Crystalline\Daemon"), Some(&own), r"WORK\bob", None),
             TaskFinding::ForOthers(r"\Crystalline\Daemon".to_string())
         );
         let spaced = "<Principals>\r\n  <Principal id=\"Author\">\r\n    <UserId>\r\n      WORK\\ada\r\n    </UserId>\r\n  </Principal>\r\n</Principals>";
         assert_eq!(
-            task_finding(Some(r"\Crystalline\Daemon"), Some(spaced), r"WORK\ada"),
+            task_finding(
+                Some(r"\Crystalline\Daemon"),
+                Some(spaced),
+                r"WORK\ada",
+                None
+            ),
             TaskFinding::Ready(r"\Crystalline\Daemon".to_string()),
             "the account is read without the space around it"
         );
@@ -7957,7 +8024,7 @@ mod tests {
     fn an_account_in_the_trigger_alone_does_not_make_the_task_run_for_this_user() {
         let xml = r"<Task><Triggers><LogonTrigger><UserId>WORK\ada</UserId></LogonTrigger></Triggers><Principals><Principal id='Author'><UserId>WORK\bob</UserId></Principal></Principals></Task>";
         assert_eq!(
-            task_finding(Some(r"\Crystalline\Daemon"), Some(xml), r"WORK\ada"),
+            task_finding(Some(r"\Crystalline\Daemon"), Some(xml), r"WORK\ada", None),
             TaskFinding::ForOthers(r"\Crystalline\Daemon".to_string())
         );
     }
@@ -7971,18 +8038,24 @@ mod tests {
             task_finding(
                 Some(r"\Crystalline\Daemon"),
                 Some(upper),
-                "WORK\\\u{fc}lker"
+                "WORK\\\u{fc}lker",
+                None
             ),
             TaskFinding::Ready(r"\Crystalline\Daemon".to_string())
         );
         let bare = "<Principal><UserId>ada</UserId></Principal>";
         assert_eq!(
-            task_finding(Some(r"\Crystalline\Daemon"), Some(bare), r"WORK\ada"),
+            task_finding(Some(r"\Crystalline\Daemon"), Some(bare), r"WORK\ada", None),
             TaskFinding::Ready(r"\Crystalline\Daemon".to_string())
         );
         let elsewhere = "<Principal><UserId>HOME\\ada</UserId></Principal>";
         assert_eq!(
-            task_finding(Some(r"\Crystalline\Daemon"), Some(elsewhere), r"WORK\ada"),
+            task_finding(
+                Some(r"\Crystalline\Daemon"),
+                Some(elsewhere),
+                r"WORK\ada",
+                None
+            ),
             TaskFinding::ForOthers(r"\Crystalline\Daemon".to_string()),
             "two domains are two accounts"
         );
@@ -7994,27 +8067,107 @@ mod tests {
     /// all. Only `doctor --fix` run by this user registers that name.
     #[test]
     fn this_users_own_task_counts_when_its_account_does_not_read_back() {
-        let own = r"\Crystalline Daemon for ada";
+        let own = crystalline_service::daemon_task::user_task_name("ada", ADA_SID);
         let mangled = "<Principal><UserId>WORK\\\u{fffd}\u{fffd}da</UserId></Principal>";
         let sid =
             "<Principal><UserId>S-1-5-21-1004336348-1177238915-682003330-1001</UserId></Principal>";
         let unreadable = "\u{fffd}\u{fffd}\u{fffd}";
         for xml in [Some(mangled), Some(sid), Some(unreadable), None] {
             assert_eq!(
-                task_finding(Some(own), xml, r"WORK\ada"),
-                TaskFinding::Ready(own.to_string()),
+                task_finding(Some(own.as_str()), xml, r"WORK\ada", Some(ADA_SID)),
+                TaskFinding::Ready(own.clone()),
                 "{xml:?}"
             );
         }
         assert_eq!(
-            task_finding(Some(r"\Crystalline\Daemon"), Some(mangled), r"WORK\ada"),
+            task_finding(
+                Some(r"\Crystalline\Daemon"),
+                Some(mangled),
+                r"WORK\ada",
+                None
+            ),
             TaskFinding::ForOthers(r"\Crystalline\Daemon".to_string()),
             "the machine name carries no user, so its account must match"
         );
         let group = "<Principal><GroupId>S-1-5-32-545</GroupId></Principal>";
         assert_eq!(
-            task_finding(Some(own), Some(group), r"WORK\ada"),
-            TaskFinding::Ready(own.to_string())
+            task_finding(Some(own.as_str()), Some(group), r"WORK\ada", Some(ADA_SID)),
+            TaskFinding::Ready(own.clone())
+        );
+    }
+
+    const ADA_SID: &str = "S-1-5-21-1004336348-1177238915-682003330-1001";
+
+    /// The 0.24.0 name is a warning, never a problem: the task still works.
+    /// After `--fix` the move is said.
+    #[test]
+    fn a_task_with_the_old_name_is_a_warning_until_fix_moves_it() {
+        let old = crystalline_service::daemon_task::legacy_user_task_name("ada");
+        let new = crystalline_service::daemon_task::user_task_name("ada", ADA_SID);
+        let mut report = DoctorReport {
+            daemon_task: Some(TaskDoctor {
+                finding: Some(TaskFinding::Ready(old.clone())),
+                old_name: Some(old.clone()),
+                ..TaskDoctor::default()
+            }),
+            ..DoctorReport::default()
+        };
+        assert_eq!(report.remaining_problems(), 0);
+        let out = render_human(&report);
+        assert!(
+            out.contains(&format!(
+                "  [warning] the task {old} has the name from Crystalline 0.24.0. Run crystalline doctor --fix to give it a name with this account's SID\n"
+            )),
+            "{out}"
+        );
+        report.daemon_task = Some(TaskDoctor {
+            finding: Some(TaskFinding::Ready(old.clone())),
+            old_name: Some(old.clone()),
+            registered_now: Some(new.clone()),
+            moved_old: Some(old.clone()),
+            ..TaskDoctor::default()
+        });
+        let out = render_human(&report);
+        assert!(
+            out.contains(&format!("  registered the task {new} for this user\n")),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!(
+                "  removed the task {old}, which had the name from Crystalline 0.24.0\n"
+            )),
+            "{out}"
+        );
+        assert!(!out.contains("[warning] the task"), "{out}");
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["daemon_task"]["moved_old"], serde_json::json!(old));
+    }
+
+    /// The own name carries the SID, so it is this user's however its
+    /// account reads back; the 0.24.0 name is not, without a principal.
+    #[test]
+    fn only_the_name_with_this_accounts_sid_is_always_this_users() {
+        let own = crystalline_service::daemon_task::user_task_name("ada", ADA_SID);
+        let old = crystalline_service::daemon_task::legacy_user_task_name("ada");
+        let mangled = "<Principal><UserId>WORK\\\u{fffd}\u{fffd}da</UserId></Principal>";
+        assert_eq!(
+            task_finding(
+                Some(own.as_str()),
+                Some(mangled),
+                r"WORK\ada",
+                Some(ADA_SID)
+            ),
+            TaskFinding::Ready(own.clone())
+        );
+        assert_eq!(
+            task_finding(
+                Some(old.as_str()),
+                Some(mangled),
+                r"WORK\ada",
+                Some(ADA_SID)
+            ),
+            TaskFinding::ForOthers(old.clone()),
+            "the old name carries no SID, so its account must match"
         );
     }
 
@@ -8038,6 +8191,7 @@ mod tests {
             gone_command: None,
             registered_now: Some(r"\Crystalline Daemon for ada".to_string()),
             error: None,
+            ..TaskDoctor::default()
         });
         assert_eq!(report.remaining_problems(), 0);
         assert!(
@@ -8069,14 +8223,14 @@ mod tests {
     fn a_task_whose_principal_cannot_be_read_is_not_reported_as_for_others() {
         let machine = crystalline_service::daemon_task::MACHINE_TASK_NAME;
         let ready = TaskFinding::Ready(machine.to_string());
-        assert_eq!(task_finding(Some(machine), None, r"WORK\ada"), ready);
+        assert_eq!(task_finding(Some(machine), None, r"WORK\ada", None), ready);
         for garbled in [
             "\u{fffd}\u{fffd}\u{fffd}",
             "<Task><Principals></Principals></Task>",
             "<Principals><Principal id=\"Author\"><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>",
         ] {
             assert_eq!(
-                task_finding(Some(machine), Some(garbled), r"WORK\ada"),
+                task_finding(Some(machine), Some(garbled), r"WORK\ada", None),
                 ready,
                 "{garbled}"
             );
@@ -8092,7 +8246,8 @@ mod tests {
     }
 
     const GONE_EXE: &str = r"C:\Program Files\Crystalline & Co\bin\crystalline.exe";
-    const OWN_TASK: &str = r"\Crystalline Daemon for ada";
+    const OWN_TASK: &str =
+        r"\Crystalline Daemon for ada (S-1-5-21-1004336348-1177238915-682003330-1001)";
 
     #[test]
     fn the_command_is_read_from_the_definition() {
@@ -8121,7 +8276,7 @@ mod tests {
         let here = |_: &Path| true;
         let gone = |_: &Path| false;
 
-        let (task, repair) = assess_task(None, None, r"WORK\ada", gone);
+        let (task, repair) = assess_task(None, None, r"WORK\ada", None, gone);
         assert_eq!(task.finding, Some(TaskFinding::Missing));
         assert_eq!(repair, TaskRepair::Register, "nothing found");
 
@@ -8129,6 +8284,7 @@ mod tests {
             Some(MACHINE_TASK_NAME),
             Some(&machine_xml),
             r"WORK\ada",
+            None,
             here,
         );
         assert_eq!(
@@ -8142,6 +8298,7 @@ mod tests {
             Some(MACHINE_TASK_NAME),
             Some(&machine_xml),
             r"WORK\ada",
+            None,
             gone,
         );
         assert_eq!(task.gone_command.as_deref(), Some(GONE_EXE));
@@ -8151,14 +8308,21 @@ mod tests {
             "a per-user task would never run: the bridge finds the machine task first"
         );
 
-        let (task, repair) = assess_task(Some(MACHINE_TASK_NAME), Some(bob), r"WORK\ada", here);
+        let (task, repair) =
+            assess_task(Some(MACHINE_TASK_NAME), Some(bob), r"WORK\ada", None, here);
         assert_eq!(
             task.finding,
             Some(TaskFinding::ForOthers(MACHINE_TASK_NAME.to_string()))
         );
         assert_eq!(repair, TaskRepair::Administrator);
 
-        let (task, repair) = assess_task(Some(OWN_TASK), Some(&own_xml), r"WORK\ada", gone);
+        let (task, repair) = assess_task(
+            Some(OWN_TASK),
+            Some(&own_xml),
+            r"WORK\ada",
+            Some(ADA_SID),
+            gone,
+        );
         assert_eq!(task.finding, Some(TaskFinding::Ready(OWN_TASK.to_string())));
         assert_eq!(task.gone_command.as_deref(), Some(GONE_EXE));
         assert_eq!(
@@ -8167,7 +8331,7 @@ mod tests {
             "this user's own task is replaced"
         );
 
-        let (task, repair) = assess_task(Some(MACHINE_TASK_NAME), None, r"WORK\ada", gone);
+        let (task, repair) = assess_task(Some(MACHINE_TASK_NAME), None, r"WORK\ada", None, gone);
         assert_eq!(
             (task.finding, task.gone_command, repair),
             (
@@ -8237,6 +8401,7 @@ mod tests {
             gone_command: Some(GONE_EXE.to_string()),
             registered_now: Some(OWN_TASK.to_string()),
             error: None,
+            ..TaskDoctor::default()
         });
         assert!(
             out.contains(&format!("registered the task {OWN_TASK} for this user")),

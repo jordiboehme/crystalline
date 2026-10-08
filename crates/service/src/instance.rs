@@ -5460,7 +5460,7 @@ mod tests {
 
         /// The same task under the per-user name `doctor --fix` registers.
         fn for_user(mut self, user: &str) -> FakeTask {
-            self.name = crate::daemon_task::user_task_name(user);
+            self.name = crate::daemon_task::user_task_name(user, "S-1-5-21-1-2-3-1001");
             self
         }
     }
@@ -5588,7 +5588,7 @@ mod tests {
         assert!(matches!(
             err.downcast_ref::<crate::daemon_task::BridgeFailure>(),
             Some(crate::daemon_task::BridgeFailure::TaskDidNotStart { task, detail })
-                if detail.contains("refused") && task == r"\Crystalline Daemon for ada"
+                if detail.contains("refused") && *task == crate::daemon_task::user_task_name("ada", "S-1-5-21-1-2-3-1001")
         ));
         drop(home);
     }
@@ -5612,7 +5612,7 @@ mod tests {
         assert_eq!(
             err.downcast_ref::<crate::daemon_task::BridgeFailure>(),
             Some(&crate::daemon_task::BridgeFailure::NoAnswer {
-                task: r"\Crystalline Daemon for ada".to_string()
+                task: crate::daemon_task::user_task_name("ada", "S-1-5-21-1-2-3-1001")
             })
         );
         assert!(

@@ -92,8 +92,11 @@ libc = { workspace = true }
 # The clean stop on sign-out and shutdown (session_end_windows): a hidden
 # top-level window. RegisterClassExW and WNDCLASSEXW are behind
 # Win32_Graphics_Gdi in windows-sys 0.61.2.
+# The account's SID for the per-user task name (daemon_task::current_sid): OpenProcessToken needs Win32_Security, ConvertSidToStringSidW Win32_Security_Authorization.
 windows-sys = { workspace = true, features = [
     "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_System_Console",
     "Win32_System_LibraryLoader",
     "Win32_UI_WindowsAndMessaging",

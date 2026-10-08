@@ -838,7 +838,7 @@ mod tests {
     fn the_no_answer_copy_names_the_real_wait() {
         let wait = format!("within {} s", crate::instance::PACKAGED_TASK_WAIT.as_secs());
         let no_answer = crate::daemon_task::BridgeFailure::NoAnswer {
-            task: crate::daemon_task::user_task_name("ada"),
+            task: crate::daemon_task::user_task_name("ada", "S-1-5-21-1-2-3-1001"),
         };
         let silent = StubStatus::for_bridge("r".into(), no_answer.clone());
         assert!(
@@ -848,9 +848,9 @@ mod tests {
         );
         assert!(no_answer.to_string().contains(&wait), "{no_answer}");
         assert!(
-            no_answer
-                .to_string()
-                .contains(r"the Windows task \Crystalline Daemon for ada started"),
+            no_answer.to_string().contains(
+                r"the Windows task \Crystalline Daemon for ada (S-1-5-21-1-2-3-1001) started"
+            ),
             "{no_answer}"
         );
     }
