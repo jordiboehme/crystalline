@@ -407,3 +407,74 @@ test("a Windows PATH with unbalanced quotes is split on every semicolon", () => 
     "C:\\Other\\crystalline.exe",
   ]);
 });
+
+test("the shim counts as started when argv[1] names its own file", () => {
+  const own = path.join(__dirname, "shim.js");
+  assert.equal(shim.isEntry(own, own), true);
+  assert.equal(shim.isEntry(path.join(__dirname, ".", "shim.js"), own), true);
+  assert.equal(shim.isEntry(path.join(__dirname, "shim.test.js"), own), false);
+  assert.equal(shim.isEntry(undefined, own), false);
+  assert.equal(shim.isEntry("", own), false);
+});
+
+test("a symlink to the shim counts as the shim", unix, () => {
+  const fs = require("node:fs");
+  const os = require("node:os");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "shim-link-"));
+  const own = path.join(__dirname, "shim.js");
+  const link = path.join(dir, "shim.js");
+  fs.symlinkSync(own, link);
+  try {
+    assert.equal(shim.isEntry(link, own), true);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Claude Desktop's built-in Node runs an extension through a host script
+// that sets process.argv[1] to the entry and loads it with import(), so
+// require.main is the host and not the shim. The host here does the same,
+// and makes every binary look absent so the shim answers as the stub.
+test("loaded the way Claude Desktop's built-in Node loads it, the shim answers initialize", async () => {
+  const fs = require("node:fs");
+  const os = require("node:os");
+  const childProcess = require("node:child_process");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "shim-host-"));
+  const host = path.join(dir, "host.js");
+  fs.writeFileSync(
+    host,
+    [
+      '"use strict";',
+      'const fs = require("node:fs");',
+      'const path = require("node:path");',
+      'const { pathToFileURL } = require("node:url");',
+      "fs.statSync = () => { throw new Error(\"no binary in this test\"); };",
+      "const [entry, ...rest] = process.argv.slice(2);",
+      'process.argv = ["node", entry, ...rest];',
+      "import(pathToFileURL(path.resolve(entry)).toString());",
+      "",
+    ].join("\n"),
+  );
+  try {
+    const child = childProcess.spawn(process.execPath, [host, path.join(__dirname, "shim.js")], {
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let out = "";
+    child.stdout.on("data", (chunk) => {
+      out += chunk;
+    });
+    const closed = new Promise((resolve) => child.on("close", resolve));
+    child.stdin.write(
+      '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}\n',
+    );
+    child.stdin.end();
+    await closed;
+    const first = out.split("\n").filter(Boolean)[0];
+    assert.ok(first, "the shim wrote no answer");
+    const reply = JSON.parse(first);
+    assert.equal(reply.id, 0);
+    assert.ok(reply.result, `not a result: ${first}`);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
