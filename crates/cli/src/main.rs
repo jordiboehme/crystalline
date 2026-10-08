@@ -12,6 +12,7 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 
 use crystalline_core::HarnessKind;
 use crystalline_core::config;
+use crystalline_core::text::plural;
 use crystalline_core::verify::{self, VerifyOptions};
 
 mod cmd;
@@ -2598,13 +2599,13 @@ async fn reindex_dispatch(
                 .map(|name| format!("\n  crystalline domain export <dir> --domain {name}"))
                 .collect();
             anyhow::bail!(
-                "refusing to wipe: this configuration names {} virtual domain(s) whose engrams live only in the index, so a wipe would delete them for good: {}. Nothing has been opened or changed.\n\n\
+                "refusing to wipe: this configuration names {} whose engrams live only in the index, so a wipe would delete them for good: {}. Nothing has been opened or changed.\n\n\
                  If the index still opens, copy them out first, then wipe:{}\n  crystalline reindex --wipe\n\n\
                  If a rebuild was all you wanted, nothing here needs wiping: crystalline reindex --full\n\n\
                  If it does not open any more - the case --wipe exists for - then this file is the only copy those engrams have, and every command that could read them needs it to open:\n  {}\n\
                  Copy it (and any -wal file beside it) somewhere outside the state directory first. Then either repair that copy with a SQLite tool and put it back, or give the engrams up: delete the domain's entry from this file by hand\n  {}\n\
                  and run crystalline reindex --wipe again. Deleting the entry is the step that loses the domain's content for good; the wipe then sets the unreadable database aside under a timestamped name, never deleting it, and rebuilds your file domains from the files on disk.",
-                virtual_domains.len(),
+                plural(virtual_domains.len(), "virtual domain", "virtual domains"),
                 virtual_domains.join(", "),
                 exports,
                 db_path,
@@ -2822,7 +2823,7 @@ async fn run_origin(command: OriginCommand, db: Option<PathBuf>, json: bool) -> 
             config,
         } => {
             // Detail is asked for whatever `--files` says, because the always
-            // printed ahead line names the change kinds: "2 local change(s)"
+            // printed ahead line names the change kinds: "2 local changes"
             // reads as two things you added, and both can be deletions. The
             // flag decides whether the paths themselves are listed under it.
             let data = crystalline_service::origin_status(
@@ -2937,11 +2938,11 @@ async fn run_origin(command: OriginCommand, db: Option<PathBuf>, json: bool) -> 
                     let refused = paths.len() - targets.len();
                     let question = if refused > 0 {
                         format!(
-                            "Discard {} file(s)? ({refused} refused above, named anyway) [y/N] ",
-                            targets.len()
+                            "Discard {}? ({refused} refused above, named anyway) [y/N] ",
+                            plural(targets.len(), "file", "files")
                         )
                     } else {
-                        format!("Discard {} file(s)? [y/N] ", targets.len())
+                        format!("Discard {}? [y/N] ", plural(targets.len(), "file", "files"))
                     };
                     print!("{question}");
                     std::io::stdout().flush()?;
@@ -3031,8 +3032,12 @@ fn print_origin_update(data: &serde_json::Value, json: bool) {
         let name = d["domain"].as_str().unwrap_or("");
         if d["bootstrapped"].as_bool().unwrap_or(false) {
             println!(
-                "{name}: bootstrapped {} engram(s) at {}",
-                d["engrams"].as_u64().unwrap_or(0),
+                "{name}: bootstrapped {} at {}",
+                plural(
+                    d["engrams"].as_u64().unwrap_or(0) as usize,
+                    "engram",
+                    "engrams"
+                ),
                 d["base_commit"].as_str().unwrap_or("")
             );
             continue;
@@ -3043,7 +3048,10 @@ fn print_origin_update(data: &serde_json::Value, json: bool) {
         }
         let applied = d["applied"].as_array().map(Vec::len).unwrap_or(0);
         let merged = d["merged"].as_array().map(Vec::len).unwrap_or(0);
-        println!("{name}: {applied} file(s) applied ({merged} merged)");
+        println!(
+            "{name}: {} applied ({merged} merged)",
+            plural(applied, "file", "files")
+        );
         for c in d["conflicts"].as_array().unwrap_or(&empty) {
             println!(
                 "  conflict: {} (resolve with: crystalline origin resolve {name} {} --keep mine|theirs)",
@@ -3107,7 +3115,7 @@ fn shared_by(proposal: &serde_json::Value) -> String {
 /// how much unshared work the domain holds and, unless it is all additions,
 /// what kind of work it is.
 ///
-/// A bare "ahead: 2 local change(s)" reads as two things you wrote, and both
+/// A bare "ahead: 2 local changes" reads as two things you wrote, and both
 /// can be deletions - somebody can share believing they publish two notes
 /// while proposing to remove two files from the team's repository. So the
 /// kinds are named whenever the set is not purely additions, whether or not
@@ -3128,10 +3136,11 @@ fn ahead_line(d: &serde_json::Value) -> String {
         })
         .collect();
     let only_additions = kinds.len() == 1 && kinds[0].ends_with(" added");
+    let changes = plural(total as usize, "local change", "local changes");
     if total == 0 || kinds.is_empty() || only_additions {
-        return format!("  ahead: {total} local change(s)");
+        return format!("  ahead: {changes}");
     }
-    format!("  ahead: {total} local change(s) ({})", kinds.join(", "))
+    format!("  ahead: {changes} ({})", kinds.join(", "))
 }
 
 /// The one line a direct domain adds under its `repo@branch` line, and
@@ -3277,7 +3286,12 @@ fn unshared_file_lines(d: &serde_json::Value) -> Vec<String> {
     let indexes = detail["generated_indexes"].as_u64().unwrap_or(0);
     if indexes > 0 {
         lines.push(format!(
-            "    plus {indexes} generated folder listing(s) riding along"
+            "    plus {} riding along",
+            plural(
+                indexes as usize,
+                "generated folder listing",
+                "generated folder listings"
+            )
         ));
     }
     lines.insert(0, "  unshared files:".to_string());
@@ -5444,7 +5458,7 @@ mod tests {
         );
         assert_eq!(
             ahead_line(&all_deleted),
-            "  ahead: 2 local change(s) (2 deleted)"
+            "  ahead: 2 local changes (2 deleted)"
         );
     }
 
@@ -5542,7 +5556,7 @@ mod tests {
         let mixed = entry(&["notes/new.md"], &["notes/edit.md"], &["notes/gone.md"], 3);
         assert_eq!(
             ahead_line(&mixed),
-            "  ahead: 3 local change(s) (1 added, 1 modified, 1 deleted)"
+            "  ahead: 3 local changes (1 added, 1 modified, 1 deleted)"
         );
     }
 
@@ -5552,11 +5566,11 @@ mod tests {
     fn the_ahead_line_stays_short_for_an_empty_set_and_for_additions() {
         assert_eq!(
             ahead_line(&entry(&[], &[], &[], 0)),
-            "  ahead: 0 local change(s)"
+            "  ahead: 0 local changes"
         );
         assert_eq!(
             ahead_line(&entry(&["a.md", "b.md"], &[], &[], 4)),
-            "  ahead: 2 local change(s)"
+            "  ahead: 2 local changes"
         );
     }
 
@@ -5567,11 +5581,11 @@ mod tests {
     fn the_ahead_line_names_a_single_kind_that_is_not_additions() {
         assert_eq!(
             ahead_line(&entry(&[], &["a.md", "b.md"], &[], 0)),
-            "  ahead: 2 local change(s) (2 modified)"
+            "  ahead: 2 local changes (2 modified)"
         );
         assert_eq!(
             ahead_line(&entry(&[], &[], &["a.md"], 0)),
-            "  ahead: 1 local change(s) (1 deleted)"
+            "  ahead: 1 local change (1 deleted)"
         );
     }
 
@@ -5582,7 +5596,7 @@ mod tests {
     fn the_ahead_line_degrades_to_the_bare_count_without_detail() {
         assert_eq!(
             ahead_line(&json!({ "domain": "advisor", "local_changes": 2 })),
-            "  ahead: 2 local change(s)"
+            "  ahead: 2 local changes"
         );
     }
 
@@ -5605,7 +5619,7 @@ mod tests {
                 "    deleted:",
                 "      CustomHeaderModule.md",
                 "      Sysimage Store (AS-2465).md",
-                "    plus 12 generated folder listing(s) riding along",
+                "    plus 12 generated folder listings riding along",
             ]
         );
     }

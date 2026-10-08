@@ -417,7 +417,10 @@ fn reporters_render_without_panicking() {
     );
 
     let human = verify::render(Format::Human, &report, false);
-    assert!(human.contains("error(s)"));
+    assert!(
+        human.contains(" error, ") || human.contains(" errors, "),
+        "{human}"
+    );
 }
 
 #[test]

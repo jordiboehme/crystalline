@@ -1444,9 +1444,10 @@ impl Engine {
             .unwrap_or(0);
         if left < crystalline_index::MIN_CONTENT_LINES {
             return Err(EngineError::Invalid(format!(
-                "that selection would leave '{permalink}' with {left} content line(s), under the \
+                "that selection would leave '{permalink}' with {}, under the \
                  {} verify rule Q001 requires; move less, or retire the whole engram instead of \
                  splitting it",
+                crystalline_core::text::plural(left, "content line", "content lines"),
                 crystalline_index::MIN_CONTENT_LINES
             )));
         }

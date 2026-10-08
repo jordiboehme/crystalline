@@ -390,9 +390,9 @@ fn check_required_file(domain: &Domain, rf: &crate::config::RequiredFile, sink: 
                     "M004",
                     Severity::Error,
                     format!(
-                        "`## {name}` in `{}` has {} bullet(s), needs at least {min}",
+                        "`## {name}` in `{}` has {}, needs at least {min}",
                         rf.path,
-                        bullets.len()
+                        crate::text::plural(bullets.len(), "bullet", "bullets")
                     ),
                     None,
                 );

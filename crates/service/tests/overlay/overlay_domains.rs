@@ -4231,7 +4231,8 @@ async fn enabling_review_on_a_dirty_domain_refuses_naming_the_paths() {
         .expect_err("a folder with unshared work in it cannot start reviewing");
     let words = refused.to_string();
     assert!(
-        words.contains("share or revert these first, then enable review"),
+        words.contains("has 1 unshared change in its folder")
+            && words.contains("share or revert it first, then enable review"),
         "the refusal says what to do with them: {words}"
     );
     assert!(

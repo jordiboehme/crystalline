@@ -5,6 +5,7 @@
 use std::time::{Duration, Instant};
 
 use crystalline_core::config::GlobalConfig;
+use crystalline_core::text::plural;
 use crystalline_remote::{
     Connection, HiddenReason, LocalDomain, MountTable, ONE_DOMAIN_LIMIT, OriginIdentity,
     ROUTING_FILE, RemoteFailure, Revocation, SourceRecord, SourceSet, read_cached, remote_dir,
@@ -36,8 +37,14 @@ pub fn local_domains_of(cfg: &GlobalConfig) -> Vec<LocalDomain> {
 /// The warning `connect` prints when the local copy a server replaces holds
 /// work the team has not seen (decision D19).
 pub fn unshared_warning(local: &str, source: &str, changes: usize) -> String {
+    let (them, they_stay) = if changes == 1 {
+        ("it", "it stays")
+    } else {
+        ("them", "they stay")
+    };
     format!(
-        "warning: your local copy of '{local}' holds {changes} change(s) you have not shared; share them first: they stay hidden while you are connected to {source}"
+        "warning: your local copy of '{local}' holds {} you have not shared; share {them} first: {they_stay} hidden while you are connected to {source}",
+        plural(changes, "change", "changes")
     )
 }
 
@@ -928,7 +935,7 @@ mod tests {
     fn the_unshared_warning_says_what_to_do_and_why() {
         assert_eq!(
             unshared_warning("platform", "acme", 3),
-            "warning: your local copy of 'platform' holds 3 change(s) you have not shared; share them first: they stay hidden while you are connected to acme"
+            "warning: your local copy of 'platform' holds 3 changes you have not shared; share them first: they stay hidden while you are connected to acme"
         );
     }
 

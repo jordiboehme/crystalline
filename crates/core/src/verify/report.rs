@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use serde::Serialize;
 
 use super::{Issue, Severity, VerifyReport};
+use crate::text::plural;
 
 /// Output format for `crystalline verify`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -79,8 +80,12 @@ pub fn to_human(report: &VerifyReport, color: bool) -> String {
     let s = &report.summary;
     let _ = writeln!(
         out,
-        "{} domain(s), {} file(s) scanned: {} error(s), {} warning(s), {} info",
-        s.domains, s.files_scanned, s.errors, s.warnings, s.infos
+        "{}, {} scanned: {}, {}, {} info",
+        plural(s.domains, "domain", "domains"),
+        plural(s.files_scanned, "file", "files"),
+        plural(s.errors, "error", "errors"),
+        plural(s.warnings, "warning", "warnings"),
+        s.infos
     );
     out
 }

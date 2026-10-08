@@ -67,6 +67,7 @@ use std::path::Path;
 use anyhow::{Result, anyhow};
 use crystalline_core::config::{self, DatabaseBackend, DomainEntry, GlobalConfig, OriginConfig};
 use crystalline_core::provision;
+use crystalline_core::text::plural;
 use crystalline_core::verify::{self, VerifyOptions};
 use crystalline_core::{HarnessKind, harness_paths};
 use crystalline_index::{
@@ -4271,7 +4272,11 @@ pub fn render_human(report: &DoctorReport) -> String {
         if d.is_virtual {
             match d.engrams {
                 Some(n) => {
-                    let _ = writeln!(out, "  ok (virtual, {n} engram(s) in the database)");
+                    let _ = writeln!(
+                        out,
+                        "  ok (virtual, {} in the database)",
+                        plural(usize::try_from(n).unwrap_or(0), "engram", "engrams")
+                    );
                 }
                 // A virtual domain lives entirely in the index, so with no
                 // route to it there is nothing to count and nothing to
@@ -4312,8 +4317,8 @@ pub fn render_human(report: &DoctorReport) -> String {
             if d.orphans_removed > 0 {
                 let _ = writeln!(
                     out,
-                    "  removed {} orphan row(s): {}",
-                    d.orphans_removed,
+                    "  removed {}: {}",
+                    plural(d.orphans_removed, "orphan row", "orphan rows"),
                     d.orphans.join(", ")
                 );
             } else if report.index == IndexAccess::Daemon {
@@ -4323,15 +4328,20 @@ pub fn render_human(report: &DoctorReport) -> String {
                 // nothing.
                 let _ = writeln!(
                     out,
-                    "  [problem] {} orphan row(s) (file missing on disk): {}. The running daemon owns the index, so removing them needs it stopped: run `crystalline ctl shutdown`, then `crystalline doctor --fix`",
-                    d.orphans.len(),
-                    d.orphans.join(", ")
+                    "  [problem] {} (file missing on disk): {}. The running daemon owns the index, so removing {} needs it stopped: run `crystalline ctl shutdown`, then `crystalline doctor --fix`",
+                    plural(d.orphans.len(), "orphan row", "orphan rows"),
+                    d.orphans.join(", "),
+                    if d.orphans.len() == 1 {
+                        "the row"
+                    } else {
+                        "them"
+                    }
                 );
             } else {
                 let _ = writeln!(
                     out,
-                    "  [problem] {} orphan row(s) (file missing on disk), rerun with --fix to remove: {}",
-                    d.orphans.len(),
+                    "  [problem] {} (file missing on disk), rerun with --fix to remove: {}",
+                    plural(d.orphans.len(), "orphan row", "orphan rows"),
                     d.orphans.join(", ")
                 );
             }
@@ -4339,8 +4349,8 @@ pub fn render_human(report: &DoctorReport) -> String {
         if !d.unindexed.is_empty() {
             let _ = writeln!(
                 out,
-                "  [problem] {} file(s) not indexed yet, run: crystalline sync --domain {}",
-                d.unindexed.len(),
+                "  [problem] {} not indexed yet, run: crystalline sync --domain {}",
+                plural(d.unindexed.len(), "file", "files"),
                 d.name
             );
             for p in &d.unindexed {
@@ -4350,8 +4360,8 @@ pub fn render_human(report: &DoctorReport) -> String {
         if !d.unsyncable.is_empty() {
             let _ = writeln!(
                 out,
-                "  [problem] {} file(s) cannot be indexed until the frontmatter is fixed (verify rule E001):",
-                d.unsyncable.len()
+                "  [problem] {} cannot be indexed until the frontmatter is fixed (verify rule E001):",
+                plural(d.unsyncable.len(), "file", "files")
             );
             for f in &d.unsyncable {
                 let _ = writeln!(out, "    {}: {}", f.path, f.message);
@@ -4360,8 +4370,8 @@ pub fn render_human(report: &DoctorReport) -> String {
         if !d.encoding_issues.is_empty() {
             let _ = writeln!(
                 out,
-                "  [problem] {} encoding issue(s), see verify rule E006:",
-                d.encoding_issues.len()
+                "  [problem] {}, see verify rule E006:",
+                plural(d.encoding_issues.len(), "encoding issue", "encoding issues")
             );
             for e in &d.encoding_issues {
                 let _ = writeln!(out, "    {}: {}", e.path, e.message);
@@ -4777,10 +4787,14 @@ pub fn render_human(report: &DoctorReport) -> String {
             } else if !o.base_mismatches.is_empty() {
                 let _ = writeln!(
                     out,
-                    "  [problem] {} ({}): {} base snapshot file(s) missing or modified: {}",
+                    "  [problem] {} ({}): {} missing or modified: {}",
                     o.name,
                     o.repo,
-                    o.base_mismatches.len(),
+                    plural(
+                        o.base_mismatches.len(),
+                        "base snapshot file",
+                        "base snapshot files"
+                    ),
                     o.base_mismatches.join(", ")
                 );
             } else {
@@ -4799,11 +4813,15 @@ pub fn render_human(report: &DoctorReport) -> String {
         };
         let _ = writeln!(
             out,
-            "embeddings: {}/{} chunks embedded with '{}'{named} ({} stale chunk(s) from a different model)",
+            "embeddings: {}/{} chunks embedded with '{}'{named} ({} from a different model)",
             e["embedded_with_configured_model"],
             e["total_chunks"],
             e["configured_model"].as_str().unwrap_or_default(),
-            e["stale_chunks"]
+            plural(
+                e["stale_chunks"].as_u64().unwrap_or(0) as usize,
+                "stale chunk",
+                "stale chunks"
+            )
         );
         if let Some(cached) = e["cached_models"].as_array().filter(|c| !c.is_empty()) {
             let listed: Vec<String> = cached
@@ -4953,7 +4971,8 @@ pub fn render_human(report: &DoctorReport) -> String {
             let names: Vec<&str> = stale.iter().filter_map(|v| v.as_str()).collect();
             let _ = writeln!(
                 out,
-                "  stale NLI checkpoint(s) no profile uses now, still on disk: {}",
+                "  {} no profile uses now, still on disk: {}",
+                plural(names.len(), "stale NLI checkpoint", "stale NLI checkpoints"),
                 names.join(", ")
             );
         }
@@ -5097,10 +5116,10 @@ pub fn render_human(report: &DoctorReport) -> String {
             }
             let _ = writeln!(
                 out,
-                "  {}: {} file(s) installed, {} mcp(s) installed, {} drifted, {} edited, {} orphaned, {} missing",
+                "  {}: {} installed, {} installed, {} drifted, {} edited, {} orphaned, {} missing",
                 h.harness,
-                h.installed_files,
-                h.installed_mcps,
+                plural(h.installed_files, "file", "files"),
+                plural(h.installed_mcps, "mcp", "mcps"),
                 h.drift,
                 h.edited,
                 h.orphaned,
@@ -5110,8 +5129,16 @@ pub fn render_human(report: &DoctorReport) -> String {
         for st in &p.stranded {
             let _ = writeln!(
                 out,
-                "  [problem] {}: {} provisioned skill file(s) left in {}, which {} still reads - run `crystalline provision` to retire them.",
-                st.harness, st.files, st.folder, st.read_by
+                "  [problem] {}: {} left in {}, which {} still reads - run `crystalline provision` to retire {}.",
+                st.harness,
+                plural(
+                    st.files,
+                    "provisioned skill file",
+                    "provisioned skill files"
+                ),
+                st.folder,
+                st.read_by,
+                if st.files == 1 { "it" } else { "them" }
             );
         }
         if !p.pending.is_empty() {
@@ -5189,15 +5216,19 @@ pub fn render_human(report: &DoctorReport) -> String {
             None => {
                 let _ = writeln!(
                     out,
-                    "  the server answers; {} domain(s) mounted",
-                    row.mounts.len()
+                    "  the server answers; {} mounted",
+                    plural(row.mounts.len(), "domain", "domains")
                 );
             }
         }
     }
 
     let remaining = report.remaining_problems();
-    let _ = writeln!(out, "{remaining} problem(s) remaining");
+    let _ = writeln!(
+        out,
+        "{} remaining",
+        plural(remaining, "problem", "problems")
+    );
     out
 }
 
@@ -5212,9 +5243,24 @@ pub fn render_human(report: &DoctorReport) -> String {
 /// build cannot read gets a sentence that asserts nothing about it.
 fn orphaned_domain_line(d: &OrphanedDomainDoctor) -> String {
     let name = &d.name;
-    let engrams = d.engrams;
+    let one = d.engrams == 1;
+    let rows = plural(
+        usize::try_from(d.engrams).unwrap_or(0),
+        "engram row",
+        "engram rows",
+    );
+    // What the sentences after the count call those rows.
+    let (they_are, them, they_stay) = if one {
+        ("It is", "it", "it stays")
+    } else {
+        ("They are", "them", "they stay")
+    };
+    let they_are_lower = if one { "it is" } else { "they are" };
     let age = match d.age_days {
-        Some(days) => format!("last seen registered {days} day(s) ago"),
+        Some(days) => format!(
+            "last seen registered {} ago",
+            plural(usize::try_from(days).unwrap_or(0), "day", "days")
+        ),
         // Not an age of zero: an index inherited from a version that never
         // recorded a registration has no evidence either way.
         None => "never seen registered by this version".to_string(),
@@ -5226,7 +5272,7 @@ fn orphaned_domain_line(d: &OrphanedDomainDoctor) -> String {
             ""
         };
         return format!(
-            "  collected {engrams} engram row(s) of '{name}' ({age}); the files on disk are untouched{row}"
+            "  collected {rows} of '{name}' ({age}); the files on disk are untouched{row}"
         );
     }
     // An empty row left behind, a file domain's or a virtual one's: the only
@@ -5245,30 +5291,30 @@ fn orphaned_domain_line(d: &OrphanedDomainDoctor) -> String {
     }
     if d.collectable {
         return format!(
-            "  [problem] {name}: {engrams} engram row(s), {age}. They are not served any more and will be collected; to clear them now run: crystalline doctor --fix"
+            "  [problem] {name}: {rows}, {age}. {they_are} not served any more and will be collected; to clear {them} now run: crystalline doctor --fix"
         );
     }
     match d.kept.as_deref().and_then(KeptReason::from_word) {
         Some(KeptReason::Virtual) => format!(
-            "  {name}: {engrams} engram row(s) in a virtual domain, {age}. They are not served any more, and a virtual domain's rows are its only copy, so nothing collects them on its own: end it with `crystalline domain remove {name} --purge`, which asks first"
+            "  {name}: {rows} in a virtual domain, {age}. {they_are} not served any more, and a virtual domain's rows are its only copy, so nothing collects {them} on its own: end it with `crystalline domain remove {name} --purge`, which asks first"
         ),
         // The live peer is serving these rows. Nothing here will ever collect
         // them, on either path, so nothing here may say it will.
         Some(KeptReason::HostedElsewhere) => format!(
-            "  {name}: {engrams} engram row(s), {age}. Another instance hosts this domain over the shared database and is still serving those rows, so they are not this instance's to collect"
+            "  {name}: {rows}, {age}. Another instance hosts this domain over the shared database and is still serving {them}, so {they_are_lower} not this instance's to collect"
         ),
         // A read-only instance collects nothing at all. The skipped line below
         // says the same thing about the run; this says it about the rows,
         // without promising a collection that needs a writable instance.
         Some(KeptReason::ReadOnly) => format!(
-            "  {name}: {engrams} engram row(s), {age}. This instance is read-only and collects nothing: they stay until a writable instance sweeps them, or until `crystalline doctor --fix` is run against one"
+            "  {name}: {rows}, {age}. This instance is read-only and collects nothing: {they_stay} until a writable instance sweeps {them}, or until `crystalline doctor --fix` is run against one"
         ),
         // Neither reaches a `doctor` run (both need a grace period, and both
         // doctor routes ask on the on-demand path), but both are honest about
         // a domain that is only waiting.
-        Some(KeptReason::Grace) | Some(KeptReason::Unstamped) => format!(
-            "  {name}: {engrams} engram row(s), {age}. They are not served any more and will be collected"
-        ),
+        Some(KeptReason::Grace) | Some(KeptReason::Unstamped) => {
+            format!("  {name}: {rows}, {age}. {they_are} not served any more and will be collected")
+        }
         // Filtered out before the render; a line that claims nothing is the
         // right answer if one ever arrives here anyway.
         Some(KeptReason::NoRows) => {
@@ -5280,7 +5326,7 @@ fn orphaned_domain_line(d: &OrphanedDomainDoctor) -> String {
         None => {
             let word = d.kept.as_deref().unwrap_or("no reason given");
             format!(
-                "  {name}: {engrams} engram row(s), {age}. They are not served any more, and this instance is not collecting them ({word})"
+                "  {name}: {rows}, {age}. {they_are} not served any more, and this instance is not collecting {them} ({word})"
             )
         }
     }
@@ -5365,7 +5411,8 @@ fn name_lines(names: &NamesDoctor, fix: bool) -> Vec<String> {
         && fixed > 0
     {
         lines.push(format!(
-            "wrote the domain's name into {fixed} link(s) that named a domain by a name only this machine uses"
+            "wrote the domain's name into {} that named a domain by a name only this machine uses",
+            plural(fixed as usize, "link", "links")
         ));
     }
     if let Some(err) = &names.fix_error {
@@ -5378,7 +5425,9 @@ fn name_lines(names: &NamesDoctor, fix: bool) -> Vec<String> {
     if !drafted.is_empty() {
         let total: u64 = drafted.iter().map(|s| s.count).sum();
         lines.push(format!(
-            "{total} link(s) that name a domain by a name only this machine uses are fixed in a draft that waits for review"
+            "{} a domain by a name only this machine uses {} fixed in a draft that waits for review",
+            plural(total as usize, "link that names", "links that name"),
+            if total == 1 { "is" } else { "are" }
         ));
         for s in &drafted {
             lines.push(format!(
@@ -6013,7 +6062,7 @@ mod tests {
         );
         assert!(out.contains("crystalline model download"), "{out}");
         assert_eq!(report.remaining_problems(), 0);
-        assert!(out.contains("0 problem(s) remaining"), "{out}");
+        assert!(out.contains("0 problems remaining"), "{out}");
 
         // The pinned commit cached with other weights: still a warning only.
         let pinned = tmp
@@ -6167,12 +6216,12 @@ mod tests {
     fn an_orphan_found_over_a_daemon_says_what_removing_it_takes() {
         let daemon = render_human(&report_with_orphans(IndexAccess::Daemon, &["gone.md"]));
         assert!(
-            daemon.contains("[problem] 1 orphan row(s) (file missing on disk): gone.md."),
+            daemon.contains("[problem] 1 orphan row (file missing on disk): gone.md."),
             "{daemon}"
         );
         assert!(
             daemon.contains(
-                "The running daemon owns the index, so removing them needs it stopped: run `crystalline ctl shutdown`, then `crystalline doctor --fix`"
+                "The running daemon owns the index, so removing the row needs it stopped: run `crystalline ctl shutdown`, then `crystalline doctor --fix`"
             ),
             "{daemon}"
         );
@@ -6357,8 +6406,8 @@ mod tests {
     fn an_aged_orphan_is_named_with_its_age_and_a_proportionate_remedy() {
         let report = orphan_report(vec![orphan("gone", 30, Some(13))], None, false);
         let out = render_human(&report);
-        assert!(out.contains("gone: 30 engram row(s)"), "{out}");
-        assert!(out.contains("last seen registered 13 day(s) ago"), "{out}");
+        assert!(out.contains("gone: 30 engram rows"), "{out}");
+        assert!(out.contains("last seen registered 13 days ago"), "{out}");
         assert!(out.contains("not served any more"), "{out}");
         assert!(out.contains("crystalline doctor --fix"), "{out}");
         assert!(
@@ -6381,10 +6430,7 @@ mod tests {
         row.collected = true;
         let report = orphan_report(vec![row], None, true);
         let out = render_human(&report);
-        assert!(
-            out.contains("collected 30 engram row(s) of 'gone'"),
-            "{out}"
-        );
+        assert!(out.contains("collected 30 engram rows of 'gone'"), "{out}");
         assert!(out.contains("files on disk are untouched"), "{out}");
         assert_eq!(report.remaining_problems(), 0);
     }
@@ -6409,7 +6455,7 @@ mod tests {
         let report = orphan_report(vec![row], None, false);
         let out = render_human(&report);
         assert!(
-            out.contains("vault: 12 engram row(s) in a virtual domain"),
+            out.contains("vault: 12 engram rows in a virtual domain"),
             "{out}"
         );
         assert!(
@@ -6443,7 +6489,7 @@ mod tests {
             false,
         );
         let out = render_human(&report);
-        assert!(out.contains("gone: 30 engram row(s)"), "{out}");
+        assert!(out.contains("gone: 30 engram rows"), "{out}");
         assert!(
             out.contains("This instance is read-only and collects nothing"),
             "the row says what will happen to it: {out}"
@@ -6683,7 +6729,7 @@ mod tests {
         assert_eq!(report.remaining_problems(), 1, "one open file");
         let out = render_human(&report);
         assert!(
-            out.contains("1 link(s) that name a domain by a name only this machine uses are fixed in a draft that waits for review"),
+            out.contains("1 link that names a domain by a name only this machine uses is fixed in a draft that waits for review"),
             "{out}"
         );
 
@@ -6730,7 +6776,7 @@ mod tests {
             "{out}"
         );
         assert!(
-            out.contains("  stale NLI checkpoint(s) no profile uses now, still on disk: MoritzLaurer/multilingual-MiniLMv2-L12-mnli-xnli"),
+            out.contains("  1 stale NLI checkpoint no profile uses now, still on disk: MoritzLaurer/multilingual-MiniLMv2-L12-mnli-xnli"),
             "{out}"
         );
         assert_eq!(
@@ -8081,9 +8127,8 @@ mod tests {
         };
         assert_eq!(report.remaining_problems(), 1);
         assert!(
-            render_human(&report).contains(
-                "  [problem] 1 file(s) not indexed yet, run: crystalline sync --domain kb"
-            ),
+            render_human(&report)
+                .contains("  [problem] 1 file not indexed yet, run: crystalline sync --domain kb"),
         );
     }
 

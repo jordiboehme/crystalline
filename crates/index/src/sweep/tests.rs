@@ -1274,7 +1274,7 @@ fn v203_hands_over_the_exact_merge_command() {
     assert_eq!(finding.domain, DOMAIN);
     assert_eq!(finding.priority, 30);
     assert_eq!(finding.fix, "crystalline tags merge deploys deploy");
-    assert!(finding.evidence.contains("#deploy used 9 time(s)"));
+    assert!(finding.evidence.contains("#deploy used 9 times"));
 }
 
 #[test]
@@ -1290,7 +1290,7 @@ fn v203_counts_observation_tags_too() {
     assert_eq!(finding.fix, "crystalline tags merge guardrails guardrail");
     assert_eq!(
         finding.evidence,
-        "#guardrail used 7 time(s); #guardrails used 1 time(s)"
+        "#guardrail used 7 times; #guardrails used 1 time"
     );
 }
 

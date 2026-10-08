@@ -633,8 +633,13 @@ pub fn journal_remove_domain(state_dir: &Path, domain: &str) -> io::Result<u64> 
             Err(io::Error::new(
                 e.kind(),
                 format!(
-                    "{e} ({} of {held} mirrored draft(s) went)",
-                    held - left.min(held)
+                    "{e} ({} of {} went)",
+                    held - left.min(held),
+                    crystalline_core::text::plural(
+                        held as usize,
+                        "mirrored draft",
+                        "mirrored drafts"
+                    )
                 ),
             ))
         }

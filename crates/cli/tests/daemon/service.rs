@@ -2483,7 +2483,7 @@ fn sync_over_a_running_daemon_fails_when_a_domain_could_not_be_scanned() {
         "the failure names the domain and says it could not be scanned, not that a file failed to parse: {stderr}"
     );
     assert!(
-        !stderr.contains("file(s) failed to sync"),
+        !stderr.contains("failed to sync in"),
         "the wrong failure class must not be claimed - no file parse failure happened here: {stderr}"
     );
 

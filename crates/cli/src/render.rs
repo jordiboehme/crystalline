@@ -835,7 +835,7 @@ mod tests {
                 "n": 1, "priority": 30, "rule": "V203", "class": "judgment",
                 "domain": "eng", "permalink": "", "title": "", "line": null,
                 "finding": "2 tag spellings look like one tag (plural variants)",
-                "evidence": "#vent used 1 time(s); #vents used 5 time(s)",
+                "evidence": "#vent used 1 time; #vents used 5 times",
                 "fix": "crystalline tags merge vent vents",
             }],
             "actions": [], "truncations": [],

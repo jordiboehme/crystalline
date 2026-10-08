@@ -1986,7 +1986,12 @@ fn detect_carry_forward(input: &SweepInput, graph: &Graph<'_>, report: &mut Swee
                 .with(
                     Class::Judgment,
                     format!(
-                        "{count} observation(s) appear in no live engram of {}",
+                        "{} in no live engram of {}",
+                        crystalline_core::text::plural(
+                            count,
+                            "observation appears",
+                            "observations appear"
+                        ),
                         fact.domain
                     ),
                     evidence,
@@ -2058,10 +2063,19 @@ fn detect_unshared(input: &SweepInput, report: &mut SweepReport) {
         .findings
         .push(Finding::about_domain("V009", &input.domain).with(
             Class::Judgment,
-            format!("{changes} change(s) have been unshared for {age} days"),
             format!(
-                "{changes} substantive local change(s); oldest change {oldest}; today={}; threshold {} days",
-                input.today, input.options.share_stale_days
+                "{} unshared for {age} days",
+                crystalline_core::text::plural(changes, "change has been", "changes have been")
+            ),
+            format!(
+                "{}; oldest change {oldest}; today={}; threshold {} days",
+                crystalline_core::text::plural(
+                    changes,
+                    "substantive local change",
+                    "substantive local changes"
+                ),
+                input.today,
+                input.options.share_stale_days
             ),
             format!("share_changes domain={}", input.domain),
         ));
@@ -2211,7 +2225,14 @@ fn detect_structure(input: &SweepInput, graph: &Graph<'_>, report: &mut SweepRep
                     Finding::about("V101", fact)
                         .with(
                             Class::Judgment,
-                            format!("references {count} retired engram(s) while still current"),
+                            format!(
+                                "references {} while still current",
+                                crystalline_core::text::plural(
+                                    count,
+                                    "retired engram",
+                                    "retired engrams"
+                                )
+                            ),
                             join_semis(targets.into_iter()),
                             match repoint {
                                 Some(link) => format!("repoint at {link}"),
@@ -2231,7 +2252,7 @@ fn detect_structure(input: &SweepInput, graph: &Graph<'_>, report: &mut SweepRep
         if lines < MIN_CONTENT_LINES {
             report.findings.push(Finding::about("V106", fact).with(
                 Class::Judgment,
-                format!("only {lines} non-blank body line(s) beyond the frontmatter"),
+                format!("only {} beyond the frontmatter", crystalline_core::text::plural(lines, "non-blank body line", "non-blank body lines")),
                 format!(
                     "content lines {lines}; need at least {MIN_CONTENT_LINES}; same shape verify Q001 flags"
                 ),
@@ -2752,8 +2773,13 @@ fn detect_redundancy(input: &SweepInput, report: &mut SweepReport) {
     let dupes = dedupe::cluster_near_duplicates(&bodies, &input.options);
     if dupes.skipped_buckets > 0 {
         report.truncations.push(format!(
-            "V201 skipped {} candidate block(s) over {} members",
-            dupes.skipped_buckets, input.options.max_bucket
+            "V201 skipped {} over {} members",
+            crystalline_core::text::plural(
+                dupes.skipped_buckets,
+                "candidate block",
+                "candidate blocks"
+            ),
+            input.options.max_bucket
         ));
     }
     if dupes.capped {
@@ -2787,7 +2813,14 @@ fn detect_redundancy(input: &SweepInput, report: &mut SweepReport) {
             Finding::about("V201", live[lead])
                 .with(
                     Class::Judgment,
-                    format!("near-duplicate of {} other engram(s)", others.len()),
+                    format!(
+                        "near-duplicate of {}",
+                        crystalline_core::text::plural(
+                            others.len(),
+                            "other engram",
+                            "other engrams"
+                        )
+                    ),
                     format!(
                         "dice at or above {:.2}; also in the cluster: {}",
                         input.options.dup_threshold,
@@ -2961,7 +2994,14 @@ fn detect_title_collisions(
             Finding::about("V202", live[lead])
                 .with(
                     Class::Judgment,
-                    format!("title collides with {} other engram(s)", members.len() - 1),
+                    format!(
+                        "title collides with {}",
+                        crystalline_core::text::plural(
+                            members.len() - 1,
+                            "other engram",
+                            "other engrams"
+                        )
+                    ),
                     listed,
                     "merge them or retitle for disambiguation".to_string(),
                 )
@@ -3017,8 +3057,13 @@ fn detect_tag_drift(input: &SweepInput, report: &mut SweepReport) {
                 ),
                 join_semis(cluster.tags.iter().map(|t| {
                     format!(
-                        "#{t} used {} time(s)",
-                        usage.get(t.as_str()).copied().unwrap_or(0)
+                        "#{t} used {}",
+                        crystalline_core::text::plural(
+                            usize::try_from(usage.get(t.as_str()).copied().unwrap_or(0))
+                                .unwrap_or(0),
+                            "time",
+                            "times"
+                        )
                     )
                 })),
                 join_semis(

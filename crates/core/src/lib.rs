@@ -40,6 +40,7 @@ pub mod similarity;
 pub mod skills;
 pub mod tags;
 pub mod temporal;
+pub mod text;
 pub mod verify;
 pub mod yaml;
 
@@ -101,6 +102,7 @@ pub use tags::{fold_tag, is_lower_hyphen, retag};
 pub use temporal::{
     DATE_FIELDS, DateFieldError, VerifiedFieldError, normalize_temporal_fields, normalize_verified,
 };
+pub use text::plural;
 pub use verify::{Issue, Severity, VerifyOptions, VerifyReport, verify_paths};
 pub use yaml::YamlValue;
 
