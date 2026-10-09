@@ -958,7 +958,7 @@ pub(crate) fn origin_share_lines(domain: &str, data: &serde_json::Value) -> Vec<
         }
         "branch_protected" => {
             lines.push(format!(
-                "The branch {} does not accept direct commits from you ({}). Share the same changes as a proposal instead: crystalline origin share --proposal.",
+                "The branch {} does not accept direct commits from you ({}). Share the same changes as a proposal instead: crystalline origin share {domain} --proposal.",
                 data["branch"].as_str().unwrap_or(""),
                 data["message"].as_str().unwrap_or("")
             ));
@@ -3854,7 +3854,7 @@ mod origin_share_tests {
         );
         assert_eq!(
             protected[0],
-            "The branch main does not accept direct commits from you (Changes must be made through a pull request.). Share the same changes as a proposal instead: crystalline origin share --proposal."
+            "The branch main does not accept direct commits from you (Changes must be made through a pull request.). Share the same changes as a proposal instead: crystalline origin share kb --proposal."
         );
         let moved = origin_share_lines(
             "kb",
