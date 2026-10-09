@@ -1589,7 +1589,7 @@ pub struct ShareOptions<'a> {
     /// How a share on a `sharing: direct` domain goes: `Some(true)` opens a
     /// proposal with the stacking and amend rules of a proposal domain,
     /// `Some(false)` tries the direct commit only and never falls back, and
-    /// `None` lets [`share_route`] decide from the refusal this machine
+    /// `None` lets `share_route` decide from the refusal this machine
     /// recorded. A domain that opens proposals ignores it.
     pub as_proposal: Option<bool>,
 }
@@ -2649,7 +2649,13 @@ pub async fn propose_preview(
         options,
     )
     .await?;
-    if let Some(number) = own_open {
+    // The note says what the share will do, so a plan that opens or stacks
+    // nothing (nothing to share, conflicts, a diverged proposal) carries none.
+    let opens = matches!(
+        plan.action,
+        PlannedAction::Update { .. } | PlannedAction::StackOnTop { .. } | PlannedAction::Create
+    );
+    if let (Some(number), true) = (own_open, opens) {
         plan.note = Some(crate::error::preview_proposal_open_note(number));
     }
     Ok(plan)
@@ -3098,7 +3104,11 @@ async fn open_proposal_on_commit(
 /// refusal before the first blob is a success-shaped outcome or a teaching
 /// refusal; blobs, trees and commits created before a forge refusal are
 /// unreachable objects the forge collects, the same residue the proposal
-/// path leaves when `create_proposal` fails after `create_branch`.
+/// path leaves when `create_proposal` fails after `create_branch`. A fallback
+/// that fails in `create_proposal` after its `create_branch` leaves that share
+/// branch on the forge with no record naming it, as the proposal path does;
+/// the refusal is saved, and the base and the local changes stay as they
+/// were, so the next share falls back again on a fresh branch.
 #[allow(clippy::too_many_arguments)]
 async fn commit_direct(
     provider: &dyn Provider,
@@ -3240,6 +3250,12 @@ async fn commit_direct(
                     return Ok(ProposeOutcome::BranchProtected { branch, message });
                 }
                 // The same changes, as a proposal, on the commit already built.
+                // It is a fresh bottom layer: no open layer is left (an open
+                // one returned ProposalOpen above), so a stack number still
+                // recorded names a dead chain and goes with it, as on the
+                // create path of [`propose`].
+                state.stack_number = None;
+                state.stack_link_pending = false;
                 let report = open_proposal_on_commit(
                     provider,
                     spec,

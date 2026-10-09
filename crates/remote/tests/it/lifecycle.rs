@@ -2275,6 +2275,7 @@ async fn with_a_refusal_recorded_a_refused_share_falls_back_to_a_proposal_on_the
     mock.protect_branch("main", "Changes must be made through a pull request.");
     share_direct(&mock, &sub, direct()).await;
     let commits_before = count(&mock, "create_commit:");
+    let before = load_state(&sub.state_dir);
     let report = match share_direct(&mock, &sub, direct()).await {
         ProposeOutcome::FellBack {
             report,
@@ -2316,6 +2317,11 @@ async fn with_a_refusal_recorded_a_refused_share_falls_back_to_a_proposal_on_the
         st.direct_refused.is_some(),
         "the refusal stands until a commit lands"
     );
+    assert_eq!(
+        st.base_commit, before.base_commit,
+        "a fallback moves no base"
+    );
+    assert_eq!(st.files, before.files, "a fallback moves no base copy");
 
     let main_updates = count(&mock, "update_branch:main:");
     write(&sub.domain_root.join("notes/third.md"), b"third\n");
@@ -2395,6 +2401,137 @@ async fn as_proposal_true_with_a_proposal_that_is_not_open_is_refused_before_any
         "{err}"
     );
     assert!(!mock.calls()[before..].iter().any(|c| is_write_call(c)));
+
+    // With an own open proposal, the refusal names it as the layer to use.
+    let number = match share_direct(&mock, &sub, choosing(Some(true))).await {
+        ProposeOutcome::Proposed(report) => report.number,
+        other => panic!("expected Proposed, got {other:?}"),
+    };
+    write(&sub.domain_root.join("notes/third.md"), b"third\n");
+    let before = mock.calls().len();
+    let err = propose(
+        &mock,
+        &share_spec(),
+        &sub.domain_root,
+        "Brand Team",
+        &sub.state_dir,
+        ShareOptions {
+            proposal: Some(99),
+            ..choosing(Some(true))
+        },
+    )
+    .await
+    .unwrap_err();
+    let layers = format!("open layers: #{number} (layer 1)");
+    assert!(
+        matches!(&err, RemoteError::Refused(text) if text.contains("proposal #99 is not an open layer") && text.contains(&layers)),
+        "{err}"
+    );
+    assert!(!mock.calls()[before..].iter().any(|c| is_write_call(c)));
+}
+
+/// Direct only stays direct only: a named own proposal is not amended.
+#[tokio::test]
+async fn as_proposal_false_answers_a_named_own_proposal_with_direct_no_amend() {
+    let mock = MockProvider::new();
+    let (sub, _) = direct_domain(&mock).await;
+    let number = match share_direct(&mock, &sub, choosing(Some(true))).await {
+        ProposeOutcome::Proposed(report) => report.number,
+        other => panic!("expected Proposed, got {other:?}"),
+    };
+    write(&sub.domain_root.join("notes/third.md"), b"third\n");
+    let before = mock.calls().len();
+    let err = propose(
+        &mock,
+        &share_spec(),
+        &sub.domain_root,
+        "Brand Team",
+        &sub.state_dir,
+        ShareOptions {
+            proposal: Some(number),
+            ..choosing(Some(false))
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&err, RemoteError::Refused(text) if text == DIRECT_NO_AMEND),
+        "{err}"
+    );
+    assert!(!mock.calls()[before..].iter().any(|c| is_write_call(c)));
+}
+
+#[tokio::test]
+async fn as_proposal_false_clears_the_refusal_when_the_commit_lands() {
+    let mock = MockProvider::new();
+    let (sub, _) = direct_domain(&mock).await;
+    mock.protect_branch("main", "Changes must be made through a pull request.");
+    share_direct(&mock, &sub, direct()).await;
+    assert!(load_state(&sub.state_dir).direct_refused.is_some());
+    mock.unprotect_branch("main");
+    let report = committed(share_direct(&mock, &sub, choosing(Some(false))).await);
+    assert!(report.refusal_cleared);
+    assert_eq!(load_state(&sub.state_dir).direct_refused, None);
+}
+
+/// A fallback opens a fresh bottom layer, so the number of a stack whose
+/// layers were all declined goes with it: the next share stacks onto the
+/// fallback in a new stack instead of extending the dead one.
+#[tokio::test]
+async fn a_fallback_after_a_declined_stack_starts_a_new_stack() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, _) = direct_domain(&mock).await;
+    let stacked = || ShareOptions {
+        stacks_allowed: true,
+        ..direct()
+    };
+    mock.protect_branch("main", "Changes must be made through a pull request.");
+    share_direct(&mock, &sub, stacked()).await;
+    let first = match share_direct(&mock, &sub, stacked()).await {
+        ProposeOutcome::FellBack { report, .. } => report.number,
+        other => panic!("expected FellBack, got {other:?}"),
+    };
+    write(&sub.domain_root.join("notes/second.md"), b"second\n");
+    let second = match share_direct(&mock, &sub, stacked()).await {
+        ProposeOutcome::Proposed(report) => report.number,
+        other => panic!("expected a stacked layer, got {other:?}"),
+    };
+    let dead = load_state(&sub.state_dir)
+        .stack_number
+        .expect("the two layers form a stack");
+    mock.set_proposal_state(first, ProposalState::Declined);
+    mock.set_proposal_state(second, ProposalState::Declined);
+
+    write(&sub.domain_root.join("notes/third.md"), b"third\n");
+    let fallback = match share_direct(&mock, &sub, stacked()).await {
+        ProposeOutcome::FellBack { report, .. } => report.number,
+        other => panic!("expected FellBack, got {other:?}"),
+    };
+    let st = load_state(&sub.state_dir);
+    assert_eq!(st.stack_number, None, "the dead stack's number is gone");
+    assert!(!st.stack_link_pending);
+
+    let calls_before = mock.calls().len();
+    write(&sub.domain_root.join("notes/fourth.md"), b"fourth\n");
+    let top = match share_direct(&mock, &sub, stacked()).await {
+        ProposeOutcome::Proposed(report) => {
+            assert_eq!(report.stack_position, Some((2, 2)), "{report:?}");
+            report.number
+        }
+        other => panic!("expected a layer stacked onto the fallback, got {other:?}"),
+    };
+    let calls = mock.calls()[calls_before..].to_vec();
+    assert!(
+        calls.contains(&format!("create_stack:[{fallback},{top}]")),
+        "{calls:?}"
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|c| c.starts_with(&format!("extend_stack:{dead}:"))),
+        "{calls:?}"
+    );
 }
 
 #[tokio::test]
@@ -2406,10 +2543,24 @@ async fn the_preview_says_how_a_share_will_go_after_a_refusal() {
     share_direct(&mock, &sub, direct()).await;
     let plan = preview_direct_share(&mock, &sub, direct()).await;
     assert_eq!(plan.note.as_deref(), Some(PREVIEW_FALLS_BACK));
-    let number = match share_direct(&mock, &sub, direct()).await {
-        ProposeOutcome::FellBack { report, .. } => report.number,
+    let fell_back = match share_direct(&mock, &sub, direct()).await {
+        ProposeOutcome::FellBack { report, .. } => report,
         other => panic!("expected FellBack, got {other:?}"),
     };
+    let (number, branch) = (fell_back.number, fell_back.branch);
+    // A reviewer pushed onto the proposal: the plan opens nothing, so it says
+    // nothing about opening a proposal.
+    let ours = mock.branch_commit(&branch).unwrap();
+    let reviewer = mock.add_commit(sub_commit_files(&[("notes/r.md", b"r\n")]), None);
+    mock.set_branch(&branch, &reviewer);
+    let plan = preview_direct_share(&mock, &sub, direct()).await;
+    assert!(
+        matches!(plan.action, PlannedAction::ProposalDiverged { .. }),
+        "{:?}",
+        plan.action
+    );
+    assert_eq!(plan.note, None);
+    mock.set_branch(&branch, &ours);
     write(&sub.domain_root.join("notes/third.md"), b"third\n");
     let plan = preview_direct_share(&mock, &sub, direct()).await;
     assert_eq!(plan.note, Some(preview_proposal_open_note(number)));
