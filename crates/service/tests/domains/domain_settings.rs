@@ -4,10 +4,11 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use crystalline_core::config::{DomainEntry, GlobalConfig};
+use crystalline_core::config::{AuthConfig, DomainEntry, GlobalConfig, ReviewMode};
 use crystalline_index::TursoStore;
-use crystalline_service::Engine;
-use crystalline_service::Scope;
+use crystalline_service::engine::PolicyEdit;
+use crystalline_service::rest::{AuthStore, Role};
+use crystalline_service::{DomainAccess, Engine, Scope};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
@@ -240,5 +241,243 @@ async fn nobody_may_change_anything_on_a_read_only_instance() {
     assert_eq!(
         row(&view["policies"], "key", "sharing")["can_change"],
         false
+    );
+}
+
+fn unset(key: &str) -> PolicyEdit {
+    PolicyEdit::Unset {
+        key: key.to_string(),
+    }
+}
+
+fn set(key: &str, value: &str) -> PolicyEdit {
+    PolicyEdit::Set {
+        key: key.to_string(),
+        value: value.to_string(),
+    }
+}
+
+#[tokio::test]
+async fn unset_removes_the_declared_key_so_the_default_applies() {
+    let (tmp, engine) = settings_engine(EVERY_SECTION, |_, _| {}).await;
+    let out = engine
+        .edit_manifest_policies("eng", &[unset("sharing")], &Scope::Unrestricted)
+        .await
+        .unwrap();
+    let on_disk = std::fs::read_to_string(tmp.path().join("eng/MANIFEST.md")).unwrap();
+    assert!(!on_disk.contains("sharing:"), "{on_disk}");
+    assert!(
+        on_disk.contains("generated_indexes: shared"),
+        "the other keys stay"
+    );
+    assert_eq!(out["draft"], false);
+    let view = engine
+        .domain_settings("eng", &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(
+        row(&view["policies"], "key", "sharing")["effective"],
+        "proposal"
+    );
+    assert_eq!(
+        row(&view["policies"], "key", "sharing")["declared"],
+        Value::Null
+    );
+}
+
+#[tokio::test]
+async fn unset_refuses_the_rename_key_and_an_unknown_key() {
+    let (_tmp, engine) = settings_engine(EVERY_SECTION, |_, _| {}).await;
+    let renamed = engine
+        .edit_manifest_policies("eng", &[unset("domain_name")], &Scope::Unrestricted)
+        .await
+        .unwrap_err();
+    assert!(
+        renamed
+            .to_string()
+            .contains("crystalline domain rename eng <new>"),
+        "{renamed}"
+    );
+    let unknown = engine
+        .edit_manifest_policies("eng", &[unset("zzz")], &Scope::Unrestricted)
+        .await
+        .unwrap_err();
+    assert!(
+        unknown.to_string().contains("is not a MANIFEST policy"),
+        "{unknown}"
+    );
+}
+
+#[tokio::test]
+async fn the_open_tier_sets_a_policy_where_edit_engram_writes() {
+    let (tmp, engine) = settings_engine(EVERY_SECTION, |_, _| {}).await;
+    assert!(!engine.auth_mcp());
+    engine
+        .edit_manifest_policies("eng", &[set("sharing", "proposal")], &Scope::Anonymous)
+        .await
+        .unwrap();
+    let on_disk = std::fs::read_to_string(tmp.path().join("eng/MANIFEST.md")).unwrap();
+    assert!(on_disk.contains("\nsharing: proposal\n"), "{on_disk}");
+    let view = engine
+        .domain_settings("eng", &Scope::Anonymous)
+        .await
+        .unwrap();
+    assert_eq!(row(&view["policies"], "key", "sharing")["can_change"], true);
+}
+
+#[tokio::test]
+async fn an_anonymous_caller_with_auth_mcp_on_is_refused() {
+    let (_tmp, engine) = settings_engine(EVERY_SECTION, |cfg, _| {
+        cfg.auth = Some(AuthConfig {
+            mcp: Some(true),
+            ..AuthConfig::default()
+        });
+    })
+    .await;
+    let err = engine
+        .edit_manifest_policies("eng", &[set("sharing", "proposal")], &Scope::Anonymous)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("only the owner of 'eng'"), "{err}");
+}
+
+#[tokio::test]
+async fn the_open_tier_is_refused_in_a_reviewing_domain_as_edit_engram_is() {
+    let (_tmp, engine) = settings_engine(EVERY_SECTION, |cfg, _| {
+        cfg.domains.get_mut("eng").unwrap().review = Some(ReviewMode::Overlay);
+    })
+    .await;
+    let err = engine
+        .edit_manifest_policies("eng", &[set("sharing", "proposal")], &Scope::Anonymous)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains(crystalline_service::OVERLAY_NEEDS_IDENTITY),
+        "{err}"
+    );
+    let view = engine
+        .domain_settings("eng", &Scope::Anonymous)
+        .await
+        .unwrap();
+    assert_eq!(
+        row(&view["policies"], "key", "sharing")["can_change"],
+        false
+    );
+}
+
+/// The view reads the MANIFEST the way read_engram does: an actor in a
+/// reviewing domain sees their own draft, the folder and every other reader
+/// still see the domain's value.
+#[tokio::test]
+async fn a_draft_policy_shows_in_the_actors_view_and_not_in_the_folder() {
+    let (tmp, engine) = settings_engine(EVERY_SECTION, |cfg, _| {
+        cfg.domains.get_mut("eng").unwrap().review = Some(ReviewMode::Overlay);
+    })
+    .await;
+    let out = engine
+        .edit_manifest_policies("eng", &[set("sharing", "proposal")], &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(out["draft"], true, "{out}");
+    let on_disk = std::fs::read_to_string(tmp.path().join("eng/MANIFEST.md")).unwrap();
+    assert_eq!(on_disk, EVERY_SECTION, "the folder is unchanged");
+    let mine = engine
+        .domain_settings("eng", &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(
+        row(&mine["policies"], "key", "sharing")["declared"],
+        "proposal"
+    );
+    let base = engine
+        .domain_settings("eng", &Scope::Anonymous)
+        .await
+        .unwrap();
+    assert_eq!(
+        row(&base["policies"], "key", "sharing")["declared"],
+        "direct"
+    );
+}
+
+#[tokio::test]
+async fn an_anonymous_caller_with_auth_mcp_on_may_change_nothing_in_the_view() {
+    let (_tmp, engine) = settings_engine(EVERY_SECTION, |cfg, _| {
+        cfg.auth = Some(AuthConfig {
+            mcp: Some(true),
+            ..AuthConfig::default()
+        });
+    })
+    .await;
+    let view = engine
+        .domain_settings("eng", &Scope::Anonymous)
+        .await
+        .unwrap();
+    assert_eq!(
+        row(&view["policies"], "key", "sharing")["can_change"],
+        false
+    );
+}
+
+/// `eng` private to `keeper`, `notes` public, `ed` a signed-in editor who owns
+/// neither.
+async fn with_accounts(engine: &Engine, root: &Path) {
+    let auth = Arc::new(AuthStore::open(&root.join("web-auth.db")).await.unwrap());
+    for (name, role) in [("keeper", Role::Editor), ("ed", Role::Editor)] {
+        auth.add_user(name, name, None, role, "pw12345678")
+            .await
+            .unwrap();
+    }
+    auth.set_domain_visibility("eng", true, "keeper")
+        .await
+        .unwrap();
+    engine.set_domain_access(Arc::new(DomainAccess::new(auth)));
+}
+
+fn user(account: &str) -> Scope {
+    Scope::User {
+        account: account.into(),
+        admin: false,
+    }
+}
+
+#[tokio::test]
+async fn a_signed_in_editor_who_does_not_own_the_domain_may_change_nothing() {
+    let (tmp, engine) = settings_engine(EVERY_SECTION, |_, _| {}).await;
+    with_accounts(&engine, tmp.path()).await;
+    let view = engine.domain_settings("notes", &user("ed")).await.unwrap();
+    assert_eq!(
+        row(&view["policies"], "key", "sharing")["can_change"],
+        false
+    );
+    let owner = engine
+        .domain_settings("eng", &user("keeper"))
+        .await
+        .unwrap();
+    assert_eq!(
+        row(&owner["policies"], "key", "sharing")["can_change"],
+        true
+    );
+}
+
+#[tokio::test]
+async fn a_hidden_private_domain_is_not_found_and_never_a_view() {
+    let (tmp, engine) = settings_engine(EVERY_SECTION, |_, _| {}).await;
+    with_accounts(&engine, tmp.path()).await;
+    let err = engine
+        .domain_settings("eng", &user("ed"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, crystalline_service::EngineError::UnknownDomain { .. }),
+        "{err}"
+    );
+    let err = engine
+        .edit_manifest_policies("eng", &[set("sharing", "proposal")], &user("ed"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, crystalline_service::EngineError::UnknownDomain { .. }),
+        "{err}"
     );
 }

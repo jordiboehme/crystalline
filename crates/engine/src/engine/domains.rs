@@ -573,6 +573,10 @@ impl Engine {
     /// Answers `{ domain, markdown, draft }`: the MANIFEST as it now reads for
     /// this caller, and whether that is their draft rather than the domain's.
     ///
+    /// The open tier passes where `edit_engram` writes (see
+    /// `Engine::require_policy_writer`); REST asks for an account first, so it
+    /// never reaches that branch.
+    ///
     /// [`DomainRight::Own`]: crate::scope::DomainRight::Own
     pub async fn set_manifest_policies(
         &self,
@@ -580,89 +584,14 @@ impl Engine {
         changes: &[(String, String)],
         scope: &crate::scope::Scope,
     ) -> Result<Value> {
-        if self.read_only {
-            return Err(EngineError::ReadOnly);
-        }
-        if changes.is_empty() {
-            return Err(EngineError::Invalid(
-                "no policy named: send an object of at least one MANIFEST policy key to its value"
-                    .to_string(),
-            ));
-        }
-        let registry = crystalline_core::policy_registry();
-        for (key, value) in changes {
-            let Some(spec) = registry.iter().find(|spec| spec.key == key) else {
-                let known: Vec<&str> = registry.iter().map(|spec| spec.key).collect();
-                return Err(EngineError::Invalid(format!(
-                    "`{key}` is not a MANIFEST policy; the policy keys are {}",
-                    known.join(", ")
-                )));
-            };
-            if spec.kind == crystalline_core::PolicyKind::Text {
-                return Err(EngineError::Invalid(format!(
-                    "`{key}` changes through a rename, which also moves this machine's name and rewrites links: use Rename domain on the domain page or `crystalline domain rename {domain} <new>`"
-                )));
-            }
-            if !spec.accepts(value) {
-                return Err(EngineError::Invalid(format!(
-                    "`{key}: {value}` is not a value `{key}` takes; write one of {}",
-                    spec.values.join(", ")
-                )));
-            }
-            if spec.changed_by == crystalline_core::PolicyRole::Owner {
-                self.require_domain_owner_refusing(
-                    domain,
-                    scope,
-                    EngineError::Forbidden(format!(
-                        "only the owner of '{domain}' or an instance admin may change `{key}`"
-                    )),
-                )
-                .await?;
-            }
-        }
-        let view = DomainView::for_write(self, domain, scope).await?;
-        let overlay = view.actor().map(str::to_string);
-        let actor = self.actor_for(None, overlay.as_deref());
-        let (desc, source) = view.resolve("manifest").await?;
-        let edits: Vec<(String, String)> = changes.to_vec();
-        self.apply_source_edit(
-            &desc,
-            &source,
-            &view,
-            None,
-            &actor,
-            None,
-            scope,
-            move |current| {
-                let mut out = current.to_string();
-                for (key, value) in &edits {
-                    out = set_frontmatter_field(&out, key, value);
-                }
-                Ok(out)
-            },
-        )
-        .await?;
-        self.refresh_routing_cache().await;
-        let markdown = match overlay.as_deref() {
-            None => self.manifest_markdown(domain).await?,
-            Some(who) => {
-                let store = self.store.lock().await;
-                store
-                    .overlay_entry(desc.domain_id, who, &desc.path)
-                    .await?
-                    .map(|row| row.content)
-                    .ok_or_else(|| {
-                        EngineError::Internal(
-                            "the MANIFEST draft was written and cannot be read back".to_string(),
-                        )
-                    })?
-            }
-        };
-        Ok(json!({
-            "domain": domain,
-            "markdown": markdown,
-            "draft": overlay.is_some(),
-        }))
+        let edits: Vec<PolicyEdit> = changes
+            .iter()
+            .map(|(key, value)| PolicyEdit::Set {
+                key: key.clone(),
+                value: value.clone(),
+            })
+            .collect();
+        self.edit_manifest_policies(domain, &edits, scope).await
     }
 
     /// Routing bullets for one virtual domain, read from its `MANIFEST.md`

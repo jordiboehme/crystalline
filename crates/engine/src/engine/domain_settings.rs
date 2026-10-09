@@ -25,6 +25,165 @@ const OVERRIDE_LOWER_CASE: &str = "Written in lower case, so verify does not mat
 /// What an override row says about an id no verify rule has.
 const OVERRIDE_UNKNOWN: &str = "Not a verify rule id, so the override does nothing.";
 
+/// One change to a MANIFEST policy key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyEdit {
+    /// Declare `key: value` in the frontmatter.
+    Set {
+        /// The policy key.
+        key: String,
+        /// The value it takes.
+        value: String,
+    },
+    /// Remove the declared key, so its default applies.
+    Unset {
+        /// The policy key.
+        key: String,
+    },
+}
+
+impl PolicyEdit {
+    /// The key this edit is about.
+    pub fn key(&self) -> &str {
+        match self {
+            PolicyEdit::Set { key, .. } | PolicyEdit::Unset { key } => key,
+        }
+    }
+}
+
+/// The registry row `edit` names, once the key and the value are ones it
+/// takes. The texts are the ones `set_manifest_policies` has always answered.
+fn checked_policy(domain: &str, edit: &PolicyEdit) -> Result<&'static crystalline_core::PolicyKey> {
+    let registry = crystalline_core::policy_registry();
+    let key = edit.key();
+    let Some(spec) = registry.iter().find(|spec| spec.key == key) else {
+        let known: Vec<&str> = registry.iter().map(|spec| spec.key).collect();
+        return Err(EngineError::Invalid(format!(
+            "`{key}` is not a MANIFEST policy; the policy keys are {}",
+            known.join(", ")
+        )));
+    };
+    if spec.kind == crystalline_core::PolicyKind::Text {
+        return Err(EngineError::Invalid(format!(
+            "`{key}` changes through a rename, which also moves this machine's name and rewrites links: use Rename domain on the domain page or `crystalline domain rename {domain} <new>`"
+        )));
+    }
+    if let PolicyEdit::Set { value, .. } = edit
+        && !spec.accepts(value)
+    {
+        return Err(EngineError::Invalid(format!(
+            "`{key}: {value}` is not a value `{key}` takes; write one of {}",
+            spec.values.join(", ")
+        )));
+    }
+    Ok(spec)
+}
+
+impl Engine {
+    /// Who may change a domain's policy keys and rule overrides: the
+    /// domain's owner or an instance admin, and on the open tier (anonymous
+    /// with `auth.mcp` off) whoever may see the domain, which is exactly
+    /// where `edit_engram` writes the same frontmatter (`refuse_unwritable`
+    /// in the MCP server). A reviewing domain still refuses the open tier
+    /// further in, in `DomainView::for_write`, as it refuses its edits.
+    ///
+    /// Its own gate rather than a looser `require_domain_owner_refusing`:
+    /// ending a domain and reading who drafts in it refuse an anonymous
+    /// caller outright, and they keep doing so. REST never reaches the open
+    /// branch, because it asks for an account first.
+    pub(crate) async fn require_policy_writer(
+        &self,
+        domain: &str,
+        key: &str,
+        scope: &crate::scope::Scope,
+    ) -> Result<()> {
+        if matches!(scope, crate::scope::Scope::Anonymous) && !self.auth_mcp() {
+            return self.require_domain(domain, scope).await;
+        }
+        self.require_domain_owner_refusing(
+            domain,
+            scope,
+            EngineError::Forbidden(format!(
+                "only the owner of '{domain}' or an instance admin may change `{key}`"
+            )),
+        )
+        .await
+    }
+
+    /// Set or remove MANIFEST policy keys through the edit path an engram
+    /// edit takes; see `Engine::set_manifest_policies`, which is this with
+    /// sets only. Every edit is checked before the first is written.
+    pub async fn edit_manifest_policies(
+        &self,
+        domain: &str,
+        edits: &[PolicyEdit],
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        if edits.is_empty() {
+            return Err(EngineError::Invalid(
+                "no policy named: send an object of at least one MANIFEST policy key to its value"
+                    .to_string(),
+            ));
+        }
+        for edit in edits {
+            let spec = checked_policy(domain, edit)?;
+            if spec.changed_by == crystalline_core::PolicyRole::Owner {
+                self.require_policy_writer(domain, edit.key(), scope)
+                    .await?;
+            }
+        }
+        let view = DomainView::for_write(self, domain, scope).await?;
+        let overlay = view.actor().map(str::to_string);
+        let actor = self.actor_for(None, overlay.as_deref());
+        let (desc, source) = view.resolve("manifest").await?;
+        let edits: Vec<PolicyEdit> = edits.to_vec();
+        self.apply_source_edit(
+            &desc,
+            &source,
+            &view,
+            None,
+            &actor,
+            None,
+            scope,
+            move |current| {
+                let mut out = current.to_string();
+                for edit in &edits {
+                    out = match edit {
+                        PolicyEdit::Set { key, value } => set_frontmatter_field(&out, key, value),
+                        PolicyEdit::Unset { key } => remove_frontmatter_field(&out, key),
+                    };
+                }
+                Ok(out)
+            },
+        )
+        .await?;
+        self.refresh_routing_cache().await;
+        let markdown = match overlay.as_deref() {
+            None => self.manifest_markdown(domain).await?,
+            Some(who) => {
+                let store = self.store.lock().await;
+                store
+                    .overlay_entry(desc.domain_id, who, &desc.path)
+                    .await?
+                    .map(|row| row.content)
+                    .ok_or_else(|| {
+                        EngineError::Internal(
+                            "the MANIFEST draft was written and cannot be read back".to_string(),
+                        )
+                    })?
+            }
+        };
+        Ok(json!({
+            "domain": domain,
+            "markdown": markdown,
+            "draft": overlay.is_some(),
+        }))
+    }
+}
+
 /// How the `text` policy key changes.
 fn rename_how(domain: &str) -> String {
     format!(
@@ -45,14 +204,27 @@ impl Engine {
         domain: &str,
         scope: &crate::scope::Scope,
     ) -> Result<Value> {
-        self.require_domain(domain, scope).await?;
+        let hidden = self.hidden_for(scope).await?;
+        let view = DomainView::for_read(self, domain, &hidden, scope)?;
+        if view.actor().is_some() {
+            // The caller's own view, as read_engram reads the MANIFEST: in a
+            // reviewing domain their draft stands over the folder.
+            match view.engram_text("manifest").await {
+                Ok(text) => {
+                    return self
+                        .domain_settings_view(domain, &text.content, false, scope)
+                        .await;
+                }
+                Err(EngineError::NotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
         let source = self.manifest_source(domain).await?;
         self.domain_settings_view(domain, &source.markdown, source.missing, scope)
             .await
     }
 
-    /// Whether `scope` may change `domain`'s policy keys and rule overrides
-    /// through configure: the domain's owner or an instance admin; the open
+    /// Whether `scope` may change `domain`'s policy keys through configure: the domain's owner or an instance admin; the open
     /// tier (anonymous with `auth.mcp` off) wherever `edit_engram` writes,
     /// which is never a reviewing domain, since a draft needs an identity;
     /// nobody on a read-only instance.
