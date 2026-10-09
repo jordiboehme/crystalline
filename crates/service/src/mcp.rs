@@ -4835,15 +4835,15 @@ const INSTANCE_ADMIN_ONLY: &str = "Changing this instance itself - the domains r
 /// refused write through its own message), and read-only is the public
 /// serving mode, where even masked settings would show paths, the sign-in
 /// setup and service addresses to anonymous readers.
+const CONFIGURE_READ_ONLY_REFUSAL: &str = "this instance is read-only, and a read-only instance \
+     does not show its configuration to connected agents; whoever runs it reads the settings \
+     on the server with `crystalline config show`";
+
 /// The one line a bare `configure` adds about the domain view.
 const CONFIGURE_DOMAIN_HINT: &str = "Call configure with domain to see and change a domain's policies, sections and rule overrides.";
 
 /// Why a call naming a domain refuses a connect.
 const CONFIGURE_DOMAIN_NO_CONNECT: &str = "connect, token, host and restart are about this instance's GitHub sign-in, not about a domain; call configure without domain to connect";
-
-const CONFIGURE_READ_ONLY_REFUSAL: &str = "this instance is read-only, and a read-only instance \
-     does not show its configuration to connected agents; whoever runs it reads the settings \
-     on the server with `crystalline config show`";
 
 /// The sentence `remove_domain` asks before it acts, rendered from
 /// [`crate::engine::Engine::domain_remove_preview`].

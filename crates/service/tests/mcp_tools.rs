@@ -1173,6 +1173,20 @@ async fn configure_with_an_unknown_domain_is_the_domain_not_found() {
     assert_eq!(configured, browsed);
 }
 
+/// A read-only instance refuses `configure` whole, a domain view included.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configure_with_a_domain_is_refused_on_a_read_only_instance() {
+    let h = Harness::new_read_only(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let err = call(client.peer(), "configure", json!({ "domain": "eng" }))
+        .await
+        .unwrap_err();
+    assert!(
+        err.contains("this instance is read-only") && err.contains("crystalline config show"),
+        "{err}"
+    );
+}
+
 /// The bare settings page points at the domain view, in one line.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_bare_configure_points_at_the_domain_view() {

@@ -1611,6 +1611,38 @@ async fn a_stranger_reaches_nothing_of_a_private_domain_over_mcp() {
     );
 }
 
+/// `configure` naming a private domain a stranger cannot see answers what it
+/// answers for a name nobody registered, apart from the name itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configure_with_a_hidden_domain_answers_the_unregistered_not_found() {
+    let ctx = mcp_ctx(true).await;
+    let token = ctx.token_for("out").await;
+    let session = McpTestSession::open(&ctx.addr, Some(&token)).await;
+
+    let hidden = session
+        .call_tool("configure", serde_json::json!({ "domain": "lab" }))
+        .await;
+    let unregistered = session
+        .call_tool("configure", serde_json::json!({ "domain": "nowhere" }))
+        .await;
+    assert!(
+        hidden.contains("not registered") && !hidden.contains("confidential"),
+        "{hidden}"
+    );
+    // The SSE envelope differs per call (chunk length, event id), the
+    // message is what must match.
+    let message = |raw: &str| {
+        let start = raw.find("\"message\":").expect("an error message");
+        let rest = &raw[start..];
+        rest[..rest.find("}}").expect("end of error")].to_string()
+    };
+    assert_eq!(
+        message(&hidden).replace("lab", "nowhere"),
+        message(&unregistered),
+        "a hidden domain is the unregistered answer"
+    );
+}
+
 /// **An absolute identifier cannot carry a write into a domain the caller may
 /// not see.**
 ///
