@@ -1090,6 +1090,118 @@ async fn configure_tool_schema_advertises_plain_object_and_array_types() {
         &json!("array"),
         "configure.unset must advertise a plain array type, got {unset_type}"
     );
+    assert_eq!(
+        schema["properties"]["domain"]["type"],
+        json!("string"),
+        "configure.domain must advertise a plain string type"
+    );
+}
+
+/// `configure` with a domain answers how that domain behaves instead of the
+/// settings page.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configure_with_a_domain_answers_the_domain_view() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+    let out = call(peer, "configure", json!({ "domain": "eng" }))
+        .await
+        .unwrap();
+    assert_eq!(out["domain"], "eng", "{out}");
+    assert_eq!(out["policies"].as_array().unwrap().len(), 3);
+    assert_eq!(out["sections"].as_array().unwrap().len(), 4);
+    assert_eq!(out["rules"]["available"], true);
+    assert_eq!(out["how"].as_array().unwrap().len(), 4);
+    assert!(
+        out.get("settings").is_none(),
+        "not the settings page: {out}"
+    );
+}
+
+/// The view is list-shaped, so it renders as TOON under the default format.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configure_with_a_domain_is_toon_by_default() {
+    let h = Harness::new_toon(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let text = call_text(client.peer(), "configure", json!({ "domain": "eng" }))
+        .await
+        .unwrap();
+    assert!(
+        serde_json::from_str::<Value>(&text).is_err(),
+        "TOON, not JSON: {text}"
+    );
+    assert!(
+        text.contains("sharing") && text.contains("When to Use"),
+        "{text}"
+    );
+}
+
+/// A virtual domain has no `.crystalline.yaml`, and the view says so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configure_with_a_virtual_domain_says_it_has_no_rule_overrides() {
+    let h = Harness::build_tweaked(&["eng"], false, true, |cfg, _| {
+        cfg.domains
+            .insert("notes".to_string(), DomainEntry::virtual_domain());
+    })
+    .await;
+    let (client, _server) = h.connect().await;
+    let out = call(client.peer(), "configure", json!({ "domain": "notes" }))
+        .await
+        .unwrap();
+    assert_eq!(out["rules"]["available"], false, "{out}");
+    assert_eq!(
+        out["rules"]["note"],
+        "A virtual domain has no .crystalline.yaml, so it has no rule overrides."
+    );
+}
+
+/// A domain nobody registered is answered the way `read_engram` answers it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configure_with_an_unknown_domain_is_the_domain_not_found() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+    let configured = call(peer, "configure", json!({ "domain": "nope" }))
+        .await
+        .unwrap_err();
+    // The domain-level not-found a domain read gives (read_engram on an
+    // unknown domain words an engram miss instead, so browse_domain is the
+    // comparable read).
+    let browsed = call(peer, "browse_domain", json!({ "domain": "nope" }))
+        .await
+        .unwrap_err();
+    assert_eq!(configured, browsed);
+}
+
+/// The bare settings page points at the domain view, in one line.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bare_configure_points_at_the_domain_view() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let out = call(client.peer(), "configure", json!({})).await.unwrap();
+    assert_eq!(
+        out["domain_settings"],
+        "Call configure with domain to see and change a domain's policies, sections and rule overrides."
+    );
+}
+
+/// A connect is about the instance, so a call naming a domain refuses it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configure_with_a_domain_refuses_a_connect() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let result = call_result(
+        client.peer(),
+        "configure",
+        json!({ "domain": "eng", "connect": "github" }),
+    )
+    .await;
+    assert_eq!(result.is_error, Some(true));
+    assert!(
+        result_text(&result).contains("without domain"),
+        "{}",
+        result_text(&result)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

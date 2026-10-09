@@ -116,6 +116,7 @@ pub fn named_domains(tool: &str, args: &Value) -> anyhow::Result<Vec<String>> {
         "discard_changes" => names_of::<DiscardChangesParams>(args),
         "remove_domain" => names_of::<RemoveDomainParams>(args),
         "provision" => names_of::<ProvisionParams>(args),
+        "configure" => names_of::<ConfigureParams>(args),
         _ => Ok(Vec::new()),
     }
 }

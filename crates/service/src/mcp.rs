@@ -2967,6 +2967,12 @@ impl McpServer {
         if self.engine.read_only() {
             return Err(ErrorData::invalid_params(CONFIGURE_READ_ONLY_REFUSAL, None));
         }
+        // A call naming a domain is about that domain: its view, and its
+        // policy keys and rule overrides. It never touches an instance
+        // setting, so the instance-change gate below is not its gate.
+        if p.domain.is_some() {
+            return self.configure_domain(p, &ctx).await;
+        }
 
         // A bare `configure` is the settings page, which is a read and stays
         // open to every caller of a read-write instance. Everything that
@@ -3028,11 +3034,9 @@ impl McpServer {
         // announced it, and reports what applied before it stopped.
         self.apply_settings(&p).await?;
 
-        self.engine
-            .configure_snapshot()
-            .await
-            .map_err(to_error)
-            .and_then(|v| self.ok_list(v))
+        let mut snapshot = self.engine.configure_snapshot().await.map_err(to_error)?;
+        snapshot["domain_settings"] = json!(CONFIGURE_DOMAIN_HINT);
+        self.ok_list(snapshot)
     }
 
     #[tool(
@@ -3925,6 +3929,39 @@ impl McpServer {
         Ok(result)
     }
 
+    /// `configure` with a domain: the view of how that domain behaves. A
+    /// domain this caller may not see is the not-found a read of it gets; a
+    /// refusal the engine raises is text the model reads.
+    async fn configure_domain(
+        &self,
+        p: ConfigureParams,
+        ctx: &RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if p.connect.is_some() || p.token.is_some() || p.host.is_some() || p.restart {
+            return refuse(CONFIGURE_DOMAIN_NO_CONNECT);
+        }
+        // The operator keys stay out of configure whatever else the call names.
+        if p.set
+            .keys()
+            .chain(p.unset.iter())
+            .any(|key| crate::settings::is_operator_key(key))
+        {
+            return refuse(crate::settings::OPERATOR_SETTING_REFUSAL);
+        }
+        let p = self.localized(p, ctx).await?;
+        let domain = p.domain.clone().unwrap_or_default();
+        let scope = self.scope_of(ctx);
+        match self.engine.domain_settings(&domain, &scope).await {
+            Ok(view) => self.ok_list(view),
+            Err(
+                EngineError::Invalid(text)
+                | EngineError::Forbidden(text)
+                | EngineError::Refused(text),
+            ) => refuse(text),
+            Err(e) => Err(to_error(e)),
+        }
+    }
+
     /// Applies `configure`'s `set` map then `unset` list, one key at a time
     /// through the engine's existing per-key [`ConfigureAction`], stopping at
     /// the first failure. On success every applied key has already taken
@@ -4798,6 +4835,12 @@ const INSTANCE_ADMIN_ONLY: &str = "Changing this instance itself - the domains r
 /// refused write through its own message), and read-only is the public
 /// serving mode, where even masked settings would show paths, the sign-in
 /// setup and service addresses to anonymous readers.
+/// The one line a bare `configure` adds about the domain view.
+const CONFIGURE_DOMAIN_HINT: &str = "Call configure with domain to see and change a domain's policies, sections and rule overrides.";
+
+/// Why a call naming a domain refuses a connect.
+const CONFIGURE_DOMAIN_NO_CONNECT: &str = "connect, token, host and restart are about this instance's GitHub sign-in, not about a domain; call configure without domain to connect";
+
 const CONFIGURE_READ_ONLY_REFUSAL: &str = "this instance is read-only, and a read-only instance \
      does not show its configuration to connected agents; whoever runs it reads the settings \
      on the server with `crystalline config show`";

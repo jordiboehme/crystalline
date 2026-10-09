@@ -538,9 +538,19 @@ pub struct EvolveParams {
 /// snapshot reports that the feature is off and how to turn it on, leaving
 /// the stored credential unread. `token` or `connect` handle a GitHub
 /// connect action on their own and ignore `set`/`unset` in the same call;
-/// give them on a separate call from a settings change.
+/// give them on a separate call from a settings change. With `domain`, every
+/// key in `set` and `unset` is that domain's; instance settings go in a call
+/// without it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct ConfigureParams {
+    /// A domain to see and change instead of the instance. configure then
+    /// answers how that domain behaves: its MANIFEST policy keys (sharing,
+    /// generated_indexes, domain_name), what each MANIFEST section does and
+    /// its .crystalline.yaml rule overrides. set and unset then address that
+    /// domain: a policy key, rules.<rule id> (a verify rule's severity) or
+    /// token_budget. Omit it for the instance settings.
+    #[serde(default)]
+    pub domain: Option<String>,
     /// Settings to change, key to value, for example { "github.enabled":
     /// "true" }. Applied in ascending key order; the first invalid key or
     /// value stops the rest and reports what was already applied. Omit or
@@ -851,6 +861,7 @@ domain_args!(OriginStatusParams { opt domain });
 domain_args!(ResolveConflictParams { one domain });
 domain_args!(WithdrawProposalParams { one domain });
 domain_args!(ProvisionParams { opt domain });
+domain_args!(ConfigureParams { opt domain });
 
 // Every text a tool parameter carries may arrive with CRLF line endings, and is
 // taken as the LF text it means: what Crystalline stores is LF only, and a
