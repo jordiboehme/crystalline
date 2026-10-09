@@ -117,6 +117,21 @@ pub fn skill(name: &str) -> Option<&'static SkillAsset> {
 mod tests {
     use super::*;
 
+    /// The collaboration skill says what to offer after a refused direct
+    /// share, and what to tell the user once shares fall back on their own.
+    #[test]
+    fn the_collaboration_skill_teaches_the_proposal_fallback() {
+        let body = skill("crystalline-collaboration").unwrap().content;
+        assert!(
+            body.contains("When a direct share answers branch_protected, offer the user to share the same changes as a proposal with `as_proposal: true`."),
+            "{body}"
+        );
+        assert!(
+            body.contains("After that, shares fall back to a proposal on their own; when a receipt carries `fell_back`, tell the user the share opened a proposal instead of a commit."),
+            "{body}"
+        );
+    }
+
     #[test]
     fn every_skill_names_the_version_that_first_shipped_it() {
         for s in SKILL_ASSETS {

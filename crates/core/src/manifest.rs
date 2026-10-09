@@ -516,8 +516,11 @@ impl GeneratedIndexes {
 /// declares nothing, and it is today's behaviour byte for byte.
 /// [`Sharing::Direct`] is the deliberate choice of a team that wants no
 /// review step in front of its knowledge repository: a share then commits the
-/// selected files onto the branch in one commit, refuses while any proposal
-/// is still open, and answers a protected branch with the way out.
+/// selected files onto the branch in one commit and answers a protected
+/// branch with the way out. A direct share is refused while a proposal is
+/// open, except one that names your own open proposal (it amends it) and one
+/// made with `as_proposal` true or after a recorded refusal (it stacks on
+/// your open proposal or amends it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Sharing {
     /// A share opens (or stacks, amends, updates) a proposal for review.
