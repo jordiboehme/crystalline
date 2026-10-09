@@ -682,21 +682,33 @@ pub async fn apply(conn: &mut PgConnection) -> Result<i64> {
         if m.version <= current {
             continue;
         }
-        // sqlx `raw_sql` runs the multi-statement DDL as one simple-query batch,
-        // so `CREATE EXTENSION` and the tables that reference its `vector` type
-        // apply together in one implicit transaction.
+        // The DDL, its backfill and the stamp are one transaction, as on
+        // Turso: a step that fails anywhere rolls back whole (dropping `tx`
+        // without a commit rolls it back), the fill is never seen half done
+        // by another connection, and its inserts share one commit instead of
+        // one each. No step uses a statement Postgres refuses inside a
+        // transaction (`CREATE INDEX CONCURRENTLY`, `VACUUM`), and a new one
+        // must not. The steps stay written to replay cleanly all the same,
+        // because a database another binary migrated may hold a step without
+        // its stamp.
+        let mut tx = sqlx::Connection::begin(&mut *conn)
+            .await
+            .map_err(|e| IndexError::Migration(e.to_string()))?;
         sqlx::raw_sql(m.sql)
-            .execute(&mut *conn)
+            .execute(&mut *tx)
             .await
             .map_err(|e| IndexError::Migration(format!("v{} ({}): {e}", m.version, m.label)))?;
-        backfill(&mut *conn, m.version)
+        backfill(&mut tx, m.version)
             .await
             .map_err(|e| IndexError::Migration(format!("v{} ({}): {e}", m.version, m.label)))?;
         let now = chrono::Utc::now().to_rfc3339();
         sqlx::query("INSERT INTO schema_migration (version, applied_at) VALUES ($1, $2)")
             .bind(m.version)
             .bind(&now)
-            .execute(&mut *conn)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| IndexError::Migration(e.to_string()))?;
+        tx.commit()
             .await
             .map_err(|e| IndexError::Migration(e.to_string()))?;
     }
@@ -722,21 +734,43 @@ async fn backfill(conn: &mut PgConnection, version: i64) -> Result<()> {
 
 /// Fill `engram_meta_value` from every engram row's stored `metadata`, every
 /// actor's rows included. `metadata::text` reads the JSONB back as JSON, so
-/// it parses with the same function the writer's rows come from.
+/// it parses with the same function the writer's rows come from. The table is
+/// cleared first, so a replay converges. The rows are read a page of
+/// [`super::BACKFILL_PAGE`] engrams at a time in id order, so memory stays
+/// bounded on a large index, and each page's rows go in as multi-row inserts
+/// across its engrams.
 async fn backfill_meta_values(conn: &mut PgConnection) -> Result<()> {
-    let stored: Vec<(i64, String)> = sqlx::query_as("SELECT id, metadata::text FROM engram")
-        .fetch_all(&mut *conn)
-        .await
-        .map_err(IndexError::from)?;
     sqlx::raw_sql("DELETE FROM engram_meta_value")
         .execute(&mut *conn)
         .await
         .map_err(IndexError::from)?;
-    for (id, text) in stored {
-        let Ok(metadata) = serde_json::from_str::<serde_json::Value>(&text) else {
-            continue;
+    let mut after = i64::MIN;
+    loop {
+        let page: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT id, metadata::text FROM engram WHERE id > $1 ORDER BY id LIMIT $2",
+        )
+        .bind(after)
+        .bind(super::BACKFILL_PAGE)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(IndexError::from)?;
+        let Some(&(last, _)) = page.last() else {
+            break;
         };
-        super::insert_meta_values(&mut *conn, id, &metadata).await?;
+        after = last;
+        let mut rows = Vec::new();
+        for (id, text) in &page {
+            let Ok(metadata) = serde_json::from_str::<serde_json::Value>(text) else {
+                continue;
+            };
+            for (key, value) in crate::store::meta_value_rows(&metadata) {
+                rows.push((*id, key, value));
+            }
+        }
+        super::insert_meta_rows(&mut *conn, &rows).await?;
+        if (page.len() as i64) < super::BACKFILL_PAGE {
+            break;
+        }
     }
     Ok(())
 }
@@ -1445,28 +1479,15 @@ mod tests {
         store.drop_schema().await.unwrap();
     }
 
-    /// The Turso v19 test's twin for v18, gated like the tests beside it.
-    /// JSONB refuses metadata that does not parse at insert time, so that
-    /// row has no twin here. The rows are compared in byte order
-    /// (`COLLATE "C"`), the order `meta_value_rows` sorts in.
-    #[tokio::test]
-    async fn v18_fills_engram_meta_value_from_the_stored_metadata() {
-        let Ok(url) = std::env::var("CRYSTALLINE_TEST_POSTGRES_URL") else {
-            return;
-        };
-        if url.is_empty() {
-            return;
-        }
-        let schema = format!("mig_meta_{}", std::process::id());
-        let base = serde_json::json!({
-            "sources": ["a \"q\" \\ b", "line\nbreak", "ünïcode", "a \"q\" \\ b"],
-            "numbers": [-3, i64::MAX, 1.5, 1, "1"],
-            "flags": [true, 1],
-            "verified": [{"by": "jordi", "at": "2026-01-01T00:00:00Z"}],
-            "kind": "anchor",
-        });
-        let draft = serde_json::json!({ "sources": ["draft-only"] });
-        let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
+    /// A schema stamped at v17 holding one domain and one engram row per
+    /// `(permalink, actor, metadata)`, at `<permalink>.md`; answers each
+    /// row's id.
+    async fn a_v17_schema_with(
+        url: &str,
+        schema: &str,
+        engrams: &[(&str, &str, &serde_json::Value)],
+    ) -> Vec<i64> {
+        let mut conn = sqlx::PgConnection::connect(url).await.unwrap();
         sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
             "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}; SET search_path TO {schema}, public"
         )))
@@ -1498,45 +1519,215 @@ mod tests {
         .fetch_one(&mut conn)
         .await
         .unwrap();
-        let mut written = Vec::new();
-        for (permalink, actor, metadata) in [("p0", "", &base), ("p1", "alice", &draft)] {
+        let mut ids = Vec::new();
+        for (permalink, actor, metadata) in engrams {
             let (id,): (i64,) = sqlx::query_as(
                 "INSERT INTO engram(domain_id, path, permalink, metadata, actor) \
-                 VALUES ($1, 'a.md', $2, $3::jsonb, $4) RETURNING id",
+                 VALUES ($1, $2 || '.md', $2, $3::jsonb, $4) RETURNING id",
             )
             .bind(domain)
-            .bind(permalink)
+            .bind(*permalink)
             .bind(metadata.to_string())
-            .bind(actor)
+            .bind(*actor)
             .fetch_one(&mut conn)
             .await
             .unwrap();
-            written.push((id, metadata.clone()));
+            ids.push(id);
         }
-        drop(conn);
+        ids
+    }
+
+    /// One engram's rows, as `(key, value)` in byte order.
+    async fn meta_rows_of(store: &crate::PostgresStore, id: i64) -> Vec<(String, String)> {
+        use crate::store::Store;
+        store
+            .meta_values()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|(e, _, _)| e.0 == id)
+            .map(|(_, k, v)| (k, v))
+            .collect()
+    }
+
+    /// The Turso v19 test's twin for v18, gated like the tests beside it.
+    /// JSONB refuses metadata that does not parse at insert time, so that
+    /// row has no twin here. The rows are compared in byte order
+    /// (`COLLATE "C"`), the order `meta_value_rows` sorts in.
+    ///
+    /// The backfill reads `metadata::text` back from JSONB, whose numbers are
+    /// `numeric`: the one place where the migration's text could differ from
+    /// the writer's. `1e-7`, `2.0`, `1e20` (`1e+20`) and `u64::MAX` come back as the
+    /// same text a fresh write gives. `-0.0` does not: `numeric` has no
+    /// negative zero, so an upgraded index holds `0.0` where a fresh write
+    /// holds `-0.0`. That is pinned below as a known, harmless difference.
+    #[tokio::test]
+    async fn v18_fills_engram_meta_value_from_the_stored_metadata() {
+        let Ok(url) = std::env::var("CRYSTALLINE_TEST_POSTGRES_URL") else {
+            return;
+        };
+        if url.is_empty() {
+            return;
+        }
+        let schema = format!("mig_meta_{}", std::process::id());
+        let base = serde_json::json!({
+            "sources": ["a \"q\" \\ b", "line\nbreak", "ünïcode", "a \"q\" \\ b"],
+            "numbers": [-3, i64::MAX, 1.5, 1, "1", 1e-7, 2.0, 1e20, u64::MAX],
+            "flags": [true, 1],
+            "verified": [{"by": "jordi", "at": "2026-01-01T00:00:00Z"}],
+            "kind": "anchor",
+        });
+        let draft = serde_json::json!({ "sources": ["draft-only"] });
+        let zero = serde_json::json!({ "z": -0.0 });
+        let ids = a_v17_schema_with(
+            &url,
+            &schema,
+            &[
+                ("p0", "", &base),
+                ("p1", "alice", &draft),
+                ("p2", "", &zero),
+            ],
+        )
+        .await;
 
         let store = crate::PostgresStore::open_in_schema(&url, &schema)
             .await
             .unwrap();
-        let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
-        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-            "SET search_path TO {schema}, public"
-        )))
-        .execute(&mut conn)
-        .await
-        .unwrap();
-        for (id, metadata) in &written {
-            let rows: Vec<(String, String)> = sqlx::query_as(
-                "SELECT key, value FROM engram_meta_value WHERE engram_id=$1 \
-                 ORDER BY key COLLATE \"C\", value COLLATE \"C\"",
-            )
-            .bind(*id)
-            .fetch_all(&mut conn)
+        assert_eq!(
+            meta_rows_of(&store, ids[0]).await,
+            crate::store::meta_value_rows(&base),
+            "the base row"
+        );
+        assert_eq!(
+            meta_rows_of(&store, ids[1]).await,
+            crate::store::meta_value_rows(&draft),
+            "a draft gets its rows too"
+        );
+        let base_rows = meta_rows_of(&store, ids[0]).await;
+        for value in ["1e-7", "2.0", "1e+20", "18446744073709551615"] {
+            assert!(
+                base_rows.contains(&("numbers".to_string(), value.to_string())),
+                "numbers = {value} in {base_rows:?}"
+            );
+        }
+        assert_eq!(
+            crate::store::meta_value_rows(&zero),
+            vec![("z".to_string(), "-0.0".to_string())],
+            "a fresh write keeps the negative zero"
+        );
+        assert_eq!(
+            meta_rows_of(&store, ids[2]).await,
+            vec![("z".to_string(), "0.0".to_string())],
+            "JSONB numeric has no negative zero, so the migration stores 0.0"
+        );
+        store.drop_schema().await.unwrap();
+    }
+
+    /// v18 replayed: a database where an earlier attempt ran the DDL and the
+    /// backfill but never stamped the step, and where a stray row sits in the
+    /// table. The next open runs the step again, and the result is exactly
+    /// the rows of the stored metadata, the stray row gone.
+    #[tokio::test]
+    async fn v18_replayed_over_a_filled_table_converges() {
+        let Ok(url) = std::env::var("CRYSTALLINE_TEST_POSTGRES_URL") else {
+            return;
+        };
+        if url.is_empty() {
+            return;
+        }
+        let schema = format!("mig_meta_replay_{}", std::process::id());
+        let metadata = serde_json::json!({ "sources": ["a", "b"], "n": 7 });
+        let ids = a_v17_schema_with(&url, &schema, &[("p0", "", &metadata)]).await;
+        {
+            let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
+            sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                "SET search_path TO {schema}, public"
+            )))
+            .execute(&mut conn)
             .await
             .unwrap();
-            assert_eq!(rows, crate::store::meta_value_rows(metadata), "engram {id}");
+            sqlx::raw_sql(MIGRATIONS[17].sql)
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            backfill(&mut conn, 18).await.unwrap();
+            sqlx::query(
+                "INSERT INTO engram_meta_value(engram_id, key, value) VALUES ($1, 'stray', '\"x\"')",
+            )
+            .bind(ids[0])
+            .execute(&mut conn)
+            .await
+            .unwrap();
+            let (stamped,): (i64,) =
+                sqlx::query_as("SELECT COALESCE(MAX(version), 0) FROM schema_migration")
+                    .fetch_one(&mut conn)
+                    .await
+                    .unwrap();
+            assert_eq!(stamped, 17, "the step ran but was never stamped");
         }
-        drop(conn);
+
+        let store = crate::PostgresStore::open_in_schema(&url, &schema)
+            .await
+            .unwrap();
+        assert_eq!(
+            meta_rows_of(&store, ids[0]).await,
+            crate::store::meta_value_rows(&metadata),
+            "the replay clears the table and fills it again"
+        );
+        store.drop_schema().await.unwrap();
+    }
+
+    /// The Turso `v19_backfill_cost_at_50k` twin: v18 over a schema of
+    /// 50,000 engrams with five `sources` anchors each, timed from the open
+    /// that runs the backfill. Ignored and gated like the tests beside it.
+    #[tokio::test]
+    #[ignore = "perf evidence: run by hand with --ignored --nocapture"]
+    async fn v18_backfill_cost_at_50k() {
+        use crate::store::Store;
+        const ENGRAMS: i64 = 50_000;
+        let Ok(url) = std::env::var("CRYSTALLINE_TEST_POSTGRES_URL") else {
+            return;
+        };
+        if url.is_empty() {
+            return;
+        }
+        let schema = format!("mig_meta_perf_{}", std::process::id());
+        a_v17_schema_with(&url, &schema, &[]).await;
+        {
+            let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
+            sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                "SET search_path TO {schema}, public"
+            )))
+            .execute(&mut conn)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO engram(domain_id, path, permalink, metadata, actor) \
+                 SELECT d.id, 'n' || i || '.md', 'note-' || i, \
+                        jsonb_build_object('sources', jsonb_build_array( \
+                            'notedown://jordi/n' || i || '/p0#b0', \
+                            'notedown://jordi/n' || i || '/p0#b1', \
+                            'notedown://jordi/n' || i || '/p0#b2', \
+                            'notedown://jordi/n' || i || '/p0#b3', \
+                            'notedown://jordi/shared/p' || (i % 1000) || '#b0')), '' \
+                 FROM domain d, generate_series(0, $1 - 1) AS i",
+            )
+            .bind(ENGRAMS)
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        }
+        let started = std::time::Instant::now();
+        let store = crate::PostgresStore::open_in_schema(&url, &schema)
+            .await
+            .unwrap();
+        let ms = started.elapsed().as_millis();
+        let rows = store.meta_values().await.unwrap().len();
+        assert_eq!(rows, 5 * ENGRAMS as usize, "five rows an engram");
+        eprintln!(
+            "PERF v18 backfill 50k: open with the migration {ms} ms, {rows} rows, {:.1} us per engram",
+            ms as f64 * 1000.0 / ENGRAMS as f64
+        );
         store.drop_schema().await.unwrap();
     }
 }

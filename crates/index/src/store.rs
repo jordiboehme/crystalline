@@ -2172,6 +2172,13 @@ pub trait Store: Send + Sync {
     #[doc(hidden)]
     async fn domain_spellings(&self) -> Result<Vec<(String, DomainId)>>;
 
+    /// Every `engram_meta_value` row, every actor's included, as
+    /// `(engram id, key, value)`, sorted by id and then byte-wise. The
+    /// parity tests read it to prove that both backends write and remove
+    /// the same rows on every write path.
+    #[doc(hidden)]
+    async fn meta_values(&self) -> Result<Vec<(EngramId, String, String)>>;
+
     /// Replace the spellings of the domains `spellings` names with exactly
     /// that list, and answer every spelling whose mapping changed - added,
     /// removed or now pointing at a different domain - sorted byte-wise.

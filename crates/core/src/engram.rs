@@ -474,9 +474,11 @@ impl Frontmatter {
     ///
     /// Two users read this one map. The index stores it as the `metadata`
     /// column and derives its `engram_meta_value` rows from it, one per list
-    /// element and per scalar. Verify rule E011 walks the same map to warn
-    /// about a key or value too long for those rows. So the keys of this map
-    /// are exactly the keys that get rows, given [`META_KEY_MAX_BYTES`].
+    /// element and per scalar. Verify reads the same map to warn about a key
+    /// or value too long for those rows. So the keys of this map are the only
+    /// keys that can get rows: a key gets none when it is longer than
+    /// [`META_KEY_MAX_BYTES`], or when none of its values has a text (see
+    /// [`meta_value_text`]).
     pub fn index_metadata(&self) -> serde_json::Map<String, serde_json::Value> {
         let date_str = |d: Option<NaiveDate>| d.map(|d| d.format("%Y-%m-%d").to_string());
         let mut meta = serde_json::Map::new();
@@ -517,7 +519,7 @@ impl Frontmatter {
 /// nothing.
 ///
 /// Two users measure against this one value: the index, when it writes the
-/// rows, and verify rule E011, which warns about a key that is too long.
+/// rows, and verify, which warns about a key that is too long.
 pub const META_KEY_MAX_BYTES: usize = 256;
 
 /// The longest value text, in bytes, that an `engram_meta_value` row holds
@@ -527,7 +529,7 @@ pub const META_KEY_MAX_BYTES: usize = 256;
 /// index backends apply the same cap, so they keep answering the same.
 ///
 /// Two users measure against this one value: the index, when it writes the
-/// rows, and verify rule E011, which warns about a value that is too long.
+/// rows, and verify, which warns about a value that is too long.
 pub const META_VALUE_MAX_BYTES: usize = 1024;
 
 /// The text a frontmatter value is stored and compared as in the index's
@@ -541,8 +543,8 @@ pub const META_VALUE_MAX_BYTES: usize = 1024;
 /// value's type first.
 ///
 /// Two users go through this one function: the index (its writer, its
-/// migration and both query builders), and verify rule E011, so verify
-/// measures a value byte for byte the way the index does.
+/// migration and both query builders), and verify, so verify measures a
+/// value byte for byte the way the index does.
 pub fn meta_value_text(value: &serde_json::Value) -> Option<String> {
     if value.is_array() || value.is_object() {
         return None;

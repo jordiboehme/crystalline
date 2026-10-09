@@ -979,20 +979,33 @@ fn value_rows(width: usize, count: usize, trailing: Option<&str>) -> String {
     rows.join(",")
 }
 
+/// How many engrams one page of the `engram_meta_value` backfill reads, so
+/// the migration's memory stays bounded on a large index.
+const BACKFILL_PAGE: i64 = 1000;
+
 /// Write one engram's `engram_meta_value` rows from its `metadata`, in the
 /// caller's transaction (see [`crate::store::meta_value_rows`]). The caller
-/// has cleared the old rows: [`TursoStore::delete_children`] on an update,
-/// the migration's own delete on a fill.
+/// has cleared the old rows: [`TursoStore::delete_children`] on an update.
 async fn insert_meta_values(
     conn: &Connection,
     engram_id: i64,
     metadata: &serde_json::Value,
 ) -> Result<()> {
-    let rows = crate::store::meta_value_rows(metadata);
+    let rows: Vec<(i64, String, String)> = crate::store::meta_value_rows(metadata)
+        .into_iter()
+        .map(|(key, value)| (engram_id, key, value))
+        .collect();
+    insert_meta_rows(conn, &rows).await
+}
+
+/// Insert `(engram id, key, value)` rows into `engram_meta_value`, any number
+/// of engrams' rows per statement, [`INSERT_CHUNK`] rows at a time (three
+/// binds a row, under the 999-parameter ceiling).
+async fn insert_meta_rows(conn: &Connection, rows: &[(i64, String, String)]) -> Result<()> {
     for batch in rows.chunks(INSERT_CHUNK) {
         let mut params: Vec<Value> = Vec::with_capacity(batch.len() * 3);
-        for (key, value) in batch {
-            params.push(Value::Integer(engram_id));
+        for (engram_id, key, value) in batch {
+            params.push(Value::Integer(*engram_id));
             params.push(Value::Text(key.clone()));
             params.push(Value::Text(value.clone()));
         }
@@ -1396,6 +1409,26 @@ impl Store for TursoStore {
         Ok(rows
             .iter()
             .filter_map(|r| Some((cell_text(r, 0)?, DomainId(cell_i64(r, 1)?))))
+            .collect())
+    }
+
+    async fn meta_values(&self) -> Result<Vec<(EngramId, String, String)>> {
+        // TEXT sorts byte-wise here, as in `domain_spellings`.
+        let rows = query_all(
+            &self.conn,
+            "SELECT engram_id, key, value FROM engram_meta_value ORDER BY engram_id, key, value",
+            Vec::new(),
+        )
+        .await?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| {
+                Some((
+                    EngramId(cell_i64(r, 0)?),
+                    cell_text(r, 1)?,
+                    cell_text(r, 2)?,
+                ))
+            })
             .collect())
     }
 
@@ -4094,119 +4127,6 @@ mod tests {
             }
         }
         map.into_iter().collect()
-    }
-
-    /// Every `(key, value)` row one engram holds in `engram_meta_value`.
-    async fn meta_rows(store: &TursoStore, engram_id: i64) -> Vec<(String, String)> {
-        let rows = query_all(
-            &store.conn,
-            "SELECT key, value FROM engram_meta_value WHERE engram_id=?1 ORDER BY key, value",
-            vec![Value::Integer(engram_id)],
-        )
-        .await
-        .unwrap();
-        rows.iter()
-            .map(|r| {
-                (
-                    cell_text(r, 0).unwrap_or_default(),
-                    cell_text(r, 1).unwrap_or_default(),
-                )
-            })
-            .collect()
-    }
-
-    async fn meta_row_count(store: &TursoStore) -> i64 {
-        scalar_i64(
-            &store.conn,
-            "SELECT count(*) FROM engram_meta_value",
-            vec![],
-        )
-        .await
-        .unwrap()
-    }
-
-    /// The rows follow every write an engram's tag rows follow: an insert,
-    /// an update, a draft, a dropped draft, a delete, a cleared domain and
-    /// a wipe. Turso does not enforce foreign keys, so each of these is a
-    /// delete written by hand, and this test is what notices one missing.
-    #[tokio::test]
-    async fn meta_value_rows_follow_every_write_of_an_engram() {
-        let store = TursoStore::open_in_memory().await.unwrap();
-        let domain = store
-            .upsert_domain("d", Some("/tmp/d"), DomainKind::File)
-            .await
-            .unwrap();
-        let mut record = record_with_observations(Vec::new());
-        record.metadata = serde_json::json!({
-            "sources": ["notedown://a/1#b1", "notedown://a/1#b2", "notedown://a/1#b1"],
-            "pages": [3, "3"],
-            "flag": true,
-            "verified": [{"by": "jordi", "at": "2026-01-01T00:00:00Z"}],
-            "summary": "x".repeat(2000),
-        });
-        let id = store.upsert_engram(domain, &record).await.unwrap().0;
-        assert_eq!(
-            meta_rows(&store, id).await,
-            vec![
-                ("flag".to_string(), "true".to_string()),
-                ("pages".to_string(), "\"3\"".to_string()),
-                ("pages".to_string(), "3".to_string()),
-                ("sources".to_string(), "\"notedown://a/1#b1\"".to_string()),
-                ("sources".to_string(), "\"notedown://a/1#b2\"".to_string()),
-            ],
-            "one row per element and per scalar; no row for a list of objects or a long text"
-        );
-
-        record.metadata = serde_json::json!({ "sources": ["notedown://a/2#b1"] });
-        assert_eq!(store.upsert_engram(domain, &record).await.unwrap().0, id);
-        assert_eq!(
-            meta_rows(&store, id).await,
-            vec![("sources".to_string(), "\"notedown://a/2#b1\"".to_string())],
-            "an update replaces the rows"
-        );
-
-        let mut draft = record.clone();
-        draft.metadata = serde_json::json!({ "sources": ["notedown://a/3#b1"] });
-        let draft_id = store
-            .upsert_overlay(domain, "alice", &draft)
-            .await
-            .unwrap()
-            .0;
-        assert_ne!(draft_id, id, "a draft is a row of its own");
-        assert_eq!(
-            meta_rows(&store, draft_id).await,
-            vec![("sources".to_string(), "\"notedown://a/3#b1\"".to_string())]
-        );
-        assert!(
-            store
-                .clear_overlay_entry(domain, "alice", "a.md")
-                .await
-                .unwrap()
-        );
-        assert!(
-            meta_rows(&store, draft_id).await.is_empty(),
-            "a dropped draft takes its rows"
-        );
-
-        store.delete_engram(domain, "a.md").await.unwrap();
-        assert_eq!(
-            meta_row_count(&store).await,
-            0,
-            "a deleted engram takes its rows"
-        );
-
-        store.upsert_engram(domain, &record).await.unwrap();
-        store.upsert_overlay(domain, "alice", &draft).await.unwrap();
-        store.clear_domain(domain).await.unwrap();
-        assert_eq!(
-            meta_row_count(&store).await,
-            0,
-            "a cleared domain takes every actor's rows"
-        );
-
-        store.upsert_engram(domain, &record).await.unwrap();
-        store.wipe().await.unwrap();
-        assert_eq!(meta_row_count(&store).await, 0, "a wipe takes every row");
     }
 
     /// The resolve pass seeks the title index on the arm that needs it.

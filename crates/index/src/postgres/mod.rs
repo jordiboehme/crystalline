@@ -671,6 +671,10 @@ fn value_rows(width: usize, count: usize, trailing: Option<&str>) -> String {
     rows.join(",")
 }
 
+/// How many engrams one page of the `engram_meta_value` backfill reads, the
+/// Turso `BACKFILL_PAGE` twin.
+const BACKFILL_PAGE: i64 = 1000;
+
 /// Write one engram's `engram_meta_value` rows, the Turso
 /// `insert_meta_values` twin, on the caller's connection so it stays in the
 /// caller's transaction.
@@ -679,11 +683,20 @@ async fn insert_meta_values(
     engram_id: i64,
     metadata: &serde_json::Value,
 ) -> Result<()> {
-    let rows = crate::store::meta_value_rows(metadata);
+    let rows: Vec<(i64, String, String)> = crate::store::meta_value_rows(metadata)
+        .into_iter()
+        .map(|(key, value)| (engram_id, key, value))
+        .collect();
+    insert_meta_rows(conn, &rows).await
+}
+
+/// Insert `(engram id, key, value)` rows into `engram_meta_value`, any number
+/// of engrams' rows per statement, [`INSERT_CHUNK`] rows at a time.
+async fn insert_meta_rows(conn: &mut PgConnection, rows: &[(i64, String, String)]) -> Result<()> {
     for batch in rows.chunks(INSERT_CHUNK) {
         let mut params: Vec<Param> = Vec::with_capacity(batch.len() * 3);
-        for (key, value) in batch {
-            params.push(Param::Int(engram_id));
+        for (engram_id, key, value) in batch {
+            params.push(Param::Int(*engram_id));
             params.push(Param::Text(key.clone()));
             params.push(Param::Text(value.clone()));
         }
@@ -1342,6 +1355,21 @@ impl Store for PostgresStore {
         Ok(rows
             .into_iter()
             .map(|(spelling, id)| (spelling, DomainId(id)))
+            .collect())
+    }
+
+    async fn meta_values(&self) -> Result<Vec<(EngramId, String, String)>> {
+        let mut conn = self.acquire().await?;
+        let rows: Vec<(i64, String, String)> = sqlx::query_as(
+            "SELECT engram_id, key, value FROM engram_meta_value \
+             ORDER BY engram_id, key COLLATE \"C\", value COLLATE \"C\"",
+        )
+        .fetch_all(conn.as_mut())
+        .await
+        .map_err(IndexError::from)?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, key, value)| (EngramId(id), key, value))
             .collect())
     }
 

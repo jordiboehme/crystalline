@@ -3853,6 +3853,123 @@ async fn search_hits_carry_tags(store: &dyn Store) {
 }
 parity!(search_hits_carry_their_engram_tags, search_hits_carry_tags);
 
+/// One engram's `engram_meta_value` rows, as `(key, value)`.
+async fn meta_rows_of(store: &dyn Store, id: EngramId) -> Vec<(String, String)> {
+    store
+        .meta_values()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|(e, _, _)| *e == id)
+        .map(|(_, k, v)| (k, v))
+        .collect()
+}
+
+async fn meta_row_count(store: &dyn Store) -> usize {
+    store.meta_values().await.unwrap().len()
+}
+
+/// The `engram_meta_value` rows follow every write an engram's tag rows
+/// follow: an insert, an update, a draft, a dropped draft, a delete, a
+/// cleared domain and a wipe. Turso does not enforce foreign keys, so each of
+/// these is a delete written by hand there; on Postgres the cascade hides a
+/// missing delete on a removal but not on an update. Both backends must hold
+/// byte for byte the same text.
+async fn meta_value_rows_follow_every_write(store: &dyn Store) {
+    let domain = store
+        .upsert_domain("d", Some("/tmp/d"), DomainKind::File)
+        .await
+        .unwrap();
+    let mut rec = record("a.md", "a", "body", "sha");
+    rec.metadata = serde_json::json!({
+        "sources": ["notedown://a/1#b1", "notedown://a/1#b2", "notedown://a/1#b1"],
+        "pages": [3, "3"],
+        "flag": true,
+        "verified": [{"by": "jordi", "at": "2026-01-01T00:00:00Z"}],
+        "summary": "x".repeat(2000),
+    });
+    let id = store.upsert_engram(domain, &rec).await.unwrap();
+    assert_eq!(
+        meta_rows_of(store, id).await,
+        vec![
+            ("flag".to_string(), "true".to_string()),
+            ("pages".to_string(), "\"3\"".to_string()),
+            ("pages".to_string(), "3".to_string()),
+            ("sources".to_string(), "\"notedown://a/1#b1\"".to_string()),
+            ("sources".to_string(), "\"notedown://a/1#b2\"".to_string()),
+        ],
+        "one row per element and per scalar; no row for a list of objects or a long text"
+    );
+
+    rec.metadata = serde_json::json!({ "sources": ["notedown://a/2#b1"] });
+    rec.stamp.sha256 = "sha2".to_string();
+    assert_eq!(store.upsert_engram(domain, &rec).await.unwrap(), id);
+    assert_eq!(
+        meta_rows_of(store, id).await,
+        vec![("sources".to_string(), "\"notedown://a/2#b1\"".to_string())],
+        "an update replaces the rows"
+    );
+
+    let mut draft = rec.clone();
+    draft.metadata = serde_json::json!({ "sources": ["notedown://a/3#b1"] });
+    let draft_id = store.upsert_overlay(domain, "alice", &draft).await.unwrap();
+    assert_ne!(draft_id, id, "a draft is a row of its own");
+    assert_eq!(
+        meta_rows_of(store, draft_id).await,
+        vec![("sources".to_string(), "\"notedown://a/3#b1\"".to_string())]
+    );
+    draft.metadata = serde_json::json!({ "sources": ["notedown://a/4#b1"] });
+    draft.stamp.sha256 = "sha3".to_string();
+    assert_eq!(
+        store.upsert_overlay(domain, "alice", &draft).await.unwrap(),
+        draft_id
+    );
+    assert_eq!(
+        meta_rows_of(store, draft_id).await,
+        vec![("sources".to_string(), "\"notedown://a/4#b1\"".to_string())],
+        "an update of a draft replaces its rows"
+    );
+    assert!(
+        store
+            .clear_overlay_entry(domain, "alice", "a.md")
+            .await
+            .unwrap()
+    );
+    assert!(
+        meta_rows_of(store, draft_id).await.is_empty(),
+        "a dropped draft takes its rows"
+    );
+
+    store.delete_engram(domain, "a.md").await.unwrap();
+    assert_eq!(
+        meta_row_count(store).await,
+        0,
+        "a deleted engram takes its rows"
+    );
+
+    store.upsert_engram(domain, &rec).await.unwrap();
+    store.upsert_overlay(domain, "alice", &draft).await.unwrap();
+    store.clear_domain(domain).await.unwrap();
+    assert_eq!(
+        meta_row_count(store).await,
+        0,
+        "a cleared domain takes every actor's rows"
+    );
+
+    let domain = store
+        .upsert_domain("d", Some("/tmp/d"), DomainKind::File)
+        .await
+        .unwrap();
+    store.upsert_engram(domain, &rec).await.unwrap();
+    assert_eq!(meta_row_count(store).await, 1);
+    store.wipe().await.unwrap();
+    assert_eq!(meta_row_count(store).await, 0, "a wipe takes every row");
+}
+parity!(
+    meta_value_rows_follow_every_write_on_both_backends,
+    meta_value_rows_follow_every_write
+);
+
 async fn search_applies_filters(store: &dyn Store) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
