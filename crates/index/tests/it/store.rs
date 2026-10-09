@@ -9734,10 +9734,12 @@ fn every_engram_reading_sql_carries_an_actor_predicate() {
         census.failures.join("\n")
     );
     assert_eq!(
-        census.sites, 170,
+        census.sites, 172,
         "the engram statement census moved; every new one needs a predicate or a waiver. \
-         69 per backend in mod.rs (the two unbinding statements of `clear_domain` are the \
-         newest, waived below; before them the guarded compare of `upsert_engram_checked` is the \
+         70 per backend in mod.rs (the `engram_meta_value` delete of `clear_domain` is the \
+         newest, waived below with the rest of that clear; before it the two unbinding \
+         statements of `clear_domain`, also waived; before them the guarded compare \
+         of `upsert_engram_checked` is the \
          newest, on the base row; before it the two `EXISTS` probes of the contradiction \
          pair write, waived by id; before them the emptiness probe of \
          `drop_empty_domain_row`, waived because a draft keeps the row too; before it the URL half \
@@ -9761,14 +9763,14 @@ fn every_engram_reading_sql_carries_an_actor_predicate() {
          that the reference now points at nothing"
     );
     assert_eq!(
-        census.waived, 28,
+        census.waived, 30,
         "the waiver list is meant to be short and deliberate; a new one needs its reason read. \
-         Fourteen per backend: the two statements of `clear_domain` that unbind the references \
+         Fifteen per backend: the two statements of `clear_domain` that unbind the references \
          from other domains into the rows about to go, `-- actor: all` because the clear takes \
          every actor's rows, the two `EXISTS` probes of `replace_contradictions`' pair \
          write, `-- actor: by id` because both ids are base rows (drafts are never \
          scored), the emptiness probe of `drop_empty_domain_row`, where any \
-         actor's row keeps the domain, the six statements of `clear_domain` - the sixth is the one that \
+         actor's row keeps the domain, the seven statements of `clear_domain` - the seventh is the `engram_meta_value` delete, the sixth the one that \
          takes the bodies out of `engram_content`, which names the rows about to go because \
          that table has no domain of its own - the id-scoped delete inside `delete_engram` \
          and `chunks_needing_embedding`'s domain scope, all `-- actor: all`, plus \

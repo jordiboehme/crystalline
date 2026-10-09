@@ -11,6 +11,7 @@ mod embed_model;
 mod lead_vectors;
 mod nli_model;
 mod perf;
+mod perf_meta;
 mod plans;
 mod recovery;
 mod reindex;

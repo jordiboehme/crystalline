@@ -111,6 +111,11 @@ pub const MIGRATIONS: &[Migration] = &[
         label: "contradiction scores",
         sql: SCHEMA_V17,
     },
+    Migration {
+        version: 18,
+        label: "metadata values",
+        sql: SCHEMA_V18,
+    },
 ];
 
 // The whole current schema in one step. The temporal columns stay TEXT ISO
@@ -587,6 +592,21 @@ CREATE TABLE IF NOT EXISTS observation_vector (
 ALTER TABLE domain ADD COLUMN IF NOT EXISTS parse_generation BIGINT NOT NULL DEFAULT 0;
 "#;
 
+// The Turso v19 twin. `IF NOT EXISTS`, because here a step and its stamp are
+// not one transaction: a step that died during its backfill is replayed whole,
+// and the backfill clears the table before it fills it, so a replay
+// converges. Foreign keys are enforced here, so the cascade is real; the
+// deletes are written out all the same, as on Turso.
+const SCHEMA_V18: &str = r#"
+CREATE TABLE IF NOT EXISTS engram_meta_value (
+    engram_id BIGINT NOT NULL REFERENCES engram(id) ON DELETE CASCADE,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    PRIMARY KEY (engram_id, key, value)
+);
+CREATE INDEX IF NOT EXISTS idx_engram_meta_value_key_value ON engram_meta_value(key, value, engram_id);
+"#;
+
 const SCHEMA_V8: &str = r#"
 CREATE TABLE attachment (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -613,13 +633,14 @@ CREATE TABLE attachment_blob (
 /// and `engram_content` references `engram`, so it goes before that.
 /// `contradiction` and `contradiction_pair` reference `engram` and `domain`,
 /// so they go first. `observation_vector` references nothing and leads the
-/// list.
+/// list. `engram_meta_value` references `engram`, so it goes before it.
 pub const WIPE_TABLES: &[&str] = &[
     "observation_vector",
     "contradiction",
     "contradiction_pair",
     "observation_tag",
     "engram_tag",
+    "engram_meta_value",
     "chunk",
     "observation",
     "relation",
@@ -668,6 +689,9 @@ pub async fn apply(conn: &mut PgConnection) -> Result<i64> {
             .execute(&mut *conn)
             .await
             .map_err(|e| IndexError::Migration(format!("v{} ({}): {e}", m.version, m.label)))?;
+        backfill(&mut *conn, m.version)
+            .await
+            .map_err(|e| IndexError::Migration(format!("v{} ({}): {e}", m.version, m.label)))?;
         let now = chrono::Utc::now().to_rfc3339();
         sqlx::query("INSERT INTO schema_migration (version, applied_at) VALUES ($1, $2)")
             .bind(m.version)
@@ -685,6 +709,36 @@ async fn current_version(conn: &mut PgConnection) -> Result<i64> {
         .await
         .map_err(|e| IndexError::Migration(e.to_string()))?;
     Ok(row.0)
+}
+
+/// The Turso `backfill` twin: the data step a migration runs after its DDL
+/// and before its stamp, for rows only Rust can derive.
+async fn backfill(conn: &mut PgConnection, version: i64) -> Result<()> {
+    match version {
+        18 => backfill_meta_values(conn).await,
+        _ => Ok(()),
+    }
+}
+
+/// Fill `engram_meta_value` from every engram row's stored `metadata`, every
+/// actor's rows included. `metadata::text` reads the JSONB back as JSON, so
+/// it parses with the same function the writer's rows come from.
+async fn backfill_meta_values(conn: &mut PgConnection) -> Result<()> {
+    let stored: Vec<(i64, String)> = sqlx::query_as("SELECT id, metadata::text FROM engram")
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(IndexError::from)?;
+    sqlx::raw_sql("DELETE FROM engram_meta_value")
+        .execute(&mut *conn)
+        .await
+        .map_err(IndexError::from)?;
+    for (id, text) in stored {
+        let Ok(metadata) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        super::insert_meta_values(&mut *conn, id, &metadata).await?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1388,6 +1442,101 @@ mod tests {
             .await
             .unwrap();
         crate::sync::upgrade_fixture::first_sync_after_the_upgrade_reparses(&store, &root).await;
+        store.drop_schema().await.unwrap();
+    }
+
+    /// The Turso v19 test's twin for v18, gated like the tests beside it.
+    /// JSONB refuses metadata that does not parse at insert time, so that
+    /// row has no twin here. The rows are compared in byte order
+    /// (`COLLATE "C"`), the order `meta_value_rows` sorts in.
+    #[tokio::test]
+    async fn v18_fills_engram_meta_value_from_the_stored_metadata() {
+        let Ok(url) = std::env::var("CRYSTALLINE_TEST_POSTGRES_URL") else {
+            return;
+        };
+        if url.is_empty() {
+            return;
+        }
+        let schema = format!("mig_meta_{}", std::process::id());
+        let base = serde_json::json!({
+            "sources": ["a \"q\" \\ b", "line\nbreak", "ünïcode", "a \"q\" \\ b"],
+            "numbers": [-3, i64::MAX, 1.5, 1, "1"],
+            "flags": [true, 1],
+            "verified": [{"by": "jordi", "at": "2026-01-01T00:00:00Z"}],
+            "kind": "anchor",
+        });
+        let draft = serde_json::json!({ "sources": ["draft-only"] });
+        let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}; SET search_path TO {schema}, public"
+        )))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE IF NOT EXISTS schema_migration (version BIGINT PRIMARY KEY, applied_at TEXT NOT NULL)",
+        )
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(
+            MIGRATIONS[17].version, 18,
+            "the eighteenth migration is v18"
+        );
+        for m in &MIGRATIONS[..17] {
+            sqlx::raw_sql(m.sql).execute(&mut conn).await.unwrap();
+            sqlx::query("INSERT INTO schema_migration (version, applied_at) VALUES ($1, $2)")
+                .bind(m.version)
+                .bind(chrono::Utc::now().to_rfc3339())
+                .execute(&mut conn)
+                .await
+                .unwrap();
+        }
+        let (domain,): (i64,) = sqlx::query_as(
+            "INSERT INTO domain(name, path, kind) VALUES ('d', '/tmp/d', 'file') RETURNING id",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+        let mut written = Vec::new();
+        for (permalink, actor, metadata) in [("p0", "", &base), ("p1", "alice", &draft)] {
+            let (id,): (i64,) = sqlx::query_as(
+                "INSERT INTO engram(domain_id, path, permalink, metadata, actor) \
+                 VALUES ($1, 'a.md', $2, $3::jsonb, $4) RETURNING id",
+            )
+            .bind(domain)
+            .bind(permalink)
+            .bind(metadata.to_string())
+            .bind(actor)
+            .fetch_one(&mut conn)
+            .await
+            .unwrap();
+            written.push((id, metadata.clone()));
+        }
+        drop(conn);
+
+        let store = crate::PostgresStore::open_in_schema(&url, &schema)
+            .await
+            .unwrap();
+        let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "SET search_path TO {schema}, public"
+        )))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+        for (id, metadata) in &written {
+            let rows: Vec<(String, String)> = sqlx::query_as(
+                "SELECT key, value FROM engram_meta_value WHERE engram_id=$1 \
+                 ORDER BY key COLLATE \"C\", value COLLATE \"C\"",
+            )
+            .bind(*id)
+            .fetch_all(&mut conn)
+            .await
+            .unwrap();
+            assert_eq!(rows, crate::store::meta_value_rows(metadata), "engram {id}");
+        }
+        drop(conn);
         store.drop_schema().await.unwrap();
     }
 }

@@ -726,39 +726,9 @@ impl EngramRecord {
             .filter(|p| !p.is_empty())
             .unwrap_or_else(|| slugify(path));
 
-        // Filterable metadata: every preserved unknown key, plus the optional
-        // non-promoted known fields, all as a JSON object. Promoted columns
-        // (type, status, title, permalink, the temporal window, description)
-        // and tags are stored in their own columns and join tables.
-        let mut meta = serde_json::Map::new();
-        for (k, v) in &fm.extra {
-            if let Ok(jv) = serde_json::to_value(v) {
-                meta.insert(k.clone(), jv);
-            }
-        }
-        let mut add_str = |key: &str, value: Option<String>| {
-            if let Some(v) = value {
-                meta.insert(key.to_string(), serde_json::Value::String(v));
-            }
-        };
-        add_str("source_date", date_str(fm.source_date));
-        // `last_verified` and `stale_after` carry the effective value whichever
-        // spelling recorded it, so a filter keeps working across an engram that
-        // has migrated to the OKF keys and one that has not.
-        add_str(
-            "last_verified",
-            fm.latest_verified()
-                .map(|v| v.at.date_naive().format("%Y-%m-%d").to_string()),
-        );
-        add_str("stale_after", date_str(fm.stale_on()));
-        add_str("temporal_confidence", fm.temporal_confidence.clone());
-        add_str("resource", fm.resource.clone());
-        // The verification trail itself stays filterable in its OKF shape.
-        if !fm.verified.is_empty()
-            && let Ok(jv) = serde_json::to_value(&fm.verified)
-        {
-            meta.insert("verified".to_string(), jv);
-        }
+        // Filterable metadata: every frontmatter key without a column of its
+        // own. Core builds it, so verify sees the same keys the index stores.
+        let meta = fm.index_metadata();
 
         let observations = engram
             .observations
@@ -970,6 +940,37 @@ fn parse_op(key: &str, op: &str, arg: &serde_json::Value) -> Result<FilterOp> {
             )));
         }
     })
+}
+
+/// Every `(key, value)` row an engram's `metadata` gives `engram_meta_value`:
+/// one per element of a list and one per scalar, for each top-level key.
+/// `metadata` holds exactly the frontmatter keys that are not promoted to a
+/// column ([`crystalline_core::Frontmatter::index_metadata`]). A key longer
+/// than [`crystalline_core::META_KEY_MAX_BYTES`] gives no row, and each value
+/// text comes from [`crystalline_core::meta_value_text`], so a list inside a
+/// list, an object and a long value give no row either. Sorted and without
+/// duplicates, so `[a, a]` is one row and the insert order never depends on
+/// the frontmatter's.
+pub(crate) fn meta_value_rows(metadata: &serde_json::Value) -> Vec<(String, String)> {
+    let Some(map) = metadata.as_object() else {
+        return Vec::new();
+    };
+    let mut rows = std::collections::BTreeSet::new();
+    for (key, value) in map {
+        if key.len() > crystalline_core::META_KEY_MAX_BYTES {
+            continue;
+        }
+        let elements: &[serde_json::Value] = match value {
+            serde_json::Value::Array(items) => items,
+            scalar => std::slice::from_ref(scalar),
+        };
+        for element in elements {
+            if let Some(text) = crystalline_core::meta_value_text(element) {
+                rows.insert((key.clone(), text));
+            }
+        }
+    }
+    rows.into_iter().collect()
 }
 
 /// A search request. Filter-only searches (no `text`) are allowed.
@@ -3299,5 +3300,37 @@ mod retired_tests {
     #[allow(clippy::assertions_on_constants)]
     fn default_retired_weight_is_a_soft_fade() {
         assert!(DEFAULT_RETIRED_WEIGHT > 0.0 && DEFAULT_RETIRED_WEIGHT < 1.0);
+    }
+}
+
+#[cfg(test)]
+mod meta_value_tests {
+    use super::meta_value_rows;
+    use crystalline_core::META_KEY_MAX_BYTES;
+    use serde_json::json;
+
+    #[test]
+    fn rows_are_one_per_list_element_and_one_per_scalar() {
+        let mut metadata = json!({
+            "sources": ["b", "a", "b"],
+            "n": 7,
+            "nested": [[1], {"x": 1}, 2],
+            "obj": {"x": 1},
+        });
+        metadata
+            .as_object_mut()
+            .unwrap()
+            .insert("k".repeat(META_KEY_MAX_BYTES + 1), json!("v"));
+        assert_eq!(
+            meta_value_rows(&metadata),
+            vec![
+                ("n".to_string(), "7".to_string()),
+                ("nested".to_string(), "2".to_string()),
+                ("sources".to_string(), "\"a\"".to_string()),
+                ("sources".to_string(), "\"b\"".to_string()),
+            ]
+        );
+        assert!(meta_value_rows(&json!(null)).is_empty());
+        assert!(meta_value_rows(&json!({})).is_empty());
     }
 }
