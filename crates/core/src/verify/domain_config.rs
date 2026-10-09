@@ -181,9 +181,11 @@ pub fn edit_domain_config(
     for edit in edits {
         match edit {
             ConfigEdit::SetRule { rule, word } => {
+                remove_other_spellings(&mut rules, rule);
                 rules.insert(Value::from(rule.as_str()), Value::from(word.as_str()));
             }
             ConfigEdit::UnsetRule { rule } => {
+                remove_other_spellings(&mut rules, rule);
                 rules.shift_remove(rule.as_str());
             }
             ConfigEdit::SetTokenBudget(_) | ConfigEdit::UnsetTokenBudget => {
@@ -231,6 +233,24 @@ pub fn edit_domain_config(
         text: Some(text),
         dropped_comments,
     })
+}
+
+/// Remove every key of `rules` that spells `rule` in another case, such as
+/// `e008` for `E008`: verify matches ids exactly, so such a key does nothing,
+/// and an edit of the rule replaces or removes it rather than leaving it
+/// beside the id verify reads.
+fn remove_other_spellings(rules: &mut serde_yaml_ng::Mapping, rule: &str) {
+    let others: Vec<serde_yaml_ng::Value> = rules
+        .keys()
+        .filter(|key| {
+            key.as_str()
+                .is_some_and(|key| key != rule && key.eq_ignore_ascii_case(rule))
+        })
+        .cloned()
+        .collect();
+    for key in others {
+        rules.shift_remove(&key);
+    }
 }
 
 /// Whether a YAML text holds nothing but blank lines and comments.
@@ -289,6 +309,31 @@ mod edit_tests {
         )
         .unwrap();
         assert!(!edited.changed, "removing an override that is not there");
+    }
+
+    /// An id the file spells in lower case is the same rule: an edit of it
+    /// replaces or removes that key, never leaves it beside the upper-case
+    /// one verify reads.
+    #[test]
+    fn an_edit_of_a_rule_takes_its_other_spelling_with_it() {
+        let current = "verify:\n  rules:\n    T001: warning\n    e008: off\n";
+        let edited = edit_domain_config(Some(current), &[rule("E008", "error")]).unwrap();
+        assert_eq!(
+            edited.text.as_deref(),
+            Some("verify:\n  rules:\n    T001: warning\n    E008: error\n")
+        );
+        let edited = edit_domain_config(
+            Some(current),
+            &[ConfigEdit::UnsetRule {
+                rule: "E008".to_string(),
+            }],
+        )
+        .unwrap();
+        assert!(edited.changed);
+        assert_eq!(
+            edited.text.as_deref(),
+            Some("verify:\n  rules:\n    T001: warning\n")
+        );
     }
 
     #[test]

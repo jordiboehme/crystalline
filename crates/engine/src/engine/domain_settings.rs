@@ -267,8 +267,27 @@ impl Engine {
         self.require_domain(domain, scope).await?;
         let mut policy_edits: Vec<PolicyEdit> = Vec::new();
         let mut config_edits: Vec<ConfigEdit> = Vec::new();
+        // Each key once: `rules.e007` and `rules.E007` are one key, and a key
+        // both set and unset has no single meaning.
+        let mut named = BTreeSet::new();
+        let mut once = |kind: &DomainKey, key: &str| -> Result<()> {
+            let target = match kind {
+                DomainKey::Policy => key.to_string(),
+                DomainKey::Rule(rule) => format!("rules.{rule}"),
+                DomainKey::TokenBudget => "token_budget".to_string(),
+            };
+            if named.insert(target.clone()) {
+                Ok(())
+            } else {
+                Err(EngineError::Invalid(format!(
+                    "`{target}` is named twice in this call. Name each key once."
+                )))
+            }
+        };
         for (key, value) in set {
-            match classify_domain_key(key)? {
+            let kind = classify_domain_key(key)?;
+            once(&kind, key)?;
+            match kind {
                 DomainKey::Policy => policy_edits.push(PolicyEdit::Set {
                     key: key.clone(),
                     value: value.clone(),
@@ -293,11 +312,20 @@ impl Engine {
             }
         }
         for key in unset {
-            match classify_domain_key(key)? {
+            let kind = classify_domain_key(key)?;
+            once(&kind, key)?;
+            match kind {
                 DomainKey::Policy => policy_edits.push(PolicyEdit::Unset { key: key.clone() }),
                 DomainKey::Rule(rule) => config_edits.push(ConfigEdit::UnsetRule { rule }),
                 DomainKey::TokenBudget => config_edits.push(ConfigEdit::UnsetTokenBudget),
             }
+        }
+        // Policy keys and rule overrides share one gate, asked before anything
+        // about the domain's files is read, so a caller who may not change the
+        // domain learns nothing about them. The key it names is only the one
+        // the refusal mentions.
+        if let Some(first) = set.keys().chain(unset.iter()).next() {
+            self.require_policy_writer(domain, first, scope).await?;
         }
         for edit in &policy_edits {
             checked_policy(domain, edit)?;
@@ -347,11 +375,6 @@ impl Engine {
                 .map_err(EngineError::Invalid)?;
             Some((path, edited))
         };
-        // Policy keys and rule overrides share one gate; the key it names is
-        // only the one the refusal mentions.
-        if let Some(first) = set.keys().chain(unset.iter()).next() {
-            self.require_policy_writer(domain, first, scope).await?;
-        }
 
         let written = if policy_edits.is_empty() {
             None
@@ -363,21 +386,23 @@ impl Engine {
         };
         let mut note = None;
         if let Some((path, edited)) = yaml.filter(|(_, edited)| edited.changed) {
-            // The write a rename waits for, like every engram write.
-            self.refuse_shadowed(domain)?;
-            let _writing = self.enter_write(domain).await?;
-            match &edited.text {
-                Some(text) => crystalline_core::config::save_bytes(&path, text.as_bytes())
-                    .map_err(|e| {
-                        EngineError::Internal(format!("writing {}: {e}", path.display()))
-                    })?,
-                None if path.exists() => {
-                    std::fs::remove_file(&path).map_err(|source| EngineError::Io {
-                        path: path.display().to_string(),
-                        source,
-                    })?
-                }
-                None => {}
+            if let Err(e) = self.write_domain_config(domain, &path, &edited).await {
+                // The policy keys have landed by now, so the answer says so.
+                return Err(match &written {
+                    Some(written) => {
+                        let keys: Vec<&str> = policy_edits.iter().map(PolicyEdit::key).collect();
+                        let how = if written["draft"] == Value::Bool(true) {
+                            " as a draft"
+                        } else {
+                            ""
+                        };
+                        EngineError::Internal(format!(
+                            "applied [{}]{how}; {DOMAIN_CONFIG_FILE} was not changed: {e}",
+                            keys.join(", ")
+                        ))
+                    }
+                    None => e,
+                });
             }
             if edited.dropped_comments {
                 note = Some(YAML_COMMENTS_DROPPED);
@@ -405,6 +430,36 @@ impl Engine {
             view["note"] = json!(note);
         }
         Ok(view)
+    }
+}
+
+impl Engine {
+    /// Write `edited` to the domain's `.crystalline.yaml` at `path`, or
+    /// remove the file when no key is left: the write a rename waits for,
+    /// like every engram write.
+    async fn write_domain_config(
+        &self,
+        domain: &str,
+        path: &Path,
+        edited: &crystalline_core::verify::EditedConfig,
+    ) -> Result<()> {
+        self.refuse_shadowed(domain)?;
+        let _writing = self.enter_write(domain).await?;
+        match &edited.text {
+            Some(text) => {
+                crystalline_core::config::save_bytes(path, text.as_bytes()).map_err(|e| match e {
+                    crystalline_core::config::ConfigError::Io { path, source } => {
+                        EngineError::Io { path, source }
+                    }
+                    other => EngineError::Internal(format!("writing {}: {other}", path.display())),
+                })
+            }
+            None if path.exists() => std::fs::remove_file(path).map_err(|source| EngineError::Io {
+                path: path.display().to_string(),
+                source,
+            }),
+            None => Ok(()),
+        }
     }
 }
 

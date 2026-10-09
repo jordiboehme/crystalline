@@ -3115,10 +3115,23 @@ async fn domain_policies_over_mcp_follow_the_owner_rule() {
         .await;
     refusal_is_readable(&rule, "a rule override refusal");
     assert!(rule.contains("only the owner of 'open'"), "{rule}");
+    let yaml_path = ctx.tmp.path().join("open/.crystalline.yaml");
+    assert!(!yaml_path.exists(), "the refused override wrote no file");
+    // The gate comes before the file is read, so a caller who may not change
+    // the domain learns nothing about it.
+    std::fs::write(&yaml_path, "verify: [unclosed\n").unwrap();
+    let rule = session
+        .call_tool(
+            "configure",
+            serde_json::json!({ "domain": "open", "set": { "rules.E007": "off" } }),
+        )
+        .await;
+    refusal_is_readable(&rule, "a rule override refusal over a broken file");
     assert!(
-        !ctx.tmp.path().join("open/.crystalline.yaml").exists(),
-        "the refused override wrote no file"
+        rule.contains("only the owner of 'open'") && !rule.contains("does not parse"),
+        "{rule}"
     );
+    std::fs::remove_file(&yaml_path).unwrap();
     let owned = session.call_tool("configure", set_sharing("lab")).await;
     changed_ok(&owned);
     let lab = std::fs::read_to_string(ctx.tmp.path().join("lab/MANIFEST.md")).unwrap();

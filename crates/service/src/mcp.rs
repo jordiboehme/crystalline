@@ -4838,15 +4838,6 @@ fn ok_split(value: Value) -> Result<CallToolResult, ErrorData> {
     Ok(result)
 }
 
-/// What an authenticated non-admin agent is told when it tries to change what
-/// this instance is: which domains are registered, how it is configured, and
-/// what it provisions into the harnesses on the machine it runs on.
-///
-/// The JSON API has always gated those admin-only; over MCP they were open to
-/// any account whose agent held a token, which is the last place the two
-/// surfaces disagreed. It names the role rather than the person, and it names
-/// the way out, because an agent that reads this has to be able to tell its
-/// user what to ask for.
 /// The refusal for the first of `keys` that only an instance admin may change
 /// ([`crystalline_core::PolicyRole::Admin`] in `registry`), when the caller is
 /// not one. No key needs the role today; REST refuses the same keys.
@@ -4867,6 +4858,15 @@ fn admin_policy_refusal<'a>(
         .map(|key| format!("only an instance admin may change `{key}`"))
 }
 
+/// What an authenticated non-admin agent is told when it tries to change what
+/// this instance is: which domains are registered, how it is configured, and
+/// what it provisions into the harnesses on the machine it runs on.
+///
+/// The JSON API has always gated those admin-only; over MCP they were open to
+/// any account whose agent held a token, which is the last place the two
+/// surfaces disagreed. It names the role rather than the person, and it names
+/// the way out, because an agent that reads this has to be able to tell its
+/// user what to ask for.
 const INSTANCE_ADMIN_ONLY: &str = "Changing this instance itself - the domains registered on it, its settings and what it provisions into the harnesses on its machine - is reserved for an instance admin, and the account this session is authenticated as does not hold that role. Ask an admin to make the change (they can do it in Fluid under Settings, or with the crystalline CLI on the server). Capturing, reading and refining knowledge in the domains you can already see is unaffected.";
 
 /// What `configure` answers on a read-only instance, for every call including

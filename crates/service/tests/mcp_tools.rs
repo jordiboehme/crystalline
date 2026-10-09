@@ -1375,6 +1375,10 @@ async fn configure_with_a_domain_refuses_a_bad_key_and_writes_nothing() {
             json!({ "domain": "eng", "set": { "auth.mcp": "false" } }),
             "This setting is changed only with the crystalline CLI.",
         ),
+        (
+            json!({ "domain": "eng", "unset": ["auth.mcp"] }),
+            "This setting is changed only with the crystalline CLI.",
+        ),
     ] {
         let result = call_result(peer, "configure", args.clone()).await;
         assert_eq!(result.is_error, Some(true), "{args}");
@@ -1442,6 +1446,119 @@ async fn a_configure_change_that_changes_nothing_leaves_the_files_alone() {
         "an undeclared key unset is no write"
     );
     assert!(out.get("note").is_none(), "{out}");
+}
+
+/// A key named twice in one call is refused, whatever its spelling, and
+/// nothing is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configure_refuses_a_key_named_twice() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+    let before = eng_manifest(&h);
+    for (args, said) in [
+        (
+            json!({ "domain": "eng", "set": { "rules.e007": "off", "rules.E007": "error" } }),
+            "`rules.E007` is named twice in this call",
+        ),
+        (
+            json!({ "domain": "eng", "set": { "sharing": "direct" }, "unset": ["sharing"] }),
+            "`sharing` is named twice in this call",
+        ),
+        (
+            json!({ "domain": "eng", "set": { "token_budget": "900" }, "unset": ["token_budget"] }),
+            "`token_budget` is named twice in this call",
+        ),
+    ] {
+        let result = call_result(peer, "configure", args.clone()).await;
+        assert_eq!(result.is_error, Some(true), "{args}");
+        assert!(
+            result_text(&result).contains(said),
+            "{args}: {}",
+            result_text(&result)
+        );
+    }
+    assert_eq!(eng_manifest(&h), before);
+    assert_eq!(eng_yaml(&h), None);
+}
+
+/// A rule id the file spells in lower case is the same rule: set and unset
+/// replace or remove it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configure_replaces_and_removes_a_rule_id_written_in_lower_case() {
+    let h = Harness::new(&["eng"]).await;
+    let lower = "verify:\n  rules:\n    T001: warning\n    e008: off\n";
+    std::fs::write(h.root.join("eng/.crystalline.yaml"), lower).unwrap();
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+    call(
+        peer,
+        "configure",
+        json!({ "domain": "eng", "set": { "rules.E008": "error" } }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        eng_yaml(&h).as_deref(),
+        Some("verify:\n  rules:\n    T001: warning\n    E008: error\n")
+    );
+    std::fs::write(h.root.join("eng/.crystalline.yaml"), lower).unwrap();
+    call(
+        peer,
+        "configure",
+        json!({ "domain": "eng", "unset": ["rules.e008"] }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        eng_yaml(&h).as_deref(),
+        Some("verify:\n  rules:\n    T001: warning\n")
+    );
+}
+
+/// An unset on a domain with no .crystalline.yaml creates no file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unset_with_no_crystalline_yaml_creates_no_file() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    call(
+        client.peer(),
+        "configure",
+        json!({ "domain": "eng", "unset": ["rules.E007", "token_budget"] }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(eng_yaml(&h), None);
+}
+
+/// When the .crystalline.yaml write fails after the MANIFEST write, the
+/// answer says which policy keys were applied, and they stay applied.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_crystalline_yaml_write_says_what_was_applied() {
+    let h = Harness::new(&["eng"]).await;
+    // The atomic write goes through this sibling; a directory there makes it
+    // fail after the file was read and the MANIFEST written.
+    let blocker = h
+        .root
+        .join(format!("eng/.crystalline.yaml.tmp.{}", std::process::id()));
+    std::fs::create_dir_all(&blocker).unwrap();
+    let (client, _server) = h.connect().await;
+    let err = call(
+        client.peer(),
+        "configure",
+        json!({ "domain": "eng", "set": { "sharing": "direct", "rules.E007": "off" } }),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.contains("applied [sharing]; .crystalline.yaml was not changed:"),
+        "{err}"
+    );
+    assert!(
+        eng_manifest(&h).contains("\nsharing: direct\n"),
+        "the policy stays"
+    );
+    assert_eq!(eng_yaml(&h), None);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1525,6 +1642,38 @@ async fn in_review_mode_a_policy_is_a_draft_and_a_rule_override_is_refused() {
         result_text(&refused).contains("reviews changes"),
         "{}",
         result_text(&refused)
+    );
+    assert_eq!(eng_yaml(&h), None);
+}
+
+/// A mixed call in review mode is refused whole: no draft of the policy key
+/// is written either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_review_mode_a_mixed_call_writes_no_draft() {
+    let h = Harness::build_tweaked(&["eng"], false, true, |cfg, _| {
+        cfg.domains.get_mut("eng").unwrap().review = Some(ReviewMode::Overlay);
+    })
+    .await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+    let refused = call_result(
+        peer,
+        "configure",
+        json!({ "domain": "eng", "set": { "sharing": "direct", "rules.E007": "off" } }),
+    )
+    .await;
+    assert_eq!(refused.is_error, Some(true));
+    assert!(
+        result_text(&refused).contains("reviews changes"),
+        "{}",
+        result_text(&refused)
+    );
+    let view = call(peer, "configure", json!({ "domain": "eng" }))
+        .await
+        .unwrap();
+    assert!(
+        policy(&view, "sharing")["declared"].is_null(),
+        "no draft: {view}"
     );
     assert_eq!(eng_yaml(&h), None);
 }
