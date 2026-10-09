@@ -658,8 +658,8 @@ jobs:
           if (-not (Test-Path $exe)) { throw 'crystalline.exe missing after install' }
           & $exe --version
           # The order in the MSI itself: EndDaemonTasks after
-          # InstallInitialize and ahead of RemoveExistingProducts (the old
-          # product's removal on an upgrade) and RemoveFiles (an uninstall).
+          # RemoveExistingProducts (a deferred action cannot sit before it,
+          # error 2613) and ahead of RemoveFiles, so it runs in a removal.
           $installer = New-Object -ComObject WindowsInstaller.Installer
           $db = $installer.GetType().InvokeMember('OpenDatabase', 'InvokeMethod', $null, $installer, @($msi, 0))
           $view = $db.GetType().InvokeMember('OpenView', 'InvokeMethod', $null, $db, @('SELECT `Action`, `Sequence` FROM `InstallExecuteSequence`'))
@@ -672,8 +672,8 @@ jobs:
           $view.GetType().InvokeMember('Close', 'InvokeMethod', $null, $view, $null) | Out-Null
           $end = $sequence['EndDaemonTasks']
           "InstallInitialize $($sequence['InstallInitialize']), EndDaemonTasks $end, RemoveExistingProducts $($sequence['RemoveExistingProducts']), RemoveFiles $($sequence['RemoveFiles'])"
-          if (-not ($end -gt $sequence['InstallInitialize'] -and $end -lt $sequence['RemoveExistingProducts'] -and $end -lt $sequence['RemoveFiles'])) {
-            throw 'EndDaemonTasks does not run between InstallInitialize and RemoveExistingProducts'
+          if (-not ($end -gt $sequence['RemoveExistingProducts'] -and $end -lt $sequence['RemoveFiles'])) {
+            throw 'EndDaemonTasks does not run between RemoveExistingProducts and RemoveFiles'
           }
           $sysPath = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment').Path
           if ($sysPath -notlike '*Crystalline\bin*') { throw 'install dir not on the system PATH' }
@@ -852,7 +852,8 @@ jobs:
           $upgradeLog = Join-Path $env:RUNNER_TEMP 'msi-upgrade.log'
           $code = & $install $new $upgradeLog
           if ($code -notin 0, 3010) { Show-MsiFailure $upgradeLog; throw "the upgrade failed: $code" }
-          if (-not (Select-String -Path $upgradeLog -Pattern 'ActionStart\(Name=EndDaemonTasks' -Quiet)) { throw 'the upgrade did not run EndDaemonTasks' }
+          # No EndDaemonTasks assertion: the old v0.24.1 product has no end
+          # step. From 0.24.2 on the old product's removal ends its daemons.
           $is = & $exe --version
           if ("$is" -notlike "*$built*") { throw "after the upgrade $exe is $is, not $built" }
           $t = Get-ScheduledTask -TaskPath '\Crystalline\' -TaskName 'Daemon' -ErrorAction SilentlyContinue

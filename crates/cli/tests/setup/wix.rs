@@ -13,7 +13,8 @@ const REGISTER: &str =
 // one. The old product's cached MSI decides this, so the condition shipped
 // now governs every later upgrade.
 const UNREGISTER: &str = "<Custom Action='UnregisterDaemonTask' Before='RemoveFiles'>REMOVE~=\"ALL\" AND NOT UPGRADINGPRODUCTCODE</Custom>";
-const END: &str = "<Custom Action='EndDaemonTasks' Before='RemoveExistingProducts'>Installed OR WIX_UPGRADE_DETECTED</Custom>";
+const END: &str =
+    "<Custom Action='EndDaemonTasks' Before='UnregisterDaemonTask'>REMOVE~=\"ALL\"</Custom>";
 const END_SCRIPT: &str = include_str!("../../wix/end-daemon-tasks.ps1");
 
 /// Standard base64, as PowerShell's -EncodedCommand reads it.
