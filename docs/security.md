@@ -61,7 +61,7 @@ The daemon also has a local control channel: a Unix socket (`service.sock` in th
 
 Set these with `crystalline config set <key> <value>` or their `CRYSTALLINE_*` variables. They are operator settings: the `configure` tool does not list them and refuses to change them, over stdio and over HTTP, for an admin's agent too. So no agent can turn token checks off, open the network bind or point the search index at another database. Watch `config.yaml` for changes you did not make. A read-only daemon refuses every settings change.
 
-With `auth.mcp` off, an agent may set a domain's policies and rule overrides through `configure` wherever it may edit that domain's MANIFEST.
+With `auth.mcp` off, an agent may set a domain's policies and rule overrides through `configure` wherever it may edit that domain's MANIFEST, which excludes a domain in review mode.
 
 | Setting | Effect | Default |
 |---|---|---|
