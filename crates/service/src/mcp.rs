@@ -2664,7 +2664,15 @@ impl McpServer {
             return answer;
         }
         let caller = self.caller(&ctx);
-        let value = self.read_core(p, &caller).await?;
+        let mut value = self.read_core(p, &caller).await?;
+        attach_configure_hint(
+            &mut value,
+            !hidden_collab_tool(
+                "configure",
+                self.engine.read_only(),
+                self.engine.github_enabled(),
+            ),
+        );
         let links = self.attachment_links(&value, &caller.scope).await;
         let mut result = ok(value)?;
         result.content.extend(links);
@@ -4883,6 +4891,23 @@ const CONFIGURE_READ_ONLY_REFUSAL: &str = "this instance is read-only, and a rea
 /// The one line a bare `configure` adds about the domain view.
 const CONFIGURE_DOMAIN_HINT: &str = "Call configure with domain to see and change a domain's policies, sections and rule overrides.";
 
+/// What a domain's MANIFEST carries when it is read over MCP.
+const CONFIGURE_MANIFEST_HINT: &str = "This is the domain's MANIFEST: configure with domain lists what each key and section does, and sets the policy keys and rule overrides.";
+
+/// Add the `configure` hint to a read of a domain's MANIFEST (the engram with
+/// permalink `manifest` at the domain root), while `configure` is listed.
+/// Attached by the rmcp handler alone: `read_core` also answers the remote
+/// ctl door, which gets no hint.
+fn attach_configure_hint(value: &mut Value, configure_listed: bool) {
+    if !configure_listed {
+        return;
+    }
+    let is_manifest = value["permalink"] == "manifest" && value["path"] == "MANIFEST.md";
+    if is_manifest && let Some(obj) = value.as_object_mut() {
+        obj.insert("configure".to_string(), json!(CONFIGURE_MANIFEST_HINT));
+    }
+}
+
 /// Why a call naming a domain refuses a connect.
 const CONFIGURE_DOMAIN_NO_CONNECT: &str = "connect, token, host and restart are about this instance's GitHub sign-in, not about a domain; call configure without domain to connect";
 
@@ -6581,5 +6606,18 @@ mod tests {
             INSTANCE_ADMIN_ONLY.contains("provision"),
             "the third class is the one the message forgot: {INSTANCE_ADMIN_ONLY}"
         );
+    }
+    #[test]
+    fn the_configure_hint_rides_only_a_root_manifest_while_configure_is_listed() {
+        let manifest = || json!({ "permalink": "manifest", "path": "MANIFEST.md" });
+        let mut listed = manifest();
+        attach_configure_hint(&mut listed, true);
+        assert_eq!(listed["configure"], CONFIGURE_MANIFEST_HINT);
+        let mut hidden = manifest();
+        attach_configure_hint(&mut hidden, false);
+        assert!(hidden.get("configure").is_none());
+        let mut nested = json!({ "permalink": "manifest", "path": "notes/MANIFEST.md" });
+        attach_configure_hint(&mut nested, true);
+        assert!(nested.get("configure").is_none(), "only the domain root's");
     }
 }

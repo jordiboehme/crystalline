@@ -7442,3 +7442,52 @@ async fn configure_refuses_an_operator_setting_and_applies_nothing() {
     .unwrap();
     assert_eq!(weight(&out)["value"], json!("0.25"));
 }
+
+const MANIFEST_HINT: &str = "This is the domain's MANIFEST: configure with domain lists what each key and section does, and sets the policy keys and rule overrides.";
+
+/// A MANIFEST read over MCP says where its keys are explained and changed;
+/// no other engram does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_manifest_read_points_at_configure_and_another_engram_does_not() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+    let manifest = call(
+        peer,
+        "read_engram",
+        json!({ "identifier": "manifest", "domain": "eng" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(manifest["configure"], MANIFEST_HINT, "{manifest}");
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Notes", "content": "Plain notes." }),
+    )
+    .await
+    .unwrap();
+    let other = call(
+        peer,
+        "read_engram",
+        json!({ "identifier": "notes", "domain": "eng" }),
+    )
+    .await
+    .unwrap();
+    assert!(other.get("configure").is_none(), "{other}");
+}
+
+/// configure is not listed on a read-only instance, so nothing points at it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_only_instance_has_no_configure_hint() {
+    let h = Harness::new_read_only(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let manifest = call(
+        client.peer(),
+        "read_engram",
+        json!({ "identifier": "manifest", "domain": "eng" }),
+    )
+    .await
+    .unwrap();
+    assert!(manifest.get("configure").is_none(), "{manifest}");
+}
