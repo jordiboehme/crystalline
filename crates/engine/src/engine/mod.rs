@@ -1357,6 +1357,7 @@ pub enum PreviewCredential {
 pub use crate::rename::RenameHold;
 pub use crate::rename::RenameStep;
 pub use crate::scope::OWNER_IDENTITY_NAME;
+pub use domain_settings::{DOMAIN_SETTINGS_HOW, VIRTUAL_NO_RULES};
 #[cfg(any(test, feature = "testing"))]
 pub use names::SpellingPushFault;
 
@@ -5235,6 +5236,7 @@ mod contradictions;
 pub use contradictions::run_contradiction_worker;
 mod delete;
 mod domain_add;
+mod domain_settings;
 mod domains;
 mod edit;
 mod evolve;
