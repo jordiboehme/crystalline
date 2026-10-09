@@ -3106,6 +3106,19 @@ async fn domain_policies_over_mcp_follow_the_owner_rule() {
         !open.contains("sharing:"),
         "the refusal wrote nothing: {open}"
     );
+    // A rule override passes the same gate as a policy key.
+    let rule = session
+        .call_tool(
+            "configure",
+            serde_json::json!({ "domain": "open", "set": { "rules.E007": "off" } }),
+        )
+        .await;
+    refusal_is_readable(&rule, "a rule override refusal");
+    assert!(rule.contains("only the owner of 'open'"), "{rule}");
+    assert!(
+        !ctx.tmp.path().join("open/.crystalline.yaml").exists(),
+        "the refused override wrote no file"
+    );
     let owned = session.call_tool("configure", set_sharing("lab")).await;
     changed_ok(&owned);
     let lab = std::fs::read_to_string(ctx.tmp.path().join("lab/MANIFEST.md")).unwrap();
