@@ -1225,7 +1225,13 @@ pub struct DomainConfig {
 }
 
 /// Verify overrides for a domain.
+///
+/// Read through [`RawVerifyConfig`], so one rule override whose value is not
+/// a word (`E007: 1`, `E001: false`) is kept aside in `not_words` and
+/// reported per rule, instead of failing the whole file and taking every
+/// other override with it.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(from = "RawVerifyConfig")]
 pub struct VerifyConfig {
     /// Rule id to severity overrides.
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
@@ -1239,6 +1245,56 @@ pub struct VerifyConfig {
     /// Required file entries.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_files: Vec<RequiredFile>,
+    /// The rules whose override value is not a word at all, in file order.
+    /// They take no effect and are reported as `M108`; never written back.
+    #[serde(skip)]
+    pub not_words: Vec<String>,
+}
+
+/// What `.crystalline.yaml`'s `verify` block deserializes as before it
+/// becomes a [`VerifyConfig`]: a rule value may be anything, and only a word
+/// becomes an override.
+#[derive(Deserialize)]
+struct RawVerifyConfig {
+    #[serde(default)]
+    rules: IndexMap<String, RuleValue>,
+    #[serde(default)]
+    token_budget: Option<usize>,
+    #[serde(default)]
+    token_budgets: IndexMap<String, usize>,
+    #[serde(default)]
+    required_files: Vec<RequiredFile>,
+}
+
+/// One rule override's value: a word, or anything else (a number, a boolean,
+/// a list), which is kept only as the fact that it was not a word.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RuleValue {
+    Word(String),
+    NotAWord(serde::de::IgnoredAny),
+}
+
+impl From<RawVerifyConfig> for VerifyConfig {
+    fn from(raw: RawVerifyConfig) -> VerifyConfig {
+        let mut rules = IndexMap::new();
+        let mut not_words = Vec::new();
+        for (rule, value) in raw.rules {
+            match value {
+                RuleValue::Word(word) => {
+                    rules.insert(rule, word);
+                }
+                RuleValue::NotAWord(_) => not_words.push(rule),
+            }
+        }
+        VerifyConfig {
+            rules,
+            token_budget: raw.token_budget,
+            token_budgets: raw.token_budgets,
+            required_files: raw.required_files,
+            not_words,
+        }
+    }
 }
 
 /// A required file entry within a domain's verify config.

@@ -16,6 +16,8 @@ use crystalline_service::engine::RenameStep;
 use crystalline_service::rest::{AuthStore, Role};
 use tokio::sync::Mutex;
 
+const OFF_RECORD: &str = "---\ntype: engram\ntitle: Gamma\npermalink: gamma\ntags:\n  - eng\nstatus: weird\n---\n\n# Gamma\n\nNo date.\n";
+const OVERRIDES: &str = "verify:\n  rules:\n    T001: warning\n    T002: off\n";
 const ALPHA: &str = "---\ntype: engram\ntitle: Alpha\npermalink: alpha\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# Alpha\n\nA rule about alpha.\n";
 
 /// What a write-test server varies.
@@ -2310,6 +2312,89 @@ async fn the_manifest_round_trip_holds_for_a_virtual_domain() {
     assert_eq!(saved_body["markdown"].as_str().unwrap(), edited);
 }
 
+/// A domain with no MANIFEST.md answers 200 with `missing: true`, empty
+/// markdown, the empty text's checksum and the starter document named for
+/// the domain; a PUT under that checksum creates the file. The admin gate
+/// still holds on the create.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_missing_manifest_reads_as_missing_and_a_put_creates_it() {
+    let _serialized = crate::support::maintenance_guard().await;
+    let fx = serve(Options::default()).await;
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    let path = fx._tmp.path().join("eng/MANIFEST.md");
+    std::fs::remove_file(&path).unwrap();
+
+    let read = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/eng/manifest",
+        &editor,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(read.status(), 200, "a missing MANIFEST is not a 404");
+    let body: serde_json::Value = read.json().await.unwrap();
+    assert_eq!(body["missing"], true, "{body}");
+    assert_eq!(body["markdown"], "");
+    let empty = crate::support::sha256_hex(b"");
+    assert_eq!(body["checksum"], empty.as_str());
+    let starter = body["sections"]["starter_document"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        starter.contains("domain_name: eng\n"),
+        "the seed declares the registered name, so no adoption renames anything: {starter}"
+    );
+
+    let refused = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/manifest",
+        &editor,
+    )
+    .header("if-match", format!("\"{empty}\""))
+    .json(&serde_json::json!({ "markdown": starter }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        refused.status(),
+        403,
+        "an editor still may not save the MANIFEST"
+    );
+    assert!(!path.exists());
+
+    let created = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/manifest",
+        &admin,
+    )
+    .header("if-match", format!("\"{empty}\""))
+    .json(&serde_json::json!({ "markdown": starter }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(created.status(), 200, "{}", created.text().await.unwrap());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), starter);
+
+    let again = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/eng/manifest",
+        &editor,
+    )
+    .send()
+    .await
+    .unwrap();
+    let body: serde_json::Value = again.json().await.unwrap();
+    assert_eq!(body["missing"], false, "{body}");
+    assert_eq!(body["markdown"], starter.as_str());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn validate_reports_findings_without_writing() {
     let fx = serve(Options::default()).await;
@@ -2349,6 +2434,60 @@ async fn validate_reports_findings_without_writing() {
         ALPHA,
         "a dry run writes nothing"
     );
+}
+
+/// The dry run holds a document named into a domain to that domain's
+/// overrides; one named into no registered domain runs every rule at its
+/// default.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn validate_applies_the_named_domains_rule_overrides() {
+    let fx = serve(Options::default()).await;
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+    std::fs::write(fx._tmp.path().join("eng/.crystalline.yaml"), OVERRIDES).unwrap();
+
+    let findings = |body: serde_json::Value| -> Vec<(String, String)> {
+        body["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| {
+                (
+                    f["rule"].as_str().unwrap().to_string(),
+                    f["severity"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    };
+
+    let resp = as_session(fx.addr, reqwest::Method::POST, "/api/v1/validate", &editor)
+        .json(&serde_json::json!({ "domain": "eng", "path": "gamma.md", "content": OFF_RECORD }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let found = findings(resp.json().await.unwrap());
+    assert!(
+        found.iter().any(|(r, s)| r == "T001" && s == "warning"),
+        "{found:?}"
+    );
+    assert!(
+        found.iter().all(|(r, s)| r != "T001" || s == "warning"),
+        "{found:?}"
+    );
+    assert!(found.iter().all(|(r, _)| r != "T002"), "{found:?}");
+
+    // No domain: the defaults, T001 an error and T002 reported.
+    let resp = as_session(fx.addr, reqwest::Method::POST, "/api/v1/validate", &editor)
+        .json(&serde_json::json!({ "content": OFF_RECORD }))
+        .send()
+        .await
+        .unwrap();
+    let found = findings(resp.json().await.unwrap());
+    assert!(
+        found.iter().any(|(r, s)| r == "T001" && s == "error"),
+        "{found:?}"
+    );
+    assert!(found.iter().any(|(r, _)| r == "T002"), "{found:?}");
 }
 
 /// The trusted-header mode, end to end on a write: a proxy identity is

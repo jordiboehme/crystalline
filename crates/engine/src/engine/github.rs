@@ -295,16 +295,19 @@ impl Engine {
         Ok(json!({ "connected": false, "token_store": kind }))
     }
 
-    /// Wraps a `github` block with the settings registry snapshot, the full
-    /// shape the `configure` tool always returns.
+    /// Wraps a `github` block with the settings an agent may change, the
+    /// full shape the `configure` tool always returns. MCP is the only
+    /// caller, so the operator keys are left out here
+    /// ([`settings::agent_snapshot`]); the CLI reads the full
+    /// [`settings::snapshot`] through `ConfigureAction::Show`.
     fn configure_snapshot_with(&self, github: Value) -> Result<Value> {
         let file = self.file_config.read().unwrap();
-        Ok(json!({ "settings": settings::snapshot(&file, &self.overlay), "github": github }))
+        Ok(json!({ "settings": settings::agent_snapshot(&file, &self.overlay), "github": github }))
     }
 
-    /// The `configure` tool's plain snapshot: every registry setting plus
-    /// the GitHub connection block. Used for a bare call and after applying
-    /// `set`/`unset`.
+    /// The `configure` tool's plain snapshot: every setting an agent may
+    /// change plus the GitHub connection block. Used for a bare call and
+    /// after applying `set`/`unset`.
     ///
     /// With `github.enabled` off the connection block is `{ github_enabled:
     /// false, note }` and nothing else: no `connected`, no `user`, no

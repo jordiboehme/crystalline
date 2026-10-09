@@ -683,13 +683,12 @@ pub fn cached_model_dirs(models_dir: &Path) -> Vec<(String, u64)> {
 /// directory that cannot be emptied (the `-with-model` image bakes a
 /// read-only layer) is logged and skipped, never an error: a cache this
 /// process may not tidy is not a reason to fail the start that called this.
+/// A removed model's lock folder under `.locks` goes with it.
 pub fn prune_model_cache(models_dir: &Path, keep: &[&str]) -> Result<Vec<(String, u64)>> {
     let mut removed = Vec::new();
     let mut candidates: Vec<(String, PathBuf)> = hub_dirs(models_dir)
         .into_iter()
-        .filter(|(repo, _)| {
-            LOCAL_MODELS.iter().any(|m| m.repo == repo) || crate::nli::is_nli_checkpoint(repo)
-        })
+        .filter(|(repo, _)| table_knows(repo))
         .collect();
     candidates.sort();
     for (repo, path) in candidates {
@@ -699,6 +698,12 @@ pub fn prune_model_cache(models_dir: &Path, keep: &[&str]) -> Result<Vec<(String
         let bytes = dir_size(&path);
         match std::fs::remove_dir_all(&path) {
             Ok(()) => {
+                // hf-hub's lock folder for the model goes with it, or it stays
+                // behind as a folder of empty lock files nothing uses.
+                // A lock held right now is a download in flight: its folder stays.
+                if !lock_held(&models_dir.join(LOCKS_DIR).join(hub_dir_name(&repo))) {
+                    remove_lock_dir(models_dir, &repo);
+                }
                 tracing::info!(
                     repo = %repo,
                     bytes,
@@ -743,6 +748,77 @@ fn hub_dirs(models_dir: &Path) -> Vec<(String, PathBuf)> {
         found.push((format!("{}/{}", parts[0], parts[1]), entry.path()));
     }
     found
+}
+
+/// The folder hf-hub keeps its download locks in, under the cache root:
+/// `.locks/models--<org>--<name>/<etag>.lock`, one zero-byte file per file it
+/// ever fetched. hf-hub never removes them, so a model that leaves the cache
+/// leaves its lock folder behind.
+const LOCKS_DIR: &str = ".locks";
+
+/// Whether one of the two model tables knows `repo`: the only repositories
+/// this build ever removes anything of.
+fn table_knows(repo: &str) -> bool {
+    LOCAL_MODELS.iter().any(|m| m.repo == repo) || crate::nli::is_nli_checkpoint(repo)
+}
+
+/// The lock folders whose model is not in the cache any more, as
+/// `(repo id, path)` sorted by repo id.
+///
+/// Only a repository the tables know is a candidate, as for
+/// [`prune_model_cache`]: a shared `CRYSTALLINE_MODELS_DIR` holds other tools'
+/// lock folders too. A folder holding a lock file that is locked right now is
+/// never stale: hf-hub takes the lock before it writes the model directory, so
+/// that is a download in flight.
+pub fn stale_model_lock_dirs(models_dir: &Path) -> Vec<(String, PathBuf)> {
+    let mut found: Vec<(String, PathBuf)> = hub_dirs(&models_dir.join(LOCKS_DIR))
+        .into_iter()
+        .filter(|(repo, _)| table_knows(repo))
+        .filter(|(repo, _)| !models_dir.join(hub_dir_name(repo)).is_dir())
+        .filter(|(_, path)| !lock_held(path))
+        .collect();
+    found.sort();
+    found
+}
+
+/// Removes every folder [`stale_model_lock_dirs`] lists, answering with the
+/// repo ids it removed. A folder that cannot be removed is logged and skipped.
+pub fn remove_stale_model_lock_dirs(models_dir: &Path) -> Vec<String> {
+    stale_model_lock_dirs(models_dir)
+        .into_iter()
+        .filter(|(repo, _)| remove_lock_dir(models_dir, repo))
+        .map(|(repo, _)| repo)
+        .collect()
+}
+
+/// Whether any lock file in `dir` is locked by somebody right now. A file that
+/// cannot be opened says nothing either way and counts as not held. Listing
+/// takes a momentary exclusive lock with `try_lock` on each file that is free,
+/// released again when the handle drops.
+fn lock_held(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        path.is_file()
+            && std::fs::File::open(&path)
+                .is_ok_and(|file| matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock)))
+    })
+}
+
+/// Removes the lock folder of `repo`. True when it removed one; a folder that
+/// is not there is not an error.
+fn remove_lock_dir(models_dir: &Path, repo: &str) -> bool {
+    let dir = models_dir.join(LOCKS_DIR).join(hub_dir_name(repo));
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => {
+            tracing::warn!(path = %dir.display(), "leaving a model lock folder in place: {e}");
+            false
+        }
+    }
 }
 
 /// The bytes a directory holds, following no symlink: hf-hub's snapshot files
@@ -896,6 +972,92 @@ mod tests {
         std::fs::write(dir.join("blobs/weights"), blob).unwrap();
         std::fs::write(dir.join("snapshots/abc/config.json"), b"{}").unwrap();
         dir
+    }
+
+    /// A lock folder hf-hub wrote for `repo`, holding one zero-byte lock file.
+    fn lock_dir(root: &std::path::Path, repo: &str) -> std::path::PathBuf {
+        let dir = root.join(LOCKS_DIR).join(hub_dir_name(repo));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("etag.lock"), b"").unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_lock_folder_whose_model_is_gone_is_stale_and_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let granite = "ibm-granite/granite-embedding-97m-multilingual-r2";
+        hub_dir(root, granite, &[7u8; 8]);
+        let kept = lock_dir(root, granite);
+        let stale = lock_dir(root, "BAAI/bge-small-en-v1.5");
+        // Not a repository either table knows: another tool's lock folder in a
+        // shared cache, left alone whatever its model directory says.
+        let foreign = lock_dir(root, "sentence-transformers/all-MiniLM-L6-v2");
+
+        let found: Vec<String> = stale_model_lock_dirs(root)
+            .into_iter()
+            .map(|(repo, _)| repo)
+            .collect();
+        assert_eq!(found, ["BAAI/bge-small-en-v1.5"]);
+
+        assert_eq!(
+            remove_stale_model_lock_dirs(root),
+            ["BAAI/bge-small-en-v1.5"]
+        );
+        assert!(!stale.exists());
+        assert!(kept.is_dir(), "the cached model keeps its lock folder");
+        assert!(foreign.is_dir(), "another tool's folder is never touched");
+        assert!(stale_model_lock_dirs(root).is_empty(), "idempotent");
+    }
+
+    #[test]
+    fn a_lock_folder_with_a_lock_held_is_a_download_in_flight() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let dir = lock_dir(root, "BAAI/bge-small-en-v1.5");
+        let held = std::fs::File::create(dir.join("other.lock")).unwrap();
+        held.lock().unwrap();
+        assert!(
+            stale_model_lock_dirs(root).is_empty(),
+            "a held lock means hf-hub is fetching that model right now"
+        );
+        drop(held);
+        assert_eq!(stale_model_lock_dirs(root).len(), 1);
+    }
+
+    #[test]
+    fn pruning_a_model_takes_its_lock_folder_with_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let granite = "ibm-granite/granite-embedding-97m-multilingual-r2";
+        hub_dir(root, granite, &[7u8; 8]);
+        hub_dir(root, "BAAI/bge-small-en-v1.5", &[3u8; 8]);
+        let kept = lock_dir(root, granite);
+        let pruned = lock_dir(root, "BAAI/bge-small-en-v1.5");
+
+        let removed = prune_model_cache(root, &[granite]).unwrap();
+        assert_eq!(removed.len(), 1, "{removed:?}");
+        assert!(
+            !pruned.exists(),
+            "the pruned model's lock folder went with it"
+        );
+        assert!(kept.is_dir());
+    }
+
+    #[test]
+    fn pruning_keeps_the_lock_folder_of_a_download_in_flight() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let granite = "ibm-granite/granite-embedding-97m-multilingual-r2";
+        hub_dir(root, granite, &[7u8; 8]);
+        hub_dir(root, "BAAI/bge-small-en-v1.5", &[3u8; 8]);
+        let dir = lock_dir(root, "BAAI/bge-small-en-v1.5");
+        let held = std::fs::File::create(dir.join("other.lock")).unwrap();
+        held.lock().unwrap();
+
+        prune_model_cache(root, &[granite]).unwrap();
+        assert!(dir.is_dir(), "a held lock keeps its folder");
+        drop(held);
     }
 
     #[test]

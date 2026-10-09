@@ -1288,6 +1288,50 @@ async fn manifest_save_is_guarded_verbatim_and_refreshes_routing() {
     );
 }
 
+/// A file domain whose MANIFEST.md is gone reads as missing, not as an
+/// error: empty markdown, `missing: true`, and the empty text's checksum as
+/// the token. A save carrying that token creates the file; any other token
+/// is a stale edit, and a second create with the same token is one too.
+#[tokio::test]
+async fn a_missing_file_manifest_reads_as_missing_and_its_first_save_creates_it() {
+    let (tmp, engine) = engine_fixture().await;
+    let path = tmp.path().join("eng/MANIFEST.md");
+    let original = std::fs::read_to_string(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+
+    let source = engine.manifest_source("eng").await.unwrap();
+    assert!(source.missing, "a gone MANIFEST is missing");
+    assert_eq!(source.markdown, "");
+    // The old read still answers NotFound for the callers that rely on it.
+    assert!(matches!(
+        engine.manifest_markdown("eng").await,
+        Err(crystalline_service::EngineError::NotFound(_))
+    ));
+
+    let empty = crate::support::sha256_hex(b"");
+    let stale = engine
+        .save_manifest("eng", &original, "beef")
+        .await
+        .unwrap_err();
+    assert!(stale.to_string().contains("stale edit"), "{stale}");
+    assert!(!path.exists(), "a refused save writes nothing");
+
+    engine
+        .save_manifest("eng", &original, &empty)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    let after = engine.manifest_source("eng").await.unwrap();
+    assert!(!after.missing);
+    assert_eq!(after.markdown, original);
+
+    let again = engine
+        .save_manifest("eng", &original, &empty)
+        .await
+        .unwrap_err();
+    assert!(again.to_string().contains("stale edit"), "{again}");
+}
+
 /// The collab layer's thin read: exact bytes, identity, checksum - no
 /// reference resolution. The checksum is the same CAS token a save takes.
 #[tokio::test]

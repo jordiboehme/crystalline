@@ -481,7 +481,7 @@ fn status_reports_pending_and_counts() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains(
-            "claude-code: 4 file(s) installed, 1 mcp(s) installed, 0 drifted, 0 edited, 0 orphaned, 0 missing"
+            "claude-code: 4 files installed, 1 mcp installed, 0 drifted, 0 edited, 0 orphaned, 0 missing"
         ),
         "{stdout}"
     );
@@ -560,11 +560,11 @@ fn status_text_folds_the_quiet_domains_and_all_lists_them_in_order() {
     assert!(starts[5].starts_with("Bravo: denied"), "{folded}");
     assert_eq!(
         starts[6],
-        "1 domain(s) declare no provisioning (run `crystalline provision status --all` to list them)",
+        "1 domain declares no provisioning (run `crystalline provision status --all` to list them)",
         "{folded}"
     );
     assert_eq!(
-        starts[7], "2 virtual domain(s), which never provision artifacts",
+        starts[7], "2 virtual domains, which never provision artifacts",
         "{folded}"
     );
     assert!(!folded.contains("quiet:"), "{folded}");
@@ -592,7 +592,10 @@ fn status_text_folds_the_quiet_domains_and_all_lists_them_in_order() {
         all.contains("Echo: virtual, never provisions artifacts"),
         "{all}"
     );
-    assert!(!all.contains("domain(s)"), "{all}");
+    assert!(
+        !all.contains("no provisioning (run") && !all.contains("which never provision artifacts"),
+        "with --all no summary line is left: {all}"
+    );
 
     // The awaiting list is in name order too.
     let tail: Vec<&str> = all
@@ -1298,11 +1301,14 @@ fn doctor_prints_covered_by_for_a_harness_that_shares_the_folder() {
     assert!(human.contains("  codex: "), "{human}");
 }
 
-/// The number in doctor's closing "N problem(s) remaining" line.
+/// The number in doctor's closing "N problems remaining" line.
 fn doctor_problems(human: &str) -> usize {
     human
         .lines()
-        .find_map(|l| l.strip_suffix(" problem(s) remaining"))
+        .find_map(|l| {
+            l.strip_suffix(" problems remaining")
+                .or_else(|| l.strip_suffix(" problem remaining"))
+        })
         .and_then(|n| n.trim().parse().ok())
         .unwrap_or_else(|| panic!("no problem count: {human}"))
 }
@@ -1338,7 +1344,7 @@ fn an_uninstalled_covers_skill_is_a_doctor_problem_and_deny_retires_it() {
     assert_eq!(stranded[0]["read_by"], "cursor", "{data}");
     let before = String::from_utf8_lossy(&doctor(false).stdout).into_owned();
     assert!(
-        before.contains("[problem] claude-code: 2 provisioned skill file(s) left in"),
+        before.contains("[problem] claude-code: 2 provisioned skill files left in"),
         "{before}"
     );
 

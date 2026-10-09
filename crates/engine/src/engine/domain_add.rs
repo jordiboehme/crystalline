@@ -5,7 +5,7 @@ impl Engine {
 
     /// Create or adopt a local file domain and bring it into the index, the
     /// non-GitHub half of `add_domain`. Resolves the on-disk root (an explicit
-    /// `folder`, otherwise `<domains_root>/<name>`), creates it, scaffolds a
+    /// `folder`, otherwise `<domains_root>/<name>`), decides the registration and only then creates it, scaffolds a
     /// `MANIFEST.md` when the folder does not already carry one (so a fresh
     /// folder becomes a domain and an existing one is adopted in place, its
     /// files untouched), registers it in the global config and syncs.
@@ -84,11 +84,12 @@ impl Engine {
                 origin::default_domain_folder(&domains_root, name.expect("checked above"))
             }
         };
-        std::fs::create_dir_all(&root).map_err(|e| {
-            EngineError::Internal(format!("creating domain directory {}: {e}", root.display()))
-        })?;
-        let canonical = std::fs::canonicalize(&root)
-            .map_err(|e| EngineError::Internal(format!("resolving {}: {e}", root.display())))?;
+        // Decided on the folder as it will be spelled once it exists, before
+        // anything is created: a refused add leaves no folder behind. A
+        // folder that is not there yet is its nearest existing ancestor,
+        // canonicalized, with the rest appended, so `/tmp` on macOS and
+        // Windows' verbatim prefix compare equal before and after creation.
+        let planned = crate::rename::canonical_path(&root);
 
         // Decide the domain name, whether we adopt an existing registration,
         // and how the name was arrived at. A caller-given name is always
@@ -102,7 +103,7 @@ impl Engine {
             Some(n) => match decide_registration(
                 n,
                 cfg.domains.get(n),
-                &RegistrationRequest::File { root: &canonical },
+                &RegistrationRequest::File { root: &planned },
             ) {
                 Registration::Adopt => (n.to_string(), true, NameOrigin::Explicit),
                 Registration::Register => (n.to_string(), false, NameOrigin::Explicit),
@@ -111,15 +112,15 @@ impl Engine {
             // No name: adopt an existing registration of this exact folder,
             // else the MANIFEST's own declared name (stepped if taken), else
             // a fresh unique name derived from the folder basename.
-            None => match existing_file_domain_at(&canonical, &cfg) {
+            None => match existing_file_domain_at(&planned, &cfg) {
                 Some(existing) => (existing.to_string(), true, NameOrigin::Derived),
                 None => {
                     let table = self.name_table_now().await;
-                    let manifest_name = domain_name_at(&canonical);
+                    let manifest_name = domain_name_at(&planned);
                     let choice = choose_domain_name(
                         None,
                         manifest_name.as_deref(),
-                        || unique_domain_name(&canonical, &cfg),
+                        || unique_domain_name(&planned, &cfg),
                         |candidate| {
                             cfg.domains.contains_key(candidate)
                                 || table.resolve(candidate).is_some()
@@ -132,6 +133,13 @@ impl Engine {
             },
         };
         let wanted = wanted.unwrap_or_else(|| domain_name.clone());
+
+        // Decided: only now does the folder come into being.
+        std::fs::create_dir_all(&root).map_err(|e| {
+            EngineError::Internal(format!("creating domain directory {}: {e}", root.display()))
+        })?;
+        let canonical = std::fs::canonicalize(&root)
+            .map_err(|e| EngineError::Internal(format!("resolving {}: {e}", root.display())))?;
 
         // Create-or-adopt: scaffold a MANIFEST.md only when the folder lacks one.
         let manifest = canonical.join("MANIFEST.md");
@@ -273,11 +281,21 @@ impl Engine {
         if is_new {
             let mut file_guard = self.file_config.write().unwrap();
             let mut file = self.fresh_file_config(&file_guard);
-            file.domains.insert(
-                name.to_string(),
-                DomainEntry::virtual_domain().with_name_origin(NameOrigin::Explicit),
-            );
-            self.persist_config(&file)?;
+            // Asked again of the file as it is now, under the guard: another
+            // process may have registered this name since the snapshot above
+            // was read. A file domain there is refused, not overwritten; a
+            // virtual one is the same registration and is kept as it is.
+            match decide_registration(name, file.domains.get(name), &RegistrationRequest::Virtual) {
+                Registration::Conflict(msg) => return Err(EngineError::Conflict(msg)),
+                Registration::Adopt => {}
+                Registration::Register => {
+                    file.domains.insert(
+                        name.to_string(),
+                        DomainEntry::virtual_domain().with_name_origin(NameOrigin::Explicit),
+                    );
+                    self.persist_config(&file)?;
+                }
+            }
             let effective = self.overlay.apply(&file);
             *file_guard = file;
             *self.config.write().unwrap() = effective;

@@ -145,6 +145,29 @@ describe("the destructive action", () => {
     expect(onConfirmingChange).toHaveBeenCalledWith(false);
   });
 
+  it("draws no confirm panel for a disabled action, even when a parent arms it", () => {
+    render(
+      <DestructiveAction
+        label="Unregister domain"
+        confirmLabel="Confirm unregister"
+        pending={false}
+        disabledReason="This instance is read only, so nothing here can be changed."
+        confirming
+        onConfirm={vi.fn()}
+      />,
+    );
+
+    // The door is shown shut: the trigger with its reason, and no second
+    // step behind it whoever asked for one.
+    expect(
+      screen.getByRole("button", { name: "Unregister domain" }),
+    ).toHaveAttribute("aria-expanded", "false");
+    expect(
+      screen.queryByRole("button", { name: "Confirm unregister" }),
+    ).toBeNull();
+    expect(screen.queryByRole("button", { name: "Keep" })).toBeNull();
+  });
+
   it("takes the focus back when the confirmation collapses under it", () => {
     const props = {
       label: "Unregister domain",

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Style lint: rejects em dashes and en dashes in tracked markdown, Rust,
 # JavaScript, shell and installer sources, keeping prose and CLI output in
-# the plain-hyphen house style.
+# the plain-hyphen house style. It also refuses a "(s)" plural inside a Rust
+# string literal under crates/*/src (log lines excepted).
 #
 # The Oxford comma was banned here until 2026-08-04 and is now allowed, so
 # that check is gone. Existing text was left as written rather than
@@ -55,6 +56,70 @@ for f in $files; do
         fail=1
     fi
 done
+
+# A "(s)" plural in a string a person reads: crystalline_core::text::plural
+# says "1 file" and "3 files" instead. A string inside a tracing:: macro call
+# is a log line and is left as it is. The check walks the Rust lexically, so
+# "(s)" in a comment or in code such as `Some(s)` never counts, and a log
+# call whose string sits on a later line than `tracing::` is still a log call.
+rust_src=$(git ls-files -- 'crates/*/src/*.rs' | grep -v '/target/' || true)
+if [ -n "$rust_src" ]; then
+    # shellcheck disable=SC2086
+    if ! perl - $rust_src <<'PERL'
+use strict;
+use warnings;
+
+my $hits = 0;
+for my $file (@ARGV) {
+    open my $fh, '<', $file or die "$file: $!";
+    my $src = do { local $/; <$fh> };
+    close $fh;
+    my ($pos, $boundary, $len) = (0, 0, length $src);
+    while ($pos < $len) {
+        pos($src) = $pos;
+        if ($src =~ /\G\/\/[^\n]*/gc) {
+            $pos = pos($src);
+        } elsif ($src =~ /\G\/\*/gc) {
+            my $depth = 1;
+            while ($depth > 0 && $src =~ /\G(?:.*?)(\/\*|\*\/)/gcs) {
+                $depth += $1 eq '/*' ? 1 : -1;
+            }
+            $pos = pos($src) // $len;
+        } elsif ($src =~ /\G(?<![A-Za-z0-9_])b?r(#*)"/gc) {
+            my $close = '"' . $1;
+            my $end = index($src, $close, pos($src));
+            $end = $len if $end < 0;
+            check($file, \$src, $pos, $end, $boundary);
+            $pos = $end + length $close;
+        } elsif ($src =~ /\G(?<![A-Za-z0-9_])b?"(?:\\.|[^"\\])*"/gcs) {
+            check($file, \$src, $pos, pos($src), $boundary);
+            $pos = pos($src);
+        } elsif ($src =~ /\G'(?:\\u\{[0-9a-fA-F]+\}|\\.|[^\\'])'/gc) {
+            $pos = pos($src);
+        } else {
+            my $c = substr($src, $pos, 1);
+            $boundary = $pos if $c eq ';' || $c eq '{' || $c eq '}';
+            $pos++;
+        }
+    }
+}
+exit($hits ? 1 : 0);
+
+sub check {
+    my ($file, $src, $start, $end, $boundary) = @_;
+    my $lit = substr($$src, $start, $end - $start);
+    my $at = index($lit, '(s)');
+    return if $at < 0;
+    return if substr($$src, $boundary, $start - $boundary) =~ /tracing::/;
+    my $line = 1 + (substr($$src, 0, $start + $at) =~ tr/\n//);
+    print "style-lint: \"(s)\" plural in a string (use crystalline_core::text::plural): $file:$line\n";
+    $hits++;
+}
+PERL
+    then
+        fail=1
+    fi
+fi
 
 if [ "$fail" -ne 0 ]; then
     exit 1

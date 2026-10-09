@@ -2708,7 +2708,8 @@ fn a_sync_without_a_daemon_reparses_a_virtual_domain() {
     let text = String::from_utf8_lossy(&out.get_output().stdout).to_string()
         + &String::from_utf8_lossy(&out.get_output().stderr);
     assert!(
-        text.contains("engram(s) of 'notes' after a parser change"),
+        text.contains("reparsed 1 engram of 'notes' after a parser change")
+            || text.contains("engrams of 'notes' after a parser change"),
         "the sync says what it did: {text}"
     );
 

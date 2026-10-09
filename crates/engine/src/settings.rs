@@ -102,6 +102,15 @@ pub struct SettingSpec {
     /// key, so masking is one flag rather than a hand-written `effective`
     /// per key and a matching list somewhere else.
     pub secret: bool,
+    /// Whether this is an operator setting: the instance's network, its
+    /// database or its sign-in. An operator key is changed only with the
+    /// crystalline CLI (`crystalline config set`), `config.yaml` or its
+    /// `CRYSTALLINE_*` variable. The MCP `configure` tool neither lists nor
+    /// changes it, so an agent cannot open the instance up, point the index
+    /// at another database or switch token checks off. Behaviour derived
+    /// from an operator key (the sign-in button's label, `web_url`, the
+    /// read-only banner) is not exposing it and stays as it is.
+    pub operator_only: bool,
     /// Parse and validate a string value, then write it into `config`.
     apply: fn(&mut GlobalConfig, &str) -> Result<(), SettingsError>,
     /// Reset this setting to its default, removing it from `config` (and its
@@ -161,6 +170,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::String,
             startup_effective: false,
             secret: false,
+            operator_only: false,
             apply: set_domains_root,
             clear: clear_domains_root,
             effective: domains_root_effective,
@@ -171,6 +181,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::Bool,
             startup_effective: false,
             secret: false,
+            operator_only: false,
             apply: set_enabled,
             clear: clear_enabled,
             effective: enabled_effective,
@@ -181,6 +192,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::Bool,
             startup_effective: false,
             secret: false,
+            operator_only: false,
             apply: set_stacks,
             clear: clear_stacks,
             effective: stacks_effective,
@@ -191,6 +203,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::String,
             startup_effective: false,
             secret: false,
+            operator_only: false,
             apply: set_share_identity,
             clear: clear_share_identity,
             effective: share_identity_effective,
@@ -201,6 +214,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::String,
             startup_effective: false,
             secret: false,
+            operator_only: false,
             apply: set_agent_identity,
             clear: clear_agent_identity,
             effective: agent_identity_effective,
@@ -211,6 +225,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::U64,
             startup_effective: false,
             secret: false,
+            operator_only: false,
             apply: set_poll_secs,
             clear: clear_poll_secs,
             effective: poll_secs_effective,
@@ -221,6 +236,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::String,
             startup_effective: false,
             secret: false,
+            operator_only: true,
             apply: set_api_url,
             clear: clear_api_url,
             effective: api_url_effective,
@@ -231,6 +247,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::String,
             startup_effective: false,
             secret: false,
+            operator_only: true,
             apply: set_oauth_client_id,
             clear: clear_oauth_client_id,
             effective: oauth_client_id_effective,
@@ -241,6 +258,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::Bool,
             startup_effective: true,
             secret: false,
+            operator_only: true,
             apply: set_read_only,
             clear: clear_read_only,
             effective: read_only_effective,
@@ -251,6 +269,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::String,
             startup_effective: true,
             secret: false,
+            operator_only: true,
             apply: set_http,
             clear: clear_http,
             effective: http_effective,
@@ -261,6 +280,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::Bool,
             startup_effective: true,
             secret: false,
+            operator_only: true,
             apply: set_ui,
             clear: clear_ui,
             effective: ui_effective,
@@ -271,6 +291,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::Bool,
             startup_effective: true,
             secret: false,
+            operator_only: true,
             apply: set_api,
             clear: clear_api,
             effective: api_effective,
@@ -281,6 +302,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::String,
             startup_effective: true,
             secret: false,
+            operator_only: true,
             apply: set_allowed_hosts,
             clear: clear_allowed_hosts,
             effective: allowed_hosts_effective,
@@ -291,6 +313,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::String,
             startup_effective: true,
             secret: false,
+            operator_only: true,
             apply: set_service_public_url,
             clear: clear_service_public_url,
             effective: service_public_url_effective,
@@ -301,6 +324,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::String,
             startup_effective: false,
             secret: false,
+            operator_only: false,
             apply: set_response_format,
             clear: clear_response_format,
             effective: response_format_effective,
@@ -311,6 +335,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::String,
             startup_effective: true,
             secret: false,
+            operator_only: false,
             apply: set_skills_serve,
             clear: clear_skills_serve,
             effective: skills_serve_effective,
@@ -321,6 +346,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::String,
             startup_effective: true,
             secret: false,
+            operator_only: true,
             apply: set_database_backend,
             clear: clear_database_backend,
             effective: database_backend_effective,
@@ -331,6 +357,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::String,
             startup_effective: true,
             secret: true,
+            operator_only: true,
             apply: set_database_url,
             clear: clear_database_url,
             effective: database_url_effective,
@@ -341,6 +368,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::F64,
             startup_effective: false,
             secret: false,
+            operator_only: false,
             apply: set_salience_weight,
             clear: clear_salience_weight,
             effective: salience_weight_effective,
@@ -351,6 +379,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::F64,
             startup_effective: false,
             secret: false,
+            operator_only: false,
             apply: set_retired_weight,
             clear: clear_retired_weight,
             effective: retired_weight_effective,
@@ -361,6 +390,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::Bool,
             startup_effective: false,
             secret: false,
+            operator_only: false,
             apply: set_index_files,
             clear: clear_index_files,
             effective: index_files_effective,
@@ -371,6 +401,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::Bool,
             startup_effective: false,
             secret: false,
+            operator_only: false,
             apply: set_capture_similar,
             clear: clear_capture_similar,
             effective: capture_similar_effective,
@@ -381,6 +412,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::String,
             startup_effective: false,
             secret: false,
+            operator_only: false,
             apply: set_evolve_contradictions,
             clear: clear_evolve_contradictions,
             effective: evolve_contradictions_effective,
@@ -391,6 +423,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::Bool,
             startup_effective: false,
             secret: false,
+            operator_only: false,
             apply: set_recall_enabled,
             clear: clear_recall_enabled,
             effective: recall_enabled_effective,
@@ -401,6 +434,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::U64,
             startup_effective: false,
             secret: false,
+            operator_only: false,
             apply: set_recall_limit,
             clear: clear_recall_limit,
             effective: recall_limit_effective,
@@ -411,6 +445,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::F64,
             startup_effective: false,
             secret: false,
+            operator_only: false,
             apply: set_recall_min_score,
             clear: clear_recall_min_score,
             effective: recall_min_score_effective,
@@ -421,6 +456,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::U64,
             startup_effective: false,
             secret: false,
+            operator_only: false,
             apply: set_remote_deadline_ms,
             clear: clear_remote_deadline_ms,
             effective: remote_deadline_ms_effective,
@@ -431,6 +467,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::String,
             startup_effective: false,
             secret: false,
+            operator_only: false,
             apply: set_identity_actor,
             clear: clear_identity_actor,
             effective: identity_actor_effective,
@@ -441,6 +478,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::String,
             startup_effective: true,
             secret: false,
+            operator_only: true,
             apply: set_trusted_header,
             clear: clear_trusted_header,
             effective: trusted_header_effective,
@@ -451,6 +489,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::Bool,
             startup_effective: true,
             secret: false,
+            operator_only: true,
             apply: set_anonymous,
             clear: clear_anonymous,
             effective: anonymous_effective,
@@ -461,6 +500,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::Bool,
             startup_effective: true,
             secret: false,
+            operator_only: true,
             apply: set_mcp,
             clear: clear_mcp,
             effective: mcp_effective,
@@ -471,6 +511,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::Bool,
             startup_effective: true,
             secret: false,
+            operator_only: true,
             apply: set_oauth,
             clear: clear_oauth,
             effective: oauth_effective,
@@ -481,6 +522,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::String,
             startup_effective: true,
             secret: false,
+            operator_only: true,
             apply: set_max_users,
             clear: clear_max_users,
             effective: max_users_effective,
@@ -491,6 +533,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::Bool,
             startup_effective: true,
             secret: false,
+            operator_only: true,
             apply: set_proxy_headers,
             clear: clear_proxy_headers,
             effective: proxy_headers_effective,
@@ -501,6 +544,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::String,
             startup_effective: true,
             secret: false,
+            operator_only: true,
             apply: set_oidc_issuer,
             clear: clear_oidc_issuer,
             effective: oidc_issuer_effective,
@@ -511,6 +555,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::String,
             startup_effective: true,
             secret: false,
+            operator_only: true,
             apply: set_oidc_client_id,
             clear: clear_oidc_client_id,
             effective: oidc_client_id_effective,
@@ -521,6 +566,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::String,
             startup_effective: true,
             secret: true,
+            operator_only: true,
             apply: set_oidc_client_secret,
             clear: clear_oidc_client_secret,
             effective: oidc_client_secret_effective,
@@ -531,6 +577,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::String,
             startup_effective: true,
             secret: false,
+            operator_only: true,
             apply: set_oidc_name,
             clear: clear_oidc_name,
             effective: oidc_name_effective,
@@ -541,6 +588,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::String,
             startup_effective: true,
             secret: false,
+            operator_only: true,
             apply: set_oidc_scopes,
             clear: clear_oidc_scopes,
             effective: oidc_scopes_effective,
@@ -551,6 +599,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::String,
             startup_effective: true,
             secret: false,
+            operator_only: true,
             apply: set_oidc_default_role,
             clear: clear_oidc_default_role,
             effective: oidc_default_role_effective,
@@ -561,6 +610,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::String,
             startup_effective: true,
             secret: false,
+            operator_only: true,
             apply: set_oidc_redirect_uri,
             clear: clear_oidc_redirect_uri,
             effective: oidc_redirect_uri_effective,
@@ -571,6 +621,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::String,
             startup_effective: true,
             secret: false,
+            operator_only: true,
             apply: set_login_free_attempts,
             clear: clear_login_free_attempts,
             effective: login_free_attempts_effective,
@@ -581,6 +632,7 @@ pub fn registry() -> &'static [SettingSpec] {
             kind: SettingKind::String,
             startup_effective: true,
             secret: false,
+            operator_only: true,
             apply: set_login_max_delay,
             clear: clear_login_max_delay,
             effective: login_max_delay_effective,
@@ -601,6 +653,31 @@ pub fn unset(config: &mut GlobalConfig, key: &str) -> Result<(), SettingsError> 
     let spec = find(key)?;
     (spec.clear)(config);
     Ok(())
+}
+
+/// What MCP `configure` answers for a set or an unset of an operator key
+/// ([`SettingSpec::operator_only`]). It never repeats the key's value or the
+/// current setting, and one operator key refuses the whole call before any
+/// key in it is applied.
+pub const OPERATOR_SETTING_REFUSAL: &str = "This setting is changed only with the crystalline CLI.";
+
+/// Whether `key` is an operator key. A key the registry does not know is not.
+pub fn is_operator_key(key: &str) -> bool {
+    registry().iter().any(|s| s.key == key && s.operator_only)
+}
+
+/// Whether the registry knows `key` at all.
+pub fn is_known_key(key: &str) -> bool {
+    registry().iter().any(|s| s.key == key)
+}
+
+/// [`snapshot`] without the operator keys: what an agent is shown by MCP
+/// `configure`. The CLI keeps the full [`snapshot`].
+pub fn agent_snapshot(file: &GlobalConfig, overlay: &EnvOverlay) -> Vec<SettingView> {
+    snapshot(file, overlay)
+        .into_iter()
+        .filter(|view| !is_operator_key(&view.key))
+        .collect()
 }
 
 /// An ordered snapshot for display: every registry key with its effective
@@ -689,6 +766,21 @@ fn find(key: &str) -> Result<&'static SettingSpec, SettingsError> {
 
 fn unknown_key(key: &str) -> SettingsError {
     let known: Vec<&str> = registry().iter().map(|s| s.key).collect();
+    SettingsError(format!(
+        "Unknown setting {key}. Known settings: {}",
+        known.join(", ")
+    ))
+}
+
+/// The unknown-key error an agent gets: the same sentence as
+/// [`unknown_key`], listing only the keys an agent may change, so an
+/// operator key's name does not reach the agent through a typo.
+pub fn unknown_agent_key(key: &str) -> SettingsError {
+    let known: Vec<&str> = registry()
+        .iter()
+        .filter(|s| !s.operator_only)
+        .map(|s| s.key)
+        .collect();
     SettingsError(format!(
         "Unknown setting {key}. Known settings: {}",
         known.join(", ")
@@ -2572,6 +2664,84 @@ mod tests {
                 "auth.login.max_delay",
             ]
         );
+    }
+
+    /// The operator keys are the instance's network, database and sign-in:
+    /// every `auth.*`, `database.*` and `service.*` key plus the two GitHub
+    /// keys that decide which GitHub this instance talks to and as which app.
+    /// No surface outside the CLI lists, reads back or sets one of these.
+    #[test]
+    fn the_operator_keys_are_the_network_the_database_and_sign_in() {
+        let operator: Vec<&str> = registry()
+            .iter()
+            .filter(|s| s.operator_only)
+            .map(|s| s.key)
+            .collect();
+        assert_eq!(
+            operator,
+            vec![
+                "github.api_url",
+                "github.oauth_client_id",
+                "service.read_only",
+                "service.http",
+                "service.ui",
+                "service.api",
+                "service.allowed_hosts",
+                "service.public_url",
+                "database.backend",
+                "database.url",
+                "auth.trusted_header",
+                "auth.anonymous",
+                "auth.mcp",
+                "auth.oauth",
+                "auth.max_users",
+                "auth.proxy_headers",
+                "auth.oidc.issuer",
+                "auth.oidc.client_id",
+                "auth.oidc.client_secret",
+                "auth.oidc.name",
+                "auth.oidc.scopes",
+                "auth.oidc.default_role",
+                "auth.oidc.redirect_uri",
+                "auth.login.free_attempts",
+                "auth.login.max_delay",
+            ]
+        );
+        // The rule, not only the list: a key added under one of the three
+        // blocks is an operator key without anybody remembering to say so.
+        for spec in registry() {
+            let by_rule = spec.key.starts_with("auth.")
+                || spec.key.starts_with("database.")
+                || (spec.key.starts_with("service.") && spec.key != "service.response_format")
+                || spec.key == "github.api_url"
+                || spec.key == "github.oauth_client_id";
+            assert_eq!(spec.operator_only, by_rule, "{}", spec.key);
+            assert_eq!(is_operator_key(spec.key), by_rule, "{}", spec.key);
+            assert!(is_known_key(spec.key), "{}", spec.key);
+        }
+        assert!(!is_operator_key("no.such.key"));
+        assert!(!is_known_key("no.such.key"));
+    }
+
+    /// What an agent sees: the snapshot without the operator keys, and an
+    /// unknown-key error that names only the keys an agent may change.
+    #[test]
+    fn the_agent_snapshot_and_the_agent_unknown_key_error_name_no_operator_key() {
+        let views = agent_snapshot(&GlobalConfig::default(), &EnvOverlay::default());
+        assert_eq!(views.len(), 18);
+        assert!(views.iter().all(|v| !is_operator_key(&v.key)));
+        assert!(views.iter().any(|v| v.key == "github.enabled"));
+        assert!(views.iter().any(|v| v.key == "service.response_format"));
+
+        let err = unknown_agent_key("zzz.bogus").to_string();
+        assert!(
+            err.starts_with("Unknown setting zzz.bogus. Known settings: "),
+            "{err}"
+        );
+        assert!(err.contains("github.enabled"), "{err}");
+        for spec in registry().iter().filter(|s| s.operator_only) {
+            assert!(!err.contains(spec.key), "{} leaked into {err}", spec.key);
+        }
     }
 
     #[test]

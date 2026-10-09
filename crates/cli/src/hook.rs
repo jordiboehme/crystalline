@@ -596,7 +596,7 @@ pub fn run_stop(harness: Option<&str>) {
         crystalline_remote::SourceSet::load(
             dir,
             crate::sources::local_domains_of(&loaded.effective),
-            |n| std::env::var(n).ok(),
+            crystalline_core::secret_env::process_var,
         )
     });
     let shadowed = sources.as_ref().map(|s| s.shadowed()).unwrap_or_default();

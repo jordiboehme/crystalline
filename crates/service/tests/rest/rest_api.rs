@@ -1862,6 +1862,10 @@ async fn domain_manifest_returns_the_markdown_source() {
     );
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["domain"], "eng");
+    assert_eq!(
+        body["missing"], false,
+        "a MANIFEST that is there is not missing"
+    );
     let markdown = body["markdown"].as_str().expect("markdown is a string");
     assert!(
         markdown.starts_with("---\n"),

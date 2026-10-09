@@ -2502,7 +2502,7 @@ fn provisioning_section_reports_domain_counts_pending_line_and_harness_drift_edi
     assert!(human.contains("cove: undecided"), "{human}");
     assert!(
         human.contains(
-            "claude-code: 3 file(s) installed, 0 mcp(s) installed, 1 drifted, 1 edited, 1 orphaned, 1 missing"
+            "claude-code: 3 files installed, 0 mcps installed, 1 drifted, 1 edited, 1 orphaned, 1 missing"
         ),
         "{human}"
     );

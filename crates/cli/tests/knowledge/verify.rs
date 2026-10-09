@@ -31,7 +31,7 @@ fn domain_good_passes_with_zero_issues() {
         .args(["verify", "domain-good"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("0 error(s), 0 warning(s), 0 info"));
+        .stdout(predicate::str::contains("0 errors, 0 warnings, 0 info"));
 }
 
 #[test]

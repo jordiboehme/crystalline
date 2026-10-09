@@ -1046,8 +1046,9 @@ fn check_csrf(identity: &Identity, req: &Request) -> Result<(), ApiError> {
 }
 
 /// Compare without an early exit, so the time taken does not narrow down how
-/// much of the token an attacker has guessed. Lengths are allowed to leak: both
-/// sides are fixed-width hex.
+/// much of the token an attacker has guessed. Lengths are allowed to leak: a
+/// minted token is fixed-width hex, and the length of a token the operator set
+/// is not a secret worth the cost of hiding.
 pub(super) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -1832,8 +1833,8 @@ fn authorize_setup(
     }
     Err(ApiError::forbidden(
         "this request did not come from the machine that serves this instance, \
-         so first-run setup needs the one-time setup token `crystalline serve` \
-         printed at startup",
+         so first-run setup needs the setup token: the one `crystalline serve` \
+         printed at startup, or the one set in CRYSTALLINE_SETUP_TOKEN",
     )
     .token_required())
 }

@@ -3478,7 +3478,7 @@
           "domains"
         ],
         "summary": "The domain's MANIFEST markdown as written.",
-        "description": "The source, not a reduction of it, so a client can render or edit it directly.\n\nThe response carries an `ETag` of `\"{checksum}-{version}\"`: the plain content checksum plus this binary's own version, so a shape `sections` gains across a release is never masked by a 304 answered from a browser's pre-upgrade cache. It is the same validator a later `PUT` compares an `If-Match` against, which accepts either this full tag or the bare checksum. `If-None-Match` naming the current tag answers 304 with no body, and `Cache-Control: no-cache` on both the 200 and the 304 keeps a stored copy revalidating instead of going heuristically fresh, so a save elsewhere is picked up on its next use.\n\n`sections` is what the core crate reads out of the source: the routing bullets and which of them an agent reads, the provisioning and tag alias declarations with every bullet that did not parse, and every frontmatter policy key with what it declares and what holds. `null` for `provisioning` or `tag_aliases` means the section is absent.\n\n`starters` and `starter_document` come from the core registry rather than from this document, so a client can show what a MANIFEST CAN say whether or not this one says any of it.",
+        "description": "The source, not a reduction of it, so a client can render or edit it directly.\n\nThe response carries an `ETag` of `\"{checksum}-{version}\"`: the plain content checksum plus this binary's own version, so a shape `sections` gains across a release is never masked by a 304 answered from a browser's pre-upgrade cache. It is the same validator a later `PUT` compares an `If-Match` against, which accepts either this full tag or the bare checksum. `If-None-Match` naming the current tag answers 304 with no body, and `Cache-Control: no-cache` on both the 200 and the 304 keeps a stored copy revalidating instead of going heuristically fresh, so a save elsewhere is picked up on its next use.\n\n`sections` is what the core crate reads out of the source: the routing bullets and which of them an agent reads, the provisioning and tag alias declarations with every bullet that did not parse, and every frontmatter policy key with what it declares and what holds. `null` for `provisioning` or `tag_aliases` means the section is absent.\n\n`starters` and `starter_document` come from the core registry rather than from this document, so a client can show what a MANIFEST CAN say whether or not this one says any of it.\n\nA domain with no MANIFEST yet answers 200 with `missing: true`, empty markdown and the checksum of the empty text; a `PUT` carrying that checksum creates it.",
         "operationId": "get_domain_manifest",
         "parameters": [
           {
@@ -3530,6 +3530,7 @@
                   "checksum": "3f8a1c05e2",
                   "domain": "eng",
                   "markdown": "---\ntitle: eng\n---\n\n## Scope\n\n- Everything about eng\n\n## When to Use\n\n- Route here for eng questions.\n",
+                  "missing": false,
                   "sections": {
                     "missing": [],
                     "policies": [
@@ -3619,7 +3620,7 @@
             }
           },
           "404": {
-            "description": "No such domain, or the domain carries no MANIFEST yet.",
+            "description": "No such domain.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -3635,7 +3636,7 @@
           "domains"
         ],
         "summary": "Save a domain's MANIFEST markdown, guarded by If-Match.",
-        "description": "The text lands verbatim, frontmatter included, apart from line endings, which are stored as LF, guarded the same way an engram save is: 428 with no `If-Match`, 412 when the token is stale (carrying the version the server holds now), 200 once it lands. A read-only instance answers 403 ahead of the precondition check, so it is never 428.",
+        "description": "The text lands verbatim, frontmatter included, apart from line endings, which are stored as LF, guarded the same way an engram save is: 428 with no `If-Match`, 412 when the token is stale (carrying the version the server holds now), 200 once it lands. A read-only instance answers 403 ahead of the precondition check, so it is never 428. A MANIFEST that is not there yet is created by a save whose `If-Match` is the checksum the read answered for it, the checksum of the empty text.",
         "operationId": "save_domain_manifest",
         "parameters": [
           {
@@ -3688,6 +3689,7 @@
                   "checksum": "3f8a1c05e2",
                   "domain": "eng",
                   "markdown": "---\ntitle: eng\n---\n\n## Scope\n\n- Everything about eng\n\n## When to Use\n\n- Route here for eng questions.\n",
+                  "missing": false,
                   "sections": {
                     "missing": [],
                     "policies": [
@@ -3784,7 +3786,7 @@
             }
           },
           "404": {
-            "description": "No such domain, or the domain carries no MANIFEST yet.",
+            "description": "No such domain.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -3893,6 +3895,7 @@
                   "checksum": "3f8a1c05e2",
                   "domain": "kb",
                   "markdown": "---\ntitle: kb\nsharing: direct\n---\n\n## Scope\n\n- Everything about kb\n\n## When to Use\n\n- Route here for kb questions.\n",
+                  "missing": false,
                   "sections": {
                     "missing": [],
                     "policies": [
@@ -8758,7 +8761,7 @@
           "engrams"
         ],
         "summary": "Pre-save validation: the findings a save would raise, without writing.",
-        "description": "Runs verify's format (`E`) and temporal (`T`) rule families over the document text, the same families `crystalline verify` runs for a single document. Link, manifest, schema and quality rules need a whole domain for context and are not run here.\n\n`T006` (missing write provenance) is dropped, so a fresh unsaved document is not nagged about a field the save is about to stamp.\n\nRefused like every other write on this surface - editor role, read-only answered first - even though nothing is ever written.",
+        "description": "Runs verify's format (`E`) and temporal (`T`) rule families over the document text, the same families `crystalline verify` runs for a single document. Link, manifest, schema and quality rules need a whole domain for context and are not run here.\n\n`T006` (missing write provenance) is dropped, so a fresh unsaved document is not nagged about a field the save is about to stamp. A document named into a registered domain is held to that domain's `.crystalline.yaml` rule overrides: `off` drops a rule, a severity re-ranks it.\n\nRefused like every other write on this surface - editor role, read-only answered first - even though nothing is ever written.",
         "operationId": "validate_document",
         "requestBody": {
           "content": {
@@ -9963,6 +9966,7 @@
           "domain",
           "markdown",
           "checksum",
+          "missing",
           "sections"
         ],
         "properties": {
@@ -9979,6 +9983,11 @@
           "markdown": {
             "type": "string",
             "description": "The MANIFEST markdown as written, frontmatter included."
+          },
+          "missing": {
+            "type": "boolean",
+            "description": "True when the domain has no MANIFEST yet. `markdown` is then empty,\n`checksum` is the checksum of the empty text, and a `PUT` carrying it\nas `If-Match` creates the MANIFEST.",
+            "example": false
           },
           "sections": {
             "$ref": "#/components/schemas/ManifestSections",

@@ -468,7 +468,7 @@ pnpm build
 # Where this run expects to find a browser, said out loud before it needs one.
 # A missing browser otherwise reports only that an executable is not at a path,
 # and the useful half of that story is which path was resolved and why.
-browsers=$(pnpm exec playwright install --dry-run chromium 2>/dev/null \
+browsers=$(pnpm exec playwright install --dry-run chromium webkit 2>/dev/null \
     | awk '/Install location/ { print $3; exit }')
 echo "smoke: playwright browsers at ${browsers:-an unknown location}"
 

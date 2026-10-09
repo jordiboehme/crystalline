@@ -168,14 +168,46 @@ where
 /// Run the temporal (`T`-family) rules against a single already-parsed
 /// engram, returning its issues at their default severities. Backs the
 /// `validate_engrams` tool, which loads engram content through the engine
-/// rather than scanning a Domain root, so there is no `.crystalline.yaml`
-/// override and no `--strict` promotion in play here.
+/// rather than scanning a Domain root, so no `.crystalline.yaml` override and
+/// no `--strict` promotion apply here; the engine passes the result through
+/// [`apply_overrides`] with the domain's settings.
 pub fn check_temporal(path: &Path, engram: &Engram) -> Vec<Issue> {
     let mut issues = Vec::new();
     let mut summary = Summary::default();
     let mut sink = Sink::new(&mut issues, &mut summary, None, false);
     temporal::check_engram(path, engram, &mut sink);
     issues
+}
+
+/// One finding as a domain's settings and the `--strict` switch leave it: a
+/// rule the domain's `.crystalline.yaml` sets `off` is dropped (`None`), a
+/// severity word re-ranks it, a word verify does not know leaves its default,
+/// and `--strict` then promotes a warning-default rule to an error.
+///
+/// The one place the override rule lives. `crystalline verify` reaches it
+/// through every `Sink::emit`, and the engine and the HTTP dry run through
+/// [`apply_overrides`], so the three cannot disagree about a domain's file.
+/// `issue.severity` is read as the rule's default.
+pub fn effective_issue(
+    mut issue: Issue,
+    verify: Option<&crate::config::VerifyConfig>,
+    strict: bool,
+) -> Option<Issue> {
+    issue.severity = severity::resolve(issue.rule, issue.severity, verify, strict)?;
+    Some(issue)
+}
+
+/// A raw finding list under a domain's overrides: [`effective_issue`] over
+/// each one, with no `--strict` promotion (that switch is
+/// `crystalline verify`'s alone).
+pub fn apply_overrides(
+    issues: Vec<Issue>,
+    verify: Option<&crate::config::VerifyConfig>,
+) -> Vec<Issue> {
+    issues
+        .into_iter()
+        .filter_map(|issue| effective_issue(issue, verify, false))
+        .collect()
 }
 
 /// Run the single-document rule families - format (`E`) and temporal (`T`) -
@@ -187,7 +219,8 @@ pub fn check_temporal(path: &Path, engram: &Engram) -> Vec<Issue> {
 /// below for the same reason - see that filter for why.
 ///
 /// Like [`check_temporal`]: no `.crystalline.yaml` override and no `--strict`
-/// promotion apply - findings come out at their default severities.
+/// promotion apply here; a caller with a domain's settings passes the result
+/// through [`apply_overrides`].
 pub fn check_document(domain: &str, rel_path: &Path, source: &str) -> Vec<Issue> {
     let file = scanner::scanned_file_from_source(rel_path, source);
     let mut issues = Vec::new();
@@ -304,24 +337,23 @@ impl<'a> Sink<'a> {
         message: impl Into<String>,
         fix: Option<String>,
     ) {
-        let Some(severity) =
-            severity::resolve(rule, default_severity, self.verify_cfg, self.strict)
-        else {
+        let raw = Issue {
+            path: forward_slashes(path),
+            line,
+            rule,
+            severity: default_severity,
+            message: message.into(),
+            fix,
+        };
+        let Some(issue) = effective_issue(raw, self.verify_cfg, self.strict) else {
             return;
         };
-        match severity {
+        match issue.severity {
             Severity::Error => self.summary.errors += 1,
             Severity::Warning => self.summary.warnings += 1,
             Severity::Info => self.summary.infos += 1,
         }
-        self.issues.push(Issue {
-            path: forward_slashes(path),
-            line,
-            rule,
-            severity,
-            message: message.into(),
-            fix,
-        });
+        self.issues.push(issue);
     }
 }
 

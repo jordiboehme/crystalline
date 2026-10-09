@@ -81,6 +81,9 @@ pub fn isolate(cmd: &mut Command, home: &Path) {
     }
     // A child logs by the filter the test gives it, never by the runner's.
     cmd.env_remove("RUST_LOG");
+    // A models cache named in the developer's shell would win over the
+    // scratch cache above, and `doctor --fix` removes lock folders there.
+    cmd.env_remove("CRYSTALLINE_MODELS_DIR");
 }
 
 /// The name in [`isolation_env`] that governs where a child isolated by
@@ -145,6 +148,9 @@ pub fn crystalline() -> Command {
     for (name, value) in isolation_env(default_home()) {
         cmd.env(name, value);
     }
+    // A models cache named in the developer's shell would win over the
+    // scratch cache above, and `doctor --fix` removes lock folders there.
+    cmd.env_remove("CRYSTALLINE_MODELS_DIR");
     cmd
 }
 
@@ -154,5 +160,8 @@ pub fn crystalline_std() -> std::process::Command {
     for (name, value) in isolation_env(default_home()) {
         cmd.env(name, value);
     }
+    // A models cache named in the developer's shell would win over the
+    // scratch cache above, and `doctor --fix` removes lock folders there.
+    cmd.env_remove("CRYSTALLINE_MODELS_DIR");
     cmd
 }

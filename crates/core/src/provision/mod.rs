@@ -1609,7 +1609,8 @@ fn render_counts(counts: &BTreeMap<String, usize>) -> String {
 /// The summary line for a session that reconciled `changes` file artifacts.
 fn reconcile_summary_notice(changes: usize) -> String {
     format!(
-        "[crystalline] Refreshed {changes} provisioned artifact(s) from your opted-in domains for this session."
+        "[crystalline] Refreshed {} from your opted-in domains for this session.",
+        crate::text::plural(changes, "provisioned artifact", "provisioned artifacts")
     )
 }
 

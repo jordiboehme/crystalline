@@ -1915,65 +1915,6 @@ impl Engine {
         Ok(plan)
     }
 
-    /// Previews which proposal a withdrawal would take out, without touching
-    /// the forge at all.
-    ///
-    /// A pure local read: the offline status path ([`ops::status`] with no
-    /// probe) reports this domain's open and declined proposals off origin
-    /// state, and [`origin::withdraw_plan_json`] resolves the target out of
-    /// that exactly as [`ops::withdraw`] would, refusing with the same
-    /// teaching errors when no single target can be named. Nothing is written
-    /// and no provider call is made, which is what lets an eliciting client
-    /// ask its user before a pull request is closed.
-    ///
-    /// It still carries the withdrawal's own gates, all of them and in the
-    /// same order - collaboration off, read-only, an unregistered domain, and
-    /// a provider this instance cannot build - rather than only the read's, so
-    /// a user is never asked to confirm a withdrawal this instance would
-    /// refuse to perform. The provider is resolved and dropped: an instance
-    /// with no credential on file has to fail in round one, where the failure
-    /// is still the answer to the call, rather than after the user has said
-    /// yes to a question.
-    ///
-    /// The provider it resolves and drops is the withdrawal's own, `actor`
-    /// included, so an instance that shares personally refuses here - before
-    /// the question - when the acting identity has no connection of its own.
-    pub async fn origin_withdraw_preview(
-        &self,
-        domain: &str,
-        proposal: Option<u64>,
-        revert: bool,
-        actor: ShareActor,
-    ) -> Result<Value> {
-        let stacks_allowed = {
-            let config = self.config.read().unwrap();
-            if !config.github_enabled() {
-                return Err(RemoteError::NotEnabled.into());
-            }
-            config.github_stacks()
-        };
-        if self.read_only {
-            return Err(EngineError::ReadOnly);
-        }
-        let lock = self.origin_lock_registered(domain)?;
-        let _guard = lock.lock().await;
-        let (spec, root, state_dir) = self.origin_spec_for_domain(domain)?;
-        // The withdrawal's own identity gate, in round one: on a reviewing
-        // domain a revert puts one actor's overlay back, and nobody in
-        // particular has none to put back.
-        self.overlay_share_identity(domain, &actor)?;
-        let (_provider, _login) = self.resolve_share_provider(&actor)?;
-        // Probe-free, so no forge call of any kind: the settlement permission
-        // is withheld for the same reason the provider was dropped.
-        let report = ops::status(&spec, &root, &state_dir, None, false).await?;
-        Ok(origin::withdraw_plan_json(
-            &report,
-            proposal,
-            revert,
-            stacks_allowed,
-        )?)
-    }
-
     /// Withdraws a share proposal for one domain: closes its pull request on
     /// the forge, retires its branch (deleted unless an open pull request is
     /// based on it or comes from it, then kept and named in `kept_branches`),

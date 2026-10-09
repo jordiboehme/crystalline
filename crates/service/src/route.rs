@@ -280,7 +280,11 @@ pub fn install_sources(engine: &Engine) {
     let Ok(dir) = crystalline_remote::remote_dir() else {
         return;
     };
-    let set = SourceSet::load(dir, engine.local_domains(), |name| std::env::var(name).ok());
+    let set = SourceSet::load(
+        dir,
+        engine.local_domains(),
+        crystalline_core::secret_env::process_var,
+    );
     engine.set_sources(Arc::new(set));
 }
 

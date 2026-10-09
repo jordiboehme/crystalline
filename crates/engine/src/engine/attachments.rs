@@ -676,10 +676,9 @@ impl Engine {
     /// from the database, which is where its whole engram actually is.
     ///
     /// That is one file read per engram in the domain, on a cross-domain move
-    /// that carries attachments and on the confirmation preview of a delete
-    /// whose engram references one ([`Engine::sole_referent_attachments`]). It
-    /// is the price of counting claims at all, both verbs are rare, and an
-    /// engram that references no attachment pays none of it.
+    /// that carries attachments. It is the price of counting claims at all,
+    /// the move is rare, and an engram that references no attachment pays none
+    /// of it.
     ///
     /// `None` when the text is genuinely absent (a row the index still lists
     /// for a file that is gone): text that is not there references nothing. A
@@ -1445,9 +1444,10 @@ impl Engine {
             .unwrap_or(0);
         if left < crystalline_index::MIN_CONTENT_LINES {
             return Err(EngineError::Invalid(format!(
-                "that selection would leave '{permalink}' with {left} content line(s), under the \
+                "that selection would leave '{permalink}' with {}, under the \
                  {} verify rule Q001 requires; move less, or retire the whole engram instead of \
                  splitting it",
+                crystalline_core::text::plural(left, "content line", "content lines"),
                 crystalline_index::MIN_CONTENT_LINES
             )));
         }

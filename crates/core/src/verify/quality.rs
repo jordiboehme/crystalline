@@ -50,7 +50,8 @@ fn check_content(file: &ScannedFile, lines: &[BodyLine], sink: &mut Sink) {
             "Q001",
             Severity::Error,
             format!(
-                "no meaningful content beyond frontmatter ({meaningful} non-blank line(s), need at least {MIN_CONTENT_LINES})"
+                "no meaningful content beyond frontmatter ({}, need at least {MIN_CONTENT_LINES})",
+                crate::text::plural(meaningful, "non-blank line", "non-blank lines")
             ),
             None,
         );

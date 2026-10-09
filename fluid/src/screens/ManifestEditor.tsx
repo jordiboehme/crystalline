@@ -216,8 +216,16 @@ function EditorSurface({
    * The section the domain page asked for, if the reader arrived by pressing
    * one of its Add buttons rather than by opening the editor.
    */
-  const seedSection = (useLocation().state as { seedSection?: string } | null)
+  const requestedSeed = (useLocation().state as { seedSection?: string } | null)
     ?.seedSection;
+  /**
+   * A MANIFEST that is not there yet opens on the whole starter document even
+   * when nothing asked for it - the domain page's Edit link leads here too -
+   * because an empty buffer is a document that cannot be saved. The seed is
+   * the server's, named for the domain as registered.
+   */
+  const seedSection =
+    requestedSeed ?? (manifest.missing ? WHOLE_MANIFEST : undefined);
   /**
    * Applied once, and only once the buffer exists: the view arrives through
    * `onReady` after this component first renders, which is why the effect

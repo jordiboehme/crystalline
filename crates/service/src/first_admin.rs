@@ -15,7 +15,9 @@
 //! messages name the variable, the path and the name, never the value.
 
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+use crystalline_core::secret_env::secret_source;
 
 use crate::rest::{AuthStore, RefusalKind, StoreRefusal};
 
@@ -55,105 +57,48 @@ pub(crate) enum Seeded {
     Ignored,
 }
 
-/// One value's source: the variable set and whether it names a file.
-struct Source {
-    var: &'static str,
-    is_file: bool,
-}
-
-/// Which of a variable and its `_FILE` form is set. An empty value counts as
-/// unset, the overlay's rule for every `CRYSTALLINE_*` variable.
-fn source(
-    var: &impl Fn(&str) -> Option<String>,
-    plain: &'static str,
-    file: &'static str,
-) -> Result<Option<(Source, String)>, String> {
-    let get = |k: &str| var(k).filter(|v| !v.is_empty());
-    match (get(plain), get(file)) {
-        (Some(_), Some(_)) => Err(format!("{plain} and {file} are both set; keep one")),
-        (Some(v), None) => Ok(Some((
-            Source {
-                var: plain,
-                is_file: false,
-            },
-            v,
-        ))),
-        (None, Some(v)) => Ok(Some((
-            Source {
-                var: file,
-                is_file: true,
-            },
-            v,
-        ))),
-        (None, None) => Ok(None),
-    }
-}
-
-/// The value of one source: the plain value as is, or the file's content minus
-/// exactly one trailing line break. Nothing else is trimmed.
-fn resolve(
-    src: &Source,
-    value: String,
-    read: &impl Fn(&Path) -> io::Result<String>,
-) -> Result<String, String> {
-    if !src.is_file {
-        return Ok(value);
-    }
-    let path = PathBuf::from(&value);
-    let mut text = read(&path).map_err(|e| {
-        format!(
-            "{} names {}, which cannot be read ({e})",
-            src.var,
-            path.display()
-        )
-    })?;
-    if text.ends_with("\r\n") {
-        text.truncate(text.len() - 2);
-    } else if text.ends_with('\n') {
-        text.truncate(text.len() - 1);
-    }
-    Ok(text)
-}
-
 /// Read the admin from the environment. `Ok(None)` when none of the four
 /// variables is set.
 pub(crate) fn from_env(
     var: impl Fn(&str) -> Option<String>,
     read: impl Fn(&Path) -> io::Result<String>,
 ) -> Result<Option<AdminSeed>, String> {
-    let name = source(&var, NAME, NAME_FILE)?;
-    let password = source(&var, PASSWORD, PASSWORD_FILE)?;
+    let name = secret_source(NAME, &var)?;
+    let password = secret_source(PASSWORD, &var)?;
     let (name, password) = match (name, password) {
         (None, None) => return Ok(None),
-        (Some((n, _)), None) => {
+        (Some(n), None) => {
             return Err(format!(
                 "{} is set but no admin password is: set {PASSWORD} or {PASSWORD_FILE} as well",
-                n.var
+                n.var()
             ));
         }
-        (None, Some((p, _))) => {
+        (None, Some(p)) => {
             return Err(format!(
                 "{} is set but no admin name is: set {NAME} or {NAME_FILE} as well",
-                p.var
+                p.var()
             ));
         }
         (Some(n), Some(p)) => (n, p),
     };
-    let (name_src, name_value) = name;
-    let (password_src, password_value) = password;
-    let name_text = resolve(&name_src, name_value, &read)?;
-    let password_text = resolve(&password_src, password_value, &read)?;
+    let name_var = if name.from_file() { NAME_FILE } else { NAME };
+    let password_var = if password.from_file() {
+        PASSWORD_FILE
+    } else {
+        PASSWORD
+    };
+    let name_text = name.resolve(&read)?;
+    let password_text = password.resolve(&read)?;
     if password_text.is_empty() {
         return Err(format!(
-            "the admin password from {} is empty; pick one with at least one character",
-            password_src.var
+            "the admin password from {password_var} is empty; pick one with at least one character"
         ));
     }
     Ok(Some(AdminSeed {
         name: name_text,
         password: password_text,
-        name_var: name_src.var,
-        password_var: password_src.var,
+        name_var,
+        password_var,
     }))
 }
 
@@ -264,6 +209,7 @@ pub(crate) async fn seed_from_environment(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::path::PathBuf;
 
     fn vars(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
         let map: HashMap<String, String> = pairs
@@ -533,5 +479,14 @@ mod tests {
         );
         assert!(err.len() > "the admin name from CRYSTALLINE_ADMIN_NAME cannot be used: ".len());
         assert_eq!(store.user_count().await.unwrap(), 0);
+    }
+
+    #[test]
+    fn the_file_forms_follow_the_shared_suffix() {
+        assert_eq!(crystalline_core::secret_env::file_var(NAME), NAME_FILE);
+        assert_eq!(
+            crystalline_core::secret_env::file_var(PASSWORD),
+            PASSWORD_FILE
+        );
     }
 }

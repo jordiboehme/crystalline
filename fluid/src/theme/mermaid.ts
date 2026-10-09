@@ -101,6 +101,13 @@ const VARIABLES = {
  * ELK's own chunk on the diagram path. Both are named rather than inherited
  * so what an engram drew yesterday is what it draws today; adopting either
  * new default is a decision to take deliberately, with the engrams in view.
+ *
+ * `htmlLabels` is off at the root (mermaid 12 reads the root key; the
+ * per-diagram ones are deprecated) because an HTML label sits in a
+ * foreignObject whose size mermaid measures before Safari applies its page
+ * zoom: under zoom the text overflows the node it belongs to. SVG text scales
+ * with its node. `wrappingWidth` is wide because SVG labels wrap at it, and a
+ * long identifier broken across two lines is no longer the identifier.
  */
 export function mermaidConfig(dark: boolean): MermaidConfig {
   return {
@@ -110,6 +117,8 @@ export function mermaidConfig(dark: boolean): MermaidConfig {
     theme: "base",
     look: "classic",
     layout: "dagre",
+    htmlLabels: false,
+    flowchart: { wrappingWidth: 2000 },
     themeVariables: dark ? { ...VARIABLES.dark } : { ...VARIABLES.light },
   };
 }

@@ -84,3 +84,33 @@ fn disconnecting_a_stored_credential_works_beside_an_environment_token() {
         "{stdout}"
     );
 }
+
+/// With both forms of the remote token set, `disconnect` surfaces the refusal
+/// that names both variables, like every other command, instead of saying no
+/// such server is connected.
+#[test]
+fn disconnect_surfaces_the_refusal_when_both_token_forms_are_set() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let config = work.path().join("config.yaml");
+
+    let mut cmd = bin();
+    isolate(&mut cmd, &home);
+    let out = cmd
+        .env("CRYSTALLINE_CONFIG", &config)
+        .env("CRYSTALLINE_REMOTE_TOKEN", "cmt_a")
+        .env("CRYSTALLINE_REMOTE_TOKEN_FILE", work.path().join("tok"))
+        .args(["disconnect", "https://kb.example.com"])
+        .output()
+        .unwrap();
+
+    assert!(!out.status.success());
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("CRYSTALLINE_REMOTE_TOKEN")
+            && stderr.contains("CRYSTALLINE_REMOTE_TOKEN_FILE")
+            && stderr.contains("both set"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("no connected server"), "{stderr}");
+}

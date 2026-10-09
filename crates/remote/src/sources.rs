@@ -45,6 +45,9 @@ pub const LOCAL_SUFFIX: &str = "local";
 /// [`REMOTE_TOKEN_ENV`].
 pub const REMOTE_URL_ENV: &str = "CRYSTALLINE_REMOTE_URL";
 /// The environment's personal MCP token for [`REMOTE_URL_ENV`].
+/// Its file form `CRYSTALLINE_REMOTE_TOKEN_FILE` is resolved by
+/// `crystalline_core::secret_env::process_var`, which every caller hands in
+/// as the environment.
 pub const REMOTE_TOKEN_ENV: &str = "CRYSTALLINE_REMOTE_TOKEN";
 /// The domains the environment's source takes, by their names on its
 /// server, comma separated. Unset or empty: every domain it offers.
@@ -908,5 +911,10 @@ mod tests {
             env_source(env, &[]).is_none(),
             "never all instead of a list it could not read"
         );
+    }
+
+    #[test]
+    fn the_remote_token_is_a_file_backed_variable() {
+        assert!(crystalline_core::secret_env::FILE_BACKED.contains(&REMOTE_TOKEN_ENV));
     }
 }

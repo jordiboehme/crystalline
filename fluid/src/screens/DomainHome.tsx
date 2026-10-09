@@ -1232,6 +1232,7 @@ function ManifestPanel({
   const empty =
     isMissing(error) ||
     manifest === undefined ||
+    manifest.missing ||
     manifest.markdown.trim() === "";
   // A read that 404ed carries no sections and so no starters either: the
   // registry travels with the manifest payload, and there is no payload. That

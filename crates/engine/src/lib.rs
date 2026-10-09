@@ -25,6 +25,11 @@ pub mod poller;
 mod rename;
 #[cfg(any(test, feature = "testing"))]
 pub use rename::RenameHold;
+/// A path spelled the one way both sides of a comparison spell it: canonical
+/// where it exists, its nearest existing ancestor canonical plus the rest
+/// where it does not. The rename journal and the daemon's config mismatch
+/// check both use it.
+pub use rename::canonical_text as canonical_path_text;
 pub use rename::{
     MachineOwner, PendingRename, RenameOwner, RenameStep, discard_pending_rename,
     machine_rename_owner, pending_rename,

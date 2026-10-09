@@ -5,6 +5,7 @@
 use std::time::{Duration, Instant};
 
 use crystalline_core::config::GlobalConfig;
+use crystalline_core::text::plural;
 use crystalline_remote::{
     Connection, HiddenReason, LocalDomain, MountTable, ONE_DOMAIN_LIMIT, OriginIdentity,
     ROUTING_FILE, RemoteFailure, Revocation, SourceRecord, SourceSet, read_cached, remote_dir,
@@ -36,8 +37,14 @@ pub fn local_domains_of(cfg: &GlobalConfig) -> Vec<LocalDomain> {
 /// The warning `connect` prints when the local copy a server replaces holds
 /// work the team has not seen (decision D19).
 pub fn unshared_warning(local: &str, source: &str, changes: usize) -> String {
+    let (them, they_stay) = if changes == 1 {
+        ("it", "it stays")
+    } else {
+        ("them", "they stay")
+    };
     format!(
-        "warning: your local copy of '{local}' holds {changes} change(s) you have not shared; share them first: they stay hidden while you are connected to {source}"
+        "warning: your local copy of '{local}' holds {} you have not shared; share {them} first: {they_stay} hidden while you are connected to {source}",
+        plural(changes, "change", "changes")
     )
 }
 
@@ -227,7 +234,12 @@ pub async fn connect_server(
     let source = &connected.source;
     // The local copies this server hides, by their own names: the
     // announcement names the mount, which may be called differently.
-    let table = SourceSet::load(dir.clone(), local.clone(), |n| std::env::var(n).ok()).table();
+    let table = SourceSet::load(
+        dir.clone(),
+        local.clone(),
+        crystalline_core::secret_env::process_var,
+    )
+    .table();
     let warnings = match crystalline_core::config::origins_state_dir() {
         Ok(origins) => unshared_warnings(&table, &loaded.effective, &origins, &source.name),
         Err(_) => Vec::new(),
@@ -412,12 +424,16 @@ pub fn open_in_browser(url: &str) {
 
 /// `crystalline disconnect <name|url>`.
 pub async fn disconnect_server(target: String, json: bool) -> anyhow::Result<()> {
+    // The overlay load first, like every other command: a refused environment
+    // (both forms of a secret set) surfaces here instead of reading as unset
+    // below.
+    crate::cmd::load(None)?;
     let dir = remote_dir()?;
     let Some(gone) = crystalline_remote::disconnect(&dir, &target).await? else {
         let taken = crystalline_remote::load_sources(&dir)
             .map(|f| f.names())
             .unwrap_or_default();
-        let env = crystalline_remote::env_source(|n| std::env::var(n).ok(), &taken);
+        let env = crystalline_remote::env_source(crystalline_core::secret_env::process_var, &taken);
         if env.is_some_and(|e| e.url == target || e.name == target) {
             anyhow::bail!(
                 "this source comes from CRYSTALLINE_REMOTE_URL and CRYSTALLINE_REMOTE_TOKEN; unset them to remove it"
@@ -461,16 +477,18 @@ pub async fn rename_mounted(
             // A mounted name gets the configuration's own words, not the
             // engine's rename refusal further on; any other name goes on to
             // the ordinary rename, which a running daemon may still answer.
-            let set = SourceSet::load(dir, Vec::new(), |n| std::env::var(n).ok());
+            let set = SourceSet::load(dir, Vec::new(), crystalline_core::secret_env::process_var);
             set.table().mount(domain)?;
             return Some(Err(e.context(format!(
                 "'{domain}' comes from a connected server, and its name on this machine cannot change while this machine's configuration does not load"
             ))));
         }
     };
-    let set = SourceSet::load(dir, local_domains_of(&loaded.effective), |n| {
-        std::env::var(n).ok()
-    });
+    let set = SourceSet::load(
+        dir,
+        local_domains_of(&loaded.effective),
+        crystalline_core::secret_env::process_var,
+    );
     let mount = set.table().mount(domain).cloned()?;
     if !local {
         return Some(Err(anyhow::anyhow!(
@@ -747,9 +765,11 @@ pub async fn source_rows(cfg: &GlobalConfig) -> Vec<SourceRow> {
     let Ok(dir) = remote_dir() else {
         return Vec::new();
     };
-    let set = SourceSet::load(dir.clone(), local_domains_of(cfg), |n| {
-        std::env::var(n).ok()
-    });
+    let set = SourceSet::load(
+        dir.clone(),
+        local_domains_of(cfg),
+        crystalline_core::secret_env::process_var,
+    );
     let records = set.records();
     if records.is_empty() {
         return Vec::new();
@@ -915,7 +935,7 @@ mod tests {
     fn the_unshared_warning_says_what_to_do_and_why() {
         assert_eq!(
             unshared_warning("platform", "acme", 3),
-            "warning: your local copy of 'platform' holds 3 change(s) you have not shared; share them first: they stay hidden while you are connected to acme"
+            "warning: your local copy of 'platform' holds 3 changes you have not shared; share them first: they stay hidden while you are connected to acme"
         );
     }
 

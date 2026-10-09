@@ -137,6 +137,9 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                     .ok()
                     .map(|dir| dir.display().to_string())
             );
+            // The config file it loaded, spelled the way a client spells its
+            // own, so `status` and `doctor` can compare the two.
+            data["config_path"] = json!(crate::instance::holder_config_path());
             (envelope_ok(data), false)
         }
         "sessions" => (
@@ -1076,6 +1079,7 @@ mod tests {
         assert_eq!(reply["data"]["mcp_line_options"], true);
         assert!(reply["data"].get("runs_in").is_some());
         assert!(reply["data"].get("state_dir").is_some());
+        assert!(reply["data"].get("config_path").is_some(), "{reply}");
     }
 
     /// The CLI's `domain add eng` beside a running daemon writes the config

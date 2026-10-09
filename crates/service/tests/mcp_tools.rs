@@ -24,6 +24,9 @@ use tokio::sync::Mutex;
 use std::ffi::OsString;
 use std::path::Path;
 
+const OFF_RECORD: &str = "---\ntype: engram\ntitle: Gamma\npermalink: gamma\ntags:\n  - eng\nstatus: weird\n---\n\n# Gamma\n\nNo date.\n";
+const OVERRIDES: &str = "verify:\n  rules:\n    T001: warning\n    T002: off\n";
+
 struct Harness {
     _tmp: tempfile::TempDir,
     engine: Arc<Engine>,
@@ -1542,6 +1545,39 @@ async fn write_read_overwrite_and_domain_errors() {
     .unwrap_err();
     assert!(err.contains("not registered"), "{err}");
     assert!(err.contains("eng"), "{err}");
+}
+
+/// The MCP tool honours `.crystalline.yaml` overrides like `crystalline
+/// verify`: T002 off, T001 ranked a warning.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn validate_engrams_honours_the_domains_rule_overrides() {
+    let h = Harness::new(&["eng"]).await;
+    std::fs::write(h.root.join("eng/gamma.md"), OFF_RECORD).unwrap();
+    std::fs::write(h.root.join("eng/.crystalline.yaml"), OVERRIDES).unwrap();
+    h.engine.sync(None).await.unwrap();
+    let (client, _server) = h.connect().await;
+
+    let out = call(
+        client.peer(),
+        "validate_engrams",
+        json!({ "domain": "eng" }),
+    )
+    .await
+    .unwrap();
+    let issues = out["issues"].as_array().unwrap();
+    assert!(
+        issues
+            .iter()
+            .any(|i| i["kind"] == "T001" && i["severity"] == "warning"),
+        "{out}"
+    );
+    assert!(
+        issues
+            .iter()
+            .all(|i| i["kind"] != "T001" || i["severity"] == "warning"),
+        "{out}"
+    );
+    assert!(issues.iter().all(|i| i["kind"] != "T002"), "{out}");
 }
 
 /// Issue 91 end to end: an agent rewrites a MANIFEST's routing section with
@@ -6700,4 +6736,109 @@ async fn a_crlf_engram_reads_as_lf_over_mcp_and_its_checksum_guards_an_edit() {
     let on_disk = std::fs::read_to_string(&path).unwrap();
     assert!(!on_disk.contains('\r'), "{on_disk:?}");
     assert!(on_disk.contains("Edited over MCP."), "{on_disk:?}");
+}
+
+/// The settings page an agent sees names no operator key: not in a `key`
+/// field, not in a doc line, not in the unknown-key error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configure_lists_no_operator_setting() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    let operator: Vec<&str> = crystalline_service::settings::registry()
+        .iter()
+        .filter(|s| s.operator_only)
+        .map(|s| s.key)
+        .collect();
+    assert_eq!(operator.len(), 25);
+
+    let out = call(peer, "configure", json!({})).await.unwrap();
+    let keys: Vec<&str> = out["settings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["key"].as_str().unwrap())
+        .collect();
+    assert_eq!(keys.len(), 18, "{keys:?}");
+    assert!(keys.contains(&"github.enabled") && keys.contains(&"search.salience_weight"));
+    assert!(
+        keys.contains(&"service.response_format"),
+        "the one service key an agent keeps: {keys:?}"
+    );
+    let text = out.to_string();
+    for key in &operator {
+        assert!(!keys.contains(key), "{key} is listed");
+        assert!(
+            !text.contains(key),
+            "{key} is named somewhere in the page: {text}"
+        );
+    }
+
+    let unknown = call(peer, "configure", json!({ "set": { "zzz.bogus": "x" } }))
+        .await
+        .unwrap_err();
+    assert!(unknown.contains("github.enabled"), "{unknown}");
+    for key in &operator {
+        assert!(!unknown.contains(key), "{key} leaked into {unknown}");
+    }
+}
+
+/// A set or an unset of an operator key is refused with one sentence that
+/// carries no value, and a call that mixes an operator key with an ordinary
+/// one applies nothing at all. An ordinary key alone still sets.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configure_refuses_an_operator_setting_and_applies_nothing() {
+    let h = Harness::new(&["eng"]).await;
+    let config_path = h.root.join("config.yaml");
+    let before = std::fs::read_to_string(&config_path).unwrap();
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    for args in [
+        json!({ "set": { "service.http": "0.0.0.0:7411" } }),
+        json!({ "unset": ["auth.mcp"] }),
+        json!({ "set": { "search.salience_weight": "0.25", "auth.oidc.client_secret": "mk-secret-4c1d" } }),
+        json!({ "set": { "database.url": "postgres://mk-user-4c1d@mk-host-4c1d/db" }, "unset": ["recall.limit"] }),
+        json!({ "set": { "github.api_url": "https://mk-ghes-4c1d.invalid/api/v3" }, "connect": "github" }),
+    ] {
+        let result = call_result(peer, "configure", args.clone()).await;
+        assert_eq!(result.is_error, Some(true), "{args}");
+        let text = result_text(&result);
+        assert_eq!(
+            text, "This setting is changed only with the crystalline CLI.",
+            "{args}"
+        );
+        assert!(!text.contains("mk-") && !text.contains("0.25") && !text.contains("0.0.0.0"));
+    }
+    assert_eq!(
+        std::fs::read_to_string(&config_path).unwrap(),
+        before,
+        "nothing was written"
+    );
+
+    let weight = |out: &Value| {
+        out["settings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["key"] == "search.salience_weight")
+            .unwrap()
+            .clone()
+    };
+    let out = call(peer, "configure", json!({})).await.unwrap();
+    assert_eq!(
+        weight(&out)["source"],
+        json!("default"),
+        "the ordinary key in the mixed call did not land"
+    );
+
+    let out = call(
+        peer,
+        "configure",
+        json!({ "set": { "search.salience_weight": "0.25" } }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(weight(&out)["value"], json!("0.25"));
 }

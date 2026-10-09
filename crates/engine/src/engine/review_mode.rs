@@ -483,12 +483,21 @@ impl Engine {
             && !unshared.paths.is_empty()
         {
             return Err(EngineError::Conflict(format!(
-                "domain '{domain}' has {} unshared change(s) in its folder that the team has not \
+                "domain '{domain}' has {} in its folder that the team has not \
                  reviewed: {}. Review mode is the promise that every change is reviewed before it \
-                 lands, and this work went round it, so share or revert these first, then enable \
+                 lands, and this work went round it, so share or revert {} first, then enable \
                  review",
-                unshared.paths.len(),
-                unshared.paths.join(", ")
+                crystalline_core::text::plural(
+                    unshared.paths.len(),
+                    "unshared change",
+                    "unshared changes"
+                ),
+                unshared.paths.join(", "),
+                if unshared.paths.len() == 1 {
+                    "it"
+                } else {
+                    "these"
+                }
             )));
         }
         if previewing {

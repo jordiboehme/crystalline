@@ -32,7 +32,7 @@ const EMBEDDED_URL = process.env.FLUID_E2E_BASE_URL;
 
 export default defineConfig({
   testDir: "./e2e",
-  // One browser, one worker: the suite shares one daemon holding one fixture
+  // Two browsers, one worker: the suite shares one daemon holding one fixture
   // domain, and nothing in it is a throughput test.
   workers: 1,
   fullyParallel: false,
@@ -47,7 +47,21 @@ export default defineConfig({
     baseURL: EMBEDDED_URL ?? BASE_URL,
     trace: "retain-on-failure",
   },
-  projects: [{ name: "chromium", use: { ...devices["Desktop Chrome"] } }],
+  // Chromium runs every journey. WebKit runs the one question only it can
+  // answer - mermaid labels under Safari's page zoom - and nothing else, so
+  // the suite does not double its run time for answers chromium already gives.
+  projects: [
+    {
+      name: "chromium",
+      use: { ...devices["Desktop Chrome"] },
+      testIgnore: /mermaid-zoom\.spec\.ts/,
+    },
+    {
+      name: "webkit",
+      use: { ...devices["Desktop Safari"] },
+      testMatch: /mermaid-zoom\.spec\.ts/,
+    },
+  ],
   // No preview server for the run against the embedded UI. Spread rather
   // than `webServer: undefined`, which exactOptionalPropertyTypes refuses.
   ...(EMBEDDED_URL === undefined && {

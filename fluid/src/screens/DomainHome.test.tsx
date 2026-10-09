@@ -1040,11 +1040,39 @@ describe("the domain screen", () => {
   });
 
   it("offers an admin the editor over a manifest that is not there yet", async () => {
+    const empty =
+      "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    const missing = {
+      domain: "eng",
+      markdown: "",
+      checksum: empty,
+      missing: true,
+      sections: sectionsResponse({
+        scope: [],
+        when_to_use: [],
+        routing: "none",
+        missing: ["Scope", "When to Use"],
+        policies: [],
+      }),
+    };
+    /** The markdown one request carried, as the app serialized it. */
+    const sentMarkdown = (init?: RequestInit): string =>
+      (
+        JSON.parse(typeof init?.body === "string" ? init.body : "{}") as {
+          markdown?: string;
+        }
+      ).markdown ?? "";
+    const put = vi.fn((_path: string, init?: RequestInit) => ({
+      ...missing,
+      markdown: sentMarkdown(init),
+      checksum: "m1",
+      missing: false,
+    }));
     serve(
       {
-        "/domains/eng/manifest": () => {
-          throw new ApiProblem(404, "not found", "no MANIFEST in domain 'eng'");
-        },
+        "/domains/eng/manifest": (path, init) =>
+          init?.method === "PUT" ? put(path, init) : missing,
+        "/validate": () => ({ findings: [], errors: 0 }),
       },
       "admin",
     );
@@ -1058,6 +1086,26 @@ describe("the domain screen", () => {
     expect(
       within(section).getByRole("link", { name: "Edit MANIFEST" }),
     ).toHaveAttribute("href", "/d/eng/manifest/edit");
+
+    // And the way through: the seed, then a save that creates the file under
+    // the checksum the read handed out for nothing.
+    await userEvent.click(
+      within(section).getByRole("button", { name: "Create a MANIFEST" }),
+    );
+    const editor = await screen.findByLabelText("MANIFEST source");
+    await waitFor(() => {
+      expect(editor.textContent).toContain("## When to Use");
+    });
+    await userEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => {
+      expect(put).toHaveBeenCalled();
+    });
+    const init = put.mock.calls[0]?.[1];
+    expect((init?.headers as Record<string, string>)["If-Match"]).toBe(
+      `"${empty}"`,
+    );
+    expect(sentMarkdown(init)).toMatch(/^---\n/);
+    expect(await screen.findByText("Saved")).toBeInTheDocument();
   });
 
   it("opens a folder into its own list", async () => {

@@ -1617,7 +1617,10 @@ pub struct ValidateResponse {
                    manifest, schema and quality rules need a whole domain for \
                    context and are not run here.\n\n`T006` (missing write \
                    provenance) is dropped, so a fresh unsaved document is not \
-                   nagged about a field the save is about to stamp.\n\nRefused \
+                   nagged about a field the save is about to stamp. A document \
+                   named into a registered domain is held to that domain's \
+                   `.crystalline.yaml` rule overrides: `off` drops a rule, a \
+                   severity re-ranks it.\n\nRefused \
                    like every other write on this surface - editor role, \
                    read-only answered first - even though nothing is ever \
                    written.",
@@ -1679,8 +1682,17 @@ pub async fn validate(
     }
     let domain = body.domain.as_deref().unwrap_or("draft");
     let rel = body.path.as_deref().unwrap_or("draft.md");
-    let issues =
-        crystalline_core::verify::check_document(domain, std::path::Path::new(rel), &body.content);
+    // The named domain's own overrides, the same ones `crystalline verify`
+    // and `validate_engrams` apply. A domain nobody registered, or one this
+    // caller may not see, has none, and the rules run at their defaults.
+    let overrides = state
+        .engine
+        .verify_overrides(domain, &identity.scope())
+        .await;
+    let issues = crystalline_core::verify::apply_overrides(
+        crystalline_core::verify::check_document(domain, std::path::Path::new(rel), &body.content),
+        overrides.as_ref(),
+    );
     let findings = findings_of(issues);
     let errors = findings.iter().filter(|f| f.severity == "error").count();
     Ok(Json(ValidateResponse { findings, errors }))

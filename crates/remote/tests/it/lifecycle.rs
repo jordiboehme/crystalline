@@ -6689,6 +6689,79 @@ async fn an_interrupted_repair_resumes_on_the_next_withdraw() {
     );
 }
 
+/// A withdrawal whose repair fails after the status flip leaves the record in
+/// the chain as Withdrawn with the repair pending, and its own queue call is
+/// never reached. The repair the next operation finishes settles that record
+/// to history, and it is what queues the branch, once: the share branch is
+/// deleted on the forge whichever path settled it.
+#[tokio::test]
+async fn a_repair_finished_later_still_retires_the_withdrawn_branch_once() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+
+    // The middle layer's withdrawal dies at the retarget of the layer above
+    // it: the pull request is closed, the stack dissolved, the record flipped.
+    mock.fail_update_proposal(layers[2].number);
+    withdraw(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        &sub.state_dir,
+        Some(layers[1].number),
+        false,
+        true,
+    )
+    .await
+    .expect_err("the retarget fails");
+    let state = load_state(&sub.state_dir);
+    assert!(state.repair_pending, "the repair is left pending");
+    let middle = state
+        .proposals
+        .iter()
+        .find(|p| p.number == layers[1].number)
+        .expect("the withdrawn layer is still in the chain");
+    assert_eq!(middle.status, ProposalStatus::Withdrawn);
+    assert!(
+        state.retire_queue.is_empty(),
+        "the withdrawal never reached its own queue call: {:?}",
+        state.retire_queue
+    );
+
+    // The next withdrawal finishes the repair first, then takes out the top.
+    mock.heal_update_proposal(layers[2].number);
+    stacked_withdraw(&mock, &sub, Some(layers[2].number), false).await;
+
+    let deletes = |branch: &str| {
+        mock.calls()
+            .iter()
+            .filter(|c| **c == format!("delete_branch:{branch}"))
+            .count()
+    };
+    assert_eq!(
+        deletes(&layers[1].branch),
+        1,
+        "the middle layer's branch is deleted, once: {:?}",
+        mock.calls()
+    );
+    assert_eq!(deletes(&layers[2].branch), 1, "{:?}", mock.calls());
+    let state = load_state(&sub.state_dir);
+    assert!(!state.repair_pending);
+    assert!(
+        state.retire_queue.is_empty(),
+        "nothing is left queued: {:?}",
+        state.retire_queue
+    );
+    assert!(
+        state
+            .history
+            .iter()
+            .any(|p| p.number == layers[1].number && p.status == ProposalStatus::Withdrawn),
+        "{:?}",
+        state.history
+    );
+}
+
 /// The other write arm of a revert - the one that restores from a layer below
 /// rather than from the trunk - is protected the same way.
 ///

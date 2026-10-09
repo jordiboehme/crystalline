@@ -311,6 +311,62 @@ fn a_domain_can_be_registered_private() {
     );
 }
 
+/// `--private` on a domain that was already registered is refused before
+/// anything is printed: plain, today's message on stderr and nothing on
+/// stdout; with `--json`, one error object on stdout. Non-zero either way,
+/// and the domain stays shared.
+#[test]
+fn private_on_an_adopted_domain_is_refused_before_any_output() {
+    let fx = Fixture::new();
+    let folder = fx.home.path().join("kb");
+    let add = |json: bool| {
+        let mut cmd = bin();
+        isolate(&mut cmd, fx.home.path());
+        if json {
+            cmd.arg("--json");
+        }
+        cmd.args(["domain", "add", "eng"])
+            .arg(&folder)
+            .args(["--no-sync", "--private", "--owner", "ada", "--config"])
+            .arg(&fx.config);
+        cmd.output().unwrap()
+    };
+
+    let plain = add(false);
+    assert!(!plain.status.success());
+    assert!(
+        plain.stdout.is_empty(),
+        "no success output first: {}",
+        String::from_utf8_lossy(&plain.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&plain.stderr);
+    assert!(
+        stderr.contains(
+            "domain 'eng' was already registered, so --private changed nothing; close an existing domain with: crystalline domain visibility eng private --owner ada"
+        ),
+        "{stderr}"
+    );
+
+    let json = add(true);
+    assert!(!json.status.success());
+    let value: serde_json::Value =
+        serde_json::from_slice(&json.stdout).expect("stdout is exactly one JSON document");
+    assert_eq!(value["ok"], false, "{value}");
+    assert!(
+        value["error"]
+            .as_str()
+            .unwrap()
+            .contains("--private changed nothing"),
+        "{value}"
+    );
+
+    let listed = fx.domain(&["members", "eng", "list"]);
+    assert!(
+        !listed.contains("private, owned by"),
+        "still shared: {listed}"
+    );
+}
+
 /// `--json` on the listing stays one parseable document, and says the same
 /// things the table does.
 #[test]

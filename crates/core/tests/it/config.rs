@@ -417,3 +417,13 @@ fn the_state_and_config_folders_ignore_a_local_cache_appdata() {
         "Windows keeps both in one roaming folder"
     );
 }
+
+#[test]
+fn a_rule_override_that_is_not_a_word_is_kept_aside_and_the_rest_load() {
+    let cfg: crystalline_core::config::DomainConfig =
+        serde_yaml_ng::from_str("verify:\n  rules:\n    E007: 1\n    T004: error\n").unwrap();
+    let verify = cfg.verify.unwrap();
+    assert_eq!(verify.rules.get("T004").map(String::as_str), Some("error"));
+    assert!(!verify.rules.contains_key("E007"));
+    assert_eq!(verify.not_words, vec!["E007".to_string()]);
+}

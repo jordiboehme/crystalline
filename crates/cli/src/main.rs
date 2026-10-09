@@ -12,6 +12,7 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 
 use crystalline_core::HarnessKind;
 use crystalline_core::config;
+use crystalline_core::text::plural;
 use crystalline_core::verify::{self, VerifyOptions};
 
 mod cmd;
@@ -980,12 +981,17 @@ enum UsersCommand {
         role: RoleArg,
         /// Read the password from stdin instead of prompting, for scripts and
         /// container provisioning. A single trailing newline is stripped.
-        #[arg(long, conflicts_with = "mcp_token")]
+        #[arg(long, conflicts_with_all = ["mcp_token", "password_file"])]
         password_stdin: bool,
+        /// Read the password from this file instead of prompting, for a
+        /// Docker secret or a provisioning script. One trailing line break
+        /// is dropped.
+        #[arg(long, value_name = "PATH", conflicts_with_all = ["mcp_token", "password_stdin"])]
+        password_file: Option<PathBuf>,
         /// Create the account with no password and issue one personal MCP
         /// token with this label, in one step: an account for an agent. The
         /// token is printed once.
-        #[arg(long, value_name = "LABEL", conflicts_with = "password_stdin")]
+        #[arg(long, value_name = "LABEL", conflicts_with_all = ["password_stdin", "password_file"])]
         mcp_token: Option<String>,
     },
     /// List every account with its role and whether it is disabled.
@@ -2228,7 +2234,20 @@ async fn status_dispatch(
         && let Some(data) =
             crystalline_service::ctl_if_running(json!({ "v": 1, "cmd": "status" })).await?
     {
-        let config_error = cmd::load(config.as_deref()).err().map(|e| e.to_string());
+        let loaded = cmd::load(config.as_deref());
+        let config_error = loaded.as_ref().err().map(|e| e.to_string());
+        // What this shell would have started against what the daemon says
+        // it serves: one line per difference a variable set here explains.
+        let mismatches = match (crystalline_service::instance::ask_holder().await, &loaded) {
+            (Some(facts), Ok(loaded)) => crystalline_service::shaping::config_mismatches(
+                &facts,
+                &crystalline_service::shaping::ClientView::of(
+                    loaded,
+                    crystalline_service::shaping::shaping_set_here(),
+                ),
+            ),
+            _ => Vec::new(),
+        };
         sources::with_daemon_failures(&mut source_rows, &data["sources"]);
         if json {
             let mut data = data;
@@ -2243,6 +2262,10 @@ async fn status_dispatch(
                     "desktop_states".to_string(),
                     serde_json::to_value(desktop_state::scan_here())?,
                 );
+                map.insert(
+                    "config_mismatch".to_string(),
+                    serde_json::to_value(&mismatches)?,
+                );
             }
             println!("{data}");
         } else {
@@ -2250,6 +2273,9 @@ async fn status_dispatch(
                 eprintln!(
                     "note: the daemon answered, but this machine's configuration did not load: {err}"
                 );
+            }
+            for mismatch in &mismatches {
+                eprintln!("note: {}", mismatch.line());
             }
             let note = format!(
                 "running (pid {}, v{}, up {})",
@@ -2573,13 +2599,13 @@ async fn reindex_dispatch(
                 .map(|name| format!("\n  crystalline domain export <dir> --domain {name}"))
                 .collect();
             anyhow::bail!(
-                "refusing to wipe: this configuration names {} virtual domain(s) whose engrams live only in the index, so a wipe would delete them for good: {}. Nothing has been opened or changed.\n\n\
+                "refusing to wipe: this configuration names {} whose engrams live only in the index, so a wipe would delete them for good: {}. Nothing has been opened or changed.\n\n\
                  If the index still opens, copy them out first, then wipe:{}\n  crystalline reindex --wipe\n\n\
                  If a rebuild was all you wanted, nothing here needs wiping: crystalline reindex --full\n\n\
                  If it does not open any more - the case --wipe exists for - then this file is the only copy those engrams have, and every command that could read them needs it to open:\n  {}\n\
                  Copy it (and any -wal file beside it) somewhere outside the state directory first. Then either repair that copy with a SQLite tool and put it back, or give the engrams up: delete the domain's entry from this file by hand\n  {}\n\
                  and run crystalline reindex --wipe again. Deleting the entry is the step that loses the domain's content for good; the wipe then sets the unreadable database aside under a timestamped name, never deleting it, and rebuilds your file domains from the files on disk.",
-                virtual_domains.len(),
+                plural(virtual_domains.len(), "virtual domain", "virtual domains"),
                 virtual_domains.join(", "),
                 exports,
                 db_path,
@@ -2797,7 +2823,7 @@ async fn run_origin(command: OriginCommand, db: Option<PathBuf>, json: bool) -> 
             config,
         } => {
             // Detail is asked for whatever `--files` says, because the always
-            // printed ahead line names the change kinds: "2 local change(s)"
+            // printed ahead line names the change kinds: "2 local changes"
             // reads as two things you added, and both can be deletions. The
             // flag decides whether the paths themselves are listed under it.
             let data = crystalline_service::origin_status(
@@ -2912,11 +2938,11 @@ async fn run_origin(command: OriginCommand, db: Option<PathBuf>, json: bool) -> 
                     let refused = paths.len() - targets.len();
                     let question = if refused > 0 {
                         format!(
-                            "Discard {} file(s)? ({refused} refused above, named anyway) [y/N] ",
-                            targets.len()
+                            "Discard {}? ({refused} refused above, named anyway) [y/N] ",
+                            plural(targets.len(), "file", "files")
                         )
                     } else {
-                        format!("Discard {} file(s)? [y/N] ", targets.len())
+                        format!("Discard {}? [y/N] ", plural(targets.len(), "file", "files"))
                     };
                     print!("{question}");
                     std::io::stdout().flush()?;
@@ -3006,8 +3032,12 @@ fn print_origin_update(data: &serde_json::Value, json: bool) {
         let name = d["domain"].as_str().unwrap_or("");
         if d["bootstrapped"].as_bool().unwrap_or(false) {
             println!(
-                "{name}: bootstrapped {} engram(s) at {}",
-                d["engrams"].as_u64().unwrap_or(0),
+                "{name}: bootstrapped {} at {}",
+                plural(
+                    d["engrams"].as_u64().unwrap_or(0) as usize,
+                    "engram",
+                    "engrams"
+                ),
                 d["base_commit"].as_str().unwrap_or("")
             );
             continue;
@@ -3018,7 +3048,10 @@ fn print_origin_update(data: &serde_json::Value, json: bool) {
         }
         let applied = d["applied"].as_array().map(Vec::len).unwrap_or(0);
         let merged = d["merged"].as_array().map(Vec::len).unwrap_or(0);
-        println!("{name}: {applied} file(s) applied ({merged} merged)");
+        println!(
+            "{name}: {} applied ({merged} merged)",
+            plural(applied, "file", "files")
+        );
         for c in d["conflicts"].as_array().unwrap_or(&empty) {
             println!(
                 "  conflict: {} (resolve with: crystalline origin resolve {name} {} --keep mine|theirs)",
@@ -3082,7 +3115,7 @@ fn shared_by(proposal: &serde_json::Value) -> String {
 /// how much unshared work the domain holds and, unless it is all additions,
 /// what kind of work it is.
 ///
-/// A bare "ahead: 2 local change(s)" reads as two things you wrote, and both
+/// A bare "ahead: 2 local changes" reads as two things you wrote, and both
 /// can be deletions - somebody can share believing they publish two notes
 /// while proposing to remove two files from the team's repository. So the
 /// kinds are named whenever the set is not purely additions, whether or not
@@ -3103,10 +3136,11 @@ fn ahead_line(d: &serde_json::Value) -> String {
         })
         .collect();
     let only_additions = kinds.len() == 1 && kinds[0].ends_with(" added");
+    let changes = plural(total as usize, "local change", "local changes");
     if total == 0 || kinds.is_empty() || only_additions {
-        return format!("  ahead: {total} local change(s)");
+        return format!("  ahead: {changes}");
     }
-    format!("  ahead: {total} local change(s) ({})", kinds.join(", "))
+    format!("  ahead: {changes} ({})", kinds.join(", "))
 }
 
 /// The one line a direct domain adds under its `repo@branch` line, and
@@ -3252,7 +3286,12 @@ fn unshared_file_lines(d: &serde_json::Value) -> Vec<String> {
     let indexes = detail["generated_indexes"].as_u64().unwrap_or(0);
     if indexes > 0 {
         lines.push(format!(
-            "    plus {indexes} generated folder listing(s) riding along"
+            "    plus {} riding along",
+            plural(
+                indexes as usize,
+                "generated folder listing",
+                "generated folder listings"
+            )
         ));
     }
     lines.insert(0, "  unshared files:".to_string());
@@ -3823,6 +3862,53 @@ where
     }
 }
 
+/// `--private` on a domain that was already registered: an existing domain
+/// is not this command's to close, and making a shared domain private is its
+/// own verb. Called before anything is printed. With `--json` the refusal is
+/// the one object on stdout, `{"ok": false, "error": ...}` (the shape of the
+/// daemon's ctl replies), and the process exits 1; without it the message is
+/// returned as the command's error.
+fn refuse_private_on_adopted(name: &str, owner: &str, json: bool) -> anyhow::Error {
+    let message = private_on_adopted_message(name, owner);
+    if json {
+        println!("{}", serde_json::json!({ "ok": false, "error": message }));
+        std::process::exit(1);
+    }
+    anyhow::anyhow!(message)
+}
+
+/// `--private` on a domain `domain add --origin` adopted: whether the name
+/// was taken is only known once the engine has chosen it, which is after the
+/// connect ran, so the domain IS connected by now and the refusal must not
+/// read as if nothing happened. The connect report comes first: printed as
+/// usual without `--json`, then the refusal as the command's error; with
+/// `--json` the one object on stdout is `{"ok": false, "error": ...,
+/// "connected": <the report>}` and the process exits 1.
+fn refuse_private_after_connect(
+    repo: &str,
+    name: &str,
+    owner: &str,
+    data: &serde_json::Value,
+    json: bool,
+) -> anyhow::Error {
+    let message = private_on_adopted_message(name, owner);
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({ "ok": false, "error": message, "connected": data })
+        );
+        std::process::exit(1);
+    }
+    cmd::print_origin_add(repo, data, false);
+    anyhow::anyhow!(message)
+}
+
+fn private_on_adopted_message(name: &str, owner: &str) -> String {
+    format!(
+        "domain '{name}' was already registered, so --private changed nothing; close an existing domain with: crystalline domain visibility {name} private --owner {owner}"
+    )
+}
+
 fn run_domain(command: DomainCommand, db: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
     match command {
         DomainCommand::Init { path, name } => cmd::domain_init(&path, name.as_deref(), json),
@@ -3865,17 +3951,14 @@ fn run_domain(command: DomainCommand, db: Option<PathBuf>, json: bool) -> anyhow
                 db,
                 no_sync,
                 json,
+                closing.as_deref(),
             )
             .await?;
             if let Some(owner) = closing {
-                // An adopted registration is somebody's existing domain, not a
-                // new one this command may close: making a shared domain
-                // private is its own decision, with its own verb.
-                if adopted {
-                    anyhow::bail!(
-                        "domain '{chosen_name}' was already registered, so --private changed nothing; close an existing domain with: crystalline domain visibility {chosen_name} private --owner {owner}"
-                    );
-                }
+                // The dispatch refused `--private` on an adopted registration
+                // before it printed anything; a domain that reaches this
+                // point is new.
+                debug_assert!(!adopted);
                 // The name is re-resolved against the config the registration
                 // just wrote rather than trusted as typed, which is what the
                 // REST path does by reading the engine's own report: a name
@@ -4252,6 +4335,9 @@ async fn mcp_dispatch(
 /// registered is what this function returns, not necessarily `name` as
 /// given. `--virtual` always needs a name, since there is no folder to
 /// derive one from.
+///
+/// `private_owner` is `--private`'s owner: an adopted registration is refused
+/// with it before anything is printed.
 #[allow(clippy::too_many_arguments)]
 async fn domain_add_dispatch(
     name: Option<String>,
@@ -4263,6 +4349,7 @@ async fn domain_add_dispatch(
     db: Option<PathBuf>,
     no_sync: bool,
     json: bool,
+    private_owner: Option<&str>,
 ) -> anyhow::Result<(String, bool)> {
     if let Some(origin_spec) = origin {
         return domain_add_origin_dispatch(
@@ -4275,6 +4362,7 @@ async fn domain_add_dispatch(
             config,
             db,
             json,
+            private_owner,
         )
         .await;
     }
@@ -4294,6 +4382,11 @@ async fn domain_add_dispatch(
             )
         })?;
         let (markdown, adopted) = cmd::domain_add_register_virtual(&name, config.as_deref())?;
+        if let Some(owner) = private_owner
+            && adopted
+        {
+            return Err(refuse_private_on_adopted(&name, owner, json));
+        }
         let scaffold = crystalline_service::scaffold_virtual_manifest(
             &name,
             &markdown,
@@ -4313,6 +4406,13 @@ async fn domain_add_dispatch(
     // needs a pre-scaffolded MANIFEST.md.
     let (chosen_name, abs, adopted, shadowed) =
         cmd::domain_add_register(name.as_deref(), path.as_deref(), config.as_deref())?;
+    // Before the `--no-sync` print and before the sync, so a refused
+    // `--private` prints nothing and indexes nothing.
+    if let Some(owner) = private_owner
+        && adopted
+    {
+        return Err(refuse_private_on_adopted(&chosen_name, owner, json));
+    }
     if no_sync {
         cmd::print_domain_add_no_sync(&chosen_name, &abs, adopted, shadowed.as_deref(), json);
         return Ok((chosen_name, adopted));
@@ -4375,6 +4475,7 @@ async fn domain_add_origin_dispatch(
     config: Option<PathBuf>,
     db: Option<PathBuf>,
     json: bool,
+    private_owner: Option<&str>,
 ) -> anyhow::Result<(String, bool)> {
     if is_virtual {
         anyhow::bail!("`domain add --origin` cannot be combined with --virtual");
@@ -4415,15 +4516,28 @@ async fn domain_add_origin_dispatch(
         config.as_deref(),
     )
     .await?;
-    cmd::print_origin_add(&repo, &data, json);
     let chosen_name = data["domain"].as_str().unwrap_or_default().to_string();
     let already_registered = snapshot.contains_key(&chosen_name);
     // Adopted when the name was already registered before this call (a
     // shared origin-less domain connected in place) or the engine answers a
     // retry with `already_connected`: either way `--private`'s caller must
-    // refuse rather than close an existing domain.
+    // refuse rather than close an existing domain. The connect has run by
+    // now, so the refusal carries its report.
     let already_connected = data["already_connected"].as_bool().unwrap_or(false);
-    Ok((chosen_name, already_registered || already_connected))
+    let adopted = already_registered || already_connected;
+    if let Some(owner) = private_owner
+        && adopted
+    {
+        return Err(refuse_private_after_connect(
+            &repo,
+            &chosen_name,
+            owner,
+            &data,
+            json,
+        ));
+    }
+    cmd::print_origin_add(&repo, &data, json);
+    Ok((chosen_name, adopted))
 }
 
 /// `domain remove`: the engine's own unregistration, over the daemon when one
@@ -4608,9 +4722,26 @@ fn daemon_task_command(action: DaemonTaskAction) -> anyhow::Result<()> {
     match action {
         DaemonTaskAction::Register { all_users } => {
             let exe = std::env::current_exe()?;
-            let name =
-                daemon_task::register(&principal(all_users), &exe).map_err(anyhow::Error::msg)?;
-            println!("registered the task {name}");
+            if all_users {
+                let name =
+                    daemon_task::register(&principal(true), &exe).map_err(anyhow::Error::msg)?;
+                println!("registered the task {name}");
+            } else {
+                let (name, moved) =
+                    daemon_task::register_for_this_user(&exe).map_err(anyhow::Error::msg)?;
+                println!("registered the task {name}");
+                match moved {
+                    daemon_task::Moved::Nothing => {}
+                    daemon_task::Moved::Removed(old) => {
+                        println!(
+                            "removed the task {old}, which had the name from Crystalline 0.24.0"
+                        )
+                    }
+                    daemon_task::Moved::Refused { task, why } => anyhow::bail!(
+                        "could not remove the task {task}, which had the name from Crystalline 0.24.0 ({why})"
+                    ),
+                }
+            }
         }
         DaemonTaskAction::Unregister { all_users } => {
             let removal = daemon_task::unregister(&principal(all_users));
@@ -5048,9 +5179,11 @@ fn mounted_part(
     let Ok(dir) = crystalline_remote::remote_dir() else {
         return empty;
     };
-    let set = crystalline_remote::SourceSet::load(dir, sources::local_domains_of(cfg), |n| {
-        std::env::var(n).ok()
-    });
+    let set = crystalline_remote::SourceSet::load(
+        dir,
+        sources::local_domains_of(cfg),
+        crystalline_core::secret_env::process_var,
+    );
     if set.is_empty() {
         return empty;
     }
@@ -5361,7 +5494,7 @@ mod tests {
         );
         assert_eq!(
             ahead_line(&all_deleted),
-            "  ahead: 2 local change(s) (2 deleted)"
+            "  ahead: 2 local changes (2 deleted)"
         );
     }
 
@@ -5459,7 +5592,7 @@ mod tests {
         let mixed = entry(&["notes/new.md"], &["notes/edit.md"], &["notes/gone.md"], 3);
         assert_eq!(
             ahead_line(&mixed),
-            "  ahead: 3 local change(s) (1 added, 1 modified, 1 deleted)"
+            "  ahead: 3 local changes (1 added, 1 modified, 1 deleted)"
         );
     }
 
@@ -5469,11 +5602,11 @@ mod tests {
     fn the_ahead_line_stays_short_for_an_empty_set_and_for_additions() {
         assert_eq!(
             ahead_line(&entry(&[], &[], &[], 0)),
-            "  ahead: 0 local change(s)"
+            "  ahead: 0 local changes"
         );
         assert_eq!(
             ahead_line(&entry(&["a.md", "b.md"], &[], &[], 4)),
-            "  ahead: 2 local change(s)"
+            "  ahead: 2 local changes"
         );
     }
 
@@ -5484,11 +5617,11 @@ mod tests {
     fn the_ahead_line_names_a_single_kind_that_is_not_additions() {
         assert_eq!(
             ahead_line(&entry(&[], &["a.md", "b.md"], &[], 0)),
-            "  ahead: 2 local change(s) (2 modified)"
+            "  ahead: 2 local changes (2 modified)"
         );
         assert_eq!(
             ahead_line(&entry(&[], &[], &["a.md"], 0)),
-            "  ahead: 1 local change(s) (1 deleted)"
+            "  ahead: 1 local change (1 deleted)"
         );
     }
 
@@ -5499,7 +5632,7 @@ mod tests {
     fn the_ahead_line_degrades_to_the_bare_count_without_detail() {
         assert_eq!(
             ahead_line(&json!({ "domain": "advisor", "local_changes": 2 })),
-            "  ahead: 2 local change(s)"
+            "  ahead: 2 local changes"
         );
     }
 
@@ -5522,7 +5655,7 @@ mod tests {
                 "    deleted:",
                 "      CustomHeaderModule.md",
                 "      Sysimage Store (AS-2465).md",
-                "    plus 12 generated folder listing(s) riding along",
+                "    plus 12 generated folder listings riding along",
             ]
         );
     }
