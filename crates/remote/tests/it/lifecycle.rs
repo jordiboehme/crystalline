@@ -2430,6 +2430,44 @@ async fn the_preview_says_how_a_share_will_go_after_a_refusal() {
     )
     .await;
     assert_eq!(plan.note, None, "{:?}", plan.action);
+    assert!(
+        matches!(
+            plan.action,
+            PlannedAction::Update { number: n, .. } | PlannedAction::Amend { number: n, .. }
+                if n == number
+        ),
+        "{:?}",
+        plan.action
+    );
+}
+
+/// Without any refusal recorded, naming this machine's own open proposal on a
+/// direct domain amends it instead of answering that there is nothing to
+/// amend.
+#[tokio::test]
+async fn naming_an_own_open_proposal_on_a_direct_domain_amends_it() {
+    let mock = MockProvider::new();
+    let (sub, _) = direct_domain(&mock).await;
+    let number = match share_direct(&mock, &sub, choosing(Some(true))).await {
+        ProposeOutcome::Proposed(report) => report.number,
+        other => panic!("expected Proposed, got {other:?}"),
+    };
+    write(&sub.domain_root.join("notes/third.md"), b"third\n");
+    let outcome = share_direct(
+        &mock,
+        &sub,
+        ShareOptions {
+            proposal: Some(number),
+            ..direct()
+        },
+    )
+    .await;
+    match outcome {
+        ProposeOutcome::Updated(updated) => assert_eq!(updated.number, number),
+        other => panic!("expected the named proposal to be amended, got {other:?}"),
+    }
+    assert_eq!(count(&mock, "update_branch:main:"), 0, "no direct attempt");
+    assert_eq!(load_state(&sub.state_dir).direct_refused, None);
 }
 
 #[tokio::test]
