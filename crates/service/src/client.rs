@@ -1726,12 +1726,14 @@ pub async fn origin_status(
 /// The standalone path shares as [`ShareActor::Owner`], as the three write
 /// verbs below do: a CLI invocation has no account behind it, so the machine
 /// owner is who it is, not a placeholder for one.
+#[allow(clippy::too_many_arguments)]
 pub async fn origin_share(
     domain: &str,
     title: Option<&str>,
     description: Option<&str>,
     proposal: Option<u64>,
     files: Option<&[String]>,
+    as_proposal: Option<bool>,
     db: Option<&Path>,
     config_path: Option<&Path>,
 ) -> anyhow::Result<Value> {
@@ -1740,7 +1742,7 @@ pub async fn origin_share(
         && let Some(data) = ctl_if_running(json!({
             "v": 1, "cmd": "origin_share", "domain": domain,
             "title": title, "description": description, "proposal": proposal,
-            "files": files,
+            "files": files, "as_proposal": as_proposal,
         }))
         .await?
     {
@@ -1751,12 +1753,13 @@ pub async fn origin_share(
     let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
     let domain = localize_standalone(&engine, domain).await;
     Ok(engine
-        .origin_share(
+        .origin_share_with(
             &domain,
             title,
             description,
             proposal,
             files,
+            as_proposal,
             ShareActor::Owner,
         )
         .await?)

@@ -631,14 +631,16 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                 Ok(files) => files,
                 Err(message) => return (envelope_err(message), false),
             };
+            let as_proposal = req.get("as_proposal").and_then(Value::as_bool);
             match shared
                 .engine
-                .origin_share(
+                .origin_share_with(
                     domain,
                     title,
                     description,
                     proposal,
                     files.as_deref(),
+                    as_proposal,
                     ShareActor::Owner,
                 )
                 .await
