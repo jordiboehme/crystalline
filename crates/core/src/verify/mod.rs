@@ -16,6 +16,7 @@
 //! additionally promotes every rule whose default severity is `Warning` to
 //! `Error`, `M108` included.
 
+mod catalog;
 mod domain_config;
 mod format;
 mod links;
@@ -35,11 +36,14 @@ use serde::Serialize;
 use crate::engram::Engram;
 use crate::parse::{BodyLine, body_lines};
 
+pub use catalog::{VERIFY_RULES, VerifyRule, verify_rule};
 pub use domain_config::{
-    ConfigProblem, DOMAIN_CONFIG_FILE, DomainConfigLoad, config_problems, load_domain_config,
+    ConfigEdit, ConfigProblem, DOMAIN_CONFIG_FILE, DomainConfigLoad, EditedConfig, config_problems,
+    edit_domain_config, load_domain_config,
 };
 pub use report::{Format, render, to_github, to_human, to_json};
 pub use scanner::ScanError;
+pub use severity::is_severity_word;
 
 /// How much more a `type: source` engram may hold than the domain's token
 /// budget allows an ordinary one.
