@@ -802,7 +802,11 @@ fn single_domain(
                            it where it is present and nothing where it is \
                            not. `sharing` names the domain's policy and \
                            `direct_shares` the commits this machine put \
-                           straight on the branch.\n\nFour keys say where the domain's \
+                           straight on the branch. `direct_refused` is null, \
+                           or names the `branch`, the forge's `message`, \
+                           `refused_at` and the `line` to show when the \
+                           branch refused this machine's direct commit; \
+                           show that line as given.\n\nFour keys say where the domain's \
                            chain of stacked proposals stands. `stack_number` \
                            is the chain's number on the forge, null when \
                            nothing is stacked. `stack_wedged` lists the \
@@ -1360,7 +1364,11 @@ pub async fn sync_now(
                    files. The plan also carries `sharing` (`proposal` or \
                    `direct`, the domain's MANIFEST policy) and `repo`, so a \
                    client knows what kind of domain it is looking at before \
-                   the action is read. A generated folder listing (`index.md`) is a change \
+                   the action is read. On a direct domain the plan may \
+                   also carry `note`, a short phrase that says how the share \
+                   will go: it falls back to a proposal if the branch refuses \
+                   it, or it opens a proposal because your proposal is still \
+                   open. A generated folder listing (`index.md`) is a change \
                    like any other here, because a share really carries it, but \
                    it is derived rather than written and is left out of the \
                    domain's `local_changes` count: a renderer counts these \
@@ -1596,8 +1604,11 @@ pub struct ShareBody {
                    \"proposal\"`; after one, a refused share opens the \
                    proposal itself and answers `proposed` with `fell_back: \
                    true` and a `note`, and a commit that lands again carries \
-                   a `note` too. A \
-                   `proposal` in the body on a direct domain is a 422. \
+                   a `note` too. While this machine has a proposal \
+                   open, a share with `proposal` naming it amends it, and \
+                   one with `as_proposal: true` or after a refusal stacks \
+                   on it or amends it. A `proposal` that names no open \
+                   proposal of this machine on a direct domain is a 422. \
                    Refused on a read-only instance.",
     params(("domain" = String, Path, description = "The registered team domain.")),
     request_body = ShareBody,
