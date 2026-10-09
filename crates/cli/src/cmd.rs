@@ -950,7 +950,7 @@ pub(crate) fn origin_share_lines(domain: &str, data: &serde_json::Value) -> Vec<
         }
         "branch_protected" => {
             lines.push(format!(
-                "Cannot commit to {}: {} Set sharing: proposal in the MANIFEST, or ask a repository admin.",
+                "The branch {} does not accept direct commits from you ({}). Share the same changes as a proposal instead: crystalline origin share --proposal.",
                 data["branch"].as_str().unwrap_or(""),
                 data["message"].as_str().unwrap_or("")
             ));
@@ -3846,7 +3846,7 @@ mod origin_share_tests {
         );
         assert_eq!(
             protected[0],
-            "Cannot commit to main: Changes must be made through a pull request. Set sharing: proposal in the MANIFEST, or ask a repository admin."
+            "The branch main does not accept direct commits from you (Changes must be made through a pull request.). Share the same changes as a proposal instead: crystalline origin share --proposal."
         );
         let moved = origin_share_lines(
             "kb",

@@ -2447,7 +2447,7 @@ async fn a_direct_preview_names_the_commit_and_an_open_proposal_refuses_it() {
 async fn a_protected_branch_answers_branch_protected_through_the_engine() {
     let tmp = tempfile::tempdir().unwrap();
     let mock = Arc::new(MockProvider::new());
-    let (eng, _root, _origins_dir) = direct_team(&tmp, mock.clone()).await;
+    let (eng, _root, origins_dir) = direct_team(&tmp, mock.clone()).await;
     mock.protect_branch("main", "Changes must be made through a pull request.");
     let result = eng
         .origin_share("brand", None, None, None, None, ShareActor::Owner)
@@ -2463,8 +2463,13 @@ async fn a_protected_branch_answers_branch_protected_through_the_engine() {
         result["guidance"]
             .as_str()
             .unwrap()
-            .contains("sharing: proposal")
+            .contains("share_changes with as_proposal: true")
     );
+    assert_eq!(result["fallback"], "proposal", "{result}");
+    let state = OriginState::load(&origins_dir.join("brand"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(state.direct_refused.unwrap().branch, "main");
 }
 
 #[tokio::test]

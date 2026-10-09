@@ -1602,7 +1602,7 @@ describe("the share dialog", () => {
         branch: "main",
         message: "Changes must be made through a pull request.",
         guidance:
-          "The branch main does not accept direct commits (Changes must be made through a pull request.). Set `sharing: proposal` in this domain's MANIFEST so shares open a proposal the branch's rules can review, or ask a repository admin to allow direct pushes.",
+          "The branch main does not accept direct commits from you (Changes must be made through a pull request.). Share the same changes as a proposal instead: share_changes with as_proposal: true (crystalline origin share --proposal).",
       },
       {
         outcome: "branch_moved",

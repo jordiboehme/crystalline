@@ -58,8 +58,8 @@ use crate::provider::{
     ProposalState, Provider, TreeWrite, UpstreamChange,
 };
 use crate::state::{
-    self, BaseStamp, BranchKept, Conflict, DirectShare, KeptKind, OriginState, Proposal,
-    ProposalStatus, ProposedChange, ProposedFile, QueuedBranch, RetireWhy,
+    self, BaseStamp, BranchKept, Conflict, DirectRefusal, DirectShare, KeptKind, OriginState,
+    Proposal, ProposalStatus, ProposedChange, ProposedFile, QueuedBranch, RetireWhy,
 };
 
 /// Above this many changed files (after subpath filtering) a compare is
@@ -3057,6 +3057,14 @@ async fn commit_direct(
                 return Ok(ProposeOutcome::BranchMoved { branch });
             }
             Err(RemoteError::BranchProtected { branch, message }) => {
+                // A fact about whoever shares from this machine, not about
+                // the domain: the MANIFEST stays as the team wrote it.
+                state.direct_refused = Some(DirectRefusal {
+                    branch: branch.clone(),
+                    message: message.clone(),
+                    refused_at: Utc::now(),
+                });
+                state.save(state_dir)?;
                 return Ok(ProposeOutcome::BranchProtected { branch, message });
             }
             Err(e) => return Err(e),

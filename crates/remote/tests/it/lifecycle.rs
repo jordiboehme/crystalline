@@ -2208,6 +2208,32 @@ async fn a_protected_branch_answers_branch_protected_with_the_forges_sentence() 
 }
 
 #[tokio::test]
+async fn a_refused_direct_share_records_the_refusal_and_opens_nothing() {
+    let mock = MockProvider::new();
+    let (sub, c1) = direct_domain(&mock).await;
+    mock.protect_branch("main", "Changes must be made through a pull request.");
+    match share_direct(&mock, &sub, direct()).await {
+        ProposeOutcome::BranchProtected { branch, .. } => assert_eq!(branch, "main"),
+        other => panic!("expected BranchProtected, got {other:?}"),
+    }
+    let st = load_state(&sub.state_dir);
+    let refusal = st.direct_refused.expect("the refusal is recorded");
+    assert_eq!(refusal.branch, "main");
+    assert_eq!(
+        refusal.message,
+        "Changes must be made through a pull request."
+    );
+    assert_eq!(st.base_commit, c1);
+    assert!(st.proposals.is_empty(), "nothing is opened on its own");
+    assert!(
+        !mock
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("create_proposal"))
+    );
+}
+
+#[tokio::test]
 async fn propose_preview_on_a_direct_domain_names_the_commit_and_the_refusals() {
     let mock = MockProvider::new();
     let (sub, _) = direct_domain(&mock).await;

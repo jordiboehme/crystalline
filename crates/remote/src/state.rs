@@ -100,6 +100,11 @@ pub struct OriginState {
     /// forge identifier and every reader of `history` treats it as one.
     #[serde(default)]
     pub direct_shares: Vec<DirectShare>,
+    /// The last refusal of a direct commit on this machine, `None` when direct
+    /// commits work or were never tried. Absent from a state written before
+    /// 0.24.3, which reads as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_refused: Option<DirectRefusal>,
     /// Conflicts from a previous pull still waiting to be resolved.
     pub conflicts: Vec<Conflict>,
     /// The GitHub stack number linking the open proposals, once two or more
@@ -324,6 +329,20 @@ pub struct DirectShare {
     pub files: Vec<ProposedFile>,
 }
 
+/// A direct commit the connected branch refused for whoever shares from this
+/// machine: the branch, the forge's own sentence and when. While it is
+/// recorded, a share on a `sharing: direct` domain falls back to a proposal
+/// when the branch refuses it again; a direct commit that lands clears it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectRefusal {
+    /// The branch that refused.
+    pub branch: String,
+    /// The forge's sentence naming the rule, verbatim.
+    pub message: String,
+    /// When the refusal came back.
+    pub refused_at: DateTime<Utc>,
+}
+
 /// An unresolved conflict from a previous pull, recorded so it can be
 /// revisited: what path, what kind, and copies of the two sides that could
 /// not be merged automatically (see [`record_conflict_files`]).
@@ -504,6 +523,7 @@ impl OriginState {
             proposals: Vec::new(),
             history: Vec::new(),
             direct_shares: Vec::new(),
+            direct_refused: None,
             conflicts: Vec::new(),
             stack_number: None,
             stacks_available: None,
@@ -999,6 +1019,31 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+
+    #[test]
+    fn a_state_from_before_direct_refused_loads_with_none() {
+        let dir = tempfile::tempdir().unwrap();
+        sample_state().save(dir.path()).unwrap();
+        let path = dir.path().join("state.json");
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(saved.get("direct_refused").is_none(), "absent while unset");
+        let loaded = OriginState::load(dir.path()).unwrap().unwrap();
+        assert_eq!(loaded.direct_refused, None);
+    }
+
+    #[test]
+    fn a_recorded_refusal_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = sample_state();
+        state.direct_refused = Some(DirectRefusal {
+            branch: "main".to_string(),
+            message: "Changes must be made through a pull request.".to_string(),
+            refused_at: chrono::Utc::now(),
+        });
+        state.save(dir.path()).unwrap();
+        assert_eq!(OriginState::load(dir.path()).unwrap(), Some(state));
+    }
 
     fn sample_state() -> OriginState {
         let mut state = OriginState::new("acme/brand-knowledge", "main");

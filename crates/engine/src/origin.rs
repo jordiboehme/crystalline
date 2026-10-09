@@ -617,6 +617,7 @@ pub(crate) fn propose_outcome_json(outcome: &ProposeOutcome) -> Value {
             "branch": branch,
             "message": message,
             "guidance": crystalline_remote::error::branch_protected_guidance(branch, message),
+            "fallback": "proposal",
         }),
         ProposeOutcome::BranchMoved { branch } => json!({
             "outcome": "branch_moved",
@@ -2293,8 +2294,9 @@ mod tests {
             protected["guidance"]
                 .as_str()
                 .unwrap()
-                .contains("sharing: proposal")
+                .contains("share_changes with as_proposal: true")
         );
+        assert_eq!(protected["fallback"], "proposal");
 
         let moved = propose_outcome_json(&ProposeOutcome::BranchMoved {
             branch: "main".to_string(),
