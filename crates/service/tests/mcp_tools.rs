@@ -7491,3 +7491,39 @@ async fn a_read_only_instance_has_no_configure_hint() {
     .unwrap();
     assert!(manifest.get("configure").is_none(), "{manifest}");
 }
+
+/// configure's description carries the words an agent searches for when it
+/// is asked to change how a domain behaves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_configure_description_names_the_domain_triggers() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let tools = client.peer().list_tools(Default::default()).await.unwrap();
+    let description = tools
+        .tools
+        .iter()
+        .find(|t| t.name == "configure")
+        .unwrap()
+        .description
+        .as_deref()
+        .unwrap_or_default()
+        .to_string();
+    for word in [
+        "domain policies",
+        "MANIFEST keys",
+        "sharing",
+        "direct",
+        "proposal",
+        "generated indexes",
+        "rule overrides",
+        ".crystalline.yaml",
+        "severity",
+        "github.enabled",
+        "the operator sets them with the crystalline CLI",
+    ] {
+        assert!(
+            description.contains(word),
+            "{word} missing from: {description}"
+        );
+    }
+}

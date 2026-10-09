@@ -2956,7 +2956,7 @@ impl McpServer {
     #[tool(
         name = "configure",
         title = "Configure Crystalline",
-        description = "View and adjust Crystalline's settings, like an app's preferences page: call with no arguments to see them, set to change them (for example github.enabled to turn on team collaboration) and connect to link your GitHub account with a short code you confirm in the browser. With a token it accepts a personal access token instead. Connecting works before or after enabling; only team domains need github.enabled turned on. The instance's network, database and sign-in are not listed here: the operator sets them with the crystalline CLI.",
+        description = "View and adjust Crystalline's settings, like an app's preferences page: call with no arguments to see them, set to change them (for example github.enabled to turn on team collaboration) and connect to link your GitHub account with a short code you confirm in the browser. With a token it accepts a personal access token instead. Connecting works before or after enabling; only team domains need github.enabled turned on. Call it with domain to see and change how one domain behaves: its domain policies (the MANIFEST keys sharing, direct or proposal, and generated indexes, local or shared), what each MANIFEST section does, and its rule overrides in .crystalline.yaml (a verify rule's severity, off, error, warning or info, and the token budget). With domain, set and unset change that domain, for example set { \"sharing\": \"direct\" } to allow direct commits or { \"rules.E007\": \"off\" } to turn a rule off. Call it with domain whenever the user wants a domain to commit directly or open proposals, to share or keep its generated indexes, or to silence or raise a rule. The instance's network, database and sign-in are not listed here: the operator sets them with the crystalline CLI.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -6607,6 +6607,7 @@ mod tests {
             "the third class is the one the message forgot: {INSTANCE_ADMIN_ONLY}"
         );
     }
+
     #[test]
     fn the_configure_hint_rides_only_a_root_manifest_while_configure_is_listed() {
         let manifest = || json!({ "permalink": "manifest", "path": "MANIFEST.md" });
@@ -6619,5 +6620,11 @@ mod tests {
         let mut nested = json!({ "permalink": "manifest", "path": "notes/MANIFEST.md" });
         attach_configure_hint(&mut nested, true);
         assert!(nested.get("configure").is_none(), "only the domain root's");
+        let mut title_only = json!({ "permalink": "manifest", "path": "manifest.md" });
+        attach_configure_hint(&mut title_only, true);
+        assert!(
+            title_only.get("configure").is_none(),
+            "a title is not the root file"
+        );
     }
 }

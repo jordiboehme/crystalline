@@ -362,4 +362,19 @@ mod tests {
         }
         assert_eq!(skill("crystalline-provisioning").unwrap().since, "0.22.1");
     }
+
+    /// Each skill names the call that shows and changes how a domain
+    /// behaves, and lists no key or value of its own.
+    #[test]
+    fn the_skills_teach_configure_with_a_domain() {
+        let sentence = "To see or change how a domain behaves (its sharing, generated indexes, MANIFEST sections or rule overrides), call configure with the domain.";
+        for name in [
+            "crystalline-intelligence",
+            "crystalline-provisioning",
+            "crystalline-collaboration",
+        ] {
+            let body = skill(name).unwrap().content;
+            assert!(body.contains(sentence), "{name}");
+        }
+    }
 }
