@@ -24,10 +24,10 @@ use super::{
 use crate::engine::EngineError;
 use crate::params::{BrowseParams, ListDomainsParams};
 use crate::scope::Scope;
-use crystalline_core::{
-    Manifest, PolicyKind, ProblemKind, TagAliasProblemKind, manifest_template, parse_engram,
-    policy_registry, starter_stanzas,
+use crystalline_core::manifest_view::{
+    ManifestFacts, ManifestProblemRow, PolicyRow, RoutingSection, manifest_facts,
 };
+use crystalline_core::{manifest_template, policy_registry, starter_stanzas};
 
 /// `GET /domains` - every registered domain with its counts, its kind and its
 /// routing bullets, plus the behavior rules that govern them.
@@ -613,36 +613,6 @@ fn starters() -> Vec<StarterStanzaView> {
         .collect()
 }
 
-/// The registry rows, joined with what `manifest` declares. A key the manifest
-/// does not know is at its registry default, which is what an absent
-/// declaration means. `domain` is this domain's local name: a `"text"` key
-/// (`domain_name` today) whose effective value is empty - absent or invalid -
-/// reads as that local name instead, since there is no registry default for
-/// free text to fall back to.
-fn policies_of(manifest: &Manifest, domain: &str) -> Vec<PolicyView> {
-    policy_registry()
-        .iter()
-        .map(|spec| {
-            let (declared, effective) = manifest.policy(spec.key).unwrap_or((None, spec.default));
-            let effective = if spec.kind == PolicyKind::Text && effective.is_empty() {
-                domain.to_string()
-            } else {
-                effective.to_string()
-            };
-            PolicyView {
-                key: spec.key.to_string(),
-                kind: spec.kind.as_str().to_string(),
-                declared: declared.map(str::to_string),
-                effective,
-                values: spec.values.iter().map(|v| v.to_string()).collect(),
-                default: spec.default.to_string(),
-                meaning: spec.meaning.to_string(),
-                changed_by: spec.changed_by.as_str().to_string(),
-            }
-        })
-        .collect()
-}
-
 impl ManifestSections {
     /// The features of `markdown`, read the way the engine reads every
     /// MANIFEST. A source the format layer will not parse - no frontmatter,
@@ -659,104 +629,85 @@ impl ManifestSections {
             .format("%Y-%m-%d")
             .to_string();
         let starter_document = manifest_template(domain, &today);
-        let Ok(engram) = parse_engram(markdown) else {
-            return ManifestSections {
-                scope: Vec::new(),
-                when_to_use: Vec::new(),
-                routing: RoutingSource::None,
-                missing: vec!["Scope".to_string(), "When to Use".to_string()],
-                provisioning: None,
-                tag_aliases: None,
-                // Not the registry defaults: nothing here was declared, and
-                // nothing here can be, until the document parses again.
-                policies: Vec::new(),
-                // The starters are not read out of the document, so they
-                // survive a document that cannot be read: a reader looking at
-                // a broken MANIFEST still learns what it can be made to say.
-                starters: starters(),
-                starter_document,
-            };
-        };
-        let manifest = Manifest::from_engram(&engram, markdown);
-        let routing = if !manifest.when_to_use().is_empty() {
-            RoutingSource::WhenToUse
-        } else if !manifest.scope().is_empty() {
-            RoutingSource::Scope
-        } else {
-            RoutingSource::None
-        };
-        ManifestSections {
-            scope: manifest.scope().to_vec(),
-            when_to_use: manifest.when_to_use().to_vec(),
+        let ManifestFacts {
+            scope,
+            when_to_use,
             routing,
-            missing: manifest
-                .missing_required_sections()
-                .iter()
-                .map(|name| name.to_string())
-                .collect(),
-            provisioning: manifest.provisioning().map(|section| ProvisioningView {
+            missing,
+            provisioning,
+            tag_aliases,
+            policies,
+            ..
+        } = manifest_facts(markdown, domain);
+        ManifestSections {
+            scope,
+            when_to_use,
+            routing: routing.into(),
+            missing,
+            provisioning: provisioning.map(|section| ProvisioningView {
                 decls: section
                     .decls
-                    .iter()
+                    .into_iter()
                     .map(|decl| ProvisioningDeclView {
-                        kind: decl.kind.id().to_string(),
-                        path: decl.path.clone(),
+                        kind: decl.kind,
+                        path: decl.path,
                     })
                     .collect(),
-                problems: section
-                    .problems
-                    .iter()
-                    .map(|problem| ManifestProblem {
-                        kind: provisioning_problem_kind(problem.kind).to_string(),
-                        bullet: problem.bullet.clone(),
-                        reason: problem.reason.clone(),
-                    })
-                    .collect(),
+                problems: section.problems.into_iter().map(Into::into).collect(),
             }),
-            tag_aliases: manifest.tag_aliases().map(|section| TagAliasesView {
+            tag_aliases: tag_aliases.map(|section| TagAliasesView {
                 decls: section
                     .decls
-                    .iter()
+                    .into_iter()
                     .map(|decl| TagAliasDeclView {
-                        alias: decl.alias.clone(),
-                        canonical: decl.canonical.clone(),
+                        alias: decl.alias,
+                        canonical: decl.canonical,
                     })
                     .collect(),
-                problems: section
-                    .problems
-                    .iter()
-                    .map(|problem| ManifestProblem {
-                        kind: tag_alias_problem_kind(problem.kind).to_string(),
-                        bullet: problem.bullet.clone(),
-                        reason: problem.reason.clone(),
-                    })
-                    .collect(),
+                problems: section.problems.into_iter().map(Into::into).collect(),
             }),
-            policies: policies_of(&manifest, domain),
+            // Empty for a MANIFEST that did not parse: core says the same.
+            policies: policies.into_iter().map(Into::into).collect(),
+            // The starters are not read out of the document, so they
+            // survive a document that cannot be read.
             starters: starters(),
             starter_document,
         }
     }
 }
 
-/// The wire spelling of a provisioning problem's kind.
-fn provisioning_problem_kind(kind: ProblemKind) -> &'static str {
-    match kind {
-        ProblemKind::Malformed => "malformed",
-        ProblemKind::UnknownType => "unknown_type",
-        ProblemKind::InvalidPath => "invalid_path",
-        ProblemKind::DuplicateType => "duplicate_type",
+impl From<PolicyRow> for PolicyView {
+    fn from(row: PolicyRow) -> PolicyView {
+        PolicyView {
+            key: row.key,
+            kind: row.kind,
+            declared: row.declared,
+            effective: row.effective,
+            values: row.values,
+            default: row.default,
+            meaning: row.meaning,
+            changed_by: row.changed_by,
+        }
     }
 }
 
-/// The wire spelling of a tag alias problem's kind.
-fn tag_alias_problem_kind(kind: TagAliasProblemKind) -> &'static str {
-    match kind {
-        TagAliasProblemKind::Malformed => "malformed",
-        TagAliasProblemKind::SelfAlias => "self_alias",
-        TagAliasProblemKind::DuplicateAlias => "duplicate_alias",
-        TagAliasProblemKind::NonCanonicalTarget => "non_canonical_target",
-        TagAliasProblemKind::ChainedAlias => "chained_alias",
+impl From<RoutingSection> for RoutingSource {
+    fn from(routing: RoutingSection) -> RoutingSource {
+        match routing {
+            RoutingSection::WhenToUse => RoutingSource::WhenToUse,
+            RoutingSection::Scope => RoutingSource::Scope,
+            RoutingSection::None => RoutingSource::None,
+        }
+    }
+}
+
+impl From<ManifestProblemRow> for ManifestProblem {
+    fn from(row: ManifestProblemRow) -> ManifestProblem {
+        ManifestProblem {
+            kind: row.kind,
+            bullet: row.bullet,
+            reason: row.reason,
+        }
     }
 }
 
@@ -1170,4 +1121,79 @@ fn manifest_checksum(markdown: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(markdown.as_bytes());
     crystalline_index::hex_lower(&hasher.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A MANIFEST that declares every policy key and every section, with one
+    /// bad bullet in each of the two sections that keep problems.
+    pub(super) const EVERY_SECTION: &str = "---\ntype: manifest\ntitle: eng\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\nrecorded_at: 2026-01-01\ngenerated_indexes: shared\nsharing: direct\ndomain_name: engineering\n---\n\n# eng\n\n## Scope\n\n- Everything about eng\n\n## When to Use\n\n- Route here for eng questions\n\n## Provisioning\n\n- skills: skills\n- widgets: w\n\n## Tag Aliases\n\n- k8s -> kubernetes\n- Kube -> k8s\n";
+
+    /// A source the format layer refuses: a null byte.
+    const UNPARSED: &str = "---\ntype: manifest\n---\n\0\n";
+
+    const GOLDEN: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/testdata/manifest_sections.golden.json"
+    );
+
+    /// The sections for the fixture, the starter document masked: it carries
+    /// today's date.
+    fn sections_json(markdown: &str) -> serde_json::Value {
+        let mut value = serde_json::to_value(ManifestSections::of(markdown, "eng")).unwrap();
+        value["starter_document"] = serde_json::json!("<masked>");
+        value
+    }
+
+    /// Writes the golden from the code as it is. Run once, before the rows
+    /// move, and commit the file it writes.
+    #[test]
+    #[ignore = "writes the golden; run by hand before a refactor"]
+    fn write_manifest_sections_golden() {
+        let golden = serde_json::json!({
+            "every_section": sections_json(EVERY_SECTION),
+            "unparsed": sections_json(UNPARSED),
+            "no_frontmatter": sections_json("no frontmatter at all\n"),
+            "empty": sections_json(""),
+        });
+        std::fs::create_dir_all(std::path::Path::new(GOLDEN).parent().unwrap()).unwrap();
+        std::fs::write(
+            GOLDEN,
+            serde_json::to_string_pretty(&golden).unwrap() + "\n",
+        )
+        .unwrap();
+    }
+
+    /// The REST sections are byte for byte what they were before the rows
+    /// moved to core.
+    #[test]
+    fn the_manifest_sections_match_the_golden() {
+        let golden: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(GOLDEN).unwrap()).unwrap();
+        assert_eq!(golden["every_section"], sections_json(EVERY_SECTION));
+        assert_eq!(golden["unparsed"], sections_json(UNPARSED));
+        assert_eq!(
+            golden["no_frontmatter"],
+            sections_json("no frontmatter at all\n")
+        );
+        assert_eq!(golden["empty"], sections_json(""));
+    }
+
+    /// One source: the policies REST sends are the rows core builds.
+    #[test]
+    fn the_rest_rows_are_the_core_rows() {
+        let rest = sections_json(EVERY_SECTION);
+        let core = crystalline_core::manifest_view::manifest_facts(EVERY_SECTION, "eng");
+        assert_eq!(
+            rest["policies"],
+            serde_json::to_value(&core.policies).unwrap()
+        );
+        assert_eq!(rest["routing"], serde_json::to_value(core.routing).unwrap());
+        assert_eq!(
+            rest["missing"],
+            serde_json::to_value(&core.missing).unwrap()
+        );
+    }
 }

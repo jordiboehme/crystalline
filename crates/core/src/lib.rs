@@ -28,6 +28,7 @@ pub mod index;
 pub mod jsonc_edit;
 pub mod line_endings;
 pub mod manifest;
+pub mod manifest_view;
 pub mod names;
 pub mod parse;
 pub mod path;

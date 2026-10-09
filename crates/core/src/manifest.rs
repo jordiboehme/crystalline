@@ -735,6 +735,8 @@ pub struct StarterStanza {
     pub meaning: &'static str,
     /// Markdown a person can save as it stands.
     pub example: &'static str,
+    /// Whether verify requires the section (`M003`): `Scope` and `When to Use`.
+    pub required: bool,
 }
 
 /// Every MANIFEST section a domain page offers to start, in display order.
@@ -744,21 +746,25 @@ pub fn starter_stanzas() -> &'static [StarterStanza] {
             section: "When to Use",
             meaning: "Agents pick this domain by these bullets. Without one, nothing routes here.",
             example: "## When to Use\n\n- Route here for questions about how our deployment pipeline works",
+            required: true,
         },
         StarterStanza {
             section: "Scope",
             meaning: "What belongs in this domain and what does not. Read for routing only when When to Use is empty.",
             example: "## Scope\n\n- Infrastructure and deployment, not application code",
+            required: true,
         },
         StarterStanza {
             section: "Provisioning",
             meaning: "Folders this domain installs into an AI harness: skills, commands, agents or MCP configs.",
             example: "## Provisioning\n\n- skills: skills",
+            required: false,
         },
         StarterStanza {
             section: "Tag Aliases",
             meaning: "Spellings that fold into one canonical tag, so a search for either finds both.",
             example: "## Tag Aliases\n\n- k8s -> kubernetes",
+            required: false,
         },
     ]
 }

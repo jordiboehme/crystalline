@@ -1,0 +1,286 @@
+{
+  "empty": {
+    "missing": [
+      "Scope",
+      "When to Use"
+    ],
+    "policies": [
+      {
+        "changed_by": "owner",
+        "declared": null,
+        "default": "local",
+        "effective": "local",
+        "key": "generated_indexes",
+        "kind": "choice",
+        "meaning": "Whether the generated folder listings travel with a share.",
+        "values": [
+          "local",
+          "shared"
+        ]
+      },
+      {
+        "changed_by": "owner",
+        "declared": null,
+        "default": "proposal",
+        "effective": "proposal",
+        "key": "sharing",
+        "kind": "choice",
+        "meaning": "Whether a share opens a proposal for review or commits straight to the branch.",
+        "values": [
+          "proposal",
+          "direct"
+        ]
+      },
+      {
+        "changed_by": "owner",
+        "declared": null,
+        "default": "",
+        "effective": "eng",
+        "key": "domain_name",
+        "kind": "text",
+        "meaning": "The name this domain is known by everywhere; links from other domains use it.",
+        "values": []
+      }
+    ],
+    "provisioning": null,
+    "routing": "none",
+    "scope": [],
+    "starter_document": "<masked>",
+    "starters": [
+      {
+        "example": "## When to Use\n\n- Route here for questions about how our deployment pipeline works",
+        "meaning": "Agents pick this domain by these bullets. Without one, nothing routes here.",
+        "section": "When to Use"
+      },
+      {
+        "example": "## Scope\n\n- Infrastructure and deployment, not application code",
+        "meaning": "What belongs in this domain and what does not. Read for routing only when When to Use is empty.",
+        "section": "Scope"
+      },
+      {
+        "example": "## Provisioning\n\n- skills: skills",
+        "meaning": "Folders this domain installs into an AI harness: skills, commands, agents or MCP configs.",
+        "section": "Provisioning"
+      },
+      {
+        "example": "## Tag Aliases\n\n- k8s -> kubernetes",
+        "meaning": "Spellings that fold into one canonical tag, so a search for either finds both.",
+        "section": "Tag Aliases"
+      }
+    ],
+    "tag_aliases": null,
+    "when_to_use": []
+  },
+  "every_section": {
+    "missing": [],
+    "policies": [
+      {
+        "changed_by": "owner",
+        "declared": "shared",
+        "default": "local",
+        "effective": "shared",
+        "key": "generated_indexes",
+        "kind": "choice",
+        "meaning": "Whether the generated folder listings travel with a share.",
+        "values": [
+          "local",
+          "shared"
+        ]
+      },
+      {
+        "changed_by": "owner",
+        "declared": "direct",
+        "default": "proposal",
+        "effective": "direct",
+        "key": "sharing",
+        "kind": "choice",
+        "meaning": "Whether a share opens a proposal for review or commits straight to the branch.",
+        "values": [
+          "proposal",
+          "direct"
+        ]
+      },
+      {
+        "changed_by": "owner",
+        "declared": "engineering",
+        "default": "",
+        "effective": "engineering",
+        "key": "domain_name",
+        "kind": "text",
+        "meaning": "The name this domain is known by everywhere; links from other domains use it.",
+        "values": []
+      }
+    ],
+    "provisioning": {
+      "decls": [
+        {
+          "kind": "skills",
+          "path": "skills"
+        }
+      ],
+      "problems": [
+        {
+          "bullet": "widgets: w",
+          "kind": "unknown_type",
+          "reason": "unknown provisioning type `widgets`, expected one of skills, commands, agents or mcps"
+        }
+      ]
+    },
+    "routing": "when_to_use",
+    "scope": [
+      "Everything about eng"
+    ],
+    "starter_document": "<masked>",
+    "starters": [
+      {
+        "example": "## When to Use\n\n- Route here for questions about how our deployment pipeline works",
+        "meaning": "Agents pick this domain by these bullets. Without one, nothing routes here.",
+        "section": "When to Use"
+      },
+      {
+        "example": "## Scope\n\n- Infrastructure and deployment, not application code",
+        "meaning": "What belongs in this domain and what does not. Read for routing only when When to Use is empty.",
+        "section": "Scope"
+      },
+      {
+        "example": "## Provisioning\n\n- skills: skills",
+        "meaning": "Folders this domain installs into an AI harness: skills, commands, agents or MCP configs.",
+        "section": "Provisioning"
+      },
+      {
+        "example": "## Tag Aliases\n\n- k8s -> kubernetes",
+        "meaning": "Spellings that fold into one canonical tag, so a search for either finds both.",
+        "section": "Tag Aliases"
+      }
+    ],
+    "tag_aliases": {
+      "decls": [
+        {
+          "alias": "k8s",
+          "canonical": "kubernetes"
+        },
+        {
+          "alias": "Kube",
+          "canonical": "k8s"
+        }
+      ],
+      "problems": [
+        {
+          "bullet": "Kube -> k8s",
+          "kind": "chained_alias",
+          "reason": "canonical `k8s` is itself an alias, resolution stays a single hop"
+        }
+      ]
+    },
+    "when_to_use": [
+      "Route here for eng questions"
+    ]
+  },
+  "no_frontmatter": {
+    "missing": [
+      "Scope",
+      "When to Use"
+    ],
+    "policies": [
+      {
+        "changed_by": "owner",
+        "declared": null,
+        "default": "local",
+        "effective": "local",
+        "key": "generated_indexes",
+        "kind": "choice",
+        "meaning": "Whether the generated folder listings travel with a share.",
+        "values": [
+          "local",
+          "shared"
+        ]
+      },
+      {
+        "changed_by": "owner",
+        "declared": null,
+        "default": "proposal",
+        "effective": "proposal",
+        "key": "sharing",
+        "kind": "choice",
+        "meaning": "Whether a share opens a proposal for review or commits straight to the branch.",
+        "values": [
+          "proposal",
+          "direct"
+        ]
+      },
+      {
+        "changed_by": "owner",
+        "declared": null,
+        "default": "",
+        "effective": "eng",
+        "key": "domain_name",
+        "kind": "text",
+        "meaning": "The name this domain is known by everywhere; links from other domains use it.",
+        "values": []
+      }
+    ],
+    "provisioning": null,
+    "routing": "none",
+    "scope": [],
+    "starter_document": "<masked>",
+    "starters": [
+      {
+        "example": "## When to Use\n\n- Route here for questions about how our deployment pipeline works",
+        "meaning": "Agents pick this domain by these bullets. Without one, nothing routes here.",
+        "section": "When to Use"
+      },
+      {
+        "example": "## Scope\n\n- Infrastructure and deployment, not application code",
+        "meaning": "What belongs in this domain and what does not. Read for routing only when When to Use is empty.",
+        "section": "Scope"
+      },
+      {
+        "example": "## Provisioning\n\n- skills: skills",
+        "meaning": "Folders this domain installs into an AI harness: skills, commands, agents or MCP configs.",
+        "section": "Provisioning"
+      },
+      {
+        "example": "## Tag Aliases\n\n- k8s -> kubernetes",
+        "meaning": "Spellings that fold into one canonical tag, so a search for either finds both.",
+        "section": "Tag Aliases"
+      }
+    ],
+    "tag_aliases": null,
+    "when_to_use": []
+  },
+  "unparsed": {
+    "missing": [
+      "Scope",
+      "When to Use"
+    ],
+    "policies": [],
+    "provisioning": null,
+    "routing": "none",
+    "scope": [],
+    "starter_document": "<masked>",
+    "starters": [
+      {
+        "example": "## When to Use\n\n- Route here for questions about how our deployment pipeline works",
+        "meaning": "Agents pick this domain by these bullets. Without one, nothing routes here.",
+        "section": "When to Use"
+      },
+      {
+        "example": "## Scope\n\n- Infrastructure and deployment, not application code",
+        "meaning": "What belongs in this domain and what does not. Read for routing only when When to Use is empty.",
+        "section": "Scope"
+      },
+      {
+        "example": "## Provisioning\n\n- skills: skills",
+        "meaning": "Folders this domain installs into an AI harness: skills, commands, agents or MCP configs.",
+        "section": "Provisioning"
+      },
+      {
+        "example": "## Tag Aliases\n\n- k8s -> kubernetes",
+        "meaning": "Spellings that fold into one canonical tag, so a search for either finds both.",
+        "section": "Tag Aliases"
+      }
+    ],
+    "tag_aliases": null,
+    "when_to_use": []
+  }
+}
