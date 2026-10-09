@@ -1595,14 +1595,111 @@ describe("the share dialog", () => {
     ).toBeDisabled();
   });
 
+  const PROTECTED_GUIDANCE =
+    "The branch main does not accept direct commits from you (Changes must be made through a pull request.). Share the same changes as a proposal instead: share_changes with as_proposal: true (crystalline origin share --proposal).";
+  const FELL_BACK =
+    "The branch main does not accept direct commits from you, so this share opened a proposal.";
+  const directPlan = () => ({
+    action: "commit",
+    branch: "main",
+    sharing: "direct",
+    effective_title: "t",
+    changes: [{ path: "notes/a.md", kind: "added" }],
+  });
+
+  it("offers the same share as a proposal after a refused direct commit", async () => {
+    const bodies: Record<string, unknown>[] = [];
+    serve({
+      "/domains/eng/sync": () => syncResponse({ sharing: "direct" }),
+      "/domains/eng/sync/changes": directPlan,
+      "/domains/eng/sync/share": (_path, init) => {
+        const body = JSON.parse(
+          typeof init?.body === "string" ? init.body : "{}",
+        ) as Record<string, unknown>;
+        bodies.push(body);
+        return body.as_proposal === true
+          ? {
+              outcome: "proposed",
+              number: 12,
+              url: "https://github.com/acme/knowledge/pull/12",
+              summary: "Share 1 new engram",
+            }
+          : {
+              outcome: "branch_protected",
+              branch: "main",
+              message: "Changes must be made through a pull request.",
+              guidance: PROTECTED_GUIDANCE,
+              fallback: "proposal",
+            };
+      },
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Commit to main" }),
+    );
+    expect(await within(dialog).findByText(PROTECTED_GUIDANCE)).toBeVisible();
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Share as a proposal" }),
+    );
+    expect(
+      await within(dialog).findByRole("link", { name: "#12" }),
+    ).toBeVisible();
+    expect(bodies[0]).not.toHaveProperty("as_proposal");
+    expect(bodies[1]).toMatchObject({ as_proposal: true });
+    expect(
+      within(dialog).queryByRole("button", { name: "Share as a proposal" }),
+    ).toBeNull();
+  });
+
+  it("says when a share fell back to a proposal", async () => {
+    serve({
+      "/domains/eng/sync": () => syncResponse({ sharing: "direct" }),
+      "/domains/eng/sync/changes": directPlan,
+      "/domains/eng/sync/share": () => ({
+        outcome: "proposed",
+        number: 9,
+        url: "https://github.com/acme/knowledge/pull/9",
+        fell_back: true,
+        note: FELL_BACK,
+      }),
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Commit to main" }),
+    );
+    expect(await within(dialog).findByText(FELL_BACK)).toBeVisible();
+    expect(within(dialog).getByRole("link", { name: "#9" })).toBeVisible();
+  });
+
+  it("says in the plan line that a share will fall back", async () => {
+    serve({
+      "/domains/eng/sync": () => syncResponse({ sharing: "direct" }),
+      "/domains/eng/sync/changes": () => ({
+        ...directPlan(),
+        note: "tries a direct commit; falls back to a proposal if the branch refuses it again",
+      }),
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+    expect(
+      await within(dialog).findByText(
+        "Sharing tries a direct commit; falls back to a proposal if the branch refuses it again.",
+      ),
+    ).toBeVisible();
+  });
+
   it("shows the guidance of a protected or moved branch", async () => {
     for (const receipt of [
       {
         outcome: "branch_protected",
         branch: "main",
         message: "Changes must be made through a pull request.",
-        guidance:
-          "The branch main does not accept direct commits from you (Changes must be made through a pull request.). Share the same changes as a proposal instead: share_changes with as_proposal: true (crystalline origin share --proposal).",
+        guidance: PROTECTED_GUIDANCE,
       },
       {
         outcome: "branch_moved",

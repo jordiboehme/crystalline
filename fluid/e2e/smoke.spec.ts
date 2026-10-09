@@ -317,6 +317,95 @@ test("the same rename dialog also opens from the policies card's 'Change name'",
   await expect(dialog).toBeHidden();
 });
 
+test("a refused direct share offers to share as a proposal", async ({
+  page,
+}) => {
+  // The fixture domain has no team origin, so the team answers are canned:
+  // a direct domain whose branch refuses the commit, then takes a proposal.
+  await page.route("**/api/v1/settings/github", (route) =>
+    route.fulfill({ json: { enabled: true, connected: true } }),
+  );
+  await page.route(`**/api/v1/domains/${DOMAIN}/sync`, (route) =>
+    route.fulfill({
+      json: {
+        domain: DOMAIN,
+        mode: "github",
+        repo: "acme/knowledge",
+        branch: "main",
+        base_commit: "9f3c1a2",
+        behind: false,
+        local_changes: 1,
+        last_checked: "2026-10-09T08:00:00Z",
+        probe_error: null,
+        sharing: "direct",
+        connection: { connected: true, user: "octo", token_store: "file" },
+        // One open proposal, as the unit tests' sync answer has: it is
+        // what puts the Proposals card on the screen.
+        open_proposals: [
+          {
+            number: 4,
+            url: "https://github.com/acme/knowledge/pull/4",
+            title: "Refine 2 engrams",
+            status: "Open",
+            review_state: null,
+            amended_upstream: false,
+            feedback: [],
+            updated_at: null,
+          },
+        ],
+        declined_proposals: [],
+        conflicts: [],
+      },
+    }),
+  );
+  await page.route(`**/api/v1/domains/${DOMAIN}/sync/changes`, (route) =>
+    route.fulfill({
+      json: {
+        action: "commit",
+        branch: "main",
+        sharing: "direct",
+        repo: "acme/knowledge",
+        effective_title: "Share 1 new engram",
+        changes: [{ path: "notes/a.md", kind: "added", last_author: null }],
+      },
+    }),
+  );
+  const bodies: Record<string, unknown>[] = [];
+  await page.route(`**/api/v1/domains/${DOMAIN}/sync/share`, (route) => {
+    const body = route.request().postDataJSON() as Record<string, unknown>;
+    bodies.push(body);
+    return route.fulfill({
+      json:
+        body.as_proposal === true
+          ? {
+              outcome: "proposed",
+              number: 12,
+              url: "https://github.com/acme/knowledge/pull/12",
+              summary: "Share 1 new engram",
+            }
+          : {
+              outcome: "branch_protected",
+              branch: "main",
+              message: "Changes must be made through a pull request.",
+              guidance:
+                "The branch main does not accept direct commits from you (Changes must be made through a pull request.). Share the same changes as a proposal instead: share_changes with as_proposal: true (crystalline origin share --proposal).",
+              fallback: "proposal",
+            },
+    });
+  });
+
+  await page.goto(`d/${DOMAIN}`);
+  const card = page.getByRole("region", { name: "Proposals" });
+  await card.getByRole("button", { name: "Share changes" }).click();
+  const dialog = page.getByRole("dialog", { name: /share/i });
+  await dialog.getByRole("button", { name: "Commit to main" }).click();
+  await dialog.getByRole("button", { name: "Share as a proposal" }).click();
+  await expect(dialog.getByRole("link", { name: "#12" })).toBeVisible();
+  expect(bodies).toHaveLength(2);
+  expect(bodies[1]).toMatchObject({ as_proposal: true });
+  await page.unrouteAll({ behavior: "ignoreErrors" });
+});
+
 test("an undeclared MANIFEST section explains itself and can be started", async ({
   page,
 }) => {

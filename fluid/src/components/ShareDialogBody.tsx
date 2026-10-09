@@ -277,7 +277,7 @@ export default function ShareDialogBody({
     real.length > 0 && !real.some((change) => selected.has(change.path));
 
   const share = useMutation({
-    mutationFn: () =>
+    mutationFn: (asProposal: boolean) =>
       shareDomain(domain, {
         ...(ownTitle ? { title: typed } : {}),
         ...(description.trim() !== ""
@@ -298,8 +298,12 @@ export default function ShareDialogBody({
                 .filter((change) => selected.has(change.path))
                 .map((change) => change.path),
             }),
+        // Only when somebody pressed "Share as a proposal": every other share
+        // leaves the route to the engine.
+        ...(asProposal ? { as_proposal: true } : {}),
       }),
     onSuccess: (result) => {
+      setProblem(null);
       setOutcome(describeOutcome(result));
     },
     onError: (error: Error) => {
@@ -512,12 +516,40 @@ export default function ShareDialogBody({
                 )}
                 {outcome.after}
               </p>
-              <div className="flex justify-end">
+              {outcome.note != null && outcome.note !== "" && (
+                <p className="text-sm text-slate-600 dark:text-slate-300">
+                  {outcome.note}
+                </p>
+              )}
+              {problem !== null && (
+                <p role="alert" className={ALERT_CLASSES}>
+                  {problem}
+                </p>
+              )}
+              <div className="flex justify-end gap-2">
+                {outcome.offerProposal === true && (
+                  <button
+                    type="button"
+                    autoFocus
+                    disabled={share.isPending}
+                    onClick={() => {
+                      setProblem(null);
+                      share.mutate(true);
+                    }}
+                    className={BUTTON.primary}
+                  >
+                    Share as a proposal
+                  </button>
+                )}
                 <button
                   type="button"
-                  autoFocus
+                  autoFocus={outcome.offerProposal !== true}
                   onClick={onClose}
-                  className={BUTTON.primary}
+                  className={
+                    outcome.offerProposal === true
+                      ? BUTTON.secondary
+                      : BUTTON.primary
+                  }
                 >
                   Close
                 </button>
@@ -561,7 +593,7 @@ export default function ShareDialogBody({
                   !identity.asking
                 ) {
                   setProblem(null);
-                  share.mutate();
+                  share.mutate(false);
                 }
               }}
             >
@@ -621,7 +653,9 @@ export default function ShareDialogBody({
               <Dialog.Description className="text-sm text-slate-500 dark:text-slate-400">
                 {planProblem === null
                   ? amending === null
-                    ? actionLine(plan.data ?? null)
+                    ? plan.data?.note
+                      ? `Sharing ${plan.data.note}.`
+                      : actionLine(plan.data ?? null)
                     : amendLine(amending, chosenLayersAbove)
                   : "This share could not be planned."}
               </Dialog.Description>
@@ -965,6 +999,13 @@ interface OutcomeSentence {
    * them; every other outcome leaves the working tree where it was.
    */
   folded?: boolean;
+  /** The server's extra line about how the share went, if it sent one. */
+  note?: string | null;
+  /**
+   * Whether the refusal offers the same share as a proposal: a direct
+   * commit the branch refused, answered with `fallback: "proposal"`.
+   */
+  offerProposal?: boolean;
 }
 
 /** A sentence with nothing to link. */
@@ -1049,12 +1090,15 @@ function describeOutcome(result: unknown): OutcomeSentence {
         asString(proposal?.url),
       );
     case "proposed":
-      return numberSentence(
-        "Opened ",
-        number,
-        `${placementLine(proposal ?? record)}.`,
-        asString(record?.url),
-      );
+      return {
+        ...numberSentence(
+          "Opened ",
+          number,
+          `${placementLine(proposal ?? record)}.`,
+          asString(record?.url),
+        ),
+        note: asString(record?.note),
+      };
     case "nothing_to_share":
       return plainSentence(
         "Nothing to share: the team already has all of this.",
@@ -1080,13 +1124,17 @@ function describeOutcome(result: unknown): OutcomeSentence {
               ` to ${branch}.`,
               asString(record?.url),
             );
-      return { ...sentence, folded };
+      return { ...sentence, folded, note: asString(record?.note) };
     }
     // The three a direct domain refuses with. Each carries the server's own
     // guidance, which names the verb that settles it, so nothing is
     // paraphrased here.
-    case "proposal_open":
     case "branch_protected":
+      return {
+        ...plainSentence(asString(record?.guidance) ?? "Nothing was shared."),
+        offerProposal: asString(record?.fallback) === "proposal",
+      };
+    case "proposal_open":
     case "branch_moved":
       return plainSentence(asString(record?.guidance) ?? "Nothing was shared.");
     case "proposal_diverged":

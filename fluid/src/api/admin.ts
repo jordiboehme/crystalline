@@ -1186,6 +1186,12 @@ export interface SharePlan {
    * blocks a `proposal_open` plan; null elsewhere.
    */
   title: string | null;
+  /**
+   * How a direct domain's share will go when it is not the plain commit:
+   * the server's own clause, for example that it falls back to a proposal
+   * if the branch refuses it again. Null otherwise, and from an older server.
+   */
+  note: string | null;
 }
 
 /**
@@ -1261,6 +1267,7 @@ export async function fetchShareChanges(domain: string): Promise<SharePlan> {
     sharing: asString(record?.sharing) === "direct" ? "direct" : "proposal",
     branch: asString(record?.branch),
     title: asString(record?.title),
+    note: asString(record?.note),
   };
 }
 
@@ -1273,7 +1280,9 @@ export async function fetchShareChanges(domain: string): Promise<SharePlan> {
  * `nothing_to_share`, `conflicts_pending`, `proposal_diverged`) and the screen
  * that asked is the one that knows which of them it is looking for.
  * {@link readStackPlacement} is how the two that landed say where in the chain
- * they landed.
+ * they landed. On a direct domain a `branch_protected` answer can offer the
+ * same share as a proposal (`fallback: "proposal"`), and a `proposed` one can
+ * say it fell back to a proposal after the branch refused the commit.
  */
 export async function shareDomain(
   domain: string,
@@ -1287,6 +1296,11 @@ export async function shareDomain(
      * request it always was.
      */
     files?: string[];
+    /**
+     * On a domain that shares directly: `true` shares as a proposal, `false`
+     * tries the direct commit only. Left out, the engine decides.
+     */
+    as_proposal?: boolean;
   },
 ): Promise<unknown> {
   return api<unknown>(`/domains/${encodeSegment(domain)}/sync/share`, {
