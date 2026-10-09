@@ -213,6 +213,14 @@ pub enum ProposeOutcome {
     },
     /// A direct share landed: one commit on the connected branch, no proposal.
     Committed(CommitReport),
+    /// The branch refused this share's direct commit while a refusal was
+    /// recorded, and the same commit opened a proposal instead.
+    FellBack {
+        /// The proposal the commit opened.
+        report: ProposeReport,
+        /// The connected branch that refused the commit.
+        refused_branch: String,
+    },
     /// A direct share refused because a proposal this machine recorded is
     /// still open; nothing was written. Merge or withdraw it first.
     ProposalOpen {
@@ -291,6 +299,9 @@ pub struct CommitReport {
     pub skipped_large: Vec<(String, u64)>,
     /// The one-line summary, as [`generate_summary_line`] writes it.
     pub summary: String,
+    /// Whether this commit cleared a recorded refusal: direct commits work
+    /// for whoever shares from this machine again.
+    pub refusal_cleared: bool,
 }
 
 /// The refusal a direct domain answers a named proposal with: there is no
@@ -1575,6 +1586,12 @@ pub struct ShareOptions<'a> {
     /// domain's MANIFEST at share time (`crystalline_core::sharing_at`); this
     /// crate never opens the MANIFEST for it.
     pub sharing: Sharing,
+    /// How a share on a `sharing: direct` domain goes: `Some(true)` opens a
+    /// proposal with the stacking and amend rules of a proposal domain,
+    /// `Some(false)` tries the direct commit only and never falls back, and
+    /// `None` lets [`share_route`] decide from the refusal this machine
+    /// recorded. A domain that opens proposals ignores it.
+    pub as_proposal: Option<bool>,
 }
 
 /// The changes a share carries once the caller's selection is applied: the
@@ -2054,6 +2071,47 @@ async fn retry_stack_link(
     }
 }
 
+/// How one share reaches the team, decided before anything is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShareRoute {
+    /// A commit onto the connected branch. `fall_back` opens a proposal with
+    /// the same commit when the branch refuses it.
+    Direct {
+        /// Whether a refusal opens a proposal.
+        fall_back: bool,
+    },
+    /// The proposal path: open, stack, update or amend.
+    Proposal,
+}
+
+/// The route of a share with `options` against `state`.
+///
+/// A proposal domain always proposes. On a direct domain `as_proposal`
+/// decides when it is given. Without it, the share goes as a proposal when
+/// this machine has an open proposal of its own and either a refusal is
+/// recorded (so work is not split between the branch and a proposal) or the
+/// share names a proposal to amend; otherwise it tries the direct commit,
+/// falling back only while a refusal is recorded. Every proposal in
+/// [`OriginState::proposals`] is this machine's own.
+pub(crate) fn share_route(options: &ShareOptions<'_>, state: &OriginState) -> ShareRoute {
+    if options.sharing != Sharing::Direct {
+        return ShareRoute::Proposal;
+    }
+    match options.as_proposal {
+        Some(true) => ShareRoute::Proposal,
+        Some(false) => ShareRoute::Direct { fall_back: false },
+        None => {
+            let refused = state.direct_refused.is_some();
+            let own_open = open_proposal(state).is_some();
+            if own_open && (refused || options.proposal.is_some()) {
+                ShareRoute::Proposal
+            } else {
+                ShareRoute::Direct { fall_back: refused }
+            }
+        }
+    }
+}
+
 /// Proposes a domain's local changes as a pull request against its origin.
 ///
 /// `domain_name` is the domain's registered name, the contract's sole
@@ -2156,11 +2214,11 @@ pub async fn propose(
         });
     }
 
-    // A domain that shares directly has no proposal to open, stack or amend,
-    // so it leaves here before the stacks probe: everything below is about
-    // proposals, and asking the forge whether it stacks them would be a
+    // A share that commits onto the branch has no proposal to open, stack or
+    // amend, so it leaves here before the stacks probe: everything below is
+    // about proposals, and asking the forge whether it stacks them would be a
     // question this share never has a use for.
-    if options.sharing == Sharing::Direct {
+    if let ShareRoute::Direct { fall_back } = share_route(&options, &state) {
         return commit_direct(
             provider,
             spec,
@@ -2169,6 +2227,7 @@ pub async fn propose(
             state_dir,
             state,
             options,
+            fall_back,
         )
         .await;
     }
@@ -2399,9 +2458,6 @@ pub async fn propose(
     let generated_title = generate_title(added, updated, deleted, indexes, domain_name);
     let effective_title = title.map(str::to_string).unwrap_or(generated_title);
     let summary = generate_summary_line(added, updated, deleted, indexes);
-    let body = description
-        .map(str::to_string)
-        .unwrap_or_else(|| generate_body(&summary, &collected.entries, domain_name));
 
     let tree_sha = provider
         .create_tree(spec, &state.base_commit, &collected.writes)
@@ -2414,53 +2470,24 @@ pub async fn propose(
             std::slice::from_ref(&state.base_commit),
         )
         .await?;
-    let branch = share_branch_name(domain_name);
-    provider.create_branch(spec, &branch, &commit_sha).await?;
-    let handle = provider
-        .create_proposal(
-            spec,
-            &ProposalRequest {
-                title: effective_title.clone(),
-                body,
-                branch: branch.clone(),
-                base_branch: spec.branch.clone(),
-            },
-        )
-        .await?;
-
-    state.proposals.push(Proposal {
-        number: handle.number,
-        url: handle.url.clone(),
-        branch: branch.clone(),
-        title: effective_title,
-        created_at: Utc::now(),
-        status: ProposalStatus::Open,
-        files: collected.files,
-        head_commit: Some(commit_sha),
-        // A fresh record carries no half-finished push: the create path either
-        // opened the proposal on this commit or failed before recording it.
-        pending_head_commit: None,
-        base_commit: Some(state.base_commit.clone()),
-        review_state: None,
-        feedback: Vec::new(),
-        updated_at: None,
-        author_login: author_login.map(str::to_string),
-    });
-    state.save(state_dir)?;
-
-    Ok(ProposeOutcome::Proposed(ProposeReport {
-        url: handle.url,
-        number: handle.number,
-        branch,
-        added: collected.added,
-        updated: collected.updated,
-        deleted: collected.deleted,
-        skipped_large: local.skipped_large,
-        summary,
-        // A bottom layer is not stacked onto anything: the chain starts here.
-        stack_number: None,
-        stack_position: None,
-    }))
+    let report = open_proposal_on_commit(
+        provider,
+        spec,
+        domain_name,
+        state_dir,
+        &mut state,
+        NewLayer {
+            commit_sha,
+            collected,
+            skipped_large: local.skipped_large,
+            title: effective_title,
+            summary,
+            description,
+            author_login,
+        },
+    )
+    .await?;
+    Ok(ProposeOutcome::Proposed(report))
 }
 
 /// What a share would do, computed without a single provider write.
@@ -2481,6 +2508,11 @@ pub struct SharePlan {
     /// How the domain shares, from the options the caller handed down;
     /// `direct` says the plan is about a commit before the action is read.
     pub sharing: Sharing,
+    /// One clause on how a direct domain's share goes when it is not the
+    /// plain direct commit: [`crate::error::PREVIEW_FALLS_BACK`] while a
+    /// refusal is recorded, or the open proposal it goes into
+    /// ([`crate::error::preview_proposal_open_note`]). `None` otherwise.
+    pub note: Option<String>,
 }
 
 /// The single thing a share would do, as [`propose_preview`] classifies it.
@@ -2581,19 +2613,60 @@ pub async fn propose_preview(
     state_dir: &Path,
     options: ShareOptions<'_>,
 ) -> Result<SharePlan, RemoteError> {
-    let title = options.title;
     pull_with(provider, spec, domain_root, state_dir, BranchCleanup::Defer).await?;
-    let mut state = OriginState::load(state_dir)?.ok_or_else(|| {
+    let state = OriginState::load(state_dir)?.ok_or_else(|| {
         RemoteError::Refused(
             "this domain has no origin state; add the domain from its origin first".to_string(),
         )
     })?;
-    // The direct plan is computed off state alone, and it leaves here for
-    // the same reason the share does: nothing below this line is about a
-    // commit onto the connected branch.
-    if options.sharing == Sharing::Direct {
-        return preview_direct(spec, domain_root, domain_name, state_dir, &state, options);
+    // The route the share would take, decided the way the share decides it.
+    // The direct plan is computed off state alone: nothing in
+    // [`preview_as_proposal`] is about a commit onto the connected branch.
+    if let ShareRoute::Direct { fall_back } = share_route(&options, &state) {
+        let mut plan = preview_direct(spec, domain_root, domain_name, state_dir, &state, options)?;
+        if fall_back && matches!(plan.action, PlannedAction::Commit { .. }) {
+            plan.note = Some(crate::error::PREVIEW_FALLS_BACK.to_string());
+        }
+        return Ok(plan);
     }
+    // The open proposal a direct domain's share goes into because a refusal
+    // is recorded. A share naming that proposal amends it and opens nothing,
+    // and one that asked for a proposal chose the route itself, so neither
+    // gets the note.
+    let own_open = (options.sharing == Sharing::Direct
+        && options.as_proposal.is_none()
+        && options.proposal.is_none()
+        && state.direct_refused.is_some())
+    .then(|| open_proposal(&state).map(|p| p.number))
+    .flatten();
+    let mut plan = preview_as_proposal(
+        provider,
+        spec,
+        domain_root,
+        domain_name,
+        state_dir,
+        state,
+        options,
+    )
+    .await?;
+    if let Some(number) = own_open {
+        plan.note = Some(crate::error::preview_proposal_open_note(number));
+    }
+    Ok(plan)
+}
+
+/// [`propose_preview`] for a share that goes as a proposal: the proposal
+/// domain's plan, and a direct domain's when the route sends it there.
+async fn preview_as_proposal(
+    provider: &dyn Provider,
+    spec: &OriginSpec,
+    domain_root: &Path,
+    domain_name: &str,
+    state_dir: &Path,
+    mut state: OriginState,
+    options: ShareOptions<'_>,
+) -> Result<SharePlan, RemoteError> {
+    let title = options.title;
     // The same capability question a real share asks, and the same cached
     // answer: a preview that guessed would name an action the share then
     // would not take.
@@ -2631,6 +2704,7 @@ pub async fn propose_preview(
                 changes: local,
                 effective_title: String::new(),
                 sharing: Sharing::Proposal,
+                note: None,
             });
         }
         // Read-only, and the same question the amend asks before its first
@@ -2657,6 +2731,7 @@ pub async fn propose_preview(
                 changes: local,
                 effective_title: String::new(),
                 sharing: Sharing::Proposal,
+                note: None,
             });
         }
         let (added, updated, deleted, indexes) = count_changes(&local);
@@ -2669,6 +2744,7 @@ pub async fn propose_preview(
                 changes: local,
                 effective_title,
                 sharing: Sharing::Proposal,
+                note: None,
             });
         }
         let layers_above = state.proposals[index + 1..]
@@ -2685,6 +2761,7 @@ pub async fn propose_preview(
             changes: local,
             effective_title,
             sharing: Sharing::Proposal,
+            note: None,
         });
     }
 
@@ -2750,6 +2827,7 @@ pub async fn propose_preview(
             changes: local,
             effective_title: String::new(),
             sharing: Sharing::Proposal,
+            note: None,
         });
     }
     if local.changes.is_empty() {
@@ -2758,6 +2836,7 @@ pub async fn propose_preview(
             changes: local,
             effective_title: String::new(),
             sharing: Sharing::Proposal,
+            note: None,
         });
     }
 
@@ -2772,6 +2851,7 @@ pub async fn propose_preview(
             changes: local,
             effective_title,
             sharing: Sharing::Proposal,
+            note: None,
         });
     }
 
@@ -2811,6 +2891,7 @@ pub async fn propose_preview(
         changes: local,
         effective_title,
         sharing: Sharing::Proposal,
+        note: None,
     })
 }
 
@@ -2891,6 +2972,7 @@ fn preview_direct(
         changes: local.clone(),
         effective_title,
         sharing: Sharing::Direct,
+        note: None,
     };
     if !state.conflicts.is_empty() {
         return Ok(plan(
@@ -2926,6 +3008,89 @@ fn preview_direct(
     ))
 }
 
+/// What a fresh bottom-layer proposal is opened from: a commit already built
+/// on the base, and the changes it carries.
+struct NewLayer<'a> {
+    commit_sha: String,
+    collected: CollectedChanges,
+    skipped_large: Vec<(String, u64)>,
+    title: String,
+    summary: String,
+    description: Option<&'a str>,
+    author_login: Option<&'a str>,
+}
+
+/// Opens a proposal on `layer`'s commit: a share branch at it, the pull
+/// request, the record. The create path of [`propose`] and the fallback of
+/// [`commit_direct`] both end here, so a fallback reuses the commit the
+/// direct attempt already built.
+async fn open_proposal_on_commit(
+    provider: &dyn Provider,
+    spec: &OriginSpec,
+    domain_name: &str,
+    state_dir: &Path,
+    state: &mut OriginState,
+    layer: NewLayer<'_>,
+) -> Result<ProposeReport, RemoteError> {
+    let NewLayer {
+        commit_sha,
+        collected,
+        skipped_large,
+        title,
+        summary,
+        description,
+        author_login,
+    } = layer;
+    let body = description
+        .map(str::to_string)
+        .unwrap_or_else(|| generate_body(&summary, &collected.entries, domain_name));
+    let branch = share_branch_name(domain_name);
+    provider.create_branch(spec, &branch, &commit_sha).await?;
+    let handle = provider
+        .create_proposal(
+            spec,
+            &ProposalRequest {
+                title: title.clone(),
+                body,
+                branch: branch.clone(),
+                base_branch: spec.branch.clone(),
+            },
+        )
+        .await?;
+    state.proposals.push(Proposal {
+        number: handle.number,
+        url: handle.url.clone(),
+        branch: branch.clone(),
+        title,
+        created_at: Utc::now(),
+        status: ProposalStatus::Open,
+        files: collected.files,
+        head_commit: Some(commit_sha),
+        // A fresh record carries no half-finished push: the create path either
+        // opened the proposal on this commit or failed before recording it.
+        pending_head_commit: None,
+        base_commit: Some(state.base_commit.clone()),
+        review_state: None,
+        feedback: Vec::new(),
+        updated_at: None,
+        author_login: author_login.map(str::to_string),
+    });
+    state.save(state_dir)?;
+    Ok(ProposeReport {
+        url: handle.url,
+        number: handle.number,
+        branch,
+        added: collected.added,
+        updated: collected.updated,
+        deleted: collected.deleted,
+        skipped_large,
+        summary,
+        // A bottom layer is not stacked onto anything: the chain starts here.
+        stack_number: None,
+        stack_position: None,
+    })
+}
+
 /// A direct share: the selected files as one commit onto the connected
 /// branch, with one pull and one retry when the branch moved underneath.
 ///
@@ -2934,6 +3099,7 @@ fn preview_direct(
 /// refusal; blobs, trees and commits created before a forge refusal are
 /// unreachable objects the forge collects, the same residue the proposal
 /// path leaves when `create_proposal` fails after `create_branch`.
+#[allow(clippy::too_many_arguments)]
 async fn commit_direct(
     provider: &dyn Provider,
     spec: &OriginSpec,
@@ -2942,6 +3108,7 @@ async fn commit_direct(
     state_dir: &Path,
     mut state: OriginState,
     options: ShareOptions<'_>,
+    fall_back: bool,
 ) -> Result<ProposeOutcome, RemoteError> {
     if options.proposal.is_some() {
         return Err(RemoteError::Refused(DIRECT_NO_AMEND.to_string()));
@@ -2998,6 +3165,9 @@ async fn commit_direct(
         {
             Ok(()) => {
                 let url = provider.commit_url(spec, &commit_sha);
+                // A commit that landed is the proof that direct commits work
+                // for this person again; the same save records both.
+                let refusal_cleared = state.direct_refused.take().is_some();
                 advance_base_after_commit(
                     &mut state,
                     state_dir,
@@ -3016,6 +3186,7 @@ async fn commit_direct(
                     deleted: collected.deleted,
                     skipped_large: local.skipped_large,
                     summary,
+                    refusal_cleared,
                 }));
             }
             Err(RemoteError::NotFastForward { branch }) if !retried => {
@@ -3065,7 +3236,31 @@ async fn commit_direct(
                     refused_at: Utc::now(),
                 });
                 state.save(state_dir)?;
-                return Ok(ProposeOutcome::BranchProtected { branch, message });
+                if !fall_back {
+                    return Ok(ProposeOutcome::BranchProtected { branch, message });
+                }
+                // The same changes, as a proposal, on the commit already built.
+                let report = open_proposal_on_commit(
+                    provider,
+                    spec,
+                    domain_name,
+                    state_dir,
+                    &mut state,
+                    NewLayer {
+                        commit_sha,
+                        collected,
+                        skipped_large: local.skipped_large,
+                        title: effective_title,
+                        summary,
+                        description: options.description,
+                        author_login: options.author_login,
+                    },
+                )
+                .await?;
+                return Ok(ProposeOutcome::FellBack {
+                    report,
+                    refused_branch: branch,
+                });
             }
             Err(e) => return Err(e),
         }
@@ -6228,5 +6423,118 @@ fn engram_title(path: &str, content: Option<&[u8]>) -> String {
     match title {
         Some(title) => format!("{title} ({path})"),
         None => path.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod share_route_tests {
+    use super::*;
+
+    fn options(
+        sharing: Sharing,
+        as_proposal: Option<bool>,
+        proposal: Option<u64>,
+    ) -> ShareOptions<'static> {
+        ShareOptions {
+            sharing,
+            as_proposal,
+            proposal,
+            ..ShareOptions::default()
+        }
+    }
+
+    fn with_open_proposal(mut state: OriginState) -> OriginState {
+        state.proposals.push(Proposal {
+            number: 7,
+            url: "https://example.test/pull/7".to_string(),
+            branch: "crystalline/share-7".to_string(),
+            title: "Seven".to_string(),
+            created_at: Utc::now(),
+            status: ProposalStatus::Open,
+            files: Vec::new(),
+            head_commit: None,
+            pending_head_commit: None,
+            base_commit: None,
+            review_state: None,
+            feedback: Vec::new(),
+            updated_at: None,
+            author_login: None,
+        });
+        state
+    }
+
+    fn refused(mut state: OriginState) -> OriginState {
+        state.direct_refused = Some(DirectRefusal {
+            branch: "main".to_string(),
+            message: "rule".to_string(),
+            refused_at: Utc::now(),
+        });
+        state
+    }
+
+    #[test]
+    fn a_proposal_domain_always_proposes() {
+        let state = refused(OriginState::new("acme/kb", "main"));
+        for as_proposal in [None, Some(true), Some(false)] {
+            assert_eq!(
+                share_route(&options(Sharing::Proposal, as_proposal, None), &state),
+                ShareRoute::Proposal,
+                "{as_proposal:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_direct_domain_routes_by_the_flag_and_the_recorded_refusal() {
+        let fresh = OriginState::new("acme/kb", "main");
+        assert_eq!(
+            share_route(&options(Sharing::Direct, None, None), &fresh),
+            ShareRoute::Direct { fall_back: false }
+        );
+        assert_eq!(
+            share_route(&options(Sharing::Direct, Some(true), None), &fresh),
+            ShareRoute::Proposal
+        );
+        assert_eq!(
+            share_route(
+                &options(Sharing::Direct, None, None),
+                &refused(fresh.clone())
+            ),
+            ShareRoute::Direct { fall_back: true }
+        );
+        assert_eq!(
+            share_route(
+                &options(Sharing::Direct, Some(false), None),
+                &refused(fresh)
+            ),
+            ShareRoute::Direct { fall_back: false }
+        );
+    }
+
+    #[test]
+    fn an_own_open_proposal_takes_the_share_while_a_refusal_is_recorded_or_it_is_named() {
+        let open = with_open_proposal(OriginState::new("acme/kb", "main"));
+        assert_eq!(
+            share_route(&options(Sharing::Direct, None, None), &open),
+            ShareRoute::Direct { fall_back: false },
+            "without a refusal, today's proposal_open answer stands"
+        );
+        assert_eq!(
+            share_route(&options(Sharing::Direct, None, Some(7)), &open),
+            ShareRoute::Proposal,
+            "a named own proposal is amended, not refused"
+        );
+        assert_eq!(
+            share_route(
+                &options(Sharing::Direct, None, None),
+                &refused(open.clone())
+            ),
+            ShareRoute::Proposal
+        );
+        assert_eq!(
+            share_route(&options(Sharing::Direct, Some(false), Some(7)), &open),
+            ShareRoute::Direct { fall_back: false },
+            "direct only stays direct only"
+        );
     }
 }

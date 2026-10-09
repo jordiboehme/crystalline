@@ -352,6 +352,12 @@ impl MockProvider {
             .insert(name.to_string(), message.to_string());
     }
 
+    /// Lifts [`MockProvider::protect_branch`]: `update_branch` on `name` takes
+    /// commits again, the way a ruleset gains a bypass entry for somebody.
+    pub fn unprotect_branch(&self, name: &str) {
+        self.inner.lock().unwrap().protected.remove(name);
+    }
+
     /// Moves `branch` to `commit` right after the `nth` `branch_head` probe
     /// of that branch FOLLOWING this call (1-based), the way a colleague's
     /// push lands between a share's pull and its update.

@@ -594,17 +594,34 @@ pub(crate) fn propose_outcome_json(outcome: &ProposeOutcome) -> Value {
             "proposal": { "number": number, "url": url, "branch": branch },
             "guidance": DIVERGED_GUIDANCE,
         }),
-        ProposeOutcome::Committed(report) => json!({
-            "outcome": "committed",
-            "sha": report.sha,
-            "url": report.url,
-            "branch": report.branch,
-            "added": report.added,
-            "updated": report.updated,
-            "deleted": report.deleted,
-            "skipped_large": report.skipped_large,
-            "summary": report.summary,
-        }),
+        ProposeOutcome::FellBack {
+            report,
+            refused_branch,
+        } => {
+            let mut receipt = propose_outcome_json(&ProposeOutcome::Proposed(report.clone()));
+            receipt["fell_back"] = json!(true);
+            receipt["note"] = json!(crystalline_remote::error::fell_back_line(refused_branch));
+            receipt
+        }
+        ProposeOutcome::Committed(report) => {
+            let mut receipt = json!({
+                "outcome": "committed",
+                "sha": report.sha,
+                "url": report.url,
+                "branch": report.branch,
+                "added": report.added,
+                "updated": report.updated,
+                "deleted": report.deleted,
+                "skipped_large": report.skipped_large,
+                "summary": report.summary,
+            });
+            if report.refusal_cleared {
+                receipt["note"] = json!(crystalline_remote::error::direct_works_again_line(
+                    &report.branch
+                ));
+            }
+            receipt
+        }
         ProposeOutcome::ProposalOpen { number, url, title } => json!({
             "outcome": "proposal_open",
             "proposal": { "number": number, "url": url, "title": title },
@@ -1101,6 +1118,7 @@ mod tests {
         )
         .unwrap();
         let plan = ops::SharePlan {
+            note: None,
             action: ops::PlannedAction::Create,
             changes: LocalChanges {
                 changes: vec![LocalChange::Modified {
@@ -2097,6 +2115,7 @@ mod tests {
     fn share_plan_json_names_the_action_and_every_change() {
         use crystalline_remote::changes::{LocalChange, LocalChanges};
         let plan = ops::SharePlan {
+            note: None,
             action: ops::PlannedAction::Update {
                 number: 4,
                 url: "https://github.com/acme/brand-knowledge/pull/4".to_string(),
@@ -2175,6 +2194,7 @@ mod tests {
             sha256: "aa".to_string(),
         };
         let plan = ops::SharePlan {
+            note: None,
             action: ops::PlannedAction::Create,
             changes: LocalChanges {
                 changes: vec![
@@ -2219,6 +2239,7 @@ mod tests {
     fn share_plan_json_shapes_the_remaining_actions() {
         use crystalline_remote::changes::LocalChanges;
         let plan = |action| ops::SharePlan {
+            note: None,
             action,
             changes: LocalChanges::default(),
             effective_title: String::new(),
@@ -2245,6 +2266,50 @@ mod tests {
         assert_eq!(diverged["branch"], "crystalline/share-brand");
     }
 
+    #[test]
+    fn a_fallback_is_the_proposal_receipt_with_its_line() {
+        let report = ops::ProposeReport {
+            url: "https://github.com/acme/kb/pull/9".to_string(),
+            number: 9,
+            branch: "crystalline/share-kb-1".to_string(),
+            added: vec!["notes/a.md".to_string()],
+            updated: vec![],
+            deleted: vec![],
+            skipped_large: vec![],
+            summary: "Share 1 new engram".to_string(),
+            stack_number: None,
+            stack_position: None,
+        };
+        let v = propose_outcome_json(&ProposeOutcome::FellBack {
+            report,
+            refused_branch: "main".to_string(),
+        });
+        assert_eq!(v["outcome"], "proposed");
+        assert_eq!(v["number"], 9);
+        assert_eq!(v["fell_back"], true);
+        assert_eq!(
+            v["note"],
+            "The branch main does not accept direct commits from you, so this share opened a proposal."
+        );
+    }
+
+    #[test]
+    fn a_commit_that_cleared_a_refusal_says_direct_commits_work_again() {
+        let v = propose_outcome_json(&ProposeOutcome::Committed(ops::CommitReport {
+            sha: "9f2c".to_string(),
+            url: None,
+            branch: "main".to_string(),
+            added: vec!["notes/b.md".to_string()],
+            updated: vec![],
+            deleted: vec![],
+            skipped_large: vec![],
+            summary: "Shares 1 new engram.".to_string(),
+            refusal_cleared: true,
+        }));
+        assert_eq!(v["outcome"], "committed");
+        assert_eq!(v["note"], "Direct commits to main work for you now.");
+    }
+
     /// A direct share's four answers: what landed, and the three refusals
     /// that are shaped as outcomes rather than errors because each one names
     /// what to do next.
@@ -2259,6 +2324,7 @@ mod tests {
             deleted: vec![],
             skipped_large: vec![],
             summary: "Shares 1 new engram.".to_string(),
+            refusal_cleared: false,
         }));
         assert_eq!(v["outcome"], "committed");
         assert_eq!(v["sha"], "9f2c");
@@ -2266,6 +2332,7 @@ mod tests {
         assert_eq!(v["branch"], "main");
         assert_eq!(v["added"], json!(["notes/b.md"]));
         assert!(v.get("number").is_none(), "a commit has no proposal number");
+        assert!(v.get("note").is_none(), "no refusal was cleared");
 
         let open = propose_outcome_json(&ProposeOutcome::ProposalOpen {
             number: 4,
@@ -2311,6 +2378,7 @@ mod tests {
     fn share_plan_json_names_the_commit_and_proposal_open_actions_and_the_policy() {
         use crystalline_remote::changes::LocalChanges;
         let plan = |action| ops::SharePlan {
+            note: None,
             action,
             changes: LocalChanges::default(),
             effective_title: String::new(),
@@ -2341,6 +2409,7 @@ mod tests {
     fn share_plan_json_names_the_stack_and_amend_actions() {
         use crystalline_remote::changes::LocalChanges;
         let plan = |action| ops::SharePlan {
+            note: None,
             action,
             changes: LocalChanges::default(),
             effective_title: String::new(),

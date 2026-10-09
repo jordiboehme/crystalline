@@ -2431,15 +2431,23 @@ async fn a_direct_preview_names_the_commit_and_an_open_proposal_refuses_it() {
             .contains("merge or withdraw proposal #4 first")
     );
 
-    let refused = eng
+    // An own open proposal named on a direct domain goes the proposal path
+    // rather than being refused: there is a proposal to amend. Proposal #4's
+    // branch was never pushed to the forge, so that path settles it and
+    // opens a fresh proposal with the change.
+    let amended = eng
         .origin_share("brand", None, None, Some(4), None, ShareActor::Owner)
-        .await
-        .unwrap_err();
+        .await;
     assert!(
-        refused
-            .to_string()
-            .contains("there is no proposal to amend"),
-        "{refused}"
+        !format!("{amended:?}").contains("there is no proposal to amend"),
+        "{amended:?}"
+    );
+    let amended = amended.unwrap();
+    assert_eq!(amended["outcome"], "proposed", "{amended}");
+    assert_eq!(
+        amended["added"],
+        serde_json::json!(["notes/new.md"]),
+        "{amended}"
     );
 }
 

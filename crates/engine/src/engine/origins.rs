@@ -1601,6 +1601,7 @@ impl Engine {
             domain,
             &state_dir,
             ops::ShareOptions {
+                as_proposal: None,
                 title,
                 description,
                 proposal,
@@ -1887,6 +1888,7 @@ impl Engine {
             domain,
             &state_dir,
             ops::ShareOptions {
+                as_proposal: None,
                 title,
                 description: None,
                 proposal,
