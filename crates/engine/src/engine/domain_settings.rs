@@ -5,7 +5,10 @@
 use super::*;
 
 use crystalline_core::manifest_view::{PolicyRow, manifest_facts, policy_rows};
-use crystalline_core::verify::{DOMAIN_CONFIG_FILE, VERIFY_RULES, load_domain_config, verify_rule};
+use crystalline_core::verify::{
+    ConfigEdit, DOMAIN_CONFIG_FILE, VERIFY_RULES, edit_domain_config, is_severity_word,
+    load_domain_config, verify_rule,
+};
 
 /// What the rules part says about a virtual domain.
 pub const VIRTUAL_NO_RULES: &str =
@@ -181,6 +184,227 @@ impl Engine {
             "markdown": markdown,
             "draft": overlay.is_some(),
         }))
+    }
+}
+
+/// The line an answer carries when the YAML edit lost comments.
+const YAML_COMMENTS_DROPPED: &str =
+    "The edit kept every key of .crystalline.yaml but not its comments.";
+
+/// Why a rule override cannot be set in a reviewing domain.
+const REVIEW_NO_RULES: &str = "This domain reviews changes before they land, and .crystalline.yaml is not an engram, so a rule override cannot be a draft. Change it in the domain's files instead.";
+
+/// Why a token budget other than a positive number is refused.
+const TOKEN_BUDGET_POSITIVE: &str = "token_budget takes a positive whole number of tokens. To turn the size rule off, set rules.Q002: off.";
+
+/// What one key of a configure call with a domain is.
+enum DomainKey {
+    /// A MANIFEST policy key.
+    Policy,
+    /// `rules.<id>`, the id as verify matches it.
+    Rule(String),
+    /// `token_budget`.
+    TokenBudget,
+}
+
+/// Which part of the domain `key` addresses, or the refusal that says what
+/// the call may name instead.
+fn classify_domain_key(key: &str) -> Result<DomainKey> {
+    let registry = crystalline_core::policy_registry();
+    if registry.iter().any(|spec| spec.key == key) {
+        return Ok(DomainKey::Policy);
+    }
+    if key == "token_budget" {
+        return Ok(DomainKey::TokenBudget);
+    }
+    if let Some(rule) = key.strip_prefix("rules.") {
+        let id = rule.trim().to_ascii_uppercase();
+        if verify_rule(&id).is_some() {
+            return Ok(DomainKey::Rule(id));
+        }
+        return Err(EngineError::Invalid(format!(
+            "`{rule}` is not a verify rule id. configure with domain lists every rule under rules, in catalog."
+        )));
+    }
+    if crate::settings::is_known_key(key) {
+        return Err(EngineError::Invalid(format!(
+            "`{key}` is an instance setting, and this call names a domain. Set instance settings in a configure call without domain."
+        )));
+    }
+    let keys: Vec<&str> = registry.iter().map(|spec| spec.key).collect();
+    Err(EngineError::Invalid(format!(
+        "`{key}` is not a domain setting. With domain, set and unset take the MANIFEST policy keys ({}), rules.<rule id> and token_budget.",
+        keys.join(", ")
+    )))
+}
+
+impl Engine {
+    /// Change `domain`'s policy keys and rule overrides: `set` and `unset`
+    /// of a configure call that names it. Every key is checked, and the
+    /// `.crystalline.yaml` read and edited in memory, before anything is
+    /// written, so one bad key writes nothing. The policy keys go through
+    /// [`Engine::edit_manifest_policies`] (a draft in a reviewing domain);
+    /// the rule overrides through [`edit_domain_config`], refused on a
+    /// virtual domain and in a reviewing one. Both pass
+    /// [`Engine::require_policy_writer`]. Answers the fresh view, with
+    /// `draft: true` when the policy edit became a draft and `note` when the
+    /// file lost its comments. Nothing is shared: on a team domain both files
+    /// become unshared local changes.
+    ///
+    /// A key only an instance admin may change ([`crystalline_core::PolicyRole::Admin`])
+    /// is not checked here, since a scope cannot say whether it administers
+    /// the instance on every surface: the surface checks it, as REST and MCP do.
+    pub async fn change_domain_settings(
+        &self,
+        domain: &str,
+        set: &BTreeMap<String, String>,
+        unset: &[String],
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        self.require_domain(domain, scope).await?;
+        let mut policy_edits: Vec<PolicyEdit> = Vec::new();
+        let mut config_edits: Vec<ConfigEdit> = Vec::new();
+        for (key, value) in set {
+            match classify_domain_key(key)? {
+                DomainKey::Policy => policy_edits.push(PolicyEdit::Set {
+                    key: key.clone(),
+                    value: value.clone(),
+                }),
+                DomainKey::Rule(rule) => {
+                    if !is_severity_word(value) {
+                        return Err(EngineError::Invalid(format!(
+                            "`{value}` is not a severity for {rule}; write off, error, warning or info"
+                        )));
+                    }
+                    config_edits.push(ConfigEdit::SetRule {
+                        rule,
+                        word: value.trim().to_string(),
+                    });
+                }
+                DomainKey::TokenBudget => match value.trim().parse::<usize>() {
+                    Ok(budget) if budget > 0 => {
+                        config_edits.push(ConfigEdit::SetTokenBudget(budget))
+                    }
+                    _ => return Err(EngineError::Invalid(TOKEN_BUDGET_POSITIVE.to_string())),
+                },
+            }
+        }
+        for key in unset {
+            match classify_domain_key(key)? {
+                DomainKey::Policy => policy_edits.push(PolicyEdit::Unset { key: key.clone() }),
+                DomainKey::Rule(rule) => config_edits.push(ConfigEdit::UnsetRule { rule }),
+                DomainKey::TokenBudget => config_edits.push(ConfigEdit::UnsetTokenBudget),
+            }
+        }
+        for edit in &policy_edits {
+            checked_policy(domain, edit)?;
+        }
+        // An edit that would leave the MANIFEST as it is writes nothing: on a
+        // team domain a no-op write would be a local change nobody made. A
+        // reviewing domain is left to the draft path, since the caller's
+        // draft, not the folder, is what such an edit compares against.
+        if !self.reviews_changes(domain) {
+            let current = self.manifest_source(domain).await?;
+            let facts = manifest_facts(&current.markdown, domain);
+            let declared = |key: &str| {
+                facts
+                    .policies
+                    .iter()
+                    .find(|row| row.key == key)
+                    .and_then(|row| row.declared.clone())
+            };
+            policy_edits.retain(|edit| match edit {
+                PolicyEdit::Set { key, value } => declared(key).as_deref() != Some(value.as_str()),
+                PolicyEdit::Unset { key } => declared(key).is_some(),
+            });
+        }
+        let yaml = if config_edits.is_empty() {
+            None
+        } else {
+            let ContentSource::File { root } = self.read_source(domain) else {
+                return Err(EngineError::Invalid(format!(
+                    "a virtual domain has no .crystalline.yaml, so '{domain}' takes no rule overrides"
+                )));
+            };
+            if self.reviews_changes(domain) {
+                return Err(EngineError::Refused(REVIEW_NO_RULES.to_string()));
+            }
+            let path = root.join(DOMAIN_CONFIG_FILE);
+            let current = match std::fs::read_to_string(&path) {
+                Ok(text) => Some(text),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(source) => {
+                    return Err(EngineError::Io {
+                        path: path.display().to_string(),
+                        source,
+                    });
+                }
+            };
+            let edited = edit_domain_config(current.as_deref(), &config_edits)
+                .map_err(EngineError::Invalid)?;
+            Some((path, edited))
+        };
+        // Policy keys and rule overrides share one gate; the key it names is
+        // only the one the refusal mentions.
+        if let Some(first) = set.keys().chain(unset.iter()).next() {
+            self.require_policy_writer(domain, first, scope).await?;
+        }
+
+        let written = if policy_edits.is_empty() {
+            None
+        } else {
+            Some(
+                self.edit_manifest_policies(domain, &policy_edits, scope)
+                    .await?,
+            )
+        };
+        let mut note = None;
+        if let Some((path, edited)) = yaml.filter(|(_, edited)| edited.changed) {
+            // The write a rename waits for, like every engram write.
+            self.refuse_shadowed(domain)?;
+            let _writing = self.enter_write(domain).await?;
+            match &edited.text {
+                Some(text) => crystalline_core::config::save_bytes(&path, text.as_bytes())
+                    .map_err(|e| {
+                        EngineError::Internal(format!("writing {}: {e}", path.display()))
+                    })?,
+                None if path.exists() => {
+                    std::fs::remove_file(&path).map_err(|source| EngineError::Io {
+                        path: path.display().to_string(),
+                        source,
+                    })?
+                }
+                None => {}
+            }
+            if edited.dropped_comments {
+                note = Some(YAML_COMMENTS_DROPPED);
+            }
+        }
+
+        let (markdown, missing, draft) = match &written {
+            Some(written) => (
+                written["markdown"].as_str().unwrap_or_default().to_string(),
+                false,
+                written["draft"] == Value::Bool(true),
+            ),
+            None => {
+                let source = self.manifest_source(domain).await?;
+                (source.markdown, source.missing, false)
+            }
+        };
+        let mut view = self
+            .domain_settings_view(domain, &markdown, missing, scope)
+            .await?;
+        if draft {
+            view["draft"] = json!(true);
+        }
+        if let Some(note) = note {
+            view["note"] = json!(note);
+        }
+        Ok(view)
     }
 }
 

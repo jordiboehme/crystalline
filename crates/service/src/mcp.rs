@@ -3951,7 +3951,28 @@ impl McpServer {
         let p = self.localized(p, ctx).await?;
         let domain = p.domain.clone().unwrap_or_default();
         let scope = self.scope_of(ctx);
-        match self.engine.domain_settings(&domain, &scope).await {
+        let answer = if p.set.is_empty() && p.unset.is_empty() {
+            self.engine.domain_settings(&domain, &scope).await
+        } else {
+            // A key only an instance admin may change is this layer's check,
+            // as it is REST's: the engine checks the owner rule only. A hidden
+            // domain is the not-found first.
+            if let Err(e) = self.engine.require_domain(&domain, &scope).await {
+                return Err(to_error(e));
+            }
+            let admin = matches!(scope, Scope::Unrestricted | Scope::User { admin: true, .. });
+            if let Some(text) = admin_policy_refusal(
+                p.set.keys().chain(p.unset.iter()),
+                crystalline_core::policy_registry(),
+                admin,
+            ) {
+                return refuse(text);
+            }
+            self.engine
+                .change_domain_settings(&domain, &p.set, &p.unset, &scope)
+                .await
+        };
+        match answer {
             Ok(view) => self.ok_list(view),
             Err(
                 EngineError::Invalid(text)
@@ -4826,6 +4847,26 @@ fn ok_split(value: Value) -> Result<CallToolResult, ErrorData> {
 /// surfaces disagreed. It names the role rather than the person, and it names
 /// the way out, because an agent that reads this has to be able to tell its
 /// user what to ask for.
+/// The refusal for the first of `keys` that only an instance admin may change
+/// ([`crystalline_core::PolicyRole::Admin`] in `registry`), when the caller is
+/// not one. No key needs the role today; REST refuses the same keys.
+fn admin_policy_refusal<'a>(
+    keys: impl IntoIterator<Item = &'a String>,
+    registry: &[crystalline_core::PolicyKey],
+    admin: bool,
+) -> Option<String> {
+    if admin {
+        return None;
+    }
+    keys.into_iter()
+        .find(|key| {
+            registry.iter().any(|spec| {
+                spec.key == key.as_str() && spec.changed_by == crystalline_core::PolicyRole::Admin
+            })
+        })
+        .map(|key| format!("only an instance admin may change `{key}`"))
+}
+
 const INSTANCE_ADMIN_ONLY: &str = "Changing this instance itself - the domains registered on it, its settings and what it provisions into the harnesses on its machine - is reserved for an instance admin, and the account this session is authenticated as does not hold that role. Ask an admin to make the change (they can do it in Fluid under Settings, or with the crystalline CLI on the server). Capturing, reading and refining knowledge in the domains you can already see is unaffected.";
 
 /// What `configure` answers on a read-only instance, for every call including
@@ -5315,6 +5356,46 @@ mod tests {
     use rmcp::model::ErrorCode;
 
     use super::*;
+
+    /// A policy key only an instance admin may change is refused to anyone
+    /// else, set or unset; an owner key passes. No such key exists yet, so
+    /// the registry here is a stand-in.
+    #[test]
+    fn an_admin_policy_key_is_refused_to_a_caller_who_is_not_an_admin() {
+        let registry = [
+            crystalline_core::PolicyKey {
+                key: "guarded",
+                kind: crystalline_core::PolicyKind::Choice,
+                values: &["on", "off"],
+                default: "off",
+                meaning: "A stand-in key only an admin changes.",
+                changed_by: crystalline_core::PolicyRole::Admin,
+            },
+            crystalline_core::PolicyKey {
+                key: "sharing",
+                kind: crystalline_core::PolicyKind::Choice,
+                values: &["proposal", "direct"],
+                default: "proposal",
+                meaning: "A stand-in owner key.",
+                changed_by: crystalline_core::PolicyRole::Owner,
+            },
+        ];
+        let keys = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            admin_policy_refusal(&keys(&["sharing", "guarded"]), &registry, false).as_deref(),
+            Some("only an instance admin may change `guarded`")
+        );
+        assert_eq!(
+            admin_policy_refusal(&keys(&["guarded"]), &registry, true),
+            None,
+            "an admin may"
+        );
+        assert_eq!(
+            admin_policy_refusal(&keys(&["sharing", "rules.E007"]), &registry, false),
+            None,
+            "an owner key and a rule override are the engine's to gate"
+        );
+    }
 
     /// A client name past [`AGENT_LABEL_CLIENT_CHARS`] is cut, and the cut
     /// carries a trailing `...` so it reads as a cut rather than as the

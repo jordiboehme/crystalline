@@ -10,7 +10,7 @@ mod support;
 use std::sync::Arc;
 
 use crystalline_core::config::{
-    DomainEntry, GitHubConfig, GlobalConfig, ResponseFormat, ServiceConfig,
+    DomainEntry, GitHubConfig, GlobalConfig, ResponseFormat, ReviewMode, ServiceConfig,
 };
 use crystalline_index::TursoStore;
 use crystalline_service::Engine;
@@ -1216,6 +1216,331 @@ async fn configure_with_a_domain_refuses_a_connect() {
         "{}",
         result_text(&result)
     );
+}
+
+fn eng_manifest(h: &Harness) -> String {
+    std::fs::read_to_string(h.root.join("eng/MANIFEST.md")).unwrap()
+}
+
+fn eng_yaml(h: &Harness) -> Option<String> {
+    std::fs::read_to_string(h.root.join("eng/.crystalline.yaml")).ok()
+}
+
+fn policy<'a>(view: &'a Value, key: &str) -> &'a Value {
+    view["policies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["key"] == key)
+        .unwrap_or_else(|| panic!("no {key} row: {view}"))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configure_sets_and_unsets_a_policy_of_a_domain() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+    let out = call(
+        peer,
+        "configure",
+        json!({ "domain": "eng", "set": { "sharing": "direct" } }),
+    )
+    .await
+    .unwrap();
+    assert!(
+        eng_manifest(&h).contains("\nsharing: direct\n"),
+        "{}",
+        eng_manifest(&h)
+    );
+    assert_eq!(policy(&out, "sharing")["declared"], "direct", "{out}");
+    assert!(out.get("draft").is_none(), "{out}");
+    let out = call(
+        peer,
+        "configure",
+        json!({ "domain": "eng", "unset": ["sharing"] }),
+    )
+    .await
+    .unwrap();
+    assert!(!eng_manifest(&h).contains("sharing:"));
+    assert_eq!(policy(&out, "sharing")["effective"], "proposal");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configure_sets_and_unsets_a_rule_override_and_the_token_budget() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+    let out = call(
+        peer,
+        "configure",
+        json!({ "domain": "eng", "set": { "rules.e007": "off", "token_budget": "5000" } }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        eng_yaml(&h).as_deref(),
+        Some("verify:\n  rules:\n    E007: off\n  token_budget: 5000\n"),
+        "the id is written upper case, as verify matches it"
+    );
+    assert_eq!(out["rules"]["overrides"][0]["rule"], "E007", "{out}");
+    assert_eq!(out["rules"]["token_budget"], 5000);
+    call(
+        peer,
+        "configure",
+        json!({ "domain": "eng", "unset": ["rules.E007", "token_budget"] }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(eng_yaml(&h), None, "the file goes with its last key");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_configure_call_sets_a_policy_and_a_rule_override_together() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let out = call(
+        client.peer(),
+        "configure",
+        json!({ "domain": "eng", "set": { "sharing": "direct", "rules.E007": "off" } }),
+    )
+    .await
+    .unwrap();
+    assert!(eng_manifest(&h).contains("\nsharing: direct\n"));
+    assert!(eng_yaml(&h).unwrap().contains("E007: off"));
+    assert_eq!(policy(&out, "sharing")["declared"], "direct");
+}
+
+/// Every key is checked before any is written: one bad key refuses the
+/// whole call, and the refusal says what is wrong.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configure_with_a_domain_refuses_a_bad_key_and_writes_nothing() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+    let before = eng_manifest(&h);
+    for (args, said) in [
+        (
+            json!({ "domain": "eng", "set": { "zzz": "x" } }),
+            "is not a domain setting",
+        ),
+        (
+            json!({ "domain": "eng", "set": { "sharing": "sideways" } }),
+            "is not a value `sharing` takes",
+        ),
+        (
+            json!({ "domain": "eng", "set": { "rules.X999": "off" } }),
+            "is not a verify rule id",
+        ),
+        (
+            json!({ "domain": "eng", "set": { "rules.V105": "off" } }),
+            "is not a verify rule id",
+        ),
+        (
+            json!({ "domain": "eng", "set": { "rules.E007": "loud" } }),
+            "is not a severity",
+        ),
+        (
+            json!({ "domain": "eng", "set": { "domain_name": "other" } }),
+            "crystalline domain rename eng <new>",
+        ),
+        (
+            json!({ "domain": "eng", "unset": ["domain_name"] }),
+            "crystalline domain rename eng <new>",
+        ),
+        (
+            json!({ "domain": "eng", "set": { "github.enabled": "true", "sharing": "direct" } }),
+            "is an instance setting",
+        ),
+        (
+            json!({ "domain": "eng", "set": { "sharing": "direct", "rules.X999": "off" } }),
+            "is not a verify rule id",
+        ),
+        (
+            json!({ "domain": "eng", "set": { "token_budget": "0" } }),
+            "rules.Q002: off",
+        ),
+        (
+            json!({ "domain": "eng", "set": { "token_budget": "-5" } }),
+            "rules.Q002: off",
+        ),
+        (
+            json!({ "domain": "eng", "set": { "token_budget": "abc" } }),
+            "rules.Q002: off",
+        ),
+        (
+            json!({ "domain": "eng", "set": { "token_budget": "1.5", "sharing": "direct" } }),
+            "rules.Q002: off",
+        ),
+        (
+            json!({ "domain": "eng", "set": { "auth.mcp": "false" } }),
+            "This setting is changed only with the crystalline CLI.",
+        ),
+    ] {
+        let result = call_result(peer, "configure", args.clone()).await;
+        assert_eq!(result.is_error, Some(true), "{args}");
+        assert!(
+            result_text(&result).contains(said),
+            "{args}: {}",
+            result_text(&result)
+        );
+    }
+    assert_eq!(eng_manifest(&h), before, "nothing was written");
+    assert_eq!(eng_yaml(&h), None);
+    assert!(
+        !h.engine.github_enabled(),
+        "the instance key was not applied"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configure_keeps_the_other_keys_of_crystalline_yaml_and_says_comments_went() {
+    let h = Harness::new(&["eng"]).await;
+    std::fs::write(
+        h.root.join("eng/.crystalline.yaml"),
+        "# tuned by hand\nverify:\n  rules:\n    T001: warning\n    e008: off\n  token_budgets:\n    notes/a.md: 900\n",
+    )
+    .unwrap();
+    let (client, _server) = h.connect().await;
+    let out = call(
+        client.peer(),
+        "configure",
+        json!({ "domain": "eng", "set": { "rules.E007": "off" } }),
+    )
+    .await
+    .unwrap();
+    let yaml = eng_yaml(&h).unwrap();
+    for kept in ["T001: warning", "e008: off", "notes/a.md: 900", "E007: off"] {
+        assert!(yaml.contains(kept), "{kept} in {yaml}");
+    }
+    assert!(!yaml.contains('#'), "{yaml}");
+    assert_eq!(
+        out["note"], "The edit kept every key of .crystalline.yaml but not its comments.",
+        "{out}"
+    );
+}
+
+/// A change to what the files already say writes nothing: no comment is
+/// lost, and a team domain gets no local change nobody made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_configure_change_that_changes_nothing_leaves_the_files_alone() {
+    let h = Harness::new(&["eng"]).await;
+    let yaml = "# tuned by hand\nverify:\n  rules:\n    T001: warning\n";
+    std::fs::write(h.root.join("eng/.crystalline.yaml"), yaml).unwrap();
+    let manifest = eng_manifest(&h);
+    let (client, _server) = h.connect().await;
+    let out = call(
+        client.peer(),
+        "configure",
+        json!({ "domain": "eng", "set": { "rules.T001": "warning" }, "unset": ["sharing", "rules.E007"] }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(eng_yaml(&h).as_deref(), Some(yaml), "the comment stays");
+    assert_eq!(
+        eng_manifest(&h),
+        manifest,
+        "an undeclared key unset is no write"
+    );
+    assert!(out.get("note").is_none(), "{out}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configure_refuses_a_crystalline_yaml_that_does_not_parse() {
+    let h = Harness::new(&["eng"]).await;
+    let broken = "verify: [unclosed\n";
+    std::fs::write(h.root.join("eng/.crystalline.yaml"), broken).unwrap();
+    let (client, _server) = h.connect().await;
+    let result = call_result(
+        client.peer(),
+        "configure",
+        json!({ "domain": "eng", "set": { "rules.E007": "off", "sharing": "direct" } }),
+    )
+    .await;
+    assert_eq!(result.is_error, Some(true));
+    assert!(
+        result_text(&result).contains("does not parse"),
+        "{}",
+        result_text(&result)
+    );
+    assert_eq!(eng_yaml(&h).as_deref(), Some(broken));
+    assert!(
+        !eng_manifest(&h).contains("sharing:"),
+        "nothing at all was written"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rule_override_is_refused_on_a_virtual_domain() {
+    let h = Harness::build_tweaked(&["eng"], false, true, |cfg, _| {
+        cfg.domains
+            .insert("notes".to_string(), DomainEntry::virtual_domain());
+    })
+    .await;
+    let (client, _server) = h.connect().await;
+    let result = call_result(
+        client.peer(),
+        "configure",
+        json!({ "domain": "notes", "set": { "rules.E007": "off" } }),
+    )
+    .await;
+    assert_eq!(result.is_error, Some(true));
+    assert!(
+        result_text(&result).contains("a virtual domain has no .crystalline.yaml"),
+        "{}",
+        result_text(&result)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn in_review_mode_a_policy_is_a_draft_and_a_rule_override_is_refused() {
+    let h = Harness::build_tweaked(&["eng"], false, true, |cfg, _| {
+        cfg.domains.get_mut("eng").unwrap().review = Some(ReviewMode::Overlay);
+    })
+    .await;
+    let before = eng_manifest(&h);
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+    let out = call(
+        peer,
+        "configure",
+        json!({ "domain": "eng", "set": { "sharing": "direct" } }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out["draft"], true, "{out}");
+    assert_eq!(
+        policy(&out, "sharing")["declared"],
+        "direct",
+        "the view is the draft"
+    );
+    assert_eq!(eng_manifest(&h), before, "the folder does not move");
+    let refused = call_result(
+        peer,
+        "configure",
+        json!({ "domain": "eng", "set": { "rules.E007": "off" } }),
+    )
+    .await;
+    assert_eq!(refused.is_error, Some(true));
+    assert!(
+        result_text(&refused).contains("reviews changes"),
+        "{}",
+        result_text(&refused)
+    );
+    assert_eq!(eng_yaml(&h), None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_only_instance_refuses_configure_with_a_domain() {
+    let h = Harness::new_read_only(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let err = call(
+        client.peer(),
+        "configure",
+        json!({ "domain": "eng", "set": { "sharing": "direct" } }),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("read-only"), "{err}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

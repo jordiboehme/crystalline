@@ -3068,6 +3068,97 @@ async fn the_open_tier_still_creates_domains_and_configures() {
     assert_eq!(std::fs::read_to_string(&config_path).unwrap(), before);
 }
 
+/// A policy change came back as a tool result that is not an error, never as
+/// a protocol error: `result` is absent from a protocol error, so its
+/// `isError` alone would read as null and pass.
+fn changed_ok(raw: &str) {
+    let payload = payload_of(raw);
+    assert!(
+        payload["result"].is_object(),
+        "a tool result, not a protocol error:\n{raw}"
+    );
+    assert_ne!(
+        payload["result"]["isError"],
+        serde_json::json!(true),
+        "{raw}"
+    );
+}
+
+/// **Domain policies over MCP follow the owner rule; the open tier follows
+/// edit_engram's.**
+///
+/// An editor of a shared domain may edit its MANIFEST but not change its
+/// policies; the owner of a private domain and an instance admin may. A
+/// domain the caller cannot see is the not-found a domain tool gives for it,
+/// and a change to it is the same not-found.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn domain_policies_over_mcp_follow_the_owner_rule() {
+    let ctx = mcp_ctx(true).await;
+    let set_sharing =
+        |domain: &str| serde_json::json!({ "domain": domain, "set": { "sharing": "direct" } });
+    let keeper = ctx.token_for("keeper").await;
+    let session = McpTestSession::open(&ctx.addr, Some(&keeper)).await;
+    let refused = session.call_tool("configure", set_sharing("open")).await;
+    refusal_is_readable(&refused, "a domain policy refusal");
+    assert!(refused.contains("only the owner of 'open'"), "{refused}");
+    let open = std::fs::read_to_string(ctx.tmp.path().join("open/MANIFEST.md")).unwrap();
+    assert!(
+        !open.contains("sharing:"),
+        "the refusal wrote nothing: {open}"
+    );
+    let owned = session.call_tool("configure", set_sharing("lab")).await;
+    changed_ok(&owned);
+    let lab = std::fs::read_to_string(ctx.tmp.path().join("lab/MANIFEST.md")).unwrap();
+    assert!(lab.contains("\nsharing: direct\n"), "{lab}");
+
+    let boss = ctx.token_for("boss").await;
+    let admin = McpTestSession::open(&ctx.addr, Some(&boss)).await;
+    let changed = admin.call_tool("configure", set_sharing("open")).await;
+    changed_ok(&changed);
+    let open = std::fs::read_to_string(ctx.tmp.path().join("open/MANIFEST.md")).unwrap();
+    assert!(open.contains("\nsharing: direct\n"), "{open}");
+
+    let looker = ctx.token_for("looker").await;
+    let stranger = McpTestSession::open(&ctx.addr, Some(&looker)).await;
+    let hidden = stranger
+        .call_tool("configure", serde_json::json!({ "domain": "lab" }))
+        .await;
+    let hidden_set = stranger.call_tool("configure", set_sharing("lab")).await;
+    let browsed = stranger
+        .call_tool("browse_domain", serde_json::json!({ "domain": "lab" }))
+        .await;
+    let not_found = &payload_of(&browsed)["error"]["message"];
+    assert!(not_found.is_string(), "{browsed}");
+    assert_eq!(
+        &payload_of(&hidden)["error"]["message"],
+        not_found,
+        "{hidden}"
+    );
+    assert_eq!(
+        &payload_of(&hidden_set)["error"]["message"],
+        not_found,
+        "{hidden_set}"
+    );
+}
+
+/// The open tier changes a shared domain's policies, as it edits its MANIFEST.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_open_tier_changes_domain_policies_where_it_edits() {
+    let ctx = mcp_ctx(false).await;
+    let session = McpTestSession::open(&ctx.addr, None).await;
+    let changed = session
+        .call_tool(
+            "configure",
+            serde_json::json!({ "domain": "open", "set": { "sharing": "direct", "rules.E007": "off" } }),
+        )
+        .await;
+    changed_ok(&changed);
+    let open = std::fs::read_to_string(ctx.tmp.path().join("open/MANIFEST.md")).unwrap();
+    assert!(open.contains("\nsharing: direct\n"), "{open}");
+    let yaml = std::fs::read_to_string(ctx.tmp.path().join("open/.crystalline.yaml")).unwrap();
+    assert!(yaml.contains("E007: off"), "{yaml}");
+}
+
 /// **A team domain is unregistered locally and nothing of the team's is
 /// touched.**
 ///
