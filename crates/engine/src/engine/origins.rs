@@ -1499,6 +1499,21 @@ impl Engine {
         })
     }
 
+    /// [`Engine::origin_share_with`] without `as_proposal`: the share goes
+    /// the way the domain and this machine's recorded refusal decide.
+    pub async fn origin_share(
+        &self,
+        domain: &str,
+        title: Option<&str>,
+        description: Option<&str>,
+        proposal: Option<u64>,
+        files: Option<&[String]>,
+        actor: ShareActor,
+    ) -> Result<Value> {
+        self.origin_share_with(domain, title, description, proposal, files, None, actor)
+            .await
+    }
+
     /// Proposes one domain's local changes as a pull request against its
     /// origin, under its origin lock.
     ///
@@ -1533,13 +1548,20 @@ impl Engine {
     /// this share creates or rewrites, in both modes
     /// (`crystalline_remote::state::Proposal::author_login`), so a chain whose
     /// layers belong to different people can say so.
-    pub async fn origin_share(
+    ///
+    /// `as_proposal` is how a share on a `sharing: direct` domain goes:
+    /// `Some(true)` opens a proposal, `Some(false)` tries the direct commit
+    /// only, `None` lets the refusal this machine recorded decide (see
+    /// `crystalline_remote::ops::ShareOptions::as_proposal`).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn origin_share_with(
         &self,
         domain: &str,
         title: Option<&str>,
         description: Option<&str>,
         proposal: Option<u64>,
         files: Option<&[String]>,
+        as_proposal: Option<bool>,
         actor: ShareActor,
     ) -> Result<Value> {
         let stacks_allowed = {
@@ -1601,7 +1623,7 @@ impl Engine {
             domain,
             &state_dir,
             ops::ShareOptions {
-                as_proposal: None,
+                as_proposal,
                 title,
                 description,
                 proposal,
@@ -1693,7 +1715,7 @@ impl Engine {
                     "conflicts": conflicts,
                 }))
             }
-            Err(e) => Err(enrich_write_error(e, acting.as_deref(), &spec.repo).into()),
+            Err(e) => Err(share_write_error(e, acting.as_deref(), &spec.repo).into()),
         }
     }
 
@@ -1822,6 +1844,25 @@ impl Engine {
         actor: ShareActor,
         credential: PreviewCredential,
     ) -> Result<Value> {
+        self.origin_share_preview_with(domain, title, proposal, files, None, actor, credential)
+            .await
+    }
+
+    /// [`Engine::origin_share_preview`] with `as_proposal`, the share's own
+    /// choice of route on a `sharing: direct` domain (see
+    /// [`Engine::origin_share_with`]), so the plan is the one that share
+    /// would follow.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn origin_share_preview_with(
+        &self,
+        domain: &str,
+        title: Option<&str>,
+        proposal: Option<u64>,
+        files: Option<&[String]>,
+        as_proposal: Option<bool>,
+        actor: ShareActor,
+        credential: PreviewCredential,
+    ) -> Result<Value> {
         let stacks_allowed = {
             let config = self.config.read().unwrap();
             if !config.github_enabled() {
@@ -1888,7 +1929,7 @@ impl Engine {
             domain,
             &state_dir,
             ops::ShareOptions {
-                as_proposal: None,
+                as_proposal,
                 title,
                 description: None,
                 proposal,

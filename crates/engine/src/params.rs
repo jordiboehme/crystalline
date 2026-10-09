@@ -663,6 +663,14 @@ pub struct ShareChangesParams {
     /// unshared change. Folder indexes of the affected folders ride along.
     #[serde(default)]
     pub files: Option<Vec<String>>,
+    /// On a domain whose MANIFEST says sharing: direct: true shares the same
+    /// changes as a proposal instead of a commit on the branch, false tries
+    /// the direct commit only and never falls back. Omit it to let the share
+    /// decide: after the branch refused your direct commit once, a share
+    /// tries the commit again and opens a proposal when it is refused. A
+    /// domain that opens proposals ignores it.
+    #[serde(default)]
+    pub as_proposal: Option<bool>,
 }
 
 /// Parameters for `discard_changes`.

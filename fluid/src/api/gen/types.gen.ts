@@ -1569,6 +1569,12 @@ export type SetupBody = {
  */
 export type ShareBody = {
     /**
+     * On a domain that shares directly: `true` opens a proposal for this
+     * share, `false` tries the direct commit only and never falls back.
+     * Absent lets the engine decide from the refusal it recorded.
+     */
+    as_proposal?: boolean | null;
+    /**
      * A longer description of what changed and why.
      */
     description?: string | null;

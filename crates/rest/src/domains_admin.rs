@@ -1548,6 +1548,12 @@ pub struct ShareBody {
     #[serde(default)]
     #[schema(example = json!(["notes/a.md"]))]
     pub files: Option<Vec<String>>,
+    /// On a domain that shares directly: `true` opens a proposal for this
+    /// share, `false` tries the direct commit only and never falls back.
+    /// Absent lets the engine decide from the refusal it recorded.
+    #[serde(default)]
+    #[schema(example = true)]
+    pub as_proposal: Option<bool>,
 }
 
 /// `POST /domains/{domain}/sync/share` - propose this domain's local changes
@@ -1584,7 +1590,13 @@ pub struct ShareBody {
                    answers `proposal_open` while any proposal is still open, \
                    `branch_protected` when the branch's rules refuse a direct \
                    commit and `branch_moved` when the branch moved twice \
-                   while the share was prepared, each with guidance. A \
+                   while the share was prepared, each with guidance. \
+                   `as_proposal: true` opens a proposal on a direct domain \
+                   instead. A `branch_protected` answer carries `fallback: \
+                   \"proposal\"`; after one, a refused share opens the \
+                   proposal itself and answers `proposed` with `fell_back: \
+                   true` and a `note`, and a commit that lands again carries \
+                   a `note` too. A \
                    `proposal` in the body on a direct domain is a 422. \
                    Refused on a read-only instance.",
     params(("domain" = String, Path, description = "The registered team domain.")),
@@ -1723,12 +1735,13 @@ pub async fn share_now(
     Ok(Json(
         state
             .engine
-            .origin_share(
+            .origin_share_with(
                 &domain,
                 body.title.as_deref(),
                 body.description.as_deref(),
                 body.proposal,
                 body.files.as_deref(),
+                body.as_proposal,
                 ShareActor::Account(caller.name().to_string()),
             )
             .await?,

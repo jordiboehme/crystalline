@@ -179,6 +179,9 @@ pub struct OriginStatusReport {
     /// Direct commits this machine put on the connected branch, newest first,
     /// from [`crate::state::OriginState::direct_shares`].
     pub direct_shares: Vec<DirectShare>,
+    /// The refusal of a direct commit this machine recorded, `None` while
+    /// direct commits work or were never tried.
+    pub direct_refused: Option<DirectRefusal>,
     /// Share branches Crystalline keeps upstream (merged, declined or
     /// withdrawn shares), each with what kept it. Empty when nothing is kept.
     pub kept_branches: Vec<QueuedBranch>,
@@ -1523,6 +1526,7 @@ pub async fn status(
         repair_pending: state.repair_pending,
         stack_link_pending: state.stack_link_pending,
         direct_shares: state.direct_shares.clone(),
+        direct_refused: state.direct_refused.clone(),
         kept_branches: state
             .retire_queue
             .iter()

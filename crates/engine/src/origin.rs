@@ -189,6 +189,9 @@ pub(crate) fn proposal_transitions_json(
 /// no proposal record to read its own history off, and the file list belongs
 /// to the commit rather than to a status glance.
 ///
+/// `direct_refused` names a refusal of a direct commit this machine recorded,
+/// with the line to show, and is `null` otherwise.
+///
 /// `kept_branches` names share branches Crystalline keeps upstream (merged,
 /// declined or withdrawn shares), each with why it was retired, what kept it
 /// and the sentence to show; always present, empty when nothing is kept.
@@ -239,6 +242,12 @@ pub(crate) fn status_report_json(
             "shared_at": share.shared_at,
             "author_login": share.author_login,
         })).collect::<Vec<Value>>(),
+        "direct_refused": report.direct_refused.as_ref().map(|refusal| json!({
+            "branch": refusal.branch,
+            "message": refusal.message,
+            "refused_at": refusal.refused_at,
+            "line": crystalline_remote::error::direct_refused_line(&refusal.branch),
+        })),
     });
     if let Some(detail) = detail
         && let Some(object) = value.as_object_mut()
@@ -854,6 +863,9 @@ pub(crate) fn share_plan_json(plan: &ops::SharePlan, root: Option<&Path>) -> Val
         "changes": changes,
         "sharing": plan.sharing.as_str(),
     });
+    if let Some(note) = &plan.note {
+        v["note"] = json!(note);
+    }
     match &plan.action {
         ops::PlannedAction::Create => v["action"] = json!("create"),
         ops::PlannedAction::Update { number, url } => {
@@ -1700,6 +1712,7 @@ mod tests {
             repair_pending: false,
             kept_branches: Vec::new(),
             stack_link_pending: false,
+            direct_refused: None,
             direct_shares: vec![crystalline_remote::state::DirectShare {
                 sha: "c0ffee".to_string(),
                 url: Some("https://forge.test/acme/brand-knowledge/commit/c0ffee".to_string()),
@@ -1730,6 +1743,42 @@ mod tests {
         assert_eq!(v["direct_shares"][0]["sha"], "c0ffee", "{v}");
         assert_eq!(v["direct_shares"][0]["author_login"], "instance-gh", "{v}");
         assert!(v["direct_shares"][0].get("files").is_none(), "{v}");
+        assert!(v["direct_refused"].is_null(), "{v}");
+    }
+
+    #[test]
+    fn the_status_names_a_recorded_refusal_with_its_line() {
+        let report = OriginStatusReport {
+            repo: "acme/kb".to_string(),
+            branch: "main".to_string(),
+            base_commit: "abc123".to_string(),
+            behind: Some(false),
+            local_changes: 1,
+            skipped_large: vec![],
+            open_proposals: vec![],
+            declined_proposals: vec![],
+            merged_unconsumed: vec![],
+            conflicts: vec![],
+            last_checked: None,
+            amended_upstream: vec![],
+            stack_number: None,
+            stack_wedged: vec![],
+            repair_pending: false,
+            kept_branches: Vec::new(),
+            stack_link_pending: false,
+            direct_shares: vec![],
+            direct_refused: Some(crystalline_remote::state::DirectRefusal {
+                branch: "main".to_string(),
+                message: "Changes must be made through a pull request.".to_string(),
+                refused_at: chrono::Utc::now(),
+            }),
+        };
+        let v = status_report_json("kb", &report, None, None);
+        assert_eq!(v["direct_refused"]["branch"], "main", "{v}");
+        assert_eq!(
+            v["direct_refused"]["line"],
+            "Direct commits to main are refused for you, so your shares go as proposals."
+        );
     }
 
     /// The merged-but-unpulled numbers ride both status shapes, because both
@@ -1769,6 +1818,7 @@ mod tests {
             repair_pending: true,
             kept_branches: Vec::new(),
             stack_link_pending: true,
+            direct_refused: None,
             direct_shares: Vec::new(),
         };
         let v = status_report_json("eng", &report, None, None);
@@ -1798,6 +1848,7 @@ mod tests {
             repair_pending: false,
             kept_branches: Vec::new(),
             stack_link_pending: false,
+            direct_refused: None,
             direct_shares: Vec::new(),
         };
         let v = status_report_json("eng", &report, None, None);
@@ -1827,6 +1878,7 @@ mod tests {
             repair_pending: false,
             kept_branches: Vec::new(),
             stack_link_pending: false,
+            direct_refused: None,
             direct_shares: Vec::new(),
         };
         let message = RemoteError::Offline.to_string();
@@ -1857,6 +1909,7 @@ mod tests {
             repair_pending: false,
             kept_branches: Vec::new(),
             stack_link_pending: false,
+            direct_refused: None,
             direct_shares: Vec::new(),
         }
     }
@@ -2506,6 +2559,7 @@ mod tests {
             repair_pending: false,
             kept_branches: Vec::new(),
             stack_link_pending: false,
+            direct_refused: None,
             direct_shares: Vec::new(),
         };
         let v = status_report_json("eng", &report, None, None);
@@ -2549,6 +2603,7 @@ mod tests {
             repair_pending: false,
             kept_branches: Vec::new(),
             stack_link_pending: false,
+            direct_refused: None,
             direct_shares: Vec::new(),
         };
         let v = status_report_json("eng", &report, None, None);
