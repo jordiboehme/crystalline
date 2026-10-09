@@ -49,6 +49,8 @@ const MARK_OIDC_SCOPES: &str = "openid mk-scope-7f3a";
 struct Options {
     /// Serve read-only: every mutation is refused, reads are not.
     read_only: bool,
+    /// Turn on the `auth.anonymous` viewer tier, with `auth.mcp` left off.
+    anonymous: bool,
     /// Start with `github.enabled` already on.
     github: bool,
     /// Share as the acting account's own GitHub identity rather than as the
@@ -103,7 +105,7 @@ async fn serve(opts: Options) -> Fixture {
         auth: Some(AuthConfig {
             trusted_header: None,
             proxy_headers: None,
-            anonymous: Some(false),
+            anonymous: Some(opts.anonymous),
             mcp: None,
             oauth: None,
             max_users: None,
@@ -1570,6 +1572,38 @@ async fn the_policy_patch_is_the_owners_and_refuses_read_only_and_a_missing_csrf
     .await
     .unwrap();
     assert_eq!(resp.status(), 403);
+}
+
+/// The engine lets the open tier change a policy where it may edit, so the
+/// REST route is what keeps the anonymous viewer tier out: with
+/// `auth.anonymous` on and `auth.mcp` off, a patch with no session is a 401
+/// and the MANIFEST on disk is unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_policy_patch_refuses_an_anonymous_viewer_on_the_open_tier() {
+    let fx = serve(Options {
+        anonymous: true,
+        ..Options::default()
+    })
+    .await;
+    let manifest = fx._tmp.path().join("eng").join("MANIFEST.md");
+    let before = std::fs::read_to_string(&manifest).unwrap();
+    let read = client()
+        .get(format!("http://{}/api/v1/domains/eng/manifest", fx.addr))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(read.status(), 200, "the viewer tier is on");
+    let resp = client()
+        .request(
+            reqwest::Method::PATCH,
+            format!("http://{}/api/v1/domains/eng/manifest", fx.addr),
+        )
+        .json(&serde_json::json!({"sharing": "direct"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "{}", resp.text().await.unwrap());
+    assert_eq!(std::fs::read_to_string(&manifest).unwrap(), before);
 }
 
 /// The offline list and detail are served with no GitHub connection and on

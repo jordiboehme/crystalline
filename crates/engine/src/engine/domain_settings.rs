@@ -224,10 +224,11 @@ impl Engine {
             .await
     }
 
-    /// Whether `scope` may change `domain`'s policy keys through configure: the domain's owner or an instance admin; the open
-    /// tier (anonymous with `auth.mcp` off) wherever `edit_engram` writes,
-    /// which is never a reviewing domain, since a draft needs an identity;
-    /// nobody on a read-only instance.
+    /// Whether `scope` may change `domain`'s policy keys through configure:
+    /// the domain's owner or an instance admin; the open tier (anonymous with
+    /// `auth.mcp` off) wherever `edit_engram` writes, which is never a
+    /// reviewing domain, since a draft needs an identity; nobody on a
+    /// read-only instance.
     pub(crate) async fn may_change_domain(
         &self,
         domain: &str,
