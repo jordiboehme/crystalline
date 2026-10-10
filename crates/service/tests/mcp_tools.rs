@@ -2859,6 +2859,7 @@ async fn search_engrams_teaches_contains_and_contains_any() {
         "{\"sources\": {\"$contains\": \"https://example.com/a\"}}",
         "{\"sources\": {\"$contains_any\": [\"https://example.com/a\", \"https://example.com/b\"]}}",
         "salience",
+        "A custom key longer than 256 bytes, or a value whose JSON is longer than 1024 bytes, is not indexed, so $contains never matches it.",
     ] {
         assert!(description.contains(needle), "{needle} in {description}");
     }
