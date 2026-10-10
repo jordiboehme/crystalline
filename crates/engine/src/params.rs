@@ -374,7 +374,8 @@ pub struct SearchParams {
     /// matches any of several:
     /// `{ sources: { $contains_any: ["https://example.com/a", "https://example.com/b"] } }`.
     /// A single value counts as a one-element list. $contains_any takes at
-    /// most 100 values. The filterable keys are the promoted ones (type, status, title, permalink,
+    /// most 100 distinct values. The filterable keys are the promoted ones
+    /// (type, status, title, permalink,
     /// recorded_at, valid_from, valid_to, tags, plus timestamp for the write
     /// instant), every custom frontmatter key an engram carries (salience among
     /// them) and source_date, last_verified, stale_after, temporal_confidence,
