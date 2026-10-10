@@ -183,6 +183,18 @@ pub fn check_temporal(path: &Path, engram: &Engram) -> Vec<Issue> {
     issues
 }
 
+/// Run `E011` against a single already-parsed engram: warn about a
+/// frontmatter key or value the metadata index cannot hold. Backs the
+/// `validate_engrams` tool beside [`check_temporal`], with the same rules
+/// about overrides: the engine passes the result through [`apply_overrides`].
+pub fn check_index_limits(path: &Path, engram: &Engram) -> Vec<Issue> {
+    let mut issues = Vec::new();
+    let mut summary = Summary::default();
+    let mut sink = Sink::new(&mut issues, &mut summary, None, false);
+    format::check_index_limits(path, &engram.frontmatter, &mut sink);
+    issues
+}
+
 /// One finding as a domain's settings and the `--strict` switch leave it: a
 /// rule the domain's `.crystalline.yaml` sets `off` is dropped (`None`), a
 /// severity word re-ranks it, a word verify does not know leaves its default,

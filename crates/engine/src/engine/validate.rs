@@ -84,10 +84,12 @@ impl Engine {
                     }));
                 }
             }
-            for issue in crystalline_core::verify::apply_overrides(
-                crystalline_core::verify::check_temporal(Path::new(&d.path), &engram),
-                verify,
-            ) {
+            let mut raw = crystalline_core::verify::check_temporal(Path::new(&d.path), &engram);
+            raw.extend(crystalline_core::verify::check_index_limits(
+                Path::new(&d.path),
+                &engram,
+            ));
+            for issue in crystalline_core::verify::apply_overrides(raw, verify) {
                 let message = match issue.fix {
                     Some(fix) => format!("{} (fix: {fix})", issue.message),
                     None => issue.message,

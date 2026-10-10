@@ -62,6 +62,11 @@ pub const VERIFY_RULES: &[VerifyRule] = &[
         "No two paths in the domain differ only in case.",
     ),
     rule("E010", "error", "No frontmatter key appears twice."),
+    rule(
+        "E011",
+        "warning",
+        "A frontmatter key and each of its values are small enough for the metadata index.",
+    ),
     rule("L001", "warning", "Every wikilink resolves."),
     rule("L002", "error", "No two engrams share a permalink."),
     rule("L003", "warning", "No two engrams share a title."),
@@ -262,7 +267,7 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(ids, sorted, "id order, each id once");
-        assert_eq!(ids.len(), 58);
+        assert_eq!(ids.len(), 59);
         for rule in VERIFY_RULES {
             assert!(
                 ["error", "warning", "info"].contains(&rule.default),
