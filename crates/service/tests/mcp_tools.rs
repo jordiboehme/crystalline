@@ -1294,6 +1294,48 @@ async fn configure_sets_and_unsets_a_rule_override_and_the_token_budget() {
     assert_eq!(eng_yaml(&h), None, "the file goes with its last key");
 }
 
+/// A number or a boolean in `set` is read as its string form, for a domain
+/// key and an instance setting alike, so `{"token_budget": 4000}` works the
+/// way `{"token_budget": "4000"}` does. A list or an object is refused with a
+/// sentence the model can read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configure_set_takes_numbers_and_booleans_as_their_string_form() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+    let out = call(
+        peer,
+        "configure",
+        json!({ "domain": "eng", "set": { "token_budget": 4000 } }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out["rules"]["token_budget"], 4000, "{out}");
+    assert_eq!(
+        eng_yaml(&h).as_deref(),
+        Some("verify:\n  token_budget: 4000\n")
+    );
+    call(peer, "configure", json!({ "set": { "github.enabled": true } }))
+        .await
+        .unwrap();
+    assert!(h.engine.github_enabled());
+    let refused = match call(
+        peer,
+        "configure",
+        json!({ "domain": "eng", "set": { "token_budget": [4000] } }),
+    )
+    .await
+    {
+        Err(e) => e,
+        Ok(Value::String(text)) => text,
+        Ok(v) => v.to_string(),
+    };
+    assert!(
+        refused.contains("set values are strings: write \"4000\""),
+        "{refused}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_configure_call_sets_a_policy_and_a_rule_override_together() {
     let h = Harness::new(&["eng"]).await;

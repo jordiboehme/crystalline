@@ -27,6 +27,34 @@ where
     Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
+/// `configure`'s `set`: a missing or null object is empty, and a number or a
+/// boolean value is read as its string form, so `{"token_budget": 4000}`
+/// means `{"token_budget": "4000"}`. The schema still advertises string
+/// values. A list or an object is refused with a sentence that says what to
+/// write.
+fn scalar_strings<'de, D>(deserializer: D) -> Result<BTreeMap<String, String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<BTreeMap<String, serde_json::Value>>::deserialize(deserializer)?;
+    raw.unwrap_or_default()
+        .into_iter()
+        .map(|(key, value)| {
+            let text = match value {
+                serde_json::Value::String(text) => text,
+                serde_json::Value::Number(n) => n.to_string(),
+                serde_json::Value::Bool(b) => b.to_string(),
+                _ => {
+                    return Err(serde::de::Error::custom(
+                        "set values are strings: write \"4000\"",
+                    ));
+                }
+            };
+            Ok((key, text))
+        })
+        .collect()
+}
+
 /// Parameters for `write_engram`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WriteParams {
@@ -559,10 +587,11 @@ pub struct ConfigureParams {
     #[serde(default)]
     pub domain: Option<String>,
     /// Settings to change, key to value, for example { "github.enabled":
-    /// "true" }. Applied in ascending key order; the first invalid key or
+    /// "true" }. Values are strings; a number or a boolean is read as its
+    /// string form. Applied in ascending key order; the first invalid key or
     /// value stops the rest and reports what was already applied. Omit or
     /// pass an empty object to leave settings unchanged.
-    #[serde(default, deserialize_with = "null_as_default")]
+    #[serde(default, deserialize_with = "scalar_strings")]
     pub set: BTreeMap<String, String>,
     /// Setting keys to reset to their default, applied after `set`. Omit or
     /// pass an empty array to leave settings unchanged.
