@@ -921,7 +921,7 @@ fn build_scalar_filters(
             // One EXISTS per requested tag (require-ALL preserved), each matching
             // the tag's whole alias equivalence class via an IN list (OR within
             // the class). The class is sorted, so the binding order is stable.
-            clauses.push(tag_class_exists(&tag.to_lowercase(), aliases, params, n));
+            clauses.push(tag_class_exists(&[tag.to_lowercase()], aliases, params, n));
         }
     }
 
@@ -932,17 +932,25 @@ fn build_scalar_filters(
     }
 }
 
-/// An `EXISTS` matching an engram that carries any member of a folded tag's
-/// alias equivalence class. Tag identity is case-folded in the index, so the
-/// class members (already folded) match `tag.name` directly. When the map is
-/// empty the class is the tag alone, so this is a one-placeholder `IN`.
+/// An `EXISTS` matching an engram that carries any member of the alias
+/// equivalence classes of the folded tags, as one flat `IN` over the union of
+/// the classes without duplicates. Tag identity is case-folded in the index,
+/// so the class members (already folded) match `tag.name` directly. One
+/// `EXISTS` for any number of tags rather than an `OR` of one per tag: turso
+/// refuses an expression tree deeper than 100, and an `OR` chain is one
+/// level per tag.
 fn tag_class_exists(
-    folded: &str,
+    folded: &[String],
     aliases: &AliasMap,
     params: &mut Vec<Param>,
     n: &mut usize,
 ) -> String {
-    let class = aliases.class_of(folded);
+    let mut seen = HashSet::new();
+    let class: Vec<String> = folded
+        .iter()
+        .flat_map(|tag| aliases.class_of(tag))
+        .filter(|member| seen.insert(member.clone()))
+        .collect();
     let ph: Vec<String> = class
         .iter()
         .map(|member| {
@@ -977,21 +985,18 @@ fn metadata_clause(
         // each value expands to its alias equivalence class. A tag is already
         // one element of the engram's tag list, so `$contains` reads as `$eq`
         // and `$contains_any` as `$in`. An empty list matches nothing; it used
-        // to emit `()`, which neither dialect parses.
-        let exists = |val: &serde_json::Value, params: &mut Vec<Param>, n: &mut usize| {
-            tag_class_exists(&fold_tag_value(val), aliases, params, n)
+        // to emit `()`, which neither dialect parses. Several values are one
+        // `EXISTS` over the union of their classes.
+        let values = match &f.op {
+            FilterOp::Eq(v) | FilterOp::Contains(v) => std::slice::from_ref(v),
+            FilterOp::In(vs) | FilterOp::ContainsAny(vs) => vs.as_slice(),
+            _ => return None,
         };
-        return match &f.op {
-            FilterOp::Eq(v) | FilterOp::Contains(v) => Some(exists(v, params, n)),
-            FilterOp::In(vs) | FilterOp::ContainsAny(vs) => {
-                if vs.is_empty() {
-                    return Some("false".to_string());
-                }
-                let parts: Vec<String> = vs.iter().map(|v| exists(v, params, n)).collect();
-                Some(format!("({})", parts.join(" OR ")))
-            }
-            _ => None,
-        };
+        if values.is_empty() {
+            return Some("false".to_string());
+        }
+        let folded: Vec<String> = values.iter().map(fold_tag_value).collect();
+        return Some(tag_class_exists(&folded, aliases, params, n));
     }
 
     let col = match key {

@@ -4448,6 +4448,41 @@ async fn contains_filters(store: &dyn Store) {
         "d.md",
         &engram("Delta", "d", "engram", "a.b:\n  - x\n", "body\n"),
     );
+    // Anchors with a quote, a backslash, a newline and non-ASCII text, and in
+    // `f` their unescaped neighbours: the backslash-quote, the backslash-n,
+    // the doubled backslash and the plain letter.
+    write(
+        root,
+        "e.md",
+        &engram(
+            "Epsilon",
+            "e",
+            "engram",
+            r#"sources:
+  - "a\"b"
+  - 'a\b'
+  - "line1\nline2"
+  - "ü"
+"#,
+            "body\n",
+        ),
+    );
+    write(
+        root,
+        "f.md",
+        &engram(
+            "Zeta",
+            "f",
+            "engram",
+            r#"sources:
+  - 'a\"b'
+  - 'line1\nline2'
+  - 'a\\b'
+  - u
+"#,
+            "body\n",
+        ),
+    );
     let report = sync_domain(store, "d", root).await.unwrap();
     assert!(
         report.failed.is_empty(),
@@ -4455,7 +4490,7 @@ async fn contains_filters(store: &dyn Store) {
         report.failed
     );
 
-    let all = perms(&["a", "b", "c", "d"]);
+    let all = perms(&["a", "b", "c", "d", "e", "f"]);
     let cases: Vec<(serde_json::Value, Vec<String>)> = vec![
         (
             serde_json::json!({ "sources": { "$contains": "notedown://jordi/n1/p1#b1" } }),
@@ -4530,6 +4565,42 @@ async fn contains_filters(store: &dyn Store) {
             perms(&[]),
         ),
         (
+            serde_json::json!({ "sources": { "$contains_any": [long, "notedown://jordi/n1/p1#b2"] } }),
+            perms(&["a"]),
+        ),
+        (
+            serde_json::json!({ "sources": { "$contains": "a\"b" } }),
+            perms(&["e"]),
+        ),
+        (
+            serde_json::json!({ "sources": { "$contains": "a\\\"b" } }),
+            perms(&["f"]),
+        ),
+        (
+            serde_json::json!({ "sources": { "$contains": "a\\b" } }),
+            perms(&["e"]),
+        ),
+        (
+            serde_json::json!({ "sources": { "$contains": "a\\\\b" } }),
+            perms(&["f"]),
+        ),
+        (
+            serde_json::json!({ "sources": { "$contains": "line1\nline2" } }),
+            perms(&["e"]),
+        ),
+        (
+            serde_json::json!({ "sources": { "$contains": "line1\\nline2" } }),
+            perms(&["f"]),
+        ),
+        (
+            serde_json::json!({ "sources": { "$contains": "ü" } }),
+            perms(&["e"]),
+        ),
+        (
+            serde_json::json!({ "sources": { "$contains": "u" } }),
+            perms(&["f"]),
+        ),
+        (
             serde_json::json!({ "a.b": { "$contains": "x" } }),
             all.clone(),
         ),
@@ -4598,6 +4669,100 @@ async fn contains_on_tags(store: &dyn Store) {
     }
 }
 parity!(contains_on_tags_follows_the_alias_class, contains_on_tags);
+
+/// `n` filler values no engram holds, then `real`, as one wire list.
+fn padded(n: usize, real: &[&str]) -> Vec<serde_json::Value> {
+    (0..n)
+        .map(|i| serde_json::Value::from(format!("nope{i}")))
+        .chain(real.iter().map(|r| serde_json::Value::from(*r)))
+        .collect()
+}
+
+/// A `$contains_any` of 100 distinct values, the cap, runs and finds its
+/// hits on both backends. On turso that is 100 `UNION ALL` arms through the
+/// real statement on the test thread, so this is also the stack proof: well
+/// past the cap, a debug build aborted the process.
+async fn contains_any_at_the_cap(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let sources = |list: &str| format!("sources:\n{list}");
+    write(
+        root,
+        "a.md",
+        &engram(
+            "Alpha",
+            "a",
+            "engram",
+            &sources("  - x1\n  - x2\n"),
+            "body\n",
+        ),
+    );
+    write(
+        root,
+        "b.md",
+        &engram("Beta", "b", "engram", &sources("  - y1\n"), "body\n"),
+    );
+    write(
+        root,
+        "c.md",
+        &engram("Gamma", "c", "engram", &sources("  - z1\n"), "body\n"),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+
+    let list = padded(98, &["x2", "y1"]);
+    assert_eq!(list.len(), 100);
+    let wire = serde_json::json!({ "sources": { "$contains_any": list } });
+    assert_eq!(
+        wire_filter_perms(store, wire, None).await,
+        perms(&["a", "b"])
+    );
+}
+parity!(contains_any_runs_at_the_cap, contains_any_at_the_cap);
+
+/// `$in` and `$contains_any` on `tags` with 100 values, the cap, are one
+/// `EXISTS` over the union of the alias classes, so they run on both
+/// backends: an `OR` of one `EXISTS` per value went past turso's expression
+/// depth of 100.
+async fn tags_at_the_cap(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "modern.md",
+        &tagged_engram("Modern", "modern", &["modern"]),
+    );
+    write(
+        root,
+        "legacy.md",
+        &tagged_engram("Legacy", "legacy", &["legacy"]),
+    );
+    write(
+        root,
+        "other.md",
+        &tagged_engram("Other", "other", &["other"]),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let d = domain_id(store, "d", root).await;
+    store
+        .replace_tag_aliases(d, &[("legacy".into(), "modern".into())])
+        .await
+        .unwrap();
+
+    let list = padded(99, &["LEGACY"]);
+    assert_eq!(list.len(), 100);
+    for wire in [
+        serde_json::json!({ "tags": { "$in": list.clone() } }),
+        serde_json::json!({ "tags": { "$contains_any": list.clone() } }),
+    ] {
+        assert_eq!(
+            wire_filter_perms(store, wire.clone(), None).await,
+            perms(&["legacy", "modern"]),
+            "{}",
+            wire.to_string().len()
+        );
+    }
+}
+parity!(tags_filters_run_at_the_cap, tags_at_the_cap);
 
 /// The rows follow the engram: a rewrite replaces them, a draft's rows are
 /// seen only by its author and shadow the base row for her, a dropped draft
@@ -7152,6 +7317,81 @@ fn contains_operators_parse_and_refuse_what_they_cannot_take() {
         let err = crystalline_index::parse_metadata_filters(&wire).unwrap_err();
         assert!(err.to_string().contains(text), "{wire}: {err}");
     }
+}
+
+/// `$contains_any`, and `$in` on `tags`, take at most 100 distinct values.
+/// Duplicates are dropped first, keeping the first of each in order, and a
+/// list with more than 100 distinct values is refused with a sentence that
+/// says what to do. `$in` on any other key is not capped.
+#[test]
+fn contains_any_takes_at_most_a_hundred_distinct_values() {
+    let wire = |key: &str, op: &str, list: Vec<serde_json::Value>| {
+        let mut inner = serde_json::Map::new();
+        inner.insert(op.to_string(), serde_json::Value::Array(list));
+        let mut outer = serde_json::Map::new();
+        outer.insert(key.to_string(), serde_json::Value::Object(inner));
+        serde_json::Value::Object(outer)
+    };
+    let values = |n: usize| -> Vec<serde_json::Value> {
+        (0..n)
+            .map(|i| serde_json::Value::from(format!("v{i}")))
+            .collect()
+    };
+    let parse = |key: &str, op: &str, list: Vec<serde_json::Value>| {
+        crystalline_index::parse_metadata_filters(&wire(key, op, list))
+    };
+
+    for (key, op) in [
+        ("sources", "$contains_any"),
+        ("tags", "$contains_any"),
+        ("tags", "$in"),
+    ] {
+        let parsed = parse(key, op, values(100)).unwrap();
+        let held = match &parsed[0].op {
+            FilterOp::ContainsAny(vs) | FilterOp::In(vs) => vs.len(),
+            other => panic!("{key} {op} parsed as {other:?}"),
+        };
+        assert_eq!(held, 100, "{key} {op} at the cap");
+
+        let err = parse(key, op, values(101)).unwrap_err();
+        let want = format!(
+            "{op} on '{key}' takes at most 100 values; split the list over several searches"
+        );
+        assert!(err.to_string().contains(&want), "{key} {op}: {err}");
+    }
+
+    // 150 values, 100 of them distinct: under the cap once the duplicates go.
+    let mut repeated = values(100);
+    repeated.extend(values(50));
+    assert_eq!(
+        parse("sources", "$contains_any", repeated).unwrap()[0].op,
+        FilterOp::ContainsAny(values(100))
+    );
+
+    // Duplicates go by JSON equality, so 7 and "7" both stay.
+    let mixed: Vec<serde_json::Value> = vec![
+        "b".into(),
+        "a".into(),
+        "b".into(),
+        7.into(),
+        "7".into(),
+        7.into(),
+    ];
+    let kept: Vec<serde_json::Value> = vec!["b".into(), "a".into(), 7.into(), "7".into()];
+    assert_eq!(
+        parse("sources", "$contains_any", mixed.clone()).unwrap()[0].op,
+        FilterOp::ContainsAny(kept.clone())
+    );
+    assert_eq!(
+        parse("tags", "$in", mixed).unwrap()[0].op,
+        FilterOp::In(kept)
+    );
+
+    assert_eq!(
+        parse("status", "$in", values(101)).unwrap()[0].op,
+        FilterOp::In(values(101)),
+        "$in on any other key is not capped"
+    );
 }
 
 /// The lexical candidate cap bounds how many LIKE matches the prefilter loads

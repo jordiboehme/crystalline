@@ -971,6 +971,38 @@ pub fn parse_metadata_filters(value: &serde_json::Value) -> Result<Vec<MetadataF
     Ok(out)
 }
 
+/// The most distinct values `$contains_any` takes, and `$in` on `tags`.
+///
+/// Turso builds one `UNION ALL` arm per `$contains_any` value and compiles a
+/// compound select by recursing once per arm: a debug build overflowed a
+/// 2 MiB thread at 250 arms, and a stack overflow aborts the whole process
+/// rather than failing the one search. 100 leaves room for the rest of the
+/// statement, and one rule at parse time keeps both backends answering the
+/// same input.
+pub(crate) const CONTAINS_ANY_MAX_VALUES: usize = 100;
+
+/// The values with duplicates dropped, first occurrence kept, refused when
+/// more than [`CONTAINS_ANY_MAX_VALUES`] distinct ones are left.
+fn capped_values(
+    key: &str,
+    op: &str,
+    values: &[serde_json::Value],
+) -> Result<Vec<serde_json::Value>> {
+    let mut seen = std::collections::HashSet::new();
+    let distinct: Vec<serde_json::Value> = values
+        .iter()
+        .filter(|v| seen.insert(v.to_string()))
+        .cloned()
+        .collect();
+    if distinct.len() > CONTAINS_ANY_MAX_VALUES {
+        return Err(crate::IndexError::Invalid(format!(
+            "{op} on '{key}' takes at most {CONTAINS_ANY_MAX_VALUES} values; \
+             split the list over several searches"
+        )));
+    }
+    Ok(distinct)
+}
+
 fn parse_op(key: &str, op: &str, arg: &serde_json::Value) -> Result<FilterOp> {
     let arr2 = |arg: &serde_json::Value| -> Result<(serde_json::Value, serde_json::Value)> {
         match arg.as_array() {
@@ -986,13 +1018,18 @@ fn parse_op(key: &str, op: &str, arg: &serde_json::Value) -> Result<FilterOp> {
         "$gte" => FilterOp::Gte(arg.clone()),
         "$lt" => FilterOp::Lt(arg.clone()),
         "$lte" => FilterOp::Lte(arg.clone()),
-        "$in" => FilterOp::In(
-            arg.as_array()
-                .ok_or_else(|| {
-                    crate::IndexError::Invalid(format!("$in on '{key}' expects an array"))
-                })?
-                .clone(),
-        ),
+        "$in" => {
+            let values = arg.as_array().ok_or_else(|| {
+                crate::IndexError::Invalid(format!("$in on '{key}' expects an array"))
+            })?;
+            // `$in` on `tags` builds the same one-`EXISTS` list as
+            // `$contains_any` does on any key, so it takes the same cap.
+            if key == "tags" {
+                FilterOp::In(capped_values(key, op, values)?)
+            } else {
+                FilterOp::In(values.clone())
+            }
+        }
         "$between" => {
             let (lo, hi) = arr2(arg)?;
             FilterOp::Between(lo, hi)
@@ -1005,16 +1042,17 @@ fn parse_op(key: &str, op: &str, arg: &serde_json::Value) -> Result<FilterOp> {
             }
             FilterOp::Contains(arg.clone())
         }
-        "$contains_any" => FilterOp::ContainsAny(
-            arg.as_array()
+        "$contains_any" => {
+            let values = arg
+                .as_array()
                 .filter(|values| values.iter().all(|v| !v.is_array() && !v.is_object()))
                 .ok_or_else(|| {
                     crate::IndexError::Invalid(format!(
                         "$contains_any on '{key}' takes an array of single values"
                     ))
-                })?
-                .clone(),
-        ),
+                })?;
+            FilterOp::ContainsAny(capped_values(key, op, values)?)
+        }
         other => {
             return Err(crate::IndexError::Invalid(format!(
                 "unknown operator '{other}' on '{key}'"
