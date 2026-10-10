@@ -1597,6 +1597,9 @@ describe("the share dialog", () => {
 
   const PROTECTED_GUIDANCE =
     "The branch main does not accept direct commits from you (Changes must be made through a pull request.). Share the same changes as a proposal instead: share_changes with as_proposal: true (crystalline origin share --proposal).";
+  // What a person reads beside the button: no tool syntax.
+  const PROTECTED_FOR_PEOPLE =
+    "The branch main does not accept direct commits from you (Changes must be made through a pull request.). Share the same changes as a proposal instead.";
   const FELL_BACK =
     "The branch main does not accept direct commits from you, so this share opened a proposal.";
   const directPlan = () => ({
@@ -1639,7 +1642,10 @@ describe("the share dialog", () => {
     await userEvent.click(
       within(dialog).getByRole("button", { name: "Commit to main" }),
     );
-    expect(await within(dialog).findByText(PROTECTED_GUIDANCE)).toBeVisible();
+    expect(
+      await within(dialog).findByText(PROTECTED_FOR_PEOPLE),
+    ).toBeVisible();
+    expect(within(dialog).queryByText(/share_changes/)).toBeNull();
     await userEvent.click(
       within(dialog).getByRole("button", { name: "Share as a proposal" }),
     );
@@ -1680,7 +1686,7 @@ describe("the share dialog", () => {
       "/domains/eng/sync": () => syncResponse({ sharing: "direct" }),
       "/domains/eng/sync/changes": () => ({
         ...directPlan(),
-        note: "tries a direct commit; falls back to a proposal if the branch refuses it again",
+        note: "This share tries a direct commit first. If the branch refuses it again, it opens a proposal.",
       }),
     });
 
@@ -1688,7 +1694,7 @@ describe("the share dialog", () => {
     const dialog = await openShareDialog();
     expect(
       await within(dialog).findByText(
-        "Sharing tries a direct commit; falls back to a proposal if the branch refuses it again.",
+        "This share tries a direct commit first. If the branch refuses it again, it opens a proposal.",
       ),
     ).toBeVisible();
   });

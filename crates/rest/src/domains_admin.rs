@@ -1368,10 +1368,10 @@ pub async fn sync_now(
                    `direct`, the domain's MANIFEST policy) and `repo`, so a \
                    client knows what kind of domain it is looking at before \
                    the action is read. On a direct domain the plan may \
-                   also carry `note`, a short phrase that says how the share \
-                   will go: it falls back to a proposal if the branch refuses \
-                   it, or it opens a proposal because your proposal is still \
-                   open. A generated folder listing (`index.md`) is a change \
+                   also carry `note`, one or two sentences to show as given \
+                   that say how the share will go: it opens a proposal if \
+                   the branch refuses it again, or it opens a proposal \
+                   because your proposal is still open. A generated folder listing (`index.md`) is a change \
                    like any other here, because a share really carries it, but \
                    it is derived rather than written and is left out of the \
                    domain's `local_changes` count: a renderer counts these \

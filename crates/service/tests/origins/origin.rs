@@ -2583,7 +2583,7 @@ async fn a_refused_direct_share_falls_back_and_the_status_says_so() {
         .unwrap();
     assert_eq!(
         plan["note"],
-        "tries a direct commit; falls back to a proposal if the branch refuses it again",
+        "This share tries a direct commit first. If the branch refuses it again, it opens a proposal.",
         "{plan}"
     );
 

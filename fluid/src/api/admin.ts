@@ -1188,8 +1188,9 @@ export interface SharePlan {
   title: string | null;
   /**
    * How a direct domain's share will go when it is not the plain commit:
-   * the server's own clause, for example that it falls back to a proposal
-   * if the branch refuses it again. Null otherwise, and from an older server.
+   * the server's own sentences, shown as given, for example that it opens a
+   * proposal if the branch refuses it again. Null otherwise, and from an
+   * older server.
    */
   note: string | null;
 }

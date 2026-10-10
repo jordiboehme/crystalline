@@ -654,7 +654,7 @@ export default function ShareDialogBody({
                 {planProblem === null
                   ? amending === null
                     ? plan.data?.note
-                      ? `Sharing ${plan.data.note}.`
+                      ? plan.data.note
                       : actionLine(plan.data ?? null)
                     : amendLine(amending, chosenLayersAbove)
                   : "This share could not be planned."}
@@ -1128,12 +1128,19 @@ function describeOutcome(result: unknown): OutcomeSentence {
     }
     // The three a direct domain refuses with. Each carries the server's own
     // guidance, which names the verb that settles it, so nothing is
-    // paraphrased here.
-    case "branch_protected":
-      return {
-        ...plainSentence(asString(record?.guidance) ?? "Nothing was shared."),
-        offerProposal: asString(record?.fallback) === "proposal",
-      };
+    // paraphrased here - except where the dialog offers the proposal itself:
+    // that guidance names a tool call for an agent, and a person beside the
+    // button is told in plain words what the button does.
+    case "branch_protected": {
+      const offerProposal = asString(record?.fallback) === "proposal";
+      const branch = asString(record?.branch);
+      const message = asString(record?.message);
+      const sentence =
+        offerProposal && branch !== null && message !== null
+          ? `The branch ${branch} does not accept direct commits from you (${message}). Share the same changes as a proposal instead.`
+          : (asString(record?.guidance) ?? "Nothing was shared.");
+      return { ...plainSentence(sentence), offerProposal };
+    }
     case "proposal_open":
     case "branch_moved":
       return plainSentence(asString(record?.guidance) ?? "Nothing was shared.");

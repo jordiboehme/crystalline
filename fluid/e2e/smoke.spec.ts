@@ -399,6 +399,11 @@ test("a refused direct share offers to share as a proposal", async ({
   await card.getByRole("button", { name: "Share changes" }).click();
   const dialog = page.getByRole("dialog", { name: /share/i });
   await dialog.getByRole("button", { name: "Commit to main" }).click();
+  await expect(
+    dialog.getByText(
+      "The branch main does not accept direct commits from you (Changes must be made through a pull request.). Share the same changes as a proposal instead.",
+    ),
+  ).toBeVisible();
   await dialog.getByRole("button", { name: "Share as a proposal" }).click();
   await expect(dialog.getByRole("link", { name: "#12" })).toBeVisible();
   expect(bodies).toHaveLength(2);

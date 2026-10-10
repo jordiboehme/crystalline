@@ -327,14 +327,16 @@ pub fn direct_refused_line(branch: &str) -> String {
 }
 
 /// What a share preview says while a refusal is recorded and the share would
-/// try the direct commit again.
+/// try the direct commit again. Whole sentences, so every surface shows it as
+/// given.
 pub const PREVIEW_FALLS_BACK: &str =
-    "tries a direct commit; falls back to a proposal if the branch refuses it again";
+    "This share tries a direct commit first. If the branch refuses it again, it opens a proposal.";
 
-/// What a share preview says when the share goes into this machine's open
-/// proposal instead of a direct commit.
+/// What a share preview says when the share goes into the acting login's
+/// open proposal instead of a direct commit. A whole sentence, like
+/// [`PREVIEW_FALLS_BACK`].
 pub fn preview_proposal_open_note(number: u64) -> String {
-    format!("opens a proposal because your proposal #{number} is still open")
+    format!("This share opens a proposal because your proposal #{number} is still open.")
 }
 
 /// The sentence a share gets when the account cannot write the repository
@@ -487,11 +489,11 @@ mod tests {
         );
         assert_eq!(
             PREVIEW_FALLS_BACK,
-            "tries a direct commit; falls back to a proposal if the branch refuses it again"
+            "This share tries a direct commit first. If the branch refuses it again, it opens a proposal."
         );
         assert_eq!(
             preview_proposal_open_note(4),
-            "opens a proposal because your proposal #4 is still open"
+            "This share opens a proposal because your proposal #4 is still open."
         );
         assert_eq!(
             no_write_access_guidance("acme/kb"),
