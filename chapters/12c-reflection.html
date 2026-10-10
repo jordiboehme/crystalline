@@ -1,0 +1,1249 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en" xml:lang="en"><head>
+
+<meta charset="utf-8">
+<meta name="generator" content="quarto-1.10.19">
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+
+
+<title>12&nbsp; Reflection – The Crystalline Handbook</title>
+<style>
+/* Default styles provided by pandoc.
+** See https://pandoc.org/MANUAL.html#variables-for-html for config info.
+*/
+span.smallcaps{font-variant: small-caps;}
+div.columns{display: flex; gap: 1.5em;}
+div.column{flex: auto;}
+@media screen {
+div.columns{gap: min(4vw, 1.5em);}
+div.column{overflow-x: auto;}
+}
+div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+ul.task-list{list-style: none;}
+ul.task-list li input[type="checkbox"] {
+  width: 0.8em;
+  margin: 0 0.8em 0.2em -1em; /* quarto-specific, see https://github.com/quarto-dev/quarto-cli/issues/4556 */ 
+  vertical-align: middle;
+}
+</style>
+
+
+<script src="../site_libs/quarto-nav/quarto-nav.js"></script>
+<script src="../site_libs/quarto-nav/headroom.min.js"></script>
+<script src="../site_libs/clipboard/clipboard.min.js"></script>
+<script src="../site_libs/quarto-search/autocomplete.umd.js"></script>
+<script src="../site_libs/quarto-search/fuse.min.js"></script>
+<script src="../site_libs/quarto-search/quarto-search.js"></script>
+<meta name="quarto:offset" content="../">
+<link href="../chapters/04-what-crystalline-provides.html" rel="next">
+<link href="../chapters/12b-possible-contradictions.html" rel="prev">
+<script src="../site_libs/quarto-html/quarto.js" type="module"></script>
+<script src="../site_libs/quarto-html/tabsets/tabsets.js" type="module"></script>
+<script src="../site_libs/quarto-html/popper.min.js"></script>
+<script src="../site_libs/quarto-html/tippy.umd.min.js"></script>
+<script src="../site_libs/quarto-html/anchor.min.js"></script>
+<link href="../site_libs/quarto-html/tippy.css" rel="stylesheet">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-71f4083f1a58969841b56873763e1dc2.css" rel="stylesheet" class="quarto-color-scheme" id="quarto-text-highlighting-styles">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-dark-e856b1a6f26af70beecb5a0a51cfee6d.css" rel="stylesheet" class="quarto-color-scheme quarto-color-alternate" id="quarto-text-highlighting-styles">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-71f4083f1a58969841b56873763e1dc2.css" rel="stylesheet" class="quarto-color-scheme-extra" id="quarto-text-highlighting-styles">
+<script src="../site_libs/bootstrap/bootstrap.min.js"></script>
+<link href="../site_libs/bootstrap/bootstrap-icons.css" rel="stylesheet">
+<link href="../site_libs/bootstrap/bootstrap-b423c91ed572b9d462947d34a333c124.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme" id="quarto-bootstrap" data-mode="light">
+<link href="../site_libs/bootstrap/bootstrap-dark-d8888d59a09d50baa3281b834af07a69.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme quarto-color-alternate" id="quarto-bootstrap" data-mode="dark">
+<link href="../site_libs/bootstrap/bootstrap-b423c91ed572b9d462947d34a333c124.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme-extra" id="quarto-bootstrap" data-mode="light">
+<script id="quarto-search-options" type="application/json">{
+  "location": "sidebar",
+  "copy-button": false,
+  "collapse-after": 3,
+  "panel-placement": "start",
+  "type": "textbox",
+  "limit": 50,
+  "keyboard-shortcut": [
+    "f",
+    "/",
+    "s"
+  ],
+  "show-item-context": false,
+  "language": {
+    "search-no-results-text": "No results",
+    "search-matching-documents-text": "matching documents",
+    "search-copy-link-title": "Copy link to search",
+    "search-hide-matches-text": "Hide additional matches",
+    "search-more-match-text": "more match in this document",
+    "search-more-matches-text": "more matches in this document",
+    "search-clear-button-title": "Clear",
+    "search-text-placeholder": "",
+    "search-detached-cancel-button-title": "Cancel",
+    "search-submit-button-title": "Submit",
+    "search-label": "Search"
+  }
+}</script>
+
+
+</head>
+
+<body class="nav-sidebar floating quarto-light"><script id="quarto-html-before-body" type="application/javascript">
+    const toggleBodyColorMode = (bsSheetEl) => {
+      const mode = bsSheetEl.getAttribute("data-mode");
+      const bodyEl = window.document.querySelector("body");
+      if (mode === "dark") {
+        bodyEl.classList.add("quarto-dark");
+        bodyEl.classList.remove("quarto-light");
+      } else {
+        bodyEl.classList.add("quarto-light");
+        bodyEl.classList.remove("quarto-dark");
+      }
+    }
+    const toggleBodyColorPrimary = () => {
+      const bsSheetEl = window.document.querySelector("link#quarto-bootstrap:not([rel=disabled-stylesheet])");
+      if (bsSheetEl) {
+        toggleBodyColorMode(bsSheetEl);
+      }
+    }
+    const setColorSchemeToggle = (alternate) => {
+      const toggles = window.document.querySelectorAll('.quarto-color-scheme-toggle');
+      for (let i=0; i < toggles.length; i++) {
+        const toggle = toggles[i];
+        if (toggle) {
+          if (alternate) {
+            toggle.classList.add("alternate");
+          } else {
+            toggle.classList.remove("alternate");
+          }
+        }
+      }
+    };
+    const toggleColorMode = (alternate) => {
+      // Switch the stylesheets
+      const primaryStylesheets = window.document.querySelectorAll('link.quarto-color-scheme:not(.quarto-color-alternate)');
+      const alternateStylesheets = window.document.querySelectorAll('link.quarto-color-scheme.quarto-color-alternate');
+      manageTransitions('#quarto-margin-sidebar .nav-link', false);
+      if (alternate) {
+        // note: dark is layered on light, we don't disable primary!
+        enableStylesheet(alternateStylesheets);
+        for (const sheetNode of alternateStylesheets) {
+          if (sheetNode.id === "quarto-bootstrap") {
+            toggleBodyColorMode(sheetNode);
+          }
+        }
+      } else {
+        disableStylesheet(alternateStylesheets);
+        enableStylesheet(primaryStylesheets)
+        toggleBodyColorPrimary();
+      }
+      manageTransitions('#quarto-margin-sidebar .nav-link', true);
+      // Switch the toggles
+      setColorSchemeToggle(alternate)
+      // Hack to workaround the fact that safari doesn't
+      // properly recolor the scrollbar when toggling (#1455)
+      if (navigator.userAgent.indexOf('Safari') > 0 && navigator.userAgent.indexOf('Chrome') == -1) {
+        manageTransitions("body", false);
+        window.scrollTo(0, 1);
+        setTimeout(() => {
+          window.scrollTo(0, 0);
+          manageTransitions("body", true);
+        }, 40);
+      }
+    }
+    const disableStylesheet = (stylesheets) => {
+      for (let i=0; i < stylesheets.length; i++) {
+        const stylesheet = stylesheets[i];
+        stylesheet.rel = 'disabled-stylesheet';
+      }
+    }
+    const enableStylesheet = (stylesheets) => {
+      for (let i=0; i < stylesheets.length; i++) {
+        const stylesheet = stylesheets[i];
+        if(stylesheet.rel !== 'stylesheet') { // for Chrome, which will still FOUC without this check
+          stylesheet.rel = 'stylesheet';
+        }
+      }
+    }
+    const manageTransitions = (selector, allowTransitions) => {
+      const els = window.document.querySelectorAll(selector);
+      for (let i=0; i < els.length; i++) {
+        const el = els[i];
+        if (allowTransitions) {
+          el.classList.remove('notransition');
+        } else {
+          el.classList.add('notransition');
+        }
+      }
+    }
+    const isFileUrl = () => {
+      return window.location.protocol === 'file:';
+    }
+    const hasAlternateSentinel = () => {
+      let styleSentinel = getColorSchemeSentinel();
+      if (styleSentinel !== null) {
+        return styleSentinel === "alternate";
+      } else {
+        return false;
+      }
+    }
+    const setStyleSentinel = (alternate) => {
+      const value = alternate ? "alternate" : "default";
+      if (!isFileUrl()) {
+        window.localStorage.setItem("quarto-color-scheme", value);
+      } else {
+        localAlternateSentinel = value;
+      }
+    }
+    const getColorSchemeSentinel = () => {
+      if (!isFileUrl()) {
+        const storageValue = window.localStorage.getItem("quarto-color-scheme");
+        return storageValue != null ? storageValue : localAlternateSentinel;
+      } else {
+        return localAlternateSentinel;
+      }
+    }
+    const toggleGiscusIfUsed = (isAlternate, darkModeDefault) => {
+      const baseTheme = document.querySelector('#giscus-base-theme')?.value ?? 'light';
+      const alternateTheme = document.querySelector('#giscus-alt-theme')?.value ?? 'dark';
+      let newTheme = '';
+      if(authorPrefersDark) {
+        newTheme = isAlternate ? baseTheme : alternateTheme;
+      } else {
+        newTheme = isAlternate ? alternateTheme : baseTheme;
+      }
+      const changeGiscusTheme = () => {
+        // From: https://github.com/giscus/giscus/issues/336
+        const sendMessage = (message) => {
+          const iframe = document.querySelector('iframe.giscus-frame');
+          if (!iframe) return;
+          iframe.contentWindow.postMessage({ giscus: message }, 'https://giscus.app');
+        }
+        sendMessage({
+          setConfig: {
+            theme: newTheme
+          }
+        });
+      }
+      const isGiscussLoaded = window.document.querySelector('iframe.giscus-frame') !== null;
+      if (isGiscussLoaded) {
+        changeGiscusTheme();
+      }
+    };
+    const authorPrefersDark = false;
+    const darkModeDefault = authorPrefersDark;
+      document.querySelector('link#quarto-text-highlighting-styles.quarto-color-scheme-extra').rel = 'disabled-stylesheet';
+      document.querySelector('link#quarto-bootstrap.quarto-color-scheme-extra').rel = 'disabled-stylesheet';
+    let localAlternateSentinel = darkModeDefault ? 'alternate' : 'default';
+    // Dark / light mode switch
+    window.quartoToggleColorScheme = () => {
+      // Read the current dark / light value
+      let toAlternate = !hasAlternateSentinel();
+      toggleColorMode(toAlternate);
+      setStyleSentinel(toAlternate);
+      toggleGiscusIfUsed(toAlternate, darkModeDefault);
+      window.dispatchEvent(new Event('resize'));
+    };
+    // Switch to dark mode if need be
+    if (hasAlternateSentinel()) {
+      toggleColorMode(true);
+    } else {
+      toggleColorMode(false);
+    }
+  </script>
+
+<div id="quarto-search-results"></div>
+  <header id="quarto-header" class="headroom fixed-top">
+  <nav class="quarto-secondary-nav">
+    <div class="container-fluid d-flex">
+      <button type="button" class="quarto-btn-toggle btn" data-bs-toggle="collapse" role="button" data-bs-target=".quarto-sidebar-collapse-item" aria-controls="quarto-sidebar" aria-expanded="false" aria-label="Toggle sidebar navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">
+        <i class="bi bi-layout-text-sidebar-reverse"></i>
+      </button>
+        <nav class="quarto-page-breadcrumbs" aria-label="breadcrumb"><ol class="breadcrumb"><li class="breadcrumb-item"><a href="../chapters/08-onboarding-an-agent.html">Working with Crystalline</a></li><li class="breadcrumb-item"><a href="../chapters/12c-reflection.html"><span class="chapter-number">12</span>&nbsp; <span class="chapter-title">Reflection</span></a></li></ol></nav>
+        <a class="flex-grow-1" role="navigation" data-bs-toggle="collapse" data-bs-target=".quarto-sidebar-collapse-item" aria-controls="quarto-sidebar" aria-expanded="false" aria-label="Toggle sidebar navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">      
+        </a>
+      <button type="button" class="btn quarto-search-button" aria-label="Search" onclick="window.quartoOpenSearch();">
+        <i class="bi bi-search"></i>
+      </button>
+    </div>
+  </nav>
+</header>
+<!-- content -->
+<div id="quarto-content" class="quarto-container page-columns page-rows-contents page-layout-article">
+<!-- sidebar -->
+  <nav id="quarto-sidebar" class="sidebar collapse collapse-horizontal quarto-sidebar-collapse-item sidebar-navigation floating overflow-auto">
+    <div class="pt-lg-2 mt-2 text-left sidebar-header">
+    <div class="sidebar-title mb-0 py-0">
+      <a href="../">The Crystalline Handbook</a> 
+        <div class="sidebar-tools-main">
+    <div class="dropdown">
+      <a href="" title="Download" id="quarto-navigation-tool-dropdown-0" class="quarto-navigation-tool dropdown-toggle px-1" data-bs-toggle="dropdown" aria-expanded="false" role="link" aria-label="Download"><i class="bi bi-download"></i></a>
+      <ul class="dropdown-menu" aria-labelledby="quarto-navigation-tool-dropdown-0">
+          <li>
+            <a class="dropdown-item sidebar-tools-main-item" href="../The-Crystalline-Handbook.pdf">
+              <i class="bi bi-file-pdf pe-1"></i>
+            Download PDF
+            </a>
+          </li>
+          <li>
+            <a class="dropdown-item sidebar-tools-main-item" href="../The-Crystalline-Handbook.epub">
+              <i class="bi bi-journal pe-1"></i>
+            Download ePub
+            </a>
+          </li>
+      </ul>
+    </div>
+  <a href="" class="quarto-color-scheme-toggle quarto-navigation-tool  px-1" onclick="window.quartoToggleColorScheme(); return false;" title="Toggle dark mode"><i class="bi"></i></a>
+</div>
+    </div>
+      </div>
+        <div class="mt-2 flex-shrink-0 align-items-center">
+        <div class="sidebar-search">
+        <div id="quarto-search" class="" title="Search"></div>
+        </div>
+        </div>
+    <div class="sidebar-menu-container"> 
+    <ul class="list-unstyled mt-1">
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Preface</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/00-colophon.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Colophon</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/00-prologue.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Prologue: Waking up</span></a>
+  </div>
+</li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-1" role="navigation" aria-expanded="true">
+ <span class="menu-text">The Idea</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-1" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="quarto-sidebar-section-1" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/01-what-is-crystalline.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><span class="chapter-number">1</span>&nbsp; <span class="chapter-title">What is Crystalline?</span></span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/02-fluid-and-crystalline-intelligence.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><span class="chapter-number">2</span>&nbsp; <span class="chapter-title">Fluid and crystalline intelligence</span></span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/03-the-lifecycle.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><span class="chapter-number">3</span>&nbsp; <span class="chapter-title">The lifecycle: learn, evolve, remember</span></span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/05-terminology.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><span class="chapter-number">4</span>&nbsp; <span class="chapter-title">Terminology</span></span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-2" role="navigation" aria-expanded="true">
+ <span class="menu-text">Getting Started</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-2" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="quarto-sidebar-section-2" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/06-installing-locally.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><span class="chapter-number">5</span>&nbsp; <span class="chapter-title">Installing locally</span></span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-3" role="navigation" aria-expanded="true">
+ <span class="menu-text">Working with Crystalline</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-3" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="quarto-sidebar-section-3" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/08-onboarding-an-agent.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><span class="chapter-number">6</span>&nbsp; <span class="chapter-title">Onboarding an agent</span></span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/09-teaching.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><span class="chapter-number">7</span>&nbsp; <span class="chapter-title">Teaching</span></span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/10-ingesting-knowledge-at-scale.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><span class="chapter-number">8</span>&nbsp; <span class="chapter-title">Ingesting knowledge at scale</span></span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/11-finding.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><span class="chapter-number">9</span>&nbsp; <span class="chapter-title">Finding</span></span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/12-evolving.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><span class="chapter-number">10</span>&nbsp; <span class="chapter-title">Evolving</span></span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/12b-possible-contradictions.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><span class="chapter-number">11</span>&nbsp; <span class="chapter-title">Possible contradictions</span></span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/12c-reflection.html" class="sidebar-item-text sidebar-link active">
+ <span class="menu-text"><span class="chapter-number">12</span>&nbsp; <span class="chapter-title">Reflection</span></span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-4" role="navigation" aria-expanded="true">
+ <span class="menu-text">The System</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-4" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="quarto-sidebar-section-4" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/04-what-crystalline-provides.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><span class="chapter-number">13</span>&nbsp; <span class="chapter-title">What Crystalline provides</span></span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-5" role="navigation" aria-expanded="true">
+ <span class="menu-text">Getting Started with a Team</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-5" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="quarto-sidebar-section-5" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/07-running-a-shared-instance.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><span class="chapter-number">14</span>&nbsp; <span class="chapter-title">Running a shared instance</span></span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-6" role="navigation" aria-expanded="true">
+ <span class="menu-text">Collaborating with Crystalline</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-6" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="quarto-sidebar-section-6" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/13-sharing-with-a-team.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><span class="chapter-number">15</span>&nbsp; <span class="chapter-title">Sharing with a team</span></span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/13b-naming-a-domain.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><span class="chapter-number">16</span>&nbsp; <span class="chapter-title">Naming a domain</span></span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/14-identity-and-access.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><span class="chapter-number">17</span>&nbsp; <span class="chapter-title">Identity and access</span></span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/15-equipping-the-agent.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><span class="chapter-number">18</span>&nbsp; <span class="chapter-title">Equipping the agent</span></span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/16-where-to-go-from-here.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><span class="chapter-number">19</span>&nbsp; <span class="chapter-title">Where to go from here</span></span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-7" role="navigation" aria-expanded="true">
+ <span class="menu-text">Reference</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-7" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="quarto-sidebar-section-7" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/17-reference-configuration.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><span class="chapter-number">20</span>&nbsp; <span class="chapter-title">Configuration</span></span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/18-reference-manifest-and-engram.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><span class="chapter-number">21</span>&nbsp; <span class="chapter-title">The MANIFEST and the engram</span></span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/19-reference-domains.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><span class="chapter-number">22</span>&nbsp; <span class="chapter-title">Domains</span></span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/20-reference-finding-codes.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><span class="chapter-number">23</span>&nbsp; <span class="chapter-title">Every finding code</span></span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-8" role="navigation" aria-expanded="true">
+ <span class="menu-text">Appendices</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-8" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="quarto-sidebar-section-8" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/90-glossary.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Glossary</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/91-questions-and-answers.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Questions and answers</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/97-list-of-figures.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">List of figures</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/98-end-of-line.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">End of line</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/99-back-cover.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Back cover</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+    </ul>
+    </div>
+</nav>
+<div id="quarto-sidebar-glass" class="quarto-sidebar-collapse-item" data-bs-toggle="collapse" data-bs-target=".quarto-sidebar-collapse-item"></div>
+<!-- margin-sidebar -->
+    <div id="quarto-margin-sidebar" class="sidebar margin-sidebar">
+        <nav id="TOC" role="doc-toc" class="toc-active">
+    <h2 id="toc-title">Table of contents</h2>
+   
+  <ul>
+  <li><a href="#why-not-read-the-engrams" id="toc-why-not-read-the-engrams" class="nav-link active" data-scroll-target="#why-not-read-the-engrams"><span class="header-section-number">12.1</span> Why not read the engrams</a></li>
+  <li><a href="#asking-a-colleague-to-present" id="toc-asking-a-colleague-to-present" class="nav-link" data-scroll-target="#asking-a-colleague-to-present"><span class="header-section-number">12.2</span> Asking a colleague to present</a></li>
+  <li><a href="#the-pact" id="toc-the-pact" class="nav-link" data-scroll-target="#the-pact"><span class="header-section-number">12.3</span> The pact</a></li>
+  <li><a href="#present-test-improve" id="toc-present-test-improve" class="nav-link" data-scroll-target="#present-test-improve"><span class="header-section-number">12.4</span> Present, test, improve</a></li>
+  <li><a href="#the-club" id="toc-the-club" class="nav-link" data-scroll-target="#the-club"><span class="header-section-number">12.5</span> The club</a></li>
+  <li><a href="#who-sees-what" id="toc-who-sees-what" class="nav-link" data-scroll-target="#who-sees-what"><span class="header-section-number">12.6</span> Who sees what</a></li>
+  <li><a href="#two-lifecycles" id="toc-two-lifecycles" class="nav-link" data-scroll-target="#two-lifecycles"><span class="header-section-number">12.7</span> Two lifecycles</a></li>
+  </ul>
+</nav>
+    </div>
+<!-- main -->
+<main class="content" id="quarto-document-content">
+
+
+<header id="title-block-header" class="quarto-title-block default"><nav class="quarto-page-breadcrumbs quarto-title-breadcrumbs d-none d-lg-block" aria-label="breadcrumb"><ol class="breadcrumb"><li class="breadcrumb-item"><a href="../chapters/08-onboarding-an-agent.html">Working with Crystalline</a></li><li class="breadcrumb-item"><a href="../chapters/12c-reflection.html"><span class="chapter-number">12</span>&nbsp; <span class="chapter-title">Reflection</span></a></li></ol></nav>
+<div class="quarto-title">
+<h1 class="title"><span id="sec-reflection" class="quarto-section-identifier"><span class="chapter-number">12</span>&nbsp; <span class="chapter-title">Reflection</span></span></h1>
+</div>
+
+
+
+<div class="quarto-title-meta">
+
+    
+  
+    
+  </div>
+  
+
+
+</header>
+
+
+<!-- TODO-0.26.0: Reflection is planned, the core for 0.26 and Fluid's part for 0.27 | source: 0.23 spec Milestones -->
+<div class="callout callout-style-default callout-note callout-titled" title="Coming soon">
+<div class="callout-header d-flex align-content-center">
+<div class="callout-icon-container">
+<i class="callout-icon"></i>
+</div>
+<div class="callout-title-container flex-fill">
+<span class="screen-reader-only">Note</span>Coming soon
+</div>
+</div>
+<div class="callout-body-container callout-body">
+<p>Reflection is planned for Crystalline 0.26 and 0.27: the files, the tools and the agent’s side first, the screens in Fluid one release later. What you read here comes from the plans, and details can still move before the release.</p>
+</div>
+</div>
+<!-- TODO-0.26.0: Reflection is where people and agents meet on a domain; the agent presents its knowledge in documents for people | source: 0.23 spec Problem, Goals 4-8 -->
+<p>Reflection is the place where people and the agent meet on a domain, and this chapter walks you through it as the plans have it. The agent writes its engrams for itself, organized so it can store, find and pick up what it learned, and nothing in them is phrased for you. Since people need what’s in there too, the agent presents it in documents for people, at their level and in a shape they can use, and what people change or say about those documents flows back into its engrams.</p>
+<section id="why-not-read-the-engrams" class="level2" data-number="12.1">
+<h2 data-number="12.1" class="anchored" data-anchor-id="why-not-read-the-engrams"><span class="header-section-number">12.1</span> Why not read the engrams</h2>
+<p>An expert who knows a topic doesn’t hand you their notebook. They explain it at your level, leave out what you don’t need and pick the order that makes sense to you. Engrams are the notebook: dense, cross-linked, full of observations written for the next session’s search, and a person reading them is reading somebody else’s shorthand.</p>
+<!-- TODO-0.27.0: Fluid gets two modes, Engrams and Reflection, and people spend their time in Reflection | source: 0.23 spec B7 -->
+<p>You can still open the engrams in Fluid, as a look into the agent’s mind (a bit like a session on the couch, or a debugger): you go there once in a while to inspect what it learned and fix it. With Reflection, Fluid gets a second mode beside the engrams, and people spend their day in that one.</p>
+</section>
+<section id="asking-a-colleague-to-present" class="level2" data-number="12.2">
+<h2 data-number="12.2" class="anchored" data-anchor-id="asking-a-colleague-to-present"><span class="header-section-number">12.2</span> Asking a colleague to present</h2>
+<p>Think of the colleague who knows a topic best: you ask them to give the team a presentation on it. Once it’s up on the screen the room works with it, and the feedback improves it for everyone, presenter included: somebody spots a gap, somebody else knew a detail the presenter didn’t, two people find out they meant different things by one word.</p>
+<!-- TODO-0.26.0: a domain switches Reflection on and the agent presents its knowledge as reflections, documents made of sections in a folder tree | source: 0.23 spec B1, B3, Vocabulary -->
+<p>Reflection does that for a domain: switch it on and the agent presents what it knows as reflections, documents in a folder tree, as many and as deep as the domain agreed. Each one is made of sections (a heading and its text), and every section records which engrams it was built from, so when one of them changes the agent knows which sections to look at again. Crystalline doesn’t write the reflections itself; it hands the agent a queue of work and the agent does the writing.</p>
+</section>
+<section id="the-pact" class="level2" data-number="12.3">
+<h2 data-number="12.3" class="anchored" data-anchor-id="the-pact"><span class="header-section-number">12.3</span> The pact</h2>
+<!-- TODO-0.26.0: PACT.md is the domain's agreement on audience, depth and structure, the counterpart of MANIFEST.md, edited by curators, the owner, a private domain's managers and instance admins | source: 0.23 spec B1, B5 (Rights: two axes), Vocabulary -->
+<p>Before anybody presents, the room agrees on how. Every domain with a Reflection has one pact, a file called <code>PACT.md</code>: who the reflections are for, how much detail they carry and how the tree is structured. The MANIFEST tells the agent what the domain holds, the pact tells everyone how to talk about it. The people who curate the domain edit the pact: everyone from engram editor up, its owner, a private domain’s managers and the instance’s admins. Everybody else who works on the reflections reads it. A change to the pact lands in the agent’s queue like any other work, and the agent reshapes the reflections to match.</p>
+<!-- TODO-0.26.0: readers and contributors propose pact changes in comments, a curator changes it | source: 0.23 spec B5 (Rights: two axes) -->
+<p>Most of the arguing is about the level of detail. The Hitchhiker’s Guide had a pact too: Ford Prefect’s fifteen years of field research on Earth went into the entry as two words, Mostly harmless. That’s fine for a guide to the galaxy and wrong for a book club, so anyone who works on the reflections can argue with it in a comment, and a curator changes it when the argument wins.</p>
+</section>
+<section id="present-test-improve" class="level2" data-number="12.4">
+<h2 data-number="12.4" class="anchored" data-anchor-id="present-test-improve"><span class="header-section-number">12.4</span> Present, test, improve</h2>
+<!-- TODO-0.26.0: the agent presents, people change and comment, the agent reads a person's change to a section before it rewrites that section and asks in a thread; three outcomes; knowledge changes are brought into the reflections | source: 0.23 spec B2, B3, B4 -->
+<p>The agent presents, and people read what it wrote, change it and comment on a passage. A person’s change shows up at once as ordinary text (no badge, no approval step). In the background Crystalline notes what changed since the agent last presented that section, and the next time the agent works the queue it reads a person’s change to a section before it rewrites that section. If a change looks wrong or doesn’t fit what it knows, the agent opens a thread on the passage and asks. It does the same with two engrams that disagree (<a href="12b-possible-contradictions.html" class="quarto-xref"><span>Chapter 11</span></a>) and asks you; here the doubt is about a person’s change, and that person is right there on the page.</p>
+<!-- TODO-0.26.0: a thread settles a change one of three ways; the agent speaks plain words without engram links | source: 0.23 spec B3, B4 -->
+<p>Either the agent knew something the person didn’t, or the person turns out to be right and the agent puts the correction into its engrams. A change ends one of three ways: the agent takes it in and presents the section again, it stays as the person’s text or it gets talked through in the thread. The agent writes plain words there and never links an engram, since many of the people in a thread can’t open one.</p>
+<!-- TODO-0.26.0: a changed or retired source engram makes its sections queue work; a relevant engram with no section gets a new section or reflection | source: 0.23 spec B3 -->
+<p>When the agent’s own knowledge moves (a correction, a retirement, something new from a session), the sections built from it are out of date and the agent brings the change into the reflections. Something new that no section covers yet gets a new section or a reflection of its own.</p>
+<!-- TODO-0.26.0: the lifecycle of a reflection: present, feedback, threads with question and learn, improve | source: 0.23 spec B1-B4 -->
+<div id="fig-reflection-lifecycle" class="quarto-float quarto-figure quarto-figure-center anchored" alt="One domain. The agent presents from its knowledge into reflections, inside a frame labelled the pact. Feedback from the reflections returns to the agent, and the agent takes what holds up back into its knowledge. People read, change and comment. A thread between the agent and the people carries question and learn both ways.">
+<figure class="quarto-float quarto-float-fig figure">
+<div aria-describedby="fig-reflection-lifecycle-caption-0ceaefa1-69ba-4598-a22c-09a6ac19f8ca">
+<img src="../diagrams/reflection-lifecycle.svg" class="img-fluid figure-img" alt="One domain. The agent presents from its knowledge into reflections, inside a frame labelled the pact. Feedback from the reflections returns to the agent, and the agent takes what holds up back into its knowledge. People read, change and comment. A thread between the agent and the people carries question and learn both ways.">
+</div>
+<figcaption class="quarto-float-caption-bottom quarto-float-caption quarto-float-fig" id="fig-reflection-lifecycle-caption-0ceaefa1-69ba-4598-a22c-09a6ac19f8ca">
+Figure&nbsp;12.1: Present, test, improve: the agent presents what it knows, people change and comment, and what holds up in a thread goes back into its knowledge.
+</figcaption>
+</figure>
+</div>
+<!-- TODO-0.26.0: the agent works the queue when nudged in a session or in a scheduled run on the home instance | source: 0.23 spec B3, B8 -->
+<p><a href="#fig-reflection-lifecycle" class="quarto-xref">Figure&nbsp;<span>12.1</span></a> shows the loop. Nobody has to remember to run it: an agent working in the domain gets reminded when the queue has open items, like it does for the sweep, and a team can schedule a nightly agent run on its server to work the queue.</p>
+</section>
+<section id="the-club" class="level2" data-number="12.5">
+<h2 data-number="12.5" class="anchored" data-anchor-id="the-club"><span class="header-section-number">12.5</span> The club</h2>
+<!-- TODO-0.26.0: an instance admin switches Reflection on at the team server and writes the pact through the agent | source: 0.23 spec B1, B3, B5 (Rights: two axes), B6 -->
+<p>Dallas runs the book club, and its engrams live in <code>club</code>, shared through the club’s repository and served by the club’s server, which you look after as its admin. Members keep asking Dallas the same things (which Star Trek volume is next, when the club gets to Dune), so he asks you to switch Reflection on, with a pact he has in mind:</p>
+<!-- TODO-0.26.0: switching on at the home instance, the backup branch, PACT.md written through the agent, presenting reflections | source: 0.23 spec B1, B3, B6 -->
+<pre class="text"><code>You:    Switch on Reflection for club. Dallas wants the pact like
+        this: for members, no spoilers past the first chapter,
+        one page per series.
+Agent:  Switched on at the club's server, so club's Reflection
+        lives there, backed up to its own branch of the club's
+        repository. PACT.md says: for club members, spoiler-free
+        past the first chapter, one reflection per series. Shall I
+        present what I know?
+You:    Go ahead.
+Agent:  Six series pages: Hitchhiker's, Dune, Dungeon Crawler Carl
+        and the Star Trek series the club reads (The Next
+        Generation, Deep Space Nine, Destiny). Each says what the
+        club read, what's next and what members thought, without
+        the endings.</code></pre>
+<!-- TODO-0.26.0: an admin sets knowledge none and Reflection contributor on an account at instance level | source: 0.23 spec B5 (Rights: two axes) -->
+<p>Lambert follows the club on her phone and has no wish to read engrams, so on her account you set the knowledge level to none and the Reflection level to contributor. She can edit every page of the club’s Reflection.</p>
+<!-- TODO-0.27.0: a contributor edits a reflection in Fluid's Reflection mode, in the browser | source: 0.23 spec B5 (Rights: two axes), B7 -->
+<p>She’s on the bus home with the Dune page open on her phone (the club’s Fluid) when she changes March to May in the line about when the club reads Dune.</p>
+<!-- TODO-0.26.0: the agent reads the change before rewriting, asks in a thread in plain words, and settles it by taking it in | source: 0.23 spec B3, B4 -->
+<p>That night the club’s scheduled agent run works the queue and reads her change first. It contradicts the agent’s engrams: the club picked March in January, after checking that the paperback was out by then. So it opens a thread on the passage:</p>
+<!-- TODO-0.26.0: a thread on a quoted passage, answered and resolved with an outcome; a feedback item taken in | source: 0.23 spec B3, B4 -->
+<pre class="text"><code>Thread on "the club reads Dune in May"
+  Agent:   This said March. The club picked March in January because
+           the paperback was out by then. What moved it?
+  Lambert: The reprint slipped. Capsule Corp Books says April now,
+           and nobody wants the hardback. I wasn't there in January,
+           so I didn't know March was about the paperback.
+  Agent:   Then May holds. I've changed what I know about the club's
+           list and the reprint, and presented the section again.
+           Resolved: taken in, Dune moves to May because the
+           paperback reprint slipped to April.</code></pre>
+<!-- TODO-0.26.0: what a thread settles goes into the engrams; a change in the engrams becomes queue work for every section built from them | source: 0.23 spec B3 -->
+<p>With the reprint date in the engrams and Dune out of March, the club needs another pick, and at the next meeting it chooses the second volume of the Destiny trilogy, which Kane’s agent captures in <code>club</code>. On a later run the agent sees that the next-up section of the Destiny page, built from the club’s list, is out of date and puts the new pick in without anybody touching the page.</p>
+</section>
+<section id="who-sees-what" class="level2" data-number="12.6">
+<h2 data-number="12.6" class="anchored" data-anchor-id="who-sees-what"><span class="header-section-number">12.6</span> Who sees what</h2>
+<!-- TODO-0.26.0: two axes: knowledge none, viewer, editor; Reflection reader, contributor, curator; curator follows from knowledge editor; defaults; an explicit level only raises access | source: 0.23 spec B5 (Rights: two axes) -->
+<p>With Reflection, access gets two axes, and you set them separately. One is the level on the engrams that <a href="07-running-a-shared-instance.html" class="quarto-xref"><span>Chapter 14</span></a> and <a href="14-identity-and-access.html" class="quarto-xref"><span>Chapter 17</span></a> describe: viewer or editor (plus manager on a private domain and admin on the instance), and one new value, none, for somebody who sees no engrams at all. The other is the Reflection level: a reader reads the reflections and comments (opening, answering, resolving and reopening threads); a contributor also edits their text and creates, moves and deletes reflections; a curator also writes sections from the engrams and settles what people changed. Nobody is made a curator by hand: everyone from engram editor up is one, and their agents curate with their rights. A viewer of the engrams is a reader by default, and a Reflection level set on top only ever raises that (to contributor, say), so nobody who can read the engrams is kept out of their Reflection.</p>
+<!-- TODO-0.26.0: where the levels are set; on an instance that lets anonymous requests in, anonymous web visitors read the reflections of the domains they can read but never comment; locally everything is allowed | source: 0.23 spec B5 (Rights: two axes) -->
+<p>On a shared domain both levels sit on the person’s account, set by an admin for every shared domain on the instance, and on a private domain they sit side by side on the membership. Anonymous web visitors get in only where the instance lets anonymous requests in, and there they read the reflections of the domains an anonymous visitor can read, the way they read those domains’ engrams, without ever commenting. On your own machine without accounts none of this applies and everything is allowed.</p>
+<!-- TODO-0.27.0: Fluid shows the Engrams mode from knowledge viewer and the Reflection mode from reader | source: 0.23 spec B5 (Rights: two axes), B7 -->
+<p>In Fluid the Engrams mode appears from knowledge viewer up and the Reflection mode from reader up, so a person with knowledge none, like Lambert, works on the reflections and never sees an engram.</p>
+<!-- TODO-0.26.0: a team domain's Reflection lives on one home instance, backed up to its own branch; a local domain keeps it locally; reflections stay out of sharing | source: 0.23 spec B1, B6 -->
+<p>Since a presentation needs one room, a team domain’s Reflection lives on one home instance, the team server: everyone works on it there and the server backs it up to its own branch of the domain’s repository. Laptops keep no copy of it, and when you share changes, only engrams go to the repository, never reflections. A domain that only lives on your machine keeps its Reflection there too, as ordinary files.</p>
+<!-- TODO-0.26.0: a member's agent reaches the home instance's Reflection through the domains from shared servers connection, reflection tools forwarded from 0.26.0 | source: 0.23 spec B6, Non-goals, Part A -->
+<p>A member’s agent reaches the club’s Reflection through the server connection <a href="07-running-a-shared-instance.html#sec-shared-servers" class="quarto-xref"><span>Section 14.9</span></a> describes, the one that lets a laptop’s Crystalline offer a server’s domains beside its own.</p>
+</section>
+<section id="two-lifecycles" class="level2" data-number="12.7">
+<h2 data-number="12.7" class="anchored" data-anchor-id="two-lifecycles"><span class="header-section-number">12.7</span> Two lifecycles</h2>
+<!-- TODO-0.26.0: evolve keeps the knowledge true, reflect keeps the reflections in step and brings back what people know; the two crossings | source: 0.23 spec B3 -->
+<p>A domain with Reflection runs two lifecycles around the same engrams (<a href="#fig-two-lifecycles" class="quarto-xref">Figure&nbsp;<span>12.2</span></a>). On the left is evolve, the sweep from <a href="12-evolving.html" class="quarto-xref"><span>Chapter 10</span></a>, with which the agent keeps its own knowledge true. Reflect keeps what people see in step with the engrams and brings back what people know. The two cross twice. A fix from the sweep (a retirement, a corrected date) leaves the sections built from the old engram out of date, so they land in the reflect queue. And what a thread settles lands in the engrams, where the sweep tends it from then on like everything else.</p>
+<!-- TODO-0.26.0: two loops share the agent's knowledge; the crossings | source: 0.23 spec B3 -->
+<div id="fig-two-lifecycles" class="quarto-float quarto-figure quarto-figure-center anchored" alt="Two clockwise loops share the agent's knowledge in the middle. On the left, evolve runs from the sweep to the fix and back. On the right, reflect runs present, feedback, improve and back. Dashed crossings: a fix leaves a presented section out of date, and what a discussion settles becomes knowledge the sweep tends.">
+<figure class="quarto-float quarto-float-fig figure">
+<div aria-describedby="fig-two-lifecycles-caption-0ceaefa1-69ba-4598-a22c-09a6ac19f8ca">
+<img src="../diagrams/two-lifecycles.svg" class="img-fluid figure-img" alt="Two clockwise loops share the agent's knowledge in the middle. On the left, evolve runs from the sweep to the fix and back. On the right, reflect runs present, feedback, improve and back. Dashed crossings: a fix leaves a presented section out of date, and what a discussion settles becomes knowledge the sweep tends.">
+</div>
+<figcaption class="quarto-float-caption-bottom quarto-float-caption quarto-float-fig" id="fig-two-lifecycles-caption-0ceaefa1-69ba-4598-a22c-09a6ac19f8ca">
+Figure&nbsp;12.2: Two lifecycles around one body of knowledge: evolve keeps it true, reflect keeps what people see in step with it.
+</figcaption>
+</figure>
+</div>
+<div class="callout callout-style-default callout-tip callout-titled" title="Under the hood">
+<div class="callout-header d-flex align-content-center">
+<div class="callout-icon-container">
+<i class="callout-icon"></i>
+</div>
+<div class="callout-title-container flex-fill">
+<span class="screen-reader-only">Tip</span>Under the hood
+</div>
+</div>
+<div class="callout-body-container callout-body">
+<!-- TODO-0.26.0: MANIFEST keys reflection and reflection_home, the layout under reflections/, the exclusion from engram paths | source: 0.23 spec B1, B6 -->
+<p>You switch Reflection on with <code>reflection: on</code> in the MANIFEST (it’s <code>off</code> until you do). On a domain with a GitHub origin the same change writes <code>reflection_home</code> too, and its value is this instance’s <code>service.public_url</code>. Without a public URL the switch refuses and tells you to switch Reflection on at the team server. On any other instance the Reflection tools refuse and name where the domain’s Reflection lives. Without a GitHub origin there’s no <code>reflection_home</code>, because the Reflection simply lives where the domain does. The files all sit under <code>reflections/</code>: <code>PACT.md</code> at its root, the reflections as markdown files in whatever folders the pact describes (each <code>##</code> heading a section), the threads of a reflection in a <code>.threads.md</code> file beside it and a hidden baseline of what was last presented under <code>reflections/.reflected/</code>. Moving a reflection takes its threads and baseline along and rewrites relative links to it. While the switch is on, the folder stays out of engram sync, the engram index, evolve, default <code>search_engrams</code> and sharing; the engram write tools refuse any path under it (<code>write_engram</code>, <code>edit_engram</code>, <code>move_engram</code>, <code>delete_engram</code>), and reflections are searched as text in an index of their own. Switching on refuses while engrams live under <code>reflections/</code> and names them, so you move them first.</p>
+<!-- TODO-0.26.0: the four tools, the reflect queue with its feedback, update and review kinds, the nudges | source: 0.23 spec B3, B4 -->
+<p>The agent gets four tools, the same list for every client (a read-only instance hides <code>reflect</code>, <code>write_reflection</code> and <code>discuss</code>), and each of them refuses on a domain with the switch off. <code>reflect</code> hands over the queue ranked, recomputes it on each call and puts the oldest item first, with its age. In the queue, <code>feedback</code> means a person changed a section since the agent last presented it, and the item carries the difference, the section’s source engrams and who changed it. <code>update</code> means the knowledge behind a section moved: a source engram changed or retired, a relevant engram has no section yet, a reflection strayed from the pact or a pact change isn’t applied yet. And <code>review</code> items are open threads waiting for the agent; within one section a <code>feedback</code> item always comes before an <code>update</code> item. <code>read_reflection</code> without a path lists the tree; give it a path and you get that reflection with its sources and open threads. <code>write_reflection</code> creates, changes, moves and deletes reflections and edits the pact (the pact only for curators, the domain’s owner, a private domain’s managers and the instance’s admins); a section written with its sources is presented from the engrams, and one written without is an ordinary edit. <code>discuss</code> opens a thread on a section or a quoted passage, answers, resolves with a short outcome and reopens; a resolved thread’s history is never rewritten. The session-start briefing names a domain’s Reflection when it has open items, and the Stop hook and the line after a write nudge the agent as they do for the sweep.</p>
+<!-- TODO-0.26.0: the Reflection level values, curator from knowledge editor, knowledge none over MCP and REST, anonymous web visitors read where the instance lets anonymous requests in but never comment; with auth.mcp off an anonymous MCP caller curates | source: 0.23 spec B5 (Rights: two axes); plans/2026-09-30-release-0.23-reflection-core-plan.md R4 -->
+<p>The Reflection level (set by an admin on the account, or on a private domain by its owner or a manager) is “as knowledge” (the default), <code>reader</code> or <code>contributor</code>, and it only ever raises access: the effective level is the higher of the default and the setting. Curator follows from knowledge <code>editor</code>, <code>manager</code>, owner or instance <code>admin</code> and is never set on its own. Without an explicit level, knowledge <code>viewer</code> gives <code>reader</code> and knowledge <code>none</code> gives <code>none</code>. A caller with knowledge <code>none</code> gets nothing from any engram tool over MCP or REST and finds its domains through the Reflection domain list. On an instance that lets anonymous requests in, an anonymous web visitor reads the reflections of the domains it may read, as it reads their engrams, but never comments; otherwise it gets no Reflection. An anonymous agent over HTTP on an instance with <code>auth.mcp</code> off is the open tier, and it curates the Reflection the way it may write engrams.</p>
+<!-- TODO-0.26.0: backup branch, restore, the scheduled run as a documented setup | source: 0.23 spec B6, B8 -->
+<p>On the home instance a job commits the whole <code>reflections/</code> folder to the branch <code>crystalline/reflections</code> of the domain’s GitHub origin with the instance’s own token; the engram branch never carries it, and a restore from that branch is a manual step. The nightly run is a documented setup, a headless agent (for example <code>claude -p</code> from cron) on the home instance working the <code>reflect</code> queue; the installer doesn’t set it up.</p>
+<!-- TODO-0.27.0: Fluid's Engrams and Reflection modes, live co-editing, comments, the jump to the source engrams, the pact, both levels on the users screen and members card, the review screen | source: 0.23 spec B7 -->
+<p>At the top of a domain in Fluid you flip between Engrams and Reflection. Reflection mode shows the tree of reflections and each reflection with live co-editing, comments anchored on selected text and a jump from a section to its source engrams, hidden from people with knowledge <code>none</code>; curators, the domain’s owner and admins edit the pact like any reflection. The users screen and the members card set both levels. A review screen per domain lists the open threads first, split into waiting for people and waiting for the agent, oldest first, and below them the <code>reflect</code> queue, to look at the way Maintenance shows the sweep.</p>
+</div>
+</div>
+<!-- TODO-0.26.0: summary of Reflection | source: 0.23 spec Part B, B5 (Rights: two axes) -->
+<div class="callout callout-style-default callout-note callout-titled" title="In brief">
+<div class="callout-header d-flex align-content-center">
+<div class="callout-icon-container">
+<i class="callout-icon"></i>
+</div>
+<div class="callout-title-container flex-fill">
+<span class="screen-reader-only">Note</span>In brief
+</div>
+</div>
+<div class="callout-body-container callout-body">
+<p>Engrams are the agent’s own knowledge, and opening them in Fluid is the exception, for inspecting and correcting. Reflection is where people and agents meet on a domain: the agent presents what it knows as reflections, at the level the domain’s pact agrees on, and everyone puts them to the test. People change and comment, the agent reads a person’s change to a section before rewriting it and asks in a thread when something doesn’t fit, and either side learns: a change goes into the engrams, stays as the person’s text or is talked through. Access has two axes, the engrams and the Reflection, so a contributor with knowledge none works on reflections without seeing an engram, and a team domain’s Reflection lives on its team server. Evolve keeps the knowledge true, reflect keeps what people see in step with it and each feeds the other.</p>
+</div>
+</div>
+
+
+</section>
+
+</main> <!-- /main -->
+<!-- The colophon's icon notes: fit the squares of icons to the paragraphs
+     beside them. theme/crystalline.scss sizes each square to three lines
+     without this. Every note gets the same square, the tallest paragraph's,
+     and the loop repeats until the text stops reflowing under the change. -->
+<script>
+(function () {
+  function fit() {
+    var notes = Array.prototype.slice.call(document.querySelectorAll(".icon-note"));
+    var pairs = [];
+    notes.forEach(function (note) {
+      var tile = note.querySelector("p:first-child");
+      var text = note.querySelector("p:last-child");
+      if (tile && text && tile !== text) pairs.push([tile, text]);
+    });
+    if (!pairs.length) return;
+    pairs.forEach(function (p) { p[0].style.height = p[0].style.width = ""; });
+    // On a narrow screen a wider square narrows the text, which grows
+    // taller, which widens the square: cap it at a third of the note.
+    var cap = Math.round(notes[0].getBoundingClientRect().width / 3);
+    var last = 0;
+    for (var i = 0; i < 6; i++) {
+      var h = 0;
+      pairs.forEach(function (p) {
+        h = Math.max(h, Math.round(p[1].getBoundingClientRect().height));
+      });
+      h = Math.min(h, cap);
+      if (h === last) break;
+      pairs.forEach(function (p) { p[0].style.height = p[0].style.width = h + "px"; });
+      last = h;
+    }
+  }
+  window.addEventListener("load", fit);
+  window.addEventListener("resize", fit);
+})();
+</script>
+<script id="quarto-html-after-body" type="application/javascript">
+  window.document.addEventListener("DOMContentLoaded", function (event) {
+    // Ensure there is a toggle, if there isn't float one in the top right
+    if (window.document.querySelector('.quarto-color-scheme-toggle') === null) {
+      const a = window.document.createElement('a');
+      a.classList.add('top-right');
+      a.classList.add('quarto-color-scheme-toggle');
+      a.href = "";
+      a.onclick = function() { try { window.quartoToggleColorScheme(); } catch {} return false; };
+      const i = window.document.createElement("i");
+      i.classList.add('bi');
+      a.appendChild(i);
+      window.document.body.appendChild(a);
+    }
+    setColorSchemeToggle(hasAlternateSentinel())
+    const icon = "";
+    const anchorJS = new window.AnchorJS();
+    anchorJS.options = {
+      placement: 'right',
+      icon: icon
+    };
+    anchorJS.add('.anchored');
+    const isCodeAnnotation = (el) => {
+      for (const clz of el.classList) {
+        if (clz.startsWith('code-annotation-')) {                     
+          return true;
+        }
+      }
+      return false;
+    }
+    const onCopySuccess = function(e) {
+      // button target
+      const button = e.trigger;
+      // don't keep focus
+      button.blur();
+      // flash "checked"
+      button.classList.add('code-copy-button-checked');
+      var currentTitle = button.getAttribute("title");
+      button.setAttribute("title", "Copied!");
+      let tooltip;
+      if (window.bootstrap) {
+        button.setAttribute("data-bs-toggle", "tooltip");
+        button.setAttribute("data-bs-placement", "left");
+        button.setAttribute("data-bs-title", "Copied!");
+        tooltip = new bootstrap.Tooltip(button, 
+          { trigger: "manual", 
+            customClass: "code-copy-button-tooltip",
+            offset: [0, -8]});
+        tooltip.show();    
+      }
+      setTimeout(function() {
+        if (tooltip) {
+          tooltip.hide();
+          button.removeAttribute("data-bs-title");
+          button.removeAttribute("data-bs-toggle");
+          button.removeAttribute("data-bs-placement");
+        }
+        button.setAttribute("title", currentTitle);
+        button.classList.remove('code-copy-button-checked');
+      }, 1000);
+      // clear code selection
+      e.clearSelection();
+    }
+    const getTextToCopy = function(trigger) {
+      const outerScaffold = trigger.parentElement.cloneNode(true);
+      const codeEl = outerScaffold.querySelector('code');
+      for (const childEl of codeEl.children) {
+        if (isCodeAnnotation(childEl)) {
+          childEl.remove();
+        }
+      }
+      return codeEl.innerText;
+    }
+    const clipboard = new window.ClipboardJS('.code-copy-button:not([data-in-quarto-modal])', {
+      text: getTextToCopy
+    });
+    clipboard.on('success', onCopySuccess);
+    if (window.document.getElementById('quarto-embedded-source-code-modal')) {
+      const clipboardModal = new window.ClipboardJS('.code-copy-button[data-in-quarto-modal]', {
+        text: getTextToCopy,
+        container: window.document.getElementById('quarto-embedded-source-code-modal')
+      });
+      clipboardModal.on('success', onCopySuccess);
+    }
+      var localhostRegex = new RegExp(/^(?:http|https):\/\/localhost\:?[0-9]*\//);
+      var mailtoRegex = new RegExp(/^mailto:/);
+        var filterRegex = new RegExp('/' + window.location.host + '/');
+      var isInternal = (href) => {
+          return filterRegex.test(href) || localhostRegex.test(href) || mailtoRegex.test(href);
+      }
+      // Inspect non-navigation links and adorn them if external
+     var links = window.document.querySelectorAll('a[href]:not(.nav-link):not(.navbar-brand):not(.toc-action):not(.sidebar-link):not(.sidebar-item-toggle):not(.pagination-link):not(.no-external):not([aria-hidden]):not(.dropdown-item):not(.quarto-navigation-tool):not(.about-link)');
+      for (var i=0; i<links.length; i++) {
+        const link = links[i];
+        if (!isInternal(link.href)) {
+          // undo the damage that might have been done by quarto-nav.js in the case of
+          // links that we want to consider external
+          if (link.dataset.originalHref !== undefined) {
+            link.href = link.dataset.originalHref;
+          }
+        }
+      }
+    function tippyHover(el, contentFn, onTriggerFn, onUntriggerFn) {
+      const config = {
+        allowHTML: true,
+        maxWidth: 500,
+        delay: 100,
+        arrow: false,
+        appendTo: function(el) {
+            return el.parentElement;
+        },
+        interactive: true,
+        interactiveBorder: 10,
+        theme: 'quarto',
+        placement: 'bottom-start',
+      };
+      if (contentFn) {
+        config.content = contentFn;
+      }
+      if (onTriggerFn) {
+        config.onTrigger = onTriggerFn;
+      }
+      if (onUntriggerFn) {
+        config.onUntrigger = onUntriggerFn;
+      }
+      window.tippy(el, config); 
+    }
+    const noterefs = window.document.querySelectorAll('a[role="doc-noteref"]');
+    for (var i=0; i<noterefs.length; i++) {
+      const ref = noterefs[i];
+      tippyHover(ref, function() {
+        // use id or data attribute instead here
+        let href = ref.getAttribute('data-footnote-href') || ref.getAttribute('href');
+        try { href = new URL(href).hash; } catch {}
+        const id = href.replace(/^#\/?/, "");
+        const note = window.document.getElementById(id);
+        if (note) {
+          return note.innerHTML;
+        } else {
+          return "";
+        }
+      });
+    }
+    const xrefs = window.document.querySelectorAll('a.quarto-xref');
+    const processXRef = (id, note) => {
+      // Strip column container classes
+      const stripColumnClz = (el) => {
+        el.classList.remove("page-full", "page-columns");
+        if (el.children) {
+          for (const child of el.children) {
+            stripColumnClz(child);
+          }
+        }
+      }
+      stripColumnClz(note)
+      if (id === null || id.startsWith('sec-')) {
+        // Special case sections, only their first couple elements
+        const container = document.createElement("div");
+        if (note.children && note.children.length > 2) {
+          container.appendChild(note.children[0].cloneNode(true));
+          for (let i = 1; i < note.children.length; i++) {
+            const child = note.children[i];
+            if (child.tagName === "P" && child.innerText === "") {
+              continue;
+            } else {
+              container.appendChild(child.cloneNode(true));
+              break;
+            }
+          }
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(container);
+          }
+          return container.innerHTML
+        } else {
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(note);
+          }
+          return note.innerHTML;
+        }
+      } else {
+        // Remove any anchor links if they are present
+        const anchorLink = note.querySelector('a.anchorjs-link');
+        if (anchorLink) {
+          anchorLink.remove();
+        }
+        if (window.Quarto?.typesetMath) {
+          window.Quarto.typesetMath(note);
+        }
+        if (note.classList.contains("callout")) {
+          return note.outerHTML;
+        } else {
+          return note.innerHTML;
+        }
+      }
+    }
+    for (var i=0; i<xrefs.length; i++) {
+      const xref = xrefs[i];
+      tippyHover(xref, undefined, function(instance) {
+        instance.disable();
+        let url = xref.getAttribute('href');
+        let hash = undefined; 
+        if (url.startsWith('#')) {
+          hash = url;
+        } else {
+          try { hash = new URL(url).hash; } catch {}
+        }
+        if (hash) {
+          const id = hash.replace(/^#\/?/, "");
+          const note = window.document.getElementById(id);
+          if (note !== null) {
+            try {
+              const html = processXRef(id, note.cloneNode(true));
+              instance.setContent(html);
+            } finally {
+              instance.enable();
+              instance.show();
+            }
+          } else {
+            // See if we can fetch this
+            fetch(url.split('#')[0])
+            .then(res => res.text())
+            .then(html => {
+              const parser = new DOMParser();
+              const htmlDoc = parser.parseFromString(html, "text/html");
+              const note = htmlDoc.getElementById(id);
+              if (note !== null) {
+                const html = processXRef(id, note);
+                instance.setContent(html);
+              } 
+            }).finally(() => {
+              instance.enable();
+              instance.show();
+            });
+          }
+        } else {
+          // See if we can fetch a full url (with no hash to target)
+          // This is a special case and we should probably do some content thinning / targeting
+          fetch(url)
+          .then(res => res.text())
+          .then(html => {
+            const parser = new DOMParser();
+            const htmlDoc = parser.parseFromString(html, "text/html");
+            const note = htmlDoc.querySelector('main.content');
+            if (note !== null) {
+              // This should only happen for chapter cross references
+              // (since there is no id in the URL)
+              // remove the first header
+              if (note.children.length > 0 && note.children[0].tagName === "HEADER") {
+                note.children[0].remove();
+              }
+              const html = processXRef(null, note);
+              instance.setContent(html);
+            } 
+          }).finally(() => {
+            instance.enable();
+            instance.show();
+          });
+        }
+      }, function(instance) {
+      });
+    }
+        let selectedAnnoteEl;
+        const selectorForAnnotation = ( cell, annotation) => {
+          let cellAttr = 'data-code-cell="' + cell + '"';
+          let lineAttr = 'data-code-annotation="' +  annotation + '"';
+          const selector = 'span[' + cellAttr + '][' + lineAttr + ']';
+          return selector;
+        }
+        const selectCodeLines = (annoteEl) => {
+          const doc = window.document;
+          const targetCell = annoteEl.getAttribute("data-target-cell");
+          const targetAnnotation = annoteEl.getAttribute("data-target-annotation");
+          const annoteSpan = window.document.querySelector(selectorForAnnotation(targetCell, targetAnnotation));
+          const lines = annoteSpan.getAttribute("data-code-lines").split(",");
+          const lineIds = lines.map((line) => {
+            return targetCell + "-" + line;
+          })
+          let top = null;
+          let height = null;
+          let parent = null;
+          if (lineIds.length > 0) {
+              //compute the position of the single el (top and bottom and make a div)
+              const el = window.document.getElementById(lineIds[0]);
+              top = el.offsetTop;
+              height = el.offsetHeight;
+              parent = el.parentElement.parentElement;
+            if (lineIds.length > 1) {
+              const lastEl = window.document.getElementById(lineIds[lineIds.length - 1]);
+              const bottom = lastEl.offsetTop + lastEl.offsetHeight;
+              height = bottom - top;
+            }
+            if (top !== null && height !== null && parent !== null) {
+              // cook up a div (if necessary) and position it 
+              let div = window.document.getElementById("code-annotation-line-highlight");
+              if (div === null) {
+                div = window.document.createElement("div");
+                div.setAttribute("id", "code-annotation-line-highlight");
+                div.style.position = 'absolute';
+                parent.appendChild(div);
+              }
+              div.style.top = top - 2 + "px";
+              div.style.height = height + 4 + "px";
+              div.style.left = 0;
+              let gutterDiv = window.document.getElementById("code-annotation-line-highlight-gutter");
+              if (gutterDiv === null) {
+                gutterDiv = window.document.createElement("div");
+                gutterDiv.setAttribute("id", "code-annotation-line-highlight-gutter");
+                gutterDiv.style.position = 'absolute';
+                const codeCell = window.document.getElementById(targetCell);
+                const gutter = codeCell.querySelector('.code-annotation-gutter');
+                gutter.appendChild(gutterDiv);
+              }
+              gutterDiv.style.top = top - 2 + "px";
+              gutterDiv.style.height = height + 4 + "px";
+            }
+            selectedAnnoteEl = annoteEl;
+          }
+        };
+        const unselectCodeLines = () => {
+          const elementsIds = ["code-annotation-line-highlight", "code-annotation-line-highlight-gutter"];
+          elementsIds.forEach((elId) => {
+            const div = window.document.getElementById(elId);
+            if (div) {
+              div.remove();
+            }
+          });
+          selectedAnnoteEl = undefined;
+        };
+          // Handle positioning of the toggle
+      window.addEventListener(
+        "resize",
+        throttle(() => {
+          elRect = undefined;
+          if (selectedAnnoteEl) {
+            selectCodeLines(selectedAnnoteEl);
+          }
+        }, 10)
+      );
+      function throttle(fn, ms) {
+      let throttle = false;
+      let timer;
+        return (...args) => {
+          if(!throttle) { // first call gets through
+              fn.apply(this, args);
+              throttle = true;
+          } else { // all the others get throttled
+              if(timer) clearTimeout(timer); // cancel #2
+              timer = setTimeout(() => {
+                fn.apply(this, args);
+                timer = throttle = false;
+              }, ms);
+          }
+        };
+      }
+        // Attach click handler to the DT
+        const annoteDls = window.document.querySelectorAll('dt[data-target-cell]');
+        for (const annoteDlNode of annoteDls) {
+          annoteDlNode.addEventListener('click', (event) => {
+            const clickedEl = event.target;
+            if (clickedEl !== selectedAnnoteEl) {
+              unselectCodeLines();
+              const activeEl = window.document.querySelector('dt[data-target-cell].code-annotation-active');
+              if (activeEl) {
+                activeEl.classList.remove('code-annotation-active');
+              }
+              selectCodeLines(clickedEl);
+              clickedEl.classList.add('code-annotation-active');
+            } else {
+              // Unselect the line
+              unselectCodeLines();
+              clickedEl.classList.remove('code-annotation-active');
+            }
+          });
+        }
+    const findCites = (el) => {
+      const parentEl = el.parentElement;
+      if (parentEl) {
+        const cites = parentEl.dataset.cites;
+        if (cites) {
+          return {
+            el,
+            cites: cites.split(' ')
+          };
+        } else {
+          return findCites(el.parentElement)
+        }
+      } else {
+        return undefined;
+      }
+    };
+    var bibliorefs = window.document.querySelectorAll('a[role="doc-biblioref"]');
+    for (var i=0; i<bibliorefs.length; i++) {
+      const ref = bibliorefs[i];
+      const citeInfo = findCites(ref);
+      if (citeInfo) {
+        tippyHover(citeInfo.el, function() {
+          var popup = window.document.createElement('div');
+          citeInfo.cites.forEach(function(cite) {
+            var citeDiv = window.document.createElement('div');
+            citeDiv.classList.add('hanging-indent');
+            citeDiv.classList.add('csl-entry');
+            var biblioDiv = window.document.getElementById('ref-' + cite);
+            if (biblioDiv) {
+              citeDiv.innerHTML = biblioDiv.innerHTML;
+            }
+            popup.appendChild(citeDiv);
+          });
+          return popup.innerHTML;
+        });
+      }
+    }
+  });
+  </script>
+<nav class="page-navigation">
+  <div class="nav-page nav-page-previous">
+      <a href="../chapters/12b-possible-contradictions.html" class="pagination-link" aria-label="Possible contradictions">
+        <i class="bi bi-arrow-left-short"></i> <span class="nav-page-text"><span class="chapter-number">11</span>&nbsp; <span class="chapter-title">Possible contradictions</span></span>
+      </a>          
+  </div>
+  <div class="nav-page nav-page-next">
+      <a href="../chapters/04-what-crystalline-provides.html" class="pagination-link" aria-label="What Crystalline provides">
+        <span class="nav-page-text"><span class="chapter-number">13</span>&nbsp; <span class="chapter-title">What Crystalline provides</span></span> <i class="bi bi-arrow-right-short"></i>
+      </a>
+  </div>
+</nav>
+</div> <!-- /content -->
+
+
+
+
+</body></html>
