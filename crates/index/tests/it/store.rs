@@ -7329,9 +7329,8 @@ fn contains_on_a_key_that_is_not_plain_is_refused() {
             inner.insert(op.to_string(), arg);
             let mut wire = serde_json::Map::new();
             wire.insert(key.to_string(), serde_json::Value::Object(inner));
-            let err =
-                crystalline_index::parse_metadata_filters(&serde_json::Value::Object(wire))
-                    .unwrap_err();
+            let err = crystalline_index::parse_metadata_filters(&serde_json::Value::Object(wire))
+                .unwrap_err();
             let text = format!("{op} on '{key}' needs a plain key (letters, digits, '_' or '-')");
             assert!(err.to_string().contains(&text), "{err}");
         }

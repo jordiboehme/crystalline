@@ -1315,9 +1315,13 @@ async fn configure_set_takes_numbers_and_booleans_as_their_string_form() {
         eng_yaml(&h).as_deref(),
         Some("verify:\n  token_budget: 4000\n")
     );
-    call(peer, "configure", json!({ "set": { "github.enabled": true } }))
-        .await
-        .unwrap();
+    call(
+        peer,
+        "configure",
+        json!({ "set": { "github.enabled": true } }),
+    )
+    .await
+    .unwrap();
     assert!(h.engine.github_enabled());
     let refused = match call(
         peer,
