@@ -17,8 +17,9 @@ use crate::store::{
     CURRENT_STATUS_CLASS, DEFAULT_RETIRED_WEIGHT, DEFAULT_SALIENCE_WEIGHT, EdgeKind,
     EmbeddingCoverage, EngramId, FilterOp, GraphEdge, GraphNode, GraphSlice, HitKind,
     MetadataFilter, Page, SearchHit, SearchMode, SearchOrder, SearchQuery, is_current_status,
-    link_frontier_sql, relation_frontier_sql, retired_factor, salience_prior,
+    link_frontier_sql, meta_value_union_sql, relation_frontier_sql, retired_factor, salience_prior,
 };
+use crystalline_core::{META_KEY_MAX_BYTES, meta_value_text};
 
 use super::{
     cell_i64, cell_real, cell_text, like_escape, path_prefix_like, query_all, query_first,
@@ -991,7 +992,9 @@ fn tag_class_exists(
 }
 
 /// Map one metadata filter to a SQL predicate, appending its bound values.
-/// Promoted keys map to columns; everything else to `json_extract`.
+/// Promoted keys map to columns. On any other key, `$contains` and
+/// `$contains_any` read `engram_meta_value` and every other operator reads
+/// `json_extract`.
 fn metadata_clause(
     f: &MetadataFilter,
     params: &mut Vec<Value>,
@@ -1002,13 +1005,19 @@ fn metadata_clause(
 
     if key == "tags" {
         // A `tags` metadata filter folds the same as the dedicated `tags` field:
-        // each value expands to its alias equivalence class.
+        // each value expands to its alias equivalence class. A tag is already
+        // one element of the engram's tag list, so `$contains` reads as `$eq`
+        // and `$contains_any` as `$in`. An empty list matches nothing; it used
+        // to emit `()`, which neither dialect parses.
         let exists = |val: &serde_json::Value, params: &mut Vec<Value>, n: &mut usize| {
             tag_class_exists(&fold_tag_value(val), aliases, params, n)
         };
         return match &f.op {
-            FilterOp::Eq(v) => Some(exists(v, params, n)),
-            FilterOp::In(vs) => {
+            FilterOp::Eq(v) | FilterOp::Contains(v) => Some(exists(v, params, n)),
+            FilterOp::In(vs) | FilterOp::ContainsAny(vs) => {
+                if vs.is_empty() {
+                    return Some("0".to_string());
+                }
                 let parts: Vec<String> = vs.iter().map(|v| exists(v, params, n)).collect();
                 Some(format!("({})", parts.join(" OR ")))
             }
@@ -1017,14 +1026,14 @@ fn metadata_clause(
     }
 
     let col = match key {
-        "status" => Some("e.status".to_string()),
-        "type" | "engram_type" => Some("e.engram_type".to_string()),
-        "recorded_at" => Some("e.recorded_at".to_string()),
-        "valid_from" => Some("e.valid_from".to_string()),
-        "valid_to" => Some("e.valid_to".to_string()),
-        "timestamp" => Some("e.timestamp".to_string()),
-        "title" => Some("e.title".to_string()),
-        "permalink" => Some("e.permalink".to_string()),
+        "status" => "e.status",
+        "type" | "engram_type" => "e.engram_type",
+        "recorded_at" => "e.recorded_at",
+        "valid_from" => "e.valid_from",
+        "valid_to" => "e.valid_to",
+        "timestamp" => "e.timestamp",
+        "title" => "e.title",
+        "permalink" => "e.permalink",
         _ => {
             if !key
                 .chars()
@@ -1032,11 +1041,21 @@ fn metadata_clause(
             {
                 return None;
             }
-            Some(format!("json_extract(e.metadata, '$.{key}')"))
+            return match &f.op {
+                FilterOp::Contains(v) => meta_value_clause(key, std::slice::from_ref(v), params, n),
+                FilterOp::ContainsAny(vs) => meta_value_clause(key, vs, params, n),
+                op => Some(op_clause(
+                    &format!("json_extract(e.metadata, '$.{key}')"),
+                    op,
+                    params,
+                    n,
+                )),
+            };
         }
-    }?;
-
-    Some(op_clause(&col, &f.op, params, n))
+    };
+    // A promoted key holds one value, which counts as a one-element list, so
+    // `op_clause` reads `$contains` as `$eq` and `$contains_any` as `$in`.
+    Some(op_clause(col, &f.op, params, n))
 }
 
 fn op_clause(col: &str, op: &FilterOp, params: &mut Vec<Value>, n: &mut usize) -> String {
@@ -1047,7 +1066,7 @@ fn op_clause(col: &str, op: &FilterOp, params: &mut Vec<Value>, n: &mut usize) -
         p
     };
     match op {
-        FilterOp::Eq(v) => format!("{col} = {}", bind(v, params, n)),
+        FilterOp::Eq(v) | FilterOp::Contains(v) => format!("{col} = {}", bind(v, params, n)),
         FilterOp::Gt(v) => format!("{col} > {}", bind(v, params, n)),
         FilterOp::Gte(v) => format!("{col} >= {}", bind(v, params, n)),
         FilterOp::Lt(v) => format!("{col} < {}", bind(v, params, n)),
@@ -1057,7 +1076,7 @@ fn op_clause(col: &str, op: &FilterOp, params: &mut Vec<Value>, n: &mut usize) -
             let b = bind(hi, params, n);
             format!("{col} BETWEEN {a} AND {b}")
         }
-        FilterOp::In(vs) => {
+        FilterOp::In(vs) | FilterOp::ContainsAny(vs) => {
             if vs.is_empty() {
                 return "0".to_string();
             }
@@ -1065,6 +1084,40 @@ fn op_clause(col: &str, op: &FilterOp, params: &mut Vec<Value>, n: &mut usize) -
             format!("{col} IN ({})", ph.join(","))
         }
     }
+}
+
+/// `$contains` or `$contains_any` on a key that is not promoted: an engram
+/// matches when one of its `engram_meta_value` rows for the key holds one of
+/// `values`. A dotted key is ignored, the way a key with a quote is: the
+/// table holds top-level keys only. A key or a value no row can hold (see
+/// `meta_value_text`) cannot match, and with nothing left the filter matches
+/// nothing.
+fn meta_value_clause(
+    key: &str,
+    values: &[serde_json::Value],
+    params: &mut Vec<Value>,
+    n: &mut usize,
+) -> Option<String> {
+    if key.contains('.') {
+        return None;
+    }
+    let encoded: Vec<String> = values.iter().filter_map(meta_value_text).collect();
+    if encoded.is_empty() || key.len() > META_KEY_MAX_BYTES {
+        return Some("0".to_string());
+    }
+    let key_ph = format!("?{n}");
+    params.push(Value::Text(key.to_string()));
+    *n += 1;
+    let value_phs: Vec<String> = encoded
+        .into_iter()
+        .map(|text| {
+            let p = format!("?{n}");
+            params.push(Value::Text(text));
+            *n += 1;
+            p
+        })
+        .collect();
+    Some(meta_value_union_sql(&key_ph, &value_phs))
 }
 
 /// Fold a `tags` filter value to the lowercase string used for alias expansion

@@ -4378,6 +4378,307 @@ async fn metadata_tags_arm_expands(store: &dyn Store) {
 }
 parity!(metadata_filter_tags_arm_expands, metadata_tags_arm_expands);
 
+/// Run one wire-form metadata filter and return the hit permalinks, sorted,
+/// as `actor` sees them (`None` is the base view).
+async fn wire_filter_perms(
+    store: &dyn Store,
+    wire: serde_json::Value,
+    actor: Option<&str>,
+) -> Vec<String> {
+    let page = store
+        .search(&SearchQuery {
+            metadata_filters: crystalline_index::parse_metadata_filters(&wire).unwrap(),
+            actor: actor.map(str::to_string),
+            limit: 50,
+            page: 1,
+            ..SearchQuery::default()
+        })
+        .await
+        .unwrap();
+    let mut perms: Vec<String> = page.items.iter().map(|h| h.permalink.clone()).collect();
+    perms.sort();
+    perms
+}
+
+fn perms(list: &[&str]) -> Vec<String> {
+    list.iter().map(|p| p.to_string()).collect()
+}
+
+/// `$contains` and `$contains_any` match one element exactly, keep a value's
+/// JSON type, treat a single value as a one-element list, compare a promoted
+/// key's column, and ignore a key with a dot or a quote the way every
+/// operator ignores a key with a quote. An engram with a custom text field
+/// over the cap syncs on both backends, and a filter on that field matches
+/// nothing.
+async fn contains_filters(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let long = "x".repeat(3000);
+    write(
+        root,
+        "a.md",
+        &engram(
+            "Alpha",
+            "a",
+            "engram",
+            &format!(
+                "sources:\n  - notedown://jordi/n1/p1#b1\n  - notedown://jordi/n1/p1#b2\npages:\n  - 3\n  - 7\nkind: anchor\nflag: true\nsummary: {long}\n"
+            ),
+            "body\n",
+        ),
+    );
+    write(
+        root,
+        "b.md",
+        &engram(
+            "Beta",
+            "b",
+            "engram",
+            "sources:\n  - notedown://jordi/n1/p1#b1\n  - notedown://jordi/n2/p1#b1\npages:\n  - 7\nkind: Anchor\ncount: \"1\"\n",
+            "body\n",
+        ),
+    );
+    write(
+        root,
+        "c.md",
+        &engram("Gamma", "c", "engram", "count: 1\n", "body\n"),
+    );
+    write(
+        root,
+        "d.md",
+        &engram("Delta", "d", "engram", "a.b:\n  - x\n", "body\n"),
+    );
+    let report = sync_domain(store, "d", root).await.unwrap();
+    assert!(
+        report.failed.is_empty(),
+        "a long field fails no write: {:?}",
+        report.failed
+    );
+
+    let all = perms(&["a", "b", "c", "d"]);
+    let cases: Vec<(serde_json::Value, Vec<String>)> = vec![
+        (
+            serde_json::json!({ "sources": { "$contains": "notedown://jordi/n1/p1#b1" } }),
+            perms(&["a", "b"]),
+        ),
+        (
+            serde_json::json!({ "sources": { "$contains": "notedown://jordi/n1/p1#b2" } }),
+            perms(&["a"]),
+        ),
+        (
+            serde_json::json!({ "sources": { "$contains": "notedown://jordi/n1/p1" } }),
+            perms(&[]),
+        ),
+        (
+            serde_json::json!({ "sources": { "$contains": "NOTEDOWN://jordi/n1/p1#b2" } }),
+            perms(&[]),
+        ),
+        (
+            serde_json::json!({ "sources": { "$contains_any": ["notedown://jordi/n1/p1#b2", "nope"] } }),
+            perms(&["a"]),
+        ),
+        (
+            serde_json::json!({ "sources": { "$contains_any": ["nope"] } }),
+            perms(&[]),
+        ),
+        (
+            serde_json::json!({ "sources": { "$contains_any": [] } }),
+            perms(&[]),
+        ),
+        (
+            serde_json::json!({ "kind": { "$contains": "anchor" } }),
+            perms(&["a"]),
+        ),
+        (
+            serde_json::json!({ "title": { "$contains": "Alpha" } }),
+            perms(&["a"]),
+        ),
+        (
+            serde_json::json!({ "title": { "$contains_any": ["Alpha", "Gamma"] } }),
+            perms(&["a", "c"]),
+        ),
+        (
+            serde_json::json!({ "pages": { "$contains": 7 } }),
+            perms(&["a", "b"]),
+        ),
+        (
+            serde_json::json!({ "pages": { "$contains": "7" } }),
+            perms(&[]),
+        ),
+        (
+            serde_json::json!({ "count": { "$contains": 1 } }),
+            perms(&["c"]),
+        ),
+        (
+            serde_json::json!({ "count": { "$contains": "1" } }),
+            perms(&["b"]),
+        ),
+        (
+            serde_json::json!({ "flag": { "$contains": true } }),
+            perms(&["a"]),
+        ),
+        (
+            serde_json::json!({ "flag": { "$contains": 1 } }),
+            perms(&[]),
+        ),
+        (
+            serde_json::json!({ "nosuch": { "$contains": "x" } }),
+            perms(&[]),
+        ),
+        (
+            serde_json::json!({ "summary": { "$contains": long } }),
+            perms(&[]),
+        ),
+        (
+            serde_json::json!({ "a.b": { "$contains": "x" } }),
+            all.clone(),
+        ),
+        (
+            serde_json::json!({ "it's": { "$contains": "x" } }),
+            all.clone(),
+        ),
+    ];
+    for (wire, want) in cases {
+        assert_eq!(
+            wire_filter_perms(store, wire.clone(), None).await,
+            want,
+            "{wire}"
+        );
+    }
+}
+parity!(
+    contains_and_contains_any_match_one_element_exactly,
+    contains_filters
+);
+
+/// On `tags`, `$contains` reads as `$eq` and `$contains_any` as `$in`, with
+/// the case folding and the alias class. An empty list matches nothing; on
+/// `tags` it used to be a SQL syntax error.
+async fn contains_on_tags(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "modern.md",
+        &tagged_engram("Modern", "modern", &["modern"]),
+    );
+    write(
+        root,
+        "legacy.md",
+        &tagged_engram("Legacy", "legacy", &["legacy"]),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let d = domain_id(store, "d", root).await;
+    store
+        .replace_tag_aliases(d, &[("legacy".into(), "modern".into())])
+        .await
+        .unwrap();
+
+    let both = perms(&["legacy", "modern"]);
+    for wire in [
+        serde_json::json!({ "tags": { "$contains": "legacy" } }),
+        serde_json::json!({ "tags": { "$contains_any": ["MODERN"] } }),
+    ] {
+        assert_eq!(
+            wire_filter_perms(store, wire.clone(), None).await,
+            both,
+            "{wire}"
+        );
+    }
+    for wire in [
+        serde_json::json!({ "tags": { "$contains_any": [] } }),
+        serde_json::json!({ "tags": { "$in": [] } }),
+    ] {
+        assert!(
+            wire_filter_perms(store, wire.clone(), None)
+                .await
+                .is_empty(),
+            "{wire}"
+        );
+    }
+}
+parity!(contains_on_tags_follows_the_alias_class, contains_on_tags);
+
+/// The rows follow the engram: a rewrite replaces them, a draft's rows are
+/// seen only by its author and shadow the base row for her, a dropped draft
+/// gives the base row back, and a deleted engram matches nothing. `x22`
+/// makes the file one byte longer, so its stamp differs within the same
+/// second.
+async fn contains_follows_writes(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let file = |anchor: &str| {
+        engram(
+            "Alpha",
+            "a",
+            "engram",
+            &format!("sources:\n  - {anchor}\n"),
+            "body\n",
+        )
+    };
+    let contains = |anchor: &str| serde_json::json!({ "sources": { "$contains": anchor } });
+    write(root, "a.md", &file("x1"));
+    sync_domain(store, "d", root).await.unwrap();
+    let domain = domain_id(store, "d", root).await;
+    assert_eq!(
+        wire_filter_perms(store, contains("x1"), None).await,
+        perms(&["a"])
+    );
+
+    write(root, "a.md", &file("x22"));
+    sync_domain(store, "d", root).await.unwrap();
+    assert!(
+        wire_filter_perms(store, contains("x1"), None)
+            .await
+            .is_empty(),
+        "a rewrite replaces the rows"
+    );
+    assert_eq!(
+        wire_filter_perms(store, contains("x22"), None).await,
+        perms(&["a"])
+    );
+
+    draft(store, domain, "alice", "a.md", &file("x3")).await;
+    assert_eq!(
+        wire_filter_perms(store, contains("x3"), Some("alice")).await,
+        perms(&["a"])
+    );
+    assert!(
+        wire_filter_perms(store, contains("x3"), None)
+            .await
+            .is_empty(),
+        "a draft's rows stay hers"
+    );
+    assert!(
+        wire_filter_perms(store, contains("x22"), Some("alice"))
+            .await
+            .is_empty(),
+        "her draft shadows the base row"
+    );
+    assert!(
+        store
+            .clear_overlay_entry(domain, "alice", "a.md")
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        wire_filter_perms(store, contains("x22"), Some("alice")).await,
+        perms(&["a"])
+    );
+
+    store.delete_engram(domain, "a.md").await.unwrap();
+    assert!(
+        wire_filter_perms(store, contains("x22"), None)
+            .await
+            .is_empty(),
+        "a deleted engram matches nothing"
+    );
+}
+parity!(
+    contains_follows_rewrites_drafts_and_deletes,
+    contains_follows_writes
+);
+
 async fn numeric_tags_metadata_filter_folds(store: &dyn Store) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
@@ -6784,6 +7085,72 @@ fn metadata_filters_accept_a_json_encoded_object() {
             err.to_string().contains("must be an object"),
             "unexpected error for {wrong}: {err}"
         );
+    }
+}
+
+/// The two list operators parse from the wire form, the double-encoded string
+/// form included, and refuse an argument they cannot take with a sentence
+/// that says what to send instead.
+#[test]
+fn contains_operators_parse_and_refuse_what_they_cannot_take() {
+    let parsed = crystalline_index::parse_metadata_filters(&serde_json::json!({
+        "sources": { "$contains": "notedown://jordi/n1/p2#b3" },
+        "pages": { "$contains_any": [7, "7", true] },
+        "empty": { "$contains_any": [] },
+    }))
+    .unwrap();
+    for expected in [
+        MetadataFilter {
+            key: "sources".into(),
+            op: FilterOp::Contains("notedown://jordi/n1/p2#b3".into()),
+        },
+        MetadataFilter {
+            key: "pages".into(),
+            op: FilterOp::ContainsAny(vec![7.into(), "7".into(), true.into()]),
+        },
+        MetadataFilter {
+            key: "empty".into(),
+            op: FilterOp::ContainsAny(Vec::new()),
+        },
+    ] {
+        assert!(parsed.contains(&expected), "{expected:?} in {parsed:?}");
+    }
+
+    let string_form = serde_json::json!("{\"sources\": {\"$contains\": \"a\"}}");
+    assert_eq!(
+        crystalline_index::parse_metadata_filters(&string_form).unwrap(),
+        vec![MetadataFilter {
+            key: "sources".into(),
+            op: FilterOp::Contains("a".into()),
+        }]
+    );
+
+    let one = "$contains on 'sources' takes one value; use $contains_any for several";
+    let many = "$contains_any on 'sources' takes an array of single values";
+    for (wire, text) in [
+        (
+            serde_json::json!({ "sources": { "$contains": ["a", "b"] } }),
+            one,
+        ),
+        (
+            serde_json::json!({ "sources": { "$contains": { "a": 1 } } }),
+            one,
+        ),
+        (
+            serde_json::json!({ "sources": { "$contains_any": "a" } }),
+            many,
+        ),
+        (
+            serde_json::json!({ "sources": { "$contains_any": [["a"]] } }),
+            many,
+        ),
+        (
+            serde_json::json!({ "sources": { "$contains_any": [{ "a": 1 }] } }),
+            many,
+        ),
+    ] {
+        let err = crystalline_index::parse_metadata_filters(&wire).unwrap_err();
+        assert!(err.to_string().contains(text), "{wire}: {err}");
     }
 }
 

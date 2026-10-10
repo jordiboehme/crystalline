@@ -229,6 +229,54 @@ pub fn resolve_pending_sql(table: &str, placeholder: &str) -> String {
     )
 }
 
+/// The `$contains` / `$contains_any` predicate over `engram_meta_value`, as
+/// postgres issues it: `key` and `values` are the caller's `$n` bind
+/// placeholders, and `values` is never empty (an empty filter is answered
+/// before this, as a constant false). Several values are one `IN` list, which
+/// postgres seeks as `value = ANY(...)` in a single index scan. The engram is
+/// matched by `e.id IN (...)`, the form both planners drive from the side
+/// table. Built here rather than inline so the plan registry in
+/// `tests/it/plans.rs` explains the statement the stores issue.
+#[doc(hidden)]
+pub fn meta_value_match_sql(key: &str, values: &[String]) -> String {
+    let test = match values {
+        [one] => format!("m.value = {one}"),
+        many => format!("m.value IN ({})", many.join(",")),
+    };
+    format!(
+        "e.id IN (SELECT m.engram_id FROM engram_meta_value m \
+         WHERE m.key = {key} AND {test})"
+    )
+}
+
+/// The same predicate as turso issues it, with `?n` placeholders: one
+/// `UNION ALL` arm per value, so each value is its own `(key, value)` seek.
+/// Turso seeks an `IN` list on the second index column as a walk of every row
+/// for the key, which for a key like `sources` is every anchor in the index.
+/// The arms sit in a derived table: a bare compound inside `IN (...)` made
+/// turso walk the domain through `idx_engram_domain` instead of seeking `e`
+/// by primary key from the list. One value gives exactly
+/// [`meta_value_match_sql`].
+#[doc(hidden)]
+pub fn meta_value_union_sql(key: &str, values: &[String]) -> String {
+    let arms: Vec<String> = values
+        .iter()
+        .map(|value| {
+            format!(
+                "SELECT m.engram_id FROM engram_meta_value m \
+                 WHERE m.key = {key} AND m.value = {value}"
+            )
+        })
+        .collect();
+    match arms.as_slice() {
+        [one] => format!("e.id IN ({one})"),
+        many => format!(
+            "e.id IN (SELECT engram_id FROM ({}))",
+            many.join(" UNION ALL ")
+        ),
+    }
+}
+
 /// The reset behind [`Store::reset_references_to_spellings`], one statement
 /// per reference table: unbind the rows that name one of the spellings in
 /// `list` (the caller's placeholders) and are bound now.
@@ -850,13 +898,21 @@ pub enum FilterOp {
     Lte(serde_json::Value),
     /// Inclusive range `[lo, hi]`.
     Between(serde_json::Value, serde_json::Value),
+    /// The value at the key is a list holding an element equal to this one,
+    /// exactly (JSON equality, no case folding). A single value counts as a
+    /// one-element list, so on a scalar key this is `$eq`.
+    Contains(serde_json::Value),
+    /// The list at the key holds any of these elements. Empty matches
+    /// nothing.
+    ContainsAny(Vec<serde_json::Value>),
 }
 
 /// A single metadata filter: a frontmatter key and an operator.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MetadataFilter {
-    /// The frontmatter key. Promoted keys map to columns; the rest map to
-    /// `json_extract(metadata, '$.key')`.
+    /// The frontmatter key. Promoted keys map to columns; on the rest,
+    /// `$contains` and `$contains_any` read `engram_meta_value` and every other
+    /// operator reads the key's value in `metadata`.
     pub key: String,
     /// The comparison to apply.
     pub op: FilterOp,
@@ -866,9 +922,16 @@ pub struct MetadataFilter {
 ///
 /// The wire form is a JSON object keyed by frontmatter key. Each value is either
 /// a bare scalar (shorthand for `$eq`) or an operator object with exactly one of
-/// `$eq`, `$in`, `$gt`, `$gte`, `$lt`, `$lte` or `$between`. `$in` takes an array
-/// and `$between` takes a two-element `[lo, hi]` array. This is the boundary the
-/// M5 MCP and CLI layers parse tool arguments through. Models routinely
+/// `$eq`, `$in`, `$gt`, `$gte`, `$lt`, `$lte`, `$between`, `$contains` or
+/// `$contains_any`. `$in` takes an array and `$between` takes a two-element
+/// `[lo, hi]` array. `$contains` takes one value and matches an engram whose
+/// list at the key holds an element equal to it, exactly (JSON equality, no
+/// case folding): `{"sources": {"$contains": "https://example.com/a"}}`.
+/// `$contains_any` takes an array of values and matches when the list holds
+/// any of them: `{"sources": {"$contains_any": ["https://example.com/a",
+/// "https://example.com/b"]}}`; an empty array matches nothing. For both, a
+/// single value counts as a one-element list. This is the boundary the M5 MCP
+/// and CLI layers parse tool arguments through. Models routinely
 /// double-encode nested tool arguments, so the whole object arriving as a JSON
 /// string is also accepted and parsed first.
 pub fn parse_metadata_filters(value: &serde_json::Value) -> Result<Vec<MetadataFilter>> {
@@ -934,6 +997,24 @@ fn parse_op(key: &str, op: &str, arg: &serde_json::Value) -> Result<FilterOp> {
             let (lo, hi) = arr2(arg)?;
             FilterOp::Between(lo, hi)
         }
+        "$contains" => {
+            if arg.is_array() || arg.is_object() {
+                return Err(crate::IndexError::Invalid(format!(
+                    "$contains on '{key}' takes one value; use $contains_any for several"
+                )));
+            }
+            FilterOp::Contains(arg.clone())
+        }
+        "$contains_any" => FilterOp::ContainsAny(
+            arg.as_array()
+                .filter(|values| values.iter().all(|v| !v.is_array() && !v.is_object()))
+                .ok_or_else(|| {
+                    crate::IndexError::Invalid(format!(
+                        "$contains_any on '{key}' takes an array of single values"
+                    ))
+                })?
+                .clone(),
+        ),
         other => {
             return Err(crate::IndexError::Invalid(format!(
                 "unknown operator '{other}' on '{key}'"
