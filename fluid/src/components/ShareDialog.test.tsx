@@ -1642,9 +1642,7 @@ describe("the share dialog", () => {
     await userEvent.click(
       within(dialog).getByRole("button", { name: "Commit to main" }),
     );
-    expect(
-      await within(dialog).findByText(PROTECTED_FOR_PEOPLE),
-    ).toBeVisible();
+    expect(await within(dialog).findByText(PROTECTED_FOR_PEOPLE)).toBeVisible();
     expect(within(dialog).queryByText(/share_changes/)).toBeNull();
     await userEvent.click(
       within(dialog).getByRole("button", { name: "Share as a proposal" }),
