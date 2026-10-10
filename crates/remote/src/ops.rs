@@ -243,6 +243,11 @@ pub enum ProposeOutcome {
         branch: String,
         /// The forge's own sentence naming the rule.
         message: String,
+        /// Whether the same changes may be shared as a proposal instead. False
+        /// while only another login's proposals are open here: a proposal
+        /// share would answer [`ProposeOutcome::ProposalOpen`], so it is not
+        /// offered.
+        offers_proposal: bool,
     },
     /// The branch moved twice while the share was prepared (or once, under a
     /// pinned pull); nothing landed and nothing local changed beyond what the
@@ -2254,6 +2259,18 @@ pub async fn propose(
         )
         .await;
     }
+    // A direct domain's share that goes as a proposal reaches only the acting
+    // login's own proposals, as 0.24.2's direct share reached none.
+    if options.sharing == Sharing::Direct {
+        refuse_foreign_amend(&state, &options)?;
+        if let Some(open) = foreign_proposal_block(&state, options.author_login) {
+            return Ok(ProposeOutcome::ProposalOpen {
+                number: open.number,
+                url: open.url.clone(),
+                title: open.title.clone(),
+            });
+        }
+    }
 
     // Ask the forge once, before any share work: whether this share can stack
     // is a property of the origin, and the answer is cached from here on.
@@ -2652,6 +2669,30 @@ pub async fn propose_preview(
         }
         return Ok(plan);
     }
+    // The same guard [`propose`] runs before any proposal work.
+    if options.sharing == Sharing::Direct {
+        refuse_foreign_amend(&state, &options)?;
+        if let Some(open) = foreign_proposal_block(&state, options.author_login) {
+            return Ok(SharePlan {
+                action: PlannedAction::ProposalOpen {
+                    number: open.number,
+                    url: open.url.clone(),
+                    title: open.title.clone(),
+                },
+                changes: select_share_files(
+                    detect_local_changes_against(
+                        domain_root,
+                        &effective_tip_files(&state),
+                        state_dir,
+                    )?,
+                    options.files,
+                )?,
+                effective_title: String::new(),
+                sharing: Sharing::Direct,
+                note: None,
+            });
+        }
+    }
     // The open proposal a direct domain's share goes into because a refusal
     // is recorded. A share naming that proposal amends it and opens nothing,
     // and one that asked for a proposal chose the route itself, so neither
@@ -2979,6 +3020,40 @@ fn own_open_proposal<'s>(state: &'s OriginState, login: Option<&str>) -> Option<
     })
 }
 
+/// The open proposal that blocks a proposal share by `login` on a direct
+/// domain: the newest open one, when proposals are open here and none of them
+/// is `login`'s own (see [`own_open_proposal`]). Such a share would otherwise
+/// update or stack on another person's proposal.
+fn foreign_proposal_block<'s>(state: &'s OriginState, login: Option<&str>) -> Option<&'s Proposal> {
+    match own_open_proposal(state, login) {
+        Some(_) => None,
+        None => open_proposal(state),
+    }
+}
+
+/// Refuses, on a direct domain, a share that names another login's proposal
+/// to amend, with [`DIRECT_NO_AMEND`], whatever the forge and whatever
+/// `as_proposal` says. A record with no login is everyone's, as in
+/// [`own_open_proposal`].
+fn refuse_foreign_amend(
+    state: &OriginState,
+    options: &ShareOptions<'_>,
+) -> Result<(), RemoteError> {
+    let Some(number) = options.proposal else {
+        return Ok(());
+    };
+    let foreign = state.proposals.iter().any(|p| {
+        p.number == number
+            && p.author_login
+                .as_deref()
+                .is_some_and(|author| Some(author) != options.author_login)
+    });
+    if foreign {
+        return Err(RemoteError::Refused(DIRECT_NO_AMEND.to_string()));
+    }
+    Ok(())
+}
+
 /// The commit message of a direct share: the title alone, or the title, a
 /// blank line and the description. No generated body: that text is a pull
 /// request body, and a commit carries its file list in its tree.
@@ -3293,7 +3368,13 @@ async fn commit_direct(
                 });
                 state.save(state_dir)?;
                 if !fall_back {
-                    return Ok(ProposeOutcome::BranchProtected { branch, message });
+                    let offers_proposal =
+                        foreign_proposal_block(&state, options.author_login).is_none();
+                    return Ok(ProposeOutcome::BranchProtected {
+                        branch,
+                        message,
+                        offers_proposal,
+                    });
                 }
                 // The same changes, as a proposal, on the commit already built.
                 // It is a fresh bottom layer: no open layer is left (an open

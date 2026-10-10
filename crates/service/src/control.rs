@@ -859,17 +859,6 @@ async fn embed_onto_response(engine: &Engine, embed: bool, data: &mut Value) {
     }
 }
 
-/// An optional proposal number from the envelope: absent or null is `None`,
-/// a whole non-negative number is that number, and anything else is a
-/// refusal naming the key.
-///
-/// Deliberately not `and_then(Value::as_u64)`, which reads a negative, a
-/// fraction or a string as absence. For `origin_share` that silent downgrade
-/// would turn "amend layer #6" into "stack a new layer", which opens a
-/// proposal the caller never asked for; for `origin_withdraw` it turns
-/// "withdraw layer #6" into "withdraw the top layer", which closes a proposal
-/// the caller never named. A refusal the caller can read is the only safe
-/// answer to a value we cannot interpret.
 /// An `origin_share` request as the daemon reads it.
 #[derive(Debug, PartialEq)]
 struct ShareRequest<'a> {
@@ -901,6 +890,17 @@ fn share_request(req: &Value) -> Result<ShareRequest<'_>, String> {
     })
 }
 
+/// An optional proposal number from the envelope: absent or null is `None`,
+/// a whole non-negative number is that number, and anything else is a
+/// refusal naming the key.
+///
+/// Deliberately not `and_then(Value::as_u64)`, which reads a negative, a
+/// fraction or a string as absence. For `origin_share` that silent downgrade
+/// would turn "amend layer #6" into "stack a new layer", which opens a
+/// proposal the caller never asked for; for `origin_withdraw` it turns
+/// "withdraw layer #6" into "withdraw the top layer", which closes a proposal
+/// the caller never named. A refusal the caller can read is the only safe
+/// answer to a value we cannot interpret.
 fn optional_number(req: &Value, key: &str) -> Result<Option<u64>, String> {
     match req.get(key) {
         None | Some(Value::Null) => Ok(None),

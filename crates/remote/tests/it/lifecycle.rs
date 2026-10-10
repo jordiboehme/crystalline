@@ -2189,7 +2189,9 @@ async fn a_protected_branch_answers_branch_protected_with_the_forges_sentence() 
     let (sub, c1) = direct_domain(&mock).await;
     mock.protect_branch("main", "Required status check \"ci\" is expected.");
     match share_direct(&mock, &sub, direct()).await {
-        ProposeOutcome::BranchProtected { branch, message } => {
+        ProposeOutcome::BranchProtected {
+            branch, message, ..
+        } => {
             assert_eq!(branch, "main");
             assert_eq!(message, "Required status check \"ci\" is expected.");
         }
@@ -2214,7 +2216,14 @@ async fn a_refused_direct_share_records_the_refusal_and_opens_nothing() {
     let (sub, c1) = direct_domain(&mock).await;
     mock.protect_branch("main", "Changes must be made through a pull request.");
     match share_direct(&mock, &sub, direct()).await {
-        ProposeOutcome::BranchProtected { branch, .. } => assert_eq!(branch, "main"),
+        ProposeOutcome::BranchProtected {
+            branch,
+            offers_proposal,
+            ..
+        } => {
+            assert_eq!(branch, "main");
+            assert!(offers_proposal, "nothing is open, so a proposal is offered");
+        }
         other => panic!("expected BranchProtected, got {other:?}"),
     }
     let st = load_state(&sub.state_dir);
@@ -2646,6 +2655,98 @@ async fn another_logins_open_proposal_neither_routes_nor_is_amended() {
         ProposeOutcome::Updated(updated) => assert_eq!(updated.number, alice),
         other => panic!("expected Alice's proposal to be updated, got {other:?}"),
     }
+}
+
+/// Alice has a proposal open and Bob's direct commit is refused. Bob's
+/// refusal offers no proposal, and `as_proposal: true` answers ProposalOpen
+/// instead of going into Alice's proposal, in the preview and the share.
+#[tokio::test]
+async fn as_proposal_does_not_reach_another_logins_open_proposal() {
+    let mock = MockProvider::new();
+    let (sub, _) = direct_domain(&mock).await;
+    let alice = match share_direct(&mock, &sub, by("alice", choosing(Some(true)))).await {
+        ProposeOutcome::Proposed(report) => report.number,
+        other => panic!("expected Proposed, got {other:?}"),
+    };
+    mock.protect_branch("main", "Changes must be made through a pull request.");
+    write(&sub.domain_root.join("notes/bob.md"), b"bob\n");
+    match share_direct(&mock, &sub, by("bob", direct())).await {
+        ProposeOutcome::BranchProtected {
+            offers_proposal, ..
+        } => assert!(!offers_proposal, "no proposal can be offered to Bob"),
+        other => panic!("expected BranchProtected, got {other:?}"),
+    }
+    let plan = preview_direct_share(&mock, &sub, by("bob", choosing(Some(true)))).await;
+    assert!(
+        matches!(plan.action, PlannedAction::ProposalOpen { number, .. } if number == alice),
+        "{:?}",
+        plan.action
+    );
+    let before = mock.calls().len();
+    match share_direct(&mock, &sub, by("bob", choosing(Some(true)))).await {
+        ProposeOutcome::ProposalOpen { number, .. } => assert_eq!(number, alice),
+        other => panic!("expected ProposalOpen, got {other:?}"),
+    }
+    assert!(!mock.calls()[before..].iter().any(|c| is_write_call(c)));
+    let st = load_state(&sub.state_dir);
+    assert_eq!(st.proposals.len(), 1);
+    assert_eq!(st.proposals[0].author_login.as_deref(), Some("alice"));
+}
+
+/// A named proposal of another login is not amended on a direct domain,
+/// with `as_proposal: true` as without it, on a forge with stacks too.
+#[tokio::test]
+async fn a_named_proposal_of_another_login_is_not_amended() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, _) = direct_domain(&mock).await;
+    let stacked = |login: &'static str, as_proposal: Option<bool>| ShareOptions {
+        stacks_allowed: true,
+        ..by(login, choosing(as_proposal))
+    };
+    let alice = match share_direct(&mock, &sub, stacked("alice", Some(true))).await {
+        ProposeOutcome::Proposed(report) => report.number,
+        other => panic!("expected Proposed, got {other:?}"),
+    };
+    write(&sub.domain_root.join("notes/bob.md"), b"bob\n");
+    for as_proposal in [Some(true), None] {
+        let options = ShareOptions {
+            proposal: Some(alice),
+            ..stacked("bob", as_proposal)
+        };
+        let before = mock.calls().len();
+        let err = propose(
+            &mock,
+            &share_spec(),
+            &sub.domain_root,
+            "Brand Team",
+            &sub.state_dir,
+            options,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, RemoteError::Refused(text) if text == DIRECT_NO_AMEND),
+            "{as_proposal:?}: {err}"
+        );
+        assert!(!mock.calls()[before..].iter().any(|c| is_write_call(c)));
+        let err = propose_preview(
+            &mock,
+            &share_spec(),
+            &sub.domain_root,
+            "Brand Team",
+            &sub.state_dir,
+            options,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, RemoteError::Refused(text) if text == DIRECT_NO_AMEND),
+            "{as_proposal:?}: {err}"
+        );
+    }
+    let st = load_state(&sub.state_dir);
+    assert_eq!(st.proposals[0].author_login.as_deref(), Some("alice"));
 }
 
 /// On a proposal domain a refusal means nothing, so the next share there

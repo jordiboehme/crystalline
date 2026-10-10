@@ -661,13 +661,25 @@ pub(crate) fn propose_outcome_json(outcome: &ProposeOutcome) -> Value {
                 "merge or withdraw proposal #{number} first; a domain that shares directly commits onto the branch the proposal is waiting to land on"
             ),
         }),
-        ProposeOutcome::BranchProtected { branch, message } => json!({
-            "outcome": "branch_protected",
-            "branch": branch,
-            "message": message,
-            "guidance": crystalline_remote::error::branch_protected_guidance(branch, message),
-            "fallback": "proposal",
-        }),
+        ProposeOutcome::BranchProtected {
+            branch,
+            message,
+            offers_proposal,
+        } => {
+            let mut receipt = json!({
+                "outcome": "branch_protected",
+                "branch": branch,
+                "message": message,
+                "guidance": crystalline_remote::error::branch_protected_guidance(branch, message),
+            });
+            // Only where a proposal share would be taken: while only another
+            // login's proposal is open here it answers proposal_open, so no
+            // button is offered for it.
+            if *offers_proposal {
+                receipt["fallback"] = json!("proposal");
+            }
+            receipt
+        }
         ProposeOutcome::BranchMoved { branch } => json!({
             "outcome": "branch_moved",
             "branch": branch,
@@ -2463,6 +2475,7 @@ mod tests {
         let protected = propose_outcome_json(&ProposeOutcome::BranchProtected {
             branch: "main".to_string(),
             message: "Changes must be made through a pull request.".to_string(),
+            offers_proposal: true,
         });
         assert_eq!(protected["outcome"], "branch_protected");
         assert_eq!(
@@ -2476,6 +2489,14 @@ mod tests {
                 .contains("share_changes with as_proposal: true")
         );
         assert_eq!(protected["fallback"], "proposal");
+        // While only another login's proposal is open, no proposal is offered.
+        let blocked = propose_outcome_json(&ProposeOutcome::BranchProtected {
+            branch: "main".to_string(),
+            message: "Changes must be made through a pull request.".to_string(),
+            offers_proposal: false,
+        });
+        assert_eq!(blocked["outcome"], "branch_protected");
+        assert!(blocked.get("fallback").is_none(), "{blocked}");
 
         let moved = propose_outcome_json(&ProposeOutcome::BranchMoved {
             branch: "main".to_string(),

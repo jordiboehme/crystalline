@@ -1604,7 +1604,9 @@ pub struct ShareBody {
                    while the share was prepared, each with guidance. \
                    `as_proposal: true` opens a proposal on a direct domain \
                    instead. A `branch_protected` answer carries `fallback: \
-                   \"proposal\"`; after one, a refused share opens the \
+                   \"proposal\"` unless only another login's proposal is \
+                   open, which no share may go into; after one, a refused \
+                   share opens the \
                    proposal itself and answers `proposed` with `fell_back: \
                    true` and a `note`, and a commit that lands again carries \
                    a `note` too. The refusal is kept per GitHub login the \
