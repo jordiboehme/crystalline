@@ -31,7 +31,7 @@ That scope is a starting bet, not a lock-in. If every hit in the scoped domain i
 
 For a question bound to a specific past date or window ("what applied on 2025-08-01", "the cost in June 2025"), do not trust text-score ranking alone - pass `metadata_filters` on `valid_from` and `valid_to` so the engram whose window actually contains that date wins over a superseded or not-yet-current one with a similar-looking snippet.
 
-To find every engram that cites a source, filter `search_engrams` on that frontmatter list: `metadata_filters` with `$contains` (or `$contains_any` for up to 100 values).
+To find every engram that cites a source, filter `search_engrams` on the frontmatter list that holds it (for example `sources`): `metadata_filters` with `$contains`, or `$contains_any` for up to 100 values.
 
 Once a hit answers the question, stop there. Reading the domain MANIFEST (`read_engram` on it, or `browse_domain`) is an extra step for when the routing line and the hits together still leave the right engram unclear, not a routine follow-up to every search - and since the MANIFEST is itself indexed, it often surfaces among the hits already.
 
