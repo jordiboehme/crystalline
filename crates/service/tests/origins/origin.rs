@@ -2478,7 +2478,71 @@ async fn a_protected_branch_answers_branch_protected_through_the_engine() {
     let state = OriginState::load(&origins_dir.join("brand"))
         .unwrap()
         .unwrap();
-    assert_eq!(state.direct_refused.unwrap().branch, "main");
+    let refusal = state
+        .direct_refusal_for(Some("instance-gh"))
+        .expect("recorded for the login the share went out on");
+    assert_eq!(refusal.branch, "main");
+}
+
+/// A status shows the refusal of the caller's own login and nobody else's,
+/// and none at all once the domain opens proposals.
+#[tokio::test]
+async fn the_status_shows_the_callers_own_refusal_and_not_on_a_proposal_domain() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let (eng, root, origins_dir) = direct_team(&tmp, mock.clone()).await;
+    let state_dir = origins_dir.join("brand");
+    let mut state = OriginState::load(&state_dir).unwrap().unwrap();
+    state.record_direct_refusal(crystalline_remote::state::DirectRefusal {
+        login: Some("alice".to_string()),
+        branch: "main".to_string(),
+        message: "Changes must be made through a pull request.".to_string(),
+        refused_at: chrono::Utc::now(),
+    });
+    state.save(&state_dir).unwrap();
+    let refused = |status: &serde_json::Value| status["domains"][0]["direct_refused"].clone();
+    let status = eng
+        .origin_status(Some("brand"), false, false, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(
+        refused(&status),
+        serde_json::Value::Null,
+        "Alice's, not ours: {status}"
+    );
+
+    mock.protect_branch("main", "Changes must be made through a pull request.");
+    eng.origin_share("brand", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    let status = eng
+        .origin_status(Some("brand"), false, false, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(
+        refused(&status)["line"],
+        "Direct commits to main are refused for you, so your shares go as proposals.",
+        "{status}"
+    );
+    assert_eq!(
+        OriginState::load(&state_dir)
+            .unwrap()
+            .unwrap()
+            .direct_refused
+            .len(),
+        2
+    );
+
+    let manifest = String::from_utf8(manifest_sharing_direct())
+        .unwrap()
+        .replace("sharing: direct", "sharing: proposal");
+    std::fs::write(root.join("MANIFEST.md"), manifest).unwrap();
+    let status = eng
+        .origin_status(Some("brand"), false, false, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(status["domains"][0]["sharing"], "proposal", "{status}");
+    assert_eq!(refused(&status), serde_json::Value::Null, "{status}");
 }
 
 /// The fallback through the engine: the first refusal offers a proposal, the

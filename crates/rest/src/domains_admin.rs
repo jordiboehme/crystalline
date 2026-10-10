@@ -805,8 +805,11 @@ fn single_domain(
                            straight on the branch. `direct_refused` is null, \
                            or names the `branch`, the forge's `message`, \
                            `refused_at` and the `line` to show when the \
-                           branch refused this machine's direct commit; \
-                           show that line as given.\n\nFour keys say where the domain's \
+                           branch refused a direct commit made under the \
+                           GitHub login this session's shares go out on; \
+                           another login's refusal never shows, nor any on \
+                           a domain that opens proposals. Show that line as \
+                           given.\n\nFour keys say where the domain's \
                            chain of stacked proposals stands. `stack_number` \
                            is the chain's number on the forge, null when \
                            nothing is stacked. `stack_wedged` lists the \

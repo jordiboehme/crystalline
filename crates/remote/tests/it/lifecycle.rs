@@ -2218,7 +2218,10 @@ async fn a_refused_direct_share_records_the_refusal_and_opens_nothing() {
         other => panic!("expected BranchProtected, got {other:?}"),
     }
     let st = load_state(&sub.state_dir);
-    let refusal = st.direct_refused.expect("the refusal is recorded");
+    let refusal = st
+        .direct_refusal_for(None)
+        .expect("the refusal is recorded");
+    assert_eq!(st.direct_refused.len(), 1);
     assert_eq!(refusal.branch, "main");
     assert_eq!(
         refusal.message,
@@ -2314,7 +2317,7 @@ async fn with_a_refusal_recorded_a_refused_share_falls_back_to_a_proposal_on_the
         Some(commit.as_str())
     );
     assert!(
-        st.direct_refused.is_some(),
+        st.direct_refusal_for(None).is_some(),
         "the refusal stands until a commit lands"
     );
     assert_eq!(
@@ -2345,7 +2348,7 @@ async fn a_direct_commit_that_lands_clears_the_refusal() {
     mock.unprotect_branch("main");
     let report = committed(share_direct(&mock, &sub, direct()).await);
     assert!(report.refusal_cleared);
-    assert_eq!(load_state(&sub.state_dir).direct_refused, None);
+    assert!(load_state(&sub.state_dir).direct_refused.is_empty());
     write(&sub.domain_root.join("notes/again.md"), b"again\n");
     assert!(!committed(share_direct(&mock, &sub, direct()).await).refusal_cleared);
 }
@@ -2361,7 +2364,7 @@ async fn as_proposal_true_opens_a_proposal_on_a_direct_domain() {
         other => panic!("expected Proposed, got {other:?}"),
     }
     assert_eq!(count(&mock, "update_branch:main:"), 0, "no direct attempt");
-    assert_eq!(load_state(&sub.state_dir).direct_refused, None);
+    assert!(load_state(&sub.state_dir).direct_refused.is_empty());
 }
 
 #[tokio::test]
@@ -2467,11 +2470,15 @@ async fn as_proposal_false_clears_the_refusal_when_the_commit_lands() {
     let (sub, _) = direct_domain(&mock).await;
     mock.protect_branch("main", "Changes must be made through a pull request.");
     share_direct(&mock, &sub, direct()).await;
-    assert!(load_state(&sub.state_dir).direct_refused.is_some());
+    assert!(
+        load_state(&sub.state_dir)
+            .direct_refusal_for(None)
+            .is_some()
+    );
     mock.unprotect_branch("main");
     let report = committed(share_direct(&mock, &sub, choosing(Some(false))).await);
     assert!(report.refusal_cleared);
-    assert_eq!(load_state(&sub.state_dir).direct_refused, None);
+    assert!(load_state(&sub.state_dir).direct_refused.is_empty());
 }
 
 /// A fallback opens a fresh bottom layer, so the number of a stack whose
@@ -2532,6 +2539,134 @@ async fn a_fallback_after_a_declined_stack_starts_a_new_stack() {
             .any(|c| c.starts_with(&format!("extend_stack:{dead}:"))),
         "{calls:?}"
     );
+}
+
+fn by(login: &'static str, options: ShareOptions<'static>) -> ShareOptions<'static> {
+    ShareOptions {
+        author_login: Some(login),
+        ..options
+    }
+}
+
+/// Two people share from one origin state. Alice is refused and Bob is not
+/// (the mock's branch rule is switched between their shares to stand for the
+/// forge's per-person rule): Bob's share lands and leaves Alice's refusal in
+/// place, and Alice's next share still falls back.
+#[tokio::test]
+async fn a_refusal_steers_only_the_login_it_was_recorded_for() {
+    let mock = MockProvider::new();
+    let (sub, _) = direct_domain(&mock).await;
+    mock.protect_branch("main", "Changes must be made through a pull request.");
+    match share_direct(&mock, &sub, by("alice", direct())).await {
+        ProposeOutcome::BranchProtected { .. } => {}
+        other => panic!("expected BranchProtected, got {other:?}"),
+    }
+    let st = load_state(&sub.state_dir);
+    assert!(st.direct_refusal_for(Some("alice")).is_some());
+    assert!(st.direct_refusal_for(Some("bob")).is_none());
+
+    mock.unprotect_branch("main");
+    let report = committed(share_direct(&mock, &sub, by("bob", direct())).await);
+    assert!(!report.refusal_cleared, "Bob had nothing to clear");
+    assert!(
+        load_state(&sub.state_dir)
+            .direct_refusal_for(Some("alice"))
+            .is_some(),
+        "Bob's landed commit proves nothing for Alice"
+    );
+
+    mock.protect_branch("main", "Changes must be made through a pull request.");
+    write(&sub.domain_root.join("notes/alice.md"), b"alice\n");
+    match share_direct(&mock, &sub, by("alice", direct())).await {
+        ProposeOutcome::FellBack { report, .. } => {
+            assert_eq!(report.added, vec!["notes/alice.md".to_string()]);
+        }
+        other => panic!("expected FellBack, got {other:?}"),
+    }
+    let st = load_state(&sub.state_dir);
+    assert_eq!(st.proposals.len(), 1);
+    assert_eq!(st.proposals[0].author_login.as_deref(), Some("alice"));
+}
+
+/// Alice's open proposal is not Bob's: his share neither goes into it nor
+/// answers "proposal open", his commit leaves her proposed file out, and the
+/// number he names is not his to amend.
+#[tokio::test]
+async fn another_logins_open_proposal_neither_routes_nor_is_amended() {
+    let mock = MockProvider::new();
+    let (sub, _) = direct_domain(&mock).await;
+    mock.protect_branch("main", "Changes must be made through a pull request.");
+    share_direct(&mock, &sub, by("alice", direct())).await;
+    let alice = match share_direct(&mock, &sub, by("alice", direct())).await {
+        ProposeOutcome::FellBack { report, .. } => report.number,
+        other => panic!("expected FellBack, got {other:?}"),
+    };
+    mock.unprotect_branch("main");
+
+    let before = count(&mock, "update_branch:main:");
+    write(&sub.domain_root.join("notes/bob.md"), b"bob\n");
+    let plan = preview_direct_share(&mock, &sub, by("bob", direct())).await;
+    assert!(
+        matches!(plan.action, PlannedAction::Commit { .. }),
+        "{:?}",
+        plan.action
+    );
+    assert_eq!(plan.note, None);
+    let err = propose(
+        &mock,
+        &share_spec(),
+        &sub.domain_root,
+        "Brand Team",
+        &sub.state_dir,
+        ShareOptions {
+            proposal: Some(alice),
+            ..by("bob", direct())
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&err, RemoteError::Refused(text) if text == DIRECT_NO_AMEND),
+        "{err}"
+    );
+    let report = committed(share_direct(&mock, &sub, by("bob", direct())).await);
+    assert_eq!(count(&mock, "update_branch:main:"), before + 1);
+    // The three changes Alice's proposal carries stay out of Bob's commit.
+    assert_eq!(report.added, vec!["notes/bob.md".to_string()]);
+    assert!(report.updated.is_empty(), "{report:?}");
+    assert!(report.deleted.is_empty(), "{report:?}");
+    let st = load_state(&sub.state_dir);
+    assert_eq!(st.proposals.len(), 1, "Alice's proposal stays as it was");
+    assert_eq!(st.proposals[0].number, alice);
+    assert!(st.direct_refusal_for(Some("alice")).is_some());
+
+    // Alice's own share still goes into her proposal.
+    write(&sub.domain_root.join("notes/alice2.md"), b"alice again\n");
+    match share_direct(&mock, &sub, by("alice", direct())).await {
+        ProposeOutcome::Updated(updated) => assert_eq!(updated.number, alice),
+        other => panic!("expected Alice's proposal to be updated, got {other:?}"),
+    }
+}
+
+/// On a proposal domain a refusal means nothing, so the next share there
+/// clears every login's.
+#[tokio::test]
+async fn a_share_on_a_proposal_domain_clears_the_recorded_refusals() {
+    let mock = MockProvider::new();
+    let (sub, _) = direct_domain(&mock).await;
+    mock.protect_branch("main", "Changes must be made through a pull request.");
+    share_direct(&mock, &sub, by("alice", direct())).await;
+    share_direct(&mock, &sub, by("bob", direct())).await;
+    assert_eq!(load_state(&sub.state_dir).direct_refused.len(), 2);
+    let proposal_domain = ShareOptions {
+        sharing: Sharing::Proposal,
+        ..by("alice", direct())
+    };
+    match share_direct(&mock, &sub, proposal_domain).await {
+        ProposeOutcome::Proposed(_) => {}
+        other => panic!("expected Proposed, got {other:?}"),
+    }
+    assert!(load_state(&sub.state_dir).direct_refused.is_empty());
 }
 
 #[tokio::test]
@@ -2618,7 +2753,7 @@ async fn naming_an_own_open_proposal_on_a_direct_domain_amends_it() {
         other => panic!("expected the named proposal to be amended, got {other:?}"),
     }
     assert_eq!(count(&mock, "update_branch:main:"), 0, "no direct attempt");
-    assert_eq!(load_state(&sub.state_dir).direct_refused, None);
+    assert!(load_state(&sub.state_dir).direct_refused.is_empty());
 }
 
 #[tokio::test]

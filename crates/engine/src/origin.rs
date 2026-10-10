@@ -32,7 +32,7 @@ use chrono::{DateTime, Utc};
 use crystalline_remote::RemoteError;
 use crystalline_remote::changes::LocalChange;
 use crystalline_remote::ops::{self, OriginStatusReport, ProposeOutcome, PullReport};
-use crystalline_remote::state::{OriginState, ProposalStatus};
+use crystalline_remote::state::{DirectRefusal, OriginState, ProposalStatus};
 use serde_json::{Value, json};
 
 use crate::engine::EngineError;
@@ -154,6 +154,27 @@ pub(crate) fn proposal_transitions_json(
         .collect()
 }
 
+/// The recorded refusal a status shows its caller: the one recorded for
+/// `viewer`, the login the caller's shares go out on, and only while the
+/// domain shares directly. A refusal is a fact about one person, so another
+/// login's never shows; `None` for `viewer` is a caller whose login could not
+/// be resolved, who is shown none. On a `sharing: proposal` domain a refusal
+/// means nothing for anyone, and the next share there clears it.
+pub(crate) fn viewer_refusal<'r>(
+    report: &'r OriginStatusReport,
+    viewer: Option<Option<&str>>,
+    sharing: crystalline_core::Sharing,
+) -> Option<&'r DirectRefusal> {
+    if sharing != crystalline_core::Sharing::Direct {
+        return None;
+    }
+    let login = viewer?;
+    report
+        .direct_refused
+        .iter()
+        .find(|refusal| refusal.login.as_deref() == login)
+}
+
 /// Shapes one domain's [`OriginStatusReport`] into `origin_status`'s
 /// per-domain entry: `{ domain, repo, branch, base_commit, behind,
 /// local_changes, skipped_large, open_proposals, declined_proposals,
@@ -189,8 +210,9 @@ pub(crate) fn proposal_transitions_json(
 /// no proposal record to read its own history off, and the file list belongs
 /// to the commit rather than to a status glance.
 ///
-/// `direct_refused` names a refusal of a direct commit this machine recorded,
-/// with the line to show, and is `null` otherwise.
+/// `direct_refused` names `refusal`, the caller's own recorded refusal of a
+/// direct commit (see [`viewer_refusal`]), with the line to show, and is
+/// `null` when there is none.
 ///
 /// `kept_branches` names share branches Crystalline keeps upstream (merged,
 /// declined or withdrawn shares), each with why it was retired, what kept it
@@ -206,6 +228,7 @@ pub(crate) fn status_report_json(
     report: &OriginStatusReport,
     probe_error: Option<String>,
     detail: Option<Value>,
+    refusal: Option<&DirectRefusal>,
 ) -> Value {
     let open: Vec<Value> = report
         .open_proposals
@@ -242,7 +265,7 @@ pub(crate) fn status_report_json(
             "shared_at": share.shared_at,
             "author_login": share.author_login,
         })).collect::<Vec<Value>>(),
-        "direct_refused": report.direct_refused.as_ref().map(|refusal| json!({
+        "direct_refused": refusal.map(|refusal| json!({
             "branch": refusal.branch,
             "message": refusal.message,
             "refused_at": refusal.refused_at,
@@ -981,6 +1004,7 @@ pub(crate) fn resolution_from<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crystalline_core::Sharing;
 
     /// An engram written by `actor`, or one with no provenance block at all
     /// when `actor` is `None`.
@@ -1712,7 +1736,7 @@ mod tests {
             repair_pending: false,
             kept_branches: Vec::new(),
             stack_link_pending: false,
-            direct_refused: None,
+            direct_refused: Vec::new(),
             direct_shares: vec![crystalline_remote::state::DirectShare {
                 sha: "c0ffee".to_string(),
                 url: Some("https://forge.test/acme/brand-knowledge/commit/c0ffee".to_string()),
@@ -1728,7 +1752,7 @@ mod tests {
                 }],
             }],
         };
-        let v = status_report_json("eng", &report, None, None);
+        let v = status_report_json("eng", &report, None, None, None);
         assert_eq!(v["domain"], "eng");
         assert_eq!(v["repo"], "acme/brand-knowledge");
         assert_eq!(v["behind"], true);
@@ -1767,17 +1791,52 @@ mod tests {
             kept_branches: Vec::new(),
             stack_link_pending: false,
             direct_shares: vec![],
-            direct_refused: Some(crystalline_remote::state::DirectRefusal {
-                branch: "main".to_string(),
-                message: "Changes must be made through a pull request.".to_string(),
-                refused_at: chrono::Utc::now(),
-            }),
+            direct_refused: vec![refused_for(Some("alice")), refused_for(None)],
         };
-        let v = status_report_json("kb", &report, None, None);
+        let refusal = viewer_refusal(&report, Some(Some("alice")), Sharing::Direct);
+        assert_eq!(refusal, Some(&report.direct_refused[0]));
+        let v = status_report_json("kb", &report, None, None, refusal);
         assert_eq!(v["direct_refused"]["branch"], "main", "{v}");
         assert_eq!(
             v["direct_refused"]["line"],
             "Direct commits to main are refused for you, so your shares go as proposals."
+        );
+        let v = status_report_json("kb", &report, None, None, None);
+        assert!(v["direct_refused"].is_null(), "{v}");
+    }
+
+    fn refused_for(login: Option<&str>) -> crystalline_remote::state::DirectRefusal {
+        crystalline_remote::state::DirectRefusal {
+            login: login.map(str::to_string),
+            branch: "main".to_string(),
+            message: "Changes must be made through a pull request.".to_string(),
+            refused_at: chrono::Utc::now(),
+        }
+    }
+
+    /// Each caller sees the refusal of their own login and nobody else's; a
+    /// caller with no resolvable login sees none, and a proposal domain shows
+    /// none to anyone.
+    #[test]
+    fn a_status_shows_only_the_callers_own_refusal_and_only_on_a_direct_domain() {
+        let mut report = poll_status_fixture();
+        report.direct_refused = vec![refused_for(Some("alice")), refused_for(None)];
+        assert_eq!(
+            viewer_refusal(&report, Some(Some("alice")), Sharing::Direct),
+            Some(&report.direct_refused[0])
+        );
+        assert_eq!(
+            viewer_refusal(&report, Some(None), Sharing::Direct),
+            Some(&report.direct_refused[1])
+        );
+        assert_eq!(
+            viewer_refusal(&report, Some(Some("bob")), Sharing::Direct),
+            None
+        );
+        assert_eq!(viewer_refusal(&report, None, Sharing::Direct), None);
+        assert_eq!(
+            viewer_refusal(&report, Some(Some("alice")), Sharing::Proposal),
+            None
         );
     }
 
@@ -1789,7 +1848,7 @@ mod tests {
         let mut report = poll_status_fixture();
         report.merged_unconsumed = vec![4, 9];
         assert_eq!(
-            status_report_json("eng", &report, None, None)["merged_unconsumed"],
+            status_report_json("eng", &report, None, None, None)["merged_unconsumed"],
             json!([4, 9])
         );
         assert_eq!(
@@ -1818,10 +1877,10 @@ mod tests {
             repair_pending: true,
             kept_branches: Vec::new(),
             stack_link_pending: true,
-            direct_refused: None,
+            direct_refused: Vec::new(),
             direct_shares: Vec::new(),
         };
-        let v = status_report_json("eng", &report, None, None);
+        let v = status_report_json("eng", &report, None, None, None);
         assert_eq!(v["stack_number"], 42);
         assert_eq!(v["stack_wedged"], json!([7]));
         assert_eq!(v["repair_pending"], true);
@@ -1848,10 +1907,10 @@ mod tests {
             repair_pending: false,
             kept_branches: Vec::new(),
             stack_link_pending: false,
-            direct_refused: None,
+            direct_refused: Vec::new(),
             direct_shares: Vec::new(),
         };
-        let v = status_report_json("eng", &report, None, None);
+        let v = status_report_json("eng", &report, None, None, None);
         assert!(v["stack_number"].is_null(), "{v}");
         assert_eq!(v["stack_wedged"], json!([]));
         assert_eq!(v["repair_pending"], false);
@@ -1878,11 +1937,11 @@ mod tests {
             repair_pending: false,
             kept_branches: Vec::new(),
             stack_link_pending: false,
-            direct_refused: None,
+            direct_refused: Vec::new(),
             direct_shares: Vec::new(),
         };
         let message = RemoteError::Offline.to_string();
-        let v = status_report_json("eng", &report, Some(message.clone()), None);
+        let v = status_report_json("eng", &report, Some(message.clone()), None, None);
         assert_eq!(v["probe_error"], message);
     }
 
@@ -1909,7 +1968,7 @@ mod tests {
             repair_pending: false,
             kept_branches: Vec::new(),
             stack_link_pending: false,
-            direct_refused: None,
+            direct_refused: Vec::new(),
             direct_shares: Vec::new(),
         }
     }
@@ -1983,7 +2042,7 @@ mod tests {
             "message": "Branch crystalline/share-1 is kept: pull request #7 is based on it and could not be moved to main. The next sync tries again.",
         }]);
         assert_eq!(
-            status_report_json("eng", &report, None, None)["kept_branches"],
+            status_report_json("eng", &report, None, None, None)["kept_branches"],
             expected
         );
         assert_eq!(
@@ -1994,7 +2053,7 @@ mod tests {
         // Present and empty rather than absent when nothing is kept.
         let plain = poll_status_fixture();
         assert_eq!(
-            status_report_json("eng", &plain, None, None)["kept_branches"],
+            status_report_json("eng", &plain, None, None, None)["kept_branches"],
             json!([])
         );
         assert_eq!(
@@ -2559,10 +2618,10 @@ mod tests {
             repair_pending: false,
             kept_branches: Vec::new(),
             stack_link_pending: false,
-            direct_refused: None,
+            direct_refused: Vec::new(),
             direct_shares: Vec::new(),
         };
-        let v = status_report_json("eng", &report, None, None);
+        let v = status_report_json("eng", &report, None, None, None);
         assert_eq!(v["open_proposals"][0]["number"], 1);
         assert_eq!(v["open_proposals"][0]["amended_upstream"], false);
         assert_eq!(v["open_proposals"][1]["number"], 2);
@@ -2603,10 +2662,10 @@ mod tests {
             repair_pending: false,
             kept_branches: Vec::new(),
             stack_link_pending: false,
-            direct_refused: None,
+            direct_refused: Vec::new(),
             direct_shares: Vec::new(),
         };
-        let v = status_report_json("eng", &report, None, None);
+        let v = status_report_json("eng", &report, None, None, None);
         assert_eq!(v["open_proposals"][0]["author_login"], "alice");
         assert!(
             v["open_proposals"][1]["author_login"].is_null(),
