@@ -620,27 +620,19 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
         // below. That is the final answer for this transport, not a
         // placeholder waiting for a session.
         "origin_share" => {
-            let domain = req.get("domain").and_then(Value::as_str).unwrap_or("");
-            let title = req.get("title").and_then(Value::as_str);
-            let description = req.get("description").and_then(Value::as_str);
-            let proposal = match optional_number(req, "proposal") {
-                Ok(proposal) => proposal,
+            let share = match share_request(req) {
+                Ok(share) => share,
                 Err(message) => return (envelope_err(message), false),
             };
-            let files = match optional_string_list(req, "files") {
-                Ok(files) => files,
-                Err(message) => return (envelope_err(message), false),
-            };
-            let as_proposal = req.get("as_proposal").and_then(Value::as_bool);
             match shared
                 .engine
                 .origin_share_with(
-                    domain,
-                    title,
-                    description,
-                    proposal,
-                    files.as_deref(),
-                    as_proposal,
+                    share.domain,
+                    share.title,
+                    share.description,
+                    share.proposal,
+                    share.files.as_deref(),
+                    share.as_proposal,
                     ShareActor::Owner,
                 )
                 .await
@@ -878,6 +870,37 @@ async fn embed_onto_response(engine: &Engine, embed: bool, data: &mut Value) {
 /// "withdraw layer #6" into "withdraw the top layer", which closes a proposal
 /// the caller never named. A refusal the caller can read is the only safe
 /// answer to a value we cannot interpret.
+/// An `origin_share` request as the daemon reads it.
+#[derive(Debug, PartialEq)]
+struct ShareRequest<'a> {
+    domain: &'a str,
+    title: Option<&'a str>,
+    description: Option<&'a str>,
+    proposal: Option<u64>,
+    files: Option<Vec<String>>,
+    as_proposal: Option<bool>,
+}
+
+/// Reads an `origin_share` request, the one `client::origin_share_request`
+/// builds. `as_proposal` must be a boolean when it is there at all: a value of
+/// another type is refused rather than read as absent, which would let the
+/// share commit directly.
+fn share_request(req: &Value) -> Result<ShareRequest<'_>, String> {
+    let as_proposal = match req.get("as_proposal") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(b)) => Some(*b),
+        Some(other) => return Err(format!("as_proposal must be true or false, not {other}")),
+    };
+    Ok(ShareRequest {
+        domain: req.get("domain").and_then(Value::as_str).unwrap_or(""),
+        title: req.get("title").and_then(Value::as_str),
+        description: req.get("description").and_then(Value::as_str),
+        proposal: optional_number(req, "proposal")?,
+        files: optional_string_list(req, "files")?,
+        as_proposal,
+    })
+}
+
 fn optional_number(req: &Value, key: &str) -> Result<Option<u64>, String> {
     match req.get(key) {
         None | Some(Value::Null) => Ok(None),
@@ -1050,6 +1073,45 @@ async fn refresh_within(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What `crystalline origin share kb --proposal` sends over the control
+    /// socket is what the daemon reads: `as_proposal` crosses as given, so the
+    /// share opens a proposal instead of committing directly, and `--direct`
+    /// and no flag cross too.
+    #[test]
+    fn origin_share_carries_as_proposal_across_the_control_socket() {
+        let files = vec!["notes/a.md".to_string()];
+        for as_proposal in [Some(true), Some(false), None] {
+            let sent = crate::client::origin_share_request(
+                "kb",
+                Some("Title"),
+                None,
+                None,
+                Some(&files),
+                as_proposal,
+            );
+            // Through the wire form, as the socket carries it.
+            let line = serde_json::to_string(&sent).unwrap();
+            let received: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(
+                share_request(&received),
+                Ok(ShareRequest {
+                    domain: "kb",
+                    title: Some("Title"),
+                    description: None,
+                    proposal: None,
+                    files: Some(files.clone()),
+                    as_proposal,
+                }),
+                "{line}"
+            );
+        }
+        let wrong = json!({ "cmd": "origin_share", "domain": "kb", "as_proposal": "true" });
+        assert_eq!(
+            share_request(&wrong),
+            Err("as_proposal must be true or false, not \"true\"".to_string())
+        );
+    }
 
     /// `holder` answers from memory: who this daemon is, while something
     /// else holds the store for the whole call.
