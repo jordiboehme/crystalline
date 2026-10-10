@@ -100,6 +100,17 @@ pub struct OriginState {
     /// forge identifier and every reader of `history` treats it as one.
     #[serde(default)]
     pub direct_shares: Vec<DirectShare>,
+    /// The last refusal of a direct commit, at most one per GitHub login the
+    /// refused share went out on (see [`DirectRefusal::login`]). Empty when
+    /// direct commits work or were never tried. Absent from a state written
+    /// before 0.24.3, which reads as empty; a single refusal object, the shape
+    /// an early 0.24.3 build wrote, reads as a one-element list.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "one_or_many_refusals"
+    )]
+    pub direct_refused: Vec<DirectRefusal>,
     /// Conflicts from a previous pull still waiting to be resolved.
     pub conflicts: Vec<Conflict>,
     /// The GitHub stack number linking the open proposals, once two or more
@@ -324,6 +335,46 @@ pub struct DirectShare {
     pub files: Vec<ProposedFile>,
 }
 
+/// A direct commit the connected branch refused for one GitHub login: the
+/// login, the branch, the forge's own sentence and when. While it is recorded,
+/// a share by that login on a `sharing: direct` domain falls back to a
+/// proposal when the branch refuses it again; a direct commit that lands for
+/// that login clears it. Another login's shares never read it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectRefusal {
+    /// The login the refused share went out on
+    /// ([`crate::ops::ShareOptions::author_login`]), `None` when that
+    /// credential names nobody. Absent from a refusal recorded before logins
+    /// were, which reads as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login: Option<String>,
+    /// The branch that refused.
+    pub branch: String,
+    /// The forge's sentence naming the rule, verbatim.
+    pub message: String,
+    /// When the refusal came back.
+    pub refused_at: DateTime<Utc>,
+}
+
+/// Reads `direct_refused` as a list, or as the single object (or null) an
+/// early 0.24.3 build wrote, which becomes a one-element (or empty) list.
+fn one_or_many_refusals<'de, D>(deserializer: D) -> Result<Vec<DirectRefusal>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        Many(Vec<DirectRefusal>),
+        One(DirectRefusal),
+    }
+    Ok(match Option::<OneOrMany>::deserialize(deserializer)? {
+        None => Vec::new(),
+        Some(OneOrMany::Many(all)) => all,
+        Some(OneOrMany::One(one)) => vec![one],
+    })
+}
+
 /// An unresolved conflict from a previous pull, recorded so it can be
 /// revisited: what path, what kind, and copies of the two sides that could
 /// not be merged automatically (see [`record_conflict_files`]).
@@ -504,6 +555,7 @@ impl OriginState {
             proposals: Vec::new(),
             history: Vec::new(),
             direct_shares: Vec::new(),
+            direct_refused: Vec::new(),
             conflicts: Vec::new(),
             stack_number: None,
             stacks_available: None,
@@ -563,6 +615,30 @@ impl OriginState {
     pub fn push_history(&mut self, proposal: Proposal) {
         self.history.insert(0, proposal);
         self.history.truncate(HISTORY_CAP);
+    }
+
+    /// The refusal recorded for `login`, if any. Only an exact match counts:
+    /// one person's refusal never steers another person's share.
+    pub fn direct_refusal_for(&self, login: Option<&str>) -> Option<&DirectRefusal> {
+        self.direct_refused
+            .iter()
+            .find(|refusal| refusal.login.as_deref() == login)
+    }
+
+    /// Records `refusal`, replacing the one recorded for the same login.
+    pub fn record_direct_refusal(&mut self, refusal: DirectRefusal) {
+        self.direct_refused
+            .retain(|recorded| recorded.login != refusal.login);
+        self.direct_refused.push(refusal);
+    }
+
+    /// Clears the refusal recorded for `login`, and says whether there was one.
+    /// Every other login's refusal stays.
+    pub fn clear_direct_refusal(&mut self, login: Option<&str>) -> bool {
+        let before = self.direct_refused.len();
+        self.direct_refused
+            .retain(|recorded| recorded.login.as_deref() != login);
+        self.direct_refused.len() != before
     }
 
     /// Inserts `share` at the front of `direct_shares` and truncates to the
@@ -999,6 +1075,80 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+
+    #[test]
+    fn a_state_from_before_direct_refused_loads_with_none() {
+        let dir = tempfile::tempdir().unwrap();
+        sample_state().save(dir.path()).unwrap();
+        let path = dir.path().join("state.json");
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(saved.get("direct_refused").is_none(), "absent while unset");
+        let loaded = OriginState::load(dir.path()).unwrap().unwrap();
+        assert!(loaded.direct_refused.is_empty());
+    }
+
+    fn refusal(login: Option<&str>) -> DirectRefusal {
+        DirectRefusal {
+            login: login.map(str::to_string),
+            branch: "main".to_string(),
+            message: "Changes must be made through a pull request.".to_string(),
+            refused_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn a_recorded_refusal_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = sample_state();
+        state.record_direct_refusal(refusal(Some("alice")));
+        state.record_direct_refusal(refusal(None));
+        state.save(dir.path()).unwrap();
+        assert_eq!(OriginState::load(dir.path()).unwrap(), Some(state));
+    }
+
+    /// The single refusal object an early 0.24.3 build wrote, with no login,
+    /// loads as one refusal recorded for no login.
+    #[test]
+    fn a_single_refusal_without_a_login_loads_as_a_one_element_list() {
+        let dir = tempfile::tempdir().unwrap();
+        sample_state().save(dir.path()).unwrap();
+        let path = dir.path().join("state.json");
+        let mut saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        saved["direct_refused"] = serde_json::json!({
+            "branch": "main",
+            "message": "Changes must be made through a pull request.",
+            "refused_at": "2026-10-09T12:00:00Z",
+        });
+        std::fs::write(&path, saved.to_string()).unwrap();
+        let loaded = OriginState::load(dir.path()).unwrap().unwrap();
+        assert_eq!(loaded.direct_refused.len(), 1);
+        assert_eq!(loaded.direct_refused[0].login, None);
+        assert_eq!(loaded.direct_refused[0].branch, "main");
+        assert!(loaded.direct_refusal_for(None).is_some());
+        assert!(loaded.direct_refusal_for(Some("alice")).is_none());
+
+        saved["direct_refused"] = serde_json::Value::Null;
+        std::fs::write(&path, saved.to_string()).unwrap();
+        let loaded = OriginState::load(dir.path()).unwrap().unwrap();
+        assert!(loaded.direct_refused.is_empty());
+    }
+
+    #[test]
+    fn a_refusal_is_recorded_and_cleared_per_login() {
+        let mut state = sample_state();
+        state.record_direct_refusal(refusal(Some("alice")));
+        state.record_direct_refusal(refusal(Some("alice")));
+        assert_eq!(state.direct_refused.len(), 1, "one refusal per login");
+        assert!(state.direct_refusal_for(Some("bob")).is_none());
+        state.record_direct_refusal(refusal(Some("bob")));
+        assert!(state.clear_direct_refusal(Some("bob")));
+        assert!(!state.clear_direct_refusal(Some("bob")));
+        assert!(state.direct_refusal_for(Some("alice")).is_some());
+        assert!(!state.clear_direct_refusal(None));
+        assert!(state.direct_refusal_for(Some("alice")).is_some());
+    }
 
     fn sample_state() -> OriginState {
         let mut state = OriginState::new("acme/brand-knowledge", "main");

@@ -7,6 +7,7 @@ use crystalline_core::manifest::{
     domain_name_of_source, generated_indexes_at, in_root_artifact_dirs, manifest_template,
     policy_registry, sharing_at, starter_stanzas, tag_alias_pairs,
 };
+use crystalline_core::manifest_view::{RoutingSection, manifest_facts, policy_rows, section_rows};
 use crystalline_core::parse_engram;
 
 fn manifest(rel: &str) -> (Manifest, String) {
@@ -1108,4 +1109,68 @@ fn the_starter_registry_names_every_section_the_page_offers() {
             stanza.section
         );
     }
+}
+
+const EVERY_SECTION: &str = "---\ntype: manifest\ntitle: eng\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\nrecorded_at: 2026-01-01\ngenerated_indexes: shared\nsharing: direct\ndomain_name: engineering\n---\n\n# eng\n\n## Scope\n\n- Everything about eng\n\n## When to Use\n\n- Route here for eng questions\n\n## Provisioning\n\n- skills: skills\n- widgets: w\n\n## Tag Aliases\n\n- k8s -> kubernetes\n- Kube -> k8s\n";
+
+#[test]
+fn manifest_facts_reads_every_policy_and_section() {
+    let facts = manifest_facts(EVERY_SECTION, "eng");
+    assert!(facts.parsed);
+    let keys: Vec<&str> = facts.policies.iter().map(|p| p.key.as_str()).collect();
+    assert_eq!(keys, ["generated_indexes", "sharing", "domain_name"]);
+    assert_eq!(facts.policies[1].declared.as_deref(), Some("direct"));
+    assert_eq!(facts.policies[1].effective, "direct");
+    assert_eq!(facts.policies[2].kind, "text");
+    assert_eq!(facts.routing, RoutingSection::WhenToUse);
+    assert!(facts.missing.is_empty());
+    let names: Vec<&str> = facts.sections.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(
+        names,
+        ["When to Use", "Scope", "Provisioning", "Tag Aliases"]
+    );
+    assert!(facts.sections.iter().all(|s| s.present));
+    let required: Vec<bool> = facts.sections.iter().map(|s| s.required).collect();
+    assert_eq!(required, [true, true, false, false]);
+    assert!(
+        facts
+            .provisioning
+            .unwrap()
+            .problems
+            .iter()
+            .any(|p| p.kind == "unknown_type")
+    );
+    assert!(
+        facts
+            .tag_aliases
+            .unwrap()
+            .problems
+            .iter()
+            .any(|p| p.kind == "chained_alias")
+    );
+}
+
+#[test]
+fn a_manifest_that_does_not_parse_declares_nothing() {
+    // A null byte is refused by the format layer.
+    let facts = manifest_facts("---\ntype: manifest\n---\n\0\n", "eng");
+    assert!(!facts.parsed);
+    assert!(facts.policies.is_empty());
+    assert_eq!(facts.routing, RoutingSection::None);
+    assert_eq!(facts.missing, ["Scope", "When to Use"]);
+    assert!(facts.sections.iter().all(|s| !s.present));
+}
+
+#[test]
+fn policy_rows_without_a_manifest_are_the_registry_defaults() {
+    let rows = policy_rows(None, "eng");
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].effective, "local");
+    assert_eq!(rows[1].effective, "proposal");
+    assert!(rows.iter().all(|r| r.declared.is_none()));
+    assert_eq!(
+        rows[2].effective, "eng",
+        "free text falls back to the local name"
+    );
+    assert_eq!(section_rows(None).len(), 4);
 }

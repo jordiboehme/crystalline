@@ -1,6 +1,6 @@
 //! The hot statements and the plans they are entitled to.
 //!
-//! One place, forty-six entries, each named by the function that issues it, so a
+//! One place, fifty entries, each named by the function that issues it, so a
 //! rewrite that drops an index fails with the function's name rather than with
 //! a diff. Every entry obtains its SQL the way the code obtains it - a shared
 //! builder, a named constant or the same `format!` the method calls - because a
@@ -130,9 +130,14 @@ pub struct HotStatement {
 /// primary key from the three statements that project one, and a full pass over
 /// it would carry every body in the index into exactly the read the move took
 /// them out of.
+///
+/// `engram_meta_value` IS here too. A full pass over it is a pass over every
+/// frontmatter value in the index, which is the read the side table exists to
+/// avoid.
 pub const GUARDED_TABLES: &[&str] = &[
     "engram",
     "engram_content",
+    "engram_meta_value",
     "chunk",
     "relation",
     "link",
@@ -160,6 +165,7 @@ const ALIASES: &[(&str, &str)] = &[
     ("cn", "contradiction"),
     ("cp", "contradiction_pair"),
     ("ov", "observation_vector"),
+    ("m", "engram_meta_value"),
 ];
 
 fn table_of(name: &str) -> &str {
@@ -206,6 +212,16 @@ const OV_FULL_KEY_SEEK: &str = "sqlite_autoindex_observation_vector_1 (model=? A
 /// green this file has no business giving.
 const QVEC_TURSO: &str = "x'00'";
 const QVEC_PG: &str = "'[0,0,0,0,0,0,0,0]'::vector";
+
+/// The side table's index, which the four `$contains` entries name in full.
+const META_VALUE_INDEX: &str = "idx_engram_meta_value_key_value";
+
+/// The anchor every tenth fixture engram cites (see [`engram_file`]): 20 of
+/// the 200 in each domain, so the planner sees a selective `(key, value)`.
+const SHARED_ANCHOR: &str = "'\"notedown://jordi/shared#b3\"'";
+
+/// One engram's own anchor, for the second value of `$contains_any`.
+const OWN_ANCHOR: &str = "'\"notedown://jordi/n1#b0\"'";
 
 /// One filter-only page, once per order a reader can ask for: the listing the
 /// domain page and every folder view page through, scoped to one domain. Every
@@ -949,6 +965,160 @@ pub fn registry() -> Vec<HotStatement> {
             turso_must_seek: &[],
             postgres_must_seek: &[],
         },
+        // `$contains` and `$contains_any` on a key that is not promoted, built
+        // by the same builders that `metadata_clause` calls: `meta_value_union_sql`
+        // on turso, `meta_value_match_sql` on postgres. The claim is the side
+        // table's index by name, unscoped and scoped. Scoped is the shape to
+        // watch: a plan that walks `idx_engram_domain` and probes the side
+        // table once per engram reads the whole domain and still passes the
+        // scan check above, which is why `the_contains_filter_drives_from_the_side_table`
+        // and its postgres twin also check how `engram` is read.
+        HotStatement {
+            issued_by: "search::metadata_clause ($contains, unscoped)",
+            turso: || {
+                crystalline_index::turso::filter_only_sql(
+                    BASE_SCREEN,
+                    &format!(
+                        "AND {}",
+                        crystalline_index::meta_value_union_sql("?1", &["?2".to_string()])
+                    ),
+                    SearchOrder::RecordedDesc,
+                    50,
+                    0,
+                )
+            },
+            postgres: || {
+                crystalline_index::postgres::filter_only_sql(
+                    BASE_SCREEN,
+                    &format!(
+                        "AND {}",
+                        crystalline_index::meta_value_match_sql("$1", &["$2".to_string()])
+                    ),
+                    SearchOrder::RecordedDesc,
+                    50,
+                    0,
+                )
+            },
+            literals: &["'sources'", SHARED_ANCHOR],
+            literals_pg: None,
+            scan_expected: &[],
+            scan_expected_pg: None,
+            turso_must_seek: &[META_VALUE_INDEX],
+            postgres_must_seek: &[META_VALUE_INDEX],
+        },
+        HotStatement {
+            issued_by: "search::metadata_clause ($contains, scoped)",
+            turso: || {
+                crystalline_index::turso::filter_only_sql(
+                    BASE_SCREEN,
+                    &format!(
+                        "AND {} AND {}",
+                        crystalline_index::turso::domain_scope_sql("?1", true),
+                        crystalline_index::meta_value_union_sql("?2", &["?3".to_string()])
+                    ),
+                    SearchOrder::RecordedDesc,
+                    50,
+                    0,
+                )
+            },
+            postgres: || {
+                crystalline_index::postgres::filter_only_sql(
+                    BASE_SCREEN,
+                    &format!(
+                        "AND d.name IN ($1) AND {}",
+                        crystalline_index::meta_value_match_sql("$2", &["$3".to_string()])
+                    ),
+                    SearchOrder::RecordedDesc,
+                    50,
+                    0,
+                )
+            },
+            literals: &["'d'", "'sources'", SHARED_ANCHOR],
+            literals_pg: None,
+            scan_expected: &[],
+            scan_expected_pg: None,
+            turso_must_seek: &[META_VALUE_INDEX],
+            postgres_must_seek: &[META_VALUE_INDEX],
+        },
+        HotStatement {
+            issued_by: "search::metadata_clause ($contains_any, unscoped)",
+            turso: || {
+                crystalline_index::turso::filter_only_sql(
+                    BASE_SCREEN,
+                    &format!(
+                        "AND {}",
+                        crystalline_index::meta_value_union_sql(
+                            "?1",
+                            &["?2".to_string(), "?3".to_string()]
+                        )
+                    ),
+                    SearchOrder::RecordedDesc,
+                    50,
+                    0,
+                )
+            },
+            postgres: || {
+                crystalline_index::postgres::filter_only_sql(
+                    BASE_SCREEN,
+                    &format!(
+                        "AND {}",
+                        crystalline_index::meta_value_match_sql(
+                            "$1",
+                            &["$2".to_string(), "$3".to_string()]
+                        )
+                    ),
+                    SearchOrder::RecordedDesc,
+                    50,
+                    0,
+                )
+            },
+            literals: &["'sources'", SHARED_ANCHOR, OWN_ANCHOR],
+            literals_pg: None,
+            scan_expected: &[],
+            scan_expected_pg: None,
+            turso_must_seek: &[META_VALUE_INDEX],
+            postgres_must_seek: &[META_VALUE_INDEX],
+        },
+        HotStatement {
+            issued_by: "search::metadata_clause ($contains_any, scoped)",
+            turso: || {
+                crystalline_index::turso::filter_only_sql(
+                    BASE_SCREEN,
+                    &format!(
+                        "AND {} AND {}",
+                        crystalline_index::turso::domain_scope_sql("?1", true),
+                        crystalline_index::meta_value_union_sql(
+                            "?2",
+                            &["?3".to_string(), "?4".to_string()]
+                        )
+                    ),
+                    SearchOrder::RecordedDesc,
+                    50,
+                    0,
+                )
+            },
+            postgres: || {
+                crystalline_index::postgres::filter_only_sql(
+                    BASE_SCREEN,
+                    &format!(
+                        "AND d.name IN ($1) AND {}",
+                        crystalline_index::meta_value_match_sql(
+                            "$2",
+                            &["$3".to_string(), "$4".to_string()]
+                        )
+                    ),
+                    SearchOrder::RecordedDesc,
+                    50,
+                    0,
+                )
+            },
+            literals: &["'d'", "'sources'", SHARED_ANCHOR, OWN_ANCHOR],
+            literals_pg: None,
+            scan_expected: &[],
+            scan_expected_pg: None,
+            turso_must_seek: &[META_VALUE_INDEX],
+            postgres_must_seek: &[META_VALUE_INDEX],
+        },
     ]
 }
 
@@ -969,8 +1139,10 @@ const FIXTURE_ENGRAMS: usize = 200;
 fn engram_file(i: usize, target: &str) -> String {
     format!(
         "---\ntype: engram\ntitle: Engram {i}\npermalink: p{i}\ntags:\n  - t\nstatus: stable\n\
-         recorded_at: 2026-01-01\nsalience: 3\n---\n\n# Engram {i}\n\n\
-         body of engram {i}, which points at [[{target}]]\n\n- relates_to [[{target}]]\n"
+         recorded_at: 2026-01-01\nsalience: 3\nsources:\n  - notedown://jordi/n{i}#b0\n  \
+         - notedown://jordi/shared#b{}\n---\n\n# Engram {i}\n\n\
+         body of engram {i}, which points at [[{target}]]\n\n- relates_to [[{target}]]\n",
+        i % 10
     )
 }
 
@@ -1308,6 +1480,261 @@ async fn a_dropped_index_is_caught_by_the_turso_plan_guard() {
     );
 }
 
+/// The four `$contains` entries reach `engram` only by primary key, from the
+/// side table: the plan names `idx_engram_meta_value_key_value`, every line
+/// that reads `engram` is a primary-key seek, and no correlated subquery is
+/// left. Without this, a scoped plan that walks the domain through
+/// `idx_engram_domain` and probes the side table once per engram passes
+/// `every_hot_statement_is_index_served_on_turso`. The unnested semi-join and
+/// the `e.id IN (...)` fallback both pass it, whatever order the plan prints
+/// its lines in (the `IN` form prints the `e` seek above its `LIST SUBQUERY`).
+///
+/// Each value is its own `(key, value)` seek: turso seeks an `IN` list on the
+/// second index column as `(key=?)` alone, a walk of every row for the key,
+/// so `$contains_any` is one `UNION ALL` arm per value and the plan must show
+/// one full-key seek per value.
+#[tokio::test]
+async fn the_contains_filter_drives_from_the_side_table() {
+    let store = turso_fixture().await;
+    let entries: Vec<HotStatement> = registry()
+        .into_iter()
+        .filter(|e| e.issued_by.starts_with("search::metadata_clause"))
+        .collect();
+    assert_eq!(entries.len(), 4, "two operators, unscoped and scoped");
+    for entry in entries {
+        let sql = bind_literals(&(entry.turso)(), entry.literals);
+        let plan = store.explain_query_plan(&sql).await.unwrap();
+        assert!(
+            plan.iter().any(|line| line.contains(META_VALUE_INDEX)),
+            "{} never reads {META_VALUE_INDEX}: {plan:?}",
+            entry.issued_by
+        );
+        let values = if entry.issued_by.contains("$contains_any") {
+            2
+        } else {
+            1
+        };
+        let point_seeks = plan
+            .iter()
+            .filter(|line| line.contains(&format!("{META_VALUE_INDEX} (key=? AND value=?)")))
+            .count();
+        let side_reads = plan
+            .iter()
+            .filter(|line| {
+                read_of(line).is_some_and(|(name, _)| table_of(name) == "engram_meta_value")
+            })
+            .count();
+        assert!(
+            point_seeks == values && side_reads == values,
+            "{}: one (key, value) seek per value, {values} in all, plan was: {plan:?}",
+            entry.issued_by
+        );
+        for line in &plan {
+            if read_of(line).is_some_and(|(name, _)| table_of(name) == "engram") {
+                assert!(
+                    line.contains("USING INTEGER PRIMARY KEY"),
+                    "{}: engram must be reached by primary key from the side table, \
+                     never walked: {line}. Whole plan: {plan:?}",
+                    entry.issued_by
+                );
+            }
+        }
+        assert!(
+            !plan.iter().any(|line| line.contains("CORRELATED")),
+            "{}: the filter still runs once per engram row, plan was: {plan:?}",
+            entry.issued_by
+        );
+    }
+}
+
+/// The `$contains` guard fails when the side table's index is gone: with it
+/// dropped, the unscoped entry reads `engram` or `engram_meta_value` without a
+/// seek, so the green run of the two tests above means something.
+#[tokio::test]
+async fn a_dropped_side_table_index_is_caught_by_the_turso_plan_guard() {
+    let store = turso_fixture().await;
+    store.drop_index(META_VALUE_INDEX).await.unwrap();
+    let entry = registry()
+        .into_iter()
+        .find(|e| e.issued_by == "search::metadata_clause ($contains, unscoped)")
+        .expect("the unscoped $contains entry is in the registry");
+    let sql = bind_literals(&(entry.turso)(), entry.literals);
+    let plan = store.explain_query_plan(&sql).await.unwrap();
+    let scanned = plan
+        .iter()
+        .filter_map(|line| read_of(line))
+        .any(|(name, seek)| !seek && ["engram", "engram_meta_value"].contains(&table_of(name)));
+    assert!(
+        scanned,
+        "with the side table's index dropped the plan must scan, so the green run means something: {plan:?}"
+    );
+}
+
+/// `$contains_any` keeps one `(key, value)` seek per value and reads `engram`
+/// only by primary key at every list length up to the cap of 100, scoped and
+/// unscoped, in the page and in the count that runs before it. Scoped with a
+/// plain `d.name IN (...)`, turso walked the domain from 9 values on in the
+/// page and in the count (168 ms for 100 values over a 50,000-engram domain),
+/// which the two-value registry entries never saw. The scope is spelled by
+/// `domain_scope_sql`, as `build_scalar_filters` spells it.
+#[tokio::test]
+async fn the_contains_any_list_keeps_its_seeks_at_every_length() {
+    let store = turso_fixture().await;
+    for n in [1usize, 2, 3, 8, 9, 10, 17, 50, 99, 100] {
+        let values: Vec<String> = (0..n).map(|i| format!("?{}", i + 3)).collect();
+        let mut literals = vec!["'d'".to_string(), "'sources'".to_string()];
+        literals.extend((0..n).map(|i| format!("'\"notedown://jordi/n{i}#b0\"'")));
+        let literals: Vec<&str> = literals.iter().map(String::as_str).collect();
+        let predicate = crystalline_index::meta_value_union_sql("?2", &values);
+        let scoped = format!(
+            "AND {} AND {predicate}",
+            crystalline_index::turso::domain_scope_sql("?1", true)
+        );
+        let unscoped = format!("AND {predicate}");
+        for (scope, filters) in [("unscoped", unscoped), ("scoped", scoped)] {
+            let page = crystalline_index::turso::filter_only_sql(
+                BASE_SCREEN,
+                &filters,
+                SearchOrder::RecordedDesc,
+                50,
+                0,
+            );
+            let count = crystalline_index::turso::filter_only_count_sql(BASE_SCREEN, &filters);
+            for (statement, sql) in [("page", page), ("count", count)] {
+                let label = format!("{n} values, {scope}, {statement}");
+                let plan = store
+                    .explain_query_plan(&bind_literals(&sql, &literals))
+                    .await
+                    .unwrap();
+                let point_seeks = plan
+                    .iter()
+                    .filter(|line| {
+                        line.contains(&format!("{META_VALUE_INDEX} (key=? AND value=?)"))
+                    })
+                    .count();
+                assert_eq!(
+                    point_seeks, n,
+                    "{label}: one (key, value) seek per value: {plan:?}"
+                );
+                for line in &plan {
+                    if read_of(line).is_some_and(|(name, _)| table_of(name) == "engram") {
+                        assert!(
+                            line.contains("USING INTEGER PRIMARY KEY"),
+                            "{label}: engram must be reached by primary key, never walked: \
+                             {line}. Whole plan: {plan:?}"
+                        );
+                    }
+                }
+                assert!(
+                    !plan.iter().any(|line| line.contains("CORRELATED")),
+                    "{label}: the filter runs once per engram row: {plan:?}"
+                );
+            }
+        }
+    }
+}
+
+/// The lexical candidate scan and semantic phase 1, the two statements a text,
+/// semantic or hybrid search issues, keep the same claim with a `$contains`
+/// filter as the filter-only page: one `(key, value)` seek per value, `engram`
+/// only by primary key and `chunk` only through `idx_chunk_engram`, scoped
+/// through `domain_scope_sql("?1", true)` and unscoped. With `+d.name` the
+/// side table is the only thing that drives these statements; were turso to
+/// stop choosing it, the plan would be a `SCAN engram` or `SCAN chunk` over
+/// every domain. The 0-value control is the plain scope with no side-table
+/// filter, which must keep reaching `engram` through the domain index.
+#[tokio::test]
+async fn text_and_semantic_scans_drive_from_the_side_table_at_every_length() {
+    let store = turso_fixture().await;
+    let like = "(lower(e.title) LIKE '%engram%' ESCAPE '\\' OR lower(e.description) LIKE '%engram%' \
+                ESCAPE '\\' OR lower(ec.content) LIKE '%engram%' ESCAPE '\\')";
+    let vector = "c.embedding IS NOT NULL AND c.model = 'fake' AND c.dims = 8";
+    for n in [0usize, 1, 9, 100] {
+        let values: Vec<String> = (0..n)
+            .map(|i| format!("'\"notedown://jordi/n{i}#b0\"'"))
+            .collect();
+        let mut forms: Vec<(&str, String)> = Vec::new();
+        if n == 0 {
+            forms.push((
+                "scoped, no side-table filter",
+                format!(
+                    "AND {}",
+                    crystalline_index::turso::domain_scope_sql("'d'", false)
+                ),
+            ));
+        } else {
+            let predicate = crystalline_index::meta_value_union_sql("'sources'", &values);
+            forms.push((
+                "scoped",
+                format!(
+                    "AND {} AND {predicate}",
+                    crystalline_index::turso::domain_scope_sql("'d'", true)
+                ),
+            ));
+            forms.push(("unscoped", format!("AND {predicate}")));
+        }
+        for (scope, filters) in forms {
+            let lexical = crystalline_index::turso::lexical_candidate_sql(
+                BASE_SCREEN,
+                &format!("{filters} AND {like}"),
+                500,
+            );
+            let semantic = bind_literals(
+                &crystalline_index::turso::semantic_phase1_sql(
+                    BASE_SCREEN,
+                    &format!("{filters} AND {vector}"),
+                ),
+                &[QVEC_TURSO],
+            );
+            for (statement, sql) in [
+                ("lexical candidates", lexical),
+                ("semantic phase 1", semantic),
+            ] {
+                let label = format!("{statement}, {n} values, {scope}");
+                let plan = store.explain_query_plan(&sql).await.unwrap();
+                let point_seeks = plan
+                    .iter()
+                    .filter(|line| {
+                        line.contains(&format!("{META_VALUE_INDEX} (key=? AND value=?)"))
+                    })
+                    .count();
+                assert_eq!(
+                    point_seeks, n,
+                    "{label}: one (key, value) seek per value: {plan:?}"
+                );
+                for line in &plan {
+                    let Some((name, _)) = read_of(line) else {
+                        continue;
+                    };
+                    match table_of(name) {
+                        "engram" if n == 0 => assert!(
+                            line.starts_with("SEARCH") && line.contains("(domain_id=?)"),
+                            "{label}: with no side-table filter the scope keeps the domain \
+                             index: {line}. Whole plan: {plan:?}"
+                        ),
+                        "engram" => assert!(
+                            line.contains("USING INTEGER PRIMARY KEY"),
+                            "{label}: engram must be reached by primary key, never walked: \
+                             {line}. Whole plan: {plan:?}"
+                        ),
+                        "chunk" => assert!(
+                            line.starts_with("SEARCH")
+                                && line.contains("idx_chunk_engram (engram_id=?)"),
+                            "{label}: chunk must be reached through idx_chunk_engram: {line}. \
+                             Whole plan: {plan:?}"
+                        ),
+                        _ => {}
+                    }
+                }
+                assert!(
+                    !plan.iter().any(|line| line.contains("CORRELATED")),
+                    "{label}: the filter runs once per row: {plan:?}"
+                );
+            }
+        }
+    }
+}
+
 // --- the postgres leg --------------------------------------------------------
 
 #[cfg(feature = "postgres")]
@@ -1429,11 +1856,66 @@ mod postgres_plans {
         all.iter().any(|node| node["Node Type"] == node_type)
     }
 
+    /// How many engrams the postgres leg adds on top of [`seed`], half in each
+    /// domain, each citing five anchors of its own.
+    ///
+    /// Postgres plans by cost, so at 400 engrams a walk of all of `engram` is
+    /// cheaper by its estimate than a few dozen primary-key probes, and the
+    /// fixture would test the planner's arithmetic on a toy table rather than
+    /// the plan a real index gets. The anchors are unique, as real ones mostly
+    /// are, so the registry's `SHARED_ANCHOR` keeps the 40 rows it has in
+    /// [`seed`] and `sources` grows to 100,800 side-table rows.
+    const BULK_ENGRAMS: usize = 20_000;
+
+    /// Add [`BULK_ENGRAMS`] engrams and their `sources` rows in two statements
+    /// over a plain connection to the store's schema, rather than through the
+    /// write path, which would take minutes. The side-table rows are the
+    /// compact JSON text of each element, as `meta_value_rows` writes them.
+    async fn bulk_seed(url: &str, schema: &str) {
+        use sqlx::Connection;
+        let mut raw = sqlx::PgConnection::connect(url).await.unwrap();
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "SET search_path TO {schema}, public; \
+             INSERT INTO engram (domain_id, path, permalink, title, engram_type, status, \
+               recorded_at, metadata) \
+             SELECT (SELECT id FROM domain WHERE name = CASE WHEN g % 2 = 0 THEN 'd' ELSE 'other' END), \
+               'bulk/b' || g || '.md', 'bulk' || g, 'Bulk ' || g, 'engram', 'stable', '2026-01-01', \
+               jsonb_build_object('sources', (SELECT jsonb_agg('notedown://jordi/bulk' || g || '#b' || k) \
+                 FROM generate_series(0, 4) k)) \
+             FROM generate_series(1, {BULK_ENGRAMS}) g; \
+             INSERT INTO engram_meta_value (engram_id, key, value) \
+             SELECT e.id, 'sources', s.value::text \
+             FROM engram e, jsonb_array_elements(e.metadata -> 'sources') s \
+             WHERE e.path LIKE 'bulk/%';"
+        )))
+        .execute(&mut raw)
+        .await
+        .unwrap();
+        raw.close().await.unwrap();
+    }
+
     async fn open_seeded(url: &str, schema: &str) -> PostgresStore {
         let store = PostgresStore::open_in_schema(url, schema).await.unwrap();
         seed(&store).await;
         store.analyze().await.unwrap();
         store
+    }
+
+    /// Grow an [`open_seeded`] store by [`BULK_ENGRAMS`] and refresh its
+    /// statistics.
+    async fn grow_to_scale(store: &PostgresStore, url: &str, schema: &str) {
+        bulk_seed(url, schema).await;
+        store.analyze().await.unwrap();
+    }
+
+    /// The entries planned on the grown fixture rather than the plain one: the
+    /// four `$contains` statements, whose claim is the side table driving the
+    /// join, which postgres only prefers once `engram` is too big to walk.
+    /// Every other entry keeps the plain fixture its claim was measured on; at
+    /// 20,400 engrams `search::scored_lexical` turns into an `engram_pkey` walk
+    /// bounded by its `LIMIT`, which is a different question from this task's.
+    fn planned_at_scale(entry: &HotStatement) -> bool {
+        entry.issued_by.starts_with("search::metadata_clause")
     }
 
     /// Every hot statement reaches its rows through an index, on postgres.
@@ -1444,60 +1926,131 @@ mod postgres_plans {
     /// the test passes on exactly the corpus size nobody has a problem with.
     /// With it, a statement no index can serve is planned as a scan anyway - the
     /// setting is a cost penalty, not a prohibition - and that is the signal.
+    ///
+    /// Two passes over one store: every entry on the plain fixture, then the
+    /// [`planned_at_scale`] entries after [`grow_to_scale`].
     #[tokio::test]
     async fn every_hot_statement_is_index_served_on_postgres() {
         let Some(url) = pg_url() else { return };
         let schema = unique_schema();
         let store = open_seeded(&url, &schema).await;
+        let (at_scale, plain): (Vec<HotStatement>, Vec<HotStatement>) =
+            registry().into_iter().partition(planned_at_scale);
+        assert_eq!(at_scale.len(), 4, "the four $contains entries");
 
-        for entry in registry() {
+        for (pass, entries) in [plain, at_scale].into_iter().enumerate() {
+            if pass == 1 {
+                grow_to_scale(&store, &url, &schema).await;
+            }
+            for entry in entries {
+                let sql = bind_literals(
+                    &(entry.postgres)(),
+                    entry.literals_pg.unwrap_or(entry.literals),
+                );
+                let plan = store.explain_json(&sql).await.unwrap_or_else(|e| {
+                    panic!("{} did not explain: {e}. Statement: {sql}", entry.issued_by)
+                });
+                let permitted = entry.scan_expected_pg.unwrap_or(entry.scan_expected);
+                for (table, node) in unseeked_reads(&plan) {
+                    assert!(
+                        permitted.iter().any(|(t, _)| *t == table),
+                        "{} reads `{table}` without seeking an index, with enable_seqscan \
+                         off, so no index covers its predicate. Node: {node}. \
+                         Statement: {sql}",
+                        entry.issued_by
+                    );
+                }
+                let seen = index_names(&plan);
+                for index in entry.postgres_must_seek {
+                    assert!(
+                        seen.iter().any(|name| name == index),
+                        "{} must be served by {index} by name; the plan read {seen:?}. \
+                         Statement: {sql}",
+                        entry.issued_by
+                    );
+                }
+                if entry.issued_by == "Store::contradiction_pairs_scored" {
+                    assert!(
+                        seen.iter().any(|name| {
+                            name == "idx_contradiction_pair_domain"
+                                || name == "idx_contradiction_pair_model"
+                        }),
+                        "Store::contradiction_pairs_scored must seek one of its two indexes; \
+                         the plan read {seen:?}. Statement: {sql}"
+                    );
+                }
+                // The lexical prefilter's real claim, the same one the turso leg
+                // makes: bounded whenever it is sorted.
+                if entry.issued_by == "search::scored_lexical"
+                    || entry.issued_by.starts_with("search::filter_only")
+                {
+                    assert!(
+                        !has_node(&plan, "Sort") || has_node(&plan, "Limit"),
+                        "{} sorts a body projection with no bound: {plan}",
+                        entry.issued_by
+                    );
+                }
+            }
+        }
+        store.drop_schema().await.unwrap();
+    }
+
+    /// The postgres twin of `the_contains_filter_drives_from_the_side_table`:
+    /// each of the four `$contains` entries seeks `idx_engram_meta_value_key_value`
+    /// on key and value, reads `engram` only through `engram_pkey` with the side
+    /// table's `engram_id` as its condition, and runs no subplan per engram row.
+    /// Without this, a scoped plan that walks the domain through
+    /// `idx_engram_domain` and hash-joins it against the side table passes
+    /// `every_hot_statement_is_index_served_on_postgres`, because that walk has
+    /// an index condition. Planner settings stay as `explain_json` leaves them;
+    /// the claim is about the fixture's real statistics.
+    #[tokio::test]
+    async fn the_contains_filter_drives_from_the_side_table_on_postgres() {
+        let Some(url) = pg_url() else { return };
+        let schema = unique_schema();
+        let store = open_seeded(&url, &schema).await;
+        grow_to_scale(&store, &url, &schema).await;
+        let entries: Vec<HotStatement> = registry().into_iter().filter(planned_at_scale).collect();
+        assert_eq!(entries.len(), 4, "two operators, unscoped and scoped");
+        for entry in entries {
             let sql = bind_literals(
                 &(entry.postgres)(),
                 entry.literals_pg.unwrap_or(entry.literals),
             );
-            let plan = store.explain_json(&sql).await.unwrap_or_else(|e| {
-                panic!("{} did not explain: {e}. Statement: {sql}", entry.issued_by)
-            });
-            let permitted = entry.scan_expected_pg.unwrap_or(entry.scan_expected);
-            for (table, node) in unseeked_reads(&plan) {
+            let plan = store.explain_json(&sql).await.unwrap();
+            let mut all = Vec::new();
+            nodes(&plan, &mut all);
+            assert!(
+                all.iter().any(|node| {
+                    node["Index Name"] == META_VALUE_INDEX
+                        && node["Index Cond"]
+                            .as_str()
+                            .is_some_and(|cond| cond.contains("key =") && cond.contains("value ="))
+                }),
+                "{} must seek {META_VALUE_INDEX} on key and value: {plan}",
+                entry.issued_by
+            );
+            for node in all.iter().filter(|node| node["Relation Name"] == "engram") {
+                let by_key = matches!(
+                    node["Node Type"].as_str(),
+                    Some("Index Scan" | "Index Only Scan")
+                ) && node["Index Name"] == "engram_pkey"
+                    && node["Index Cond"]
+                        .as_str()
+                        .is_some_and(|cond| cond.contains("m.engram_id"));
                 assert!(
-                    permitted.iter().any(|(t, _)| *t == table),
-                    "{} reads `{table}` without seeking an index, with enable_seqscan \
-                     off, so no index covers its predicate. Node: {node}. \
-                     Statement: {sql}",
+                    by_key,
+                    "{}: engram must be reached by primary key from the side table, \
+                     never walked: {node}. Whole plan: {plan}",
                     entry.issued_by
                 );
             }
-            let seen = index_names(&plan);
-            for index in entry.postgres_must_seek {
-                assert!(
-                    seen.iter().any(|name| name == index),
-                    "{} must be served by {index} by name; the plan read {seen:?}. \
-                     Statement: {sql}",
-                    entry.issued_by
-                );
-            }
-            if entry.issued_by == "Store::contradiction_pairs_scored" {
-                assert!(
-                    seen.iter().any(|name| {
-                        name == "idx_contradiction_pair_domain"
-                            || name == "idx_contradiction_pair_model"
-                    }),
-                    "Store::contradiction_pairs_scored must seek one of its two indexes; \
-                     the plan read {seen:?}. Statement: {sql}"
-                );
-            }
-            // The lexical prefilter's real claim, the same one the turso leg
-            // makes: bounded whenever it is sorted.
-            if entry.issued_by == "search::scored_lexical"
-                || entry.issued_by.starts_with("search::filter_only")
-            {
-                assert!(
-                    !has_node(&plan, "Sort") || has_node(&plan, "Limit"),
-                    "{} sorts a body projection with no bound: {plan}",
-                    entry.issued_by
-                );
-            }
+            assert!(
+                !all.iter()
+                    .any(|node| node["Parent Relationship"] == "SubPlan"),
+                "{}: the filter still runs once per engram row: {plan}",
+                entry.issued_by
+            );
         }
         store.drop_schema().await.unwrap();
     }

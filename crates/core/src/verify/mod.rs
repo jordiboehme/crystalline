@@ -16,6 +16,7 @@
 //! additionally promotes every rule whose default severity is `Warning` to
 //! `Error`, `M108` included.
 
+mod catalog;
 mod domain_config;
 mod format;
 mod links;
@@ -35,11 +36,14 @@ use serde::Serialize;
 use crate::engram::Engram;
 use crate::parse::{BodyLine, body_lines};
 
+pub use catalog::{VERIFY_RULES, VerifyRule, verify_rule};
 pub use domain_config::{
-    ConfigProblem, DOMAIN_CONFIG_FILE, DomainConfigLoad, config_problems, load_domain_config,
+    ConfigEdit, ConfigProblem, DOMAIN_CONFIG_FILE, DomainConfigLoad, EditedConfig, config_problems,
+    edit_domain_config, load_domain_config,
 };
 pub use report::{Format, render, to_github, to_human, to_json};
 pub use scanner::ScanError;
+pub use severity::is_severity_word;
 
 /// How much more a `type: source` engram may hold than the domain's token
 /// budget allows an ordinary one.
@@ -176,6 +180,18 @@ pub fn check_temporal(path: &Path, engram: &Engram) -> Vec<Issue> {
     let mut summary = Summary::default();
     let mut sink = Sink::new(&mut issues, &mut summary, None, false);
     temporal::check_engram(path, engram, &mut sink);
+    issues
+}
+
+/// Run `E011` against a single already-parsed engram: warn about a
+/// frontmatter key or value the metadata index cannot hold. Backs the
+/// `validate_engrams` tool beside [`check_temporal`], with the same rules
+/// about overrides: the engine passes the result through [`apply_overrides`].
+pub fn check_index_limits(path: &Path, engram: &Engram) -> Vec<Issue> {
+    let mut issues = Vec::new();
+    let mut summary = Summary::default();
+    let mut sink = Sink::new(&mut issues, &mut summary, None, false);
+    format::check_index_limits(path, &engram.frontmatter, &mut sink);
     issues
 }
 

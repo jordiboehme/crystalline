@@ -28,6 +28,7 @@ pub mod index;
 pub mod jsonc_edit;
 pub mod line_endings;
 pub mod manifest;
+pub mod manifest_view;
 pub mod names;
 pub mod parse;
 pub mod path;
@@ -55,8 +56,9 @@ pub use attachment::{
 };
 pub use emit::emit_engram;
 pub use engram::{
-    EVOLVE_ACK_KEY, Engram, EvolveAck, Frontmatter, Generated, Heading, LinkTarget, Observation,
-    RECOMMENDED_STATUSES, RECOMMENDED_TYPES, Relation, SchemaDef, Verification, Verified, WikiLink,
+    EVOLVE_ACK_KEY, Engram, EvolveAck, Frontmatter, Generated, Heading, LinkTarget,
+    META_KEY_MAX_BYTES, META_VALUE_MAX_BYTES, Observation, RECOMMENDED_STATUSES, RECOMMENDED_TYPES,
+    Relation, SchemaDef, Verification, Verified, WikiLink, meta_value_text,
 };
 pub use harness::profile::{
     CommandSpelling, EntryShape, HookDialect, HostSignal, McpStyle, PathSpec, PointerStyle,

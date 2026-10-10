@@ -30,8 +30,8 @@ mod search;
 /// than holding a second copy of the number.
 #[doc(hidden)]
 pub use search::{
-    DEFAULT_MIN_SIMILARITY, filter_only_sql, lexical_candidate_sql, node_hydrate_sql,
-    semantic_hydrate_sql, semantic_phase1_sql,
+    DEFAULT_MIN_SIMILARITY, domain_scope_sql, filter_only_count_sql, filter_only_sql,
+    lexical_candidate_sql, node_hydrate_sql, semantic_hydrate_sql, semantic_phase1_sql,
 };
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -638,6 +638,11 @@ impl TursoStore {
             self.conn.execute(&sql, params).await?;
         }
 
+        // Frontmatter values, exactly where the tag rows are written: one row
+        // per list element and per scalar of every non-promoted key, so
+        // `$contains` seeks instead of reading every row's `metadata`.
+        insert_meta_values(&self.conn, engram_id, &record.metadata).await?;
+
         Ok(EngramId(engram_id))
     }
 
@@ -656,6 +661,7 @@ impl TursoStore {
         for sql in [
             "DELETE FROM observation WHERE engram_id=?1",
             "DELETE FROM engram_tag WHERE engram_id=?1",
+            "DELETE FROM engram_meta_value WHERE engram_id=?1",
             "DELETE FROM relation WHERE engram_id=?1",
             "DELETE FROM link WHERE engram_id=?1",
         ] {
@@ -971,6 +977,45 @@ fn value_rows(width: usize, count: usize, trailing: Option<&str>) -> String {
         rows.push(format!("({})", cells.join(",")));
     }
     rows.join(",")
+}
+
+/// How many engrams one page of the `engram_meta_value` backfill reads, so
+/// the migration's memory stays bounded on a large index.
+const BACKFILL_PAGE: i64 = 1000;
+
+/// Write one engram's `engram_meta_value` rows from its `metadata`, in the
+/// caller's transaction (see [`crate::store::meta_value_rows`]). The caller
+/// has cleared the old rows: [`TursoStore::delete_children`] on an update.
+async fn insert_meta_values(
+    conn: &Connection,
+    engram_id: i64,
+    metadata: &serde_json::Value,
+) -> Result<()> {
+    let rows: Vec<(i64, String, String)> = crate::store::meta_value_rows(metadata)
+        .into_iter()
+        .map(|(key, value)| (engram_id, key, value))
+        .collect();
+    insert_meta_rows(conn, &rows).await
+}
+
+/// Insert `(engram id, key, value)` rows into `engram_meta_value`, any number
+/// of engrams' rows per statement, [`INSERT_CHUNK`] rows at a time (three
+/// binds a row, under the 999-parameter ceiling).
+async fn insert_meta_rows(conn: &Connection, rows: &[(i64, String, String)]) -> Result<()> {
+    for batch in rows.chunks(INSERT_CHUNK) {
+        let mut params: Vec<Value> = Vec::with_capacity(batch.len() * 3);
+        for (engram_id, key, value) in batch {
+            params.push(Value::Integer(*engram_id));
+            params.push(Value::Text(key.clone()));
+            params.push(Value::Text(value.clone()));
+        }
+        let sql = format!(
+            "INSERT OR IGNORE INTO engram_meta_value(engram_id, key, value) VALUES {}",
+            value_rows(3, batch.len(), None)
+        );
+        conn.execute(&sql, params).await?;
+    }
+    Ok(())
 }
 
 /// The multi-row observation INSERT for `count` rows, returning each new row's id
@@ -1364,6 +1409,26 @@ impl Store for TursoStore {
         Ok(rows
             .iter()
             .filter_map(|r| Some((cell_text(r, 0)?, DomainId(cell_i64(r, 1)?))))
+            .collect())
+    }
+
+    async fn meta_values(&self) -> Result<Vec<(EngramId, String, String)>> {
+        // TEXT sorts byte-wise here, as in `domain_spellings`.
+        let rows = query_all(
+            &self.conn,
+            "SELECT engram_id, key, value FROM engram_meta_value ORDER BY engram_id, key, value",
+            Vec::new(),
+        )
+        .await?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| {
+                Some((
+                    EngramId(cell_i64(r, 0)?),
+                    cell_text(r, 1)?,
+                    cell_text(r, 2)?,
+                ))
+            })
             .collect())
     }
 
@@ -1810,6 +1875,7 @@ impl Store for TursoStore {
             "DELETE FROM observation_tag WHERE observation_id IN \
              (SELECT o.id FROM observation o JOIN engram e ON e.id=o.engram_id WHERE e.domain_id=?1)",
             "DELETE FROM engram_tag WHERE engram_id IN (SELECT id FROM engram WHERE domain_id=?1)",
+            "DELETE FROM engram_meta_value WHERE engram_id IN (SELECT id FROM engram WHERE domain_id=?1)",
             "DELETE FROM chunk WHERE engram_id IN (SELECT id FROM engram WHERE domain_id=?1)",
             "DELETE FROM observation WHERE engram_id IN (SELECT id FROM engram WHERE domain_id=?1)",
             "DELETE FROM relation WHERE domain_id=?1",

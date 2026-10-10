@@ -13,8 +13,9 @@
 //! the domain is registered under another name. `E010` is the one parse
 //! failure with a name of its own: a frontmatter key held more than once,
 //! reported per key with its lines when removing the later copies is all the
-//! file needs (everything else that does not parse stays `E001`).
+//! file needs (everything else that does not parse stays `E001`), and
 //! `crystalline doctor --fix` removes the extra copies when they all agree.
+//! `E011` warns about a key or value too large for the metadata index.
 //!
 //! `E009` is the odd one out twice over: it is about paths rather than
 //! frontmatter, and it is domain-scoped rather than per-file, so it runs from
@@ -23,9 +24,12 @@
 //! document's path collides with it.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use crate::address::slugify;
-use crate::engram::RECOMMENDED_TYPES;
+use crate::engram::{
+    Frontmatter, META_KEY_MAX_BYTES, META_VALUE_MAX_BYTES, RECOMMENDED_TYPES, meta_value_text,
+};
 use crate::frontmatter::{DuplicateKey, duplicate_keys, keep_first_copies, line_list};
 use crate::parse::{ParseError, parse_engram};
 
@@ -204,6 +208,8 @@ pub(crate) fn check(file: &ScannedFile, domain_name: &str, sink: &mut Sink) {
         );
     }
 
+    check_index_limits(&file.path, fm, sink);
+
     for tag in &fm.tags {
         if !crate::tags::is_lower_hyphen(tag) {
             sink.emit(
@@ -214,6 +220,60 @@ pub(crate) fn check(file: &ScannedFile, domain_name: &str, sink: &mut Sink) {
                 format!("tag `{tag}` is not lowercase-with-hyphens"),
                 None,
             );
+        }
+    }
+}
+
+/// `E011`: a frontmatter key or value the metadata index cannot hold. The
+/// index drops a key over [`META_KEY_MAX_BYTES`] and a value whose compact
+/// JSON text is over [`META_VALUE_MAX_BYTES`], so a `$contains` filter never
+/// finds either. The walk is [`Frontmatter::index_metadata`], so the rule
+/// fires for exactly the keys that would get rows, and a value is measured
+/// with [`meta_value_text`], byte for byte the way the index does.
+pub(crate) fn check_index_limits(path: &Path, fm: &Frontmatter, sink: &mut Sink) {
+    let too_long = |value: &serde_json::Value| meta_value_text(value).is_none();
+    for (key, value) in &fm.index_metadata() {
+        if key.len() > META_KEY_MAX_BYTES {
+            sink.emit(
+                path,
+                None,
+                "E011",
+                Severity::Warning,
+                format!(
+                    "frontmatter key `{key}` is longer than {META_KEY_MAX_BYTES} bytes, so the metadata index skips it and a $contains filter cannot find it"
+                ),
+                Some("use a shorter key".into()),
+            );
+            continue;
+        }
+        let over =
+            format!("over {META_VALUE_MAX_BYTES} bytes, so a $contains filter cannot find it");
+        let fix = Some("shorten the value, or keep long text in the body".to_string());
+        match value {
+            serde_json::Value::Object(_) => {}
+            serde_json::Value::Array(items) => {
+                for (i, item) in items.iter().enumerate() {
+                    if !item.is_array() && !item.is_object() && too_long(item) {
+                        sink.emit(
+                            path,
+                            None,
+                            "E011",
+                            Severity::Warning,
+                            format!("frontmatter key `{key}` element {} is {over}", i + 1),
+                            fix.clone(),
+                        );
+                    }
+                }
+            }
+            scalar if too_long(scalar) => sink.emit(
+                path,
+                None,
+                "E011",
+                Severity::Warning,
+                format!("frontmatter key `{key}` is {over}"),
+                fix,
+            ),
+            _ => {}
         }
     }
 }
@@ -482,5 +542,84 @@ mod tests {
         let source = "---\ntype: engram\ntitle: \"Alpha\nstatus: a\nstatus: a\n---\n\nBody.\n";
         let rules: Vec<&str> = document_findings(source).iter().map(|i| i.rule).collect();
         assert_eq!(rules, ["E001"]);
+    }
+
+    fn with_extra(line: &str) -> String {
+        format!(
+            "---\ntype: engram\ntitle: Alpha\ndomain_name: eng\npermalink: alpha\nstatus: stable\n{line}\n---\n\nBody.\n"
+        )
+    }
+
+    fn e011(source: &str) -> Vec<Issue> {
+        document_findings(source)
+            .into_iter()
+            .filter(|i| i.rule == "E011")
+            .collect()
+    }
+
+    #[test]
+    fn a_key_over_256_bytes_is_one_e011_naming_it() {
+        let key = "k".repeat(257);
+        let found = e011(&with_extra(&format!("{key}: x")));
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert_eq!(found[0].severity, Severity::Warning);
+        assert!(found[0].message.contains(&format!("`{key}`")));
+        assert!(found[0].message.contains("longer than 256 bytes"));
+    }
+
+    #[test]
+    fn a_custom_value_over_1024_bytes_is_one_e011() {
+        let found = e011(&with_extra(&format!("note: {}", "v".repeat(1100))));
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert!(found[0].message.contains("`note`"));
+        assert!(
+            found[0]
+                .message
+                .contains("over 1024 bytes, so a $contains filter cannot find it")
+        );
+        assert_eq!(
+            found[0].fix.as_deref(),
+            Some("shorten the value, or keep long text in the body")
+        );
+    }
+
+    #[test]
+    fn one_long_list_element_is_one_e011_naming_its_position() {
+        let source = with_extra(&format!(
+            "refs:\n  - short\n  - {}\n  - tiny",
+            "v".repeat(1100)
+        ));
+        let found = e011(&source);
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert!(found[0].message.contains("`refs` element 2 "), "{found:#?}");
+    }
+
+    #[test]
+    fn a_promoted_key_over_1kb_gets_no_e011() {
+        let source = format!(
+            "---\ntype: engram\ntitle: {}\ndomain_name: eng\npermalink: alpha\nstatus: stable\n---\n\nBody.\n",
+            "t".repeat(1500)
+        );
+        assert!(e011(&source).is_empty());
+    }
+
+    #[test]
+    fn a_value_exactly_at_the_limit_gets_nothing() {
+        // The compact JSON text carries two quote marks.
+        let value = "v".repeat(META_VALUE_MAX_BYTES - 2);
+        assert!(e011(&with_extra(&format!("note: {value}"))).is_empty());
+        let key = "k".repeat(META_KEY_MAX_BYTES);
+        assert!(e011(&with_extra(&format!("{key}: x"))).is_empty());
+        let over = "v".repeat(META_VALUE_MAX_BYTES - 1);
+        assert_eq!(e011(&with_extra(&format!("note: {over}"))).len(), 1);
+    }
+
+    #[test]
+    fn e011_can_be_turned_off_in_the_domain_config() {
+        let found = e011(&with_extra(&format!("note: {}", "v".repeat(1100))));
+        let mut cfg = crate::config::VerifyConfig::default();
+        cfg.rules.insert("E011".to_string(), "off".to_string());
+        assert!(crate::verify::apply_overrides(found.clone(), Some(&cfg)).is_empty());
+        assert_eq!(crate::verify::apply_overrides(found, None).len(), 1);
     }
 }

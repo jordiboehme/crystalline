@@ -17,8 +17,9 @@ use crate::store::{
     CURRENT_STATUS_CLASS, DEFAULT_RETIRED_WEIGHT, DEFAULT_SALIENCE_WEIGHT, EdgeKind,
     EmbeddingCoverage, EngramId, FilterOp, GraphEdge, GraphNode, GraphSlice, HitKind,
     MetadataFilter, Page, SearchHit, SearchMode, SearchOrder, SearchQuery, is_current_status,
-    link_frontier_sql, relation_frontier_sql, retired_factor, salience_prior,
+    link_frontier_sql, meta_value_union_sql, relation_frontier_sql, retired_factor, salience_prior,
 };
+use crystalline_core::{META_KEY_MAX_BYTES, meta_value_text};
 
 use super::{
     cell_i64, cell_real, cell_text, like_escape, path_prefix_like, query_all, query_first,
@@ -357,10 +358,7 @@ async fn filter_only(
 ) -> Result<Page<SearchHit>> {
     let total = scalar_i64(
         conn,
-        &format!(
-            "SELECT count(*) FROM engram e JOIN domain d ON d.id=e.domain_id \
-             WHERE {actor_screen} {and_filters}"
-        ),
+        &filter_only_count_sql(actor_screen, and_filters),
         params.clone(),
     )
     .await?
@@ -657,6 +655,17 @@ pub fn filter_only_sql(
     )
 }
 
+/// The count a filter-only page runs first, with the same filters. Built here
+/// so the plan pins explain the statement this store issues: it has no
+/// `ORDER BY` and no `LIMIT`, so turso can plan it differently from the page.
+#[doc(hidden)]
+pub fn filter_only_count_sql(actor_screen: &str, and_filters: &str) -> String {
+    format!(
+        "SELECT count(*) FROM engram e JOIN domain d ON d.id=e.domain_id \
+         WHERE {actor_screen} {and_filters}"
+    )
+}
+
 /// The lexical candidate prefilter: every row matching the reader's terms and
 /// filters, capped, ranked afterwards in Rust.
 ///
@@ -666,7 +675,10 @@ pub fn filter_only_sql(
 /// `d.name IN (...)` drives the join from `domain` and reaches `engram`
 /// through `idx_engram_domain`, whose order is not rowid order - and what
 /// holds that sorter down is the `LIMIT` in this same statement, which lets
-/// turso keep `candidate_cap` records rather than the match set. Both
+/// turso keep `candidate_cap` records rather than the match set. With a
+/// `$contains` filter the scope is `+d.name` instead (see
+/// [`domain_scope_sql`]), and the join is driven from `engram_meta_value`,
+/// with `engram` read by primary key. Both
 /// properties are pinned by `EXPLAIN QUERY PLAN` beside this builder
 /// ([`the_lexical_candidate_scan_stays_index_ordered_under_a_folder_filter`])
 /// and by a source scan in `tests/it/turso_only.rs`. Keep the bound and keep the
@@ -873,6 +885,9 @@ fn build_scalar_filters(
     n: &mut usize,
     aliases: &AliasMap,
 ) {
+    // Where the domain scope sits in `clauses`, and its placeholders, so it
+    // can be respelled once the metadata filters are known.
+    let mut scope: Option<(usize, String)> = None;
     if let Some(domains) = &query.domains
         && !domains.is_empty()
     {
@@ -885,7 +900,8 @@ fn build_scalar_filters(
                 p
             })
             .collect();
-        clauses.push(format!("d.name IN ({})", ph.join(",")));
+        scope = Some((clauses.len(), ph.join(",")));
+        clauses.push(domain_scope_sql(&ph.join(","), false));
     }
 
     // A folder filter, matched as a literal prefix: the caller hands the folder
@@ -953,28 +969,60 @@ fn build_scalar_filters(
             // One EXISTS per requested tag (require-ALL preserved), each matching
             // the tag's whole alias equivalence class via an IN list (OR within
             // the class). The class is sorted, so the binding order is stable.
-            clauses.push(tag_class_exists(&tag.to_lowercase(), aliases, params, n));
+            clauses.push(tag_class_exists(&[tag.to_lowercase()], aliases, params, n));
         }
     }
 
+    let mut side_table = false;
     for f in &query.metadata_filters {
-        if let Some(clause) = metadata_clause(f, params, n, aliases) {
+        if let Some(clause) = metadata_clause(f, params, n, aliases, &mut side_table) {
             clauses.push(clause);
         }
     }
+    if side_table && let Some((at, list)) = scope {
+        clauses[at] = domain_scope_sql(&list, true);
+    }
 }
 
-/// An `EXISTS` matching an engram that carries any member of a folded tag's
-/// alias equivalence class. Tag identity is case-folded in the index, so the
-/// class members (already folded) match `tag.name` directly. When the map is
-/// empty the class is the tag alone, so this is a one-placeholder `IN`.
+/// The domain scope of a search, over the caller's placeholders.
+///
+/// `d.name IN (...)` lets turso start from `domain` by name and reach
+/// `engram` through `idx_engram_domain`, which a scoped listing needs. With a
+/// `$contains` or `$contains_any` filter that reads `engram_meta_value`, that
+/// same path is the wrong one: turso has no table statistics, so from about
+/// ten matched values on it judged a walk of the whole domain cheaper than
+/// the primary-key probes from the side table, for the page and for the count
+/// (168 ms for 100 values over a 50,000-engram domain). `+d.name` is the same
+/// test with the name index taken out of the planner's choice, so the side
+/// table drives the join and `domain` is checked by primary key on each hit.
+#[doc(hidden)]
+pub fn domain_scope_sql(list: &str, side_table_drives: bool) -> String {
+    if side_table_drives {
+        format!("+d.name IN ({list})")
+    } else {
+        format!("d.name IN ({list})")
+    }
+}
+
+/// An `EXISTS` matching an engram that carries any member of the alias
+/// equivalence classes of the folded tags, as one flat `IN` over the union of
+/// the classes without duplicates. Tag identity is case-folded in the index,
+/// so the class members (already folded) match `tag.name` directly. One
+/// `EXISTS` for any number of tags rather than an `OR` of one per tag: turso
+/// refuses an expression tree deeper than 100, and an `OR` chain is one
+/// level per tag.
 fn tag_class_exists(
-    folded: &str,
+    folded: &[String],
     aliases: &AliasMap,
     params: &mut Vec<Value>,
     n: &mut usize,
 ) -> String {
-    let class = aliases.class_of(folded);
+    let mut seen = HashSet::new();
+    let class: Vec<String> = folded
+        .iter()
+        .flat_map(|tag| aliases.class_of(tag))
+        .filter(|member| seen.insert(member.clone()))
+        .collect();
     let ph: Vec<String> = class
         .iter()
         .map(|member| {
@@ -991,40 +1039,46 @@ fn tag_class_exists(
 }
 
 /// Map one metadata filter to a SQL predicate, appending its bound values.
-/// Promoted keys map to columns; everything else to `json_extract`.
+/// Promoted keys map to columns. On any other key, `$contains` and
+/// `$contains_any` read `engram_meta_value` and every other operator reads
+/// `json_extract`.
 fn metadata_clause(
     f: &MetadataFilter,
     params: &mut Vec<Value>,
     n: &mut usize,
     aliases: &AliasMap,
+    side_table: &mut bool,
 ) -> Option<String> {
     let key = f.key.as_str();
 
     if key == "tags" {
         // A `tags` metadata filter folds the same as the dedicated `tags` field:
-        // each value expands to its alias equivalence class.
-        let exists = |val: &serde_json::Value, params: &mut Vec<Value>, n: &mut usize| {
-            tag_class_exists(&fold_tag_value(val), aliases, params, n)
+        // each value expands to its alias equivalence class. A tag is already
+        // one element of the engram's tag list, so `$contains` reads as `$eq`
+        // and `$contains_any` as `$in`. An empty list matches nothing; it used
+        // to emit `()`, which neither dialect parses. Several values are one
+        // `EXISTS` over the union of their classes.
+        let values = match &f.op {
+            FilterOp::Eq(v) | FilterOp::Contains(v) => std::slice::from_ref(v),
+            FilterOp::In(vs) | FilterOp::ContainsAny(vs) => vs.as_slice(),
+            _ => return None,
         };
-        return match &f.op {
-            FilterOp::Eq(v) => Some(exists(v, params, n)),
-            FilterOp::In(vs) => {
-                let parts: Vec<String> = vs.iter().map(|v| exists(v, params, n)).collect();
-                Some(format!("({})", parts.join(" OR ")))
-            }
-            _ => None,
-        };
+        if values.is_empty() {
+            return Some("0".to_string());
+        }
+        let folded: Vec<String> = values.iter().map(fold_tag_value).collect();
+        return Some(tag_class_exists(&folded, aliases, params, n));
     }
 
     let col = match key {
-        "status" => Some("e.status".to_string()),
-        "type" | "engram_type" => Some("e.engram_type".to_string()),
-        "recorded_at" => Some("e.recorded_at".to_string()),
-        "valid_from" => Some("e.valid_from".to_string()),
-        "valid_to" => Some("e.valid_to".to_string()),
-        "timestamp" => Some("e.timestamp".to_string()),
-        "title" => Some("e.title".to_string()),
-        "permalink" => Some("e.permalink".to_string()),
+        "status" => "e.status",
+        "type" | "engram_type" => "e.engram_type",
+        "recorded_at" => "e.recorded_at",
+        "valid_from" => "e.valid_from",
+        "valid_to" => "e.valid_to",
+        "timestamp" => "e.timestamp",
+        "title" => "e.title",
+        "permalink" => "e.permalink",
         _ => {
             if !key
                 .chars()
@@ -1032,11 +1086,23 @@ fn metadata_clause(
             {
                 return None;
             }
-            Some(format!("json_extract(e.metadata, '$.{key}')"))
+            return match &f.op {
+                FilterOp::Contains(v) => {
+                    meta_value_clause(key, std::slice::from_ref(v), params, n, side_table)
+                }
+                FilterOp::ContainsAny(vs) => meta_value_clause(key, vs, params, n, side_table),
+                op => Some(op_clause(
+                    &format!("json_extract(e.metadata, '$.{key}')"),
+                    op,
+                    params,
+                    n,
+                )),
+            };
         }
-    }?;
-
-    Some(op_clause(&col, &f.op, params, n))
+    };
+    // A promoted key holds one value, which counts as a one-element list, so
+    // `op_clause` reads `$contains` as `$eq` and `$contains_any` as `$in`.
+    Some(op_clause(col, &f.op, params, n))
 }
 
 fn op_clause(col: &str, op: &FilterOp, params: &mut Vec<Value>, n: &mut usize) -> String {
@@ -1047,7 +1113,7 @@ fn op_clause(col: &str, op: &FilterOp, params: &mut Vec<Value>, n: &mut usize) -
         p
     };
     match op {
-        FilterOp::Eq(v) => format!("{col} = {}", bind(v, params, n)),
+        FilterOp::Eq(v) | FilterOp::Contains(v) => format!("{col} = {}", bind(v, params, n)),
         FilterOp::Gt(v) => format!("{col} > {}", bind(v, params, n)),
         FilterOp::Gte(v) => format!("{col} >= {}", bind(v, params, n)),
         FilterOp::Lt(v) => format!("{col} < {}", bind(v, params, n)),
@@ -1057,7 +1123,7 @@ fn op_clause(col: &str, op: &FilterOp, params: &mut Vec<Value>, n: &mut usize) -
             let b = bind(hi, params, n);
             format!("{col} BETWEEN {a} AND {b}")
         }
-        FilterOp::In(vs) => {
+        FilterOp::In(vs) | FilterOp::ContainsAny(vs) => {
             if vs.is_empty() {
                 return "0".to_string();
             }
@@ -1065,6 +1131,44 @@ fn op_clause(col: &str, op: &FilterOp, params: &mut Vec<Value>, n: &mut usize) -
             format!("{col} IN ({})", ph.join(","))
         }
     }
+}
+
+/// `$contains` or `$contains_any` on a key that is not promoted: an engram
+/// matches when one of its `engram_meta_value` rows for the key holds one of
+/// `values`. The parser refuses a key that is not plain
+/// ([`crate::parse_metadata_filters`]); a dotted one is still ignored here as
+/// a guard, since the table holds top-level keys only. A key or a value no row can hold (see
+/// `meta_value_text`) cannot match, and with nothing left the filter matches
+/// nothing. `side_table` is set when the predicate reads the side table, so
+/// the domain scope can step aside (see [`domain_scope_sql`]).
+fn meta_value_clause(
+    key: &str,
+    values: &[serde_json::Value],
+    params: &mut Vec<Value>,
+    n: &mut usize,
+    side_table: &mut bool,
+) -> Option<String> {
+    if key.contains('.') {
+        return None;
+    }
+    let encoded: Vec<String> = values.iter().filter_map(meta_value_text).collect();
+    if encoded.is_empty() || key.len() > META_KEY_MAX_BYTES {
+        return Some("0".to_string());
+    }
+    let key_ph = format!("?{n}");
+    params.push(Value::Text(key.to_string()));
+    *n += 1;
+    let value_phs: Vec<String> = encoded
+        .into_iter()
+        .map(|text| {
+            let p = format!("?{n}");
+            params.push(Value::Text(text));
+            *n += 1;
+            p
+        })
+        .collect();
+    *side_table = true;
+    Some(meta_value_union_sql(&key_ph, &value_phs))
 }
 
 /// Fold a `tags` filter value to the lowercase string used for alias expansion
@@ -1681,6 +1785,55 @@ mod tests {
             "e.id, d.name, e.permalink, e.title, e.engram_type, e.status, \
      e.description, COALESCE(ec.content, ''), CAST(json_extract(e.metadata, '$.salience') AS REAL)"
         );
+    }
+
+    /// `build_scalar_filters` spells the domain scope `+d.name` only when a
+    /// filter really reads `engram_meta_value`, and the plain `d.name` that
+    /// keeps the domain index in every other case: no metadata filter, `$eq`,
+    /// `tags`, a dotted key on `$eq`, and a filter that is the constant false because
+    /// no row can hold its value. The plan pins build their scope by hand, so
+    /// this is what ties the store's choice of spelling to a test.
+    #[test]
+    fn the_domain_scope_steps_aside_only_for_a_side_table_filter() {
+        let scope_of = |filters: serde_json::Value| -> String {
+            let query = SearchQuery {
+                domains: Some(vec!["d".to_string()]),
+                metadata_filters: crate::store::parse_metadata_filters(&filters).unwrap(),
+                ..SearchQuery::default()
+            };
+            let mut clauses: Vec<String> = Vec::new();
+            let mut params: Vec<Value> = Vec::new();
+            let mut n = 1usize;
+            build_scalar_filters(
+                &query,
+                &mut clauses,
+                &mut params,
+                &mut n,
+                &crate::alias::AliasMap::default(),
+            );
+            clauses[0].clone()
+        };
+
+        assert_eq!(
+            scope_of(serde_json::json!({ "sources": { "$contains": "a" } })),
+            "+d.name IN (?1)"
+        );
+        assert_eq!(
+            scope_of(serde_json::json!({ "sources": { "$contains_any": ["a", "b"] } })),
+            "+d.name IN (?1)"
+        );
+        let long = "x".repeat(3000);
+        for filters in [
+            serde_json::json!({}),
+            serde_json::json!({ "sources": { "$eq": "a" } }),
+            serde_json::json!({ "tags": { "$contains": "a" } }),
+            serde_json::json!({ "a.b": { "$eq": "a" } }),
+            serde_json::json!({ "sources": { "$contains": long } }),
+            serde_json::json!({ "sources": { "$contains_any": [] } }),
+            serde_json::json!({ "title": { "$contains": "a" } }),
+        ] {
+            assert_eq!(scope_of(filters.clone()), "d.name IN (?1)", "{filters}");
+        }
     }
 
     /// The lexical candidate scan keeps its index order under a folder filter.

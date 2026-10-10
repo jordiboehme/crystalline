@@ -877,7 +877,9 @@ pub(crate) fn print_origin_add(repo: &str, data: &serde_json::Value, json: bool)
 /// layers also says where it sits, through [`stack_line`]; a share that also
 /// carried refreshed folder listings says so in one line of its own, through
 /// [`change_count_lines`]. A direct domain's commit is reported with its
-/// branch and page (`committed`), and so are the three direct refusals: a
+/// branch and page (`committed`), a share that fell back to a proposal (or a
+/// direct commit that works again) adds the receipt's `note` under its first
+/// line, and so are the three direct refusals: a
 /// proposal still open, a branch whose rules refuse the commit, a branch that
 /// moved twice.
 pub(crate) fn print_origin_share(domain: &str, data: &serde_json::Value, json: bool) {
@@ -901,6 +903,9 @@ pub(crate) fn origin_share_lines(domain: &str, data: &serde_json::Value) -> Vec<
                 "Opened proposal: {}",
                 data["url"].as_str().unwrap_or("")
             ));
+            if let Some(note) = data["note"].as_str() {
+                lines.push(format!("  {note}"));
+            }
             if let Some(summary) = data["summary"].as_str() {
                 lines.push(format!("  {summary}"));
             }
@@ -934,6 +939,9 @@ pub(crate) fn origin_share_lines(domain: &str, data: &serde_json::Value) -> Vec<
                 "Committed to {}: {at}",
                 data["branch"].as_str().unwrap_or("")
             ));
+            if let Some(note) = data["note"].as_str() {
+                lines.push(format!("  {note}"));
+            }
             if let Some(summary) = data["summary"].as_str() {
                 lines.push(format!("  {summary}"));
             }
@@ -948,13 +956,16 @@ pub(crate) fn origin_share_lines(domain: &str, data: &serde_json::Value) -> Vec<
                 prop["url"].as_str().unwrap_or("")
             ));
         }
-        "branch_protected" => {
-            lines.push(format!(
-                "Cannot commit to {}: {} Set sharing: proposal in the MANIFEST, or ask a repository admin.",
+        // With no proposal on offer (another person's proposal is open), the
+        // engine's own sentence says what to do, and it is shown as given.
+        "branch_protected" => match (data["fallback"].as_str(), data["guidance"].as_str()) {
+            (None, Some(guidance)) => lines.push(guidance.to_string()),
+            _ => lines.push(format!(
+                "The branch {} does not accept direct commits from you ({}). Share the same changes as a proposal instead: crystalline origin share {domain} --proposal.",
                 data["branch"].as_str().unwrap_or(""),
                 data["message"].as_str().unwrap_or("")
-            ));
-        }
+            )),
+        },
         "branch_moved" => {
             lines.push(format!(
                 "The branch {} moved while sharing; run: crystalline origin update --domain {domain} and share again.",
@@ -3842,12 +3853,18 @@ mod origin_share_tests {
         );
         let protected = origin_share_lines(
             "kb",
-            &json!({ "outcome": "branch_protected", "branch": "main", "message": "Changes must be made through a pull request.", "guidance": "g" }),
+            &json!({ "outcome": "branch_protected", "branch": "main", "message": "Changes must be made through a pull request.", "guidance": "g", "fallback": "proposal" }),
         );
         assert_eq!(
             protected[0],
-            "Cannot commit to main: Changes must be made through a pull request. Set sharing: proposal in the MANIFEST, or ask a repository admin."
+            "The branch main does not accept direct commits from you (Changes must be made through a pull request.). Share the same changes as a proposal instead: crystalline origin share kb --proposal."
         );
+        let blocked_text = "The branch main does not accept direct commits from you (Changes must be made through a pull request.). Another person's proposal is open on this domain, so share again once it is merged or closed.";
+        let blocked = origin_share_lines(
+            "kb",
+            &json!({ "outcome": "branch_protected", "branch": "main", "message": "Changes must be made through a pull request.", "guidance": blocked_text }),
+        );
+        assert_eq!(blocked[0], blocked_text, "no proposal is offered");
         let moved = origin_share_lines(
             "kb",
             &json!({ "outcome": "branch_moved", "branch": "main", "guidance": "g" }),
@@ -3856,6 +3873,28 @@ mod origin_share_tests {
             moved[0],
             "The branch main moved while sharing; run: crystalline origin update --domain kb and share again."
         );
+    }
+
+    #[test]
+    fn a_fallback_and_a_direct_commit_that_works_again_say_so() {
+        let fell_back = origin_share_lines(
+            "kb",
+            &json!({ "outcome": "proposed", "url": "https://github.com/acme/kb/pull/9", "number": 9, "summary": "Share 1 new engram", "fell_back": true, "note": "The branch main does not accept direct commits from you, so this share opened a proposal." }),
+        );
+        assert_eq!(
+            fell_back[0],
+            "Opened proposal: https://github.com/acme/kb/pull/9"
+        );
+        assert_eq!(
+            fell_back[1],
+            "  The branch main does not accept direct commits from you, so this share opened a proposal."
+        );
+        let works = origin_share_lines(
+            "kb",
+            &json!({ "outcome": "committed", "sha": "9f2c1a7deadbeef", "url": null, "branch": "main", "summary": "Share 1 new engram", "note": "Direct commits to main work for you now." }),
+        );
+        assert_eq!(works[0], "Committed to main: 9f2c1a7");
+        assert_eq!(works[1], "  Direct commits to main work for you now.");
     }
 }
 

@@ -1634,12 +1634,13 @@ async fn origin_status_names_why_and_what_kept_a_branch() {
 /// The keys one domain entry carries when nobody asked for detail. Pinned as a
 /// list rather than spot-checked so an accidental `detail: null` - a key that
 /// costs every reader something and says nothing - fails here.
-const STATUS_KEYS_WITHOUT_DETAIL: [&str; 20] = [
+const STATUS_KEYS_WITHOUT_DETAIL: [&str; 21] = [
     "base_commit",
     "behind",
     "branch",
     "conflicts",
     "declined_proposals",
+    "direct_refused",
     "direct_shares",
     "domain",
     "kept_branches",
@@ -2431,15 +2432,23 @@ async fn a_direct_preview_names_the_commit_and_an_open_proposal_refuses_it() {
             .contains("merge or withdraw proposal #4 first")
     );
 
-    let refused = eng
+    // An own open proposal named on a direct domain goes the proposal path
+    // rather than being refused: there is a proposal to amend. Proposal #4's
+    // branch was never pushed to the forge, so that path settles it and
+    // opens a fresh proposal with the change.
+    let amended = eng
         .origin_share("brand", None, None, Some(4), None, ShareActor::Owner)
-        .await
-        .unwrap_err();
+        .await;
     assert!(
-        refused
-            .to_string()
-            .contains("there is no proposal to amend"),
-        "{refused}"
+        !format!("{amended:?}").contains("there is no proposal to amend"),
+        "{amended:?}"
+    );
+    let amended = amended.unwrap();
+    assert_eq!(amended["outcome"], "proposed", "{amended}");
+    assert_eq!(
+        amended["added"],
+        serde_json::json!(["notes/new.md"]),
+        "{amended}"
     );
 }
 
@@ -2447,7 +2456,7 @@ async fn a_direct_preview_names_the_commit_and_an_open_proposal_refuses_it() {
 async fn a_protected_branch_answers_branch_protected_through_the_engine() {
     let tmp = tempfile::tempdir().unwrap();
     let mock = Arc::new(MockProvider::new());
-    let (eng, _root, _origins_dir) = direct_team(&tmp, mock.clone()).await;
+    let (eng, _root, origins_dir) = direct_team(&tmp, mock.clone()).await;
     mock.protect_branch("main", "Changes must be made through a pull request.");
     let result = eng
         .origin_share("brand", None, None, None, None, ShareActor::Owner)
@@ -2463,7 +2472,183 @@ async fn a_protected_branch_answers_branch_protected_through_the_engine() {
         result["guidance"]
             .as_str()
             .unwrap()
-            .contains("sharing: proposal")
+            .contains("share_changes with as_proposal: true")
+    );
+    assert_eq!(result["fallback"], "proposal", "{result}");
+    let state = OriginState::load(&origins_dir.join("brand"))
+        .unwrap()
+        .unwrap();
+    let refusal = state
+        .direct_refusal_for(Some("instance-gh"))
+        .expect("recorded for the login the share went out on");
+    assert_eq!(refusal.branch, "main");
+}
+
+/// A status shows the refusal of the caller's own login and nobody else's,
+/// and none at all once the domain opens proposals.
+#[tokio::test]
+async fn the_status_shows_the_callers_own_refusal_and_not_on_a_proposal_domain() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let (eng, root, origins_dir) = direct_team(&tmp, mock.clone()).await;
+    let state_dir = origins_dir.join("brand");
+    let mut state = OriginState::load(&state_dir).unwrap().unwrap();
+    state.record_direct_refusal(crystalline_remote::state::DirectRefusal {
+        login: Some("alice".to_string()),
+        branch: "main".to_string(),
+        message: "Changes must be made through a pull request.".to_string(),
+        refused_at: chrono::Utc::now(),
+    });
+    state.save(&state_dir).unwrap();
+    let refused = |status: &serde_json::Value| status["domains"][0]["direct_refused"].clone();
+    let status = eng
+        .origin_status(Some("brand"), false, false, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(
+        refused(&status),
+        serde_json::Value::Null,
+        "Alice's, not ours: {status}"
+    );
+
+    mock.protect_branch("main", "Changes must be made through a pull request.");
+    eng.origin_share("brand", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    let status = eng
+        .origin_status(Some("brand"), false, false, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(
+        refused(&status)["line"],
+        "Direct commits to main are refused for you, so your shares go as proposals.",
+        "{status}"
+    );
+    assert_eq!(
+        OriginState::load(&state_dir)
+            .unwrap()
+            .unwrap()
+            .direct_refused
+            .len(),
+        2
+    );
+
+    let manifest = String::from_utf8(manifest_sharing_direct())
+        .unwrap()
+        .replace("sharing: direct", "sharing: proposal");
+    std::fs::write(root.join("MANIFEST.md"), manifest).unwrap();
+    let status = eng
+        .origin_status(Some("brand"), false, false, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(status["domains"][0]["sharing"], "proposal", "{status}");
+    assert_eq!(refused(&status), serde_json::Value::Null, "{status}");
+}
+
+/// The fallback through the engine: the first refusal offers a proposal, the
+/// status line and the preview name it, and the next refused share opens a
+/// proposal and says so.
+#[tokio::test]
+async fn a_refused_direct_share_falls_back_and_the_status_says_so() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let (eng, _root, _origins_dir) = direct_team(&tmp, mock.clone()).await;
+    mock.protect_branch("main", "Changes must be made through a pull request.");
+    let first = eng
+        .origin_share("brand", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(first["outcome"], "branch_protected", "{first}");
+    assert_eq!(first["fallback"], "proposal");
+
+    let status = eng
+        .origin_status(Some("brand"), false, false, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(
+        status["domains"][0]["direct_refused"]["line"],
+        "Direct commits to main are refused for you, so your shares go as proposals.",
+        "{status}"
+    );
+    let plan = eng
+        .origin_share_preview(
+            "brand",
+            None,
+            None,
+            None,
+            ShareActor::Owner,
+            PreviewCredential::ActingIdentity,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        plan["note"],
+        "This share tries a direct commit first. If the branch refuses it again, it opens a proposal.",
+        "{plan}"
+    );
+
+    let second = eng
+        .origin_share("brand", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(second["outcome"], "proposed", "{second}");
+    assert_eq!(second["fell_back"], true);
+    assert_eq!(
+        second["note"],
+        "The branch main does not accept direct commits from you, so this share opened a proposal."
+    );
+}
+
+/// A direct commit that lands after a refusal clears it and says so.
+#[tokio::test]
+async fn a_direct_commit_that_lands_after_a_refusal_says_direct_works_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let (eng, _root, _origins_dir) = direct_team(&tmp, mock.clone()).await;
+    mock.protect_branch("main", "Changes must be made through a pull request.");
+    eng.origin_share("brand", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    mock.unprotect_branch("main");
+    let landed = eng
+        .origin_share("brand", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(landed["outcome"], "committed", "{landed}");
+    assert_eq!(landed["note"], "Direct commits to main work for you now.");
+    let status = eng
+        .origin_status(Some("brand"), false, false, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(
+        status["domains"][0]["direct_refused"],
+        serde_json::Value::Null
+    );
+}
+
+#[tokio::test]
+async fn as_proposal_opens_a_proposal_through_the_engine() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let (eng, _root, _origins_dir) = direct_team(&tmp, mock.clone()).await;
+    let shared = eng
+        .origin_share_with(
+            "brand",
+            None,
+            None,
+            None,
+            None,
+            Some(true),
+            ShareActor::Owner,
+        )
+        .await
+        .unwrap();
+    assert_eq!(shared["outcome"], "proposed", "{shared}");
+    assert!(
+        !mock
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("update_branch:main:"))
     );
 }
 
@@ -2991,9 +3176,10 @@ async fn a_403_on_a_personal_share_teaches_the_collaborator_requirement() {
         .origin_share("kb", None, None, None, None, ShareActor::Owner)
         .await
         .expect_err("the forge refuses this one too");
-    assert!(
-        !err.to_string().contains("collaborator"),
-        "an instance-token failure keeps its own words: {err}"
+    assert_eq!(
+        err.to_string(),
+        "Your GitHub account cannot write to acme/kb, so neither a direct commit nor a proposal can be made. Ask the repository's admins for write access.",
+        "an instance-token failure says the account cannot write the repository"
     );
 }
 

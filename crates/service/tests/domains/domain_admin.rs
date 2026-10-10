@@ -1107,3 +1107,54 @@ async fn validate_honours_the_domains_rule_overrides() {
     assert!(t001.iter().all(|i| i["severity"] == "warning"), "{report}");
     assert!(issues.iter().all(|i| i["kind"] != "T002"), "{report}");
 }
+
+/// validate_engrams reports E011 for a custom field the metadata index cannot
+/// hold, and a domain override turns it off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn validate_warns_about_frontmatter_the_index_cannot_hold() {
+    let (tmp, engine) = engine().await;
+    let long = format!(
+        "---\ntype: engram\ntitle: Gamma\npermalink: gamma\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-01-01\nnote: {}\n---\n\n# Gamma\n\nBody.\n",
+        "v".repeat(1100)
+    );
+    std::fs::write(tmp.path().join("eng/gamma.md"), long).unwrap();
+    engine.sync(None).await.unwrap();
+    let params = ValidateParams {
+        domain: "eng".to_string(),
+        identifier: None,
+        engram_type: None,
+        drift: false,
+    };
+
+    let report = engine
+        .validate_engrams(&params, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    let e011: Vec<_> = report["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["kind"] == "E011")
+        .collect();
+    assert_eq!(e011.len(), 1, "{report}");
+    assert_eq!(e011[0]["severity"], "warning");
+    assert!(e011[0]["message"].as_str().unwrap().contains("`note`"));
+
+    std::fs::write(
+        tmp.path().join("eng/.crystalline.yaml"),
+        "verify:\n  rules:\n    E011: off\n",
+    )
+    .unwrap();
+    let report = engine
+        .validate_engrams(&params, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert!(
+        report["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|i| i["kind"] != "E011"),
+        "{report}"
+    );
+}

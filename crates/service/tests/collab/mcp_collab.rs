@@ -2070,6 +2070,50 @@ async fn share_changes_commits_on_a_direct_domain_and_refuses_under_an_open_prop
     );
 }
 
+/// share_changes takes as_proposal, and on a direct domain it opens a
+/// proposal instead of committing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn share_changes_with_as_proposal_opens_a_proposal_on_a_direct_domain() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest_sharing_direct())]));
+    mock.set_branch("main", &commit);
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("brand-knowledge");
+    let eng = Arc::new(engine_with_provider(&config_path, &origins_dir, mock.clone()).await);
+    eng.origin_add(
+        "acme/brand-knowledge",
+        Some("brand"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+    std::fs::create_dir_all(root.join("notes")).unwrap();
+    std::fs::write(
+        root.join("notes/new.md"),
+        engram("New", "new", "brand new content"),
+    )
+    .unwrap();
+    let (client, _server) = connect(eng).await;
+    let out = call(
+        client.peer(),
+        "share_changes",
+        json!({ "domain": "brand", "as_proposal": true }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out["outcome"], json!("proposed"), "{out}");
+    assert!(
+        !mock
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("update_branch:main:"))
+    );
+}
+
 /// A team-domain engine with one engram edited beside the base copy and one
 /// new file, ready for a discard: returns the engine, the domain root and the
 /// base bytes of the edited engram.

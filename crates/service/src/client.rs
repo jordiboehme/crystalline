@@ -1726,22 +1726,26 @@ pub async fn origin_status(
 /// The standalone path shares as [`ShareActor::Owner`], as the three write
 /// verbs below do: a CLI invocation has no account behind it, so the machine
 /// owner is who it is, not a placeholder for one.
+#[allow(clippy::too_many_arguments)]
 pub async fn origin_share(
     domain: &str,
     title: Option<&str>,
     description: Option<&str>,
     proposal: Option<u64>,
     files: Option<&[String]>,
+    as_proposal: Option<bool>,
     db: Option<&Path>,
     config_path: Option<&Path>,
 ) -> anyhow::Result<Value> {
-    use serde_json::json;
     if use_daemon(db, config_path)
-        && let Some(data) = ctl_if_running(json!({
-            "v": 1, "cmd": "origin_share", "domain": domain,
-            "title": title, "description": description, "proposal": proposal,
-            "files": files,
-        }))
+        && let Some(data) = ctl_if_running(origin_share_request(
+            domain,
+            title,
+            description,
+            proposal,
+            files,
+            as_proposal,
+        ))
         .await?
     {
         return Ok(data);
@@ -1751,15 +1755,35 @@ pub async fn origin_share(
     let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
     let domain = localize_standalone(&engine, domain).await;
     Ok(engine
-        .origin_share(
+        .origin_share_with(
             &domain,
             title,
             description,
             proposal,
             files,
+            as_proposal,
             ShareActor::Owner,
         )
         .await?)
+}
+
+/// The control-socket request [`origin_share`] sends, built in one place so
+/// the daemon's reader (`control::share_request`) is tested against exactly
+/// these keys: a key spelled differently on one side would read as absent,
+/// and an absent `as_proposal` lets a share commit directly.
+pub(crate) fn origin_share_request(
+    domain: &str,
+    title: Option<&str>,
+    description: Option<&str>,
+    proposal: Option<u64>,
+    files: Option<&[String]>,
+    as_proposal: Option<bool>,
+) -> Value {
+    serde_json::json!({
+        "v": 1, "cmd": "origin_share", "domain": domain,
+        "title": title, "description": description, "proposal": proposal,
+        "files": files, "as_proposal": as_proposal,
+    })
 }
 
 /// Withdraw a share proposal for one team domain: over the daemon when one

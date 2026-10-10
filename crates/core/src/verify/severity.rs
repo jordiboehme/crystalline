@@ -21,6 +21,12 @@ pub(crate) fn parse_word(word: &str) -> Option<Option<Severity>> {
     }
 }
 
+/// Whether `word` is a severity a `.crystalline.yaml` override may carry:
+/// `off`, `error`, `warning`, `info` or one of their short forms, any case.
+pub fn is_severity_word(word: &str) -> bool {
+    parse_word(word).is_some()
+}
+
 pub(crate) fn resolve(
     rule: &str,
     default: Severity,

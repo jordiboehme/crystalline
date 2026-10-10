@@ -3853,6 +3853,123 @@ async fn search_hits_carry_tags(store: &dyn Store) {
 }
 parity!(search_hits_carry_their_engram_tags, search_hits_carry_tags);
 
+/// One engram's `engram_meta_value` rows, as `(key, value)`.
+async fn meta_rows_of(store: &dyn Store, id: EngramId) -> Vec<(String, String)> {
+    store
+        .meta_values()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|(e, _, _)| *e == id)
+        .map(|(_, k, v)| (k, v))
+        .collect()
+}
+
+async fn meta_row_count(store: &dyn Store) -> usize {
+    store.meta_values().await.unwrap().len()
+}
+
+/// The `engram_meta_value` rows follow every write an engram's tag rows
+/// follow: an insert, an update, a draft, a dropped draft, a delete, a
+/// cleared domain and a wipe. Turso does not enforce foreign keys, so each of
+/// these is a delete written by hand there; on Postgres the cascade hides a
+/// missing delete on a removal but not on an update. Both backends must hold
+/// byte for byte the same text.
+async fn meta_value_rows_follow_every_write(store: &dyn Store) {
+    let domain = store
+        .upsert_domain("d", Some("/tmp/d"), DomainKind::File)
+        .await
+        .unwrap();
+    let mut rec = record("a.md", "a", "body", "sha");
+    rec.metadata = serde_json::json!({
+        "sources": ["notedown://a/1#b1", "notedown://a/1#b2", "notedown://a/1#b1"],
+        "pages": [3, "3"],
+        "flag": true,
+        "verified": [{"by": "jordi", "at": "2026-01-01T00:00:00Z"}],
+        "summary": "x".repeat(2000),
+    });
+    let id = store.upsert_engram(domain, &rec).await.unwrap();
+    assert_eq!(
+        meta_rows_of(store, id).await,
+        vec![
+            ("flag".to_string(), "true".to_string()),
+            ("pages".to_string(), "\"3\"".to_string()),
+            ("pages".to_string(), "3".to_string()),
+            ("sources".to_string(), "\"notedown://a/1#b1\"".to_string()),
+            ("sources".to_string(), "\"notedown://a/1#b2\"".to_string()),
+        ],
+        "one row per element and per scalar; no row for a list of objects or a long text"
+    );
+
+    rec.metadata = serde_json::json!({ "sources": ["notedown://a/2#b1"] });
+    rec.stamp.sha256 = "sha2".to_string();
+    assert_eq!(store.upsert_engram(domain, &rec).await.unwrap(), id);
+    assert_eq!(
+        meta_rows_of(store, id).await,
+        vec![("sources".to_string(), "\"notedown://a/2#b1\"".to_string())],
+        "an update replaces the rows"
+    );
+
+    let mut draft = rec.clone();
+    draft.metadata = serde_json::json!({ "sources": ["notedown://a/3#b1"] });
+    let draft_id = store.upsert_overlay(domain, "alice", &draft).await.unwrap();
+    assert_ne!(draft_id, id, "a draft is a row of its own");
+    assert_eq!(
+        meta_rows_of(store, draft_id).await,
+        vec![("sources".to_string(), "\"notedown://a/3#b1\"".to_string())]
+    );
+    draft.metadata = serde_json::json!({ "sources": ["notedown://a/4#b1"] });
+    draft.stamp.sha256 = "sha3".to_string();
+    assert_eq!(
+        store.upsert_overlay(domain, "alice", &draft).await.unwrap(),
+        draft_id
+    );
+    assert_eq!(
+        meta_rows_of(store, draft_id).await,
+        vec![("sources".to_string(), "\"notedown://a/4#b1\"".to_string())],
+        "an update of a draft replaces its rows"
+    );
+    assert!(
+        store
+            .clear_overlay_entry(domain, "alice", "a.md")
+            .await
+            .unwrap()
+    );
+    assert!(
+        meta_rows_of(store, draft_id).await.is_empty(),
+        "a dropped draft takes its rows"
+    );
+
+    store.delete_engram(domain, "a.md").await.unwrap();
+    assert_eq!(
+        meta_row_count(store).await,
+        0,
+        "a deleted engram takes its rows"
+    );
+
+    store.upsert_engram(domain, &rec).await.unwrap();
+    store.upsert_overlay(domain, "alice", &draft).await.unwrap();
+    store.clear_domain(domain).await.unwrap();
+    assert_eq!(
+        meta_row_count(store).await,
+        0,
+        "a cleared domain takes every actor's rows"
+    );
+
+    let domain = store
+        .upsert_domain("d", Some("/tmp/d"), DomainKind::File)
+        .await
+        .unwrap();
+    store.upsert_engram(domain, &rec).await.unwrap();
+    assert_eq!(meta_row_count(store).await, 1);
+    store.wipe().await.unwrap();
+    assert_eq!(meta_row_count(store).await, 0, "a wipe takes every row");
+}
+parity!(
+    meta_value_rows_follow_every_write_on_both_backends,
+    meta_value_rows_follow_every_write
+);
+
 async fn search_applies_filters(store: &dyn Store) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
@@ -4260,6 +4377,467 @@ async fn metadata_tags_arm_expands(store: &dyn Store) {
     assert_eq!(meta_filter_perms(store, in_op).await, want);
 }
 parity!(metadata_filter_tags_arm_expands, metadata_tags_arm_expands);
+
+/// Run one wire-form metadata filter and return the hit permalinks, sorted,
+/// as `actor` sees them (`None` is the base view).
+async fn wire_filter_perms(
+    store: &dyn Store,
+    wire: serde_json::Value,
+    actor: Option<&str>,
+) -> Vec<String> {
+    let page = store
+        .search(&SearchQuery {
+            metadata_filters: crystalline_index::parse_metadata_filters(&wire).unwrap(),
+            actor: actor.map(str::to_string),
+            limit: 50,
+            page: 1,
+            ..SearchQuery::default()
+        })
+        .await
+        .unwrap();
+    let mut perms: Vec<String> = page.items.iter().map(|h| h.permalink.clone()).collect();
+    perms.sort();
+    perms
+}
+
+fn perms(list: &[&str]) -> Vec<String> {
+    list.iter().map(|p| p.to_string()).collect()
+}
+
+/// `$contains` and `$contains_any` match one element exactly, keep a value's
+/// JSON type, treat a single value as a one-element list, compare a promoted
+/// key's column, and ignore a key with a dot or a quote the way every
+/// operator ignores a key with a quote. An engram with a custom text field
+/// over the cap syncs on both backends, and a filter on that field matches
+/// nothing.
+async fn contains_filters(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let long = "x".repeat(3000);
+    write(
+        root,
+        "a.md",
+        &engram(
+            "Alpha",
+            "a",
+            "engram",
+            &format!(
+                "sources:\n  - notedown://jordi/n1/p1#b1\n  - notedown://jordi/n1/p1#b2\npages:\n  - 3\n  - 7\nkind: anchor\nflag: true\nsummary: {long}\n"
+            ),
+            "body\n",
+        ),
+    );
+    write(
+        root,
+        "b.md",
+        &engram(
+            "Beta",
+            "b",
+            "engram",
+            "sources:\n  - notedown://jordi/n1/p1#b1\n  - notedown://jordi/n2/p1#b1\npages:\n  - 7\nkind: Anchor\ncount: \"1\"\n",
+            "body\n",
+        ),
+    );
+    write(
+        root,
+        "c.md",
+        &engram("Gamma", "c", "engram", "count: 1\n", "body\n"),
+    );
+    write(
+        root,
+        "d.md",
+        &engram("Delta", "d", "engram", "a.b:\n  - x\n", "body\n"),
+    );
+    // Anchors with a quote, a backslash, a newline and non-ASCII text, and in
+    // `f` their unescaped neighbours: the backslash-quote, the backslash-n,
+    // the doubled backslash and the plain letter.
+    write(
+        root,
+        "e.md",
+        &engram(
+            "Epsilon",
+            "e",
+            "engram",
+            r#"sources:
+  - "a\"b"
+  - 'a\b'
+  - "line1\nline2"
+  - "ü"
+"#,
+            "body\n",
+        ),
+    );
+    write(
+        root,
+        "f.md",
+        &engram(
+            "Zeta",
+            "f",
+            "engram",
+            r#"sources:
+  - 'a\"b'
+  - 'line1\nline2'
+  - 'a\\b'
+  - u
+"#,
+            "body\n",
+        ),
+    );
+    let report = sync_domain(store, "d", root).await.unwrap();
+    assert!(
+        report.failed.is_empty(),
+        "a long field fails no write: {:?}",
+        report.failed
+    );
+
+    let cases: Vec<(serde_json::Value, Vec<String>)> = vec![
+        (
+            serde_json::json!({ "sources": { "$contains": "notedown://jordi/n1/p1#b1" } }),
+            perms(&["a", "b"]),
+        ),
+        (
+            serde_json::json!({ "sources": { "$contains": "notedown://jordi/n1/p1#b2" } }),
+            perms(&["a"]),
+        ),
+        (
+            serde_json::json!({ "sources": { "$contains": "notedown://jordi/n1/p1" } }),
+            perms(&[]),
+        ),
+        (
+            serde_json::json!({ "sources": { "$contains": "NOTEDOWN://jordi/n1/p1#b2" } }),
+            perms(&[]),
+        ),
+        (
+            serde_json::json!({ "sources": { "$contains_any": ["notedown://jordi/n1/p1#b2", "nope"] } }),
+            perms(&["a"]),
+        ),
+        (
+            serde_json::json!({ "sources": { "$contains_any": ["nope"] } }),
+            perms(&[]),
+        ),
+        (
+            serde_json::json!({ "sources": { "$contains_any": [] } }),
+            perms(&[]),
+        ),
+        (
+            serde_json::json!({ "kind": { "$contains": "anchor" } }),
+            perms(&["a"]),
+        ),
+        (
+            serde_json::json!({ "title": { "$contains": "Alpha" } }),
+            perms(&["a"]),
+        ),
+        (
+            serde_json::json!({ "title": { "$contains_any": ["Alpha", "Gamma"] } }),
+            perms(&["a", "c"]),
+        ),
+        (
+            serde_json::json!({ "pages": { "$contains": 7 } }),
+            perms(&["a", "b"]),
+        ),
+        (
+            serde_json::json!({ "pages": { "$contains": "7" } }),
+            perms(&[]),
+        ),
+        (
+            serde_json::json!({ "count": { "$contains": 1 } }),
+            perms(&["c"]),
+        ),
+        (
+            serde_json::json!({ "count": { "$contains": "1" } }),
+            perms(&["b"]),
+        ),
+        (
+            serde_json::json!({ "flag": { "$contains": true } }),
+            perms(&["a"]),
+        ),
+        (
+            serde_json::json!({ "flag": { "$contains": 1 } }),
+            perms(&[]),
+        ),
+        (
+            serde_json::json!({ "nosuch": { "$contains": "x" } }),
+            perms(&[]),
+        ),
+        (
+            serde_json::json!({ "summary": { "$contains": long } }),
+            perms(&[]),
+        ),
+        (
+            serde_json::json!({ "sources": { "$contains_any": [long, "notedown://jordi/n1/p1#b2"] } }),
+            perms(&["a"]),
+        ),
+        (
+            serde_json::json!({ "sources": { "$contains": "a\"b" } }),
+            perms(&["e"]),
+        ),
+        (
+            serde_json::json!({ "sources": { "$contains": "a\\\"b" } }),
+            perms(&["f"]),
+        ),
+        (
+            serde_json::json!({ "sources": { "$contains": "a\\b" } }),
+            perms(&["e"]),
+        ),
+        (
+            serde_json::json!({ "sources": { "$contains": "a\\\\b" } }),
+            perms(&["f"]),
+        ),
+        (
+            serde_json::json!({ "sources": { "$contains": "line1\nline2" } }),
+            perms(&["e"]),
+        ),
+        (
+            serde_json::json!({ "sources": { "$contains": "line1\\nline2" } }),
+            perms(&["f"]),
+        ),
+        (
+            serde_json::json!({ "sources": { "$contains": "ü" } }),
+            perms(&["e"]),
+        ),
+        (
+            serde_json::json!({ "sources": { "$contains": "u" } }),
+            perms(&["f"]),
+        ),
+    ];
+    for (wire, want) in cases {
+        assert_eq!(
+            wire_filter_perms(store, wire.clone(), None).await,
+            want,
+            "{wire}"
+        );
+    }
+}
+parity!(
+    contains_and_contains_any_match_one_element_exactly,
+    contains_filters
+);
+
+/// On `tags`, `$contains` reads as `$eq` and `$contains_any` as `$in`, with
+/// the case folding and the alias class. An empty list matches nothing; on
+/// `tags` it used to be a SQL syntax error.
+async fn contains_on_tags(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "modern.md",
+        &tagged_engram("Modern", "modern", &["modern"]),
+    );
+    write(
+        root,
+        "legacy.md",
+        &tagged_engram("Legacy", "legacy", &["legacy"]),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let d = domain_id(store, "d", root).await;
+    store
+        .replace_tag_aliases(d, &[("legacy".into(), "modern".into())])
+        .await
+        .unwrap();
+
+    let both = perms(&["legacy", "modern"]);
+    for wire in [
+        serde_json::json!({ "tags": { "$contains": "legacy" } }),
+        serde_json::json!({ "tags": { "$contains_any": ["MODERN"] } }),
+    ] {
+        assert_eq!(
+            wire_filter_perms(store, wire.clone(), None).await,
+            both,
+            "{wire}"
+        );
+    }
+    for wire in [
+        serde_json::json!({ "tags": { "$contains_any": [] } }),
+        serde_json::json!({ "tags": { "$in": [] } }),
+    ] {
+        assert!(
+            wire_filter_perms(store, wire.clone(), None)
+                .await
+                .is_empty(),
+            "{wire}"
+        );
+    }
+}
+parity!(contains_on_tags_follows_the_alias_class, contains_on_tags);
+
+/// `n` filler values no engram holds, then `real`, as one wire list.
+fn padded(n: usize, real: &[&str]) -> Vec<serde_json::Value> {
+    (0..n)
+        .map(|i| serde_json::Value::from(format!("nope{i}")))
+        .chain(real.iter().map(|r| serde_json::Value::from(*r)))
+        .collect()
+}
+
+/// A `$contains_any` of 100 distinct values, the cap, runs and finds its
+/// hits on both backends. On turso that is 100 `UNION ALL` arms through the
+/// real statement on the test thread, so this is also the stack proof: well
+/// past the cap, a debug build aborted the process.
+async fn contains_any_at_the_cap(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let sources = |list: &str| format!("sources:\n{list}");
+    write(
+        root,
+        "a.md",
+        &engram(
+            "Alpha",
+            "a",
+            "engram",
+            &sources("  - x1\n  - x2\n"),
+            "body\n",
+        ),
+    );
+    write(
+        root,
+        "b.md",
+        &engram("Beta", "b", "engram", &sources("  - y1\n"), "body\n"),
+    );
+    write(
+        root,
+        "c.md",
+        &engram("Gamma", "c", "engram", &sources("  - z1\n"), "body\n"),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+
+    // `x1` is the first value and `y1` the last, so `a` matches through the
+    // first value and `b` through the last, and `a`, which also matches `x2`,
+    // must still come back once.
+    let mut list = vec![serde_json::Value::from("x1")];
+    list.extend(padded(97, &["x2", "y1"]));
+    assert_eq!(list.len(), 100);
+    let wire = serde_json::json!({ "sources": { "$contains_any": list } });
+    assert_eq!(
+        wire_filter_perms(store, wire, None).await,
+        perms(&["a", "b"])
+    );
+}
+parity!(contains_any_runs_at_the_cap, contains_any_at_the_cap);
+
+/// `$in` and `$contains_any` on `tags` with 100 values, the cap, are one
+/// `EXISTS` over the union of the alias classes, so they run on both
+/// backends: an `OR` of one `EXISTS` per value went past turso's expression
+/// depth of 100.
+async fn tags_at_the_cap(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        root,
+        "modern.md",
+        &tagged_engram("Modern", "modern", &["modern"]),
+    );
+    write(
+        root,
+        "legacy.md",
+        &tagged_engram("Legacy", "legacy", &["legacy"]),
+    );
+    write(
+        root,
+        "other.md",
+        &tagged_engram("Other", "other", &["other"]),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+    let d = domain_id(store, "d", root).await;
+    store
+        .replace_tag_aliases(d, &[("legacy".into(), "modern".into())])
+        .await
+        .unwrap();
+
+    let list = padded(99, &["LEGACY"]);
+    assert_eq!(list.len(), 100);
+    for wire in [
+        serde_json::json!({ "tags": { "$in": list.clone() } }),
+        serde_json::json!({ "tags": { "$contains_any": list.clone() } }),
+    ] {
+        assert_eq!(
+            wire_filter_perms(store, wire.clone(), None).await,
+            perms(&["legacy", "modern"]),
+            "{}",
+            wire.to_string().len()
+        );
+    }
+}
+parity!(tags_filters_run_at_the_cap, tags_at_the_cap);
+
+/// The rows follow the engram: a rewrite replaces them, a draft's rows are
+/// seen only by its author and shadow the base row for her, a dropped draft
+/// gives the base row back, and a deleted engram matches nothing. `x22`
+/// makes the file one byte longer, so its stamp differs within the same
+/// second.
+async fn contains_follows_writes(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let file = |anchor: &str| {
+        engram(
+            "Alpha",
+            "a",
+            "engram",
+            &format!("sources:\n  - {anchor}\n"),
+            "body\n",
+        )
+    };
+    let contains = |anchor: &str| serde_json::json!({ "sources": { "$contains": anchor } });
+    write(root, "a.md", &file("x1"));
+    sync_domain(store, "d", root).await.unwrap();
+    let domain = domain_id(store, "d", root).await;
+    assert_eq!(
+        wire_filter_perms(store, contains("x1"), None).await,
+        perms(&["a"])
+    );
+
+    write(root, "a.md", &file("x22"));
+    sync_domain(store, "d", root).await.unwrap();
+    assert!(
+        wire_filter_perms(store, contains("x1"), None)
+            .await
+            .is_empty(),
+        "a rewrite replaces the rows"
+    );
+    assert_eq!(
+        wire_filter_perms(store, contains("x22"), None).await,
+        perms(&["a"])
+    );
+
+    draft(store, domain, "alice", "a.md", &file("x3")).await;
+    assert_eq!(
+        wire_filter_perms(store, contains("x3"), Some("alice")).await,
+        perms(&["a"])
+    );
+    assert!(
+        wire_filter_perms(store, contains("x3"), None)
+            .await
+            .is_empty(),
+        "a draft's rows stay hers"
+    );
+    assert!(
+        wire_filter_perms(store, contains("x22"), Some("alice"))
+            .await
+            .is_empty(),
+        "her draft shadows the base row"
+    );
+    assert!(
+        store
+            .clear_overlay_entry(domain, "alice", "a.md")
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        wire_filter_perms(store, contains("x22"), Some("alice")).await,
+        perms(&["a"])
+    );
+
+    store.delete_engram(domain, "a.md").await.unwrap();
+    assert!(
+        wire_filter_perms(store, contains("x22"), None)
+            .await
+            .is_empty(),
+        "a deleted engram matches nothing"
+    );
+}
+parity!(
+    contains_follows_rewrites_drafts_and_deletes,
+    contains_follows_writes
+);
 
 async fn numeric_tags_metadata_filter_folds(store: &dyn Store) {
     let dir = tempfile::tempdir().unwrap();
@@ -6668,6 +7246,183 @@ fn metadata_filters_accept_a_json_encoded_object() {
             "unexpected error for {wrong}: {err}"
         );
     }
+}
+
+/// The two list operators parse from the wire form, the double-encoded string
+/// form included, and refuse an argument they cannot take with a sentence
+/// that says what to send instead.
+#[test]
+fn contains_operators_parse_and_refuse_what_they_cannot_take() {
+    let parsed = crystalline_index::parse_metadata_filters(&serde_json::json!({
+        "sources": { "$contains": "notedown://jordi/n1/p2#b3" },
+        "pages": { "$contains_any": [7, "7", true] },
+        "empty": { "$contains_any": [] },
+    }))
+    .unwrap();
+    for expected in [
+        MetadataFilter {
+            key: "sources".into(),
+            op: FilterOp::Contains("notedown://jordi/n1/p2#b3".into()),
+        },
+        MetadataFilter {
+            key: "pages".into(),
+            op: FilterOp::ContainsAny(vec![7.into(), "7".into(), true.into()]),
+        },
+        MetadataFilter {
+            key: "empty".into(),
+            op: FilterOp::ContainsAny(Vec::new()),
+        },
+    ] {
+        assert!(parsed.contains(&expected), "{expected:?} in {parsed:?}");
+    }
+
+    let string_form = serde_json::json!("{\"sources\": {\"$contains\": \"a\"}}");
+    assert_eq!(
+        crystalline_index::parse_metadata_filters(&string_form).unwrap(),
+        vec![MetadataFilter {
+            key: "sources".into(),
+            op: FilterOp::Contains("a".into()),
+        }]
+    );
+
+    let one = "$contains on 'sources' takes one value; use $contains_any for several";
+    let many = "$contains_any on 'sources' takes an array of single values";
+    for (wire, text) in [
+        (
+            serde_json::json!({ "sources": { "$contains": ["a", "b"] } }),
+            one,
+        ),
+        (
+            serde_json::json!({ "sources": { "$contains": { "a": 1 } } }),
+            one,
+        ),
+        (
+            serde_json::json!({ "sources": { "$contains_any": "a" } }),
+            many,
+        ),
+        (
+            serde_json::json!({ "sources": { "$contains_any": [["a"]] } }),
+            many,
+        ),
+        (
+            serde_json::json!({ "sources": { "$contains_any": [{ "a": 1 }] } }),
+            many,
+        ),
+    ] {
+        let err = crystalline_index::parse_metadata_filters(&wire).unwrap_err();
+        assert!(err.to_string().contains(text), "{wire}: {err}");
+    }
+}
+
+/// A key `$contains` or `$contains_any` cannot use (a dot, a quote, a letter
+/// outside ASCII) is refused by name instead of being dropped, which would
+/// widen the search to every engram. The older operators keep ignoring such
+/// a key.
+#[test]
+fn contains_on_a_key_that_is_not_plain_is_refused() {
+    for key in ["a.b", "it's", "größe", "a b"] {
+        for (op, arg) in [
+            ("$contains", serde_json::json!("x")),
+            ("$contains_any", serde_json::json!(["x"])),
+        ] {
+            let mut inner = serde_json::Map::new();
+            inner.insert(op.to_string(), arg);
+            let mut wire = serde_json::Map::new();
+            wire.insert(key.to_string(), serde_json::Value::Object(inner));
+            let err = crystalline_index::parse_metadata_filters(&serde_json::Value::Object(wire))
+                .unwrap_err();
+            let text = format!("{op} on '{key}' needs a plain key (letters, digits, '_' or '-')");
+            assert!(err.to_string().contains(&text), "{err}");
+        }
+    }
+    assert_eq!(
+        crystalline_index::parse_metadata_filters(&serde_json::json!({
+            "sources": { "$contains": "x" },
+            "my_key-2": { "$contains_any": ["x"] },
+        }))
+        .unwrap()
+        .len(),
+        2
+    );
+    assert!(
+        crystalline_index::parse_metadata_filters(&serde_json::json!({ "a.b": { "$eq": "x" } }))
+            .is_ok()
+    );
+}
+
+/// `$contains_any`, and `$in` on `tags`, take at most 100 distinct values.
+/// Duplicates are dropped first, keeping the first of each in order, and a
+/// list with more than 100 distinct values is refused with a sentence that
+/// says what to do. `$in` on any other key is not capped.
+#[test]
+fn contains_any_takes_at_most_a_hundred_distinct_values() {
+    let wire = |key: &str, op: &str, list: Vec<serde_json::Value>| {
+        let mut inner = serde_json::Map::new();
+        inner.insert(op.to_string(), serde_json::Value::Array(list));
+        let mut outer = serde_json::Map::new();
+        outer.insert(key.to_string(), serde_json::Value::Object(inner));
+        serde_json::Value::Object(outer)
+    };
+    let values = |n: usize| -> Vec<serde_json::Value> {
+        (0..n)
+            .map(|i| serde_json::Value::from(format!("v{i}")))
+            .collect()
+    };
+    let parse = |key: &str, op: &str, list: Vec<serde_json::Value>| {
+        crystalline_index::parse_metadata_filters(&wire(key, op, list))
+    };
+
+    for (key, op) in [
+        ("sources", "$contains_any"),
+        ("tags", "$contains_any"),
+        ("tags", "$in"),
+    ] {
+        let parsed = parse(key, op, values(100)).unwrap();
+        let held = match &parsed[0].op {
+            FilterOp::ContainsAny(vs) | FilterOp::In(vs) => vs.len(),
+            other => panic!("{key} {op} parsed as {other:?}"),
+        };
+        assert_eq!(held, 100, "{key} {op} at the cap");
+
+        let err = parse(key, op, values(101)).unwrap_err();
+        let want = format!(
+            "{op} on '{key}' takes at most 100 values; split the list over several searches"
+        );
+        assert!(err.to_string().contains(&want), "{key} {op}: {err}");
+    }
+
+    // 150 values, 100 of them distinct: under the cap once the duplicates go.
+    let mut repeated = values(100);
+    repeated.extend(values(50));
+    assert_eq!(
+        parse("sources", "$contains_any", repeated).unwrap()[0].op,
+        FilterOp::ContainsAny(values(100))
+    );
+
+    // Duplicates go by JSON equality, so 7 and "7" both stay.
+    let mixed: Vec<serde_json::Value> = vec![
+        "b".into(),
+        "a".into(),
+        "b".into(),
+        7.into(),
+        "7".into(),
+        7.into(),
+    ];
+    let kept: Vec<serde_json::Value> = vec!["b".into(), "a".into(), 7.into(), "7".into()];
+    assert_eq!(
+        parse("sources", "$contains_any", mixed.clone()).unwrap()[0].op,
+        FilterOp::ContainsAny(kept.clone())
+    );
+    assert_eq!(
+        parse("tags", "$in", mixed).unwrap()[0].op,
+        FilterOp::In(kept)
+    );
+
+    assert_eq!(
+        parse("status", "$in", values(101)).unwrap()[0].op,
+        FilterOp::In(values(101)),
+        "$in on any other key is not capped"
+    );
 }
 
 /// The lexical candidate cap bounds how many LIKE matches the prefilter loads
@@ -9734,10 +10489,12 @@ fn every_engram_reading_sql_carries_an_actor_predicate() {
         census.failures.join("\n")
     );
     assert_eq!(
-        census.sites, 170,
+        census.sites, 172,
         "the engram statement census moved; every new one needs a predicate or a waiver. \
-         69 per backend in mod.rs (the two unbinding statements of `clear_domain` are the \
-         newest, waived below; before them the guarded compare of `upsert_engram_checked` is the \
+         70 per backend in mod.rs (the `engram_meta_value` delete of `clear_domain` is the \
+         newest, waived below with the rest of that clear; before it the two unbinding \
+         statements of `clear_domain`, also waived; before them the guarded compare \
+         of `upsert_engram_checked` is the \
          newest, on the base row; before it the two `EXISTS` probes of the contradiction \
          pair write, waived by id; before them the emptiness probe of \
          `drop_empty_domain_row`, waived because a draft keeps the row too; before it the URL half \
@@ -9761,14 +10518,14 @@ fn every_engram_reading_sql_carries_an_actor_predicate() {
          that the reference now points at nothing"
     );
     assert_eq!(
-        census.waived, 28,
+        census.waived, 30,
         "the waiver list is meant to be short and deliberate; a new one needs its reason read. \
-         Fourteen per backend: the two statements of `clear_domain` that unbind the references \
+         Fifteen per backend: the two statements of `clear_domain` that unbind the references \
          from other domains into the rows about to go, `-- actor: all` because the clear takes \
          every actor's rows, the two `EXISTS` probes of `replace_contradictions`' pair \
          write, `-- actor: by id` because both ids are base rows (drafts are never \
          scored), the emptiness probe of `drop_empty_domain_row`, where any \
-         actor's row keeps the domain, the six statements of `clear_domain` - the sixth is the one that \
+         actor's row keeps the domain, the seven statements of `clear_domain` - the seventh is the `engram_meta_value` delete, the sixth the one that \
          takes the bodies out of `engram_content`, which names the rows about to go because \
          that table has no domain of its own - the id-scoped delete inside `delete_engram` \
          and `chunks_needing_embedding`'s domain scope, all `-- actor: all`, plus \

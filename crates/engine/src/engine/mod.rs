@@ -1357,6 +1357,7 @@ pub enum PreviewCredential {
 pub use crate::rename::RenameHold;
 pub use crate::rename::RenameStep;
 pub use crate::scope::OWNER_IDENTITY_NAME;
+pub use domain_settings::{DOMAIN_SETTINGS_HOW, PolicyEdit, VIRTUAL_NO_RULES};
 #[cfg(any(test, feature = "testing"))]
 pub use names::SpellingPushFault;
 
@@ -1573,6 +1574,21 @@ fn enrich_write_error(e: RemoteError, login: Option<&str>, repo: &str) -> Remote
             "the GitHub connection for @{login} has expired or was revoked - reconnect your GitHub identity (Fluid profile, or 'crystalline connect github --personal')."
         )),
         other => other,
+    }
+}
+
+/// [`enrich_write_error`] for a share, plus the one failure a share on the
+/// instance credential reads badly raw: GitHub refusing the blob or the
+/// commit with a plain 403 means the account cannot write the repository at
+/// all, so neither a direct commit nor a proposal can be made. The two
+/// organization-policy refusals are their own variants by now and pass
+/// unchanged, and personal mode keeps the words `enrich_write_error` gives it.
+fn share_write_error(e: RemoteError, login: Option<&str>, repo: &str) -> RemoteError {
+    match (e, login) {
+        (RemoteError::Api { status: 403, .. }, None) => {
+            RemoteError::Refused(crystalline_remote::error::no_write_access_guidance(repo))
+        }
+        (e, login) => enrich_write_error(e, login, repo),
     }
 }
 
@@ -5235,6 +5251,7 @@ mod contradictions;
 pub use contradictions::run_contradiction_worker;
 mod delete;
 mod domain_add;
+mod domain_settings;
 mod domains;
 mod edit;
 mod evolve;
@@ -9367,6 +9384,32 @@ mod share_actor_tests {
             err.to_string(),
             "your GitHub account @alice needs write access to team/knowledge - ask a maintainer to add you as a collaborator."
         );
+    }
+
+    /// A share on the instance credential that GitHub refuses with a plain
+    /// 403 says the account cannot write the repository; personal mode keeps
+    /// its own words, and the organization-policy refusals pass unchanged.
+    #[test]
+    fn a_share_403_on_the_instance_credential_says_the_account_cannot_write() {
+        let forbidden = || RemoteError::Api {
+            status: 403,
+            message: "Resource not accessible by integration".to_string(),
+        };
+        assert_eq!(
+            share_write_error(forbidden(), None, "acme/kb").to_string(),
+            "Your GitHub account cannot write to acme/kb, so neither a direct commit nor a proposal can be made. Ask the repository's admins for write access."
+        );
+        assert!(
+            share_write_error(forbidden(), Some("alice"), "acme/kb")
+                .to_string()
+                .contains("@alice needs write access")
+        );
+        let sso = RemoteError::SsoAuthorizationRequired {
+            org: "acme".to_string(),
+            url: "https://github.com/orgs/acme/sso".to_string(),
+        };
+        let text = sso.to_string();
+        assert_eq!(share_write_error(sso, None, "acme/kb").to_string(), text);
     }
 
     /// The two organization-policy refusals are 403s upstream too, but the

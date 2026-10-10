@@ -671,6 +671,44 @@ fn value_rows(width: usize, count: usize, trailing: Option<&str>) -> String {
     rows.join(",")
 }
 
+/// How many engrams one page of the `engram_meta_value` backfill reads, the
+/// Turso `BACKFILL_PAGE` twin.
+const BACKFILL_PAGE: i64 = 1000;
+
+/// Write one engram's `engram_meta_value` rows, the Turso
+/// `insert_meta_values` twin, on the caller's connection so it stays in the
+/// caller's transaction.
+async fn insert_meta_values(
+    conn: &mut PgConnection,
+    engram_id: i64,
+    metadata: &serde_json::Value,
+) -> Result<()> {
+    let rows: Vec<(i64, String, String)> = crate::store::meta_value_rows(metadata)
+        .into_iter()
+        .map(|(key, value)| (engram_id, key, value))
+        .collect();
+    insert_meta_rows(conn, &rows).await
+}
+
+/// Insert `(engram id, key, value)` rows into `engram_meta_value`, any number
+/// of engrams' rows per statement, [`INSERT_CHUNK`] rows at a time.
+async fn insert_meta_rows(conn: &mut PgConnection, rows: &[(i64, String, String)]) -> Result<()> {
+    for batch in rows.chunks(INSERT_CHUNK) {
+        let mut params: Vec<Param> = Vec::with_capacity(batch.len() * 3);
+        for (engram_id, key, value) in batch {
+            params.push(Param::Int(*engram_id));
+            params.push(Param::Text(key.clone()));
+            params.push(Param::Text(value.clone()));
+        }
+        let sql = format!(
+            "INSERT INTO engram_meta_value(engram_id, key, value) VALUES {} ON CONFLICT DO NOTHING",
+            value_rows(3, batch.len(), None)
+        );
+        exec(&mut *conn, &sql, params).await?;
+    }
+    Ok(())
+}
+
 /// The multi-row observation INSERT for `count` rows, returning each new row's id
 /// with its source line so observation tags map to the right observation without
 /// depending on `RETURNING` row order.
@@ -976,6 +1014,7 @@ async fn delete_children(conn: &mut PgConnection, engram_id: i64) -> Result<()> 
     for sql in [
         "DELETE FROM observation WHERE engram_id=$1",
         "DELETE FROM engram_tag WHERE engram_id=$1",
+        "DELETE FROM engram_meta_value WHERE engram_id=$1",
         "DELETE FROM relation WHERE engram_id=$1",
         "DELETE FROM link WHERE engram_id=$1",
     ] {
@@ -1316,6 +1355,21 @@ impl Store for PostgresStore {
         Ok(rows
             .into_iter()
             .map(|(spelling, id)| (spelling, DomainId(id)))
+            .collect())
+    }
+
+    async fn meta_values(&self) -> Result<Vec<(EngramId, String, String)>> {
+        let mut conn = self.acquire().await?;
+        let rows: Vec<(i64, String, String)> = sqlx::query_as(
+            "SELECT engram_id, key, value FROM engram_meta_value \
+             ORDER BY engram_id, key COLLATE \"C\", value COLLATE \"C\"",
+        )
+        .fetch_all(conn.as_mut())
+        .await
+        .map_err(IndexError::from)?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, key, value)| (EngramId(id), key, value))
             .collect())
     }
 
@@ -1786,6 +1840,7 @@ impl Store for PostgresStore {
             "DELETE FROM observation_tag WHERE observation_id IN \
              (SELECT o.id FROM observation o JOIN engram e ON e.id=o.engram_id WHERE e.domain_id=$1)",
             "DELETE FROM engram_tag WHERE engram_id IN (SELECT id FROM engram WHERE domain_id=$1)",
+            "DELETE FROM engram_meta_value WHERE engram_id IN (SELECT id FROM engram WHERE domain_id=$1)",
             "DELETE FROM chunk WHERE engram_id IN (SELECT id FROM engram WHERE domain_id=$1)",
             "DELETE FROM observation WHERE engram_id IN (SELECT id FROM engram WHERE domain_id=$1)",
             "DELETE FROM relation WHERE domain_id=$1",
@@ -4309,6 +4364,9 @@ impl PostgresStore {
             );
             exec(&mut *c, &sql, params).await?;
         }
+
+        // Frontmatter values, exactly where the tag rows are written.
+        insert_meta_values(&mut *c, engram_id, &record.metadata).await?;
 
         Ok(EngramId(engram_id))
     }

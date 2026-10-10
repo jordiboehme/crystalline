@@ -112,6 +112,11 @@ pub const MIGRATIONS: &[Migration] = &[
         label: "contradiction scores",
         sql: SCHEMA_V18,
     },
+    Migration {
+        version: 19,
+        label: "metadata values",
+        sql: SCHEMA_V19,
+    },
 ];
 
 const SCHEMA_V1: &str = r#"
@@ -692,6 +697,27 @@ CREATE TABLE observation_vector (
 ALTER TABLE domain ADD COLUMN parse_generation INTEGER NOT NULL DEFAULT 0;
 "#;
 
+// One row per element of a list and one per scalar of every frontmatter key
+// that is not promoted to a column, so `$contains` and `$contains_any` seek
+// `(key, value)` instead of reading every engram's `metadata`. `value` is the
+// compact JSON of the element (`crystalline_core::meta_value_text`), so `"1"`,
+// `1` and `true` stay three values. The primary key drops a list's duplicates
+// and serves the per-engram delete; the index carries `engram_id` after the
+// seek key, so a filter is answered from the index alone. The cascade is
+// declared for the record: this connection does not enforce foreign keys, so
+// `delete_children` and `clear_domain` delete by hand. The rows are filled
+// from the stored `metadata` by `backfill`, in this step's transaction, with
+// the function every write uses.
+const SCHEMA_V19: &str = r#"
+CREATE TABLE engram_meta_value (
+    engram_id INTEGER NOT NULL REFERENCES engram(id) ON DELETE CASCADE,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    PRIMARY KEY (engram_id, key, value)
+);
+CREATE INDEX idx_engram_meta_value_key_value ON engram_meta_value(key, value, engram_id);
+"#;
+
 const SCHEMA_V9: &str = r#"
 CREATE TABLE attachment (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -717,13 +743,15 @@ CREATE TABLE attachment_blob (
 /// goes before it, and `engram_content` references `engram`, so it goes
 /// before that. `contradiction` and `contradiction_pair` reference `engram`
 /// and `domain`, so they go first. `observation_vector` references nothing
-/// and leads the list.
+/// and leads the list. `engram_meta_value` references `engram`, so it goes
+/// before it.
 pub const WIPE_TABLES: &[&str] = &[
     "observation_vector",
     "contradiction",
     "contradiction_pair",
     "observation_tag",
     "engram_tag",
+    "engram_meta_value",
     "chunk",
     "observation",
     "relation",
@@ -805,6 +833,13 @@ async fn apply_migrations(conn: &Connection, migrations: &[Migration]) -> Result
                 m.version, m.label
             )));
         }
+        if let Err(e) = backfill(conn, m.version).await {
+            let _ = conn.execute("ROLLBACK", ()).await;
+            return Err(IndexError::Migration(format!(
+                "v{} ({}): {e}",
+                m.version, m.label
+            )));
+        }
         let now = chrono::Utc::now().to_rfc3339();
         if let Err(e) = conn
             .execute(
@@ -840,6 +875,72 @@ async fn current_version(conn: &Connection) -> Result<i64> {
             .unwrap_or(0)),
         None => Ok(0),
     }
+}
+
+/// The data step a migration runs after its DDL and before its stamp, in the
+/// same transaction, for rows only Rust can derive. v19's rows come from the
+/// function every write uses, so an upgraded index and a freshly written one
+/// hold the same rows by construction. A SQL fill could not promise that:
+/// `json_each` reads a JSON `true` back as the integer 1, and floats print
+/// differently in each engine.
+async fn backfill(conn: &Connection, version: i64) -> Result<()> {
+    match version {
+        19 => backfill_meta_values(conn).await,
+        _ => Ok(()),
+    }
+}
+
+/// Fill `engram_meta_value` from every engram row's stored `metadata`, every
+/// actor's rows included: a draft is searchable, so it needs its rows too. A
+/// row whose metadata does not parse gets no rows instead of failing the
+/// migration, because a failed migration makes `open_resilient` set the
+/// whole index aside. The rows are read a page of [`super::BACKFILL_PAGE`]
+/// engrams at a time in id order, so memory stays bounded on a large index,
+/// and each page's rows go in as multi-row inserts across its engrams. Every
+/// `Rows` is dropped before the page's inserts (see the `execute_batch` note
+/// in `apply_migrations`).
+async fn backfill_meta_values(conn: &Connection) -> Result<()> {
+    conn.execute("DELETE FROM engram_meta_value", ()).await?;
+    let mut after = i64::MIN;
+    loop {
+        let mut seen = 0_i64;
+        let mut page: Vec<(i64, String)> = Vec::new();
+        {
+            let mut rows = conn
+                .query(
+                    "SELECT id, metadata FROM engram WHERE id > ?1 ORDER BY id LIMIT ?2",
+                    vec![
+                        turso::Value::Integer(after),
+                        turso::Value::Integer(super::BACKFILL_PAGE),
+                    ],
+                )
+                .await?;
+            while let Some(r) = rows.next().await? {
+                let Ok(turso::Value::Integer(id)) = r.get_value(0) else {
+                    continue;
+                };
+                seen += 1;
+                after = after.max(id);
+                if let Ok(turso::Value::Text(text)) = r.get_value(1) {
+                    page.push((id, text));
+                }
+            }
+        }
+        let mut meta_rows = Vec::new();
+        for (id, text) in &page {
+            let Ok(metadata) = serde_json::from_str::<serde_json::Value>(text) else {
+                continue;
+            };
+            for (key, value) in crate::store::meta_value_rows(&metadata) {
+                meta_rows.push((*id, key, value));
+            }
+        }
+        super::insert_meta_rows(conn, &meta_rows).await?;
+        if seen < super::BACKFILL_PAGE {
+            break;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2073,5 +2174,201 @@ mod tests {
         }
         let store = crate::TursoStore::open(&db_path).await.unwrap();
         crate::sync::upgrade_fixture::first_sync_after_the_upgrade_reparses(&store, &root).await;
+    }
+
+    async fn meta_rows(conn: &Connection, id: i64) -> Vec<(String, String)> {
+        let mut rows = conn
+            .query(
+                "SELECT key, value FROM engram_meta_value WHERE engram_id=?1 ORDER BY key, value",
+                vec![turso::Value::Integer(id)],
+            )
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        while let Some(r) = rows.next().await.unwrap() {
+            if let (Ok(turso::Value::Text(k)), Ok(turso::Value::Text(v))) =
+                (r.get_value(0), r.get_value(1))
+            {
+                out.push((k, v));
+            }
+        }
+        out
+    }
+
+    /// The upgrade cost at scale: v19 over an index of 50,000 engrams an
+    /// older binary wrote, each citing five `sources` anchors (the
+    /// `perf_meta` corpus), timed from the open that runs the backfill.
+    /// Ignored and never a gate; run with
+    /// `cargo test -p crystalline-index --lib --release -- v19_backfill_cost_at_50k --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore = "perf evidence: run by hand with --ignored --nocapture"]
+    async fn v19_backfill_cost_at_50k() {
+        use crate::store::Store;
+        const ENGRAMS: i64 = 50_000;
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("index.db");
+        {
+            let db = Builder::new_local(db_path.to_str().unwrap())
+                .build()
+                .await
+                .unwrap();
+            let conn = db.connect().unwrap();
+            apply_migrations(&conn, &MIGRATIONS[..18]).await.unwrap();
+            conn.execute(
+                "INSERT INTO domain(id, name, path, kind) VALUES (1, 'notes', '/tmp/n', 'file')",
+                (),
+            )
+            .await
+            .unwrap();
+            conn.execute("BEGIN", ()).await.unwrap();
+            for start in (0..ENGRAMS).step_by(100) {
+                let mut params = Vec::new();
+                let mut tuples = Vec::new();
+                for i in start..start + 100 {
+                    let mut sources: Vec<String> = (0..4)
+                        .map(|b| format!("notedown://jordi/n{i}/p0#b{b}"))
+                        .collect();
+                    sources.push(format!("notedown://jordi/shared/p{}#b0", i % 1000));
+                    let n = params.len();
+                    tuples.push(format!(
+                        "(?{}, 1, ?{}, ?{}, ?{}, '')",
+                        n + 1,
+                        n + 2,
+                        n + 3,
+                        n + 4
+                    ));
+                    params.push(turso::Value::Integer(i + 1));
+                    params.push(turso::Value::Text(format!("n{i}.md")));
+                    params.push(turso::Value::Text(format!("note-{i}")));
+                    params.push(turso::Value::Text(
+                        serde_json::json!({ "sources": sources }).to_string(),
+                    ));
+                }
+                conn.execute(
+                    &format!(
+                        "INSERT INTO engram(id, domain_id, path, permalink, metadata, actor) VALUES {}",
+                        tuples.join(",")
+                    ),
+                    params,
+                )
+                .await
+                .unwrap();
+            }
+            conn.execute("COMMIT", ()).await.unwrap();
+        }
+        let started = std::time::Instant::now();
+        let store = crate::TursoStore::open(&db_path).await.unwrap();
+        let ms = started.elapsed().as_millis();
+        assert_eq!(store.store_info().await.unwrap().schema_version, 19);
+        let rows = store.meta_values().await.unwrap().len();
+        assert_eq!(rows, 5 * ENGRAMS as usize, "five rows an engram");
+        eprintln!(
+            "PERF v19 backfill 50k: open with the migration {ms} ms, {rows} rows, {:.1} us per engram",
+            ms as f64 * 1000.0 / ENGRAMS as f64
+        );
+    }
+
+    /// v19 over an index an older binary wrote. Every engram row, a draft
+    /// among them, comes out holding the rows a fresh write of the same
+    /// metadata gives, so `$contains` answers right after the upgrade and
+    /// nothing needs a reindex. The fixture is the hard one: a quote, a
+    /// backslash, a newline, non-ASCII text, a duplicate element, a negative
+    /// number, i64::MAX, a float, "1" beside 1, true beside 1 and a list of
+    /// objects; and one row whose metadata does not parse, which gets no
+    /// rows and fails nothing, because a failed migration sets the index
+    /// aside.
+    #[tokio::test]
+    async fn v19_fills_engram_meta_value_from_the_stored_metadata() {
+        use crate::store::Store;
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let base = serde_json::json!({
+            "sources": ["a \"q\" \\ b", "line\nbreak", "ünïcode", "a \"q\" \\ b"],
+            "numbers": [-3, i64::MAX, 1.5, 1, "1", 1e-7, 2.0, 1e20, u64::MAX, -0.0],
+            "flags": [true, 1],
+            "verified": [{"by": "jordi", "at": "2026-01-01T00:00:00Z"}],
+            "kind": "anchor",
+        });
+        let draft = serde_json::json!({ "sources": ["draft-only"] });
+        {
+            let db = Builder::new_local(db_path.to_str().unwrap())
+                .build()
+                .await
+                .unwrap();
+            let conn = db.connect().unwrap();
+            assert_eq!(
+                MIGRATIONS[18].version, 19,
+                "the nineteenth migration is v19"
+            );
+            apply_migrations(&conn, &MIGRATIONS[..18]).await.unwrap();
+            conn.execute(
+                "INSERT INTO domain(id, name, path, kind) VALUES (1, 'd', '/tmp/d', 'file')",
+                (),
+            )
+            .await
+            .unwrap();
+            for (id, path, actor, metadata) in [
+                (7_i64, "a.md", "", base.to_string()),
+                (8, "a.md", "alice", draft.to_string()),
+                (9, "b.md", "", "not json".to_string()),
+            ] {
+                conn.execute(
+                    "INSERT INTO engram(id, domain_id, path, permalink, metadata, actor) \
+                     VALUES (?1, 1, ?2, ?3, ?4, ?5)",
+                    vec![
+                        turso::Value::Integer(id),
+                        turso::Value::Text(path.to_string()),
+                        turso::Value::Text(format!("p{id}")),
+                        turso::Value::Text(metadata),
+                        turso::Value::Text(actor.to_string()),
+                    ],
+                )
+                .await
+                .unwrap();
+            }
+        }
+        let store = crate::TursoStore::open(&db_path).await.unwrap();
+        assert_eq!(store.store_info().await.unwrap().schema_version, 19);
+
+        let base_rows = meta_rows(&store.conn, 7).await;
+        assert_eq!(base_rows, crate::store::meta_value_rows(&base));
+        assert_eq!(
+            meta_rows(&store.conn, 8).await,
+            crate::store::meta_value_rows(&draft),
+            "a draft gets its rows too"
+        );
+        assert!(
+            meta_rows(&store.conn, 9).await.is_empty(),
+            "metadata that does not parse gets no rows"
+        );
+        for (key, value) in [
+            ("numbers", "\"1\""),
+            ("numbers", "1"),
+            ("numbers", "9223372036854775807"),
+            ("numbers", "1e-7"),
+            ("numbers", "2.0"),
+            ("numbers", "1e+20"),
+            ("numbers", "18446744073709551615"),
+            // Turso stores `metadata` as text, so the negative zero survives
+            // here; the Postgres twin documents that JSONB turns it into 0.0.
+            ("numbers", "-0.0"),
+            ("flags", "true"),
+            ("flags", "1"),
+            ("sources", "\"line\\nbreak\""),
+        ] {
+            assert!(
+                base_rows.contains(&(key.to_string(), value.to_string())),
+                "{key} = {value} in {base_rows:?}"
+            );
+        }
+        assert!(
+            !base_rows.iter().any(|(k, _)| k == "verified"),
+            "a list of objects gives no row"
+        );
+        assert_eq!(
+            base_rows.iter().filter(|(k, _)| k == "sources").count(),
+            3,
+            "the duplicate element is one row"
+        );
     }
 }

@@ -435,6 +435,10 @@ impl MountTable {
         let mounted: Vec<&Mount> = named.iter().filter_map(|n| self.mount(n)).collect();
         match shape {
             ToolShape::LocalOnly => match mounted.first() {
+                Some(m) if tool == "configure" => Route::Refused(format!(
+                    "'{}' comes from {}; configure changes this machine's own domains, so change '{}' on {} itself",
+                    m.local, m.source, m.local, m.source
+                )),
                 Some(m) => Route::Refused(format!(
                     "'{}' comes from {}; {tool} acts on this machine's own domains. Disconnect the source with crystalline disconnect {}",
                     m.local, m.source, m.source
@@ -1545,6 +1549,30 @@ mod tests {
             .route("search_engrams", ToolShape::AllDomains, &[]),
             Route::Local,
             "a source that mounts nothing makes no fan-out"
+        );
+    }
+
+    #[test]
+    fn configure_on_a_mounted_domain_says_to_change_it_on_its_server() {
+        let mut file = SourcesFile::default();
+        file.sources.push(source("beta"));
+        let (table, _) = assign(
+            &mut file,
+            &[local("notes", None)],
+            &served(&[("beta", vec![remote("specs", None)])]),
+        );
+        let n = |names: &[&str]| names.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let Route::Refused(why) = table.route("configure", ToolShape::LocalOnly, &n(&["specs"]))
+        else {
+            panic!("configure refuses a mounted domain");
+        };
+        assert_eq!(
+            why,
+            "'specs' comes from beta; configure changes this machine's own domains, so change 'specs' on beta itself"
+        );
+        assert_eq!(
+            table.route("configure", ToolShape::LocalOnly, &n(&["notes"])),
+            Route::Local
         );
     }
 

@@ -1589,9 +1589,15 @@ enum OriginCommand {
         #[arg(long)]
         message: Option<String>,
         /// Amend this open proposal (layer) instead of stacking a new one;
-        /// the layers above it are re-based automatically.
-        #[arg(long)]
-        proposal: Option<u64>,
+        /// the layers above it are re-based automatically. Given with no
+        /// number on a domain that shares directly, the share opens a
+        /// proposal instead of committing to the branch.
+        #[arg(long, num_args = 0..=1, value_name = "N")]
+        proposal: Option<Option<u64>>,
+        /// On a domain that shares directly, try the direct commit only and
+        /// never fall back to a proposal.
+        #[arg(long, conflicts_with = "proposal")]
+        direct: bool,
         /// Share only this changed file, relative to the domain root. Repeat
         /// for several; omit to share every unshared change. Where the domain
         /// shares its generated listings, the index.md of each chosen file's
@@ -2842,6 +2848,7 @@ async fn run_origin(command: OriginCommand, db: Option<PathBuf>, json: bool) -> 
             title,
             message,
             proposal,
+            direct,
             files,
             config,
         } => {
@@ -2849,12 +2856,14 @@ async fn run_origin(command: OriginCommand, db: Option<PathBuf>, json: bool) -> 
             // answer from an empty selection: the flag's absence must not
             // become a selection of nothing.
             let chosen = (!files.is_empty()).then_some(files.as_slice());
+            let (as_proposal, amend) = share_choice(proposal, direct);
             let data = crystalline_service::origin_share(
                 &domain,
                 title.as_deref(),
                 message.as_deref(),
-                proposal,
+                amend,
                 chosen,
+                as_proposal,
                 db.as_deref(),
                 config.as_deref(),
             )
@@ -3143,6 +3152,26 @@ fn ahead_line(d: &serde_json::Value) -> String {
     format!("  ahead: {changes} ({})", kinds.join(", "))
 }
 
+/// `origin share`'s flags as the share takes them: `(as_proposal, amend)`.
+/// A bare `--proposal` asks for a proposal; `--proposal <n>` amends that
+/// layer, as it always did; `--direct` asks for the direct commit only.
+fn share_choice(proposal: Option<Option<u64>>, direct: bool) -> (Option<bool>, Option<u64>) {
+    match (proposal, direct) {
+        (Some(None), _) => (Some(true), None),
+        (Some(Some(number)), _) => (None, Some(number)),
+        (None, true) => (Some(false), None),
+        (None, false) => (None, None),
+    }
+}
+
+/// The line a domain prints while this machine has a refused direct commit
+/// on record, and nothing otherwise; an older daemon sends no key.
+fn direct_refused_line(d: &serde_json::Value) -> Option<String> {
+    d["direct_refused"]["line"]
+        .as_str()
+        .map(|line| format!("  {line}"))
+}
+
 /// The one line a direct domain adds under its `repo@branch` line, and
 /// nothing for a proposal domain: a domain that behaves as it always did
 /// prints as it always did.
@@ -3424,6 +3453,9 @@ fn print_origin_status(data: &serde_json::Value, files: bool, json: bool) {
         // A direct domain's commits stand where a reviewing domain's proposals
         // stand: this is the section that says what already reached the team.
         for line in direct_share_lines(d) {
+            println!("{line}");
+        }
+        if let Some(line) = direct_refused_line(d) {
             println!("{line}");
         }
         // The chain's own standing, after the layers it is about. Each line
@@ -5355,6 +5387,83 @@ fn to_core_format(f: OutputFormat) -> verify::Format {
 mod tests {
     use super::*;
     use serde_json::{Value, json};
+
+    fn share_flags(args: &[&str]) -> (Option<Option<u64>>, bool) {
+        let mut argv = vec!["crystalline", "origin", "share"];
+        argv.extend_from_slice(args);
+        let cli = Cli::try_parse_from(argv).unwrap();
+        let Some(Command::Origin {
+            command: OriginCommand::Share {
+                proposal, direct, ..
+            },
+        }) = cli.command
+        else {
+            panic!("expected `origin share`");
+        };
+        (proposal, direct)
+    }
+
+    /// `--proposal` alone asks for a proposal, `--proposal 4` amends #4 as it
+    /// always did, `--direct` asks for the direct commit only.
+    #[test]
+    fn origin_share_parses_proposal_with_and_without_a_number_and_direct() {
+        assert_eq!(share_flags(&["kb"]), (None, false));
+        assert_eq!(share_flags(&["kb", "--proposal"]), (Some(None), false));
+        assert_eq!(
+            share_flags(&["kb", "--proposal", "4"]),
+            (Some(Some(4)), false)
+        );
+        assert_eq!(share_flags(&["kb", "--direct"]), (None, true));
+        assert_eq!(
+            share_flags(&["kb", "--proposal", "--file", "notes/a.md"]),
+            (Some(None), false)
+        );
+        assert!(
+            Cli::try_parse_from([
+                "crystalline",
+                "origin",
+                "share",
+                "kb",
+                "--proposal",
+                "--direct"
+            ])
+            .is_err()
+        );
+        let err = Cli::try_parse_from(["crystalline", "origin", "share", "--proposal", "kb"])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("kb"), "the misplaced domain is named: {err}");
+    }
+
+    #[test]
+    fn the_share_flags_map_to_as_proposal_and_the_amend_number() {
+        assert_eq!(share_choice(None, false), (None, None));
+        assert_eq!(share_choice(Some(None), false), (Some(true), None));
+        assert_eq!(share_choice(Some(Some(4)), false), (None, Some(4)));
+        assert_eq!(share_choice(None, true), (Some(false), None));
+    }
+
+    #[test]
+    fn the_status_names_a_recorded_refusal() {
+        assert_eq!(
+            direct_refused_line(&json!({
+                "direct_refused": { "branch": "main", "line": "Direct commits to main are refused for you, so your shares go as proposals." }
+            })),
+            Some(
+                "  Direct commits to main are refused for you, so your shares go as proposals."
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            direct_refused_line(&json!({ "direct_refused": null })),
+            None
+        );
+        assert_eq!(
+            direct_refused_line(&json!({ "domain": "kb" })),
+            None,
+            "an older daemon"
+        );
+    }
 
     /// The ruled bound: session start waits a second at most, and the daemon
     /// is told to answer well inside it, so its stale lines arrive in time.

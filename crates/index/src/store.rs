@@ -229,6 +229,56 @@ pub fn resolve_pending_sql(table: &str, placeholder: &str) -> String {
     )
 }
 
+/// The `$contains` / `$contains_any` predicate over `engram_meta_value`, as
+/// postgres issues it: `key` and `values` are the caller's `$n` bind
+/// placeholders, and `values` is never empty (an empty filter is answered
+/// before this, as a constant false). Several values are one `IN` list, which
+/// postgres seeks as `value = ANY(...)` in a single index scan. The engram is
+/// matched by `e.id IN (...)`, the form both planners drive from the side
+/// table. Built here rather than inline so the plan registry in
+/// `tests/it/plans.rs` explains the statement the stores issue.
+#[doc(hidden)]
+pub fn meta_value_match_sql(key: &str, values: &[String]) -> String {
+    let test = match values {
+        [one] => format!("m.value = {one}"),
+        many => format!("m.value IN ({})", many.join(",")),
+    };
+    format!(
+        "e.id IN (SELECT m.engram_id FROM engram_meta_value m \
+         WHERE m.key = {key} AND {test})"
+    )
+}
+
+/// The same predicate as turso issues it, with `?n` placeholders: one
+/// `UNION ALL` arm per value, so each value is its own `(key, value)` seek.
+/// Turso seeks an `IN` list on the second index column as a walk of every row
+/// for the key, which for a key like `sources` is every anchor in the index.
+/// The arms sit in a derived table: a bare compound inside `IN (...)` made
+/// turso walk the domain through `idx_engram_domain` instead of seeking `e`
+/// by primary key from the list. A scoped search also spells its scope as
+/// `+d.name` while this predicate is in it (`turso::domain_scope_sql`), or
+/// turso walks the domain from about ten values on. One value gives exactly
+/// [`meta_value_match_sql`].
+#[doc(hidden)]
+pub fn meta_value_union_sql(key: &str, values: &[String]) -> String {
+    let arms: Vec<String> = values
+        .iter()
+        .map(|value| {
+            format!(
+                "SELECT m.engram_id FROM engram_meta_value m \
+                 WHERE m.key = {key} AND m.value = {value}"
+            )
+        })
+        .collect();
+    match arms.as_slice() {
+        [one] => format!("e.id IN ({one})"),
+        many => format!(
+            "e.id IN (SELECT engram_id FROM ({}))",
+            many.join(" UNION ALL ")
+        ),
+    }
+}
+
 /// The reset behind [`Store::reset_references_to_spellings`], one statement
 /// per reference table: unbind the rows that name one of the spellings in
 /// `list` (the caller's placeholders) and are bound now.
@@ -726,39 +776,9 @@ impl EngramRecord {
             .filter(|p| !p.is_empty())
             .unwrap_or_else(|| slugify(path));
 
-        // Filterable metadata: every preserved unknown key, plus the optional
-        // non-promoted known fields, all as a JSON object. Promoted columns
-        // (type, status, title, permalink, the temporal window, description)
-        // and tags are stored in their own columns and join tables.
-        let mut meta = serde_json::Map::new();
-        for (k, v) in &fm.extra {
-            if let Ok(jv) = serde_json::to_value(v) {
-                meta.insert(k.clone(), jv);
-            }
-        }
-        let mut add_str = |key: &str, value: Option<String>| {
-            if let Some(v) = value {
-                meta.insert(key.to_string(), serde_json::Value::String(v));
-            }
-        };
-        add_str("source_date", date_str(fm.source_date));
-        // `last_verified` and `stale_after` carry the effective value whichever
-        // spelling recorded it, so a filter keeps working across an engram that
-        // has migrated to the OKF keys and one that has not.
-        add_str(
-            "last_verified",
-            fm.latest_verified()
-                .map(|v| v.at.date_naive().format("%Y-%m-%d").to_string()),
-        );
-        add_str("stale_after", date_str(fm.stale_on()));
-        add_str("temporal_confidence", fm.temporal_confidence.clone());
-        add_str("resource", fm.resource.clone());
-        // The verification trail itself stays filterable in its OKF shape.
-        if !fm.verified.is_empty()
-            && let Ok(jv) = serde_json::to_value(&fm.verified)
-        {
-            meta.insert("verified".to_string(), jv);
-        }
+        // Filterable metadata: every frontmatter key without a column of its
+        // own. Core builds it, so verify sees the same keys the index stores.
+        let meta = fm.index_metadata();
 
         let observations = engram
             .observations
@@ -880,13 +900,21 @@ pub enum FilterOp {
     Lte(serde_json::Value),
     /// Inclusive range `[lo, hi]`.
     Between(serde_json::Value, serde_json::Value),
+    /// The value at the key is a list holding an element equal to this one,
+    /// exactly (JSON equality, no case folding). A single value counts as a
+    /// one-element list, so on a scalar key this is `$eq`.
+    Contains(serde_json::Value),
+    /// The list at the key holds any of these elements. Empty matches
+    /// nothing.
+    ContainsAny(Vec<serde_json::Value>),
 }
 
 /// A single metadata filter: a frontmatter key and an operator.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MetadataFilter {
-    /// The frontmatter key. Promoted keys map to columns; the rest map to
-    /// `json_extract(metadata, '$.key')`.
+    /// The frontmatter key. Promoted keys map to columns; on the rest,
+    /// `$contains` and `$contains_any` read `engram_meta_value` and every other
+    /// operator reads the key's value in `metadata`.
     pub key: String,
     /// The comparison to apply.
     pub op: FilterOp,
@@ -896,9 +924,17 @@ pub struct MetadataFilter {
 ///
 /// The wire form is a JSON object keyed by frontmatter key. Each value is either
 /// a bare scalar (shorthand for `$eq`) or an operator object with exactly one of
-/// `$eq`, `$in`, `$gt`, `$gte`, `$lt`, `$lte` or `$between`. `$in` takes an array
-/// and `$between` takes a two-element `[lo, hi]` array. This is the boundary the
-/// M5 MCP and CLI layers parse tool arguments through. Models routinely
+/// `$eq`, `$in`, `$gt`, `$gte`, `$lt`, `$lte`, `$between`, `$contains` or
+/// `$contains_any`. `$in` takes an array and `$between` takes a two-element
+/// `[lo, hi]` array. `$contains` takes one value and matches an engram whose
+/// list at the key holds an element equal to it, exactly (JSON equality, no
+/// case folding): `{"sources": {"$contains": "https://example.com/a"}}`.
+/// `$contains_any` takes an array of values and matches when the list holds
+/// any of them: `{"sources": {"$contains_any": ["https://example.com/a",
+/// "https://example.com/b"]}}`; an empty array matches nothing. For both, a
+/// single value counts as a one-element list, and a key that is not plain
+/// (ASCII letters, digits, `_` or `-`) is refused. This is the boundary the M5 MCP
+/// and CLI layers parse tool arguments through. Models routinely
 /// double-encode nested tool arguments, so the whole object arriving as a JSON
 /// string is also accepted and parsed first.
 pub fn parse_metadata_filters(value: &serde_json::Value) -> Result<Vec<MetadataFilter>> {
@@ -938,6 +974,55 @@ pub fn parse_metadata_filters(value: &serde_json::Value) -> Result<Vec<MetadataF
     Ok(out)
 }
 
+/// The most distinct values `$contains_any` takes, and `$in` on `tags`.
+///
+/// Turso builds one `UNION ALL` arm per `$contains_any` value and compiles a
+/// compound select by recursing once per arm: a debug build overflowed a
+/// 2 MiB thread at 250 arms, and a stack overflow aborts the whole process
+/// rather than failing the one search. 100 leaves room for the rest of the
+/// statement, and one rule at parse time keeps both backends answering the
+/// same input.
+pub(crate) const CONTAINS_ANY_MAX_VALUES: usize = 100;
+
+/// The values with duplicates dropped, first occurrence kept, refused when
+/// more than [`CONTAINS_ANY_MAX_VALUES`] distinct ones are left.
+fn capped_values(
+    key: &str,
+    op: &str,
+    values: &[serde_json::Value],
+) -> Result<Vec<serde_json::Value>> {
+    let mut seen = std::collections::HashSet::new();
+    let distinct: Vec<serde_json::Value> = values
+        .iter()
+        .filter(|v| seen.insert(v.to_string()))
+        .cloned()
+        .collect();
+    if distinct.len() > CONTAINS_ANY_MAX_VALUES {
+        return Err(crate::IndexError::Invalid(format!(
+            "{op} on '{key}' takes at most {CONTAINS_ANY_MAX_VALUES} values; \
+             split the list over several searches"
+        )));
+    }
+    Ok(distinct)
+}
+
+/// `$contains` and `$contains_any` need a key of ASCII letters, digits, `_`
+/// or `-`. A key the side table cannot be asked for (a dot, a quote, a letter
+/// outside ASCII) is refused by name: dropping the filter, as the older
+/// operators do, would widen the search to every engram.
+fn refuse_unplain_key(key: &str, op: &str) -> Result<()> {
+    if !key.is_empty()
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Ok(());
+    }
+    Err(crate::IndexError::Invalid(format!(
+        "{op} on '{key}' needs a plain key (letters, digits, '_' or '-')"
+    )))
+}
+
 fn parse_op(key: &str, op: &str, arg: &serde_json::Value) -> Result<FilterOp> {
     let arr2 = |arg: &serde_json::Value| -> Result<(serde_json::Value, serde_json::Value)> {
         match arg.as_array() {
@@ -953,16 +1038,42 @@ fn parse_op(key: &str, op: &str, arg: &serde_json::Value) -> Result<FilterOp> {
         "$gte" => FilterOp::Gte(arg.clone()),
         "$lt" => FilterOp::Lt(arg.clone()),
         "$lte" => FilterOp::Lte(arg.clone()),
-        "$in" => FilterOp::In(
-            arg.as_array()
-                .ok_or_else(|| {
-                    crate::IndexError::Invalid(format!("$in on '{key}' expects an array"))
-                })?
-                .clone(),
-        ),
+        "$in" => {
+            let values = arg.as_array().ok_or_else(|| {
+                crate::IndexError::Invalid(format!("$in on '{key}' expects an array"))
+            })?;
+            // `$in` on `tags` builds the same one-`EXISTS` list as
+            // `$contains_any` does on any key, so it takes the same cap.
+            if key == "tags" {
+                FilterOp::In(capped_values(key, op, values)?)
+            } else {
+                FilterOp::In(values.clone())
+            }
+        }
         "$between" => {
             let (lo, hi) = arr2(arg)?;
             FilterOp::Between(lo, hi)
+        }
+        "$contains" => {
+            refuse_unplain_key(key, op)?;
+            if arg.is_array() || arg.is_object() {
+                return Err(crate::IndexError::Invalid(format!(
+                    "$contains on '{key}' takes one value; use $contains_any for several"
+                )));
+            }
+            FilterOp::Contains(arg.clone())
+        }
+        "$contains_any" => {
+            refuse_unplain_key(key, op)?;
+            let values = arg
+                .as_array()
+                .filter(|values| values.iter().all(|v| !v.is_array() && !v.is_object()))
+                .ok_or_else(|| {
+                    crate::IndexError::Invalid(format!(
+                        "$contains_any on '{key}' takes an array of single values"
+                    ))
+                })?;
+            FilterOp::ContainsAny(capped_values(key, op, values)?)
         }
         other => {
             return Err(crate::IndexError::Invalid(format!(
@@ -970,6 +1081,37 @@ fn parse_op(key: &str, op: &str, arg: &serde_json::Value) -> Result<FilterOp> {
             )));
         }
     })
+}
+
+/// Every `(key, value)` row an engram's `metadata` gives `engram_meta_value`:
+/// one per element of a list and one per scalar, for each top-level key.
+/// `metadata` holds exactly the frontmatter keys that are not promoted to a
+/// column ([`crystalline_core::Frontmatter::index_metadata`]). A key longer
+/// than [`crystalline_core::META_KEY_MAX_BYTES`] gives no row, and each value
+/// text comes from [`crystalline_core::meta_value_text`], so a list inside a
+/// list, an object and a long value give no row either. Sorted and without
+/// duplicates, so `[a, a]` is one row and the insert order never depends on
+/// the frontmatter's.
+pub(crate) fn meta_value_rows(metadata: &serde_json::Value) -> Vec<(String, String)> {
+    let Some(map) = metadata.as_object() else {
+        return Vec::new();
+    };
+    let mut rows = std::collections::BTreeSet::new();
+    for (key, value) in map {
+        if key.len() > crystalline_core::META_KEY_MAX_BYTES {
+            continue;
+        }
+        let elements: &[serde_json::Value] = match value {
+            serde_json::Value::Array(items) => items,
+            scalar => std::slice::from_ref(scalar),
+        };
+        for element in elements {
+            if let Some(text) = crystalline_core::meta_value_text(element) {
+                rows.insert((key.clone(), text));
+            }
+        }
+    }
+    rows.into_iter().collect()
 }
 
 /// A search request. Filter-only searches (no `text`) are allowed.
@@ -2171,6 +2313,13 @@ pub trait Store: Send + Sync {
     #[doc(hidden)]
     async fn domain_spellings(&self) -> Result<Vec<(String, DomainId)>>;
 
+    /// Every `engram_meta_value` row, every actor's included, as
+    /// `(engram id, key, value)`, sorted by id and then byte-wise. The
+    /// parity tests read it to prove that both backends write and remove
+    /// the same rows on every write path.
+    #[doc(hidden)]
+    async fn meta_values(&self) -> Result<Vec<(EngramId, String, String)>>;
+
     /// Replace the spellings of the domains `spellings` names with exactly
     /// that list, and answer every spelling whose mapping changed - added,
     /// removed or now pointing at a different domain - sorted byte-wise.
@@ -3299,5 +3448,37 @@ mod retired_tests {
     #[allow(clippy::assertions_on_constants)]
     fn default_retired_weight_is_a_soft_fade() {
         assert!(DEFAULT_RETIRED_WEIGHT > 0.0 && DEFAULT_RETIRED_WEIGHT < 1.0);
+    }
+}
+
+#[cfg(test)]
+mod meta_value_tests {
+    use super::meta_value_rows;
+    use crystalline_core::META_KEY_MAX_BYTES;
+    use serde_json::json;
+
+    #[test]
+    fn rows_are_one_per_list_element_and_one_per_scalar() {
+        let mut metadata = json!({
+            "sources": ["b", "a", "b"],
+            "n": 7,
+            "nested": [[1], {"x": 1}, 2],
+            "obj": {"x": 1},
+        });
+        metadata
+            .as_object_mut()
+            .unwrap()
+            .insert("k".repeat(META_KEY_MAX_BYTES + 1), json!("v"));
+        assert_eq!(
+            meta_value_rows(&metadata),
+            vec![
+                ("n".to_string(), "7".to_string()),
+                ("nested".to_string(), "2".to_string()),
+                ("sources".to_string(), "\"a\"".to_string()),
+                ("sources".to_string(), "\"b\"".to_string()),
+            ]
+        );
+        assert!(meta_value_rows(&json!(null)).is_empty());
+        assert!(meta_value_rows(&json!({})).is_empty());
     }
 }

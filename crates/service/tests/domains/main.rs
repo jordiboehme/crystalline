@@ -16,6 +16,7 @@ mod contradictions;
 mod domain_access;
 mod domain_admin;
 mod domain_rename;
+mod domain_settings;
 mod evolve;
 mod evolve_twins;
 mod metal_runtime;

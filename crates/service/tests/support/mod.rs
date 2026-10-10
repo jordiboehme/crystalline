@@ -417,6 +417,12 @@ impl MockProvider {
             .insert(name.to_string(), message.to_string());
     }
 
+    /// Lifts [`MockProvider::protect_branch`]: `update_branch` on `name` takes
+    /// commits again.
+    pub fn unprotect_branch(&self, name: &str) {
+        self.inner.lock().unwrap().protected.remove(name);
+    }
+
     /// The message `create_commit` was given for `commit`.
     pub fn commit_message(&self, commit: &str) -> Option<String> {
         self.inner

@@ -463,6 +463,94 @@ impl Frontmatter {
             at: at.fixed_offset(),
         })
     }
+
+    /// The filterable metadata of this Engram: every frontmatter key that is
+    /// not promoted to a column of its own, as a JSON object. That is every
+    /// preserved unknown key (a known key whose value did not parse lands
+    /// there too), plus the optional known fields that have no column. The
+    /// promoted keys (type, status, title, permalink, the temporal window,
+    /// description) and tags are stored in their own columns and join tables
+    /// and never appear here, and neither do the provenance and schema keys.
+    ///
+    /// Two users read this one map. The index stores it as the `metadata`
+    /// column and derives its `engram_meta_value` rows from it, one per list
+    /// element and per scalar. Verify reads the same map to warn about a key
+    /// or value too long for those rows. So the keys of this map are the only
+    /// keys that can get rows: a key gets none when it is longer than
+    /// [`META_KEY_MAX_BYTES`], or when none of its values has a text (see
+    /// [`meta_value_text`]).
+    pub fn index_metadata(&self) -> serde_json::Map<String, serde_json::Value> {
+        let date_str = |d: Option<NaiveDate>| d.map(|d| d.format("%Y-%m-%d").to_string());
+        let mut meta = serde_json::Map::new();
+        for (k, v) in &self.extra {
+            if let Ok(jv) = serde_json::to_value(v) {
+                meta.insert(k.clone(), jv);
+            }
+        }
+        let mut add_str = |key: &str, value: Option<String>| {
+            if let Some(v) = value {
+                meta.insert(key.to_string(), serde_json::Value::String(v));
+            }
+        };
+        add_str("source_date", date_str(self.source_date));
+        // `last_verified` and `stale_after` carry the effective value whichever
+        // spelling recorded it, so a filter keeps working across an engram that
+        // has migrated to the OKF keys and one that has not.
+        add_str(
+            "last_verified",
+            self.latest_verified()
+                .map(|v| v.at.date_naive().format("%Y-%m-%d").to_string()),
+        );
+        add_str("stale_after", date_str(self.stale_on()));
+        add_str("temporal_confidence", self.temporal_confidence.clone());
+        add_str("resource", self.resource.clone());
+        // The verification trail itself stays filterable in its OKF shape.
+        if !self.verified.is_empty()
+            && let Ok(jv) = serde_json::to_value(&self.verified)
+        {
+            meta.insert("verified".to_string(), jv);
+        }
+        meta
+    }
+}
+
+/// The longest frontmatter key, in bytes, that gets `engram_meta_value` rows
+/// in the index. A longer key gets no rows, and a `$contains` on it matches
+/// nothing.
+///
+/// Two users measure against this one value: the index, when it writes the
+/// rows, and verify, which warns about a key that is too long.
+pub const META_KEY_MAX_BYTES: usize = 256;
+
+/// The longest value text, in bytes, that an `engram_meta_value` row holds
+/// (see [`meta_value_text`]). Postgres refuses a btree entry above about
+/// 2.7 KB, and every scalar of a non-promoted key gets a row, so one long
+/// custom text field would otherwise fail its engram's write there. Both
+/// index backends apply the same cap, so they keep answering the same.
+///
+/// Two users measure against this one value: the index, when it writes the
+/// rows, and verify, which warns about a value that is too long.
+pub const META_VALUE_MAX_BYTES: usize = 1024;
+
+/// The text a frontmatter value is stored and compared as in the index's
+/// `engram_meta_value` table: its compact JSON. So the string `"1"`, the
+/// number `1` and the boolean `true` are three values, and a string needs no
+/// escaping rule of its own.
+///
+/// `None` in two different cases: the value is a list or an object (those
+/// never get a row of their own), or its text is longer than
+/// [`META_VALUE_MAX_BYTES`]. A caller that must tell the two apart checks the
+/// value's type first.
+///
+/// Two users go through this one function: the index (its writer, its
+/// migration and both query builders), and verify, so verify measures a
+/// value byte for byte the way the index does.
+pub fn meta_value_text(value: &serde_json::Value) -> Option<String> {
+    if value.is_array() || value.is_object() {
+        return None;
+    }
+    let text = value.to_string();
+    (text.len() <= META_VALUE_MAX_BYTES).then_some(text)
 }
 
 impl Engram {
@@ -490,5 +578,46 @@ impl Engram {
             || f.temporal_confidence.is_some()
             || f.schema_def.is_some()
             || !f.extra.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod meta_value_tests {
+    use super::{META_VALUE_MAX_BYTES, meta_value_text};
+    use serde_json::json;
+
+    /// A value is stored as its compact JSON, so the string "1", the number
+    /// 1 and the boolean true are three different values, and the escapes
+    /// are serde_json's wherever a value is written or compared.
+    #[test]
+    fn a_value_keeps_its_json_type() {
+        assert_eq!(meta_value_text(&json!("1")).as_deref(), Some("\"1\""));
+        assert_eq!(meta_value_text(&json!(1)).as_deref(), Some("1"));
+        assert_eq!(meta_value_text(&json!(true)).as_deref(), Some("true"));
+        assert_eq!(meta_value_text(&json!(1.5)).as_deref(), Some("1.5"));
+        assert_eq!(meta_value_text(&json!(-3)).as_deref(), Some("-3"));
+        assert_eq!(
+            meta_value_text(&json!(i64::MAX)).as_deref(),
+            Some("9223372036854775807")
+        );
+        assert_eq!(meta_value_text(&json!(null)).as_deref(), Some("null"));
+        assert_eq!(
+            meta_value_text(&json!("a \"q\" \\ \n ü")).as_deref(),
+            Some("\"a \\\"q\\\" \\\\ \\n ü\"")
+        );
+        assert_eq!(meta_value_text(&json!(["a"])), None);
+        assert_eq!(meta_value_text(&json!({"a": 1})), None);
+    }
+
+    /// Postgres refuses a btree entry above about 2.7 KB, so a long value
+    /// gets no row on either backend instead of failing the engram's write.
+    #[test]
+    fn a_value_longer_than_the_cap_has_no_text() {
+        let fits = "x".repeat(META_VALUE_MAX_BYTES - 2);
+        assert_eq!(
+            meta_value_text(&json!(fits.as_str())).map(|t| t.len()),
+            Some(META_VALUE_MAX_BYTES)
+        );
+        assert_eq!(meta_value_text(&json!(format!("{fits}x"))), None);
     }
 }

@@ -295,15 +295,65 @@ impl RemoteError {
 }
 
 /// The sentence a caller is given when a branch rule refused a direct
-/// commit: what the forge said, and the two ways out (share as a proposal,
-/// or have the rule relaxed).
+/// commit: what the forge said, and the way out, a proposal of the same
+/// changes. Never a change to the MANIFEST: the policy is the team's.
 ///
 /// Lives here rather than beside each surface that renders it, so the
 /// [`RemoteError::BranchProtected`] display and every receipt carrying a
 /// `guidance` field say the same thing word for word.
 pub fn branch_protected_guidance(branch: &str, message: &str) -> String {
     format!(
-        "The branch {branch} does not accept direct commits ({message}). Set `sharing: proposal` in this domain's MANIFEST so shares open a proposal the branch's rules can review, or ask a repository admin to allow direct pushes."
+        "The branch {branch} does not accept direct commits from you ({message}). Share the same changes as a proposal instead: share_changes with as_proposal: true (crystalline origin share --proposal)."
+    )
+}
+
+/// The guidance of a refused direct commit when no proposal can be offered:
+/// only another person's proposal is open on the domain, and no share goes
+/// into it (see `ProposeOutcome::BranchProtected::offers_proposal`). Every
+/// surface shows it as given.
+pub fn branch_protected_blocked_guidance(branch: &str, message: &str) -> String {
+    format!(
+        "The branch {branch} does not accept direct commits from you ({message}). Another person's proposal is open on this domain, so share again once it is merged or closed."
+    )
+}
+
+/// The line a share receipt carries when the branch refused its direct
+/// commit and the same commit opened a proposal.
+pub fn fell_back_line(branch: &str) -> String {
+    format!(
+        "The branch {branch} does not accept direct commits from you, so this share opened a proposal."
+    )
+}
+
+/// The line a share receipt carries when a direct commit landed after a
+/// recorded refusal.
+pub fn direct_works_again_line(branch: &str) -> String {
+    format!("Direct commits to {branch} work for you now.")
+}
+
+/// The status line while a refusal is recorded.
+pub fn direct_refused_line(branch: &str) -> String {
+    format!("Direct commits to {branch} are refused for you, so your shares go as proposals.")
+}
+
+/// What a share preview says while a refusal is recorded and the share would
+/// try the direct commit again. Whole sentences, so every surface shows it as
+/// given.
+pub const PREVIEW_FALLS_BACK: &str =
+    "This share tries a direct commit first. If the branch refuses it again, it opens a proposal.";
+
+/// What a share preview says when the share goes into the acting login's
+/// open proposal instead of a direct commit. A whole sentence, like
+/// [`PREVIEW_FALLS_BACK`].
+pub fn preview_proposal_open_note(number: u64) -> String {
+    format!("This share opens a proposal because your proposal #{number} is still open.")
+}
+
+/// The sentence a share gets when the account cannot write the repository
+/// at all: GitHub refused the blob or the commit before any branch moved.
+pub fn no_write_access_guidance(repo: &str) -> String {
+    format!(
+        "Your GitHub account cannot write to {repo}, so neither a direct commit nor a proposal can be made. Ask the repository's admins for write access."
     )
 }
 
@@ -417,8 +467,8 @@ mod tests {
 
     /// A branch rule refusing a direct commit has to name three things: the
     /// branch, the forge's own sentence for the rule and what to do instead.
-    /// The way out is the policy key, because that is the one a person can
-    /// change without asking anybody.
+    /// The way out is a proposal of the same changes, never a change to the
+    /// MANIFEST: the policy is the team's.
     #[test]
     fn branch_protected_names_the_branch_the_rule_and_the_way_out() {
         let text = RemoteError::BranchProtected {
@@ -426,13 +476,39 @@ mod tests {
             message: "Changes must be made through a pull request.".to_string(),
         }
         .to_string();
-        assert!(
-            text.starts_with(
-                "The branch main does not accept direct commits (Changes must be made through a pull request.)."
-            ),
-            "{text}"
+        assert_eq!(
+            text,
+            "The branch main does not accept direct commits from you (Changes must be made through a pull request.). Share the same changes as a proposal instead: share_changes with as_proposal: true (crystalline origin share --proposal)."
         );
-        assert!(text.contains("sharing: proposal"), "{text}");
+        assert!(!text.contains("MANIFEST"), "{text}");
+    }
+
+    #[test]
+    fn the_fallback_texts_name_the_branch_and_the_repository() {
+        assert_eq!(
+            fell_back_line("main"),
+            "The branch main does not accept direct commits from you, so this share opened a proposal."
+        );
+        assert_eq!(
+            direct_works_again_line("main"),
+            "Direct commits to main work for you now."
+        );
+        assert_eq!(
+            direct_refused_line("main"),
+            "Direct commits to main are refused for you, so your shares go as proposals."
+        );
+        assert_eq!(
+            PREVIEW_FALLS_BACK,
+            "This share tries a direct commit first. If the branch refuses it again, it opens a proposal."
+        );
+        assert_eq!(
+            preview_proposal_open_note(4),
+            "This share opens a proposal because your proposal #4 is still open."
+        );
+        assert_eq!(
+            no_write_access_guidance("acme/kb"),
+            "Your GitHub account cannot write to acme/kb, so neither a direct commit nor a proposal can be made. Ask the repository's admins for write access."
+        );
     }
 
     /// The two guidance sentences are one move apart: the error a refused

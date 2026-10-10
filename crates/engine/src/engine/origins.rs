@@ -913,13 +913,18 @@ impl Engine {
         let connection = self.origin_status_connection().await?;
 
         let actor = crate::scope::overlay_actor(scope);
-        // Whose changes a `diff` answers: the acting identity, the way every
-        // other surface of this feature resolves one.
-        let diff_actor = diff.then(|| match scope {
+        // Who is asking, as a share would act: whose changes a `diff`
+        // answers, and whose recorded refusal the status shows.
+        let share_actor = match scope {
             crate::scope::Scope::Unrestricted => ShareActor::Owner,
             crate::scope::Scope::User { account, .. } => ShareActor::Account(account.clone()),
             crate::scope::Scope::Anonymous => ShareActor::HttpAgent,
-        });
+        };
+        // A refusal is recorded per login, so the status reads it under the
+        // login this caller's shares go out on. Resolved once, outside every
+        // domain's lock; unresolvable reads as "shown none".
+        let viewer = self.share_login_for(&share_actor);
+        let diff_actor = diff.then_some(share_actor);
         let mut domains = Vec::new();
         let mut errors = Vec::new();
         for (name, entry) in targets {
@@ -1003,6 +1008,7 @@ impl Engine {
                     diff_block.as_ref(),
                     &view,
                     converged.as_ref(),
+                    viewer.as_ref().map(Option::as_deref),
                 )
                 .await
             {
@@ -1042,6 +1048,7 @@ impl Engine {
     /// list up anywhere else, so a status that degrades to local state still
     /// names what is unshared rather than dropping the one answer it can still
     /// give from the working tree alone.
+    #[allow(clippy::too_many_arguments)]
     async fn origin_status_one(
         &self,
         name: &str,
@@ -1050,6 +1057,7 @@ impl Engine {
         diff: Option<&Value>,
         drafts: &crate::review::DraftView,
         converged: Option<&Value>,
+        viewer: Option<Option<&str>>,
     ) -> Result<Value> {
         let lock = self.origin_lock(name);
         let _guard = lock.lock().await;
@@ -1137,6 +1145,7 @@ impl Engine {
                 &report,
                 None,
                 change_detail(),
+                origin::viewer_refusal(&report, viewer, sharing),
             ))),
             Err(e) if probe.is_some() && origin::is_probe_transport_error(&e) => {
                 // AuthExpired is one of the transport errors this arm catches
@@ -1151,6 +1160,7 @@ impl Engine {
                     &report,
                     Some(e.to_string()),
                     change_detail(),
+                    origin::viewer_refusal(&report, viewer, sharing),
                 )))
             }
             Err(e) => Err(e.into()),
@@ -1499,6 +1509,21 @@ impl Engine {
         })
     }
 
+    /// [`Engine::origin_share_with`] without `as_proposal`: the share goes
+    /// the way the domain and this machine's recorded refusal decide.
+    pub async fn origin_share(
+        &self,
+        domain: &str,
+        title: Option<&str>,
+        description: Option<&str>,
+        proposal: Option<u64>,
+        files: Option<&[String]>,
+        actor: ShareActor,
+    ) -> Result<Value> {
+        self.origin_share_with(domain, title, description, proposal, files, None, actor)
+            .await
+    }
+
     /// Proposes one domain's local changes as a pull request against its
     /// origin, under its origin lock.
     ///
@@ -1533,13 +1558,20 @@ impl Engine {
     /// this share creates or rewrites, in both modes
     /// (`crystalline_remote::state::Proposal::author_login`), so a chain whose
     /// layers belong to different people can say so.
-    pub async fn origin_share(
+    ///
+    /// `as_proposal` is how a share on a `sharing: direct` domain goes:
+    /// `Some(true)` opens a proposal, `Some(false)` tries the direct commit
+    /// only, `None` lets the refusal recorded for the acting login decide (see
+    /// `crystalline_remote::ops::ShareOptions::as_proposal`).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn origin_share_with(
         &self,
         domain: &str,
         title: Option<&str>,
         description: Option<&str>,
         proposal: Option<u64>,
         files: Option<&[String]>,
+        as_proposal: Option<bool>,
         actor: ShareActor,
     ) -> Result<Value> {
         let stacks_allowed = {
@@ -1601,6 +1633,7 @@ impl Engine {
             domain,
             &state_dir,
             ops::ShareOptions {
+                as_proposal,
                 title,
                 description,
                 proposal,
@@ -1692,7 +1725,7 @@ impl Engine {
                     "conflicts": conflicts,
                 }))
             }
-            Err(e) => Err(enrich_write_error(e, acting.as_deref(), &spec.repo).into()),
+            Err(e) => Err(share_write_error(e, acting.as_deref(), &spec.repo).into()),
         }
     }
 
@@ -1821,6 +1854,25 @@ impl Engine {
         actor: ShareActor,
         credential: PreviewCredential,
     ) -> Result<Value> {
+        self.origin_share_preview_with(domain, title, proposal, files, None, actor, credential)
+            .await
+    }
+
+    /// [`Engine::origin_share_preview`] with `as_proposal`, the share's own
+    /// choice of route on a `sharing: direct` domain (see
+    /// [`Engine::origin_share_with`]), so the plan is the one that share
+    /// would follow.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn origin_share_preview_with(
+        &self,
+        domain: &str,
+        title: Option<&str>,
+        proposal: Option<u64>,
+        files: Option<&[String]>,
+        as_proposal: Option<bool>,
+        actor: ShareActor,
+        credential: PreviewCredential,
+    ) -> Result<Value> {
         let stacks_allowed = {
             let config = self.config.read().unwrap();
             if !config.github_enabled() {
@@ -1887,6 +1939,7 @@ impl Engine {
             domain,
             &state_dir,
             ops::ShareOptions {
+                as_proposal,
                 title,
                 description: None,
                 proposal,
@@ -3164,6 +3217,19 @@ impl Engine {
             Arc::new(GitHubProvider::new(api_url, Some(token.access_token))),
             login,
         ))
+    }
+
+    /// The login a share by `actor` would go out on, the one
+    /// [`Engine::resolve_share_provider`] hands the share, without building a
+    /// client: `Some(None)` for a credential that names nobody, and `None`
+    /// when no credential resolves for `actor` (not connected, no personal
+    /// token, no agent identity), which a status reads as "nobody's refusal".
+    fn share_login_for(&self, actor: &ShareActor) -> Option<Option<String>> {
+        if self.origin_provider_override.is_some() {
+            return Some(self.origin_provider_override_login.clone());
+        }
+        let (_, token) = self.resolve_share_credential(actor).ok()?;
+        Some(token.user_display().map(str::to_string))
     }
 
     /// The credential half of [`Engine::resolve_share_provider`]: the api url

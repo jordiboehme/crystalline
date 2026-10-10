@@ -2664,7 +2664,15 @@ impl McpServer {
             return answer;
         }
         let caller = self.caller(&ctx);
-        let value = self.read_core(p, &caller).await?;
+        let mut value = self.read_core(p, &caller).await?;
+        attach_configure_hint(
+            &mut value,
+            !hidden_collab_tool(
+                "configure",
+                self.engine.read_only(),
+                self.engine.github_enabled(),
+            ),
+        );
         let links = self.attachment_links(&value, &caller.scope).await;
         let mut result = ok(value)?;
         result.content.extend(links);
@@ -2770,7 +2778,7 @@ impl McpServer {
     #[tool(
         name = "search_engrams",
         title = "Search engrams",
-        description = "Search across every registered domain by default (an all-domain sweep) or a chosen few to recall relevant knowledge and experience. Defaults to hybrid lexical-plus-semantic ranking and falls back to plain text when embeddings are not ready. Filter by type, tags, status, arbitrary frontmatter or a recorded-after date; a filter-only search with no query text is allowed. Every hit is labelled with its domain, and a hit inside an observation carries its line. A hit's snippet is a short window around the match, never the whole engram: read_engram returns the full content, so read before citing or summarizing what a hit only previews. The result reports total, page, limit and count; when count is below total, request the next page to see the rest. A tags filter also matches through a domain's tag aliases (the MANIFEST `## Tag Aliases` section), so a merged old tag name still finds its engrams. A status filter on stable or current matches both, since they are one state under two spellings; any other status matches exactly. Hybrid ranking adds a small salience prior, so an engram marked salient at write time ranks above equally relevant unmarked ones without ever excluding a result. Engrams whose status is deprecated, superseded, archived or legacy are softly faded in ranking (the search.retired_weight setting, default 0.6, 1.0 disables), reordered but never excluded. Every hit on the returned page also comes back as a resource_link block beside the text, in hit order: follow the crystalline:// handle with resources/read instead of assembling the address out of the row's domain and permalink. The result carries one web_url_template; fill in a hit's domain and permalink to hand a person that engram's page.",
+        description = "Search across every registered domain by default (an all-domain sweep) or a chosen few to recall relevant knowledge and experience. Defaults to hybrid lexical-plus-semantic ranking and falls back to plain text when embeddings are not ready. Filter by type, tags, status, arbitrary frontmatter or a recorded-after date; a filter-only search with no query text is allowed. A metadata filter can also match one element of a list, exactly, with $contains ({\"sources\": {\"$contains\": \"https://example.com/a\"}}), or any of several with $contains_any ({\"sources\": {\"$contains_any\": [\"https://example.com/a\", \"https://example.com/b\"]}}); a single value counts as a one-element list. Call it to find every engram that cites a source, an anchor or a URL in a frontmatter list such as sources. $contains_any takes at most 100 distinct values. A custom key longer than 256 bytes, or a value whose JSON is longer than 1024 bytes, is not indexed, so $contains never matches it. On tags, both operators fold case and tag aliases. Every hit is labelled with its domain, and a hit inside an observation carries its line. A hit's snippet is a short window around the match, never the whole engram: read_engram returns the full content, so read before citing or summarizing what a hit only previews. The result reports total, page, limit and count; when count is below total, request the next page to see the rest. A tags filter also matches through a domain's tag aliases (the MANIFEST `## Tag Aliases` section), so a merged old tag name still finds its engrams. A status filter on stable or current matches both, since they are one state under two spellings; any other status matches exactly. Hybrid ranking adds a small salience prior, so an engram marked salient at write time ranks above equally relevant unmarked ones without ever excluding a result. Engrams whose status is deprecated, superseded, archived or legacy are softly faded in ranking (the search.retired_weight setting, default 0.6, 1.0 disables), reordered but never excluded. Every hit on the returned page also comes back as a resource_link block beside the text, in hit order: follow the crystalline:// handle with resources/read instead of assembling the address out of the row's domain and permalink. The result carries one web_url_template; fill in a hit's domain and permalink to hand a person that engram's page.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn search_engrams(
@@ -2948,7 +2956,7 @@ impl McpServer {
     #[tool(
         name = "configure",
         title = "Configure Crystalline",
-        description = "View and adjust Crystalline's settings, like an app's preferences page: call with no arguments to see them, set to change them (for example github.enabled to turn on team collaboration) and connect to link your GitHub account with a short code you confirm in the browser. With a token it accepts a personal access token instead. Connecting works before or after enabling; only team domains need github.enabled turned on. The instance's network, database and sign-in are not listed here: the operator sets them with the crystalline CLI.",
+        description = "View and adjust Crystalline's settings, like an app's preferences page: call with no arguments to see them, set to change them (for example github.enabled to turn on team collaboration) and connect to link your GitHub account with a short code you confirm in the browser. With a token it accepts a personal access token instead. Connecting works before or after enabling; only team domains need github.enabled turned on. Call it with domain to see and change how one domain behaves: its domain policies (the MANIFEST keys sharing, direct or proposal, and generated indexes, local or shared), what each MANIFEST section does, and its rule overrides in .crystalline.yaml (a verify rule's severity, off, error, warning or info, and the token budget). With domain, set and unset change that domain, for example set { \"sharing\": \"direct\" } to allow direct commits or { \"rules.E007\": \"off\" } to turn a rule off. Call it with domain whenever the user wants a domain to commit directly or open proposals, to share or keep its generated indexes, or to silence or raise a rule. The instance's network, database and sign-in are not listed here: the operator sets them with the crystalline CLI.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -2966,6 +2974,12 @@ impl McpServer {
         }
         if self.engine.read_only() {
             return Err(ErrorData::invalid_params(CONFIGURE_READ_ONLY_REFUSAL, None));
+        }
+        // A call naming a domain is about that domain: its view, and its
+        // policy keys and rule overrides. It never touches an instance
+        // setting, so the instance-change gate below is not its gate.
+        if p.domain.is_some() {
+            return self.configure_domain(p, &ctx).await;
         }
 
         // A bare `configure` is the settings page, which is a read and stays
@@ -3028,11 +3042,9 @@ impl McpServer {
         // announced it, and reports what applied before it stopped.
         self.apply_settings(&p).await?;
 
-        self.engine
-            .configure_snapshot()
-            .await
-            .map_err(to_error)
-            .and_then(|v| self.ok_list(v))
+        let mut snapshot = self.engine.configure_snapshot().await.map_err(to_error)?;
+        snapshot["domain_settings"] = json!(CONFIGURE_DOMAIN_HINT);
+        self.ok_list(snapshot)
     }
 
     #[tool(
@@ -3223,7 +3235,7 @@ impl McpServer {
     #[tool(
         name = "share_changes",
         title = "Share changes",
-        description = "Share this domain's new knowledge and experience with the team as a proposal they review on GitHub; returns the review URL to hand to the user. In a review-mode domain the share is exactly your draft entries. Where the forge serves stacked pull requests, sharing while a proposal is open STACKS a new proposal on top of it - each share gets its own focused review - and reviewers merge layers bottom-up (merging the top lands the whole chain). Pass proposal to amend that open layer instead (the way to act on its review feedback); layers above it are re-based automatically. An edit to a file an open higher layer already changed belongs in that higher layer - pass its number - rather than in a lower amend, which would only be overwritten by the layer above it. On forges without stacks the open proposal is updated in place as before: same proposal number, same URL, a fresh commit reviewers are notified about, never a duplicate. Review feedback (approvals, change requests, comments) arrives through update_domain and origin_status, so the loop is: share, read the feedback, refine the engrams, share again naming the layer the feedback belongs to. If a reviewer pushed commits onto the proposal branch the update refuses with guidance: let the review finish on GitHub, or withdraw_proposal and share afresh. A domain whose MANIFEST declares sharing: direct has no review step: the share commits the selected files straight onto the connected branch, in one commit authored by the acting identity, and returns the commit's sha and URL instead of a proposal; it refuses while any proposal is still open (merge or withdraw it first) and answers branch_protected when the branch's rules do not accept direct commits. Pass files to share only some of the changed files - an array of domain-relative paths, with the generated folder indexes of the folders they live in riding along; anything left out stays an unshared local change for a later share, and a path that is not among this domain's unshared changes refuses and names itself. Refuses while conflicts are unsettled so the team always reviews a clean proposal. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure. Where the instance sets github.share_identity to personal, the proposal is authored by the sharer's own personal GitHub identity rather than by the one instance credential: connect one in Fluid (profile > GitHub identity) or with 'crystalline connect github --personal' - without a connection the share refuses and says so - while agent shares over HTTP run as the account the agent authenticated as, or as the account github.agent_identity names where agents are not made to authenticate. The call shares at once, with no question to the user, so make it when the person wants the work shared.",
+        description = "Share this domain's new knowledge and experience with the team as a proposal they review on GitHub; returns the review URL to hand to the user. In a review-mode domain the share is exactly your draft entries. Where the forge serves stacked pull requests, sharing while a proposal is open STACKS a new proposal on top of it - each share gets its own focused review - and reviewers merge layers bottom-up (merging the top lands the whole chain). Pass proposal to amend that open layer instead (the way to act on its review feedback); layers above it are re-based automatically. An edit to a file an open higher layer already changed belongs in that higher layer - pass its number - rather than in a lower amend, which would only be overwritten by the layer above it. On forges without stacks the open proposal is updated in place as before: same proposal number, same URL, a fresh commit reviewers are notified about, never a duplicate. Review feedback (approvals, change requests, comments) arrives through update_domain and origin_status, so the loop is: share, read the feedback, refine the engrams, share again naming the layer the feedback belongs to. If a reviewer pushed commits onto the proposal branch the update refuses with guidance: let the review finish on GitHub, or withdraw_proposal and share afresh. A domain whose MANIFEST declares sharing: direct has no review step: the share commits the selected files straight onto the connected branch, in one commit authored by the acting identity, and returns the commit's sha and URL instead of a proposal; while one of your proposals is open, a share that names it with proposal amends it, a share with as_proposal: true stacks on it or amends it, and after a refusal a share does that on its own; any other direct share refuses while one of your proposals is open (merge or withdraw it first); another person's open proposal does not stop your direct commit, and files that only that proposal changed stay out of your commit. Another person's proposal is never yours to amend or extend: as_proposal: true or a proposal number naming it is refused while it is open. A direct share answers branch_protected when the branch's rules do not accept your direct commits. When that answer carries fallback, it offers the same changes as a proposal: offer it to the user and call again with as_proposal: true. Without fallback (another person's proposal is open), relay its guidance as given. After such a refusal, later shares try the direct commit and fall back to a proposal on their own, and a receipt with fell_back says so; as_proposal: false tries the direct commit only. Pass files to share only some of the changed files - an array of domain-relative paths, with the generated folder indexes of the folders they live in riding along; anything left out stays an unshared local change for a later share, and a path that is not among this domain's unshared changes refuses and names itself. Refuses while conflicts are unsettled so the team always reviews a clean proposal. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure. Where the instance sets github.share_identity to personal, the proposal is authored by the sharer's own personal GitHub identity rather than by the one instance credential: connect one in Fluid (profile > GitHub identity) or with 'crystalline connect github --personal' - without a connection the share refuses and says so - while agent shares over HTTP run as the account the agent authenticated as, or as the account github.agent_identity names where agents are not made to authenticate. The call shares at once, with no question to the user, so make it when the person wants the work shared.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -3267,12 +3279,13 @@ impl McpServer {
         // keeps the shape it had.
         match self
             .engine
-            .origin_share(
+            .origin_share_with(
                 &p.domain,
                 p.title.as_deref(),
                 p.description.as_deref(),
                 p.proposal,
                 p.files.as_deref(),
+                p.as_proposal,
                 self.share_actor(&ctx),
             )
             .await
@@ -3324,7 +3337,7 @@ impl McpServer {
     #[tool(
         name = "origin_status",
         title = "Origin status",
-        description = "Review each shared domain's standing: whether the team has new knowledge to learn, what is waiting to be shared, each open proposal's number, URL, review state (approved, changes requested, commented), whether a reviewer amended its branch, its feedback count, plus declined proposals and any conflicts to settle, and the domain's sharing policy (proposal or direct) with the commits this machine put straight on the branch (direct_shares). Unshared work is a bare count by default (local_changes): pass detail: true to have it named instead, which returns the unshared, uncommitted, not-yet-proposed files as domain-relative paths grouped by change kind - added, modified, deleted - beside a count of the generated folder listings that ride along with a share. Ask for detail whenever you have to say WHICH files are unshared or what would go into the next proposal, and report those paths as given; never work the change set out from the filesystem with a directory listing, a timestamp scan or git, because a deleted file is gone from disk and no scan can see it, and a scan whose count happens to match is not confirmation. Pass diff: true with a domain to also get both sides of every unshared file, the team's and yours, which is what to read before discard_changes. Where the forge serves stacked pull requests every open proposal also carries its position in the chain - layer 1 is the bottom, and reviewers merge bottom-up - beside the domain's stack number, the declined layers still wedged under open work, and whether this chain is mid-repair, which means the next share or withdraw finishes it. Those keys are absent while nothing is stacked, and a position with no stack number means these layers are not grouped on the forge - either the link is still owed, or this domain is not stacking at all. Feedback bodies are not repeated here - update_domain returns the reviewers' comment text. Each proposal carries the author_login it was shared under where one was recorded, which is how a chain whose layers belong to different people says so: an instance that sets github.share_identity to personal shares under each sharer's own connected personal GitHub identity (Fluid's profile > GitHub identity, or 'crystalline connect github --personal'), while agent shares over HTTP run as the account the agent authenticated as, or as the account github.agent_identity names where agents are not made to authenticate; reading and pulling always stay on the one instance credential. kept_branches names a share branch Crystalline keeps upstream: an open pull request is based on it or comes from it, the branch a pull request should move to no longer exists, GitHub refused the delete or a waiting move still needs the branch. Each entry says why (merged, declined or withdrawn share) and what kept it; relay its message as given. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure.",
+        description = "Review each shared domain's standing: whether the team has new knowledge to learn, what is waiting to be shared, each open proposal's number, URL, review state (approved, changes requested, commented), whether a reviewer amended its branch, its feedback count, plus declined proposals and any conflicts to settle, and the domain's sharing policy (proposal or direct) with the commits this machine put straight on the branch (direct_shares). When the branch refused a direct commit made under the GitHub login your shares go out on, direct_refused names the branch, the forge's message and the date, and its line says that your shares now go as proposals; relay that line as given. It is null otherwise, and another person's refusal never shows here. Unshared work is a bare count by default (local_changes): pass detail: true to have it named instead, which returns the unshared, uncommitted, not-yet-proposed files as domain-relative paths grouped by change kind - added, modified, deleted - beside a count of the generated folder listings that ride along with a share. Ask for detail whenever you have to say WHICH files are unshared or what would go into the next proposal, and report those paths as given; never work the change set out from the filesystem with a directory listing, a timestamp scan or git, because a deleted file is gone from disk and no scan can see it, and a scan whose count happens to match is not confirmation. Pass diff: true with a domain to also get both sides of every unshared file, the team's and yours, which is what to read before discard_changes. Where the forge serves stacked pull requests every open proposal also carries its position in the chain - layer 1 is the bottom, and reviewers merge bottom-up - beside the domain's stack number, the declined layers still wedged under open work, and whether this chain is mid-repair, which means the next share or withdraw finishes it. Those keys are absent while nothing is stacked, and a position with no stack number means these layers are not grouped on the forge - either the link is still owed, or this domain is not stacking at all. Feedback bodies are not repeated here - update_domain returns the reviewers' comment text. Each proposal carries the author_login it was shared under where one was recorded, which is how a chain whose layers belong to different people says so: an instance that sets github.share_identity to personal shares under each sharer's own connected personal GitHub identity (Fluid's profile > GitHub identity, or 'crystalline connect github --personal'), while agent shares over HTTP run as the account the agent authenticated as, or as the account github.agent_identity names where agents are not made to authenticate; reading and pulling always stay on the one instance credential. kept_branches names a share branch Crystalline keeps upstream: an open pull request is based on it or comes from it, the branch a pull request should move to no longer exists, GitHub refused the delete or a waiting move still needs the branch. Each entry says why (merged, declined or withdrawn share) and what kept it; relay its message as given. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure.",
         annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn origin_status(
@@ -3923,6 +3936,60 @@ impl McpServer {
         let mut result = self.ok_list(value)?;
         result.content.extend(links);
         Ok(result)
+    }
+
+    /// `configure` with a domain: the view of how that domain behaves. A
+    /// domain this caller may not see is the not-found a read of it gets; a
+    /// refusal the engine raises is text the model reads.
+    async fn configure_domain(
+        &self,
+        p: ConfigureParams,
+        ctx: &RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if p.connect.is_some() || p.token.is_some() || p.host.is_some() || p.restart {
+            return refuse(CONFIGURE_DOMAIN_NO_CONNECT);
+        }
+        // The operator keys stay out of configure whatever else the call names.
+        if p.set
+            .keys()
+            .chain(p.unset.iter())
+            .any(|key| crate::settings::is_operator_key(key))
+        {
+            return refuse(crate::settings::OPERATOR_SETTING_REFUSAL);
+        }
+        let p = self.localized(p, ctx).await?;
+        let domain = p.domain.clone().unwrap_or_default();
+        let scope = self.scope_of(ctx);
+        let answer = if p.set.is_empty() && p.unset.is_empty() {
+            self.engine.domain_settings(&domain, &scope).await
+        } else {
+            // A key only an instance admin may change is this layer's check,
+            // as it is REST's: the engine checks the owner rule only. A hidden
+            // domain is the not-found first.
+            if let Err(e) = self.engine.require_domain(&domain, &scope).await {
+                return Err(to_error(e));
+            }
+            let admin = matches!(scope, Scope::Unrestricted | Scope::User { admin: true, .. });
+            if let Some(text) = admin_policy_refusal(
+                p.set.keys().chain(p.unset.iter()),
+                crystalline_core::policy_registry(),
+                admin,
+            ) {
+                return refuse(text);
+            }
+            self.engine
+                .change_domain_settings(&domain, &p.set, &p.unset, &scope)
+                .await
+        };
+        match answer {
+            Ok(view) => self.ok_list(view),
+            Err(
+                EngineError::Invalid(text)
+                | EngineError::Forbidden(text)
+                | EngineError::Refused(text),
+            ) => refuse(text),
+            Err(e) => Err(to_error(e)),
+        }
     }
 
     /// Applies `configure`'s `set` map then `unset` list, one key at a time
@@ -4780,6 +4847,26 @@ fn ok_split(value: Value) -> Result<CallToolResult, ErrorData> {
     Ok(result)
 }
 
+/// The refusal for the first of `keys` that only an instance admin may change
+/// ([`crystalline_core::PolicyRole::Admin`] in `registry`), when the caller is
+/// not one. No key needs the role today; REST refuses the same keys.
+fn admin_policy_refusal<'a>(
+    keys: impl IntoIterator<Item = &'a String>,
+    registry: &[crystalline_core::PolicyKey],
+    admin: bool,
+) -> Option<String> {
+    if admin {
+        return None;
+    }
+    keys.into_iter()
+        .find(|key| {
+            registry.iter().any(|spec| {
+                spec.key == key.as_str() && spec.changed_by == crystalline_core::PolicyRole::Admin
+            })
+        })
+        .map(|key| format!("only an instance admin may change `{key}`"))
+}
+
 /// What an authenticated non-admin agent is told when it tries to change what
 /// this instance is: which domains are registered, how it is configured, and
 /// what it provisions into the harnesses on the machine it runs on.
@@ -4801,6 +4888,29 @@ const INSTANCE_ADMIN_ONLY: &str = "Changing this instance itself - the domains r
 const CONFIGURE_READ_ONLY_REFUSAL: &str = "this instance is read-only, and a read-only instance \
      does not show its configuration to connected agents; whoever runs it reads the settings \
      on the server with `crystalline config show`";
+
+/// The one line a bare `configure` adds about the domain view.
+const CONFIGURE_DOMAIN_HINT: &str = "Call configure with domain to see and change a domain's policies, sections and rule overrides.";
+
+/// What a domain's MANIFEST carries when it is read over MCP.
+const CONFIGURE_MANIFEST_HINT: &str = "This is the domain's MANIFEST: configure with domain lists what each key and section does, and sets the policy keys and rule overrides.";
+
+/// Add the `configure` hint to a read of a domain's MANIFEST (the engram with
+/// permalink `manifest` at the domain root), while `configure` is listed.
+/// Attached by the rmcp handler alone: `read_core` also answers the remote
+/// ctl door, which gets no hint.
+fn attach_configure_hint(value: &mut Value, configure_listed: bool) {
+    if !configure_listed {
+        return;
+    }
+    let is_manifest = value["permalink"] == "manifest" && value["path"] == "MANIFEST.md";
+    if is_manifest && let Some(obj) = value.as_object_mut() {
+        obj.insert("configure".to_string(), json!(CONFIGURE_MANIFEST_HINT));
+    }
+}
+
+/// Why a call naming a domain refuses a connect.
+const CONFIGURE_DOMAIN_NO_CONNECT: &str = "connect, token, host and restart are about this instance's GitHub sign-in, not about a domain; call configure without domain to connect";
 
 /// The sentence `remove_domain` asks before it acts, rendered from
 /// [`crate::engine::Engine::domain_remove_preview`].
@@ -5272,6 +5382,46 @@ mod tests {
     use rmcp::model::ErrorCode;
 
     use super::*;
+
+    /// A policy key only an instance admin may change is refused to anyone
+    /// else, set or unset; an owner key passes. No such key exists yet, so
+    /// the registry here is a stand-in.
+    #[test]
+    fn an_admin_policy_key_is_refused_to_a_caller_who_is_not_an_admin() {
+        let registry = [
+            crystalline_core::PolicyKey {
+                key: "guarded",
+                kind: crystalline_core::PolicyKind::Choice,
+                values: &["on", "off"],
+                default: "off",
+                meaning: "A stand-in key only an admin changes.",
+                changed_by: crystalline_core::PolicyRole::Admin,
+            },
+            crystalline_core::PolicyKey {
+                key: "sharing",
+                kind: crystalline_core::PolicyKind::Choice,
+                values: &["proposal", "direct"],
+                default: "proposal",
+                meaning: "A stand-in owner key.",
+                changed_by: crystalline_core::PolicyRole::Owner,
+            },
+        ];
+        let keys = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            admin_policy_refusal(&keys(&["sharing", "guarded"]), &registry, false).as_deref(),
+            Some("only an instance admin may change `guarded`")
+        );
+        assert_eq!(
+            admin_policy_refusal(&keys(&["guarded"]), &registry, true),
+            None,
+            "an admin may"
+        );
+        assert_eq!(
+            admin_policy_refusal(&keys(&["sharing", "rules.E007"]), &registry, false),
+            None,
+            "an owner key and a rule override are the engine's to gate"
+        );
+    }
 
     /// A client name past [`AGENT_LABEL_CLIENT_CHARS`] is cut, and the cut
     /// carries a trailing `...` so it reads as a cut rather than as the
@@ -6456,6 +6606,26 @@ mod tests {
         assert!(
             INSTANCE_ADMIN_ONLY.contains("provision"),
             "the third class is the one the message forgot: {INSTANCE_ADMIN_ONLY}"
+        );
+    }
+
+    #[test]
+    fn the_configure_hint_rides_only_a_root_manifest_while_configure_is_listed() {
+        let manifest = || json!({ "permalink": "manifest", "path": "MANIFEST.md" });
+        let mut listed = manifest();
+        attach_configure_hint(&mut listed, true);
+        assert_eq!(listed["configure"], CONFIGURE_MANIFEST_HINT);
+        let mut hidden = manifest();
+        attach_configure_hint(&mut hidden, false);
+        assert!(hidden.get("configure").is_none());
+        let mut nested = json!({ "permalink": "manifest", "path": "notes/MANIFEST.md" });
+        attach_configure_hint(&mut nested, true);
+        assert!(nested.get("configure").is_none(), "only the domain root's");
+        let mut title_only = json!({ "permalink": "manifest", "path": "manifest.md" });
+        attach_configure_hint(&mut title_only, true);
+        assert!(
+            title_only.get("configure").is_none(),
+            "a title is not the root file"
         );
     }
 }

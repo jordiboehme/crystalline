@@ -56,6 +56,8 @@ To bring in an MCP server the person already registered, rewrite it as an `mcps`
 
 ## Declare the folders in the MANIFEST
 
+To see or change how a domain behaves (its sharing, generated indexes, MANIFEST sections or rule overrides), call configure with the domain.
+
 Say which bullets you will write, one per kind, each `kind: path` relative to the MANIFEST. Then call `read_engram` with `"identifier": "manifest"` and the domain, and `edit_engram` with the `expected_checksum` from that read.
 
 For a new section use `"operation": "append"` with `## Provisioning` and the bullets as content:
