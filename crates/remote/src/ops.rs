@@ -2111,7 +2111,9 @@ pub(crate) enum ShareRoute {
 /// direct attempt falls back while that login's refusal is recorded, and only
 /// while no proposal of anyone's is open here: a fallback opens a fresh bottom
 /// layer, which another person's open chain has no room for, so such a share
-/// answers the refusal instead and offers `as_proposal`.
+/// answers the refusal instead and offers no proposal
+/// (`ProposeOutcome::BranchProtected::offers_proposal` is false): a proposal
+/// share there answers `ProposalOpen` (see [`foreign_proposal_block`]).
 pub(crate) fn share_route(options: &ShareOptions<'_>, state: &OriginState) -> ShareRoute {
     if options.sharing != Sharing::Direct {
         return ShareRoute::Proposal;
