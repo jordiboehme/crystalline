@@ -255,7 +255,9 @@ pub fn meta_value_match_sql(key: &str, values: &[String]) -> String {
 /// for the key, which for a key like `sources` is every anchor in the index.
 /// The arms sit in a derived table: a bare compound inside `IN (...)` made
 /// turso walk the domain through `idx_engram_domain` instead of seeking `e`
-/// by primary key from the list. One value gives exactly
+/// by primary key from the list. A scoped search also spells its scope as
+/// `+d.name` while this predicate is in it (`turso::domain_scope_sql`), or
+/// turso walks the domain from about ten values on. One value gives exactly
 /// [`meta_value_match_sql`].
 #[doc(hidden)]
 pub fn meta_value_union_sql(key: &str, values: &[String]) -> String {

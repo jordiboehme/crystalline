@@ -4709,7 +4709,10 @@ async fn contains_any_at_the_cap(store: &dyn Store) {
     );
     sync_domain(store, "d", root).await.unwrap();
 
-    let list = padded(98, &["x2", "y1"]);
+    // `x1` opens the list and `x2` closes it, so `a` matches through the
+    // first group and the last one and must still come back once.
+    let mut list = vec![serde_json::Value::from("x1")];
+    list.extend(padded(97, &["x2", "y1"]));
     assert_eq!(list.len(), 100);
     let wire = serde_json::json!({ "sources": { "$contains_any": list } });
     assert_eq!(

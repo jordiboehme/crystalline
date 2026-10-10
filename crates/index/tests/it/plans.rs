@@ -1012,7 +1012,8 @@ pub fn registry() -> Vec<HotStatement> {
                 crystalline_index::turso::filter_only_sql(
                     BASE_SCREEN,
                     &format!(
-                        "AND d.name IN (?1) AND {}",
+                        "AND {} AND {}",
+                        crystalline_index::turso::domain_scope_sql("?1", true),
                         crystalline_index::meta_value_union_sql("?2", &["?3".to_string()])
                     ),
                     SearchOrder::RecordedDesc,
@@ -1084,7 +1085,8 @@ pub fn registry() -> Vec<HotStatement> {
                 crystalline_index::turso::filter_only_sql(
                     BASE_SCREEN,
                     &format!(
-                        "AND d.name IN (?1) AND {}",
+                        "AND {} AND {}",
+                        crystalline_index::turso::domain_scope_sql("?1", true),
                         crystalline_index::meta_value_union_sql(
                             "?2",
                             &["?3".to_string(), "?4".to_string()]
@@ -1566,6 +1568,70 @@ async fn a_dropped_side_table_index_is_caught_by_the_turso_plan_guard() {
         scanned,
         "with the side table's index dropped the plan must scan, so the green run means something: {plan:?}"
     );
+}
+
+/// `$contains_any` keeps one `(key, value)` seek per value and reads `engram`
+/// only by primary key at every list length up to the cap of 100, scoped and
+/// unscoped, in the page and in the count that runs before it. Scoped with a
+/// plain `d.name IN (...)`, turso walked the domain from 9 values on in the
+/// page and in the count (213 ms for 100 values over a 50,000-engram domain),
+/// which the two-value registry entries never saw. The scope is spelled by
+/// `domain_scope_sql`, as `build_scalar_filters` spells it.
+#[tokio::test]
+async fn the_contains_any_list_keeps_its_seeks_at_every_length() {
+    let store = turso_fixture().await;
+    for n in [1usize, 2, 3, 8, 9, 10, 17, 50, 99, 100] {
+        let values: Vec<String> = (0..n).map(|i| format!("?{}", i + 3)).collect();
+        let mut literals = vec!["'d'".to_string(), "'sources'".to_string()];
+        literals.extend((0..n).map(|i| format!("'\"notedown://jordi/n{i}#b0\"'")));
+        let literals: Vec<&str> = literals.iter().map(String::as_str).collect();
+        let predicate = crystalline_index::meta_value_union_sql("?2", &values);
+        let scoped = format!(
+            "AND {} AND {predicate}",
+            crystalline_index::turso::domain_scope_sql("?1", true)
+        );
+        let unscoped = format!("AND {predicate}");
+        for (scope, filters) in [("unscoped", unscoped), ("scoped", scoped)] {
+            let page = crystalline_index::turso::filter_only_sql(
+                BASE_SCREEN,
+                &filters,
+                SearchOrder::RecordedDesc,
+                50,
+                0,
+            );
+            let count = crystalline_index::turso::filter_only_count_sql(BASE_SCREEN, &filters);
+            for (statement, sql) in [("page", page), ("count", count)] {
+                let label = format!("{n} values, {scope}, {statement}");
+                let plan = store
+                    .explain_query_plan(&bind_literals(&sql, &literals))
+                    .await
+                    .unwrap();
+                let point_seeks = plan
+                    .iter()
+                    .filter(|line| {
+                        line.contains(&format!("{META_VALUE_INDEX} (key=? AND value=?)"))
+                    })
+                    .count();
+                assert_eq!(
+                    point_seeks, n,
+                    "{label}: one (key, value) seek per value: {plan:?}"
+                );
+                for line in &plan {
+                    if read_of(line).is_some_and(|(name, _)| table_of(name) == "engram") {
+                        assert!(
+                            line.contains("USING INTEGER PRIMARY KEY"),
+                            "{label}: engram must be reached by primary key, never walked: \
+                             {line}. Whole plan: {plan:?}"
+                        );
+                    }
+                }
+                assert!(
+                    !plan.iter().any(|line| line.contains("CORRELATED")),
+                    "{label}: the filter runs once per engram row: {plan:?}"
+                );
+            }
+        }
+    }
 }
 
 // --- the postgres leg --------------------------------------------------------

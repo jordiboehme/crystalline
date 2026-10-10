@@ -201,7 +201,8 @@ async fn contains_filter_at_50k() {
     let scoped = crystalline_index::turso::filter_only_sql(
         "e.actor = ''",
         &format!(
-            "AND d.name IN (?1) AND {}",
+            "AND {} AND {}",
+            crystalline_index::turso::domain_scope_sql("?1", true),
             meta_value_union_sql("?2", &["?3".to_string()])
         ),
         SearchOrder::RecordedDesc,

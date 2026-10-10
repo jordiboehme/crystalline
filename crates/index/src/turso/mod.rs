@@ -30,8 +30,8 @@ mod search;
 /// than holding a second copy of the number.
 #[doc(hidden)]
 pub use search::{
-    DEFAULT_MIN_SIMILARITY, filter_only_sql, lexical_candidate_sql, node_hydrate_sql,
-    semantic_hydrate_sql, semantic_phase1_sql,
+    DEFAULT_MIN_SIMILARITY, domain_scope_sql, filter_only_count_sql, filter_only_sql,
+    lexical_candidate_sql, node_hydrate_sql, semantic_hydrate_sql, semantic_phase1_sql,
 };
 
 use std::collections::{BTreeMap, HashMap, HashSet};

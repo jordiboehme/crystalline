@@ -358,10 +358,7 @@ async fn filter_only(
 ) -> Result<Page<SearchHit>> {
     let total = scalar_i64(
         conn,
-        &format!(
-            "SELECT count(*) FROM engram e JOIN domain d ON d.id=e.domain_id \
-             WHERE {actor_screen} {and_filters}"
-        ),
+        &filter_only_count_sql(actor_screen, and_filters),
         params.clone(),
     )
     .await?
@@ -658,6 +655,17 @@ pub fn filter_only_sql(
     )
 }
 
+/// The count a filter-only page runs first, with the same filters. Built here
+/// so the plan pins explain the statement this store issues: it has no
+/// `ORDER BY` and no `LIMIT`, so turso can plan it differently from the page.
+#[doc(hidden)]
+pub fn filter_only_count_sql(actor_screen: &str, and_filters: &str) -> String {
+    format!(
+        "SELECT count(*) FROM engram e JOIN domain d ON d.id=e.domain_id \
+         WHERE {actor_screen} {and_filters}"
+    )
+}
+
 /// The lexical candidate prefilter: every row matching the reader's terms and
 /// filters, capped, ranked afterwards in Rust.
 ///
@@ -874,6 +882,9 @@ fn build_scalar_filters(
     n: &mut usize,
     aliases: &AliasMap,
 ) {
+    // Where the domain scope sits in `clauses`, and its placeholders, so it
+    // can be respelled once the metadata filters are known.
+    let mut scope: Option<(usize, String)> = None;
     if let Some(domains) = &query.domains
         && !domains.is_empty()
     {
@@ -886,7 +897,8 @@ fn build_scalar_filters(
                 p
             })
             .collect();
-        clauses.push(format!("d.name IN ({})", ph.join(",")));
+        scope = Some((clauses.len(), ph.join(",")));
+        clauses.push(domain_scope_sql(&ph.join(","), false));
     }
 
     // A folder filter, matched as a literal prefix: the caller hands the folder
@@ -958,10 +970,34 @@ fn build_scalar_filters(
         }
     }
 
+    let mut side_table = false;
     for f in &query.metadata_filters {
-        if let Some(clause) = metadata_clause(f, params, n, aliases) {
+        if let Some(clause) = metadata_clause(f, params, n, aliases, &mut side_table) {
             clauses.push(clause);
         }
+    }
+    if side_table && let Some((at, list)) = scope {
+        clauses[at] = domain_scope_sql(&list, true);
+    }
+}
+
+/// The domain scope of a search, over the caller's placeholders.
+///
+/// `d.name IN (...)` lets turso start from `domain` by name and reach
+/// `engram` through `idx_engram_domain`, which a scoped listing needs. With a
+/// `$contains` or `$contains_any` filter that reads `engram_meta_value`, that
+/// same path is the wrong one: turso has no table statistics, so from about
+/// ten matched values on it judged a walk of the whole domain cheaper than
+/// the primary-key probes from the side table, for the page and for the count
+/// (213 ms for 100 values over a 50,000-engram domain). `+d.name` is the same
+/// test with the name index taken out of the planner's choice, so the side
+/// table drives the join and `domain` is checked by primary key on each hit.
+#[doc(hidden)]
+pub fn domain_scope_sql(list: &str, side_table_drives: bool) -> String {
+    if side_table_drives {
+        format!("+d.name IN ({list})")
+    } else {
+        format!("d.name IN ({list})")
     }
 }
 
@@ -1008,6 +1044,7 @@ fn metadata_clause(
     params: &mut Vec<Value>,
     n: &mut usize,
     aliases: &AliasMap,
+    side_table: &mut bool,
 ) -> Option<String> {
     let key = f.key.as_str();
 
@@ -1047,8 +1084,10 @@ fn metadata_clause(
                 return None;
             }
             return match &f.op {
-                FilterOp::Contains(v) => meta_value_clause(key, std::slice::from_ref(v), params, n),
-                FilterOp::ContainsAny(vs) => meta_value_clause(key, vs, params, n),
+                FilterOp::Contains(v) => {
+                    meta_value_clause(key, std::slice::from_ref(v), params, n, side_table)
+                }
+                FilterOp::ContainsAny(vs) => meta_value_clause(key, vs, params, n, side_table),
                 op => Some(op_clause(
                     &format!("json_extract(e.metadata, '$.{key}')"),
                     op,
@@ -1096,12 +1135,14 @@ fn op_clause(col: &str, op: &FilterOp, params: &mut Vec<Value>, n: &mut usize) -
 /// `values`. A dotted key is ignored, the way a key with a quote is: the
 /// table holds top-level keys only. A key or a value no row can hold (see
 /// `meta_value_text`) cannot match, and with nothing left the filter matches
-/// nothing.
+/// nothing. `side_table` is set when the predicate reads the side table, so
+/// the domain scope can step aside (see [`domain_scope_sql`]).
 fn meta_value_clause(
     key: &str,
     values: &[serde_json::Value],
     params: &mut Vec<Value>,
     n: &mut usize,
+    side_table: &mut bool,
 ) -> Option<String> {
     if key.contains('.') {
         return None;
@@ -1122,6 +1163,7 @@ fn meta_value_clause(
             p
         })
         .collect();
+    *side_table = true;
     Some(meta_value_union_sql(&key_ph, &value_phs))
 }
 
