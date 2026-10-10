@@ -822,6 +822,19 @@ jobs:
             Select-String -Path $log -Pattern 'Return value 3' -Context 40,3 | ForEach-Object { $_.Context.PreContext; $_.Line; $_.Context.PostContext; '-----' }
             Select-String -Path $log -Pattern 'Error \d{4}|error code|CustomAction .* returned actual error|Product: Crystalline -- ' | Select-Object -First 40
           }
+          # The smoke test's daemon left an index at this build's schema in the
+          # state directory, and v0.24.1 refuses a schema newer than it knows.
+          Get-Process -Name crystalline -ErrorAction SilentlyContinue | Stop-Process -Force
+          $profileDir = Join-Path $env:APPDATA 'crystalline'
+          Remove-Item -Recurse -Force $profileDir -ErrorAction SilentlyContinue
+          if (Test-Path $profileDir) { throw "could not clear $profileDir" }
+          function Show-DaemonFailure {
+            Write-Host '--- ctl status'
+            & $exe ctl status 2>&1 | Write-Host
+            Write-Host "--- tail of $profileDir\daemon.log"
+            $daemonLog = Join-Path $profileDir 'daemon.log'
+            if (Test-Path $daemonLog) { Get-Content $daemonLog -Tail 40 | Write-Host } else { Write-Host 'no daemon.log' }
+          }
           $old = Join-Path $env:RUNNER_TEMP "crystalline-v0.24.1-$env:LEG_PLATFORM.msi"
           Invoke-WebRequest -Uri "https://github.com/$env:GITHUB_REPOSITORY/releases/download/v0.24.1/crystalline-v0.24.1-$env:LEG_PLATFORM.msi" -OutFile $old
           $new = (Get-Item dist/*.msi).FullName
@@ -848,7 +861,7 @@ jobs:
             if ($LASTEXITCODE -eq 0) { $oldUp = $true; break }
             Start-Sleep -Milliseconds 500
           }
-          if (-not $oldUp) { throw 'the v0.24.1 task started no daemon that answers' }
+          if (-not $oldUp) { Show-DaemonFailure; throw 'the v0.24.1 task started no daemon that answers' }
           $upgradeLog = Join-Path $env:RUNNER_TEMP 'msi-upgrade.log'
           $code = & $install $new $upgradeLog
           if ($code -notin 0, 3010) { Show-MsiFailure $upgradeLog; throw "the upgrade failed: $code" }
@@ -870,7 +883,7 @@ jobs:
             if ($LASTEXITCODE -eq 0) { $status = $out | ConvertFrom-Json; break }
             Start-Sleep -Milliseconds 500
           }
-          if (-not $status) { throw 'after the upgrade the task started no daemon that answers' }
+          if (-not $status) { Show-DaemonFailure; throw 'after the upgrade the task started no daemon that answers' }
           if ("$($status.version)" -notlike "$built*") { throw "the task's daemon is v$($status.version), not $built" }
           "the upgraded task started a v$($status.version) daemon that answers"
           & $exe ctl shutdown *> $null
