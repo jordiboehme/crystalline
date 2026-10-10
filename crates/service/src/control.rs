@@ -1434,7 +1434,16 @@ mod tests {
             // neighbours, where a stray `optional_number` would keep this
             // test green over an arm that no longer calls it - so move this
             // pattern with the code rather than leaving it to match by luck.
-            let body = &rest[..rest.find("\n        \"").unwrap_or(rest.len())];
+            let mut body = &rest[..rest.find("\n        \"").unwrap_or(rest.len())];
+            // The share arm reads its request through `share_request`, so the
+            // guard is looked for in that function's body.
+            if body.contains("share_request(req)") {
+                let start = source
+                    .find("fn share_request(")
+                    .expect("share_request is defined");
+                let rest = &source[start..];
+                body = &rest[..rest.find("\n}\n").unwrap_or(rest.len())];
+            }
             assert!(
                 body.contains("optional_number(req, \"proposal\")"),
                 "{arm} must read its proposal through optional_number"
