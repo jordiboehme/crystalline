@@ -1607,11 +1607,12 @@ pub struct ShareBody {
                    \"proposal\"`; after one, a refused share opens the \
                    proposal itself and answers `proposed` with `fell_back: \
                    true` and a `note`, and a commit that lands again carries \
-                   a `note` too. While this machine has a proposal \
+                   a `note` too. The refusal is kept per GitHub login the \
+                   share goes out on. While that login has a proposal \
                    open, a share with `proposal` naming it amends it, and \
                    one with `as_proposal: true` or after a refusal stacks \
                    on it or amends it. A `proposal` that names no open \
-                   proposal of this machine on a direct domain is a 422. \
+                   proposal of that login on a direct domain is a 422. \
                    Refused on a read-only instance.",
     params(("domain" = String, Path, description = "The registered team domain.")),
     request_body = ShareBody,
