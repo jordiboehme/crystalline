@@ -46,8 +46,9 @@ pub fn load_domain_config(root: &Path) -> DomainConfigLoad {
     if !path.is_file() {
         return DomainConfigLoad::default();
     }
-    // A file of blank lines and comments sets nothing. YAML reads it as no
-    // document at all, and that is an empty file, not one that does not parse.
+    // A file of blank lines, comments and document markers sets nothing. YAML
+    // reads it as no document at all, and that is an empty file, not one that
+    // does not parse.
     if std::fs::read_to_string(&path).is_ok_and(|text| is_blank_yaml(&text)) {
         return DomainConfigLoad::default();
     }
@@ -253,11 +254,17 @@ fn remove_other_spellings(rules: &mut serde_yaml_ng::Mapping, rule: &str) {
     }
 }
 
-/// Whether a YAML text holds nothing but blank lines and comments.
+/// Whether a YAML text holds nothing but blank lines, comments and the
+/// document markers `---` and `...` (a marker may carry a comment after it).
+/// A leading `---` is how many people start a YAML file.
 fn is_blank_yaml(text: &str) -> bool {
     text.lines().all(|line| {
         let trimmed = line.trim();
-        trimmed.is_empty() || trimmed.starts_with('#')
+        let rest = trimmed
+            .strip_prefix("---")
+            .or_else(|| trimmed.strip_prefix("..."))
+            .map_or(trimmed, str::trim_start);
+        rest.is_empty() || rest.starts_with('#')
     })
 }
 
@@ -368,7 +375,14 @@ mod edit_tests {
 
     #[test]
     fn an_empty_or_comment_only_file_takes_the_key() {
-        for current in ["", "\n", "# nothing here yet\n"] {
+        for current in [
+            "",
+            "\n",
+            "# nothing here yet\n",
+            "---\n",
+            "---\n# nothing here yet\n",
+            "--- # start\n...\n",
+        ] {
             let edited = edit_domain_config(Some(current), &[rule("E007", "off")]).unwrap();
             assert_eq!(
                 edited.text.as_deref(),
@@ -398,7 +412,15 @@ mod edit_tests {
     /// and that is all it is.
     #[test]
     fn a_blank_or_comment_only_file_sets_nothing_and_is_no_problem() {
-        for text in ["", "\n", "# nothing here yet\n"] {
+        for text in [
+            "",
+            "\n",
+            "# nothing here yet\n",
+            "---\n",
+            "---\n# nothing here yet\n",
+            "  ---  \n\n...\n",
+            "--- # start\n",
+        ] {
             let dir = tempfile::tempdir().unwrap();
             std::fs::write(dir.path().join(DOMAIN_CONFIG_FILE), text).unwrap();
             let load = load_domain_config(dir.path());

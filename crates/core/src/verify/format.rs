@@ -13,9 +13,9 @@
 //! the domain is registered under another name. `E010` is the one parse
 //! failure with a name of its own: a frontmatter key held more than once,
 //! reported per key with its lines when removing the later copies is all the
-//! file needs (everything else that does not parse stays `E001`). `E011` warns about a
-//! key or value too large for the metadata index.
+//! file needs (everything else that does not parse stays `E001`), and
 //! `crystalline doctor --fix` removes the extra copies when they all agree.
+//! `E011` warns about a key or value too large for the metadata index.
 //!
 //! `E009` is the odd one out twice over: it is about paths rather than
 //! frontmatter, and it is domain-scoped rather than per-file, so it runs from
