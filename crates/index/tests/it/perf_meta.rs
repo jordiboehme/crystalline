@@ -212,17 +212,49 @@ async fn contains_filter_at_50k() {
     .replace("?3", anchor)
     .replace("?2", "'sources'")
     .replace("?1", "'notes'");
-    // The count statement of `turso::search::filter_only`, spelled out here for
-    // the report only: it runs before every page, with the same filters. This
-    // copy guards nothing; the median above is what would catch a scan.
-    let count = format!(
-        "SELECT count(*) FROM engram e JOIN domain d ON d.id=e.domain_id WHERE e.actor = '' AND {}",
-        meta_value_union_sql("'sources'", &[anchor.to_string()])
+    // The count statement `turso::search::filter_only` runs before every page,
+    // with the same filters, from the store's own builder.
+    let count = crystalline_index::turso::filter_only_count_sql(
+        "e.actor = ''",
+        &format!(
+            "AND {}",
+            meta_value_union_sql("'sources'", &[anchor.to_string()])
+        ),
     );
+    // The 100-value statements, scoped and unscoped, page and count: the case
+    // that walked the domain before the scope stepped aside.
+    let hundred: Vec<String> = (0..100)
+        .map(|i| format!("'\"notedown://jordi/n{i}/p0#b0\"'"))
+        .collect();
+    let any_100 = meta_value_union_sql("'sources'", &hundred);
+    let scoped_100 = format!(
+        "AND {} AND {any_100}",
+        crystalline_index::turso::domain_scope_sql("'notes'", true)
+    );
+    let unscoped_100 = format!("AND {any_100}");
+    let page_100 = |filters: &str| {
+        crystalline_index::turso::filter_only_sql(
+            "e.actor = ''",
+            filters,
+            SearchOrder::RecordedDesc,
+            10,
+            0,
+        )
+    };
     for (label, sql) in [
         ("page, unscoped", unscoped),
         ("page, scoped", scoped),
         ("count, unscoped", count),
+        ("100 values, page, unscoped", page_100(&unscoped_100)),
+        ("100 values, page, scoped", page_100(&scoped_100)),
+        (
+            "100 values, count, unscoped",
+            crystalline_index::turso::filter_only_count_sql("e.actor = ''", &unscoped_100),
+        ),
+        (
+            "100 values, count, scoped",
+            crystalline_index::turso::filter_only_count_sql("e.actor = ''", &scoped_100),
+        ),
     ] {
         let plan = store.explain_query_plan(&sql).await.unwrap();
         eprintln!("PERF meta 50k plan, {label}: {}", plan.join(" | "));
@@ -247,8 +279,19 @@ async fn contains_filter_at_50k_postgres() {
     };
     let corpus = tempfile::tempdir().unwrap();
     generate_sourced_domain(corpus.path());
-    let schema = format!("perf_meta_{}", std::process::id());
-    let store = crystalline_index::PostgresStore::open_in_schema(&url, &schema)
+    // One fixed schema, dropped on start: a run that panicked before its own
+    // `drop_schema` below leaves the schema behind, and the next run clears it.
+    let schema = "perf_meta";
+    {
+        use sqlx::Connection;
+        let mut raw = sqlx::PgConnection::connect(&url).await.unwrap();
+        sqlx::raw_sql("DROP SCHEMA IF EXISTS perf_meta CASCADE")
+            .execute(&mut raw)
+            .await
+            .unwrap();
+        raw.close().await.unwrap();
+    }
+    let store = crystalline_index::PostgresStore::open_in_schema(&url, schema)
         .await
         .unwrap();
     let store = Mutex::new(store);

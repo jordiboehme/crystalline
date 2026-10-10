@@ -1574,7 +1574,7 @@ async fn a_dropped_side_table_index_is_caught_by_the_turso_plan_guard() {
 /// only by primary key at every list length up to the cap of 100, scoped and
 /// unscoped, in the page and in the count that runs before it. Scoped with a
 /// plain `d.name IN (...)`, turso walked the domain from 9 values on in the
-/// page and in the count (213 ms for 100 values over a 50,000-engram domain),
+/// page and in the count (168 ms for 100 values over a 50,000-engram domain),
 /// which the two-value registry entries never saw. The scope is spelled by
 /// `domain_scope_sql`, as `build_scalar_filters` spells it.
 #[tokio::test]
@@ -1628,6 +1628,107 @@ async fn the_contains_any_list_keeps_its_seeks_at_every_length() {
                 assert!(
                     !plan.iter().any(|line| line.contains("CORRELATED")),
                     "{label}: the filter runs once per engram row: {plan:?}"
+                );
+            }
+        }
+    }
+}
+
+/// The lexical candidate scan and semantic phase 1, the two statements a text,
+/// semantic or hybrid search issues, keep the same claim with a `$contains`
+/// filter as the filter-only page: one `(key, value)` seek per value, `engram`
+/// only by primary key and `chunk` only through `idx_chunk_engram`, scoped
+/// through `domain_scope_sql("?1", true)` and unscoped. With `+d.name` the
+/// side table is the only thing that drives these statements; were turso to
+/// stop choosing it, the plan would be a `SCAN engram` or `SCAN chunk` over
+/// every domain. The 0-value control is the plain scope with no side-table
+/// filter, which must keep reaching `engram` through the domain index.
+#[tokio::test]
+async fn text_and_semantic_scans_drive_from_the_side_table_at_every_length() {
+    let store = turso_fixture().await;
+    let like = "(lower(e.title) LIKE '%engram%' ESCAPE '\\' OR lower(e.description) LIKE '%engram%' \
+                ESCAPE '\\' OR lower(ec.content) LIKE '%engram%' ESCAPE '\\')";
+    let vector = "c.embedding IS NOT NULL AND c.model = 'fake' AND c.dims = 8";
+    for n in [0usize, 1, 9, 100] {
+        let values: Vec<String> = (0..n)
+            .map(|i| format!("'\"notedown://jordi/n{i}#b0\"'"))
+            .collect();
+        let mut forms: Vec<(&str, String)> = Vec::new();
+        if n == 0 {
+            forms.push((
+                "scoped, no side-table filter",
+                format!(
+                    "AND {}",
+                    crystalline_index::turso::domain_scope_sql("'d'", false)
+                ),
+            ));
+        } else {
+            let predicate = crystalline_index::meta_value_union_sql("'sources'", &values);
+            forms.push((
+                "scoped",
+                format!(
+                    "AND {} AND {predicate}",
+                    crystalline_index::turso::domain_scope_sql("'d'", true)
+                ),
+            ));
+            forms.push(("unscoped", format!("AND {predicate}")));
+        }
+        for (scope, filters) in forms {
+            let lexical = crystalline_index::turso::lexical_candidate_sql(
+                BASE_SCREEN,
+                &format!("{filters} AND {like}"),
+                500,
+            );
+            let semantic = bind_literals(
+                &crystalline_index::turso::semantic_phase1_sql(
+                    BASE_SCREEN,
+                    &format!("{filters} AND {vector}"),
+                ),
+                &[QVEC_TURSO],
+            );
+            for (statement, sql) in [
+                ("lexical candidates", lexical),
+                ("semantic phase 1", semantic),
+            ] {
+                let label = format!("{statement}, {n} values, {scope}");
+                let plan = store.explain_query_plan(&sql).await.unwrap();
+                let point_seeks = plan
+                    .iter()
+                    .filter(|line| {
+                        line.contains(&format!("{META_VALUE_INDEX} (key=? AND value=?)"))
+                    })
+                    .count();
+                assert_eq!(
+                    point_seeks, n,
+                    "{label}: one (key, value) seek per value: {plan:?}"
+                );
+                for line in &plan {
+                    let Some((name, _)) = read_of(line) else {
+                        continue;
+                    };
+                    match table_of(name) {
+                        "engram" if n == 0 => assert!(
+                            line.starts_with("SEARCH") && line.contains("(domain_id=?)"),
+                            "{label}: with no side-table filter the scope keeps the domain \
+                             index: {line}. Whole plan: {plan:?}"
+                        ),
+                        "engram" => assert!(
+                            line.contains("USING INTEGER PRIMARY KEY"),
+                            "{label}: engram must be reached by primary key, never walked: \
+                             {line}. Whole plan: {plan:?}"
+                        ),
+                        "chunk" => assert!(
+                            line.starts_with("SEARCH")
+                                && line.contains("idx_chunk_engram (engram_id=?)"),
+                            "{label}: chunk must be reached through idx_chunk_engram: {line}. \
+                             Whole plan: {plan:?}"
+                        ),
+                        _ => {}
+                    }
+                }
+                assert!(
+                    !plan.iter().any(|line| line.contains("CORRELATED")),
+                    "{label}: the filter runs once per row: {plan:?}"
                 );
             }
         }

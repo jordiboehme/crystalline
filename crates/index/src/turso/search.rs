@@ -675,7 +675,10 @@ pub fn filter_only_count_sql(actor_screen: &str, and_filters: &str) -> String {
 /// `d.name IN (...)` drives the join from `domain` and reaches `engram`
 /// through `idx_engram_domain`, whose order is not rowid order - and what
 /// holds that sorter down is the `LIMIT` in this same statement, which lets
-/// turso keep `candidate_cap` records rather than the match set. Both
+/// turso keep `candidate_cap` records rather than the match set. With a
+/// `$contains` filter the scope is `+d.name` instead (see
+/// [`domain_scope_sql`]), and the join is driven from `engram_meta_value`,
+/// with `engram` read by primary key. Both
 /// properties are pinned by `EXPLAIN QUERY PLAN` beside this builder
 /// ([`the_lexical_candidate_scan_stays_index_ordered_under_a_folder_filter`])
 /// and by a source scan in `tests/it/turso_only.rs`. Keep the bound and keep the
@@ -989,7 +992,7 @@ fn build_scalar_filters(
 /// same path is the wrong one: turso has no table statistics, so from about
 /// ten matched values on it judged a walk of the whole domain cheaper than
 /// the primary-key probes from the side table, for the page and for the count
-/// (213 ms for 100 values over a 50,000-engram domain). `+d.name` is the same
+/// (168 ms for 100 values over a 50,000-engram domain). `+d.name` is the same
 /// test with the name index taken out of the planner's choice, so the side
 /// table drives the join and `domain` is checked by primary key on each hit.
 #[doc(hidden)]
@@ -1781,6 +1784,55 @@ mod tests {
             "e.id, d.name, e.permalink, e.title, e.engram_type, e.status, \
      e.description, COALESCE(ec.content, ''), CAST(json_extract(e.metadata, '$.salience') AS REAL)"
         );
+    }
+
+    /// `build_scalar_filters` spells the domain scope `+d.name` only when a
+    /// filter really reads `engram_meta_value`, and the plain `d.name` that
+    /// keeps the domain index in every other case: no metadata filter, `$eq`,
+    /// `tags`, a dotted key, and a filter that is the constant false because
+    /// no row can hold its value. The plan pins build their scope by hand, so
+    /// this is what ties the store's choice of spelling to a test.
+    #[test]
+    fn the_domain_scope_steps_aside_only_for_a_side_table_filter() {
+        let scope_of = |filters: serde_json::Value| -> String {
+            let query = SearchQuery {
+                domains: Some(vec!["d".to_string()]),
+                metadata_filters: crate::store::parse_metadata_filters(&filters).unwrap(),
+                ..SearchQuery::default()
+            };
+            let mut clauses: Vec<String> = Vec::new();
+            let mut params: Vec<Value> = Vec::new();
+            let mut n = 1usize;
+            build_scalar_filters(
+                &query,
+                &mut clauses,
+                &mut params,
+                &mut n,
+                &crate::alias::AliasMap::default(),
+            );
+            clauses[0].clone()
+        };
+
+        assert_eq!(
+            scope_of(serde_json::json!({ "sources": { "$contains": "a" } })),
+            "+d.name IN (?1)"
+        );
+        assert_eq!(
+            scope_of(serde_json::json!({ "sources": { "$contains_any": ["a", "b"] } })),
+            "+d.name IN (?1)"
+        );
+        let long = "x".repeat(3000);
+        for filters in [
+            serde_json::json!({}),
+            serde_json::json!({ "sources": { "$eq": "a" } }),
+            serde_json::json!({ "tags": { "$contains": "a" } }),
+            serde_json::json!({ "a.b": { "$contains": "a" } }),
+            serde_json::json!({ "sources": { "$contains": long } }),
+            serde_json::json!({ "sources": { "$contains_any": [] } }),
+            serde_json::json!({ "title": { "$contains": "a" } }),
+        ] {
+            assert_eq!(scope_of(filters.clone()), "d.name IN (?1)", "{filters}");
+        }
     }
 
     /// The lexical candidate scan keeps its index order under a folder filter.

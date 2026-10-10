@@ -4709,8 +4709,9 @@ async fn contains_any_at_the_cap(store: &dyn Store) {
     );
     sync_domain(store, "d", root).await.unwrap();
 
-    // `x1` opens the list and `x2` closes it, so `a` matches through the
-    // first group and the last one and must still come back once.
+    // `x1` is the first value and `y1` the last, so `a` matches through the
+    // first value and `b` through the last, and `a`, which also matches `x2`,
+    // must still come back once.
     let mut list = vec![serde_json::Value::from("x1")];
     list.extend(padded(97, &["x2", "y1"]));
     assert_eq!(list.len(), 100);
