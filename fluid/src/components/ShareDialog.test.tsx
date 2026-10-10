@@ -1706,6 +1706,14 @@ describe("the share dialog", () => {
         guidance: PROTECTED_GUIDANCE,
       },
       {
+        // Another person's proposal is open, so no proposal is offered.
+        outcome: "branch_protected",
+        branch: "main",
+        message: "Changes must be made through a pull request.",
+        guidance:
+          "The branch main does not accept direct commits from you (Changes must be made through a pull request.). Another person's proposal is open on this domain, so share again once it is merged or closed.",
+      },
+      {
         outcome: "branch_moved",
         branch: "main",
         guidance:
@@ -1733,6 +1741,10 @@ describe("the share dialog", () => {
       // Nothing was written, and the server's own words say what to do about
       // it rather than the dialog inventing a sentence per refusal.
       expect(await within(dialog).findByText(receipt.guidance)).toBeVisible();
+      // No fallback in the receipt, so no button offers a proposal.
+      expect(
+        within(dialog).queryByRole("button", { name: "Share as a proposal" }),
+      ).toBeNull();
       unmount();
     }
   });

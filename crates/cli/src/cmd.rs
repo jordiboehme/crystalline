@@ -956,13 +956,16 @@ pub(crate) fn origin_share_lines(domain: &str, data: &serde_json::Value) -> Vec<
                 prop["url"].as_str().unwrap_or("")
             ));
         }
-        "branch_protected" => {
-            lines.push(format!(
+        // With no proposal on offer (another person's proposal is open), the
+        // engine's own sentence says what to do, and it is shown as given.
+        "branch_protected" => match (data["fallback"].as_str(), data["guidance"].as_str()) {
+            (None, Some(guidance)) => lines.push(guidance.to_string()),
+            _ => lines.push(format!(
                 "The branch {} does not accept direct commits from you ({}). Share the same changes as a proposal instead: crystalline origin share {domain} --proposal.",
                 data["branch"].as_str().unwrap_or(""),
                 data["message"].as_str().unwrap_or("")
-            ));
-        }
+            )),
+        },
         "branch_moved" => {
             lines.push(format!(
                 "The branch {} moved while sharing; run: crystalline origin update --domain {domain} and share again.",
@@ -3850,12 +3853,18 @@ mod origin_share_tests {
         );
         let protected = origin_share_lines(
             "kb",
-            &json!({ "outcome": "branch_protected", "branch": "main", "message": "Changes must be made through a pull request.", "guidance": "g" }),
+            &json!({ "outcome": "branch_protected", "branch": "main", "message": "Changes must be made through a pull request.", "guidance": "g", "fallback": "proposal" }),
         );
         assert_eq!(
             protected[0],
             "The branch main does not accept direct commits from you (Changes must be made through a pull request.). Share the same changes as a proposal instead: crystalline origin share kb --proposal."
         );
+        let blocked_text = "The branch main does not accept direct commits from you (Changes must be made through a pull request.). Another person's proposal is open on this domain, so share again once it is merged or closed.";
+        let blocked = origin_share_lines(
+            "kb",
+            &json!({ "outcome": "branch_protected", "branch": "main", "message": "Changes must be made through a pull request.", "guidance": blocked_text }),
+        );
+        assert_eq!(blocked[0], blocked_text, "no proposal is offered");
         let moved = origin_share_lines(
             "kb",
             &json!({ "outcome": "branch_moved", "branch": "main", "guidance": "g" }),

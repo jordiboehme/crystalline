@@ -666,11 +666,16 @@ pub(crate) fn propose_outcome_json(outcome: &ProposeOutcome) -> Value {
             message,
             offers_proposal,
         } => {
+            let guidance = if *offers_proposal {
+                crystalline_remote::error::branch_protected_guidance(branch, message)
+            } else {
+                crystalline_remote::error::branch_protected_blocked_guidance(branch, message)
+            };
             let mut receipt = json!({
                 "outcome": "branch_protected",
                 "branch": branch,
                 "message": message,
-                "guidance": crystalline_remote::error::branch_protected_guidance(branch, message),
+                "guidance": guidance,
             });
             // Only where a proposal share would be taken: while only another
             // login's proposal is open here it answers proposal_open, so no
@@ -2497,6 +2502,10 @@ mod tests {
         });
         assert_eq!(blocked["outcome"], "branch_protected");
         assert!(blocked.get("fallback").is_none(), "{blocked}");
+        assert_eq!(
+            blocked["guidance"],
+            "The branch main does not accept direct commits from you (Changes must be made through a pull request.). Another person's proposal is open on this domain, so share again once it is merged or closed."
+        );
 
         let moved = propose_outcome_json(&ProposeOutcome::BranchMoved {
             branch: "main".to_string(),

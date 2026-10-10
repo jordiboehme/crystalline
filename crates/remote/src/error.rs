@@ -307,6 +307,16 @@ pub fn branch_protected_guidance(branch: &str, message: &str) -> String {
     )
 }
 
+/// The guidance of a refused direct commit when no proposal can be offered:
+/// only another person's proposal is open on the domain, and no share goes
+/// into it (see `ProposeOutcome::BranchProtected::offers_proposal`). Every
+/// surface shows it as given.
+pub fn branch_protected_blocked_guidance(branch: &str, message: &str) -> String {
+    format!(
+        "The branch {branch} does not accept direct commits from you ({message}). Another person's proposal is open on this domain, so share again once it is merged or closed."
+    )
+}
+
 /// The line a share receipt carries when the branch refused its direct
 /// commit and the same commit opened a proposal.
 pub fn fell_back_line(branch: &str) -> String {

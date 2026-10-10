@@ -2672,8 +2672,16 @@ async fn as_proposal_does_not_reach_another_logins_open_proposal() {
     write(&sub.domain_root.join("notes/bob.md"), b"bob\n");
     match share_direct(&mock, &sub, by("bob", direct())).await {
         ProposeOutcome::BranchProtected {
-            offers_proposal, ..
-        } => assert!(!offers_proposal, "no proposal can be offered to Bob"),
+            branch,
+            message,
+            offers_proposal,
+        } => {
+            assert!(!offers_proposal, "no proposal can be offered to Bob");
+            assert_eq!(
+                crystalline_remote::error::branch_protected_blocked_guidance(&branch, &message),
+                "The branch main does not accept direct commits from you (Changes must be made through a pull request.). Another person's proposal is open on this domain, so share again once it is merged or closed."
+            );
+        }
         other => panic!("expected BranchProtected, got {other:?}"),
     }
     let plan = preview_direct_share(&mock, &sub, by("bob", choosing(Some(true)))).await;
