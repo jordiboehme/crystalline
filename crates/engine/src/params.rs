@@ -367,8 +367,14 @@ pub struct SearchParams {
     /// matches exactly.
     #[serde(default)]
     pub status: Option<String>,
-    /// Frontmatter filters, `{ key: value }` or `{ key: { $gt: n } }`. The
-    /// filterable keys are the promoted ones (type, status, title, permalink,
+    /// Frontmatter filters, `{ key: value }` or `{ key: { $op: arg } }` with
+    /// $eq, $in, $gt, $gte, $lt, $lte, $between `[lo, hi]`, $contains or
+    /// $contains_any. $contains matches one element of a list exactly:
+    /// `{ sources: { $contains: "https://example.com/a" } }`. $contains_any
+    /// matches any of several:
+    /// `{ sources: { $contains_any: ["https://example.com/a", "https://example.com/b"] } }`.
+    /// A single value counts as a one-element list. $contains_any takes at
+    /// most 100 values. The filterable keys are the promoted ones (type, status, title, permalink,
     /// recorded_at, valid_from, valid_to, tags, plus timestamp for the write
     /// instant), every custom frontmatter key an engram carries (salience among
     /// them) and source_date, last_verified, stale_after, temporal_confidence,

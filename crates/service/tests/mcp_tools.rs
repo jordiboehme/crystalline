@@ -2762,6 +2762,118 @@ async fn search_filter_only_and_text_fallback() {
     assert_eq!(hits[0]["tags"], json!(["software"]));
 }
 
+/// `metadata_filters` with `$contains` finds exactly the engrams whose
+/// `sources` list cites an anchor, the call an ingesting agent makes when a
+/// block of a note changed or went away, and `$contains_any` finds those
+/// citing any of several.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn search_engrams_contains_finds_the_engrams_that_cite_an_anchor() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+    for (title, sources) in [
+        (
+            "Page one",
+            json!(["notedown://jordi/n1/p1#b1", "notedown://jordi/n1/p1#b2"]),
+        ),
+        ("Page two", json!(["notedown://jordi/n1/p1#b1"])),
+        ("Page three", json!(["notedown://jordi/n2/p1#b1"])),
+    ] {
+        call(
+            peer,
+            "write_engram",
+            json!({
+                "domain": "eng",
+                "title": title,
+                "content": format!("{title} text"),
+                "metadata": { "sources": sources },
+            }),
+        )
+        .await
+        .unwrap();
+    }
+    let titles = |out: &Value| -> Vec<String> {
+        let mut t: Vec<String> = out["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["title"].as_str().unwrap().to_string())
+            .collect();
+        t.sort();
+        t
+    };
+
+    let out = call(
+        peer,
+        "search_engrams",
+        json!({ "metadata_filters": { "sources": { "$contains": "notedown://jordi/n1/p1#b1" } } }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out["total"], json!(2));
+    assert_eq!(titles(&out), vec!["Page one", "Page two"]);
+
+    let out = call(
+        peer,
+        "search_engrams",
+        json!({ "metadata_filters": { "sources": { "$contains_any": [
+            "notedown://jordi/n1/p1#b2",
+            "notedown://jordi/n2/p1#b1",
+        ] } } }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(titles(&out), vec!["Page one", "Page three"]);
+
+    let refused = match call(
+        peer,
+        "search_engrams",
+        json!({ "metadata_filters": { "sources": { "$contains": ["a", "b"] } } }),
+    )
+    .await
+    {
+        Err(e) => e,
+        Ok(v) => v.to_string(),
+    };
+    assert!(
+        refused.contains("$contains on 'sources' takes one value; use $contains_any for several"),
+        "{refused}"
+    );
+}
+
+/// The two list operators reach an agent only through the tool copy: the
+/// description and the `metadata_filters` parameter each name both, with an
+/// example, and the salience sentence stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn search_engrams_teaches_contains_and_contains_any() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let tools = client.peer().list_tools(Default::default()).await.unwrap();
+    let search = tools
+        .tools
+        .iter()
+        .find(|t| t.name == "search_engrams")
+        .expect("search_engrams tool present");
+    let description = search.description.as_deref().unwrap_or("");
+    for needle in [
+        "{\"sources\": {\"$contains\": \"https://example.com/a\"}}",
+        "{\"sources\": {\"$contains_any\": [\"https://example.com/a\", \"https://example.com/b\"]}}",
+        "salience",
+    ] {
+        assert!(description.contains(needle), "{needle} in {description}");
+    }
+    let schema = serde_json::to_value(&search.input_schema).unwrap();
+    let param = schema["properties"]["metadata_filters"]["description"]
+        .as_str()
+        .unwrap_or_default();
+    for needle in [
+        "{ sources: { $contains: \"https://example.com/a\" } }",
+        "{ sources: { $contains_any: [\"https://example.com/a\", \"https://example.com/b\"] } }",
+    ] {
+        assert!(param.contains(needle), "{needle} in {param}");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn move_same_domain_and_cross_domain_link_rewrite() {
     let h = Harness::new(&["eng", "ops"]).await;
