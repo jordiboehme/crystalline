@@ -1574,7 +1574,8 @@ async fn an_unset_with_no_crystalline_yaml_creates_no_file() {
 }
 
 /// When the .crystalline.yaml write fails after the MANIFEST write, the
-/// answer says which policy keys were applied, and they stay applied.
+/// answer says which policy keys were applied, and they stay applied. It is a
+/// tool error the model reads, not a protocol error a client may hide.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_crystalline_yaml_write_says_what_was_applied() {
     let h = Harness::new(&["eng"]).await;
@@ -1585,15 +1586,16 @@ async fn a_failed_crystalline_yaml_write_says_what_was_applied() {
         .join(format!("eng/.crystalline.yaml.tmp.{}", std::process::id()));
     std::fs::create_dir_all(&blocker).unwrap();
     let (client, _server) = h.connect().await;
-    let err = call(
+    let result = call_result(
         client.peer(),
         "configure",
         json!({ "domain": "eng", "set": { "sharing": "direct", "rules.E007": "off" } }),
     )
-    .await
-    .unwrap_err();
+    .await;
+    assert_eq!(result.is_error, Some(true));
+    let err = result_text(&result);
     assert!(
-        err.contains("applied [sharing]; .crystalline.yaml was not changed:"),
+        err.starts_with("applied [sharing]; .crystalline.yaml was not changed:"),
         "{err}"
     );
     assert!(

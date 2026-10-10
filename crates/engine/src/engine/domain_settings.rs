@@ -396,7 +396,10 @@ impl Engine {
                         } else {
                             ""
                         };
-                        EngineError::Internal(format!(
+                        // A refusal rather than an internal error, so the
+                        // model reads the one sentence that says the policy
+                        // did land.
+                        EngineError::Refused(format!(
                             "applied [{}]{how}; {DOMAIN_CONFIG_FILE} was not changed: {e}",
                             keys.join(", ")
                         ))
