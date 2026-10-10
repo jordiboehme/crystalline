@@ -932,7 +932,8 @@ pub struct MetadataFilter {
 /// `$contains_any` takes an array of values and matches when the list holds
 /// any of them: `{"sources": {"$contains_any": ["https://example.com/a",
 /// "https://example.com/b"]}}`; an empty array matches nothing. For both, a
-/// single value counts as a one-element list. This is the boundary the M5 MCP
+/// single value counts as a one-element list, and a key that is not plain
+/// (ASCII letters, digits, `_` or `-`) is refused. This is the boundary the M5 MCP
 /// and CLI layers parse tool arguments through. Models routinely
 /// double-encode nested tool arguments, so the whole object arriving as a JSON
 /// string is also accepted and parsed first.
@@ -1005,6 +1006,23 @@ fn capped_values(
     Ok(distinct)
 }
 
+/// `$contains` and `$contains_any` need a key of ASCII letters, digits, `_`
+/// or `-`. A key the side table cannot be asked for (a dot, a quote, a letter
+/// outside ASCII) is refused by name: dropping the filter, as the older
+/// operators do, would widen the search to every engram.
+fn refuse_unplain_key(key: &str, op: &str) -> Result<()> {
+    if !key.is_empty()
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Ok(());
+    }
+    Err(crate::IndexError::Invalid(format!(
+        "{op} on '{key}' needs a plain key (letters, digits, '_' or '-')"
+    )))
+}
+
 fn parse_op(key: &str, op: &str, arg: &serde_json::Value) -> Result<FilterOp> {
     let arr2 = |arg: &serde_json::Value| -> Result<(serde_json::Value, serde_json::Value)> {
         match arg.as_array() {
@@ -1037,6 +1055,7 @@ fn parse_op(key: &str, op: &str, arg: &serde_json::Value) -> Result<FilterOp> {
             FilterOp::Between(lo, hi)
         }
         "$contains" => {
+            refuse_unplain_key(key, op)?;
             if arg.is_array() || arg.is_object() {
                 return Err(crate::IndexError::Invalid(format!(
                     "$contains on '{key}' takes one value; use $contains_any for several"
@@ -1045,6 +1064,7 @@ fn parse_op(key: &str, op: &str, arg: &serde_json::Value) -> Result<FilterOp> {
             FilterOp::Contains(arg.clone())
         }
         "$contains_any" => {
+            refuse_unplain_key(key, op)?;
             let values = arg
                 .as_array()
                 .filter(|values| values.iter().all(|v| !v.is_array() && !v.is_object()))

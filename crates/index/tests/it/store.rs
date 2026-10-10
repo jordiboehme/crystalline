@@ -4490,7 +4490,6 @@ async fn contains_filters(store: &dyn Store) {
         report.failed
     );
 
-    let all = perms(&["a", "b", "c", "d", "e", "f"]);
     let cases: Vec<(serde_json::Value, Vec<String>)> = vec![
         (
             serde_json::json!({ "sources": { "$contains": "notedown://jordi/n1/p1#b1" } }),
@@ -4599,14 +4598,6 @@ async fn contains_filters(store: &dyn Store) {
         (
             serde_json::json!({ "sources": { "$contains": "u" } }),
             perms(&["f"]),
-        ),
-        (
-            serde_json::json!({ "a.b": { "$contains": "x" } }),
-            all.clone(),
-        ),
-        (
-            serde_json::json!({ "it's": { "$contains": "x" } }),
-            all.clone(),
         ),
     ];
     for (wire, want) in cases {
@@ -7321,6 +7312,43 @@ fn contains_operators_parse_and_refuse_what_they_cannot_take() {
         let err = crystalline_index::parse_metadata_filters(&wire).unwrap_err();
         assert!(err.to_string().contains(text), "{wire}: {err}");
     }
+}
+
+/// A key `$contains` or `$contains_any` cannot use (a dot, a quote, a letter
+/// outside ASCII) is refused by name instead of being dropped, which would
+/// widen the search to every engram. The older operators keep ignoring such
+/// a key.
+#[test]
+fn contains_on_a_key_that_is_not_plain_is_refused() {
+    for key in ["a.b", "it's", "größe", "a b"] {
+        for (op, arg) in [
+            ("$contains", serde_json::json!("x")),
+            ("$contains_any", serde_json::json!(["x"])),
+        ] {
+            let mut inner = serde_json::Map::new();
+            inner.insert(op.to_string(), arg);
+            let mut wire = serde_json::Map::new();
+            wire.insert(key.to_string(), serde_json::Value::Object(inner));
+            let err =
+                crystalline_index::parse_metadata_filters(&serde_json::Value::Object(wire))
+                    .unwrap_err();
+            let text = format!("{op} on '{key}' needs a plain key (letters, digits, '_' or '-')");
+            assert!(err.to_string().contains(&text), "{err}");
+        }
+    }
+    assert_eq!(
+        crystalline_index::parse_metadata_filters(&serde_json::json!({
+            "sources": { "$contains": "x" },
+            "my_key-2": { "$contains_any": ["x"] },
+        }))
+        .unwrap()
+        .len(),
+        2
+    );
+    assert!(
+        crystalline_index::parse_metadata_filters(&serde_json::json!({ "a.b": { "$eq": "x" } }))
+            .is_ok()
+    );
 }
 
 /// `$contains_any`, and `$in` on `tags`, take at most 100 distinct values.

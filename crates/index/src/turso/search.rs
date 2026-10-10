@@ -1135,8 +1135,9 @@ fn op_clause(col: &str, op: &FilterOp, params: &mut Vec<Value>, n: &mut usize) -
 
 /// `$contains` or `$contains_any` on a key that is not promoted: an engram
 /// matches when one of its `engram_meta_value` rows for the key holds one of
-/// `values`. A dotted key is ignored, the way a key with a quote is: the
-/// table holds top-level keys only. A key or a value no row can hold (see
+/// `values`. The parser refuses a key that is not plain
+/// ([`crate::parse_metadata_filters`]); a dotted one is still ignored here as
+/// a guard, since the table holds top-level keys only. A key or a value no row can hold (see
 /// `meta_value_text`) cannot match, and with nothing left the filter matches
 /// nothing. `side_table` is set when the predicate reads the side table, so
 /// the domain scope can step aside (see [`domain_scope_sql`]).
@@ -1789,7 +1790,7 @@ mod tests {
     /// `build_scalar_filters` spells the domain scope `+d.name` only when a
     /// filter really reads `engram_meta_value`, and the plain `d.name` that
     /// keeps the domain index in every other case: no metadata filter, `$eq`,
-    /// `tags`, a dotted key, and a filter that is the constant false because
+    /// `tags`, a dotted key on `$eq`, and a filter that is the constant false because
     /// no row can hold its value. The plan pins build their scope by hand, so
     /// this is what ties the store's choice of spelling to a test.
     #[test]
@@ -1826,7 +1827,7 @@ mod tests {
             serde_json::json!({}),
             serde_json::json!({ "sources": { "$eq": "a" } }),
             serde_json::json!({ "tags": { "$contains": "a" } }),
-            serde_json::json!({ "a.b": { "$contains": "a" } }),
+            serde_json::json!({ "a.b": { "$eq": "a" } }),
             serde_json::json!({ "sources": { "$contains": long } }),
             serde_json::json!({ "sources": { "$contains_any": [] } }),
             serde_json::json!({ "title": { "$contains": "a" } }),
