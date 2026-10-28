@@ -112,11 +112,13 @@ A team domain's [Reflection](reflection.md) lives at one home, the team server. 
 
 A plain clone of the repository, added as a local domain, skips these checks. Two guards cover it.
 
-The first guard is the team marker, `team: github` in the MANIFEST. Crystalline writes it, right after the title, and it is never set by hand. A connect does not write it, so the folder stays clean after a connect. The first share from a connected instance does:
+The first guard is the team marker, `team: github` in the MANIFEST. Crystalline writes it, right after the title, and it is never set by hand. A connect does not write it, so the folder stays clean after a connect. The next share from a connected instance carries it:
 
 - A share of everything carries it when there is something else to share.
 - A share of chosen files carries it as one more file when the MANIFEST has no other unshared change. Otherwise it waits for a share that includes the MANIFEST.
-- A domain that reviews changes shares drafts, so its shares do not write it.
+- On a domain that takes changes directly, the share writes the line into the folder first. On a domain that reviews changes, the line goes into the proposal like any other change, and the folder gets it when the team merges the proposal.
+
+The share never adds it silently. The share preview (Fluid's share dialog too) and the share receipt name `MANIFEST.md` with the reason, "marks this repository as a team domain; added once", and the pull request body or the commit message ends with a line that says so. This holds for the shares of headless reflect and evolve runs too.
 
 On an instance where the domain is not connected, the marker refuses Reflection. Switching it on is refused with a sentence that says to connect the domain (`crystalline domain add <name> --origin <owner>/<repo>`) and to switch Reflection on at the team server. A Reflection that is already on does not run there: its state is `homeless`, and every Reflection verb is refused (409 over the JSON API). The engrams keep working. A local domain without the marker, for example one you back up to your own GitHub repository, works as before. A value other than `github` is read as absent, and `crystalline verify` reports it as `M010`.
 

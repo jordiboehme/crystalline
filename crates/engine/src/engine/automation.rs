@@ -616,14 +616,20 @@ impl Engine {
             .filter_map(|k| report[*k].as_array())
             .flatten()
             .collect();
-        Ok(json!({
+        let mut answer = json!({
             "outcome": "shared",
             "url": url,
             "files": carried,
             "held_back": held_back,
             "attributed": attributed,
             "recorded": recorded,
-        }))
+        });
+        // The team marker the share added, with its reason, so a run's
+        // report says why the MANIFEST is among its files.
+        if let Some(marker) = receipt.get("team_marker") {
+            answer["team_marker"] = marker.clone();
+        }
+        Ok(answer)
     }
 
     /// The newest `limit` runs of `lp` on `domain`, newest first:

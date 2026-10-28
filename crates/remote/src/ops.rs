@@ -1631,6 +1631,11 @@ pub struct ShareOptions<'a> {
     pub title: Option<&'a str>,
     /// The proposal's description body.
     pub description: Option<&'a str>,
+    /// A line the caller adds at the end of the pull request body or the
+    /// commit message, after the description or the generated body. The
+    /// engine says with it why a file it added itself rides along (the team
+    /// marker in the MANIFEST); this crate only places it.
+    pub note: Option<&'a str>,
     /// Amend this open layer instead of stacking a new proposal.
     pub proposal: Option<u64>,
     /// Whether stacked proposals may be used at all (github.stacks config).
@@ -2288,6 +2293,12 @@ pub async fn propose(
         author_login,
         ..
     } = options;
+    // The caller's text and the note that ends whichever body the share
+    // writes, carried as one value to every place a body is written.
+    let description = Description {
+        text: description,
+        note: options.note,
+    };
     // Freshness first: every proposal must be mergeable at creation.
     pull(provider, spec, domain_root, state_dir).await?;
     let mut state = OriginState::load(state_dir)?.ok_or_else(|| {
@@ -2558,8 +2569,15 @@ pub async fn propose(
     }
 
     // 5. Create, as today, plus head_commit/base_commit on the fresh record.
-    let collected =
-        collect_changes(provider, spec, domain_root, state_dir, &local, description).await?;
+    let collected = collect_changes(
+        provider,
+        spec,
+        domain_root,
+        state_dir,
+        &local,
+        description.text,
+    )
+    .await?;
 
     let (added, updated, deleted, indexes) = count_collected(&collected);
     let generated_title = generate_title(added, updated, deleted, indexes, domain_name);
@@ -3131,10 +3149,53 @@ fn refuse_foreign_amend(
 /// The commit message of a direct share: the title alone, or the title, a
 /// blank line and the description. No generated body: that text is a pull
 /// request body, and a commit carries its file list in its tree.
-fn commit_message(title: &str, description: Option<&str>) -> String {
-    match description.map(str::trim).filter(|d| !d.is_empty()) {
-        Some(description) => format!("{title}\n\n{description}"),
-        None => title.to_string(),
+fn commit_message(title: &str, description: Description<'_>) -> String {
+    let parts: Vec<&str> = [description.text, description.note]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect();
+    if parts.is_empty() {
+        return title.to_string();
+    }
+    format!("{title}\n\n{}", parts.join("\n\n"))
+}
+
+/// A share's description as every body it writes reads it: the caller's own
+/// text (`None` for the generated body) and a note the caller wants at the
+/// end of whichever body that is.
+///
+/// One value rather than two parameters, so the five places a share writes a
+/// pull request body or a commit message cannot take one and forget the
+/// other.
+#[derive(Debug, Clone, Copy, Default)]
+struct Description<'a> {
+    text: Option<&'a str>,
+    note: Option<&'a str>,
+}
+
+impl<'a> Description<'a> {
+    /// The description `options` carries.
+    fn of(options: &ShareOptions<'a>) -> Description<'a> {
+        Description {
+            text: options.description,
+            note: options.note,
+        }
+    }
+
+    /// The pull request body: the caller's text, or `generated` when there
+    /// is none, then the note on a paragraph of its own.
+    fn body(self, generated: impl FnOnce() -> String) -> String {
+        let mut body = self.text.map(str::to_string).unwrap_or_else(generated);
+        if let Some(note) = self.note.map(str::trim).filter(|note| !note.is_empty()) {
+            let kept = body.trim_end().len();
+            body.truncate(kept);
+            body.push_str("\n\n");
+            body.push_str(note);
+            body.push('\n');
+        }
+        body
     }
 }
 
@@ -3213,7 +3274,7 @@ struct NewLayer<'a> {
     skipped_large: Vec<(String, u64)>,
     title: String,
     summary: String,
-    description: Option<&'a str>,
+    description: Description<'a>,
     author_login: Option<&'a str>,
 }
 
@@ -3238,9 +3299,7 @@ async fn open_proposal_on_commit(
         description,
         author_login,
     } = layer;
-    let body = description
-        .map(str::to_string)
-        .unwrap_or_else(|| generate_body(&summary, &collected.entries, domain_name));
+    let body = description.body(|| generate_body(&summary, &collected.entries, domain_name));
     let branch = share_branch_name(domain_name);
     provider.create_branch(spec, &branch, &commit_sha).await?;
     let handle = provider
@@ -3358,7 +3417,7 @@ async fn commit_direct(
             .map(str::to_string)
             .unwrap_or_else(|| generate_title(added, updated, deleted, indexes, domain_name));
         let summary = generate_summary_line(added, updated, deleted, indexes);
-        let message = commit_message(&effective_title, options.description);
+        let message = commit_message(&effective_title, Description::of(&options));
         let tree_sha = provider
             .create_tree(spec, &state.base_commit, &collected.writes)
             .await?;
@@ -3491,7 +3550,7 @@ async fn commit_direct(
                         skipped_large: local.skipped_large,
                         title: effective_title,
                         summary,
-                        description: options.description,
+                        description: Description::of(&options),
                         author_login: options.author_login,
                     },
                 )
@@ -3755,19 +3814,24 @@ async fn update_open_proposal(
     live_head: String,
     local: crate::changes::LocalChanges,
     title: Option<&str>,
-    description: Option<&str>,
+    description: Description<'_>,
     author_login: Option<&str>,
 ) -> Result<ProposeOutcome, RemoteError> {
-    let collected =
-        collect_changes(provider, spec, domain_root, state_dir, &local, description).await?;
+    let collected = collect_changes(
+        provider,
+        spec,
+        domain_root,
+        state_dir,
+        &local,
+        description.text,
+    )
+    .await?;
 
     let (added, updated, deleted, indexes) = count_collected(&collected);
     let generated_title = generate_title(added, updated, deleted, indexes, domain_name);
     let effective_title = title.map(str::to_string).unwrap_or(generated_title);
     let summary = generate_summary_line(added, updated, deleted, indexes);
-    let body = description
-        .map(str::to_string)
-        .unwrap_or_else(|| generate_body(&summary, &collected.entries, domain_name));
+    let body = description.body(|| generate_body(&summary, &collected.entries, domain_name));
 
     // Parents: plain child of the branch head while the proposal's recorded
     // base still equals the current one; a two-parent merge commit (head
@@ -3881,19 +3945,24 @@ async fn stack_new_layer(
     top_head: String,
     local: crate::changes::LocalChanges,
     title: Option<&str>,
-    description: Option<&str>,
+    description: Description<'_>,
     author_login: Option<&str>,
 ) -> Result<ProposeOutcome, RemoteError> {
-    let collected =
-        collect_changes(provider, spec, domain_root, state_dir, &local, description).await?;
+    let collected = collect_changes(
+        provider,
+        spec,
+        domain_root,
+        state_dir,
+        &local,
+        description.text,
+    )
+    .await?;
 
     let (added, updated, deleted, indexes) = count_collected(&collected);
     let generated_title = generate_title(added, updated, deleted, indexes, domain_name);
     let effective_title = title.map(str::to_string).unwrap_or(generated_title);
     let summary = generate_summary_line(added, updated, deleted, indexes);
-    let body = description
-        .map(str::to_string)
-        .unwrap_or_else(|| generate_body(&summary, &collected.entries, domain_name));
+    let body = description.body(|| generate_body(&summary, &collected.entries, domain_name));
 
     let tree_sha = provider
         .create_tree(spec, &top_head, &collected.writes)
@@ -4279,7 +4348,7 @@ async fn amend_layer(
     mut state: OriginState,
     index: usize,
     title: Option<&str>,
-    description: Option<&str>,
+    description: Description<'_>,
     author_login: Option<&str>,
     // Only `files` and `reflection` are read: what the share carries and the
     // Reflection mode its detection runs under.
@@ -4356,7 +4425,7 @@ async fn amend_layer(
         &below,
         &owned_above,
         &fresh,
-        description,
+        description.text,
     )
     .await?;
 
@@ -4364,9 +4433,7 @@ async fn amend_layer(
     let generated_title = generate_title(added, updated, deleted, indexes, domain_name);
     let effective_title = title.map(str::to_string).unwrap_or(generated_title);
     let summary = generate_summary_line(added, updated, deleted, indexes);
-    let body = description
-        .map(str::to_string)
-        .unwrap_or_else(|| generate_body(&summary, &collected.entries, domain_name));
+    let body = description.body(|| generate_body(&summary, &collected.entries, domain_name));
 
     // The tree is built on the tip below this layer - the layer beneath it,
     // or the trunk for the bottom one - so the layer's diff stays its own

@@ -1250,6 +1250,27 @@ export interface SharePlan {
    * older server.
    */
   note: string | null;
+  /**
+   * The team marker this share adds to the MANIFEST, with the server's
+   * reason, when it adds one; null otherwise, and from an older server. It
+   * is not in `changes`: the folder does not hold it yet, and `changes` is
+   * what a person ticks and discards.
+   */
+  teamMarker: TeamMarker | null;
+}
+
+/** A file a share adds on its own, and why: the team marker in the MANIFEST. */
+export interface TeamMarker {
+  path: string;
+  reason: string;
+}
+
+/** Read a `team_marker` entry off a plan or a share receipt. */
+export function readTeamMarker(payload: unknown): TeamMarker | null {
+  const record = asObject(payload);
+  const path = asString(record?.path);
+  const reason = asString(record?.reason);
+  return path === null || reason === null ? null : { path, reason };
 }
 
 /**
@@ -1327,6 +1348,7 @@ export async function fetchShareChanges(domain: string): Promise<SharePlan> {
     title: asString(record?.title),
     own: record?.own !== false,
     note: asString(record?.note),
+    teamMarker: readTeamMarker(record?.team_marker),
   };
 }
 

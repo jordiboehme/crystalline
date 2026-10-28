@@ -476,6 +476,23 @@ async fn a_share_of_everything_carries_the_team_marker() {
     std::fs::create_dir_all(root.join("notes")).unwrap();
     std::fs::write(root.join("notes/new.md"), engram("New", "new", "fresh")).unwrap();
     eng.sync(Some("brand-knowledge")).await.unwrap();
+    let preview = eng
+        .origin_share_preview(
+            "brand-knowledge",
+            None,
+            None,
+            None,
+            ShareActor::Owner,
+            PreviewCredential::ActingIdentity,
+        )
+        .await
+        .unwrap();
+    assert_eq!(preview["team_marker"], team_marker(), "{preview}");
+    assert_eq!(
+        std::fs::read(root.join("MANIFEST.md")).unwrap(),
+        manifest_unmarked(),
+        "a preview writes nothing"
+    );
     let result = eng
         .origin_share("brand-knowledge", None, None, None, None, ShareActor::Owner)
         .await
@@ -483,11 +500,35 @@ async fn a_share_of_everything_carries_the_team_marker() {
     assert_eq!(result["outcome"], "proposed", "{result}");
     assert_eq!(result["added"], serde_json::json!(["notes/new.md"]));
     assert_eq!(result["updated"], serde_json::json!(["MANIFEST.md"]));
+    assert_eq!(result["team_marker"], team_marker(), "{result}");
     let shared = shared_manifest(&mock, &result);
     assert!(shared.contains("title: Team\nteam: github\n"), "{shared}");
     let local = std::fs::read_to_string(root.join("MANIFEST.md")).unwrap();
     assert_eq!(local, shared, "the folder holds what was shared");
+    let body = mock
+        .proposal_body(result["number"].as_u64().unwrap())
+        .unwrap();
+    assert!(
+        body.contains("Domain: brand-knowledge"),
+        "the generated body stays: {body}"
+    );
+    assert!(
+        body.trim_end().ends_with(MARKER_NOTE),
+        "the body says why the MANIFEST changed: {body}"
+    );
 }
+
+/// What the receipt and the preview say about the marker.
+fn team_marker() -> serde_json::Value {
+    serde_json::json!({
+        "path": "MANIFEST.md",
+        "reason": "marks this repository as a team domain; added once"
+    })
+}
+
+/// The line a pull request body or a commit message ends with when the
+/// share added the marker.
+const MARKER_NOTE: &str = "MANIFEST.md gains `team: github`. Crystalline added it: it marks this repository as a team domain, and it is added once.";
 
 /// Two members of a team whose repository has no marker yet: the first one's
 /// share carries it and is merged, and the second one, who has not pulled
@@ -578,6 +619,7 @@ async fn a_share_with_nothing_to_share_writes_no_marker() {
         .await
         .unwrap();
     assert_eq!(result["outcome"], "nothing_to_share", "{result}");
+    assert!(result.get("team_marker").is_none(), "{result}");
     assert_eq!(
         std::fs::read(root.join("MANIFEST.md")).unwrap(),
         manifest_unmarked()
@@ -613,6 +655,7 @@ async fn a_narrowed_share_adds_the_marker_only_to_an_unchanged_manifest() {
         "{result}"
     );
     assert_eq!(result["updated"], serde_json::json!(["MANIFEST.md"]));
+    assert_eq!(result["team_marker"], team_marker(), "{result}");
     let shared = shared_manifest(&mock, &result);
     let before = String::from_utf8(manifest_unmarked()).unwrap();
     assert_eq!(
@@ -640,6 +683,7 @@ async fn a_narrowed_share_adds_the_marker_only_to_an_unchanged_manifest() {
         .await
         .unwrap();
     assert_eq!(result["updated"], serde_json::json!([]), "{result}");
+    assert!(result.get("team_marker").is_none(), "{result}");
     assert_eq!(
         std::fs::read_to_string(root.join("MANIFEST.md")).unwrap(),
         edited,
@@ -4337,11 +4381,12 @@ async fn delete_file(eng: &Engine, actor: &str, path: &str) {
 const OLD_PNG: &[u8] = b"\x89PNG\r\n\x1a\n\x00the team's old deck";
 const DECK_PNG: &[u8] = b"\x89PNG\r\n\x1a\n\x00a deck only alice has";
 
-/// A domain that reviews changes shares drafts, never the folder, so its
-/// share writes no team marker into the folder: that would be a change
-/// nobody drafted.
+/// A domain that reviews changes gets the marker through its review: the
+/// next proposal carries the MANIFEST line like any other change, the
+/// preview and the receipt say so, and the folder moves only when the team
+/// merges it.
 #[tokio::test]
-async fn a_review_mode_share_writes_no_team_marker() {
+async fn a_review_mode_share_carries_the_marker_through_the_proposal() {
     let tmp = tempfile::tempdir().unwrap();
     let mock = Arc::new(MockProvider::new());
     let eng = reviewing_domain(
@@ -4355,15 +4400,41 @@ async fn a_review_mode_share_writes_no_team_marker() {
     .await;
     let root = tmp.path().join("team-knowledge");
     draft(&eng, "owner", "notes/plan.md", DRAFT_PLAN).await;
+    let preview = eng
+        .origin_share_preview(
+            "team",
+            None,
+            None,
+            None,
+            ShareActor::Owner,
+            PreviewCredential::ActingIdentity,
+        )
+        .await
+        .unwrap();
+    assert_eq!(preview["team_marker"], team_marker(), "{preview}");
     let result = eng
         .origin_share("team", None, None, None, None, ShareActor::Owner)
         .await
         .unwrap();
     assert_eq!(result["outcome"], "proposed", "{result}");
-    assert_eq!(result["updated"], serde_json::json!(["notes/plan.md"]));
+    assert_eq!(
+        result["updated"],
+        serde_json::json!(["MANIFEST.md", "notes/plan.md"]),
+        "{result}"
+    );
+    assert_eq!(result["team_marker"], team_marker(), "{result}");
+    let shared = shared_manifest(&mock, &result);
+    assert_eq!(
+        shared,
+        String::from_utf8(manifest_unmarked())
+            .unwrap()
+            .replace("title: Team\n", "title: Team\nteam: github\n"),
+        "the proposal carries exactly the marker line"
+    );
     assert_eq!(
         std::fs::read(root.join("MANIFEST.md")).unwrap(),
-        manifest_unmarked()
+        manifest_unmarked(),
+        "the folder waits for the review"
     );
 }
 

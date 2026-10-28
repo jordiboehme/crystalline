@@ -676,10 +676,16 @@ async fn direct_team(
     tmp: &tempfile::TempDir,
     mock: Arc<MockProvider>,
 ) -> (Engine, std::path::PathBuf) {
-    let commit = mock.add_commit(BTreeMap::from([(
-        "MANIFEST.md".to_string(),
-        team_manifest_direct(),
-    )]));
+    direct_team_with(tmp, mock, team_manifest_direct()).await
+}
+
+/// [`direct_team`] over a MANIFEST of the caller's own.
+async fn direct_team_with(
+    tmp: &tempfile::TempDir,
+    mock: Arc<MockProvider>,
+    manifest: Vec<u8>,
+) -> (Engine, std::path::PathBuf) {
+    let commit = mock.add_commit(BTreeMap::from([("MANIFEST.md".to_string(), manifest)]));
     mock.set_branch("main", &commit);
     let cfg = GlobalConfig {
         github: Some(GitHubConfig {
@@ -758,6 +764,56 @@ fn names(list: &Value) -> Vec<String> {
         .collect();
     out.sort();
     out
+}
+
+/// A run's share on a repository with no team marker yet carries it once,
+/// and says so: the receipt names the MANIFEST with the reason, and the pull
+/// request body ends with the note after the run's own summary.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_share_carries_the_team_marker_and_says_why() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let unmarked = String::from_utf8(team_manifest_direct())
+        .unwrap()
+        .replace("team: github\n", "")
+        .into_bytes();
+    let (eng, root) = direct_team_with(&tmp, mock.clone(), unmarked).await;
+    let token = take(&eng, Loop::Evolve, "brand", "k8s").await;
+    write_note(&root, "notes/fix.md", "the run's fix");
+    let shared = eng
+        .automation_share(
+            Loop::Evolve,
+            "brand",
+            &token,
+            "Fixed one finding.",
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert_eq!(shared["outcome"], "shared", "{shared}");
+    assert_eq!(
+        shared_files(&shared),
+        vec!["MANIFEST.md", "notes/fix.md"],
+        "{shared}"
+    );
+    assert_eq!(
+        shared["team_marker"],
+        serde_json::json!({
+            "path": "MANIFEST.md",
+            "reason": "marks this repository as a team domain; added once"
+        }),
+        "{shared}"
+    );
+    let body = mock
+        .proposal_body(1)
+        .expect("the run opened a pull request");
+    assert!(body.starts_with("Fixed one finding."), "{body}");
+    assert!(
+        body.trim_end().ends_with(
+            "MANIFEST.md gains `team: github`. Crystalline added it: it marks this repository as a team domain, and it is added once."
+        ),
+        "{body}"
+    );
 }
 
 /// The no-account fallback: a lease taken as the machine owner cannot

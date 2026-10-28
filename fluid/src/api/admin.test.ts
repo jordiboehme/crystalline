@@ -1047,6 +1047,8 @@ describe("the admin client layer", () => {
       own: true,
       // No note: the plain share needs no sentence about how it will go.
       note: null,
+      // No marker: the share adds nothing of its own.
+      teamMarker: null,
     });
     // And the key it is cached under, which is deliberately not one of the
     // `["domains", ...]` keys every other read of a domain is filed under:
