@@ -717,6 +717,15 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                 Err(e) => (envelope_err(e.to_string()), false),
             }
         }
+        // Who may read a domain changed in the accounts store from another
+        // process (the CLI's `domain visibility`, `domain members`, `domain
+        // transfer`): look for Reflection pages that now cite a domain fewer
+        // people may read and schedule their backup, so they drop off the
+        // backup branch at once instead of at the next recount.
+        "readers_changed" => {
+            let marked = shared.engine.schedule_too_wide_backups().await;
+            (envelope_ok(json!({ "marked": marked })), false)
+        }
         // The runner's verbs for the reflect and evolve loops, as the machine
         // owner: no account, so a share falls back to the changed files.
         automation if crate::automation_ctl::AUTOMATION_COMMANDS.contains(&automation) => (

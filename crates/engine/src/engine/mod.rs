@@ -1142,6 +1142,9 @@ pub struct Engine {
     // before a due backup loses the mark, and the next change marks it again
     // and commits both (the backup diffs the whole folder).
     backup_marks: crate::reflection_backup::BackupMarks,
+    // Per domain, the pages its last backup held back because they cite a
+    // domain fewer people may read (`Engine::reflection_backup_held_back`).
+    backup_held: std::sync::Mutex<HashMap<String, Vec<String>>>,
     /// What the last complete walk of each domain saw of its Reflection:
     /// `None` when it was not in effect, else its threads files by page,
     /// with the checksum last seen or written. The next complete walk
@@ -1287,20 +1290,34 @@ pub struct Engine {
     // be a cycle neither side ever drops; `None` (nothing installed) is every
     // engine that serves no web surface, which has no rooms to close.
     collab: std::sync::OnceLock<std::sync::Weak<crate::collab::session::CollabSessions>>,
-    // The private-domain resolver every scoped read is filtered through,
-    // installed once when the HTTP surface starts (`daemon::http_base`, the
-    // one funnel both router builders reach, right after the `AuthStore` it
-    // wraps exists).
+    // The private-domain resolver every scoped read is filtered through.
+    // Every serving stack installs it before it answers anything
+    // (`client::install_domain_access`: the daemon with its HTTP surface on
+    // or off, the embedded stdio stack and a one-shot tool run), because a
+    // Reflection page reaches the readers of its domain whoever writes it;
+    // `daemon::http_base` installs it too, for a router built on its own.
     //
     // A `OnceLock` rather than a field on the constructor because the engine
-    // is built long before - and often without - an accounts database: a
-    // one-shot CLI command, the embedded stdio MCP stack and every test engine
-    // never install one, and `Engine::hidden_domains` answers `None` for them,
-    // which is the same answer the `Scope::Unrestricted` those surfaces pass
-    // would have produced anyway. Set once and never replaced, so a second
+    // is built long before - and often without - an accounts database: the
+    // other one-shot CLI commands and every test engine never install one,
+    // and `Engine::hidden_domains` answers `None` for them, which is the same
+    // answer the `Scope::Unrestricted` those surfaces pass would have
+    // produced anyway. Set once and never replaced, so a second
     // router built over one engine keeps the first store rather than silently
     // swapping the authority mid-flight.
     domain_access: std::sync::OnceLock<Arc<crate::scope::DomainAccess>>,
+    // Why the resolver above could not be built, on a stack that tried to
+    // build one (every serving stack does, before it answers anything) and
+    // could not open the accounts store. While it is set and no resolver is,
+    // nobody knows who reads a domain, so a Reflection source outside its
+    // page's domain is refused and the queue names every such source: the
+    // check fails closed instead of letting everything through.
+    domain_access_unavailable: std::sync::OnceLock<String>,
+    // Where the accounts store would be, on a stack that found none when it
+    // started: no account and so no private domain existed then. Should the
+    // file appear while the stack runs, the readers are unknown again and
+    // the check fails closed until a restart installs the resolver.
+    domain_access_absent: std::sync::OnceLock<std::path::PathBuf>,
     // The servers this machine offers domains from (`crystalline connect`),
     // installed once by whoever serves this engine to its owner: the daemon at
     // start, a one-shot CLI command before it routes. Absent everywhere else
@@ -2408,6 +2425,7 @@ impl Engine {
             #[cfg(any(test, feature = "testing"))]
             app_store_lookup: None,
             backup_marks: Default::default(),
+            backup_held: Default::default(),
             reflection_walks: Default::default(),
             origins_dir_override: None,
             state_dir_override: None,
@@ -2438,6 +2456,8 @@ impl Engine {
             join_fence: tokio::sync::RwLock::new(()),
             collab: std::sync::OnceLock::new(),
             domain_access: std::sync::OnceLock::new(),
+            domain_access_unavailable: std::sync::OnceLock::new(),
+            domain_access_absent: std::sync::OnceLock::new(),
             sources: std::sync::OnceLock::new(),
             web_origin: std::sync::OnceLock::new(),
             joins: Arc::new(crate::join::Joins::default()),
@@ -2849,6 +2869,24 @@ impl Engine {
     /// possibly different, store.
     pub fn set_domain_access(&self, access: Arc<crate::scope::DomainAccess>) {
         let _ = self.domain_access.set(access);
+    }
+
+    /// Record that this stack tried to install the private-domain resolver
+    /// and could not, with why (the accounts store did not open). From then
+    /// on, until a resolver is installed, a Reflection source outside its
+    /// page's domain is refused and the queue names every such source, since
+    /// nobody here knows who reads which domain. A second call is ignored.
+    pub fn set_domain_access_unavailable(&self, why: String) {
+        let _ = self.domain_access_unavailable.set(why);
+    }
+
+    /// Record that this stack found no accounts store at `path` when it
+    /// started: no account and no private domain exist, so every reader of
+    /// one domain reads the next. Should the file appear while the stack
+    /// runs, the readers are unknown and Reflection sources outside a page's
+    /// domain are refused until a restart. A second call is ignored.
+    pub fn set_domain_access_absent(&self, path: std::path::PathBuf) {
+        let _ = self.domain_access_absent.set(path);
     }
 
     /// Install this machine's sources. A no-op on a second call.
@@ -4040,6 +4078,20 @@ impl Engine {
         marked
     }
 
+    /// The pages of `domain` its last backup held back, sorted: each cites
+    /// a domain fewer people may read than `domain` (a `source_too_wide`
+    /// item in the queue), so it stays off the backup branch, whose head
+    /// loses the copy it had, until a curator settles it. Empty when nothing
+    /// was held back or no backup ran.
+    pub fn reflection_backup_held_back(&self, domain: &str) -> Vec<String> {
+        self.backup_held
+            .lock()
+            .expect("backup held")
+            .get(domain)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// Mark every domain whose Reflection is switched on, once, when the
     /// daemon starts: the marks live in memory, so a change made before a
     /// restart (or while GitHub collaboration was off) is backed up without
@@ -4109,7 +4161,25 @@ impl Engine {
                 self.backup_marks.clear(&domain);
                 continue;
             }
+            // A page that cites a domain fewer people may read than this one
+            // is held back with its threads, its baseline and the files only
+            // it links: the branch is read by the repository's people, not
+            // by this domain's readers.
+            let mut held_pages: Vec<String> = Vec::new();
             let attempt: Result<crystalline_remote::reflections_backup::BackupOutcome> = async {
+                held_pages = self.too_wide_pages(&domain).await?;
+                let assets = self.held_assets(&domain, &held_pages).await?;
+                let held: std::collections::BTreeSet<String> = held_pages
+                    .iter()
+                    .flat_map(|page| {
+                        [
+                            page.clone(),
+                            crystalline_core::reflection::threads_path(page),
+                            crystalline_core::reflection::baseline_path(page),
+                        ]
+                    })
+                    .chain(assets)
+                    .collect();
                 let (spec, root, state_dir) = self.origin_spec_for_domain(&domain)?;
                 Ok(crystalline_remote::reflections_backup::backup_reflections(
                     provider.as_ref(),
@@ -4117,13 +4187,32 @@ impl Engine {
                     &root,
                     &state_dir,
                     &format!("Back up the Reflection of {domain}"),
+                    &held,
                 )
                 .await?)
             }
             .await;
             let mut paused = false;
             match &attempt {
-                Ok(_) => self.backup_marks.clear_if_unchanged(&domain, now),
+                Ok(_) => {
+                    self.backup_marks.clear_if_unchanged(&domain, now);
+                    let before = self
+                        .backup_held
+                        .lock()
+                        .expect("backup held")
+                        .insert(domain.clone(), held_pages.clone())
+                        .unwrap_or_default();
+                    if !held_pages.is_empty() {
+                        self.backup_marks.hold(&domain, now);
+                        if before != held_pages {
+                            tracing::warn!(
+                                domain = %domain,
+                                "reflection backup: held back {} because they cite a domain fewer people may read; they go out once a curator settles them",
+                                held_pages.join(", ")
+                            );
+                        }
+                    }
+                }
                 Err(EngineError::Remote(RemoteError::RateLimited { reset })) => {
                     // GitHub limits the token, not the repository: every
                     // domain waits, the origin poller's pulls included.

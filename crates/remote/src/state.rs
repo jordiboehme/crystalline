@@ -44,6 +44,12 @@ use crate::merge::ConflictKind;
 /// is worse than failing loudly.
 pub const CURRENT_VERSION: u32 = 1;
 
+/// The file in a domain's origin state folder that records that the team
+/// declined this instance's claim of the domain's evolve home: it holds the
+/// address that was declined. While it is there the instance does not claim
+/// the home again; a person removing `evolve_home` here takes it away.
+pub const EVOLVE_HOME_DECLINED_FILE: &str = "evolve_home_declined";
+
 /// How many entries [`OriginState::push_history`] keeps.
 const HISTORY_CAP: usize = 20;
 

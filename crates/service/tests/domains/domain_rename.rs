@@ -3257,6 +3257,14 @@ both_backends!(
 /// by its local name here.
 async fn finishing_respells_the_domain_of_reflection_sources_body(store: Arc<Mutex<dyn Store>>) {
     let m = machine(store).await;
+    // `eng` is private to ada, so a page that cites it must be read by no
+    // one else either: `ops` is made private to ada too.
+    AuthStore::open(&m.state().join("web-auth.db"))
+        .await
+        .unwrap()
+        .set_domain_visibility("ops", true, "ada")
+        .await
+        .unwrap();
     std::fs::write(
         m.root.join("ops/MANIFEST.md"),
         manifest("Ops").replacen("status: current\n", "status: current\nreflection: on\n", 1),

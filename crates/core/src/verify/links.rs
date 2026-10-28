@@ -153,6 +153,7 @@ pub(crate) fn check(
         }
 
         check_crystalline_urls(file, lines, domain_names, lookup, sink);
+        check_file_links(domain, file, lines, &own_path, sink);
     }
 }
 
@@ -421,6 +422,66 @@ fn check_crystalline_urls(
                     None,
                 );
             }
+        }
+    }
+}
+
+/// L007: a relative link or image whose destination is not a note and names
+/// no file in the domain, such as an attachment an import left behind. A note
+/// link (`.md`) is L001's, a URL, `crystalline://` link, mail link, absolute
+/// path and bare `#anchor` are not files of this domain, and a destination
+/// with a `?query` is a request rather than a path, so none of them is
+/// judged here. The path is resolved against the engram's folder and looked
+/// up under the domain root only: one that climbs out of the domain is
+/// reported without ever being read.
+fn check_file_links(
+    domain: &Domain,
+    file: &ScannedFile,
+    lines: &[BodyLine],
+    own_path: &str,
+    sink: &mut Sink,
+) {
+    use crate::reflection::links::{code_spans, is_relative, read_destination, resolve_in_domain};
+
+    for bl in lines.iter().filter(|bl| !bl.in_fence) {
+        if !bl.text.contains("](") {
+            continue;
+        }
+        let spans = code_spans(bl.text);
+        let in_code = |at: usize| spans.iter().any(|(s, e)| (*s..*e).contains(&at));
+        let mut seen: Vec<String> = Vec::new();
+        let mut cursor = 0;
+        while let Some(found) = bl.text[cursor..].find("](") {
+            let open = cursor + found + 2;
+            cursor = open;
+            let Some(dest) = read_destination(bl.text, open) else {
+                continue;
+            };
+            cursor = dest.close;
+            let path = dest.path;
+            if in_code(open)
+                || !is_relative(&path)
+                || path.contains('?')
+                || path.to_ascii_lowercase().ends_with(".md")
+                || seen.contains(&path)
+            {
+                continue;
+            }
+            let present = resolve_in_domain(own_path, &path)
+                .is_some_and(|landed| domain.root.join(landed).exists());
+            if !present {
+                sink.emit(
+                    &file.path,
+                    Some(bl.line_no),
+                    "L007",
+                    Severity::Warning,
+                    format!(
+                        "`{own_path}` links to `{path}`, but the domain has no such file. Add the file, or fix or remove the link."
+                    ),
+                    None,
+                );
+            }
+            seen.push(path);
         }
     }
 }

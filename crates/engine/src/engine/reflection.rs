@@ -463,7 +463,7 @@ impl Engine {
     /// slash), the spelling [`crystalline_core::validate_reflection_home`]
     /// holds the stored key to, so a home this instance writes compares
     /// equal to the one it reads back. `None` when unset or not a valid base.
-    fn own_public_url(&self) -> Option<String> {
+    pub(super) fn own_public_url(&self) -> Option<String> {
         crate::settings::public_base(&self.config.read().unwrap()).map(|base| base.to_string())
     }
 

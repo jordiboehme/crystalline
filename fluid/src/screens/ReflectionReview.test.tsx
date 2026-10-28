@@ -413,6 +413,48 @@ describe("the review screen", () => {
     });
   });
 
+  it("names a section that cites a domain fewer people may read, with its source", async () => {
+    serve({
+      ...REVIEW,
+      queue: {
+        ...REVIEW.queue,
+        queue: [
+          {
+            n: 1,
+            kind: "update",
+            what: "source_too_wide",
+            path: "guides/deploying.md",
+            section: "7f3a9c2e",
+            heading: "Night deploys",
+            age_secs: 3600,
+            sources: [
+              {
+                permalink: "team/harbor-team",
+                title: "Harbor team",
+                state: "current",
+                domain: "harbor",
+              },
+            ],
+            note: "this section cites a domain fewer people may read than this page's domain",
+          },
+        ],
+      },
+    });
+    renderApp("/d/eng/reflection/review");
+    const queue = await screen.findByRole("region", { name: "Reflect queue" });
+    expect(
+      await within(queue).findByText("Cites a domain fewer people read"),
+    ).toBeVisible();
+    expect(
+      within(queue).getByText(
+        /This section cites a domain fewer people may read than this one\./,
+      ),
+    ).toBeVisible();
+    expect(
+      within(queue).getByRole("link", { name: "Harbor team in domain harbor" }),
+    ).toHaveAttribute("href", "/d/harbor/e/team/harbor-team");
+  });
+
   it("links a source of another domain into its domain and counts the ones the reader cannot open", async () => {
     serve({
       ...REVIEW,

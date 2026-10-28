@@ -20,6 +20,30 @@ use crate::scope::Scope;
 /// them but that they need a person who may open their domain.
 pub(crate) const HIDDEN_SOURCE_NOTE: &str = "a source in a domain you cannot open has changed";
 
+/// What a write is refused with when it names a source in a domain fewer
+/// people may read than the page's domain ([`Engine::readers_cover`]). The
+/// writer may open that domain (the refusal for one it may not comes first
+/// and is an unknown domain's), so naming the source tells it nothing new.
+/// It asks for the text to go too: the rule sees only the sources a write
+/// names, so a writer that drops the source and keeps what it drew from it
+/// is not caught.
+pub(crate) const TOO_WIDE_REFUSAL: &str = "this source is in a domain fewer people may read than this page's domain; leave out the source and every sentence drawn from it, since the check sees only named sources, or write that text on a page in that domain instead";
+
+/// What a write is refused with when its page is in a domain connected to
+/// GitHub and the source is in one that is not (a local or a virtual
+/// domain): the page is backed up to the repository, whose readers are not
+/// the accounts here, so personal knowledge would reach a repository.
+pub(crate) const NOT_ON_GITHUB_REFUSAL: &str = "this source is in a domain that is not shared through GitHub, and this page is backed up to a GitHub repository; leave out the source and every sentence drawn from it, or cite it from a page in that domain instead";
+
+/// What a write is refused with when it names a source in another domain
+/// on a stack that could not open its accounts store: who reads which
+/// domain is unknown there, so the check fails closed.
+pub(crate) const UNKNOWN_READERS_REFUSAL: &str = "who may read each domain is unknown here because the accounts store could not be read, so a source outside this page's domain is refused until it can; remove that source and the text drawn from it, or try again once the accounts store is back";
+
+/// What a `source_too_wide` item says to a caller who may open every
+/// domain the item is about.
+pub(crate) const TOO_WIDE_NOTE: &str = "this section cites a domain fewer people may read than this page's domain, or one not shared through GitHub while this page is backed up to a GitHub repository, so its text reaches people who may not read that domain; remove that source and the text drawn from it. The page stays as it is until a curator does";
+
 /// What a `source_unavailable` item says to a caller who may open the
 /// domain, with how to clear it.
 pub(crate) fn unavailable_note(domain: &str) -> String {
@@ -62,6 +86,20 @@ impl SourceFacts {
         let stored = src.domain.as_deref()?;
         let shown = self.local.get(stored).map_or(stored, String::as_str);
         (shown != self.own_domain).then_some(shown)
+    }
+
+    /// The local name of `src`'s domain when it is another domain than the
+    /// page's and can be checked here: the domain whose readers
+    /// [`Engine::readers_cover`] is asked about. `None` for a source of the
+    /// page's own domain and for one whose domain cannot be checked here,
+    /// whose readers nobody here knows.
+    pub(crate) fn checked_domain(&self, src: &r::SourceRef) -> Option<&str> {
+        let stored = src.domain.as_deref()?;
+        if !matches!(self.foreign.get(stored), Some(Some(_))) {
+            return None;
+        }
+        let local = self.local.get(stored)?;
+        (*local != self.own_domain).then_some(local.as_str())
     }
 
     /// Whether `src` is in a domain that cannot be checked here.
@@ -167,10 +205,69 @@ impl Engine {
     /// The registered local domain a stored source domain names, when it can
     /// be checked here: a name that resolves to a domain this instance
     /// registered and a connected server does not hide.
-    fn checkable_domain(&self, table: &NameTable, name: &str) -> Option<String> {
+    pub(super) fn checkable_domain(&self, table: &NameTable, name: &str) -> Option<String> {
         let local = table.resolve(name)?;
         (self.knows_domain(local) && !self.shadowed_domains().contains(local))
             .then(|| local.to_string())
+    }
+
+    /// Whether a page of domain `page` may carry text drawn from domain
+    /// `source` (both local names): whether every reader of the page may
+    /// read text drawn from `source` anyway. The rule and who counts as a
+    /// reader are [`crate::scope::DomainAccess::readers_cover`]'s.
+    ///
+    /// It never looks at who asks: the machine owner, who reads every
+    /// domain, is held to it too, since the page's readers are the ones the
+    /// text reaches. Every serving stack (the daemon, with or without its
+    /// HTTP surface, and the embedded stdio stack) installs a resolver
+    /// before it answers anything. One that tried and could not open the
+    /// accounts store fails closed: no other domain is covered. Only an
+    /// engine that never tried (a one-shot command or a test engine, where
+    /// no accounts store is in play) answers that every page covers every
+    /// domain.
+    pub(crate) async fn readers_cover(&self, page: &str, source: &str) -> Result<bool> {
+        if self.leaves_github(page, source) {
+            return Ok(false);
+        }
+        let Some(access) = self.domain_access.get() else {
+            // Failed closed: a stack that could not open its accounts store
+            // knows no reader, so no other domain is covered.
+            return Ok(self.readers_unknown().is_none());
+        };
+        access
+            .readers_cover(page, source)
+            .await
+            .map_err(|e| EngineError::Internal(e.to_string()))
+    }
+
+    /// Whether a page of `page` citing `source` would carry a domain that
+    /// is not connected to GitHub into the GitHub repository `page` is
+    /// backed up to. Until access follows GitHub, any two connected domains
+    /// count as alike: their repositories' readers are not compared.
+    pub(crate) fn leaves_github(&self, page: &str, source: &str) -> bool {
+        let on_github = |domain: &str| {
+            self.domain_entry(domain)
+                .is_ok_and(|entry| entry.origin.is_some())
+        };
+        on_github(page) && !on_github(source)
+    }
+
+    /// Why nobody here knows who reads which domain, when that is so: no
+    /// resolver is installed, and either the accounts store could not be
+    /// opened, or none was there at the start and one is there now.
+    fn readers_unknown(&self) -> Option<String> {
+        if self.domain_access.get().is_some() {
+            return None;
+        }
+        if let Some(why) = self.domain_access_unavailable.get() {
+            return Some(why.clone());
+        }
+        self.domain_access_absent
+            .get()
+            .filter(|path| path.exists())
+            .map(|_| {
+                "the accounts store was created after this server started; restart it".to_string()
+            })
     }
 
     /// The entries of a write's `sources`, each resolved: a bare permalink
@@ -179,7 +276,11 @@ impl Engine {
     /// engrams in; one it may not see, one nobody registered here and one a
     /// connected server serves are refused with the bytes an unknown domain
     /// gets, naming the spelling the writer used, so a private domain's
-    /// existence never shows.
+    /// existence never shows. Then it must be one every reader of the page
+    /// may read ([`Engine::readers_cover`]), whoever writes: a page never
+    /// carries text drawn from a domain fewer people may read. That check
+    /// comes second, so its refusal only ever names a domain the writer may
+    /// open.
     pub(crate) async fn resolve_source_names<'a>(
         &self,
         own: &str,
@@ -219,6 +320,21 @@ impl Engine {
             let domain = if local == own {
                 None
             } else {
+                if let Some(why) = self.readers_unknown() {
+                    return Err(EngineError::Invalid(format!(
+                        "'{name}': {UNKNOWN_READERS_REFUSAL} ({why})"
+                    )));
+                }
+                if self.leaves_github(own, local) {
+                    return Err(EngineError::Invalid(format!(
+                        "'{name}': {NOT_ON_GITHUB_REFUSAL}"
+                    )));
+                }
+                if !self.readers_cover(own, local).await? {
+                    return Err(EngineError::Invalid(format!(
+                        "'{name}': {TOO_WIDE_REFUSAL}"
+                    )));
+                }
                 Some(table.normalize(&spelled).unwrap_or(&spelled).to_string())
             };
             out.insert(name.clone(), NamedSource { domain, permalink });

@@ -2801,6 +2801,7 @@ pub async fn set_visibility(
             .set_domain_visibility(&domain, true, caller.name())
             .await
             .map_err(|e| ApiError::internal(format!("setting the domain's visibility: {e:#}")))?;
+        crate::readers_changed(&state);
         return Ok(StatusCode::NO_CONTENT);
     }
     // Re-sharing: the owner or an admin. The domain gate comes FIRST here,
@@ -2833,6 +2834,7 @@ pub async fn set_visibility(
         .set_domain_visibility(&domain, false, caller.name.as_str())
         .await
         .map_err(|e| ApiError::internal(format!("setting the domain's visibility: {e:#}")))?;
+    crate::readers_changed(&state);
     Ok(StatusCode::NO_CONTENT)
 }
 

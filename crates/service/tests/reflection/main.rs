@@ -18,6 +18,7 @@ mod mode_change;
 mod nudges;
 mod own_writes;
 mod queue;
+mod reach;
 mod rest;
 mod rights;
 mod search;

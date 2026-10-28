@@ -1030,6 +1030,62 @@ fn the_github_team_marker_and_an_absent_one_are_clean() {
     );
 }
 
+// --- The evolve home (M013) -------------------------------------------------
+
+fn manifest_declaring_evolve_home(value: &str) -> String {
+    format!(
+        "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\nevolve_home: {value}\n---\n\n## Scope\n\n- Charts of the harbor\n\n## When to Use\n\n- When asked about the harbor\n"
+    )
+}
+
+#[test]
+fn an_evolve_home_that_is_no_server_address_is_m013_error() {
+    let dir = tempdir().unwrap();
+    write(
+        dir.path(),
+        "MANIFEST.md",
+        &manifest_declaring_evolve_home("https://kb.example.com/"),
+    );
+    let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+    let m013 = report
+        .issues
+        .iter()
+        .find(|i| i.rule == "M013")
+        .expect("M013 present");
+    assert_eq!(m013.severity, Severity::Error);
+    assert!(
+        m013.message.starts_with(
+            "`evolve_home: https://kb.example.com/` cannot be the home of this domain's scheduled evolve: "
+        ),
+        "{}",
+        m013.message
+    );
+    assert_eq!(
+        m013.fix.as_deref(),
+        Some(
+            "read as absent, so every clone of this team domain may run a scheduled evolve; remove the line, and the next scheduled evolve run at the team server fills it in"
+        )
+    );
+    assert_eq!(report.exit_code(), 1);
+}
+
+#[test]
+fn a_valid_evolve_home_and_an_absent_one_are_clean() {
+    for manifest in [
+        manifest_declaring_evolve_home("https://kb.example.com"),
+        manifest_declaring_team("github"),
+    ] {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "MANIFEST.md", &manifest);
+        let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+        assert!(
+            !report.issues.iter().any(|i| i.rule == "M013"),
+            "{:?}",
+            report.issues
+        );
+    }
+}
+
 /// The MANIFEST issue 91 left behind: `## When to Use` twice, the first one
 /// empty, which is the one routing reads.
 const DOUBLED_MANIFEST: &str = "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n## Scope\n\n- Facts about the solar system\n\n## When to Use\n\n## When to Use\n\n- When asked about moons or planets\n";
@@ -1751,4 +1807,115 @@ fn m012_counts_links_under_the_folder_and_a_linked_folder() {
         "{}",
         m012[0].message
     );
+}
+
+/// One engram body inside a clean domain, plus any extra files, and the L007
+/// messages verify reports for it.
+fn l007_messages(
+    extra: &[&str],
+    engram_path: &str,
+    body: &str,
+    config: Option<&str>,
+) -> Vec<String> {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("plant");
+    write(&root, "MANIFEST.md", CLEAN_MANIFEST);
+    if let Some(config) = config {
+        write(&root, ".crystalline.yaml", config);
+    }
+    for rel in extra {
+        write(&root, rel, "data");
+    }
+    write(
+        &root,
+        engram_path,
+        &format!(
+            "---\ntype: engram\ntitle: Pump\npermalink: pump\ntags:\n- plant\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\n---\n\n# Pump\n\n{body}\n\nA second paragraph of prose, so the body clears the minimum line count.\n"
+        ),
+    );
+    let report = verify::verify_paths([root.as_path()], &VerifyOptions::default()).unwrap();
+    report
+        .issues
+        .iter()
+        .filter(|i| i.rule == "L007")
+        .map(|i| format!("{:?} {}", i.severity, i.message))
+        .collect()
+}
+
+#[test]
+fn a_link_to_a_file_the_domain_does_not_have_is_an_l007_warning() {
+    let got = l007_messages(
+        &[],
+        "pump.md",
+        "Raw data: [dump](pump.assets/attachment-1.bin) and ![plan](img/plan.png).",
+        None,
+    );
+    assert_eq!(
+        got,
+        vec![
+            "Warning `pump.md` links to `pump.assets/attachment-1.bin`, but the domain has no such file. Add the file, or fix or remove the link.",
+            "Warning `pump.md` links to `img/plan.png`, but the domain has no such file. Add the file, or fix or remove the link.",
+        ]
+    );
+}
+
+#[test]
+fn a_link_to_a_file_the_domain_has_is_sound() {
+    let got = l007_messages(
+        &["pump.assets/attachment-1.bin", "sub/up.pdf", "my file.png"],
+        "sub/pump.md",
+        "[a](../pump.assets/attachment-1.bin) [b](up.pdf) ![c](<../my file.png>) ![d](../my%20file.png)",
+        None,
+    );
+    assert!(got.is_empty(), "{got:?}");
+}
+
+#[test]
+fn l007_resolves_dot_dot_from_the_engrams_folder_and_never_leaves_the_domain() {
+    let got = l007_messages(
+        &["pump.bin"],
+        "sub/pump.md",
+        "[x](pump.bin) [y](../../outside.bin)",
+        None,
+    );
+    assert_eq!(
+        got,
+        vec![
+            "Warning `sub/pump.md` links to `pump.bin`, but the domain has no such file. Add the file, or fix or remove the link.",
+            "Warning `sub/pump.md` links to `../../outside.bin`, but the domain has no such file. Add the file, or fix or remove the link.",
+        ]
+    );
+}
+
+#[test]
+fn l007_ignores_urls_anchors_queries_code_fences_and_markdown_targets() {
+    let body = "[a](https://example.com/x.bin) [b](crystalline://plant/pump) [c](#top) \
+[d](mailto:me@example.com) [e](/abs/x.bin) [f](x.bin?raw=1) [g](x.bin#part) `[h](code.bin)`\n\n\
+```\n[i](fenced.bin)\n```\n\n[j](gone.md) [k](index.md)";
+    let got = l007_messages(&[], "pump.md", body, None);
+    // Only the fragment link lands on a path: `x.bin` is missing.
+    assert_eq!(
+        got,
+        vec![
+            "Warning `pump.md` links to `x.bin`, but the domain has no such file. Add the file, or fix or remove the link."
+        ]
+    );
+}
+
+#[test]
+fn l007_follows_the_domains_severity_override() {
+    let off = l007_messages(
+        &[],
+        "pump.md",
+        "[a](gone.bin)",
+        Some("verify:\n  rules:\n    L007: off\n"),
+    );
+    assert!(off.is_empty(), "{off:?}");
+    let error = l007_messages(
+        &[],
+        "pump.md",
+        "[a](gone.bin)",
+        Some("verify:\n  rules:\n    L007: error\n"),
+    );
+    assert!(error[0].starts_with("Error "), "{error:?}");
 }
