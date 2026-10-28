@@ -969,6 +969,17 @@ jobs:
           paths: tests/fixtures/domain-good
           comment: 'false'
 
+      # The team-repository input wired off, over the fixture a team
+      # repository passes with. The action runs the latest release, so the
+      # run with the input on joins here once a release carries
+      # --team-repository (0.30.0); until then the crystalline crate's
+      # `team_repository_adds_the_team_rules` covers the flag itself.
+      - uses: ./action # zizmor: ignore[self-repository]
+        with:
+          paths: tests/fixtures/team-repository-good
+          team-repository: 'false'
+          comment: 'false'
+
   # The proof `changes` looks for on main: this pull request run passed every
   # gated job on this tree. A job `if` without a status function means
   # `success() && ...`, and a skipped need skips this job, so a run with a

@@ -190,6 +190,10 @@ fn every_domain_walk_asks_the_layout() {
     let allowed: &[(&str, &str)] = &[
         // Walks a folder that is about to be imported, before it is a domain.
         ("core/src/import.rs", "collect_entries"),
+        // Lists every file under `reflections/`, hidden ones included, for
+        // verify's M012: whatever the layout would call each one, any file
+        // there is the finding.
+        ("core/src/verify/team.rs", "reflection_files"),
         // A `#[cfg(test)]` unit test of the walk error a missing folder gives.
         (
             "remote/src/changes.rs",

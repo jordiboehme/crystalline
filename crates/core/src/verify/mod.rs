@@ -15,6 +15,10 @@
 //! is reported as `M108` (a warning) and otherwise changes nothing. `--strict`
 //! additionally promotes every rule whose default severity is `Warning` to
 //! `Error`, `M108` included.
+//!
+//! `--team-repository` adds the rules for a repository a team shares through
+//! GitHub (`M011`, `M012`, `M109`), which the domain's own settings cannot
+//! lower; see the `team` module.
 
 mod catalog;
 mod domain_config;
@@ -26,6 +30,7 @@ mod report;
 mod scanner;
 mod schema_rules;
 mod severity;
+mod team;
 mod temporal;
 mod util;
 
@@ -155,6 +160,11 @@ pub struct VerifyOptions {
     /// When set, applied to every scanned domain instead of discovering
     /// each domain's own `.crystalline.yaml`.
     pub config_override: Option<crate::config::DomainConfig>,
+    /// Also run the team repository rules (`M011`, `M012`, `M109`): the
+    /// checks for the repository of a domain shared through GitHub, where a
+    /// Reflection must never be kept. Off by default, so plain verify of a
+    /// local domain or a personal backup repository is unchanged.
+    pub team_repository: bool,
 }
 
 /// Verify one or more paths. Each path given directly is treated as a
@@ -411,6 +421,13 @@ fn run_rules(domains: &[scanner::Domain], options: &VerifyOptions) -> VerifyRepo
     };
 
     for domain in domains {
+        // The team repository rules first, through a sink that reads no
+        // domain settings: a `.crystalline.yaml` in the very change they
+        // guard must not be able to turn them off.
+        if options.team_repository {
+            let mut sink = Sink::new(&mut issues, &mut summary, None, options.strict);
+            team::check(domain, &mut sink);
+        }
         let mut sink = Sink::new(
             &mut issues,
             &mut summary,

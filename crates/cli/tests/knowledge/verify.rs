@@ -230,3 +230,75 @@ fn defaults_to_current_directory_when_no_paths_given() {
         .assert()
         .success();
 }
+
+/// `--team-repository` adds the team repository rules: the good fixture
+/// (marker present, Reflection off, an engram under `reflections/`) passes,
+/// the bad one (a clone's Reflection pushed with no home and no marker)
+/// fails with `M011`, `M012` and `M109`, and plain verify of the bad one
+/// reports none of them.
+#[test]
+fn team_repository_adds_the_team_rules() {
+    crate::common::crystalline()
+        .current_dir(fixtures_dir())
+        .args(["verify", "team-repository-good", "--team-repository"])
+        .assert()
+        .success();
+
+    let output = crate::common::crystalline()
+        .current_dir(fixtures_dir())
+        .args([
+            "verify",
+            "team-repository-bad",
+            "--team-repository",
+            "--format",
+            "json",
+        ])
+        .assert()
+        .code(1)
+        .get_output()
+        .stdout
+        .clone();
+    let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    let rules: BTreeSet<String> = report["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["rule"].as_str().unwrap().to_string())
+        .collect();
+    for rule in ["M011", "M012", "M109"] {
+        assert!(rules.contains(rule), "{rule}: {report}");
+    }
+
+    let plain = crate::common::crystalline()
+        .current_dir(fixtures_dir())
+        .args(["verify", "team-repository-bad", "--format", "json"])
+        .assert()
+        .get_output()
+        .stdout
+        .clone();
+    let plain: serde_json::Value = serde_json::from_slice(&plain).unwrap();
+    assert!(
+        plain["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|i| !["M011", "M012", "M109"].contains(&i["rule"].as_str().unwrap())),
+        "{plain}"
+    );
+
+    // The GitHub annotation carries the whole message on one line.
+    crate::common::crystalline()
+        .current_dir(fixtures_dir())
+        .args([
+            "verify",
+            "team-repository-bad",
+            "--team-repository",
+            "--format",
+            "github",
+        ])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains(
+            "::error file=team-repository-bad/reflections,title=M012::The MANIFEST says `reflection: on`, and this branch holds 3 files under reflections/: reflections/PACT.md, reflections/guides/tides.md, reflections/guides/tides.threads.md.",
+        ));
+}

@@ -99,6 +99,16 @@ pub const VERIFY_RULES: &[VerifyRule] = &[
     rule("M008", "error", "domain_name can name a domain."),
     rule("M009", "error", "read_only is off or on."),
     rule("M010", "error", "team names a known forge (github)."),
+    rule(
+        "M011",
+        "error",
+        "In a team repository, reflection: on comes with a valid reflection_home.",
+    ),
+    rule(
+        "M012",
+        "error",
+        "In a team repository, no file lies under reflections/ while Reflection is on.",
+    ),
     rule("M101", "warning", "When to Use is not empty."),
     rule("M102", "warning", "Section bullets stay short."),
     rule("M103", "warning", "No section heading appears twice."),
@@ -118,6 +128,11 @@ pub const VERIFY_RULES: &[VerifyRule] = &[
         "M108",
         "warning",
         "The .crystalline.yaml parses and every severity in it is a word.",
+    ),
+    rule(
+        "M109",
+        "warning",
+        "In a team repository, the MANIFEST carries team: github.",
     ),
     rule(
         "Q001",
@@ -249,6 +264,7 @@ mod tests {
         ("mod.rs", include_str!("mod.rs")),
         ("quality.rs", include_str!("quality.rs")),
         ("schema_rules.rs", include_str!("schema_rules.rs")),
+        ("team.rs", include_str!("team.rs")),
         ("temporal.rs", include_str!("temporal.rs")),
     ];
 
@@ -288,7 +304,7 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(ids, sorted, "id order, each id once");
-        assert_eq!(ids.len(), 64);
+        assert_eq!(ids.len(), 67);
         for rule in VERIFY_RULES {
             assert!(
                 ["error", "warning", "info"].contains(&rule.default),

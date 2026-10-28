@@ -106,6 +106,52 @@ On a team domain, switching it on here stays a local change, because sharing is 
 
 The flag is shown everywhere. The routing block marks the domain "(read-only)", a domain row in `list_domains`, `browse_domain` and `read_engram` carries `read_only: true`, and Fluid shows a lock. The same mark also means "you cannot write here" for a reason that is yours, not the domain's: a viewer role, or a write list that leaves the domain out (see [An account per agent](deployment.md#an-account-per-agent)). The refusal sentence names the reason. Maintenance leaves a locked domain alone until the flag is off. A value other than `on` or `off` is read as `off`, and `crystalline verify` reports it as `M009`.
 
+### Keep a team repository's Reflection safe
+
+A team domain's [Reflection](reflection.md) lives at one home, the team server. The home fills in `reflection_home` when Reflection is switched on there, and it backs the Reflection up to the `crystalline/reflections` branch. A share never carries a file under `reflections/` while Reflection is on. Pages and threads can hold comments from people who may not read the engrams, so they stay off the shared branch.
+
+A plain clone of the repository, added as a local domain, skips these checks. Two guards cover it.
+
+The first guard is the team marker, `team: github` in the MANIFEST. Crystalline writes it, right after the title, and it is never set by hand. A connect does not write it, so the folder stays clean after a connect. The first share from a connected instance does:
+
+- A share of everything carries it when there is something else to share.
+- A share of chosen files carries it as one more file when the MANIFEST has no other unshared change. Otherwise it waits for a share that includes the MANIFEST.
+- A domain that reviews changes shares drafts, so its shares do not write it.
+
+On an instance where the domain is not connected, the marker refuses Reflection. Switching it on is refused with a sentence that says to connect the domain (`crystalline domain add <name> --origin <owner>/<repo>`) and to switch Reflection on at the team server. A Reflection that is already on does not run there: its state is `homeless`, and every Reflection verb is refused (409 over the JSON API). The engrams keep working. A local domain without the marker, for example one you back up to your own GitHub repository, works as before. A value other than `github` is read as absent, and `crystalline verify` reports it as `M010`.
+
+The second guard is a check in the repository itself. `crystalline verify --team-repository`, or the GitHub Action with `team-repository: 'true'`, adds three rules:
+
+- `M011`, an error: `reflection: on` without a valid `reflection_home`.
+- `M012`, an error: any file under `reflections/`, in any letter case, while Reflection is on. One finding lists the paths. With Reflection off, `reflections/` is ordinary content and stays allowed.
+- `M109`, a warning: the MANIFEST has no `team: github`. A repository from before 0.30.0 gets the line with its next share from a connected instance.
+
+The domain's own `.crystalline.yaml` cannot turn these three rules off, so a pull request cannot switch off the check that guards it. Each finding says what is wrong, why, and what to do, because a team member reads it in the pull request comment.
+
+```yaml
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jordiboehme/crystalline/action@v0.30.0
+        with:
+          team-repository: 'true'
+```
+
+Run it for the shared branch only. The `crystalline/reflections` branch holds the Reflection backup on purpose, and the check would fail there.
+
+The check blocks a change only when it is a required status check in the branch protection (or a ruleset) of the shared branch. Without that, it only reports after the push. Add a `CODEOWNERS` entry for `MANIFEST.md`, `reflections/` and `.crystalline.yaml`, so a change to them needs a review by the team's owners. A repository admin can still bypass all of this.
+
 ### Private domains
 
 A domain does not have to be shared with the whole team to exist on a team instance. Make one private (from its Members card in Fluid, or `crystalline domain visibility <domain> private --owner <account>` from the CLI) and only its owner, the accounts invited into it and instance admins can see it at all. Everyone else gets the same answer a domain nobody registered gets. Be honest about what that protects: private is a wall between accounts, not from whoever operates the machine. The CLI, running on the host, administers every domain, invited or not, exactly the way a GitHub organization owner sees every repository in it. See [Private domains](deployment.md#private-domains) for membership levels and the full command set.

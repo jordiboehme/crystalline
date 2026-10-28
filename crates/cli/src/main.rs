@@ -105,6 +105,13 @@ enum Command {
         /// of each domain's own `.crystalline.yaml`.
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Also check what the repository of a team domain must never hold:
+        /// a Reflection switched on without a home (M011), files under
+        /// reflections/ while Reflection is on (M012), and a MANIFEST
+        /// without `team: github` (M109, a warning). A domain's own
+        /// .crystalline.yaml cannot turn these rules off.
+        #[arg(long)]
+        team_repository: bool,
     },
     /// Generate a session-start knowledge routing prompt. No database,
     /// service or network connection is used.
@@ -2036,7 +2043,8 @@ fn run() -> anyhow::Result<()> {
             strict,
             format,
             config,
-        }) => run_verify(paths, strict, format, config, cli.json),
+            team_repository,
+        }) => run_verify(paths, strict, team_repository, format, config, cli.json),
         Some(Command::Prompt { kind }) => match kind {
             PromptKind::System {
                 workspace,
@@ -5195,6 +5203,7 @@ fn init_cli_tracing(command: Option<&Command>) {
 fn run_verify(
     paths: Vec<PathBuf>,
     strict: bool,
+    team_repository: bool,
     format: Option<OutputFormat>,
     config_path: Option<PathBuf>,
     json_flag: bool,
@@ -5216,6 +5225,7 @@ fn run_verify(
     let options = VerifyOptions {
         strict,
         config_override,
+        team_repository,
     };
 
     let report = match verify::verify_paths(paths, &options) {
