@@ -5,6 +5,7 @@ import { API_BASE, api } from "./client";
 import {
   changedVersions,
   deleteReflectionAsset,
+  discloseReflectionSection,
   fetchReflectionAssets,
   moveReflection,
   moveReflectionAsset,
@@ -323,6 +324,44 @@ describe("calls", () => {
     await searchReflections("eng", { query: "night" });
     expect(apiMock).toHaveBeenLastCalledWith(
       "/domains/eng/reflection/search?q=night&limit=20",
+    );
+  });
+
+  it("shares a section's text on purpose and reads who confirmed it", async () => {
+    apiMock.mockResolvedValue({
+      domain: "eng",
+      path: "overview.md",
+      section: "7f3a9c2e",
+      disclosed: { by: "keeper", at: "2026-10-28T09:00:00Z" },
+    });
+    expect(
+      await discloseReflectionSection("eng", "overview.md", "7f3a9c2e"),
+    ).toEqual({ by: "keeper", at: "2026-10-28T09:00:00Z" });
+    expect(apiMock).toHaveBeenCalledWith("/domains/eng/reflection/disclose", {
+      method: "POST",
+      body: JSON.stringify({ path: "overview.md", section: "7f3a9c2e" }),
+    });
+  });
+
+  it("reads the question a too wide item carries", () => {
+    const queue = readQueue({
+      total: 1,
+      kinds: { feedback: 0, update: 1, review: 0 },
+      queue: [
+        {
+          n: 1,
+          kind: "update",
+          what: "source_too_wide",
+          path: "overview.md",
+          section: "7f3a9c2e",
+          heading: "Team",
+          age_secs: 1,
+          question: "Share text from harbor on a page more people may read?",
+        },
+      ],
+    });
+    expect(queue.items[0]?.question).toBe(
+      "Share text from harbor on a page more people may read?",
     );
   });
 
