@@ -100,7 +100,7 @@ fn checked_policy(domain: &str, edit: &PolicyEdit) -> Result<&'static crystallin
         return match edit {
             PolicyEdit::Unset { .. } => Ok(spec),
             PolicyEdit::Set { .. } => Err(EngineError::Invalid(format!(
-                "`{key}` is filled in by the first scheduled evolve run at an instance with service.public_url; it is not set by hand. To move the home, remove it at the instance that should run evolve (unset {key}), then run evolve there"
+                "`{key}` is filled in by the first scheduled evolve run at an instance with service.public_url; it is not set by hand. To move the home, remove it at the instance that should run evolve (unset {key}), then run evolve there. On a domain that reviews changes the removal is a draft, and the old home holds until its proposal is merged and pulled here"
             ))),
         };
     }
@@ -205,6 +205,9 @@ impl Engine {
         // would produce, so the policy PATCH, configure and a raw MANIFEST
         // edit refuse with one sentence. A switch-off (`set reflection: off`,
         // or `unset reflection`) is never screened.
+        let unsets_evolve_home = edits.iter().any(
+            |edit| matches!(edit, PolicyEdit::Unset { key } if key == crystalline_core::EVOLVE_HOME_KEY),
+        );
         let mut edits: Vec<PolicyEdit> = edits.to_vec();
         let wants_on = edits.iter().any(|edit| {
             matches!(edit, PolicyEdit::Set { key, value }
@@ -287,6 +290,11 @@ impl Engine {
         )
         .await?;
         self.refresh_routing_cache().await;
+        // Removing the evolve home is how a person lets this instance claim
+        // it again after the team declined its claim.
+        if unsets_evolve_home {
+            self.forget_declined_evolve_claim(domain);
+        }
         // A draft moves no switch: the folder's MANIFEST decides.
         if overlay.is_none() {
             self.announce_switch_if_moved(domain, switch_before, change_label(scope));
@@ -321,6 +329,17 @@ impl Engine {
 }
 
 impl Engine {
+    /// Forget that the team declined this instance's claim of the evolve
+    /// home of `domain`, so its next scheduled evolve run claims it again.
+    fn forget_declined_evolve_claim(&self, domain: &str) {
+        if let Some(path) = self.evolve_claim_declined_path(domain)
+            && path.is_file()
+            && let Err(e) = std::fs::remove_file(&path)
+        {
+            tracing::warn!("forgetting the declined evolve home claim of '{domain}': {e}");
+        }
+    }
+
     /// Write `edits` into the MANIFEST of `domain` for the engine itself,
     /// through the edit path an engram edit takes and without the policy
     /// checks a caller's edit gets: the keys only the engine fills in
@@ -522,6 +541,15 @@ impl Engine {
         // team domain a no-op write would be a local change nobody made. A
         // reviewing domain is left to the draft path, since the caller's
         // draft, not the folder, is what such an edit compares against.
+        //
+        // An unset of `evolve_home` the folder no longer declares (the
+        // withdrawn claim of a declined one) is not a write, but it is still
+        // the person's word that this instance may claim the home again.
+        if policy_edits.iter().any(
+            |edit| matches!(edit, PolicyEdit::Unset { key } if key == crystalline_core::EVOLVE_HOME_KEY),
+        ) {
+            self.forget_declined_evolve_claim(domain);
+        }
         if !self.reviews_changes(domain) {
             let current = self.manifest_source(domain).await?;
             let facts = manifest_facts(&current.markdown, domain);
@@ -878,7 +906,7 @@ fn policy_json(row: &PolicyRow, may_change: bool, domain: &str) -> Value {
     } else if row.key == crystalline_core::TEAM_KEY {
         "added by the next share from an instance connected to GitHub (through the proposal on a domain that reviews changes); never set by hand".to_string()
     } else if row.key == crystalline_core::EVOLVE_HOME_KEY {
-        "filled in by the first scheduled evolve run at an instance with service.public_url; to move the home, unset it with configure at the instance that should run evolve".to_string()
+        "filled in by the first scheduled evolve run at an instance with service.public_url; to move the home, unset it with configure at the instance that should run evolve (on a domain that reviews changes, it moves once that proposal is merged and pulled)".to_string()
     } else if text {
         rename_how(domain)
     } else if row.key == crystalline_core::READ_ONLY_KEY {

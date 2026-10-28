@@ -302,9 +302,15 @@ impl Engine {
         // (it failed, was stopped or ran with --no-share) rides with this
         // run: a MANIFEST unshared at the take would be held back as a
         // person's work, and no later run would carry it.
-        let pending_claim = match lp {
-            Loop::Evolve => self.pending_evolve_claim(domain),
+        // A claim the team declined is withdrawn first, so this run neither
+        // carries it nor acts as the home.
+        let withdrawn = match lp {
+            Loop::Evolve => self.withdraw_declined_evolve_claim(domain).await,
             Loop::Reflect => None,
+        };
+        let pending_claim = match lp {
+            Loop::Evolve if withdrawn.is_none() => self.pending_evolve_claim(domain),
+            _ => None,
         };
         if pending_claim.is_some() {
             unshared_at_start.retain(|file| file.path != MANIFEST_FILE);
@@ -322,7 +328,11 @@ impl Engine {
             .await?;
         // After the lease is held, so of two takes racing only the one that
         // won writes the home.
-        if let Some(own) = pending_claim {
+        if withdrawn.is_some() {
+            taken["note"] = json!(format!(
+                "The team declined this instance's evolve_home claim for '{domain}', so it is withdrawn here and this instance is not the home: every clone of it may run evolve. To claim it again, unset evolve_home here (configure) and run evolve."
+            ));
+        } else if let Some(own) = pending_claim {
             self.note_claim_written(domain, scope).await;
             taken["note"] = json!(format!(
                 "The claim of the evolve home of '{domain}' for this instance (evolve_home: {own}) is not in the team's copy yet, so this run's pull request carries it too."
@@ -955,6 +965,14 @@ impl Engine {
                 )),
             );
         }
+        if self.evolve_claim_declined(domain) {
+            return (
+                None,
+                Some(format!(
+                    "'{domain}' has no evolve_home yet, so every clone of it may run evolve. This instance does not claim it again on its own (see crystalline doctor)."
+                )),
+            );
+        }
         let Some(own) = self
             .own_public_url()
             .filter(|own| crystalline_core::validate_evolve_home(own).is_ok())
@@ -998,6 +1016,65 @@ impl Engine {
         {
             tracing::warn!("noting the evolve home of '{domain}' for its run: {e}");
         }
+    }
+
+    /// The record that the team declined this instance's claim of the
+    /// evolve home of `domain`, in its origin state folder.
+    pub(crate) fn evolve_claim_declined_path(&self, domain: &str) -> Option<PathBuf> {
+        self.origin_state_dir(domain)
+            .ok()
+            .map(|dir| dir.join(crystalline_remote::state::EVOLVE_HOME_DECLINED_FILE))
+    }
+
+    /// Whether the team declined this instance's claim of the evolve home of
+    /// `domain` and nobody took the record away since.
+    fn evolve_claim_declined(&self, domain: &str) -> bool {
+        self.evolve_claim_declined_path(domain)
+            .is_some_and(|path| path.is_file())
+    }
+
+    /// Withdraw this instance's unshared claim of the evolve home of
+    /// `domain` when the team closed the pull request that carried it
+    /// without merging: the MANIFEST goes back to the team's copy, and the
+    /// decline is recorded, so the instance stops acting as the home and
+    /// does not claim it again on its own. Answers the withdrawn address.
+    ///
+    /// The pull request carried the claim when it lists the MANIFEST with
+    /// exactly the bytes the folder still holds; a MANIFEST changed since is
+    /// a person's, and stays.
+    async fn withdraw_declined_evolve_claim(&self, domain: &str) -> Option<String> {
+        let own = self.pending_evolve_claim(domain)?;
+        let dir = self.origin_state_dir(domain).ok()?;
+        let state = crystalline_remote::state::OriginState::load(&dir).ok()??;
+        let ContentSource::File { root } = self.read_source(domain) else {
+            return None;
+        };
+        let current = std::fs::read(root.join(MANIFEST_FILE)).ok()?;
+        let sha = sha256_hex(&current);
+        let declined = state
+            .proposals
+            .iter()
+            .chain(state.history.iter())
+            .filter(|p| p.status == crystalline_remote::state::ProposalStatus::Declined)
+            .flat_map(|p| p.files.iter())
+            .any(|file| file.path == MANIFEST_FILE && file.sha256.as_deref() == Some(&sha));
+        if !declined {
+            return None;
+        }
+        let base = std::fs::read(dir.join("base").join(MANIFEST_FILE)).ok()?;
+        if let Err(e) = std::fs::write(root.join(MANIFEST_FILE), &base).and_then(|()| {
+            std::fs::write(
+                dir.join(crystalline_remote::state::EVOLVE_HOME_DECLINED_FILE),
+                &own,
+            )
+        }) {
+            tracing::warn!("withdrawing the declined evolve home claim of '{domain}': {e}");
+            return None;
+        }
+        if let Err(e) = self.sync(Some(domain)).await {
+            tracing::warn!("syncing '{domain}' after withdrawing its evolve home claim: {e}");
+        }
+        Some(own)
     }
 
     /// This instance's address, when the MANIFEST of `domain` claims the

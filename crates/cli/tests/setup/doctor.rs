@@ -1665,6 +1665,33 @@ fn a_team_domain_without_an_evolve_home_is_a_warning() {
         "https://kb.example.com"
     );
 
+    // A value that is no server address is named as invalid, not as missing.
+    std::fs::write(
+        domain_dir.join("MANIFEST.md"),
+        "---\ntype: manifest\ntitle: Brand\nevolve_home: https://kb.example.com/\n---\n\n# Brand\n",
+    )
+    .unwrap();
+    let (_, human) = run(false);
+    assert!(
+        human.contains("warning: brand has an evolve_home that is not a server address (verify reports it as M013), so every clone of this team domain may run a scheduled evolve. Remove the line, and the first scheduled evolve run at an instance with service.public_url claims the home."),
+        "{human}"
+    );
+    assert!(!human.contains("no evolve_home yet"), "{human}");
+
+    // The team declined this instance's claim: said instead of the rest.
+    std::fs::write(domain_dir.join("MANIFEST.md"), "# Manifest\n").unwrap();
+    std::fs::write(
+        origin_dir.join("evolve_home_declined"),
+        "https://kb.example.com",
+    )
+    .unwrap();
+    let (_, human) = run(false);
+    assert!(
+        human.contains("warning: the team declined this instance's evolve_home claim for brand, so every clone of this team domain may run a scheduled evolve. To claim it again, unset evolve_home here (configure) and run evolve."),
+        "{human}"
+    );
+    assert!(!human.contains("no evolve_home yet"), "{human}");
+
     let _ = std::fs::remove_dir_all(&home);
 }
 
