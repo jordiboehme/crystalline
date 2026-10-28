@@ -968,33 +968,40 @@ impl DomainAccess {
 
     /// Whether a Reflection page of domain `page` may carry text drawn from
     /// the engrams of domain `source`: whether every reader of the page may
-    /// read text drawn from `source` anyway. Text on a page reaches every
-    /// reader of the page, so a page whose domain more people read than the
-    /// source's would hand the source's knowledge to people who may not
-    /// read it.
+    /// read those engrams anyway. Text on a page reaches every reader of the
+    /// page, so a page read by someone who may not read the source's engrams
+    /// would hand that knowledge to them.
     ///
-    /// Who counts as a reader, on both sides, is who may read the domain's
-    /// Reflection (the private `decide_reflection` at [`ReflectionRight::Read`] or
-    /// more, before any write list, which only caps writing). That is the
-    /// right measure for the source too: a domain's own pages are text drawn
-    /// from its engrams, so its Reflection readers already may read such
-    /// text. Spelled out:
+    /// The two sides are measured differently, each by what reaches whom:
     ///
-    /// * a shared domain is read by every anonymous caller (the
+    /// * the page's readers are who may read the page's domain's Reflection
+    ///   (the private `decide_reflection` at [`ReflectionRight::Read`] or
+    ///   more, before any write list, which only caps writing);
+    /// * the source's readers are who may read its engrams (the private
+    ///   `decide` at [`DomainRight::Read`] or more). A Reflection level on
+    ///   the source's domain does not count: it opens that domain's pages,
+    ///   which its curators wrote for that audience, never its engrams.
+    ///
+    /// Spelled out:
+    ///
+    /// * a shared domain's Reflection is read by every anonymous caller (the
     ///   `auth.anonymous` tier, counted whether or not it is on, so a later
     ///   switch does not open a leak), every enabled account whose instance
     ///   role is viewer, editor or admin, every account at instance
     ///   knowledge `none` whose instance Reflection level is reader or
-    ///   contributor, and every account created later. It is an open set,
-    ///   so a shared page covers a shared source and never a private one;
-    /// * a private domain is read by its owner, every instance admin, every
-    ///   member at knowledge viewer or more, and every member at knowledge
-    ///   `none` whose Reflection level on it is reader or contributor. Never
-    ///   by an anonymous caller, a disabled account or an account created
-    ///   later. A page there covers a source when each of those accounts
-    ///   also reads the source: for a shared source, when none of them is an
-    ///   account at instance knowledge `none` without an instance
-    ///   Reflection level;
+    ///   contributor, and every account created later. Its engrams are read
+    ///   by the same, less the accounts at instance knowledge `none`. So a
+    ///   shared page never covers a private source, and covers another
+    ///   shared domain only while no enabled account at instance knowledge
+    ///   `none` has an instance Reflection level (an account created later
+    ///   with one is caught by the queue, which asks again on every scan);
+    /// * a private domain's Reflection is read by its owner, every instance
+    ///   admin, every member at knowledge viewer or more, and every member at
+    ///   knowledge `none` whose Reflection level on it is reader or
+    ///   contributor. Its engrams are read by the same, less those members at
+    ///   knowledge `none`. Never by an anonymous caller, a disabled account
+    ///   or an account created later. A page there covers a source when each
+    ///   of its readers also reads the source's engrams;
     /// * the machine owner and the instance admins read everything, so they
     ///   never make a difference.
     ///
@@ -1006,10 +1013,10 @@ impl DomainAccess {
         }
         let page_acl = self.auth.domain_visibility(page).await?;
         let source_acl = self.auth.domain_visibility(source).await?;
-        match (&page_acl, &source_acl) {
-            (None, None) => return Ok(true),
-            (None, Some(_)) => return Ok(false),
-            (Some(_), _) => {}
+        // A shared page reaches anonymous callers and accounts not made
+        // yet, who never read a private domain.
+        if page_acl.is_none() && source_acl.is_some() {
+            return Ok(false);
         }
         let members = |list: Vec<crate::auth_store::DomainMember>| {
             list.into_iter()
@@ -1021,15 +1028,23 @@ impl DomainAccess {
             Some(_) => members(self.auth.domain_members(source).await?),
             None => HashMap::new(),
         };
-        let reads = |principal: &Principal,
-                     acl: Option<&DomainAcl>,
-                     members: &HashMap<String, (MemberLevel, ReflectionLevel)>,
-                     name: &str| {
-            let (level, reflection) = match members.get(name) {
+        let member =
+            |members: &HashMap<String, (MemberLevel, ReflectionLevel)>, name: &str| match members
+                .get(name)
+            {
                 Some((level, reflection)) => (Some(*level), *reflection),
                 None => (None, ReflectionLevel::Default),
             };
-            decide_reflection(principal, acl, level, reflection, false) >= ReflectionRight::Read
+        // Who reads the page: its domain's Reflection readers.
+        let reads_page = |principal: &Principal, name: &str| {
+            let (level, reflection) = member(&page_members, name);
+            decide_reflection(principal, page_acl.as_ref(), level, reflection, false)
+                >= ReflectionRight::Read
+        };
+        // Who reads the source: its engrams' readers.
+        let reads_source = |principal: &Principal, name: &str| {
+            let (level, _) = member(&source_members, name);
+            decide(principal, source_acl.as_ref(), level) >= DomainRight::Read
         };
         for user in self.auth.list_users().await? {
             if user.disabled {
@@ -1040,9 +1055,7 @@ impl DomainAccess {
                 role: user.role,
                 reflection: user.reflection,
             };
-            if reads(&principal, page_acl.as_ref(), &page_members, &user.name)
-                && !reads(&principal, source_acl.as_ref(), &source_members, &user.name)
-            {
+            if reads_page(&principal, &user.name) && !reads_source(&principal, &user.name) {
                 return Ok(false);
             }
         }
@@ -1333,9 +1346,10 @@ mod tests {
         assert!(access.readers_cover("vault", "lab").await.unwrap());
     }
 
-    /// The page's readers are its Reflection's readers: a member at
-    /// knowledge `none` with a Reflection level reads the page and is not
-    /// among the source's readers, so the page does not cover the source.
+    /// The page's readers are its Reflection's readers, the source's are its
+    /// engrams' readers: a member at knowledge `none` with a Reflection
+    /// level reads the page and is not a reader of the source, not even
+    /// with the same levels on the source's domain.
     #[tokio::test]
     async fn a_reflection_only_member_counts_as_a_reader_of_the_page() {
         let dir = tempfile::tempdir().unwrap();
@@ -1353,7 +1367,8 @@ mod tests {
         .await
         .unwrap();
         assert!(!access.readers_cover("lab", "vault").await.unwrap());
-        // Given the same on vault, ann reads both.
+        // Given the same on vault, ann reads vault's Reflection and still no
+        // engram there: a source is measured by who reads its engrams.
         auth.upsert_domain_member(
             "vault",
             "ann",
@@ -1363,6 +1378,11 @@ mod tests {
         )
         .await
         .unwrap();
+        assert!(!access.readers_cover("lab", "vault").await.unwrap());
+        // As a viewer of vault she reads its engrams.
+        auth.upsert_domain_member("vault", "ann", MemberLevel::Viewer, None, "keeper")
+            .await
+            .unwrap();
         assert!(access.readers_cover("lab", "vault").await.unwrap());
     }
 
@@ -1382,10 +1402,36 @@ mod tests {
             .unwrap();
         let access = DomainAccess::new(auth.clone());
         assert!(!access.readers_cover("lab", "shared").await.unwrap());
+        // An instance Reflection level lets nora read shared Reflections,
+        // never a shared domain's engrams: still not covered.
         auth.set_reflection_level("nora", ReflectionLevel::Reader)
             .await
             .unwrap();
-        assert!(access.readers_cover("lab", "shared").await.unwrap());
+        assert!(!access.readers_cover("lab", "shared").await.unwrap());
+    }
+
+    /// A shared page is read by every account at instance knowledge `none`
+    /// that has an instance Reflection level, and such an account reads no
+    /// shared domain's engrams: while one exists, a shared page covers no
+    /// other shared domain.
+    #[tokio::test]
+    async fn an_instance_none_reflection_reader_keeps_shared_from_covering_shared() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = store(&dir).await;
+        covering(&auth).await;
+        let access = DomainAccess::new(auth.clone());
+        assert!(access.readers_cover("shared", "other").await.unwrap());
+        auth.add_user("nora", "nora", None, Role::None, "pw12345678")
+            .await
+            .unwrap();
+        assert!(
+            access.readers_cover("shared", "other").await.unwrap(),
+            "without a Reflection level nora reads neither"
+        );
+        auth.set_reflection_level("nora", ReflectionLevel::Reader)
+            .await
+            .unwrap();
+        assert!(!access.readers_cover("shared", "other").await.unwrap());
     }
 
     /// A renamed domain keeps who may do what: the rights answered for the
