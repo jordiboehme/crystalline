@@ -374,6 +374,10 @@ pub struct OriginDoctor {
     /// bootstraps itself when the daemon connects, so `remaining_problems`
     /// skips it where a config-file domain would count.
     pub env_defined: bool,
+    /// The `evolve_home` the domain's MANIFEST names, or `None` when it
+    /// names no valid home yet: then every clone of the team domain may run
+    /// a scheduled evolve, and the report warns until an instance claims it.
+    pub evolve_home: Option<String>,
 }
 
 /// GitHub collaboration diagnostics, present only when `github.enabled` is
@@ -2526,7 +2530,9 @@ fn policy_values(key: &str) -> &'static [&'static str] {
 /// takes, or for a text key what that key holds.
 fn policy_expected(key: &str) -> String {
     match policy_values(key) {
-        [] if key == crystalline_core::REFLECTION_HOME_KEY => {
+        [] if key == crystalline_core::REFLECTION_HOME_KEY
+            || key == crystalline_core::EVOLVE_HOME_KEY =>
+        {
             "an http or https address with no trailing slash".to_string()
         }
         [] if key == crystalline_core::TEAM_KEY => {
@@ -2555,6 +2561,9 @@ fn policy_read_as<'a>(key: &str, read_as: &'a str) -> &'a str {
     match (read_as.is_empty(), key) {
         (false, _) => read_as,
         (true, crystalline_core::REFLECTION_HOME_KEY) => "ignored; the Reflection has no home",
+        (true, crystalline_core::EVOLVE_HOME_KEY) => {
+            "ignored; every clone may run a scheduled evolve"
+        }
         (true, crystalline_core::TEAM_KEY) => "ignored; not treated as a team domain",
         (true, _) => "ignored; the local name holds",
     }
@@ -4001,6 +4010,10 @@ fn check_github(
             state_present,
             base_mismatches,
             env_defined: overlay.env_domain(name).is_some(),
+            evolve_home: entry
+                .path
+                .as_deref()
+                .and_then(crystalline_core::evolve_home_at),
         });
     }
 
@@ -5089,6 +5102,15 @@ pub fn render_human(report: &DoctorReport) -> String {
                 );
             } else {
                 let _ = writeln!(out, "  {} ({}): ok", o.name, o.repo);
+            }
+            // A warning, not a problem: a team domain worked by one runner
+            // is fine without a home, and only the operator knows that.
+            if o.evolve_home.is_none() {
+                let _ = writeln!(
+                    out,
+                    "  warning: {} has no evolve_home yet, so every clone of this team domain may run a scheduled evolve. The first scheduled evolve run (crystalline evolve run) at an instance with service.public_url claims it.",
+                    o.name
+                );
             }
         }
     }

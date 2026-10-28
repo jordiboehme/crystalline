@@ -783,7 +783,10 @@ pub struct ConfigureParams {
     /// instance send a signed webhook when reflect or evolve work is due;
     /// reflection_home is filled in when Reflection is switched on, never
     /// set; team marks a domain shared through GitHub and is added by the
-    /// next share from a connected instance, never set), what each MANIFEST section does and its .crystalline.yaml rule
+    /// next share from a connected instance, never set; evolve_home names
+    /// the one instance whose scheduled evolve runs work a team domain, is
+    /// filled in by the first scheduled evolve run there and never set, and
+    /// unset moves it), what each MANIFEST section does and its .crystalline.yaml rule
     /// overrides. set and unset then address that
     /// domain: a policy key, `rules.<rule id>` (a verify rule's severity) or
     /// token_budget. Omit it for the instance settings.

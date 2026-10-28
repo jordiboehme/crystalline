@@ -92,6 +92,18 @@ fn checked_policy(domain: &str, edit: &PolicyEdit) -> Result<&'static crystallin
             known.join(", ")
         )));
     };
+    // The one text key a person may remove: removing the evolve home is how
+    // it moves, since the next scheduled evolve run where it was removed
+    // claims it again. Setting it stays the engine's, so a home is always an
+    // address the instance read from its own settings.
+    if key == crystalline_core::EVOLVE_HOME_KEY {
+        return match edit {
+            PolicyEdit::Unset { .. } => Ok(spec),
+            PolicyEdit::Set { .. } => Err(EngineError::Invalid(format!(
+                "`{key}` is filled in by the first scheduled evolve run at an instance with service.public_url; it is not set by hand. To move the home, remove it at the instance that should run evolve (unset {key}), then run evolve there"
+            ))),
+        };
+    }
     if spec.kind == crystalline_core::PolicyKind::Text {
         return Err(EngineError::Invalid(
             if key == crystalline_core::REFLECTION_HOME_KEY {
@@ -305,6 +317,39 @@ impl Engine {
             receipt["note"] = json!(SWITCH_OFF_SHARED_NOTE);
         }
         Ok(receipt)
+    }
+}
+
+impl Engine {
+    /// Write `edits` into the MANIFEST of `domain` for the engine itself,
+    /// through the edit path an engram edit takes and without the policy
+    /// checks a caller's edit gets: the keys only the engine fills in
+    /// (`evolve_home`) land this way. On a domain that reviews changes it is
+    /// `scope`'s draft, like any other change of theirs, so it goes through
+    /// the review. Answers whether it became a draft.
+    pub(crate) async fn write_engine_policies(
+        &self,
+        domain: &str,
+        edits: Vec<PolicyEdit>,
+        scope: &crate::scope::Scope,
+    ) -> Result<bool> {
+        let view = DomainView::for_write(self, domain, scope).await?;
+        let overlay = view.actor().map(str::to_string);
+        let actor = self.actor_for(None, overlay.as_deref());
+        let (desc, source) = view.resolve("manifest").await?;
+        self.apply_source_edit(
+            &desc,
+            &source,
+            &view,
+            None,
+            &actor,
+            None,
+            scope,
+            move |current| Ok(apply_policy_edits(current, &edits)),
+        )
+        .await?;
+        self.refresh_routing_cache().await;
+        Ok(overlay.is_some())
     }
 }
 
@@ -832,6 +877,8 @@ fn policy_json(row: &PolicyRow, may_change: bool, domain: &str) -> Value {
             .to_string()
     } else if row.key == crystalline_core::TEAM_KEY {
         "added by the next share from an instance connected to GitHub (through the proposal on a domain that reviews changes); never set by hand".to_string()
+    } else if row.key == crystalline_core::EVOLVE_HOME_KEY {
+        "filled in by the first scheduled evolve run at an instance with service.public_url; to move the home, unset it with configure at the instance that should run evolve".to_string()
     } else if text {
         rename_how(domain)
     } else if row.key == crystalline_core::READ_ONLY_KEY {

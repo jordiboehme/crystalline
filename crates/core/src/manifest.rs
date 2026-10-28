@@ -68,6 +68,17 @@ const REFLECTION_ON: &str = "on";
 /// connected to GitHub; never typed by hand.
 pub const REFLECTION_HOME_KEY: &str = "reflection_home";
 
+/// The MANIFEST frontmatter key naming the one instance whose scheduled
+/// evolve runs work a team domain: that instance's `service.public_url`, as
+/// an origin, in the spelling [`validate_evolve_home`] holds it to. Written
+/// by the engine when the first scheduled evolve run takes its lease at an
+/// instance with an address, and carried by that run's pull request; never
+/// typed by hand. Every other clone of the team domain refuses a scheduled
+/// run and names the home, so five laptops with a copy each do not open
+/// five pull requests for the same findings. A local or virtual domain
+/// ignores it.
+pub const EVOLVE_HOME_KEY: &str = "evolve_home";
+
 /// Declare `name` as the domain's canonical name in MANIFEST `source`: an
 /// existing [`DOMAIN_NAME_KEY`] key, however it is spelled, is rewritten in
 /// place, a missing one goes right after `title`, where a person adding it
@@ -228,6 +239,9 @@ pub struct Manifest {
     /// The [`TEAM_KEY`] value as written, or `None` when absent. Read
     /// through [`Manifest::team`].
     team: Option<String>,
+    /// The [`EVOLVE_HOME_KEY`] value as written, or `None` when absent.
+    /// Read through [`Manifest::evolve_home`].
+    evolve_home: Option<String>,
 }
 
 impl Manifest {
@@ -267,6 +281,11 @@ impl Manifest {
             .get(EVOLVE_TRIGGER_KEY)
             .map(scalar_text);
         let team = engram.frontmatter.extra.get(TEAM_KEY).map(scalar_text);
+        let evolve_home = engram
+            .frontmatter
+            .extra
+            .get(EVOLVE_HOME_KEY)
+            .map(scalar_text);
         let domain_name_extra = engram.frontmatter.extra.get(DOMAIN_NAME_KEY);
         let declared_domain_name = domain_name_extra.map(scalar_text);
         let domain_name_is_string = matches!(domain_name_extra, Some(YamlValue::String(_)));
@@ -319,6 +338,7 @@ impl Manifest {
             reflect_trigger,
             evolve_trigger,
             team,
+            evolve_home,
         }
     }
 
@@ -619,6 +639,21 @@ impl Manifest {
             .filter(|value| validate_reflection_home(value).is_ok())
     }
 
+    /// The `evolve_home` declaration exactly as written, for reporting.
+    pub fn declared_evolve_home(&self) -> Option<&str> {
+        self.evolve_home.as_deref()
+    }
+
+    /// The origin of the instance whose scheduled evolve runs work this
+    /// domain, or `None` when the key is absent or is not an origin
+    /// [`validate_evolve_home`] accepts. An invalid value reads as absent:
+    /// verify reports it as `M013`.
+    pub fn evolve_home(&self) -> Option<&str> {
+        self.evolve_home
+            .as_deref()
+            .filter(|value| validate_evolve_home(value).is_ok())
+    }
+
     /// The `team` declaration exactly as written, for reporting only, never
     /// for deciding behaviour: [`Manifest::team`] is what decides.
     pub fn declared_team(&self) -> Option<&str> {
@@ -671,6 +706,10 @@ impl Manifest {
             TEAM_KEY => Some((
                 self.declared_team(),
                 self.team().map_or("", TeamForge::as_str),
+            )),
+            EVOLVE_HOME_KEY => Some((
+                self.declared_evolve_home(),
+                self.evolve_home().unwrap_or(""),
             )),
             _ => None,
         }
@@ -1023,6 +1062,30 @@ pub fn validate_reflection_home(value: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Why `value` cannot be the home of a team domain's scheduled evolve, or
+/// `Ok` when it can: the rule [`validate_reflection_home`] applies, since
+/// both keys hold an instance's `service.public_url` and are compared with
+/// it exactly.
+pub fn validate_evolve_home(value: &str) -> Result<(), String> {
+    validate_reflection_home(value)
+}
+
+/// The evolve home the domain rooted at `root` declares, or `None` when the
+/// MANIFEST is missing, unreadable, unparseable or names no valid home.
+pub fn evolve_home_at(root: &Path) -> Option<String> {
+    let source = std::fs::read_to_string(root.join("MANIFEST.md")).ok()?;
+    evolve_home_of_source(&source)
+}
+
+/// [`evolve_home_at`] over a MANIFEST text in hand, which is how a virtual
+/// domain's MANIFEST is read.
+pub fn evolve_home_of_source(source: &str) -> Option<String> {
+    let engram = parse_engram(source).ok()?;
+    Manifest::from_engram(&engram, source)
+        .evolve_home()
+        .map(str::to_string)
+}
+
 /// The [`ReflectionSwitch`] the domain rooted at `root` declares, read from
 /// its `MANIFEST.md`. [`ReflectionSwitch::Off`] whenever the MANIFEST is
 /// missing, unreadable, unparseable or silent: the shape of [`sharing_at`].
@@ -1117,8 +1180,9 @@ impl PolicyKey {
     /// [`PolicyKind::Choice`] key accepts exactly its listed `values`; a
     /// [`PolicyKind::Text`] key accepts whatever its own rule says -
     /// [`DOMAIN_NAME_KEY`] defers to [`validate_domain_name`],
-    /// [`REFLECTION_HOME_KEY`] to [`validate_reflection_home`], [`TEAM_KEY`]
-    /// to [`TeamForge::parse`], and any other text key (there is none today)
+    /// [`REFLECTION_HOME_KEY`] to [`validate_reflection_home`],
+    /// [`EVOLVE_HOME_KEY`] to [`validate_evolve_home`], [`TEAM_KEY`] to
+    /// [`TeamForge::parse`], and any other text key (there is none today)
     /// falls back to "not blank".
     pub fn accepts(&self, value: &str) -> bool {
         match self.kind {
@@ -1126,6 +1190,7 @@ impl PolicyKey {
             PolicyKind::Text => match self.key {
                 DOMAIN_NAME_KEY => validate_domain_name(value).is_ok(),
                 REFLECTION_HOME_KEY => validate_reflection_home(value).is_ok(),
+                EVOLVE_HOME_KEY => validate_evolve_home(value).is_ok(),
                 TEAM_KEY => TeamForge::parse(value).is_some(),
                 _ => !value.trim().is_empty(),
             },
@@ -1206,6 +1271,14 @@ pub fn policy_registry() -> &'static [PolicyKey] {
             values: &[],
             default: "",
             meaning: "Marks a team domain shared through GitHub; its Reflection is switched on only at the team server.",
+            changed_by: PolicyRole::Owner,
+        },
+        PolicyKey {
+            key: EVOLVE_HOME_KEY,
+            kind: PolicyKind::Text,
+            values: &[],
+            default: "",
+            meaning: "The address of the one server whose scheduled evolve runs work this team domain; filled in by its first scheduled evolve run.",
             changed_by: PolicyRole::Owner,
         },
     ]

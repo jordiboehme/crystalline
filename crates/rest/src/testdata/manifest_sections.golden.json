@@ -112,6 +112,16 @@
         "kind": "text",
         "meaning": "Marks a team domain shared through GitHub; its Reflection is switched on only at the team server.",
         "values": []
+      },
+      {
+        "changed_by": "owner",
+        "declared": null,
+        "default": "",
+        "effective": "",
+        "key": "evolve_home",
+        "kind": "text",
+        "meaning": "The address of the one server whose scheduled evolve runs work this team domain; filled in by its first scheduled evolve run.",
+        "values": []
       }
     ],
     "provisioning": null,
@@ -254,6 +264,16 @@
         "key": "team",
         "kind": "text",
         "meaning": "Marks a team domain shared through GitHub; its Reflection is switched on only at the team server.",
+        "values": []
+      },
+      {
+        "changed_by": "owner",
+        "declared": null,
+        "default": "",
+        "effective": "",
+        "key": "evolve_home",
+        "kind": "text",
+        "meaning": "The address of the one server whose scheduled evolve runs work this team domain; filled in by its first scheduled evolve run.",
         "values": []
       }
     ],
@@ -455,6 +475,16 @@
         "kind": "text",
         "meaning": "Marks a team domain shared through GitHub; its Reflection is switched on only at the team server.",
         "values": []
+      },
+      {
+        "changed_by": "owner",
+        "declared": null,
+        "default": "",
+        "effective": "",
+        "key": "evolve_home",
+        "kind": "text",
+        "meaning": "The address of the one server whose scheduled evolve runs work this team domain; filled in by its first scheduled evolve run.",
+        "values": []
       }
     ],
     "provisioning": {
@@ -634,6 +664,16 @@
         "key": "team",
         "kind": "text",
         "meaning": "Marks a team domain shared through GitHub; its Reflection is switched on only at the team server.",
+        "values": []
+      },
+      {
+        "changed_by": "owner",
+        "declared": null,
+        "default": "",
+        "effective": "",
+        "key": "evolve_home",
+        "kind": "text",
+        "meaning": "The address of the one server whose scheduled evolve runs work this team domain; filled in by its first scheduled evolve run.",
         "values": []
       }
     ],

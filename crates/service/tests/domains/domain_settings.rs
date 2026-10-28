@@ -81,7 +81,8 @@ async fn the_view_of_a_file_domain_names_every_policy_section_and_part() {
             "reflection_home",
             "reflect_trigger",
             "evolve_trigger",
-            "team"
+            "team",
+            "evolve_home"
         ]
     );
     let team = row(&view["policies"], "key", "team");
@@ -138,7 +139,7 @@ async fn the_view_of_a_file_domain_names_every_policy_section_and_part() {
     assert_eq!(view["rules"]["available"], true);
     assert_eq!(view["rules"]["file_present"], false);
     assert_eq!(view["rules"]["overrides"], json!([]));
-    assert_eq!(view["rules"]["catalog"].as_array().unwrap().len(), 67);
+    assert_eq!(view["rules"]["catalog"].as_array().unwrap().len(), 69);
     assert_eq!(view["how"].as_array().unwrap().len(), 4);
 }
 

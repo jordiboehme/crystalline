@@ -267,6 +267,12 @@ impl Engine {
     /// runs the loop. A stale lease is taken over, and the run that held it
     /// is recorded as expired, once: the store names the lease the claim
     /// replaced in the claim itself.
+    ///
+    /// An evolve take on a team domain whose MANIFEST names no
+    /// `evolve_home` claims the home for this instance when it has a
+    /// `service.public_url` (see `claim_evolve_home`): the answer then
+    /// carries `evolve_home` and a `note`, and without an address only the
+    /// `note` that every clone may still run evolve.
     pub async fn automation_lease_take(
         &self,
         lp: Loop,
@@ -297,9 +303,36 @@ impl Engine {
             unshared_at_start,
             due_at_start: due.items.into_iter().map(|(key, _)| key).collect(),
         };
+        let mut taken = self
+            .take_lease(lp, id, &holder, &now, &stale_before)
+            .await?;
+        // After the lease is held, so of two takes racing only the one that
+        // won writes the home.
+        if lp == Loop::Evolve {
+            let (home, note) = self.claim_evolve_home(domain, scope).await;
+            if let Some(home) = home {
+                taken["evolve_home"] = json!(home);
+            }
+            if let Some(note) = note {
+                taken["note"] = json!(note);
+            }
+        }
+        Ok(taken)
+    }
+
+    /// The store half of [`Engine::automation_lease_take`]: claim the lease
+    /// and record a stale lease it replaced as expired.
+    async fn take_lease(
+        &self,
+        lp: Loop,
+        id: DomainId,
+        holder: &LeaseHolder,
+        now: &str,
+        stale_before: &str,
+    ) -> Result<Value> {
         let store = self.store.lock().await;
         match store
-            .take_automation_lease(id, lp.as_str(), &holder, &now, &stale_before)
+            .take_automation_lease(id, lp.as_str(), holder, now, stale_before)
             .await?
         {
             LeaseClaim::Held(_) => Err(EngineError::Refused(ALREADY_RUNNING.to_string())),
@@ -795,6 +828,14 @@ impl Engine {
                 if self.domain_is_read_only(domain).await {
                     return Runs::Nowhere(EngineError::DomainReadOnly(domain.to_string()));
                 }
+                // The home first, then the host lock among the instances that
+                // are the home: instances of one shared database usually
+                // serve one address, so they all are, and the lock picks one.
+                // Where the home names another address than the lock holder
+                // has, nobody in that group runs, and each names the other.
+                if let Some(home) = self.evolve_home_elsewhere(domain) {
+                    return Runs::On(home);
+                }
                 if !self.store_is_shared().await {
                     return Runs::Here;
                 }
@@ -820,6 +861,118 @@ impl Engine {
                 }
             }
         }
+    }
+
+    /// The `evolve_home` the MANIFEST of `domain` names, when the domain is
+    /// a team domain and the home is not this instance: the loop runs there,
+    /// and this clone refuses a scheduled run. A team domain is one connected
+    /// to GitHub here, or a plain clone that carries the team marker, which
+    /// could carry a run's changes to the team with a git push. A local or a
+    /// virtual domain ignores the key, and so does a MANIFEST whose value is
+    /// not an address (verify's `M013`).
+    fn evolve_home_elsewhere(&self, domain: &str) -> Option<String> {
+        let ContentSource::File { root } = self.read_source(domain) else {
+            return None;
+        };
+        let home = crystalline_core::evolve_home_at(&root)?;
+        let team = self
+            .domain_entry(domain)
+            .is_ok_and(|entry| entry.origin.is_some())
+            || crystalline_core::team_at(&root).is_some();
+        (team && self.own_public_url().as_deref() != Some(home.as_str())).then_some(home)
+    }
+
+    /// Claim the evolve home of `domain` for this instance, for the evolve
+    /// run that just took its lease: `(home, note)`.
+    ///
+    /// Crystalline never starts a program, so it has no switch that says
+    /// "evolve is scheduled here". The lease take is the one step every
+    /// scheduled runner passes through (`evolve run`, `watch`, a container
+    /// job, n8n, a run a webhook started), which makes it the moment an
+    /// instance learns that it runs evolve. Only a domain connected to
+    /// GitHub here with no `evolve_home` is claimed, and only by an instance
+    /// with a `service.public_url`: without one it cannot be named, and the
+    /// note says every clone may still run evolve.
+    ///
+    /// The line is written as the runner, through the edit path (a draft on
+    /// a domain that reviews changes), and noted as the run's write, so the
+    /// run's own pull request carries it and the merge makes it every
+    /// clone's. A MANIFEST whose `evolve_home` is not an address is left to
+    /// its owner (`M013`), as the team marker leaves an unknown `team`.
+    /// A failed write never fails the take: the run goes on, and the note
+    /// says why there is no home.
+    async fn claim_evolve_home(
+        &self,
+        domain: &str,
+        scope: &Scope,
+    ) -> (Option<String>, Option<String>) {
+        let connected = self.config.read().unwrap().github_enabled()
+            && self
+                .domain_entry(domain)
+                .is_ok_and(|entry| entry.origin.is_some());
+        if !connected {
+            return (None, None);
+        }
+        let ContentSource::File { root } = self.read_source(domain) else {
+            return (None, None);
+        };
+        let declared = std::fs::read_to_string(root.join("MANIFEST.md"))
+            .ok()
+            .and_then(|source| {
+                let engram = parse_engram(&source).ok()?;
+                Manifest::from_engram(&engram, &source)
+                    .declared_evolve_home()
+                    .map(str::to_string)
+            });
+        if let Some(declared) = declared {
+            if crystalline_core::validate_evolve_home(&declared).is_ok() {
+                // The loop runs here, so the home is this instance already.
+                return (None, None);
+            }
+            return (
+                None,
+                Some(format!(
+                    "'{domain}' names an evolve_home that is not a server address (`{declared}`, verify reports it as M013), so every clone of it may run evolve. Remove the line, and the next scheduled evolve run at an instance with service.public_url claims the home."
+                )),
+            );
+        }
+        let Some(own) = self
+            .own_public_url()
+            .filter(|own| crystalline_core::validate_evolve_home(own).is_ok())
+        else {
+            return (
+                None,
+                Some(format!(
+                    "'{domain}' has no evolve_home yet, so every clone of it may run evolve. This instance has no service.public_url, so it cannot become the home: the first scheduled evolve run at an instance with one claims it."
+                )),
+            );
+        };
+        let edit = vec![super::domain_settings::PolicyEdit::Set {
+            key: crystalline_core::EVOLVE_HOME_KEY.to_string(),
+            value: own.clone(),
+        }];
+        if let Err(e) = self.write_engine_policies(domain, edit, scope).await {
+            tracing::warn!("claiming the evolve home of '{domain}': {e}");
+            return (
+                None,
+                Some(format!(
+                    "'{domain}' has no evolve_home yet, so every clone of it may run evolve. Writing this instance as its home failed: {e}"
+                )),
+            );
+        }
+        if let Some(account) = scope_account(scope)
+            && let Err(e) = self
+                .note_written(domain, &account, &["MANIFEST.md".to_string()])
+                .await
+        {
+            tracing::warn!("noting the evolve home of '{domain}' for its run: {e}");
+        }
+        (
+            Some(own.clone()),
+            Some(format!(
+                "This instance is now the evolve home of '{domain}' (evolve_home: {own}). The run's pull request carries the MANIFEST change; once it is merged, other clones of the domain refuse a scheduled evolve run."
+            )),
+        )
     }
 
     /// The index row of `domain`, which the lease and the runs hang on.

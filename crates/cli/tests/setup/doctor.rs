@@ -1610,6 +1610,64 @@ fn github_section_reports_missing_origin_state_as_a_problem() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// A team domain whose MANIFEST names no `evolve_home` is warned about:
+/// every clone may run a scheduled evolve until an instance claims the home.
+/// The warning is not a problem, and a MANIFEST that names a home has none.
+#[test]
+#[cfg(unix)]
+fn a_team_domain_without_an_evolve_home_is_a_warning() {
+    let (home, state_dir) = isolated_home("evolve-home");
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+    let domain_dir = work.path().join("kb-brand");
+    write_team_domain_config(&config, &domain_dir);
+    let origin_dir = state_dir.join("origins/brand");
+    std::fs::create_dir_all(origin_dir.join("base")).unwrap();
+    std::fs::write(
+        origin_dir.join("state.json"),
+        r#"{"version":1,"repo":"acme/brand-knowledge","branch":"main","base_commit":"abc123","ref_etag":null,"last_checked":null,"files":{},"proposals":[],"history":[],"conflicts":[]}"#,
+    )
+    .unwrap();
+    let run = |json: bool| {
+        let mut cmd = bin();
+        apply_home(&mut cmd, &home);
+        if json {
+            cmd.arg("--json");
+        }
+        let out = cmd
+            .args(["doctor", "--config"])
+            .arg(&config)
+            .args(["--db"])
+            .arg(work.path().join("index.db"))
+            .output()
+            .unwrap();
+        (out.status.code(), String::from_utf8(out.stdout).unwrap())
+    };
+    let warning = "warning: brand has no evolve_home yet, so every clone of this team domain may run a scheduled evolve. The first scheduled evolve run (crystalline evolve run) at an instance with service.public_url claims it.";
+    let (code, human) = run(false);
+    assert!(human.contains(warning), "{human}");
+    let (json_code, json) = run(true);
+    assert_eq!(code, json_code, "the warning changes no exit code: {human}");
+    let report: Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(report["github"]["origins"][0]["evolve_home"], Value::Null);
+
+    std::fs::write(
+        domain_dir.join("MANIFEST.md"),
+        "---\ntype: manifest\ntitle: Brand\nevolve_home: https://kb.example.com\n---\n\n# Brand\n",
+    )
+    .unwrap();
+    let (_, human) = run(false);
+    assert!(!human.contains("no evolve_home yet"), "{human}");
+    let (_, json) = run(true);
+    let report: Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+        report["github"]["origins"][0]["evolve_home"],
+        "https://kb.example.com"
+    );
+
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// In a team domain, the copy the base snapshot has is the one that stays,
 /// so the file is byte-equal to the base again and no change is pending.
 #[test]

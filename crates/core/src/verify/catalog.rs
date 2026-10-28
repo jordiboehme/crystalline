@@ -114,6 +114,11 @@ pub const VERIFY_RULES: &[VerifyRule] = &[
         "error",
         "In a team repository, no file lies under reflections/ while Reflection is on.",
     ),
+    rule(
+        "M013",
+        "error",
+        "evolve_home, when present, is a server address.",
+    ),
     rule("M101", "warning", "When to Use is not empty."),
     rule("M102", "warning", "Section bullets stay short."),
     rule("M103", "warning", "No section heading appears twice."),
@@ -309,7 +314,7 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(ids, sorted, "id order, each id once");
-        assert_eq!(ids.len(), 68);
+        assert_eq!(ids.len(), 69);
         for rule in VERIFY_RULES {
             assert!(
                 ["error", "warning", "info"].contains(&rule.default),

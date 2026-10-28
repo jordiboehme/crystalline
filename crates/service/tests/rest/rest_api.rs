@@ -2079,7 +2079,8 @@ async fn domain_manifest_carries_every_section_it_declares() {
                 { "key": "reflection_home", "kind": "text", "declared": null, "effective": "", "values": [], "default": "", "meaning": "The address of the one server this domain's Reflection lives on; filled in when Reflection is switched on.", "changed_by": "owner" },
                 { "key": "reflect_trigger", "kind": "choice", "declared": null, "effective": "off", "values": ["off", "webhook"], "default": "off", "meaning": "Send a signed webhook when reflect work is waiting.", "changed_by": "owner" },
                 { "key": "evolve_trigger", "kind": "choice", "declared": null, "effective": "off", "values": ["off", "webhook"], "default": "off", "meaning": "Send a signed webhook when maintenance findings pile up.", "changed_by": "owner" },
-                { "key": "team", "kind": "text", "declared": null, "effective": "", "values": [], "default": "", "meaning": "Marks a team domain shared through GitHub; its Reflection is switched on only at the team server.", "changed_by": "owner" }
+                { "key": "team", "kind": "text", "declared": null, "effective": "", "values": [], "default": "", "meaning": "Marks a team domain shared through GitHub; its Reflection is switched on only at the team server.", "changed_by": "owner" },
+                { "key": "evolve_home", "kind": "text", "declared": null, "effective": "", "values": [], "default": "", "meaning": "The address of the one server whose scheduled evolve runs work this team domain; filled in by its first scheduled evolve run.", "changed_by": "owner" }
             ],
             "starters": starters_json()
         }),
@@ -2119,7 +2120,8 @@ async fn domain_manifest_names_what_it_lacks() {
                 { "key": "reflection_home", "kind": "text", "declared": null, "effective": "", "values": [], "default": "", "meaning": "The address of the one server this domain's Reflection lives on; filled in when Reflection is switched on.", "changed_by": "owner" },
                 { "key": "reflect_trigger", "kind": "choice", "declared": null, "effective": "off", "values": ["off", "webhook"], "default": "off", "meaning": "Send a signed webhook when reflect work is waiting.", "changed_by": "owner" },
                 { "key": "evolve_trigger", "kind": "choice", "declared": null, "effective": "off", "values": ["off", "webhook"], "default": "off", "meaning": "Send a signed webhook when maintenance findings pile up.", "changed_by": "owner" },
-                { "key": "team", "kind": "text", "declared": null, "effective": "", "values": [], "default": "", "meaning": "Marks a team domain shared through GitHub; its Reflection is switched on only at the team server.", "changed_by": "owner" }
+                { "key": "team", "kind": "text", "declared": null, "effective": "", "values": [], "default": "", "meaning": "Marks a team domain shared through GitHub; its Reflection is switched on only at the team server.", "changed_by": "owner" },
+                { "key": "evolve_home", "kind": "text", "declared": null, "effective": "", "values": [], "default": "", "meaning": "The address of the one server whose scheduled evolve runs work this team domain; filled in by its first scheduled evolve run.", "changed_by": "owner" }
             ],
             "starters": starters_json()
         }),
