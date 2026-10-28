@@ -118,9 +118,11 @@ const TRIGGER_WEBHOOK: &str = "webhook";
 
 /// The MANIFEST frontmatter key that marks a domain as a team domain shared
 /// through a forge: the value names the forge ([`TeamForge`]), and an absent
-/// key is a domain nobody declared shared. Written by the engine when the
-/// domain is connected to GitHub and carried to the team with a share, like
-/// [`REFLECTION_HOME_KEY`]; never typed by hand.
+/// key is a domain nobody declared shared. Written by the engine, like
+/// [`REFLECTION_HOME_KEY`], and never typed by hand: the next share from an
+/// instance connected to GitHub adds it, into the folder of a domain that
+/// takes changes directly and into the proposal of one that reviews
+/// changes, where it goes through the review like any other line.
 ///
 /// It exists for one reader that cannot ask the instance which domains are
 /// connected: a plain clone of the team repository, registered as a local

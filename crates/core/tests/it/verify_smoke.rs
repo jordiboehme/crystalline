@@ -996,7 +996,7 @@ fn an_unrecognized_team_value_is_m010_error() {
     assert_eq!(
         m010.fix.as_deref(),
         Some(
-            "read as absent, so this domain is not treated as a team domain; Crystalline writes `team: github` itself when the domain is connected to GitHub"
+            "read as absent, so this domain is not treated as a team domain; write `team: github`, or remove the line and the next share from an instance connected to the domain adds it"
         )
     );
     assert_eq!(report.exit_code(), 1);

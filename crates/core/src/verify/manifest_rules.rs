@@ -283,7 +283,7 @@ pub(crate) fn check_manifest_text(
                 TeamForge::GitHub.as_str()
             ),
             Some(format!(
-                "read as absent, so this domain is not treated as a team domain; Crystalline writes `{TEAM_KEY}: {}` itself when the domain is connected to GitHub",
+                "read as absent, so this domain is not treated as a team domain; write `{TEAM_KEY}: {}`, or remove the line and the next share from an instance connected to the domain adds it",
                 TeamForge::GitHub.as_str()
             )),
         );

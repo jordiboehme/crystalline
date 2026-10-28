@@ -90,7 +90,7 @@ async fn the_view_of_a_file_domain_names_every_policy_section_and_part() {
         team["how"]
             .as_str()
             .unwrap()
-            .contains("written when the domain is connected to GitHub"),
+            .contains("added by the next share from an instance connected to GitHub"),
         "{team}"
     );
     let home = row(&view["policies"], "key", "reflection_home");
@@ -202,7 +202,7 @@ async fn the_team_marker_is_never_set_by_hand() {
         .unwrap_err()
         .to_string();
     assert!(
-        err.contains("written when the domain is connected to GitHub"),
+        err.contains("added by the next share from an instance connected to GitHub"),
         "{err}"
     );
 }
