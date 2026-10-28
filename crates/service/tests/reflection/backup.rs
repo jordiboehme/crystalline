@@ -814,9 +814,11 @@ async fn the_backup_branch_carries_the_reflection_files_byte_for_byte() {
 }
 
 /// [`home`] beside a shared `harbor` with one engram, keeper as an
-/// account, and the resolver installed.
+/// account, and the resolver installed. With `harbor_on_github`, `harbor`
+/// is connected to its own repository too.
 async fn home_beside_harbor(
     mock: Arc<MockProvider>,
+    harbor_on_github: bool,
 ) -> (Fx, Arc<crystalline_service::rest::AuthStore>) {
     let fx = fixture_with(
         &[
@@ -856,10 +858,16 @@ async fn home_beside_harbor(
                 engram("Harbor team", "team/harbor-team", "- [fact] five people"),
             )
             .unwrap();
-            cfg.domains.insert(
-                "harbor".into(),
-                crystalline_core::config::DomainEntry::file(root),
-            );
+            let mut entry = crystalline_core::config::DomainEntry::file(root);
+            if harbor_on_github {
+                entry.origin = Some(OriginConfig {
+                    repo: "acme/harbor".into(),
+                    path: None,
+                    branch: Some("main".into()),
+                    poll_secs: None,
+                });
+            }
+            cfg.domains.insert("harbor".into(), entry);
         },
     )
     .await;
@@ -899,7 +907,7 @@ async fn home_beside_harbor(
 async fn a_page_with_a_too_wide_source_is_held_back_until_it_is_settled() {
     let mock = Arc::new(MockProvider::new());
     main_commit(&mock);
-    let (fx, auth) = home_beside_harbor(mock.clone()).await;
+    let (fx, auth) = home_beside_harbor(mock.clone(), true).await;
     let page = "# Wide\n\nFor people.\n\n## Team\n\nFive people.\n";
     let mut wide = write("wide.md", page);
     wide.sources = BTreeMap::from([(
@@ -955,4 +963,151 @@ async fn a_page_with_a_too_wide_source_is_held_back_until_it_is_settled() {
     );
     assert!(head_paths().contains(&"reflections/wide.md".to_string()));
     assert!(fx.engine.reflection_backup_held_back("eng").is_empty());
+}
+
+/// The page of `eng` (connected to GitHub) whose `Team` section cites
+/// harbor's engram.
+fn citing_harbor(path: &str) -> crystalline_service::params::WriteReflectionParams {
+    let mut p = write(path, "# Wide\n\nFor people.\n\n## Team\n\nFive people.\n");
+    p.sources = BTreeMap::from([(
+        "Team".to_string(),
+        vec!["crystalline://harbor/team/harbor-team".to_string()],
+    )]);
+    p
+}
+
+/// A page of a domain backed up to a GitHub repository may not cite a
+/// domain that is not connected to GitHub, even when the accounts allow it
+/// (both domains are shared here): personal knowledge never reaches a
+/// repository.
+#[tokio::test]
+async fn a_github_page_cannot_cite_a_local_domain() {
+    let mock = Arc::new(MockProvider::new());
+    main_commit(&mock);
+    let (fx, _) = home_beside_harbor(mock, false).await;
+    let err = fx
+        .engine
+        .write_reflection(&citing_harbor("wide.md"), &agent())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("this source is in a domain that is not shared through GitHub, and this page is backed up to a GitHub repository"),
+        "{err}"
+    );
+    assert!(!fx.root.join("reflections/wide.md").exists());
+}
+
+#[tokio::test]
+async fn a_github_page_can_cite_another_github_domain() {
+    let mock = Arc::new(MockProvider::new());
+    main_commit(&mock);
+    let (fx, _) = home_beside_harbor(mock, true).await;
+    fx.engine
+        .write_reflection(&citing_harbor("wide.md"), &agent())
+        .await
+        .unwrap();
+}
+
+/// A page that cites a local domain from a GitHub domain anyway (here
+/// edited on disk) is named in the queue and held back from the backup.
+#[tokio::test]
+async fn an_existing_github_page_citing_a_local_domain_is_named_and_held_back() {
+    let mock = Arc::new(MockProvider::new());
+    main_commit(&mock);
+    let (fx, _) = home_beside_harbor(mock.clone(), false).await;
+    fx.engine
+        .write_reflection(&write("a.md", "# A\n\n## One\n\nText.\n"), &agent())
+        .await
+        .unwrap();
+    std::fs::write(
+        fx.root.join("reflections/forged.md"),
+        "---\nreflection:\n  aaaa1111:\n    sources:\n    - domain: harbor\n      engram: team/harbor-team\n      checksum: abc\n---\n\n# Forged\n\n## Team\n<!-- r:aaaa1111 -->\n\nFive.\n",
+    )
+    .unwrap();
+    fx.engine.sync(None).await.unwrap();
+    let queue = fx
+        .engine
+        .reflect(
+            &crystalline_service::params::ReflectParams {
+                domains: vec!["eng".into()],
+                limit: Some(100),
+                ..Default::default()
+            },
+            &agent(),
+        )
+        .await
+        .unwrap();
+    let items: Vec<&serde_json::Value> = queue["queue"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["what"] == "source_too_wide")
+        .collect();
+    assert_eq!(items.len(), 1, "{queue}");
+    assert_eq!(items[0]["path"], "forged.md", "{queue}");
+
+    fx.engine.mark_reflection_dirty("eng", BackupCause::Settled);
+    fx.engine.reflection_backup_tick(Instant::now()).await;
+    let paths = mock.commit_paths(&mock.branch_commit(BACKUP_BRANCH).unwrap());
+    assert!(paths.contains(&"reflections/a.md".to_string()), "{paths:?}");
+    assert!(!paths.iter().any(|p| p.contains("forged.md")), "{paths:?}");
+    assert_eq!(
+        fx.engine.reflection_backup_held_back("eng"),
+        vec!["forged.md".to_string()]
+    );
+}
+
+/// A narrowing marks nothing in the Reflection, so the daemon's periodic
+/// recount (and every accounts change through the JSON API) looks for pages
+/// that newly cite a domain fewer people may read and schedules a backup,
+/// which drops them off the branch head at once.
+#[tokio::test]
+async fn a_narrowing_schedules_a_backup_that_drops_the_page() {
+    let mock = Arc::new(MockProvider::new());
+    main_commit(&mock);
+    let (fx, auth) = home_beside_harbor(mock.clone(), true).await;
+    fx.engine
+        .write_reflection(&citing_harbor("wide.md"), &agent())
+        .await
+        .unwrap();
+    fx.engine.reflection_backup_tick(Instant::now()).await;
+    let head_paths = || mock.commit_paths(&mock.branch_commit(BACKUP_BRANCH).unwrap());
+    assert!(head_paths().contains(&"reflections/wide.md".to_string()));
+
+    auth.set_domain_visibility("harbor", true, "keeper")
+        .await
+        .unwrap();
+    assert!(
+        fx.engine
+            .reflection_backup_tick(Instant::now())
+            .await
+            .is_empty(),
+        "nothing marked by the narrowing itself"
+    );
+    assert_eq!(
+        fx.engine.schedule_too_wide_backups().await,
+        vec!["eng".to_string()]
+    );
+    let done = fx.engine.reflection_backup_tick(Instant::now()).await;
+    assert_eq!(done.len(), 1, "{done:?}");
+    assert!(!head_paths().iter().any(|p| p.contains("wide.md")));
+    // Held now: the next look schedules nothing new.
+    assert!(fx.engine.schedule_too_wide_backups().await.is_empty());
+
+    // The periodic recount runs the same look.
+    let (fx, auth) = home_beside_harbor(mock.clone(), true).await;
+    fx.engine
+        .write_reflection(&citing_harbor("wide.md"), &agent())
+        .await
+        .unwrap();
+    fx.engine.reflection_backup_tick(Instant::now()).await;
+    auth.set_domain_visibility("harbor", true, "keeper")
+        .await
+        .unwrap();
+    fx.engine.record_reflect_counts().await.unwrap();
+    assert_eq!(
+        fx.engine.reflection_backup_tick(Instant::now()).await.len(),
+        1
+    );
 }

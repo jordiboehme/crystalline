@@ -52,9 +52,9 @@ fn ok(home: &Path, args: &[&str], stdin: Option<&str>) {
     );
 }
 
-/// `eng` (Reflection on, shared) and `harbor` (one engram, private to
-/// keeper), registered in an isolated home.
-fn workspace() -> tempfile::TempDir {
+/// `eng` (Reflection on) and `harbor` (one engram) registered in an
+/// isolated home, both shared, with no account.
+fn registered() -> tempfile::TempDir {
     let home = tempfile::tempdir().unwrap();
     let h = home.path();
     for name in ["eng", "harbor"] {
@@ -82,6 +82,13 @@ fn workspace() -> tempfile::TempDir {
         let dir = h.join(name);
         ok(h, &["domain", "add", name, dir.to_str().unwrap()], None);
     }
+    home
+}
+
+/// [`registered`] with keeper as an account and `harbor` private to keeper.
+fn workspace() -> tempfile::TempDir {
+    let home = registered();
+    let h = home.path();
     ok(
         h,
         &[
@@ -106,6 +113,40 @@ fn workspace() -> tempfile::TempDir {
         ],
         None,
     );
+    home
+}
+
+/// [`registered`] with `eng` connected to a GitHub repository and its
+/// Reflection at home here; `harbor` stays a local domain, shared, so the
+/// accounts allow the citation and only the GitHub rule refuses it.
+fn team_workspace() -> tempfile::TempDir {
+    use crystalline_core::config::{GlobalConfig, OriginConfig};
+    let home = registered();
+    let h = home.path();
+    let manifest = h.join("eng/MANIFEST.md");
+    let text = std::fs::read_to_string(&manifest).unwrap();
+    std::fs::write(
+        &manifest,
+        text.replacen(
+            "reflection: on\n",
+            "reflection: on\nreflection_home: https://kb.example.com\n",
+            1,
+        ),
+    )
+    .unwrap();
+    let path = h.join("config.yaml");
+    let mut cfg: GlobalConfig = crystalline_core::config::load_yaml(&path).unwrap();
+    cfg.domains.get_mut("eng").unwrap().origin = Some(OriginConfig {
+        repo: "acme/kb".into(),
+        path: None,
+        branch: Some("main".into()),
+        poll_secs: None,
+    });
+    let mut service = cfg.service.clone().unwrap_or_default();
+    service.public_url = Some("https://kb.example.com".into());
+    cfg.service = Some(service);
+    crystalline_core::config::save_yaml(&path, &cfg).unwrap();
+    ok(h, &["sync"], None);
     home
 }
 
@@ -184,4 +225,15 @@ fn a_daemon_with_http_off_refuses_a_source_fewer_people_may_read() {
     let _ = daemon.wait();
     assert!(answer.contains(TOO_WIDE), "{answer}");
     assert!(!h.join("eng/reflections/overview.md").exists());
+}
+
+#[test]
+fn the_embedded_stack_refuses_a_local_source_on_a_github_page() {
+    let home = team_workspace();
+    let answer = cite_over(child(home.path(), &["mcp", "--embedded"]));
+    assert!(
+        answer.contains("this source is in a domain that is not shared through GitHub"),
+        "{answer}"
+    );
+    assert!(!home.path().join("eng/reflections/overview.md").exists());
 }

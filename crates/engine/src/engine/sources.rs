@@ -29,6 +29,12 @@ pub(crate) const HIDDEN_SOURCE_NOTE: &str = "a source in a domain you cannot ope
 /// is not caught.
 pub(crate) const TOO_WIDE_REFUSAL: &str = "this source is in a domain fewer people may read than this page's domain; leave out the source and every sentence drawn from it, since the check sees only named sources, or write that text on a page in that domain instead";
 
+/// What a write is refused with when its page is in a domain connected to
+/// GitHub and the source is in one that is not (a local or a virtual
+/// domain): the page is backed up to the repository, whose readers are not
+/// the accounts here, so personal knowledge would reach a repository.
+pub(crate) const NOT_ON_GITHUB_REFUSAL: &str = "this source is in a domain that is not shared through GitHub, and this page is backed up to a GitHub repository; leave out the source and every sentence drawn from it, or cite it from a page in that domain instead";
+
 /// What a write is refused with when it names a source in another domain
 /// on a stack that could not open its accounts store: who reads which
 /// domain is unknown there, so the check fails closed.
@@ -36,7 +42,7 @@ pub(crate) const UNKNOWN_READERS_REFUSAL: &str = "who may read each domain is un
 
 /// What a `source_too_wide` item says to a caller who may open every
 /// domain the item is about.
-pub(crate) const TOO_WIDE_NOTE: &str = "this section cites a domain fewer people may read than this page's domain, so its text reaches people who may not read that domain; remove that source and the text drawn from it. The page stays as it is until a curator does";
+pub(crate) const TOO_WIDE_NOTE: &str = "this section cites a domain fewer people may read than this page's domain, or one not shared through GitHub while this page is backed up to a GitHub repository, so its text reaches people who may not read that domain; remove that source and the text drawn from it. The page stays as it is until a curator does";
 
 /// What a `source_unavailable` item says to a caller who may open the
 /// domain, with how to clear it.
@@ -220,6 +226,9 @@ impl Engine {
     /// no accounts store is in play) answers that every page covers every
     /// domain.
     pub(crate) async fn readers_cover(&self, page: &str, source: &str) -> Result<bool> {
+        if self.leaves_github(page, source) {
+            return Ok(false);
+        }
         let Some(access) = self.domain_access.get() else {
             // Failed closed: a stack that could not open its accounts store
             // knows no reader, so no other domain is covered.
@@ -229,6 +238,18 @@ impl Engine {
             .readers_cover(page, source)
             .await
             .map_err(|e| EngineError::Internal(e.to_string()))
+    }
+
+    /// Whether a page of `page` citing `source` would carry a domain that
+    /// is not connected to GitHub into the GitHub repository `page` is
+    /// backed up to. Until access follows GitHub, any two connected domains
+    /// count as alike: their repositories' readers are not compared.
+    pub(crate) fn leaves_github(&self, page: &str, source: &str) -> bool {
+        let on_github = |domain: &str| {
+            self.domain_entry(domain)
+                .is_ok_and(|entry| entry.origin.is_some())
+        };
+        on_github(page) && !on_github(source)
     }
 
     /// Why nobody here knows who reads which domain, when that is so: no
@@ -302,6 +323,11 @@ impl Engine {
                 if let Some(why) = self.readers_unknown() {
                     return Err(EngineError::Invalid(format!(
                         "'{name}': {UNKNOWN_READERS_REFUSAL} ({why})"
+                    )));
+                }
+                if self.leaves_github(own, local) {
+                    return Err(EngineError::Invalid(format!(
+                        "'{name}': {NOT_ON_GITHUB_REFUSAL}"
                     )));
                 }
                 if !self.readers_cover(own, local).await? {

@@ -220,6 +220,43 @@ enum Detail {
 }
 
 impl Engine {
+    /// Schedule a backup of every Reflection this instance backs up that has
+    /// a page newly citing a domain fewer people may read (or one not shared
+    /// through GitHub): a page its last backup did not hold back. Answers
+    /// the domains marked, sorted.
+    ///
+    /// Who may read a domain changes in the accounts store (a domain made
+    /// private, a member removed, a role lowered), often from another
+    /// process, and nothing in the Reflection is marked by it. Without this
+    /// look such a page would stay on the backup branch head until the next
+    /// change. The daemon's recount runs it every few minutes, and the JSON
+    /// API's accounts routes run it after each change.
+    pub async fn schedule_too_wide_backups(&self) -> Vec<String> {
+        let mut marked = Vec::new();
+        let domains: Vec<String> = self.registered_domain_entries().keys().cloned().collect();
+        for domain in domains {
+            if self.reflection_switch(&domain) == crystalline_core::ReflectionSwitch::Off
+                || !self.backs_up_reflection_here(&domain).await
+            {
+                continue;
+            }
+            let pages = match self.too_wide_pages(&domain).await {
+                Ok(pages) => pages,
+                Err(e) => {
+                    tracing::debug!(domain = %domain, "too wide pages not read: {e}");
+                    continue;
+                }
+            };
+            let held = self.reflection_backup_held_back(&domain);
+            if pages.iter().any(|page| !held.contains(page)) {
+                self.mark_reflection_dirty(&domain, crate::reflection_backup::BackupCause::Settled);
+                marked.push(domain);
+            }
+        }
+        marked.sort();
+        marked
+    }
+
     /// The pages of `domain` (by path inside `reflections/`, sorted) with a
     /// section that cites a domain fewer people may read than `domain`: the
     /// pages the queue names with `source_too_wide`, for every source, seen
@@ -1310,6 +1347,9 @@ impl Engine {
     /// for `hook_status`. The daemon's count tick calls this; nothing else
     /// writes `reflect_open`.
     pub async fn record_reflect_counts(&self) -> Result<BTreeMap<String, u64>> {
+        // The same pass looks for pages a change of readers left too wide,
+        // so they drop off the backup branch without waiting for an edit.
+        self.schedule_too_wide_backups().await;
         // The unnamed scope already leaves out a hidden copy and a read-only
         // domain, so nothing is filtered here.
         let counts: BTreeMap<String, u64> = self
