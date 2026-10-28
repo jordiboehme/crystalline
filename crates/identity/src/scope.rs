@@ -351,6 +351,19 @@ fn decide_reflection(
     }
 }
 
+/// Who read a Reflection page when a person shared text on it on purpose
+/// ([`DomainAccess::page_readers`]): what a confirmation is held against
+/// later ([`DomainAccess::readers_cover_for`]).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PageReaders {
+    /// A shared domain's page: everyone who reaches the instance, anonymous
+    /// callers and accounts made later included.
+    Everyone,
+    /// A private domain's page: these accounts, by their folded names.
+    Accounts(std::collections::BTreeSet<String>),
+}
+
 /// Who calls a reflection verb. Every reflection verb takes one, because
 /// three things travel together: the scope the rights are decided for, the
 /// name a thread entry and the `changed_by` bookkeeping record, and whether
@@ -1008,11 +1021,90 @@ impl DomainAccess {
     /// A page always covers its own domain. Read fresh on every call, so a
     /// membership change counts at once.
     pub async fn readers_cover(&self, page: &str, source: &str) -> Result<bool> {
+        self.cover(page, source, None).await
+    }
+
+    /// Who reads a Reflection page of domain `page` right now, as a person's
+    /// confirmation is recorded for ([`DomainAccess::readers_cover_for`]):
+    /// [`PageReaders::Everyone`] for a shared domain, whose Reflection reaches
+    /// anonymous callers and accounts not made yet, and for a private one the
+    /// enabled accounts that read its Reflection (the reader side of
+    /// [`DomainAccess::readers_cover`]). Names are the store's folded
+    /// spelling. The machine owner is never named: it reads every domain.
+    pub async fn page_readers(&self, page: &str) -> Result<PageReaders> {
+        let Some(acl) = self.auth.domain_visibility(page).await? else {
+            return Ok(PageReaders::Everyone);
+        };
+        let members: HashMap<String, (MemberLevel, ReflectionLevel)> = self
+            .auth
+            .domain_members(page)
+            .await?
+            .into_iter()
+            .map(|m| (m.principal, (m.level, m.reflection)))
+            .collect();
+        let mut readers = std::collections::BTreeSet::new();
+        for user in self.auth.list_users().await? {
+            if user.disabled {
+                continue;
+            }
+            let (level, reflection) = match members.get(&user.name) {
+                Some((level, reflection)) => (Some(*level), *reflection),
+                None => (None, ReflectionLevel::Default),
+            };
+            let principal = Principal::Account {
+                name: user.name.clone(),
+                role: user.role,
+                reflection: user.reflection,
+            };
+            if decide_reflection(&principal, Some(&acl), level, reflection, false)
+                >= ReflectionRight::Read
+            {
+                readers.insert(user.name);
+            }
+        }
+        Ok(PageReaders::Accounts(readers))
+    }
+
+    /// [`DomainAccess::readers_cover`] for a page whose text drawn from
+    /// `source` a person shared on purpose with `confirmed`, the page's
+    /// readers when they did ([`DomainAccess::page_readers`]). Covered unless
+    /// someone reads the page now who was not among `confirmed` and may not
+    /// read the source's engrams: the person agreed to the readers of that
+    /// time, so a widening asks again. A reader who lost the source since
+    /// changes nothing, since the text reached them already. A page shared
+    /// since a confirmation for named accounts is never covered by it: its
+    /// readers now include anonymous callers and accounts not made yet.
+    pub async fn readers_cover_for(
+        &self,
+        page: &str,
+        source: &str,
+        confirmed: &PageReaders,
+    ) -> Result<bool> {
+        match confirmed {
+            PageReaders::Everyone => Ok(true),
+            PageReaders::Accounts(names) => self.cover(page, source, Some(names)).await,
+        }
+    }
+
+    /// [`DomainAccess::readers_cover`], with the page readers in `confirmed`
+    /// counted as covered whatever they read.
+    async fn cover(
+        &self,
+        page: &str,
+        source: &str,
+        confirmed: Option<&std::collections::BTreeSet<String>>,
+    ) -> Result<bool> {
         if page.trim() == source.trim() {
             return Ok(true);
         }
         let page_acl = self.auth.domain_visibility(page).await?;
         let source_acl = self.auth.domain_visibility(source).await?;
+        // A confirmation for named accounts never covers a shared page:
+        // anonymous callers and accounts made later read it, and none of
+        // them was named.
+        if page_acl.is_none() && confirmed.is_some() {
+            return Ok(false);
+        }
         // A shared page reaches anonymous callers and accounts not made
         // yet, who never read a private domain.
         if page_acl.is_none() && source_acl.is_some() {
@@ -1055,7 +1147,10 @@ impl DomainAccess {
                 role: user.role,
                 reflection: user.reflection,
             };
-            if reads_page(&principal, &user.name) && !reads_source(&principal, &user.name) {
+            if reads_page(&principal, &user.name)
+                && !reads_source(&principal, &user.name)
+                && !confirmed.is_some_and(|names| names.contains(&user.name))
+            {
                 return Ok(false);
             }
         }
@@ -1432,6 +1527,70 @@ mod tests {
             .await
             .unwrap();
         assert!(!access.readers_cover("shared", "other").await.unwrap());
+    }
+
+    /// Who reads a page is named for a confirmation: everyone for a shared
+    /// domain, the accounts that read its Reflection for a private one
+    /// (keeper the owner, boss the admin, mem the member).
+    #[tokio::test]
+    async fn a_page_is_read_by_everyone_or_by_named_accounts() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = store(&dir).await;
+        covering(&auth).await;
+        let access = DomainAccess::new(auth);
+        assert_eq!(
+            access.page_readers("shared").await.unwrap(),
+            PageReaders::Everyone
+        );
+        let PageReaders::Accounts(readers) = access.page_readers("lab").await.unwrap() else {
+            panic!("a private page has named readers");
+        };
+        assert!(readers.contains("mem") && readers.contains("keeper"), "{readers:?}");
+        assert!(!readers.contains("ann"), "{readers:?}");
+    }
+
+    /// A page confirmed for its readers covers a source as long as no reader
+    /// came that was not one then and may not read the source: a reader who
+    /// lost the source afterwards changes nothing, a new one does, and so
+    /// does the page becoming shared. A confirmation for everyone always
+    /// covers.
+    #[tokio::test]
+    async fn a_confirmation_covers_the_readers_it_was_given_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = store(&dir).await;
+        covering(&auth).await;
+        let access = DomainAccess::new(auth.clone());
+        // ann reads lab and not vault: lab does not cover vault.
+        auth.upsert_domain_member("lab", "ann", MemberLevel::Viewer, None, "keeper")
+            .await
+            .unwrap();
+        assert!(!access.readers_cover("lab", "vault").await.unwrap());
+        let confirmed = access.page_readers("lab").await.unwrap();
+        assert!(access.readers_cover_for("lab", "vault", &confirmed).await.unwrap());
+        // mem loses vault: mem read the page then, so nothing changes.
+        auth.remove_domain_member("vault", "mem").await.unwrap();
+        assert!(access.readers_cover_for("lab", "vault", &confirmed).await.unwrap());
+        // A new reader of the page who may not read vault.
+        auth.add_user("lee", "lee", None, Role::Viewer, "pw12345678")
+            .await
+            .unwrap();
+        auth.upsert_domain_member("lab", "lee", MemberLevel::Viewer, None, "keeper")
+            .await
+            .unwrap();
+        assert!(!access.readers_cover_for("lab", "vault", &confirmed).await.unwrap());
+        // Shared now: anonymous and later accounts read it.
+        auth.remove_domain_member("lab", "lee").await.unwrap();
+        assert!(access.readers_cover_for("lab", "vault", &confirmed).await.unwrap());
+        auth.set_domain_visibility("lab", false, "keeper")
+            .await
+            .unwrap();
+        assert!(!access.readers_cover_for("lab", "vault", &confirmed).await.unwrap());
+        assert!(
+            access
+                .readers_cover_for("lab", "vault", &PageReaders::Everyone)
+                .await
+                .unwrap()
+        );
     }
 
     /// A renamed domain keeps who may do what: the rights answered for the
