@@ -9,6 +9,7 @@
 #[path = "../support/mod.rs"]
 mod support;
 
+mod github_link;
 mod mcp_auth;
 mod oauth;
 mod oidc;

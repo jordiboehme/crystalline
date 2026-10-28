@@ -17,7 +17,7 @@ use chrono::Utc;
 use crystalline_core::config::{GitHubConfig, GlobalConfig, ServiceConfig};
 use crystalline_index::TursoStore;
 use crystalline_remote::UserTokenGrant;
-use crystalline_service::engine::{EngineError, ShareActor};
+use crystalline_service::engine::{EngineError, GithubUnlink, ShareActor};
 use crystalline_service::rest::{AuthStore, Role};
 use crystalline_service::{DomainAccess, Engine, EnvOverlay};
 use serde_json::Value;
@@ -424,7 +424,15 @@ async fn unlink_revokes_at_github_and_deletes_the_row() {
         .unwrap();
     connect_with_change(&eng, tmp.path(), "acme/kb", "kb").await;
 
-    eng.unlink_github("ada").await.unwrap();
+    assert_eq!(
+        eng.unlink_github("ada").await.unwrap(),
+        GithubUnlink::Unlinked
+    );
+    assert_eq!(
+        eng.unlink_github("ada").await.unwrap(),
+        GithubUnlink::NotLinked,
+        "a second unlink finds nothing"
+    );
 
     let revokes = forge.revokes.lock().unwrap().clone();
     assert_eq!(revokes.len(), 1, "{revokes:?}");
@@ -460,7 +468,14 @@ async fn a_failed_revoke_still_deletes_locally() {
     connect_with_change(&eng, tmp.path(), "acme/kb", "kb").await;
     forge.revoke_fails.store(true, Ordering::SeqCst);
 
-    eng.unlink_github("ada").await.unwrap();
+    let outcome = eng.unlink_github("ada").await.unwrap();
+    assert_eq!(outcome, GithubUnlink::NotRevoked);
+    assert_eq!(
+        outcome.warning(),
+        Some(
+            "unlinked here; GitHub could not be reached to revoke the token, revoke it in your GitHub settings"
+        )
+    );
 
     assert_eq!(
         forge.revokes.lock().unwrap().len(),

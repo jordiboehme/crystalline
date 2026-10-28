@@ -1186,6 +1186,9 @@ pub struct Engine {
     // The clock the App memory measures a failed keychain read against;
     // `Instant::now` outside tests (see `Engine::with_app_clock`).
     app_clock: github_app::AppClock,
+    // The clock a GitHub web-flow link's pending state is aged by;
+    // `Instant::now` outside tests (see `Engine::with_link_clock`).
+    link_clock: github_app::AppClock,
     // Test-only: answers the App store read in place of the keychain and the
     // file, so a test can stage a keychain that fails and then recovers.
     #[cfg(any(test, feature = "testing"))]
@@ -2479,6 +2482,7 @@ impl Engine {
             origin_provider_override_login: None,
             github_app: std::sync::RwLock::new(github_app::AppState::new()),
             app_clock: Arc::new(Instant::now),
+            link_clock: Arc::new(Instant::now),
             #[cfg(any(test, feature = "testing"))]
             app_store_lookup: None,
             backup_marks: Default::default(),
@@ -4462,6 +4466,23 @@ impl Engine {
     pub fn with_app_clock(mut self, clock: github_app::AppClock) -> Engine {
         self.app_clock = clock;
         self
+    }
+
+    /// Read `clock` instead of the system clock for the age of a GitHub
+    /// web-flow link in flight (see [`Engine::link_clock_now`]). Test-only:
+    /// lets a test step past the ten minutes a state lives instead of
+    /// waiting for them.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_link_clock(mut self, clock: github_app::AppClock) -> Engine {
+        self.link_clock = clock;
+        self
+    }
+
+    /// The moment a GitHub web-flow link in flight is measured against: when
+    /// it started and whether its state has expired. The system clock
+    /// outside tests.
+    pub fn link_clock_now(&self) -> Instant {
+        (self.link_clock)()
     }
 
     /// Force the GitHub token store to a plain file under `dir`, never the
@@ -7594,6 +7615,35 @@ pub struct GithubLinkView {
     /// The once-reported failure of this account's last link device flow.
     pub error: Option<String>,
 }
+
+/// What [`Engine::unlink_github`] did, so a surface can tell the person
+/// whether the token still works at GitHub.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GithubUnlink {
+    /// The account had no link; nothing was touched.
+    NotLinked,
+    /// The link and its token are gone here, and GitHub revoked the token
+    /// (or no token was left to revoke).
+    Unlinked,
+    /// The link and its token are gone here, but the token could not be
+    /// revoked at GitHub (unreachable, refused, or the App has no client
+    /// secret), so it stays valid there until it expires.
+    NotRevoked,
+}
+
+impl GithubUnlink {
+    /// The sentence to tell the person, when there is one:
+    /// [`UNLINKED_NOT_REVOKED`] for [`GithubUnlink::NotRevoked`].
+    pub fn warning(self) -> Option<&'static str> {
+        match self {
+            GithubUnlink::NotRevoked => Some(UNLINKED_NOT_REVOKED),
+            GithubUnlink::NotLinked | GithubUnlink::Unlinked => None,
+        }
+    }
+}
+
+/// What an unlink tells the person when GitHub did not revoke the token.
+pub const UNLINKED_NOT_REVOKED: &str = "unlinked here; GitHub could not be reached to revoke the token, revoke it in your GitHub settings";
 
 /// One in-flight GitHub device-flow sign-in, held by
 /// [`Engine::pending_connect`] so a second `configure` connect call while

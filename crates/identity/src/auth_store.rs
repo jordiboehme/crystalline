@@ -1129,6 +1129,12 @@ CREATE TABLE IF NOT EXISTS account_write_domain (
 );
 ";
 
+/// The sentence [`AuthStore::link_github`] refuses a GitHub account that is
+/// already linked to another Crystalline account with
+/// ([`RefusalKind::GithubIdTaken`]). Public so a surface can recognise the
+/// refusal by it and answer 409 with these words.
+pub const GITHUB_ID_TAKEN: &str = "this GitHub account is already linked to another Crystalline account; an admin can unlink it there";
+
 /// Prefix every MCP token is minted with, so a token is recognizable at a
 /// glance and distinct from a session cookie or a CSRF value. The remainder is
 /// 64 lowercase hex characters, 32 bytes from the OS CSPRNG.
@@ -2235,9 +2241,7 @@ impl AuthStore {
             {
                 return Err(refuse(
                     RefusalKind::GithubIdTaken,
-                    "this GitHub account is already linked to another Crystalline account; an \
-                     admin can unlink it there"
-                        .to_string(),
+                    GITHUB_ID_TAKEN.to_string(),
                 ));
             }
             let now = chrono::Utc::now();

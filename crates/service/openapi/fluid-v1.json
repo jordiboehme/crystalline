@@ -8779,6 +8779,80 @@
         }
       }
     },
+    "/api/v1/github/link/callback": {
+      "get": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "Where GitHub sends the browser back to finish a link.",
+        "description": "Needs the session that started the link (the session cookie is SameSite=Lax, so it rides GitHub's redirect). The state must name a link this session started in the last ten minutes and is spent by this call. Then the code is exchanged and the account linked, and the browser is sent to `/profile?github=linked`, or to `/profile?github_error=<code>` with `id_taken` (the GitHub account is linked to another account), `denied` (the person cancelled at GitHub) or `failed` (anything else).",
+        "operationId": "finish_github_link",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "query",
+            "description": "The authorization code, exchanged once for a user token.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "state",
+            "in": "query",
+            "description": "The state `start` minted.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "error",
+            "in": "query",
+            "description": "GitHub's refusal, `access_denied` when the person cancelled.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "303": {
+            "description": "To the profile, with `github=linked` or `github_error=<code>`."
+          },
+          "400": {
+            "description": "No state, or a state this session did not start, already used, or expired. Nothing reached GitHub.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No session.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/graph": {
       "get": {
         "tags": [
@@ -9161,6 +9235,160 @@
           },
           "422": {
             "description": "The body is JSON but not a token, the token is empty, GitHub refused it, or this account's name cannot address a credential.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/me/github-link": {
+      "get": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "The caller's own link to a GitHub account through the App.",
+        "description": "Any signed-in account, viewers included: the link says who the person is at GitHub. A pure read, served even on a read-only instance. No token material.",
+        "operationId": "get_my_github_link",
+        "responses": {
+          "200": {
+            "description": "The link.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GithubLinkResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or an anonymous one.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "Unlink the caller's own account from GitHub.",
+        "description": "Any signed-in account, and refused on a read-only instance. Revokes the user token at GitHub, deletes it here and removes the link. When GitHub cannot revoke it, the unlink still happens here and `warning` says so. Idempotent: an account without a link answers `was_linked: false`.",
+        "operationId": "unlink_my_github_link",
+        "responses": {
+          "200": {
+            "description": "Unlinked.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GithubUnlinkResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or an anonymous one.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/me/github-link/start": {
+      "post": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "Start linking the caller's account to GitHub through the App's web flow.",
+        "description": "Any signed-in account, and refused on a read-only instance. Answers GitHub's authorize url; the page sends the browser there, and GitHub sends it back to `GET /github/link/callback`, which links the account of the session that started this and nobody else's. The state lives ten minutes and is good for one callback.",
+        "operationId": "start_my_github_link",
+        "responses": {
+          "200": {
+            "description": "Where to send the browser.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StartGithubLinkResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or an anonymous one.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`service.public_url` is not set, so there is no callback address to give GitHub, or the GitHub App has no client secret, so a code cannot be exchanged. The detail names the fix.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "No GitHub App is configured on this instance, or it cannot be used. The detail names the fix.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Too many links are in flight at once; try again in a moment.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -11034,6 +11262,69 @@
         }
       }
     },
+    "/api/v1/users/{name}/github-link": {
+      "delete": {
+        "tags": [
+          "users"
+        ],
+        "summary": "`DELETE /users/{name}/github-link` - unlink another account from GitHub.",
+        "description": "Admin only: this is how a GitHub account linked to the wrong Crystalline\naccount is freed, so the right one can link it. The user token is revoked\nat GitHub, deleted here and the link removed, exactly as when the person\nunlinks themselves. An admin may unlink its own account here too; nothing\nabout its session depends on the link.",
+        "operationId": "unlink_user_github_link",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "The account, in any casing.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Unlinked.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GithubUnlinkResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin, a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/users/{name}/password": {
       "post": {
         "tags": [
@@ -12186,6 +12477,78 @@
           }
         }
       },
+      "GithubLinkResponse": {
+        "type": "object",
+        "description": "One account's link to a GitHub account through the instance's GitHub App: who it is linked to, since when, and whether the user token still works. No token material, ever.",
+        "required": [
+          "linked",
+          "token_live"
+        ],
+        "properties": {
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The last link device flow's failure, reported on exactly one read."
+          },
+          "github_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "GitHub's numeric user id.",
+            "example": 583231,
+            "minimum": 0
+          },
+          "host": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`github.com` or the Enterprise Server host.",
+            "example": "github.com"
+          },
+          "linked": {
+            "type": "boolean",
+            "description": "Whether the account is linked.",
+            "example": true
+          },
+          "linked_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "When the link was made, RFC 3339.",
+            "example": "2026-10-28T09:12:44Z"
+          },
+          "login": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The GitHub login last seen for the linked id.",
+            "example": "octo"
+          },
+          "pending": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/GithubPendingView",
+                "description": "This account's link device flow waiting for the browser side, when\none runs (the device flow is started from the CLI)."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "token_live": {
+            "type": "boolean",
+            "description": "False once the user token is known to be gone (revoked, or its\nrefresh token expired). The link stays; linking again restores it.",
+            "example": true
+          }
+        }
+      },
       "GithubPendingView": {
         "type": "object",
         "description": "The half of a running device flow a browser has to show: the short code the user types in, where they type it, and how long is left to do so.",
@@ -12265,6 +12628,34 @@
             ],
             "description": "The account login, when connected.",
             "example": "octo"
+          }
+        }
+      },
+      "GithubUnlinkResponse": {
+        "type": "object",
+        "description": "What an unlink answers.",
+        "required": [
+          "linked",
+          "was_linked"
+        ],
+        "properties": {
+          "linked": {
+            "type": "boolean",
+            "description": "Always false: the account is not linked any more.",
+            "example": false
+          },
+          "warning": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Set when the link is gone here but GitHub did not revoke the token:\nthe person should revoke it in their GitHub settings.",
+            "example": "unlinked here; GitHub could not be reached to revoke the token, revoke it in your GitHub settings"
+          },
+          "was_linked": {
+            "type": "boolean",
+            "description": "Whether there was a link to remove.",
+            "example": true
           }
         }
       },
@@ -14080,6 +14471,20 @@
             ],
             "description": "The pull request title. Defaults to a generated summary.",
             "example": "Refine 2 engrams in kb"
+          }
+        }
+      },
+      "StartGithubLinkResponse": {
+        "type": "object",
+        "description": "What `POST /me/github-link/start` answers: where to send the browser.",
+        "required": [
+          "authorize_url"
+        ],
+        "properties": {
+          "authorize_url": {
+            "type": "string",
+            "description": "GitHub's authorize url for this flow. The page navigates the browser\nthere; GitHub sends it back to the callback.",
+            "example": "https://github.com/login/oauth/authorize?client_id=Iv23.x&redirect_uri=https%3A%2F%2Fkb.example.com%2Fapi%2Fv1%2Fgithub%2Flink%2Fcallback&state=..."
           }
         }
       },

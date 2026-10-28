@@ -591,6 +591,42 @@ export type GithubIdentityResponse = {
 };
 
 /**
+ * One account's link to a GitHub account through the instance's GitHub App: who it is linked to, since when, and whether the user token still works. No token material, ever.
+ */
+export type GithubLinkResponse = {
+    /**
+     * The last link device flow's failure, reported on exactly one read.
+     */
+    error?: string | null;
+    /**
+     * GitHub's numeric user id.
+     */
+    github_id?: number | null;
+    /**
+     * `github.com` or the Enterprise Server host.
+     */
+    host?: string | null;
+    /**
+     * Whether the account is linked.
+     */
+    linked: boolean;
+    /**
+     * When the link was made, RFC 3339.
+     */
+    linked_at?: string | null;
+    /**
+     * The GitHub login last seen for the linked id.
+     */
+    login?: string | null;
+    pending?: GithubPendingView | null;
+    /**
+     * False once the user token is known to be gone (revoked, or its
+     * refresh token expired). The link stays; linking again restores it.
+     */
+    token_live: boolean;
+};
+
+/**
  * The half of a running device flow a browser has to show: the short code the user types in, where they type it, and how long is left to do so.
  */
 export type GithubPendingView = {
@@ -637,6 +673,25 @@ export type GithubStatusResponse = {
      * The account login, when connected.
      */
     user?: string | null;
+};
+
+/**
+ * What an unlink answers.
+ */
+export type GithubUnlinkResponse = {
+    /**
+     * Always false: the account is not linked any more.
+     */
+    linked: boolean;
+    /**
+     * Set when the link is gone here but GitHub did not revoke the token:
+     * the person should revoke it in their GitHub settings.
+     */
+    warning?: string | null;
+    /**
+     * Whether there was a link to remove.
+     */
+    was_linked: boolean;
 };
 
 /**
@@ -1965,6 +2020,17 @@ export type ShareBody = {
      * The pull request title. Defaults to a generated summary.
      */
     title?: string | null;
+};
+
+/**
+ * What `POST /me/github-link/start` answers: where to send the browser.
+ */
+export type StartGithubLinkResponse = {
+    /**
+     * GitHub's authorize url for this flow. The page navigates the browser
+     * there; GitHub sends it back to the callback.
+     */
+    authorize_url: string;
 };
 
 /**
@@ -6503,6 +6569,43 @@ export type GithubDomainNameResponses = {
 
 export type GithubDomainNameResponse = GithubDomainNameResponses[keyof GithubDomainNameResponses];
 
+export type FinishGithubLinkData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * The authorization code, exchanged once for a user token.
+         */
+        code?: string;
+        /**
+         * The state `start` minted.
+         */
+        state?: string;
+        /**
+         * GitHub's refusal, `access_denied` when the person cancelled.
+         */
+        error?: string;
+    };
+    url: '/api/v1/github/link/callback';
+};
+
+export type FinishGithubLinkErrors = {
+    /**
+     * No state, or a state this session did not start, already used, or expired. Nothing reached GitHub.
+     */
+    400: ProblemDetail;
+    /**
+     * No session.
+     */
+    401: ProblemDetail;
+    /**
+     * The trusted-header identity names a disabled account.
+     */
+    403: ProblemDetail;
+};
+
+export type FinishGithubLinkError = FinishGithubLinkErrors[keyof FinishGithubLinkErrors];
+
 export type GetGraphData = {
     body?: never;
     path?: never;
@@ -6708,6 +6811,105 @@ export type ConnectMyGithubIdentityTokenResponses = {
 };
 
 export type ConnectMyGithubIdentityTokenResponse = ConnectMyGithubIdentityTokenResponses[keyof ConnectMyGithubIdentityTokenResponses];
+
+export type UnlinkMyGithubLinkData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/v1/me/github-link';
+};
+
+export type UnlinkMyGithubLinkErrors = {
+    /**
+     * No identity, or an anonymous one.
+     */
+    401: ProblemDetail;
+    /**
+     * A cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
+     */
+    403: ProblemDetail;
+};
+
+export type UnlinkMyGithubLinkError = UnlinkMyGithubLinkErrors[keyof UnlinkMyGithubLinkErrors];
+
+export type UnlinkMyGithubLinkResponses = {
+    /**
+     * Unlinked.
+     */
+    200: GithubUnlinkResponse;
+};
+
+export type UnlinkMyGithubLinkResponse = UnlinkMyGithubLinkResponses[keyof UnlinkMyGithubLinkResponses];
+
+export type GetMyGithubLinkData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/v1/me/github-link';
+};
+
+export type GetMyGithubLinkErrors = {
+    /**
+     * No identity, or an anonymous one.
+     */
+    401: ProblemDetail;
+    /**
+     * The trusted-header identity names a disabled account.
+     */
+    403: ProblemDetail;
+};
+
+export type GetMyGithubLinkError = GetMyGithubLinkErrors[keyof GetMyGithubLinkErrors];
+
+export type GetMyGithubLinkResponses = {
+    /**
+     * The link.
+     */
+    200: GithubLinkResponse;
+};
+
+export type GetMyGithubLinkResponse = GetMyGithubLinkResponses[keyof GetMyGithubLinkResponses];
+
+export type StartMyGithubLinkData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/v1/me/github-link/start';
+};
+
+export type StartMyGithubLinkErrors = {
+    /**
+     * No identity, or an anonymous one.
+     */
+    401: ProblemDetail;
+    /**
+     * A cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
+     */
+    403: ProblemDetail;
+    /**
+     * `service.public_url` is not set, so there is no callback address to give GitHub, or the GitHub App has no client secret, so a code cannot be exchanged. The detail names the fix.
+     */
+    409: ProblemDetail;
+    /**
+     * No GitHub App is configured on this instance, or it cannot be used. The detail names the fix.
+     */
+    422: ProblemDetail;
+    /**
+     * Too many links are in flight at once; try again in a moment.
+     */
+    503: ProblemDetail;
+};
+
+export type StartMyGithubLinkError = StartMyGithubLinkErrors[keyof StartMyGithubLinkErrors];
+
+export type StartMyGithubLinkResponses = {
+    /**
+     * Where to send the browser.
+     */
+    200: StartGithubLinkResponse;
+};
+
+export type StartMyGithubLinkResponse = StartMyGithubLinkResponses[keyof StartMyGithubLinkResponses];
 
 export type ListMyIdentityLinksData = {
     body?: never;
@@ -7731,6 +7933,44 @@ export type UpdateUserResponses = {
 };
 
 export type UpdateUserResponse = UpdateUserResponses[keyof UpdateUserResponses];
+
+export type UnlinkUserGithubLinkData = {
+    body?: never;
+    path: {
+        /**
+         * The account, in any casing.
+         */
+        name: string;
+    };
+    query?: never;
+    url: '/api/v1/users/{name}/github-link';
+};
+
+export type UnlinkUserGithubLinkErrors = {
+    /**
+     * No identity.
+     */
+    401: ProblemDetail;
+    /**
+     * The caller is not an admin, a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
+     */
+    403: ProblemDetail;
+    /**
+     * No such account.
+     */
+    404: ProblemDetail;
+};
+
+export type UnlinkUserGithubLinkError = UnlinkUserGithubLinkErrors[keyof UnlinkUserGithubLinkErrors];
+
+export type UnlinkUserGithubLinkResponses = {
+    /**
+     * Unlinked.
+     */
+    200: GithubUnlinkResponse;
+};
+
+export type UnlinkUserGithubLinkResponse = UnlinkUserGithubLinkResponses[keyof UnlinkUserGithubLinkResponses];
 
 export type ResetUserPasswordData = {
     body: PasswordBody;

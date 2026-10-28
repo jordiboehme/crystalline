@@ -3463,6 +3463,33 @@ fn write_ops() -> Vec<WriteOp> {
             min_role: Role::Editor,
             read_only_exempt: false,
         },
+        // The GitHub App link: any signed-in account links or unlinks its own
+        // (a viewer included: the link is who the person is at GitHub), and
+        // an admin unlinks anybody's. Not read-only exempt: a link writes the
+        // person's token as well as the accounts database. The fixture has no
+        // App, so the start's allowed leg answers 422 past authorization and
+        // the two unlinks find nothing to remove.
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/me/github-link/start",
+            body: None,
+            min_role: Role::Viewer,
+            read_only_exempt: false,
+        },
+        WriteOp {
+            method: Method::DELETE,
+            path: "/api/v1/me/github-link",
+            body: None,
+            min_role: Role::Viewer,
+            read_only_exempt: false,
+        },
+        WriteOp {
+            method: Method::DELETE,
+            path: "/api/v1/users/mark/github-link",
+            body: None,
+            min_role: Role::Admin,
+            read_only_exempt: false,
+        },
         // Starting a single sign-on that links its identity to the caller's
         // account. Viewer-level like the two surfaces below (how somebody
         // signs in is not a privilege) and read-only exempt for the same

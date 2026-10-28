@@ -29,6 +29,7 @@ use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
 use serde::de::DeserializeOwned;
 
+use crate::auth_store::GITHUB_ID_TAKEN;
 use crate::engine::{EngineError, FILE_HOSTED_MARK, FILE_NO_HOST_MARK, ONLY_ELSEWHERE};
 
 /// An error response in RFC 9457 shape. `title` is a short stable slug a
@@ -656,6 +657,13 @@ impl From<EngineError> for ApiError {
             EngineError::Conflict(ref text) if text.contains(ONLY_ELSEWHERE) => {
                 ApiError::conflict(detail)
             }
+            // And a seventh: a GitHub account that is already linked to
+            // another Crystalline account. The request is fine; the GitHub
+            // account is taken until an admin unlinks it there, and the
+            // store's sentence says so.
+            EngineError::Conflict(ref text) if text.contains(GITHUB_ID_TAKEN) => {
+                ApiError::conflict(detail)
+            }
             // And a sixth: a write into a file domain another instance on
             // this shared database hosts. The request is fine; this instance
             // is not the one that writes the domain.
@@ -793,6 +801,17 @@ mod tests {
         );
         let floored = ApiError::service_unavailable("busy").retry_after(0);
         assert_eq!(floored.retry_after, Some(1), "a wait is never zero seconds");
+    }
+
+    /// A GitHub account linked to another Crystalline account is a 409 that
+    /// carries the store's sentence, not the 422 a plain conflict gets.
+    #[test]
+    fn a_github_account_linked_elsewhere_is_409_with_the_sentence() {
+        let err: ApiError = EngineError::Conflict(GITHUB_ID_TAKEN.to_string()).into();
+        assert_eq!(err.status, StatusCode::CONFLICT);
+        assert_eq!(err.detail, GITHUB_ID_TAKEN);
+        let plain: ApiError = EngineError::Conflict("something else".to_string()).into();
+        assert_eq!(plain.status, StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[test]

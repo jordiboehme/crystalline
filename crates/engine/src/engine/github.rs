@@ -831,10 +831,25 @@ impl Engine {
     /// Only this identity's cache entry is evicted, not the whole cache: every
     /// other credential this process resolved is still valid, and re-reading
     /// them would cost a keychain prompt each for nothing.
+    ///
+    /// With a GitHub App configured and the account linked through it, this
+    /// is [`Engine::unlink_github`]: the token is revoked at GitHub and the
+    /// link goes with it. A token connected the older way (no link) is
+    /// deleted as before.
     pub async fn disconnect_github_identity(&self, account: &str) -> Result<GithubIdentity> {
         let identity = personal_identity(account)?;
         if self.read_only {
             return Err(EngineError::ReadOnly);
+        }
+        if self.linked_through_app(account).await? {
+            // The token is an App user token behind a link: deleting it here
+            // alone would leave it valid at GitHub and leave a link that
+            // claims a live token. The unlink revokes it and drops both.
+            let outcome = self.unlink_github(account).await?;
+            if let Some(warning) = outcome.warning() {
+                tracing::warn!("disconnecting the GitHub identity of {account}: {warning}");
+            }
+            return self.github_identity_status(account).await;
         }
         let host = self.github_token_host();
         let (store, token) = self.github_credential_for(&identity, host.as_deref())?;
@@ -905,6 +920,35 @@ impl Engine {
             }
             super::github_app::AppSlot::Absent | super::github_app::AppSlot::Unloaded => Ok(()),
         }
+    }
+
+    /// Whether `account` has a GitHub link on an instance with a GitHub App
+    /// configured (usable or not). False without an App or without an
+    /// accounts store, so a process with neither (the CLI) never asks.
+    async fn linked_through_app(&self, account: &str) -> Result<bool> {
+        let app = matches!(
+            self.github_app_slot(),
+            super::github_app::AppSlot::Ready(_) | super::github_app::AppSlot::Refused(_)
+        );
+        let Some(access) = self.domain_access.get().filter(|_| app) else {
+            return Ok(false);
+        };
+        Ok(access
+            .github_link_of(account)
+            .await
+            .map_err(|e| EngineError::Internal(e.to_string()))?
+            .is_some())
+    }
+
+    /// The GitHub App a web-flow link goes through: the App, when one is
+    /// configured and usable and this process keeps accounts to link.
+    /// Refused otherwise, with the same errors [`Engine::link_github`]
+    /// answers. The caller builds the authorize url and exchanges the code
+    /// with the App's client id, client secret and auth base.
+    pub fn github_link_app(&self) -> Result<Arc<crystalline_remote::GithubApp>> {
+        let app = self.link_app()?;
+        self.link_access()?;
+        Ok(app)
     }
 
     /// The App a link goes through, or why there is none to use.
@@ -1034,7 +1078,11 @@ impl Engine {
     /// authorized GitHub Apps). A token is touched only when the account had
     /// a link, so an account without one keeps whatever it connected another
     /// way. Idempotent: unlinking an account without a link succeeds.
-    pub async fn unlink_github(&self, account: &str) -> Result<()> {
+    ///
+    /// The answer says which of the three happened, so a surface can tell
+    /// the person to revoke the token themselves when GitHub did not
+    /// ([`GithubUnlink::warning`]).
+    pub async fn unlink_github(&self, account: &str) -> Result<GithubUnlink> {
         let identity = personal_identity(account)?;
         if self.read_only {
             return Err(EngineError::ReadOnly);
@@ -1045,11 +1093,15 @@ impl Engine {
             .await
             .map_err(|e| EngineError::Internal(e.to_string()))?
             .is_some();
+        let mut outcome = GithubUnlink::NotLinked;
         if linked {
             let host = self.github_token_host();
             let (_store, token) = self.github_credential_for(&identity, host.as_deref())?;
-            if let Some(token) = token {
-                self.revoke_user_token(account, &token).await;
+            outcome = GithubUnlink::Unlinked;
+            if let Some(token) = token
+                && !self.revoke_user_token(account, &token).await
+            {
+                outcome = GithubUnlink::NotRevoked;
             }
             // The row before the token: a failure in between leaves a token
             // without a link, never a link that claims a live token it no
@@ -1061,19 +1113,20 @@ impl Engine {
             self.forget_personal_token(&identity, host.as_deref())?;
         }
         self.clear_pending_for(&identity);
-        Ok(())
+        Ok(outcome)
     }
 
     /// Revokes `token` at GitHub through the App, logging rather than
     /// failing when that cannot be done: an unlink always goes through here.
-    async fn revoke_user_token(&self, account: &str, token: &StoredToken) {
+    /// True when GitHub revoked it.
+    async fn revoke_user_token(&self, account: &str, token: &StoredToken) -> bool {
         let app = match self.github_app_slot() {
             super::github_app::AppSlot::Ready(router) => router.app().clone(),
             _ => {
                 tracing::warn!(
                     "no usable GitHub App to revoke the GitHub token of {account} with; it is deleted here and stays valid at GitHub until it expires"
                 );
-                return;
+                return false;
             }
         };
         let credentials = app.credentials();
@@ -1081,7 +1134,7 @@ impl Engine {
             tracing::warn!(
                 "the GitHub App has no client secret, so the GitHub token of {account} could not be revoked; it is deleted here and stays valid at GitHub until it expires"
             );
-            return;
+            return false;
         };
         match crystalline_remote::github::auth::revoke_user_token(
             app.api_url(),
@@ -1091,10 +1144,16 @@ impl Engine {
         )
         .await
         {
-            Ok(()) => tracing::info!("the GitHub token of {account} was revoked at GitHub"),
-            Err(e) => tracing::warn!(
-                "the GitHub token of {account} could not be revoked at GitHub ({e}); it is deleted here and stays valid at GitHub until it expires"
-            ),
+            Ok(()) => {
+                tracing::info!("the GitHub token of {account} was revoked at GitHub");
+                true
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "the GitHub token of {account} could not be revoked at GitHub ({e}); it is deleted here and stays valid at GitHub until it expires"
+                );
+                false
+            }
         }
     }
 

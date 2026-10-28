@@ -41,6 +41,7 @@ mod events;
 mod evolve;
 mod files;
 mod github_identity;
+mod github_link;
 mod github_settings;
 mod graph;
 mod identity_links;
@@ -51,6 +52,7 @@ mod members;
 mod oauth;
 mod oauth_grants;
 mod oidc;
+mod pending;
 mod reflections;
 mod users_api;
 
@@ -238,6 +240,11 @@ use crate::scope::{DomainAccess, DomainRight};
         github_identity::connect,
         github_identity::token,
         github_identity::disconnect,
+        github_link::status,
+        github_link::start,
+        github_link::callback,
+        github_link::unlink,
+        users_api::unlink_github,
         mcp_tokens::list,
         mcp_tokens::issue,
         mcp_tokens::rotate,
@@ -330,6 +337,9 @@ use crate::scope::{DomainAccess, DomainRight};
         github_settings::GithubStatusResponse,
         github_settings::GithubPendingView,
         github_identity::GithubIdentityResponse,
+        github_link::GithubLinkResponse,
+        github_link::StartGithubLinkResponse,
+        github_link::GithubUnlinkResponse,
         schemas::McpTokenInfo,
         mcp_tokens::IssueBody,
         mcp_tokens::IssuedTokenResponse,
@@ -413,6 +423,9 @@ pub struct RestState {
     /// collab upgrade route joins rooms in it, and every save it makes goes
     /// back through the engine above.
     pub collab: Arc<crate::collab::session::CollabSessions>,
+    /// The GitHub App web-flow links in flight, one store for this process.
+    /// See [`github_link`].
+    pub(crate) github_links: Arc<github_link::GithubLinkFlows>,
     /// The path this instance is served under, from `service.public_url`:
     /// every cookie is scoped to it, so two instances on one host keep
     /// separate sessions, and the sign-in landing and `return_to` are built
@@ -483,6 +496,7 @@ impl RestState {
             base_path: crate::settings::base_path(&config),
             collab,
             engine,
+            github_links: Arc::default(),
             oauth,
             oidc,
             access: Arc::new(DomainAccess::new(auth.clone())),
@@ -1028,6 +1042,12 @@ fn routes(state: RestState) -> Router {
             patch(users_api::update).delete(users_api::remove),
         )
         .route("/users/{name}/password", post(users_api::reset_password))
+        // Admin only, inside the handler: frees a GitHub account linked to
+        // the wrong Crystalline account. See [`github_link`].
+        .route(
+            "/users/{name}/github-link",
+            delete(users_api::unlink_github),
+        )
         // Admin only as well, and enforced the same way. The GET is a pure
         // read and is served on a read-only instance; the three mutations
         // are refused there, like every other write on this surface.
@@ -1060,6 +1080,18 @@ fn routes(state: RestState) -> Router {
             post(github_identity::connect),
         )
         .route("/me/github-identity/token", put(github_identity::token))
+        // The same person's link through the GitHub App, made with the App's
+        // web flow. Open to every signed-in account, viewers included: the
+        // link says who the person is at GitHub. The callback is where GitHub
+        // sends the browser back; it is NOT a public path, because the
+        // session that started the link is what it is bound to. See
+        // [`github_link`].
+        .route(
+            "/me/github-link",
+            get(github_link::status).delete(github_link::unlink),
+        )
+        .route("/me/github-link/start", post(github_link::start))
+        .route(github_link::CALLBACK_PATH, get(github_link::callback))
         // The other half of the same self-service idea: the tokens this
         // account's AGENTS authenticate with when `auth.mcp` is on. Open to
         // every signed-in account, viewers included - an agent acts as the
