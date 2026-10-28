@@ -184,6 +184,11 @@ function syntaxErrors(dialog: HTMLElement): HTMLElement[] {
   });
 }
 
+// Above roughly load average 80 this file's slower tests come close to the
+// 5000 ms default (measured 2026-10-28); the raise keeps a loaded machine from
+// reading as a failure. Never raise the global default to hide this.
+vi.setConfig({ testTimeout: 15000 });
+
 describe("the C64 screen's launch (M4 C1 to C4)", () => {
   it("launches from the page the first click came from (Review Focus 1)", async () => {
     // Mutation caught: the origin read at the third click (always "/"), the

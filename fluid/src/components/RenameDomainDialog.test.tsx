@@ -111,6 +111,11 @@ beforeEach(() => {
   apiMock.mockReset();
 });
 
+// Above roughly load average 80 this file's slower tests come close to the
+// 5000 ms default (measured 2026-10-28); the raise keeps a loaded machine from
+// reading as a failure. Never raise the global default to hide this.
+vi.setConfig({ testTimeout: 15000 });
+
 describe("the rename dialog", () => {
   it("lands on the engram view even when the domain opens on its Reflection", async () => {
     // The report is drawn by the engram view alone; the domain's own address
