@@ -966,6 +966,89 @@ impl DomainAccess {
         Ok(Some(readers))
     }
 
+    /// Whether a Reflection page of domain `page` may carry text drawn from
+    /// the engrams of domain `source`: whether every reader of the page may
+    /// read text drawn from `source` anyway. Text on a page reaches every
+    /// reader of the page, so a page whose domain more people read than the
+    /// source's would hand the source's knowledge to people who may not
+    /// read it.
+    ///
+    /// Who counts as a reader, on both sides, is who may read the domain's
+    /// Reflection (the private `decide_reflection` at [`ReflectionRight::Read`] or
+    /// more, before any write list, which only caps writing). That is the
+    /// right measure for the source too: a domain's own pages are text drawn
+    /// from its engrams, so its Reflection readers already may read such
+    /// text. Spelled out:
+    ///
+    /// * a shared domain is read by every anonymous caller (the
+    ///   `auth.anonymous` tier, counted whether or not it is on, so a later
+    ///   switch does not open a leak), every enabled account whose instance
+    ///   role is viewer, editor or admin, every account at instance
+    ///   knowledge `none` whose instance Reflection level is reader or
+    ///   contributor, and every account created later. It is an open set,
+    ///   so a shared page covers a shared source and never a private one;
+    /// * a private domain is read by its owner, every instance admin, every
+    ///   member at knowledge viewer or more, and every member at knowledge
+    ///   `none` whose Reflection level on it is reader or contributor. Never
+    ///   by an anonymous caller, a disabled account or an account created
+    ///   later. A page there covers a source when each of those accounts
+    ///   also reads the source: for a shared source, when none of them is an
+    ///   account at instance knowledge `none` without an instance
+    ///   Reflection level;
+    /// * the machine owner and the instance admins read everything, so they
+    ///   never make a difference.
+    ///
+    /// A page always covers its own domain. Read fresh on every call, so a
+    /// membership change counts at once.
+    pub async fn readers_cover(&self, page: &str, source: &str) -> Result<bool> {
+        if page.trim() == source.trim() {
+            return Ok(true);
+        }
+        let page_acl = self.auth.domain_visibility(page).await?;
+        let source_acl = self.auth.domain_visibility(source).await?;
+        match (&page_acl, &source_acl) {
+            (None, None) => return Ok(true),
+            (None, Some(_)) => return Ok(false),
+            (Some(_), _) => {}
+        }
+        let members = |list: Vec<crate::auth_store::DomainMember>| {
+            list.into_iter()
+                .map(|m| (m.principal, (m.level, m.reflection)))
+                .collect::<HashMap<_, _>>()
+        };
+        let page_members = members(self.auth.domain_members(page).await?);
+        let source_members = match &source_acl {
+            Some(_) => members(self.auth.domain_members(source).await?),
+            None => HashMap::new(),
+        };
+        let reads = |principal: &Principal,
+                     acl: Option<&DomainAcl>,
+                     members: &HashMap<String, (MemberLevel, ReflectionLevel)>,
+                     name: &str| {
+            let (level, reflection) = match members.get(name) {
+                Some((level, reflection)) => (Some(*level), *reflection),
+                None => (None, ReflectionLevel::Default),
+            };
+            decide_reflection(principal, acl, level, reflection, false) >= ReflectionRight::Read
+        };
+        for user in self.auth.list_users().await? {
+            if user.disabled {
+                continue;
+            }
+            let principal = Principal::Account {
+                name: user.name.clone(),
+                role: user.role,
+                reflection: user.reflection,
+            };
+            if reads(&principal, page_acl.as_ref(), &page_members, &user.name)
+                && !reads(&principal, source_acl.as_ref(), &source_members, &user.name)
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// Retire the visibility and membership records of a domain that no longer
     /// exists.
     ///
@@ -1192,6 +1275,117 @@ mod tests {
             .map(str::to_string)
             .collect();
         assert_eq!(readers, expected);
+    }
+
+    /// `lab` and `vault` private to keeper and `mem` a viewer of both; `ann`
+    /// an instance viewer who is no member yet. Instance roles from [`cast`].
+    async fn covering(auth: &AuthStore) {
+        cast(auth).await;
+        auth.add_user("ann", "ann", None, Role::Viewer, "pw12345678")
+            .await
+            .unwrap();
+        for domain in ["lab", "vault"] {
+            auth.set_domain_visibility(domain, true, "keeper")
+                .await
+                .unwrap();
+            auth.upsert_domain_member(domain, "mem", MemberLevel::Viewer, None, "keeper")
+                .await
+                .unwrap();
+        }
+    }
+
+    /// A shared page never covers a private source, however few accounts
+    /// there are: anonymous callers and every account signed up later read
+    /// a shared domain. A private page covers a shared source, and every
+    /// page covers its own domain.
+    #[tokio::test]
+    async fn a_shared_page_never_covers_a_private_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = store(&dir).await;
+        covering(&auth).await;
+        let access = DomainAccess::new(auth);
+        assert!(!access.readers_cover("shared", "lab").await.unwrap());
+        assert!(access.readers_cover("lab", "shared").await.unwrap());
+        assert!(access.readers_cover("shared", "other").await.unwrap());
+        assert!(access.readers_cover("lab", "lab").await.unwrap());
+    }
+
+    /// A private page covers a private source exactly when every account
+    /// that reads the page reads the source too: the same readers, or more
+    /// on the source, cover; one reader of the page the source lacks does
+    /// not. Instance admins and the owner read both and change nothing.
+    #[tokio::test]
+    async fn a_private_page_covers_a_source_whose_readers_include_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = store(&dir).await;
+        covering(&auth).await;
+        let access = DomainAccess::new(auth.clone());
+        assert!(access.readers_cover("lab", "vault").await.unwrap());
+        // vault gains a reader lab lacks: still covered.
+        auth.upsert_domain_member("vault", "out", MemberLevel::Viewer, None, "keeper")
+            .await
+            .unwrap();
+        assert!(access.readers_cover("lab", "vault").await.unwrap());
+        // So a page in vault no longer covers lab.
+        assert!(!access.readers_cover("vault", "lab").await.unwrap());
+        // A disabled account reads nothing, so it is nobody's reader.
+        auth.set_disabled("out", true).await.unwrap();
+        assert!(access.readers_cover("vault", "lab").await.unwrap());
+    }
+
+    /// The page's readers are its Reflection's readers: a member at
+    /// knowledge `none` with a Reflection level reads the page and is not
+    /// among the source's readers, so the page does not cover the source.
+    #[tokio::test]
+    async fn a_reflection_only_member_counts_as_a_reader_of_the_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = store(&dir).await;
+        covering(&auth).await;
+        let access = DomainAccess::new(auth.clone());
+        assert!(access.readers_cover("lab", "vault").await.unwrap());
+        auth.upsert_domain_member(
+            "lab",
+            "ann",
+            MemberLevel::None,
+            Some(ReflectionLevel::Reader),
+            "keeper",
+        )
+        .await
+        .unwrap();
+        assert!(!access.readers_cover("lab", "vault").await.unwrap());
+        // Given the same on vault, ann reads both.
+        auth.upsert_domain_member(
+            "vault",
+            "ann",
+            MemberLevel::None,
+            Some(ReflectionLevel::Reader),
+            "keeper",
+        )
+        .await
+        .unwrap();
+        assert!(access.readers_cover("lab", "vault").await.unwrap());
+    }
+
+    /// An account at instance knowledge `none` reads no shared domain unless
+    /// its instance Reflection level says so. As a member of a private page's
+    /// domain it keeps that page from covering a shared source.
+    #[tokio::test]
+    async fn an_instance_none_member_keeps_a_private_page_from_covering_a_shared_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = store(&dir).await;
+        covering(&auth).await;
+        auth.add_user("nora", "nora", None, Role::None, "pw12345678")
+            .await
+            .unwrap();
+        auth.upsert_domain_member("lab", "nora", MemberLevel::Viewer, None, "keeper")
+            .await
+            .unwrap();
+        let access = DomainAccess::new(auth.clone());
+        assert!(!access.readers_cover("lab", "shared").await.unwrap());
+        auth.set_reflection_level("nora", ReflectionLevel::Reader)
+            .await
+            .unwrap();
+        assert!(access.readers_cover("lab", "shared").await.unwrap());
     }
 
     /// A renamed domain keeps who may do what: the rights answered for the

@@ -57,6 +57,7 @@ const WHAT_LABEL: Record<string, string> = {
   source_retired: "A source was retired",
   source_missing: "A source is gone",
   source_unavailable: "Sources not checked here",
+  source_too_wide: "Cites a domain fewer people read",
   off_structure: "Outside the pact's structure",
   asset_missing: "Missing file",
   engram_attachment: "Links to an engram file",
@@ -368,6 +369,13 @@ function QueueRow({
       {item.structure.length > 0 && (
         <p className="text-caption mt-1 text-muted">
           {`This page is not in a folder the pact names (${structureFolders(item.structure).join(", ")}).`}
+        </p>
+      )}
+      {item.what === "source_too_wide" && (
+        <p className="mt-1">
+          This section cites a domain fewer people may read than this one.
+          Remove that source and the text drawn from it; the page stays as it is
+          until then.
         </p>
       )}
       {item.count !== null && item.what === "unreflected" && (

@@ -994,10 +994,13 @@ pub struct QueueQuery {
                            the previous host wrote: `only_elsewhere` is \
                            `{ previous_host, engrams, attachments, pages, \
                            files }`, counts only, `previous_host` null when \
-                           unknown) or `source_unavailable` (one per page and \
+                           unknown), `source_unavailable` (one per page and \
                            domain that cannot be checked here, `section` null, \
                            with `source_domain`, `count`, `sections` and \
-                           `note`). A source in `sources` may carry `domain`, \
+                           `note`) or `source_too_wide` (one per section that \
+                           cites a domain fewer people may read than the \
+                           page's domain, with `sources` and `note`; only \
+                           sources the caller may open count). A source in `sources` may carry `domain`, \
                            the local name of another domain than the page's. \
                            Sources in a domain the caller may not open are \
                            never named. A feedback item and an update item \

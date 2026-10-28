@@ -20,6 +20,16 @@ use crate::scope::Scope;
 /// them but that they need a person who may open their domain.
 pub(crate) const HIDDEN_SOURCE_NOTE: &str = "a source in a domain you cannot open has changed";
 
+/// What a write is refused with when it names a source in a domain fewer
+/// people may read than the page's domain ([`Engine::readers_cover`]). The
+/// writer may open that domain (the refusal for one it may not comes first
+/// and is an unknown domain's), so naming the source tells it nothing new.
+pub(crate) const TOO_WIDE_REFUSAL: &str = "this source is in a domain fewer people may read than this page's domain; cite it from a page in that domain instead";
+
+/// What a `source_too_wide` item says to a caller who may open every
+/// domain the item is about.
+pub(crate) const TOO_WIDE_NOTE: &str = "this section cites a domain fewer people may read than this page's domain, so its text reaches people who may not read that domain; remove that source and the text drawn from it. The page stays as it is until a curator does";
+
 /// What a `source_unavailable` item says to a caller who may open the
 /// domain, with how to clear it.
 pub(crate) fn unavailable_note(domain: &str) -> String {
@@ -62,6 +72,20 @@ impl SourceFacts {
         let stored = src.domain.as_deref()?;
         let shown = self.local.get(stored).map_or(stored, String::as_str);
         (shown != self.own_domain).then_some(shown)
+    }
+
+    /// The local name of `src`'s domain when it is another domain than the
+    /// page's and can be checked here: the domain whose readers
+    /// [`Engine::readers_cover`] is asked about. `None` for a source of the
+    /// page's own domain and for one whose domain cannot be checked here,
+    /// whose readers nobody here knows.
+    pub(crate) fn checked_domain(&self, src: &r::SourceRef) -> Option<&str> {
+        let stored = src.domain.as_deref()?;
+        if !matches!(self.foreign.get(stored), Some(Some(_))) {
+            return None;
+        }
+        let local = self.local.get(stored)?;
+        (*local != self.own_domain).then_some(local.as_str())
     }
 
     /// Whether `src` is in a domain that cannot be checked here.
@@ -173,13 +197,38 @@ impl Engine {
             .then(|| local.to_string())
     }
 
+    /// Whether a page of domain `page` may carry text drawn from domain
+    /// `source` (both local names): whether every reader of the page may
+    /// read text drawn from `source` anyway. The rule and who counts as a
+    /// reader are [`crate::scope::DomainAccess::readers_cover`]'s.
+    ///
+    /// It never looks at who asks: the machine owner, who reads every
+    /// domain, is held to it too, since the page's readers are the ones the
+    /// text reaches. With no resolver installed (an engine with no HTTP
+    /// surface, where every caller is the machine owner and nobody else
+    /// reads anything) every page covers every domain; the queue names a
+    /// page that does not once a resolver knows the readers.
+    pub(crate) async fn readers_cover(&self, page: &str, source: &str) -> Result<bool> {
+        let Some(access) = self.domain_access.get() else {
+            return Ok(true);
+        };
+        access
+            .readers_cover(page, source)
+            .await
+            .map_err(|e| EngineError::Internal(e.to_string()))
+    }
+
     /// The entries of a write's `sources`, each resolved: a bare permalink
     /// is the page's own, and so is an address whose domain (in any
     /// spelling) is the page's. Another domain must be one `scope` may read
     /// engrams in; one it may not see, one nobody registered here and one a
     /// connected server serves are refused with the bytes an unknown domain
     /// gets, naming the spelling the writer used, so a private domain's
-    /// existence never shows.
+    /// existence never shows. Then it must be one every reader of the page
+    /// may read ([`Engine::readers_cover`]), whoever writes: a page never
+    /// carries text drawn from a domain fewer people may read. That check
+    /// comes second, so its refusal only ever names a domain the writer may
+    /// open.
     pub(crate) async fn resolve_source_names<'a>(
         &self,
         own: &str,
@@ -219,6 +268,11 @@ impl Engine {
             let domain = if local == own {
                 None
             } else {
+                if !self.readers_cover(own, local).await? {
+                    return Err(EngineError::Invalid(format!(
+                        "'{name}': {TOO_WIDE_REFUSAL}"
+                    )));
+                }
                 Some(table.normalize(&spelled).unwrap_or(&spelled).to_string())
             };
             out.insert(name.clone(), NamedSource { domain, permalink });
