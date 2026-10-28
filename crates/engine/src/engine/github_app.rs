@@ -369,6 +369,12 @@ impl Engine {
     /// address) gets the slot's own router, whose commits the bot authors.
     /// Attribution never fails a share: when the person or the bot cannot be
     /// read, a warning is logged and the bot authors the commit.
+    ///
+    /// The author address is the account's email as the admin, the identity
+    /// provider or the forward-auth proxy supplied it. Crystalline does not
+    /// verify it, and GitHub credits the commit to whichever GitHub account
+    /// holds that address; an identity provider address marked
+    /// `email_verified: false` is never stored, so it never gets here.
     pub(super) async fn app_share_router(
         &self,
         router: Arc<AppRouter>,
@@ -386,7 +392,10 @@ impl Engine {
         };
         let contact = match access.account_contact(account).await {
             Ok(Some(contact)) => contact,
-            Ok(None) => return router,
+            Ok(None) => {
+                tracing::debug!("no account named {account}, so the GitHub App authors its share");
+                return router;
+            }
             Err(e) => {
                 tracing::warn!(
                     "the account {account} could not be read, so the GitHub App authors its share: {e}"
@@ -394,8 +403,12 @@ impl Engine {
                 return router;
             }
         };
-        // Wave 1: an account without an address of its own is not named.
+        // An account without an address of its own is not named; the bot
+        // authors it.
         let Some(email) = contact.email else {
+            tracing::debug!(
+                "the account {account} has no email address, so the GitHub App authors its share"
+            );
             return router;
         };
         let committer = match router.app().bot_identity(repo).await {

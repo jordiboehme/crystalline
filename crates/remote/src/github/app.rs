@@ -143,7 +143,12 @@ fn noreply_domain(host: Option<&str>) -> String {
     match host {
         None => "users.noreply.github.com".to_string(),
         Some(host) => {
-            let bare = host.split(':').next().unwrap_or(host);
+            // A bracketed IPv6 host ends in `]` and has no port to drop;
+            // anything else loses the part after its last `:`.
+            let bare = match host.rsplit_once(':') {
+                Some((bare, _)) if !host.ends_with(']') => bare,
+                _ => host,
+            };
             format!("users.noreply.{bare}")
         }
     }
@@ -639,6 +644,15 @@ mod tests {
             noreply_domain(Some("ghe.example.com:8443")),
             "users.noreply.ghe.example.com",
             "an email domain carries no port"
+        );
+        assert_eq!(
+            noreply_domain(Some("[2001:db8::1]")),
+            "users.noreply.[2001:db8::1]",
+            "a bracketed IPv6 host keeps its colons"
+        );
+        assert_eq!(
+            noreply_domain(Some("[2001:db8::1]:8443")),
+            "users.noreply.[2001:db8::1]"
         );
     }
 

@@ -1972,6 +1972,13 @@ pub struct OidcClaims {
     pub display: Option<String>,
     /// `email`. Presentation only: matching an address against an existing
     /// account is exactly the silent takeover this design refuses.
+    ///
+    /// An address the provider marks `email_verified: false` is not taken
+    /// (`None`), so a sign-in never stores it and a returning one keeps the
+    /// address stored before. It becomes the author address of a share
+    /// through the GitHub App, and GitHub credits a commit to whoever holds
+    /// that address. An absent `email_verified` keeps the address, because
+    /// many providers never send the claim.
     pub email: Option<String>,
     /// The account this sign-in was started to link an identity to, from
     /// `POST /auth/oidc/login`. `None` is an ordinary sign-in.
@@ -1995,7 +2002,10 @@ impl OidcClaims {
                 // one unlocalized name writes into.
                 .and_then(|localized| localized.get(None))
                 .and_then(|value| text(value.as_str())),
-            email: claims.email().and_then(|value| text(value.as_str())),
+            email: claims
+                .email()
+                .filter(|_| claims.email_verified() != Some(false))
+                .and_then(|value| text(value.as_str())),
             link_for,
         }
     }
@@ -2036,6 +2046,7 @@ impl OidcClaims {
             filled.push("name");
         }
         if self.email.is_none()
+            && info.email_verified() != Some(false)
             && let Some(value) = info.email().and_then(|value| text(value.as_str()))
         {
             self.email = Some(value);
@@ -2880,6 +2891,61 @@ mod tests {
         };
         assert!(claims.fill_missing_from_userinfo(&sparse).is_empty());
         assert!(claims.lacks_presentation_claims());
+    }
+
+    /// An address the provider itself marks unverified is never taken, from
+    /// the ID token or from userinfo: it is the commit author address of a
+    /// share through the GitHub App, and GitHub credits a commit to whoever
+    /// holds that address. A token that says nothing about verification keeps
+    /// its address, since many providers never send the claim.
+    #[test]
+    fn an_email_marked_unverified_is_dropped_and_an_unmarked_one_is_kept() {
+        let token = |verified: Option<bool>| {
+            let mut raw = serde_json::json!({
+                "iss": "https://idp.example/realm",
+                "sub": "sub-1",
+                "aud": ["crystalline"],
+                "exp": 4102444800u64,
+                "iat": 1767225600u64,
+                "email": "ada@example.test",
+            });
+            if let Some(verified) = verified {
+                raw["email_verified"] = serde_json::json!(verified);
+            }
+            let claims: CoreIdTokenClaims = serde_json::from_value(raw).unwrap();
+            OidcClaims::from_id_token(&claims, None)
+        };
+        assert_eq!(token(Some(false)).email, None, "unverified is dropped");
+        assert_eq!(
+            token(None).email.as_deref(),
+            Some("ada@example.test"),
+            "an absent email_verified keeps today's behaviour"
+        );
+        assert_eq!(token(Some(true)).email.as_deref(), Some("ada@example.test"));
+
+        let userinfo = |json: &[u8]| {
+            let info =
+                CoreUserInfoClaims::from_json::<std::convert::Infallible>(json, None).unwrap();
+            let mut claims = OidcClaims {
+                issuer: "i".to_string(),
+                subject: "sub-1".to_string(),
+                preferred_username: None,
+                display: None,
+                email: None,
+                link_for: None,
+            };
+            claims.fill_missing_from_userinfo(&info);
+            claims.email
+        };
+        assert_eq!(
+            userinfo(br#"{"sub":"sub-1","email":"ada@example.test","email_verified":false}"#),
+            None,
+            "userinfo cannot bring back an unverified address"
+        );
+        assert_eq!(
+            userinfo(br#"{"sub":"sub-1","email":"ada@example.test"}"#).as_deref(),
+            Some("ada@example.test")
+        );
     }
 
     /// Why a take missed, without asking `Pending` - which holds the PKCE
