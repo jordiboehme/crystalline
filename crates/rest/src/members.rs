@@ -461,6 +461,7 @@ pub async fn set_member(
         .upsert_domain_member(&domain, &principal, body.level, body.reflection, &actor)
         .await
         .map_err(store_error)?;
+    crate::readers_changed(&state);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -593,6 +594,7 @@ pub async fn remove_member(
             "that account is not a member of this domain",
         ));
     }
+    crate::readers_changed(&state);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -678,5 +680,6 @@ pub async fn set_owner(
         .transfer_domain(&domain, &body.owner)
         .await
         .map_err(store_error)?;
+    crate::readers_changed(&state);
     Ok(StatusCode::NO_CONTENT)
 }

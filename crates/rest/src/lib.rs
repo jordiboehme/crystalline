@@ -1208,6 +1208,18 @@ async fn wrong_method() -> ApiError {
 /// asked. The `crystalline` CLI on the server that holds the data is the
 /// recovery path - there is no flag that reopens this surface, on purpose
 /// (resolved ambiguity 7 in the plan).
+/// Who may read a domain just changed (visibility, a membership, an
+/// account's role, Reflection level or state): look, off the request, for
+/// Reflection pages that now cite a domain fewer people may read and
+/// schedule their backup, so they drop off the backup branch at once
+/// instead of at the next edit (`Engine::schedule_too_wide_backups`).
+pub(crate) fn readers_changed(state: &RestState) {
+    let engine = state.engine.clone();
+    tokio::spawn(async move {
+        engine.schedule_too_wide_backups().await;
+    });
+}
+
 pub(crate) fn refuse_read_only(state: &RestState) -> Result<(), ApiError> {
     if state.engine.read_only() {
         return Err(ApiError::forbidden(

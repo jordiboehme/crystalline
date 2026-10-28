@@ -249,6 +249,7 @@ pub async fn create(
         .await?
         .map_err(|e| store_error(e, &body.name))?;
     let user = read_back(&state, &body.name).await?;
+    crate::readers_changed(&state);
     Ok((StatusCode::CREATED, Json(UserResponse { user })))
 }
 
@@ -459,6 +460,7 @@ pub async fn update(
             .await
             .map_err(|e| store_error(e, &name))?;
     }
+    crate::readers_changed(&state);
     let user = read_back(&state, &name).await?;
     Ok(Json(UserResponse { user }))
 }

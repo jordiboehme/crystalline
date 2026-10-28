@@ -237,7 +237,20 @@ pub async fn run(domain: String, command: MembersCommand, json: bool) -> Result<
             println!("Removed '{name}' from domain '{domain}'.");
         }
     }
+    readers_changed().await;
     Ok(())
+}
+
+/// Tell a running daemon that who may read a domain changed, so it looks
+/// for Reflection pages that now cite a domain fewer people may read and
+/// backs them up off the branch at once. Never starts a daemon, and a
+/// daemon that is not there or does not know the command changes nothing:
+/// its recount every few minutes finds the same pages.
+async fn readers_changed() {
+    let _ = crystalline_service::ctl_if_running_passive(
+        serde_json::json!({ "v": 1, "cmd": "readers_changed" }),
+    )
+    .await;
 }
 
 /// `crystalline domain visibility <domain> private|default`.
@@ -336,6 +349,7 @@ pub async fn visibility(
             }
         }
     }
+    readers_changed().await;
     Ok(())
 }
 
@@ -366,6 +380,7 @@ pub async fn transfer(
              {domain} add <account>` if they should stay."
         );
     }
+    readers_changed().await;
     Ok(())
 }
 

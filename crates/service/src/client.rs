@@ -759,6 +759,10 @@ async fn build_embedded(
             .with_instance_label(name);
     }
     let engine = Arc::new(engine);
+    // Who reads which domain, known before the stack answers anything: a
+    // Reflection page this stack writes reaches every reader of its domain
+    // and the backup branch, whether or not anybody reads it over HTTP here.
+    install_domain_access(&engine).await;
     tokio::spawn(crate::engine::run_embed_worker(engine.clone(), embed_rx));
     // A rename a stopped daemon left half done is finished before the first
     // sync and before the routing cache reads a name, as the daemon does.
@@ -1089,6 +1093,9 @@ pub async fn run_tool(
     // machine's, read from disk for this one command. The opener above has
     // already finished any rename an earlier run left half done.
     let engine = Arc::new(engine);
+    // A tool run here can write a Reflection page, which reaches every
+    // reader of its domain: this command knows them as a daemon would.
+    install_domain_access(&engine).await;
     if use_daemon(db, config_path) {
         crate::route::install_sources(&engine);
     }
@@ -1628,6 +1635,50 @@ pub use crystalline_engine::machine_rename_owner;
 /// machine's default configuration does not load, say) is handed on as it
 /// is, so the engine refuses a rename and skips a name adoption rather than
 /// running either unchecked; a warning says so once here.
+/// Install the private-domain resolver on a serving stack, over this
+/// machine's accounts store, and hand the store back for the HTTP surface to
+/// share. Every serving stack calls it before it answers anything: the
+/// daemon (HTTP on or off), the embedded stdio stack and a one-shot tool
+/// run, so a stack knows its readers whether or not anybody signs in here.
+/// A store that is not there is not created: with no account there is no
+/// private domain, and the engine refuses other domains' sources should the
+/// file appear while it runs.
+///
+/// Fails closed: when the store cannot be opened, the engine is told so
+/// ([`Engine::set_domain_access_unavailable`]) and then
+/// refuses every Reflection source outside its page's domain, never lets
+/// one through.
+pub(crate) async fn install_domain_access(engine: &Engine) -> Option<Arc<crate::rest::AuthStore>> {
+    let opened = match crystalline_core::config::web_auth_db_path() {
+        // No store yet: no account and no private domain exist, so nothing
+        // is opened (or created, which would change this machine's state
+        // from a stack that only reads it). The engine watches for the file
+        // and fails closed should it appear.
+        Ok(path) if !path.exists() => {
+            engine.set_domain_access_absent(path);
+            return None;
+        }
+        Ok(path) => crate::rest::AuthStore::open(&path)
+            .await
+            .map_err(|e| format!("{e:#}")),
+        Err(e) => Err(format!("{e:#}")),
+    };
+    match opened {
+        Ok(auth) => {
+            let auth = Arc::new(auth);
+            engine.set_domain_access(Arc::new(crate::scope::DomainAccess::new(auth.clone())));
+            Some(auth)
+        }
+        Err(why) => {
+            tracing::warn!(
+                "the accounts store could not be opened ({why}); Reflection sources outside a page's own domain are refused until it opens"
+            );
+            engine.set_domain_access_unavailable(why);
+            None
+        }
+    }
+}
+
 pub(crate) fn machine_owner_for_engine() -> anyhow::Result<crystalline_engine::RenameOwner> {
     let lookup = machine_rename_owner();
     if let Err(e) = &lookup {
