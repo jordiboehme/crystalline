@@ -801,11 +801,22 @@ pub async fn pull_with(
             _ => base.as_deref(),
         };
 
-        match merge_file(merge_base, local.as_deref(), upstream) {
+        // The evolve home is the engine's line, never a person's: when the
+        // team's copy names a home and this clone holds an unshared claim of
+        // its own, the team's home wins without a conflict, so two clones
+        // that claimed at once do not both keep running evolve.
+        let settled = if rel == "MANIFEST.md" {
+            settled_manifest(merge_base, local.as_deref(), upstream)
+        } else {
+            None
+        };
+        let local_for_merge = settled.as_deref().or(local.as_deref());
+
+        match merge_file(merge_base, local_for_merge, upstream) {
             FileMerge::Apply(bytes) => {
                 write_pulled_file(&wt_path, &bytes)?;
                 applied.push(rel.clone());
-                if is_three_way_merge(merge_base, local.as_deref(), upstream) {
+                if is_three_way_merge(merge_base, local_for_merge, upstream) {
                     merged.push(rel.clone());
                 }
             }
@@ -813,7 +824,14 @@ pub async fn pull_with(
                 remove_working_file(&wt_path)?;
                 applied.push(rel.clone());
             }
-            FileMerge::Converged => {}
+            // The team's copy and the settled MANIFEST agree, and the file
+            // on disk still holds the claim the settling dropped.
+            FileMerge::Converged => {
+                if let Some(bytes) = &settled {
+                    write_pulled_file(&wt_path, bytes)?;
+                    applied.push(rel.clone());
+                }
+            }
             FileMerge::Conflict(kind) => {
                 // The local file is left untouched. Skip recording when an
                 // identical open conflict already exists (same path, same
@@ -6993,6 +7011,22 @@ fn engram_title(path: &str, content: Option<&[u8]>) -> String {
         Some(title) => format!("{title} ({path})"),
         None => path.to_string(),
     }
+}
+
+/// [`crystalline_core::settle_evolve_home_claim`] over the bytes of one
+/// MANIFEST, or `None` when any side is not text or nothing is to settle.
+fn settled_manifest(
+    base: Option<&[u8]>,
+    local: Option<&[u8]>,
+    upstream: Option<&[u8]>,
+) -> Option<Vec<u8>> {
+    let base = match base {
+        Some(bytes) => Some(std::str::from_utf8(bytes).ok()?),
+        None => None,
+    };
+    let local = std::str::from_utf8(local?).ok()?;
+    let upstream = std::str::from_utf8(upstream?).ok()?;
+    crystalline_core::settle_evolve_home_claim(base, local, upstream).map(String::into_bytes)
 }
 
 #[cfg(test)]

@@ -1086,6 +1086,45 @@ pub fn evolve_home_of_source(source: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// What a pull writes in place of the local MANIFEST when the team's copy
+/// names an evolve home and this clone holds an unshared claim of its own:
+/// the team's home wins without a conflict, since the key is the engine's
+/// and two clones that claimed at once must not both keep running evolve.
+///
+/// `None` leaves the merge as it is: when the team names no home, names the
+/// one the local text names, or the local claim is already in the base.
+/// Otherwise the local text with the team's home in the line, or the base
+/// itself when the claim (and the `generated` stamp the edit path wrote
+/// with it) is all the local text changed, so the pull takes the team's
+/// MANIFEST as it is and no claim is left behind to share.
+pub fn settle_evolve_home_claim(base: Option<&str>, local: &str, upstream: &str) -> Option<String> {
+    let declared = |text: &str| -> Option<String> {
+        let engram = parse_engram(text).ok()?;
+        Manifest::from_engram(&engram, text)
+            .declared_evolve_home()
+            .map(str::to_string)
+    };
+    let team = evolve_home_of_source(upstream)?;
+    let claim = declared(local)?;
+    if claim == team || base.and_then(declared).as_deref() == Some(claim.as_str()) {
+        return None;
+    }
+    let bare = |text: &str| {
+        let text = crate::emit::remove_frontmatter_field(text, EVOLVE_HOME_KEY);
+        crate::emit::remove_frontmatter_field(&text, "generated")
+    };
+    if let Some(base) = base
+        && crate::frontmatter::same_content(&bare(local), &bare(base))
+    {
+        return Some(base.to_string());
+    }
+    Some(crate::emit::set_frontmatter_field(
+        local,
+        EVOLVE_HOME_KEY,
+        &team,
+    ))
+}
+
 /// The [`ReflectionSwitch`] the domain rooted at `root` declares, read from
 /// its `MANIFEST.md`. [`ReflectionSwitch::Off`] whenever the MANIFEST is
 /// missing, unreadable, unparseable or silent: the shape of [`sharing_at`].

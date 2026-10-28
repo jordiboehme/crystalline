@@ -11,6 +11,7 @@ use chrono::{DateTime, FixedOffset};
 use crystalline_core::automation::Loop;
 use crystalline_core::config::{GitHubConfig, GlobalConfig, ServiceConfig};
 use crystalline_index::TursoStore;
+use crystalline_remote::provider::ProposalState;
 use crystalline_service::engine::{PolicyEdit, ShareActor};
 use crystalline_service::rest::{AuthStore, Role};
 use crystalline_service::{DomainAccess, Engine, EngineError, Scope};
@@ -49,6 +50,16 @@ async fn team_at(
 ) -> (Engine, std::path::PathBuf) {
     let commit = mock.add_commit(BTreeMap::from([("MANIFEST.md".to_string(), manifest)]));
     mock.set_branch("main", &commit);
+    clone_at(tmp, mock, public_url).await
+}
+
+/// Another clone of the team domain `brand` the forge already holds, on an
+/// instance whose `service.public_url` is `public_url`.
+async fn clone_at(
+    tmp: &tempfile::TempDir,
+    mock: Arc<MockProvider>,
+    public_url: Option<&str>,
+) -> (Engine, std::path::PathBuf) {
     let cfg = GlobalConfig {
         github: Some(GitHubConfig {
             enabled: Some(true),
@@ -478,7 +489,7 @@ async fn the_home_moves_by_removing_it_where_evolve_should_run() {
         .unwrap_err();
     assert_eq!(
         set.to_string(),
-        "`evolve_home` is filled in by the first scheduled evolve run at an instance with service.public_url; it is not set by hand. To move the home, remove it at the instance that should run evolve (unset evolve_home), then run evolve there"
+        "`evolve_home` is filled in by the first scheduled evolve run at an instance with service.public_url; it is not set by hand. To move the home, remove it at the instance that should run evolve (unset evolve_home), then run evolve there. On a domain that reviews changes the removal is a draft, and the old home holds until its proposal is merged and pulled here"
     );
     // Through configure, as an agent or a person removes it.
     eng.change_domain_settings(
@@ -517,7 +528,7 @@ async fn the_policies_view_says_how_the_home_is_filled_in() {
     assert_eq!(row["can_change"], false, "{row}");
     assert_eq!(
         row["how"],
-        "filled in by the first scheduled evolve run at an instance with service.public_url; to move the home, unset it with configure at the instance that should run evolve",
+        "filled in by the first scheduled evolve run at an instance with service.public_url; to move the home, unset it with configure at the instance that should run evolve (on a domain that reviews changes, it moves once that proposal is merged and pulled)",
         "{row}"
     );
 }
@@ -572,4 +583,200 @@ async fn on_postgres_the_home_comes_first_and_the_host_lock_decides_among_the_ho
     let s = status_of(&b.engine, "eng").await;
     assert!(s["runs_on"].is_string(), "the host lock holder: {s}");
     assert_ne!(s["runs_on"], "https://b.example", "{s}");
+}
+
+/// Another instance's address.
+const B: &str = "https://b.example";
+
+/// Two clones claim at once and A's claim merges first. B's next pull takes
+/// the team's home for the line instead of raising a conflict, drops B's
+/// own claim, and B refuses and names A. B's other unshared work still
+/// shares.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn when_two_clones_claim_at_once_the_merged_claim_wins_on_the_next_pull() {
+    let (tmp_a, tmp_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let mock = Arc::new(MockProvider::new());
+    let (a, _a_root) = team_at(&tmp_a, mock.clone(), team_manifest(""), Some(HERE)).await;
+    let (b, b_root) = clone_at(&tmp_b, mock.clone(), Some(B)).await;
+
+    for (eng, url) in [(&a, HERE), (&b, B)] {
+        let taken = take_as(eng, "brand", &Scope::Unrestricted).await;
+        assert_eq!(taken["evolve_home"], url, "{taken}");
+        eng.automation_lease_release(
+            Loop::Evolve,
+            "brand",
+            taken["token"].as_str().unwrap(),
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    }
+    write_note(&b_root, "notes/b-work.md", "a person's work at B");
+    b.sync(Some("brand")).await.unwrap();
+
+    let first = a
+        .origin_share("brand", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    // The domain shares directly, so A's claim is on the team's branch now,
+    // as a merged pull request would put it.
+    assert_eq!(first["outcome"], "committed", "{first}");
+
+    let pulled = b
+        .origin_update(Some("brand"), &Scope::Unrestricted)
+        .await
+        .unwrap();
+    let status = b
+        .origin_status(Some("brand"), false, false, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    let conflicts = &status["domains"][0]["conflicts"];
+    assert!(
+        conflicts.as_array().is_some_and(|c| c.is_empty()),
+        "no conflict: {pulled} {status}"
+    );
+    assert!(manifest_text(&b_root).contains("evolve_home: https://kb.example.com\n"));
+    assert_eq!(status_of(&b, "brand").await["runs_on"], HERE);
+    let refused = b
+        .automation_lease_take(Loop::Evolve, "brand", "k8s", &Scope::Unrestricted)
+        .await
+        .unwrap_err();
+    assert_eq!(refused.to_string(), "runs on https://kb.example.com");
+
+    let shared = b
+        .origin_share("brand", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(shared["outcome"], "committed", "{shared}");
+    assert_eq!(
+        shared["added"],
+        serde_json::json!(["notes/b-work.md"]),
+        "{shared}"
+    );
+    assert_eq!(shared["updated"], serde_json::json!([]), "{shared}");
+}
+
+/// The team closes the claim's pull request without merging it. The next
+/// run withdraws the claim (the MANIFEST goes back to the team's copy),
+/// this instance stops acting as the home and says so once, and it does
+/// not claim again on its own. Unsetting the key here claims again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_declined_claim_is_withdrawn_and_not_made_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let (eng, root) = team_at(&tmp, mock.clone(), team_manifest(""), Some(HERE)).await;
+    let before = manifest_text(&root);
+    let taken = take_as(&eng, "brand", &Scope::Unrestricted).await;
+    let token = taken["token"].as_str().unwrap();
+    let shared = eng
+        .automation_share(Loop::Evolve, "brand", token, "Claim.", &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(shared_files(&shared), vec!["MANIFEST.md"], "{shared}");
+    eng.automation_lease_release(Loop::Evolve, "brand", token, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    mock.set_proposal_state(1, ProposalState::Declined);
+    eng.origin_update(Some("brand"), &Scope::Unrestricted)
+        .await
+        .unwrap();
+
+    let withdrawn = take_as(&eng, "brand", &Scope::Unrestricted).await;
+    assert!(withdrawn.get("evolve_home").is_none(), "{withdrawn}");
+    assert_eq!(
+        withdrawn["note"],
+        "The team declined this instance's evolve_home claim for 'brand', so it is withdrawn here and this instance is not the home: every clone of it may run evolve. To claim it again, unset evolve_home here (configure) and run evolve.",
+        "{withdrawn}"
+    );
+    assert_eq!(manifest_text(&root), before, "back to the team's copy");
+    let changes = eng
+        .local_changes("brand", &ShareActor::Owner)
+        .await
+        .unwrap();
+    assert!(
+        !changes.to_string().contains("MANIFEST.md"),
+        "nothing left to share: {changes}"
+    );
+    eng.automation_lease_release(
+        Loop::Evolve,
+        "brand",
+        withdrawn["token"].as_str().unwrap(),
+        &Scope::Unrestricted,
+    )
+    .await
+    .unwrap();
+
+    let later = take_as(&eng, "brand", &Scope::Unrestricted).await;
+    assert!(later.get("evolve_home").is_none(), "no new claim: {later}");
+    assert!(
+        !later["note"].as_str().unwrap_or("").contains("declined"),
+        "said once: {later}"
+    );
+    assert_eq!(manifest_text(&root), before);
+    eng.automation_lease_release(
+        Loop::Evolve,
+        "brand",
+        later["token"].as_str().unwrap(),
+        &Scope::Unrestricted,
+    )
+    .await
+    .unwrap();
+
+    eng.change_domain_settings(
+        "brand",
+        &std::collections::BTreeMap::new(),
+        &["evolve_home".to_string()],
+        &Scope::Unrestricted,
+    )
+    .await
+    .unwrap();
+    let again = take_as(&eng, "brand", &Scope::Unrestricted).await;
+    assert_eq!(again["evolve_home"], HERE, "{again}");
+}
+
+/// Moving the home on a domain that reviews changes: the unset is a draft,
+/// so the old home holds until the proposal is merged and pulled; then the
+/// next run here claims the home.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_a_reviewing_domain_the_home_moves_once_the_unset_is_merged_and_pulled() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let manifest = team_manifest("evolve_home: https://home.example\n");
+    let (eng, root) = team_at(&tmp, mock.clone(), manifest, Some(HERE)).await;
+    eng.set_review_mode(
+        "brand",
+        Some(crystalline_core::config::ReviewMode::Overlay),
+        crystalline_service::ReviewModeConfirm::Confirmed { folds: Vec::new() },
+        &Scope::Unrestricted,
+    )
+    .await
+    .unwrap();
+    let answer = eng
+        .change_domain_settings(
+            "brand",
+            &std::collections::BTreeMap::new(),
+            &["evolve_home".to_string()],
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert_eq!(answer["draft"], true, "{answer}");
+    assert_eq!(
+        status_of(&eng, "brand").await["runs_on"],
+        THERE,
+        "the reviewed MANIFEST still names the old home"
+    );
+
+    // The team merges the proposal; the pull brings the MANIFEST without
+    // the key into the folder.
+    let unset = team_manifest("");
+    let commit = mock.add_commit(BTreeMap::from([("MANIFEST.md".to_string(), unset)]));
+    mock.set_branch("main", &commit);
+    eng.origin_update(Some("brand"), &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert!(!manifest_text(&root).contains("evolve_home"));
+    assert_eq!(status_of(&eng, "brand").await["runs_on"], Value::Null);
+    let taken = take_as(&eng, "brand", &Scope::Unrestricted).await;
+    assert_eq!(taken["evolve_home"], HERE, "{taken}");
 }
