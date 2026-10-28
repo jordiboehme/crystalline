@@ -33,7 +33,7 @@ use crystalline_remote::provider::{
 use crystalline_remote::reflections_backup::BACKUP_BRANCH;
 use crystalline_remote::state::OriginState;
 use crystalline_remote::{AppCredentials, AppLookup, AppStore, RemoteError};
-use crystalline_service::engine::{EngineError, ShareActor};
+use crystalline_service::engine::{ConfigureAction, EngineError, ShareActor};
 use crystalline_service::reflection_backup::BackupCause;
 use crystalline_service::rest::{AuthStore, Role};
 use crystalline_service::{DomainAccess, Engine, EnvOverlay, Scope};
@@ -1112,6 +1112,47 @@ async fn a_saved_app_for_another_host_is_refused_and_nothing_falls_back() {
     assert!(error.contains("github.com"), "{status}");
 }
 
+/// A clock an engine reads for its App memory, moved by the test instead of
+/// by waiting.
+#[derive(Clone)]
+struct StepClock(Arc<StdMutex<Instant>>);
+
+impl StepClock {
+    fn new() -> StepClock {
+        StepClock(Arc::new(StdMutex::new(Instant::now())))
+    }
+
+    fn advance(&self, by: Duration) {
+        *self.0.lock().unwrap() += by;
+    }
+
+    fn install(&self, eng: Engine) -> Engine {
+        let at = self.0.clone();
+        eng.with_app_clock(Arc::new(move || *at.lock().unwrap()))
+    }
+}
+
+/// A lookup that answers like a keychain that failed for the first
+/// `failures` reads (with `marker` beside the empty file) and then holds
+/// `saved`, counting every read.
+fn flaky_keychain(
+    file_dir: PathBuf,
+    failures: usize,
+    marker: Option<String>,
+    saved: Option<AppCredentials>,
+    reads: Arc<AtomicUsize>,
+) -> crystalline_service::engine::AppLookupFn {
+    Arc::new(move || {
+        let failed = reads.fetch_add(1, Ordering::SeqCst) < failures;
+        Ok(AppLookup {
+            store: AppStore::file_fallback(&file_dir),
+            credentials: if failed { None } else { saved.clone() },
+            keychain_failed: failed.then(|| "the keychain is locked".to_string()),
+            marker: if failed { marker.clone() } else { None },
+        })
+    })
+}
+
 #[tokio::test]
 async fn a_keychain_that_failed_to_answer_is_asked_again_and_not_cached_as_no_app() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1123,31 +1164,35 @@ async fn a_keychain_that_failed_to_answer_is_asked_again_and_not_cached_as_no_ap
     )
     .await;
     let host = url.trim_start_matches("http://").to_string();
-    let file_dir = tmp.path().join("tokens");
     let lookups = Arc::new(AtomicUsize::new(0));
-    let counted = lookups.clone();
+    let clock = StepClock::new();
     // The keychain holds the App but is locked for the first read: the file
-    // fallback answers with nothing. From the second read on it answers.
-    let eng = engine(
-        tmp.path(),
-        &url,
-        &[("CRYSTALLINE_GITHUB_TOKEN", INSTANCE_TOKEN)],
-    )
-    .await
-    .with_app_store_lookup(Arc::new(move || {
-        let first = counted.fetch_add(1, Ordering::SeqCst) == 0;
-        Ok(AppLookup {
-            store: AppStore::file_fallback(&file_dir),
-            credentials: (!first).then(|| saved_app(&host)),
-            keychain_failed: first.then(|| "the keychain is locked".to_string()),
-        })
-    }));
+    // fallback answers with nothing, and no marker says an App is saved
+    // there. From the second read on it answers.
+    let eng = clock.install(
+        engine(
+            tmp.path(),
+            &url,
+            &[("CRYSTALLINE_GITHUB_TOKEN", INSTANCE_TOKEN)],
+        )
+        .await
+        .with_app_store_lookup(flaky_keychain(
+            tmp.path().join("tokens"),
+            1,
+            None,
+            Some(saved_app(&host)),
+            lookups.clone(),
+        )),
+    );
     let root = tmp.path().join("kb");
     // The one call the failed read answered: it cannot be told apart from an
     // instance without an App, so it runs as one.
     connect(&eng, "acme/kb", "kb", &root).await;
     let before = forge.hits().len();
 
+    // The failure is remembered for a minute, so the keychain is asked
+    // again only once that minute is over.
+    clock.advance(Duration::from_secs(61));
     let head = mock.add_commit(files(&[
         ("MANIFEST.md", manifest("")),
         ("notes/new.md", engram("New", "new", "added upstream")),
@@ -1169,4 +1214,311 @@ async fn a_keychain_that_failed_to_answer_is_asked_again_and_not_cached_as_no_ap
             .all(|h| h.auth == bearer("ghs_test")),
         "once the keychain answered, every call went out on the installation token: {after:?}"
     );
+}
+
+#[tokio::test]
+async fn a_failed_keychain_read_is_remembered_for_a_minute() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = repo_with_manifest("");
+    let (_forge, url) =
+        spawn_forge(&[("acme/kb", mock)], &[("acme/kb", 1)], &[(1, "ghs_test")]).await;
+    let reads = Arc::new(AtomicUsize::new(0));
+    let clock = StepClock::new();
+    let eng = clock.install(
+        engine(
+            tmp.path(),
+            &url,
+            &[("CRYSTALLINE_GITHUB_TOKEN", INSTANCE_TOKEN)],
+        )
+        .await
+        .with_app_store_lookup(flaky_keychain(
+            tmp.path().join("tokens"),
+            usize::MAX,
+            None,
+            None,
+            reads.clone(),
+        )),
+    );
+    let root = tmp.path().join("kb");
+    connect(&eng, "acme/kb", "kb", &root).await;
+    for _ in 0..3 {
+        eng.origin_update(Some("kb"), &Scope::Unrestricted)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "a wedged keychain is asked once a minute, not on every operation"
+    );
+
+    let status = eng
+        .origin_status(None, false, false, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(
+        status["connection"]["app"]["keychain_unreadable"],
+        json!("the keychain is locked"),
+        "{status}"
+    );
+
+    clock.advance(Duration::from_secs(59));
+    eng.origin_update(Some("kb"), &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "still inside the minute");
+    clock.advance(Duration::from_secs(2));
+    eng.origin_update(Some("kb"), &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(reads.load(Ordering::SeqCst), 2, "asked again after it");
+}
+
+#[tokio::test]
+async fn a_failed_keychain_read_with_the_marker_refuses_and_never_uses_the_instance_token() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = repo_with_manifest("");
+    let (forge, url) =
+        spawn_forge(&[("acme/kb", mock)], &[("acme/kb", 1)], &[(1, "ghs_test")]).await;
+    let host = url.trim_start_matches("http://").to_string();
+    let reads = Arc::new(AtomicUsize::new(0));
+    let clock = StepClock::new();
+    let eng = clock.install(
+        engine(
+            tmp.path(),
+            &url,
+            &[("CRYSTALLINE_GITHUB_TOKEN", INSTANCE_TOKEN)],
+        )
+        .await
+        .with_app_store_lookup(flaky_keychain(
+            tmp.path().join("tokens"),
+            2,
+            Some(host.clone()),
+            Some(saved_app(&host)),
+            reads.clone(),
+        )),
+    );
+    let root = tmp.path().join("kb");
+
+    let err = eng
+        .origin_add(
+            "acme/kb",
+            Some("kb"),
+            None,
+            None,
+            Some(root.to_str().unwrap()),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains(
+            "the GitHub App is saved in the keychain, which could not be read; try again or unlock it"
+        ),
+        "{err}"
+    );
+    assert!(
+        forge.hits().is_empty(),
+        "nothing went out, on the instance token least of all: {:?}",
+        forge.hits()
+    );
+    let status = eng
+        .origin_status(None, false, false, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(
+        status["connection"]["app"]["keychain_unreadable"],
+        json!("the keychain is locked"),
+        "{status}"
+    );
+    assert!(
+        status["connection"]["app"]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("could not be read"),
+        "{status}"
+    );
+
+    // The next read after the minute fails too and still refuses; the one
+    // after that answers and the App is used.
+    clock.advance(Duration::from_secs(61));
+    assert!(
+        eng.origin_add(
+            "acme/kb",
+            Some("kb"),
+            None,
+            None,
+            Some(root.to_str().unwrap())
+        )
+        .await
+        .is_err()
+    );
+    clock.advance(Duration::from_secs(61));
+    connect(&eng, "acme/kb", "kb", &root).await;
+    assert_eq!(reads.load(Ordering::SeqCst), 3);
+    assert!(
+        forge
+            .hits()
+            .iter()
+            .filter(|h| h.is_repo_call())
+            .all(|h| h.auth == bearer("ghs_test")),
+        "{:?}",
+        forge.hits()
+    );
+}
+
+#[tokio::test]
+async fn a_marker_for_another_host_does_not_refuse() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = repo_with_manifest("");
+    let (forge, url) =
+        spawn_forge(&[("acme/kb", mock)], &[("acme/kb", 1)], &[(1, "ghs_test")]).await;
+    let eng = engine(
+        tmp.path(),
+        &url,
+        &[("CRYSTALLINE_GITHUB_TOKEN", INSTANCE_TOKEN)],
+    )
+    .await
+    .with_app_store_lookup(flaky_keychain(
+        tmp.path().join("tokens"),
+        usize::MAX,
+        Some("ghe.other.example".to_string()),
+        None,
+        Arc::new(AtomicUsize::new(0)),
+    ));
+    connect(&eng, "acme/kb", "kb", &tmp.path().join("kb")).await;
+    assert!(
+        repo_auths(&forge, "acme/kb")
+            .iter()
+            .all(|a| *a == bearer(INSTANCE_TOKEN))
+    );
+}
+
+#[tokio::test]
+async fn the_app_slot_follows_a_changed_api_url() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_forge, url) = spawn_forge(&[], &[], &[]).await;
+    let (_other, other_url) = spawn_forge(&[], &[], &[]).await;
+    let host = url.trim_start_matches("http://");
+    AppStore::file_fallback(&tmp.path().join("tokens"))
+        .save(&saved_app(host))
+        .unwrap();
+    let eng = engine(tmp.path(), &url, &[]).await;
+    assert!(eng.github_app().is_some());
+
+    eng.configure(&ConfigureAction::Set {
+        key: "github.api_url".to_string(),
+        value: other_url.clone(),
+    })
+    .await
+    .unwrap();
+    assert!(
+        eng.github_app().is_none(),
+        "the App saved for the old host is not kept for the new one"
+    );
+
+    eng.configure(&ConfigureAction::Set {
+        key: "github.api_url".to_string(),
+        value: url.clone(),
+    })
+    .await
+    .unwrap();
+    assert!(eng.github_app().is_some(), "and is found again for its own");
+}
+
+#[tokio::test]
+async fn an_instance_with_only_an_app_reports_connected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_forge, url) = spawn_forge(&[], &[], &[]).await;
+    let env: Vec<_> = app_env()
+        .into_iter()
+        .filter(|(k, _)| *k != "CRYSTALLINE_GITHUB_TOKEN")
+        .collect();
+    let eng = engine(tmp.path(), &url, &env).await;
+    let status = eng
+        .origin_status(None, false, false, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(status["connection"]["connected"], json!(true), "{status}");
+    let configure = eng.configure_snapshot().await.unwrap();
+    assert_eq!(configure["github"]["connected"], json!(true), "{configure}");
+}
+
+/// The App credentials `github app set` hands the engine: no slug, which
+/// the validation reads from GitHub.
+fn app_to_set() -> AppCredentials {
+    AppCredentials {
+        app_id: 7,
+        client_id: "Iv23.test".to_string(),
+        client_secret: Some("CLIENTSECRETVALUE".to_string()),
+        private_key: PEM.to_string(),
+        webhook_secret: Some("WEBHOOKSECRETVALUE".to_string()),
+        slug: None,
+        host: String::new(),
+    }
+}
+
+#[tokio::test]
+async fn set_github_app_validates_saves_and_swaps_the_app_and_remove_drops_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (forge, url) = spawn_forge(&[], &[], &[]).await;
+    let eng = engine(
+        tmp.path(),
+        &url,
+        &[("CRYSTALLINE_GITHUB_TOKEN", INSTANCE_TOKEN)],
+    )
+    .await;
+    assert!(eng.github_app().is_none(), "no App yet, and that is kept");
+
+    let status = eng.set_github_app(app_to_set()).await.unwrap();
+    assert!(status.configured);
+    assert_eq!(status.slug.as_deref(), Some(SLUG), "read from GitHub");
+    assert_eq!(status.app_id, Some(7));
+    assert!(status.client_secret_set && status.webhook_secret_set);
+    assert!(forge.hits().iter().any(|h| h.path == "/app"), "validated");
+    let saved = AppStore::file_fallback(&tmp.path().join("tokens"))
+        .load()
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.slug.as_deref(), Some(SLUG));
+    assert_eq!(saved.host, url.trim_start_matches("http://"));
+    assert!(eng.github_app().is_some(), "the slot took the new App");
+
+    eng.remove_github_app().await.unwrap();
+    assert!(eng.github_app().is_none());
+    assert_eq!(
+        AppStore::file_fallback(&tmp.path().join("tokens"))
+            .load()
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn set_github_app_refuses_an_app_github_does_not_know_by_that_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_forge, url) = spawn_forge(&[], &[], &[]).await;
+    let eng = engine(tmp.path(), &url, &[]).await;
+    let mut wrong = app_to_set();
+    wrong.app_id = 8;
+    let err = eng.set_github_app(wrong).await.unwrap_err().to_string();
+    assert!(err.contains('7') && err.contains('8'), "{err}");
+    assert_eq!(
+        AppStore::file_fallback(&tmp.path().join("tokens"))
+            .load()
+            .unwrap(),
+        None,
+        "nothing saved"
+    );
+}
+
+#[tokio::test]
+async fn set_and_remove_refuse_while_the_environment_supplies_the_app() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (forge, url) = spawn_forge(&[], &[], &[]).await;
+    let eng = engine(tmp.path(), &url, &app_env()).await;
+    let err = eng.set_github_app(app_to_set()).await.unwrap_err();
+    assert!(err.to_string().contains("CRYSTALLINE_GITHUB_APP_"), "{err}");
+    let err = eng.remove_github_app().await.unwrap_err();
+    assert!(err.to_string().contains("CRYSTALLINE_GITHUB_APP_"), "{err}");
+    assert!(forge.hits().is_empty(), "refused before asking GitHub");
 }

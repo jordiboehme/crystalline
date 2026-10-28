@@ -7103,6 +7103,9 @@ fn every_instance_write_guard_meets_the_domain_flag() {
         ("engine.rs", "connect_with_token"),
         ("engine.rs", "disconnect_github_identity"),
         ("engine.rs", "github_disconnect"),
+        // The instance's GitHub App, a credential like the connection.
+        ("engine.rs", "remove_github_app"),
+        ("engine.rs", "set_github_app"),
         ("engine.rs", "start_device_connect"),
         ("engine.rs", "start_github_identity_device_flow"),
     ];

@@ -180,6 +180,11 @@ enum Command {
         /// The source's name or its URL, as crystalline status lists it.
         target: String,
     },
+    /// Manage this instance's GitHub integration beyond the sign-in.
+    Github {
+        #[command(subcommand)]
+        command: GithubCommand,
+    },
     /// Wire a coding harness up to Crystalline in one idempotent step:
     /// register the MCP server, install the SessionStart routing hook, the
     /// Stop capture-nudge hook and the UserPromptSubmit recall hook, and
@@ -1679,6 +1684,63 @@ enum TagsCommand {
 }
 
 #[derive(Subcommand, Debug)]
+enum GithubCommand {
+    /// Show, set or remove the GitHub App this instance reads, pulls and
+    /// shares through. With an App, each repository is reached with the
+    /// App's installation token instead of one person's sign-in.
+    App {
+        #[command(subcommand)]
+        command: GithubAppCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum GithubAppCommand {
+    /// Show the App: where it comes from, its id, client id and slug, which
+    /// secrets are set (never the secrets) and the accounts it is installed
+    /// on.
+    Status {
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Save an App for this instance, for setups without a browser. The
+    /// private key and the secrets are read from files, never from the
+    /// command line. GitHub is asked first whether it accepts the key; the
+    /// App is saved in the keychain, or in a file only this user can read
+    /// when there is no working keychain. Refused while the
+    /// CRYSTALLINE_GITHUB_APP_* variables supply the App.
+    Set {
+        /// The numeric App id, from the App's settings page.
+        #[arg(long)]
+        app_id: u64,
+        /// The App's client id (Iv1... or Iv23...).
+        #[arg(long)]
+        client_id: String,
+        /// The PEM private key file GitHub gave for the App.
+        #[arg(long, value_name = "PATH")]
+        private_key_file: PathBuf,
+        /// A file holding the App's client secret.
+        #[arg(long, value_name = "PATH")]
+        client_secret_file: Option<PathBuf>,
+        /// A file holding the secret GitHub signs the App's webhooks with.
+        #[arg(long, value_name = "PATH")]
+        webhook_secret_file: Option<PathBuf>,
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Remove the saved App. Reading, pulling and sharing go back to the
+    /// instance's own GitHub sign-in. Refused while the
+    /// CRYSTALLINE_GITHUB_APP_* variables supply the App.
+    Remove {
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum ConnectCommand {
     /// Sign in to GitHub: paste a personal access token, or sign in with a
     /// short code in the browser. Works whether or not team domains are
@@ -2107,6 +2169,9 @@ fn run() -> anyhow::Result<()> {
         Some(Command::Connect { .. }) => anyhow::bail!(
             "name what to connect to: crystalline connect <url> for a Crystalline server, or crystalline connect github"
         ),
+        Some(Command::Github {
+            command: GithubCommand::App { command },
+        }) => on_runtime(move || run_github_app(command, cli.json)),
         Some(Command::Disconnect { target }) => {
             on_runtime(move || sources::disconnect_server(target, cli.json))
         }
@@ -3094,6 +3159,43 @@ async fn run_connect(command: ConnectCommand, json: bool) -> anyhow::Result<()> 
                 json,
             )
             .await
+        }
+    }
+}
+
+/// `github app status|set|remove`: in-process, like `connect github` (the
+/// App is this machine's credential, not content); a running daemon is told
+/// when the saved App changed, and answers `status` for itself.
+async fn run_github_app(command: GithubAppCommand, json: bool) -> anyhow::Result<()> {
+    let token_store_dir = cmd::test_token_store_dir();
+    match command {
+        GithubAppCommand::Status { config } => {
+            cmd::github_app_status(config.as_deref(), token_store_dir.as_deref(), json).await
+        }
+        GithubAppCommand::Set {
+            app_id,
+            client_id,
+            private_key_file,
+            client_secret_file,
+            webhook_secret_file,
+            config,
+        } => {
+            cmd::github_app_set(
+                cmd::AppFiles {
+                    app_id,
+                    client_id,
+                    private_key: private_key_file,
+                    client_secret: client_secret_file,
+                    webhook_secret: webhook_secret_file,
+                },
+                config.as_deref(),
+                token_store_dir.as_deref(),
+                json,
+            )
+            .await
+        }
+        GithubAppCommand::Remove { config } => {
+            cmd::github_app_remove(config.as_deref(), token_store_dir.as_deref(), json).await
         }
     }
 }

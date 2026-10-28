@@ -193,6 +193,26 @@ pub struct AppInfo {
     pub html_url: String,
 }
 
+/// What one `GET /app` said, for `doctor`: the App (or why not), and
+/// GitHub's own clock from the answer's `Date` header, which is there even
+/// when the signed token was refused. A refused token is most often a clock
+/// that is off, so the date is read before the answer is.
+#[derive(Debug)]
+pub struct AppProbe {
+    /// The App, or why it could not be read.
+    pub info: Result<AppInfo, RemoteError>,
+    /// GitHub's time when it answered, `None` when there was no answer or
+    /// it carried no readable `Date`.
+    pub server_date: Option<DateTime<Utc>>,
+}
+
+/// `GET /app/installations` entry.
+#[derive(Deserialize)]
+struct InstallationListEntry {
+    #[serde(default)]
+    account: Option<OwnerResponse>,
+}
+
 /// `GET /app` response.
 #[derive(Deserialize)]
 struct AppResponse {
@@ -361,6 +381,73 @@ impl GithubApp {
     /// so it also proves the private key and the client id are accepted.
     pub async fn app_info(&self) -> Result<AppInfo, RemoteError> {
         let response = self.send_as_app(Method::GET, "/app").await?;
+        self.read_app_info(response).await
+    }
+
+    /// [`GithubApp::app_info`] plus GitHub's clock from the same answer.
+    /// Never fails as a whole: a refusal lands in [`AppProbe::info`].
+    pub async fn probe(&self) -> AppProbe {
+        let jwt = match app_jwt(&self.key, &self.creds.client_id, (self.clock)()) {
+            Ok(jwt) => jwt,
+            Err(e) => {
+                return AppProbe {
+                    info: Err(e),
+                    server_date: None,
+                };
+            }
+        };
+        let response = match send(self.request(Method::GET, "/app", Some(&jwt))).await {
+            Ok(response) => response,
+            Err(e) => {
+                return AppProbe {
+                    info: Err(e),
+                    server_date: None,
+                };
+            }
+        };
+        let server_date = header(&response, "date")
+            .and_then(|date| DateTime::parse_from_rfc2822(&date).ok())
+            .map(|date| date.with_timezone(&Utc));
+        let info = if response.status() == StatusCode::UNAUTHORIZED {
+            Err(jwt_refused())
+        } else {
+            self.read_app_info(response).await
+        };
+        AppProbe { info, server_date }
+    }
+
+    /// The accounts the App is installed on, by login, from
+    /// `GET /app/installations` (every page).
+    pub async fn installations(&self) -> Result<Vec<String>, RemoteError> {
+        const PER_PAGE: usize = 100;
+        let mut accounts = Vec::new();
+        for page in 1.. {
+            let path = format!("/app/installations?per_page={PER_PAGE}&page={page}");
+            let response = self.send_as_app(Method::GET, &path).await?;
+            let response = check_response(response, None, true, &self.api_url).await?;
+            let entries: Vec<InstallationListEntry> = parse_json(response).await?;
+            let last = entries.len() < PER_PAGE;
+            accounts.extend(
+                entries
+                    .into_iter()
+                    .filter_map(|entry| entry.account.map(|owner| owner.login)),
+            );
+            if last {
+                break;
+            }
+        }
+        Ok(accounts)
+    }
+
+    /// The credentials this App was built from. In-process only: callers
+    /// read the identifying fields and whether a secret is set, and never
+    /// print a secret.
+    pub fn credentials(&self) -> &AppCredentials {
+        &self.creds
+    }
+
+    /// Reads a `GET /app` answer into an [`AppInfo`] and keeps its slug.
+    async fn read_app_info(&self, response: Response) -> Result<AppInfo, RemoteError> {
         if response.status() == StatusCode::NOT_FOUND {
             return Err(RemoteError::EndpointMissing {
                 endpoint: "GET /app".to_string(),
@@ -542,12 +629,17 @@ impl GithubApp {
         let jwt = app_jwt(&self.key, &self.creds.client_id, (self.clock)())?;
         let response = send(self.request(method, path, Some(&jwt))).await?;
         if response.status() == StatusCode::UNAUTHORIZED {
-            return Err(RemoteError::AppCredential(
-                "GitHub refused the App's signed token: the private key or the client id does not belong to this App, or this machine's clock is off".to_string(),
-            ));
+            return Err(jwt_refused());
         }
         Ok(response)
     }
+}
+
+/// GitHub refused the App's signed token.
+fn jwt_refused() -> RemoteError {
+    RemoteError::AppCredential(
+        "GitHub refused the App's signed token: the private key or the client id does not belong to this App, or this machine's clock is off".to_string(),
+    )
 }
 
 /// Sends a built request, with a transport failure (no answer at all) read

@@ -625,6 +625,20 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                 Err(e) => (envelope_err(e.to_string()), false),
             }
         }
+        // This daemon's GitHub App, as it runs it: read only, with GitHub
+        // asked for the slug and the installations. No secret is in it.
+        "github_app_status" => (
+            envelope_ok(json!(shared.engine.github_app_status().await)),
+            false,
+        ),
+        // The CLI just saved or removed the App in this machine's store, so
+        // this daemon drops the App it holds and looks for it again on the
+        // next origin operation. Nothing is sent but the notice: the
+        // credentials never travel over the socket.
+        "github_app_changed" => {
+            shared.engine.reset_github_app();
+            (envelope_ok(json!({ "reset": true })), false)
+        }
         // Pull one origin-connected domain (or every one) up to date.
         "origin_update" => {
             let domain = req.get("domain").and_then(Value::as_str);

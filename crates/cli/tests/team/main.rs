@@ -19,6 +19,7 @@ mod domain_members;
 mod domain_rename;
 mod domain_review;
 mod env_token;
+mod github_app;
 mod origin;
 #[cfg(unix)]
 mod remote_run;

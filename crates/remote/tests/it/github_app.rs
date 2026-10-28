@@ -613,3 +613,70 @@ async fn bot_identity_is_read_with_the_repositorys_installation_token() {
         "a private-mode Enterprise Server or the anonymous rate limit must not refuse it"
     );
 }
+
+// --- the checks `doctor` runs ------------------------------------------------
+
+#[tokio::test]
+async fn the_probe_reads_githubs_clock_even_when_the_jwt_is_refused() {
+    let refusing = Router::new().route(
+        "/app",
+        get(|| async {
+            (
+                StatusCode::UNAUTHORIZED,
+                [("Date", "Wed, 28 Oct 2026 12:02:00 GMT")],
+                Json(serde_json::json!({"message": "'Issued at' claim must be before now"})),
+            )
+        }),
+    );
+    let base = spawn(refusing).await;
+    let app = GithubApp::new(Some(base.clone()), creds(&host_of(&base), Some(SLUG))).unwrap();
+
+    let probe = app.probe().await;
+    assert!(
+        matches!(probe.info, Err(RemoteError::AppCredential(_))),
+        "{:?}",
+        probe.info
+    );
+    assert_eq!(probe.server_date, Some(t0() + Duration::seconds(120)));
+}
+
+#[tokio::test]
+async fn the_probe_answers_the_app_and_githubs_clock() {
+    let answering = Router::new().route(
+        "/app",
+        get(|| async {
+            (
+                StatusCode::OK,
+                [("Date", "Wed, 28 Oct 2026 12:00:00 GMT")],
+                Json(serde_json::json!({"id": 7, "slug": SLUG, "owner": {"login": "acme"}})),
+            )
+        }),
+    );
+    let base = spawn(answering).await;
+    let app = GithubApp::new(Some(base.clone()), creds(&host_of(&base), None)).unwrap();
+
+    let probe = app.probe().await;
+    assert_eq!(probe.info.unwrap().slug, SLUG);
+    assert_eq!(probe.server_date, Some(t0()));
+    assert_eq!(app.known_slug().as_deref(), Some(SLUG), "the slug is kept");
+}
+
+#[tokio::test]
+async fn installations_name_the_accounts_the_app_is_installed_on() {
+    let listing = Router::new().route(
+        "/app/installations",
+        get(|| async {
+            Json(serde_json::json!([
+                {"id": 1, "account": {"login": "acme"}},
+                {"id": 2, "account": {"login": "octo-org"}},
+            ]))
+        }),
+    );
+    let base = spawn(listing).await;
+    let app = GithubApp::new(Some(base.clone()), creds(&host_of(&base), Some(SLUG))).unwrap();
+
+    assert_eq!(
+        app.installations().await.unwrap(),
+        vec!["acme".to_string(), "octo-org".to_string()]
+    );
+}

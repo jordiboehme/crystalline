@@ -395,6 +395,39 @@ pub struct GithubDoctor {
     /// Diagnostics for every domain connected to an origin (filtered by
     /// `--domain` like every other section).
     pub origins: Vec<OriginDoctor>,
+    /// The GitHub App checks, when an App is configured (or one is saved in
+    /// a keychain that could not be read). Absent without an App.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app: Option<AppDoctor>,
+}
+
+/// What `doctor` found out about this instance's GitHub App. No secret is
+/// ever part of it.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct AppDoctor {
+    /// Where the App comes from: `environment`, `keyring` or `file`.
+    pub source: Option<String>,
+    /// Whether the credentials make a usable App: the private key parses and
+    /// the App belongs to the host `github.api_url` points at.
+    pub credentials_parse: bool,
+    /// Whether GitHub accepted the App's signed token on `GET /app`. `None`
+    /// when GitHub could not be asked.
+    pub jwt_accepted: Option<bool>,
+    /// Whether the App's installations could be listed. `None` when that was
+    /// not tried, because the token was refused or GitHub was not reached.
+    pub installations_reachable: Option<bool>,
+    /// `service.public_url` is set, so webhooks can reach this instance, but
+    /// the App has no webhook secret to verify them with.
+    pub webhook_secret_missing: bool,
+    /// GitHub's clock minus this machine's, in seconds, from the `Date` of
+    /// GitHub's answer. Above a minute either way GitHub refuses the App's
+    /// signed token.
+    pub clock_skew_secs: Option<i64>,
+    /// Why the keychain could not be read, when it holds the App and could
+    /// not be read.
+    pub keychain_unreadable: Option<String>,
+    /// What is wrong, in the words a person acts on; `None` when nothing is.
+    pub problem: Option<String>,
 }
 
 /// One connected server, as doctor checks it.
@@ -1642,6 +1675,9 @@ impl DoctorReport {
                 }
                 n += o.base_mismatches.len();
             }
+            if g.app.as_ref().is_some_and(|a| a.problem.is_some()) {
+                n += 1;
+            }
         }
         // A harness that was never installed is not a problem; an
         // unparseable settings/hooks file or MCP file for one that was is,
@@ -1925,7 +1961,7 @@ pub async fn run(
     let environment = check_environment(&loaded.overlay);
 
     let github = if cfg.github_enabled() {
-        Some(check_github(cfg, &loaded.overlay, &targets)?)
+        Some(check_github(cfg, &loaded.overlay, &targets).await?)
     } else {
         None
     };
@@ -3952,7 +3988,7 @@ fn mirror_present(cfg: &GlobalConfig, name: &str) -> Option<bool> {
 /// `CRYSTALLINE_GITHUB_TOKEN`, that store is used directly instead of probing
 /// the keychain or the token file, so a headless node's diagnostics never
 /// touch a credential store that variable makes irrelevant.
-fn check_github(
+async fn check_github(
     cfg: &GlobalConfig,
     overlay: &EnvOverlay,
     targets: &[(String, DomainEntry)],
@@ -4012,7 +4048,121 @@ fn check_github(
             .map(str::to_string),
         token_store: store.kind().to_string(),
         origins,
+        app: check_github_app(cfg, overlay).await,
     })
+}
+
+/// How far GitHub's clock may be from this machine's before `doctor` calls
+/// it a problem. The App's signed token is issued a minute in the past, so
+/// a larger gap gets it refused.
+const MAX_CLOCK_SKEW_SECS: i64 = 60;
+
+/// The GitHub App checks: the credentials make an App, GitHub accepts its
+/// signed token (`GET /app`), the installations can be listed, the clocks
+/// agree within a minute, and a webhook secret is set when
+/// `service.public_url` lets webhooks in. `None` when no App is configured.
+async fn check_github_app(cfg: &GlobalConfig, overlay: &EnvOverlay) -> Option<AppDoctor> {
+    use crystalline_remote::{AppLookup, GithubApp, RemoteError};
+
+    let api_url = cfg.github.as_ref().and_then(|g| g.api_url.clone());
+    let (credentials, source) = match overlay.github_app(api_url.as_deref()) {
+        Some(Ok(credentials)) => (credentials, "environment"),
+        Some(Err(detail)) => {
+            return Some(AppDoctor {
+                source: Some("environment".to_string()),
+                problem: Some(RemoteError::AppCredential(detail).to_string()),
+                ..AppDoctor::default()
+            });
+        }
+        None => {
+            let home = crystalline_service::engine::AppHome {
+                api_url: api_url.clone(),
+                dir: config::origins_state_dir().ok()?,
+                file_only: false,
+            };
+            match home.lookup() {
+                Ok(AppLookup {
+                    credentials: Some(credentials),
+                    store,
+                    ..
+                }) => (credentials, store.kind()),
+                Ok(AppLookup {
+                    keychain_failed: Some(reason),
+                    marker: Some(_),
+                    ..
+                }) => {
+                    return Some(AppDoctor {
+                        source: Some("keyring".to_string()),
+                        problem: Some(format!(
+                            "the GitHub App is saved in the keychain, which could not be read ({reason}); origin operations are refused until it answers, so unlock it"
+                        )),
+                        keychain_unreadable: Some(reason),
+                        ..AppDoctor::default()
+                    });
+                }
+                Ok(_) => return None,
+                Err(e) => {
+                    return Some(AppDoctor {
+                        problem: Some(format!("the saved GitHub App could not be read: {e}")),
+                        ..AppDoctor::default()
+                    });
+                }
+            }
+        }
+    };
+    let mut doctor = AppDoctor {
+        source: Some(source.to_string()),
+        webhook_secret_missing: cfg.service_public_url().is_some()
+            && credentials.webhook_secret.is_none(),
+        ..AppDoctor::default()
+    };
+    let mut problems = Vec::new();
+    match GithubApp::new(api_url, credentials) {
+        Err(e) => problems.push(e.to_string()),
+        Ok(app) => {
+            doctor.credentials_parse = true;
+            let probe = app.probe().await;
+            doctor.clock_skew_secs = probe
+                .server_date
+                .map(|date| (date - chrono::Utc::now()).num_seconds());
+            match &probe.info {
+                Ok(_) => doctor.jwt_accepted = Some(true),
+                Err(e @ RemoteError::AppCredential(_)) => {
+                    doctor.jwt_accepted = Some(false);
+                    problems.push(e.to_string());
+                }
+                Err(e) => problems.push(format!("GitHub could not be asked about the App: {e}")),
+            }
+            if let Some(skew) = doctor.clock_skew_secs
+                && skew.abs() > MAX_CLOCK_SKEW_SECS
+            {
+                let (gap, way) = if skew > 0 {
+                    (skew, "behind")
+                } else {
+                    (-skew, "ahead of")
+                };
+                problems.push(format!(
+                    "this machine's clock is {gap} seconds {way} GitHub's; GitHub refuses the App's signed token when the clocks are more than a minute apart, so set the clock right"
+                ));
+            }
+            if doctor.jwt_accepted == Some(true) {
+                match app.installations().await {
+                    Ok(_) => doctor.installations_reachable = Some(true),
+                    Err(e) => {
+                        doctor.installations_reachable = Some(false);
+                        problems.push(format!("the App's installations could not be listed: {e}"));
+                    }
+                }
+            }
+        }
+    }
+    if doctor.webhook_secret_missing {
+        problems.push(
+            "service.public_url is set but the GitHub App has no webhook secret, so its webhook deliveries cannot be verified; save one with crystalline github app set --webhook-secret-file or CRYSTALLINE_GITHUB_APP_WEBHOOK_SECRET".to_string(),
+        );
+    }
+    doctor.problem = (!problems.is_empty()).then(|| problems.join("; "));
+    Some(doctor)
 }
 
 async fn embedding_summary(store: &dyn Store, cfg: &GlobalConfig) -> Result<serde_json::Value> {
@@ -5057,6 +5207,20 @@ pub fn render_human(report: &DoctorReport) -> String {
                 "  not connected ({} token store). Run: crystalline connect github",
                 g.token_store
             );
+        }
+        if let Some(app) = &g.app {
+            let source = app.source.as_deref().unwrap_or("?");
+            match &app.problem {
+                Some(problem) => {
+                    let _ = writeln!(out, "  [problem] GitHub App ({source}): {problem}");
+                }
+                None => {
+                    let _ = writeln!(
+                        out,
+                        "  GitHub App ({source}): signed token accepted, installations reachable, clock within a minute of GitHub's"
+                    );
+                }
+            }
         }
         if g.origins.is_empty() {
             let _ = writeln!(out, "  no team domains connected to an origin");

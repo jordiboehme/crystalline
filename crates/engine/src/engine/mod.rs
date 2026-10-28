@@ -1130,7 +1130,10 @@ pub struct Engine {
     // store on the first origin operation that needs a credential (see
     // `Engine::github_app_slot`). With no App it stays `Absent` and every
     // provider is built from the instance credential exactly as before.
-    github_app: std::sync::RwLock<github_app::AppSlot>,
+    github_app: std::sync::RwLock<github_app::AppState>,
+    // The clock the App memory measures a failed keychain read against;
+    // `Instant::now` outside tests (see `Engine::with_app_clock`).
+    app_clock: github_app::AppClock,
     // Test-only: answers the App store read in place of the keychain and the
     // file, so a test can stage a keychain that fails and then recovers.
     #[cfg(any(test, feature = "testing"))]
@@ -2400,7 +2403,8 @@ impl Engine {
             moves_waiting: std::sync::atomic::AtomicUsize::new(0),
             origin_provider_override: None,
             origin_provider_override_login: None,
-            github_app: std::sync::RwLock::new(github_app::AppSlot::Unloaded),
+            github_app: std::sync::RwLock::new(github_app::AppState::new()),
+            app_clock: Arc::new(Instant::now),
             #[cfg(any(test, feature = "testing"))]
             app_store_lookup: None,
             backup_marks: Default::default(),
@@ -4301,6 +4305,15 @@ impl Engine {
     #[cfg(any(test, feature = "testing"))]
     pub fn with_app_store_lookup(mut self, lookup: github_app::AppLookupFn) -> Engine {
         self.app_store_lookup = Some(lookup);
+        self
+    }
+
+    /// Read `clock` instead of the system clock for how long a failed App
+    /// keychain read is remembered. Test-only: lets a test step past the
+    /// minute instead of waiting for it.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_app_clock(mut self, clock: github_app::AppClock) -> Engine {
+        self.app_clock = clock;
         self
     }
 
@@ -7195,6 +7208,9 @@ mod evolve;
 mod fence;
 mod github;
 mod github_app;
+#[cfg(any(test, feature = "testing"))]
+pub use github_app::AppLookupFn;
+pub use github_app::{APP_FROM_ENV, AppClock, AppHome, GithubAppStatus};
 mod kept;
 mod move_;
 mod name_report;

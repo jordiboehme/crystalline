@@ -25,6 +25,12 @@ use crate::token::{
 /// The file the file-backed store writes within its state directory.
 const APP_FILE_NAME: &str = "github-app.json";
 
+/// The marker a keychain save leaves beside the file store: it holds the
+/// App's host and no secret. A keychain that later fails to answer reads the
+/// same as one that holds no App; the marker is how the engine tells them
+/// apart, and refuses rather than fall back to the instance token.
+const MARKER_FILE_NAME: &str = "github-app.present";
+
 /// What an Environment-backed credential tells the person who tries to change
 /// it: the variables are the source of truth until they are unset.
 const ENV_READ_ONLY: &str = "the GitHub App credentials come from the CRYSTALLINE_GITHUB_APP_* environment variables and are read-only; unset them to manage saved credentials";
@@ -112,6 +118,10 @@ pub struct AppLookup {
     /// fallback answered instead. `None` after a clean keychain read and
     /// under the no-keychain test seam.
     pub keychain_failed: Option<String>,
+    /// The host the marker names, read only when the keychain failed: an
+    /// App was saved in that keychain for this host (see
+    /// [`AppStore::save_marked`]). `None` when the keychain answered.
+    pub marker: Option<String>,
 }
 
 impl AppStore {
@@ -147,6 +157,7 @@ impl AppStore {
                 store,
                 credentials,
                 keychain_failed: None,
+                marker: None,
             });
         }
         Self::lookup_bounded(host, fallback_dir, |account| {
@@ -167,11 +178,13 @@ impl AppStore {
                 store: AppStore::Keyring { account },
                 credentials: Some(from_json(&json)?),
                 keychain_failed: None,
+                marker: None,
             }),
             KeyringRead::Empty => Ok(AppLookup {
                 store: AppStore::Keyring { account },
                 credentials: None,
                 keychain_failed: None,
+                marker: None,
             }),
             KeyringRead::Failed(reason) => {
                 let store = AppStore::file_fallback(fallback_dir);
@@ -180,6 +193,7 @@ impl AppStore {
                     store,
                     credentials,
                     keychain_failed: Some(reason),
+                    marker: read_marker(fallback_dir),
                 })
             }
         }
@@ -202,6 +216,40 @@ impl AppStore {
             }
             AppStore::File { path } => write_secret_file(path, &to_json(credentials)?),
             AppStore::Env => Err(env_read_only()),
+        }
+    }
+
+    /// [`AppStore::save`], plus the marker for a keychain save: written into
+    /// `marker_dir` (the directory the file store lives in) before the
+    /// keychain item, and a save whose marker cannot be written saves
+    /// nothing. A file save writes no marker, since the file is read
+    /// whatever the keychain does.
+    pub fn save_marked(
+        &self,
+        credentials: &AppCredentials,
+        marker_dir: &Path,
+    ) -> Result<(), RemoteError> {
+        match self {
+            AppStore::Keyring { account } => {
+                save_keyring_marked(account, credentials, marker_dir, |account, json| {
+                    keyring_write(account, json, KEYRING_TIMEOUT)
+                })
+            }
+            other => other.save(credentials),
+        }
+    }
+
+    /// [`AppStore::delete`], then the marker in `marker_dir`, in that order:
+    /// a marker outliving its keychain item only refuses until the next
+    /// remove, while an item outliving its marker would be missed.
+    pub fn delete_marked(&self, marker_dir: &Path) -> Result<(), RemoteError> {
+        match self {
+            AppStore::Keyring { account } => {
+                delete_keyring_marked(account, marker_dir, |account| {
+                    keyring_delete(account, KEYRING_TIMEOUT)
+                })
+            }
+            other => other.delete(),
         }
     }
 
@@ -254,6 +302,67 @@ fn account_for(host: Option<&str>) -> String {
         None | Some("github.com") => "github-app".to_string(),
         Some(host) => format!("github-app:{host}"),
     }
+}
+
+/// The marker's path within `dir`.
+fn marker_path(dir: &Path) -> PathBuf {
+    dir.join(MARKER_FILE_NAME)
+}
+
+/// The host the marker in `dir` names, when one was written. An unreadable
+/// or empty marker still says an App was saved, so it reads as an unnamed
+/// host rather than none.
+pub fn read_marker(dir: &Path) -> Option<String> {
+    let path = marker_path(dir);
+    match std::fs::read_to_string(&path) {
+        Ok(host) => Some(host.trim().to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => path.exists().then(String::new),
+    }
+}
+
+/// Writes the marker for `host` into `dir`.
+fn write_marker(dir: &Path, host: &str) -> Result<(), RemoteError> {
+    std::fs::create_dir_all(dir)
+        .and_then(|()| std::fs::write(marker_path(dir), format!("{host}\n")))
+        .map_err(|e| RemoteError::Credential {
+            detail: format!("could not write the GitHub App marker: {e}"),
+        })
+}
+
+/// Deletes the marker in `dir`; a missing one is not an error.
+fn delete_marker(dir: &Path) -> Result<(), RemoteError> {
+    match std::fs::remove_file(marker_path(dir)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(RemoteError::Credential {
+            detail: format!("could not delete the GitHub App marker: {e}"),
+        }),
+    }
+}
+
+/// The keychain half of [`AppStore::save_marked`], with the keychain write
+/// injected so a test drives it without the real keychain.
+fn save_keyring_marked(
+    account: &str,
+    credentials: &AppCredentials,
+    marker_dir: &Path,
+    write: impl FnOnce(&str, String) -> Result<(), RemoteError>,
+) -> Result<(), RemoteError> {
+    let json = to_json(credentials)?;
+    write_marker(marker_dir, &credentials.host)?;
+    write(account, json)
+}
+
+/// The keychain half of [`AppStore::delete_marked`], with the keychain
+/// delete injected.
+fn delete_keyring_marked(
+    account: &str,
+    marker_dir: &Path,
+    delete: impl FnOnce(&str) -> Result<(), RemoteError>,
+) -> Result<(), RemoteError> {
+    delete(account)?;
+    delete_marker(marker_dir)
 }
 
 fn env_read_only() -> RemoteError {
@@ -381,6 +490,83 @@ mod tests {
         let found = AppStore::lookup(Some("ghes.example"), dir.path()).unwrap();
         assert_eq!(found.store.kind(), "file");
         assert_eq!(found.keychain_failed, None);
+    }
+
+    #[test]
+    fn a_keychain_save_writes_the_marker_before_the_item_and_a_delete_removes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = sample();
+        app.host = "ghes.example".to_string();
+        let mut written = None;
+        save_keyring_marked(
+            "github-app:ghes.example",
+            &app,
+            dir.path(),
+            |account, json| {
+                assert!(
+                    marker_path(dir.path()).exists(),
+                    "the marker is written before the keychain item"
+                );
+                written = Some((account.to_string(), json));
+                Ok(())
+            },
+        )
+        .unwrap();
+        let (account, json) = written.unwrap();
+        assert_eq!(account, "github-app:ghes.example");
+        assert_eq!(from_json(&json).unwrap(), app);
+        assert_eq!(read_marker(dir.path()).as_deref(), Some("ghes.example"));
+        let marker = std::fs::read_to_string(marker_path(dir.path())).unwrap();
+        for secret in ["CLIENTSECRETVALUE", "PRIVATEKEYBODY", "WEBHOOKSECRETVALUE"] {
+            assert!(!marker.contains(secret), "the marker holds no secret");
+        }
+
+        delete_keyring_marked("github-app:ghes.example", dir.path(), |_| Ok(())).unwrap();
+        assert_eq!(read_marker(dir.path()), None);
+    }
+
+    #[test]
+    fn a_keychain_save_whose_marker_cannot_be_written_saves_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory where the marker file would go: the write fails.
+        std::fs::create_dir_all(marker_path(dir.path())).unwrap();
+        let mut reached = false;
+        let err = save_keyring_marked("github-app", &sample(), dir.path(), |_, _| {
+            reached = true;
+            Ok(())
+        });
+        assert!(err.is_err());
+        assert!(!reached, "no keychain item without its marker");
+    }
+
+    #[test]
+    fn a_failed_keychain_read_carries_the_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let failed = |dir: &Path| {
+            AppStore::lookup_bounded(None, dir, |_| {
+                KeyringRead::Failed("the keychain is locked".to_string())
+            })
+            .unwrap()
+        };
+        assert_eq!(failed(dir.path()).marker, None, "no marker, nothing saved");
+        write_marker(dir.path(), "github.com").unwrap();
+        assert_eq!(failed(dir.path()).marker.as_deref(), Some("github.com"));
+        let empty = AppStore::lookup_bounded(None, dir.path(), |_| KeyringRead::Empty).unwrap();
+        assert_eq!(
+            empty.marker, None,
+            "a keychain that answered needs no marker"
+        );
+    }
+
+    #[test]
+    fn a_file_save_writes_no_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AppStore::file_fallback(dir.path());
+        store.save_marked(&sample(), dir.path()).unwrap();
+        assert_eq!(read_marker(dir.path()), None);
+        assert_eq!(store.load().unwrap(), Some(sample()));
+        store.delete_marked(dir.path()).unwrap();
+        assert_eq!(store.load().unwrap(), None);
     }
 
     #[test]

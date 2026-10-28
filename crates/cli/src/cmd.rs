@@ -4939,3 +4939,236 @@ mod embeddings_line_tests {
         }
     }
 }
+
+/// What `crystalline github app set` was handed: the App's ids and the files
+/// its private key and secrets are read from.
+pub(crate) struct AppFiles {
+    pub app_id: u64,
+    pub client_id: String,
+    pub private_key: PathBuf,
+    pub client_secret: Option<PathBuf>,
+    pub webhook_secret: Option<PathBuf>,
+}
+
+/// Reads one secret file, losing exactly one trailing line break the way the
+/// `_FILE` variables do. An empty file is refused, naming the flag and the
+/// path, never a value.
+fn read_secret_file(flag: &str, path: &Path) -> Result<String> {
+    let text = std::fs::read_to_string(path).map_err(|e| {
+        anyhow!(
+            "{flag} names {}, which cannot be read ({e})",
+            path.display()
+        )
+    })?;
+    let value = crystalline_core::secret_env::trim_one_line_break(&text).to_string();
+    if value.trim().is_empty() {
+        bail!("{flag} names {}, which is empty", path.display());
+    }
+    Ok(value)
+}
+
+/// Where this CLI process finds and keeps the GitHub App: the effective
+/// `github.api_url` of `loaded`, and the state directory beside the token
+/// store, or only the file under `token_store_dir` (the test seam, see
+/// [`test_token_store_dir`]).
+fn app_home(
+    loaded: &crystalline_service::LoadedConfig,
+    token_store_dir: Option<&Path>,
+) -> Result<crystalline_service::engine::AppHome> {
+    let api_url = loaded
+        .effective
+        .github
+        .as_ref()
+        .and_then(|g| g.api_url.clone());
+    Ok(match token_store_dir {
+        Some(dir) => crystalline_service::engine::AppHome {
+            api_url,
+            dir: dir.to_path_buf(),
+            file_only: true,
+        },
+        None => crystalline_service::engine::AppHome {
+            api_url,
+            dir: config::origins_state_dir()
+                .map_err(|e| anyhow!("could not resolve the state directory: {e}"))?,
+            file_only: false,
+        },
+    })
+}
+
+/// Tells a running daemon that the saved App changed, so it drops the one
+/// it holds. Only the notice travels; the credentials never do.
+async fn notify_daemon_app_changed() -> DaemonNotice {
+    match crystalline_service::client::ctl_if_running(serde_json::json!({
+        "cmd": "github_app_changed",
+    }))
+    .await
+    {
+        Ok(Some(_)) => DaemonNotice::Notified,
+        Ok(None) => DaemonNotice::NotRunning,
+        Err(e) => DaemonNotice::Refused(e.to_string()),
+    }
+}
+
+/// `crystalline github app status`: the daemon's view when one is running
+/// and no `--config` names another file, else this process's own read of
+/// the environment and the App store. GitHub is asked for the slug and the
+/// installations either way. No secret is printed.
+pub async fn github_app_status(
+    config_override: Option<&Path>,
+    token_store_dir: Option<&Path>,
+    json: bool,
+) -> Result<()> {
+    let from_daemon = match config_override {
+        Some(_) => None,
+        None => crystalline_service::client::ctl_if_running(serde_json::json!({
+            "v": 1, "cmd": "github_app_status",
+        }))
+        .await?
+        .map(serde_json::from_value::<crystalline_service::engine::GithubAppStatus>)
+        .transpose()?,
+    };
+    let status = match from_daemon {
+        Some(status) => status,
+        None => {
+            let loaded = load(config_override)?;
+            app_home(&loaded, token_store_dir)?
+                .status(&loaded.overlay)
+                .await
+        }
+    };
+    print_github_app_status(&status, json)
+}
+
+/// `crystalline github app set`: reads the secrets from their files,
+/// validates the App against GitHub and saves it (see
+/// [`crystalline_service::engine::AppHome::save`]), then tells a running
+/// daemon to drop the App it holds.
+pub async fn github_app_set(
+    files: AppFiles,
+    config_override: Option<&Path>,
+    token_store_dir: Option<&Path>,
+    json: bool,
+) -> Result<()> {
+    let loaded = load(config_override)?;
+    if loaded.effective.read_only() {
+        bail!("{}", crystalline_service::engine::EngineError::ReadOnly);
+    }
+    let api_url = loaded
+        .effective
+        .github
+        .as_ref()
+        .and_then(|g| g.api_url.clone());
+    // Before any file is read or GitHub is asked: the environment decides.
+    if loaded.overlay.github_app(api_url.as_deref()).is_some() {
+        bail!("{}", crystalline_service::engine::APP_FROM_ENV);
+    }
+    let client_id = files.client_id.trim().to_string();
+    if client_id.is_empty() {
+        bail!("--client-id is empty");
+    }
+    let credentials = crystalline_remote::AppCredentials {
+        app_id: files.app_id,
+        client_id,
+        private_key: read_secret_file("--private-key-file", &files.private_key)?,
+        client_secret: files
+            .client_secret
+            .as_deref()
+            .map(|path| read_secret_file("--client-secret-file", path))
+            .transpose()?,
+        webhook_secret: files
+            .webhook_secret
+            .as_deref()
+            .map(|path| read_secret_file("--webhook-secret-file", path))
+            .transpose()?,
+        slug: None,
+        host: String::new(),
+    };
+    let status = app_home(&loaded, token_store_dir)?
+        .save(&loaded.overlay, credentials)
+        .await?;
+    let told = notify_daemon_app_changed().await;
+    print_github_app_status(&status, json)?;
+    if !json {
+        report_daemon_notice(&told);
+    }
+    Ok(())
+}
+
+/// `crystalline github app remove`: deletes the saved App and its keychain
+/// marker, then tells a running daemon to drop the App it holds.
+pub async fn github_app_remove(
+    config_override: Option<&Path>,
+    token_store_dir: Option<&Path>,
+    json: bool,
+) -> Result<()> {
+    let loaded = load(config_override)?;
+    if loaded.effective.read_only() {
+        bail!("{}", crystalline_service::engine::EngineError::ReadOnly);
+    }
+    app_home(&loaded, token_store_dir)?.remove(&loaded.overlay)?;
+    let told = notify_daemon_app_changed().await;
+    if json {
+        let mut report = serde_json::json!({ "removed": true, "daemon": told.as_str() });
+        if let DaemonNotice::Refused(e) = &told {
+            report["daemon_error"] = serde_json::json!(e);
+        }
+        println!("{report}");
+    } else {
+        println!(
+            "Removed the GitHub App. Origin operations use this instance's GitHub sign-in again."
+        );
+        report_daemon_notice(&told);
+    }
+    Ok(())
+}
+
+/// The line a person reads when a running daemon could not be told.
+fn report_daemon_notice(told: &DaemonNotice) {
+    if let DaemonNotice::Refused(e) = told {
+        println!("A running daemon could not be told ({e}); restart it so it picks up the change.");
+    }
+}
+
+/// Prints an App status, as compact JSON or as lines a person reads.
+fn print_github_app_status(
+    status: &crystalline_service::engine::GithubAppStatus,
+    json: bool,
+) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string(status)?);
+        return Ok(());
+    }
+    if !status.configured {
+        println!("No GitHub App is configured. Run: crystalline github app set --help");
+        if let Some(error) = &status.error {
+            println!("{error}");
+        }
+        return Ok(());
+    }
+    let unknown = || "?".to_string();
+    println!(
+        "GitHub App {} (id {}, client id {}) from the {}",
+        status.slug.clone().unwrap_or_else(unknown),
+        status
+            .app_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(unknown),
+        status.client_id.clone().unwrap_or_else(unknown),
+        status.source.clone().unwrap_or_else(unknown),
+    );
+    let set = |on: bool| if on { "set" } else { "not set" };
+    println!(
+        "  client secret: {}, webhook secret: {}",
+        set(status.client_secret_set),
+        set(status.webhook_secret_set)
+    );
+    match &status.installations {
+        Some(accounts) if accounts.is_empty() => println!("  not installed on any account yet"),
+        Some(accounts) => println!("  installed on: {}", accounts.join(", ")),
+        None => {}
+    }
+    if let Some(error) = &status.error {
+        println!("  [problem] {error}");
+    }
+    Ok(())
+}

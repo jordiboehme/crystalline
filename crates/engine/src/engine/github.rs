@@ -346,7 +346,10 @@ impl Engine {
                 "note": "GitHub is switched off on this instance; set github.enabled true with configure to connect or read the connection.",
             }));
         }
-        let github = self.configure_connection_block().await?;
+        let mut github = self.configure_connection_block().await?;
+        // Read only, and from what this engine already holds: no secret, and
+        // no request to GitHub, since agents call configure often.
+        github["app"] = json!(self.github_app_local_status());
         self.configure_snapshot_with(github)
     }
 

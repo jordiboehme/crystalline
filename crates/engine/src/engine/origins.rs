@@ -3820,8 +3820,14 @@ impl Engine {
             .and_then(|g| g.api_url.clone());
         let host = origin::token_host(api_url.as_deref());
         let (store, token) = self.github_credential(host.as_deref())?;
+        // An App is a connection of its own: an instance that runs one
+        // reads, pulls and shares without an instance token. Asked only when
+        // no token is on file, so an instance without an App reads exactly
+        // what it read before.
+        let connected =
+            token.is_some() || matches!(self.github_app_slot(), github_app::AppSlot::Ready(_));
         Ok(json!({
-            "connected": token.is_some(),
+            "connected": connected,
             "user": token.as_ref().and_then(|t| t.user_display()),
             "token_store": store.kind(),
         }))
@@ -3896,6 +3902,12 @@ impl Engine {
             connection["app"] = json!({
                 "error": RemoteError::AppCredential(detail).to_string(),
             });
+        }
+        // A keychain that could not be read is said here while the failure
+        // is remembered: an App saved in it is refused, and without one the
+        // status says the keychain was not readable all the same.
+        if let Some(reason) = self.github_app_keychain_unreadable() {
+            connection["app"]["keychain_unreadable"] = json!(reason);
         }
         if mode == ShareIdentityMode::Personal {
             connection["owner_identity"] =
@@ -4088,7 +4100,7 @@ impl Engine {
     fn drop_github_credential_on_auth(&self, e: &RemoteError) {
         if matches!(e, RemoteError::AuthExpired) {
             self.github_tokens.lock().unwrap().clear();
-            if let github_app::AppSlot::Ready(router) = &*self.github_app.read().unwrap() {
+            if let Some(router) = self.github_app.read().unwrap().ready() {
                 router.app().evict_all();
             }
         }
