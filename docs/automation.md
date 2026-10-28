@@ -57,7 +57,7 @@ claude --mcp-config <config> --strict-mcp-config --setting-sources "" --tools ""
   --output-format stream-json --verbose --max-turns 60 -p "<the shipped prompt>"
 ```
 
-So the agent sees only the Crystalline MCP server, no built-in tools, no settings files and no hooks. When something is due and `claude` is on `PATH`, `crystalline reflect run --dry-run` prints the command, with placeholders for the config and the prompt. These flags were checked against Claude Code 2.1.312.
+So the agent sees only the Crystalline MCP server, no built-in tools, no settings files and no hooks. The local MCP config starts `crystalline mcp --unattended`, which marks the session as one nobody is behind: it is never asked to share Reflection text from a domain fewer people may read (see [Sharing a source on purpose](reflection.md#sharing-a-source-on-purpose)). A runner that connects to a server with a token is held the same way while its account holds the lease. When something is due and `claude` is on `PATH`, `crystalline reflect run --dry-run` prints the command, with placeholders for the config and the prompt. These flags were checked against Claude Code 2.1.312.
 
 The agent gets no Crystalline credentials in its environment: every variable that starts with `CRYSTALLINE_` and holds `TOKEN`, `SECRET` or `PASSWORD` is removed. The remote bearer is in the MCP config only, and the config with its folder is removed when the run ends, also after an error or a stop. Your Anthropic credential (`ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN`) is passed on as it is.
 
