@@ -253,6 +253,17 @@ pub fn registry() -> &'static [SettingSpec] {
             effective: oauth_client_id_effective,
         },
         SettingSpec {
+            key: "github.oauth_client_secret",
+            doc: "The client secret of a registered GitHub App; with it set, people link their own GitHub identity through a browser authorization instead of the device code. A credential, so it is only ever shown as (set) and never echoed back - prefer supplying it through CRYSTALLINE_GITHUB_OAUTH_CLIENT_SECRET, which keeps it out of the config file and out of the shell history a value typed at config set lands in",
+            kind: SettingKind::String,
+            startup_effective: false,
+            secret: true,
+            operator_only: true,
+            apply: set_oauth_client_secret,
+            clear: clear_oauth_client_secret,
+            effective: oauth_client_secret_effective,
+        },
+        SettingSpec {
             key: "service.read_only",
             doc: "Serve knowledge read-only, hiding every tool that writes (applies at the next daemon start)",
             kind: SettingKind::Bool,
@@ -1178,6 +1189,43 @@ fn oauth_client_id_effective(config: &GlobalConfig) -> (String, bool) {
         stored.unwrap_or_else(|| crystalline_remote::GITHUB_CLIENT_ID.to_string()),
         is_default,
     )
+}
+
+// --- github.oauth_client_secret -----------------------------------------------
+
+fn set_oauth_client_secret(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(SettingsError(
+            "github.oauth_client_secret must not be empty - unset it instead to turn it off"
+                .to_string(),
+        ));
+    }
+    config
+        .github
+        .get_or_insert_with(GitHubConfig::default)
+        .oauth_client_secret = Some(trimmed.to_string());
+    Ok(())
+}
+
+fn clear_oauth_client_secret(config: &mut GlobalConfig) {
+    if let Some(g) = config.github.as_mut() {
+        g.oauth_client_secret = None;
+    }
+    drop_github_if_empty(config);
+}
+
+/// Raw like every sibling: [`SettingSpec::display`] masks it because the
+/// registry entry is `secret: true`.
+fn oauth_client_secret_effective(config: &GlobalConfig) -> (String, bool) {
+    match config
+        .github
+        .as_ref()
+        .and_then(|g| g.oauth_client_secret.clone())
+    {
+        Some(v) => (v, false),
+        None => (String::new(), true),
+    }
 }
 
 // --- service.read_only ---------------------------------------------------------
@@ -2787,6 +2835,7 @@ mod tests {
                 "github.poll_secs",
                 "github.api_url",
                 "github.oauth_client_id",
+                "github.oauth_client_secret",
                 "service.read_only",
                 "service.http",
                 "service.ui",
@@ -2830,7 +2879,7 @@ mod tests {
     }
 
     /// The operator keys are the instance's network, database and sign-in:
-    /// every `auth.*`, `database.*` and `service.*` key plus the two GitHub
+    /// every `auth.*`, `database.*` and `service.*` key plus the three GitHub
     /// keys that decide which GitHub this instance talks to and as which app.
     /// No surface outside the CLI lists, reads back or sets one of these.
     #[test]
@@ -2845,6 +2894,7 @@ mod tests {
             vec![
                 "github.api_url",
                 "github.oauth_client_id",
+                "github.oauth_client_secret",
                 "service.read_only",
                 "service.http",
                 "service.ui",
@@ -2881,6 +2931,7 @@ mod tests {
                 || (spec.key.starts_with("service.") && spec.key != "service.response_format")
                 || spec.key == "github.api_url"
                 || spec.key == "github.oauth_client_id"
+                || spec.key == "github.oauth_client_secret"
                 || spec.key.starts_with("automation.");
             assert_eq!(spec.operator_only, by_rule, "{}", spec.key);
             assert_eq!(is_operator_key(spec.key), by_rule, "{}", spec.key);
@@ -2937,6 +2988,10 @@ mod tests {
                 (
                     "github.oauth_client_id",
                     "CRYSTALLINE_GITHUB_OAUTH_CLIENT_ID".to_string()
+                ),
+                (
+                    "github.oauth_client_secret",
+                    "CRYSTALLINE_GITHUB_OAUTH_CLIENT_SECRET".to_string()
                 ),
                 (
                     "service.read_only",
@@ -3057,6 +3112,7 @@ mod tests {
         assert!(change_note("github.poll_secs", &no_env).is_none());
         assert!(change_note("github.api_url", &no_env).is_none());
         assert!(change_note("github.oauth_client_id", &no_env).is_none());
+        assert!(change_note("github.oauth_client_secret", &no_env).is_none());
         assert!(change_note("service.read_only", &no_env).is_some());
         assert!(change_note("service.http", &no_env).is_some());
         assert!(change_note("service.ui", &no_env).is_some());
@@ -3539,7 +3595,7 @@ mod tests {
         apply(&mut cfg, "github.enabled", "true").unwrap();
 
         let views = snapshot(&cfg, &EnvOverlay::default());
-        assert_eq!(views.len(), 46);
+        assert_eq!(views.len(), 47);
         assert_eq!(
             views.iter().map(|v| v.key.as_str()).collect::<Vec<_>>(),
             vec![
@@ -3551,6 +3607,7 @@ mod tests {
                 "github.poll_secs",
                 "github.api_url",
                 "github.oauth_client_id",
+                "github.oauth_client_secret",
                 "service.read_only",
                 "service.http",
                 "service.ui",
@@ -3633,92 +3690,96 @@ mod tests {
         assert_eq!(oauth.value, crystalline_remote::GITHUB_CLIENT_ID);
         assert_eq!(oauth.source, SettingSource::Default);
 
-        let read_only = &views[8];
+        let oauth_secret = &views[8];
+        assert_eq!(oauth_secret.value, "");
+        assert_eq!(oauth_secret.source, SettingSource::Default);
+
+        let read_only = &views[9];
         assert_eq!(read_only.value, "false");
         assert_eq!(read_only.source, SettingSource::Default);
 
         // The endpoint is on by default, so the effective value nobody set is the
         // loopback address the daemon will actually bind.
-        let http = &views[9];
+        let http = &views[10];
         assert_eq!(http.value, "127.0.0.1:7411");
         assert_eq!(http.source, SettingSource::Default);
 
         // Both HTTP-surface toggles default to on, so an unconfigured install
         // gets the web UI and the JSON API on that endpoint.
-        let ui = &views[10];
+        let ui = &views[11];
         assert_eq!(ui.value, "true");
         assert_eq!(ui.source, SettingSource::Default);
 
-        let api = &views[11];
+        let api = &views[12];
         assert_eq!(api.value, "true");
         assert_eq!(api.source, SettingSource::Default);
 
-        let allowed_hosts = &views[12];
+        let allowed_hosts = &views[13];
         assert_eq!(allowed_hosts.value, "");
         assert_eq!(allowed_hosts.source, SettingSource::Default);
 
-        let public_url = &views[13];
+        let public_url = &views[14];
         assert_eq!(public_url.value, "");
         assert_eq!(public_url.source, SettingSource::Default);
 
-        let response_format = &views[14];
+        let response_format = &views[15];
         assert_eq!(response_format.value, "toon");
         assert_eq!(response_format.source, SettingSource::Default);
 
-        let skills_serve = &views[15];
+        let skills_serve = &views[16];
         assert_eq!(skills_serve.value, "auto");
         assert_eq!(skills_serve.source, SettingSource::Default);
 
-        let backend = &views[16];
+        let backend = &views[17];
         assert_eq!(backend.value, "turso");
         assert_eq!(backend.source, SettingSource::Default);
 
-        let url = &views[17];
+        let url = &views[18];
         assert_eq!(url.value, "");
         assert_eq!(url.source, SettingSource::Default);
 
-        let salience_weight = &views[18];
+        let salience_weight = &views[19];
         assert_eq!(salience_weight.value, "0.15");
         assert_eq!(salience_weight.source, SettingSource::Default);
 
-        let retired_weight = &views[19];
+        let retired_weight = &views[20];
         assert_eq!(retired_weight.value, "0.6");
         assert_eq!(retired_weight.source, SettingSource::Default);
 
-        let index_files = &views[20];
+        let index_files = &views[21];
         assert_eq!(index_files.value, "true");
         assert_eq!(index_files.source, SettingSource::Default);
 
-        let capture_similar = &views[21];
+        let capture_similar = &views[22];
         assert_eq!(capture_similar.value, "true");
         assert_eq!(capture_similar.source, SettingSource::Default);
 
-        let contradictions = &views[22];
+        let contradictions = &views[23];
         assert_eq!(contradictions.key, "evolve.contradictions");
         assert_eq!(contradictions.value, "off");
         assert_eq!(contradictions.source, SettingSource::Default);
 
-        let recall_enabled = &views[23];
+        let recall_enabled = &views[24];
         assert_eq!(recall_enabled.value, "true");
         assert_eq!(recall_enabled.source, SettingSource::Default);
 
-        let recall_limit = &views[24];
+        let recall_limit = &views[25];
         assert_eq!(recall_limit.value, "3");
         assert_eq!(recall_limit.source, SettingSource::Default);
 
-        let recall_min_score = &views[25];
+        let recall_min_score = &views[26];
         assert_eq!(recall_min_score.value, "0.69");
         assert_eq!(recall_min_score.source, SettingSource::Default);
 
-        let identity_actor = &views[27];
+        let identity_actor = &views[28];
         assert_eq!(identity_actor.value, "");
         assert_eq!(identity_actor.source, SettingSource::Default);
 
-        let trusted_header = &views[28];
+        let trusted_header = &views[29];
         assert_eq!(trusted_header.value, "");
         assert_eq!(trusted_header.source, SettingSource::Default);
 
-        let anonymous = &views[29];
+        let anonymous = &views[30];
         assert_eq!(anonymous.value, "false");
         assert_eq!(anonymous.source, SettingSource::Default);
     }
@@ -4654,6 +4715,7 @@ mod tests {
         assert_eq!(
             secrets.iter().map(|s| s.key).collect::<Vec<_>>(),
             vec![
+                "github.oauth_client_secret",
                 "database.url",
                 "auth.oidc.client_secret",
                 "automation.webhook.secret"
@@ -4882,6 +4944,22 @@ mod tests {
             "https://login.microsoftonline.com/9f1c-tenant/v2.0",
         )
         .unwrap();
+    }
+
+    #[test]
+    fn github_oauth_client_secret_round_trips_and_rejects_empty() {
+        let mut cfg = GlobalConfig::default();
+        apply(&mut cfg, "github.oauth_client_secret", " hunter2 ").unwrap();
+        assert_eq!(
+            cfg.github
+                .as_ref()
+                .and_then(|g| g.oauth_client_secret.as_deref()),
+            Some("hunter2")
+        );
+        let err = apply(&mut cfg, "github.oauth_client_secret", "   ").unwrap_err();
+        assert!(err.to_string().contains("unset it instead"), "{err}");
+        unset(&mut cfg, "github.oauth_client_secret").unwrap();
+        assert!(cfg.github.is_none());
     }
 
     #[test]

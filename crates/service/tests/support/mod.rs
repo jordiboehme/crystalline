@@ -111,6 +111,8 @@ pub const MOUNTED_OPERATIONS: &[&str] = &[
     "GET /api/v1/auth/oidc/login",
     "POST /api/v1/auth/oidc/login",
     "GET /api/v1/auth/oidc/callback",
+    "GET /api/v1/auth/github/connect",
+    "GET /api/v1/auth/github/callback",
     "GET /api/v1/auth/providers",
     "POST /api/v1/oauth/register",
     "GET /api/v1/oauth/authorize",

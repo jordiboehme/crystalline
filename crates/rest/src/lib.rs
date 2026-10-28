@@ -42,6 +42,7 @@ mod evolve;
 mod files;
 mod github_identity;
 mod github_settings;
+mod github_web;
 mod graph;
 mod identity_links;
 mod kept;
@@ -109,8 +110,10 @@ use crate::scope::{DomainAccess, DomainRight};
                        admin.\n\nEvery path but `/auth/login`, `/auth/logout`, \
                        `/auth/me`, `/auth/setup`, `/auth/providers`, \
                        `/oauth/register`, `/oauth/authorize`, \
-                       `/oauth/token` and the \
-                       two `/auth/oidc/*` routes is closed by default: a \
+                       `/oauth/token`, the \
+                       two `/auth/oidc/*` routes and the two \
+                       `/auth/github/*` browser routes of the GitHub link \
+                       flow is closed by default: a \
                        request that \
                        carries no identity is answered 401 ahead of routing, so \
                        an unauthenticated caller never learns which paths \
@@ -238,6 +241,8 @@ use crate::scope::{DomainAccess, DomainRight};
         github_identity::connect,
         github_identity::token,
         github_identity::disconnect,
+        github_web::connect,
+        github_web::callback,
         mcp_tokens::list,
         mcp_tokens::issue,
         mcp_tokens::rotate,
@@ -686,6 +691,14 @@ fn routes(state: RestState) -> Router {
         .route(oidc::LOGIN_PATH, get(oidc::login).post(oidc::start_link))
         .route(oidc::CALLBACK_PATH, get(oidc::callback))
         .route(oidc::PROVIDERS_PATH, get(oidc::providers))
+        // The two browser halves of the GitHub App web authorization, public
+        // by path for the same reason the sign-on routes are: a link is
+        // opened by a browser that may not have signed in yet, and the
+        // callback is authenticated by the single-use state the engine minted
+        // rather than by a session. Both decide for themselves what an
+        // unidentified request gets; see [`github_web`].
+        .route(github_web::CONNECT_PATH, get(github_web::connect))
+        .route(github_web::CALLBACK_PATH, get(github_web::callback))
         // Dynamic client registration, public by path for the reason the four
         // routes above are public: a client registers before anybody has
         // signed in anywhere, so there is no session it could carry. It is

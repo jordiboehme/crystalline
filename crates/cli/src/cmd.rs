@@ -3707,6 +3707,9 @@ pub async fn connect_github(
             .unwrap_or_else(|| "github.com".to_string()),
         user: login.clone(),
         created_at: chrono::Utc::now(),
+        refresh_token: None,
+        expires_at: None,
+        refresh_token_expires_at: None,
     };
     let store = match token_store_dir {
         Some(dir) => {

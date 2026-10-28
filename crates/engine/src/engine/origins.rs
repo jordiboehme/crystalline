@@ -1664,6 +1664,7 @@ impl Engine {
         if let (Some(who), true) = (drafting.as_deref(), stacks_allowed) {
             self.refuse_open_proposal_while_reviewing(domain, &state_dir, who)?;
         }
+        self.refresh_share_credential(&actor).await?;
         let (provider, login) = self.resolve_share_provider(&actor)?;
         let acting = self.personal_write_login(login.as_deref());
         // In review mode the share is of the actor's own drafts, which are in
@@ -1975,6 +1976,7 @@ impl Engine {
             // confirm a share this instance would then refuse.
             self.refuse_open_proposal_while_reviewing(domain, &state_dir, who)?;
         }
+        self.refresh_share_credential(&actor).await?;
         let (provider, login) = match self.resolve_share_provider(&actor) {
             Ok(resolved) => resolved,
             Err(e)
@@ -2102,6 +2104,7 @@ impl Engine {
         } else {
             Vec::new()
         };
+        self.refresh_share_credential(&actor).await?;
         let (provider, login) = self.resolve_share_provider(&actor)?;
         let acting = self.personal_write_login(login.as_deref());
         let mut report = ops::withdraw(
@@ -3403,6 +3406,41 @@ impl Engine {
         Ok((api_url, token))
     }
 
+    /// Refreshes the credential the next write would go out on, when that
+    /// credential is a personal one with an expiring GitHub App user token
+    /// about to run out (see [`Engine::refresh_personal_credential`]). Called
+    /// right before [`Engine::resolve_share_provider`], which is sync and
+    /// serves whatever the credential cache holds; this is the one await that
+    /// gets a fresh token in there first.
+    ///
+    /// Silent about everything that is not a refresh: an injected provider, an
+    /// instance-mode share, an actor with no identity to resolve. The refusals
+    /// those deserve are `resolve_share_credential`'s to raise one call later,
+    /// in its own words, and raising them here would only mean raising them
+    /// twice.
+    pub(super) async fn refresh_share_credential(&self, actor: &ShareActor) -> Result<()> {
+        if self.origin_provider_override.is_some() {
+            return Ok(());
+        }
+        let (api_url, mode, agent_identity) = {
+            let config = self.config.read().unwrap();
+            (
+                config.github.as_ref().and_then(|g| g.api_url.clone()),
+                config.github_share_identity(),
+                config.github_agent_identity().map(str::to_string),
+            )
+        };
+        if mode != ShareIdentityMode::Personal {
+            return Ok(());
+        }
+        let Ok(name) = self.acting_identity_name(actor, agent_identity) else {
+            return Ok(());
+        };
+        let host = origin::token_host(api_url.as_deref());
+        self.refresh_personal_credential(&TokenIdentity::Personal(name), host.as_deref())
+            .await
+    }
+
     /// The login a write failure is enriched in the name of: the acting login
     /// when this instance shares personally, `None` otherwise.
     ///
@@ -3724,7 +3762,7 @@ impl Engine {
     /// clearing every entry (up to one per identity per host now) avoids
     /// threading the offending host through every provider-op call site and
     /// costs only one extra keychain read per host on the next touch.
-    fn drop_github_credential_on_auth(&self, e: &RemoteError) {
+    pub(super) fn drop_github_credential_on_auth(&self, e: &RemoteError) {
         if matches!(e, RemoteError::AuthExpired) {
             self.github_tokens.lock().unwrap().clear();
         }

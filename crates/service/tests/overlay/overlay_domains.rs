@@ -7097,6 +7097,10 @@ fn every_instance_write_guard_meets_the_domain_flag() {
         ("engine.rs", "github_disconnect"),
         ("engine.rs", "start_device_connect"),
         ("engine.rs", "start_github_identity_device_flow"),
+        // The browser link flow: it stores the signed-in account's own
+        // GitHub credential, never a domain's content.
+        ("engine.rs", "start_github_web_connect"),
+        ("engine.rs", "complete_github_web_connect"),
     ];
     let mut strays: Vec<&(String, String)> = guarded
         .iter()

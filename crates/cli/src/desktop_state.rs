@@ -241,6 +241,7 @@ pub(crate) fn carry_github(real: &mut GlobalConfig, private: &GlobalConfig) -> V
         agent_identity,
         api_url,
         oauth_client_id,
+        oauth_client_secret,
     } = from;
     let had_block = real.github.is_some();
     let to = real.github.get_or_insert_with(GitHubConfig::default);
@@ -270,6 +271,12 @@ pub(crate) fn carry_github(real: &mut GlobalConfig, private: &GlobalConfig) -> V
         &mut to.oauth_client_id,
         oauth_client_id,
         "github.oauth_client_id",
+        &mut carried,
+    );
+    take(
+        &mut to.oauth_client_secret,
+        oauth_client_secret,
+        "github.oauth_client_secret",
         &mut carried,
     );
     if !had_block && carried.is_empty() {
@@ -763,6 +770,7 @@ mod tests {
                 agent_identity: Some("share-bot".to_string()),
                 api_url: Some("https://ghe.example.com/api/v3".to_string()),
                 oauth_client_id: Some("Iv1.0123456789abcdef".to_string()),
+                oauth_client_secret: Some("shh".to_string()),
             }),
             ..GlobalConfig::default()
         };
@@ -782,7 +790,8 @@ mod tests {
                 "github.share_identity",
                 "github.agent_identity",
                 "github.api_url",
-                "github.oauth_client_id"
+                "github.oauth_client_id",
+                "github.oauth_client_secret"
             ]
         );
         let github = real.github.clone().unwrap();
@@ -803,7 +812,7 @@ mod tests {
 
         let mut fresh = GlobalConfig::default();
         let all = carry_github(&mut fresh, &private);
-        assert_eq!(all.len(), 7, "every key of the block: {all:?}");
+        assert_eq!(all.len(), 8, "every key of the block: {all:?}");
         for key in &all {
             assert!(
                 crystalline_service::settings::registry()

@@ -3585,7 +3585,7 @@ impl McpServer {
     #[tool(
         name = "configure",
         title = "Configure Crystalline",
-        description = "View and adjust Crystalline's settings, like an app's preferences page: call with no arguments to see them, set to change them (for example github.enabled to turn on team collaboration) and connect to link your GitHub account with a short code you confirm in the browser. With a token it accepts a personal access token instead. Connecting works before or after enabling; only team domains need github.enabled turned on. Call it with domain to see and change how one domain behaves: its domain policies (the MANIFEST keys sharing, direct or proposal, generated_indexes, local or shared, and read_only, off or on, and domain_name, the name links from other domains use, and reflection, off or on (on makes reflections/ the domain's Reflection and is refused while engrams live there; reflection_home is filled in, never set), and reflect_trigger and evolve_trigger, off or webhook (webhook makes the instance send a signed webhook when reflect or evolve work is due, so an outside runner such as n8n starts without polling)), what each MANIFEST section does, and its rule overrides in .crystalline.yaml (a verify rule's severity, off, error, warning or info, and the token budget). With domain, set and unset change that domain, for example set { \"sharing\": \"direct\" } to allow direct commits or { \"rules.E007\": \"off\" } to turn a rule off. read_only: on refuses every write to the domain; switch it on when the user asks. Call it with domain whenever the user wants a domain to commit directly or open proposals, to share or keep its generated indexes, or to silence or raise a rule. With domain it refuses these: switching read_only off (only a person does that, in the domain policies), any other change on a read-only domain, a rule override in a domain that reviews changes (.crystalline.yaml is not an engram, so change the file in the domain), a rule override in a virtual domain (it has no .crystalline.yaml), and any call on a mounted domain (change it on the server it comes from). In a domain that reviews changes a policy change becomes your draft. The instance's network, database and sign-in are not listed here: the operator sets them with the crystalline CLI.",
+        description = "View and adjust Crystalline's settings, like an app's preferences page: call with no arguments to see them, set to change them (for example github.enabled to turn on team collaboration) and connect: \"github\" to link, connect or reconnect a GitHub account. Call it whenever someone asks to connect or sign in to GitHub, and whenever sharing, a proposal or an origin check fails because no GitHub identity is connected. On an instance that registered a GitHub App of its own, connect answers a single-use browser link in url - relay it and ask the person to open it while signed in here - and otherwise a short code to confirm at github.com/login/device. With a token it accepts a personal access token instead. Connecting works before or after enabling; only team domains need github.enabled turned on. Call it with domain to see and change how one domain behaves: its domain policies (the MANIFEST keys sharing, direct or proposal, generated_indexes, local or shared, and read_only, off or on, and domain_name, the name links from other domains use, and reflection, off or on (on makes reflections/ the domain's Reflection and is refused while engrams live there; reflection_home is filled in, never set), and reflect_trigger and evolve_trigger, off or webhook (webhook makes the instance send a signed webhook when reflect or evolve work is due, so an outside runner such as n8n starts without polling)), what each MANIFEST section does, and its rule overrides in .crystalline.yaml (a verify rule's severity, off, error, warning or info, and the token budget). With domain, set and unset change that domain, for example set { \"sharing\": \"direct\" } to allow direct commits or { \"rules.E007\": \"off\" } to turn a rule off. read_only: on refuses every write to the domain; switch it on when the user asks. Call it with domain whenever the user wants a domain to commit directly or open proposals, to share or keep its generated indexes, or to silence or raise a rule. With domain it refuses these: switching read_only off (only a person does that, in the domain policies), any other change on a read-only domain, a rule override in a domain that reviews changes (.crystalline.yaml is not an engram, so change the file in the domain), a rule override in a virtual domain (it has no .crystalline.yaml), and any call on a mounted domain (change it on the server it comes from). In a domain that reviews changes a policy change becomes your draft. The instance's network, database and sign-in are not listed here: the operator sets them with the crystalline CLI.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -3635,6 +3635,25 @@ impl McpServer {
             .any(|key| crate::settings::is_operator_key(key))
         {
             return refuse(crate::settings::OPERATOR_SETTING_REFUSAL);
+        }
+
+        // A browser link connects the CALLER's own GitHub identity rather than
+        // the one this instance acts as, exactly as `POST
+        // /me/github-identity/connect` does, so it is not an instance change
+        // and the gate above is not the rule for it. Only a session that
+        // authenticated has an account to bind a link to: a stdio session is
+        // the machine owner, and an instance that registered no GitHub App has
+        // no browser flow at all, so both fall through to the device code
+        // below unchanged.
+        if p.token.is_none()
+            && p.connect.as_deref() == Some("github")
+            && let Some(account) = mcp_account(&ctx)
+        {
+            match self.engine.start_github_web_connect(&account).await {
+                Ok(link) => return ok(web_connect_result(&account, &link)),
+                Err(EngineError::Refused(_)) => {}
+                Err(e) => return Err(to_error(e)),
+            }
         }
 
         if p.token.is_some() || p.connect.is_some() {
@@ -5690,6 +5709,27 @@ fn attachment_contents(uri: &str, bytes: Vec<u8>, mime: &str) -> ResourceContent
         }
     }
     ResourceContents::blob(BASE64.encode(bytes), uri).with_mime_type(mime)
+}
+
+/// A minted browser link as the caller reads it: the address to open, how long
+/// it stays good and the sentence to relay.
+///
+/// Shaped like the device flow's answer rather than like a sentence, so a
+/// client that already reads `pending_connect.next_steps` has the same two
+/// things to do with this - show the address, relay the guidance.
+fn web_connect_result(account: &str, link: &crate::engine::WebConnectStart) -> Value {
+    json!({
+        "connect": "github",
+        "account": account,
+        "url": link.url,
+        "expires_in_secs": link.expires_in_secs,
+        "next_steps": format!(
+            "Open {} in a browser that is signed in to Crystalline as '{account}', and approve \
+             the authorization GitHub asks for. The link works once and expires in {} seconds; \
+             call configure with connect: \"github\" again for a fresh one.",
+            link.url, link.expires_in_secs
+        ),
+    })
 }
 
 /// Wrap an engine value as a successful tool result. The compact JSON is the

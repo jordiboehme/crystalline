@@ -8215,7 +8215,7 @@ async fn configure_lists_no_operator_setting() {
         .filter(|s| s.operator_only)
         .map(|s| s.key)
         .collect();
-    assert_eq!(operator.len(), 28);
+    assert_eq!(operator.len(), 29);
 
     let out = call(peer, "configure", json!({})).await.unwrap();
     let keys: Vec<&str> = out["settings"]

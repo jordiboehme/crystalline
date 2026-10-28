@@ -557,10 +557,12 @@ impl Drop for Resume {
 fn a_hanging_renew_does_not_hold_up_a_sigterm() {
     let env = env_with_domains("hr");
     let term = env.dir.join("term");
+    // The sleep ignores TERM: the stop signals the whole process group, and a
+    // sleep that died first could end the script before its trap ran.
     env.fake_claude(
         &format!(
             r#"trap 'echo term > "{term}"; exit 143' TERM
-sleep 30 &
+(trap '' TERM; exec sleep 30) &
 wait $!"#,
             term = term.display()
         ),

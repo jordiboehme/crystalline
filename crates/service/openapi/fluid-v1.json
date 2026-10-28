@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Crystalline Fluid API",
-    "description": "The JSON API the Crystalline daemon mounts at `/api/v1` on its HTTP endpoint (127.0.0.1:7411 by default), the surface the Fluid UI talks to. Reading is open to any signed-in viewer; writing content needs an editor account and the `If-Match` token of the version being replaced, and account management needs an admin.\n\nEvery path but `/auth/login`, `/auth/logout`, `/auth/me`, `/auth/setup`, `/auth/providers`, `/oauth/register`, `/oauth/authorize`, `/oauth/token` and the two `/auth/oidc/*` routes is closed by default: a request that carries no identity is answered 401 ahead of routing, so an unauthenticated caller never learns which paths exist. Every failure is an RFC 9457 problem detail sent as `application/problem+json`.\n\nThe payloads marked as generic objects are the engine's own JSON, passed through unchanged so this API and the MCP tools stay one source of truth; each carries an example of the shape it answers with.",
+    "description": "The JSON API the Crystalline daemon mounts at `/api/v1` on its HTTP endpoint (127.0.0.1:7411 by default), the surface the Fluid UI talks to. Reading is open to any signed-in viewer; writing content needs an editor account and the `If-Match` token of the version being replaced, and account management needs an admin.\n\nEvery path but `/auth/login`, `/auth/logout`, `/auth/me`, `/auth/setup`, `/auth/providers`, `/oauth/register`, `/oauth/authorize`, `/oauth/token`, the two `/auth/oidc/*` routes and the two `/auth/github/*` browser routes of the GitHub link flow is closed by default: a request that carries no identity is answered 401 ahead of routing, so an unauthenticated caller never learns which paths exist. Every failure is an RFC 9457 problem detail sent as `application/problem+json`.\n\nThe payloads marked as generic objects are the engine's own JSON, passed through unchanged so this API and the MCP tools stay one source of truth; each carries an example of the shape it answers with.",
     "license": {
       "name": "MPL-2.0"
     },
@@ -105,6 +105,138 @@
                   "$ref": "#/components/schemas/ProblemDetail"
                 }
               }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/github/callback": {
+      "get": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Finish a GitHub authorization and store the credential.",
+        "description": "The address registered with the GitHub App, below `service.public_url`. Exchanges the code for the account named by the single-use state, validates the token against GitHub and stores it as that account's own credential; the token is never echoed and never leaves the server. Answers a small self-contained HTML page saying whether the connection stands, with `no-store` and `no-referrer` so the code in this url travels nowhere.",
+        "operationId": "github_web_callback",
+        "parameters": [
+          {
+            "name": "state",
+            "in": "query",
+            "description": "The state this instance minted when it sent the browser to GitHub.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "code",
+            "in": "query",
+            "description": "The authorization code to exchange, on the way back from an approval.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "error",
+            "in": "query",
+            "description": "GitHub's own error code when the person declined, or when the app is\nnot in a state that can be authorized.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "error_description",
+            "in": "query",
+            "description": "GitHub's sentence about that error.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Connected. The page names the GitHub login.",
+            "content": {
+              "text/html": {}
+            }
+          },
+          "400": {
+            "description": "The person declined at GitHub, or the callback carries neither a code nor an error.",
+            "content": {
+              "text/html": {}
+            }
+          },
+          "403": {
+            "description": "This instance is read-only, so no credential could be stored.",
+            "content": {
+              "text/html": {}
+            }
+          },
+          "422": {
+            "description": "The authorization is spent or expired, or GitHub refused the exchange.",
+            "content": {
+              "text/html": {}
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/github/connect": {
+      "get": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Spend a GitHub connection link and redirect to GitHub.",
+        "description": "Where a link minted by `POST /me/github-identity/connect` (or by the `configure` MCP tool) lands. Needs a browser session as the same account the link was minted for: a request with none is sent to sign in and back here, and one signed in as another account is refused 403, which is what stops a link forwarded to somebody else from connecting their GitHub account to the sender's. The nonce is spent whatever the outcome. Answers HTML, never a problem detail: a person reads this, not a script.",
+        "operationId": "github_web_connect",
+        "parameters": [
+          {
+            "name": "n",
+            "in": "query",
+            "description": "The single-use nonce the link was minted with.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "302": {
+            "description": "Follow `location`: GitHub's authorization endpoint when the link was good, this instance's sign-in when the browser carried no session.",
+            "headers": {
+              "location": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Where the browser goes next."
+              }
+            }
+          },
+          "400": {
+            "description": "The link carries no nonce.",
+            "content": {
+              "text/html": {}
+            }
+          },
+          "401": {
+            "description": "No session, and no single sign-on to send the browser to: sign in and open the link again.",
+            "content": {
+              "text/html": {}
+            }
+          },
+          "403": {
+            "description": "The session names another account than the link was minted for.",
+            "content": {
+              "text/html": {}
+            }
+          },
+          "422": {
+            "description": "The link is spent or expired, or this instance is not set up for the browser flow.",
+            "content": {
+              "text/html": {}
             }
           }
         }
@@ -9022,8 +9154,8 @@
         "tags": [
           "settings"
         ],
-        "summary": "Start a device-code sign-in for the caller's own identity.",
-        "description": "Editors and admins only, and refused on a read-only instance. Answers 202 with the short code to confirm in a browser; the flow runs in the background and its outcome is read from `GET /me/github-identity`. A second call from the same account reports that same flow, unless `restart=true` is given, which abandons it and issues a fresh code; one made while another identity's sign-in is in flight is refused 409 either way. Unlike the instance connect, this does not turn `github.enabled` on: enabling collaboration is an admin's instance-wide decision.",
+        "summary": "Start a sign-in for the caller's own GitHub identity.",
+        "description": "Editors and admins only, and refused on a read-only instance. On an instance that registered a GitHub App of its own (`github.oauth_client_id`, `github.oauth_client_secret` and `service.public_url`) this answers 202 with `authorize_url`: a single-use link, good for five minutes, to be opened in a browser signed in as this same account. Everywhere else it answers 202 with the short device code to confirm in a browser; the flow runs in the background and its outcome is read from `GET /me/github-identity`. A second call from the same account reports that same flow, unless `restart=true` is given, which abandons it and issues a fresh code; one made while another identity's sign-in is in flight is refused 409 either way. Unlike the instance connect, this does not turn `github.enabled` on: enabling collaboration is an admin's instance-wide decision.",
         "operationId": "connect_my_github_identity_device",
         "parameters": [
           {
@@ -9038,7 +9170,7 @@
         ],
         "responses": {
           "202": {
-            "description": "The flow started (or this account's was already running): `pending` carries the code to confirm. Poll `GET /me/github-identity` for the outcome.",
+            "description": "The flow started: `authorize_url` carries the link to open on an instance with a GitHub App of its own, and otherwise `pending` carries the code to confirm (or this account's already running flow's). Poll `GET /me/github-identity` for the outcome.",
             "content": {
               "application/json": {
                 "schema": {
@@ -12136,6 +12268,24 @@
             "type": "string",
             "description": "The account this identity belongs to: always the caller's own.",
             "example": "ada"
+          },
+          "authorize_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Where to send a browser to connect this account's identity, when this\ninstance registered a GitHub App of its own and the connect route\nanswered with a link instead of a device code. Null everywhere else,\nincluding on every read: a link is minted by the connect, never by a\nstatus.",
+            "example": "https://kb.example/api/v1/auth/github/connect?n=..."
+          },
+          "authorize_url_expires_in_secs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "How long that link stays usable, in seconds.",
+            "example": 300,
+            "minimum": 0
           },
           "connected": {
             "type": "boolean",

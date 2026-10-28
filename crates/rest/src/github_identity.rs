@@ -58,6 +58,16 @@ pub struct GithubIdentityResponse {
     /// This account's device flow's failure (expired, denied), reported on
     /// exactly one status read after the flow ends, then cleared.
     pub error: Option<String>,
+    /// Where to send a browser to connect this account's identity, when this
+    /// instance registered a GitHub App of its own and the connect route
+    /// answered with a link instead of a device code. Null everywhere else,
+    /// including on every read: a link is minted by the connect, never by a
+    /// status.
+    #[schema(example = "https://kb.example/api/v1/auth/github/connect?n=...")]
+    pub authorize_url: Option<String>,
+    /// How long that link stays usable, in seconds.
+    #[schema(example = 300)]
+    pub authorize_url_expires_in_secs: Option<u64>,
 }
 
 fn view(c: crate::engine::GithubIdentity) -> GithubIdentityResponse {
@@ -73,6 +83,8 @@ fn view(c: crate::engine::GithubIdentity) -> GithubIdentityResponse {
             expires_in_secs: p.expires_in_secs,
         }),
         error: c.error,
+        authorize_url: None,
+        authorize_url_expires_in_secs: None,
     }
 }
 
@@ -186,15 +198,28 @@ pub async fn status(
 /// started in a terminal and never seen, or left to go stale: it abandons
 /// this account's pending flow and issues a fresh code. It abandons only this
 /// account's own; another identity's is still 409.
+///
+/// On an instance that registered a GitHub App of its own this answers a link
+/// instead: `authorize_url`, to be opened in a browser signed in as this same
+/// account, which is a better connection than a device code because the
+/// credential it stores can be refreshed rather than only replaced. Everything
+/// else about the answer is unchanged, and an instance with no app registered
+/// still gets the device code and nothing else. See [`super::github_web`].
 #[utoipa::path(
     post,
     path = "/api/v1/me/github-identity/connect",
     tag = "settings",
     operation_id = "connect_my_github_identity_device",
-    summary = "Start a device-code sign-in for the caller's own identity.",
+    summary = "Start a sign-in for the caller's own GitHub identity.",
     description = "Editors and admins only, and refused on a read-only \
-                   instance. Answers 202 with the short code to confirm in a \
-                   browser; the flow runs in the background and its outcome is \
+                   instance. On an instance that registered a GitHub App of \
+                   its own (`github.oauth_client_id`, \
+                   `github.oauth_client_secret` and `service.public_url`) this \
+                   answers 202 with `authorize_url`: a single-use link, good \
+                   for five minutes, to be opened in a browser signed in as \
+                   this same account. Everywhere else it answers 202 with the \
+                   short device code to confirm in a browser; the flow runs in \
+                   the background and its outcome is \
                    read from `GET /me/github-identity`. A second call from the \
                    same account reports that same flow, unless `restart=true` \
                    is given, which abandons it and issues a fresh code; one \
@@ -206,8 +231,10 @@ pub async fn status(
     responses(
         (
             status = 202,
-            description = "The flow started (or this account's was already \
-                           running): `pending` carries the code to confirm. \
+            description = "The flow started: `authorize_url` carries the link \
+                           to open on an instance with a GitHub App of its \
+                           own, and otherwise `pending` carries the code to \
+                           confirm (or this account's already running flow's). \
                            Poll `GET /me/github-identity` for the outcome.",
             body = GithubIdentityResponse,
         ),
@@ -250,6 +277,18 @@ pub async fn connect(
 ) -> Result<Response, ApiError> {
     let caller = require_own_identity(&identity)?;
     refuse_read_only(&state)?;
+    match state.engine.start_github_web_connect(caller.name()).await {
+        Ok(link) => {
+            let mut body = view(state.engine.github_identity_status(caller.name()).await?);
+            body.authorize_url = Some(link.url);
+            body.authorize_url_expires_in_secs = Some(link.expires_in_secs);
+            return Ok((StatusCode::ACCEPTED, Json(body)).into_response());
+        }
+        // No GitHub App registered here, so there is no browser flow to offer:
+        // the device code, exactly as before.
+        Err(crate::engine::EngineError::Refused(_)) => {}
+        Err(e) => return Err(e.into()),
+    }
     let started = state
         .engine
         .start_github_identity_device_flow(caller.name(), query.restart)

@@ -772,7 +772,7 @@ impl DatabaseConfig {
 /// The `github` block: whether team collaboration through GitHub is turned
 /// on and its provider settings. Reads like a settings-page section - see the
 /// `configure` tool, which exposes exactly these keys.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct GitHubConfig {
     /// Turns GitHub collaboration on or off. Absent means off: no
     /// collaboration tools are shown and the origin poller never runs.
@@ -807,6 +807,13 @@ pub struct GitHubConfig {
     /// Needed only for a GitHub Enterprise Server deployment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth_client_id: Option<String>,
+    /// The client secret of a registered GitHub App, which turns on the web
+    /// authorization-code link flow beside the device flow. A credential: it
+    /// is stored here but never rendered back, and
+    /// `CRYSTALLINE_GITHUB_OAUTH_CLIENT_SECRET` supplies it instead where a
+    /// deployment keeps secrets out of the config file entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_client_secret: Option<String>,
 }
 
 /// How shares are credentialed: one instance token, or each person's own.
@@ -1176,6 +1183,26 @@ impl std::fmt::Debug for OidcConfig {
             .field("scopes", &self.scopes)
             .field("default_role", &self.default_role)
             .field("redirect_uri", &self.redirect_uri)
+            .finish()
+    }
+}
+
+/// Hand-written for the same reason as [`OidcConfig`]'s: the client secret is
+/// masked unconditionally, every other field renders as-is.
+impl std::fmt::Debug for GitHubConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GitHubConfig")
+            .field("enabled", &self.enabled)
+            .field("poll_secs", &self.poll_secs)
+            .field("stacks", &self.stacks)
+            .field("share_identity", &self.share_identity)
+            .field("agent_identity", &self.agent_identity)
+            .field("api_url", &self.api_url)
+            .field("oauth_client_id", &self.oauth_client_id)
+            .field(
+                "oauth_client_secret",
+                &self.oauth_client_secret.as_ref().map(|_| SECRET_DISPLAY),
+            )
             .finish()
     }
 }
@@ -1858,6 +1885,27 @@ mod tests {
 
         let unset = format!("{:?}", OidcConfig::default());
         assert!(unset.contains("client_secret: None"), "{unset}");
+    }
+
+    #[test]
+    fn the_github_debug_render_masks_the_oauth_client_secret_and_nothing_else() {
+        let cfg = GlobalConfig {
+            github: Some(GitHubConfig {
+                enabled: Some(true),
+                oauth_client_id: Some("Iv1.abcd".into()),
+                oauth_client_secret: Some("hunter2".into()),
+                ..GitHubConfig::default()
+            }),
+            ..GlobalConfig::default()
+        };
+
+        let rendered = format!("{cfg:?}");
+        assert!(!rendered.contains("hunter2"), "{rendered}");
+        assert!(rendered.contains(SECRET_DISPLAY), "{rendered}");
+        assert!(rendered.contains("Iv1.abcd"), "{rendered}");
+
+        let unset = format!("{:?}", GitHubConfig::default());
+        assert!(unset.contains("oauth_client_secret: None"), "{unset}");
     }
 
     /// The other credential a config carries in a field that is not called

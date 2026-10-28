@@ -5587,13 +5587,16 @@ async fn no_rest_response_carries_an_operator_setting() {
     // saying so; every other read must answer 2xx, so an error body cannot
     // stand in for the route's real answer.
     const REFUSED: &[&str] = &["/api/v1/sync", "/api/v1/github/domain-name?repo=acme/kb"];
-    // A stream, two redirects into the identity provider and the OAuth
-    // consent redirect: none of them answers with a JSON body to read.
+    // A stream, two redirects into the identity provider, the OAuth consent
+    // redirect and the GitHub link flow's redirect and result page: none of
+    // them answers with a JSON body to read.
     const SKIPPED: &[&str] = &[
         "GET /api/v1/events",
         "GET /api/v1/auth/oidc/login",
         "GET /api/v1/auth/oidc/callback",
         "GET /api/v1/oauth/authorize",
+        "GET /api/v1/auth/github/connect",
+        "GET /api/v1/auth/github/callback",
     ];
     for op in crate::support::MOUNTED_OPERATIONS
         .iter()

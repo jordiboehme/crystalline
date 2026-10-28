@@ -116,9 +116,29 @@ pub struct StoredToken {
     pub user: String,
     /// When this token was saved.
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// The rotating refresh token of an expiring GitHub App user token.
+    /// Absent for a token that never expires.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
+    /// When `access_token` stops working. Absent means it does not expire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When `refresh_token` stops working.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_token_expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl StoredToken {
+    /// Whether the access token expires at or before `now + skew`. A token
+    /// with no recorded expiry never does.
+    pub fn expires_within(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        skew: chrono::Duration,
+    ) -> bool {
+        self.expires_at.is_some_and(|at| at <= now + skew)
+    }
+
     /// The signed-in login for display, or `None` when it is unknown. Only
     /// [`TokenStore::Env`] ever produces an empty `user` (an
     /// environment-supplied token with no login lookup behind it); every
@@ -134,7 +154,7 @@ impl StoredToken {
     }
 }
 
-/// Redacts `access_token`: a `StoredToken` reaches `Debug` output in a log
+/// Redacts `access_token` and `refresh_token`: a `StoredToken` reaches `Debug` output in a log
 /// line, a panic message or a test failure far more easily than it reaches
 /// `Display` (which this type has none of), so the derive is deliberately not
 /// used here. Every other field is plain, non-secret metadata and prints as
@@ -146,6 +166,12 @@ impl std::fmt::Debug for StoredToken {
             .field("host", &self.host)
             .field("user", &self.user)
             .field("created_at", &self.created_at)
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("expires_at", &self.expires_at)
+            .field("refresh_token_expires_at", &self.refresh_token_expires_at)
             .finish()
     }
 }
@@ -435,6 +461,9 @@ impl TokenStore {
                 host: host.clone(),
                 user: String::new(),
                 created_at: chrono::Utc::now(),
+                refresh_token: None,
+                expires_at: None,
+                refresh_token_expires_at: None,
             })),
         }
     }
@@ -831,7 +860,55 @@ mod tests {
             host: "github.com".to_string(),
             user: "octocat".to_string(),
             created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            refresh_token: None,
+            expires_at: None,
+            refresh_token_expires_at: None,
         }
+    }
+
+    #[test]
+    fn an_old_format_token_file_still_loads_and_does_not_grow_new_keys() {
+        let old = r#"{"access_token":"gho_old","host":"github.com","user":"octocat","created_at":"2023-11-14T22:13:20Z"}"#;
+        let token = from_json(old).unwrap();
+        assert_eq!(token.access_token, "gho_old");
+        assert_eq!(token.refresh_token, None);
+        assert_eq!(token.expires_at, None);
+        assert_eq!(token.refresh_token_expires_at, None);
+
+        let rendered = to_json(&token).unwrap();
+        assert!(!rendered.contains("refresh_token"), "{rendered}");
+        assert!(!rendered.contains("expires_at"), "{rendered}");
+    }
+
+    #[test]
+    fn the_refresh_fields_round_trip_and_the_debug_render_redacts_the_refresh_token() {
+        let mut token = sample_token();
+        token.refresh_token = Some("ghr_REFRESHSECRET".to_string());
+        token.expires_at = chrono::DateTime::from_timestamp(1_700_028_800, 0);
+        token.refresh_token_expires_at = chrono::DateTime::from_timestamp(1_715_000_000, 0);
+
+        let back = from_json(&to_json(&token).unwrap()).unwrap();
+        assert_eq!(back, token);
+
+        let debugged = format!("{token:?}");
+        assert!(!debugged.contains("REFRESHSECRET"), "{debugged}");
+        assert!(!debugged.contains("examplesecret"), "{debugged}");
+        assert!(debugged.contains("<redacted>"), "{debugged}");
+    }
+
+    #[test]
+    fn expires_within_reads_the_expiry_against_now_plus_skew() {
+        let now = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let skew = chrono::Duration::seconds(60);
+        let mut token = sample_token();
+        assert!(!token.expires_within(now, skew), "no expiry never expires");
+
+        token.expires_at = Some(now + chrono::Duration::seconds(61));
+        assert!(!token.expires_within(now, skew));
+        token.expires_at = Some(now + chrono::Duration::seconds(60));
+        assert!(token.expires_within(now, skew));
+        token.expires_at = Some(now - chrono::Duration::seconds(5));
+        assert!(token.expires_within(now, skew));
     }
 
     // The keyring arms of `resolve_and_load` and `save_resolving` are

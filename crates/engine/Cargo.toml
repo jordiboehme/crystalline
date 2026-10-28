@@ -31,6 +31,9 @@ crystalline-remote = { workspace = true }
 crystalline-identity = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+# The browser-flow nonce and state (engine/github_web.rs) are base64url over
+# raw CSPRNG bytes, the shape every other random-secret site here mints.
+base64 = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 # diffy has a workspace pin already (crates/remote uses it), but this crate
@@ -38,6 +41,7 @@ chrono = { workspace = true }
 # needs its own line.
 diffy = { workspace = true }
 futures = { workspace = true }
+getrandom = { workspace = true }
 globset = { workspace = true }
 http = { workspace = true }
 indexmap = { workspace = true }
@@ -55,6 +59,9 @@ walkdir = { workspace = true }
 yrs = { workspace = true }
 
 [dev-dependencies]
+# The throwaway localhost GitHub the web-flow tests exchange and refresh
+# against, in the style crates/remote's own mock-server tests use.
+axum = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 serde_yaml_ng = { workspace = true }

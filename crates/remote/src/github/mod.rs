@@ -21,6 +21,7 @@
 
 pub mod auth;
 mod types;
+pub mod web;
 
 use std::time::Duration;
 

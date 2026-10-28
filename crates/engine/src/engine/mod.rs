@@ -1177,6 +1177,18 @@ pub struct Engine {
     // a `connect` landing later - in this process or a standalone CLI writing
     // the same keychain item - is picked up on the very next call.
     github_tokens: Arc<std::sync::Mutex<HashMap<String, CachedGithub>>>,
+    // The handshakes of the GitHub App web flow that are in flight: the
+    // single-use nonces `start_github_web_connect` minted and the single-use
+    // states `github_web_authorize` sent to GitHub. Bounded and swept on every
+    // use; nothing in it survives a restart, which costs an unfinished link
+    // one click. See `github_web`.
+    web_connect: std::sync::Mutex<github_web::WebConnectPending>,
+    // One async mutex per credential slot, serializing the refresh of an
+    // expiring GitHub App user token: GitHub rotates the refresh token on
+    // every use, so two concurrent refreshes of the same credential would
+    // leave one holding a token the other already invalidated. Keyed by
+    // `credential_cache_key`, like the cache above.
+    github_refresh_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     // The background origin poller's observable state: every domain's poll
     // schedule and most recent result, plus the poller's one shared
     // rate-limit pause. Always present (not an `Option`), whether or not
@@ -2399,6 +2411,8 @@ impl Engine {
             pending_connect: std::sync::Mutex::new(None),
             token_store_dir_override: None,
             github_tokens: Arc::default(),
+            web_connect: std::sync::Mutex::new(github_web::WebConnectPending::default()),
+            github_refresh_locks: std::sync::Mutex::new(HashMap::new()),
             origin_poller: poller::OriginPollerState::default(),
             routing_virtual: std::sync::RwLock::new(BTreeMap::new()),
             virtual_read_only: std::sync::RwLock::new(BTreeSet::new()),
@@ -7172,6 +7186,8 @@ mod edit;
 mod evolve;
 mod fence;
 mod github;
+mod github_web;
+pub use github_web::{GITHUB_CALLBACK_PATH, GITHUB_CONNECT_PATH, WebConnectStart};
 mod kept;
 mod move_;
 mod name_report;
@@ -11254,6 +11270,9 @@ mod share_actor_tests {
                 host: "github.com".to_string(),
                 user: user.to_string(),
                 created_at: Utc::now(),
+                refresh_token: None,
+                expires_at: None,
+                refresh_token_expires_at: None,
             })
             .unwrap();
     }
