@@ -3,7 +3,7 @@
 //! writer (the home instance), so there is no merge; the branch shares no
 //! history with the tracked one, so it never carries an engram.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -141,6 +141,20 @@ fn prefix(spec: &OriginSpec) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
+/// The repo path `path` below the Reflection folder of the domain at
+/// `prefix` (the folder's own name in any case left off), or `None` when it
+/// is not inside it.
+fn inner_path<'a>(path: &'a str, prefix: Option<&str>) -> Option<&'a str> {
+    let rest = match prefix {
+        Some(sub) => path.strip_prefix(sub)?.strip_prefix('/')?,
+        None => path,
+    };
+    let (first, inner) = rest.split_once('/')?;
+    first
+        .eq_ignore_ascii_case(crystalline_core::reflection::REFLECTIONS_DIR)
+        .then_some(inner)
+}
+
 /// Whether the repo path `path` is inside the Reflection of the domain at
 /// `prefix`: its first segment below the prefix folds to `reflections`.
 fn is_ours(path: &str, prefix: Option<&str>) -> bool {
@@ -176,15 +190,25 @@ async fn moved_by_others_only(
 /// backup to [`BACKUP_BRANCH`]. The state is saved only after the branch
 /// moved, so a failure anywhere before leaves the next attempt to commit the
 /// same change once.
+///
+/// `held` names files inside the Reflection (paths below `reflections/`)
+/// the caller holds back: they are left out as if they were not on disk, so
+/// a copy the branch head holds is removed from it (its history keeps it),
+/// and they go out again on the first backup that no longer holds them.
 pub async fn backup_reflections(
     provider: &dyn Provider,
     spec: &OriginSpec,
     domain_root: &Path,
     state_dir: &Path,
     message: &str,
+    held: &BTreeSet<String>,
 ) -> Result<BackupOutcome, RemoteError> {
     let mut state = load(state_dir);
-    let files = collect(domain_root, spec.subpath.as_deref())?;
+    let mut files = collect(domain_root, spec.subpath.as_deref())?;
+    if !held.is_empty() {
+        let sub = prefix(spec);
+        files.retain(|path, _| !inner_path(path, sub).is_some_and(|inner| held.contains(inner)));
+    }
     let hashes: BTreeMap<String, String> = files
         .iter()
         .map(|(p, b)| (p.clone(), crate::state::sha256_hex(b)))

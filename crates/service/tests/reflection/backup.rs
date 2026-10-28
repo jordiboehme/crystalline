@@ -812,3 +812,147 @@ async fn the_backup_branch_carries_the_reflection_files_byte_for_byte() {
         "{paths:?}"
     );
 }
+
+/// [`home`] beside a shared `harbor` with one engram, keeper as an
+/// account, and the resolver installed.
+async fn home_beside_harbor(
+    mock: Arc<MockProvider>,
+) -> (Fx, Arc<crystalline_service::rest::AuthStore>) {
+    let fx = fixture_with(
+        &[
+            (
+                "MANIFEST.md",
+                &manifest(&format!("reflection: on\nreflection_home: {HOME}\n")),
+            ),
+            (
+                "runbooks/deploy.md",
+                &engram("Deploy", "runbooks/deploy", "- [fact] deploys run at night"),
+            ),
+        ],
+        |cfg, base| {
+            cfg.domains.get_mut("eng").unwrap().origin = Some(OriginConfig {
+                repo: "acme/kb".into(),
+                path: None,
+                branch: Some("main".into()),
+                poll_secs: None,
+            });
+            cfg.service = Some(ServiceConfig {
+                public_url: Some(HOME.into()),
+                ..Default::default()
+            });
+            cfg.github = Some(GitHubConfig {
+                enabled: Some(true),
+                ..Default::default()
+            });
+            let root = base.join("harbor");
+            std::fs::create_dir_all(root.join("team")).unwrap();
+            std::fs::write(
+                root.join("MANIFEST.md"),
+                crystalline_core::manifest_template("harbor", "2026-01-01"),
+            )
+            .unwrap();
+            std::fs::write(
+                root.join("team/harbor-team.md"),
+                engram("Harbor team", "team/harbor-team", "- [fact] five people"),
+            )
+            .unwrap();
+            cfg.domains.insert(
+                "harbor".into(),
+                crystalline_core::config::DomainEntry::file(root),
+            );
+        },
+    )
+    .await;
+    let engine = Arc::try_unwrap(fx.engine).ok().expect("one handle");
+    let engine = engine.with_origin_provider(mock);
+    let auth = Arc::new(
+        crystalline_service::rest::AuthStore::open(&fx.tmp.path().join("web-auth.db"))
+            .await
+            .unwrap(),
+    );
+    auth.add_user(
+        "keeper",
+        "keeper",
+        None,
+        crystalline_service::rest::Role::Editor,
+        "pw12345678",
+    )
+    .await
+    .unwrap();
+    engine.set_domain_access(Arc::new(crystalline_service::DomainAccess::new(
+        auth.clone(),
+    )));
+    (
+        Fx {
+            engine: Arc::new(engine),
+            ..fx
+        },
+        auth,
+    )
+}
+
+/// A page that cites a domain fewer people may read than its own is held
+/// back from the backup branch (with its baseline), and the branch head
+/// loses the copy it had; the hold is said. Once a curator takes the source
+/// out, the page goes to the branch again.
+#[tokio::test]
+async fn a_page_with_a_too_wide_source_is_held_back_until_it_is_settled() {
+    let mock = Arc::new(MockProvider::new());
+    main_commit(&mock);
+    let (fx, auth) = home_beside_harbor(mock.clone()).await;
+    let page = "# Wide\n\nFor people.\n\n## Team\n\nFive people.\n";
+    let mut wide = write("wide.md", page);
+    wide.sources = BTreeMap::from([(
+        "Team".to_string(),
+        vec!["crystalline://harbor/team/harbor-team".to_string()],
+    )]);
+    fx.engine.write_reflection(&wide, &agent()).await.unwrap();
+    fx.engine
+        .write_reflection(&write("a.md", "# A\n\n## One\n\nText.\n"), &agent())
+        .await
+        .unwrap();
+    let head_paths = || mock.commit_paths(&mock.branch_commit(BACKUP_BRANCH).unwrap());
+    fx.engine.reflection_backup_tick(Instant::now()).await;
+    assert!(head_paths().contains(&"reflections/wide.md".to_string()));
+    assert!(fx.engine.reflection_backup_held_back("eng").is_empty());
+
+    // harbor narrows: the next backup leaves the page and its baseline out.
+    auth.set_domain_visibility("harbor", true, "keeper")
+        .await
+        .unwrap();
+    fx.engine.mark_reflection_dirty("eng", BackupCause::Settled);
+    let now = Instant::now();
+    let held = fx.engine.reflection_backup_tick(now).await;
+    assert_eq!(held.len(), 1, "{held:?}");
+    let paths = head_paths();
+    assert!(!paths.iter().any(|p| p.contains("wide.md")), "{paths:?}");
+    assert!(paths.contains(&"reflections/a.md".to_string()), "{paths:?}");
+    assert_eq!(
+        fx.engine.reflection_backup_held_back("eng"),
+        vec!["wide.md".to_string()]
+    );
+    // The hold is looked at again later without a new change.
+    assert!(fx.engine.reflection_backup_tick(now).await.is_empty());
+    assert_eq!(
+        fx.engine
+            .reflection_backup_tick(now + Duration::from_secs(3600))
+            .await
+            .len(),
+        1
+    );
+
+    // Settled: the source and its text are out, and the page goes back.
+    let mut settled = write("wide.md", "# Wide\n\nFor people.\n\n## Team\n\nA team.\n");
+    settled.sources = BTreeMap::from([("Team".to_string(), vec!["runbooks/deploy".to_string()])]);
+    fx.engine
+        .write_reflection(&settled, &agent())
+        .await
+        .unwrap();
+    let done = fx.engine.reflection_backup_tick(Instant::now()).await;
+    assert!(
+        matches!(done[..], [(_, Ok(BackupOutcome::Committed { .. }))]),
+        "{done:?}"
+    );
+    assert!(head_paths().contains(&"reflections/wide.md".to_string()));
+    assert!(fx.engine.reflection_backup_held_back("eng").is_empty());
+}

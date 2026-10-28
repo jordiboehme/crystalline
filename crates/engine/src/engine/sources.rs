@@ -228,6 +228,54 @@ impl Engine {
             .map_err(|e| EngineError::Internal(e.to_string()))
     }
 
+    /// The pages of `domain` (by path inside `reflections/`, sorted) with a
+    /// section that cites a domain fewer people may read than `domain`: the
+    /// pages the queue names with `source_too_wide`, for every source, seen
+    /// by whom or not. A source whose domain cannot be checked here is not
+    /// counted, as in the queue.
+    pub(crate) async fn too_wide_pages(&self, domain: &str) -> Result<Vec<String>> {
+        let rows = {
+            let store = self.store.lock().await;
+            let Some(id) = store.domain_id(domain).await? else {
+                return Ok(Vec::new());
+            };
+            store.list_reflections(id).await?
+        };
+        let table = self.name_table_now().await;
+        let mut covers: HashMap<String, bool> = HashMap::new();
+        let mut out = Vec::new();
+        for row in rows {
+            let mut wide = false;
+            for record in r::read_provenance(&row.content).into_values() {
+                for src in &record.sources {
+                    let Some(name) = src.domain.as_deref() else {
+                        continue;
+                    };
+                    let Some(local) = self.checkable_domain(&table, name) else {
+                        continue;
+                    };
+                    if local == domain {
+                        continue;
+                    }
+                    let covered = match covers.get(&local) {
+                        Some(covered) => *covered,
+                        None => {
+                            let covered = self.readers_cover(domain, &local).await?;
+                            covers.insert(local, covered);
+                            covered
+                        }
+                    };
+                    wide |= !covered;
+                }
+            }
+            if wide {
+                out.push(row.path);
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
     /// The entries of a write's `sources`, each resolved: a bare permalink
     /// is the page's own, and so is an address whose domain (in any
     /// spelling) is the page's. Another domain must be one `scope` may read

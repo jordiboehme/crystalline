@@ -1130,6 +1130,9 @@ pub struct Engine {
     // before a due backup loses the mark, and the next change marks it again
     // and commits both (the backup diffs the whole folder).
     backup_marks: crate::reflection_backup::BackupMarks,
+    // Per domain, the pages its last backup held back because they cite a
+    // domain fewer people may read (`Engine::reflection_backup_held_back`).
+    backup_held: std::sync::Mutex<HashMap<String, Vec<String>>>,
     /// What the last complete walk of each domain saw of its Reflection:
     /// `None` when it was not in effect, else its threads files by page,
     /// with the checksum last seen or written. The next complete walk
@@ -2401,6 +2404,7 @@ impl Engine {
             origin_provider_override: None,
             origin_provider_override_login: None,
             backup_marks: Default::default(),
+            backup_held: Default::default(),
             reflection_walks: Default::default(),
             origins_dir_override: None,
             state_dir_override: None,
@@ -4043,6 +4047,20 @@ impl Engine {
         marked
     }
 
+    /// The pages of `domain` its last backup held back, sorted: each cites
+    /// a domain fewer people may read than `domain` (a `source_too_wide`
+    /// item in the queue), so it stays off the backup branch, whose head
+    /// loses the copy it had, until a curator settles it. Empty when nothing
+    /// was held back or no backup ran.
+    pub fn reflection_backup_held_back(&self, domain: &str) -> Vec<String> {
+        self.backup_held
+            .lock()
+            .expect("backup held")
+            .get(domain)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// Mark every domain whose Reflection is switched on, once, when the
     /// daemon starts: the marks live in memory, so a change made before a
     /// restart (or while GitHub collaboration was off) is backed up without
@@ -4112,7 +4130,22 @@ impl Engine {
                 self.backup_marks.clear(&domain);
                 continue;
             }
+            // A page that cites a domain fewer people may read than this one
+            // is held back with its threads and baseline: the branch is read
+            // by the repository's people, not by this domain's readers.
+            let mut held_pages: Vec<String> = Vec::new();
             let attempt: Result<crystalline_remote::reflections_backup::BackupOutcome> = async {
+                held_pages = self.too_wide_pages(&domain).await?;
+                let held: std::collections::BTreeSet<String> = held_pages
+                    .iter()
+                    .flat_map(|page| {
+                        [
+                            page.clone(),
+                            crystalline_core::reflection::threads_path(page),
+                            crystalline_core::reflection::baseline_path(page),
+                        ]
+                    })
+                    .collect();
                 let (spec, root, state_dir) = self.origin_spec_for_domain(&domain)?;
                 Ok(crystalline_remote::reflections_backup::backup_reflections(
                     provider.as_ref(),
@@ -4120,13 +4153,32 @@ impl Engine {
                     &root,
                     &state_dir,
                     &format!("Back up the Reflection of {domain}"),
+                    &held,
                 )
                 .await?)
             }
             .await;
             let mut paused = false;
             match &attempt {
-                Ok(_) => self.backup_marks.clear_if_unchanged(&domain, now),
+                Ok(_) => {
+                    self.backup_marks.clear_if_unchanged(&domain, now);
+                    let before = self
+                        .backup_held
+                        .lock()
+                        .expect("backup held")
+                        .insert(domain.clone(), held_pages.clone())
+                        .unwrap_or_default();
+                    if !held_pages.is_empty() {
+                        self.backup_marks.hold(&domain, now);
+                        if before != held_pages {
+                            tracing::warn!(
+                                domain = %domain,
+                                "reflection backup: held back {} because they cite a domain fewer people may read; they go out once a curator settles them",
+                                held_pages.join(", ")
+                            );
+                        }
+                    }
+                }
                 Err(EngineError::Remote(RemoteError::RateLimited { reset })) => {
                     // GitHub limits the token, not the repository: every
                     // domain waits, the origin poller's pulls included.
