@@ -2040,3 +2040,162 @@ async fn the_cache_answers_without_the_store_lock() {
         .unwrap();
     assert!(effective);
 }
+
+// --- The team marker on a domain that is not connected here ------------------
+
+/// A plain clone of a team repository, registered as a local domain: its
+/// MANIFEST carries `team: github`, and nothing connects it here. Switching
+/// Reflection on is refused through every surface that switches it, and the
+/// refusal says what to do instead.
+#[tokio::test]
+async fn an_unconnected_team_domain_refuses_the_switch() {
+    let fx = fixture(&[("MANIFEST.md", &manifest("team: github\n"))]).await;
+    let err = fx
+        .engine
+        .set_manifest_policies("eng", &on(), &Scope::Unrestricted)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("'eng' is a team domain") && err.contains("not connected here"),
+        "{err}"
+    );
+    assert!(
+        err.contains("crystalline domain add eng --origin <owner>/<repo>")
+            && err.contains("at the team server"),
+        "{err}"
+    );
+    let set = std::collections::BTreeMap::from([("reflection".to_string(), "on".to_string())]);
+    let err = fx
+        .engine
+        .change_domain_settings("eng", &set, &[], &Scope::Unrestricted)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("'eng' is a team domain"), "{err}");
+    // A raw MANIFEST edit meets the same screen.
+    let err = fx
+        .engine
+        .edit_engram(&EditParams {
+            identifier: "manifest".into(),
+            domain: "eng".into(),
+            operation: "find_replace".into(),
+            find_text: Some("team: github\n".into()),
+            content: Some("team: github\nreflection: on\n".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("'eng' is a team domain"), "{err}");
+    let text = std::fs::read_to_string(fx.root.join("MANIFEST.md")).unwrap();
+    assert!(!text.contains("reflection: on"), "{text}");
+    assert!(!fx.root.join("reflections/PACT.md").exists());
+}
+
+/// One edit that drops the marker and switches Reflection on is screened
+/// against the text it replaces, so it is refused too.
+#[tokio::test]
+async fn dropping_the_marker_in_the_switching_edit_is_still_refused() {
+    let fx = fixture(&[("MANIFEST.md", &manifest("team: github\n"))]).await;
+    let err = fx
+        .engine
+        .edit_engram(&EditParams {
+            identifier: "manifest".into(),
+            domain: "eng".into(),
+            operation: "find_replace".into(),
+            find_text: Some("team: github\n".into()),
+            content: Some("reflection: on\n".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("'eng' is a team domain"), "{err}");
+}
+
+/// A personal backup repository of a local domain: a `.git` folder with a
+/// GitHub remote, and no team marker. Reflection switches on as it always
+/// did, with no home, and is served here.
+#[tokio::test]
+async fn a_local_backup_repository_without_the_marker_switches_on() {
+    let fx = fixture(&[(
+        ".git/config",
+        "[remote \"origin\"]\n\turl = git@github.com:jordi/notes-backup.git\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n",
+    )])
+    .await;
+    fx.engine
+        .set_manifest_policies("eng", &on(), &Scope::Unrestricted)
+        .await
+        .unwrap();
+    let text = std::fs::read_to_string(fx.root.join("MANIFEST.md")).unwrap();
+    assert!(
+        text.contains("reflection: on") && !text.contains("reflection_home"),
+        "{text}"
+    );
+    assert_eq!(
+        fx.engine.reflection_state("eng").await.unwrap(),
+        ReflectionState::On {
+            home: crystalline_service::ReflectionHome::Local
+        }
+    );
+    fx.engine
+        .read_reflection_tree("eng", &ReflectionCaller::owner())
+        .await
+        .unwrap();
+}
+
+/// A clone whose MANIFEST already says `reflection: on` (a hand edit, or a
+/// pull of somebody's push): the gate of every reflection verb refuses, and
+/// the state reads as homeless, so no Reflection runs on the stray copy.
+/// The engram side keeps working.
+#[tokio::test]
+async fn the_gate_refuses_an_unconnected_team_domain_that_says_on() {
+    let fx = fixture(&[
+        ("MANIFEST.md", &manifest("team: github\nreflection: on\n")),
+        ("reflections/page.md", &page("Page")),
+    ])
+    .await;
+    assert_eq!(
+        fx.engine.reflection_state("eng").await.unwrap(),
+        ReflectionState::Homeless
+    );
+    let err = fx
+        .engine
+        .read_reflection_tree("eng", &ReflectionCaller::owner())
+        .await
+        .unwrap_err();
+    let text = err.to_string();
+    assert!(
+        text.contains(crystalline_service::engine::REFUSED_UNCONNECTED_TEAM)
+            && text.starts_with("'eng' is a team domain"),
+        "{text}"
+    );
+    // Switching on again (the homeless refill) is refused the same way and
+    // writes no home.
+    let err = fx
+        .engine
+        .set_manifest_policies("eng", &on(), &Scope::Unrestricted)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("'eng' is a team domain"), "{err}");
+    let manifest_text = std::fs::read_to_string(fx.root.join("MANIFEST.md")).unwrap();
+    assert!(
+        !manifest_text.contains("reflection_home"),
+        "{manifest_text}"
+    );
+    // The engrams are still there to read.
+    fx.engine
+        .read_engram(
+            &crystalline_service::params::ReadParams {
+                identifier: "manifest".into(),
+                domain: Some("eng".into()),
+                share_link: None,
+                include_images: false,
+            },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+}

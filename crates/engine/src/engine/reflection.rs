@@ -45,6 +45,13 @@ pub const REFUSED_PENDING_SPELLINGS: &str =
     "waits until only one folder spells reflections/, in any letter case";
 /// The refusal for a GitHub-connected domain whose Reflection has no home.
 pub const REFUSED_HOMELESS: &str = "this domain is connected to GitHub and its Reflection has no home yet: switch Reflection on in the domain policies at the team server";
+/// The words every refusal for a team domain that is not connected here
+/// carries: a MANIFEST with the [`crystalline_core::TEAM_KEY`] marker and no
+/// origin on this instance, typically a plain clone of the team repository
+/// registered as a local domain. The switch-on and the gate both refuse it
+/// with [`unconnected_team_refusal`], which names the domain before these
+/// words.
+pub const REFUSED_UNCONNECTED_TEAM: &str = "is a team domain and is not connected here";
 /// The start of the refusal for a Reflection held by another instance; its
 /// address follows.
 pub const REFUSED_ELSEWHERE_START: &str = "this domain's Reflection lives at ";
@@ -139,6 +146,8 @@ impl ReflectionAccess {
 /// The facts the switch is screened against, gathered before any write lock.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SwitchFacts {
+    /// The domain's name, for the refusals that tell a person what to run.
+    pub domain: String,
     pub virtual_domain: bool,
     /// The folders in the domain root that spell `reflections` in any letter
     /// case, sorted. More than one cannot be one Reflection: their files
@@ -183,6 +192,30 @@ fn declared_home(source: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The whole sentence for a team domain that is not connected here, as the
+/// switch-on and the gate both answer it: what is wrong, why, and the two
+/// steps that fix it. A team domain's Reflection lives only at its home,
+/// the team server, which fills in `reflection_home` and backs it up to its
+/// own branch; a copy that is not connected has neither check, so whatever
+/// Reflection it kept would travel with a plain git push instead.
+pub(crate) fn unconnected_team_refusal(domain: &str) -> String {
+    format!(
+        "'{domain}' {REFUSED_UNCONNECTED_TEAM}. A team domain's Reflection lives only at its home, the team server. Connect the domain first (crystalline domain add {domain} --origin <owner>/<repo>, or add_domain with repo; configure turns collaboration on), then switch Reflection on in the domain policies at the team server"
+    )
+}
+
+/// Whether a team domain that is not connected here is about to keep a
+/// Reflection: one of `texts` carries the team marker, and the facts say the
+/// domain has no origin on this instance. A virtual domain is refused for
+/// its own reason first.
+fn unconnected_team(facts: &SwitchFacts, texts: &[&str]) -> bool {
+    !facts.origin
+        && !facts.virtual_domain
+        && texts
+            .iter()
+            .any(|text| crystalline_core::team_of_source(text).is_some())
+}
+
 /// The refusal of a switch-on for a virtual domain.
 pub(crate) fn virtual_refusal() -> EngineError {
     EngineError::Invalid(
@@ -199,6 +232,16 @@ pub(crate) fn screen_switch(before: &str, after: &str, facts: &SwitchFacts) -> R
     }
     if facts.virtual_domain {
         return Err(virtual_refusal());
+    }
+    // Before every other check: a team domain that is not connected here
+    // never keeps a Reflection, so moving engrams out first would be work
+    // for nothing. The text it replaces counts as much as the text it
+    // writes, so one edit that drops the marker and switches on is refused
+    // too.
+    if unconnected_team(facts, &[before, after]) {
+        return Err(EngineError::Invalid(unconnected_team_refusal(
+            &facts.domain,
+        )));
     }
     if facts.folders.len() > 1 {
         let named: Vec<String> = facts.folders.iter().map(|f| format!("{f}/")).collect();
@@ -263,6 +306,14 @@ pub(crate) fn refuse_unscreened_switch_on(before: &str, after: &str) -> Result<(
 /// this instance's `service.public_url` as its `reflection_home`. Also the
 /// whole screen of the home refill, where the switch is already on.
 pub(crate) fn screen_home(after: &str, facts: &SwitchFacts) -> Result<()> {
+    // A homeless domain is also a team domain that is not connected here
+    // and already says `on`: switching it on again must not pass as a
+    // refill, which has no home to fill in for a domain with no origin.
+    if unconnected_team(facts, &[after]) {
+        return Err(EngineError::Invalid(unconnected_team_refusal(
+            &facts.domain,
+        )));
+    }
     if facts.origin {
         let Some(own) = facts.own_url.as_deref() else {
             return Err(EngineError::Invalid(
@@ -459,6 +510,7 @@ impl Engine {
         let origin = entry.origin.is_some();
         let ContentSource::File { root } = self.read_source(domain) else {
             return Ok(SwitchFacts {
+                domain: domain.to_string(),
                 virtual_domain: true,
                 origin,
                 own_url,
@@ -488,6 +540,7 @@ impl Engine {
             }
         }
         Ok(SwitchFacts {
+            domain: domain.to_string(),
             virtual_domain: false,
             folders,
             engrams: named.engrams,
@@ -596,6 +649,13 @@ impl Engine {
             }
             (Some(home), _) => Ok(ReflectionState::Elsewhere { url: home }),
             (None, true) => Ok(ReflectionState::Homeless),
+            // A team domain that is not connected here (its MANIFEST carries
+            // the marker) has no home here either: its Reflection lives at
+            // the team server, so this copy reads as homeless and the gate
+            // refuses it, whatever the switch says.
+            (None, false) if crystalline_core::team_at(&root).is_some() => {
+                Ok(ReflectionState::Homeless)
+            }
             (None, false) => Ok(ReflectionState::On {
                 home: ReflectionHome::Local,
             }),
@@ -838,8 +898,11 @@ impl Engine {
                     "Reflection for '{domain}' {REFUSED_PENDING}"
                 )));
             }
-            ReflectionState::Homeless => {
+            ReflectionState::Homeless if self.domain_has_origin(domain)? => {
                 return Err(EngineError::Refused(REFUSED_HOMELESS.to_string()));
+            }
+            ReflectionState::Homeless => {
+                return Err(EngineError::Refused(unconnected_team_refusal(domain)));
             }
             ReflectionState::Elsewhere { url } => {
                 return Err(EngineError::Refused(format!(
