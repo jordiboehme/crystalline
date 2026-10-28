@@ -260,9 +260,9 @@ pub struct EnvOverlay {
     /// The GitHub App from the `CRYSTALLINE_GITHUB_APP_*` variables
     /// ([`GITHUB_APP_ID_ENV`]): `None` when none is set, `Err` with a
     /// sentence (never carrying a secret) when the values do not make a
-    /// usable App. Its `host` follows the `github.api_url` the environment
-    /// sets, else `github.com`; a `github.api_url` that only the config file
-    /// carries is not visible here.
+    /// usable App. Its `host` is left empty here: the overlay cannot see a
+    /// `github.api_url` that only the config file carries, so
+    /// [`EnvOverlay::github_app`] fills it from the caller's effective value.
     github_app: Option<Result<AppCredentials, String>>,
     /// The `CRYSTALLINE_GITHUB_APP_*` variable actually set for each field, as
     /// (key, variable), for [`EnvOverlay::active_overrides`].
@@ -478,11 +478,7 @@ impl EnvOverlay {
 
         let domains = resolve_env_domains(domain_vars, origin_vars, review_vars)?;
 
-        let api_url = settings
-            .iter()
-            .find(|(key, _)| key == "github.api_url")
-            .map(|(_, value)| value.as_str());
-        let github_app = github_app_from(&app_vars, api_url)?;
+        let github_app = github_app_from(&app_vars)?;
         let github_app_vars = GITHUB_APP_ENVS
             .iter()
             .filter(|(var, _)| app_vars.contains_key(var))
@@ -592,8 +588,23 @@ impl EnvOverlay {
     /// key that cannot be used; a missing required variable never gets here,
     /// it stops the start. Environment-supplied, so read-only: nothing saves
     /// it and it wins over a saved App.
-    pub fn github_app(&self) -> Option<Result<AppCredentials, String>> {
-        self.github_app.clone()
+    ///
+    /// `effective_api_url` is `github.api_url` from the effective config
+    /// (file plus this overlay), which decides `AppCredentials.host`:
+    /// `github.com`, or the bare Enterprise Server host. The overlay alone
+    /// cannot know it, so no accessor guesses.
+    pub fn github_app(
+        &self,
+        effective_api_url: Option<&str>,
+    ) -> Option<Result<AppCredentials, String>> {
+        let host =
+            origin::token_host(effective_api_url).unwrap_or_else(|| "github.com".to_string());
+        self.github_app.clone().map(|app| {
+            app.map(|mut credentials| {
+                credentials.host = host;
+                credentials
+            })
+        })
     }
 
     /// Every active override as `(variable, key, display value)`, for surfacing
@@ -684,7 +695,6 @@ fn file_sourced_var(file_sourced: &[(String, String)], plain: &str) -> String {
 /// to surface, never with the value in it.
 fn github_app_from(
     vars: &HashMap<&'static str, String>,
-    api_url: Option<&str>,
 ) -> Result<Option<Result<AppCredentials, String>>, OverlayError> {
     if vars.is_empty() {
         return Ok(None);
@@ -712,7 +722,6 @@ fn github_app_from(
     if let Err(e) = crystalline_remote::github::app::AppKey::from_pem(&private_key) {
         return Ok(Some(Err(format!("{GITHUB_APP_PRIVATE_KEY_ENV}: {e}"))));
     }
-    let host = origin::token_host(api_url).unwrap_or_else(|| "github.com".to_string());
     Ok(Some(Ok(AppCredentials {
         app_id,
         client_id: vars[GITHUB_APP_CLIENT_ID_ENV].clone(),
@@ -720,7 +729,7 @@ fn github_app_from(
         private_key,
         webhook_secret: vars.get(GITHUB_APP_WEBHOOK_SECRET_ENV).cloned(),
         slug: None,
-        host,
+        host: String::new(),
     })))
 }
 
@@ -2036,7 +2045,6 @@ mod tests {
                     "CRYSTALLINE_GITHUB_APP_WEBHOOK_SECRET_FILE",
                     "/run/secrets/hook",
                 ),
-                ("CRYSTALLINE_GITHUB_API_URL", "https://ghes.example/api/v3"),
             ],
             &[
                 ("/run/secrets/key", APP_KEY),
@@ -2044,7 +2052,10 @@ mod tests {
             ],
         )
         .unwrap();
-        let app = ov.github_app().expect("the App is configured").unwrap();
+        let app = ov
+            .github_app(Some("https://ghes.example/api/v3"))
+            .expect("the App is configured")
+            .unwrap();
         assert_eq!(app.app_id, 4242);
         assert_eq!(app.client_id, "Iv23liSAMPLE");
         assert_eq!(
@@ -2053,7 +2064,10 @@ mod tests {
         );
         assert_eq!(app.webhook_secret.as_deref(), Some("hooksecret"));
         assert_eq!(app.client_secret.as_deref(), Some("clientsecret"));
-        assert_eq!(app.host, "ghes.example", "the host follows github.api_url");
+        assert_eq!(
+            app.host, "ghes.example",
+            "the host follows the effective github.api_url, which may come from config.yaml"
+        );
         assert!(!ov.is_empty());
 
         let shown = ov.active_overrides();
@@ -2081,7 +2095,7 @@ mod tests {
             &[],
         )
         .unwrap();
-        assert_eq!(ov.github_app().unwrap().unwrap().host, "github.com");
+        assert_eq!(ov.github_app(None).unwrap().unwrap().host, "github.com");
 
         let bad_key = overlay_reading(
             &[
@@ -2092,7 +2106,7 @@ mod tests {
             &[],
         )
         .unwrap();
-        let msg = bad_key.github_app().unwrap().unwrap_err();
+        let msg = bad_key.github_app(None).unwrap().unwrap_err();
         assert!(!msg.contains("SECRETNOTAKEY"), "{msg}");
 
         let bad_id = overlay_reading(
@@ -2106,12 +2120,17 @@ mod tests {
         .unwrap();
         assert!(
             bad_id
-                .github_app()
+                .github_app(None)
                 .unwrap()
                 .unwrap_err()
                 .contains("CRYSTALLINE_GITHUB_APP_ID")
         );
-        assert!(overlay_reading(&[], &[]).unwrap().github_app().is_none());
+        assert!(
+            overlay_reading(&[], &[])
+                .unwrap()
+                .github_app(None)
+                .is_none()
+        );
     }
 
     #[test]

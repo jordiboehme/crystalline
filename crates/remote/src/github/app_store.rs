@@ -70,6 +70,15 @@ impl std::fmt::Debug for AppCredentials {
     }
 }
 
+impl AppCredentials {
+    /// The `host` argument [`AppStore::resolve_and_load`] takes: `None` for
+    /// GitHub.com, the Enterprise Server host otherwise. The one place the
+    /// credentials' `"github.com"` string becomes the store's `None`.
+    pub fn store_host(&self) -> Option<&str> {
+        (self.host != "github.com").then_some(self.host.as_str())
+    }
+}
+
 /// Where the credentials of a GitHub App are persisted between runs.
 #[derive(Clone, Debug)]
 pub enum AppStore {
@@ -196,11 +205,12 @@ impl AppStore {
 }
 
 /// The keyring account for `host`: `github-app`, or `github-app:<host>` for a
-/// GitHub Enterprise Server host. Namespaced away from the token accounts
+/// GitHub Enterprise Server host. `Some("github.com")` is the same account as
+/// `None`, so the two spellings of GitHub.com never split one App in two. Namespaced away from the token accounts
 /// (`github`, `github:<host>`) so an App never overwrites a sign-in.
 fn account_for(host: Option<&str>) -> String {
     match host {
-        None => "github-app".to_string(),
+        None | Some("github.com") => "github-app".to_string(),
         Some(host) => format!("github-app:{host}"),
     }
 }
@@ -283,6 +293,12 @@ mod tests {
     fn app_accounts_are_host_scoped_and_apart_from_token_accounts() {
         assert_eq!(account_for(None), "github-app");
         assert_eq!(account_for(Some("ghes.example")), "github-app:ghes.example");
+        assert_eq!(account_for(Some("github.com")), "github-app");
+        let mut app = sample();
+        assert_eq!(app.store_host(), None);
+        assert_eq!(account_for(app.store_host()), "github-app");
+        app.host = "ghes.example".to_string();
+        assert_eq!(account_for(app.store_host()), "github-app:ghes.example");
     }
 
     #[test]
