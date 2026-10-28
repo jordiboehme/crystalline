@@ -41,7 +41,7 @@
 
 services:
   db:
-    image: pgvector/pgvector:0.8.2-pg17-bookworm
+    image: pgvector/pgvector:0.8.7-pg17-bookworm
     environment:
       POSTGRES_USER: crystalline
       POSTGRES_PASSWORD: crystalline

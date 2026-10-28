@@ -281,9 +281,9 @@ jobs:
       - name: Install Rust toolchain
         run: rustup show
 
-      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
-          tool: nextest@0.9.149
+          tool: nextest@0.9.150
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
@@ -356,7 +356,7 @@ jobs:
             -e POSTGRES_PASSWORD=crystalline \
             -e POSTGRES_DB=crystalline_test \
             -p 5432:5432 \
-            pgvector/pgvector:0.8.2-pg17-bookworm
+            pgvector/pgvector:0.8.7-pg17-bookworm
           for _ in $(seq 1 60); do
             if docker exec pg pg_isready -h 127.0.0.1 -U postgres -d crystalline_test >/dev/null 2>&1; then
               break
@@ -421,9 +421,9 @@ jobs:
       - name: Install Rust toolchain
         run: rustup show
 
-      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
-          tool: nextest@0.9.149
+          tool: nextest@0.9.150
 
       # Restores what the test legs saved on main and saves nothing.
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3

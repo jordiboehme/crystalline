@@ -14,7 +14,7 @@
 #   docker build -t crystalline-runner examples/kubernetes
 #
 # Pin both versions. The loop commands need Crystalline 0.29.0 or newer, and
-# Claude Code 2.1.304 is the version the runner's flags were checked against.
+# Claude Code 2.1.312 is the version the runner's flags were checked against.
 
 ARG CRYSTALLINE_TAG=v0.29.0
 FROM ghcr.io/jordiboehme/crystalline:${CRYSTALLINE_TAG} AS crystalline
@@ -29,7 +29,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-ARG CLAUDE_CODE_VERSION=2.1.304
+ARG CLAUDE_CODE_VERSION=2.1.312
 RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
     && npm cache clean --force
 

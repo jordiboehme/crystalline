@@ -57,7 +57,7 @@ claude --mcp-config <config> --strict-mcp-config --setting-sources "" --tools ""
   --output-format stream-json --verbose --max-turns 60 -p "<the shipped prompt>"
 ```
 
-So the agent sees only the Crystalline MCP server, no built-in tools, no settings files and no hooks. When something is due and `claude` is on `PATH`, `crystalline reflect run --dry-run` prints the command, with placeholders for the config and the prompt. These flags were checked against Claude Code 2.1.304.
+So the agent sees only the Crystalline MCP server, no built-in tools, no settings files and no hooks. When something is due and `claude` is on `PATH`, `crystalline reflect run --dry-run` prints the command, with placeholders for the config and the prompt. These flags were checked against Claude Code 2.1.312.
 
 The agent gets no Crystalline credentials in its environment: every variable that starts with `CRYSTALLINE_` and holds `TOKEN`, `SECRET` or `PASSWORD` is removed. The remote bearer is in the MCP config only, and the config with its folder is removed when the run ends, also after an error or a stop. Your Anthropic credential (`ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN`) is passed on as it is.
 
@@ -176,7 +176,7 @@ An n8n node cannot renew the lease while the AI Agent node works, so the renewin
 
 [`examples/kubernetes/`](../examples/kubernetes/) has a runner image and three manifests. They run in remote mode against the team server.
 
-- `Dockerfile`: Claude Code 2.1.304 on a Node base image, plus the `crystalline` binary copied from the published image. The published image is distroless, so nothing can be installed on top of it. The runner image is an example, not a published image.
+- `Dockerfile`: Claude Code 2.1.312 on a Node base image, plus the `crystalline` binary copied from the published image. The published image is distroless, so nothing can be installed on top of it. The runner image is an example, not a published image.
 - `reflect-cronjob.yaml`: `crystalline reflect run --runner k8s` every 5 minutes, with `concurrencyPolicy: Forbid` and a grace period of 30 seconds. `CRYSTALLINE_REMOTE_TOKEN` and the Anthropic credential come from a Secret by reference. Nothing due means the pod ends within seconds.
 - `evolve-cronjob.yaml`: the same shape, weekly, with its own account.
 - `watch-deployment.yaml`: one replica of `crystalline reflect watch`, for answers within a minute instead of within 5 minutes.
