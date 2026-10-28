@@ -170,6 +170,13 @@ pub(super) async fn run_one(
         }
         Err(e) => return Err(e),
     };
+    // What the take says about the domain's evolve home: that this
+    // instance claimed it, or that every clone may still run evolve.
+    if !opts.json
+        && let Some(note) = take["note"].as_str()
+    {
+        println!("{domain}: {note}");
+    }
     let token = take["token"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("the lease answer carried no token"))?

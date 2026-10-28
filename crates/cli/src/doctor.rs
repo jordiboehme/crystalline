@@ -374,6 +374,16 @@ pub struct OriginDoctor {
     /// bootstraps itself when the daemon connects, so `remaining_problems`
     /// skips it where a config-file domain would count.
     pub env_defined: bool,
+    /// The `evolve_home` the domain's MANIFEST names, or `None` when it
+    /// names no valid home yet: then every clone of the team domain may run
+    /// a scheduled evolve, and the report warns until an instance claims it.
+    pub evolve_home: Option<String>,
+    /// Whether the MANIFEST declares an `evolve_home` that is not a server
+    /// address (verify's `M013`), which reads as no home.
+    pub evolve_home_invalid: bool,
+    /// Whether the team declined this instance's claim of the evolve home,
+    /// so it does not claim it again until a person unsets the key here.
+    pub evolve_home_declined: bool,
 }
 
 /// GitHub collaboration diagnostics, present only when `github.enabled` is
@@ -2526,7 +2536,9 @@ fn policy_values(key: &str) -> &'static [&'static str] {
 /// takes, or for a text key what that key holds.
 fn policy_expected(key: &str) -> String {
     match policy_values(key) {
-        [] if key == crystalline_core::REFLECTION_HOME_KEY => {
+        [] if key == crystalline_core::REFLECTION_HOME_KEY
+            || key == crystalline_core::EVOLVE_HOME_KEY =>
+        {
             "an http or https address with no trailing slash".to_string()
         }
         [] if key == crystalline_core::TEAM_KEY => {
@@ -2555,6 +2567,9 @@ fn policy_read_as<'a>(key: &str, read_as: &'a str) -> &'a str {
     match (read_as.is_empty(), key) {
         (false, _) => read_as,
         (true, crystalline_core::REFLECTION_HOME_KEY) => "ignored; the Reflection has no home",
+        (true, crystalline_core::EVOLVE_HOME_KEY) => {
+            "ignored; every clone may run a scheduled evolve"
+        }
         (true, crystalline_core::TEAM_KEY) => "ignored; not treated as a team domain",
         (true, _) => "ignored; the local name holds",
     }
@@ -4001,6 +4016,24 @@ fn check_github(
             state_present,
             base_mismatches,
             env_defined: overlay.env_domain(name).is_some(),
+            evolve_home: entry
+                .path
+                .as_deref()
+                .and_then(crystalline_core::evolve_home_at),
+            evolve_home_invalid: entry
+                .path
+                .as_deref()
+                .and_then(|root| std::fs::read_to_string(root.join("MANIFEST.md")).ok())
+                .and_then(|source| {
+                    let engram = crystalline_core::parse_engram(&source).ok()?;
+                    crystalline_core::Manifest::from_engram(&engram, &source)
+                        .declared_evolve_home()
+                        .map(|declared| crystalline_core::validate_evolve_home(declared).is_err())
+                })
+                .unwrap_or(false),
+            evolve_home_declined: dir
+                .join(crystalline_remote::state::EVOLVE_HOME_DECLINED_FILE)
+                .is_file(),
         });
     }
 
@@ -5089,6 +5122,27 @@ pub fn render_human(report: &DoctorReport) -> String {
                 );
             } else {
                 let _ = writeln!(out, "  {} ({}): ok", o.name, o.repo);
+            }
+            // A warning, not a problem: a team domain worked by one runner
+            // is fine without a home, and only the operator knows that.
+            if o.evolve_home_declined {
+                let _ = writeln!(
+                    out,
+                    "  warning: the team declined this instance's evolve_home claim for {}, so every clone of this team domain may run a scheduled evolve. To claim it again, unset evolve_home here (configure) and run evolve.",
+                    o.name
+                );
+            } else if o.evolve_home_invalid {
+                let _ = writeln!(
+                    out,
+                    "  warning: {} has an evolve_home that is not a server address (verify reports it as M013), so every clone of this team domain may run a scheduled evolve. Remove the line, and the first scheduled evolve run at an instance with service.public_url claims the home.",
+                    o.name
+                );
+            } else if o.evolve_home.is_none() {
+                let _ = writeln!(
+                    out,
+                    "  warning: {} has no evolve_home yet, so every clone of this team domain may run a scheduled evolve. The first scheduled evolve run (crystalline evolve run) at an instance with service.public_url claims it.",
+                    o.name
+                );
             }
         }
     }

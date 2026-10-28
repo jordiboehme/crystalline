@@ -1030,6 +1030,62 @@ fn the_github_team_marker_and_an_absent_one_are_clean() {
     );
 }
 
+// --- The evolve home (M013) -------------------------------------------------
+
+fn manifest_declaring_evolve_home(value: &str) -> String {
+    format!(
+        "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\nevolve_home: {value}\n---\n\n## Scope\n\n- Charts of the harbor\n\n## When to Use\n\n- When asked about the harbor\n"
+    )
+}
+
+#[test]
+fn an_evolve_home_that_is_no_server_address_is_m013_error() {
+    let dir = tempdir().unwrap();
+    write(
+        dir.path(),
+        "MANIFEST.md",
+        &manifest_declaring_evolve_home("https://kb.example.com/"),
+    );
+    let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+    let m013 = report
+        .issues
+        .iter()
+        .find(|i| i.rule == "M013")
+        .expect("M013 present");
+    assert_eq!(m013.severity, Severity::Error);
+    assert!(
+        m013.message.starts_with(
+            "`evolve_home: https://kb.example.com/` cannot be the home of this domain's scheduled evolve: "
+        ),
+        "{}",
+        m013.message
+    );
+    assert_eq!(
+        m013.fix.as_deref(),
+        Some(
+            "read as absent, so every clone of this team domain may run a scheduled evolve; remove the line, and the next scheduled evolve run at the team server fills it in"
+        )
+    );
+    assert_eq!(report.exit_code(), 1);
+}
+
+#[test]
+fn a_valid_evolve_home_and_an_absent_one_are_clean() {
+    for manifest in [
+        manifest_declaring_evolve_home("https://kb.example.com"),
+        manifest_declaring_team("github"),
+    ] {
+        let dir = tempdir().unwrap();
+        write(dir.path(), "MANIFEST.md", &manifest);
+        let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+        assert!(
+            !report.issues.iter().any(|i| i.rule == "M013"),
+            "{:?}",
+            report.issues
+        );
+    }
+}
+
 /// The MANIFEST issue 91 left behind: `## When to Use` twice, the first one
 /// empty, which is the one routing reads.
 const DOUBLED_MANIFEST: &str = "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n## Scope\n\n- Facts about the solar system\n\n## When to Use\n\n## When to Use\n\n- When asked about moons or planets\n";
