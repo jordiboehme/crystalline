@@ -594,6 +594,12 @@ async fn revoke_sends_basic_auth_and_the_token_in_the_body() {
                         .get("authorization")
                         .and_then(|v| v.to_str().ok())
                         .map(str::to_string);
+                    assert_eq!(
+                        headers
+                            .get("x-github-api-version")
+                            .and_then(|v| v.to_str().ok()),
+                        Some("2022-11-28")
+                    );
                     seen.lock().unwrap().push((auth, body));
                     axum::http::StatusCode::NO_CONTENT
                 }
@@ -644,6 +650,12 @@ async fn github_user_reads_id_login_and_email() {
                 headers.get("authorization").and_then(|v| v.to_str().ok()),
                 Some("Bearer ghu_access")
             );
+            assert_eq!(
+                headers
+                    .get("x-github-api-version")
+                    .and_then(|v| v.to_str().ok()),
+                Some("2022-11-28")
+            );
             Json(serde_json::json!({"id": 583231, "login": "octocat", "email": null}))
         }),
     );
@@ -667,4 +679,55 @@ async fn github_user_maps_unauthorized_to_auth_expired() {
     let err = github_user(&base, "bad").await.unwrap_err();
 
     assert!(matches!(err, RemoteError::AuthExpired), "{err:?}");
+}
+
+#[tokio::test]
+async fn revoke_never_puts_a_reflected_body_into_the_error() {
+    let app = Router::new().route(
+        "/applications/c/token",
+        axum::routing::delete(|body: String| async move {
+            (
+                axum::http::StatusCode::BAD_GATEWAY,
+                format!("<html>bad gateway for {body}</html>"),
+            )
+        }),
+    );
+    let base = spawn(app).await;
+
+    let err = revoke_user_token(&base, "c", "s", "ghu_livetoken")
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, RemoteError::Api { status: 502, .. }),
+        "{err:?}"
+    );
+    assert!(
+        !format!("{err:?} {err}").contains("ghu_livetoken"),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_out_of_range_expires_in_reads_as_no_expiry() {
+    let app = Router::new().route(
+        "/login/oauth/access_token",
+        post(|| async {
+            Json(serde_json::json!({
+                "access_token": "ghu_x",
+                "expires_in": i64::MAX,
+                "refresh_token": "ghr_x",
+                "refresh_token_expires_in": i64::MAX,
+            }))
+        }),
+    );
+    let base = spawn(app).await;
+
+    let grant = exchange_code(&base, "c", "s", "code", "http://127.0.0.1/cb")
+        .await
+        .unwrap();
+
+    assert_eq!(grant.access_token, "ghu_x");
+    assert!(grant.expires_at.is_none());
+    assert!(grant.refresh_expires_at.is_none());
 }

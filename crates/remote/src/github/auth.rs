@@ -209,15 +209,19 @@ struct AccessTokenResponse {
 impl AccessTokenResponse {
     /// The grant this response carries, when it carries a token. The two
     /// lifetimes arrive as seconds from now and become absolute times here.
+    /// A lifetime too large to represent as a time reads as no expiry rather
+    /// than panicking on a malformed response.
     fn into_grant(self) -> Option<UserTokenGrant> {
         let access_token = self.access_token?;
         let now = Utc::now();
-        let at = |secs: i64| now + chrono::Duration::seconds(secs);
+        let at = |secs: i64| {
+            chrono::TimeDelta::try_seconds(secs).and_then(|d| now.checked_add_signed(d))
+        };
         Some(UserTokenGrant {
             access_token,
             refresh_token: self.refresh_token,
-            expires_at: self.expires_in.map(at),
-            refresh_expires_at: self.refresh_token_expires_in.map(at),
+            expires_at: self.expires_in.and_then(at),
+            refresh_expires_at: self.refresh_token_expires_in.and_then(at),
         })
     }
 }
@@ -235,6 +239,9 @@ pub struct UserTokenGrant {
     /// When `access_token` stops working (`expires_in` from the response).
     pub expires_at: Option<DateTime<Utc>>,
     /// When `refresh_token` stops working (`refresh_token_expires_in`).
+    /// `None` means there is no refresh token or its expiry is unknown (the
+    /// response did not say, or the value was out of range), not only that it
+    /// never expires.
     pub refresh_expires_at: Option<DateTime<Utc>>,
 }
 
@@ -517,6 +524,7 @@ pub async fn revoke_user_token(
         ))
         .basic_auth(client_id, Some(client_secret))
         .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", super::API_VERSION)
         .header("User-Agent", "crystalline")
         .json(&serde_json::json!({ "access_token": access_token }))
         .send()
@@ -526,14 +534,21 @@ pub async fn revoke_user_token(
     if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
         return Ok(());
     }
-    let message = response
-        .text()
-        .await
-        .unwrap_or_else(|_| "no error message provided".to_string());
+    // The request body holds a live token, which a proxy or an error page
+    // could reflect, so only GitHub's own `message` field is passed on.
+    let message = safe_error_message(response.text().await.ok().as_deref());
     Err(RemoteError::Api {
         status: status.as_u16(),
         message,
     })
+}
+
+/// GitHub's `message` field out of an error body, or a fixed text. Never the
+/// raw body: a request that carried a token or a code could see it echoed.
+fn safe_error_message(body: Option<&str>) -> String {
+    body.and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
+        .and_then(|v| v.get("message")?.as_str().map(str::to_string))
+        .unwrap_or_else(|| "no error message provided".to_string())
 }
 
 /// The GitHub account a user token belongs to.
@@ -555,6 +570,7 @@ pub async fn github_user(api_url: &str, token: &str) -> Result<GithubUser, Remot
         .get(format!("{}/user", api_url.trim_end_matches('/')))
         .bearer_auth(token)
         .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", super::API_VERSION)
         .header("User-Agent", "crystalline")
         .send()
         .await
@@ -583,10 +599,7 @@ async fn parse_auth_json<T: serde::de::DeserializeOwned>(
 ) -> Result<T, RemoteError> {
     let status = response.status();
     if !status.is_success() {
-        let message = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "no error message provided".to_string());
+        let message = safe_error_message(response.text().await.ok().as_deref());
         return Err(RemoteError::Api {
             status: status.as_u16(),
             message,
