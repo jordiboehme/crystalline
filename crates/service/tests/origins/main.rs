@@ -1,5 +1,5 @@
 //! One test binary for the origin suites: GitHub collaboration through the in-
-//! memory forge and the origin poller.
+//! memory forge, the origin poller and the GitHub App's credential seam.
 //!
 //! Each module below was a test binary of its own. The files are unchanged
 //! apart from reaching the shared helpers as `crate::support`, so a test is
@@ -9,6 +9,7 @@
 #[path = "../support/mod.rs"]
 mod support;
 
+mod github_app;
 mod origin;
 mod origin_names;
 mod poller;

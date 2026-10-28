@@ -88,6 +88,10 @@ const STACK_WRITE_BACKOFF: [Duration; STACK_WRITE_ATTEMPTS - 1] =
 /// [`RemoteError::Offline`] rather than hanging forever.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// The HTTP client type [`GitHubProvider::with_client`] takes, named here so
+/// a caller holding one needs no direct dependency on the HTTP crate.
+pub type HttpClient = reqwest::Client;
+
 /// A [`Provider`] backed by the GitHub REST and Git Data APIs over HTTP.
 pub struct GitHubProvider {
     client: reqwest::Client,
@@ -100,13 +104,34 @@ impl GitHubProvider {
     /// carrying `token` as a bearer credential. `token: None` sends
     /// unauthenticated requests, which works against public repositories.
     pub fn new(api_url: Option<String>, token: Option<String>) -> GitHubProvider {
+        GitHubProvider::with_client(GitHubProvider::http_client(), api_url, token)
+    }
+
+    /// The HTTP client a provider sends through, with the per-request
+    /// timeout every GitHub call here runs under.
+    ///
+    /// Building one loads the platform trust store, which is slow, so a
+    /// caller that makes a provider per call (one per repository token)
+    /// builds this once and hands a clone to each
+    /// [`with_client`](GitHubProvider::with_client). A clone shares the
+    /// connection pool.
+    pub fn http_client() -> HttpClient {
+        reqwest::Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .build()
+            .expect("the client config here is static and always valid")
+    }
+
+    /// [`new`](GitHubProvider::new) over a client the caller already holds,
+    /// from [`http_client`](GitHubProvider::http_client).
+    pub fn with_client(
+        client: HttpClient,
+        api_url: Option<String>,
+        token: Option<String>,
+    ) -> GitHubProvider {
         let api_url = api_url
             .map(|url| url.trim_end_matches('/').to_string())
             .unwrap_or_else(|| DEFAULT_API_URL.to_string());
-        let client = reqwest::Client::builder()
-            .timeout(REQUEST_TIMEOUT)
-            .build()
-            .expect("the client config here is static and always valid");
         GitHubProvider {
             client,
             api_url,

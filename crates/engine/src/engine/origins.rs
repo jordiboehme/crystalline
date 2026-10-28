@@ -1293,11 +1293,17 @@ impl Engine {
                 .unwrap_or_default()
         });
         let sharing = crystalline_core::sharing_at(&root);
+        let app = self.origin_status_app(&spec.repo).await;
         let with_out_of_band = |mut value: Value| {
             if let Some(object) = value.as_object_mut() {
                 // Read off the folder like the change detail is, so every
                 // status surface says which kind of domain it is looking at.
                 object.insert("sharing".to_string(), json!(sharing.as_str()));
+                // Only with an App configured, so a status without one reads
+                // exactly as it always has.
+                if let Some(app) = &app {
+                    object.insert("app".to_string(), app.clone());
+                }
             }
             if let Some(paths) = &out_of_band
                 && let Some(object) = value.as_object_mut()
@@ -1345,7 +1351,14 @@ impl Engine {
                 change_detail(),
                 origin::viewer_refusal(&report, viewer, sharing),
             ))),
-            Err(e) if probe.is_some() && origin::is_probe_transport_error(&e) => {
+            // A repository the App is not installed on degrades the same way:
+            // the report still comes back from local state, with the refusal
+            // (and its install url) as the probe error and in `app`.
+            Err(e)
+                if probe.is_some()
+                    && (origin::is_probe_transport_error(&e)
+                        || matches!(e, RemoteError::AppNotInstalled { .. })) =>
+            {
                 // AuthExpired is one of the transport errors this arm catches
                 // (see `origin::is_probe_transport_error`), so a probe that
                 // failed because the token was revoked drops the cached
@@ -1365,6 +1378,29 @@ impl Engine {
             }
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// The `app` block of one domain's status: `{ installed, install_url }`
+    /// when a GitHub App is configured, `None` otherwise. `installed` is
+    /// `null` when GitHub could not be asked (offline, rate limited), and
+    /// `install_url` is `null` when the App's slug could not be read. Never
+    /// an error: a status survives an App that cannot be reached.
+    async fn origin_status_app(&self, repo: &str) -> Option<Value> {
+        let github_app::AppSlot::Ready(router) = self.github_app_slot() else {
+            return None;
+        };
+        let app = router.app();
+        // Asked afresh rather than read from the cache: an uninstall since the
+        // last call is exactly what this block exists to show.
+        app.evict_repo(repo);
+        let (installed, install_url) = match app.installation_for(repo).await {
+            Ok(_) => (json!(true), app.install_url().await.ok()),
+            Err(RemoteError::AppNotInstalled { install_url, .. }) => {
+                (json!(false), Some(install_url))
+            }
+            Err(_) => (Value::Null, app.install_url().await.ok()),
+        };
+        Some(json!({ "installed": installed, "install_url": install_url }))
     }
 
     /// Runs one scheduling pass of the background origin poller: checks
@@ -1408,7 +1444,12 @@ impl Engine {
             }
             self.origin_poller.set_rate_limited_until(None);
         }
-        if !self.origin_connection_offline().0 {
+        // An App is a connection of its own: an instance that runs one needs
+        // no instance token to pull. Asked only when no token is on file, so
+        // an instance without an App reads exactly what it read before.
+        if !self.origin_connection_offline().0
+            && !matches!(self.github_app_slot(), github_app::AppSlot::Ready(_))
+        {
             if self.origin_poller.should_log_no_token(now) {
                 tracing::debug!(
                     "origin poll: no GitHub connection yet; waiting for connect to resume polling"
@@ -3480,7 +3521,7 @@ impl Engine {
 
     /// The base directory per-domain origin state lives under: the test
     /// override, or the real state directory.
-    fn origins_base_dir(&self) -> Result<PathBuf> {
+    pub(super) fn origins_base_dir(&self) -> Result<PathBuf> {
         match &self.origins_dir_override {
             Some(p) => Ok(p.clone()),
             None => crystalline_core::config::origins_state_dir()
@@ -3547,9 +3588,24 @@ impl Engine {
     /// a machine that has not connected yet is never cached, so a later
     /// connect is seen too. Errors with `RemoteError::NotConnected` when no
     /// token has been saved and no test provider is injected.
+    ///
+    /// With a GitHub App configured (see [`Engine::github_app`]) the provider
+    /// is the App's [`github_app::AppRouter`] instead, which sends each call
+    /// on the installation token of the repository it is about, and the
+    /// instance credential is not read at all. A repository the App is not
+    /// installed on is refused with `RemoteError::AppNotInstalled` naming the
+    /// install url, never served on the instance credential. An App that is
+    /// configured but unusable refuses every operation the same way.
     pub(super) fn resolve_origin_provider(&self) -> Result<Arc<dyn Provider>> {
         if let Some(p) = &self.origin_provider_override {
             return Ok(p.clone());
+        }
+        match self.github_app_slot() {
+            github_app::AppSlot::Ready(router) => return Ok(router),
+            github_app::AppSlot::Refused(detail) => {
+                return Err(RemoteError::AppCredential(detail).into());
+            }
+            github_app::AppSlot::Absent | github_app::AppSlot::Unloaded => {}
         }
         let api_url = self
             .config
@@ -3598,6 +3654,10 @@ impl Engine {
         if let Some(p) = &self.origin_provider_override {
             return Ok((p.clone(), self.origin_provider_override_login.clone()));
         }
+        if let Some(app) = self.instance_share_app()? {
+            let login = app.bot_login();
+            return Ok((app, login));
+        }
         let (api_url, token) = self.resolve_share_credential(actor)?;
         let login = token.user_display().map(str::to_string);
         Ok((
@@ -3615,8 +3675,29 @@ impl Engine {
         if self.origin_provider_override.is_some() {
             return Some(self.origin_provider_override_login.clone());
         }
+        match self.instance_share_app() {
+            Ok(Some(app)) => return Some(app.bot_login()),
+            Ok(None) => {}
+            Err(_) => return None,
+        }
         let (_, token) = self.resolve_share_credential(actor).ok()?;
         Some(token.user_display().map(str::to_string))
+    }
+
+    /// The App a share goes out through, when it goes out through one: in
+    /// `instance` mode with an App configured, the same
+    /// [`github_app::AppRouter`] the read side uses, and an unusable App
+    /// refuses. `personal` mode never takes the App: a person's write runs
+    /// on that person's own credential, as before.
+    fn instance_share_app(&self) -> Result<Option<Arc<github_app::AppRouter>>> {
+        if self.config.read().unwrap().github_share_identity() != ShareIdentityMode::Instance {
+            return Ok(None);
+        }
+        match self.github_app_slot() {
+            github_app::AppSlot::Ready(router) => Ok(Some(router)),
+            github_app::AppSlot::Refused(detail) => Err(RemoteError::AppCredential(detail).into()),
+            github_app::AppSlot::Absent | github_app::AppSlot::Unloaded => Ok(None),
+        }
     }
 
     /// The credential half of [`Engine::resolve_share_provider`]: the api url
@@ -3802,6 +3883,13 @@ impl Engine {
             )
         };
         connection["share_identity"] = json!(mode.as_str());
+        // A configured App that cannot be used refuses every origin
+        // operation; this is where the status says why.
+        if let github_app::AppSlot::Refused(detail) = self.github_app_slot() {
+            connection["app"] = json!({
+                "error": RemoteError::AppCredential(detail).to_string(),
+            });
+        }
         if mode == ShareIdentityMode::Personal {
             connection["owner_identity"] =
                 self.personal_slot_json(OWNER_IDENTITY_NAME, &connection);
@@ -3983,9 +4071,19 @@ impl Engine {
     /// clearing every entry (up to one per identity per host now) avoids
     /// threading the offending host through every provider-op call site and
     /// costs only one extra keychain read per host on the next touch.
+    ///
+    /// With a GitHub App, a 401 has already been retried once on a renewed
+    /// installation token inside [`github_app::AppRouter`]; one that still
+    /// reaches here means the installation itself changed, so every
+    /// installation and token the App cached is forgotten too and the next
+    /// call looks the repository up again (and says so when the App is gone).
+    /// Only an App already loaded is touched: this never loads one.
     fn drop_github_credential_on_auth(&self, e: &RemoteError) {
         if matches!(e, RemoteError::AuthExpired) {
             self.github_tokens.lock().unwrap().clear();
+            if let github_app::AppSlot::Ready(router) = &*self.github_app.read().unwrap() {
+                router.app().evict_all();
+            }
         }
     }
 }

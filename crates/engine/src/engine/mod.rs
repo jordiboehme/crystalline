@@ -1126,6 +1126,11 @@ pub struct Engine {
     // leaves it as - reads exactly as an instance whose credential names
     // nobody. Production code never sets this either.
     origin_provider_override_login: Option<String>,
+    // The GitHub App this instance runs, read from the environment or the App
+    // store on the first origin operation that needs a credential (see
+    // `Engine::github_app_slot`). With no App it stays `Absent` and every
+    // provider is built from the instance credential exactly as before.
+    github_app: std::sync::RwLock<github_app::AppSlot>,
     // The Reflections marked for their backup commit, in memory: a restart
     // before a due backup loses the mark, and the next change marks it again
     // and commits both (the backup diffs the whole folder).
@@ -2391,6 +2396,7 @@ impl Engine {
             moves_waiting: std::sync::atomic::AtomicUsize::new(0),
             origin_provider_override: None,
             origin_provider_override_login: None,
+            github_app: std::sync::RwLock::new(github_app::AppSlot::Unloaded),
             backup_marks: Default::default(),
             reflection_walks: Default::default(),
             origins_dir_override: None,
@@ -7172,6 +7178,7 @@ mod edit;
 mod evolve;
 mod fence;
 mod github;
+mod github_app;
 mod kept;
 mod move_;
 mod name_report;
@@ -8373,7 +8380,11 @@ fn default_branch_refusal(repo: &str, e: RemoteError) -> EngineError {
         RemoteError::AuthExpired
         | RemoteError::NotConnected
         | RemoteError::SsoAuthorizationRequired { .. }
-        | RemoteError::OauthAppRestricted { .. } => e.into(),
+        | RemoteError::OauthAppRestricted { .. }
+        // A credential problem, which naming a branch would not fix: the App
+        // is not installed on the repository, or cannot be used at all.
+        | RemoteError::AppNotInstalled { .. }
+        | RemoteError::AppCredential(_) => e.into(),
         other => RemoteError::Refused(format!(
             "could not read the default branch of {repo} ({other}), so nothing was added; \
              name the branch to track (--branch on the command line, branch in add_domain \

@@ -19,6 +19,7 @@ filter = '''
     (package(crystalline-remote) & binary(it) & test(/^(github_app|github_client|github_auth)::/))
     | (package(crystalline-service) & (
         binary(collab_ws)
+        | (binary(origins) & test(/^github_app::/))
         | (binary(rest_admin) & test(/^(rest_admin_api|rest_draft_links|rest_write_api)::/))
         | (binary(rest) & test(/^(rest_api|rest_evolve|rest_files|rest_setup_api|ui_serving)::/))
         | (binary(auth) & test(/^(oauth|oidc)::/))))
@@ -29,9 +30,9 @@ test-group = 'forge-wire'
 
 # Keeps a hung test from wedging the whole run: the sandboxed environments
 # this repo is developed in can stall the loopback-binding suites
-# (crates/remote/tests/it/github_client.rs, it/github_auth.rs and
-# it/github_app.rs bind 127.0.0.1:0), and without a terminate-after nextest
-# waits forever.
+# (crates/remote/tests/it/github_client.rs, it/github_auth.rs,
+# it/github_app.rs and crates/service/tests/origins/github_app.rs bind
+# 127.0.0.1:0), and without a terminate-after nextest waits forever.
 [profile.default]
 slow-timeout = { period = "120s", terminate-after = 2 }
 # A test whose child process outlives it by more than this is reported as a
@@ -46,7 +47,10 @@ leak-timeout = "500ms"
 # past the 240s the default override allows, killing tests that were only slow.
 # They still terminate, so a genuine hang cannot wedge the run.
 [[profile.default.overrides]]
-filter = 'package(crystalline-remote) & binary(it) & test(/^(github_app|github_client|github_auth)::/)'
+filter = '''
+    (package(crystalline-remote) & binary(it) & test(/^(github_app|github_client|github_auth)::/))
+    | (package(crystalline-service) & binary(origins) & test(/^github_app::/))
+'''
 slow-timeout = { period = "120s", terminate-after = 10 }
 
 # The same environmental stall, observed on two more loopback users during

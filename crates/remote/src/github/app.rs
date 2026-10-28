@@ -457,6 +457,13 @@ impl GithubApp {
         lock(&self.installations).retain(|_, installation| *installation != id);
     }
 
+    /// Forgets every installation and every token, so the next call for any
+    /// repository looks its installation up again.
+    pub fn evict_all(&self) {
+        lock(&self.tokens).clear();
+        lock(&self.installations).clear();
+    }
+
     /// Where an owner installs the App:
     /// `<web base>/apps/<slug>/installations/new`, on the Enterprise Server
     /// host when `github.api_url` names one. Needs the slug, so it reads
@@ -470,8 +477,14 @@ impl GithubApp {
         ))
     }
 
+    /// The App's slug when it is already known (saved with the credentials,
+    /// or read by an earlier `GET /app`), without a request.
+    pub fn known_slug(&self) -> Option<String> {
+        lock(&self.slug).clone()
+    }
+
     /// The App's slug: saved with the credentials, or read from `GET /app`.
-    async fn slug(&self) -> Result<String, RemoteError> {
+    pub async fn slug(&self) -> Result<String, RemoteError> {
         if let Some(slug) = lock(&self.slug).clone() {
             return Ok(slug);
         }

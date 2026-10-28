@@ -143,12 +143,19 @@ impl AppStore {
         }
     }
 
+    /// The file backend under `dir`, never the keychain: what
+    /// [`AppStore::resolve_and_load`] falls back to, for a caller (a test
+    /// seam) that must not reach the OS credential store at all.
+    pub fn file_fallback(dir: &Path) -> AppStore {
+        AppStore::File {
+            path: dir.join(APP_FILE_NAME),
+        }
+    }
+
     fn file_and_load(
         fallback_dir: &Path,
     ) -> Result<(AppStore, Option<AppCredentials>), RemoteError> {
-        let store = AppStore::File {
-            path: fallback_dir.join(APP_FILE_NAME),
-        };
+        let store = AppStore::file_fallback(fallback_dir);
         let credentials = store.load()?;
         Ok((store, credentials))
     }

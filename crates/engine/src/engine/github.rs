@@ -253,6 +253,8 @@ impl Engine {
         }
         let host = self.github_token_host();
         matches!(self.github_credential(host.as_deref()), Ok((_, Some(_))))
+            // An App reads and pulls without an instance token.
+            || matches!(self.github_app_slot(), super::github_app::AppSlot::Ready(_))
     }
 
     /// Forget the stored credential: delete it where it lives, drop its cache
