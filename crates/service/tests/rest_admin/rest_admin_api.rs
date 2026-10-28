@@ -829,7 +829,9 @@ const KB_MANIFEST: &[u8] = b"---\ntype: manifest\ntitle: kb\npermalink: manifest
 
 /// The same MANIFEST declaring `sharing: direct`, so a share of this domain
 /// commits straight onto the connected branch.
-const KB_MANIFEST_DIRECT: &[u8] = b"---\ntype: manifest\ntitle: kb\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\nsharing: direct\n---\n\n# kb\n\n## Scope\n\n- shared knowledge\n\n## When to Use\n\n- Route here for team questions\n";
+/// Carries the team marker, as every team repository does after its first
+/// share from 0.30.0 on, so a direct share's commit message is the share's own.
+const KB_MANIFEST_DIRECT: &[u8] = b"---\ntype: manifest\ntitle: kb\nteam: github\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\nsharing: direct\n---\n\n# kb\n\n## Scope\n\n- shared knowledge\n\n## When to Use\n\n- Route here for team questions\n";
 
 /// [`serve_team_with_mock`] with this instance's share-identity mode chosen:
 /// `personal` makes a share run as the acting account's own GitHub identity,
