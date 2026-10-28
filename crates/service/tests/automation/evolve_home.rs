@@ -135,7 +135,7 @@ async fn the_first_scheduled_run_claims_the_home_and_its_pull_request_carries_it
     assert_eq!(taken["evolve_home"], HERE, "{taken}");
     assert_eq!(
         taken["note"],
-        "This instance is now the evolve home of 'brand' (evolve_home: https://kb.example.com). The run's pull request carries the MANIFEST change; once it is merged, other clones of the domain refuse a scheduled evolve run.",
+        "This instance is now the evolve home of 'brand' (evolve_home: https://kb.example.com). The run's pull request carries the MANIFEST change, or the next run's when this run shares nothing; once it is merged, other clones of the domain refuse a scheduled evolve run.",
         "{taken}"
     );
     assert!(
@@ -174,13 +174,162 @@ async fn the_first_scheduled_run_claims_the_home_and_its_pull_request_carries_it
         vec!["MANIFEST.md", "notes/fix.md"],
         "{shared}"
     );
-    // A second run finds its own home and claims nothing.
+    // A second run while the pull request is open claims nothing new; it
+    // carries the claim on until the team's copy has it.
     eng.automation_lease_release(Loop::Evolve, "brand", token, &Scope::Unrestricted)
         .await
         .unwrap();
     let again = take_as(&eng, "brand", &Scope::Unrestricted).await;
     assert!(again.get("evolve_home").is_none(), "{again}");
-    assert!(again.get("note").is_none(), "{again}");
+    assert!(
+        again["note"]
+            .as_str()
+            .unwrap()
+            .contains("is not in the team's copy yet"),
+        "{again}"
+    );
+}
+
+/// A claim the first run never shared (it failed, was stopped or ran with
+/// `--no-share`) is not stranded: the next run says so, and its pull request
+/// carries the MANIFEST change, which a person's edit would otherwise hold
+/// back as unshared work from before the take.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_claim_the_first_run_did_not_share_rides_with_the_next_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let (eng, root) = team_at(&tmp, mock.clone(), team_manifest(""), Some(HERE)).await;
+    let first = take_as(&eng, "brand", &Scope::Unrestricted).await;
+    assert_eq!(first["evolve_home"], HERE, "{first}");
+    eng.automation_lease_release(
+        Loop::Evolve,
+        "brand",
+        first["token"].as_str().unwrap(),
+        &Scope::Unrestricted,
+    )
+    .await
+    .unwrap();
+
+    let second = take_as(&eng, "brand", &Scope::Unrestricted).await;
+    assert!(second.get("evolve_home").is_none(), "{second}");
+    assert_eq!(
+        second["note"],
+        "The claim of the evolve home of 'brand' for this instance (evolve_home: https://kb.example.com) is not in the team's copy yet, so this run's pull request carries it too.",
+        "{second}"
+    );
+    write_note(&root, "notes/fix.md", "the run's fix");
+    let shared = eng
+        .automation_share(
+            Loop::Evolve,
+            "brand",
+            second["token"].as_str().unwrap(),
+            "Fixed one finding.",
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert_eq!(shared["outcome"], "shared", "{shared}");
+    assert_eq!(
+        shared_files(&shared),
+        vec!["MANIFEST.md", "notes/fix.md"],
+        "{shared}"
+    );
+    assert_eq!(shared["held_back"], serde_json::json!([]), "{shared}");
+}
+
+/// A person's own edit of the MANIFEST beside an unshared claim is theirs to
+/// share: the run holds the MANIFEST back, as it holds back any file a
+/// person had unshared work on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_claim_beside_a_persons_manifest_edit_is_held_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let (eng, root) = team_at(&tmp, mock.clone(), team_manifest(""), Some(HERE)).await;
+    let first = take_as(&eng, "brand", &Scope::Unrestricted).await;
+    eng.automation_lease_release(
+        Loop::Evolve,
+        "brand",
+        first["token"].as_str().unwrap(),
+        &Scope::Unrestricted,
+    )
+    .await
+    .unwrap();
+    let edited = manifest_text(&root).replace("- always\n", "- always, and on Mondays\n");
+    std::fs::write(root.join("MANIFEST.md"), edited).unwrap();
+    eng.sync(Some("brand")).await.unwrap();
+
+    let second = take_as(&eng, "brand", &Scope::Unrestricted).await;
+    assert!(second.get("note").is_none(), "{second}");
+    write_note(&root, "notes/fix.md", "the run's fix");
+    std::fs::write(
+        root.join("MANIFEST.md"),
+        manifest_text(&root).replace("on Mondays", "on Mondays and Fridays"),
+    )
+    .unwrap();
+    let shared = eng
+        .automation_share(
+            Loop::Evolve,
+            "brand",
+            second["token"].as_str().unwrap(),
+            "Fixed one finding.",
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert_eq!(shared_files(&shared), vec!["notes/fix.md"], "{shared}");
+    assert_eq!(
+        shared["held_back"],
+        serde_json::json!(["MANIFEST.md"]),
+        "{shared}"
+    );
+}
+
+/// On a domain that reviews changes the claim is the runner's draft, and
+/// the run's proposal carries it through the review.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn on_a_reviewing_domain_the_claim_is_the_runners_draft_and_rides_the_proposal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let (eng, root) = team_at(&tmp, mock.clone(), team_manifest(""), Some(HERE)).await;
+    eng.set_review_mode(
+        "brand",
+        Some(crystalline_core::config::ReviewMode::Overlay),
+        crystalline_service::ReviewModeConfirm::Confirmed { folds: Vec::new() },
+        &Scope::Unrestricted,
+    )
+    .await
+    .unwrap();
+    let auth = Arc::new(
+        AuthStore::open(&tmp.path().join("web-auth.db"))
+            .await
+            .unwrap(),
+    );
+    auth.add_user("runner", "runner", None, Role::Editor, "pw12345678")
+        .await
+        .unwrap();
+    eng.set_domain_access(Arc::new(DomainAccess::new(auth)));
+    let runner = Scope::User {
+        account: "runner".into(),
+        admin: false,
+    };
+    let taken = take_as(&eng, "brand", &runner).await;
+    assert_eq!(taken["evolve_home"], HERE, "{taken}");
+    assert!(
+        !manifest_text(&root).contains("evolve_home"),
+        "the folder is the reviewed truth; the claim is a draft"
+    );
+    let shared = eng
+        .automation_share(
+            Loop::Evolve,
+            "brand",
+            taken["token"].as_str().unwrap(),
+            "Claimed the home.",
+            &runner,
+        )
+        .await
+        .unwrap();
+    assert_eq!(shared["outcome"], "shared", "{shared}");
+    assert_eq!(shared_files(&shared), vec!["MANIFEST.md"], "{shared}");
 }
 
 /// A runner with its own account: the claim is noted as the run's write,
@@ -331,11 +480,11 @@ async fn the_home_moves_by_removing_it_where_evolve_should_run() {
         set.to_string(),
         "`evolve_home` is filled in by the first scheduled evolve run at an instance with service.public_url; it is not set by hand. To move the home, remove it at the instance that should run evolve (unset evolve_home), then run evolve there"
     );
-    eng.edit_manifest_policies(
+    // Through configure, as an agent or a person removes it.
+    eng.change_domain_settings(
         "brand",
-        &[PolicyEdit::Unset {
-            key: "evolve_home".into(),
-        }],
+        &std::collections::BTreeMap::new(),
+        &["evolve_home".to_string()],
         &Scope::Unrestricted,
     )
     .await

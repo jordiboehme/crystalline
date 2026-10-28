@@ -19,6 +19,9 @@ use crystalline_index::{
 
 use crate::scope::{ReflectionCaller, ReflectionRight, Scope};
 
+/// The MANIFEST's path in a domain, as the share and the run's writes name it.
+const MANIFEST_FILE: &str = "MANIFEST.md";
+
 /// Why a domain whose loop can run nowhere here is not due.
 const NOT_HOSTED_HERE: &str = "not hosted here";
 
@@ -294,7 +297,18 @@ impl Engine {
         }
         let id = self.loop_domain_id(domain).await?;
         let due = self.loop_due(lp, domain, id, scope).await?;
-        let unshared_at_start = self.unshared_now(domain, scope).await?;
+        let mut unshared_at_start = self.unshared_now(domain, scope).await?;
+        // A claim of the evolve home an earlier run wrote and never shared
+        // (it failed, was stopped or ran with --no-share) rides with this
+        // run: a MANIFEST unshared at the take would be held back as a
+        // person's work, and no later run would carry it.
+        let pending_claim = match lp {
+            Loop::Evolve => self.pending_evolve_claim(domain),
+            Loop::Reflect => None,
+        };
+        if pending_claim.is_some() {
+            unshared_at_start.retain(|file| file.path != MANIFEST_FILE);
+        }
         let (now, stale_before) = self.automation_window();
         let holder = LeaseHolder {
             instance_id: self.instance_id.clone(),
@@ -308,7 +322,12 @@ impl Engine {
             .await?;
         // After the lease is held, so of two takes racing only the one that
         // won writes the home.
-        if lp == Loop::Evolve {
+        if let Some(own) = pending_claim {
+            self.note_claim_written(domain, scope).await;
+            taken["note"] = json!(format!(
+                "The claim of the evolve home of '{domain}' for this instance (evolve_home: {own}) is not in the team's copy yet, so this run's pull request carries it too."
+            ));
+        } else if lp == Loop::Evolve {
             let (home, note) = self.claim_evolve_home(domain, scope).await;
             if let Some(home) = home {
                 taken["evolve_home"] = json!(home);
@@ -960,19 +979,63 @@ impl Engine {
                 )),
             );
         }
+        self.note_claim_written(domain, scope).await;
+        (
+            Some(own.clone()),
+            Some(format!(
+                "This instance is now the evolve home of '{domain}' (evolve_home: {own}). The run's pull request carries the MANIFEST change, or the next run's when this run shares nothing; once it is merged, other clones of the domain refuse a scheduled evolve run."
+            )),
+        )
+    }
+
+    /// Note the MANIFEST as the run's own write, for a runner with an
+    /// account, so its attributed share carries the evolve home's line.
+    async fn note_claim_written(&self, domain: &str, scope: &Scope) {
         if let Some(account) = scope_account(scope)
             && let Err(e) = self
-                .note_written(domain, &account, &["MANIFEST.md".to_string()])
+                .note_written(domain, &account, &[MANIFEST_FILE.to_string()])
                 .await
         {
             tracing::warn!("noting the evolve home of '{domain}' for its run: {e}");
         }
-        (
-            Some(own.clone()),
-            Some(format!(
-                "This instance is now the evolve home of '{domain}' (evolve_home: {own}). The run's pull request carries the MANIFEST change; once it is merged, other clones of the domain refuse a scheduled evolve run."
-            )),
-        )
+    }
+
+    /// This instance's address, when the MANIFEST of `domain` claims the
+    /// evolve home for it and the claim is not in the team's copy yet: the
+    /// folder's MANIFEST names this instance, the base snapshot's does not,
+    /// and the two differ in nothing else but the `generated` stamp the
+    /// edit path writes. A MANIFEST with a person's own unshared edit is not
+    /// a pending claim, so the run holds it back as their work. A domain
+    /// that reviews changes keeps the claim in the runner's draft, which the
+    /// next take writes again (the folder has no home), so it needs no help.
+    fn pending_evolve_claim(&self, domain: &str) -> Option<String> {
+        let connected = self.config.read().unwrap().github_enabled()
+            && self
+                .domain_entry(domain)
+                .is_ok_and(|entry| entry.origin.is_some());
+        if !connected {
+            return None;
+        }
+        let own = self.own_public_url()?;
+        let ContentSource::File { root } = self.read_source(domain) else {
+            return None;
+        };
+        let current = std::fs::read_to_string(root.join(MANIFEST_FILE)).ok()?;
+        let current = crystalline_core::to_lf(&current).into_owned();
+        if crystalline_core::evolve_home_of_source(&current).as_deref() != Some(own.as_str()) {
+            return None;
+        }
+        let base_dir = self.origin_state_dir(domain).ok()?.join("base");
+        let base = std::fs::read_to_string(base_dir.join(MANIFEST_FILE)).ok()?;
+        let base = crystalline_core::to_lf(&base).into_owned();
+        if crystalline_core::evolve_home_of_source(&base).as_deref() == Some(own.as_str()) {
+            return None;
+        }
+        let bare = |text: &str| {
+            let text = remove_frontmatter_field(text, crystalline_core::EVOLVE_HOME_KEY);
+            remove_frontmatter_field(&text, "generated")
+        };
+        crystalline_core::frontmatter::same_content(&bare(&current), &bare(&base)).then_some(own)
     }
 
     /// The index row of `domain`, which the lease and the runs hang on.
