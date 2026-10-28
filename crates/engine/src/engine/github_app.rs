@@ -833,9 +833,17 @@ impl Engine {
                 None
             }
         };
+        // A link made on another host (before `github.api_url` changed) is
+        // not this host's id, so it is not used.
         let email = match linked {
-            Some(link) => Some(router.app().user_noreply_email(link.github_id, &link.login)),
-            None => contact.email,
+            Some(link)
+                if link
+                    .host
+                    .eq_ignore_ascii_case(&router.app().credentials().host) =>
+            {
+                Some(router.app().user_noreply_email(link.github_id, &link.login))
+            }
+            _ => contact.email,
         };
         // An account without an address of its own is not named; the bot
         // authors it.

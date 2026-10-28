@@ -561,7 +561,9 @@ async fn a_device_flow_link_lands_as_a_link() {
     let mut linked = None;
     for _ in 0..200 {
         let status = eng.github_link_status("ada").await.unwrap();
-        if status.linked {
+        // The row is written a moment before the flow's outcome lands, so
+        // a read in between sees the link with the code still pending.
+        if status.linked && status.pending.is_none() {
             linked = Some(status);
             break;
         }
