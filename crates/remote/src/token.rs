@@ -123,7 +123,8 @@ pub struct StoredToken {
     /// When `access_token` stops working; `None` when it never does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
-    /// When `refresh_token` stops working; `None` when there is none.
+    /// When `refresh_token` stops working. `None` means there is no refresh
+    /// token or its expiry is unknown, not only that it never expires.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh_expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }

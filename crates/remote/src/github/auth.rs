@@ -543,11 +543,16 @@ pub async fn revoke_user_token(
     })
 }
 
-/// GitHub's `message` field out of an error body, or a fixed text. Never the
+/// GitHub's `message` field out of an error body, else the OAuth endpoints'
+/// `error_description`, else their `error` code, else a fixed text. Never the
 /// raw body: a request that carried a token or a code could see it echoed.
 fn safe_error_message(body: Option<&str>) -> String {
     body.and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
-        .and_then(|v| v.get("message")?.as_str().map(str::to_string))
+        .and_then(|v| {
+            ["message", "error_description", "error"]
+                .iter()
+                .find_map(|k| v.get(k)?.as_str().map(str::to_string))
+        })
         .unwrap_or_else(|| "no error message provided".to_string())
 }
 

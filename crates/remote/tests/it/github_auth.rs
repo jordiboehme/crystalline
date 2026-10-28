@@ -110,7 +110,10 @@ async fn start_device_flow_maps_a_non_success_status_to_api() {
         .await
         .unwrap_err();
     match err {
-        RemoteError::Api { status, .. } => assert_eq!(status, 400),
+        RemoteError::Api { status, message } => {
+            assert_eq!(status, 400);
+            assert!(message.contains("unsupported_grant_type"), "{message}");
+        }
         other => panic!("expected Api, got {other:?}"),
     }
 }
