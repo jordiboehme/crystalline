@@ -164,7 +164,11 @@ An instance without `service.public_url` cannot be the home. A run there goes on
 
 `evolve_engrams` and `crystalline evolve` in a session are not refused anywhere. They only read, and they open no pull request. What a person fixes from the findings travels with their own share, like any other edit.
 
-To move the home, remove the key at the instance that should run evolve (`configure` with the domain and `unset: ["evolve_home"]`, or delete the line from the MANIFEST there), then run evolve there. That run claims the home and its pull request carries the new address. A local domain and a virtual domain ignore the key. A plain clone that carries `team: github` is a team domain and is refused like any other clone.
+To move the home, remove the key at the instance that should run evolve (`configure` with the domain and `unset: ["evolve_home"]`, or delete the line from the MANIFEST there), then run evolve there. On a domain that takes changes directly the removal is in the folder at once, so that run claims the home and its pull request carries the new address. On a domain that reviews changes the removal is your draft: the folder still names the old home, so the old home keeps running and this instance keeps refusing. Share the draft. Once the team merges the proposal and this instance pulls it, the next run here claims the home through a proposal of its own.
+
+When two clones claim at the same time, the claim the team merges first wins. The other clone's next pull takes the team's home for that line without a conflict and drops its own claim, and that clone then refuses and names the home. Its other unshared work stays and shares as before.
+
+When the team closes the claim's pull request without merging it, the next run at that instance withdraws the claim: the MANIFEST goes back to the team's copy, the run says so once, and `crystalline doctor` warns that the team declined the claim. The instance does not claim the home again on its own. To claim it again, unset `evolve_home` there with `configure` and run evolve. A local domain and a virtual domain ignore the key. A plain clone that carries `team: github` is a team domain and is refused like any other clone.
 
 ### Private domains
 
