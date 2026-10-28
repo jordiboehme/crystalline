@@ -21,7 +21,7 @@ When the PACT has no `## Presentation` section, use the defaults below. If you s
 
 When you rewrite a whole page, pass the `checksum` from `read_reflection` as `expected_checksum`, so a change a person made since your read is refused instead of overwritten.
 
-Record the engrams each section was built from with `sources` on `write_reflection`, as permalinks in this domain or `crystalline://<domain>/<permalink>` addresses for another domain; never write them into the page as HTML comments or text.
+Record the engrams each section was built from with `sources` on `write_reflection`, as permalinks in this domain or `crystalline://<domain>/<permalink>` addresses for another domain; never write them into the page as HTML comments or text. Cite another domain only when everyone who reads this page may read that domain too: a source in a domain fewer people may read is refused, and a `source_too_wide` item in `reflect` asks you to remove such a source and the text drawn from it.
 
 ## Where an element is required
 
