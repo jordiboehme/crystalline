@@ -81,6 +81,11 @@ pub const VERIFY_RULES: &[VerifyRule] = &[
         "info",
         "A link names a domain outside the scan, so it cannot be checked.",
     ),
+    rule(
+        "L007",
+        "warning",
+        "A relative link or image to a file that is not a note points at a file the domain has.",
+    ),
     rule("M001", "error", "The MANIFEST, or a required file, exists."),
     rule(
         "M002",
@@ -304,7 +309,7 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(ids, sorted, "id order, each id once");
-        assert_eq!(ids.len(), 67);
+        assert_eq!(ids.len(), 68);
         for rule in VERIFY_RULES {
             assert!(
                 ["error", "warning", "info"].contains(&rule.default),
