@@ -2523,7 +2523,16 @@ async fn direct_team(
     tmp: &tempfile::TempDir,
     mock: Arc<MockProvider>,
 ) -> (Engine, std::path::PathBuf, std::path::PathBuf) {
-    let commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest_sharing_direct())]));
+    direct_team_with(tmp, mock, manifest_sharing_direct()).await
+}
+
+/// [`direct_team`] over a MANIFEST of the caller's own.
+async fn direct_team_with(
+    tmp: &tempfile::TempDir,
+    mock: Arc<MockProvider>,
+    manifest: Vec<u8>,
+) -> (Engine, std::path::PathBuf, std::path::PathBuf) {
+    let commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest)]));
     mock.set_branch("main", &commit);
     let config_path = tmp.path().join("config.yaml");
     let origins_dir = tmp.path().join("origins");
@@ -2788,6 +2797,29 @@ async fn a_direct_preview_names_the_commit_and_an_open_proposal_refuses_it() {
         serde_json::json!(["notes/new.md"]),
         "{amended}"
     );
+}
+
+/// A share that shares nothing names no team marker and leaves none
+/// behind: a direct share the branch refuses answers `branch_protected`
+/// without `team_marker`, and the folder's MANIFEST is as it was, so the
+/// marker is not a local change nobody asked for.
+#[tokio::test]
+async fn a_refused_share_names_no_team_marker_and_leaves_none() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let unmarked = String::from_utf8(manifest_sharing_direct())
+        .unwrap()
+        .replace("team: github\n", "")
+        .into_bytes();
+    let (eng, root, _origins_dir) = direct_team_with(&tmp, mock.clone(), unmarked.clone()).await;
+    mock.protect_branch("main", "Changes must be made through a pull request.");
+    let result = eng
+        .origin_share("brand", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(result["outcome"], "branch_protected", "{result}");
+    assert!(result.get("team_marker").is_none(), "{result}");
+    assert_eq!(std::fs::read(root.join("MANIFEST.md")).unwrap(), unmarked);
 }
 
 #[tokio::test]

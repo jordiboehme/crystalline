@@ -2061,11 +2061,16 @@ async fn a_share_carries_only_the_chosen_files_and_the_plan_names_their_authors(
     // along with it in a domain that declares `generated_indexes: shared`;
     // this one declares nothing, so the listing stays on this machine.
     assert_eq!(shared["added"], serde_json::json!(["mine.md"]), "{shared}");
+    // The file nobody ticked stays behind. This repository has no team
+    // marker yet, so the MANIFEST joins the share with that one line; the
+    // refused share above took back the line it had written, so it rides
+    // here as the only other file.
     assert_eq!(
         shared["updated"],
-        serde_json::json!([]),
-        "the file nobody ticked stays behind: {shared}"
+        serde_json::json!(["MANIFEST.md"]),
+        "{shared}"
     );
+    assert_eq!(shared["team_marker"]["path"], "MANIFEST.md", "{shared}");
 }
 
 /// The stacked half of the share route. `the_share_routes_walk_the_loop`

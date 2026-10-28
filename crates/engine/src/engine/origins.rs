@@ -15,6 +15,12 @@ const TEAM_MARKER_NOTE: &str = "MANIFEST.md gains `team: github`. Crystalline ad
 /// carries, and the file list it goes on with when the marker joined a
 /// narrowed one.
 struct TeamMarker {
+    /// The MANIFEST text before the marker, for a share that ends up
+    /// sharing nothing and takes the marker back out of the folder.
+    current: String,
+    /// Whether the marker was written into the folder (a domain that takes
+    /// changes directly) rather than into a staged tree.
+    in_folder: bool,
     marked: String,
     files: Option<Vec<String>>,
 }
@@ -491,7 +497,12 @@ impl Engine {
                 Some(list)
             }
         };
-        Ok(Some(TeamMarker { marked, files }))
+        Ok(Some(TeamMarker {
+            current: current.to_string(),
+            in_folder: false,
+            marked,
+            files,
+        }))
     }
 
     /// Write the marker [`Engine::plan_team_marker`] planned into the folder
@@ -1815,7 +1826,12 @@ impl Engine {
                 .await
             {
                 Ok(Some(plan)) => match self.write_team_marker(domain, &root, &plan.marked).await {
-                    Ok(true) => marker = Some(plan),
+                    Ok(true) => {
+                        marker = Some(TeamMarker {
+                            in_folder: true,
+                            ..plan
+                        })
+                    }
                     Ok(false) => {}
                     Err(e) => tracing::warn!(
                         "writing the team marker of '{domain}' before a share failed: {e}"
@@ -1906,10 +1922,22 @@ impl Engine {
         {
             Ok(outcome) => {
                 let mut receipt = origin::propose_outcome_json(&outcome);
-                if marker.is_some()
-                    && !matches!(outcome, ops::ProposeOutcome::NothingToShare { .. })
-                {
-                    receipt["team_marker"] = team_marker_json();
+                // Only an outcome that carried something to the team carried
+                // the marker; a refusal or a diverged proposal shared nothing,
+                // and the marker it wrote into the folder is taken back.
+                let shared = matches!(
+                    outcome,
+                    ops::ProposeOutcome::Proposed(_)
+                        | ops::ProposeOutcome::Updated(_)
+                        | ops::ProposeOutcome::Committed(_)
+                        | ops::ProposeOutcome::FellBack { .. }
+                );
+                if let Some(plan) = &marker {
+                    if shared {
+                        receipt["team_marker"] = team_marker_json();
+                    } else {
+                        self.take_back_team_marker(domain, &root, plan).await;
+                    }
                 }
                 // A reviewing domain's direct commit: the folder is written
                 // from the base copies the commit advanced, those paths are
@@ -1972,6 +2000,9 @@ impl Engine {
                 Ok(receipt)
             }
             Err(RemoteError::ConflictsPending { count }) => {
+                if let Some(plan) = &marker {
+                    self.take_back_team_marker(domain, &root, plan).await;
+                }
                 // The conflicts refusal is the loudest case for syncing: the
                 // pull ran, applied everything that merged cleanly and only
                 // then refused, so this shape carries the most unindexed work
@@ -1989,7 +2020,36 @@ impl Engine {
                     "conflicts": conflicts,
                 }))
             }
-            Err(e) => Err(share_write_error(e, acting.as_deref(), &spec.repo).into()),
+            Err(e) => {
+                if let Some(plan) = &marker {
+                    self.take_back_team_marker(domain, &root, plan).await;
+                }
+                Err(share_write_error(e, acting.as_deref(), &spec.repo).into())
+            }
+        }
+    }
+
+    /// Take the team marker a share wrote into the folder back out when the
+    /// share carried nothing to the team, so it never stays behind as a
+    /// local change nobody asked for. Only while the MANIFEST still holds
+    /// exactly what the marker write left: a pull or a person that changed
+    /// it since owns it now. Best effort, like the write.
+    async fn take_back_team_marker(&self, domain: &str, root: &Path, plan: &TeamMarker) {
+        if !plan.in_folder {
+            return;
+        }
+        let path = root.join(MANIFEST_PATH);
+        let unchanged = std::fs::read_to_string(&path)
+            .is_ok_and(|text| crystalline_core::to_lf(&text) == plan.marked);
+        if !unchanged {
+            return;
+        }
+        if let Err(e) = write_file(&path, &plan.current) {
+            tracing::warn!("taking the team marker of '{domain}' back failed: {e}");
+            return;
+        }
+        if let Err(e) = self.sync(Some(domain)).await {
+            tracing::warn!("indexing '{domain}' after taking the team marker back failed: {e}");
         }
     }
 
