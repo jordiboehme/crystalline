@@ -125,10 +125,10 @@ On an instance where the domain is not connected, the marker refuses Reflection.
 The second guard is a check in the repository itself. `crystalline verify --team-repository`, or the GitHub Action with `team-repository: 'true'`, adds three rules:
 
 - `M011`, an error: `reflection: on` without a valid `reflection_home`.
-- `M012`, an error: any file under `reflections/`, in any letter case, while Reflection is on. One finding lists the paths. With Reflection off, `reflections/` is ordinary content and stays allowed.
-- `M109`, a warning: the MANIFEST has no `team: github`. A repository from before 0.30.0 gets the line with its next share from a connected instance.
+- `M012`, an error: any file or link under `reflections/`, in any letter case, while Reflection is on, and a `reflections` link in place of the folder. One finding lists the paths, and its annotation points at the first one. With Reflection off, `reflections/` is ordinary content and stays allowed.
+- `M109`, a warning: the MANIFEST has no `team: github`, or spells it another way (`team: GitHub` marks nothing). A repository from before 0.30.0 gets the line with its next share from a connected instance; on a domain that reviews changes, with the next proposal, once the team merges it.
 
-The domain's own `.crystalline.yaml` cannot turn these three rules off, so a pull request cannot switch off the check that guards it. Each finding says what is wrong, why, and what to do, because a team member reads it in the pull request comment.
+The domain's own `.crystalline.yaml` cannot turn these three rules off, and in this mode it cannot turn off `M010` (an unknown `team` value) either, so a pull request cannot switch off the check that guards it. Each finding says what is wrong, why, and what to do, because a team member reads it in the pull request comment.
 
 ```yaml
 on:

@@ -18,7 +18,7 @@
 //!
 //! `--team-repository` adds the rules for a repository a team shares through
 //! GitHub (`M011`, `M012`, `M109`), which the domain's own settings cannot
-//! lower; see the `team` module.
+//! lower, and puts `M010` out of their reach too; see the `team` module.
 
 mod catalog;
 mod domain_config;
@@ -359,6 +359,10 @@ pub(crate) struct Sink<'a> {
     summary: &'a mut Summary,
     verify_cfg: Option<&'a crate::config::VerifyConfig>,
     strict: bool,
+    /// Rules the domain's own settings do not reach in this run: `M010` in a
+    /// team repository, so a pull request cannot misspell the team marker
+    /// and turn off the finding about it in the same change.
+    fixed: &'static [&'static str],
 }
 
 impl<'a> Sink<'a> {
@@ -373,7 +377,14 @@ impl<'a> Sink<'a> {
             summary,
             verify_cfg,
             strict,
+            fixed: &[],
         }
+    }
+
+    /// This sink, with `rules` out of reach of the domain's settings.
+    fn with_fixed(mut self, rules: &'static [&'static str]) -> Sink<'a> {
+        self.fixed = rules;
+        self
     }
 
     /// Emit a finding at its rule's default severity. Resolves the
@@ -396,7 +407,12 @@ impl<'a> Sink<'a> {
             message: message.into(),
             fix,
         };
-        let Some(issue) = effective_issue(raw, self.verify_cfg, self.strict) else {
+        let verify_cfg = if self.fixed.contains(&rule) {
+            None
+        } else {
+            self.verify_cfg
+        };
+        let Some(issue) = effective_issue(raw, verify_cfg, self.strict) else {
             return;
         };
         match issue.severity {
@@ -433,7 +449,12 @@ fn run_rules(domains: &[scanner::Domain], options: &VerifyOptions) -> VerifyRepo
             &mut summary,
             domain.config.verify.as_ref(),
             options.strict,
-        );
+        )
+        .with_fixed(if options.team_repository {
+            &["M010"]
+        } else {
+            &[]
+        });
         // The domain's own settings first: a severity word verify does not
         // know, or a file that does not parse, silently took an override
         // away. One `M108` per problem, against the file itself.

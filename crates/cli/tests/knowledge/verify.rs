@@ -299,6 +299,6 @@ fn team_repository_adds_the_team_rules() {
         .assert()
         .code(1)
         .stdout(predicate::str::contains(
-            "::error file=team-repository-bad/reflections,title=M012::The MANIFEST says `reflection: on`, and this branch holds 3 files under reflections/: reflections/PACT.md, reflections/guides/tides.md, reflections/guides/tides.threads.md.",
+            "::error file=team-repository-bad/reflections/PACT.md,title=M012::The MANIFEST says `reflection: on`, and this branch holds 3 files under reflections/: reflections/PACT.md, reflections/guides/tides.md, reflections/guides/tides.threads.md.",
         ));
 }

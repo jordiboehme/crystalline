@@ -1557,7 +1557,13 @@ fn files_under_reflections_while_reflection_is_on_are_one_m012() {
         report.issues
     );
     assert_eq!(m012[0].severity, Severity::Error);
-    assert!(m012[0].path.ends_with("reflections"), "{:?}", m012[0].path);
+    assert!(
+        m012[0]
+            .path
+            .ends_with("reflections/.reflected/guides/setup.md"),
+        "the annotation points at the first file: {:?}",
+        m012[0].path
+    );
     assert_eq!(
         m012[0].message,
         format!(
@@ -1628,7 +1634,7 @@ fn a_missing_team_marker_is_an_m109_warning() {
     assert_eq!(m109[0].severity, Severity::Warning);
     assert_eq!(
         m109[0].message,
-        "The MANIFEST has no `team: github` line. The line marks this repository as a team domain, so Crystalline refuses to switch Reflection on in a clone that is not connected to the team. Share once from an instance connected to the domain; the share adds the line."
+        "The MANIFEST has no `team: github` line. The line marks this repository as a team domain, so Crystalline refuses to switch Reflection on in a clone that is not connected to the team. Share once from an instance connected to the domain: the share adds the line. On a domain that reviews changes, the share's proposal adds it, and the line arrives here when the team merges that proposal."
     );
     assert_eq!(report.exit_code(), 0, "a warning alone does not fail");
 
@@ -1639,12 +1645,42 @@ fn a_missing_team_marker_is_an_m109_warning() {
     let report = verify::verify_paths([dir.path()], &strict).unwrap();
     assert_eq!(rules_of(&report, "M109")[0].severity, Severity::Error);
 
-    // An unknown value is M010's; M109 is for a missing line only.
+    // An unknown value marks nothing, so in a team repository it is a
+    // missing marker too, beside M010's error about the value itself.
     let dir = tempdir().unwrap();
-    write(dir.path(), "MANIFEST.md", &team_manifest("team: gitlab\n"));
+    write(dir.path(), "MANIFEST.md", &team_manifest("team: GitHub\n"));
     let report = verify::verify_paths([dir.path()], &team_options()).unwrap();
-    assert!(rules_of(&report, "M109").is_empty(), "{:#?}", report.issues);
+    let m109 = rules_of(&report, "M109");
+    assert_eq!(m109.len(), 1, "{:#?}", report.issues);
+    assert_eq!(
+        m109[0].message,
+        "The MANIFEST says `team: GitHub`, and only `team: github` marks this repository as a team domain, so Crystalline refuses to switch Reflection on in a clone that is not connected to the team. Write `team: github` instead."
+    );
     assert_eq!(rules_of(&report, "M010").len(), 1);
+}
+
+/// A pull request cannot disarm the marker by misspelling it and turning
+/// M010 off in the same change: in a team repository M010 ignores the
+/// domain's settings like the team rules do, and M109 still warns. Plain
+/// verify keeps honouring the override.
+#[test]
+fn a_misspelled_marker_cannot_be_silenced_in_a_team_repository() {
+    let dir = tempdir().unwrap();
+    write(dir.path(), "MANIFEST.md", &team_manifest("team: GitHub\n"));
+    write(
+        dir.path(),
+        ".crystalline.yaml",
+        "verify:\n  rules:\n    M010: off\n",
+    );
+    let report = verify::verify_paths([dir.path()], &team_options()).unwrap();
+    let m010 = rules_of(&report, "M010");
+    assert_eq!(m010.len(), 1, "{:#?}", report.issues);
+    assert_eq!(m010[0].severity, Severity::Error);
+    assert_eq!(rules_of(&report, "M109").len(), 1, "{:#?}", report.issues);
+    assert_eq!(report.exit_code(), 1);
+
+    let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+    assert!(rules_of(&report, "M010").is_empty(), "{:#?}", report.issues);
 }
 
 /// The guard cannot be switched off from inside the repository it guards:
@@ -1668,4 +1704,51 @@ fn the_domains_own_settings_cannot_turn_the_team_rules_off() {
     assert_eq!(rules_of(&report, "M011")[0].severity, Severity::Error);
     assert_eq!(rules_of(&report, "M012")[0].severity, Severity::Error);
     assert_eq!(rules_of(&report, "M109")[0].severity, Severity::Warning);
+}
+
+/// A link counts as present under `reflections/`, whatever it points at, and
+/// so does a `reflections` folder that is itself a link: git keeps links as
+/// they are, so a pushed link is a pushed Reflection path either way.
+#[cfg(unix)]
+#[test]
+fn m012_counts_links_under_the_folder_and_a_linked_folder() {
+    let dir = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    write(outside.path(), "page.md", "# Page\n");
+    let manifest =
+        team_manifest("team: github\nreflection: on\nreflection_home: https://team.example.com\n");
+
+    let root = dir.path().join("linked-files");
+    write(&root, "MANIFEST.md", &manifest);
+    write(&root, "reflections/PACT.md", "# Pact\n");
+    std::os::unix::fs::symlink(
+        outside.path().join("page.md"),
+        root.join("reflections/page.md"),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(outside.path(), root.join("reflections/elsewhere")).unwrap();
+    let report = verify::verify_paths([&root], &team_options()).unwrap();
+    let m012 = rules_of(&report, "M012");
+    assert_eq!(m012.len(), 1, "{:#?}", report.issues);
+    assert!(
+        m012[0].message.contains(
+            "holds 3 files under reflections/: reflections/PACT.md, reflections/elsewhere, reflections/page.md."
+        ),
+        "{}",
+        m012[0].message
+    );
+
+    let root = dir.path().join("linked-folder");
+    write(&root, "MANIFEST.md", &manifest);
+    std::os::unix::fs::symlink(outside.path(), root.join("reflections")).unwrap();
+    let report = verify::verify_paths([&root], &team_options()).unwrap();
+    let m012 = rules_of(&report, "M012");
+    assert_eq!(m012.len(), 1, "{:#?}", report.issues);
+    assert!(
+        m012[0]
+            .message
+            .contains("holds 1 file under reflections/: reflections."),
+        "{}",
+        m012[0].message
+    );
 }

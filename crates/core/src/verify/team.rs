@@ -36,7 +36,7 @@ use crate::manifest::{
     Manifest, REFLECTION_HOME_KEY, REFLECTION_KEY, ReflectionSwitch, TEAM_KEY, TeamForge,
     validate_reflection_home,
 };
-use crate::reflection::reflection_folders;
+use crate::reflection::REFLECTIONS_DIR;
 
 use super::scanner::Domain;
 use super::{Severity, Sink};
@@ -61,21 +61,23 @@ pub(crate) fn check(domain: &Domain, sink: &mut Sink) {
     let manifest = Manifest::from_engram(engram, &file.source);
     let path = &file.path;
 
-    // `M109`: the marker is missing. A warning: every repository from
-    // before 0.30.0 lacks it until its next share from a connected
-    // instance, and an unknown value is `M010`'s finding, not this one.
-    if manifest.declared_team().is_none() {
+    // `M109`: the marker is missing, or spelled so that it marks nothing.
+    // A warning: every repository from before 0.30.0 lacks it until its
+    // next share from a connected instance. A misspelled value is asked
+    // after the parse rather than the text, so `team: GitHub` cannot pass
+    // for a marker here; `M010` reports the value itself, and in a team
+    // repository the domain's settings cannot turn that off either.
+    if manifest.team().is_none() {
         let github = TeamForge::GitHub.as_str();
-        sink.emit(
-            path,
-            None,
-            "M109",
-            Severity::Warning,
-            format!(
-                "The MANIFEST has no `{TEAM_KEY}: {github}` line. The line marks this repository as a team domain, so Crystalline refuses to switch Reflection on in a clone that is not connected to the team. Share once from an instance connected to the domain; the share adds the line."
+        let message = match manifest.declared_team() {
+            None => format!(
+                "The MANIFEST has no `{TEAM_KEY}: {github}` line. The line marks this repository as a team domain, so Crystalline refuses to switch Reflection on in a clone that is not connected to the team. Share once from an instance connected to the domain: the share adds the line. On a domain that reviews changes, the share's proposal adds it, and the line arrives here when the team merges that proposal."
             ),
-            None,
-        );
+            Some(value) => format!(
+                "The MANIFEST says `{TEAM_KEY}: {value}`, and only `{TEAM_KEY}: {github}` marks this repository as a team domain, so Crystalline refuses to switch Reflection on in a clone that is not connected to the team. Write `{TEAM_KEY}: {github}` instead."
+            ),
+        };
+        sink.emit(path, None, "M109", Severity::Warning, message, None);
     }
 
     if manifest.reflection() != ReflectionSwitch::On {
@@ -115,13 +117,9 @@ pub(crate) fn check(domain: &Domain, sink: &mut Sink) {
     // Reflection pushed by mistake holds pages, threads, baselines and
     // assets, and a comment listing each of them would bury the reason.
     let files = reflection_files(&domain.root);
-    if files.is_empty() {
+    let Some(first) = files.first() else {
         return;
-    }
-    let folder = reflection_folders(&domain.root)
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| crate::reflection::REFLECTIONS_DIR.to_string());
+    };
     let mut listed = files
         .iter()
         .take(LISTED_PATHS)
@@ -131,8 +129,10 @@ pub(crate) fn check(domain: &Domain, sink: &mut Sink) {
     if files.len() > LISTED_PATHS {
         listed.push_str(&format!(" and {} more", files.len() - LISTED_PATHS));
     }
+    // The annotation points at the first file, which is in the change that
+    // pushed the Reflection, so the forge shows it beside the diff.
     sink.emit(
-        &domain.root.join(folder),
+        &domain.root.join(first),
         None,
         "M012",
         Severity::Error,
@@ -144,19 +144,40 @@ pub(crate) fn check(domain: &Domain, sink: &mut Sink) {
     );
 }
 
-/// Every file under the folders that spell `reflections/` in any letter
-/// case, hidden ones included (a pushed Reflection carries its
-/// `.reflected/` baselines too), as domain-relative forward-slash paths,
-/// sorted. A folder that cannot be walked is skipped: the rule reports what
-/// it can see.
+/// Every path under `reflections/` in any letter case, as domain-relative
+/// forward-slash paths, sorted: each file, hidden ones included (a pushed
+/// Reflection carries its `.reflected/` baselines too), and each link,
+/// whatever it points at. A `reflections` entry that is itself a link counts
+/// as one path. Git keeps a link as a link, so a pushed link is a pushed
+/// Reflection path, and following one could leave the repository; links are
+/// counted, never followed. A folder that cannot be walked is skipped: the
+/// rule reports what it can see.
 fn reflection_files(root: &Path) -> Vec<String> {
     let mut out = Vec::new();
-    for folder in reflection_folders(root) {
-        for entry in WalkDir::new(root.join(&folder)).into_iter().flatten() {
-            if !entry.file_type().is_file() {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if !name.eq_ignore_ascii_case(REFLECTIONS_DIR) {
+            continue;
+        }
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if !kind.is_dir() {
+            // A file or a link named `reflections`: present as it is.
+            out.push(name);
+            continue;
+        }
+        for inner in WalkDir::new(entry.path()).into_iter().flatten() {
+            let kind = inner.file_type();
+            if !(kind.is_file() || kind.is_symlink()) {
                 continue;
             }
-            if let Ok(rel) = entry.path().strip_prefix(root) {
+            if let Ok(rel) = inner.path().strip_prefix(root) {
                 let parts: Vec<String> = rel
                     .components()
                     .map(|c| c.as_os_str().to_string_lossy().into_owned())
