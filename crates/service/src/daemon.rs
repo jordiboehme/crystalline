@@ -1169,7 +1169,14 @@ async fn handle_conn(mut stream: IpcStream, shared: Arc<Shared>) {
             // the surface under a live client across a daemon restart.
             let gate = harness_gate_from_options(&options);
             let server = McpServer::new(shared.engine.clone()).with_harness_gate(gate);
-            match rmcp::serve_server(server, stream).await {
+            // The line limit rmcp applies by default, named here from the one
+            // constant the stdio bridge bounds its lines with, so the bridge
+            // never forwards a line this end would drop (see
+            // `crate::line_limit`).
+            let (read, write) = tokio::io::split(stream);
+            let transport = rmcp::transport::async_rw::AsyncRwTransport::new_server(read, write)
+                .with_max_line_length(crate::line_limit::STDIO_LINE_LIMIT);
+            match rmcp::serve_server(server, transport).await {
                 Ok(running) => {
                     let _ = running.waiting().await;
                 }

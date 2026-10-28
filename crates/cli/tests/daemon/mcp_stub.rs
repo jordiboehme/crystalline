@@ -363,3 +363,35 @@ fn daemon_path_falls_through_to_the_stub_after_the_spawn_budget() {
     assert_eq!(mcp.list_tools(), vec!["status".to_string()]);
     assert_eq!(mcp.close_and_wait(), 0);
 }
+
+/// The degraded status server leaves at once when rmcp ends its session on
+/// its own (a modern `server/discover` followed by a notification, which the
+/// start-up loop refuses), stdin still open: the bounded reader reads stdin on
+/// a thread of its own, so the runtime has no stuck read to wait for.
+#[test]
+fn the_stub_exits_when_rmcp_ends_the_session_with_stdin_open() {
+    let env = Env::locked("stub-gone");
+    let mut mcp = Mcp::spawn(&env, true, None);
+    mcp.send(&json!({
+        "jsonrpc": "2.0", "id": 1, "method": "server/discover",
+        "params": { "_meta": {
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientInfo": { "name": "it", "version": "0" },
+            "io.modelcontextprotocol/clientCapabilities": {},
+        }},
+    }));
+    let answer = mcp.read();
+    assert!(answer.get("result").is_some(), "discover: {answer}");
+    mcp.send(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }));
+    let start = Instant::now();
+    loop {
+        if mcp.child.try_wait().unwrap().is_some() {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(15),
+            "the stub is still running with its session over"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
