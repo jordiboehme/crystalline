@@ -4,14 +4,12 @@
 
 use std::collections::HashSet;
 use std::path::Path;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 
 use interprocess::local_socket::tokio::Stream as IpcStream;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader, ReadBuf};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 
 use crystalline_remote::ops::DiscardTarget;
 
@@ -21,6 +19,7 @@ use crate::instance::{
     Connection, HarnessGate, acquire_ownership, acquire_standalone_ownership, ensure_daemon,
     try_attach,
 };
+use crate::line_limit::{BoundedLines, Incoming, STDIO_LINE_LIMIT, serve_guarded};
 use crate::mcp::McpServer;
 use crate::overlay;
 use crate::params::*;
@@ -68,38 +67,15 @@ fn initialize_error_reply(opener_line: &str, err_text: &str) -> Option<String> {
     Some(reply.to_string())
 }
 
-/// An [`AsyncRead`] wrapper that yields a buffered `prefix` slice before
-/// delegating to `inner`. [`run_mcp`] builds one after reading the session
-/// opener to re-front the line it already took off stdin, together with
-/// anything the underlying `BufReader` had buffered past it, so the serving
-/// path (the daemon relay or the embedded rmcp server) sees that opener as its
-/// first line with no special replay.
-struct Prefixed<R> {
-    prefix: Vec<u8>,
-    inner: R,
-}
-
-impl<R: AsyncRead + Unpin> AsyncRead for Prefixed<R> {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        if !self.prefix.is_empty() {
-            let n = std::cmp::min(self.prefix.len(), buf.remaining());
-            buf.put_slice(&self.prefix[..n]);
-            self.prefix.drain(..n);
-            return Poll::Ready(Ok(()));
-        }
-        Pin::new(&mut self.inner).poll_read(cx, buf)
-    }
-}
-
-/// Read the line that opens the session off `reader`: an `initialize` request
+/// Read the line that opens the session off `stdin`: an `initialize` request
 /// in the legacy era, a `server/discover` probe in the modern one, or whatever
-/// else the client sent first. Returns it so the caller can prepend it to a
-/// wrapped reader before handing that to the daemon relay or to
-/// `rmcp::serve_server`, or `None` on stdin EOF before anything arrived.
+/// else the client sent first. Returns it so the caller can hand it back with
+/// [`BoundedLines::replay`] before giving the reader to the daemon relay or to
+/// [`serve_guarded`], or `None` on stdin EOF before anything arrived.
+///
+/// The read is bounded like every other one ([`crate::line_limit`]): an opener
+/// over the limit comes back as [`Incoming::Oversized`] and is refused by
+/// whichever path serves the session, exactly like a later line.
 ///
 /// Every line is returned exactly as it came, so rmcp sees and judges it the
 /// way it always has - a `server/discover` probe included, which rmcp answers
@@ -109,17 +85,11 @@ impl<R: AsyncRead + Unpin> AsyncRead for Prefixed<R> {
 /// This used to drain and answer probes in a loop, which is why it could return
 /// only an `initialize`. Forwarding replaces answering, so exactly one line is
 /// read and the loop is gone.
-async fn read_session_opener<R>(reader: &mut BufReader<R>) -> std::io::Result<Option<String>>
+async fn read_session_opener<R>(stdin: &mut BoundedLines<R>) -> std::io::Result<Option<Incoming>>
 where
     R: AsyncRead + Unpin,
 {
-    let mut buf = String::new();
-    let n = reader.read_line(&mut buf).await?;
-    if n == 0 {
-        return Ok(None);
-    }
-    // read_line keeps the trailing newline; strip it to canonicalize.
-    Ok(Some(buf.trim_end_matches(['\r', '\n']).to_string()))
+    stdin.next_line().await
 }
 
 /// What the harness that spawned this process already does for itself, from
@@ -241,9 +211,9 @@ pub async fn run_mcp(
     // close during the window is still the unsurvivable case, and nothing here
     // closes stdio.
     let mut stdout = tokio::io::stdout();
-    let mut reader = BufReader::new(tokio::io::stdin());
+    let mut stdin = BoundedLines::new(tokio::io::stdin(), STDIO_LINE_LIMIT);
     let (opened, daemon) = if embedded {
-        (read_session_opener(&mut reader).await, None)
+        (read_session_opener(&mut stdin).await, None)
     } else {
         // `read_only` is forwarded only to a daemon this call spawns; attaching
         // to an already-running daemon uses that daemon's own mode. The `mcp`
@@ -251,7 +221,7 @@ pub async fn run_mcp(
         // client's opener: the daemon counts a session from that line, and a
         // daemon with a bounded life (`--exit-when-idle`) must see this stub
         // as a client while the client is still composing its first request.
-        let (opened, daemon) = tokio::join!(read_session_opener(&mut reader), async {
+        let (opened, daemon) = tokio::join!(read_session_opener(&mut stdin), async {
             let conn = ensure_daemon(true, db, config_path, read_only).await?;
             conn.into_mcp(harness_gate)
                 .await
@@ -263,12 +233,17 @@ pub async fn run_mcp(
     // Stdin EOF before the client said anything means it left mid-window; a
     // daemon this call spawned staying up is fine by design, so exit cleanly.
     // A real read error propagates.
-    let Some(opener_line) = opened? else {
+    let Some(opener) = opened? else {
         return Ok(());
     };
-    // Re-front the opener (plus anything buffered past it) so the serving path
-    // reads it as its first stdin line with no special replay.
-    let primed = prime_reader(&opener_line, reader);
+    // Kept for the last-resort error reply below; an oversized opener has no
+    // text left to answer from, and the serving path refuses it anyway.
+    let opener_line = match &opener {
+        Incoming::Line(line) => Some(String::from_utf8_lossy(line).into_owned()),
+        Incoming::Oversized(_) => None,
+    };
+    // Hand the opener back so the serving path reads it as its first line.
+    stdin.replay(opener);
 
     // A daemon is up: relay through it. A failed attach or handshake falls
     // through to the embedded path rather than propagating, so an unreachable
@@ -277,7 +252,7 @@ pub async fn run_mcp(
     if let Some(daemon) = daemon {
         match daemon {
             Ok(stream) => {
-                return pump_stdio(stream, primed, db, config_path, read_only, harness_gate).await;
+                return pump_stdio(stream, stdin, db, config_path, read_only, harness_gate).await;
             }
             Err(e) if packaged => {
                 let bridge = crate::daemon_task::BridgeFailure::of(&e);
@@ -285,7 +260,7 @@ pub async fn run_mcp(
                     "this process runs inside an app package and only bridges to the daemon: {bridge}"
                 );
                 let status = crate::stub::StubStatus::for_bridge(format!("{e:#}"), bridge);
-                return serve_degraded_stub(status, primed).await;
+                return serve_degraded_stub(status, stdin).await;
             }
             Err(e) => tracing::warn!("no daemon available ({e:#}); running embedded"),
         }
@@ -298,22 +273,25 @@ pub async fn run_mcp(
     // degraded status server: `initialize` succeeds with per-case instructions
     // and a `status` tool explaining the failure and its fix, so the model can
     // relay it instead of the session going dark. Every fallible step lives in
-    // `build_embedded`, ahead of the primed reader, so on failure the reader is
+    // `build_embedded`, ahead of the bounded reader, so on failure the reader is
     // still intact for the stub. Only if the stub itself fails to serve do we
     // fall back to the old `-32000` reply and a non-zero exit (stderr carries
     // the chain for the Desktop log).
     match build_embedded(db, config_path, read_only, harness_gate).await {
-        Ok(stack) => run_embedded_stdio(stack, primed).await,
+        Ok(stack) => run_embedded_stdio(stack, stdin).await,
         Err(e) => {
             tracing::error!(
                 "crystalline mcp cannot start ({e:#}); serving a degraded status server"
             );
             let status = crate::stub::StubStatus::gather(format!("{e:#}")).await;
-            match serve_degraded_stub(status, primed).await {
+            match serve_degraded_stub(status, stdin).await {
                 Ok(()) => Ok(()),
                 Err(stub_err) => {
                     tracing::warn!("degraded status server failed ({stub_err:#})");
-                    if let Some(reply) = initialize_error_reply(&opener_line, &format!("{e:#}")) {
+                    if let Some(reply) = opener_line
+                        .as_deref()
+                        .and_then(|line| initialize_error_reply(line, &format!("{e:#}")))
+                    {
                         let _ = stdout.write_all(reply.as_bytes()).await;
                         let _ = stdout.write_all(b"\n").await;
                         let _ = stdout.flush().await;
@@ -323,22 +301,6 @@ pub async fn run_mcp(
             }
         }
     }
-}
-
-/// Re-front the session opener ahead of stdin: the prefix is the line, a
-/// newline and whatever the `BufReader` buffered past it, the inner is the raw
-/// stdin. See [`Prefixed`].
-fn prime_reader(
-    opener_line: &str,
-    reader: BufReader<tokio::io::Stdin>,
-) -> Prefixed<tokio::io::Stdin> {
-    let buffered = reader.buffer().to_vec();
-    let inner = reader.into_inner();
-    let mut prefix = Vec::with_capacity(opener_line.len() + 1 + buffered.len());
-    prefix.extend_from_slice(opener_line.as_bytes());
-    prefix.push(b'\n');
-    prefix.extend_from_slice(&buffered);
-    Prefixed { prefix, inner }
 }
 
 /// The oldest Claude Desktop extension launcher this binary works with, as a
@@ -528,9 +490,15 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> Session<S> {
 /// Relay lines both ways until one side ends. Returns how the session ended
 /// and whether any daemon line was forwarded, the signal that the connection
 /// was genuinely serving rather than dying straight after a reconnect.
+///
+/// A client line over the stdio limit ([`crate::line_limit`]) is answered
+/// here, on stdout, and never reaches the daemon: the daemon's rmcp would drop
+/// it without a word and the client would wait forever. It is not recorded in
+/// [`RelayState`] either, since no daemon will ever answer it, so a restart
+/// does not answer it a second time.
 async fn relay_loop<In, Out, S>(
     relay: &mut RelayState,
-    stdin: &mut tokio::io::Lines<BufReader<In>>,
+    stdin: &mut BoundedLines<In>,
     stdout: &mut Out,
     session: &mut Session<S>,
 ) -> std::io::Result<(SessionEnd, bool)>
@@ -547,7 +515,19 @@ where
                     let _ = session.sock_write.shutdown().await;
                     return Ok((SessionEnd::StdinClosed, served_any));
                 }
-                Some(line) => {
+                Some(Incoming::Oversized(over)) => {
+                    if let Some(reply) = over.refusal() {
+                        stdout.write_all(reply.as_bytes()).await?;
+                        stdout.write_all(b"\n").await?;
+                        stdout.flush().await?;
+                    }
+                }
+                Some(Incoming::Line(line)) => {
+                    // What tokio's `Lines` did with a line that is not UTF-8,
+                    // which this reader replaced: the relay ends with an error.
+                    let line = String::from_utf8(line).map_err(|e| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+                    })?;
                     // Every client line is forwarded verbatim, a
                     // `server/discover` probe included: the daemon's rmcp
                     // classifies and answers it. From here on it is an ordinary
@@ -649,7 +629,7 @@ where
 /// loudly instead of spinning forever.
 async fn pump_stdio<R>(
     stream: IpcStream,
-    reader: R,
+    mut stdin: BoundedLines<R>,
     db: Option<&Path>,
     config_path: Option<&Path>,
     read_only: bool,
@@ -662,7 +642,6 @@ where
         launcher_note: launcher_note_from_env(),
         ..RelayState::default()
     };
-    let mut stdin = BufReader::new(reader).lines();
     let mut stdout = tokio::io::stdout();
     let mut session = Session::new(stream);
     let mut fruitless_reconnects = 0u32;
@@ -714,7 +693,7 @@ where
 /// The built-and-ready in-process stack: the tool server plus the index
 /// ownership it holds for the session. Every fallible startup step already ran
 /// in [`build_embedded`], so [`run_embedded_stdio`] only has to serve and can
-/// take the primed reader with no risk of failing after it is consumed.
+/// take the bounded reader with no risk of failing after it is consumed.
 struct EmbeddedStack {
     server: McpServer,
     /// The engine the server runs on, kept here too so the end of the session
@@ -729,7 +708,7 @@ struct EmbeddedStack {
 /// load the config and overlay, open the store, construct the engine, launch
 /// the background sync and embed workers and prime the routing cache. Every
 /// step that can fail lives here, ahead of the reader ever being touched, so a
-/// terminal failure leaves [`run_mcp`]'s primed `initialize` reader intact for
+/// terminal failure leaves [`run_mcp`]'s bounded reader, opener and all, intact for
 /// the degraded stub to serve. The effective read-only mode is the explicit
 /// flag or `service.read_only`.
 async fn build_embedded(
@@ -846,11 +825,12 @@ async fn build_embedded(
     })
 }
 
-/// Serve the built stack over stdio until the client closes stdin. `reader` is
-/// the primed stdin [`run_mcp`] already fronted with the drained `initialize`,
-/// so this path never touches the pre-init probe itself; it hands the reader
-/// straight to `rmcp::serve_server`. This runs only after [`build_embedded`]
-/// succeeded, so nothing here consumes the reader on a startup failure.
+/// Serve the built stack over stdio until the client closes stdin. `stdin` is
+/// the bounded reader [`run_mcp`] handed the session opener back to, so this
+/// path never touches the opener itself; it hands the reader to
+/// [`serve_guarded`], which answers a line over the limit and feeds rmcp the
+/// rest. This runs only after [`build_embedded`] succeeded, so nothing here
+/// consumes the reader on a startup failure.
 ///
 /// A served session ends the process the way a daemon's shutdown does, in
 /// `std::process::exit` through [`Departure`], and never by returning: this
@@ -858,17 +838,11 @@ async fn build_embedded(
 /// download in a blocking task, and a return would leave the process waiting
 /// for that task in the runtime's drop with its lock file already removed and
 /// the index still held.
-async fn run_embedded_stdio<R>(stack: EmbeddedStack, reader: R) -> anyhow::Result<()>
+async fn run_embedded_stdio<R>(stack: EmbeddedStack, stdin: BoundedLines<R>) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
-    let stdout = tokio::io::stdout();
-    let server = stack.server;
-    let session = async move {
-        let running = rmcp::serve_server(server, (reader, stdout)).await?;
-        let _ = running.waiting().await;
-        anyhow::Ok(())
-    };
+    let session = serve_guarded(stack.server, stdin, tokio::io::stdout());
     // The host locks this stack claimed go back when the session ends, as a
     // daemon's do at its shutdown, so another instance can take the domains
     // at once; a session that failed to start gives them back too.
@@ -910,18 +884,20 @@ async fn serve_then_release(
 /// the embedded stack could not start (see [`crate::stub`]). It holds no lock
 /// and opens no store, so serving it cannot itself fail for the reasons that
 /// forced the degradation; it ends when the client closes stdin, exactly like
-/// [`run_embedded_stdio`].
-async fn serve_degraded_stub<R>(status: crate::stub::StubStatus, reader: R) -> anyhow::Result<()>
+/// [`run_embedded_stdio`], and bounds its lines the same way.
+async fn serve_degraded_stub<R>(
+    status: crate::stub::StubStatus,
+    stdin: BoundedLines<R>,
+) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
-    let running = rmcp::serve_server(
+    serve_guarded(
         crate::stub::DegradedServer::new(status),
-        (reader, tokio::io::stdout()),
+        stdin,
+        tokio::io::stdout(),
     )
-    .await?;
-    let _ = running.waiting().await;
-    Ok(())
+    .await
 }
 
 /// Open the index in-process for a standalone command, or say why it could
@@ -2733,8 +2709,8 @@ mod tests {
         );
     }
 
-    fn lines_from(bytes: &'static [u8]) -> tokio::io::Lines<BufReader<&'static [u8]>> {
-        BufReader::new(bytes).lines()
+    fn lines_from(bytes: &'static [u8]) -> BoundedLines<&'static [u8]> {
+        BoundedLines::new(bytes, STDIO_LINE_LIMIT)
     }
 
     /// Turning review ON carries no fold answers, and the request has to say
@@ -3055,7 +3031,7 @@ mod tests {
             launcher_note: Some(LAUNCHER_NOTE),
             ..RelayState::default()
         };
-        let mut stdin = BufReader::new(stdin_read).lines();
+        let mut stdin = BoundedLines::new(stdin_read, STDIO_LINE_LIMIT);
         let mut stdout = Vec::new();
         let mut session = Session::new(bridge_side);
         relay_loop(&mut relay, &mut stdin, &mut stdout, &mut session)
@@ -3159,7 +3135,7 @@ mod tests {
             .await
             .unwrap();
         let mut relay = RelayState::default();
-        let mut stdin = BufReader::new(stdin_read).lines();
+        let mut stdin = BoundedLines::new(stdin_read, STDIO_LINE_LIMIT);
         let mut stdout = Vec::new();
         let mut session = Session::new(bridge_side);
 
@@ -3467,48 +3443,48 @@ mod tests {
     async fn the_session_opener_is_returned_verbatim_and_nothing_is_answered_here() {
         let input: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"server/discover\"}\n\
             extra-buffered-past-the-opener\n";
-        let mut reader = BufReader::new(input);
-        let opener = read_session_opener(&mut reader)
+        let mut stdin = BoundedLines::new(input, STDIO_LINE_LIMIT);
+        let opener = read_session_opener(&mut stdin)
             .await
             .unwrap()
             .expect("the probe opens the session instead of being consumed");
-        assert_eq!(opener, BARE_PROBE, "the opener read rewrites nothing");
+        assert_eq!(
+            opener,
+            Incoming::Line(BARE_PROBE.as_bytes().to_vec()),
+            "the opener read rewrites nothing"
+        );
 
-        // The bytes buffered past it are still readable off the reader, so the
-        // primed handoff is unchanged.
-        let mut rest = String::new();
-        reader.read_to_string(&mut rest).await.unwrap();
-        assert!(rest.contains("extra-buffered-past-the-opener"), "{rest}");
+        // Handed back, it is read first, and the line after it is still there,
+        // so the serving path sees the session from its first line.
+        stdin.replay(opener);
+        assert_eq!(
+            stdin.next_line().await.unwrap(),
+            Some(Incoming::Line(BARE_PROBE.as_bytes().to_vec()))
+        );
+        assert_eq!(
+            stdin.next_line().await.unwrap(),
+            Some(Incoming::Line(b"extra-buffered-past-the-opener".to_vec()))
+        );
 
         // An `initialize` opener comes back verbatim too: the legacy era is
         // untouched by any of this.
         let init: &[u8] =
             b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n";
-        let mut reader = BufReader::new(init);
-        let opener = read_session_opener(&mut reader).await.unwrap().unwrap();
+        let mut stdin = BoundedLines::new(init, STDIO_LINE_LIMIT);
+        let opener = read_session_opener(&mut stdin).await.unwrap().unwrap();
         assert_eq!(
             opener,
-            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#
+            Incoming::Line(
+                br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#.to_vec()
+            )
         );
     }
 
     #[tokio::test]
     async fn read_session_opener_returns_none_on_eof() {
         let input: &[u8] = b"";
-        let mut reader = BufReader::new(input);
-        assert!(read_session_opener(&mut reader).await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn prefixed_reader_yields_prefix_then_inner() {
-        let inner: &[u8] = b"world";
-        let mut reader = Prefixed {
-            prefix: b"hello ".to_vec(),
-            inner,
-        };
-        let mut out = String::new();
-        reader.read_to_string(&mut out).await.unwrap();
-        assert_eq!(out, "hello world");
+        let mut stdin = BoundedLines::new(input, STDIO_LINE_LIMIT);
+        assert!(read_session_opener(&mut stdin).await.unwrap().is_none());
     }
 
     /// A `server/discover` probe on the relay path reaches the daemon exactly
@@ -3542,7 +3518,7 @@ mod tests {
         });
 
         let mut relay = RelayState::default();
-        let mut stdin = BufReader::new(stdin_read).lines();
+        let mut stdin = BoundedLines::new(stdin_read, STDIO_LINE_LIMIT);
         let mut stdout = Vec::new();
         let mut session = Session::new(bridge_side);
 
@@ -3628,23 +3604,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn primed_reader_hands_relay_loop_the_initialize_then_follow_up() {
-        // The primed reader carries the drained `initialize` line as its prefix
-        // and whatever the client sent next in its inner reader. Fed through
-        // `BufReader::new(reader).lines()` and relayed from a plain
-        // `RelayState::default()`, both exactly as `pump_stdio` does, the relay
-        // must forward `initialize` first and the follow-up next, proving the
-        // handoff preserves ordering with no special replay.
+    async fn a_replayed_opener_reaches_relay_loop_before_the_follow_up() {
+        // `run_mcp` reads the `initialize` line before it knows who serves the
+        // session and hands it back to the bounded reader, ahead of whatever
+        // the client sent next. Relayed from a plain `RelayState::default()`,
+        // exactly as `pump_stdio` does, the relay must forward `initialize`
+        // first and the follow-up next, proving the handoff preserves
+        // ordering.
         let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
         let follow: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n";
-        let mut prefix = Vec::with_capacity(init.len() + 1);
-        prefix.extend_from_slice(init.as_bytes());
-        prefix.push(b'\n');
-        let primed = Prefixed {
-            prefix,
-            inner: follow,
-        };
-        let mut stdin = BufReader::new(primed).lines();
+        let mut stdin = BoundedLines::new(follow, STDIO_LINE_LIMIT);
+        stdin.replay(Incoming::Line(init.as_bytes().to_vec()));
 
         let (bridge_side, daemon_side) = tokio::io::duplex(4096);
         let daemon = tokio::spawn(async move {
@@ -3666,9 +3636,272 @@ mod tests {
         let (first, second) = daemon.await.unwrap();
         assert!(first.contains("\"initialize\""), "{first}");
         assert!(second.contains("tools/list"), "{second}");
-        // The relay recorded the primed initialize as the handshake, so a later
+        // The relay recorded the replayed initialize as the handshake, so a later
         // daemon restart can replay it.
         assert!(relay.init_request.as_ref().unwrap().contains("initialize"));
         assert_eq!(relay.init_id, Some(serde_json::json!(1)));
+    }
+
+    // --- a message over the stdio line limit: answered, never dropped -------
+    //
+    // rmcp drops a line over its limit with only a log line, so a client that
+    // sent one waited forever. Both stdio paths now answer it with an Invalid
+    // Request naming the limit, and carry on with the next line.
+
+    /// A request of exactly `len` bytes (newline not counted), padded with
+    /// JSON whitespace inside its params so it still parses.
+    fn padded_request(id: u32, method: &str, len: usize) -> Vec<u8> {
+        let head = format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"{method}","params":{{"#);
+        let mut line = head.into_bytes();
+        assert!(line.len() + 2 <= len, "the head fits in {len} bytes");
+        line.resize(len - 2, b' ');
+        line.extend_from_slice(b"}}");
+        line
+    }
+
+    /// A notification over `len` bytes.
+    fn oversized_notification(len: usize) -> Vec<u8> {
+        let mut line =
+            br#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"p":""#.to_vec();
+        line.resize(len + 1, b'x');
+        line.extend_from_slice(br#""}}"#);
+        line
+    }
+
+    const STEP: std::time::Duration = std::time::Duration::from_secs(20);
+
+    /// Read stdout lines until every id in `ids` was answered, keyed by id.
+    /// Every line must carry one of them: a notification over the limit
+    /// leaves no answer behind.
+    async fn answers_for<R: AsyncRead + Unpin>(
+        lines: &mut tokio::io::Lines<BufReader<R>>,
+        ids: &[Value],
+    ) -> std::collections::HashMap<Value, Value> {
+        let mut answers = std::collections::HashMap::new();
+        while answers.len() < ids.len() {
+            let line = tokio::time::timeout(STEP, lines.next_line())
+                .await
+                .expect("an answer instead of silence")
+                .unwrap()
+                .expect("an answer instead of a closed pipe");
+            let v: Value = serde_json::from_str(&line).unwrap();
+            assert!(ids.contains(&v["id"]), "an answer nobody asked for: {line}");
+            answers.insert(v["id"].clone(), v);
+        }
+        answers
+    }
+
+    fn assert_refused(answer: &Value, limit: usize) {
+        assert_eq!(
+            answer["error"]["code"],
+            serde_json::json!(-32600),
+            "{answer}"
+        );
+        let message = answer["error"]["message"].as_str().unwrap();
+        assert!(message.contains("not processed"), "{message}");
+        if limit == STDIO_LINE_LIMIT {
+            assert!(message.contains("16 MiB"), "{message}");
+        }
+    }
+
+    /// The bridge: `lines` go in on stdin, the fake daemon answers every line
+    /// it receives with an empty result for its id, and the relay runs until
+    /// the daemon closes after `forwarded` lines. Returns stdout and what the
+    /// daemon saw.
+    async fn relay_through_bridge(
+        input: Vec<u8>,
+        limit: usize,
+        forwarded: usize,
+    ) -> (Vec<u8>, Vec<String>, RelayState) {
+        let (bridge_side, daemon_side) = tokio::io::duplex(1 << 16);
+        let daemon = tokio::spawn(async move {
+            let (read, mut write) = tokio::io::split(daemon_side);
+            let mut lines = BufReader::new(read).lines();
+            let mut seen = Vec::new();
+            for _ in 0..forwarded {
+                let line = lines.next_line().await.unwrap().unwrap();
+                let v: Value = serde_json::from_str(&line).unwrap();
+                let answer = serde_json::json!({"jsonrpc": "2.0", "id": v["id"], "result": {}});
+                write
+                    .write_all(format!("{answer}\n").as_bytes())
+                    .await
+                    .unwrap();
+                write.flush().await.unwrap();
+                seen.push(line);
+            }
+            seen
+        });
+        let (mut stdin_feed, stdin_read) = tokio::io::duplex(1 << 16);
+        let feeder = tokio::spawn(async move {
+            stdin_feed.write_all(&input).await.unwrap();
+            stdin_feed.flush().await.unwrap();
+            // Held open: the relay ends on the daemon's close, not on stdin's.
+            stdin_feed
+        });
+        let mut relay = RelayState::default();
+        let mut stdin = BoundedLines::new(stdin_read, limit);
+        let mut stdout = Vec::new();
+        let mut session = Session::new(bridge_side);
+        let (end, _) = tokio::time::timeout(
+            STEP,
+            relay_loop(&mut relay, &mut stdin, &mut stdout, &mut session),
+        )
+        .await
+        .expect("the relay reads past the oversized lines")
+        .unwrap();
+        assert_eq!(end, SessionEnd::SocketClosed);
+        let seen = daemon.await.unwrap();
+        drop(feeder.await.unwrap());
+        (stdout, seen, relay)
+    }
+
+    /// At the real limit on the bridge: a line of exactly the limit (newline
+    /// included) reaches the daemon whole, one byte more is answered here and
+    /// never forwarded, and the next request is relayed as usual.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_bridge_answers_a_line_over_the_limit_and_relays_the_next() {
+        let limit = STDIO_LINE_LIMIT;
+        let mut input = padded_request(1, "tools/list", limit - 1);
+        input.push(b'\n');
+        input.extend_from_slice(&padded_request(2, "tools/call", limit));
+        input.push(b'\n');
+        input.extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"ping\"}\n");
+
+        let (stdout, seen, relay) = relay_through_bridge(input, limit, 2).await;
+
+        assert_eq!(seen.len(), 2);
+        assert_eq!(
+            seen[0].len(),
+            limit - 1,
+            "the line at the limit is forwarded whole"
+        );
+        assert!(seen[1].contains("\"id\":3"), "{}", seen[1]);
+        let out = String::from_utf8(stdout).unwrap();
+        let answers: Vec<Value> = out
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(answers.len(), 3, "{out}");
+        let refused = answers
+            .iter()
+            .find(|a| a["id"] == serde_json::json!(2))
+            .expect("the oversized request is answered");
+        assert_refused(refused, limit);
+        assert!(
+            relay.outstanding.is_empty(),
+            "the refused request never waits for the daemon: {:?}",
+            relay.outstanding
+        );
+    }
+
+    /// The bridge at a small limit: a notification over it is dropped with no
+    /// answer, and the request after it is relayed.
+    #[tokio::test]
+    async fn the_bridge_drops_a_notification_over_the_limit_without_an_answer() {
+        let limit = 256;
+        let mut input = oversized_notification(limit);
+        input.push(b'\n');
+        input.extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"ping\"}\n");
+
+        let (stdout, seen, _) = relay_through_bridge(input, limit, 1).await;
+
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].contains("\"id\":5"), "{}", seen[0]);
+        let out = String::from_utf8(stdout).unwrap();
+        assert_eq!(out.lines().count(), 1, "only the ping's answer: {out}");
+    }
+
+    async fn in_memory_engine(tmp: &Path) -> Arc<Engine> {
+        let store = crystalline_index::TursoStore::open_in_memory()
+            .await
+            .unwrap();
+        Arc::new(Engine::new(
+            Arc::new(tokio::sync::Mutex::new(store)),
+            crystalline_core::config::GlobalConfig::default(),
+            None,
+            Some(tmp.join("config.yaml")),
+        ))
+    }
+
+    const INITIALIZE: &[u8] =
+        b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\
+        \"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\
+        \"clientInfo\":{\"name\":\"limit\",\"version\":\"0\"}}}\n";
+
+    /// The embedded path, through [`serve_guarded`] with a real server:
+    /// `initialize`, a `tools/list` of exactly the limit (answered), one a
+    /// byte over (refused), a notification over it (no answer) and a
+    /// `tools/list` after them (answered). Then stdin closes and the serve
+    /// returns.
+    async fn serve_embedded_around_the_limit(limit: usize) {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = in_memory_engine(tmp.path()).await;
+        let (mut stdin_feed, stdin_read) = tokio::io::duplex(1 << 16);
+        let (stdout_write, stdout_read) = tokio::io::duplex(1 << 16);
+        let served = tokio::spawn(serve_guarded(
+            McpServer::new(engine),
+            BoundedLines::new(stdin_read, limit),
+            stdout_write,
+        ));
+        let mut out = BufReader::new(stdout_read).lines();
+
+        let mut input = INITIALIZE.to_vec();
+        input.extend_from_slice(&padded_request(2, "tools/list", limit - 1));
+        input.push(b'\n');
+        input.extend_from_slice(&padded_request(3, "tools/list", limit));
+        input.push(b'\n');
+        input.extend_from_slice(&oversized_notification(limit));
+        input.push(b'\n');
+        input.extend_from_slice(
+            b"{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/list\",\"params\":{}}\n",
+        );
+        let feeder = tokio::spawn(async move {
+            stdin_feed.write_all(&input).await.unwrap();
+            stdin_feed.flush().await.unwrap();
+            stdin_feed
+        });
+
+        let ids: Vec<Value> = (1..=4).map(|id| serde_json::json!(id)).collect();
+        let answers = answers_for(&mut out, &ids).await;
+        assert!(
+            answers[&ids[0]]["result"].is_object(),
+            "{:?}",
+            answers[&ids[0]]
+        );
+        assert!(
+            answers[&ids[1]]["result"]["tools"].is_array(),
+            "the request at the limit is served: {:?}",
+            answers[&ids[1]]
+        );
+        assert_refused(&answers[&ids[2]], limit);
+        assert!(
+            answers[&ids[3]]["result"]["tools"].is_array(),
+            "the session carries on: {:?}",
+            answers[&ids[3]]
+        );
+
+        // The end of input ends the session, with nothing else written: the
+        // notification left no answer behind.
+        drop(feeder.await.unwrap());
+        let rest = tokio::time::timeout(STEP, out.next_line())
+            .await
+            .expect("stdout closes with the session")
+            .unwrap();
+        assert!(rest.is_none(), "nothing after the answers: {rest:?}");
+        tokio::time::timeout(STEP, served)
+            .await
+            .expect("the serve returns at the end of input")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_embedded_stack_answers_a_line_over_the_limit_and_serves_the_next() {
+        serve_embedded_around_the_limit(STDIO_LINE_LIMIT).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_embedded_stack_bounds_lines_at_any_limit() {
+        serve_embedded_around_the_limit(4096).await;
     }
 }
