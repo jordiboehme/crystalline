@@ -1,5 +1,8 @@
 use super::*;
 
+/// The MANIFEST's path in a domain and in every share of it.
+const MANIFEST_PATH: &str = "MANIFEST.md";
+
 impl Engine {
     // --- origin (GitHub collaboration) ----------------------------------------
 
@@ -383,6 +386,130 @@ impl Engine {
         self.append_name_fields(&mut result, &domain_name).await?;
         self.note_beside_mounts(&mut result, &wanted, &domain_name, scope);
         Ok(result)
+    }
+
+    /// Write the team marker ([`crystalline_core::TEAM_KEY`]) into the
+    /// MANIFEST of `domain`, which is connected to GitHub, just before a
+    /// share of `files` (`None` is the whole unshared delta), so the share
+    /// carries it to the team. From then on every clone of the repository
+    /// tells the instance it is registered on that its Reflection belongs to
+    /// the team server (see the switch screen and the gate in
+    /// `engine::reflection`). Answers the file list the share goes on with:
+    /// `Some` only when the marker was added to a narrowed list.
+    ///
+    /// The share, not the connect, is the one place every connected instance
+    /// passes through on its way to the team, existing connections included.
+    /// A connect never writes into the team's MANIFEST (a fresh connect has
+    /// no local change, and review mode needs exactly that clean folder to
+    /// start), and a write on every pull would be a local change nobody made
+    /// that comes back after every discard. Written here, the marker and the
+    /// share are one act and nothing lingers:
+    ///
+    /// - a share of everything writes it when there is something else to
+    ///   share, so pressing share with nothing to share stays a no-op;
+    /// - a narrowed share writes it when the list names the MANIFEST, and
+    ///   when the MANIFEST holds no other unshared change, in which case the
+    ///   MANIFEST joins the list and exactly one line rides along; a MANIFEST
+    ///   with somebody's unshared edits that were not chosen is left alone
+    ///   for a share that includes it.
+    ///
+    /// Nothing is written where a write would be wrong or cannot go through
+    /// the folder: a read-only instance or domain, a domain that reviews
+    /// changes (its share is of drafts, and a folder write there would be a
+    /// change nobody drafted), a virtual domain, a MANIFEST that already
+    /// declares a `team` (an unknown value is left for its owner: verify
+    /// reports it as `M010`, and a newer release may know it), and a
+    /// frontmatter the marker cannot be cut into. Every instance writes the
+    /// same line at the same place, so two members who share it at once
+    /// leave a merge nothing to reconcile. A failure here never fails the
+    /// share: the marker waits for the next one.
+    async fn team_marker_for_share(
+        &self,
+        domain: &str,
+        files: Option<&[String]>,
+    ) -> Option<Vec<String>> {
+        match self.write_team_marker_for_share(domain, files).await {
+            Ok(list) => list,
+            Err(e) => {
+                tracing::warn!(
+                    domain = %domain,
+                    error = %e,
+                    "writing the team marker before a share failed; the next share tries again"
+                );
+                None
+            }
+        }
+    }
+
+    /// The body of [`Engine::team_marker_for_share`], with its errors.
+    async fn write_team_marker_for_share(
+        &self,
+        domain: &str,
+        files: Option<&[String]>,
+    ) -> Result<Option<Vec<String>>> {
+        if self.read_only
+            || self.reviews_changes(domain)
+            || self.domain_is_read_only(domain).await
+            || !matches!(self.read_source(domain), ContentSource::File { .. })
+        {
+            return Ok(None);
+        }
+        let scope = crate::scope::Scope::Unrestricted;
+        let view = DomainView::for_write(self, domain, &scope).await?;
+        let (desc, source) = view.resolve("manifest").await?;
+        let Some(current) = view.text_at(&source, &desc).await? else {
+            return Ok(None);
+        };
+        let declares_team = crystalline_core::parse_engram(&current)
+            .map(|e| {
+                crystalline_core::Manifest::from_engram(&e, &current)
+                    .declared_team()
+                    .is_some()
+            })
+            .unwrap_or(true);
+        let marked =
+            crystalline_core::set_team_marker(&current, crystalline_core::TeamForge::GitHub);
+        if declares_team || marked == current {
+            return Ok(None);
+        }
+        let (_, _, _, local) =
+            self.team_local_changes(domain, self.reflection_mode(domain).await?)?;
+        let changed: Vec<&str> = local
+            .changes
+            .iter()
+            .filter(|change| !change.is_generated_index())
+            .map(|change| change.path())
+            .collect();
+        let manifest_changed = changed.contains(&MANIFEST_PATH);
+        let joined = match files {
+            None if changed.is_empty() => return Ok(None),
+            None => None,
+            Some(list) if list.iter().any(|path| path == MANIFEST_PATH) => None,
+            Some(_) if manifest_changed => return Ok(None),
+            Some(list) => {
+                let mut list = list.to_vec();
+                list.push(MANIFEST_PATH.to_string());
+                Some(list)
+            }
+        };
+        let actor = self.actor_for(None, None);
+        self.apply_source_edit(
+            &desc,
+            &source,
+            &view,
+            None,
+            &actor,
+            None,
+            &scope,
+            move |current| {
+                Ok(crystalline_core::set_team_marker(
+                    current,
+                    crystalline_core::TeamForge::GitHub,
+                ))
+            },
+        )
+        .await?;
+        Ok(joined)
     }
 
     /// The branch a connect tracks: the one asked for, else the one the forge
@@ -1666,6 +1793,13 @@ impl Engine {
         }
         let (provider, login) = self.resolve_share_provider(&actor)?;
         let acting = self.personal_write_login(login.as_deref());
+        // The team marker rides with a share of the folder; a share of
+        // drafts is left alone (see `team_marker_for_share`).
+        let joined = match drafting {
+            None => self.team_marker_for_share(domain, files).await,
+            Some(_) => None,
+        };
+        let files = joined.as_deref().or(files);
         // In review mode the share is of the actor's own drafts, which are in
         // the index and on nobody's disk, so the tree `ops` detects against is
         // staged here. `None` is a domain that takes changes directly, whose

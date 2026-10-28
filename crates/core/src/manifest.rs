@@ -116,6 +116,25 @@ const TRIGGER_OFF: &str = "off";
 /// The trigger value that sends the signed webhook.
 const TRIGGER_WEBHOOK: &str = "webhook";
 
+/// The MANIFEST frontmatter key that marks a domain as a team domain shared
+/// through a forge: the value names the forge ([`TeamForge`]), and an absent
+/// key is a domain nobody declared shared. Written by the engine when the
+/// domain is connected to GitHub and carried to the team with a share, like
+/// [`REFLECTION_HOME_KEY`]; never typed by hand.
+///
+/// It exists for one reader that cannot ask the instance which domains are
+/// connected: a plain clone of the team repository, registered as a local
+/// domain. Such a clone has no origin, so nothing else tells it that its
+/// Reflection belongs to the team server, and a personal backup repository
+/// of a local domain (a `.git` folder with a GitHub remote, but no marker)
+/// must keep working exactly as before. The engine refuses to switch
+/// Reflection on, and the Reflection gate refuses to serve one, for a domain
+/// that carries this marker and is not connected here.
+pub const TEAM_KEY: &str = "team";
+
+/// The `team` value of a domain shared through GitHub.
+const TEAM_GITHUB: &str = "github";
+
 /// The starter MANIFEST engram for a new domain: valid frontmatter and the two
 /// required routing sections (`Scope`, `When to Use`) plus a `Notes for Agents`
 /// section, all as prompts to fill in. `today` is a pre-formatted `%Y-%m-%d`
@@ -204,6 +223,9 @@ pub struct Manifest {
     /// The [`EVOLVE_TRIGGER_KEY`] value as written, or `None` when absent.
     /// Read through [`Manifest::trigger`].
     evolve_trigger: Option<String>,
+    /// The [`TEAM_KEY`] value as written, or `None` when absent. Read
+    /// through [`Manifest::team`].
+    team: Option<String>,
 }
 
 impl Manifest {
@@ -242,6 +264,7 @@ impl Manifest {
             .extra
             .get(EVOLVE_TRIGGER_KEY)
             .map(scalar_text);
+        let team = engram.frontmatter.extra.get(TEAM_KEY).map(scalar_text);
         let domain_name_extra = engram.frontmatter.extra.get(DOMAIN_NAME_KEY);
         let declared_domain_name = domain_name_extra.map(scalar_text);
         let domain_name_is_string = matches!(domain_name_extra, Some(YamlValue::String(_)));
@@ -293,6 +316,7 @@ impl Manifest {
             reflection_home,
             reflect_trigger,
             evolve_trigger,
+            team,
         }
     }
 
@@ -593,6 +617,20 @@ impl Manifest {
             .filter(|value| validate_reflection_home(value).is_ok())
     }
 
+    /// The `team` declaration exactly as written, for reporting only, never
+    /// for deciding behaviour: [`Manifest::team`] is what decides.
+    pub fn declared_team(&self) -> Option<&str> {
+        self.team.as_deref()
+    }
+
+    /// The forge this domain declares it is shared through, or `None` when
+    /// the key is absent or names no forge [`TeamForge::parse`] knows. An
+    /// unknown value reads as absent, so a typo never refuses anybody's
+    /// Reflection; verify reports it as `M010` instead.
+    pub fn team(&self) -> Option<TeamForge> {
+        self.team.as_deref().and_then(TeamForge::parse)
+    }
+
     /// Whether a declared `domain_name` was written as a YAML string, valid
     /// or not. Crate-private; see the field doc comment for why the M008
     /// verify rule needs it.
@@ -627,6 +665,10 @@ impl Manifest {
             EVOLVE_TRIGGER_KEY => Some((
                 self.declared_trigger(Loop::Evolve),
                 self.trigger(Loop::Evolve).as_str(),
+            )),
+            TEAM_KEY => Some((
+                self.declared_team(),
+                self.team().map_or("", TeamForge::as_str),
             )),
             _ => None,
         }
@@ -818,6 +860,61 @@ impl ReadOnly {
     pub fn is_on(self) -> bool {
         self == ReadOnly::On
     }
+}
+
+/// The forge a team domain is shared through, as its MANIFEST's
+/// [`TEAM_KEY`] names it. One forge today; the key's value names it so a
+/// second one needs no new key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TeamForge {
+    /// Shared through a GitHub repository.
+    GitHub,
+}
+
+impl TeamForge {
+    /// The value's spelling in the MANIFEST frontmatter.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TeamForge::GitHub => TEAM_GITHUB,
+        }
+    }
+
+    /// Parse a declared value, `None` when it names no known forge. Exact
+    /// and case sensitive, like every other declaration a MANIFEST carries.
+    pub fn parse(value: &str) -> Option<TeamForge> {
+        match value {
+            TEAM_GITHUB => Some(TeamForge::GitHub),
+            _ => None,
+        }
+    }
+}
+
+/// The [`TeamForge`] a MANIFEST text in hand declares, or `None` when it
+/// declares none, an unknown one or does not parse.
+pub fn team_of_source(source: &str) -> Option<TeamForge> {
+    if !source.contains(TEAM_KEY) && !source.contains('\\') {
+        return None;
+    }
+    let engram = parse_engram(source).ok()?;
+    Manifest::from_engram(&engram, source).team()
+}
+
+/// The [`TeamForge`] the domain rooted at `root` declares in its
+/// `MANIFEST.md`, or `None` whenever the MANIFEST is missing, unreadable,
+/// unparseable or declares none: the shape of [`read_only_at`].
+pub fn team_at(root: &Path) -> Option<TeamForge> {
+    let source = std::fs::read_to_string(root.join("MANIFEST.md")).ok()?;
+    team_of_source(&source)
+}
+
+/// Declare `forge` as the domain's [`TEAM_KEY`] in MANIFEST `source`: an
+/// existing key is rewritten in place, a missing one goes right after
+/// `title`, the place [`set_declared_name`] uses too. Every instance that
+/// writes the marker writes the same line at the same place, so two members
+/// who share it at once leave a merge nothing to reconcile. A frontmatter
+/// that cannot be cut into key blocks (flow style) is left as it is.
+pub fn set_team_marker(source: &str, forge: TeamForge) -> String {
+    crate::emit::set_frontmatter_field_after(source, TEAM_KEY, forge.as_str(), "title")
 }
 
 /// The [`GeneratedIndexes`] policy the domain rooted at `root` declares, read
@@ -1018,14 +1115,16 @@ impl PolicyKey {
     /// [`PolicyKind::Choice`] key accepts exactly its listed `values`; a
     /// [`PolicyKind::Text`] key accepts whatever its own rule says -
     /// [`DOMAIN_NAME_KEY`] defers to [`validate_domain_name`],
-    /// [`REFLECTION_HOME_KEY`] to [`validate_reflection_home`], and any other
-    /// text key (there is none today) falls back to "not blank".
+    /// [`REFLECTION_HOME_KEY`] to [`validate_reflection_home`], [`TEAM_KEY`]
+    /// to [`TeamForge::parse`], and any other text key (there is none today)
+    /// falls back to "not blank".
     pub fn accepts(&self, value: &str) -> bool {
         match self.kind {
             PolicyKind::Choice => self.values.contains(&value),
             PolicyKind::Text => match self.key {
                 DOMAIN_NAME_KEY => validate_domain_name(value).is_ok(),
                 REFLECTION_HOME_KEY => validate_reflection_home(value).is_ok(),
+                TEAM_KEY => TeamForge::parse(value).is_some(),
                 _ => !value.trim().is_empty(),
             },
         }
@@ -1097,6 +1196,14 @@ pub fn policy_registry() -> &'static [PolicyKey] {
             values: &[TRIGGER_OFF, TRIGGER_WEBHOOK],
             default: TRIGGER_OFF,
             meaning: "Send a signed webhook when maintenance findings pile up.",
+            changed_by: PolicyRole::Owner,
+        },
+        PolicyKey {
+            key: TEAM_KEY,
+            kind: PolicyKind::Text,
+            values: &[],
+            default: "",
+            meaning: "Marks a team domain shared through GitHub; its Reflection is switched on only at the team server.",
             changed_by: PolicyRole::Owner,
         },
     ]

@@ -664,8 +664,10 @@ async fn rights_are_checked() {
 
 // --- sharing ----------------------------------------------------------------
 
+/// Carries the team marker, as every team repository does after its first
+/// share from 0.30.0 on, so a run's share carries only the run's files.
 fn team_manifest_direct() -> Vec<u8> {
-    b"---\ntype: manifest\ntitle: Team\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\nsharing: direct\n---\n\n# Team\n\n## Scope\n\n- shared knowledge\n\n## When to Use\n\n- always\n".to_vec()
+    b"---\ntype: manifest\ntitle: Team\nteam: github\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\nsharing: direct\n---\n\n# Team\n\n## Scope\n\n- shared knowledge\n\n## When to Use\n\n- always\n".to_vec()
 }
 
 /// A team domain `brand` registered from the forge, whose MANIFEST shares

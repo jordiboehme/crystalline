@@ -98,6 +98,10 @@ fn checked_policy(domain: &str, edit: &PolicyEdit) -> Result<&'static crystallin
                 format!(
                     "`{key}` is filled in when Reflection is switched on for a domain connected to GitHub; it is not set by hand"
                 )
+            } else if key == crystalline_core::TEAM_KEY {
+                format!(
+                    "`{key}` is written when the domain is connected to GitHub; it is not set by hand"
+                )
             } else {
                 format!(
                     "`{key}` changes through a rename, which also moves this machine's name and rewrites links: use Rename domain on the domain page or `crystalline domain rename {domain} <new>`"
@@ -826,6 +830,8 @@ fn policy_json(row: &PolicyRow, may_change: bool, domain: &str) -> Value {
     value["how"] = json!(if row.key == crystalline_core::REFLECTION_HOME_KEY {
         "filled in when Reflection is switched on for a domain connected to GitHub; never set by hand"
             .to_string()
+    } else if row.key == crystalline_core::TEAM_KEY {
+        "written when the domain is connected to GitHub; never set by hand".to_string()
     } else if text {
         rename_how(domain)
     } else if row.key == crystalline_core::READ_ONLY_KEY {

@@ -2529,6 +2529,9 @@ fn policy_expected(key: &str) -> String {
         [] if key == crystalline_core::REFLECTION_HOME_KEY => {
             "an http or https address with no trailing slash".to_string()
         }
+        [] if key == crystalline_core::TEAM_KEY => {
+            crystalline_core::TeamForge::GitHub.as_str().to_string()
+        }
         [] => "a valid domain name".to_string(),
         values => join_or(values),
     }
@@ -2552,6 +2555,7 @@ fn policy_read_as<'a>(key: &str, read_as: &'a str) -> &'a str {
     match (read_as.is_empty(), key) {
         (false, _) => read_as,
         (true, crystalline_core::REFLECTION_HOME_KEY) => "ignored; the Reflection has no home",
+        (true, crystalline_core::TEAM_KEY) => "ignored; not treated as a team domain",
         (true, _) => "ignored; the local name holds",
     }
 }

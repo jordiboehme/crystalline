@@ -969,6 +969,67 @@ fn both_recognized_read_only_values_are_clean() {
     }
 }
 
+// --- The team marker (M010) --------------------------------------------------
+
+fn manifest_declaring_team(value: &str) -> String {
+    format!(
+        "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\nteam: {value}\n---\n\n## Scope\n\n- Charts of the harbor\n\n## When to Use\n\n- When asked about the harbor\n"
+    )
+}
+
+#[test]
+fn an_unrecognized_team_value_is_m010_error() {
+    let dir = tempdir().unwrap();
+    write(
+        dir.path(),
+        "MANIFEST.md",
+        &manifest_declaring_team("gitlab"),
+    );
+    let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+    let m010 = report
+        .issues
+        .iter()
+        .find(|i| i.rule == "M010")
+        .expect("M010 present");
+    assert_eq!(m010.severity, Severity::Error);
+    assert_eq!(m010.message, "`team: gitlab` is not `github`");
+    assert_eq!(
+        m010.fix.as_deref(),
+        Some(
+            "read as absent, so this domain is not treated as a team domain; Crystalline writes `team: github` itself when the domain is connected to GitHub"
+        )
+    );
+    assert_eq!(report.exit_code(), 1);
+}
+
+#[test]
+fn the_github_team_marker_and_an_absent_one_are_clean() {
+    let dir = tempdir().unwrap();
+    write(
+        dir.path(),
+        "MANIFEST.md",
+        &manifest_declaring_team("github"),
+    );
+    let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+    assert!(
+        !report.issues.iter().any(|i| i.rule == "M010"),
+        "{:?}",
+        report.issues
+    );
+    let dir = tempdir().unwrap();
+    write(
+        dir.path(),
+        "MANIFEST.md",
+        &manifest_declaring_read_only("off"),
+    );
+    let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+    assert!(
+        !report.issues.iter().any(|i| i.rule == "M010"),
+        "{:?}",
+        report.issues
+    );
+}
+
 /// The MANIFEST issue 91 left behind: `## When to Use` twice, the first one
 /// empty, which is the one routing reads.
 const DOUBLED_MANIFEST: &str = "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n## Scope\n\n- Facts about the solar system\n\n## When to Use\n\n## When to Use\n\n- When asked about moons or planets\n";

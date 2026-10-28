@@ -1192,7 +1192,7 @@ async fn configure_with_a_domain_answers_the_domain_view() {
         .await
         .unwrap();
     assert_eq!(out["domain"], "eng", "{out}");
-    assert_eq!(out["policies"].as_array().unwrap().len(), 8);
+    assert_eq!(out["policies"].as_array().unwrap().len(), 9);
     assert_eq!(out["sections"].as_array().unwrap().len(), 4);
     assert_eq!(out["rules"]["available"], true);
     assert_eq!(out["how"].as_array().unwrap().len(), 4);
