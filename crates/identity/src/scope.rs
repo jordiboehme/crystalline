@@ -509,6 +509,16 @@ pub struct DomainAccess {
     auth: Arc<AuthStore>,
 }
 
+/// How an account is named on the commits it makes through the GitHub App:
+/// its display name and, when it gave one, its contact address.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccountContact {
+    /// The account's display name.
+    pub display: String,
+    /// The account's contact address, `None` when it has none.
+    pub email: Option<String>,
+}
+
 /// What one read of the visibility records says: which domains are private,
 /// and which of those the asking scope may not read.
 ///
@@ -686,6 +696,21 @@ impl DomainAccess {
     /// ended. Answers how many were standing.
     pub async fn end_domain_overlay_grants(&self, domain: &str) -> Result<u64> {
         self.auth.end_domain_overlay_grants(domain).await
+    }
+
+    /// The display name and contact address of `account`, or `None` for a
+    /// name that is not an account. A blank address reads as none.
+    ///
+    /// Narrow for the same reason as every delegation here: a share needs the
+    /// two fields it names a commit's author with, not the account row.
+    pub async fn account_contact(&self, account: &str) -> Result<Option<AccountContact>> {
+        Ok(self.auth.user(account).await?.map(|user| AccountContact {
+            display: user.display,
+            email: user
+                .email
+                .map(|email| email.trim().to_string())
+                .filter(|email| !email.is_empty()),
+        }))
     }
 
     /// What `scope` may do on `domain`.
@@ -1154,6 +1179,41 @@ mod tests {
                 .await
                 .unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn account_contact_answers_the_display_name_and_the_email() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = store(&dir).await;
+        auth.add_user(
+            "ada",
+            "Ada Lovelace",
+            Some("ada@example.com"),
+            Role::Editor,
+            "pw12345678",
+        )
+        .await
+        .unwrap();
+        auth.add_user("bob", "Bob", None, Role::Editor, "pw12345678")
+            .await
+            .unwrap();
+        let access = DomainAccess::new(auth);
+
+        assert_eq!(
+            access.account_contact("ada").await.unwrap(),
+            Some(AccountContact {
+                display: "Ada Lovelace".to_string(),
+                email: Some("ada@example.com".to_string()),
+            })
+        );
+        assert_eq!(
+            access.account_contact("bob").await.unwrap(),
+            Some(AccountContact {
+                display: "Bob".to_string(),
+                email: None,
+            })
+        );
+        assert_eq!(access.account_contact("nobody").await.unwrap(), None);
     }
 
     fn user(account: &str, admin: bool) -> Scope {

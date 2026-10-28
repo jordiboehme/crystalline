@@ -1855,7 +1855,7 @@ impl Engine {
         if let (Some(who), true) = (drafting.as_deref(), stacks_allowed) {
             self.refuse_open_proposal_while_reviewing(domain, &state_dir, who)?;
         }
-        let (provider, login) = self.resolve_share_provider(&actor)?;
+        let (provider, login) = self.resolve_share_provider(&actor, &spec.repo).await?;
         let acting = self.personal_write_login(login.as_deref());
         // The team marker, for a share of the folder: written into the folder
         // before anything is detected (see `Engine::plan_team_marker`). A
@@ -2265,7 +2265,7 @@ impl Engine {
             // confirm a share this instance would then refuse.
             self.refuse_open_proposal_while_reviewing(domain, &state_dir, who)?;
         }
-        let (provider, login) = match self.resolve_share_provider(&actor) {
+        let (provider, login) = match self.resolve_share_provider(&actor, &spec.repo).await {
             Ok(resolved) => resolved,
             Err(e)
                 if credential == PreviewCredential::ReadScopeFallback
@@ -2402,7 +2402,7 @@ impl Engine {
         } else {
             Vec::new()
         };
-        let (provider, login) = self.resolve_share_provider(&actor)?;
+        let (provider, login) = self.resolve_share_provider(&actor, &spec.repo).await?;
         let acting = self.personal_write_login(login.as_deref());
         let mut report = ops::withdraw(
             provider.as_ref(),
@@ -3647,14 +3647,21 @@ impl Engine {
     /// is whatever [`Engine::with_origin_provider_login`] supplied beside it -
     /// `None` unless a test asked for one, which is the same answer as a
     /// credential that names nobody.
-    pub(super) fn resolve_share_provider(
+    ///
+    /// Through a GitHub App, the share's commits name the acting account as
+    /// author and the App's bot as committer when the account has a contact
+    /// address (see [`Engine::app_share_router`]); `repo` is the repository
+    /// whose installation token reads the bot's identity.
+    pub(super) async fn resolve_share_provider(
         &self,
         actor: &ShareActor,
+        repo: &str,
     ) -> Result<(Arc<dyn Provider>, Option<String>)> {
         if let Some(p) = &self.origin_provider_override {
             return Ok((p.clone(), self.origin_provider_override_login.clone()));
         }
         if let Some(app) = self.instance_share_app()? {
+            let app = self.app_share_router(app, actor, repo).await;
             let login = app.bot_login();
             return Ok((app, login));
         }

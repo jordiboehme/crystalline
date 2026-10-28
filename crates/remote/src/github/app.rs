@@ -126,11 +126,28 @@ pub fn app_jwt(key: &AppKey, client_id: &str, now: DateTime<Utc>) -> Result<Stri
 /// middle of a share.
 const RENEW_BEFORE: Duration = Duration::minutes(5);
 
-/// The domain of a GitHub user's `noreply` commit address,
-/// `<id>+<login>@users.noreply.github.com`. GitHub documents this form for
-/// github.com only; Enterprise Server uses it too as far as is known, which
-/// is unverified, so it lives in this one place.
-const NOREPLY_DOMAIN: &str = "users.noreply.github.com";
+/// The domain of a GitHub account's `noreply` commit address,
+/// `<id>+<login>@<domain>`, for the host an API url stands for (`None` is
+/// github.com, as [`api_host`] answers it).
+///
+/// github.com: `users.noreply.github.com`, as GitHub documents it ("Email
+/// addresses reference", the `noreply` section: `ID+USERNAME@users.noreply.github.com`).
+/// That section is published for github.com and GitHub Enterprise Cloud only;
+/// the Enterprise Server edition of the same page leaves it out and documents
+/// no `noreply` address form at all, so the docs leave Enterprise Server
+/// unclear. For an Enterprise Server host this mirrors the github.com form
+/// under that host, `users.noreply.<host>`, the same form the user `noreply`
+/// address of a linked account takes here; GitHub does not document it. Any
+/// port is dropped, since an email domain has none.
+fn noreply_domain(host: Option<&str>) -> String {
+    match host {
+        None => "users.noreply.github.com".to_string(),
+        Some(host) => {
+            let bare = host.split(':').next().unwrap_or(host);
+            format!("users.noreply.{bare}")
+        }
+    }
+}
 
 /// The clock a [`GithubApp`] reads: the issue time of its JWTs and the
 /// moment a cached token is measured against. [`GithubApp::new`] uses the
@@ -357,20 +374,26 @@ impl GithubApp {
     }
 
     /// The identity the App's commits carry: `<slug>[bot]` and its `noreply`
-    /// address, read once from `GET /users/<slug>[bot]` and kept.
-    pub async fn bot_identity(&self) -> Result<CommitIdentity, RemoteError> {
+    /// address on this host (see `noreply_domain`), read once from
+    /// `GET /users/<slug>[bot]` and kept.
+    ///
+    /// The lookup goes out on `repo`'s installation token: the App's JWT is
+    /// only accepted on `/app` routes, and an anonymous request would be
+    /// refused by an Enterprise Server in private mode and counts against the
+    /// small unauthenticated rate limit.
+    pub async fn bot_identity(&self, repo: &str) -> Result<CommitIdentity, RemoteError> {
         if let Some(bot) = lock(&self.bot).clone() {
             return Ok(bot);
         }
         let login = format!("{}[bot]", self.slug().await?);
-        // A public profile: the App's JWT is only accepted on `/app` routes,
-        // so this goes out without a credential.
+        let token = self.token_for_repo(repo).await?;
         let path = format!("/users/{}", segment(&login));
-        let response = send(self.request(Method::GET, &path, None)).await?;
-        let response = check_response(response, None, false, &self.api_url).await?;
+        let response = send(self.request(Method::GET, &path, Some(&token))).await?;
+        let response = check_response(response, None, true, &self.api_url).await?;
         let user: UserResponse = parse_json(response).await?;
+        let domain = noreply_domain(api_host(&self.api_url).as_deref());
         let bot = CommitIdentity {
-            email: format!("{}+{}@{NOREPLY_DOMAIN}", user.id, user.login),
+            email: format!("{}+{}@{domain}", user.id, user.login),
             name: user.login,
         };
         *lock(&self.bot) = Some(bot.clone());
@@ -603,6 +626,20 @@ mod tests {
     fn app_key_debug_prints_no_key_material() {
         let key = AppKey::from_pem(PKCS1).unwrap();
         assert_eq!(format!("{key:?}"), "AppKey(<redacted>)");
+    }
+
+    #[test]
+    fn the_noreply_domain_follows_the_host() {
+        assert_eq!(noreply_domain(None), "users.noreply.github.com");
+        assert_eq!(
+            noreply_domain(Some("ghe.example.com")),
+            "users.noreply.ghe.example.com"
+        );
+        assert_eq!(
+            noreply_domain(Some("ghe.example.com:8443")),
+            "users.noreply.ghe.example.com",
+            "an email domain carries no port"
+        );
     }
 
     /// Signed with the PKCS#1 fixture and cross-checked against `openssl dgst

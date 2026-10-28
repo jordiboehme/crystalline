@@ -15,7 +15,9 @@ use crystalline_remote::provider::{
     CompareResult, Feedback, HeadProbe, OpenProposalRef, OriginSpec, ProposalHandle,
     ProposalRequest, ProposalState, Provider, StackInfo, TreeWrite,
 };
-use crystalline_remote::{AppLookup, AppStore, CommitIdentities, GithubApp, RemoteError};
+use crystalline_remote::{
+    AppLookup, AppStore, CommitIdentities, CommitIdentity, GithubApp, RemoteError,
+};
 
 use super::*;
 
@@ -56,9 +58,10 @@ pub(crate) enum AppSlot {
 pub(crate) struct AppRouter {
     app: Arc<GithubApp>,
     api_url: Option<String>,
-    /// Who an `instance` share's commits name as author and committer. Always
-    /// `None` until commit attribution lands; nothing reads it yet.
-    #[allow(dead_code)]
+    /// Who the commits made through this router name as author and
+    /// committer. `None` on the router the slot keeps, which every pull, the
+    /// Reflection backup and an owner's share use, so the bot authors those;
+    /// set only on the per-share copy [`AppRouter::with_commit`] makes.
     commit: Option<CommitIdentities>,
     client: HttpClient,
 }
@@ -70,6 +73,20 @@ impl AppRouter {
             api_url,
             commit: None,
             client: GitHubProvider::http_client(),
+        }
+    }
+
+    /// A copy of this router whose commits name `identities` as author and
+    /// committer. A copy, never a change to the slot's router: that one is
+    /// shared by every operation, and a person's name must not leak into
+    /// another share or the backup. The copy shares the App's caches and
+    /// the HTTP client.
+    pub(crate) fn with_commit(&self, identities: CommitIdentities) -> AppRouter {
+        AppRouter {
+            app: self.app.clone(),
+            api_url: self.api_url.clone(),
+            commit: Some(identities),
+            client: self.client.clone(),
         }
     }
 
@@ -85,7 +102,12 @@ impl AppRouter {
     }
 
     fn provider(&self, token: Option<String>) -> GitHubProvider {
-        GitHubProvider::with_client(self.client.clone(), self.api_url.clone(), token)
+        let provider =
+            GitHubProvider::with_client(self.client.clone(), self.api_url.clone(), token);
+        match &self.commit {
+            Some(identities) => provider.with_commit_identities(identities.clone()),
+            None => provider,
+        }
     }
 
     /// Forgets the token `repo` was just refused with, so the next
@@ -335,6 +357,61 @@ impl Engine {
             AppSlot::Ready(router) => Some(router.app().clone()),
             _ => None,
         }
+    }
+
+    /// The router an `instance` share by `actor` on `repo` goes out through.
+    ///
+    /// Reads the App's slug first when the credentials carried none (an App
+    /// from the environment), so the share records the bot's login from the
+    /// very first one. An account that has a contact address is named as the
+    /// commits' author, with the App's bot as committer; everyone else (the
+    /// machine owner, an unauthenticated agent, an account without an
+    /// address) gets the slot's own router, whose commits the bot authors.
+    /// Attribution never fails a share: when the person or the bot cannot be
+    /// read, a warning is logged and the bot authors the commit.
+    pub(super) async fn app_share_router(
+        &self,
+        router: Arc<AppRouter>,
+        actor: &ShareActor,
+        repo: &str,
+    ) -> Arc<AppRouter> {
+        if let Err(e) = router.app().slug().await {
+            tracing::debug!("the GitHub App's slug could not be read before a share: {e}");
+        }
+        let ShareActor::Account(account) = actor else {
+            return router;
+        };
+        let Some(access) = self.domain_access.get() else {
+            return router;
+        };
+        let contact = match access.account_contact(account).await {
+            Ok(Some(contact)) => contact,
+            Ok(None) => return router,
+            Err(e) => {
+                tracing::warn!(
+                    "the account {account} could not be read, so the GitHub App authors its share: {e}"
+                );
+                return router;
+            }
+        };
+        // Wave 1: an account without an address of its own is not named.
+        let Some(email) = contact.email else {
+            return router;
+        };
+        let committer = match router.app().bot_identity(repo).await {
+            Ok(bot) => bot,
+            Err(e) => {
+                tracing::warn!(
+                    "the GitHub App's bot identity could not be read, so the App authors the share of {account}: {e}"
+                );
+                return router;
+            }
+        };
+        let author = CommitIdentity {
+            name: contact.display,
+            email,
+        };
+        Arc::new(router.with_commit(CommitIdentities { author, committer }))
     }
 
     /// The App slot, loading it on first use. An injected test provider

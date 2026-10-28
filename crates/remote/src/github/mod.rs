@@ -34,6 +34,7 @@ use reqwest::{Method, Response, StatusCode};
 use serde::de::DeserializeOwned;
 
 use crate::error::RemoteError;
+use crate::github::app::{CommitIdentities, CommitIdentity};
 use crate::provider::{
     ChangeKind, CompareResult, Feedback, HeadProbe, OpenProposalRef, OriginSpec, ProposalHandle,
     ProposalRequest, ProposalState, Provider, StackInfo, StackMember, TreeWrite, UpstreamChange,
@@ -41,10 +42,10 @@ use crate::provider::{
 use types::{
     BlobResponse, CloseProposalRequest, CommitResponse, CompareFile, CompareResponse,
     CreateBlobRequest, CreateCommitRequest, CreateProposalRequest, CreateProposalResponse,
-    CreateRefRequest, CreateTreeRequest, CurrentUserResponse, ErrorBody, IssueCommentResponse,
-    OpenProposalListItem, ProposalStateResponse, RefResponse, RepoResponse, ReviewCommentResponse,
-    ReviewResponse, ShaResponse, StackResponse, StackWriteRequest, TreeEntryRequest,
-    UpdateProposalRequest, UpdateRefRequest,
+    CreateRefRequest, CreateTreeRequest, CurrentUserResponse, ErrorBody, GitActor,
+    IssueCommentResponse, OpenProposalListItem, ProposalStateResponse, RefResponse, RepoResponse,
+    ReviewCommentResponse, ReviewResponse, ShaResponse, StackResponse, StackWriteRequest,
+    TreeEntryRequest, UpdateProposalRequest, UpdateRefRequest,
 };
 
 /// What a single URL path segment or query value keeps unencoded: the
@@ -97,6 +98,9 @@ pub struct GitHubProvider {
     client: reqwest::Client,
     api_url: String,
     token: Option<String>,
+    /// Who [`Provider::create_commit`] names as author and committer; `None`
+    /// leaves both to GitHub, which records the token's own identity.
+    commit: Option<CommitIdentities>,
 }
 
 impl GitHubProvider {
@@ -136,7 +140,15 @@ impl GitHubProvider {
             client,
             api_url,
             token,
+            commit: None,
         }
+    }
+
+    /// Names `identities` as the author and the committer of every commit
+    /// this provider creates. Nothing else it sends changes.
+    pub fn with_commit_identities(mut self, identities: CommitIdentities) -> GitHubProvider {
+        self.commit = Some(identities);
+        self
     }
 
     /// Starts a request against `path` (which must start with `/`),
@@ -487,10 +499,16 @@ impl Provider for GitHubProvider {
     ) -> Result<String, RemoteError> {
         let (owner, name) = split_repo(&origin.repo)?;
         let path = format!("/repos/{owner}/{name}/git/commits");
+        let actor = |identity: &CommitIdentity| GitActor {
+            name: identity.name.clone(),
+            email: identity.email.clone(),
+        };
         let body = CreateCommitRequest {
             message: message.to_string(),
             tree: tree.to_string(),
             parents: parents.to_vec(),
+            author: self.commit.as_ref().map(|c| actor(&c.author)),
+            committer: self.commit.as_ref().map(|c| actor(&c.committer)),
         };
         let response = self
             .send(self.request(Method::POST, &path).json(&body))

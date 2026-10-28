@@ -442,11 +442,15 @@ async fn install_url_uses_the_saved_slug_without_a_request() {
 async fn ghes_base_url_is_used_for_every_app_call() {
     let mock = Arc::new(mock_with(&[("acme/knowledge", 11)]));
     let base = spawn(router(mock.clone(), "/api/v3")).await;
-    let app = GithubApp::new(
-        Some(format!("{base}/api/v3")),
-        creds(&host_of(&base), Some(SLUG)),
-    )
-    .unwrap();
+    // Pinned, so the minted token (which expires an hour after `t0`) is
+    // fresh whatever the wall clock says.
+    let app = TestClock::new().install(
+        GithubApp::new(
+            Some(format!("{base}/api/v3")),
+            creds(&host_of(&base), Some(SLUG)),
+        )
+        .unwrap(),
+    );
 
     let info = app.app_info().await.unwrap();
     assert_eq!(info.slug, SLUG);
@@ -454,7 +458,7 @@ async fn ghes_base_url_is_used_for_every_app_call() {
         app.token_for_repo("acme/knowledge").await.unwrap(),
         "ghs_11_1"
     );
-    app.bot_identity().await.unwrap();
+    app.bot_identity("acme/knowledge").await.unwrap();
     assert!(app.token_for_repo("acme/missing").await.is_err());
 
     assert_eq!(mock.count("UNROUTED"), 0, "every call stays under /api/v3");
@@ -574,21 +578,38 @@ async fn app_info_reads_the_app() {
 
 #[tokio::test]
 async fn bot_identity_is_slug_bot_with_the_noreply_email() {
-    let (mock, _base, app, _clock) = serve(Mock::default()).await;
+    let (mock, base, app, _clock) = serve(mock_with(&[("acme/kb", 11)])).await;
 
-    let bot = app.bot_identity().await.unwrap();
+    let bot = app.bot_identity("acme/kb").await.unwrap();
+    // The loopback forge stands for an Enterprise Server at 127.0.0.1, so
+    // the address takes that host; github.com is pinned in the unit tests.
+    let host = host_of(&base);
+    let host = host.split(':').next().unwrap();
     assert_eq!(
         bot,
         CommitIdentity {
             name: "crystalline-acme[bot]".to_string(),
-            email: "41898282+crystalline-acme[bot]@users.noreply.github.com".to_string(),
+            email: format!("41898282+crystalline-acme[bot]@users.noreply.{host}"),
         }
     );
-    assert_eq!(app.bot_identity().await.unwrap(), bot);
+    assert_eq!(app.bot_identity("acme/kb").await.unwrap(), bot);
     assert_eq!(mock.count("GET /users/"), 1, "the identity is cached");
     assert_eq!(
         mock.count("GET /users/crystalline-acme%5Bbot%5D"),
         1,
         "the brackets are percent-encoded"
+    );
+}
+
+#[tokio::test]
+async fn bot_identity_is_read_with_the_repositorys_installation_token() {
+    let (mock, _base, app, _clock) = serve(mock_with(&[("acme/kb", 11)])).await;
+
+    app.bot_identity("acme/kb").await.unwrap();
+    let headers = mock.headers_of("GET /users/");
+    assert_eq!(
+        headers.get("authorization").unwrap().to_str().unwrap(),
+        "Bearer ghs_11_1",
+        "a private-mode Enterprise Server or the anonymous rate limit must not refuse it"
     );
 }

@@ -31,10 +31,12 @@ use crystalline_remote::provider::{
     ChangeKind, OriginSpec, ProposalRequest, ProposalState, Provider, TreeWrite,
 };
 use crystalline_remote::reflections_backup::BACKUP_BRANCH;
+use crystalline_remote::state::OriginState;
 use crystalline_remote::{AppCredentials, AppLookup, AppStore, RemoteError};
 use crystalline_service::engine::{EngineError, ShareActor};
 use crystalline_service::reflection_backup::BackupCause;
-use crystalline_service::{Engine, EnvOverlay, Scope};
+use crystalline_service::rest::{AuthStore, Role};
+use crystalline_service::{DomainAccess, Engine, EnvOverlay, Scope};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -86,6 +88,8 @@ struct Forge {
     mints: StdMutex<Vec<u64>>,
     /// How many `POST .../git/trees` still answer 401.
     trees_unauthorized: AtomicUsize,
+    /// The body of every `POST .../git/commits`, in order.
+    commits: StdMutex<Vec<Value>>,
 }
 
 impl Forge {
@@ -95,6 +99,10 @@ impl Forge {
 
     fn mints(&self) -> Vec<u64> {
         self.mints.lock().unwrap().clone()
+    }
+
+    fn commits(&self) -> Vec<Value> {
+        self.commits.lock().unwrap().clone()
     }
 
     /// Takes the App off `repo`: the lookup answers 404 from now on, and the
@@ -146,6 +154,7 @@ async fn spawn_forge(
         log: StdMutex::new(Vec::new()),
         mints: StdMutex::new(Vec::new()),
         trees_unauthorized: AtomicUsize::new(0),
+        commits: StdMutex::new(Vec::new()),
     });
     let router = Router::new().fallback(handle).with_state(forge.clone());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -233,6 +242,14 @@ async fn handle(
             "token": forge.tokens[&id],
             "expires_at": expires.to_rfc3339(),
         }));
+    }
+    if let Some(login) = path.strip_prefix("/users/")
+        && method == Method::GET
+    {
+        let login = percent_encoding::percent_decode_str(login)
+            .decode_utf8_lossy()
+            .into_owned();
+        return ok(json!({"login": login, "id": 41898282, "type": "Bot"}));
     }
     let Some(repo) = hit.repo() else {
         return not_found();
@@ -398,6 +415,7 @@ async fn repo_route(
         };
     }
     if tail == "/git/commits" && post {
+        forge.commits.lock().unwrap().push(body.clone());
         let parents: Vec<String> = body["parents"]
             .as_array()
             .unwrap()
@@ -834,6 +852,120 @@ async fn a_401_mid_share_renews_the_installation_token_once() {
     );
 }
 
+/// A connected `kb` domain on an App instance with one new engram waiting
+/// to be shared.
+async fn app_share_setup(tmp: &Path) -> (Arc<Forge>, Engine) {
+    let mock = repo_with_manifest("");
+    let (forge, url) = spawn_forge(
+        &[("acme/kb", mock.clone())],
+        &[("acme/kb", 1)],
+        &[(1, "ghs_test")],
+    )
+    .await;
+    let eng = engine(tmp, &url, &app_env()).await;
+    let root = tmp.join("kb");
+    connect(&eng, "acme/kb", "kb", &root).await;
+    std::fs::create_dir_all(root.join("notes")).unwrap();
+    std::fs::write(
+        root.join("notes/new.md"),
+        engram("New", "new", "brand new content"),
+    )
+    .unwrap();
+    (forge, eng)
+}
+
+#[tokio::test]
+async fn an_instance_share_with_the_app_names_the_person_as_author_and_the_bot_as_committer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (forge, eng) = app_share_setup(tmp.path()).await;
+    let auth = Arc::new(AuthStore::open(&tmp.path().join("auth.db")).await.unwrap());
+    auth.add_user(
+        "ada",
+        "Ada Lovelace",
+        Some("ada@example.com"),
+        Role::Editor,
+        "pw12345678",
+    )
+    .await
+    .unwrap();
+    eng.set_domain_access(Arc::new(DomainAccess::new(auth)));
+
+    let result = eng
+        .origin_share(
+            "kb",
+            None,
+            None,
+            None,
+            None,
+            ShareActor::Account("ada".to_string()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["outcome"], "proposed", "{result}");
+
+    let commits = forge.commits();
+    assert_eq!(commits.len(), 1, "{commits:?}");
+    let commit = &commits[0];
+    assert_eq!(commit["author"]["name"], "Ada Lovelace", "{commit}");
+    assert_eq!(commit["author"]["email"], "ada@example.com", "{commit}");
+    assert_eq!(
+        commit["committer"]["name"], "crystalline-acme[bot]",
+        "{commit}"
+    );
+    assert_eq!(
+        commit["committer"]["email"], "41898282+crystalline-acme[bot]@users.noreply.127.0.0.1",
+        "{commit}"
+    );
+    let users: Vec<Hit> = forge
+        .hits()
+        .into_iter()
+        .filter(|h| h.path.starts_with("/users/"))
+        .collect();
+    assert_eq!(users.len(), 1, "{users:?}");
+    assert_eq!(
+        users[0].auth,
+        bearer("ghs_test"),
+        "the bot is looked up on the installation token"
+    );
+    // The environment names no slug, so the share reads it before it records
+    // whose proposal this is.
+    let state = OriginState::load(&tmp.path().join("origins/kb"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        state.proposals[0].author_login.as_deref(),
+        Some("crystalline-acme[bot]")
+    );
+}
+
+#[tokio::test]
+async fn an_owner_share_with_the_app_is_bot_authored() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (forge, eng) = app_share_setup(tmp.path()).await;
+
+    let result = eng
+        .origin_share("kb", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(result["outcome"], "proposed", "{result}");
+
+    let commits = forge.commits();
+    assert_eq!(commits.len(), 1, "{commits:?}");
+    let keys: Vec<&String> = commits[0].as_object().unwrap().keys().collect();
+    assert!(
+        !keys.iter().any(|k| *k == "author" || *k == "committer"),
+        "the owner's share names nobody, so the bot authors it: {keys:?}"
+    );
+    let state = OriginState::load(&tmp.path().join("origins/kb"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        state.proposals[0].author_login.as_deref(),
+        Some("crystalline-acme[bot]"),
+        "the slug is read at the share entry, so the first share records the bot"
+    );
+}
+
 #[tokio::test]
 async fn the_backup_tick_uses_one_token_per_repository() {
     let tmp = tempfile::tempdir().unwrap();
@@ -879,6 +1011,14 @@ async fn the_backup_tick_uses_one_token_per_repository() {
         });
         assert!(wrote, "{repo} got its backup commit");
     }
+    assert!(
+        forge
+            .commits()
+            .iter()
+            .all(|c| c.get("author").is_none() && c.get("committer").is_none()),
+        "the Reflection backup names nobody, so the bot authors it: {:?}",
+        forge.commits()
+    );
     let mut mints = forge.mints();
     mints.sort_unstable();
     assert_eq!(mints, vec![11, 22], "one token per installation, reused");
