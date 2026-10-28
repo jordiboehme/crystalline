@@ -270,3 +270,40 @@ fn doctor_flags_a_public_url_without_webhook_secret() {
     assert!(problem.contains("webhook secret"), "{app}");
     assert!(!problem.contains("clock"), "{app}");
 }
+
+#[test]
+fn doctor_says_connected_through_a_healthy_app() {
+    let github = FakeGithub::start(0);
+    let report = doctor_with_app(&github, &[]);
+    assert_eq!(report["github"]["app"]["problem"], Value::Null, "{report}");
+    assert_eq!(report["github"]["connected"], serde_json::json!(true));
+    assert_eq!(
+        report["github"]["connected_through_app"],
+        serde_json::json!(true)
+    );
+
+    let home = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let config = write_config(work.path(), &github.url);
+    let mut cmd = crate::common::crystalline();
+    isolate(&mut cmd, home.path());
+    let out = cmd
+        .env("CRYSTALLINE_GITHUB_APP_ID", "7")
+        .env("CRYSTALLINE_GITHUB_APP_CLIENT_ID", "Iv23.test")
+        .env("CRYSTALLINE_GITHUB_APP_PRIVATE_KEY", PEM)
+        .args(["doctor", "--config"])
+        .arg(&config)
+        .arg("--db")
+        .arg(work.path().join("index.db"))
+        .output()
+        .unwrap();
+    let human = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        human.contains("connected through the GitHub App"),
+        "{human}"
+    );
+    assert!(
+        !human.contains("Run: crystalline connect github"),
+        "{human}"
+    );
+}

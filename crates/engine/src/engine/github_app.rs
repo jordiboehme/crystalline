@@ -40,8 +40,7 @@ const UNREADABLE_FOR: Duration = Duration::from_secs(60);
 
 /// What an origin operation is refused with while the keychain that holds
 /// the App (the marker says so) cannot be read.
-pub(crate) const KEYCHAIN_REFUSAL: &str =
-    "the GitHub App is saved in the keychain, which could not be read; try again or unlock it";
+pub(crate) const KEYCHAIN_REFUSAL: &str = "the GitHub App is saved in the keychain, which could not be read; try again or unlock it, or run crystalline github app remove";
 
 /// What `set` and `remove` are refused with while the environment supplies
 /// the App.
@@ -107,22 +106,63 @@ impl GithubAppStatus {
     }
 }
 
+/// A stand-in for the App store's keychain, for tests (see
+/// [`AppHome::with_keychain`]): the read [`AppHome::lookup`] makes, and the
+/// keychain delete [`AppHome::remove`] tries.
+#[cfg(any(test, feature = "testing"))]
+pub struct AppKeychainSeam {
+    /// Answers [`AppHome::lookup`].
+    pub lookup: AppLookupFn,
+    /// Answers the keychain delete.
+    pub delete: Arc<dyn Fn() -> StdResult<(), RemoteError> + Send + Sync>,
+}
+
 /// Where one configuration finds and keeps its GitHub App: the effective
 /// `github.api_url`, and the state directory the file store and the
 /// keychain marker live in. The engine builds one for itself; the CLI builds
 /// one to set or remove an App without opening an engine, so both go through
 /// the same code.
-#[derive(Clone, Debug)]
 pub struct AppHome {
-    /// The effective `github.api_url`.
-    pub api_url: Option<String>,
-    /// The state directory beside the token store.
-    pub dir: PathBuf,
-    /// Only the file under `dir`, never the keychain: the test seam.
-    pub file_only: bool,
+    api_url: Option<String>,
+    dir: PathBuf,
+    file_only: bool,
+    #[cfg(any(test, feature = "testing"))]
+    seam: Option<AppKeychainSeam>,
+}
+
+/// What [`AppHome::remove`] did.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppRemoval {
+    /// Why the keychain could not be read, when it could not: a GitHub App
+    /// saved there may remain, and the remove is to be run again once the
+    /// keychain is unlocked. The file copy and the marker are gone either
+    /// way.
+    pub keychain_unreadable: Option<String>,
 }
 
 impl AppHome {
+    /// The home for `api_url` (the effective `github.api_url`) with the file
+    /// store and the marker in `dir`; `file_only` never reads or writes the
+    /// keychain (the test seam).
+    pub fn new(api_url: Option<String>, dir: PathBuf, file_only: bool) -> AppHome {
+        AppHome {
+            api_url,
+            dir,
+            file_only,
+            #[cfg(any(test, feature = "testing"))]
+            seam: None,
+        }
+    }
+
+    /// Answers the keychain with `seam` instead of the OS keychain.
+    /// Test-only: lets a test stage a keychain that cannot be read, which
+    /// the real one cannot be made to do on demand.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_keychain(mut self, seam: AppKeychainSeam) -> AppHome {
+        self.seam = Some(seam);
+        self
+    }
+
     /// The host the App is saved for: `github.com` or the Enterprise Server
     /// host of `api_url`.
     fn host(&self) -> String {
@@ -131,6 +171,10 @@ impl AppHome {
 
     /// One read of the App store for this home.
     pub fn lookup(&self) -> StdResult<AppLookup, RemoteError> {
+        #[cfg(any(test, feature = "testing"))]
+        if let Some(seam) = &self.seam {
+            return (seam.lookup)();
+        }
         if self.file_only {
             let store = AppStore::file_fallback(&self.dir);
             let credentials = store.load()?;
@@ -145,6 +189,19 @@ impl AppHome {
             origin::token_host(self.api_url.as_deref()).as_deref(),
             &self.dir,
         )
+    }
+
+    /// Tries to delete the keychain item while the keychain could not be
+    /// read: it may answer a delete, and a failure changes nothing.
+    fn try_keychain_delete(&self) -> StdResult<(), RemoteError> {
+        #[cfg(any(test, feature = "testing"))]
+        if let Some(seam) = &self.seam {
+            return (seam.delete)();
+        }
+        if self.file_only {
+            return Ok(());
+        }
+        AppStore::keyring(origin::token_host(self.api_url.as_deref()).as_deref()).delete()
     }
 
     /// The App as this home finds it, read afresh, with GitHub asked for
@@ -162,9 +219,11 @@ impl AppHome {
                 }) => (credentials, store.kind()),
                 Ok(AppLookup {
                     keychain_failed: Some(reason),
-                    marker,
+                    marker: Some(marker),
                     ..
-                }) => return unreadable_status(&reason, marker.is_some()),
+                }) if marker_names_host(&marker, self.api_url.as_deref()) => {
+                    return unreadable_status(&reason);
+                }
                 Ok(_) => return GithubAppStatus::default(),
                 Err(e) => return refused_status(None, detail_of(e)),
             },
@@ -181,10 +240,13 @@ impl AppHome {
 
     /// Validates `credentials` against GitHub (`GET /app` with the App's
     /// signed token) and saves them: in the keychain with its marker when
-    /// the keychain works, else in the file. The slug and the host are
-    /// taken from GitHub and the effective `github.api_url`, whatever the
-    /// caller passed. Refused while the environment supplies the App, and
-    /// when GitHub knows the key as another App.
+    /// the keychain works (dropping an older copy in the file, which a
+    /// later keychain failure would otherwise hand over), else in the file.
+    /// The slug and the host are taken from GitHub and the effective
+    /// `github.api_url`, whatever the caller passed. Refused while the
+    /// environment supplies the App, while the keychain holds an App it
+    /// cannot hand over (the marker says so), and when GitHub knows the key
+    /// as another App.
     pub async fn save(
         &self,
         overlay: &EnvOverlay,
@@ -192,6 +254,16 @@ impl AppHome {
     ) -> Result<GithubAppStatus> {
         if overlay.github_app(self.api_url.as_deref()).is_some() {
             return Err(EngineError::Conflict(APP_FROM_ENV.to_string()));
+        }
+        let found = self.lookup()?;
+        // A save to the file would be shadowed by the keychain's App once
+        // the keychain answers again.
+        if let (Some(reason), Some(marker)) = (&found.keychain_failed, &found.marker)
+            && marker_names_host(marker, self.api_url.as_deref())
+        {
+            return Err(EngineError::Conflict(format!(
+                "the keychain could not be read ({reason}), and a GitHub App is saved there; unlock it and run the set again, or run crystalline github app remove first"
+            )));
         }
         credentials.host = self.host();
         credentials.slug = None;
@@ -204,15 +276,10 @@ impl AppHome {
             )));
         }
         credentials.slug = Some(info.slug);
-        let found = self.lookup()?;
-        // The keychain holds an App it cannot hand over right now: a save to
-        // the file would be shadowed by that App once the keychain answers.
-        if let (Some(reason), Some(_)) = (&found.keychain_failed, &found.marker) {
-            return Err(EngineError::Conflict(format!(
-                "the keychain could not be read ({reason}), and a GitHub App is saved there; unlock it and run the set again"
-            )));
-        }
         found.store.save_marked(&credentials, &self.dir)?;
+        if matches!(found.store, AppStore::Keyring { .. }) {
+            AppStore::file_fallback(&self.dir).delete()?;
+        }
         let status = GithubAppStatus::of(&credentials, found.store.kind());
         Ok(match app.installations().await {
             Ok(accounts) => GithubAppStatus {
@@ -226,25 +293,46 @@ impl AppHome {
         })
     }
 
-    /// Deletes the saved App, its keychain marker and any copy in the file.
-    /// Refused while the environment supplies the App, and while the
-    /// keychain cannot be read (an App saved there would stay behind).
-    pub fn remove(&self, overlay: &EnvOverlay) -> Result<()> {
+    /// Deletes the saved App: the keychain item, the copy in the file and
+    /// the keychain marker. Refused only while the environment supplies the
+    /// App. When the keychain cannot be read the file copy and the marker
+    /// still go, the keychain delete is tried, and the answer says a
+    /// keychain item may remain: a stale marker is never a dead end.
+    pub fn remove(&self, overlay: &EnvOverlay) -> Result<AppRemoval> {
         if overlay.github_app(self.api_url.as_deref()).is_some() {
             return Err(EngineError::Conflict(APP_FROM_ENV.to_string()));
         }
         let found = self.lookup()?;
-        if let Some(reason) = found.keychain_failed {
-            return Err(EngineError::Conflict(format!(
-                "the keychain could not be read ({reason}), so a GitHub App saved there cannot be removed; unlock it and run the remove again"
-            )));
+        let file = AppStore::file_fallback(&self.dir);
+        match found.keychain_failed {
+            None => {
+                found.store.delete_marked(&self.dir)?;
+                file.delete_marked(&self.dir)?;
+                Ok(AppRemoval::default())
+            }
+            Some(reason) => {
+                let left = match self.try_keychain_delete() {
+                    Ok(()) => None,
+                    Err(e) => {
+                        tracing::debug!("the GitHub App keychain item could not be deleted: {e}");
+                        Some(reason)
+                    }
+                };
+                file.delete_marked(&self.dir)?;
+                Ok(AppRemoval {
+                    keychain_unreadable: left,
+                })
+            }
         }
-        found.store.delete_marked(&self.dir)?;
-        if !matches!(found.store, AppStore::File { .. }) {
-            AppStore::file_fallback(&self.dir).delete_marked(&self.dir)?;
-        }
-        Ok(())
     }
+}
+
+/// Whether a keychain marker names the host `api_url` stands for. An
+/// unreadable (empty) marker names no host and counts for every one: it
+/// still says an App was saved.
+pub fn marker_names_host(marker: &str, api_url: Option<&str>) -> bool {
+    let host = origin::token_host(api_url).unwrap_or_else(|| "github.com".to_string());
+    marker.is_empty() || marker.eq_ignore_ascii_case(&host)
 }
 
 /// The error an origin operation is refused with under a `Refused` slot:
@@ -269,24 +357,14 @@ fn refused_status(source: Option<&str>, detail: String) -> GithubAppStatus {
     }
 }
 
-/// The status while the keychain cannot be read: an App saved there (the
-/// marker says so) is configured and refused; without the marker nothing
-/// is known to be saved.
-fn unreadable_status(reason: &str, saved: bool) -> GithubAppStatus {
-    if saved {
-        GithubAppStatus {
-            configured: true,
-            source: Some("keyring".to_string()),
-            error: Some(format!("{KEYCHAIN_REFUSAL} ({reason})")),
-            ..GithubAppStatus::default()
-        }
-    } else {
-        GithubAppStatus {
-            error: Some(format!(
-                "the keychain could not be read ({reason}); a GitHub App saved there is not seen until it answers"
-            )),
-            ..GithubAppStatus::default()
-        }
+/// The status while the keychain that holds the App (the marker says so)
+/// cannot be read: configured, and refused until it answers.
+fn unreadable_status(reason: &str) -> GithubAppStatus {
+    GithubAppStatus {
+        configured: true,
+        source: Some("keyring".to_string()),
+        error: Some(format!("{KEYCHAIN_REFUSAL} ({reason})")),
+        ..GithubAppStatus::default()
     }
 }
 
@@ -813,15 +891,17 @@ impl Engine {
         *self.github_app.write().unwrap() = AppState::new();
     }
 
-    /// Why the keychain could not be read, while a failed read is
-    /// remembered.
+    /// Why the keychain that holds the App (the marker says so) could not be
+    /// read, while that failure is remembered. A failed read without the
+    /// marker is not reported: nothing is known to be saved there, and an
+    /// instance without an App reports exactly what it reported before.
     pub(super) fn github_app_keychain_unreadable(&self) -> Option<String> {
         let now = (self.app_clock)();
         let state = self.github_app.read().unwrap();
         state
             .unreadable
             .as_ref()
-            .filter(|u| now.saturating_duration_since(u.at) < UNREADABLE_FOR)
+            .filter(|u| u.saved && now.saturating_duration_since(u.at) < UNREADABLE_FOR)
             .map(|u| u.reason.clone())
     }
 
@@ -840,16 +920,8 @@ impl Engine {
     /// store, the way [`Engine::github_credential_for`] reads tokens.
     pub(super) fn app_home(&self) -> Result<AppHome> {
         Ok(match &self.token_store_dir_override {
-            Some(dir) => AppHome {
-                api_url: self.effective_api_url(),
-                dir: dir.clone(),
-                file_only: true,
-            },
-            None => AppHome {
-                api_url: self.effective_api_url(),
-                dir: self.origins_base_dir()?,
-                file_only: false,
-            },
+            Some(dir) => AppHome::new(self.effective_api_url(), dir.clone(), true),
+            None => AppHome::new(self.effective_api_url(), self.origins_base_dir()?, false),
         })
     }
 
@@ -868,15 +940,13 @@ impl Engine {
                 status.slug = router.app().known_slug();
                 status
             }
-            AppSlot::Refused(detail) if detail == KEYCHAIN_REFUSAL => unreadable_status(
-                &self.github_app_keychain_unreadable().unwrap_or_default(),
-                true,
-            ),
+            AppSlot::Refused(detail) if detail == KEYCHAIN_REFUSAL => {
+                unreadable_status(&self.github_app_keychain_unreadable().unwrap_or_default())
+            }
             AppSlot::Refused(detail) => refused_status(source, detail),
-            AppSlot::Absent | AppSlot::Unloaded => match self.github_app_keychain_unreadable() {
-                Some(reason) => unreadable_status(&reason, false),
-                None => GithubAppStatus::default(),
-            },
+            // Without a marker an unreadable keychain is no App at all: the
+            // report stays what it was before the App existed.
+            AppSlot::Absent | AppSlot::Unloaded => GithubAppStatus::default(),
         }
     }
 
@@ -904,7 +974,7 @@ impl Engine {
 
     /// Removes the saved App (see [`AppHome::remove`]) and drops the App the
     /// engine held: origin operations run on the instance credential again.
-    pub async fn remove_github_app(&self) -> Result<()> {
+    pub async fn remove_github_app(&self) -> Result<AppRemoval> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
@@ -946,12 +1016,7 @@ impl Engine {
                     marker,
                     ..
                 }) => {
-                    let host =
-                        origin::token_host(api_url).unwrap_or_else(|| "github.com".to_string());
-                    // An unreadable marker names no host and still counts.
-                    let saved = marker.is_some_and(|marked| {
-                        marked.is_empty() || marked.eq_ignore_ascii_case(&host)
-                    });
+                    let saved = marker.is_some_and(|marked| marker_names_host(&marked, api_url));
                     if saved {
                         tracing::warn!(
                             "the keychain could not be read ({reason}); the GitHub App saved there is not used, and origin operations are refused until it answers"

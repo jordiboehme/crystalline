@@ -4981,25 +4981,23 @@ fn app_home(
         .as_ref()
         .and_then(|g| g.api_url.clone());
     Ok(match token_store_dir {
-        Some(dir) => crystalline_service::engine::AppHome {
+        Some(dir) => crystalline_service::engine::AppHome::new(api_url, dir.to_path_buf(), true),
+        None => crystalline_service::engine::AppHome::new(
             api_url,
-            dir: dir.to_path_buf(),
-            file_only: true,
-        },
-        None => crystalline_service::engine::AppHome {
-            api_url,
-            dir: config::origins_state_dir()
+            config::origins_state_dir()
                 .map_err(|e| anyhow!("could not resolve the state directory: {e}"))?,
-            file_only: false,
-        },
+            false,
+        ),
     })
 }
 
 /// Tells a running daemon that the saved App changed, so it drops the one
-/// it holds. Only the notice travels; the credentials never do.
+/// it holds. Only the notice travels; the credentials never do. Sent
+/// whatever `--config` names: the App store lives in this machine's state
+/// directory, which the one daemon reads whichever config file it serves.
 async fn notify_daemon_app_changed() -> DaemonNotice {
     match crystalline_service::client::ctl_if_running(serde_json::json!({
-        "cmd": "github_app_changed",
+        "v": 1, "cmd": "github_app_changed",
     }))
     .await
     {
@@ -5105,10 +5103,14 @@ pub async fn github_app_remove(
     if loaded.effective.read_only() {
         bail!("{}", crystalline_service::engine::EngineError::ReadOnly);
     }
-    app_home(&loaded, token_store_dir)?.remove(&loaded.overlay)?;
+    let removal = app_home(&loaded, token_store_dir)?.remove(&loaded.overlay)?;
     let told = notify_daemon_app_changed().await;
     if json {
-        let mut report = serde_json::json!({ "removed": true, "daemon": told.as_str() });
+        let mut report = serde_json::json!({
+            "removed": true,
+            "keychain_unreadable": removal.keychain_unreadable,
+            "daemon": told.as_str(),
+        });
         if let DaemonNotice::Refused(e) = &told {
             report["daemon_error"] = serde_json::json!(e);
         }
@@ -5117,6 +5119,11 @@ pub async fn github_app_remove(
         println!(
             "Removed the GitHub App. Origin operations use this instance's GitHub sign-in again."
         );
+        if let Some(reason) = &removal.keychain_unreadable {
+            println!(
+                "The keychain could not be read ({reason}), so a GitHub App saved there may remain. Run crystalline github app remove again once the keychain is unlocked."
+            );
+        }
         report_daemon_notice(&told);
     }
     Ok(())

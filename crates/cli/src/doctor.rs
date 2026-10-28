@@ -382,8 +382,12 @@ pub struct OriginDoctor {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct GithubDoctor {
     /// Whether a GitHub token is on file for this machine (or supplied by
-    /// `CRYSTALLINE_GITHUB_TOKEN`).
+    /// `CRYSTALLINE_GITHUB_TOKEN`), or a GitHub App that GitHub accepts is
+    /// configured.
     pub connected: bool,
+    /// Connected only through the GitHub App: no instance token is on file.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub connected_through_app: bool,
     /// The connected user's login. `None` when not connected, and also for
     /// the environment token store, whose synthesized identity has no login
     /// attached (see `StoredToken::user_display`).
@@ -4040,16 +4044,61 @@ async fn check_github(
         });
     }
 
+    let app = check_github_app(cfg, overlay).await;
+    // An App GitHub accepts is a connection of its own: reading, pulling and
+    // sharing go through it without an instance token.
+    let app_connected = app
+        .as_ref()
+        .is_some_and(|a| a.problem.is_none() && a.jwt_accepted == Some(true));
     Ok(GithubDoctor {
-        connected: token.is_some(),
+        connected: token.is_some() || app_connected,
+        connected_through_app: token.is_none() && app_connected,
         user: token
             .as_ref()
             .and_then(|t| t.user_display())
             .map(str::to_string),
         token_store: store.kind().to_string(),
         origins,
-        app: check_github_app(cfg, overlay).await,
+        app,
     })
+}
+
+/// What one App store read means for `doctor`: the saved App and its
+/// store, or what to report instead (`None`: no App, and no section). A
+/// keychain that could not be read is reported only when the marker says an
+/// App for this host is saved there; without it the section stays as it was
+/// before the App existed.
+fn saved_app_for_doctor(
+    found: Result<crystalline_remote::AppLookup, crystalline_remote::RemoteError>,
+    api_url: Option<&str>,
+) -> std::result::Result<(crystalline_remote::AppCredentials, &'static str), Option<AppDoctor>> {
+    use crystalline_remote::AppLookup;
+    match found {
+        Ok(AppLookup {
+            credentials: Some(credentials),
+            store,
+            ..
+        }) => Ok((credentials, store.kind())),
+        Ok(AppLookup {
+            keychain_failed: Some(reason),
+            marker: Some(marker),
+            ..
+        }) if crystalline_service::engine::marker_names_host(&marker, api_url) => {
+            Err(Some(AppDoctor {
+                source: Some("keyring".to_string()),
+                problem: Some(format!(
+                    "the GitHub App is saved in the keychain, which could not be read ({reason}); origin operations are refused until it answers, so unlock it, or run crystalline github app remove"
+                )),
+                keychain_unreadable: Some(reason),
+                ..AppDoctor::default()
+            }))
+        }
+        Ok(_) => Err(None),
+        Err(e) => Err(Some(AppDoctor {
+            problem: Some(format!("the saved GitHub App could not be read: {e}")),
+            ..AppDoctor::default()
+        })),
+    }
 }
 
 /// How far GitHub's clock may be from this machine's before `doctor` calls
@@ -4062,7 +4111,7 @@ const MAX_CLOCK_SKEW_SECS: i64 = 60;
 /// agree within a minute, and a webhook secret is set when
 /// `service.public_url` lets webhooks in. `None` when no App is configured.
 async fn check_github_app(cfg: &GlobalConfig, overlay: &EnvOverlay) -> Option<AppDoctor> {
-    use crystalline_remote::{AppLookup, GithubApp, RemoteError};
+    use crystalline_remote::{GithubApp, RemoteError};
 
     let api_url = cfg.github.as_ref().and_then(|g| g.api_url.clone());
     let (credentials, source) = match overlay.github_app(api_url.as_deref()) {
@@ -4075,50 +4124,14 @@ async fn check_github_app(cfg: &GlobalConfig, overlay: &EnvOverlay) -> Option<Ap
             });
         }
         None => {
-            let home = crystalline_service::engine::AppHome {
-                api_url: api_url.clone(),
-                dir: config::origins_state_dir().ok()?,
-                file_only: false,
-            };
-            match home.lookup() {
-                Ok(AppLookup {
-                    credentials: Some(credentials),
-                    store,
-                    ..
-                }) => (credentials, store.kind()),
-                Ok(AppLookup {
-                    keychain_failed: Some(reason),
-                    marker: Some(_),
-                    ..
-                }) => {
-                    return Some(AppDoctor {
-                        source: Some("keyring".to_string()),
-                        problem: Some(format!(
-                            "the GitHub App is saved in the keychain, which could not be read ({reason}); origin operations are refused until it answers, so unlock it"
-                        )),
-                        keychain_unreadable: Some(reason),
-                        ..AppDoctor::default()
-                    });
-                }
-                // Not a problem: no App is known to be saved there. Said all
-                // the same, since an App saved before the marker existed
-                // would not be seen.
-                Ok(AppLookup {
-                    keychain_failed: Some(reason),
-                    ..
-                }) => {
-                    return Some(AppDoctor {
-                        keychain_unreadable: Some(reason),
-                        ..AppDoctor::default()
-                    });
-                }
-                Ok(_) => return None,
-                Err(e) => {
-                    return Some(AppDoctor {
-                        problem: Some(format!("the saved GitHub App could not be read: {e}")),
-                        ..AppDoctor::default()
-                    });
-                }
+            let home = crystalline_service::engine::AppHome::new(
+                api_url.clone(),
+                config::origins_state_dir().ok()?,
+                false,
+            );
+            match saved_app_for_doctor(home.lookup(), api_url.as_deref()) {
+                Ok(found) => found,
+                Err(report) => return report,
             }
         }
     };
@@ -5201,7 +5214,12 @@ pub fn render_human(report: &DoctorReport) -> String {
 
     if let Some(g) = &report.github {
         let _ = writeln!(out, "github:");
-        if g.connected && g.token_store == "environment" {
+        if g.connected_through_app {
+            let _ = writeln!(
+                out,
+                "  connected through the GitHub App (no instance sign-in on file)"
+            );
+        } else if g.connected && g.token_store == "environment" {
             let _ = writeln!(
                 out,
                 "  connected via CRYSTALLINE_GITHUB_TOKEN (environment token store)"
@@ -5222,17 +5240,11 @@ pub fn render_human(report: &DoctorReport) -> String {
         }
         if let Some(app) = &g.app {
             let source = app.source.as_deref().unwrap_or("?");
-            match (&app.problem, &app.source, &app.keychain_unreadable) {
-                (Some(problem), _, _) => {
+            match &app.problem {
+                Some(problem) => {
                     let _ = writeln!(out, "  [problem] GitHub App ({source}): {problem}");
                 }
-                (None, None, Some(reason)) => {
-                    let _ = writeln!(
-                        out,
-                        "  the keychain could not be read ({reason}); no GitHub App is known to be saved there"
-                    );
-                }
-                (None, _, _) => {
+                None => {
                     let mut passed = vec!["key parses"];
                     if app.jwt_accepted == Some(true) {
                         passed.push("signed token accepted");
@@ -6014,6 +6026,46 @@ mod tests {
     use super::*;
     use crystalline_core::config::EvolveConfig;
     use crystalline_index::{TursoStore, sync_domain};
+
+    /// A failed keychain read beside the file store, with `marker`.
+    fn unreadable(marker: Option<&str>) -> crystalline_remote::AppLookup {
+        crystalline_remote::AppLookup {
+            store: crystalline_remote::AppStore::file_fallback(Path::new("/nonexistent")),
+            credentials: None,
+            keychain_failed: Some("no keychain daemon".to_string()),
+            marker: marker.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn an_unreadable_keychain_is_a_doctor_problem_only_behind_a_marker_for_this_host() {
+        let api = Some("https://ghe.example.com/api/v3");
+        assert!(
+            matches!(saved_app_for_doctor(Ok(unreadable(None)), api), Err(None)),
+            "no marker: no App section at all"
+        );
+        assert!(
+            matches!(
+                saved_app_for_doctor(Ok(unreadable(Some("github.com"))), api),
+                Err(None)
+            ),
+            "a marker for another host is not a problem here"
+        );
+        match saved_app_for_doctor(Ok(unreadable(Some("GHE.example.com"))), api) {
+            Err(Some(doctor)) => {
+                assert_eq!(
+                    doctor.keychain_unreadable.as_deref(),
+                    Some("no keychain daemon")
+                );
+                let problem = doctor.problem.unwrap();
+                assert!(
+                    problem.contains("crystalline github app remove"),
+                    "{problem}"
+                );
+            }
+            other => panic!("expected a problem, got {other:?}"),
+        }
+    }
 
     fn owner(index: &str, config: &str, state_dir: &str) -> crystalline_service::RenameOwner {
         crystalline_service::RenameOwner {

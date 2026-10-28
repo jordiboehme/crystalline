@@ -7208,9 +7208,11 @@ mod evolve;
 mod fence;
 mod github;
 mod github_app;
+pub use github_app::{
+    APP_FROM_ENV, AppClock, AppHome, AppRemoval, GithubAppStatus, marker_names_host,
+};
 #[cfg(any(test, feature = "testing"))]
-pub use github_app::AppLookupFn;
-pub use github_app::{APP_FROM_ENV, AppClock, AppHome, GithubAppStatus};
+pub use github_app::{AppKeychainSeam, AppLookupFn};
 mod kept;
 mod move_;
 mod name_report;
@@ -7372,7 +7374,9 @@ pub struct GithubConnection {
     pub connected: bool,
     /// The account login, when connected.
     pub user: Option<String>,
-    /// "keyring" | "file" | "environment", when connected.
+    /// "keyring" | "file" | "environment", when connected; "GitHub App"
+    /// when only the instance's GitHub App connects it (then `user` is the
+    /// App's bot login, when known).
     pub token_store: Option<String>,
     /// A device flow waiting for the browser side.
     pub pending: Option<GithubPending>,

@@ -199,6 +199,14 @@ impl AppStore {
         }
     }
 
+    /// The keychain backend for `host` (`None` for GitHub.com), without
+    /// reading it: for a delete that is tried while a read failed.
+    pub fn keyring(host: Option<&str>) -> AppStore {
+        AppStore::Keyring {
+            account: account_for(host),
+        }
+    }
+
     /// The file backend under `dir`, never the keychain: what
     /// [`AppStore::resolve_and_load`] falls back to, for a caller (a test
     /// seam) that must not reach the OS credential store at all.
@@ -241,7 +249,9 @@ impl AppStore {
 
     /// [`AppStore::delete`], then the marker in `marker_dir`, in that order:
     /// a marker outliving its keychain item only refuses until the next
-    /// remove, while an item outliving its marker would be missed.
+    /// remove, while an item outliving its marker would be missed. Deleting
+    /// the file copy takes the marker too: a remove means no App at all, and
+    /// a marker left behind would keep refusing origin operations.
     pub fn delete_marked(&self, marker_dir: &Path) -> Result<(), RemoteError> {
         match self {
             AppStore::Keyring { account } => {
@@ -249,7 +259,11 @@ impl AppStore {
                     keyring_delete(account, KEYRING_TIMEOUT)
                 })
             }
-            other => other.delete(),
+            AppStore::File { .. } => {
+                self.delete()?;
+                delete_marker(marker_dir)
+            }
+            AppStore::Env => self.delete(),
         }
     }
 
@@ -321,12 +335,19 @@ pub fn read_marker(dir: &Path) -> Option<String> {
     }
 }
 
-/// Writes the marker for `host` into `dir`.
+/// Writes the marker for `host` into `dir`, through a temporary file and a
+/// rename, so a crash never leaves a half-written marker behind.
 fn write_marker(dir: &Path, host: &str) -> Result<(), RemoteError> {
+    let path = marker_path(dir);
+    let tmp = path.with_extension(format!("present.tmp.{}", std::process::id()));
     std::fs::create_dir_all(dir)
-        .and_then(|()| std::fs::write(marker_path(dir), format!("{host}\n")))
-        .map_err(|e| RemoteError::Credential {
-            detail: format!("could not write the GitHub App marker: {e}"),
+        .and_then(|()| std::fs::write(&tmp, format!("{host}\n")))
+        .and_then(|()| std::fs::rename(&tmp, &path))
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            RemoteError::Credential {
+                detail: format!("could not write the GitHub App marker: {e}"),
+            }
         })
 }
 
@@ -350,8 +371,15 @@ fn save_keyring_marked(
     write: impl FnOnce(&str, String) -> Result<(), RemoteError>,
 ) -> Result<(), RemoteError> {
     let json = to_json(credentials)?;
+    // A marker already there stands for an item saved earlier, which a
+    // failed write leaves in place; only a marker this save wrote is undone.
+    let existed = marker_path(marker_dir).exists();
     write_marker(marker_dir, &credentials.host)?;
-    write(account, json)
+    write(account, json).inspect_err(|_| {
+        if !existed {
+            let _ = delete_marker(marker_dir);
+        }
+    })
 }
 
 /// The keychain half of [`AppStore::delete_marked`], with the keychain
@@ -540,6 +568,32 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_keychain_write_takes_back_the_marker_it_wrote_and_only_that() {
+        let dir = tempfile::tempdir().unwrap();
+        let refuse = |_: &str, _: String| {
+            Err(RemoteError::Credential {
+                detail: "the keychain is locked".to_string(),
+            })
+        };
+        assert!(save_keyring_marked("github-app", &sample(), dir.path(), refuse).is_err());
+        assert_eq!(read_marker(dir.path()), None, "no item, so no marker");
+
+        // A marker from an earlier save stands for that item and stays.
+        write_marker(dir.path(), "github.com").unwrap();
+        assert!(save_keyring_marked("github-app", &sample(), dir.path(), refuse).is_err());
+        assert_eq!(read_marker(dir.path()).as_deref(), Some("github.com"));
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(
+            leftovers,
+            vec!["github-app.present".to_string()],
+            "no temp file left"
+        );
+    }
+
+    #[test]
     fn a_failed_keychain_read_carries_the_marker() {
         let dir = tempfile::tempdir().unwrap();
         let failed = |dir: &Path| {
@@ -565,8 +619,10 @@ mod tests {
         store.save_marked(&sample(), dir.path()).unwrap();
         assert_eq!(read_marker(dir.path()), None);
         assert_eq!(store.load().unwrap(), Some(sample()));
+        write_marker(dir.path(), "github.com").unwrap();
         store.delete_marked(dir.path()).unwrap();
         assert_eq!(store.load().unwrap(), None);
+        assert_eq!(read_marker(dir.path()), None, "a remove leaves no marker");
     }
 
     #[test]

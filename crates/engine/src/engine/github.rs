@@ -233,6 +233,23 @@ impl Engine {
                 .to_string(),
             expires_in_secs: v["expires_in_secs"].as_u64().unwrap_or_default(),
         });
+        // An instance with only a GitHub App is connected through it: the
+        // screen names the App's bot and the App as the store, rather than
+        // "not connected" above an App that works.
+        let app = match (&token, self.github_app_slot()) {
+            (None, super::github_app::AppSlot::Ready(router)) => Some(router),
+            _ => None,
+        };
+        if let Some(router) = app {
+            return Ok(GithubConnection {
+                enabled: self.github_enabled(),
+                connected: true,
+                user: router.bot_login(),
+                token_store: Some("GitHub App".to_string()),
+                pending,
+                error,
+            });
+        }
         Ok(GithubConnection {
             enabled: self.github_enabled(),
             connected: token.is_some(),

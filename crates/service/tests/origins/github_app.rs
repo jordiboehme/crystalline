@@ -33,6 +33,7 @@ use crystalline_remote::provider::{
 use crystalline_remote::reflections_backup::BACKUP_BRANCH;
 use crystalline_remote::state::OriginState;
 use crystalline_remote::{AppCredentials, AppLookup, AppStore, RemoteError};
+use crystalline_service::engine::{AppHome, AppKeychainSeam};
 use crystalline_service::engine::{ConfigureAction, EngineError, ShareActor};
 use crystalline_service::reflection_backup::BackupCause;
 use crystalline_service::rest::{AuthStore, Role};
@@ -1256,10 +1257,16 @@ async fn a_failed_keychain_read_is_remembered_for_a_minute() {
         .origin_status(None, false, false, &Scope::Unrestricted)
         .await
         .unwrap();
+    assert!(
+        status["connection"].get("app").is_none(),
+        "without a marker nothing is known to be saved there, so the status is today's: {status}"
+    );
+    let configure = eng.configure_snapshot().await.unwrap();
+    assert_eq!(configure["github"]["app"]["configured"], json!(false));
     assert_eq!(
-        status["connection"]["app"]["keychain_unreadable"],
-        json!("the keychain is locked"),
-        "{status}"
+        configure["github"]["app"]["error"],
+        Value::Null,
+        "{configure}"
     );
 
     clock.advance(Duration::from_secs(59));
@@ -1312,7 +1319,7 @@ async fn a_failed_keychain_read_with_the_marker_refuses_and_never_uses_the_insta
         .unwrap_err();
     assert_eq!(
         err.to_string(),
-        "the GitHub App is saved in the keychain, which could not be read; try again or unlock it"
+        "the GitHub App is saved in the keychain, which could not be read; try again or unlock it, or run crystalline github app remove"
     );
     assert!(
         forge.hits().is_empty(),
@@ -1331,7 +1338,7 @@ async fn a_failed_keychain_read_with_the_marker_refuses_and_never_uses_the_insta
     assert_eq!(
         status["connection"]["app"]["error"],
         json!(
-            "the GitHub App is saved in the keychain, which could not be read; try again or unlock it"
+            "the GitHub App is saved in the keychain, which could not be read; try again or unlock it, or run crystalline github app remove"
         ),
         "{status}"
     );
@@ -1439,6 +1446,9 @@ async fn an_instance_with_only_an_app_reports_connected() {
     assert_eq!(status["connection"]["connected"], json!(true), "{status}");
     let configure = eng.configure_snapshot().await.unwrap();
     assert_eq!(configure["github"]["connected"], json!(true), "{configure}");
+    let settings = eng.github_connection().await.unwrap();
+    assert!(settings.connected, "{settings:?}");
+    assert_eq!(settings.token_store.as_deref(), Some("GitHub App"));
 }
 
 /// The App credentials `github app set` hands the engine: no slug, which
@@ -1519,4 +1529,103 @@ async fn set_and_remove_refuse_while_the_environment_supplies_the_app() {
     let err = eng.remove_github_app().await.unwrap_err();
     assert!(err.to_string().contains("CRYSTALLINE_GITHUB_APP_"), "{err}");
     assert!(forge.hits().is_empty(), "refused before asking GitHub");
+}
+
+/// An `AppHome` whose keychain cannot be read, with the marker for `host`
+/// beside the file store when `marker` is set, and a keychain delete that
+/// answers `delete_works`.
+fn unreadable_home(dir: &Path, host: &str, marker: bool, delete_works: bool) -> AppHome {
+    if marker {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("github-app.present"), format!("{host}\n")).unwrap();
+    }
+    let file_dir = dir.to_path_buf();
+    let marker = marker.then(|| host.to_string());
+    AppHome::new(Some(format!("http://{host}")), dir.to_path_buf(), false).with_keychain(
+        AppKeychainSeam {
+            lookup: Arc::new(move || {
+                let store = AppStore::file_fallback(&file_dir);
+                Ok(AppLookup {
+                    credentials: store.load()?,
+                    store,
+                    keychain_failed: Some("no keychain daemon".to_string()),
+                    marker: marker.clone(),
+                })
+            }),
+            delete: Arc::new(move || {
+                if delete_works {
+                    Ok(())
+                } else {
+                    Err(RemoteError::Credential {
+                        detail: "no keychain daemon".to_string(),
+                    })
+                }
+            }),
+        },
+    )
+}
+
+fn no_env() -> EnvOverlay {
+    EnvOverlay::from_vars(Vec::<(String, String)>::new()).unwrap()
+}
+
+#[tokio::test]
+async fn remove_on_an_unreadable_keychain_drops_the_file_copy_and_the_marker() {
+    for marker in [true, false] {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("tokens");
+        let host = "127.0.0.1:9";
+        let home = unreadable_home(&dir, host, marker, false);
+        AppStore::file_fallback(&dir)
+            .save(&saved_app(host))
+            .unwrap();
+
+        let removal = home.remove(&no_env()).unwrap();
+        assert_eq!(
+            removal.keychain_unreadable.as_deref(),
+            Some("no keychain daemon"),
+            "the answer says a keychain item may remain"
+        );
+        assert!(
+            !dir.join("github-app.json").exists(),
+            "the file copy is gone"
+        );
+        assert!(
+            !dir.join("github-app.present").exists(),
+            "the marker is gone, so origin operations are no longer refused"
+        );
+    }
+}
+
+#[tokio::test]
+async fn remove_on_an_unreadable_keychain_that_takes_the_delete_says_nothing_remains() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("tokens");
+    let home = unreadable_home(&dir, "127.0.0.1:9", true, true);
+    assert_eq!(home.remove(&no_env()).unwrap().keychain_unreadable, None);
+    assert!(!dir.join("github-app.present").exists());
+}
+
+#[tokio::test]
+async fn set_behind_the_marker_on_an_unreadable_keychain_is_refused_before_github_is_asked() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (forge, url) = spawn_forge(&[], &[], &[]).await;
+    let host = url.trim_start_matches("http://");
+    let dir = tmp.path().join("tokens");
+    let home = unreadable_home(&dir, host, true, false);
+
+    let err = home.save(&no_env(), app_to_set()).await.unwrap_err();
+    assert!(
+        err.to_string().contains("keychain could not be read"),
+        "{err}"
+    );
+    assert!(
+        err.to_string().contains("crystalline github app remove"),
+        "the way out is named: {err}"
+    );
+    assert!(
+        !dir.join("github-app.json").exists(),
+        "nothing saved to the file"
+    );
+    assert!(forge.hits().is_empty(), "{:?}", forge.hits());
 }
