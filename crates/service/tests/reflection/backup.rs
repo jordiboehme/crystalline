@@ -1172,3 +1172,193 @@ async fn a_held_page_holds_back_the_files_only_it_links() {
     fx.engine.reflection_backup_tick(Instant::now()).await;
     assert!(head_paths().contains(&"reflections/assets/only.png".to_string()));
 }
+
+/// Serve `fx`'s engine over HTTP with `auth`, adding `boss`, an instance
+/// admin: the JSON API whose accounts routes run the narrowing hook.
+async fn serve_backup_home(
+    fx: &Fx,
+    auth: Arc<crystalline_service::rest::AuthStore>,
+) -> std::net::SocketAddr {
+    auth.add_user(
+        "boss",
+        "boss",
+        None,
+        crystalline_service::rest::Role::Admin,
+        "pw12345678",
+    )
+    .await
+    .unwrap();
+    let router = crystalline_service::daemon::http_router(
+        fx.engine.clone(),
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        &[],
+        auth,
+        None,
+    )
+    .unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    addr
+}
+
+/// Tick until a backup ran (the hook schedules it off the request), for at
+/// most five seconds; the paths of the branch head then.
+async fn backed_up_after_hook(fx: &Fx, mock: &MockProvider) -> Vec<String> {
+    let start = Instant::now();
+    while fx
+        .engine
+        .reflection_backup_tick(Instant::now())
+        .await
+        .is_empty()
+    {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "no backup was scheduled"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    mock.commit_paths(&mock.branch_commit(BACKUP_BRANCH).unwrap())
+}
+
+/// A domain made private through the JSON API schedules the backup that
+/// drops a page citing it from the branch head, with no edit and no wait.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_visibility_change_through_the_api_drops_the_page() {
+    let mock = Arc::new(MockProvider::new());
+    main_commit(&mock);
+    let (fx, auth) = home_beside_harbor(mock.clone(), true).await;
+    fx.engine
+        .write_reflection(&citing_harbor("wide.md"), &agent())
+        .await
+        .unwrap();
+    fx.engine.reflection_backup_tick(Instant::now()).await;
+    let addr = serve_backup_home(&fx, auth).await;
+    let boss = crate::rest::Session::login(addr, "boss").await;
+    let (status, body) = boss
+        .send(
+            reqwest::Method::PUT,
+            "/api/v1/domains/harbor/visibility",
+            Some(serde_json::json!({ "private": true })),
+        )
+        .await;
+    assert_eq!(status, 204, "{body}");
+    let paths = backed_up_after_hook(&fx, &mock).await;
+    assert!(!paths.iter().any(|p| p.contains("wide.md")), "{paths:?}");
+}
+
+/// A member added through the JSON API to the page's private domain, who
+/// may not read the cited domain, schedules the backup that drops the page.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_membership_change_through_the_api_drops_the_page() {
+    let mock = Arc::new(MockProvider::new());
+    main_commit(&mock);
+    let (fx, auth) = home_beside_harbor(mock.clone(), true).await;
+    auth.add_user(
+        "sam",
+        "sam",
+        None,
+        crystalline_service::rest::Role::Viewer,
+        "pw12345678",
+    )
+    .await
+    .unwrap();
+    for domain in ["eng", "harbor"] {
+        auth.set_domain_visibility(domain, true, "keeper")
+            .await
+            .unwrap();
+    }
+    fx.engine
+        .write_reflection(&citing_harbor("wide.md"), &agent())
+        .await
+        .unwrap();
+    fx.engine.reflection_backup_tick(Instant::now()).await;
+    let addr = serve_backup_home(&fx, auth).await;
+    let keeper = crate::rest::Session::login(addr, "keeper").await;
+    let (status, body) = keeper
+        .send(
+            reqwest::Method::PUT,
+            "/api/v1/domains/eng/members/sam",
+            Some(serde_json::json!({ "level": "viewer" })),
+        )
+        .await;
+    assert_eq!(status, 204, "{body}");
+    let paths = backed_up_after_hook(&fx, &mock).await;
+    assert!(!paths.iter().any(|p| p.contains("wide.md")), "{paths:?}");
+}
+
+/// The CLI's accounts commands run in their own process and tell a running
+/// daemon over the control socket (`readers_changed`), which schedules the
+/// backup that drops the page.
+#[tokio::test]
+async fn the_control_socket_hook_drops_the_page() {
+    let mock = Arc::new(MockProvider::new());
+    main_commit(&mock);
+    let (fx, auth) = home_beside_harbor(mock.clone(), true).await;
+    fx.engine
+        .write_reflection(&citing_harbor("wide.md"), &agent())
+        .await
+        .unwrap();
+    fx.engine.reflection_backup_tick(Instant::now()).await;
+    auth.set_domain_visibility("harbor", true, "keeper")
+        .await
+        .unwrap();
+    let answer = crystalline_service::control::answer_for_test(
+        fx.engine.clone(),
+        &serde_json::json!({ "v": 1, "cmd": "readers_changed" }),
+    )
+    .await;
+    assert_eq!(answer["ok"], true, "{answer}");
+    let paths = backed_up_after_hook(&fx, &mock).await;
+    assert!(!paths.iter().any(|p| p.contains("wide.md")), "{paths:?}");
+}
+
+/// A held page is looked at again after the recheck wait with no change
+/// marked: once its source domain is shared again it goes back.
+#[tokio::test]
+async fn a_held_page_goes_back_after_the_recheck_once_nothing_holds_it() {
+    let mock = Arc::new(MockProvider::new());
+    main_commit(&mock);
+    let (fx, auth) = home_beside_harbor(mock.clone(), true).await;
+    fx.engine
+        .write_reflection(&citing_harbor("wide.md"), &agent())
+        .await
+        .unwrap();
+    fx.engine
+        .write_reflection(&write("a.md", "# A\n\n## One\n\nText.\n"), &agent())
+        .await
+        .unwrap();
+    auth.set_domain_visibility("harbor", true, "keeper")
+        .await
+        .unwrap();
+    let now = Instant::now();
+    fx.engine.reflection_backup_tick(now).await;
+    let head_paths = || mock.commit_paths(&mock.branch_commit(BACKUP_BRANCH).unwrap());
+    assert!(!head_paths().iter().any(|p| p.contains("wide.md")));
+    auth.set_domain_visibility("harbor", false, "keeper")
+        .await
+        .unwrap();
+    let recheck = crystalline_service::reflection_backup::HELD_RECHECK;
+    assert!(
+        fx.engine
+            .reflection_backup_tick(now + recheck - Duration::from_secs(1))
+            .await
+            .is_empty(),
+        "not before the wait"
+    );
+    assert_eq!(
+        fx.engine.reflection_backup_tick(now + recheck).await.len(),
+        1
+    );
+    assert!(head_paths().contains(&"reflections/wide.md".to_string()));
+    assert!(fx.engine.reflection_backup_held_back("eng").is_empty());
+}
