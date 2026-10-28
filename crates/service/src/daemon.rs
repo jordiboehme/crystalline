@@ -610,6 +610,12 @@ pub async fn run_serve(
         Some(addr) => setup_token_for(addr, accounts_db.as_deref(), configured_setup).await,
         None => None,
     };
+    // Who reads which domain, known before anything is served or backed up,
+    // with the HTTP surface on or off: a Reflection page this daemon writes
+    // reaches every reader of its domain and the backup branch either way.
+    // Opened after the two short-lived opens above have closed theirs, and
+    // shared with the HTTP surface below, so this process holds one handle.
+    let accounts = crate::client::install_domain_access(&engine).await;
 
     if !daemon_flag {
         if std::io::stderr().is_terminal() {
@@ -880,7 +886,9 @@ pub async fn run_serve(
             // actually applies: a `--http` address beats both `service.http`
             // spellings, so telling a flag user to edit the config would be
             // advice that does nothing.
-            let router = match http_service(allowed_hosts, e, sessions, token, streams_rx).await {
+            let router = match http_service(accounts, allowed_hosts, e, sessions, token, streams_rx)
+                .await
+            {
                 Ok(router) => router,
                 Err(err) => {
                     tracing::warn!(
@@ -1474,12 +1482,25 @@ async fn run_watcher(
 /// else already holds, and a served endpoint that stopped. Only the middle one
 /// is about a port, and only it should ever tell an operator to free one.
 async fn http_service(
+    accounts: Option<Arc<crate::rest::AuthStore>>,
     allowed_hosts: Vec<String>,
     engine: Arc<Engine>,
     http_sessions: Arc<AtomicUsize>,
     setup_token: Option<String>,
     shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<axum::Router> {
+    // The store the daemon opened at start, so the engine's resolver and the
+    // HTTP surface read one handle.
+    if let Some(auth) = accounts {
+        return http_router_with_shutdown(
+            engine,
+            http_sessions,
+            &allowed_hosts,
+            auth,
+            setup_token,
+            shutdown,
+        );
+    }
     http_service_at(
         &crystalline_core::config::web_auth_db_path()?,
         allowed_hosts,

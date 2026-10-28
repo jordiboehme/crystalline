@@ -26,6 +26,11 @@ pub(crate) const HIDDEN_SOURCE_NOTE: &str = "a source in a domain you cannot ope
 /// and is an unknown domain's), so naming the source tells it nothing new.
 pub(crate) const TOO_WIDE_REFUSAL: &str = "this source is in a domain fewer people may read than this page's domain; cite it from a page in that domain instead";
 
+/// What a write is refused with when it names a source in another domain
+/// on a stack that could not open its accounts store: who reads which
+/// domain is unknown there, so the check fails closed.
+pub(crate) const UNKNOWN_READERS_REFUSAL: &str = "who may read each domain is unknown here because the accounts store could not be opened, so a source outside this page's domain is refused until it opens; remove that source and the text drawn from it, or try again once the accounts store is back";
+
 /// What a `source_too_wide` item says to a caller who may open every
 /// domain the item is about.
 pub(crate) const TOO_WIDE_NOTE: &str = "this section cites a domain fewer people may read than this page's domain, so its text reaches people who may not read that domain; remove that source and the text drawn from it. The page stays as it is until a curator does";
@@ -204,13 +209,18 @@ impl Engine {
     ///
     /// It never looks at who asks: the machine owner, who reads every
     /// domain, is held to it too, since the page's readers are the ones the
-    /// text reaches. With no resolver installed (an engine with no HTTP
-    /// surface, where every caller is the machine owner and nobody else
-    /// reads anything) every page covers every domain; the queue names a
-    /// page that does not once a resolver knows the readers.
+    /// text reaches. Every serving stack (the daemon, with or without its
+    /// HTTP surface, and the embedded stdio stack) installs a resolver
+    /// before it answers anything. One that tried and could not open the
+    /// accounts store fails closed: no other domain is covered. Only an
+    /// engine that never tried (a one-shot command or a test engine, where
+    /// no accounts store is in play) answers that every page covers every
+    /// domain.
     pub(crate) async fn readers_cover(&self, page: &str, source: &str) -> Result<bool> {
         let Some(access) = self.domain_access.get() else {
-            return Ok(true);
+            // Failed closed: a stack that could not open its accounts store
+            // knows no reader, so no other domain is covered.
+            return Ok(self.domain_access_unavailable.get().is_none());
         };
         access
             .readers_cover(page, source)
@@ -268,6 +278,13 @@ impl Engine {
             let domain = if local == own {
                 None
             } else {
+                if let Some(why) = self.domain_access_unavailable.get()
+                    && self.domain_access.get().is_none()
+                {
+                    return Err(EngineError::Invalid(format!(
+                        "'{name}': {UNKNOWN_READERS_REFUSAL} ({why})"
+                    )));
+                }
                 if !self.readers_cover(own, local).await? {
                     return Err(EngineError::Invalid(format!(
                         "'{name}': {TOO_WIDE_REFUSAL}"

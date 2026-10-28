@@ -1275,20 +1275,29 @@ pub struct Engine {
     // be a cycle neither side ever drops; `None` (nothing installed) is every
     // engine that serves no web surface, which has no rooms to close.
     collab: std::sync::OnceLock<std::sync::Weak<crate::collab::session::CollabSessions>>,
-    // The private-domain resolver every scoped read is filtered through,
-    // installed once when the HTTP surface starts (`daemon::http_base`, the
-    // one funnel both router builders reach, right after the `AuthStore` it
-    // wraps exists).
+    // The private-domain resolver every scoped read is filtered through.
+    // Every serving stack installs it before it answers anything
+    // (`client::install_domain_access`: the daemon with its HTTP surface on
+    // or off, the embedded stdio stack and a one-shot tool run), because a
+    // Reflection page reaches the readers of its domain whoever writes it;
+    // `daemon::http_base` installs it too, for a router built on its own.
     //
     // A `OnceLock` rather than a field on the constructor because the engine
-    // is built long before - and often without - an accounts database: a
-    // one-shot CLI command, the embedded stdio MCP stack and every test engine
-    // never install one, and `Engine::hidden_domains` answers `None` for them,
-    // which is the same answer the `Scope::Unrestricted` those surfaces pass
-    // would have produced anyway. Set once and never replaced, so a second
+    // is built long before - and often without - an accounts database: the
+    // other one-shot CLI commands and every test engine never install one,
+    // and `Engine::hidden_domains` answers `None` for them, which is the same
+    // answer the `Scope::Unrestricted` those surfaces pass would have
+    // produced anyway. Set once and never replaced, so a second
     // router built over one engine keeps the first store rather than silently
     // swapping the authority mid-flight.
     domain_access: std::sync::OnceLock<Arc<crate::scope::DomainAccess>>,
+    // Why the resolver above could not be built, on a stack that tried to
+    // build one (every serving stack does, before it answers anything) and
+    // could not open the accounts store. While it is set and no resolver is,
+    // nobody knows who reads a domain, so a Reflection source outside its
+    // page's domain is refused and the queue names every such source: the
+    // check fails closed instead of letting everything through.
+    domain_access_unavailable: std::sync::OnceLock<String>,
     // The servers this machine offers domains from (`crystalline connect`),
     // installed once by whoever serves this engine to its owner: the daemon at
     // start, a one-shot CLI command before it routes. Absent everywhere else
@@ -2422,6 +2431,7 @@ impl Engine {
             join_fence: tokio::sync::RwLock::new(()),
             collab: std::sync::OnceLock::new(),
             domain_access: std::sync::OnceLock::new(),
+            domain_access_unavailable: std::sync::OnceLock::new(),
             sources: std::sync::OnceLock::new(),
             web_origin: std::sync::OnceLock::new(),
             joins: Arc::new(crate::join::Joins::default()),
@@ -2833,6 +2843,15 @@ impl Engine {
     /// possibly different, store.
     pub fn set_domain_access(&self, access: Arc<crate::scope::DomainAccess>) {
         let _ = self.domain_access.set(access);
+    }
+
+    /// Record that this stack tried to install the private-domain resolver
+    /// and could not, with why (the accounts store did not open). From then
+    /// on, until a resolver is installed, a Reflection source outside its
+    /// page's domain is refused and the queue names every such source, since
+    /// nobody here knows who reads which domain. A second call is ignored.
+    pub fn set_domain_access_unavailable(&self, why: String) {
+        let _ = self.domain_access_unavailable.set(why);
     }
 
     /// Install this machine's sources. A no-op on a second call.

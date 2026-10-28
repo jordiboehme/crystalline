@@ -229,40 +229,54 @@ async fn a_public_page_cannot_cite_a_domain_anonymous_cannot_read() {
     assert!(err.contains(TOO_WIDE), "{err}");
 }
 
-/// The headless reflect run is the machine owner on stdio, who may read
-/// every domain: it is refused the same way, over the MCP tool and through
-/// the engine.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_owner_on_stdio_is_refused_the_same_way() {
-    let (fx, auth) = reach().await;
-    private(&auth, "harbor", &["sam"]).await;
+/// A stack that could not open its accounts store knows no reader: it
+/// refuses every source outside the page's own domain, a shared one
+/// included, says why, and names every such source already on a page in
+/// the queue. A source of the page's own domain still goes. (The real
+/// stacks that serve the machine owner on stdio are run end to end in the
+/// CLI suite, `team::reflection_reach`.)
+#[tokio::test]
+async fn without_the_accounts_store_every_other_domain_is_refused() {
+    let (fx, _) = accounts().await;
+    fx.engine
+        .write_reflection(&cite(&[TEAM]), &agent())
+        .await
+        .unwrap();
+    fx.engine
+        .set_domain_access_unavailable("the file is locked".to_string());
     let err = fx
         .engine
         .write_reflection(&cite(&[TEAM]), &agent())
         .await
         .unwrap_err()
         .to_string();
-    assert!(err.contains(TOO_WIDE), "{err}");
-
-    let (client, _server) = crate::assets_mcp::connect(fx.engine.clone()).await;
-    let mut params = rmcp::model::CallToolRequestParams::new("write_reflection");
-    params = params.with_arguments(
-        json!({
-            "domain": "eng",
-            "path": "overview.md",
-            "markdown": OVERVIEW,
-            "sources": { "Team": [TEAM] },
-        })
-        .as_object()
-        .unwrap()
-        .clone(),
+    assert!(
+        err.contains("the accounts store could not be opened"),
+        "{err}"
     );
-    let answer = match client.peer().call_tool(params).await {
-        Ok(result) => serde_json::to_string(&result).unwrap(),
-        Err(e) => format!("{e:?}"),
-    };
-    assert!(answer.contains(TOO_WIDE), "{answer}");
-    assert!(!page_exists(&fx), "nothing written");
+    assert!(err.contains("the file is locked"), "{err}");
+    assert!(err.contains("the text drawn from it"), "{err}");
+    fx.engine
+        .write_reflection(&cite(&["runbooks/deploy"]), &agent())
+        .await
+        .unwrap();
+    let mut back = write("other.md", OVERVIEW);
+    back.sources = BTreeMap::from([("Team".to_string(), vec![TEAM.to_string()])]);
+    assert!(fx.engine.write_reflection(&back, &agent()).await.is_err());
+
+    let mut kept = write("kept.md", OVERVIEW);
+    kept.sources = BTreeMap::from([("Team".to_string(), vec!["runbooks/deploy".to_string()])]);
+    fx.engine.write_reflection(&kept, &agent()).await.unwrap();
+    // The page written before the store went missing is named.
+    std::fs::write(
+        fx.root.join("reflections/forged.md"),
+        "---\nreflection:\n  aaaa1111:\n    sources:\n    - domain: harbor\n      engram: team/harbor-team\n      checksum: abc\n---\n\n# Forged\n\n## Team\n<!-- r:aaaa1111 -->\n\nFive.\n",
+    )
+    .unwrap();
+    fx.engine.sync(None).await.unwrap();
+    let (items, queue) = too_wide(&fx, &agent()).await;
+    assert_eq!(items.len(), 1, "{queue}");
+    assert_eq!(items[0]["path"], "forged.md", "{queue}");
 }
 
 /// A writer who may not open the source's domain is told what a domain
