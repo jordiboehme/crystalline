@@ -24,11 +24,14 @@ pub const FILE_SUFFIX: &str = "_FILE";
 /// The names are spelled out here because this crate cannot name the
 /// overlay's or the remote crate's constants; their own tests pin that the
 /// spellings agree.
-pub const FILE_BACKED: [&str; 4] = [
+pub const FILE_BACKED: [&str; 7] = [
     "CRYSTALLINE_AUTH_OIDC_CLIENT_SECRET",
     "CRYSTALLINE_GITHUB_TOKEN",
     "CRYSTALLINE_REMOTE_TOKEN",
     "CRYSTALLINE_AUTOMATION_WEBHOOK_SECRET",
+    "CRYSTALLINE_GITHUB_APP_CLIENT_SECRET",
+    "CRYSTALLINE_GITHUB_APP_PRIVATE_KEY",
+    "CRYSTALLINE_GITHUB_APP_WEBHOOK_SECRET",
 ];
 
 /// The file form of `plain`: `CRYSTALLINE_GITHUB_TOKEN` becomes
@@ -303,7 +306,7 @@ mod tests {
     }
 
     #[test]
-    fn the_file_backed_variables_are_the_four_secrets() {
+    fn the_file_backed_variables_are_the_seven_secrets() {
         assert_eq!(
             FILE_BACKED,
             [
@@ -311,6 +314,9 @@ mod tests {
                 "CRYSTALLINE_GITHUB_TOKEN",
                 "CRYSTALLINE_REMOTE_TOKEN",
                 "CRYSTALLINE_AUTOMATION_WEBHOOK_SECRET",
+                "CRYSTALLINE_GITHUB_APP_CLIENT_SECRET",
+                "CRYSTALLINE_GITHUB_APP_PRIVATE_KEY",
+                "CRYSTALLINE_GITHUB_APP_WEBHOOK_SECRET",
             ]
         );
         assert_eq!(

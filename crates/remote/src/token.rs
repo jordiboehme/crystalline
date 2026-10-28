@@ -718,7 +718,11 @@ pub(crate) fn keyring_read(account: &str, timeout: Duration) -> KeyringRead {
 /// One bounded keychain write for `account`, the shape both
 /// [`TokenStore::save_resolving_for`] and [`TokenStore::save`] write
 /// through. `Err` carries the reason, a timeout included.
-fn keyring_write(account: &str, json: String, timeout: Duration) -> Result<(), RemoteError> {
+pub(crate) fn keyring_write(
+    account: &str,
+    json: String,
+    timeout: Duration,
+) -> Result<(), RemoteError> {
     refuse_real_keychain_under_test("save");
     let owned = account.to_string();
     keyring_call_with_timeout(timeout, "save", move || {
@@ -732,7 +736,7 @@ fn keyring_write(account: &str, json: String, timeout: Duration) -> Result<(), R
 
 /// One bounded keychain delete for `account`. Deleting an entry that is not
 /// there is not an error, exactly as it was before the bound.
-fn keyring_delete(account: &str, timeout: Duration) -> Result<(), RemoteError> {
+pub(crate) fn keyring_delete(account: &str, timeout: Duration) -> Result<(), RemoteError> {
     refuse_real_keychain_under_test("delete");
     let owned = account.to_string();
     keyring_call_with_timeout(timeout, "delete", move || {
@@ -779,7 +783,19 @@ fn from_json(json: &str) -> Result<StoredToken, RemoteError> {
 /// owner-only, then renamed into place, so a reader never sees a partial
 /// file and no other local account can read the token in between.
 fn save_file(path: &Path, token: &StoredToken) -> Result<(), RemoteError> {
-    let json = to_json(token)?;
+    write_secret_file(path, &to_json(token)?)
+}
+
+fn load_file(path: &Path) -> Result<Option<StoredToken>, RemoteError> {
+    match read_secret_file(path)? {
+        Some(contents) => from_json(&contents).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// The write half of [`save_file`] over already-serialized text, shared with
+/// the App credential store so both lock a secret file down the same way.
+pub(crate) fn write_secret_file(path: &Path, json: &str) -> Result<(), RemoteError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -790,15 +806,17 @@ fn save_file(path: &Path, token: &StoredToken) -> Result<(), RemoteError> {
     Ok(())
 }
 
-fn load_file(path: &Path) -> Result<Option<StoredToken>, RemoteError> {
+/// The read half of [`load_file`]: the file's text, or `None` when it does not
+/// exist.
+pub(crate) fn read_secret_file(path: &Path) -> Result<Option<String>, RemoteError> {
     match std::fs::read_to_string(path) {
-        Ok(contents) => from_json(&contents).map(Some),
+        Ok(contents) => Ok(Some(contents)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.into()),
     }
 }
 
-fn delete_file(path: &Path) -> Result<(), RemoteError> {
+pub(crate) fn delete_file(path: &Path) -> Result<(), RemoteError> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),

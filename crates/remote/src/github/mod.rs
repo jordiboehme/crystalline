@@ -20,6 +20,7 @@
 //! the pagination test in `tests/it/github_client.rs`.
 
 pub mod app;
+pub mod app_store;
 pub mod auth;
 mod types;
 

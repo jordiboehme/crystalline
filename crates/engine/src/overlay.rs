@@ -62,6 +62,8 @@ use crystalline_core::config::{
     self, DomainEntry, GlobalConfig, NameOrigin, OriginConfig, ReviewMode,
 };
 
+use crystalline_remote::github::app_store::AppCredentials;
+
 use crate::origin;
 use crate::settings;
 
@@ -98,6 +100,22 @@ const REVIEW_OVERLAY_VALUE: &str = "overlay";
 /// never reads it itself (see `crate::engine::Engine::github_credential`
 /// and the `crystalline_remote::token` module docs).
 pub const GITHUB_TOKEN_ENV: &str = "CRYSTALLINE_GITHUB_TOKEN";
+
+/// The variables that carry a GitHub App's credentials for a headless node.
+/// Any one set requires [`GITHUB_APP_ID_ENV`], [`GITHUB_APP_CLIENT_ID_ENV`]
+/// and [`GITHUB_APP_PRIVATE_KEY_ENV`] together; the private key and the two
+/// secrets also take a `_FILE` form. They are not settings-registry keys and
+/// never reach `config.yaml` (docs name them `github.app.*`); like
+/// [`GITHUB_TOKEN_ENV`] they are read-only and win over a saved App.
+pub const GITHUB_APP_ID_ENV: &str = "CRYSTALLINE_GITHUB_APP_ID";
+/// See [`GITHUB_APP_ID_ENV`].
+pub const GITHUB_APP_CLIENT_ID_ENV: &str = "CRYSTALLINE_GITHUB_APP_CLIENT_ID";
+/// See [`GITHUB_APP_ID_ENV`].
+pub const GITHUB_APP_CLIENT_SECRET_ENV: &str = "CRYSTALLINE_GITHUB_APP_CLIENT_SECRET";
+/// See [`GITHUB_APP_ID_ENV`].
+pub const GITHUB_APP_PRIVATE_KEY_ENV: &str = "CRYSTALLINE_GITHUB_APP_PRIVATE_KEY";
+/// See [`GITHUB_APP_ID_ENV`].
+pub const GITHUB_APP_WEBHOOK_SECRET_ENV: &str = "CRYSTALLINE_GITHUB_APP_WEBHOOK_SECRET";
 
 /// The install-channel marker env var. The mcpb manifest sets it to "mcpb".
 pub const CHANNEL_ENV: &str = "CRYSTALLINE_CHANNEL";
@@ -239,6 +257,16 @@ pub struct EnvOverlay {
     /// Never written back to the config file and never the `Default`/`Clone`
     /// derive's business to print: see the manual `Debug` impl below.
     github_token: Option<String>,
+    /// The GitHub App from the `CRYSTALLINE_GITHUB_APP_*` variables
+    /// ([`GITHUB_APP_ID_ENV`]): `None` when none is set, `Err` with a
+    /// sentence (never carrying a secret) when the values do not make a
+    /// usable App. Its `host` follows the `github.api_url` the environment
+    /// sets, else `github.com`; a `github.api_url` that only the config file
+    /// carries is not visible here.
+    github_app: Option<Result<AppCredentials, String>>,
+    /// The `CRYSTALLINE_GITHUB_APP_*` variable actually set for each field, as
+    /// (key, variable), for [`EnvOverlay::active_overrides`].
+    github_app_vars: Vec<(&'static str, String)>,
     /// The config file path from [`CONFIG_PATH_ENV`], tilde-expanded. `None`
     /// when the variable is absent or empty.
     config_path: Option<PathBuf>,
@@ -281,6 +309,7 @@ impl std::fmt::Debug for EnvOverlay {
                 "github_token",
                 &self.github_token.as_ref().map(|_| "<redacted>"),
             )
+            .field("github_app", &self.github_app)
             .field("config_path", &self.config_path)
             .field("file_sourced", &self.file_sourced)
             .finish()
@@ -348,6 +377,7 @@ impl EnvOverlay {
         let mut settings = Vec::new();
         let mut config_path = None;
         let mut github_token = None;
+        let mut app_vars: HashMap<&'static str, String> = HashMap::new();
         // A scratch config the setting values are applied to as they parse, so
         // the combined database check below sees every applied value at once.
         let mut scratch = GlobalConfig::default();
@@ -372,6 +402,12 @@ impl EnvOverlay {
             if name == GITHUB_TOKEN_ENV {
                 if !value.is_empty() {
                     github_token = Some(value);
+                }
+                continue;
+            }
+            if let Some(field) = GITHUB_APP_ENVS.iter().find(|(var, _)| *var == name) {
+                if !value.is_empty() {
+                    app_vars.insert(field.0, value);
                 }
                 continue;
             }
@@ -442,10 +478,23 @@ impl EnvOverlay {
 
         let domains = resolve_env_domains(domain_vars, origin_vars, review_vars)?;
 
+        let api_url = settings
+            .iter()
+            .find(|(key, _)| key == "github.api_url")
+            .map(|(_, value)| value.as_str());
+        let github_app = github_app_from(&app_vars, api_url)?;
+        let github_app_vars = GITHUB_APP_ENVS
+            .iter()
+            .filter(|(var, _)| app_vars.contains_key(var))
+            .map(|(var, key)| (*key, file_sourced_var(&file_sourced, var)))
+            .collect();
+
         Ok(EnvOverlay {
             settings,
             domains,
             github_token,
+            github_app,
+            github_app_vars,
             config_path,
             file_sourced,
         })
@@ -464,6 +513,7 @@ impl EnvOverlay {
         self.settings.is_empty()
             && self.domains.is_empty()
             && self.github_token.is_none()
+            && self.github_app.is_none()
             && self.config_path.is_none()
     }
 
@@ -537,6 +587,15 @@ impl EnvOverlay {
         self.github_token.as_deref()
     }
 
+    /// The GitHub App from the `CRYSTALLINE_GITHUB_APP_*` variables, if the
+    /// environment set any. `Err` carries a sentence for an id or a private
+    /// key that cannot be used; a missing required variable never gets here,
+    /// it stops the start. Environment-supplied, so read-only: nothing saves
+    /// it and it wins over a saved App.
+    pub fn github_app(&self) -> Option<Result<AppCredentials, String>> {
+        self.github_app.clone()
+    }
+
     /// Every active override as `(variable, key, display value)`, for surfacing
     /// in `doctor` and the like: first the setting overrides, then the
     /// env-defined domains (keyed `domain.<name>`, their path as the display
@@ -577,6 +636,13 @@ impl EnvOverlay {
                 "(set)".to_string(),
             ));
         }
+        for (key, var) in &self.github_app_vars {
+            out.push((
+                var.clone(),
+                format!("github.app.{key}"),
+                "(set)".to_string(),
+            ));
+        }
         out
     }
 
@@ -589,6 +655,73 @@ impl EnvOverlay {
             .map(|(_, file)| file.clone())
             .unwrap_or(plain)
     }
+}
+
+/// Every `CRYSTALLINE_GITHUB_APP_*` variable with the `github.app.<key>` it is
+/// documented as, in the order a message lists them.
+const GITHUB_APP_ENVS: [(&str, &str); 5] = [
+    (GITHUB_APP_ID_ENV, "id"),
+    (GITHUB_APP_CLIENT_ID_ENV, "client_id"),
+    (GITHUB_APP_CLIENT_SECRET_ENV, "client_secret"),
+    (GITHUB_APP_PRIVATE_KEY_ENV, "private_key"),
+    (GITHUB_APP_WEBHOOK_SECRET_ENV, "webhook_secret"),
+];
+
+/// The variable to name for `plain`: its `_FILE` form when the value came
+/// from a file.
+fn file_sourced_var(file_sourced: &[(String, String)], plain: &str) -> String {
+    file_sourced
+        .iter()
+        .find(|(p, _)| p == plain)
+        .map(|(_, file)| file.clone())
+        .unwrap_or_else(|| plain.to_string())
+}
+
+/// Builds the App from the variables that were set. None set is no App; some
+/// set without the id, the client id and the private key is fatal, naming
+/// what is missing, because a half-configured App would otherwise sit unused
+/// without a word. An unusable id or key is reported as `Err` for the caller
+/// to surface, never with the value in it.
+fn github_app_from(
+    vars: &HashMap<&'static str, String>,
+    api_url: Option<&str>,
+) -> Result<Option<Result<AppCredentials, String>>, OverlayError> {
+    if vars.is_empty() {
+        return Ok(None);
+    }
+    let missing: Vec<&str> = [
+        GITHUB_APP_ID_ENV,
+        GITHUB_APP_CLIENT_ID_ENV,
+        GITHUB_APP_PRIVATE_KEY_ENV,
+    ]
+    .into_iter()
+    .filter(|var| !vars.contains_key(var))
+    .collect();
+    if !missing.is_empty() {
+        return Err(OverlayError(format!(
+            "GitHub App environment is incomplete: set {} too (an App needs an id, a client id and a private key together)",
+            missing.join(" and ")
+        )));
+    }
+    let private_key = vars[GITHUB_APP_PRIVATE_KEY_ENV].clone();
+    let Ok(app_id) = vars[GITHUB_APP_ID_ENV].trim().parse::<u64>() else {
+        return Ok(Some(Err(format!(
+            "{GITHUB_APP_ID_ENV} must be the App's numeric id"
+        ))));
+    };
+    if let Err(e) = crystalline_remote::github::app::AppKey::from_pem(&private_key) {
+        return Ok(Some(Err(format!("{GITHUB_APP_PRIVATE_KEY_ENV}: {e}"))));
+    }
+    let host = origin::token_host(api_url).unwrap_or_else(|| "github.com".to_string());
+    Ok(Some(Ok(AppCredentials {
+        app_id,
+        client_id: vars[GITHUB_APP_CLIENT_ID_ENV].clone(),
+        client_secret: vars.get(GITHUB_APP_CLIENT_SECRET_ENV).cloned(),
+        private_key,
+        webhook_secret: vars.get(GITHUB_APP_WEBHOOK_SECRET_ENV).cloned(),
+        slug: None,
+        host,
+    })))
 }
 
 /// Name and value pairs, the shape [`resolve_file_secrets`] takes and returns.
@@ -1866,6 +1999,121 @@ mod tests {
         assert!(!format!("{file:?}").contains("ghp_file"));
     }
 
+    const APP_KEY: &str = include_str!("../../remote/tests/fixtures/app-key-pkcs1.pem");
+
+    #[test]
+    fn env_app_needs_id_client_id_and_key_together() {
+        let err = overlay_reading(&[("CRYSTALLINE_GITHUB_APP_ID", "4242")], &[]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("CRYSTALLINE_GITHUB_APP_PRIVATE_KEY"), "{msg}");
+        assert!(msg.contains("CRYSTALLINE_GITHUB_APP_CLIENT_ID"), "{msg}");
+        assert!(
+            !msg.contains("CRYSTALLINE_GITHUB_APP_ID"),
+            "only the missing ones: {msg}"
+        );
+
+        // A lone optional secret is also "any set".
+        let err =
+            overlay_reading(&[("CRYSTALLINE_GITHUB_APP_WEBHOOK_SECRET", "w")], &[]).unwrap_err();
+        assert!(
+            err.to_string().contains("CRYSTALLINE_GITHUB_APP_ID"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn env_app_private_key_reads_from_its_file_form() {
+        let ov = overlay_reading(
+            &[
+                ("CRYSTALLINE_GITHUB_APP_ID", "4242"),
+                ("CRYSTALLINE_GITHUB_APP_CLIENT_ID", "Iv23liSAMPLE"),
+                ("CRYSTALLINE_GITHUB_APP_CLIENT_SECRET", "clientsecret"),
+                (
+                    "CRYSTALLINE_GITHUB_APP_PRIVATE_KEY_FILE",
+                    "/run/secrets/key",
+                ),
+                (
+                    "CRYSTALLINE_GITHUB_APP_WEBHOOK_SECRET_FILE",
+                    "/run/secrets/hook",
+                ),
+                ("CRYSTALLINE_GITHUB_API_URL", "https://ghes.example/api/v3"),
+            ],
+            &[
+                ("/run/secrets/key", APP_KEY),
+                ("/run/secrets/hook", "hooksecret\n"),
+            ],
+        )
+        .unwrap();
+        let app = ov.github_app().expect("the App is configured").unwrap();
+        assert_eq!(app.app_id, 4242);
+        assert_eq!(app.client_id, "Iv23liSAMPLE");
+        assert_eq!(
+            app.private_key,
+            APP_KEY.strip_suffix('\n').unwrap_or(APP_KEY)
+        );
+        assert_eq!(app.webhook_secret.as_deref(), Some("hooksecret"));
+        assert_eq!(app.client_secret.as_deref(), Some("clientsecret"));
+        assert_eq!(app.host, "ghes.example", "the host follows github.api_url");
+        assert!(!ov.is_empty());
+
+        let shown = ov.active_overrides();
+        assert!(
+            shown.iter().any(
+                |(var, key, value)| var == "CRYSTALLINE_GITHUB_APP_PRIVATE_KEY_FILE"
+                    && key == "github.app.private_key"
+                    && value == "(set)"
+            ),
+            "{shown:?}"
+        );
+        let debugged = format!("{ov:?}");
+        assert!(!debugged.contains("hooksecret") && !debugged.contains("clientsecret"));
+        assert!(!debugged.contains("BEGIN"), "{debugged}");
+    }
+
+    #[test]
+    fn env_app_defaults_to_github_com_and_flags_an_unusable_id_or_key() {
+        let ov = overlay_reading(
+            &[
+                ("CRYSTALLINE_GITHUB_APP_ID", "4242"),
+                ("CRYSTALLINE_GITHUB_APP_CLIENT_ID", "Iv23liSAMPLE"),
+                ("CRYSTALLINE_GITHUB_APP_PRIVATE_KEY", APP_KEY),
+            ],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(ov.github_app().unwrap().unwrap().host, "github.com");
+
+        let bad_key = overlay_reading(
+            &[
+                ("CRYSTALLINE_GITHUB_APP_ID", "4242"),
+                ("CRYSTALLINE_GITHUB_APP_CLIENT_ID", "c"),
+                ("CRYSTALLINE_GITHUB_APP_PRIVATE_KEY", "SECRETNOTAKEY"),
+            ],
+            &[],
+        )
+        .unwrap();
+        let msg = bad_key.github_app().unwrap().unwrap_err();
+        assert!(!msg.contains("SECRETNOTAKEY"), "{msg}");
+
+        let bad_id = overlay_reading(
+            &[
+                ("CRYSTALLINE_GITHUB_APP_ID", "forty-two"),
+                ("CRYSTALLINE_GITHUB_APP_CLIENT_ID", "c"),
+                ("CRYSTALLINE_GITHUB_APP_PRIVATE_KEY", APP_KEY),
+            ],
+            &[],
+        )
+        .unwrap();
+        assert!(
+            bad_id
+                .github_app()
+                .unwrap()
+                .unwrap_err()
+                .contains("CRYSTALLINE_GITHUB_APP_ID")
+        );
+        assert!(overlay_reading(&[], &[]).unwrap().github_app().is_none());
+    }
+
     #[test]
     fn the_oidc_client_secret_reads_plain_and_from_a_file() {
         let plain =
@@ -1976,6 +2224,13 @@ mod tests {
         assert!(backed.contains(&oidc.as_str()));
         assert!(backed.contains(&GITHUB_TOKEN_ENV));
         assert!(backed.contains(&"CRYSTALLINE_REMOTE_TOKEN"));
+        for name in [
+            GITHUB_APP_CLIENT_SECRET_ENV,
+            GITHUB_APP_PRIVATE_KEY_ENV,
+            GITHUB_APP_WEBHOOK_SECRET_ENV,
+        ] {
+            assert!(backed.contains(&name), "{name}");
+        }
     }
 
     #[test]
