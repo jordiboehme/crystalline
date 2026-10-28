@@ -16,7 +16,7 @@ max-threads = 4
 
 [[profile.default.overrides]]
 filter = '''
-    (package(crystalline-remote) & binary(it) & test(/^(github_client|github_auth)::/))
+    (package(crystalline-remote) & binary(it) & test(/^(github_app|github_client|github_auth)::/))
     | (package(crystalline-service) & (
         binary(collab_ws)
         | (binary(rest_admin) & test(/^(rest_admin_api|rest_draft_links|rest_write_api)::/))
@@ -29,8 +29,9 @@ test-group = 'forge-wire'
 
 # Keeps a hung test from wedging the whole run: the sandboxed environments
 # this repo is developed in can stall the loopback-binding suites
-# (crates/remote/tests/it/github_client.rs and it/github_auth.rs bind
-# 127.0.0.1:0), and without a terminate-after nextest waits forever.
+# (crates/remote/tests/it/github_client.rs, it/github_auth.rs and
+# it/github_app.rs bind 127.0.0.1:0), and without a terminate-after nextest
+# waits forever.
 [profile.default]
 slow-timeout = { period = "120s", terminate-after = 2 }
 # A test whose child process outlives it by more than this is reported as a
@@ -39,13 +40,13 @@ slow-timeout = { period = "120s", terminate-after = 2 }
 # under load, so the window is widened rather than the class investigated.
 leak-timeout = "500ms"
 
-# The same two loopback suites, given a far longer ceiling rather than a mute:
+# The same loopback suites, given a far longer ceiling rather than a mute:
 # they finish in under a second standalone, but a machine under environmental
 # load (a post-update Gatekeeper scan, a sandbox) has been seen stalling them
 # past the 240s the default override allows, killing tests that were only slow.
 # They still terminate, so a genuine hang cannot wedge the run.
 [[profile.default.overrides]]
-filter = 'package(crystalline-remote) & binary(it) & test(/^(github_client|github_auth)::/)'
+filter = 'package(crystalline-remote) & binary(it) & test(/^(github_app|github_client|github_auth)::/)'
 slow-timeout = { period = "120s", terminate-after = 10 }
 
 # The same environmental stall, observed on two more loopback users during

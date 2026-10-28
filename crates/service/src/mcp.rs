@@ -6373,6 +6373,9 @@ fn to_error(e: EngineError) -> ErrorData {
 /// tells the caller the opposite of what the message says. The two
 /// organization-policy refusals sit in that same class for the same reason:
 /// nothing is broken here, and the message names the page that clears it.
+/// A GitHub App that is not installed on the repository joins them for the
+/// same reason (its message is the install url), while an endpoint the
+/// GitHub server does not offer is the server's state, not the caller's.
 /// This match is exhaustive over `RemoteError` so a new variant must be
 /// classified here rather than silently defaulting.
 fn remote_to_error(e: RemoteError) -> ErrorData {
@@ -6389,6 +6392,7 @@ fn remote_to_error(e: RemoteError) -> ErrorData {
         | RemoteError::Credential { .. }
         | RemoteError::ServerCredential { .. }
         | RemoteError::AppCredential(_)
+        | RemoteError::EndpointMissing { .. }
         | RemoteError::BaseUnavailable => ErrorData::internal_error(message, None),
         RemoteError::NotEnabled
         | RemoteError::NotConnected
@@ -6403,6 +6407,7 @@ fn remote_to_error(e: RemoteError) -> ErrorData {
         | RemoteError::Refused(_)
         | RemoteError::SsoAuthorizationRequired { .. }
         | RemoteError::OauthAppRestricted { .. }
+        | RemoteError::AppNotInstalled { .. }
         | RemoteError::ConflictNotFound { .. } => ErrorData::invalid_params(message, None),
     }
 }

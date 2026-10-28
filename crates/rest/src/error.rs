@@ -697,8 +697,10 @@ impl From<anyhow::Error> for ApiError {
 /// them, since its message is the way out of a situation the request itself
 /// created and a 500 would file it as a server fault, and an organization
 /// policy refusal (single sign-on, OAuth app restrictions) beside it, which
-/// names the page that clears it - and a repository or proposal that does not
-/// exist becomes a 404.
+/// names the page that clears it, and a GitHub App not installed on the
+/// repository, whose message is the install url - and a repository or
+/// proposal that does not exist becomes a 404. An endpoint the GitHub server
+/// does not offer stays a 500.
 fn remote_to_api_error(e: crystalline_remote::RemoteError, detail: String) -> ApiError {
     use crystalline_remote::RemoteError;
     match e {
@@ -713,6 +715,7 @@ fn remote_to_api_error(e: crystalline_remote::RemoteError, detail: String) -> Ap
         | RemoteError::Credential { .. }
         | RemoteError::ServerCredential { .. }
         | RemoteError::AppCredential(_)
+        | RemoteError::EndpointMissing { .. }
         | RemoteError::BaseUnavailable => internal_error(detail),
         RemoteError::RepoNotFound { .. }
         | RemoteError::NotADomain { .. }
@@ -727,6 +730,7 @@ fn remote_to_api_error(e: crystalline_remote::RemoteError, detail: String) -> Ap
         | RemoteError::Refused(_)
         | RemoteError::SsoAuthorizationRequired { .. }
         | RemoteError::OauthAppRestricted { .. }
+        | RemoteError::AppNotInstalled { .. }
         | RemoteError::ConflictsPending { .. } => unprocessable_error(detail),
     }
 }

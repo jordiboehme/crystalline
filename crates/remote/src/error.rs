@@ -278,6 +278,42 @@ pub enum RemoteError {
         "The GitHub App credential is unusable: {0}. Check the private key and client id of the App."
     )]
     AppCredential(String),
+
+    /// The GitHub App is configured, but not installed on the repository (or
+    /// the installation does not grant it). Never answered with the instance
+    /// credential instead: the install url is the way out.
+    #[error(
+        "the GitHub App is not installed on {repo}: install it at {install_url}, then try again"
+    )]
+    AppNotInstalled {
+        /// The repository, `owner/name`.
+        repo: String,
+        /// Where an owner of the repository installs the App.
+        install_url: String,
+    },
+
+    /// GitHub answered 404 for an endpoint that always exists on a GitHub
+    /// that supports GitHub Apps: an Enterprise Server too old for it, or a
+    /// server that is not GitHub. `ghes_version` is the
+    /// `X-GitHub-Enterprise-Version` header when the server sent one.
+    #[error(
+        "This GitHub server does not offer {endpoint}{}. The GitHub App needs a GitHub Enterprise Server version that GitHub still supports; ask the server's administrator to upgrade, or check github.api_url.",
+        ghes_version_clause(ghes_version.as_deref())
+    )]
+    EndpointMissing {
+        /// The request that found no endpoint, `METHOD /path`.
+        endpoint: String,
+        /// The Enterprise Server version, when the server named one.
+        ghes_version: Option<String>,
+    },
+}
+
+/// The ` (GitHub Enterprise Server x.y.z)` clause of
+/// [`RemoteError::EndpointMissing`], empty when no version was sent.
+fn ghes_version_clause(version: Option<&str>) -> String {
+    version
+        .map(|v| format!(" (GitHub Enterprise Server {v})"))
+        .unwrap_or_default()
 }
 
 impl RemoteError {
@@ -321,7 +357,9 @@ impl RemoteError {
             | RemoteError::State(_)
             | RemoteError::Credential { .. }
             | RemoteError::ServerCredential { .. }
-            | RemoteError::AppCredential(_) => false,
+            | RemoteError::AppCredential(_)
+            | RemoteError::AppNotInstalled { .. }
+            | RemoteError::EndpointMissing { .. } => false,
         }
     }
 }
@@ -979,6 +1017,21 @@ mod tests {
                 detail: "boom".to_string(),
             }
             .to_string(),
+            RemoteError::AppNotInstalled {
+                repo: "acme/knowledge".to_string(),
+                install_url: "https://github.com/apps/acme/installations/new".to_string(),
+            }
+            .to_string(),
+            RemoteError::EndpointMissing {
+                endpoint: "GET /app".to_string(),
+                ghes_version: Some("3.14.2".to_string()),
+            }
+            .to_string(),
+            RemoteError::EndpointMissing {
+                endpoint: "GET /app".to_string(),
+                ghes_version: None,
+            }
+            .to_string(),
         ];
         for msg in samples {
             assert!(!msg.contains(em_dash), "{msg}");
@@ -1026,6 +1079,14 @@ mod tests {
             },
             RemoteError::Refused("no".to_string()),
             RemoteError::NotEnabled,
+            RemoteError::AppNotInstalled {
+                repo: "team/knowledge".to_string(),
+                install_url: "https://github.com/apps/acme/installations/new".to_string(),
+            },
+            RemoteError::EndpointMissing {
+                endpoint: "GET /app".to_string(),
+                ghes_version: None,
+            },
         ] {
             assert!(!permanent.is_temporary(), "{permanent:?}");
         }

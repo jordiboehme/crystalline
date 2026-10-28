@@ -44,6 +44,7 @@ pub use fanout::{
     part_request_limit,
 };
 pub use github::GitHubProvider;
+pub use github::app::{AppInfo, CommitIdentities, CommitIdentity, GithubApp};
 pub use github::app_store::{AppCredentials, AppStore};
 pub use github::auth::{DeviceFlowStart, DevicePoll, GITHUB_CLIENT_ID};
 pub use github::{validate_repo, validate_repo_path};
