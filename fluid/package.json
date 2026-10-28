@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.29.1",
   "type": "module",
-  "packageManager": "pnpm@12.15.0",
+  "packageManager": "pnpm@12.16.0",
   "engines": {
     "node": ">=22.12.0"
   },
@@ -32,14 +32,14 @@
     "@lezer/common": "1.5.4",
     "@lezer/highlight": "1.2.5",
     "@panzoom/panzoom": "^4.6.2",
-    "@tanstack/react-query": "^5.104.5",
-    "@tanstack/react-virtual": "^3.14.22",
-    "@truto/turndown-plugin-gfm": "1.0.6",
+    "@tanstack/react-query": "^5.105.0",
+    "@tanstack/react-virtual": "^3.14.23",
+    "@truto/turndown-plugin-gfm": "1.0.7",
     "cmdk": "^1.1.1",
     "cytoscape": "^3.34.4",
     "katex": "0.19.1",
     "lib0": "0.2.119",
-    "lucide-react": "1.61.0",
+    "lucide-react": "1.62.0",
     "mermaid": "^12.2.0",
     "radix-ui": "^1.8.1",
     "react": "^19.3.1",
@@ -79,7 +79,7 @@
     "prettier": "^3.9.10",
     "tailwindcss": "^4.3.3",
     "typescript": "~6.0.3",
-    "typescript-eslint": "^8.72.0",
+    "typescript-eslint": "^8.72.1",
     "vite": "^8.3.5",
     "vitest": "^5.0.5"
   }
