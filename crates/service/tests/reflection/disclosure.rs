@@ -815,3 +815,73 @@ async fn a_legacy_person_is_asked_through_an_elicitation_request() {
     }
     assert!(page_exists(&fx));
 }
+
+// --- the JSON API -------------------------------------------------------
+
+/// Fluid's Review confirms a `source_too_wide` item over the JSON API: the
+/// queue item carries the question, a curator who may read the source shares
+/// it, and one who may not is refused without the domain being named.
+#[tokio::test]
+async fn the_json_api_confirms_a_named_section_for_a_person() {
+    let fx = crate::sources::crossing().await;
+    fx.engine
+        .write_reflection(&cite(), &agent_as("keeper"))
+        .await
+        .unwrap();
+    let served = crate::rest::serve_fx(fx, false).await;
+    // harbor narrows to keeper: the page everyone reads is too wide now.
+    served
+        .auth
+        .set_domain_visibility("harbor", true, "keeper")
+        .await
+        .unwrap();
+    let keeper = crate::rest::Session::login(served.addr, "keeper").await;
+    let (status, review) = keeper.get("/api/v1/domains/eng/reflection/review").await;
+    assert_eq!(status, 200, "{review}");
+    let item = review["queue"]["queue"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["what"] == "source_too_wide")
+        .cloned()
+        .expect("the section is named");
+    assert!(
+        item["question"]
+            .as_str()
+            .unwrap()
+            .contains("everyone who can open this instance"),
+        "{item}"
+    );
+    let body = json!({ "path": "overview.md", "section": item["section"] });
+
+    // ed curates eng and may not read harbor.
+    let ed = crate::rest::Session::login(served.addr, "ed").await;
+    let (status, refused) = ed
+        .send(
+            reqwest::Method::POST,
+            "/api/v1/domains/eng/reflection/disclose",
+            Some(body.clone()),
+        )
+        .await;
+    assert_eq!(status, 403, "{refused}");
+    assert!(!refused.to_string().contains("harbor"), "{refused}");
+
+    let (status, done) = keeper
+        .send(
+            reqwest::Method::POST,
+            "/api/v1/domains/eng/reflection/disclose",
+            Some(body),
+        )
+        .await;
+    assert_eq!(status, 200, "{done}");
+    assert_eq!(done["disclosed"]["by"], json!("keeper"), "{done}");
+    let (_, review) = keeper.get("/api/v1/domains/eng/reflection/review").await;
+    assert!(
+        !review["queue"]["queue"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["what"] == "source_too_wide"),
+        "{review}"
+    );
+}

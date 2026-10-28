@@ -212,6 +212,7 @@ use crate::scope::{DomainAccess, DomainRight};
         reflections::save,
         reflections::remove,
         reflections::move_to,
+        reflections::disclose,
         reflections::threads,
         reflections::open,
         reflections::step,
@@ -346,6 +347,7 @@ use crate::scope::{DomainAccess, DomainRight};
         oauth::TokenResponse,
         reflections::SaveReflectionBody,
         reflections::MoveReflectionBody,
+        reflections::DiscloseReflectionBody,
         reflections::OpenThreadBody,
         reflections::ThreadStepBody,
         reflections::ReflectionAssetsResponse,
@@ -971,6 +973,10 @@ fn routes(state: RestState) -> Router {
         .route(
             "/domains/{domain}/reflection/move",
             post(reflections::move_to),
+        )
+        .route(
+            "/domains/{domain}/reflection/disclose",
+            post(reflections::disclose),
         )
         .route(
             "/domains/{domain}/reflection/threads",

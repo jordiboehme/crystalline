@@ -183,6 +183,7 @@ pub const MOUNTED_OPERATIONS: &[&str] = &[
     "GET /api/v1/domains/{domain}/reflection",
     "GET /api/v1/domains/{domain}/reflection/tree",
     "POST /api/v1/domains/{domain}/reflection/move",
+    "POST /api/v1/domains/{domain}/reflection/disclose",
     "GET /api/v1/domains/{domain}/reflection/threads",
     "POST /api/v1/domains/{domain}/reflection/threads",
     "POST /api/v1/domains/{domain}/reflection/threads/{id}/{action}",
