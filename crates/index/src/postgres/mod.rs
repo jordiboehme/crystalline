@@ -4950,7 +4950,8 @@ impl Store for PostgresStore {
     async fn reflection_disclosures(&self, domain: DomainId) -> Result<Vec<(String, String)>> {
         let mut conn = self.acquire().await?;
         let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT path, records FROM reflection_disclosure WHERE domain_id=$1 ORDER BY path",
+            "SELECT path, records FROM reflection_disclosure WHERE domain_id=$1 \
+             ORDER BY path COLLATE \"C\"",
         )
         .bind(domain.0)
         .fetch_all(conn.as_mut())
