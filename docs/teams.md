@@ -154,6 +154,18 @@ Run it for the shared branch only. The `crystalline/reflections` branch holds th
 
 The check blocks a change only when it is a required status check in the branch protection (or a ruleset) of the shared branch. Without that, it only reports after the push. Add a `CODEOWNERS` entry for `MANIFEST.md`, `reflections/` and `.crystalline.yaml`, so a change to them needs a review by the team's owners. A repository admin can still bypass all of this.
 
+### One evolve runner per team domain
+
+Every clone of a team domain can run the evolve loop on a schedule (see [Run the loops on their own](automation.md)). Five laptops that each run `crystalline evolve run` on the same domain would open five pull requests for the same findings. So a team domain has one evolve home: the instance whose `service.public_url` is the domain's `evolve_home`.
+
+Crystalline fills `evolve_home` in. It is never set by hand. The first scheduled evolve run at an instance with a `service.public_url` claims the home when it takes its lease: `crystalline evolve run`, `watch`, a container job or n8n. The run writes `evolve_home: <its address>` into the MANIFEST, and the run's own pull request carries that line beside its fixes. On a domain that reviews changes, the line is the runner's draft and goes through the review. The run says so in one line. Once the pull request is merged, every other clone refuses a scheduled run: `crystalline evolve status` and `run` say `runs on <home>`, the lease is refused with `runs on <home>`, and the evolve webhook is not sent there.
+
+An instance without `service.public_url` cannot be the home. A run there goes on as before and says that every clone may still run evolve. `crystalline doctor` warns about a team domain with no `evolve_home` too. A value that is not a server address is read as absent, and `crystalline verify` reports it as `M013`.
+
+`evolve_engrams` and `crystalline evolve` in a session are not refused anywhere. They only read, and they open no pull request. What a person fixes from the findings travels with their own share, like any other edit.
+
+To move the home, remove the key at the instance that should run evolve (`configure` with the domain and `unset: ["evolve_home"]`, or delete the line from the MANIFEST there), then run evolve there. That run claims the home and its pull request carries the new address. A local domain and a virtual domain ignore the key. A plain clone that carries `team: github` is a team domain and is refused like any other clone.
+
 ### Private domains
 
 A domain does not have to be shared with the whole team to exist on a team instance. Make one private (from its Members card in Fluid, or `crystalline domain visibility <domain> private --owner <account>` from the CLI) and only its owner, the accounts invited into it and instance admins can see it at all. Everyone else gets the same answer a domain nobody registered gets. Be honest about what that protects: private is a wall between accounts, not from whoever operates the machine. The CLI, running on the host, administers every domain, invited or not, exactly the way a GitHub organization owner sees every repository in it. See [Private domains](deployment.md#private-domains) for membership levels and the full command set.
