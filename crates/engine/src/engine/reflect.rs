@@ -15,7 +15,7 @@ use super::*;
 use crate::scope::{ReflectionCaller, ReflectionRight, Scope};
 
 /// How an agent works the queue, returned with every page.
-pub const REFLECT_GUIDANCE: &str = "Work feedback items first: read what the person changed and decide - take it into the engrams (change them, then write_reflection the section with its sources), keep it as their text (write_reflection action=settle outcome=kept), or answer it in a thread (discuss with answers_feedback). Taking feedback into the engrams of another domain needs write access there; without it, answer in a thread or settle it as kept. Then update items: bring changed engrams into their sections and write them with sources; for a source_too_wide item, the section cites a domain fewer people may read than the page's domain: write the section again without that source and without the text drawn from it; cover unreflected engrams with a new section or reflection; move pages the pact's structure does not fit (its ## Structure bullets are globs, one per top-level bullet); apply a changed pact to the pages it affects, and when the pages follow the pact again, settle PACT.md (write_reflection action=settle without sections settles the whole page). When a person asks you for a page or space, add a bullet to the pact's ## Pages (add the heading if the pact has none) with its path or glob, their request in their words, who asked and the date. Add a matching ## Structure glob and name each section's sources. To place new engrams read ## Pages, and to recreate a page rebuild it from its bullet. Files under reflections/assets/: link an unreferenced file from the section it belongs to, or remove it with write_reflection action=delete_asset (ask first: removing is irreversible); for a missing file, ask a person to add it or correct the link; an engram attachment cannot be embedded, so ask a person to copy the file into reflections/assets/ and point the link there. A host_moved item means this instance took the domain over on a shared database and its disk lacks files the previous host wrote: their rows are kept and counted, never written here, so do not rewrite or delete those pages and files; ask a person to copy the domain folder over (or restore it) and sync, or to run the sync with --accept-disk if the files are gone for good. Answer review threads in plain words - the people reading them may not see engrams. Answer a person's thread and leave it open. The person who opened it resolves it. A thread item carries the label of its opening comment and whether it blocks: answer blocking threads first; a praise needs no answer unless it asks something. Present every page you write with the crystalline-presentation skill (the skills tool serves it).";
+pub const REFLECT_GUIDANCE: &str = "Work feedback items first: read what the person changed and decide - take it into the engrams (change them, then write_reflection the section with its sources), keep it as their text (write_reflection action=settle outcome=kept), or answer it in a thread (discuss with answers_feedback). Taking feedback into the engrams of another domain needs write access there; without it, answer in a thread or settle it as kept. Then update items: bring changed engrams into their sections and write them with sources; for a source_too_wide item, the section cites a domain fewer people may read than the page's domain: write the section again without that source and without the text drawn from it (the check sees only named sources, so dropping the source and keeping its text still leaks it); when write_reflection refuses a source for the same reason, leave out its text as well; cover unreflected engrams with a new section or reflection; move pages the pact's structure does not fit (its ## Structure bullets are globs, one per top-level bullet); apply a changed pact to the pages it affects, and when the pages follow the pact again, settle PACT.md (write_reflection action=settle without sections settles the whole page). When a person asks you for a page or space, add a bullet to the pact's ## Pages (add the heading if the pact has none) with its path or glob, their request in their words, who asked and the date. Add a matching ## Structure glob and name each section's sources. To place new engrams read ## Pages, and to recreate a page rebuild it from its bullet. Files under reflections/assets/: link an unreferenced file from the section it belongs to, or remove it with write_reflection action=delete_asset (ask first: removing is irreversible); for a missing file, ask a person to add it or correct the link; an engram attachment cannot be embedded, so ask a person to copy the file into reflections/assets/ and point the link there. A host_moved item means this instance took the domain over on a shared database and its disk lacks files the previous host wrote: their rows are kept and counted, never written here, so do not rewrite or delete those pages and files; ask a person to copy the domain folder over (or restore it) and sync, or to run the sync with --accept-disk if the files are gone for good. Answer review threads in plain words - the people reading them may not see engrams. Answer a person's thread and leave it open. The person who opened it resolves it. A thread item carries the label of its opening comment and whether it blocks: answer blocking threads first; a praise needs no answer unless it asks something. Present every page you write with the crystalline-presentation skill (the skills tool serves it).";
 
 /// An off-structure item's hint when no Structure glob fits any page.
 pub const STRUCTURE_HINT: &str = "The pact's ## Structure bullets are read as globs, one per top-level bullet, for example - guides/*.md. None of them matches a page.";
@@ -220,6 +220,54 @@ enum Detail {
 }
 
 impl Engine {
+    /// The pages of `domain` (by path inside `reflections/`, sorted) with a
+    /// section that cites a domain fewer people may read than `domain`: the
+    /// pages the queue names with `source_too_wide`, for every source, seen
+    /// by whom or not. A source whose domain cannot be checked here is not
+    /// counted, as in the queue.
+    pub(crate) async fn too_wide_pages(&self, domain: &str) -> Result<Vec<String>> {
+        let rows = {
+            let store = self.store.lock().await;
+            let Some(id) = store.domain_id(domain).await? else {
+                return Ok(Vec::new());
+            };
+            store.list_reflections(id).await?
+        };
+        let table = self.name_table_now().await;
+        let mut covers: HashMap<String, bool> = HashMap::new();
+        let mut out = Vec::new();
+        for row in rows {
+            let mut wide = false;
+            for record in r::read_provenance(&row.content).into_values() {
+                for src in &record.sources {
+                    let Some(name) = src.domain.as_deref() else {
+                        continue;
+                    };
+                    let Some(local) = self.checkable_domain(&table, name) else {
+                        continue;
+                    };
+                    if local == domain {
+                        continue;
+                    }
+                    let covered = match covers.get(&local) {
+                        Some(covered) => *covered,
+                        None => {
+                            let covered = self.readers_cover(domain, &local).await?;
+                            covers.insert(local, covered);
+                            covered
+                        }
+                    };
+                    wide |= !covered;
+                }
+            }
+            if wide {
+                out.push(row.path);
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
     /// Every open item of one domain's Reflection, unranked, as `scope`
     /// may see them: a source in a domain it may not open is counted on its
     /// item and never named. `threads` is [`Engine::all_threads`] of the

@@ -1301,6 +1301,11 @@ pub struct Engine {
     // page's domain is refused and the queue names every such source: the
     // check fails closed instead of letting everything through.
     domain_access_unavailable: std::sync::OnceLock<String>,
+    // Where the accounts store would be, on a stack that found none when it
+    // started: no account and so no private domain existed then. Should the
+    // file appear while the stack runs, the readers are unknown again and
+    // the check fails closed until a restart installs the resolver.
+    domain_access_absent: std::sync::OnceLock<std::path::PathBuf>,
     // The servers this machine offers domains from (`crystalline connect`),
     // installed once by whoever serves this engine to its owner: the daemon at
     // start, a one-shot CLI command before it routes. Absent everywhere else
@@ -2436,6 +2441,7 @@ impl Engine {
             collab: std::sync::OnceLock::new(),
             domain_access: std::sync::OnceLock::new(),
             domain_access_unavailable: std::sync::OnceLock::new(),
+            domain_access_absent: std::sync::OnceLock::new(),
             sources: std::sync::OnceLock::new(),
             web_origin: std::sync::OnceLock::new(),
             joins: Arc::new(crate::join::Joins::default()),
@@ -2856,6 +2862,15 @@ impl Engine {
     /// nobody here knows who reads which domain. A second call is ignored.
     pub fn set_domain_access_unavailable(&self, why: String) {
         let _ = self.domain_access_unavailable.set(why);
+    }
+
+    /// Record that this stack found no accounts store at `path` when it
+    /// started: no account and no private domain exist, so every reader of
+    /// one domain reads the next. Should the file appear while the stack
+    /// runs, the readers are unknown and Reflection sources outside a page's
+    /// domain are refused until a restart. A second call is ignored.
+    pub fn set_domain_access_absent(&self, path: std::path::PathBuf) {
+        let _ = self.domain_access_absent.set(path);
     }
 
     /// Install this machine's sources. A no-op on a second call.

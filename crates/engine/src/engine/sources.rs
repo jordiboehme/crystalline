@@ -24,12 +24,15 @@ pub(crate) const HIDDEN_SOURCE_NOTE: &str = "a source in a domain you cannot ope
 /// people may read than the page's domain ([`Engine::readers_cover`]). The
 /// writer may open that domain (the refusal for one it may not comes first
 /// and is an unknown domain's), so naming the source tells it nothing new.
-pub(crate) const TOO_WIDE_REFUSAL: &str = "this source is in a domain fewer people may read than this page's domain; cite it from a page in that domain instead";
+/// It asks for the text to go too: the rule sees only the sources a write
+/// names, so a writer that drops the source and keeps what it drew from it
+/// is not caught.
+pub(crate) const TOO_WIDE_REFUSAL: &str = "this source is in a domain fewer people may read than this page's domain; leave out the source and every sentence drawn from it, since the check sees only named sources, or write that text on a page in that domain instead";
 
 /// What a write is refused with when it names a source in another domain
 /// on a stack that could not open its accounts store: who reads which
 /// domain is unknown there, so the check fails closed.
-pub(crate) const UNKNOWN_READERS_REFUSAL: &str = "who may read each domain is unknown here because the accounts store could not be opened, so a source outside this page's domain is refused until it opens; remove that source and the text drawn from it, or try again once the accounts store is back";
+pub(crate) const UNKNOWN_READERS_REFUSAL: &str = "who may read each domain is unknown here because the accounts store could not be read, so a source outside this page's domain is refused until it can; remove that source and the text drawn from it, or try again once the accounts store is back";
 
 /// What a `source_too_wide` item says to a caller who may open every
 /// domain the item is about.
@@ -196,7 +199,7 @@ impl Engine {
     /// The registered local domain a stored source domain names, when it can
     /// be checked here: a name that resolves to a domain this instance
     /// registered and a connected server does not hide.
-    fn checkable_domain(&self, table: &NameTable, name: &str) -> Option<String> {
+    pub(super) fn checkable_domain(&self, table: &NameTable, name: &str) -> Option<String> {
         let local = table.resolve(name)?;
         (self.knows_domain(local) && !self.shadowed_domains().contains(local))
             .then(|| local.to_string())
@@ -220,7 +223,7 @@ impl Engine {
         let Some(access) = self.domain_access.get() else {
             // Failed closed: a stack that could not open its accounts store
             // knows no reader, so no other domain is covered.
-            return Ok(self.domain_access_unavailable.get().is_none());
+            return Ok(self.readers_unknown().is_none());
         };
         access
             .readers_cover(page, source)
@@ -228,52 +231,22 @@ impl Engine {
             .map_err(|e| EngineError::Internal(e.to_string()))
     }
 
-    /// The pages of `domain` (by path inside `reflections/`, sorted) with a
-    /// section that cites a domain fewer people may read than `domain`: the
-    /// pages the queue names with `source_too_wide`, for every source, seen
-    /// by whom or not. A source whose domain cannot be checked here is not
-    /// counted, as in the queue.
-    pub(crate) async fn too_wide_pages(&self, domain: &str) -> Result<Vec<String>> {
-        let rows = {
-            let store = self.store.lock().await;
-            let Some(id) = store.domain_id(domain).await? else {
-                return Ok(Vec::new());
-            };
-            store.list_reflections(id).await?
-        };
-        let table = self.name_table_now().await;
-        let mut covers: HashMap<String, bool> = HashMap::new();
-        let mut out = Vec::new();
-        for row in rows {
-            let mut wide = false;
-            for record in r::read_provenance(&row.content).into_values() {
-                for src in &record.sources {
-                    let Some(name) = src.domain.as_deref() else {
-                        continue;
-                    };
-                    let Some(local) = self.checkable_domain(&table, name) else {
-                        continue;
-                    };
-                    if local == domain {
-                        continue;
-                    }
-                    let covered = match covers.get(&local) {
-                        Some(covered) => *covered,
-                        None => {
-                            let covered = self.readers_cover(domain, &local).await?;
-                            covers.insert(local, covered);
-                            covered
-                        }
-                    };
-                    wide |= !covered;
-                }
-            }
-            if wide {
-                out.push(row.path);
-            }
+    /// Why nobody here knows who reads which domain, when that is so: no
+    /// resolver is installed, and either the accounts store could not be
+    /// opened, or none was there at the start and one is there now.
+    fn readers_unknown(&self) -> Option<String> {
+        if self.domain_access.get().is_some() {
+            return None;
         }
-        out.sort();
-        Ok(out)
+        if let Some(why) = self.domain_access_unavailable.get() {
+            return Some(why.clone());
+        }
+        self.domain_access_absent
+            .get()
+            .filter(|path| path.exists())
+            .map(|_| {
+                "the accounts store was created after this server started; restart it".to_string()
+            })
     }
 
     /// The entries of a write's `sources`, each resolved: a bare permalink
@@ -326,9 +299,7 @@ impl Engine {
             let domain = if local == own {
                 None
             } else {
-                if let Some(why) = self.domain_access_unavailable.get()
-                    && self.domain_access.get().is_none()
-                {
+                if let Some(why) = self.readers_unknown() {
                     return Err(EngineError::Invalid(format!(
                         "'{name}': {UNKNOWN_READERS_REFUSAL} ({why})"
                     )));

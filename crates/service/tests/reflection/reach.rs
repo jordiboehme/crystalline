@@ -22,7 +22,7 @@ const TEAM: &str = "crystalline://harbor/team/harbor-team";
 const ROTA: &str = "crystalline://harbor/team/rota";
 
 /// What a write that cites a domain fewer people may read is refused with.
-const TOO_WIDE: &str = "this source is in a domain fewer people may read than this page's domain; cite it from a page in that domain instead";
+const TOO_WIDE: &str = "this source is in a domain fewer people may read than this page's domain; leave out the source and every sentence drawn from it, since the check sees only named sources, or write that text on a page in that domain instead";
 
 const OVERVIEW: &str = "# Overview\n\nFor people.\n\n## Team\n\nFive people.\n";
 
@@ -251,7 +251,7 @@ async fn without_the_accounts_store_every_other_domain_is_refused() {
         .unwrap_err()
         .to_string();
     assert!(
-        err.contains("the accounts store could not be opened"),
+        err.contains("the accounts store could not be read"),
         "{err}"
     );
     assert!(err.contains("the file is locked"), "{err}");
@@ -277,6 +277,28 @@ async fn without_the_accounts_store_every_other_domain_is_refused() {
     let (items, queue) = too_wide(&fx, &agent()).await;
     assert_eq!(items.len(), 1, "{queue}");
     assert_eq!(items[0]["path"], "forged.md", "{queue}");
+}
+
+/// A stack that found no accounts store at its start knows there is no
+/// account and no private domain; should the store appear while it runs,
+/// it no longer knows its readers and refuses other domains' sources.
+#[tokio::test]
+async fn an_accounts_store_that_appears_later_closes_the_check() {
+    let fx = crate::sources::crossing().await;
+    let path = fx.tmp.path().join("later-auth.db");
+    fx.engine.set_domain_access_absent(path.clone());
+    fx.engine
+        .write_reflection(&cite(&[TEAM]), &agent())
+        .await
+        .unwrap();
+    std::fs::write(&path, b"").unwrap();
+    let err = fx
+        .engine
+        .write_reflection(&cite(&[TEAM]), &agent())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("restart it"), "{err}");
 }
 
 /// A writer who may not open the source's domain is told what a domain
@@ -352,6 +374,11 @@ async fn narrowing_a_source_domain_raises_source_too_wide() {
     assert_eq!(item["path"], "overview.md", "{item}");
     assert_eq!(item["heading"], "Team", "{item}");
     assert_eq!(item["sources"][0]["domain"], "harbor", "{item}");
+    let guidance = queue["guidance"].as_str().unwrap();
+    assert!(
+        guidance.contains("source_too_wide") && guidance.contains("text drawn from it"),
+        "{guidance}"
+    );
     let note = item["note"].as_str().unwrap();
     assert!(note.contains("fewer people may read"), "{note}");
     assert!(note.contains("remove that source"), "{note}");

@@ -1659,9 +1659,11 @@ pub use crystalline_engine::machine_rename_owner;
 /// Install the private-domain resolver on a serving stack, over this
 /// machine's accounts store, and hand the store back for the HTTP surface to
 /// share. Every serving stack calls it before it answers anything: the
-/// daemon (HTTP on or off) and the embedded stdio stack. The store is opened
-/// (and created when missing, as the daemon's HTTP surface always did), so a
-/// stack knows its readers whether or not anybody signs in here.
+/// daemon (HTTP on or off), the embedded stdio stack and a one-shot tool
+/// run, so a stack knows its readers whether or not anybody signs in here.
+/// A store that is not there is not created: with no account there is no
+/// private domain, and the engine refuses other domains' sources should the
+/// file appear while it runs.
 ///
 /// Fails closed: when the store cannot be opened, the engine is told so
 /// ([`Engine::set_domain_access_unavailable`]) and then
@@ -1669,6 +1671,14 @@ pub use crystalline_engine::machine_rename_owner;
 /// one through.
 pub(crate) async fn install_domain_access(engine: &Engine) -> Option<Arc<crate::rest::AuthStore>> {
     let opened = match crystalline_core::config::web_auth_db_path() {
+        // No store yet: no account and no private domain exist, so nothing
+        // is opened (or created, which would change this machine's state
+        // from a stack that only reads it). The engine watches for the file
+        // and fails closed should it appear.
+        Ok(path) if !path.exists() => {
+            engine.set_domain_access_absent(path);
+            return None;
+        }
         Ok(path) => crate::rest::AuthStore::open(&path)
             .await
             .map_err(|e| format!("{e:#}")),
