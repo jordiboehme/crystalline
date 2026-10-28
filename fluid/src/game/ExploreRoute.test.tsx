@@ -54,7 +54,7 @@ import {
   userFixture,
 } from "../test/harness";
 import type { Director } from "./audio/director";
-import { CONNECTED_KEY, DTMF, dialNumber } from "./audio/modem";
+import { DTMF, dialNumber } from "./audio/modem";
 import { FakeAudioContext } from "./audio/testContext";
 import { primeAudio, releasePrimedAudio, takePrimedAudio } from "./launch";
 import { INVERT_KEY, type Session, type SessionOptions } from "./session";
@@ -507,9 +507,6 @@ afterEach(() => {
   sound.directors.length = 0;
   sound.contexts.length = 0;
   sound.dials.length = 0;
-  // The connecting screen shows once per tab session: every test starts a
-  // new one.
-  window.sessionStorage.clear();
 });
 
 /**
@@ -537,6 +534,11 @@ async function skipOpening(): Promise<HTMLElement> {
   const opening = await screen.findByRole("dialog", OPENING);
   fireEvent.click(opening);
   return screen.getByRole("dialog", CONNECTING);
+}
+
+/** Skips both screens of the launch: the station has its keys back. */
+async function skipLaunch() {
+  fireEvent.click(await skipOpening());
 }
 const LIFT = { name: "Choose a stop" } as const;
 
@@ -855,6 +857,7 @@ describe("ExploreRoute", () => {
     await waitFor(() => {
       expect(lastRoom()).toBe("alpha");
     });
+    await skipLaunch();
     await settle(500);
 
     await typeWord("idclev");
@@ -892,6 +895,7 @@ describe("ExploreRoute", () => {
     await waitFor(() => {
       expect(lastRoom()).toBe("alpha");
     });
+    await skipLaunch();
     await settle(500);
 
     await typeWord("idclev");
@@ -917,6 +921,7 @@ describe("ExploreRoute", () => {
     await waitFor(() => {
       expect(lastRoom()).toBe("alpha");
     });
+    await skipLaunch();
     await settle(500);
     await typeWord("idclev");
     await screen.findByRole("dialog", LEVELS);
@@ -1036,6 +1041,7 @@ describe("ExploreRoute", () => {
     await waitFor(() => {
       expect(lastRoomSpec()?.title).toBe("AIRLOCK");
     });
+    await skipLaunch();
     await settle(300);
     await act(async () => {
       window.dispatchEvent(new KeyboardEvent("keydown", { code: "KeyF" }));
@@ -1604,10 +1610,11 @@ describe("ExploreRoute", () => {
       view.unmount();
     });
 
-    // Mutation caught: the key set when the screen was skipped (a later
-    // launch in the tab would never dial in), the screen shown on every
-    // mount, or the session not held busy under it.
-    it("skips the connecting screen when the context is not running (Review Focus 5)", async () => {
+    // Mutation caught: a launch that shows nothing (a second launch in the
+    // tab, or a context still waiting for its click), a dial started on a
+    // context that does not run, or the session not held busy under the
+    // screens.
+    it("shows the opening and the connecting screen on every launch", async () => {
       gl.available = true;
       stubAudio();
       primeAudio();
@@ -1624,23 +1631,23 @@ describe("ExploreRoute", () => {
         await settle(50);
         return view;
       };
+      // Not running: both screens show, silently, and nothing is dialled.
       const first = await mountAt();
-      expect(screen.queryByRole("dialog", OPENING)).toBeNull();
-      expect(screen.queryByRole("dialog", CONNECTING)).toBeNull();
-      expect(window.sessionStorage.getItem(CONNECTED_KEY)).toBeNull();
+      expect(made.sessions.at(-1)?.busy.at(-1)).toBe(true);
+      const quiet = await skipOpening();
       expect(sound.dials).toEqual([]);
-      expect(made.sessions.at(-1)?.busy).not.toContain(true);
+      fireEvent.click(quiet);
+      expect(screen.queryByRole("dialog", CONNECTING)).toBeNull();
+      expect(made.sessions.at(-1)?.busy.at(-1)).toBe(false);
+      expect(sound.dials).toEqual([]);
       first.unmount();
 
-      // Running: the screen shows, the key is set, the session is busy
-      // and the domain's number is dialled.
+      // Running: the opening first, the session held busy and nothing
+      // dialled yet.
       ctx.deferred = false;
       ctx.state = "running";
       const second = await mountAt();
-      // The opening question first: the session is held busy under it and
-      // nothing is dialled yet.
       expect(screen.queryByRole("dialog", CONNECTING)).toBeNull();
-      expect(window.sessionStorage.getItem(CONNECTED_KEY)).toBe("1");
       expect(made.sessions.at(-1)?.busy.at(-1)).toBe(true);
       expect(sound.dials).toEqual([]);
       // Done: the connecting screen shows, still busy, and dials.
@@ -1657,13 +1664,36 @@ describe("ExploreRoute", () => {
       expect(made.sessions.at(-1)?.busy.at(-1)).toBe(false);
       second.unmount();
 
-      // Again in the same tab session: neither screen.
+      // Again in the same tab: the opening shows again and dials again.
       ctx.state = "running";
       const third = await mountAt();
-      expect(screen.queryByRole("dialog", OPENING)).toBeNull();
-      expect(screen.queryByRole("dialog", CONNECTING)).toBeNull();
-      expect(sound.dials).toHaveLength(1);
+      await skipOpening();
+      expect(sound.dials.map((d) => d.number)).toEqual([
+        dialNumber("eng"),
+        dialNumber("eng"),
+      ]);
       third.unmount();
+    });
+
+    // Mutation caught: a remount that shows the screens a second time or
+    // drops the phase the first mount was in, with the context silent.
+    it("shows the screens once under StrictMode, also when the context does not run", async () => {
+      gl.available = true;
+      stubAudio();
+      primeAudio();
+      const ctx = sound.contexts[0]!;
+      ctx.state = "suspended";
+      ctx.deferred = true;
+      serve();
+      const view = renderAt("/%CF%80", true);
+      await screen.findByRole("dialog", OPENING);
+      await settle(50);
+      expect(screen.getAllByRole("dialog", OPENING)).toHaveLength(1);
+      expect(made.sessions.at(-1)?.busy.at(-1)).toBe(true);
+      await skipOpening();
+      expect(screen.getAllByRole("dialog", CONNECTING)).toHaveLength(1);
+      expect(sound.dials).toEqual([]);
+      view.unmount();
     });
 
     // Mutation caught: the input taking a key the opening screen
@@ -1819,6 +1849,7 @@ describe("ExploreRoute", () => {
       await waitFor(() => {
         expect(stream.subs).toHaveLength(1);
       });
+      await skipLaunch();
       const sub = stream.subs[0]!;
       expect(sub.options?.identity).toBeDefined();
       const onCarrier = sub.options?.onCarrier;

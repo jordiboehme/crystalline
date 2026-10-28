@@ -43,9 +43,6 @@ export const HANDSHAKE_MS = 5000;
 /** The quiet time after a NO CARRIER that played (M4 C27). */
 export const CARRIER_QUIET_MS = 60_000;
 
-/** Where the tab remembers that the station dialled in (M4 C26). */
-export const CONNECTED_KEY = "station.connected";
-
 /** A key's tones: on, then off before the next key. */
 const KEY_ON_S = 0.09;
 const KEY_OFF_S = 0.07;
