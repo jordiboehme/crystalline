@@ -1371,7 +1371,10 @@ pub async fn sync_now(
                    also carry `note`, one or two sentences to show as given \
                    that say how the share will go: it opens a proposal if \
                    the branch refuses it again, or it opens a proposal \
-                   because your proposal is still open. A generated folder listing (`index.md`) is a change \
+                   because your proposal is still open. When the share \
+                   would add the team marker (`team: github`) to the \
+                   MANIFEST, the plan carries `team_marker`, `{ path, \
+                   reason }`, beside the change list. A generated folder listing (`index.md`) is a change \
                    like any other here, because a share really carries it, but \
                    it is derived rather than written and is left out of the \
                    domain's `local_changes` count: a renderer counts these \
@@ -1615,6 +1618,9 @@ pub struct ShareBody {
                    one with `as_proposal: true` or after a refusal stacks \
                    on it or amends it. A `proposal` that names no open \
                    proposal of that login on a direct domain is a 422. \
+                   A share that added the team marker (`team: github`) to \
+                   the MANIFEST carries `team_marker`, `{ path, reason }`, \
+                   and its pull request body or commit message says why. \
                    Refused on a read-only instance.",
     params(("domain" = String, Path, description = "The registered team domain.")),
     request_body = ShareBody,

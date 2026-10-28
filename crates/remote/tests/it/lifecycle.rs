@@ -2017,6 +2017,48 @@ async fn the_commit_message_is_the_title_alone_or_title_blank_line_description()
     );
 }
 
+/// A note the caller adds ends the commit message, after the description or
+/// on its own after the title.
+#[tokio::test]
+async fn a_note_ends_the_commit_message() {
+    let mock = MockProvider::new();
+    let (sub, _) = direct_domain(&mock).await;
+    let first = committed(
+        share_direct(
+            &mock,
+            &sub,
+            ShareOptions {
+                title: Some("More"),
+                description: Some("Why it matters."),
+                note: Some("A note."),
+                ..direct()
+            },
+        )
+        .await,
+    );
+    assert_eq!(
+        mock.commit_message(&first.sha).as_deref(),
+        Some("More\n\nWhy it matters.\n\nA note.")
+    );
+    write(&sub.domain_root.join("notes/more.md"), b"more\n");
+    let second = committed(
+        share_direct(
+            &mock,
+            &sub,
+            ShareOptions {
+                title: Some("Again"),
+                note: Some("A note."),
+                ..direct()
+            },
+        )
+        .await,
+    );
+    assert_eq!(
+        mock.commit_message(&second.sha).as_deref(),
+        Some("Again\n\nA note.")
+    );
+}
+
 #[tokio::test]
 async fn an_open_proposal_refuses_a_direct_share_and_writes_nothing() {
     let mock = MockProvider::new();

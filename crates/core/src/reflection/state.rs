@@ -23,7 +23,10 @@ pub enum ReflectionState {
         /// The domain-relative paths of the engrams that wait to move out.
         engrams: Vec<String>,
     },
-    /// Switched on for a GitHub-connected domain with no `reflection_home`.
+    /// Switched on for a GitHub-connected domain with no `reflection_home`,
+    /// or for a team domain (its MANIFEST carries the `team` marker) that
+    /// is not connected on this instance: either way its home, the team
+    /// server, is not here and has not been filled in.
     Homeless,
     /// Switched on, and its home is another instance.
     Elsewhere {

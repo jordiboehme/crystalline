@@ -19,6 +19,15 @@ inputs:
     description: 'Promote every rule whose default severity is Warning to Error.'
     required: false
     default: 'false'
+  team-repository:
+    description: >-
+      Also run the team repository rules (crystalline verify
+      --team-repository, release 0.30.0 or newer): a Reflection switched on
+      without a home (M011) and files under reflections/ while Reflection is
+      on (M012) fail the run, and a MANIFEST without `team: github` (M109)
+      is a warning. Set it to true in the repository of a team domain.
+    required: false
+    default: 'false'
   comment:
     description: 'Post or update a single summary comment on the pull request.'
     required: false
@@ -134,17 +143,21 @@ runs:
         CRYSTALLINE_BIN: ${{ steps.extract.outputs.bin }}
         WORKDIR: ${{ steps.download.outputs.workdir }}
         STRICT: ${{ inputs.strict }}
+        TEAM_REPOSITORY: ${{ inputs.team-repository }}
         PATHS: ${{ inputs.paths }}
       run: |
         set +e
         read -r -d '' -a paths <<< "$PATHS"
-        strict_flag=()
+        flags=()
         if [ "$STRICT" = "true" ]; then
-          strict_flag=(--strict)
+          flags+=(--strict)
         fi
-        "$CRYSTALLINE_BIN" verify "${paths[@]}" "${strict_flag[@]}" --format github
+        if [ "$TEAM_REPOSITORY" = "true" ]; then
+          flags+=(--team-repository)
+        fi
+        "$CRYSTALLINE_BIN" verify "${paths[@]}" "${flags[@]}" --format github
         code=$?
-        "$CRYSTALLINE_BIN" verify "${paths[@]}" "${strict_flag[@]}" --format json > "$WORKDIR/crystalline-verify.json"
+        "$CRYSTALLINE_BIN" verify "${paths[@]}" "${flags[@]}" --format json > "$WORKDIR/crystalline-verify.json"
         echo "exit-code=$code" >> "$GITHUB_OUTPUT"
       continue-on-error: true
 

@@ -969,6 +969,67 @@ fn both_recognized_read_only_values_are_clean() {
     }
 }
 
+// --- The team marker (M010) --------------------------------------------------
+
+fn manifest_declaring_team(value: &str) -> String {
+    format!(
+        "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\nteam: {value}\n---\n\n## Scope\n\n- Charts of the harbor\n\n## When to Use\n\n- When asked about the harbor\n"
+    )
+}
+
+#[test]
+fn an_unrecognized_team_value_is_m010_error() {
+    let dir = tempdir().unwrap();
+    write(
+        dir.path(),
+        "MANIFEST.md",
+        &manifest_declaring_team("gitlab"),
+    );
+    let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+    let m010 = report
+        .issues
+        .iter()
+        .find(|i| i.rule == "M010")
+        .expect("M010 present");
+    assert_eq!(m010.severity, Severity::Error);
+    assert_eq!(m010.message, "`team: gitlab` is not `github`");
+    assert_eq!(
+        m010.fix.as_deref(),
+        Some(
+            "read as absent, so this domain is not treated as a team domain; write `team: github`, or remove the line and the next share from an instance connected to the domain adds it"
+        )
+    );
+    assert_eq!(report.exit_code(), 1);
+}
+
+#[test]
+fn the_github_team_marker_and_an_absent_one_are_clean() {
+    let dir = tempdir().unwrap();
+    write(
+        dir.path(),
+        "MANIFEST.md",
+        &manifest_declaring_team("github"),
+    );
+    let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+    assert!(
+        !report.issues.iter().any(|i| i.rule == "M010"),
+        "{:?}",
+        report.issues
+    );
+    let dir = tempdir().unwrap();
+    write(
+        dir.path(),
+        "MANIFEST.md",
+        &manifest_declaring_read_only("off"),
+    );
+    let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+    assert!(
+        !report.issues.iter().any(|i| i.rule == "M010"),
+        "{:?}",
+        report.issues
+    );
+}
+
 /// The MANIFEST issue 91 left behind: `## When to Use` twice, the first one
 /// empty, which is the one routing reads.
 const DOUBLED_MANIFEST: &str = "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n## Scope\n\n- Facts about the solar system\n\n## When to Use\n\n## When to Use\n\n- When asked about moons or planets\n";
@@ -1374,4 +1435,320 @@ fn a_file_that_is_not_utf8_is_an_e006_error_and_the_scan_goes_on() {
     assert!(e006.message.contains("not valid UTF-8"), "{}", e006.message);
     assert_eq!(e006.line, Some(11));
     assert_eq!(report.summary.files_scanned, 2);
+}
+
+// --- Team repository rules (M011, M012, M109) --------------------------------
+
+fn team_manifest(lines: &str) -> String {
+    format!(
+        "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\n{lines}---\n\n## Scope\n\n- Charts of the harbor\n\n## When to Use\n\n- When asked about the harbor\n"
+    )
+}
+
+fn team_options() -> VerifyOptions {
+    VerifyOptions {
+        team_repository: true,
+        ..VerifyOptions::default()
+    }
+}
+
+fn rules_of(report: &verify::VerifyReport, rule: &str) -> Vec<verify::Issue> {
+    report
+        .issues
+        .iter()
+        .filter(|i| i.rule == rule)
+        .cloned()
+        .collect()
+}
+
+const M012_WHY: &str = "In a team repository the Reflection lives only at its home, the team server, and is backed up to the crystalline/reflections branch, never to the shared branch. Its pages and threads can hold comments from people who may not read the engrams. Remove these files from this branch, and switch Reflection on at the team server in the domain policies instead.";
+
+#[test]
+fn plain_verify_runs_no_team_repository_rule() {
+    let dir = tempdir().unwrap();
+    write(
+        dir.path(),
+        "MANIFEST.md",
+        &team_manifest("reflection: on\n"),
+    );
+    write(dir.path(), "reflections/page.md", "# Page\n");
+    let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+    for rule in ["M011", "M012", "M109"] {
+        assert!(
+            rules_of(&report, rule).is_empty(),
+            "{rule}: {:#?}",
+            report.issues
+        );
+    }
+}
+
+#[test]
+fn reflection_on_without_a_home_is_m011_in_a_team_repository() {
+    let dir = tempdir().unwrap();
+    write(
+        dir.path(),
+        "MANIFEST.md",
+        &team_manifest("team: github\nreflection: on\n"),
+    );
+    let report = verify::verify_paths([dir.path()], &team_options()).unwrap();
+    let m011 = rules_of(&report, "M011");
+    assert_eq!(m011.len(), 1, "{:#?}", report.issues);
+    assert_eq!(m011[0].severity, Severity::Error);
+    assert!(m011[0].path.ends_with("MANIFEST.md"));
+    assert_eq!(
+        m011[0].message,
+        "The MANIFEST says `reflection: on` and has no `reflection_home`. In a team repository the Reflection lives only at its home, the team server, which fills in `reflection_home` when Reflection is switched on there. Without a home, any clone of this repository can keep its own Reflection and push its pages and threads to the shared branch. Set `reflection` back to `off`, or switch Reflection on at the team server in the domain policies, so the home is filled in."
+    );
+    assert_eq!(m011[0].fix, None, "the message says what to do");
+    assert_eq!(report.exit_code(), 1);
+}
+
+#[test]
+fn a_home_that_is_not_a_server_address_is_m011_too() {
+    let dir = tempdir().unwrap();
+    write(
+        dir.path(),
+        "MANIFEST.md",
+        &team_manifest("team: github\nreflection: on\nreflection_home: team.example.com\n"),
+    );
+    let report = verify::verify_paths([dir.path()], &team_options()).unwrap();
+    let m011 = rules_of(&report, "M011");
+    assert_eq!(m011.len(), 1, "{:#?}", report.issues);
+    assert!(
+        m011[0].message.starts_with(
+            "The MANIFEST says `reflection: on`, and its `reflection_home` cannot be a home: `team.example.com` is not a server address"
+        ),
+        "{}",
+        m011[0].message
+    );
+
+    let dir = tempdir().unwrap();
+    write(
+        dir.path(),
+        "MANIFEST.md",
+        &team_manifest("team: github\nreflection: on\nreflection_home: https://team.example.com\n"),
+    );
+    let report = verify::verify_paths([dir.path()], &team_options()).unwrap();
+    assert!(rules_of(&report, "M011").is_empty(), "{:#?}", report.issues);
+}
+
+#[test]
+fn files_under_reflections_while_reflection_is_on_are_one_m012() {
+    let dir = tempdir().unwrap();
+    write(
+        dir.path(),
+        "MANIFEST.md",
+        &team_manifest("team: github\nreflection: on\nreflection_home: https://team.example.com\n"),
+    );
+    write(dir.path(), "reflections/PACT.md", "# Pact\n");
+    write(dir.path(), "reflections/guides/setup.md", "# Setup\n");
+    write(dir.path(), "reflections/assets/deck.png", "png");
+    write(
+        dir.path(),
+        "reflections/.reflected/guides/setup.md",
+        "# Setup\n",
+    );
+    let report = verify::verify_paths([dir.path()], &team_options()).unwrap();
+    let m012 = rules_of(&report, "M012");
+    assert_eq!(
+        m012.len(),
+        1,
+        "one finding for the folder: {:#?}",
+        report.issues
+    );
+    assert_eq!(m012[0].severity, Severity::Error);
+    assert!(
+        m012[0]
+            .path
+            .ends_with("reflections/.reflected/guides/setup.md"),
+        "the annotation points at the first file: {:?}",
+        m012[0].path
+    );
+    assert_eq!(
+        m012[0].message,
+        format!(
+            "The MANIFEST says `reflection: on`, and this branch holds 4 files under reflections/: reflections/.reflected/guides/setup.md, reflections/PACT.md, reflections/assets/deck.png, reflections/guides/setup.md. {M012_WHY}"
+        )
+    );
+    assert_eq!(report.exit_code(), 1);
+}
+
+#[test]
+fn m012_reads_the_folder_in_any_letter_case_and_caps_the_list() {
+    let dir = tempdir().unwrap();
+    write(
+        dir.path(),
+        "MANIFEST.md",
+        &team_manifest("team: github\nreflection: on\nreflection_home: https://team.example.com\n"),
+    );
+    for n in 0..25 {
+        write(
+            dir.path(),
+            &format!("Reflections/page-{n:02}.md"),
+            "# Page\n",
+        );
+    }
+    let report = verify::verify_paths([dir.path()], &team_options()).unwrap();
+    let m012 = rules_of(&report, "M012");
+    assert_eq!(m012.len(), 1, "{:#?}", report.issues);
+    let message = &m012[0].message;
+    assert!(
+        message.starts_with(
+            "The MANIFEST says `reflection: on`, and this branch holds 25 files under reflections/: Reflections/page-00.md, "
+        ),
+        "{message}"
+    );
+    assert!(
+        message.contains("Reflections/page-19.md and 5 more. In a team repository"),
+        "{message}"
+    );
+    assert!(!message.contains("page-20"), "{message}");
+}
+
+#[test]
+fn with_reflection_off_the_reflections_folder_is_ordinary_content() {
+    let dir = tempdir().unwrap();
+    write(dir.path(), "MANIFEST.md", &team_manifest("team: github\n"));
+    write(
+        dir.path(),
+        "reflections/notes.md",
+        "---\ntype: engram\ntitle: Notes\npermalink: reflections/notes\ntags:\n- harbor\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\n---\n\n# Notes\n\nTide tables for the harbor.\n",
+    );
+    let report = verify::verify_paths([dir.path()], &team_options()).unwrap();
+    for rule in ["M011", "M012", "M109"] {
+        assert!(
+            rules_of(&report, rule).is_empty(),
+            "{rule}: {:#?}",
+            report.issues
+        );
+    }
+}
+
+#[test]
+fn a_missing_team_marker_is_an_m109_warning() {
+    let dir = tempdir().unwrap();
+    write(dir.path(), "MANIFEST.md", &team_manifest(""));
+    let report = verify::verify_paths([dir.path()], &team_options()).unwrap();
+    let m109 = rules_of(&report, "M109");
+    assert_eq!(m109.len(), 1, "{:#?}", report.issues);
+    assert_eq!(m109[0].severity, Severity::Warning);
+    assert_eq!(
+        m109[0].message,
+        "The MANIFEST has no `team: github` line. The line marks this repository as a team domain, so Crystalline refuses to switch Reflection on in a clone that is not connected to the team. Share once from an instance connected to the domain: the share adds the line. On a domain that reviews changes, the share's proposal adds it, and the line arrives here when the team merges that proposal."
+    );
+    assert_eq!(report.exit_code(), 0, "a warning alone does not fail");
+
+    let strict = VerifyOptions {
+        strict: true,
+        ..team_options()
+    };
+    let report = verify::verify_paths([dir.path()], &strict).unwrap();
+    assert_eq!(rules_of(&report, "M109")[0].severity, Severity::Error);
+
+    // An unknown value marks nothing, so in a team repository it is a
+    // missing marker too, beside M010's error about the value itself.
+    let dir = tempdir().unwrap();
+    write(dir.path(), "MANIFEST.md", &team_manifest("team: GitHub\n"));
+    let report = verify::verify_paths([dir.path()], &team_options()).unwrap();
+    let m109 = rules_of(&report, "M109");
+    assert_eq!(m109.len(), 1, "{:#?}", report.issues);
+    assert_eq!(
+        m109[0].message,
+        "The MANIFEST says `team: GitHub`, and only `team: github` marks this repository as a team domain, so Crystalline refuses to switch Reflection on in a clone that is not connected to the team. Write `team: github` instead."
+    );
+    assert_eq!(rules_of(&report, "M010").len(), 1);
+}
+
+/// A pull request cannot disarm the marker by misspelling it and turning
+/// M010 off in the same change: in a team repository M010 ignores the
+/// domain's settings like the team rules do, and M109 still warns. Plain
+/// verify keeps honouring the override.
+#[test]
+fn a_misspelled_marker_cannot_be_silenced_in_a_team_repository() {
+    let dir = tempdir().unwrap();
+    write(dir.path(), "MANIFEST.md", &team_manifest("team: GitHub\n"));
+    write(
+        dir.path(),
+        ".crystalline.yaml",
+        "verify:\n  rules:\n    M010: off\n",
+    );
+    let report = verify::verify_paths([dir.path()], &team_options()).unwrap();
+    let m010 = rules_of(&report, "M010");
+    assert_eq!(m010.len(), 1, "{:#?}", report.issues);
+    assert_eq!(m010[0].severity, Severity::Error);
+    assert_eq!(rules_of(&report, "M109").len(), 1, "{:#?}", report.issues);
+    assert_eq!(report.exit_code(), 1);
+
+    let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+    assert!(rules_of(&report, "M010").is_empty(), "{:#?}", report.issues);
+}
+
+/// The guard cannot be switched off from inside the repository it guards:
+/// a `.crystalline.yaml` in the same pull request could otherwise set the
+/// rules `off`.
+#[test]
+fn the_domains_own_settings_cannot_turn_the_team_rules_off() {
+    let dir = tempdir().unwrap();
+    write(
+        dir.path(),
+        "MANIFEST.md",
+        &team_manifest("reflection: on\n"),
+    );
+    write(dir.path(), "reflections/page.md", "# Page\n");
+    write(
+        dir.path(),
+        ".crystalline.yaml",
+        "verify:\n  rules:\n    M011: off\n    M012: info\n    M109: off\n",
+    );
+    let report = verify::verify_paths([dir.path()], &team_options()).unwrap();
+    assert_eq!(rules_of(&report, "M011")[0].severity, Severity::Error);
+    assert_eq!(rules_of(&report, "M012")[0].severity, Severity::Error);
+    assert_eq!(rules_of(&report, "M109")[0].severity, Severity::Warning);
+}
+
+/// A link counts as present under `reflections/`, whatever it points at, and
+/// so does a `reflections` folder that is itself a link: git keeps links as
+/// they are, so a pushed link is a pushed Reflection path either way.
+#[cfg(unix)]
+#[test]
+fn m012_counts_links_under_the_folder_and_a_linked_folder() {
+    let dir = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    write(outside.path(), "page.md", "# Page\n");
+    let manifest =
+        team_manifest("team: github\nreflection: on\nreflection_home: https://team.example.com\n");
+
+    let root = dir.path().join("linked-files");
+    write(&root, "MANIFEST.md", &manifest);
+    write(&root, "reflections/PACT.md", "# Pact\n");
+    std::os::unix::fs::symlink(
+        outside.path().join("page.md"),
+        root.join("reflections/page.md"),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(outside.path(), root.join("reflections/elsewhere")).unwrap();
+    let report = verify::verify_paths([&root], &team_options()).unwrap();
+    let m012 = rules_of(&report, "M012");
+    assert_eq!(m012.len(), 1, "{:#?}", report.issues);
+    assert!(
+        m012[0].message.contains(
+            "holds 3 files under reflections/: reflections/PACT.md, reflections/elsewhere, reflections/page.md."
+        ),
+        "{}",
+        m012[0].message
+    );
+
+    let root = dir.path().join("linked-folder");
+    write(&root, "MANIFEST.md", &manifest);
+    std::os::unix::fs::symlink(outside.path(), root.join("reflections")).unwrap();
+    let report = verify::verify_paths([&root], &team_options()).unwrap();
+    let m012 = rules_of(&report, "M012");
+    assert_eq!(m012.len(), 1, "{:#?}", report.issues);
+    assert!(
+        m012[0]
+            .message
+            .contains("holds 1 file under reflections/: reflections."),
+        "{}",
+        m012[0].message
+    );
 }

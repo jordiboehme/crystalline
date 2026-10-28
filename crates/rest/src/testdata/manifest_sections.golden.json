@@ -102,6 +102,16 @@
           "off",
           "webhook"
         ]
+      },
+      {
+        "changed_by": "owner",
+        "declared": null,
+        "default": "",
+        "effective": "",
+        "key": "team",
+        "kind": "text",
+        "meaning": "Marks a team domain shared through GitHub; its Reflection is switched on only at the team server.",
+        "values": []
       }
     ],
     "provisioning": null,
@@ -235,6 +245,16 @@
           "off",
           "webhook"
         ]
+      },
+      {
+        "changed_by": "owner",
+        "declared": null,
+        "default": "",
+        "effective": "",
+        "key": "team",
+        "kind": "text",
+        "meaning": "Marks a team domain shared through GitHub; its Reflection is switched on only at the team server.",
+        "values": []
       }
     ],
     "provisioning": {
@@ -425,6 +445,16 @@
           "off",
           "webhook"
         ]
+      },
+      {
+        "changed_by": "owner",
+        "declared": null,
+        "default": "",
+        "effective": "",
+        "key": "team",
+        "kind": "text",
+        "meaning": "Marks a team domain shared through GitHub; its Reflection is switched on only at the team server.",
+        "values": []
       }
     ],
     "provisioning": {
@@ -595,6 +625,16 @@
           "off",
           "webhook"
         ]
+      },
+      {
+        "changed_by": "owner",
+        "declared": null,
+        "default": "",
+        "effective": "",
+        "key": "team",
+        "kind": "text",
+        "meaning": "Marks a team domain shared through GitHub; its Reflection is switched on only at the team server.",
+        "values": []
       }
     ],
     "provisioning": null,

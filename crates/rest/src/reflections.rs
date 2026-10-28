@@ -18,7 +18,7 @@ use crate::engine::{
     ANONYMOUS_COMMENT, ASSET_EXISTS, EngineError, MOVE_ONTO_A_FILE, REFUSED_ELSEWHERE_START,
     REFUSED_HOMELESS, REFUSED_HOSTED_START, REFUSED_OFF_START, REFUSED_PENDING,
     REFUSED_PENDING_NAMED, REFUSED_PENDING_SPELLINGS, REFUSED_PENDING_UNOPENED,
-    REFUSED_PENDING_UNREADABLE, ReflectionSearch, TARGET_TAKEN,
+    REFUSED_PENDING_UNREADABLE, REFUSED_UNCONNECTED_TEAM, ReflectionSearch, TARGET_TAKEN,
 };
 use crate::files::{AttachmentView, attachment_response};
 use crate::params::{DiscussParams, WriteReflectionParams};
@@ -85,7 +85,8 @@ pub(crate) fn reflection_error(e: EngineError) -> ApiError {
                 || text.contains(REFUSED_PENDING_UNREADABLE)
                 || text.contains(REFUSED_PENDING_UNOPENED)
                 || text.contains(REFUSED_PENDING_SPELLINGS)
-                || text == REFUSED_HOMELESS =>
+                || text == REFUSED_HOMELESS
+                || text.contains(REFUSED_UNCONNECTED_TEAM) =>
         {
             ApiError::conflict(text.clone())
         }
@@ -1760,7 +1761,7 @@ mod tests {
         );
     }
 
-    /// The five "not here" states are 409, and only the elsewhere one names
+    /// The "not here" states are 409, and only the elsewhere one names
     /// the home.
     #[test]
     fn the_reflection_states_are_conflicts_and_elsewhere_names_its_home() {
@@ -1780,6 +1781,9 @@ mod tests {
             format!("Reflection for 'eng' {REFUSED_PENDING_UNOPENED}: reflections/y.md"),
             format!("Reflection for 'eng' {REFUSED_PENDING_SPELLINGS}: Reflections/, reflections/"),
             REFUSED_HOMELESS.to_string(),
+            format!(
+                "'eng' {REFUSED_UNCONNECTED_TEAM}. A team domain's Reflection lives only at its home"
+            ),
             format!("{REFUSED_HOSTED_START}alpha; move it with crystalline serve --take-over"),
         ] {
             let e = reflection_error(EngineError::Refused(text.clone()));

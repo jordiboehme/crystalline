@@ -829,7 +829,9 @@ const KB_MANIFEST: &[u8] = b"---\ntype: manifest\ntitle: kb\npermalink: manifest
 
 /// The same MANIFEST declaring `sharing: direct`, so a share of this domain
 /// commits straight onto the connected branch.
-const KB_MANIFEST_DIRECT: &[u8] = b"---\ntype: manifest\ntitle: kb\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\nsharing: direct\n---\n\n# kb\n\n## Scope\n\n- shared knowledge\n\n## When to Use\n\n- Route here for team questions\n";
+/// Carries the team marker, as every team repository does after its first
+/// share from 0.30.0 on, so a direct share's commit message is the share's own.
+const KB_MANIFEST_DIRECT: &[u8] = b"---\ntype: manifest\ntitle: kb\nteam: github\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\nsharing: direct\n---\n\n# kb\n\n## Scope\n\n- shared knowledge\n\n## When to Use\n\n- Route here for team questions\n";
 
 /// [`serve_team_with_mock`] with this instance's share-identity mode chosen:
 /// `personal` makes a share run as the acting account's own GitHub identity,
@@ -1339,7 +1341,8 @@ async fn the_manifest_read_carries_the_policies_and_the_patch_writes_one() {
             { "key": "reflection", "kind": "choice", "declared": null, "effective": "off", "values": ["off", "on"], "default": "off", "meaning": "Whether this domain keeps a Reflection: documents for people under reflections/.", "changed_by": "owner" },
             { "key": "reflection_home", "kind": "text", "declared": null, "effective": "", "values": [], "default": "", "meaning": "The address of the one server this domain's Reflection lives on; filled in when Reflection is switched on.", "changed_by": "owner" },
             { "key": "reflect_trigger", "kind": "choice", "declared": null, "effective": "off", "values": ["off", "webhook"], "default": "off", "meaning": "Send a signed webhook when reflect work is waiting.", "changed_by": "owner" },
-            { "key": "evolve_trigger", "kind": "choice", "declared": null, "effective": "off", "values": ["off", "webhook"], "default": "off", "meaning": "Send a signed webhook when maintenance findings pile up.", "changed_by": "owner" }
+            { "key": "evolve_trigger", "kind": "choice", "declared": null, "effective": "off", "values": ["off", "webhook"], "default": "off", "meaning": "Send a signed webhook when maintenance findings pile up.", "changed_by": "owner" },
+            { "key": "team", "kind": "text", "declared": null, "effective": "", "values": [], "default": "", "meaning": "Marks a team domain shared through GitHub; its Reflection is switched on only at the team server.", "changed_by": "owner" }
         ]),
         "{body}"
     );
@@ -2058,11 +2061,16 @@ async fn a_share_carries_only_the_chosen_files_and_the_plan_names_their_authors(
     // along with it in a domain that declares `generated_indexes: shared`;
     // this one declares nothing, so the listing stays on this machine.
     assert_eq!(shared["added"], serde_json::json!(["mine.md"]), "{shared}");
+    // The file nobody ticked stays behind. This repository has no team
+    // marker yet, so the MANIFEST joins the share with that one line; the
+    // refused share above took back the line it had written, so it rides
+    // here as the only other file.
     assert_eq!(
         shared["updated"],
-        serde_json::json!([]),
-        "the file nobody ticked stays behind: {shared}"
+        serde_json::json!(["MANIFEST.md"]),
+        "{shared}"
     );
+    assert_eq!(shared["team_marker"]["path"], "MANIFEST.md", "{shared}");
 }
 
 /// The stacked half of the share route. `the_share_routes_walk_the_loop`

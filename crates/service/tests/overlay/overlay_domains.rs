@@ -36,10 +36,13 @@ use yrs::updates::decoder::{Decode, DecoderV1};
 use yrs::updates::encoder::Encode;
 use yrs::{Doc, GetString, ReadTxn, Text, Transact, Update};
 
-const MANIFEST: &str = "---\ntype: manifest\ntitle: team\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# team\n\n## Scope\n\n- The shared domain\n\n## When to Use\n\n- Route here for team work\n";
+// Both carry the team marker, as every team repository does after its first
+// share from 0.30.0 on, so a share here carries exactly the drafts a
+// scenario makes.
+const MANIFEST: &str = "---\ntype: manifest\ntitle: team\nteam: github\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# team\n\n## Scope\n\n- The shared domain\n\n## When to Use\n\n- Route here for team work\n";
 /// The same MANIFEST, declaring that a share of this domain commits straight
 /// onto the connected branch instead of opening a proposal for review.
-const MANIFEST_DIRECT: &str = "---\ntype: manifest\ntitle: team\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\nrecorded_at: 2026-01-01\nsharing: direct\n---\n\n# team\n\n## Scope\n\n- The shared domain\n\n## When to Use\n\n- Route here for team work\n";
+const MANIFEST_DIRECT: &str = "---\ntype: manifest\ntitle: team\nteam: github\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\nrecorded_at: 2026-01-01\nsharing: direct\n---\n\n# team\n\n## Scope\n\n- The shared domain\n\n## When to Use\n\n- Route here for team work\n";
 /// The base engram: what the domain's files on disk say exists.
 const PLAN: &str = "---\ntype: engram\ntitle: Plan\npermalink: plan\ntags:\n  - team\nstatus: stable\nrecorded_at: 2026-01-02\n---\n\n# Plan\n\n- [decision] the plan as the team has it #team\n";
 /// Alice's draft of the same path: her private rewrite of it.
@@ -1760,7 +1763,12 @@ async fn a_domain_that_reviews_nothing_can_still_fold_the_drafts_it_holds() {
 #[tokio::test]
 async fn folding_a_draft_that_switches_reflection_on_seeds_the_pact() {
     let f = review_fixture().await;
-    let on = MANIFEST.replace("status: stable\n", "status: stable\nreflection: on\n");
+    // This fixture's domain has no origin, so a MANIFEST that kept the team
+    // marker would be a stray clone whose Reflection is refused; the draft
+    // drops it to stay the local domain the scenario is about.
+    let on = MANIFEST
+        .replace("team: github\n", "")
+        .replace("status: stable\n", "status: stable\nreflection: on\n");
     f.draft("team", "alice", "MANIFEST.md", &on).await;
     let mut rx = f.engine.changes().subscribe();
     f.engine

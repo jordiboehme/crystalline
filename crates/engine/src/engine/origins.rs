@@ -1,5 +1,35 @@
 use super::*;
 
+/// The MANIFEST's path in a domain and in every share of it.
+const MANIFEST_PATH: &str = "MANIFEST.md";
+
+/// Why the MANIFEST rides along on a share that adds the team marker, as
+/// the share receipt and the preview name it beside the path.
+pub const TEAM_MARKER_REASON: &str = "marks this repository as a team domain; added once";
+
+/// The line a share that adds the team marker ends its pull request body or
+/// commit message with, so a reviewer reads why the MANIFEST changed.
+const TEAM_MARKER_NOTE: &str = "MANIFEST.md gains `team: github`. Crystalline added it: it marks this repository as a team domain, and it is added once.";
+
+/// What the team marker does for one share: the MANIFEST text the share
+/// carries, and the file list it goes on with when the marker joined a
+/// narrowed one.
+struct TeamMarker {
+    /// The MANIFEST text before the marker, for a share that ends up
+    /// sharing nothing and takes the marker back out of the folder.
+    current: String,
+    /// Whether the marker was written into the folder (a domain that takes
+    /// changes directly) rather than into a staged tree.
+    in_folder: bool,
+    marked: String,
+    files: Option<Vec<String>>,
+}
+
+/// The receipt and preview entry for a share that carries the team marker.
+fn team_marker_json() -> Value {
+    json!({ "path": MANIFEST_PATH, "reason": TEAM_MARKER_REASON })
+}
+
 impl Engine {
     // --- origin (GitHub collaboration) ----------------------------------------
 
@@ -383,6 +413,126 @@ impl Engine {
         self.append_name_fields(&mut result, &domain_name).await?;
         self.note_beside_mounts(&mut result, &wanted, &domain_name, scope);
         Ok(result)
+    }
+
+    /// Whether the share of `files` (`None` is the whole unshared delta) out
+    /// of the tree at `tree` carries the team marker
+    /// ([`crystalline_core::TEAM_KEY`]), and if so the MANIFEST text it
+    /// carries and the file list it goes on with. `tree` is the folder for a
+    /// domain that takes changes directly, and the staged tree of the
+    /// actor's drafts for one that reviews changes. Reads only: the share
+    /// writes what this answers, and the preview reports it.
+    ///
+    /// The share, not the connect, is the one place every connected instance
+    /// passes through on its way to the team, existing connections included.
+    /// A connect never writes into the team's MANIFEST (a fresh connect has
+    /// no local change, and review mode needs exactly that clean folder to
+    /// start), and a write on every pull would be a local change nobody made
+    /// that comes back after every discard. At the share, the marker and the
+    /// share are one act, the receipt, the preview and the pull request body
+    /// say so, and on a domain that reviews changes it goes through the
+    /// review like any other line:
+    ///
+    /// - a share of everything carries it when there is something else to
+    ///   share, so pressing share with nothing to share stays a no-op;
+    /// - a narrowed share carries it when the list names the MANIFEST, and
+    ///   when the MANIFEST holds no other unshared change, in which case the
+    ///   MANIFEST joins the list and exactly one line rides along; a MANIFEST
+    ///   with unshared edits that were not chosen is left for a share that
+    ///   includes it.
+    ///
+    /// Nothing is carried from a read-only instance or domain, from a
+    /// MANIFEST that already declares a `team` (an unknown value is left for
+    /// its owner: verify reports it as `M010`, and a newer release may know
+    /// it) or from a frontmatter the marker cannot be cut into.
+    async fn plan_team_marker(
+        &self,
+        domain: &str,
+        tree: &Path,
+        state_dir: &Path,
+        files: Option<&[String]>,
+    ) -> Result<Option<TeamMarker>> {
+        if self.read_only || self.domain_is_read_only(domain).await {
+            return Ok(None);
+        }
+        let Ok(current) = std::fs::read_to_string(tree.join(MANIFEST_PATH)) else {
+            return Ok(None);
+        };
+        let current = crystalline_core::to_lf(&current);
+        let declares_team = crystalline_core::parse_engram(&current)
+            .map(|e| {
+                crystalline_core::Manifest::from_engram(&e, &current)
+                    .declared_team()
+                    .is_some()
+            })
+            .unwrap_or(true);
+        let marked =
+            crystalline_core::set_team_marker(&current, crystalline_core::TeamForge::GitHub);
+        if declares_team || marked == current {
+            return Ok(None);
+        }
+        let Some(state) = crystalline_remote::state::OriginState::load(state_dir)? else {
+            return Ok(None);
+        };
+        let local = crystalline_remote::changes::detect_local_changes_against(
+            tree,
+            &ops::unshared_base(&state),
+            state_dir,
+            self.reflection_mode(domain).await?,
+        )?;
+        let changed: Vec<&str> = local
+            .changes
+            .iter()
+            .filter(|change| !change.is_generated_index())
+            .map(|change| change.path())
+            .collect();
+        let files = match files {
+            None if changed.is_empty() => return Ok(None),
+            None => None,
+            Some(list) if list.iter().any(|path| path == MANIFEST_PATH) => None,
+            Some(_) if changed.contains(&MANIFEST_PATH) => return Ok(None),
+            Some(list) => {
+                let mut list = list.to_vec();
+                list.push(MANIFEST_PATH.to_string());
+                Some(list)
+            }
+        };
+        Ok(Some(TeamMarker {
+            current: current.to_string(),
+            in_folder: false,
+            marked,
+            files,
+        }))
+    }
+
+    /// Write the marker [`Engine::plan_team_marker`] planned into the folder
+    /// of a domain that takes changes directly, just before its share.
+    /// Answers whether it wrote: a MANIFEST open in a co-editing room is
+    /// left to the room, and the next share tries again.
+    ///
+    /// Written as bytes, not through the edit path, so it carries no
+    /// `generated` stamp: every instance writes exactly the same line at the
+    /// same place, and a member whose share pulls the MANIFEST another
+    /// member's share already marked meets a merge with nothing to
+    /// reconcile. A stamp of its own would differ on every instance and make
+    /// that pull a conflict nobody caused.
+    async fn write_team_marker(&self, domain: &str, root: &Path, marked: &str) -> Result<bool> {
+        // The write ticket and the read-only screen, as every write has.
+        let scope = crate::scope::Scope::Unrestricted;
+        let view = DomainView::for_write(self, domain, &scope).await?;
+        let (desc, _) = view.resolve("manifest").await?;
+        if let Some(rooms) = self.collab_rooms()
+            && rooms
+                .live_text(&desc.domain, &desc.permalink, None)
+                .await
+                .is_some()
+        {
+            return Ok(false);
+        }
+        write_file(&join_rel(root, &desc.path), marked)?;
+        drop(view);
+        self.sync(Some(domain)).await?;
+        Ok(true)
     }
 
     /// The branch a connect tracks: the one asked for, else the one the forge
@@ -1666,6 +1816,33 @@ impl Engine {
         }
         let (provider, login) = self.resolve_share_provider(&actor)?;
         let acting = self.personal_write_login(login.as_deref());
+        // The team marker, for a share of the folder: written into the folder
+        // before anything is detected (see `Engine::plan_team_marker`). A
+        // failure never fails the share; the marker waits for the next one.
+        let mut marker: Option<TeamMarker> = None;
+        if drafting.is_none() {
+            match self
+                .plan_team_marker(domain, &root, &state_dir, files)
+                .await
+            {
+                Ok(Some(plan)) => match self.write_team_marker(domain, &root, &plan.marked).await {
+                    Ok(true) => {
+                        marker = Some(TeamMarker {
+                            in_folder: true,
+                            ..plan
+                        })
+                    }
+                    Ok(false) => {}
+                    Err(e) => tracing::warn!(
+                        "writing the team marker of '{domain}' before a share failed: {e}"
+                    ),
+                },
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!("planning the team marker of '{domain}' failed: {e}")
+                }
+            }
+        }
         // In review mode the share is of the actor's own drafts, which are in
         // the index and on nobody's disk, so the tree `ops` detects against is
         // staged here. `None` is a domain that takes changes directly, whose
@@ -1694,6 +1871,28 @@ impl Engine {
         let detect_in = staging
             .as_ref()
             .map_or(root.as_path(), |prepared| prepared.staging.root());
+        // In review mode the marker joins the staged tree of the actor's
+        // drafts, so it goes through the review like any other line; the
+        // folder moves only when the team merges it.
+        if let Some(prepared) = staging.as_ref() {
+            let tree = prepared.staging.root();
+            match self.plan_team_marker(domain, tree, &state_dir, files).await {
+                Ok(Some(plan)) => match write_file(&tree.join(MANIFEST_PATH), &plan.marked) {
+                    Ok(()) => marker = Some(plan),
+                    Err(e) => tracing::warn!(
+                        "staging the team marker of '{domain}' for a share failed: {e}"
+                    ),
+                },
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!("planning the team marker of '{domain}' failed: {e}")
+                }
+            }
+        }
+        let files = marker
+            .as_ref()
+            .and_then(|plan| plan.files.as_deref())
+            .or(files);
         match ops::propose(
             share_provider,
             &spec,
@@ -1704,6 +1903,7 @@ impl Engine {
                 as_proposal,
                 title,
                 description,
+                note: marker.is_some().then_some(TEAM_MARKER_NOTE),
                 proposal,
                 stacks_allowed,
                 // Who the proposal record names, in either identity mode: the
@@ -1722,6 +1922,23 @@ impl Engine {
         {
             Ok(outcome) => {
                 let mut receipt = origin::propose_outcome_json(&outcome);
+                // Only an outcome that carried something to the team carried
+                // the marker; a refusal or a diverged proposal shared nothing,
+                // and the marker it wrote into the folder is taken back.
+                let shared = matches!(
+                    outcome,
+                    ops::ProposeOutcome::Proposed(_)
+                        | ops::ProposeOutcome::Updated(_)
+                        | ops::ProposeOutcome::Committed(_)
+                        | ops::ProposeOutcome::FellBack { .. }
+                );
+                if let Some(plan) = &marker {
+                    if shared {
+                        receipt["team_marker"] = team_marker_json();
+                    } else {
+                        self.take_back_team_marker(domain, &root, plan).await;
+                    }
+                }
                 // A reviewing domain's direct commit: the folder is written
                 // from the base copies the commit advanced, those paths are
                 // indexed, and the convergence pass a merged proposal's pull
@@ -1783,6 +2000,9 @@ impl Engine {
                 Ok(receipt)
             }
             Err(RemoteError::ConflictsPending { count }) => {
+                if let Some(plan) = &marker {
+                    self.take_back_team_marker(domain, &root, plan).await;
+                }
                 // The conflicts refusal is the loudest case for syncing: the
                 // pull ran, applied everything that merged cleanly and only
                 // then refused, so this shape carries the most unindexed work
@@ -1800,7 +2020,36 @@ impl Engine {
                     "conflicts": conflicts,
                 }))
             }
-            Err(e) => Err(share_write_error(e, acting.as_deref(), &spec.repo).into()),
+            Err(e) => {
+                if let Some(plan) = &marker {
+                    self.take_back_team_marker(domain, &root, plan).await;
+                }
+                Err(share_write_error(e, acting.as_deref(), &spec.repo).into())
+            }
+        }
+    }
+
+    /// Take the team marker a share wrote into the folder back out when the
+    /// share carried nothing to the team, so it never stays behind as a
+    /// local change nobody asked for. Only while the MANIFEST still holds
+    /// exactly what the marker write left: a pull or a person that changed
+    /// it since owns it now. Best effort, like the write.
+    async fn take_back_team_marker(&self, domain: &str, root: &Path, plan: &TeamMarker) {
+        if !plan.in_folder {
+            return;
+        }
+        let path = root.join(MANIFEST_PATH);
+        let unchanged = std::fs::read_to_string(&path)
+            .is_ok_and(|text| crystalline_core::to_lf(&text) == plan.marked);
+        if !unchanged {
+            return;
+        }
+        if let Err(e) = write_file(&path, &plan.current) {
+            tracing::warn!("taking the team marker of '{domain}' back failed: {e}");
+            return;
+        }
+        if let Err(e) = self.sync(Some(domain)).await {
+            tracing::warn!("indexing '{domain}' after taking the team marker back failed: {e}");
         }
     }
 
@@ -2021,6 +2270,7 @@ impl Engine {
                 as_proposal,
                 title,
                 description: None,
+                note: None,
                 proposal,
                 stacks_allowed,
                 // Carried for the same reason the provider is: a preview
@@ -2044,6 +2294,15 @@ impl Engine {
         // it rather than with a column answering a question nobody asked.
         let provenance = drafting.is_none().then_some(root.as_path());
         let mut plan = origin::share_plan_json(&plan, provenance);
+        // The marker the share would add, named beside the plan rather than
+        // in its change list: the folder does not hold it yet, and the
+        // change list is what a person ticks and discards.
+        if let Ok(Some(_)) = self
+            .plan_team_marker(domain, detect_in, &state_dir, files)
+            .await
+        {
+            plan["team_marker"] = team_marker_json();
+        }
         // The repository beside the branch, so Fluid's share dialog can say
         // where a commit goes without a second lookup.
         plan["repo"] = json!(spec.repo);

@@ -101,8 +101,20 @@ async fn engine_with_env(
     .with_env_overlay(overlay)
 }
 
+/// The team's MANIFEST, carrying the team marker as every repository does
+/// after its first share from 0.30.0 on, so a share here carries exactly the
+/// changes a scenario makes. [`manifest_unmarked`] is the repository from
+/// before.
 fn manifest() -> Vec<u8> {
-    b"---\ntype: manifest\ntitle: Team\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Team\n\n## Scope\n\n- shared knowledge\n\n## When to Use\n\n- always\n".to_vec()
+    b"---\ntype: manifest\ntitle: Team\nteam: github\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Team\n\n## Scope\n\n- shared knowledge\n\n## When to Use\n\n- always\n".to_vec()
+}
+
+/// The team's MANIFEST before 0.30.0: no team marker yet.
+fn manifest_unmarked() -> Vec<u8> {
+    String::from_utf8(manifest())
+        .unwrap()
+        .replace("team: github\n", "")
+        .into_bytes()
 }
 
 /// The same MANIFEST, declaring that this domain's generated folder listings
@@ -110,7 +122,7 @@ fn manifest() -> Vec<u8> {
 /// listing in a share has to say so, the way a real team says it once in the
 /// file all of its members hold.
 fn manifest_sharing_indexes() -> Vec<u8> {
-    b"---\ntype: manifest\ntitle: Team\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\ngenerated_indexes: shared\n---\n\n# Team\n\n## Scope\n\n- shared knowledge\n\n## When to Use\n\n- always\n".to_vec()
+    b"---\ntype: manifest\ntitle: Team\nteam: github\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\ngenerated_indexes: shared\n---\n\n# Team\n\n## Scope\n\n- shared knowledge\n\n## When to Use\n\n- always\n".to_vec()
 }
 
 /// The same MANIFEST, declaring that a share of this domain commits straight
@@ -118,7 +130,7 @@ fn manifest_sharing_indexes() -> Vec<u8> {
 /// `proposal`, so a scenario whose subject is the direct path has to say so,
 /// the way a real team says it once in the file all of its members hold.
 fn manifest_sharing_direct() -> Vec<u8> {
-    b"---\ntype: manifest\ntitle: Team\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\nsharing: direct\n---\n\n# Team\n\n## Scope\n\n- shared knowledge\n\n## When to Use\n\n- always\n".to_vec()
+    b"---\ntype: manifest\ntitle: Team\nteam: github\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\nsharing: direct\n---\n\n# Team\n\n## Scope\n\n- shared knowledge\n\n## When to Use\n\n- always\n".to_vec()
 }
 
 fn engram(title: &str, permalink: &str, body: &str) -> Vec<u8> {
@@ -410,6 +422,272 @@ async fn origin_add_creates_folder_registers_domain_and_indexes_engrams() {
             .as_str()
             .unwrap()
             .contains("shared knowledge about turbines")
+    );
+}
+
+/// A fresh connect of the team repository at `acme/brand-knowledge`, whose
+/// MANIFEST carries no team marker yet (a repository from before 0.30.0).
+async fn connected_unmarked(tmp: &Path) -> (Engine, Arc<MockProvider>, std::path::PathBuf) {
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest_unmarked())]));
+    mock.set_branch("main", &commit);
+    let root = tmp.join("brand-knowledge");
+    let eng = engine_with(
+        &tmp.join("config.yaml"),
+        &tmp.join("origins"),
+        mock.clone(),
+        true,
+        false,
+    )
+    .await;
+    let result = eng
+        .origin_add(
+            "acme/brand-knowledge",
+            None,
+            None,
+            None,
+            Some(root.to_str().unwrap()),
+        )
+        .await
+        .unwrap();
+    // A connect never writes into the team's MANIFEST: the folder is clean.
+    assert_eq!(result["local_changes"], 0, "{result}");
+    assert_eq!(
+        std::fs::read(root.join("MANIFEST.md")).unwrap(),
+        manifest_unmarked(),
+        "the connect leaves the MANIFEST as the team wrote it"
+    );
+    (eng, mock, root)
+}
+
+fn shared_manifest(mock: &MockProvider, result: &serde_json::Value) -> String {
+    let branch = result["branch"].as_str().expect("a proposal branch");
+    let commit = mock.branch_commit(branch).expect("the share made a branch");
+    String::from_utf8(mock.commit_file(&commit, "MANIFEST.md").unwrap()).unwrap()
+}
+
+/// The first share of everything from a connected instance carries the team
+/// marker: the MANIFEST gains `team: github` right after its title, in the
+/// folder and in the proposal, beside the change that was shared.
+#[tokio::test]
+async fn a_share_of_everything_carries_the_team_marker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (eng, mock, root) = connected_unmarked(tmp.path()).await;
+    std::fs::create_dir_all(root.join("notes")).unwrap();
+    std::fs::write(root.join("notes/new.md"), engram("New", "new", "fresh")).unwrap();
+    eng.sync(Some("brand-knowledge")).await.unwrap();
+    let preview = eng
+        .origin_share_preview(
+            "brand-knowledge",
+            None,
+            None,
+            None,
+            ShareActor::Owner,
+            PreviewCredential::ActingIdentity,
+        )
+        .await
+        .unwrap();
+    assert_eq!(preview["team_marker"], team_marker(), "{preview}");
+    assert_eq!(
+        std::fs::read(root.join("MANIFEST.md")).unwrap(),
+        manifest_unmarked(),
+        "a preview writes nothing"
+    );
+    let result = eng
+        .origin_share("brand-knowledge", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(result["outcome"], "proposed", "{result}");
+    assert_eq!(result["added"], serde_json::json!(["notes/new.md"]));
+    assert_eq!(result["updated"], serde_json::json!(["MANIFEST.md"]));
+    assert_eq!(result["team_marker"], team_marker(), "{result}");
+    let shared = shared_manifest(&mock, &result);
+    assert!(shared.contains("title: Team\nteam: github\n"), "{shared}");
+    let local = std::fs::read_to_string(root.join("MANIFEST.md")).unwrap();
+    assert_eq!(local, shared, "the folder holds what was shared");
+    let body = mock
+        .proposal_body(result["number"].as_u64().unwrap())
+        .unwrap();
+    assert!(
+        body.contains("Domain: brand-knowledge"),
+        "the generated body stays: {body}"
+    );
+    assert!(
+        body.trim_end().ends_with(MARKER_NOTE),
+        "the body says why the MANIFEST changed: {body}"
+    );
+}
+
+/// What the receipt and the preview say about the marker.
+fn team_marker() -> serde_json::Value {
+    serde_json::json!({
+        "path": "MANIFEST.md",
+        "reason": "marks this repository as a team domain; added once"
+    })
+}
+
+/// The line a pull request body or a commit message ends with when the
+/// share added the marker.
+const MARKER_NOTE: &str = "MANIFEST.md gains `team: github`. Crystalline added it: it marks this repository as a team domain, and it is added once.";
+
+/// Two members of a team whose repository has no marker yet: the first one's
+/// share carries it and is merged, and the second one, who has not pulled
+/// since, shares without a conflict. Both instances write the same bytes
+/// for the marker, so the inline pull of the second share takes the team's
+/// MANIFEST as it is.
+#[tokio::test]
+async fn a_second_member_shares_the_marker_without_a_conflict() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest_unmarked())]));
+    mock.set_branch("main", &commit);
+    let mut members = Vec::new();
+    for who in ["ann", "ben"] {
+        let dir = tmp.path().join(who);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.join("brand-knowledge");
+        let eng = engine_with(
+            &dir.join("config.yaml"),
+            &dir.join("origins"),
+            mock.clone(),
+            true,
+            false,
+        )
+        .await;
+        eng.origin_add(
+            "acme/brand-knowledge",
+            None,
+            None,
+            None,
+            Some(root.to_str().unwrap()),
+        )
+        .await
+        .unwrap();
+        std::fs::create_dir_all(root.join("notes")).unwrap();
+        std::fs::write(
+            root.join(format!("notes/{who}.md")),
+            engram(who, who, "a change of my own"),
+        )
+        .unwrap();
+        eng.sync(Some("brand-knowledge")).await.unwrap();
+        members.push((eng, root));
+    }
+
+    let (ann, _) = &members[0];
+    let first = ann
+        .origin_share("brand-knowledge", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(first["outcome"], "proposed", "{first}");
+    let merged = mock
+        .branch_commit(first["branch"].as_str().unwrap())
+        .unwrap();
+    mock.set_branch("main", &merged);
+    mock.set_proposal_state(first["number"].as_u64().unwrap(), ProposalState::Merged);
+
+    let (ben, ben_root) = &members[1];
+    let second = ben
+        .origin_share("brand-knowledge", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(second["outcome"], "proposed", "{second}");
+    assert_eq!(
+        second["added"],
+        serde_json::json!(["notes/ben.md"]),
+        "{second}"
+    );
+    assert_eq!(
+        second["updated"],
+        serde_json::json!([]),
+        "the team's MANIFEST already says it: {second}"
+    );
+    let local = std::fs::read_to_string(ben_root.join("MANIFEST.md")).unwrap();
+    assert_eq!(
+        crystalline_core::team_of_source(&local),
+        Some(crystalline_core::TeamForge::GitHub)
+    );
+}
+
+/// Pressing share with nothing to share stays a no-op: the marker alone
+/// never opens a proposal.
+#[tokio::test]
+async fn a_share_with_nothing_to_share_writes_no_marker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (eng, _mock, root) = connected_unmarked(tmp.path()).await;
+    let result = eng
+        .origin_share("brand-knowledge", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(result["outcome"], "nothing_to_share", "{result}");
+    assert!(result.get("team_marker").is_none(), "{result}");
+    assert_eq!(
+        std::fs::read(root.join("MANIFEST.md")).unwrap(),
+        manifest_unmarked()
+    );
+}
+
+/// A narrowed share carries the marker as one more file when the MANIFEST
+/// has no other unshared change, so exactly one line rides along. A MANIFEST
+/// holding unshared edits nobody chose is left alone for a share that
+/// includes it.
+#[tokio::test]
+async fn a_narrowed_share_adds_the_marker_only_to_an_unchanged_manifest() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (eng, mock, root) = connected_unmarked(tmp.path()).await;
+    std::fs::create_dir_all(root.join("notes")).unwrap();
+    std::fs::write(root.join("notes/a.md"), engram("A", "a", "mine")).unwrap();
+    std::fs::write(root.join("notes/b.md"), engram("B", "b", "theirs")).unwrap();
+    eng.sync(Some("brand-knowledge")).await.unwrap();
+    let result = eng
+        .origin_share(
+            "brand-knowledge",
+            None,
+            None,
+            None,
+            Some(&["notes/a.md".to_string()]),
+            ShareActor::Owner,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        result["added"],
+        serde_json::json!(["notes/a.md"]),
+        "{result}"
+    );
+    assert_eq!(result["updated"], serde_json::json!(["MANIFEST.md"]));
+    assert_eq!(result["team_marker"], team_marker(), "{result}");
+    let shared = shared_manifest(&mock, &result);
+    let before = String::from_utf8(manifest_unmarked()).unwrap();
+    assert_eq!(
+        shared,
+        before.replace("title: Team\n", "title: Team\nteam: github\n"),
+        "one line and nothing else"
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (eng, _mock, root) = connected_unmarked(tmp.path()).await;
+    let edited = before.replace("- always\n", "- always\n- and on Fridays\n");
+    std::fs::write(root.join("MANIFEST.md"), &edited).unwrap();
+    std::fs::create_dir_all(root.join("notes")).unwrap();
+    std::fs::write(root.join("notes/a.md"), engram("A", "a", "mine")).unwrap();
+    eng.sync(Some("brand-knowledge")).await.unwrap();
+    let result = eng
+        .origin_share(
+            "brand-knowledge",
+            None,
+            None,
+            None,
+            Some(&["notes/a.md".to_string()]),
+            ShareActor::Owner,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["updated"], serde_json::json!([]), "{result}");
+    assert!(result.get("team_marker").is_none(), "{result}");
+    assert_eq!(
+        std::fs::read_to_string(root.join("MANIFEST.md")).unwrap(),
+        edited,
+        "the unchosen MANIFEST edit is left as it was"
     );
 }
 
@@ -2245,7 +2523,16 @@ async fn direct_team(
     tmp: &tempfile::TempDir,
     mock: Arc<MockProvider>,
 ) -> (Engine, std::path::PathBuf, std::path::PathBuf) {
-    let commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest_sharing_direct())]));
+    direct_team_with(tmp, mock, manifest_sharing_direct()).await
+}
+
+/// [`direct_team`] over a MANIFEST of the caller's own.
+async fn direct_team_with(
+    tmp: &tempfile::TempDir,
+    mock: Arc<MockProvider>,
+    manifest: Vec<u8>,
+) -> (Engine, std::path::PathBuf, std::path::PathBuf) {
+    let commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest)]));
     mock.set_branch("main", &commit);
     let config_path = tmp.path().join("config.yaml");
     let origins_dir = tmp.path().join("origins");
@@ -2510,6 +2797,29 @@ async fn a_direct_preview_names_the_commit_and_an_open_proposal_refuses_it() {
         serde_json::json!(["notes/new.md"]),
         "{amended}"
     );
+}
+
+/// A share that shares nothing names no team marker and leaves none
+/// behind: a direct share the branch refuses answers `branch_protected`
+/// without `team_marker`, and the folder's MANIFEST is as it was, so the
+/// marker is not a local change nobody asked for.
+#[tokio::test]
+async fn a_refused_share_names_no_team_marker_and_leaves_none() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let unmarked = String::from_utf8(manifest_sharing_direct())
+        .unwrap()
+        .replace("team: github\n", "")
+        .into_bytes();
+    let (eng, root, _origins_dir) = direct_team_with(&tmp, mock.clone(), unmarked.clone()).await;
+    mock.protect_branch("main", "Changes must be made through a pull request.");
+    let result = eng
+        .origin_share("brand", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(result["outcome"], "branch_protected", "{result}");
+    assert!(result.get("team_marker").is_none(), "{result}");
+    assert_eq!(std::fs::read(root.join("MANIFEST.md")).unwrap(), unmarked);
 }
 
 #[tokio::test]
@@ -4102,6 +4412,63 @@ async fn delete_file(eng: &Engine, actor: &str, path: &str) {
 /// A file the team already has, and one only an actor's draft has.
 const OLD_PNG: &[u8] = b"\x89PNG\r\n\x1a\n\x00the team's old deck";
 const DECK_PNG: &[u8] = b"\x89PNG\r\n\x1a\n\x00a deck only alice has";
+
+/// A domain that reviews changes gets the marker through its review: the
+/// next proposal carries the MANIFEST line like any other change, the
+/// preview and the receipt say so, and the folder moves only when the team
+/// merges it.
+#[tokio::test]
+async fn a_review_mode_share_carries_the_marker_through_the_proposal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let eng = reviewing_domain(
+        tmp.path(),
+        mock.clone(),
+        &[
+            ("MANIFEST.md", manifest_unmarked()),
+            ("notes/plan.md", team_plan()),
+        ],
+    )
+    .await;
+    let root = tmp.path().join("team-knowledge");
+    draft(&eng, "owner", "notes/plan.md", DRAFT_PLAN).await;
+    let preview = eng
+        .origin_share_preview(
+            "team",
+            None,
+            None,
+            None,
+            ShareActor::Owner,
+            PreviewCredential::ActingIdentity,
+        )
+        .await
+        .unwrap();
+    assert_eq!(preview["team_marker"], team_marker(), "{preview}");
+    let result = eng
+        .origin_share("team", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(result["outcome"], "proposed", "{result}");
+    assert_eq!(
+        result["updated"],
+        serde_json::json!(["MANIFEST.md", "notes/plan.md"]),
+        "{result}"
+    );
+    assert_eq!(result["team_marker"], team_marker(), "{result}");
+    let shared = shared_manifest(&mock, &result);
+    assert_eq!(
+        shared,
+        String::from_utf8(manifest_unmarked())
+            .unwrap()
+            .replace("title: Team\n", "title: Team\nteam: github\n"),
+        "the proposal carries exactly the marker line"
+    );
+    assert_eq!(
+        std::fs::read(root.join("MANIFEST.md")).unwrap(),
+        manifest_unmarked(),
+        "the folder waits for the review"
+    );
+}
 
 /// A share carries the acting actor's overlay FILES beside their rows: the
 /// bytes of a file they drafted travel as an addition, their deletion of a

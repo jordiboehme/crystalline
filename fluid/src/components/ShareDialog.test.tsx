@@ -317,6 +317,47 @@ describe("the share dialog", () => {
     ).toBeInTheDocument();
   });
 
+  it("names the team marker a share adds, in the plan and after the share", async () => {
+    const marker = {
+      path: "MANIFEST.md",
+      reason: "marks this repository as a team domain; added once",
+    };
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "create",
+        effective_title: "Share 1 new engram from eng",
+        changes: [{ path: "notes/a.md", kind: "added" }],
+        team_marker: marker,
+      }),
+      "/domains/eng/sync/share": (_path, init) =>
+        init?.method === "POST"
+          ? {
+              outcome: "proposed",
+              number: 7,
+              url: "https://github.com/acme/knowledge/pull/7",
+              team_marker: marker,
+            }
+          : null,
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+    const line =
+      "MANIFEST.md also travels with this share: it marks this repository as a team domain; added once.";
+    expect(await within(dialog).findByText(line)).toBeVisible();
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Share" }),
+    );
+    expect(
+      await within(dialog).findByText(acrossElements(/opened proposal #7/i)),
+    ).toBeInTheDocument();
+    expect(
+      within(dialog).getByText(
+        "MANIFEST.md went with this share: it marks this repository as a team domain; added once.",
+      ),
+    ).toBeVisible();
+  });
+
   it("sends the description somebody wrote, trimmed", async () => {
     const shared = vi.fn(() => ({
       outcome: "proposed",

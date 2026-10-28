@@ -11,10 +11,13 @@ Three checks ask three questions: does the format hold, is the machinery healthy
   with:
     paths: knowledge/       # space-separated domain roots, default '.'
     strict: 'false'         # promote Warning rules to Error
+    team-repository: 'false' # also run the team repository rules (0.30.0 and newer)
     version: v0.29.1        # crystalline binary tag to download, or 'latest'
 ```
 
 The action ref (`@v0.29.1`) pins the action's own code. `version` pins the crystalline binary it downloads, so pinning both gives a fully reproducible check. The binary is checksum-verified, then the action runs `crystalline verify`, annotates the run and, on a pull request, posts a single summary comment kept up to date in place.
+
+In the repository of a team domain, set `team-repository: 'true'`. It runs `crystalline verify --team-repository`, which fails on a Reflection switched on without a home (`M011`) and on files under `reflections/` while Reflection is on (`M012`), and warns when the MANIFEST lacks `team: github` (`M109`). See [Keep a team repository's Reflection safe](teams.md#keep-a-team-repositorys-reflection-safe).
 
 A domain can tune the rules in a `.crystalline.yaml` at its root: under `verify.rules`, each rule id takes `off`, `error`, `warning` or `info` (for example `Q002: off`). Verify never fails on a mistake in that file, but it no longer keeps quiet about one either: a value that is not one of those words, or a file that does not parse, is reported as `M108`, a warning against `.crystalline.yaml` that names the rule and the word. The rule it was meant for runs at its default. `--strict` turns `M108` into an error like any other warning, which is how a CI run catches an override that was silently lost.
 
