@@ -705,7 +705,8 @@ impl ConnectAuth for RealConnectAuth {
         auth_base: &str,
         client_id: &str,
     ) -> std::result::Result<crystalline_remote::DeviceFlowStart, RemoteError> {
-        crystalline_remote::github::auth::start_device_flow(auth_base, client_id).await
+        crystalline_remote::github::auth::start_device_flow(auth_base, client_id, Some("repo"))
+            .await
     }
 
     async fn run_device_flow(
@@ -714,7 +715,9 @@ impl ConnectAuth for RealConnectAuth {
         client_id: &str,
         start: &crystalline_remote::DeviceFlowStart,
     ) -> std::result::Result<String, RemoteError> {
-        crystalline_remote::github::auth::run_device_flow(auth_base, client_id, start).await
+        crystalline_remote::github::auth::run_device_flow(auth_base, client_id, start)
+            .await
+            .map(|grant| grant.access_token)
     }
 
     async fn validate_token(
@@ -11390,6 +11393,9 @@ mod share_actor_tests {
                 host: "github.com".to_string(),
                 user: user.to_string(),
                 created_at: Utc::now(),
+                refresh_token: None,
+                expires_at: None,
+                refresh_expires_at: None,
             })
             .unwrap();
     }

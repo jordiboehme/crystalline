@@ -3707,6 +3707,9 @@ pub async fn connect_github(
             .unwrap_or_else(|| "github.com".to_string()),
         user: login.clone(),
         created_at: chrono::Utc::now(),
+        refresh_token: None,
+        expires_at: None,
+        refresh_expires_at: None,
     };
     let store = match token_store_dir {
         Some(dir) => {
@@ -3919,9 +3922,10 @@ async fn device_flow_sign_in(
     client_id: &str,
     api_url: Option<&str>,
 ) -> Result<(String, String)> {
-    let start = crystalline_remote::github::auth::start_device_flow(auth_base, client_id)
-        .await
-        .map_err(|e| anyhow!("{e}"))?;
+    let start =
+        crystalline_remote::github::auth::start_device_flow(auth_base, client_id, Some("repo"))
+            .await
+            .map_err(|e| anyhow!("{e}"))?;
     print_device_code(&start, auth_base);
 
     let ticker = tokio::spawn(async {
@@ -3947,7 +3951,9 @@ async fn device_flow_sign_in(
         crystalline_remote::github::auth::run_device_flow(auth_base, client_id, &start).await;
     ticker.abort();
     eprintln!();
-    let access_token = poll.map_err(|e| device_flow_error(auth_base, e))?;
+    let access_token = poll
+        .map(|grant| grant.access_token)
+        .map_err(|e| device_flow_error(auth_base, e))?;
 
     let login = crystalline_remote::github::auth::validate_token(api_url, &access_token)
         .await

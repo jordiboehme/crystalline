@@ -116,6 +116,16 @@ pub struct StoredToken {
     pub user: String,
     /// When this token was saved.
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// The refresh token of an expiring GitHub App user token; `None` for an
+    /// OAuth App token or a personal access token, which do not expire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
+    /// When `access_token` stops working; `None` when it never does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When `refresh_token` stops working; `None` when there is none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl StoredToken {
@@ -134,7 +144,7 @@ impl StoredToken {
     }
 }
 
-/// Redacts `access_token`: a `StoredToken` reaches `Debug` output in a log
+/// Redacts `access_token` and `refresh_token`: a `StoredToken` reaches `Debug` output in a log
 /// line, a panic message or a test failure far more easily than it reaches
 /// `Display` (which this type has none of), so the derive is deliberately not
 /// used here. Every other field is plain, non-secret metadata and prints as
@@ -146,6 +156,12 @@ impl std::fmt::Debug for StoredToken {
             .field("host", &self.host)
             .field("user", &self.user)
             .field("created_at", &self.created_at)
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("expires_at", &self.expires_at)
+            .field("refresh_expires_at", &self.refresh_expires_at)
             .finish()
     }
 }
@@ -435,6 +451,9 @@ impl TokenStore {
                 host: host.clone(),
                 user: String::new(),
                 created_at: chrono::Utc::now(),
+                refresh_token: None,
+                expires_at: None,
+                refresh_expires_at: None,
             })),
         }
     }
@@ -849,7 +868,43 @@ mod tests {
             host: "github.com".to_string(),
             user: "octocat".to_string(),
             created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            refresh_token: None,
+            expires_at: None,
+            refresh_expires_at: None,
         }
+    }
+
+    #[test]
+    fn stored_token_reads_old_json_without_the_new_fields() {
+        let old = r#"{"access_token":"gho_x","host":"github.com","user":"octocat","created_at":"2023-11-14T22:13:20Z"}"#;
+        let token: StoredToken = serde_json::from_str(old).unwrap();
+        assert!(token.refresh_token.is_none());
+        assert!(token.expires_at.is_none());
+        assert!(token.refresh_expires_at.is_none());
+        // A token without the new fields serializes without them too.
+        let json = serde_json::to_string(&token).unwrap();
+        assert!(!json.contains("refresh"), "{json}");
+    }
+
+    #[test]
+    fn stored_token_round_trips_the_refresh_fields() {
+        let mut token = sample_token();
+        token.refresh_token = Some("ghr_secretrefresh".to_string());
+        token.expires_at = chrono::DateTime::from_timestamp(1_700_028_800, 0);
+        token.refresh_expires_at = chrono::DateTime::from_timestamp(1_715_897_600, 0);
+        let back: StoredToken =
+            serde_json::from_str(&serde_json::to_string(&token).unwrap()).unwrap();
+        assert_eq!(back, token);
+    }
+
+    #[test]
+    fn stored_token_debug_redacts_the_refresh_token() {
+        let mut token = sample_token();
+        token.refresh_token = Some("ghr_secretrefresh".to_string());
+        let debug = format!("{token:?}");
+        assert!(!debug.contains("ghr_secretrefresh"), "{debug}");
+        assert!(!debug.contains("gho_examplesecret"), "{debug}");
+        assert!(debug.contains("refresh_token"), "{debug}");
     }
 
     // The keyring arms of `resolve_and_load` and `save_resolving` are
