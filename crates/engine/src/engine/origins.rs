@@ -3602,9 +3602,7 @@ impl Engine {
         }
         match self.github_app_slot() {
             github_app::AppSlot::Ready(router) => return Ok(router),
-            github_app::AppSlot::Refused(detail) => {
-                return Err(RemoteError::AppCredential(detail).into());
-            }
+            github_app::AppSlot::Refused(detail) => return Err(github_app::app_refusal(detail)),
             github_app::AppSlot::Absent | github_app::AppSlot::Unloaded => {}
         }
         let api_url = self
@@ -3702,7 +3700,7 @@ impl Engine {
         }
         match self.github_app_slot() {
             github_app::AppSlot::Ready(router) => Ok(Some(router)),
-            github_app::AppSlot::Refused(detail) => Err(RemoteError::AppCredential(detail).into()),
+            github_app::AppSlot::Refused(detail) => Err(github_app::app_refusal(detail)),
             github_app::AppSlot::Absent | github_app::AppSlot::Unloaded => Ok(None),
         }
     }
@@ -3900,7 +3898,7 @@ impl Engine {
         // operation; this is where the status says why.
         if let github_app::AppSlot::Refused(detail) = self.github_app_slot() {
             connection["app"] = json!({
-                "error": RemoteError::AppCredential(detail).to_string(),
+                "error": github_app::app_refusal(detail).to_string(),
             });
         }
         // A keychain that could not be read is said here while the failure

@@ -205,6 +205,13 @@ impl AppHome {
         }
         credentials.slug = Some(info.slug);
         let found = self.lookup()?;
+        // The keychain holds an App it cannot hand over right now: a save to
+        // the file would be shadowed by that App once the keychain answers.
+        if let (Some(reason), Some(_)) = (&found.keychain_failed, &found.marker) {
+            return Err(EngineError::Conflict(format!(
+                "the keychain could not be read ({reason}), and a GitHub App is saved there; unlock it and run the set again"
+            )));
+        }
         found.store.save_marked(&credentials, &self.dir)?;
         let status = GithubAppStatus::of(&credentials, found.store.kind());
         Ok(match app.installations().await {
@@ -237,6 +244,18 @@ impl AppHome {
             AppStore::file_fallback(&self.dir).delete_marked(&self.dir)?;
         }
         Ok(())
+    }
+}
+
+/// The error an origin operation is refused with under a `Refused` slot:
+/// the ruling's own sentence while the keychain holding the App cannot be
+/// read (a locked keychain is not a bad key), else the App credential
+/// error.
+pub(crate) fn app_refusal(detail: String) -> EngineError {
+    if detail == KEYCHAIN_REFUSAL {
+        EngineError::Conflict(detail)
+    } else {
+        RemoteError::AppCredential(detail).into()
     }
 }
 

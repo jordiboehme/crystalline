@@ -1310,11 +1310,9 @@ async fn a_failed_keychain_read_with_the_marker_refuses_and_never_uses_the_insta
         )
         .await
         .unwrap_err();
-    assert!(
-        err.to_string().contains(
-            "the GitHub App is saved in the keychain, which could not be read; try again or unlock it"
-        ),
-        "{err}"
+    assert_eq!(
+        err.to_string(),
+        "the GitHub App is saved in the keychain, which could not be read; try again or unlock it"
     );
     assert!(
         forge.hits().is_empty(),
@@ -1330,11 +1328,11 @@ async fn a_failed_keychain_read_with_the_marker_refuses_and_never_uses_the_insta
         json!("the keychain is locked"),
         "{status}"
     );
-    assert!(
-        status["connection"]["app"]["error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("could not be read"),
+    assert_eq!(
+        status["connection"]["app"]["error"],
+        json!(
+            "the GitHub App is saved in the keychain, which could not be read; try again or unlock it"
+        ),
         "{status}"
     );
 

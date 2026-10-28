@@ -4100,6 +4100,18 @@ async fn check_github_app(cfg: &GlobalConfig, overlay: &EnvOverlay) -> Option<Ap
                         ..AppDoctor::default()
                     });
                 }
+                // Not a problem: no App is known to be saved there. Said all
+                // the same, since an App saved before the marker existed
+                // would not be seen.
+                Ok(AppLookup {
+                    keychain_failed: Some(reason),
+                    ..
+                }) => {
+                    return Some(AppDoctor {
+                        keychain_unreadable: Some(reason),
+                        ..AppDoctor::default()
+                    });
+                }
                 Ok(_) => return None,
                 Err(e) => {
                     return Some(AppDoctor {
@@ -5210,15 +5222,28 @@ pub fn render_human(report: &DoctorReport) -> String {
         }
         if let Some(app) = &g.app {
             let source = app.source.as_deref().unwrap_or("?");
-            match &app.problem {
-                Some(problem) => {
+            match (&app.problem, &app.source, &app.keychain_unreadable) {
+                (Some(problem), _, _) => {
                     let _ = writeln!(out, "  [problem] GitHub App ({source}): {problem}");
                 }
-                None => {
+                (None, None, Some(reason)) => {
                     let _ = writeln!(
                         out,
-                        "  GitHub App ({source}): signed token accepted, installations reachable, clock within a minute of GitHub's"
+                        "  the keychain could not be read ({reason}); no GitHub App is known to be saved there"
                     );
+                }
+                (None, _, _) => {
+                    let mut passed = vec!["key parses"];
+                    if app.jwt_accepted == Some(true) {
+                        passed.push("signed token accepted");
+                    }
+                    if app.installations_reachable == Some(true) {
+                        passed.push("installations reachable");
+                    }
+                    if app.clock_skew_secs.is_some() {
+                        passed.push("clock within a minute of GitHub's");
+                    }
+                    let _ = writeln!(out, "  GitHub App ({source}): {}", passed.join(", "));
                 }
             }
         }
