@@ -1111,3 +1111,64 @@ async fn a_narrowing_schedules_a_backup_that_drops_the_page() {
         1
     );
 }
+
+/// The files only a held page links are held back with it and go out again
+/// with it; a file a page that is not held links too stays on the branch.
+#[tokio::test]
+async fn a_held_page_holds_back_the_files_only_it_links() {
+    let mock = Arc::new(MockProvider::new());
+    main_commit(&mock);
+    let (fx, auth) = home_beside_harbor(mock.clone(), true).await;
+    for asset in ["assets/only.png", "assets/shared.png"] {
+        fx.engine
+            .reflection_asset_write("eng", asset, crate::assets::PNG.to_vec(), &agent())
+            .await
+            .unwrap();
+    }
+    let mut wide = write(
+        "wide.md",
+        "# Wide\n\nFor people.\n\n## Team\n\nFive people.\n\n![only](assets/only.png)\n\n![shared](assets/shared.png)\n",
+    );
+    wide.sources = BTreeMap::from([(
+        "Team".to_string(),
+        vec!["crystalline://harbor/team/harbor-team".to_string()],
+    )]);
+    fx.engine.write_reflection(&wide, &agent()).await.unwrap();
+    fx.engine
+        .write_reflection(
+            &write("a.md", "# A\n\n## One\n\n![shared](assets/shared.png)\n"),
+            &agent(),
+        )
+        .await
+        .unwrap();
+    let head_paths = || mock.commit_paths(&mock.branch_commit(BACKUP_BRANCH).unwrap());
+    fx.engine.reflection_backup_tick(Instant::now()).await;
+    assert!(head_paths().contains(&"reflections/assets/only.png".to_string()));
+
+    auth.set_domain_visibility("harbor", true, "keeper")
+        .await
+        .unwrap();
+    fx.engine.mark_reflection_dirty("eng", BackupCause::Settled);
+    fx.engine.reflection_backup_tick(Instant::now()).await;
+    let paths = head_paths();
+    assert!(
+        !paths.contains(&"reflections/assets/only.png".to_string()),
+        "{paths:?}"
+    );
+    assert!(
+        paths.contains(&"reflections/assets/shared.png".to_string()),
+        "{paths:?}"
+    );
+
+    let mut settled = write(
+        "wide.md",
+        "# Wide\n\nFor people.\n\n## Team\n\nA team.\n\n![only](assets/only.png)\n",
+    );
+    settled.sources = BTreeMap::from([("Team".to_string(), vec!["runbooks/deploy".to_string()])]);
+    fx.engine
+        .write_reflection(&settled, &agent())
+        .await
+        .unwrap();
+    fx.engine.reflection_backup_tick(Instant::now()).await;
+    assert!(head_paths().contains(&"reflections/assets/only.png".to_string()));
+}

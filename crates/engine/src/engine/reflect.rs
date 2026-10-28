@@ -220,6 +220,38 @@ enum Detail {
 }
 
 impl Engine {
+    /// The files under `reflections/assets/` (by path inside
+    /// `reflections/`) that only `held` pages of `domain` link: they carry
+    /// what those pages show, so the backup holds them back with them. A
+    /// file a page that is not held links too stays.
+    pub(crate) async fn held_assets(
+        &self,
+        domain: &str,
+        held: &[String],
+    ) -> Result<BTreeSet<String>> {
+        if held.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let rows = {
+            let store = self.store.lock().await;
+            let Some(id) = store.domain_id(domain).await? else {
+                return Ok(BTreeSet::new());
+            };
+            store.list_reflections(id).await?
+        };
+        let mut by_held = BTreeSet::new();
+        let mut by_others = BTreeSet::new();
+        for row in &rows {
+            let refs = r::reflection_asset_refs(&row.content, &row.path);
+            if held.contains(&row.path) {
+                by_held.extend(refs);
+            } else {
+                by_others.extend(refs);
+            }
+        }
+        Ok(by_held.difference(&by_others).cloned().collect())
+    }
+
     /// Schedule a backup of every Reflection this instance backs up that has
     /// a page newly citing a domain fewer people may read (or one not shared
     /// through GitHub): a page its last backup did not hold back. Answers

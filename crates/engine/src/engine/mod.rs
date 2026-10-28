@@ -4146,11 +4146,13 @@ impl Engine {
                 continue;
             }
             // A page that cites a domain fewer people may read than this one
-            // is held back with its threads and baseline: the branch is read
-            // by the repository's people, not by this domain's readers.
+            // is held back with its threads, its baseline and the files only
+            // it links: the branch is read by the repository's people, not
+            // by this domain's readers.
             let mut held_pages: Vec<String> = Vec::new();
             let attempt: Result<crystalline_remote::reflections_backup::BackupOutcome> = async {
                 held_pages = self.too_wide_pages(&domain).await?;
+                let assets = self.held_assets(&domain, &held_pages).await?;
                 let held: std::collections::BTreeSet<String> = held_pages
                     .iter()
                     .flat_map(|page| {
@@ -4160,6 +4162,7 @@ impl Engine {
                             crystalline_core::reflection::baseline_path(page),
                         ]
                     })
+                    .chain(assets)
                     .collect();
                 let (spec, root, state_dir) = self.origin_spec_for_domain(&domain)?;
                 Ok(crystalline_remote::reflections_backup::backup_reflections(
