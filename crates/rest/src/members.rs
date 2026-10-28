@@ -200,7 +200,8 @@ fn store_error(e: anyhow::Error) -> ApiError {
             | RefusalKind::IdentityAlreadyLinked
             | RefusalKind::IssuerAlreadyHeld
             | RefusalKind::NoSuchToken
-            | RefusalKind::CapReached,
+            | RefusalKind::CapReached
+            | RefusalKind::GithubIdTaken,
         )
         | None => ApiError::internal(format!("{e:#}")),
     }

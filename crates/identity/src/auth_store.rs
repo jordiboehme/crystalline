@@ -264,6 +264,56 @@ pub struct IdentityLink {
     pub linked_by: String,
 }
 
+/// The GitHub account a Crystalline account is linked to. The numeric
+/// `github_id` is the identity (a login can be renamed or recycled); `login`
+/// is only a display cache that [`AuthStore::set_github_login`] refreshes.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct GithubLink {
+    /// The Crystalline account.
+    pub account: String,
+    /// The GitHub host in its one stored form: lowercase, trimmed, `github.com`
+    /// for GitHub.com and the bare Enterprise Server host (no scheme, no
+    /// path) otherwise. The same spelling `AppCredentials::host` carries.
+    pub host: String,
+    /// GitHub's numeric user id on that host.
+    pub github_id: u64,
+    /// The login last seen for the id, a cache.
+    pub login: String,
+    /// When the link was made.
+    pub linked_at: chrono::DateTime<chrono::Utc>,
+    /// False once the stored user token is known to be gone (revoked or
+    /// expired); the link itself stays.
+    pub token_live: bool,
+}
+
+/// The stored form of a GitHub host: trimmed and lowercased.
+fn normalize_github_host(host: &str) -> Result<String> {
+    let host = host.trim().to_ascii_lowercase();
+    if host.is_empty() {
+        bail!("a GitHub host must not be empty");
+    }
+    Ok(host)
+}
+
+const GITHUB_LINK_COLUMNS: &str = "account, host, github_id, login, linked_at, token_live";
+
+fn github_link_from_row(row: &Row) -> GithubLink {
+    GithubLink {
+        account: cell_text(row, 0).unwrap_or_default(),
+        host: cell_text(row, 1).unwrap_or_default(),
+        github_id: match row.get_value(2) {
+            Ok(Value::Integer(id)) => u64::try_from(id).unwrap_or_default(),
+            _ => 0,
+        },
+        login: cell_text(row, 3).unwrap_or_default(),
+        linked_at: cell_text(row, 4)
+            .and_then(|at| chrono::DateTime::parse_from_rfc3339(&at).ok())
+            .map(|at| at.with_timezone(&chrono::Utc))
+            .unwrap_or_default(),
+        token_live: matches!(row.get_value(5), Ok(Value::Integer(live)) if live != 0),
+    }
+}
+
 /// What [`AuthStore::provision_linked_user`] records as the linker when a
 /// first sign-in creates the account it links.
 pub const LINKED_BY_JIT: &str = "jit";
@@ -794,6 +844,9 @@ pub enum RefusalKind {
     /// whitespace. A bad request rather than a fault, on the surfaces that can
     /// be handed one.
     InvalidName,
+    /// The GitHub account (host and numeric id) is already linked to another
+    /// Crystalline account. See [`AuthStore::link_github`].
+    GithubIdTaken,
 }
 
 /// A refused membership change: [`RefusalKind`] plus the sentence the store
@@ -1025,6 +1078,10 @@ CREATE TABLE IF NOT EXISTS identity_link (
 CREATE INDEX IF NOT EXISTS identity_link_user ON identity_link (user);
 CREATE UNIQUE INDEX IF NOT EXISTS identity_link_issuer_user
     ON identity_link (issuer, user);
+CREATE TABLE IF NOT EXISTS github_link (
+    account TEXT PRIMARY KEY NOT NULL, host TEXT NOT NULL, github_id INTEGER NOT NULL,
+    login TEXT NOT NULL, linked_at TEXT NOT NULL, token_live INTEGER NOT NULL DEFAULT 1);
+CREATE UNIQUE INDEX IF NOT EXISTS github_link_host_id ON github_link (host, github_id);
 CREATE TABLE IF NOT EXISTS oauth_clients (
     client_id TEXT PRIMARY KEY,
     client_name TEXT NOT NULL,
@@ -1738,6 +1795,7 @@ impl AuthStore {
             self.delete_mcp_tokens_of(&name).await?;
             self.delete_memberships_of(&name).await?;
             self.delete_identity_links_of(&name).await?;
+            self.delete_github_link_of(&name).await?;
             self.delete_oauth_grants_of(&name).await?;
             self.delete_write_list_of(&name).await?;
             self.disown_domains_of(&name).await?;
@@ -1783,6 +1841,7 @@ impl AuthStore {
             self.delete_mcp_tokens_of(&name).await?;
             self.delete_memberships_of(&name).await?;
             self.delete_identity_links_of(&name).await?;
+            self.delete_github_link_of(&name).await?;
             self.delete_oauth_grants_of(&name).await?;
             self.delete_write_list_of(&name).await?;
             self.disown_domains_of(&name).await?;
@@ -2127,6 +2186,187 @@ impl AuthStore {
             });
         }
         Ok(links)
+    }
+
+    /// Link `account` to the GitHub account `github_id` on `host`. Relinking
+    /// an account replaces its row (a fresh `linked_at`, a live token).
+    /// Refused with [`RefusalKind::GithubIdTaken`] when another account holds
+    /// the same `(host, id)`, and with [`RefusalKind::NoSuchAccount`] when
+    /// `account` does not exist. `host` is stored lowercase.
+    pub async fn link_github(
+        &self,
+        account: &str,
+        host: &str,
+        github_id: u64,
+        login: &str,
+    ) -> Result<GithubLink> {
+        let account = normalize_account_name(account)?;
+        let host = normalize_github_host(host)?;
+        let id = i64::try_from(github_id).context("a GitHub id out of range")?;
+        let _guard = self.guard.lock().await;
+        self.begin_immediate()
+            .await
+            .with_context(|| format!("linking GitHub to user '{account}'"))?;
+        let result = async {
+            if self
+                .query_first(
+                    "SELECT 1 FROM users WHERE name = ?1",
+                    vec![Value::Text(account.clone())],
+                )
+                .await?
+                .is_none()
+            {
+                return Err(refuse(
+                    RefusalKind::NoSuchAccount,
+                    format!("no such user: '{account}'"),
+                ));
+            }
+            if self
+                .query_first(
+                    "SELECT 1 FROM github_link WHERE host = ?1 AND github_id = ?2 AND account <> ?3",
+                    vec![
+                        Value::Text(host.clone()),
+                        Value::Integer(id),
+                        Value::Text(account.clone()),
+                    ],
+                )
+                .await?
+                .is_some()
+            {
+                return Err(refuse(
+                    RefusalKind::GithubIdTaken,
+                    "this GitHub account is already linked to another Crystalline account; an \
+                     admin can unlink it there"
+                        .to_string(),
+                ));
+            }
+            let now = chrono::Utc::now();
+            self.conn
+                .execute(
+                    "DELETE FROM github_link WHERE account = ?1",
+                    vec![Value::Text(account.clone())],
+                )
+                .await
+                .with_context(|| format!("replacing the GitHub link of user '{account}'"))?;
+            self.conn
+                .execute(
+                    "INSERT INTO github_link (account, host, github_id, login, linked_at, token_live)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 1)",
+                    vec![
+                        Value::Text(account.clone()),
+                        Value::Text(host.clone()),
+                        Value::Integer(id),
+                        Value::Text(login.to_string()),
+                        Value::Text(now.to_rfc3339()),
+                    ],
+                )
+                .await
+                .with_context(|| format!("linking GitHub to user '{account}'"))?;
+            Ok(GithubLink {
+                account: account.clone(),
+                host: host.clone(),
+                github_id,
+                login: login.to_string(),
+                linked_at: now,
+                token_live: true,
+            })
+        }
+        .await;
+        self.finish(result).await
+    }
+
+    /// The GitHub link of one account, if it has one.
+    pub async fn github_link_of(&self, account: &str) -> Result<Option<GithubLink>> {
+        let account = normalize_account_name(account)?;
+        let _guard = self.guard.lock().await;
+        Ok(self
+            .query_first(
+                &format!("SELECT {GITHUB_LINK_COLUMNS} FROM github_link WHERE account = ?1"),
+                vec![Value::Text(account)],
+            )
+            .await?
+            .map(|row| github_link_from_row(&row)))
+    }
+
+    /// The account linked to GitHub id `github_id` on `host`, if any.
+    pub async fn account_for_github(&self, host: &str, github_id: u64) -> Result<Option<String>> {
+        let host = normalize_github_host(host)?;
+        let Ok(id) = i64::try_from(github_id) else {
+            return Ok(None);
+        };
+        let _guard = self.guard.lock().await;
+        Ok(self
+            .query_first(
+                "SELECT account FROM github_link WHERE host = ?1 AND github_id = ?2",
+                vec![Value::Text(host), Value::Integer(id)],
+            )
+            .await?
+            .and_then(|row| cell_text(&row, 0)))
+    }
+
+    /// Every GitHub link, by account.
+    pub async fn github_links(&self) -> Result<Vec<GithubLink>> {
+        let _guard = self.guard.lock().await;
+        let mut rows = self
+            .conn
+            .query(
+                &format!("SELECT {GITHUB_LINK_COLUMNS} FROM github_link ORDER BY account"),
+                (),
+            )
+            .await
+            .context("reading the GitHub links")?;
+        let mut links = Vec::new();
+        while let Some(row) = rows.next().await.context("reading the GitHub links")? {
+            links.push(github_link_from_row(&row));
+        }
+        Ok(links)
+    }
+
+    /// Refresh the cached login of an account's link after a rename on
+    /// GitHub. False when the account has no link.
+    pub async fn set_github_login(&self, account: &str, login: &str) -> Result<bool> {
+        let account = normalize_account_name(account)?;
+        let _guard = self.guard.lock().await;
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE github_link SET login = ?2 WHERE account = ?1",
+                vec![Value::Text(account), Value::Text(login.to_string())],
+            )
+            .await
+            .context("updating the GitHub login")?;
+        Ok(changed > 0)
+    }
+
+    /// Record that the stored user token is gone; the link stays. False when
+    /// the account has no link.
+    pub async fn mark_github_token_gone(&self, account: &str) -> Result<bool> {
+        let account = normalize_account_name(account)?;
+        let _guard = self.guard.lock().await;
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE github_link SET token_live = 0 WHERE account = ?1",
+                vec![Value::Text(account)],
+            )
+            .await
+            .context("marking the GitHub token gone")?;
+        Ok(changed > 0)
+    }
+
+    /// Remove an account's GitHub link. True when there was one.
+    pub async fn unlink_github(&self, account: &str) -> Result<bool> {
+        let account = normalize_account_name(account)?;
+        let _guard = self.guard.lock().await;
+        let changed = self
+            .conn
+            .execute(
+                "DELETE FROM github_link WHERE account = ?1",
+                vec![Value::Text(account)],
+            )
+            .await
+            .context("removing the GitHub link")?;
+        Ok(changed > 0)
     }
 
     /// Create an account for an identity nobody has seen before, and link it,
@@ -5097,6 +5337,18 @@ impl AuthStore {
             row.as_ref().map(|row| row.get_value(0)),
             Some(Ok(Value::Integer(present))) if present != 0
         ))
+    }
+
+    /// Drop the GitHub link of one account, inside the removal transaction.
+    async fn delete_github_link_of(&self, name: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM github_link WHERE account = ?1",
+                vec![Value::Text(name.to_string())],
+            )
+            .await
+            .with_context(|| format!("removing the GitHub link of user '{name}'"))?;
+        Ok(())
     }
 
     /// Drop every identity linked to one account. Called inside the removal
@@ -10610,5 +10862,167 @@ mod tests {
             text.contains(&minted.id.to_string()),
             "while the id still prints: {text}"
         );
+    }
+
+    #[tokio::test]
+    async fn one_github_id_links_to_one_account_per_host() {
+        let (_dir, auth) = store().await;
+        for name in ["ann", "bea"] {
+            auth.add_user(name, name, None, Role::Editor, "pw12345678")
+                .await
+                .unwrap();
+        }
+        let link = auth
+            .link_github("ann", "GitHub.com", 42, "ann-gh")
+            .await
+            .unwrap();
+        assert_eq!(link.host, "github.com");
+        assert_eq!(link.github_id, 42);
+        assert!(link.token_live);
+        let err = auth
+            .link_github("bea", "github.com", 42, "other")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            StoreRefusal::kind_of(&err),
+            Some(RefusalKind::GithubIdTaken)
+        );
+        assert!(err.to_string().contains(
+            "this GitHub account is already linked to another Crystalline account; an admin can unlink it there"
+        ));
+        // The same id on another host is another person.
+        auth.link_github("bea", "ghe.example.com", 42, "bea-ghe")
+            .await
+            .unwrap();
+        assert_eq!(
+            auth.account_for_github("github.com", 42)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("ann")
+        );
+        assert_eq!(
+            auth.account_for_github("ghe.example.com", 42)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("bea")
+        );
+        assert_eq!(
+            auth.account_for_github("github.com", 7).await.unwrap(),
+            None
+        );
+        assert_eq!(auth.github_links().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn relinking_replaces_the_row() {
+        let (_dir, auth) = store().await;
+        auth.add_user("ann", "Ann", None, Role::Editor, "pw12345678")
+            .await
+            .unwrap();
+        auth.link_github("ann", "github.com", 1, "old")
+            .await
+            .unwrap();
+        auth.mark_github_token_gone("ann").await.unwrap();
+        let link = auth
+            .link_github("ann", "github.com", 2, "new")
+            .await
+            .unwrap();
+        assert_eq!(link.github_id, 2);
+        assert!(link.token_live, "a fresh link has a live token");
+        let all = auth.github_links().await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].login, "new");
+        assert_eq!(
+            auth.account_for_github("github.com", 1).await.unwrap(),
+            None
+        );
+        // The same id again is a relink of one's own row, not a conflict.
+        auth.link_github("ann", "github.com", 2, "renamed")
+            .await
+            .unwrap();
+        assert_eq!(
+            auth.github_link_of("ann").await.unwrap().unwrap().login,
+            "renamed"
+        );
+        auth.set_github_login("ann", "again").await.unwrap();
+        assert_eq!(
+            auth.github_link_of("ann").await.unwrap().unwrap().login,
+            "again"
+        );
+        assert!(auth.unlink_github("ann").await.unwrap());
+        assert!(!auth.unlink_github("ann").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn removing_a_user_removes_its_link() {
+        let (_dir, auth) = store().await;
+        auth.add_user("root", "Root", None, Role::Admin, "pw12345678")
+            .await
+            .unwrap();
+        for name in ["ann", "bea"] {
+            auth.add_user(name, name, None, Role::Editor, "pw12345678")
+                .await
+                .unwrap();
+        }
+        auth.link_github("ann", "github.com", 5, "ann")
+            .await
+            .unwrap();
+        auth.link_github("bea", "github.com", 6, "bea")
+            .await
+            .unwrap();
+        auth.remove_user("ann").await.unwrap();
+        auth.remove_user_force("bea").await.unwrap();
+        assert!(auth.github_links().await.unwrap().is_empty());
+        auth.add_user("cy", "Cy", None, Role::Editor, "pw12345678")
+            .await
+            .unwrap();
+        auth.link_github("cy", "github.com", 5, "cy").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn marking_the_token_gone_keeps_the_link() {
+        let (_dir, auth) = store().await;
+        auth.add_user("ann", "Ann", None, Role::Editor, "pw12345678")
+            .await
+            .unwrap();
+        auth.link_github("ann", "github.com", 9, "ann")
+            .await
+            .unwrap();
+        assert!(auth.mark_github_token_gone("ann").await.unwrap());
+        let link = auth.github_link_of("ann").await.unwrap().unwrap();
+        assert!(!link.token_live);
+        assert_eq!(link.github_id, 9);
+        assert!(!auth.mark_github_token_gone("nobody").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn an_old_database_gains_the_table_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("web-auth.db");
+        {
+            let db = turso::Builder::new_local(path.to_str().unwrap())
+                .build()
+                .await
+                .unwrap();
+            let conn = db.connect().unwrap();
+            let start = SCHEMA
+                .find("CREATE TABLE IF NOT EXISTS github_link")
+                .unwrap();
+            let end = start + SCHEMA[start..].find("github_link_host_id").unwrap();
+            let end = end + SCHEMA[end..].find(";\n").unwrap() + 2;
+            let old = format!("{}{}", &SCHEMA[..start], &SCHEMA[end..]);
+            assert!(!old.contains("github_link"));
+            conn.execute_batch(&old).await.unwrap();
+        }
+        let auth = AuthStore::open(&path).await.unwrap();
+        auth.add_user("ann", "Ann", None, Role::Editor, "pw12345678")
+            .await
+            .unwrap();
+        auth.link_github("ann", "github.com", 3, "ann")
+            .await
+            .unwrap();
+        assert_eq!(auth.github_links().await.unwrap().len(), 1);
     }
 }
