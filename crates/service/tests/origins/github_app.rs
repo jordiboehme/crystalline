@@ -31,7 +31,7 @@ use crystalline_remote::provider::{
     ChangeKind, OriginSpec, ProposalRequest, ProposalState, Provider, TreeWrite,
 };
 use crystalline_remote::reflections_backup::BACKUP_BRANCH;
-use crystalline_remote::{AppCredentials, AppStore, RemoteError};
+use crystalline_remote::{AppCredentials, AppLookup, AppStore, RemoteError};
 use crystalline_service::engine::{EngineError, ShareActor};
 use crystalline_service::reflection_backup::BackupCause;
 use crystalline_service::{Engine, EnvOverlay, Scope};
@@ -970,4 +970,63 @@ async fn a_saved_app_for_another_host_is_refused_and_nothing_falls_back() {
         .as_str()
         .unwrap_or_default();
     assert!(error.contains("github.com"), "{status}");
+}
+
+#[tokio::test]
+async fn a_keychain_that_failed_to_answer_is_asked_again_and_not_cached_as_no_app() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = repo_with_manifest("");
+    let (forge, url) = spawn_forge(
+        &[("acme/kb", mock.clone())],
+        &[("acme/kb", 1)],
+        &[(1, "ghs_test")],
+    )
+    .await;
+    let host = url.trim_start_matches("http://").to_string();
+    let file_dir = tmp.path().join("tokens");
+    let lookups = Arc::new(AtomicUsize::new(0));
+    let counted = lookups.clone();
+    // The keychain holds the App but is locked for the first read: the file
+    // fallback answers with nothing. From the second read on it answers.
+    let eng = engine(
+        tmp.path(),
+        &url,
+        &[("CRYSTALLINE_GITHUB_TOKEN", INSTANCE_TOKEN)],
+    )
+    .await
+    .with_app_store_lookup(Arc::new(move || {
+        let first = counted.fetch_add(1, Ordering::SeqCst) == 0;
+        Ok(AppLookup {
+            store: AppStore::file_fallback(&file_dir),
+            credentials: (!first).then(|| saved_app(&host)),
+            keychain_failed: first.then(|| "the keychain is locked".to_string()),
+        })
+    }));
+    let root = tmp.path().join("kb");
+    // The one call the failed read answered: it cannot be told apart from an
+    // instance without an App, so it runs as one.
+    connect(&eng, "acme/kb", "kb", &root).await;
+    let before = forge.hits().len();
+
+    let head = mock.add_commit(files(&[
+        ("MANIFEST.md", manifest("")),
+        ("notes/new.md", engram("New", "new", "added upstream")),
+    ]));
+    mock.set_branch("main", &head);
+    eng.origin_update(Some("kb"), &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert!(root.join("notes/new.md").exists());
+
+    assert_eq!(lookups.load(Ordering::SeqCst), 2, "asked again, then kept");
+    assert!(eng.github_app().is_some());
+    let after: Vec<Hit> = forge.hits().into_iter().skip(before).collect();
+    assert!(after.iter().any(Hit::is_repo_call));
+    assert!(
+        after
+            .iter()
+            .filter(|h| h.is_repo_call())
+            .all(|h| h.auth == bearer("ghs_test")),
+        "once the keychain answered, every call went out on the installation token: {after:?}"
+    );
 }

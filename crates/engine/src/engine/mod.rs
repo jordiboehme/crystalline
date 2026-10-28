@@ -1131,6 +1131,10 @@ pub struct Engine {
     // `Engine::github_app_slot`). With no App it stays `Absent` and every
     // provider is built from the instance credential exactly as before.
     github_app: std::sync::RwLock<github_app::AppSlot>,
+    // Test-only: answers the App store read in place of the keychain and the
+    // file, so a test can stage a keychain that fails and then recovers.
+    #[cfg(any(test, feature = "testing"))]
+    app_store_lookup: Option<github_app::AppLookupFn>,
     // The Reflections marked for their backup commit, in memory: a restart
     // before a due backup loses the mark, and the next change marks it again
     // and commits both (the backup diffs the whole folder).
@@ -2397,6 +2401,8 @@ impl Engine {
             origin_provider_override: None,
             origin_provider_override_login: None,
             github_app: std::sync::RwLock::new(github_app::AppSlot::Unloaded),
+            #[cfg(any(test, feature = "testing"))]
+            app_store_lookup: None,
             backup_marks: Default::default(),
             reflection_walks: Default::default(),
             origins_dir_override: None,
@@ -4285,6 +4291,16 @@ impl Engine {
     /// `RealConnectAuth`.
     pub fn with_connect_auth(mut self, auth: Arc<dyn ConnectAuth>) -> Engine {
         self.connect_auth = auth;
+        self
+    }
+
+    /// Answer the GitHub App store read with `lookup` instead of the keychain
+    /// and the file. Test-only: lets a test stage a keychain read that fails
+    /// and one that later succeeds, which the real keychain cannot be made
+    /// to do on demand.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_app_store_lookup(mut self, lookup: github_app::AppLookupFn) -> Engine {
+        self.app_store_lookup = Some(lookup);
         self
     }
 

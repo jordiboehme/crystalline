@@ -15,9 +15,14 @@ use crystalline_remote::provider::{
     CompareResult, Feedback, HeadProbe, OpenProposalRef, OriginSpec, ProposalHandle,
     ProposalRequest, ProposalState, Provider, StackInfo, TreeWrite,
 };
-use crystalline_remote::{AppCredentials, AppStore, CommitIdentities, GithubApp, RemoteError};
+use crystalline_remote::{AppLookup, AppStore, CommitIdentities, GithubApp, RemoteError};
 
 use super::*;
+
+/// A stand-in for the App store read, for tests (see
+/// `Engine::with_app_store_lookup`).
+#[cfg(any(test, feature = "testing"))]
+pub type AppLookupFn = Arc<dyn Fn() -> StdResult<AppLookup, RemoteError> + Send + Sync>;
 
 /// What this engine knows about its GitHub App. Read once, on the first
 /// origin operation that needs a credential, and kept.
@@ -348,17 +353,24 @@ impl Engine {
         let mut slot = self.github_app.write().unwrap();
         // Another caller may have loaded it while this one waited for the
         // write lock.
-        if let AppSlot::Unloaded = &*slot {
-            *slot = self.load_github_app();
+        if !matches!(*slot, AppSlot::Unloaded) {
+            return slot.clone();
         }
-        slot.clone()
+        match self.load_github_app() {
+            Loaded::Keep(loaded) => {
+                *slot = loaded.clone();
+                loaded
+            }
+            // Left `Unloaded`, so the next call asks the keychain again.
+            Loaded::ThisCallOnly(loaded) => loaded,
+        }
     }
 
     /// Finds the App: the `CRYSTALLINE_GITHUB_APP_*` variables win over a
     /// saved App. Either goes through [`GithubApp::new`] against the
     /// effective `github.api_url`, so a saved App for another host is refused
     /// (and said so in the log and in `origin status`) rather than used.
-    fn load_github_app(&self) -> AppSlot {
+    fn load_github_app(&self) -> Loaded {
         let api_url = self
             .config
             .read()
@@ -368,40 +380,81 @@ impl Engine {
             .and_then(|g| g.api_url.clone());
         let (source, credentials) = match self.overlay.github_app(api_url.as_deref()) {
             Some(Ok(credentials)) => ("the environment", credentials),
-            Some(Err(detail)) => return refused("the environment", detail),
+            Some(Err(detail)) => return Loaded::Keep(refused("the environment", detail)),
             None => match self.saved_github_app(api_url.as_deref()) {
-                Ok(Some(credentials)) => ("the App store", credentials),
-                Ok(None) => return AppSlot::Absent,
-                Err(e) => return refused("the App store", detail_of(e)),
+                Ok(AppLookup {
+                    credentials: Some(credentials),
+                    ..
+                }) => ("the App store", credentials),
+                Ok(AppLookup {
+                    credentials: None,
+                    keychain_failed: None,
+                    ..
+                }) => return Loaded::Keep(AppSlot::Absent),
+                // The keychain did not answer (locked, slow, or no keychain
+                // on this machine at all) and the file holds no App. An App
+                // saved in that keychain would read exactly like this, so the
+                // absence is not kept: the next call asks again, the way the
+                // token cache never keeps a missing token. The cost is one
+                // bounded keychain read per origin operation while it fails.
+                Ok(AppLookup {
+                    credentials: None,
+                    keychain_failed: Some(reason),
+                    ..
+                }) => {
+                    tracing::debug!(
+                        "no GitHub App in the file store and the keychain could not be read \
+                         ({reason}); asking again on the next origin operation"
+                    );
+                    return Loaded::ThisCallOnly(AppSlot::Absent);
+                }
+                Err(e) => return Loaded::Keep(refused("the App store", detail_of(e))),
             },
         };
-        match GithubApp::new(api_url.clone(), credentials) {
+        Loaded::Keep(match GithubApp::new(api_url.clone(), credentials) {
             Ok(app) => {
                 tracing::info!("GitHub App loaded from {source}");
                 AppSlot::Ready(Arc::new(AppRouter::new(Arc::new(app), api_url)))
             }
             Err(e) => refused(source, detail_of(e)),
-        }
+        })
     }
 
     /// The saved App for the effective host: from the file under the test
     /// token directory when one is set (never the keychain), else the real
     /// store, the way [`Engine::github_credential_for`] reads tokens.
-    fn saved_github_app(
-        &self,
-        api_url: Option<&str>,
-    ) -> StdResult<Option<AppCredentials>, RemoteError> {
+    fn saved_github_app(&self, api_url: Option<&str>) -> StdResult<AppLookup, RemoteError> {
+        #[cfg(any(test, feature = "testing"))]
+        if let Some(lookup) = &self.app_store_lookup {
+            return lookup();
+        }
         match &self.token_store_dir_override {
-            Some(dir) => AppStore::file_fallback(dir).load(),
+            Some(dir) => {
+                let store = AppStore::file_fallback(dir);
+                let credentials = store.load()?;
+                Ok(AppLookup {
+                    store,
+                    credentials,
+                    keychain_failed: None,
+                })
+            }
             None => {
                 let base = self
                     .origins_base_dir()
                     .map_err(|e| RemoteError::AppCredential(e.to_string()))?;
                 let host = origin::token_host(api_url);
-                AppStore::resolve_and_load(host.as_deref(), &base).map(|(_, found)| found)
+                AppStore::lookup(host.as_deref(), &base)
             }
         }
     }
+}
+
+/// What one App load found, and whether it may be kept for the process.
+enum Loaded {
+    /// A settled answer: kept in the slot.
+    Keep(AppSlot),
+    /// An answer for this call only; the slot stays `Unloaded`.
+    ThisCallOnly(AppSlot),
 }
 
 /// The detail an App refusal carries: the [`RemoteError::AppCredential`]

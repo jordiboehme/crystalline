@@ -101,6 +101,19 @@ pub enum AppStore {
     Env,
 }
 
+/// What [`AppStore::lookup`] found, and where.
+#[derive(Debug)]
+pub struct AppLookup {
+    /// The backend the credentials live in, or would be saved to.
+    pub store: AppStore,
+    /// The saved App, or `None` when that backend holds none.
+    pub credentials: Option<AppCredentials>,
+    /// Why the keychain could not be read, when it could not and the file
+    /// fallback answered instead. `None` after a clean keychain read and
+    /// under the no-keychain test seam.
+    pub keychain_failed: Option<String>,
+}
+
 impl AppStore {
     /// Picks a backend for `host` and loads whatever it already holds, in
     /// exactly one keychain read. `host` is `None` for GitHub.com,
@@ -116,30 +129,59 @@ impl AppStore {
         host: Option<&str>,
         fallback_dir: &Path,
     ) -> Result<(AppStore, Option<AppCredentials>), RemoteError> {
-        Self::resolve_and_load_bounded(host, fallback_dir, |account| {
+        AppStore::lookup(host, fallback_dir).map(|found| (found.store, found.credentials))
+    }
+
+    /// [`AppStore::resolve_and_load`], also saying whether the keychain read
+    /// failed and the answer came from the file fallback instead. A caller
+    /// that caches "no App" must not cache it then: an App saved in a
+    /// keychain that was locked or slow at that moment would read as none.
+    pub fn lookup(host: Option<&str>, fallback_dir: &Path) -> Result<AppLookup, RemoteError> {
+        // The test seam: never construct the real keychain backend, see
+        // `token::refuse_real_keychain`. The file is then the only store
+        // there is, so nothing failed.
+        if refuse_real_keychain() {
+            let store = AppStore::file_fallback(fallback_dir);
+            let credentials = store.load()?;
+            return Ok(AppLookup {
+                store,
+                credentials,
+                keychain_failed: None,
+            });
+        }
+        Self::lookup_bounded(host, fallback_dir, |account| {
             keyring_read(account, KEYRING_TIMEOUT)
         })
     }
 
-    /// [`AppStore::resolve_and_load`] with the keychain read injected so a
-    /// test can drive each branch without touching the real keychain.
-    fn resolve_and_load_bounded(
+    /// [`AppStore::lookup`] with the keychain read injected, so a test can
+    /// drive each branch without touching the real keychain.
+    fn lookup_bounded(
         host: Option<&str>,
         fallback_dir: &Path,
         read: impl FnOnce(&str) -> KeyringRead,
-    ) -> Result<(AppStore, Option<AppCredentials>), RemoteError> {
-        // The test seam: never construct the real keychain backend, see
-        // `token::refuse_real_keychain`.
-        if refuse_real_keychain() {
-            return Self::file_and_load(fallback_dir);
-        }
+    ) -> Result<AppLookup, RemoteError> {
         let account = account_for(host);
         match read(&account) {
-            KeyringRead::Found(json) => {
-                Ok((AppStore::Keyring { account }, Some(from_json(&json)?)))
+            KeyringRead::Found(json) => Ok(AppLookup {
+                store: AppStore::Keyring { account },
+                credentials: Some(from_json(&json)?),
+                keychain_failed: None,
+            }),
+            KeyringRead::Empty => Ok(AppLookup {
+                store: AppStore::Keyring { account },
+                credentials: None,
+                keychain_failed: None,
+            }),
+            KeyringRead::Failed(reason) => {
+                let store = AppStore::file_fallback(fallback_dir);
+                let credentials = store.load()?;
+                Ok(AppLookup {
+                    store,
+                    credentials,
+                    keychain_failed: Some(reason),
+                })
             }
-            KeyringRead::Empty => Ok((AppStore::Keyring { account }, None)),
-            KeyringRead::Failed(_) => Self::file_and_load(fallback_dir),
         }
     }
 
@@ -150,14 +192,6 @@ impl AppStore {
         AppStore::File {
             path: dir.join(APP_FILE_NAME),
         }
-    }
-
-    fn file_and_load(
-        fallback_dir: &Path,
-    ) -> Result<(AppStore, Option<AppCredentials>), RemoteError> {
-        let store = AppStore::file_fallback(fallback_dir);
-        let credentials = store.load()?;
-        Ok((store, credentials))
     }
 
     /// Saves `credentials`, replacing whatever was saved before.
@@ -310,16 +344,43 @@ mod tests {
 
     #[test]
     fn app_keyring_branches_pick_the_backend_from_one_read() {
-        // The test seam is bypassed on purpose by calling the bounded form
-        // only when the process is not under it; under it the seam wins, so
-        // this pins the account naming and the seam together.
         let dir = tempfile::tempdir().unwrap();
-        let (store, _) =
-            AppStore::resolve_and_load_bounded(Some("ghes.example"), dir.path(), |_| {
-                panic!("the keychain is never read under the no-keychain seam")
-            })
-            .unwrap();
-        assert_eq!(store.kind(), "file");
+        let found = AppStore::lookup_bounded(Some("ghes.example"), dir.path(), |account| {
+            assert_eq!(account, "github-app:ghes.example");
+            KeyringRead::Found(to_json(&sample()).unwrap())
+        })
+        .unwrap();
+        assert_eq!(found.store.kind(), "keyring");
+        assert_eq!(found.credentials, Some(sample()));
+        assert_eq!(found.keychain_failed, None);
+
+        let empty = AppStore::lookup_bounded(None, dir.path(), |_| KeyringRead::Empty).unwrap();
+        assert_eq!(empty.store.kind(), "keyring");
+        assert_eq!(empty.credentials, None);
+        assert_eq!(
+            empty.keychain_failed, None,
+            "an empty keychain is an answer"
+        );
+
+        let failed = AppStore::lookup_bounded(None, dir.path(), |_| {
+            KeyringRead::Failed("the keychain is locked".to_string())
+        })
+        .unwrap();
+        assert_eq!(failed.store.kind(), "file");
+        assert_eq!(failed.credentials, None);
+        assert_eq!(
+            failed.keychain_failed.as_deref(),
+            Some("the keychain is locked"),
+            "a failed read says so, so nobody caches its empty file as no App"
+        );
+    }
+
+    #[test]
+    fn app_lookup_under_the_no_keychain_seam_reads_the_file_and_reports_no_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let found = AppStore::lookup(Some("ghes.example"), dir.path()).unwrap();
+        assert_eq!(found.store.kind(), "file");
+        assert_eq!(found.keychain_failed, None);
     }
 
     #[test]
