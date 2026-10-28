@@ -173,6 +173,25 @@ fn write_auths(forge: &Forge, repo: &str) -> Vec<Option<String>> {
         .collect()
 }
 
+/// Makes every refresh wait at the forge until the returned semaphore gets
+/// permits.
+fn hold_refreshes(forge: &Forge) -> Arc<tokio::sync::Semaphore> {
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    *forge.refresh_gate.lock().unwrap() = Some(gate.clone());
+    gate
+}
+
+/// Waits until the forge has seen `n` refresh requests.
+async fn wait_for_refreshes(forge: &Forge, n: usize) {
+    for _ in 0..1000 {
+        if refreshes(forge).len() >= n {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("the forge never saw {n} refreshes");
+}
+
 fn refreshes(forge: &Forge) -> Vec<String> {
     forge.refreshes.lock().unwrap().clone()
 }
@@ -321,7 +340,16 @@ async fn two_concurrent_shares_refresh_once() {
     connect_with_change(&eng, tmp.path(), "acme/kb", "kb").await;
     connect_with_change(&eng, tmp.path(), "acme/kb2", "kb2").await;
 
-    let (one, two) = tokio::join!(share_as_ada(&eng, "kb"), share_as_ada(&eng, "kb2"));
+    // The first refresh is held open at the forge while the second share
+    // runs, so the two overlap for certain: without the per-account lock
+    // the second share presents the spent refresh token too and is refused.
+    let gate = hold_refreshes(&forge);
+    let release = async {
+        wait_for_refreshes(&forge, 1).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        gate.add_permits(16);
+    };
+    let (one, two, ()) = tokio::join!(share_as_ada(&eng, "kb"), share_as_ada(&eng, "kb2"), release);
     assert_eq!(one.unwrap()["outcome"], "proposed");
     assert_eq!(two.unwrap()["outcome"], "proposed");
     assert_eq!(
@@ -334,6 +362,56 @@ async fn two_concurrent_shares_refresh_once() {
         assert!(!auths.is_empty());
         assert!(auths.iter().all(|a| *a == bearer("ghu_new")), "{auths:?}");
     }
+}
+
+#[tokio::test]
+async fn a_share_cancelled_during_the_refresh_still_saves_the_new_pair() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (forge, url) = forge_with_ada("ghu_old").await;
+    forge.refreshable.lock().unwrap().insert(
+        "ghr_old".to_string(),
+        (
+            "ghu_new".to_string(),
+            "ghr_new".to_string(),
+            (ADA_ID, ADA_LOGIN.to_string()),
+        ),
+    );
+    let eng = engine(tmp.path(), &url, "personal").await;
+    eng.link_github(
+        "ada",
+        grant(
+            "ghu_old",
+            Some("ghr_old"),
+            Some(chrono::Duration::minutes(2)),
+        ),
+    )
+    .await
+    .unwrap();
+    connect_with_change(&eng, tmp.path(), "acme/kb", "kb").await;
+
+    // GitHub has rotated the pair and not answered yet when the share is
+    // dropped, the way a handler is dropped when its client goes away.
+    let gate = hold_refreshes(&forge);
+    {
+        let share = share_as_ada(&eng, "kb");
+        tokio::pin!(share);
+        tokio::select! {
+            result = &mut share => panic!("the share finished before the refresh: {result:?}"),
+            () = wait_for_refreshes(&forge, 1) => {}
+        }
+    }
+    gate.add_permits(16);
+
+    let result = share_as_ada(&eng, "kb").await.unwrap();
+    assert_eq!(result["outcome"], "proposed", "{result}");
+    assert_eq!(
+        refreshes(&forge),
+        vec!["ghr_old".to_string()],
+        "the renewed pair was saved, so no second refresh"
+    );
+    let auths = write_auths(&forge, "acme/kb");
+    assert!(!auths.is_empty());
+    assert!(auths.iter().all(|a| *a == bearer("ghu_new")), "{auths:?}");
 }
 
 #[tokio::test]

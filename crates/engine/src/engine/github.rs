@@ -1051,11 +1051,14 @@ impl Engine {
             if let Some(token) = token {
                 self.revoke_user_token(account, &token).await;
             }
-            self.forget_personal_token(&identity, host.as_deref())?;
+            // The row before the token: a failure in between leaves a token
+            // without a link, never a link that claims a live token it no
+            // longer has.
             access
                 .unlink_github(account)
                 .await
                 .map_err(|e| EngineError::Internal(e.to_string()))?;
+            self.forget_personal_token(&identity, host.as_deref())?;
         }
         self.clear_pending_for(&identity);
         Ok(())
@@ -1123,6 +1126,14 @@ impl Engine {
     /// token and keeps the link, and the share is refused with
     /// [`PERSONAL_TOKEN_MISSING`]; any other failure (offline, a GitHub
     /// error) refuses this share and keeps the token for the next one.
+    ///
+    /// The renewal and the save of the new pair run in a task of their own,
+    /// which holds the account's lock until both are done. GitHub spends the
+    /// old refresh token the moment it answers, so a share that is cancelled
+    /// in that window (a client that went away) must not take the save with
+    /// it: the new pair would be lost and the person would have to link
+    /// again. A save that fails is logged as an error, and the share still
+    /// goes out on the renewed token.
     pub(super) async fn personal_user_token(&self, account: &str) -> Result<StoredToken> {
         let identity = TokenIdentity::Personal(account.to_string());
         let host = self.github_token_host();
@@ -1137,7 +1148,7 @@ impl Engine {
             .entry(account.to_string())
             .or_default()
             .clone();
-        let _guard = lock.lock().await;
+        let guard = lock.lock_owned().await;
         // Read again under the lock: a share that held it before this one
         // has renewed the token, and the cache serves the new one.
         let token = self.personal_token_on_file(&identity, host.as_deref())?;
@@ -1155,7 +1166,7 @@ impl Engine {
                 return Ok(token);
             }
         };
-        let refresh = match token.refresh_token.as_deref() {
+        let refresh = match token.refresh_token.clone() {
             Some(refresh) if token.refresh_expires_at.is_none_or(|at| at > now) => refresh,
             // Nothing to renew with: still usable until it expires, gone
             // after.
@@ -1166,39 +1177,50 @@ impl Engine {
                     .await);
             }
         };
-        let credentials = app.credentials();
-        let renewed = crystalline_remote::github::auth::refresh_user_token(
-            app.auth_base(),
-            &credentials.client_id,
-            credentials.client_secret.as_deref(),
-            refresh,
-        )
-        .await;
-        let grant = match renewed {
-            Ok(grant) => grant,
-            Err(RemoteError::AuthExpired) => {
-                return Err(self
-                    .personal_token_gone(account, &identity, host.as_deref())
-                    .await);
+        let plan = self.github_save_plan_for(&identity, host.as_deref())?;
+        let owner = account.to_string();
+        let renewal = tokio::spawn(async move {
+            // Held until the new pair is saved, so a share waiting for this
+            // account reads the renewed token, never the spent one.
+            let _guard = guard;
+            let credentials = app.credentials();
+            let grant = crystalline_remote::github::auth::refresh_user_token(
+                app.auth_base(),
+                &credentials.client_id,
+                credentials.client_secret.as_deref(),
+                &refresh,
+            )
+            .await?;
+            let renewed = StoredToken {
+                access_token: grant.access_token,
+                host: token.host,
+                user: token.user,
+                created_at: now,
+                refresh_token: grant.refresh_token,
+                expires_at: grant.expires_at,
+                refresh_expires_at: grant.refresh_expires_at,
+            };
+            match save_off_runtime(plan, renewed.clone()).await {
+                Ok(()) => tracing::info!("the GitHub token of {owner} was renewed"),
+                Err(e) => tracing::error!(
+                    "the GitHub token of {owner} was renewed but could not be saved ({e}); this share uses it, and {owner} may have to link GitHub again"
+                ),
             }
+            Ok::<StoredToken, RemoteError>(renewed)
+        });
+        let renewed = renewal.await.map_err(|e| {
+            EngineError::Internal(format!("the GitHub token renewal did not finish: {e}"))
+        })?;
+        match renewed {
+            Ok(token) => Ok(token),
+            Err(RemoteError::AuthExpired) => Err(self
+                .personal_token_gone(account, &identity, host.as_deref())
+                .await),
             Err(e) => {
                 tracing::warn!("the GitHub token of {account} could not be renewed: {e}");
-                return Err(e.into());
+                Err(e.into())
             }
-        };
-        let renewed = StoredToken {
-            access_token: grant.access_token,
-            host: token.host.clone(),
-            user: token.user.clone(),
-            created_at: now,
-            refresh_token: grant.refresh_token,
-            expires_at: grant.expires_at,
-            refresh_expires_at: grant.refresh_expires_at,
-        };
-        let plan = self.github_save_plan_for(&identity, host.as_deref())?;
-        save_off_runtime(plan, renewed.clone()).await?;
-        tracing::info!("the GitHub token of {account} was renewed");
-        Ok(renewed)
+        }
     }
 
     /// The personal token on file for `identity`, or the refusal a share
@@ -1272,7 +1294,9 @@ pub(super) struct LinkFlow {
 /// The link itself, shared by [`Engine::link_github`] and the device-flow
 /// task: ask GitHub who the token is, write the row, then save the token as
 /// the account's personal credential. The row goes first, so a GitHub
-/// account already linked elsewhere is refused before a token is stored.
+/// account already linked elsewhere is refused before a token is stored; a
+/// save that fails after it marks the row's token gone, so the link never
+/// claims a token it does not have.
 async fn complete_link(
     flow: &LinkFlow,
     token_host: Option<String>,
@@ -1292,7 +1316,7 @@ async fn complete_link(
         )
         .await
         .map_err(link_refusal)?;
-    save_off_runtime(
+    let saved = save_off_runtime(
         plan,
         StoredToken {
             access_token: grant.access_token,
@@ -1304,7 +1328,16 @@ async fn complete_link(
             refresh_expires_at: grant.refresh_expires_at,
         },
     )
-    .await?;
+    .await;
+    if let Err(e) = saved {
+        if let Err(mark) = flow.access.mark_github_token_gone(&flow.account).await {
+            tracing::warn!(
+                "the GitHub link of {} could not be marked after a failed token save: {mark}",
+                flow.account
+            );
+        }
+        return Err(e.into());
+    }
     tracing::info!(
         account = %flow.account,
         github_id = link.github_id,

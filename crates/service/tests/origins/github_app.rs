@@ -111,6 +111,9 @@ pub(crate) struct Forge {
     pub(crate) revokes: StdMutex<Vec<(Option<String>, String)>>,
     /// When set, every revoke answers 503.
     pub(crate) revoke_fails: std::sync::atomic::AtomicBool,
+    /// When set, a refresh answers only once the test adds a permit here,
+    /// instead of after 200 ms.
+    pub(crate) refresh_gate: StdMutex<Option<Arc<tokio::sync::Semaphore>>>,
 }
 
 impl Forge {
@@ -181,6 +184,7 @@ pub(crate) async fn spawn_forge(
         refreshes: StdMutex::new(Vec::new()),
         revokes: StdMutex::new(Vec::new()),
         revoke_fails: std::sync::atomic::AtomicBool::new(false),
+        refresh_gate: StdMutex::new(None),
     });
     let router = Router::new().fallback(handle).with_state(forge.clone());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -342,28 +346,39 @@ async fn handle(
 
 /// `POST /login/oauth/access_token` with `grant_type=refresh_token`: answers
 /// the next pair for a refresh token the forge knows and spends it, and
-/// `bad_refresh_token` for any other. Slow on purpose, so two shares that
-/// both decide to refresh overlap.
+/// `bad_refresh_token` for any other. The pair is rotated before the answer
+/// is sent, and the answer waits: 200 ms, or until a test opens
+/// `refresh_gate`.
 async fn refresh_route(forge: &Forge, body: Bytes) -> Response {
     let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
     let presented = body["refresh_token"]
         .as_str()
         .unwrap_or_default()
         .to_string();
-    forge.refreshes.lock().unwrap().push(presented.clone());
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Spent and rotated at once, the way GitHub does it: whatever happens to
+    // the caller after this, the old refresh token no longer works.
     let next = forge.refreshable.lock().unwrap().remove(&presented);
+    if let Some((access, _, owner)) = &next {
+        forge
+            .users
+            .lock()
+            .unwrap()
+            .insert(access.clone(), owner.clone());
+    }
+    forge.refreshes.lock().unwrap().push(presented.clone());
+    let gate = forge.refresh_gate.lock().unwrap().clone();
+    match gate {
+        Some(gate) => drop(gate.acquire().await.unwrap()),
+        None => tokio::time::sleep(Duration::from_millis(200)).await,
+    }
     match next {
-        Some((access, refresh, owner)) => {
-            forge.users.lock().unwrap().insert(access.clone(), owner);
-            ok(json!({
-                "access_token": access,
-                "token_type": "bearer",
-                "expires_in": 28800,
-                "refresh_token": refresh,
-                "refresh_token_expires_in": 15897600,
-            }))
-        }
+        Some((access, refresh, _owner)) => ok(json!({
+            "access_token": access,
+            "token_type": "bearer",
+            "expires_in": 28800,
+            "refresh_token": refresh,
+            "refresh_token_expires_in": 15897600,
+        })),
         None => ok(json!({
             "error": "bad_refresh_token",
             "error_description": "The refresh token passed is incorrect or expired.",
