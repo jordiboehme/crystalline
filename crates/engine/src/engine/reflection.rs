@@ -49,8 +49,7 @@ pub const REFUSED_HOMELESS: &str = "this domain is connected to GitHub and its R
 /// carries: a MANIFEST with the [`crystalline_core::TEAM_KEY`] marker and no
 /// origin on this instance, typically a plain clone of the team repository
 /// registered as a local domain. The switch-on and the gate both refuse it
-/// with [`unconnected_team_refusal`], which names the domain before these
-/// words.
+/// with one sentence that names the domain before these words.
 pub const REFUSED_UNCONNECTED_TEAM: &str = "is a team domain and is not connected here";
 /// The start of the refusal for a Reflection held by another instance; its
 /// address follows.
