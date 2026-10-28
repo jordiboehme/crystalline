@@ -639,6 +639,15 @@ impl Engine {
         if !engrams.is_empty() {
             return Ok(ReflectionState::Pending { engrams });
         }
+        // A team domain that is not connected here (its MANIFEST carries
+        // the marker) has no home here, whatever its MANIFEST names: its
+        // Reflection lives at the team server, which only a connected copy
+        // can be. Asked before the home, so a plain clone on the team
+        // server's own machine, whose MANIFEST names this very instance, is
+        // refused like every other stray copy.
+        if !origin && crystalline_core::team_at(&root).is_some() {
+            return Ok(ReflectionState::Homeless);
+        }
         let declared = crystalline_core::reflection_home_at(&root);
         match (declared, origin) {
             (Some(home), _) if self.own_public_url().as_deref() == Some(home.as_str()) => {
@@ -648,13 +657,6 @@ impl Engine {
             }
             (Some(home), _) => Ok(ReflectionState::Elsewhere { url: home }),
             (None, true) => Ok(ReflectionState::Homeless),
-            // A team domain that is not connected here (its MANIFEST carries
-            // the marker) has no home here either: its Reflection lives at
-            // the team server, so this copy reads as homeless and the gate
-            // refuses it, whatever the switch says.
-            (None, false) if crystalline_core::team_at(&root).is_some() => {
-                Ok(ReflectionState::Homeless)
-            }
             (None, false) => Ok(ReflectionState::On {
                 home: ReflectionHome::Local,
             }),

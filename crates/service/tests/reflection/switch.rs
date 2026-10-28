@@ -2199,3 +2199,56 @@ async fn the_gate_refuses_an_unconnected_team_domain_that_says_on() {
         .await
         .unwrap();
 }
+
+/// A plain clone on the team server's own machine: its MANIFEST carries the
+/// marker, says `reflection: on` and names this instance as the home, and
+/// nothing connects it here. It is refused like any other stray clone. Once
+/// the same domain is connected, the gate lets go and the Reflection is
+/// served here, at its home.
+#[tokio::test]
+async fn a_clone_naming_this_instance_as_home_is_refused_until_it_is_connected() {
+    let files = [
+        (
+            "MANIFEST.md",
+            manifest("team: github\nreflection: on\nreflection_home: https://kb.example.com\n"),
+        ),
+        ("reflections/page.md", page("Page")),
+    ];
+    let files: Vec<(&str, &str)> = files.iter().map(|(p, t)| (*p, t.as_str())).collect();
+    let fx = fixture_with(&files, |cfg, _| {
+        cfg.service = Some(ServiceConfig {
+            public_url: Some("https://kb.example.com".into()),
+            ..Default::default()
+        });
+    })
+    .await;
+    assert_eq!(
+        fx.engine.reflection_state("eng").await.unwrap(),
+        ReflectionState::Homeless
+    );
+    let err = fx
+        .engine
+        .read_reflection_tree("eng", &ReflectionCaller::owner())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains(crystalline_service::engine::REFUSED_UNCONNECTED_TEAM),
+        "{err}"
+    );
+
+    let fx = fixture_with(&files, |cfg, _| {
+        with_origin(cfg, Some("https://kb.example.com"))
+    })
+    .await;
+    assert_eq!(
+        fx.engine.reflection_state("eng").await.unwrap(),
+        ReflectionState::On {
+            home: crystalline_service::ReflectionHome::Here
+        }
+    );
+    fx.engine
+        .read_reflection_tree("eng", &ReflectionCaller::owner())
+        .await
+        .unwrap();
+}
