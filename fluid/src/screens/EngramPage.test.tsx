@@ -249,6 +249,11 @@ beforeEach(() => {
   localStorage.clear();
 });
 
+// Above roughly load average 80 this file's slower tests come close to the
+// 5000 ms default (measured 2026-10-28); the raise keeps a loaded machine from
+// reading as a failure. Never raise the global default to hide this.
+vi.setConfig({ testTimeout: 15000 });
+
 describe("the engram page", () => {
   it("a locked domain's engram page shows the lock and its text and offers no Edit", async () => {
     serve({

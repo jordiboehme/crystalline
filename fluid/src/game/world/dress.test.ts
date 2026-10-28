@@ -1916,6 +1916,8 @@ describe("rare props (2.6d C9 to C13)", () => {
     }
   });
 
+  // A sweep over many seeded rooms: about 3 s at load average 80 (measured
+  // 2026-10-28), close to the 5 s default, and past it under heavier load.
   it("hangs a forced poster only on a free edge no prop, fixture or hero holds, with nothing standing in front (2.6d C11, Review Focus 3)", () => {
     // Mutation caught: the poster step not checking `used` (it lands on a
     // sign's edge), not keep-clear (a floor prop stands before it), or
@@ -1993,7 +1995,7 @@ describe("rare props (2.6d C9 to C13)", () => {
     // Most rooms keep an open edge after their mandatory props. If this
     // bound fails, report the count before changing it.
     expect(hung).toBeGreaterThan(rooms.length / 2);
-  });
+  }, 20_000);
 
   it("marks at most one eligible crate, inside the footprint it replaces, and changes nothing else (2.6d C12, Review Focus 4)", () => {
     // Mutation caught: the small crate (variant 0) marked, whose 0.8 m box

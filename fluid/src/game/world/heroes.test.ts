@@ -1598,6 +1598,8 @@ describe("the hero pass", () => {
     expect(checked).toBeGreaterThan(10);
   }, 30_000);
 
+  // A sweep over many seeded halls: about 24 s at load average 80 (measured
+  // 2026-10-28), too close to a 30 s budget.
   it("keeps a cabinet's use point on the floor and clear of every blocker", () => {
     let seen = 0;
     for (const { base } of [...WORKSHOP_BASES, ...HUB_BASES])
@@ -1620,7 +1622,7 @@ describe("the hero pass", () => {
         }
       }
     expect(seen).toBeGreaterThan(0);
-  }, 30_000);
+  }, 60_000);
 
   // One room per kind: the first reseeded workshop, hub or bridge layout
   // that places it.
@@ -1950,6 +1952,8 @@ describe("the free-standing police box (2.6e)", () => {
     }
   });
 
+  // A sweep over many seeded halls: about 19 s at load average 80 (measured
+  // 2026-10-28), too close to a 30 s budget.
   it("never stands it against a wall: nothing in the walkway of a finished room, over a sweep of halls", () => {
     // Mutation caught: the box backed against a wall again, the walkway
     // checked against the floor only (a fixture, a scaffold frame or
@@ -2016,5 +2020,5 @@ describe("the free-standing police box (2.6e)", () => {
       `2.6e police box stood free in ${String(boxes)} of ${String(rooms)} finished rooms`,
     );
     expect(boxes / rooms).toBeGreaterThanOrEqual(OPEN_BOX_RATE);
-  }, 30_000);
+  }, 60_000);
 });
