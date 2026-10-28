@@ -776,18 +776,23 @@ impl Engine {
     ///
     /// Reads the App's slug first when the credentials carried none (an App
     /// from the environment), so the share records the bot's login from the
-    /// very first one. An account that has a contact address is named as the
-    /// commits' author, with the App's bot as committer; everyone else (the
-    /// machine owner, an unauthenticated agent, an account without an
-    /// address) gets the slot's own router, whose commits the bot authors.
-    /// Attribution never fails a share: when the person or the bot cannot be
-    /// read, a warning is logged and the bot authors the commit.
+    /// very first one. An account that has a GitHub link or a contact
+    /// address is named as the commits' author, with the App's bot as
+    /// committer; everyone else (the machine owner, an unauthenticated agent,
+    /// an account with neither) gets the slot's own router, whose commits
+    /// the bot authors. Attribution never fails a share: when the person or
+    /// the bot cannot be read, a warning is logged and the bot authors the
+    /// commit.
     ///
-    /// The author address is the account's email as the admin, the identity
-    /// provider or the forward-auth proxy supplied it. Crystalline does not
-    /// verify it, and GitHub credits the commit to whichever GitHub account
-    /// holds that address; an identity provider address marked
-    /// `email_verified: false` is never stored, so it never gets here.
+    /// The author address of a linked account is the link's GitHub
+    /// `noreply` address, `<github_id>+<login>@users.noreply.<host>` (see
+    /// [`GithubApp::user_noreply_email`]): GitHub verified that identity, so
+    /// it wins over any account email. Without a link it is the account's
+    /// email as the admin, the identity provider or the forward-auth proxy
+    /// supplied it. Crystalline does not verify that one, and GitHub credits
+    /// the commit to whichever GitHub account holds that address; an
+    /// identity provider address marked `email_verified: false` is never
+    /// stored, so it never gets here.
     pub(super) async fn app_share_router(
         &self,
         router: Arc<AppRouter>,
@@ -816,11 +821,27 @@ impl Engine {
                 return router;
             }
         };
+        // A linked account is named by its GitHub noreply address, which
+        // GitHub verified; the account email only without a link. A link
+        // that cannot be read falls back to the account email.
+        let linked = match access.github_link_of(account).await {
+            Ok(link) => link,
+            Err(e) => {
+                tracing::warn!(
+                    "the GitHub link of {account} could not be read, so its share is authored with the account email: {e}"
+                );
+                None
+            }
+        };
+        let email = match linked {
+            Some(link) => Some(router.app().user_noreply_email(link.github_id, &link.login)),
+            None => contact.email,
+        };
         // An account without an address of its own is not named; the bot
         // authors it.
-        let Some(email) = contact.email else {
+        let Some(email) = email else {
             tracing::debug!(
-                "the account {account} has no email address, so the GitHub App authors its share"
+                "the account {account} has no email address and no GitHub link, so the GitHub App authors its share"
             );
             return router;
         };

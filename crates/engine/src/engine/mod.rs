@@ -692,6 +692,38 @@ pub trait ConnectAuth: Send + Sync {
         api_url: Option<&str>,
         token: &str,
     ) -> std::result::Result<String, RemoteError>;
+
+    /// Starts a GitHub App's device-flow sign-in, which sends no scope (an
+    /// App's permissions are its own). By default the same call as
+    /// [`ConnectAuth::start_device_flow`], so a test double that only
+    /// answers that one serves both.
+    async fn start_app_device_flow(
+        &self,
+        auth_base: &str,
+        client_id: &str,
+    ) -> std::result::Result<crystalline_remote::DeviceFlowStart, RemoteError> {
+        self.start_device_flow(auth_base, client_id).await
+    }
+
+    /// Runs a started device flow to completion, returning the whole grant:
+    /// a GitHub App's user token comes with a refresh token and its expiry,
+    /// which a link must keep. By default the token of
+    /// [`ConnectAuth::run_device_flow`] with nothing else, the shape of a
+    /// token that never expires.
+    async fn run_device_flow_grant(
+        &self,
+        auth_base: &str,
+        client_id: &str,
+        start: &crystalline_remote::DeviceFlowStart,
+    ) -> std::result::Result<crystalline_remote::UserTokenGrant, RemoteError> {
+        let access_token = self.run_device_flow(auth_base, client_id, start).await?;
+        Ok(crystalline_remote::UserTokenGrant {
+            access_token,
+            refresh_token: None,
+            expires_at: None,
+            refresh_expires_at: None,
+        })
+    }
 }
 
 /// The production [`ConnectAuth`]: delegates straight to
@@ -726,6 +758,23 @@ impl ConnectAuth for RealConnectAuth {
         token: &str,
     ) -> std::result::Result<String, RemoteError> {
         crystalline_remote::github::auth::validate_token(api_url, token).await
+    }
+
+    async fn start_app_device_flow(
+        &self,
+        auth_base: &str,
+        client_id: &str,
+    ) -> std::result::Result<crystalline_remote::DeviceFlowStart, RemoteError> {
+        crystalline_remote::github::auth::start_device_flow(auth_base, client_id, None).await
+    }
+
+    async fn run_device_flow_grant(
+        &self,
+        auth_base: &str,
+        client_id: &str,
+        start: &crystalline_remote::DeviceFlowStart,
+    ) -> std::result::Result<crystalline_remote::UserTokenGrant, RemoteError> {
+        crystalline_remote::github::auth::run_device_flow(auth_base, client_id, start).await
     }
 }
 
@@ -1195,6 +1244,11 @@ pub struct Engine {
     // a `connect` landing later - in this process or a standalone CLI writing
     // the same keychain item - is picked up on the very next call.
     github_tokens: Arc<std::sync::Mutex<HashMap<String, CachedGithub>>>,
+    // One lock per account whose App user token is being refreshed, so two
+    // shares that find it expiring refresh it once: GitHub spends a refresh
+    // token on use, and a second exchange of the same one would be refused
+    // and cost the person their token. See `Engine::personal_user_token`.
+    personal_refresh: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     // The background origin poller's observable state: every domain's poll
     // schedule and most recent result, plus the poller's one shared
     // rate-limit pause. Always present (not an `Option`), whether or not
@@ -2436,6 +2490,7 @@ impl Engine {
             pending_connect: std::sync::Mutex::new(None),
             token_store_dir_override: None,
             github_tokens: Arc::default(),
+            personal_refresh: std::sync::Mutex::default(),
             origin_poller: poller::OriginPollerState::default(),
             routing_virtual: std::sync::RwLock::new(BTreeMap::new()),
             virtual_read_only: std::sync::RwLock::new(BTreeSet::new()),
@@ -7511,6 +7566,32 @@ pub struct GithubIdentity {
     /// This account's device flow waiting for the browser side.
     pub pending: Option<GithubPending>,
     /// The once-reported failure of this account's last device flow.
+    pub error: Option<String>,
+}
+
+/// One account's link to a GitHub account, as the profile and the CLI show
+/// it. Carries no token material: who the account is linked to, since when,
+/// whether the user token is still live, and the device flow's poll.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GithubLinkView {
+    /// Whether the account is linked.
+    pub linked: bool,
+    /// The GitHub login last seen for the linked id.
+    pub login: Option<String>,
+    /// GitHub's numeric user id.
+    pub github_id: Option<u64>,
+    /// The GitHub host of the link: `github.com` or the Enterprise Server
+    /// host.
+    pub host: Option<String>,
+    /// When the link was made.
+    pub linked_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// False once the user token is known to be gone (revoked, or its
+    /// refresh token expired): the link stays and the person links again to
+    /// share personally.
+    pub token_live: bool,
+    /// This account's link device flow waiting for the browser side.
+    pub pending: Option<GithubPending>,
+    /// The once-reported failure of this account's last link device flow.
     pub error: Option<String>,
 }
 

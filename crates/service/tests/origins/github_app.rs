@@ -46,23 +46,23 @@ use crate::support::MockProvider;
 
 /// The throwaway test key the remote crate's App tests sign with; it belongs
 /// to no App.
-const PEM: &str = include_str!("../../../remote/tests/fixtures/app-key-pkcs1.pem");
+pub(crate) const PEM: &str = include_str!("../../../remote/tests/fixtures/app-key-pkcs1.pem");
 
-const SLUG: &str = "crystalline-acme";
-const INSTANCE_TOKEN: &str = "gho_instance";
+pub(crate) const SLUG: &str = "crystalline-acme";
+pub(crate) const INSTANCE_TOKEN: &str = "gho_instance";
 const HOME: &str = "https://kb.example.com";
 
 /// One request the fake forge saw.
 #[derive(Clone, Debug)]
-struct Hit {
-    method: String,
-    path: String,
-    auth: Option<String>,
+pub(crate) struct Hit {
+    pub(crate) method: String,
+    pub(crate) path: String,
+    pub(crate) auth: Option<String>,
 }
 
 impl Hit {
     /// The repository a `/repos/{owner}/{name}/...` request is about.
-    fn repo(&self) -> Option<String> {
+    pub(crate) fn repo(&self) -> Option<String> {
         let rest = self.path.strip_prefix("/repos/")?;
         let mut parts = rest.split('/');
         Some(format!("{}/{}", parts.next()?, parts.next()?))
@@ -70,14 +70,18 @@ impl Hit {
 
     /// A request for the repository's content or history, as opposed to the
     /// App's installation lookup.
-    fn is_repo_call(&self) -> bool {
+    pub(crate) fn is_repo_call(&self) -> bool {
         self.repo().is_some() && !self.path.ends_with("/installation")
     }
 }
 
+/// What one refresh token's exchange answers: the new access token, the new
+/// refresh token, and the GitHub user both belong to.
+pub(crate) type Refreshed = (String, String, (u64, String));
+
 /// A GitHub stand-in: repositories, which installation covers each one, the
 /// token each installation mints, and the log.
-struct Forge {
+pub(crate) struct Forge {
     repos: HashMap<String, Arc<MockProvider>>,
     /// Repository -> installation id, for the repositories the App is
     /// installed on.
@@ -91,10 +95,26 @@ struct Forge {
     trees_unauthorized: AtomicUsize,
     /// The body of every `POST .../git/commits`, in order.
     commits: StdMutex<Vec<Value>>,
+    /// The App user tokens (`ghu_`) that may read and write every
+    /// repository, and who each one belongs to on `GET /user`.
+    pub(crate) users: StdMutex<HashMap<String, (u64, String)>>,
+    /// Refresh token -> the access and refresh token its exchange answers,
+    /// and whose they are. A refresh token is spent on use, the way GitHub
+    /// spends it: a second exchange of the same one answers
+    /// `bad_refresh_token`.
+    pub(crate) refreshable: StdMutex<HashMap<String, Refreshed>>,
+    /// Every refresh token a `POST /login/oauth/access_token` presented, in
+    /// order.
+    pub(crate) refreshes: StdMutex<Vec<String>>,
+    /// Every `DELETE /applications/{client_id}/token`: its `Authorization`
+    /// header and the token in its body.
+    pub(crate) revokes: StdMutex<Vec<(Option<String>, String)>>,
+    /// When set, every revoke answers 503.
+    pub(crate) revoke_fails: std::sync::atomic::AtomicBool,
 }
 
 impl Forge {
-    fn hits(&self) -> Vec<Hit> {
+    pub(crate) fn hits(&self) -> Vec<Hit> {
         self.log.lock().unwrap().clone()
     }
 
@@ -102,7 +122,7 @@ impl Forge {
         self.mints.lock().unwrap().clone()
     }
 
-    fn commits(&self) -> Vec<Value> {
+    pub(crate) fn commits(&self) -> Vec<Value> {
         self.commits.lock().unwrap().clone()
     }
 
@@ -120,7 +140,7 @@ impl Forge {
         let Some(token) = auth.and_then(|a| a.strip_prefix("Bearer ")) else {
             return false;
         };
-        if token == INSTANCE_TOKEN {
+        if token == INSTANCE_TOKEN || self.users.lock().unwrap().contains_key(token) {
             return true;
         }
         match self.installed.lock().unwrap().get(repo) {
@@ -132,7 +152,7 @@ impl Forge {
 
 /// Builds the forge and serves it on a loopback port; returns it with its
 /// base url, which is also the `github.api_url` the engine is pointed at.
-async fn spawn_forge(
+pub(crate) async fn spawn_forge(
     repos: &[(&str, Arc<MockProvider>)],
     installed: &[(&str, u64)],
     tokens: &[(u64, &str)],
@@ -156,6 +176,11 @@ async fn spawn_forge(
         mints: StdMutex::new(Vec::new()),
         trees_unauthorized: AtomicUsize::new(0),
         commits: StdMutex::new(Vec::new()),
+        users: StdMutex::new(HashMap::new()),
+        refreshable: StdMutex::new(HashMap::new()),
+        refreshes: StdMutex::new(Vec::new()),
+        revokes: StdMutex::new(Vec::new()),
+        revoke_fails: std::sync::atomic::AtomicBool::new(false),
     });
     let router = Router::new().fallback(handle).with_state(forge.clone());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -220,6 +245,37 @@ async fn handle(
     };
     forge.log.lock().unwrap().push(hit.clone());
 
+    if path == "/login/oauth/access_token" && method == Method::POST {
+        return refresh_route(&forge, body).await;
+    }
+    if path == "/user" && method == Method::GET {
+        let token = auth.as_deref().and_then(|a| a.strip_prefix("Bearer "));
+        return match token.and_then(|t| forge.users.lock().unwrap().get(t).cloned()) {
+            Some((id, login)) => ok(json!({"id": id, "login": login})),
+            None => (
+                StatusCode::UNAUTHORIZED,
+                axum::Json(json!({"message": "Bad credentials"})),
+            )
+                .into_response(),
+        };
+    }
+    if path.starts_with("/applications/") && path.ends_with("/token") && method == Method::DELETE {
+        let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        let token = body["access_token"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        forge.revokes.lock().unwrap().push((auth, token.clone()));
+        if forge.revoke_fails.load(Ordering::SeqCst) {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                axum::Json(json!({"message": "unavailable"})),
+            )
+                .into_response();
+        }
+        forge.users.lock().unwrap().remove(&token);
+        return StatusCode::NO_CONTENT.into_response();
+    }
     if path == "/app" && method == Method::GET {
         return ok(json!({
             "id": 7,
@@ -282,6 +338,37 @@ async fn handle(
     };
     let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
     repo_route(&forge, &mock, &origin, &method, &uri, &tail, body).await
+}
+
+/// `POST /login/oauth/access_token` with `grant_type=refresh_token`: answers
+/// the next pair for a refresh token the forge knows and spends it, and
+/// `bad_refresh_token` for any other. Slow on purpose, so two shares that
+/// both decide to refresh overlap.
+async fn refresh_route(forge: &Forge, body: Bytes) -> Response {
+    let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    let presented = body["refresh_token"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    forge.refreshes.lock().unwrap().push(presented.clone());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let next = forge.refreshable.lock().unwrap().remove(&presented);
+    match next {
+        Some((access, refresh, owner)) => {
+            forge.users.lock().unwrap().insert(access.clone(), owner);
+            ok(json!({
+                "access_token": access,
+                "token_type": "bearer",
+                "expires_in": 28800,
+                "refresh_token": refresh,
+                "refresh_token_expires_in": 15897600,
+            }))
+        }
+        None => ok(json!({
+            "error": "bad_refresh_token",
+            "error_description": "The refresh token passed is incorrect or expired.",
+        })),
+    }
 }
 
 async fn repo_route(
@@ -542,21 +629,21 @@ async fn repo_route(
 
 // --- the engine --------------------------------------------------------------
 
-fn manifest(extra: &str) -> Vec<u8> {
+pub(crate) fn manifest(extra: &str) -> Vec<u8> {
     format!(
         "---\ntype: manifest\ntitle: Team\nteam: github\npermalink: manifest\n{extra}tags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Team\n\n## Scope\n\n- shared knowledge\n\n## When to Use\n\n- always\n"
     )
     .into_bytes()
 }
 
-fn engram(title: &str, permalink: &str, body: &str) -> Vec<u8> {
+pub(crate) fn engram(title: &str, permalink: &str, body: &str) -> Vec<u8> {
     format!(
         "---\ntype: engram\ntitle: {title}\npermalink: {permalink}\ntags:\n  - test\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n{body}\n"
     )
     .into_bytes()
 }
 
-fn files(pairs: &[(&str, Vec<u8>)]) -> BTreeMap<String, Vec<u8>> {
+pub(crate) fn files(pairs: &[(&str, Vec<u8>)]) -> BTreeMap<String, Vec<u8>> {
     pairs
         .iter()
         .map(|(path, bytes)| (path.to_string(), bytes.clone()))
@@ -565,7 +652,7 @@ fn files(pairs: &[(&str, Vec<u8>)]) -> BTreeMap<String, Vec<u8>> {
 
 /// A repository holding only its MANIFEST (plus `extra` MANIFEST lines) on
 /// `main`.
-fn repo_with_manifest(extra: &str) -> Arc<MockProvider> {
+pub(crate) fn repo_with_manifest(extra: &str) -> Arc<MockProvider> {
     let mock = Arc::new(MockProvider::new());
     let head = mock.add_commit(files(&[("MANIFEST.md", manifest(extra))]));
     mock.set_branch("main", &head);
@@ -574,7 +661,7 @@ fn repo_with_manifest(extra: &str) -> Arc<MockProvider> {
 
 /// The environment of an instance with an App: the instance token too, so a
 /// test can tell which of the two a request carried.
-fn app_env() -> Vec<(&'static str, &'static str)> {
+pub(crate) fn app_env() -> Vec<(&'static str, &'static str)> {
     vec![
         ("CRYSTALLINE_GITHUB_TOKEN", INSTANCE_TOKEN),
         ("CRYSTALLINE_GITHUB_APP_ID", "7"),
@@ -585,7 +672,7 @@ fn app_env() -> Vec<(&'static str, &'static str)> {
 
 /// An engine pointed at the forge, with every state directory in `tmp` and
 /// the given environment.
-async fn engine(tmp: &Path, api_url: &str, env: &[(&str, &str)]) -> Engine {
+pub(crate) async fn engine(tmp: &Path, api_url: &str, env: &[(&str, &str)]) -> Engine {
     let store = TursoStore::open_in_memory().await.unwrap();
     let cfg = GlobalConfig {
         github: Some(GitHubConfig {
@@ -617,14 +704,14 @@ async fn engine(tmp: &Path, api_url: &str, env: &[(&str, &str)]) -> Engine {
     .with_env_overlay(overlay)
 }
 
-async fn connect(eng: &Engine, repo: &str, name: &str, root: &Path) -> Value {
+pub(crate) async fn connect(eng: &Engine, repo: &str, name: &str, root: &Path) -> Value {
     eng.origin_add(repo, Some(name), None, None, Some(root.to_str().unwrap()))
         .await
         .unwrap()
 }
 
 /// Every `Authorization` value the repository calls of `repo` carried.
-fn repo_auths(forge: &Forge, repo: &str) -> Vec<Option<String>> {
+pub(crate) fn repo_auths(forge: &Forge, repo: &str) -> Vec<Option<String>> {
     forge
         .hits()
         .into_iter()
@@ -633,7 +720,7 @@ fn repo_auths(forge: &Forge, repo: &str) -> Vec<Option<String>> {
         .collect()
 }
 
-fn bearer(token: &str) -> Option<String> {
+pub(crate) fn bearer(token: &str) -> Option<String> {
     Some(format!("Bearer {token}"))
 }
 

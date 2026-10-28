@@ -446,6 +446,25 @@ impl GithubApp {
         &self.creds
     }
 
+    /// The REST API base this App sends to, without a trailing slash.
+    pub fn api_url(&self) -> &str {
+        &self.api_url
+    }
+
+    /// The base of this App's OAuth endpoints (the web flow, the device
+    /// flow and the user-token refresh), see [`auth::auth_base`].
+    pub fn auth_base(&self) -> &str {
+        &self.auth_base
+    }
+
+    /// The `noreply` commit address of the GitHub user `id`/`login` on this
+    /// App's host, `<id>+<login>@<domain>` (see `noreply_domain`): the
+    /// address a linked person's commits name them by.
+    pub fn user_noreply_email(&self, id: u64, login: &str) -> String {
+        let domain = noreply_domain(api_host(&self.api_url).as_deref());
+        format!("{id}+{login}@{domain}")
+    }
+
     /// Reads a `GET /app` answer into an [`AppInfo`] and keeps its slug.
     async fn read_app_info(&self, response: Response) -> Result<AppInfo, RemoteError> {
         if response.status() == StatusCode::NOT_FOUND {

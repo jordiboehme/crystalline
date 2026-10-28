@@ -10,6 +10,7 @@
 mod support;
 
 mod github_app;
+mod github_link;
 mod origin;
 mod origin_names;
 mod poller;

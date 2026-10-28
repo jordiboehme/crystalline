@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::auth_store::{AuthStore, DomainAcl, MemberLevel, ReflectionLevel, Role};
+use crate::auth_store::{AuthStore, DomainAcl, GithubLink, MemberLevel, ReflectionLevel, Role};
 
 /// The fixed identity name the machine owner's personal credential is stored
 /// under - the CLI and stdio MCP have no account to be, so they share one local
@@ -711,6 +711,40 @@ impl DomainAccess {
                 .map(|email| email.trim().to_string())
                 .filter(|email| !email.is_empty()),
         }))
+    }
+
+    /// The GitHub link of `account`, or `None` when it has none.
+    ///
+    /// The link delegations below are narrow for the same reason as every
+    /// delegation here: the engine links, reads, marks and unlinks one
+    /// account's row and never lists the table.
+    pub async fn github_link_of(&self, account: &str) -> Result<Option<GithubLink>> {
+        self.auth.github_link_of(account).await
+    }
+
+    /// Link `account` to the GitHub account `github_id` on `host` (see
+    /// [`AuthStore::link_github`]: another account holding the id is refused
+    /// with [`crate::auth_store::RefusalKind::GithubIdTaken`]). `host` is the
+    /// bare host the App runs on, never a URL.
+    pub async fn link_github(
+        &self,
+        account: &str,
+        host: &str,
+        github_id: u64,
+        login: &str,
+    ) -> Result<GithubLink> {
+        self.auth.link_github(account, host, github_id, login).await
+    }
+
+    /// Say that the stored user token of `account` is gone (revoked or
+    /// expired); the link stays. Answers whether a row was marked.
+    pub async fn mark_github_token_gone(&self, account: &str) -> Result<bool> {
+        self.auth.mark_github_token_gone(account).await
+    }
+
+    /// Delete the GitHub link of `account`. Answers whether there was one.
+    pub async fn unlink_github(&self, account: &str) -> Result<bool> {
+        self.auth.unlink_github(account).await
     }
 
     /// What `scope` may do on `domain`.

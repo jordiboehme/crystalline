@@ -3663,7 +3663,10 @@ impl Engine {
             let login = app.bot_login();
             return Ok((app, login));
         }
-        let (api_url, token) = self.resolve_share_credential(actor)?;
+        let (api_url, token) = match self.personal_app_identity(actor)? {
+            Some(name) => (self.share_api_url(), self.personal_user_token(&name).await?),
+            None => self.resolve_share_credential(actor)?,
+        };
         let login = token.user_display().map(str::to_string);
         Ok((
             Arc::new(GitHubProvider::new(api_url, Some(token.access_token))),
@@ -3687,6 +3690,37 @@ impl Engine {
         }
         let (_, token) = self.resolve_share_credential(actor).ok()?;
         Some(token.user_display().map(str::to_string))
+    }
+
+    /// The personal identity a share by `actor` runs under when it goes out
+    /// on a GitHub App user token: in `personal` mode with a usable App. That
+    /// token is renewed before use ([`Engine::personal_user_token`]); without
+    /// an App, or with one that cannot be used, the personal credential is
+    /// read as before ([`Engine::resolve_share_credential`]).
+    fn personal_app_identity(&self, actor: &ShareActor) -> Result<Option<String>> {
+        let (mode, agent_identity) = {
+            let config = self.config.read().unwrap();
+            (
+                config.github_share_identity(),
+                config.github_agent_identity().map(str::to_string),
+            )
+        };
+        if mode != ShareIdentityMode::Personal
+            || !matches!(self.github_app_slot(), github_app::AppSlot::Ready(_))
+        {
+            return Ok(None);
+        }
+        self.acting_identity_name(actor, agent_identity).map(Some)
+    }
+
+    /// The effective `github.api_url` a share's client is built against.
+    fn share_api_url(&self) -> Option<String> {
+        self.config
+            .read()
+            .unwrap()
+            .github
+            .as_ref()
+            .and_then(|g| g.api_url.clone())
     }
 
     /// The App a share goes out through, when it goes out through one: in

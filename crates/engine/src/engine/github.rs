@@ -1,3 +1,5 @@
+use crystalline_remote::UserTokenGrant;
+
 use super::*;
 
 impl Engine {
@@ -443,7 +445,7 @@ impl Engine {
             return Err(EngineError::ReadOnly);
         }
         let Some(view) = self
-            .begin_device_flow(&TokenIdentity::Instance, host, restart)
+            .begin_device_flow(&TokenIdentity::Instance, host, restart, None)
             .await?
         else {
             let mut github = self.configure_connection_block().await?;
@@ -496,11 +498,16 @@ impl Engine {
     /// flow: another identity's still refuses with
     /// [`EngineError::ConnectInProgress`], since a restart is a statement
     /// about one's own sign-in, never a licence to cancel somebody else's.
+    ///
+    /// `link` turns the sign-in into a GitHub App link: the App's client id
+    /// and no scope, the whole grant kept, and the landed token linked to
+    /// the account (see [`complete_link`]) rather than only saved.
     pub(super) async fn begin_device_flow(
         &self,
         identity: &TokenIdentity,
         host: Option<&str>,
         restart: bool,
+        link: Option<LinkFlow>,
     ) -> Result<Option<Value>> {
         {
             let mut guard = self.pending_connect.lock().unwrap();
@@ -540,8 +547,16 @@ impl Engine {
         }
 
         let api_url = self.connect_api_url(host);
-        let auth_base = crystalline_remote::github::auth::auth_base(api_url.as_deref());
-        let client_id = self.oauth_client_id();
+        let (auth_base, client_id) = match &link {
+            Some(flow) => (
+                flow.app.auth_base().to_string(),
+                flow.app.credentials().client_id.clone(),
+            ),
+            None => (
+                crystalline_remote::github::auth::auth_base(api_url.as_deref()),
+                self.oauth_client_id(),
+            ),
+        };
         let label = identity_label(identity);
         // Where this identity's token will be saved, resolved BEFORE anything
         // is started. It is fallible, and it used to run after the pending
@@ -550,11 +565,19 @@ impl Engine {
         // no code has been asked for and no record exists.
         let token_host = origin::token_host(api_url.as_deref());
         let plan = self.github_save_plan_for(identity, token_host.as_deref())?;
-        let start = match self
-            .connect_auth
-            .start_device_flow(&auth_base, &client_id)
-            .await
-        {
+        let started = match &link {
+            Some(_) => {
+                self.connect_auth
+                    .start_app_device_flow(&auth_base, &client_id)
+                    .await
+            }
+            None => {
+                self.connect_auth
+                    .start_device_flow(&auth_base, &client_id)
+                    .await
+            }
+        };
+        let start = match started {
             Ok(start) => start,
             Err(e) => {
                 tracing::warn!(
@@ -587,6 +610,20 @@ impl Engine {
         let record_slot = outcome_slot.clone();
         let task = tokio::spawn(async move {
             let result: std::result::Result<String, (&'static str, RemoteError)> = async {
+                if let Some(flow) = link {
+                    let grant = auth
+                        .run_device_flow_grant(&auth_base, &client_id, &start)
+                        .await
+                        .map_err(|e| ("poll", e))?;
+                    tracing::info!(
+                        identity = %task_label,
+                        "github link sign-in: user token received from GitHub"
+                    );
+                    let linked = complete_link(&flow, token_host, plan, grant)
+                        .await
+                        .map_err(|e| ("link", remote_of(e)))?;
+                    return Ok(linked.login);
+                }
                 let access_token = auth
                     .run_device_flow(&auth_base, &client_id, &start)
                     .await
@@ -718,6 +755,10 @@ impl Engine {
     /// environment store is instance-only, by construction in
     /// `crystalline_remote::token`), and an instance whose machine credential
     /// comes from the environment is exactly the kind that shares personally.
+    ///
+    /// Refused while a GitHub App is configured: a person then links GitHub
+    /// through the App ([`Engine::link_github`]), whose user token renews
+    /// itself, and a pasted token would sit in the same slot beside it.
     pub async fn connect_github_identity_token(
         &self,
         account: &str,
@@ -727,6 +768,7 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
+        self.refuse_oauth_identity_under_app()?;
         let api_url = self.connect_api_url(None);
         let user = self
             .connect_auth
@@ -764,6 +806,9 @@ impl Engine {
     /// unless `restart` is set, which abandons this account's own pending
     /// flow and issues a fresh code. A restart never touches another
     /// identity's flow; that is still refused.
+    ///
+    /// Refused while a GitHub App is configured, like the pasted token: the
+    /// App's own device flow is [`Engine::start_github_link_device_flow`].
     pub async fn start_github_identity_device_flow(
         &self,
         account: &str,
@@ -773,7 +818,9 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
-        self.begin_device_flow(&identity, None, restart).await?;
+        self.refuse_oauth_identity_under_app()?;
+        self.begin_device_flow(&identity, None, restart, None)
+            .await?;
         self.github_identity_status(account).await
     }
 
@@ -844,5 +891,447 @@ impl Engine {
             .retain(|key, _| !key.starts_with(&prefix));
         self.clear_pending_for(&identity);
         Ok(())
+    }
+
+    // --- one account's GitHub link (GitHub App) -----------------------------
+
+    /// Refuses the OAuth App way of connecting a person's GitHub identity
+    /// while a GitHub App is configured, usable or not: the person links
+    /// through the App instead. Without an App nothing changes.
+    fn refuse_oauth_identity_under_app(&self) -> Result<()> {
+        match self.github_app_slot() {
+            super::github_app::AppSlot::Ready(_) | super::github_app::AppSlot::Refused(_) => {
+                Err(EngineError::Conflict(OAUTH_IDENTITY_UNDER_APP.to_string()))
+            }
+            super::github_app::AppSlot::Absent | super::github_app::AppSlot::Unloaded => Ok(()),
+        }
+    }
+
+    /// The App a link goes through, or why there is none to use.
+    fn link_app(&self) -> Result<Arc<crystalline_remote::GithubApp>> {
+        match self.github_app_slot() {
+            super::github_app::AppSlot::Ready(router) => Ok(router.app().clone()),
+            super::github_app::AppSlot::Refused(detail) => {
+                Err(super::github_app::app_refusal(detail))
+            }
+            super::github_app::AppSlot::Absent | super::github_app::AppSlot::Unloaded => {
+                Err(EngineError::Conflict(NO_APP_TO_LINK.to_string()))
+            }
+        }
+    }
+
+    /// The accounts store a link is kept in. Only a process that serves
+    /// accounts (the daemon with its HTTP surface) has one.
+    fn link_access(&self) -> Result<Arc<crate::scope::DomainAccess>> {
+        self.domain_access
+            .get()
+            .cloned()
+            .ok_or_else(|| EngineError::Conflict(NO_ACCOUNTS_TO_LINK.to_string()))
+    }
+
+    /// One account's GitHub link, for the profile that manages it: who it is
+    /// linked to, since when, whether the user token is still live, and the
+    /// link device flow's poll. A pure read; it reports a failed device
+    /// flow's reason on exactly one read, like
+    /// [`Engine::github_identity_status`].
+    ///
+    /// An engine without an accounts store reports no link.
+    pub async fn github_link_status(&self, account: &str) -> Result<GithubLinkView> {
+        let identity = personal_identity(account)?;
+        let error = match self.take_finished_pending_for(&identity) {
+            Some(Err(e)) => Some(e.to_string()),
+            _ => None,
+        };
+        let pending = self.pending_view_for(&identity).map(|v| GithubPending {
+            user_code: v["user_code"].as_str().unwrap_or_default().to_string(),
+            verification_url: v["verification_url"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            expires_in_secs: v["expires_in_secs"].as_u64().unwrap_or_default(),
+        });
+        let link = match self.domain_access.get() {
+            Some(access) => access
+                .github_link_of(account)
+                .await
+                .map_err(|e| EngineError::Internal(e.to_string()))?,
+            None => None,
+        };
+        Ok(GithubLinkView {
+            linked: link.is_some(),
+            login: link.as_ref().map(|l| l.login.clone()),
+            github_id: link.as_ref().map(|l| l.github_id),
+            host: link.as_ref().map(|l| l.host.clone()),
+            linked_at: link.as_ref().map(|l| l.linked_at),
+            token_live: link.as_ref().is_some_and(|l| l.token_live),
+            pending,
+            error,
+        })
+    }
+
+    /// Link `account` to the GitHub account a GitHub App user token belongs
+    /// to: ask GitHub who the token is (`GET /user`), write the link row and
+    /// save the token as the account's personal credential, which
+    /// `personal` shares then go out on (renewed before it expires, see
+    /// `Engine::personal_user_token`).
+    ///
+    /// Refused without a usable App, without an accounts store, on a
+    /// read-only instance, and when the GitHub account is already linked to
+    /// another account (a [`EngineError::Conflict`] carrying the store's
+    /// sentence). Relinking replaces the account's row and token.
+    pub async fn link_github(
+        &self,
+        account: &str,
+        grant: UserTokenGrant,
+    ) -> Result<GithubLinkView> {
+        let identity = personal_identity(account)?;
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        let flow = LinkFlow {
+            app: self.link_app()?,
+            access: self.link_access()?,
+            account: account.to_string(),
+        };
+        let token_host = self.github_token_host();
+        let plan = self.github_save_plan_for(&identity, token_host.as_deref())?;
+        complete_link(&flow, token_host, plan, grant).await?;
+        // A link settles this identity now: a device flow of this person's
+        // still in flight must not land on top of it later.
+        self.clear_pending_for(&identity);
+        self.github_link_status(account).await
+    }
+
+    /// Start a GitHub App device-flow sign-in that links `account` when it
+    /// lands. Returns at once with the link status (a [`GithubLinkView`] as
+    /// JSON) carrying the code to confirm; the flow runs in the background
+    /// and its outcome is read from [`Engine::github_link_status`]. One
+    /// sign-in at a time across the engine, as for every device flow; the
+    /// same account asking again gets the code already outstanding.
+    pub async fn start_github_link_device_flow(&self, account: &str) -> Result<Value> {
+        let identity = personal_identity(account)?;
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        let flow = LinkFlow {
+            app: self.link_app()?,
+            access: self.link_access()?,
+            account: account.to_string(),
+        };
+        self.begin_device_flow(&identity, None, false, Some(flow))
+            .await?;
+        let status = self.github_link_status(account).await?;
+        serde_json::to_value(status).map_err(|e| EngineError::Internal(e.to_string()))
+    }
+
+    /// Unlink `account` from GitHub: revoke its user token at GitHub, delete
+    /// the token here and delete the link row.
+    ///
+    /// The revoke is best effort. When GitHub cannot be reached, refuses it
+    /// or the App has no client secret to revoke with, the token and the row
+    /// are still deleted here and a warning says the token may stay valid at
+    /// GitHub until it expires (the person can revoke it under their
+    /// authorized GitHub Apps). A token is touched only when the account had
+    /// a link, so an account without one keeps whatever it connected another
+    /// way. Idempotent: unlinking an account without a link succeeds.
+    pub async fn unlink_github(&self, account: &str) -> Result<()> {
+        let identity = personal_identity(account)?;
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        let access = self.link_access()?;
+        let linked = access
+            .github_link_of(account)
+            .await
+            .map_err(|e| EngineError::Internal(e.to_string()))?
+            .is_some();
+        if linked {
+            let host = self.github_token_host();
+            let (_store, token) = self.github_credential_for(&identity, host.as_deref())?;
+            if let Some(token) = token {
+                self.revoke_user_token(account, &token).await;
+            }
+            self.forget_personal_token(&identity, host.as_deref())?;
+            access
+                .unlink_github(account)
+                .await
+                .map_err(|e| EngineError::Internal(e.to_string()))?;
+        }
+        self.clear_pending_for(&identity);
+        Ok(())
+    }
+
+    /// Revokes `token` at GitHub through the App, logging rather than
+    /// failing when that cannot be done: an unlink always goes through here.
+    async fn revoke_user_token(&self, account: &str, token: &StoredToken) {
+        let app = match self.github_app_slot() {
+            super::github_app::AppSlot::Ready(router) => router.app().clone(),
+            _ => {
+                tracing::warn!(
+                    "no usable GitHub App to revoke the GitHub token of {account} with; it is deleted here and stays valid at GitHub until it expires"
+                );
+                return;
+            }
+        };
+        let credentials = app.credentials();
+        let Some(secret) = credentials.client_secret.as_deref() else {
+            tracing::warn!(
+                "the GitHub App has no client secret, so the GitHub token of {account} could not be revoked; it is deleted here and stays valid at GitHub until it expires"
+            );
+            return;
+        };
+        match crystalline_remote::github::auth::revoke_user_token(
+            app.api_url(),
+            &credentials.client_id,
+            secret,
+            &token.access_token,
+        )
+        .await
+        {
+            Ok(()) => tracing::info!("the GitHub token of {account} was revoked at GitHub"),
+            Err(e) => tracing::warn!(
+                "the GitHub token of {account} could not be revoked at GitHub ({e}); it is deleted here and stays valid at GitHub until it expires"
+            ),
+        }
+    }
+
+    /// Deletes one personal token where it lives and drops its cache slot.
+    fn forget_personal_token(&self, identity: &TokenIdentity, host: Option<&str>) -> Result<()> {
+        let (store, token) = self.github_credential_for(identity, host)?;
+        if token.is_some() {
+            store.delete().map_err(EngineError::Remote)?;
+        }
+        self.github_tokens
+            .lock()
+            .unwrap()
+            .remove(&credential_cache_key(identity, host));
+        Ok(())
+    }
+
+    /// The App user token a `personal` share by `account` goes out on,
+    /// renewed first when it expires within [`REFRESH_BEFORE`].
+    ///
+    /// One renewal per account at a time: GitHub spends a refresh token on
+    /// use, so a second exchange of the same one would be refused. A share
+    /// that finds the token due waits for the account's lock and then reads
+    /// the token again, so it goes out on the token the first one renewed.
+    ///
+    /// A token without an expiry (an Enterprise Server App with expiring
+    /// tokens switched off) is used as it is and never renewed. A renewal
+    /// GitHub refuses (`bad_refresh_token`: revoked, or the refresh token
+    /// expired after six months) marks the link's token gone, deletes the
+    /// token and keeps the link, and the share is refused with
+    /// [`PERSONAL_TOKEN_MISSING`]; any other failure (offline, a GitHub
+    /// error) refuses this share and keeps the token for the next one.
+    pub(super) async fn personal_user_token(&self, account: &str) -> Result<StoredToken> {
+        let identity = TokenIdentity::Personal(account.to_string());
+        let host = self.github_token_host();
+        let token = self.personal_token_on_file(&identity, host.as_deref())?;
+        if !due_for_refresh(&token, chrono::Utc::now()) {
+            return Ok(token);
+        }
+        let lock = self
+            .personal_refresh
+            .lock()
+            .unwrap()
+            .entry(account.to_string())
+            .or_default()
+            .clone();
+        let _guard = lock.lock().await;
+        // Read again under the lock: a share that held it before this one
+        // has renewed the token, and the cache serves the new one.
+        let token = self.personal_token_on_file(&identity, host.as_deref())?;
+        let now = chrono::Utc::now();
+        if !due_for_refresh(&token, now) {
+            return Ok(token);
+        }
+        let app = match self.github_app_slot() {
+            super::github_app::AppSlot::Ready(router) => router.app().clone(),
+            super::github_app::AppSlot::Refused(detail) => {
+                return Err(super::github_app::app_refusal(detail));
+            }
+            // No App to renew it through: the token goes out as it is.
+            super::github_app::AppSlot::Absent | super::github_app::AppSlot::Unloaded => {
+                return Ok(token);
+            }
+        };
+        let refresh = match token.refresh_token.as_deref() {
+            Some(refresh) if token.refresh_expires_at.is_none_or(|at| at > now) => refresh,
+            // Nothing to renew with: still usable until it expires, gone
+            // after.
+            _ if token.expires_at.is_some_and(|at| at > now) => return Ok(token),
+            _ => {
+                return Err(self
+                    .personal_token_gone(account, &identity, host.as_deref())
+                    .await);
+            }
+        };
+        let credentials = app.credentials();
+        let renewed = crystalline_remote::github::auth::refresh_user_token(
+            app.auth_base(),
+            &credentials.client_id,
+            credentials.client_secret.as_deref(),
+            refresh,
+        )
+        .await;
+        let grant = match renewed {
+            Ok(grant) => grant,
+            Err(RemoteError::AuthExpired) => {
+                return Err(self
+                    .personal_token_gone(account, &identity, host.as_deref())
+                    .await);
+            }
+            Err(e) => {
+                tracing::warn!("the GitHub token of {account} could not be renewed: {e}");
+                return Err(e.into());
+            }
+        };
+        let renewed = StoredToken {
+            access_token: grant.access_token,
+            host: token.host.clone(),
+            user: token.user.clone(),
+            created_at: now,
+            refresh_token: grant.refresh_token,
+            expires_at: grant.expires_at,
+            refresh_expires_at: grant.refresh_expires_at,
+        };
+        let plan = self.github_save_plan_for(&identity, host.as_deref())?;
+        save_off_runtime(plan, renewed.clone()).await?;
+        tracing::info!("the GitHub token of {account} was renewed");
+        Ok(renewed)
+    }
+
+    /// The personal token on file for `identity`, or the refusal a share
+    /// without one gets.
+    fn personal_token_on_file(
+        &self,
+        identity: &TokenIdentity,
+        host: Option<&str>,
+    ) -> Result<StoredToken> {
+        let (_store, token) = self.github_credential_for(identity, host)?;
+        token.ok_or_else(|| RemoteError::Refused(PERSONAL_TOKEN_MISSING.to_string()).into())
+    }
+
+    /// GitHub refused to renew the token of `account`: mark the link's token
+    /// gone (the link stays, the id is still true), delete the token, and
+    /// answer the refusal the share gets. A failure on the way is logged;
+    /// the refusal stands either way.
+    async fn personal_token_gone(
+        &self,
+        account: &str,
+        identity: &TokenIdentity,
+        host: Option<&str>,
+    ) -> EngineError {
+        tracing::warn!(
+            "GitHub refused to renew the GitHub token of {account}; it is deleted and {account} links GitHub again to share"
+        );
+        if let Some(access) = self.domain_access.get()
+            && let Err(e) = access.mark_github_token_gone(account).await
+        {
+            tracing::warn!("the GitHub link of {account} could not be marked: {e}");
+        }
+        if let Err(e) = self.forget_personal_token(identity, host) {
+            tracing::warn!("the GitHub token of {account} could not be deleted: {e}");
+        }
+        RemoteError::Refused(PERSONAL_TOKEN_MISSING.to_string()).into()
+    }
+}
+
+/// What the OAuth App way of connecting a person's GitHub identity is
+/// refused with while a GitHub App is configured.
+const OAUTH_IDENTITY_UNDER_APP: &str =
+    "this instance uses a GitHub App: connect GitHub from your profile";
+
+/// What a link is refused with when no GitHub App is configured.
+const NO_APP_TO_LINK: &str = "linking a GitHub account needs a GitHub App, and none is configured on this instance; an admin sets one up with: crystalline github app set";
+
+/// What a link is refused with in a process that serves no accounts.
+const NO_ACCOUNTS_TO_LINK: &str =
+    "linking a GitHub account needs the accounts of a running Crystalline server; link it there";
+
+/// How long before its expiry an App user token is renewed: a token this
+/// close to the end could expire in the middle of a share.
+const REFRESH_BEFORE: chrono::Duration = chrono::Duration::minutes(5);
+
+/// Whether `token` is renewed before use at `now`: it expires within
+/// [`REFRESH_BEFORE`]. A token without an expiry never is.
+fn due_for_refresh(token: &StoredToken, now: chrono::DateTime<chrono::Utc>) -> bool {
+    token
+        .expires_at
+        .is_some_and(|at| at - REFRESH_BEFORE <= now)
+}
+
+/// Everything a link needs that the device-flow task must own: the App, the
+/// accounts store and the account.
+pub(super) struct LinkFlow {
+    app: Arc<crystalline_remote::GithubApp>,
+    access: Arc<crate::scope::DomainAccess>,
+    account: String,
+}
+
+/// The link itself, shared by [`Engine::link_github`] and the device-flow
+/// task: ask GitHub who the token is, write the row, then save the token as
+/// the account's personal credential. The row goes first, so a GitHub
+/// account already linked elsewhere is refused before a token is stored.
+async fn complete_link(
+    flow: &LinkFlow,
+    token_host: Option<String>,
+    plan: TokenSavePlan,
+    grant: UserTokenGrant,
+) -> Result<crate::auth_store::GithubLink> {
+    let user =
+        crystalline_remote::github::auth::github_user(flow.app.api_url(), &grant.access_token)
+            .await?;
+    let link = flow
+        .access
+        .link_github(
+            &flow.account,
+            &flow.app.credentials().host,
+            user.id,
+            &user.login,
+        )
+        .await
+        .map_err(link_refusal)?;
+    save_off_runtime(
+        plan,
+        StoredToken {
+            access_token: grant.access_token,
+            host: token_host.unwrap_or_else(|| "github.com".to_string()),
+            user: user.login,
+            created_at: chrono::Utc::now(),
+            refresh_token: grant.refresh_token,
+            expires_at: grant.expires_at,
+            refresh_expires_at: grant.refresh_expires_at,
+        },
+    )
+    .await?;
+    tracing::info!(
+        account = %flow.account,
+        github_id = link.github_id,
+        login = %link.login,
+        "github account linked"
+    );
+    Ok(link)
+}
+
+/// The engine error for a refused link: the store's own sentence as a
+/// conflict (a GitHub account linked to another account), a missing account
+/// as not found, anything else as internal.
+fn link_refusal(e: anyhow::Error) -> EngineError {
+    use crate::auth_store::{RefusalKind, StoreRefusal};
+    match e.chain().find_map(|c| c.downcast_ref::<StoreRefusal>()) {
+        Some(refusal) if refusal.kind() == RefusalKind::NoSuchAccount => {
+            EngineError::NotFound(refusal.to_string())
+        }
+        Some(refusal) => EngineError::Conflict(refusal.to_string()),
+        None => EngineError::Internal(e.to_string()),
+    }
+}
+
+/// An engine error as the device-flow outcome slot holds it.
+fn remote_of(e: EngineError) -> RemoteError {
+    match e {
+        EngineError::Remote(e) => e,
+        other => RemoteError::Refused(other.to_string()),
     }
 }
