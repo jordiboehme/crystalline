@@ -152,6 +152,13 @@ keyring = { version = "4.2.0", default-features = false, features = ["v1"] }
 tar = "0.4.46"
 flate2 = "1.1.10"
 base64 = "0.23.1"
+# Signs the GitHub App JWT (RS256, crates/remote). Already in the graph through
+# reqwest's rustls; the feature set below is exactly what rustls enables, so no
+# new C build appears. Never the `rsa` crate: deny.toml ignores the Marvin
+# advisory on the ground that Crystalline never signs through it.
+aws-lc-rs = { version = "=1.18.2", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
+# PEM decoding of the App private key (PKCS#1 and PKCS#8); already in the graph.
+rustls-pki-types = { version = "=1.15.1", features = ["std"] }
 # Percent-decoding for the MCP `resources/read` uri (crates/service). Already
 # in the graph through axum and url; named directly because the MCP surface
 # decodes an attachment uri itself, with no extractor doing it on the way in.

@@ -1520,6 +1520,7 @@ name = "crystalline-remote"
 version = "0.29.1"
 dependencies = [
  "async-trait",
+ "aws-lc-rs",
  "axum",
  "base64 0.23.1",
  "chrono",
@@ -1531,6 +1532,7 @@ dependencies = [
  "keyring",
  "percent-encoding",
  "reqwest",
+ "rustls-pki-types",
  "same-file",
  "serde",
  "serde_json",

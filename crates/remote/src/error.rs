@@ -270,6 +270,14 @@ pub enum RemoteError {
         /// A short, human-readable description of what went wrong.
         detail: String,
     },
+
+    /// The GitHub App's private key or client id could not be used to sign:
+    /// the PEM is not an RSA key, or signing failed. The text names the
+    /// problem and never carries key bytes.
+    #[error(
+        "The GitHub App credential is unusable: {0}. Check the private key and client id of the App."
+    )]
+    AppCredential(String),
 }
 
 impl RemoteError {
@@ -312,7 +320,8 @@ impl RemoteError {
             | RemoteError::WorkingTree { .. }
             | RemoteError::State(_)
             | RemoteError::Credential { .. }
-            | RemoteError::ServerCredential { .. } => false,
+            | RemoteError::ServerCredential { .. }
+            | RemoteError::AppCredential(_) => false,
         }
     }
 }

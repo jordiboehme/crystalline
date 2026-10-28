@@ -19,6 +19,7 @@
 //! costs at most one harmless extra request, and it is the shape covered by
 //! the pagination test in `tests/it/github_client.rs`.
 
+pub mod app;
 pub mod auth;
 mod types;
 

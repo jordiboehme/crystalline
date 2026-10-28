@@ -712,6 +712,7 @@ fn remote_to_api_error(e: crystalline_remote::RemoteError, detail: String) -> Ap
         | RemoteError::State(_)
         | RemoteError::Credential { .. }
         | RemoteError::ServerCredential { .. }
+        | RemoteError::AppCredential(_)
         | RemoteError::BaseUnavailable => internal_error(detail),
         RemoteError::RepoNotFound { .. }
         | RemoteError::NotADomain { .. }
