@@ -419,9 +419,15 @@ impl Engine {
     /// change nobody drafted), a virtual domain, a MANIFEST that already
     /// declares a `team` (an unknown value is left for its owner: verify
     /// reports it as `M010`, and a newer release may know it), and a
-    /// frontmatter the marker cannot be cut into. Every instance writes the
-    /// same line at the same place, so two members who share it at once
-    /// leave a merge nothing to reconcile. A failure here never fails the
+    /// frontmatter the marker cannot be cut into. A MANIFEST open in a
+    /// co-editing room is left to the room too; the next share tries again.
+    ///
+    /// The marker is written as bytes, not through the edit path, so it
+    /// carries no `generated` stamp: every instance writes exactly the same
+    /// line at the same place, and a member whose share pulls the MANIFEST
+    /// another member's share already marked meets a merge with nothing to
+    /// reconcile. A stamp of its own would differ on every instance and make
+    /// that pull a conflict nobody caused. A failure here never fails the
     /// share: the marker waits for the next one.
     async fn team_marker_for_share(
         &self,
@@ -447,19 +453,29 @@ impl Engine {
         domain: &str,
         files: Option<&[String]>,
     ) -> Result<Option<Vec<String>>> {
-        if self.read_only
-            || self.reviews_changes(domain)
-            || self.domain_is_read_only(domain).await
-            || !matches!(self.read_source(domain), ContentSource::File { .. })
+        if self.read_only || self.reviews_changes(domain) || self.domain_is_read_only(domain).await
         {
             return Ok(None);
         }
+        let ContentSource::File { root } = self.read_source(domain) else {
+            return Ok(None);
+        };
+        // The write ticket and the read-only screen, as every write has.
         let scope = crate::scope::Scope::Unrestricted;
         let view = DomainView::for_write(self, domain, &scope).await?;
         let (desc, source) = view.resolve("manifest").await?;
         let Some(current) = view.text_at(&source, &desc).await? else {
             return Ok(None);
         };
+        if let Some(rooms) = self.collab_rooms()
+            && rooms
+                .live_text(&desc.domain, &desc.permalink, None)
+                .await
+                .is_some()
+        {
+            return Ok(None);
+        }
+        let current = crystalline_core::to_lf(&current);
         let declares_team = crystalline_core::parse_engram(&current)
             .map(|e| {
                 crystalline_core::Manifest::from_engram(&e, &current)
@@ -492,23 +508,9 @@ impl Engine {
                 Some(list)
             }
         };
-        let actor = self.actor_for(None, None);
-        self.apply_source_edit(
-            &desc,
-            &source,
-            &view,
-            None,
-            &actor,
-            None,
-            &scope,
-            move |current| {
-                Ok(crystalline_core::set_team_marker(
-                    current,
-                    crystalline_core::TeamForge::GitHub,
-                ))
-            },
-        )
-        .await?;
+        write_file(&join_rel(&root, &desc.path), &marked)?;
+        drop(view);
+        self.sync(Some(domain)).await?;
         Ok(joined)
     }
 

@@ -489,6 +489,84 @@ async fn a_share_of_everything_carries_the_team_marker() {
     assert_eq!(local, shared, "the folder holds what was shared");
 }
 
+/// Two members of a team whose repository has no marker yet: the first one's
+/// share carries it and is merged, and the second one, who has not pulled
+/// since, shares without a conflict. Both instances write the same bytes
+/// for the marker, so the inline pull of the second share takes the team's
+/// MANIFEST as it is.
+#[tokio::test]
+async fn a_second_member_shares_the_marker_without_a_conflict() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest_unmarked())]));
+    mock.set_branch("main", &commit);
+    let mut members = Vec::new();
+    for who in ["ann", "ben"] {
+        let dir = tmp.path().join(who);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.join("brand-knowledge");
+        let eng = engine_with(
+            &dir.join("config.yaml"),
+            &dir.join("origins"),
+            mock.clone(),
+            true,
+            false,
+        )
+        .await;
+        eng.origin_add(
+            "acme/brand-knowledge",
+            None,
+            None,
+            None,
+            Some(root.to_str().unwrap()),
+        )
+        .await
+        .unwrap();
+        std::fs::create_dir_all(root.join("notes")).unwrap();
+        std::fs::write(
+            root.join(format!("notes/{who}.md")),
+            engram(who, who, "a change of my own"),
+        )
+        .unwrap();
+        eng.sync(Some("brand-knowledge")).await.unwrap();
+        members.push((eng, root));
+    }
+
+    let (ann, _) = &members[0];
+    let first = ann
+        .origin_share("brand-knowledge", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(first["outcome"], "proposed", "{first}");
+    let merged = mock
+        .branch_commit(first["branch"].as_str().unwrap())
+        .unwrap();
+    mock.set_branch("main", &merged);
+    mock.set_proposal_state(first["number"].as_u64().unwrap(), ProposalState::Merged);
+
+    let (ben, ben_root) = &members[1];
+    let second = ben
+        .origin_share("brand-knowledge", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(second["outcome"], "proposed", "{second}");
+    assert_eq!(
+        second["added"],
+        serde_json::json!(["notes/ben.md"]),
+        "{second}"
+    );
+    assert_eq!(
+        second["updated"],
+        serde_json::json!([]),
+        "the team's MANIFEST already says it: {second}"
+    );
+    let local = std::fs::read_to_string(ben_root.join("MANIFEST.md")).unwrap();
+    assert_eq!(
+        crystalline_core::team_of_source(&local),
+        Some(crystalline_core::TeamForge::GitHub)
+    );
+}
+
 /// Pressing share with nothing to share stays a no-op: the marker alone
 /// never opens a proposal.
 #[tokio::test]
@@ -537,14 +615,8 @@ async fn a_narrowed_share_adds_the_marker_only_to_an_unchanged_manifest() {
     assert_eq!(result["updated"], serde_json::json!(["MANIFEST.md"]));
     let shared = shared_manifest(&mock, &result);
     let before = String::from_utf8(manifest_unmarked()).unwrap();
-    // The marker line, and the write provenance every engine write stamps.
-    let without_provenance: String = shared
-        .lines()
-        .filter(|line| !line.starts_with("generated:"))
-        .map(|line| format!("{line}\n"))
-        .collect();
     assert_eq!(
-        without_provenance,
+        shared,
         before.replace("title: Team\n", "title: Team\nteam: github\n"),
         "one line and nothing else"
     );
