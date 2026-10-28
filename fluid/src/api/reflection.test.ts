@@ -335,11 +335,15 @@ describe("calls", () => {
       disclosed: { by: "keeper", at: "2026-10-28T09:00:00Z" },
     });
     expect(
-      await discloseReflectionSection("eng", "overview.md", "7f3a9c2e"),
+      await discloseReflectionSection("eng", "overview.md", "7f3a9c2e", "b1"),
     ).toEqual({ by: "keeper", at: "2026-10-28T09:00:00Z" });
     expect(apiMock).toHaveBeenCalledWith("/domains/eng/reflection/disclose", {
       method: "POST",
-      body: JSON.stringify({ path: "overview.md", section: "7f3a9c2e" }),
+      body: JSON.stringify({
+        path: "overview.md",
+        section: "7f3a9c2e",
+        basis: "b1",
+      }),
     });
   });
 
@@ -357,12 +361,14 @@ describe("calls", () => {
           heading: "Team",
           age_secs: 1,
           question: "Share text from harbor on a page more people may read?",
+          basis: "b1",
         },
       ],
     });
     expect(queue.items[0]?.question).toBe(
       "Share text from harbor on a page more people may read?",
     );
+    expect(queue.items[0]?.basis).toBe("b1");
   });
 
   it("reads the pages a move could not relink", async () => {

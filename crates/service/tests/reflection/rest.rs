@@ -906,6 +906,7 @@ fn reflection_requests(domain: &str) -> Vec<(reqwest::Method, String, Option<Val
     let body = json!({
         "markdown": "# A\n", "path": "guides/deploying.md", "section": "Night deploys",
         "text": "Why?", "outcome": "Yes.", "from": "guides/deploying.md", "to": "x/deploying.md",
+        "basis": "b1",
     });
     let ops: Vec<_> = crate::support::MOUNTED_OPERATIONS
         .iter()

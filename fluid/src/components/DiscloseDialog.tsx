@@ -23,23 +23,33 @@ export function DiscloseDialog({
   path,
   section,
   question,
+  basis,
   onClose,
 }: {
   domain: string;
   path: string;
   section: string;
   question: string;
+  basis: string;
   onClose: () => void;
 }): ReactElement {
   const queryClient = useQueryClient();
   const share = useMutation({
-    mutationFn: () => discloseReflectionSection(domain, path, section),
+    mutationFn: () => discloseReflectionSection(domain, path, section, basis),
     onSuccess: () => {
       void queryClient.invalidateQueries({
         queryKey: reflectionReviewKey(domain),
       });
       invalidateReflection(queryClient, domain);
       onClose();
+    },
+    // A refusal stays in the dialog. When the page's readers changed since
+    // the question was read (409), the review is read again, so the item
+    // asks the new question the next time.
+    onError: () => {
+      void queryClient.invalidateQueries({
+        queryKey: reflectionReviewKey(domain),
+      });
     },
   });
   return (

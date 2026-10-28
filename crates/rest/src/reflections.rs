@@ -657,6 +657,10 @@ pub struct DiscloseReflectionBody {
     pub path: String,
     /// The id of the section a `source_too_wide` item names.
     pub section: String,
+    /// The item's `basis`: what the person's yes is bound to. When the
+    /// page's readers or its repository changed since the item was read, the
+    /// confirmation is refused with 409 and the person is asked again.
+    pub basis: String,
 }
 
 /// `POST /domains/{domain}/reflection/disclose`
@@ -709,6 +713,14 @@ pub struct DiscloseReflectionBody {
             content_type = "application/problem+json",
         ),
         (
+            status = 409,
+            description = "Who may read the page, or where it is backed up, \
+                           changed since the item was read: read the queue \
+                           again and ask the person the new question.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
             status = 422,
             description = "A bad path, or nobody here knows who reads which \
                            domain because the accounts store could not be read.",
@@ -730,7 +742,13 @@ pub async fn disclose(
     // agent's token, so a confirmation here is that person's.
     state
         .engine
-        .confirm_reflection_disclosure(&domain, &body.path, &body.section, &caller(&identity))
+        .confirm_reflection_disclosure(
+            &domain,
+            &body.path,
+            &body.section,
+            &body.basis,
+            &caller(&identity),
+        )
         .await
         .map(Json)
         .map_err(reflection_error)
@@ -1086,10 +1104,11 @@ pub struct QueueQuery {
                            with `source_domain`, `count`, `sections` and \
                            `note`) or `source_too_wide` (one per section that \
                            cites a domain fewer people may read than the \
-                           page's domain, with `sources`, `note` and \
+                           page's domain, with `sources`, `note`, \
                            `question`, what a person is asked before they \
                            share it on purpose through \
-                           `POST /domains/{domain}/reflection/disclose`; only \
+                           `POST /domains/{domain}/reflection/disclose`, and \
+                           `basis`, what that call carries back; only \
                            sources the caller may open count). A source in `sources` may carry `domain`, \
                            the local name of another domain than the page's. \
                            Sources in a domain the caller may not open are \

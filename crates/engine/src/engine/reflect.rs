@@ -665,15 +665,16 @@ impl Engine {
                     wide_stamps.sort();
                     wide_domains.sort();
                     // What a person is asked to share it on purpose (Fluid's
-                    // Review asks it); it names only domains this caller
-                    // may open.
-                    let question = self
-                        .disclosure_question_for(domain, &row.path, &wide_domains)
+                    // Review asks it), and the basis their yes carries back;
+                    // it names only domains this caller may open.
+                    let ask = self
+                        .disclosure_ask_for(domain, &row.path, &wide_domains)
                         .await?;
                     let extra = json!({
                         "sources": wide_shown,
                         "note": TOO_WIDE_NOTE,
-                        "question": question,
+                        "question": ask.question,
+                        "basis": ask.basis,
                     });
                     items.push(Item {
                         kind: "update",

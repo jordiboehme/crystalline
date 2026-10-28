@@ -1371,15 +1371,19 @@ async fn a_confirmed_local_source_names_the_repository_and_is_backed_up() {
     let mock = Arc::new(MockProvider::new());
     main_commit(&mock);
     let (fx, _) = home_beside_harbor(mock.clone(), false).await;
-    let question = fx
+    let ask = fx
         .engine
         .reflection_disclosure_question(&citing_harbor("wide.md"), &agent())
         .await
         .unwrap()
         .expect("a local source on a GitHub page is a question");
-    assert!(question.contains("GitHub repository acme/kb"), "{question}");
+    assert!(
+        ask.question.contains("GitHub repository acme/kb"),
+        "{}",
+        ask.question
+    );
     let mut confirmed = citing_harbor("wide.md");
-    confirmed.disclosed = true;
+    confirmed.disclosed = Some(ask.basis);
     fx.engine
         .write_reflection(&confirmed, &agent())
         .await

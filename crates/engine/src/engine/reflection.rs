@@ -1663,7 +1663,7 @@ impl Engine {
         // A person's confirmation lets a source through that the reach rule
         // alone refuses (`super::disclosure`); nobody behind the caller, no
         // confirmation.
-        let by = super::disclosure::confirmer(caller).filter(|_| p.disclosed);
+        let by = super::disclosure::confirmer(caller).filter(|_| p.disclosed.is_some());
         let named = self
             .resolve_source_names(
                 &p.domain,
@@ -1679,6 +1679,11 @@ impl Engine {
         let abs = access.abs(&p.path);
         let baseline_abs = access.abs(&r::baseline_path(&p.path));
         let _lock = self.lock_file(&abs).await;
+        // The person said yes to the readers the question named: still them?
+        if let (Some(_), Some(basis)) = (&by, p.disclosed.as_deref()) {
+            self.hold_disclosure_to_its_question(&p.domain, &p.path, &named, basis)
+                .await?;
+        }
 
         let current = read_opt(&abs)?;
         // Rule 0: a create never replaces a page, and a stale checksum is

@@ -587,8 +587,9 @@ const DISCLOSURE_WAIT: std::time::Duration = std::time::Duration::from_secs(600)
 /// answer. An accept sent along with a first call answers nothing and is
 /// asked again. The process is the daemon, or the embedded stack, that served
 /// the first round, which is where the second one arrives.
+#[allow(clippy::type_complexity)]
 static DISCLOSURE_ASKS: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>,
+    std::sync::Mutex<std::collections::HashMap<String, (String, String, std::time::Instant)>>,
 > = std::sync::LazyLock::new(Default::default);
 
 /// What a disclosure answer must match: the write's arguments and who makes
@@ -598,25 +599,28 @@ fn disclosure_key(p: &WriteReflectionParams, caller: &ReflectionCaller) -> Strin
     crystalline_core::provision::receipt::sha256_hex(text.as_bytes())
 }
 
-/// Remember a disclosure question about `key` and hand out its state.
-fn disclosure_state(key: String) -> String {
+/// Remember a disclosure question about `key`, asked on `basis`
+/// ([`crate::engine::DisclosureAsk::basis`]), and hand out its state.
+fn disclosure_state(key: String, basis: String) -> String {
     let mut bytes = [0u8; 32];
     getrandom::fill(&mut bytes).expect("the OS CSPRNG is available");
     let state: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
     let mut asks = DISCLOSURE_ASKS.lock().unwrap_or_else(|e| e.into_inner());
     let now = std::time::Instant::now();
-    asks.retain(|_, (_, until)| *until > now);
-    asks.insert(state.clone(), (key, now + DISCLOSURE_WAIT));
+    asks.retain(|_, (_, _, until)| *until > now);
+    asks.insert(state.clone(), (key, basis, now + DISCLOSURE_WAIT));
     state
 }
 
-/// Whether `state` is a live disclosure question about `key`. Taken either
-/// way: a state answers once.
-fn take_disclosure_state(state: &str, key: &str) -> bool {
+/// The basis of the live disclosure question `state` names, when it was
+/// asked about `key`. Taken either way: a state answers once.
+fn take_disclosure_state(state: &str, key: &str) -> Option<String> {
     let mut asks = DISCLOSURE_ASKS.lock().unwrap_or_else(|e| e.into_inner());
     match asks.remove(state) {
-        Some((asked, until)) => asked == key && until > std::time::Instant::now(),
-        None => false,
+        Some((asked, basis, until)) if asked == key && until > std::time::Instant::now() => {
+            Some(basis)
+        }
+        _ => None,
     }
 }
 
@@ -3668,8 +3672,8 @@ impl McpServer {
     /// rule alone would refuse: its sources name a domain fewer people may
     /// read than the page's, or one not shared through GitHub while the page
     /// is backed up there ([`Engine::reflection_disclosure_question`]). A yes
-    /// sets [`WriteReflectionParams::disclosed`], the one bit the engine
-    /// takes a person's confirmation from.
+    /// sets [`WriteReflectionParams::disclosed`], the one field the engine
+    /// takes a person's confirmation from, as the basis of the question asked.
     ///
     /// Nobody is asked, and the write goes on to be refused as before, when
     /// there is no person behind the session to ask:
@@ -3697,7 +3701,7 @@ impl McpServer {
         ctx: &RequestContext<RoleServer>,
     ) -> Disclosure {
         // An error here is the write's own refusal, and the write gives it.
-        let Ok(Some(question)) = self.engine.reflection_disclosure_question(p, caller).await else {
+        let Ok(Some(ask)) = self.engine.reflection_disclosure_question(p, caller).await else {
             return Disclosure::Go;
         };
         if self.gate.unattended
@@ -3722,7 +3726,8 @@ impl McpServer {
                 // A state with an answer: it counts only for the question
                 // asked about this very write, once.
                 (Some(state), Some(answer)) => {
-                    p.disclosed = take_disclosure_state(&state, &key) && disclosure_yes(&answer);
+                    p.disclosed =
+                        take_disclosure_state(&state, &key).filter(|_| disclosure_yes(&answer));
                     Disclosure::Go
                 }
                 // A state without an answer answers nothing, and is used up.
@@ -3738,14 +3743,14 @@ impl McpServer {
                         InputRequest::Elicitation(ElicitRequest::new(
                             ElicitRequestParams::FormElicitationParams {
                                 meta: None,
-                                message: question,
+                                message: ask.question,
                                 requested_schema: disclosure_schema(),
                             },
                         )),
                     );
                     Disclosure::Ask(InputRequiredResult::new(
                         Some(requests),
-                        Some(disclosure_state(key)),
+                        Some(disclosure_state(key, ask.basis)),
                     ))
                 }
             };
@@ -3762,7 +3767,7 @@ impl McpServer {
             .create_elicitation_with_timeout(
                 ElicitRequestParams::FormElicitationParams {
                     meta: None,
-                    message: question,
+                    message: ask.question,
                     requested_schema: disclosure_schema(),
                 },
                 Some(DISCLOSURE_WAIT),
@@ -3771,7 +3776,7 @@ impl McpServer {
         match answer {
             Ok(answer) => {
                 let answer = serde_json::to_value(&answer).unwrap_or_default();
-                p.disclosed = disclosure_yes(&answer);
+                p.disclosed = disclosure_yes(&answer).then_some(ask.basis);
             }
             Err(e) => tracing::debug!("a disclosure question got no answer: {e}"),
         }

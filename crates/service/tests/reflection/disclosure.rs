@@ -94,10 +94,17 @@ fn cite() -> WriteReflectionParams {
     p
 }
 
-/// [`cite`] as a person confirmed it.
-fn confirmed() -> WriteReflectionParams {
+/// [`cite`] as the person behind `caller` confirmed it: the basis of the
+/// question they were asked, or a made-up one when nothing was asked.
+async fn confirmed(fx: &Fx, caller: &ReflectionCaller) -> WriteReflectionParams {
     let mut p = cite();
-    p.disclosed = true;
+    let asked = fx
+        .engine
+        .reflection_disclosure_question(&p, caller)
+        .await
+        .ok()
+        .flatten();
+    p.disclosed = Some(asked.map_or_else(|| "never asked".to_string(), |ask| ask.basis));
     p
 }
 
@@ -157,7 +164,8 @@ async fn the_question_names_the_readers_and_what_happens() {
         .reflection_disclosure_question(&cite(), &agent_as("sam"))
         .await
         .unwrap()
-        .expect("a reach refusal is a question");
+        .expect("a reach refusal is a question")
+        .question;
     assert!(question.contains("harbor"), "{question}");
     assert!(
         question.contains("everyone who can open this instance"),
@@ -191,7 +199,8 @@ async fn a_private_page_is_named_by_how_many_read_it() {
         .reflection_disclosure_question(&cite(), &agent_as("keeper"))
         .await
         .unwrap()
-        .unwrap();
+        .unwrap()
+        .question;
     assert!(
         question.contains("the 3 accounts that may read eng"),
         "{question}"
@@ -205,7 +214,7 @@ async fn a_private_page_is_named_by_how_many_read_it() {
 async fn a_confirmed_write_lands_and_records_who_confirmed() {
     let (fx, _auth) = private_harbor().await;
     fx.engine
-        .write_reflection(&confirmed(), &agent_as("sam"))
+        .write_reflection(&confirmed(&fx, &agent_as("sam")).await, &agent_as("sam"))
         .await
         .unwrap();
     assert!(page_exists(&fx));
@@ -216,6 +225,65 @@ async fn a_confirmed_write_lands_and_records_who_confirmed() {
     // Not in the page file: nothing about the confirmation is written there.
     let text = std::fs::read_to_string(fx.root.join("reflections/overview.md")).unwrap();
     assert!(!text.contains("disclos"), "{text}");
+}
+
+/// The person agreed to the readers named in the question. When the page's
+/// readers change between the question and the write, the write is refused
+/// and nothing is recorded: the person is asked again.
+#[tokio::test]
+async fn a_yes_to_readers_that_changed_since_is_refused() {
+    let (fx, auth) = reach().await;
+    private(&auth, "harbor", &[]).await;
+    private(&auth, "eng", &["sam"]).await;
+    let p = confirmed(&fx, &agent_as("keeper")).await;
+    // ann joins eng after keeper was asked.
+    auth.upsert_domain_member("eng", "ann", MemberLevel::Editor, None, "keeper")
+        .await
+        .unwrap();
+    let err = fx
+        .engine
+        .write_reflection(&p, &agent_as("keeper"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("changed since"), "{err}");
+    assert!(!page_exists(&fx));
+    // Asked again, the yes lands.
+    fx.engine
+        .write_reflection(
+            &confirmed(&fx, &agent_as("keeper")).await,
+            &agent_as("keeper"),
+        )
+        .await
+        .unwrap();
+}
+
+/// The same in Fluid: a question shown before the page's readers changed
+/// confirms nothing.
+#[tokio::test]
+async fn a_person_confirming_a_stale_question_is_refused() {
+    let (fx, auth) = reach().await;
+    fx.engine
+        .write_reflection(&cite(), &agent_as("keeper"))
+        .await
+        .unwrap();
+    private(&auth, "harbor", &[]).await;
+    private(&auth, "eng", &["sam"]).await;
+    let items = too_wide(&fx, &agent_as("keeper")).await;
+    let section = items[0]["section"].as_str().unwrap().to_string();
+    let basis = items[0]["basis"].as_str().unwrap().to_string();
+    auth.upsert_domain_member("eng", "ann", MemberLevel::Editor, None, "keeper")
+        .await
+        .unwrap();
+    let keeper = ReflectionCaller::person(user("keeper"), "keeper");
+    let err = fx
+        .engine
+        .confirm_reflection_disclosure("eng", "overview.md", &section, &basis, &keeper)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("changed since"), "{err}");
+    assert_eq!(too_wide(&fx, &agent_as("keeper")).await.len(), 1);
 }
 
 /// Without the confirmation the write is refused exactly as before.
@@ -239,7 +307,7 @@ async fn a_confirmation_never_opens_a_domain_the_writer_cannot_read() {
     let (fx, _auth) = private_harbor().await;
     let err = fx
         .engine
-        .write_reflection(&confirmed(), &agent_as("ann"))
+        .write_reflection(&confirmed(&fx, &agent_as("ann")).await, &agent_as("ann"))
         .await
         .unwrap_err()
         .to_string();
@@ -254,7 +322,7 @@ async fn the_anonymous_caller_confirms_nothing() {
     let open = ReflectionCaller::agent(Scope::Anonymous, "agent", true);
     assert!(
         fx.engine
-            .write_reflection(&confirmed(), &open)
+            .write_reflection(&confirmed(&fx, &open).await, &open)
             .await
             .is_err()
     );
@@ -276,7 +344,7 @@ async fn unknown_readers_are_never_confirmable() {
     );
     assert!(
         fx.engine
-            .write_reflection(&confirmed(), &agent_as("sam"))
+            .write_reflection(&confirmed(&fx, &agent_as("sam")).await, &agent_as("sam"))
             .await
             .is_err()
     );
@@ -295,7 +363,10 @@ async fn widening_the_page_names_the_section_again_and_narrowing_the_source_does
     private(&auth, "harbor", &["ann"]).await;
     private(&auth, "eng", &["ann", "sam"]).await;
     fx.engine
-        .write_reflection(&confirmed(), &agent_as("keeper"))
+        .write_reflection(
+            &confirmed(&fx, &agent_as("keeper")).await,
+            &agent_as("keeper"),
+        )
         .await
         .unwrap();
     assert!(too_wide(&fx, &agent_as("keeper")).await.is_empty());
@@ -319,7 +390,10 @@ async fn sharing_a_private_page_names_the_section_again() {
     private(&auth, "harbor", &[]).await;
     private(&auth, "eng", &["sam"]).await;
     fx.engine
-        .write_reflection(&confirmed(), &agent_as("keeper"))
+        .write_reflection(
+            &confirmed(&fx, &agent_as("keeper")).await,
+            &agent_as("keeper"),
+        )
         .await
         .unwrap();
     assert!(too_wide(&fx, &agent_as("keeper")).await.is_empty());
@@ -351,7 +425,7 @@ async fn a_confirmation_in_the_page_file_has_no_effect() {
 async fn a_later_unconfirmed_write_of_the_source_is_refused() {
     let (fx, _auth) = private_harbor().await;
     fx.engine
-        .write_reflection(&confirmed(), &agent_as("sam"))
+        .write_reflection(&confirmed(&fx, &agent_as("sam")).await, &agent_as("sam"))
         .await
         .unwrap();
     let err = fx
@@ -369,7 +443,7 @@ async fn a_later_unconfirmed_write_of_the_source_is_refused() {
 async fn the_confirmation_moves_and_goes_with_the_page() {
     let (fx, _auth) = private_harbor().await;
     fx.engine
-        .write_reflection(&confirmed(), &agent_as("sam"))
+        .write_reflection(&confirmed(&fx, &agent_as("sam")).await, &agent_as("sam"))
         .await
         .unwrap();
     let mut mv = WriteReflectionParams {
@@ -419,6 +493,7 @@ async fn a_person_confirms_a_named_section() {
         "{question}"
     );
     let section = items[0]["section"].as_str().unwrap().to_string();
+    let basis = items[0]["basis"].as_str().unwrap().to_string();
 
     // ann may not read harbor: she cannot confirm, and learns nothing.
     assert!(
@@ -427,6 +502,7 @@ async fn a_person_confirms_a_named_section() {
                 "eng",
                 "overview.md",
                 &section,
+                &basis,
                 &ReflectionCaller::person(user("ann"), "ann"),
             )
             .await
@@ -438,6 +514,7 @@ async fn a_person_confirms_a_named_section() {
             "eng",
             "overview.md",
             &section,
+            &basis,
             &ReflectionCaller::person(user("sam"), "sam"),
         )
         .await
@@ -852,7 +929,11 @@ async fn the_json_api_confirms_a_named_section_for_a_person() {
             .contains("everyone who can open this instance"),
         "{item}"
     );
-    let body = json!({ "path": "overview.md", "section": item["section"] });
+    let body = json!({
+        "path": "overview.md",
+        "section": item["section"],
+        "basis": item["basis"],
+    });
 
     // ed curates eng and may not read harbor.
     let ed = crate::rest::Session::login(served.addr, "ed").await;

@@ -351,11 +351,13 @@ function ShareOnPurpose({
   path,
   section,
   question,
+  basis,
 }: {
   domain: string;
   path: string;
   section: string;
   question: string;
+  basis: string;
 }): ReactElement {
   const [open, setOpen] = useState(false);
   return (
@@ -375,6 +377,7 @@ function ShareOnPurpose({
           path={path}
           section={section}
           question={question}
+          basis={basis}
           onClose={() => {
             setOpen(false);
           }}
@@ -429,12 +432,14 @@ function QueueRow({
       )}
       {item.what === "source_too_wide" &&
         item.question !== null &&
+        item.basis !== null &&
         item.section !== null && (
           <ShareOnPurpose
             domain={domain}
             path={item.path}
             section={item.section}
             question={item.question}
+            basis={item.basis}
           />
         )}
       {item.count !== null && item.what === "unreflected" && (

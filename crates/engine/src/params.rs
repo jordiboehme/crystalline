@@ -692,12 +692,15 @@ pub struct WriteReflectionParams {
     pub create_only: bool,
     /// A person confirmed this write: its sections may carry text from a
     /// domain fewer people may read than the page's, or one not shared
-    /// through GitHub while the page is backed up there. Set only by the
-    /// surface that asked that person (the MCP server after its question was
-    /// answered); never deserialized, so no agent can set it in its
-    /// arguments and the MCP schema does not show it.
+    /// through GitHub while the page is backed up there. Holds the `basis`
+    /// of the question they said yes to
+    /// (`Engine::reflection_disclosure_question`), so a write whose readers
+    /// changed since is refused rather than recorded for readers the person
+    /// never saw. Set only by the surface that asked that person (the MCP
+    /// server after its question was answered); never deserialized, so no
+    /// agent can set it in its arguments and the MCP schema does not show it.
     #[serde(skip)]
-    pub disclosed: bool,
+    pub disclosed: Option<String>,
 }
 
 /// Parameters for `discuss`.

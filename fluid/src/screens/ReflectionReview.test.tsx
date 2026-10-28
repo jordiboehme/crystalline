@@ -500,6 +500,7 @@ describe("the review screen", () => {
                 age_secs: 3600,
                 sources: [],
                 question,
+                basis: "b1",
               },
             ],
           },
@@ -538,8 +539,82 @@ describe("the review screen", () => {
     await user.click(within(again).getByRole("button", { name: "Share it" }));
     await waitFor(() => {
       expect(posted).toEqual([
-        { path: "guides/deploying.md", section: "7f3a9c2e" },
+        { path: "guides/deploying.md", section: "7f3a9c2e", basis: "b1" },
       ]);
+    });
+  });
+
+  it("says so and reads the review again when the readers changed since the question", async () => {
+    let reviews = 0;
+    const changed =
+      "who may read this page, or where it is backed up, changed since the person was asked; ask them again";
+    apiMock.mockImplementation(
+      answersFor({
+        "/auth/me": () => meResponse({ user: userFixture() }),
+        "/domains": () => ({ behavior: [], domains: [] }),
+        "/reflection/domains": () => ({ domains: [] }),
+        "/domains/eng/reflection": () => ({
+          domain: "eng",
+          enabled: true,
+          state: "on",
+          home: "local",
+          home_url: null,
+          right: "curate",
+          engrams_visible: true,
+          pending_engrams: [],
+        }),
+        "/domains/eng/reflection/tree": () => ({
+          domain: "eng",
+          pact: {
+            path: "PACT.md",
+            title: "PACT",
+            exists: true,
+            open_threads: 0,
+          },
+          nodes: [],
+        }),
+        "/domains/eng/reflection/review": () => {
+          reviews += 1;
+          return {
+            ...REVIEW,
+            queue: {
+              ...REVIEW.queue,
+              queue: [
+                {
+                  n: 1,
+                  kind: "update",
+                  what: "source_too_wide",
+                  path: "guides/deploying.md",
+                  section: "7f3a9c2e",
+                  heading: "Night deploys",
+                  age_secs: 3600,
+                  sources: [],
+                  question: "Share text from harbor?",
+                  basis: "b1",
+                },
+              ],
+            },
+          };
+        },
+        "/domains/eng/reflection/disclose": () => {
+          throw new ApiProblem(409, "Conflict", changed);
+        },
+      }),
+    );
+    const user = userEvent.setup();
+    renderApp("/d/eng/reflection/review");
+    const queue = await screen.findByRole("region", { name: "Reflect queue" });
+    await user.click(
+      await within(queue).findByRole("button", { name: "Share on purpose" }),
+    );
+    const dialog = await screen.findByRole("dialog", {
+      name: "Share text from a domain fewer people read",
+    });
+    const before = reviews;
+    await user.click(within(dialog).getByRole("button", { name: "Share it" }));
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent(changed);
+    await waitFor(() => {
+      expect(reviews).toBeGreaterThan(before);
     });
   });
 

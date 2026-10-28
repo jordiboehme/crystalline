@@ -66,6 +66,11 @@ export interface SectionView {
   sources: SourceView[] | null;
   /** Sources in a domain the reader may not open: a count, never named. */
   hiddenSources: number;
+  /**
+   * Who shared the section's text from a domain fewer people read on
+   * purpose, and when. Only a curator is sent it.
+   */
+  disclosed: Disclosed | null;
 }
 
 export type AnchorState = "found" | "text_changed" | "section_gone";
@@ -138,6 +143,8 @@ export interface QueueItem {
    * section's text on purpose. Null when the server sent none.
    */
   question: string | null;
+  /** `source_too_wide`: what the person's yes is bound to, sent back with it. */
+  basis: string | null;
 }
 /** What a host move left on the previous host's disk, as counts. */
 export interface OnlyElsewhere {
@@ -369,6 +376,7 @@ export function readDoc(payload: unknown): ReflectionDoc {
           changed: s?.changed === true,
           sources: readSources(s?.sources),
           hiddenSources: asNumber(s?.hidden_sources) ?? 0,
+          disclosed: readDisclosed(s?.disclosed),
         },
       ];
     }),
@@ -424,6 +432,7 @@ function readItem(value: unknown): QueueItem | null {
     asset: asString(r?.asset),
     onlyElsewhere: readOnlyElsewhere(r?.only_elsewhere),
     question: asString(r?.question),
+    basis: asString(r?.basis),
   };
 }
 
@@ -625,26 +634,32 @@ export interface Disclosed {
   at: string;
 }
 
+function readDisclosed(value: unknown): Disclosed | null {
+  const r = asObject(value);
+  const by = asString(r?.by);
+  const at = asString(r?.at);
+  return by === null || at === null ? null : { by, at };
+}
+
 /**
  * Share the text of a section the queue names as `source_too_wide` with the
- * page's readers, on purpose: the person's answer to the item's question.
- * Null when the server found nothing left to confirm.
+ * page's readers, on purpose: the person's answer to the item's question,
+ * bound to its `basis`. A 409 means the page's readers changed since the
+ * question was read. Null when the server found nothing left to confirm.
  */
 export async function discloseReflectionSection(
   domain: string,
   path: string,
   section: string,
+  basis: string,
 ): Promise<Disclosed | null> {
   const r = asObject(
     await api<unknown>(`${base(domain)}/reflection/disclose`, {
       method: "POST",
-      body: JSON.stringify({ path, section }),
+      body: JSON.stringify({ path, section, basis }),
     }),
   );
-  const disclosed = asObject(r?.disclosed);
-  const by = asString(disclosed?.by);
-  const at = asString(disclosed?.at);
-  return by === null || at === null ? null : { by, at };
+  return readDisclosed(r?.disclosed);
 }
 
 export async function fetchThreads(

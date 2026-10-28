@@ -31,6 +31,23 @@ use crate::scope::{PageReaders, ReflectionCaller, ReflectionRight, Scope};
 /// What a refused write adds when nobody could be asked: how a person can
 /// still share the text on purpose. It never points at Fluid, where a
 /// refused write leaves nothing to confirm.
+/// What a confirmed write is refused with when the page's readers, or the
+/// repository it is backed up to, changed between the question and the
+/// answer: the person agreed to the readers they were shown.
+pub const DISCLOSURE_CHANGED: &str = "who may read this page, or where it is backed up, changed since the person was asked; ask them again";
+
+/// A question a person is asked before text from a narrower domain goes
+/// onto a page, with what their yes is bound to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisclosureAsk {
+    /// The question, in plain words.
+    pub question: String,
+    /// A digest of the question and of the page's readers and repository it
+    /// was asked about. A confirmation carries it back, and it must still be
+    /// what the page has when the confirmation lands.
+    pub basis: String,
+}
+
 pub const NOBODY_ASKED_NOTE: &str = "a person who may read that domain can share it on purpose by making this write from an MCP client that can put a question to them; an unattended run never can";
 
 /// One person's confirmation that a section may carry text from the engrams
@@ -239,14 +256,16 @@ impl Engine {
         covered.map_err(|e| EngineError::Internal(e.to_string()))
     }
 
-    /// The question for sources in `sources` (local names) on page `path`
-    /// of `page`, naming each half of the rule they break now.
-    pub(crate) async fn disclosure_question_for(
+    /// The question for sources in `sources` (local names, sorted) on page
+    /// `path` of `page`, naming each half of the rule they break now, with
+    /// its basis: the question, who reads the page now and the repository
+    /// it is backed up to, the very facts a confirmation records.
+    pub(crate) async fn disclosure_ask_for(
         &self,
         page: &str,
         path: &str,
         sources: &[String],
-    ) -> Result<String> {
+    ) -> Result<DisclosureAsk> {
         let mut accounts_wide = false;
         let mut github_wide = false;
         for source in sources {
@@ -258,23 +277,59 @@ impl Engine {
                     .map_err(|e| EngineError::Internal(e.to_string()))?;
             }
         }
-        let readers = if accounts_wide {
-            self.page_readers_now(page).await?
-        } else {
-            None
-        };
-        let repo = if github_wide {
-            self.page_repo(page)
-        } else {
-            None
-        };
-        Ok(question(
+        let readers = self.page_readers_now(page).await?;
+        let repo = self.page_repo(page);
+        let question = question(
             page,
             path,
             sources,
-            readers.as_ref(),
-            repo.as_deref(),
-        ))
+            readers.as_ref().filter(|_| accounts_wide),
+            repo.as_deref().filter(|_| github_wide),
+        );
+        let basis = sha256_hex(
+            json!({ "question": question, "readers": readers, "repo": repo })
+                .to_string()
+                .as_bytes(),
+        );
+        Ok(DisclosureAsk { question, basis })
+    }
+
+    /// The local names, sorted, of the domains a write may carry only on a
+    /// person's confirmation ([`super::sources::NamedSource::disclose`]).
+    async fn disclosed_domains(
+        &self,
+        named: &HashMap<String, super::sources::NamedSource>,
+    ) -> Vec<String> {
+        let table = self.name_table_now().await;
+        let mut sources: Vec<String> = named
+            .values()
+            .filter(|n| n.disclose)
+            .filter_map(|n| n.domain.as_deref())
+            .map(|stored| table.resolve(stored).unwrap_or(stored).to_string())
+            .collect();
+        sources.sort();
+        sources.dedup();
+        sources
+    }
+
+    /// Refuse a confirmed write whose question no longer stands: the
+    /// person's yes (`basis`) was given for other readers, or another
+    /// repository, than the page has now. Called under the page's lock.
+    pub(super) async fn hold_disclosure_to_its_question(
+        &self,
+        page: &str,
+        path: &str,
+        named: &HashMap<String, super::sources::NamedSource>,
+        basis: &str,
+    ) -> Result<()> {
+        let sources = self.disclosed_domains(named).await;
+        if sources.is_empty() {
+            return Ok(());
+        }
+        if self.disclosure_ask_for(page, path, &sources).await?.basis != basis {
+            return Err(EngineError::Conflict(DISCLOSURE_CHANGED.into()));
+        }
+        Ok(())
     }
 
     /// The question a person is asked before this write lands, when it
@@ -293,7 +348,7 @@ impl Engine {
         &self,
         p: &WriteReflectionParams,
         caller: &ReflectionCaller,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<DisclosureAsk>> {
         if p.sources.is_empty() || p.action.as_deref().is_some_and(|action| action != "write") {
             return Ok(None);
         }
@@ -306,19 +361,11 @@ impl Engine {
         let named = self
             .resolve_source_names(&p.domain, &caller.scope, p.sources.values().flatten(), true)
             .await?;
-        let table = self.name_table_now().await;
-        let mut sources: Vec<String> = named
-            .values()
-            .filter(|n| n.disclose)
-            .filter_map(|n| n.domain.as_deref())
-            .map(|stored| table.resolve(stored).unwrap_or(stored).to_string())
-            .collect();
-        sources.sort();
-        sources.dedup();
+        let sources = self.disclosed_domains(&named).await;
         if sources.is_empty() {
             return Ok(None);
         }
-        self.disclosure_question_for(&p.domain, &p.path, &sources)
+        self.disclosure_ask_for(&p.domain, &p.path, &sources)
             .await
             .map(Some)
     }
@@ -397,7 +444,10 @@ impl Engine {
     ///
     /// The caller needs a person behind it, the right to curate the page and
     /// the right to read every source's domain (one it may not open is
-    /// refused without being named). Nothing is asked when nobody here knows
+    /// refused without being named). `basis` is the item's: when the page's
+    /// readers or repository changed since the item was read, the question
+    /// the person answered no longer stands and the confirmation is refused
+    /// ([`DISCLOSURE_CHANGED`]). Nothing is asked when nobody here knows
     /// who reads which domain. Answers `{domain, path, section, disclosed}`,
     /// `disclosed` `{by, at}`, or null when there was nothing to confirm.
     pub async fn confirm_reflection_disclosure(
@@ -405,6 +455,7 @@ impl Engine {
         domain: &str,
         path: &str,
         section: &str,
+        basis: &str,
         caller: &ReflectionCaller,
     ) -> Result<Value> {
         if self.read_only {
@@ -439,6 +490,7 @@ impl Engine {
         let hidden = self.hidden_for(&caller.scope).await?;
         let recorded = self.reflection_disclosures(access.domain_id).await?;
         let mut wide: Vec<String> = Vec::new();
+        let mut wide_local: Vec<String> = Vec::new();
         for src in &record.sources {
             let Some(stored) = src.domain.as_deref() else {
                 continue;
@@ -456,10 +508,13 @@ impl Engine {
                 continue;
             }
             let existing = recorded.find(path, section, stored);
-            if !self.source_covered(domain, &local, existing).await?
-                && !wide.iter().any(|s| s == stored)
-            {
-                wide.push(stored.to_string());
+            if !self.source_covered(domain, &local, existing).await? {
+                if !wide.iter().any(|s| s == stored) {
+                    wide.push(stored.to_string());
+                }
+                if !wide_local.contains(&local) {
+                    wide_local.push(local);
+                }
             }
         }
         if wide.is_empty() {
@@ -469,6 +524,17 @@ impl Engine {
                 "section": section,
                 "disclosed": Value::Null,
             }));
+        }
+        // The person answered the question the queue showed them; it must
+        // still be the question for this page now.
+        wide_local.sort();
+        if self
+            .disclosure_ask_for(domain, path, &wide_local)
+            .await?
+            .basis
+            != basis
+        {
+            return Err(EngineError::Conflict(DISCLOSURE_CHANGED.into()));
         }
         let confirmed: Vec<(String, String)> = wide
             .into_iter()
