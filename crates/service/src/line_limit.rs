@@ -182,7 +182,8 @@ fn describe_bytes(bytes: usize) -> String {
 /// and loses no byte.
 ///
 /// A last line without a newline is still returned at end of input, as
-/// tokio's `Lines` returns it.
+/// tokio's `Lines` returns it, with the newline its forwarder adds counted
+/// against the limit.
 pub(crate) struct BoundedLines<R> {
     reader: BufReader<R>,
     limit: usize,
@@ -267,12 +268,23 @@ impl<R: AsyncRead + Unpin> BoundedLines<R> {
 
     /// End of input: a line being discarded is answered like any other, a
     /// partial line is returned as it is, and after that there is nothing.
+    ///
+    /// A partial line has no newline yet, and both paths forward it with one
+    /// added, so the newline is counted here: a last line of exactly `limit`
+    /// bytes would reach rmcp as `limit + 1` and be dropped there in silence,
+    /// so it is refused instead, like any line one byte over.
     fn at_end(&mut self) -> Option<Incoming> {
         if self.discarding {
             return Some(self.finish_oversized());
         }
         if self.line.is_empty() {
             return None;
+        }
+        if self.line.len().saturating_add(1) > self.limit {
+            self.scan = Scan::default();
+            self.scan.feed(&self.line);
+            self.line = Vec::new();
+            return Some(self.finish_oversized());
         }
         Some(Incoming::Line(self.take_line()))
     }
@@ -459,6 +471,106 @@ impl Scan {
         } else {
             OversizedKind::Request { id: self.id }
         }
+    }
+}
+
+/// How many bytes the stdin thread of [`read_on_thread`] reads at once, and
+/// how many such chunks may wait for the reader: a bound on what is held
+/// between the two, so a client that writes faster than lines are served is
+/// slowed down by the pipe rather than buffered without end.
+const THREAD_CHUNK_BYTES: usize = 64 * 1024;
+const THREAD_CHUNKS_QUEUED: usize = 4;
+
+/// Read `source` on a dedicated OS thread and hand the bytes over as an
+/// [`AsyncRead`]: what `client::run_mcp` reads stdin through.
+///
+/// **Why not `tokio::io::stdin()`.** tokio reads stdin on its blocking pool,
+/// and a read there cannot be cancelled: dropping the future leaves the
+/// thread inside `read` until the client writes or closes stdin. The runtime
+/// waits for its blocking pool when it is dropped, so when rmcp ends a session
+/// on its own while the client keeps stdin open (a notification where the
+/// start-up loop expects a request, a failed write to stdout, a failed
+/// handshake), the embedded stack and the degraded status server never got
+/// to exit: [`serve_guarded`] keeps a read of stdin pending at all times,
+/// which a plain rmcp transport only did while it was serving. A thread of our
+/// own is not the runtime's to wait for; the process exit ends it wherever it
+/// stands.
+///
+/// The thread ends by itself at the end of input, on a read error (handed on
+/// as the reader's error) and once the reader is dropped.
+pub(crate) fn read_on_thread<S>(source: S) -> std::io::Result<ThreadReader>
+where
+    S: std::io::Read + Send + 'static,
+{
+    let (chunks, received) = tokio::sync::mpsc::channel(THREAD_CHUNKS_QUEUED);
+    std::thread::Builder::new()
+        .name("crystalline-stdin".into())
+        .spawn(move || pass_on(source, &chunks))?;
+    Ok(ThreadReader {
+        chunks: received,
+        chunk: Vec::new(),
+        at: 0,
+    })
+}
+
+/// The loop of the thread [`read_on_thread`] starts.
+fn pass_on<S: std::io::Read>(
+    mut source: S,
+    chunks: &tokio::sync::mpsc::Sender<std::io::Result<Vec<u8>>>,
+) {
+    loop {
+        let mut chunk = vec![0; THREAD_CHUNK_BYTES];
+        let sent = match source.read(&mut chunk) {
+            Ok(0) => return,
+            Ok(n) => {
+                chunk.truncate(n);
+                chunks.blocking_send(Ok(chunk))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                let _ = chunks.blocking_send(Err(e));
+                return;
+            }
+        };
+        if sent.is_err() {
+            // The reader is gone; nobody wants the rest.
+            return;
+        }
+    }
+}
+
+/// The reading end of [`read_on_thread`].
+pub(crate) struct ThreadReader {
+    chunks: tokio::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    /// The chunk being handed out, and how far into it.
+    chunk: Vec<u8>,
+    at: usize,
+}
+
+impl AsyncRead for ThreadReader {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        use std::task::Poll;
+        if self.at == self.chunk.len() {
+            match self.chunks.poll_recv(cx) {
+                Poll::Ready(Some(Ok(chunk))) => {
+                    self.chunk = chunk;
+                    self.at = 0;
+                }
+                Poll::Ready(Some(Err(e))) => return Poll::Ready(Err(e)),
+                // The thread is done: end of input.
+                Poll::Ready(None) => return Poll::Ready(Ok(())),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        let n = (self.chunk.len() - self.at).min(buf.remaining());
+        let at = self.at;
+        buf.put_slice(&self.chunk[at..at + n]);
+        self.at += n;
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -816,6 +928,33 @@ mod tests {
         cut.extend_from_slice(&line_of(LIMIT));
         let items = all(&cut, LIMIT).await;
         assert_eq!(reply_of(&items[0])["id"], serde_json::json!(3));
+    }
+
+    /// A last line without a newline is forwarded with one added, so the
+    /// newline counts: `limit` bytes at the end of input are refused, one
+    /// byte less is served.
+    #[tokio::test]
+    async fn a_last_line_without_a_newline_counts_the_one_it_will_get() {
+        let fits = padded(1, LIMIT - 1);
+        assert_eq!(all(&fits, LIMIT).await, vec![Incoming::Line(fits.clone())]);
+
+        let items = all(&padded(2, LIMIT), LIMIT).await;
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(reply_of(&items[0])["id"], serde_json::json!(2));
+    }
+
+    /// The thread reader hands on every byte in order and ends with its
+    /// source.
+    #[tokio::test]
+    async fn the_thread_reader_hands_on_every_byte() {
+        use tokio::io::AsyncReadExt;
+        let source: Vec<u8> = (0..THREAD_CHUNK_BYTES * 3 + 17)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let mut reader = read_on_thread(std::io::Cursor::new(source.clone())).unwrap();
+        let mut read = Vec::new();
+        reader.read_to_end(&mut read).await.unwrap();
+        assert_eq!(read, source);
     }
 
     /// A replayed item comes back before anything else is read.

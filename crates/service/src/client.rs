@@ -19,7 +19,7 @@ use crate::instance::{
     Connection, HarnessGate, acquire_ownership, acquire_standalone_ownership, ensure_daemon,
     try_attach,
 };
-use crate::line_limit::{BoundedLines, Incoming, STDIO_LINE_LIMIT, serve_guarded};
+use crate::line_limit::{BoundedLines, Incoming, STDIO_LINE_LIMIT, read_on_thread, serve_guarded};
 use crate::mcp::McpServer;
 use crate::overlay;
 use crate::params::*;
@@ -211,7 +211,10 @@ pub async fn run_mcp(
     // close during the window is still the unsurvivable case, and nothing here
     // closes stdio.
     let mut stdout = tokio::io::stdout();
-    let mut stdin = BoundedLines::new(tokio::io::stdin(), STDIO_LINE_LIMIT);
+    // Read on a thread of its own rather than tokio's blocking pool, so a
+    // session rmcp ends while stdin stays open does not keep the process
+    // alive at the runtime's drop (see `read_on_thread`).
+    let mut stdin = BoundedLines::new(read_on_thread(std::io::stdin())?, STDIO_LINE_LIMIT);
     let (opened, daemon) = if embedded {
         (read_session_opener(&mut stdin).await, None)
     } else {
@@ -3903,5 +3906,113 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_embedded_stack_bounds_lines_at_any_limit() {
         serve_embedded_around_the_limit(4096).await;
+    }
+
+    /// A last line of exactly the limit with no newline is refused by the
+    /// bridge, never forwarded: with the newline the relay adds it would be one
+    /// byte over at the daemon, which drops it in silence.
+    #[tokio::test]
+    async fn the_bridge_refuses_a_last_line_of_the_limit_without_a_newline() {
+        let limit = 256;
+        let input = padded_request(9, "tools/call", limit);
+        let (bridge_side, mut daemon_side) = tokio::io::duplex(4096);
+        let mut relay = RelayState::default();
+        let mut stdin = BoundedLines::new(input.as_slice(), limit);
+        let mut stdout = Vec::new();
+        let mut session = Session::new(bridge_side);
+        let (end, _) = relay_loop(&mut relay, &mut stdin, &mut stdout, &mut session)
+            .await
+            .unwrap();
+        assert_eq!(end, SessionEnd::StdinClosed);
+        let mut forwarded = Vec::new();
+        daemon_side.read_to_end(&mut forwarded).await.unwrap();
+        assert!(forwarded.is_empty(), "nothing reaches the daemon");
+        let answer: Value = serde_json::from_slice(stdout.trim_ascii_end()).unwrap();
+        assert_eq!(answer["id"], serde_json::json!(9));
+        assert_refused(&answer, limit);
+    }
+
+    /// The same on the embedded path: the last line, `limit` bytes with no
+    /// newline, is refused rather than handed to rmcp one byte over.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_embedded_stack_refuses_a_last_line_of_the_limit_without_a_newline() {
+        let limit = 4096;
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = in_memory_engine(tmp.path()).await;
+        let mut input = INITIALIZE.to_vec();
+        input.extend_from_slice(&padded_request(2, "tools/list", limit));
+        let (stdout_write, stdout_read) = tokio::io::duplex(1 << 16);
+        let served = tokio::spawn(serve_guarded(
+            McpServer::new(engine),
+            BoundedLines::new(std::io::Cursor::new(input), limit),
+            stdout_write,
+        ));
+        let mut out = BufReader::new(stdout_read).lines();
+        let ids = [serde_json::json!(1), serde_json::json!(2)];
+        let answers = answers_for(&mut out, &ids).await;
+        assert!(
+            answers[&ids[0]]["result"].is_object(),
+            "{:?}",
+            answers[&ids[0]]
+        );
+        assert_refused(&answers[&ids[1]], limit);
+        let _ = tokio::time::timeout(STEP, served)
+            .await
+            .expect("the serve returns at the end of input");
+    }
+
+    /// When rmcp gives a session up on its own while the client keeps stdin
+    /// open, [`serve_guarded`] returns and the runtime it ran on can be
+    /// dropped at once: stdin is read through [`read_on_thread`], so no read
+    /// of it is parked on the runtime's blocking pool, which a runtime waits
+    /// for at its drop. The session is a modern `server/discover` and then a
+    /// notification, which rmcp's start-up loop refuses.
+    #[test]
+    fn a_session_rmcp_ends_lets_the_runtime_go_with_stdin_still_open() {
+        let (stdin_read, mut stdin_write) = std::io::pipe().unwrap();
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            let out = runtime.block_on(async move {
+                let tmp = tempfile::tempdir().unwrap();
+                let engine = in_memory_engine(tmp.path()).await;
+                let (stdout_write, mut stdout_read) = tokio::io::duplex(1 << 16);
+                let collected = tokio::spawn(async move {
+                    let mut out = Vec::new();
+                    stdout_read.read_to_end(&mut out).await.unwrap();
+                    out
+                });
+                let stdin =
+                    BoundedLines::new(read_on_thread(stdin_read).unwrap(), STDIO_LINE_LIMIT);
+                let _ = serve_guarded(McpServer::new(engine), stdin, stdout_write).await;
+                collected.await.unwrap()
+            });
+            drop(runtime);
+            let _ = done.send(out);
+        });
+
+        let probe = complete_probe(
+            serde_json::json!(1),
+            crate::mcp::newest_served_protocol_version().as_str(),
+        );
+        std::io::Write::write_all(
+            &mut stdin_write,
+            format!("{probe}\n{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}}\n")
+                .as_bytes(),
+        )
+        .unwrap();
+        let out = finished
+            .recv_timeout(STEP)
+            .expect("the session ends and the runtime drops with stdin still open");
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.contains("\"id\":1"),
+            "the probe was answered first: {out}"
+        );
+        drop(stdin_write);
     }
 }
