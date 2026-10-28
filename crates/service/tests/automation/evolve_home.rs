@@ -780,3 +780,100 @@ async fn on_a_reviewing_domain_the_home_moves_once_the_unset_is_merged_and_pulle
     let taken = take_as(&eng, "brand", &Scope::Unrestricted).await;
     assert_eq!(taken["evolve_home"], HERE, "{taken}");
 }
+
+/// A deliberate move survives an unrelated change of the team's MANIFEST:
+/// the base names the old home, so the pull keeps this instance's claim
+/// instead of taking the team's copy of the line.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_moved_home_survives_an_unrelated_upstream_manifest_change() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let manifest = team_manifest("evolve_home: https://home.example\n");
+    let (eng, root) = team_at(&tmp, mock.clone(), manifest, Some(HERE)).await;
+    eng.change_domain_settings(
+        "brand",
+        &std::collections::BTreeMap::new(),
+        &["evolve_home".to_string()],
+        &Scope::Unrestricted,
+    )
+    .await
+    .unwrap();
+    let taken = take_as(&eng, "brand", &Scope::Unrestricted).await;
+    assert_eq!(taken["evolve_home"], HERE, "{taken}");
+    eng.automation_lease_release(
+        Loop::Evolve,
+        "brand",
+        taken["token"].as_str().unwrap(),
+        &Scope::Unrestricted,
+    )
+    .await
+    .unwrap();
+
+    let upstream = String::from_utf8(team_manifest("evolve_home: https://home.example\n"))
+        .unwrap()
+        .replace("- always\n", "- always, and on Mondays\n");
+    let commit = mock.add_commit(BTreeMap::from([(
+        "MANIFEST.md".to_string(),
+        upstream.into_bytes(),
+    )]));
+    mock.set_branch("main", &commit);
+    eng.origin_update(Some("brand"), &Scope::Unrestricted)
+        .await
+        .unwrap();
+
+    let text = manifest_text(&root);
+    assert!(
+        text.contains("evolve_home: https://kb.example.com\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("on Mondays"),
+        "the team's change landed: {text}"
+    );
+    assert_eq!(status_of(&eng, "brand").await["runs_on"], Value::Null);
+}
+
+/// A team MANIFEST with CRLF line endings: the declined claim is still
+/// recognised and withdrawn, and nothing is left to share.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_declined_claim_on_a_crlf_manifest_is_withdrawn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let crlf = String::from_utf8(team_manifest(""))
+        .unwrap()
+        .replace('\n', "\r\n")
+        .into_bytes();
+    let (eng, root) = team_at(&tmp, mock.clone(), crlf, Some(HERE)).await;
+    let taken = take_as(&eng, "brand", &Scope::Unrestricted).await;
+    let token = taken["token"].as_str().unwrap();
+    let shared = eng
+        .automation_share(Loop::Evolve, "brand", token, "Claim.", &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(shared_files(&shared), vec!["MANIFEST.md"], "{shared}");
+    eng.automation_lease_release(Loop::Evolve, "brand", token, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    mock.set_proposal_state(1, ProposalState::Declined);
+    eng.origin_update(Some("brand"), &Scope::Unrestricted)
+        .await
+        .unwrap();
+
+    let withdrawn = take_as(&eng, "brand", &Scope::Unrestricted).await;
+    assert!(
+        withdrawn["note"]
+            .as_str()
+            .unwrap()
+            .starts_with("The team declined"),
+        "{withdrawn}"
+    );
+    assert!(!manifest_text(&root).contains("evolve_home"));
+    let changes = eng
+        .local_changes("brand", &ShareActor::Owner)
+        .await
+        .unwrap();
+    assert!(
+        !changes.to_string().contains("MANIFEST.md"),
+        "nothing left to share: {changes}"
+    );
+}

@@ -1092,7 +1092,8 @@ pub fn evolve_home_of_source(source: &str) -> Option<String> {
 /// and two clones that claimed at once must not both keep running evolve.
 ///
 /// `None` leaves the merge as it is: when the team names no home, names the
-/// one the local text names, or the local claim is already in the base.
+/// one the local text names, or the base names a home already, so the local
+/// line is the base's or a deliberate move rather than a racing first claim.
 /// Otherwise the local text with the team's home in the line, or the base
 /// itself when the claim (and the `generated` stamp the edit path wrote
 /// with it) is all the local text changed, so the pull takes the team's
@@ -1106,7 +1107,11 @@ pub fn settle_evolve_home_claim(base: Option<&str>, local: &str, upstream: &str)
     };
     let team = evolve_home_of_source(upstream)?;
     let claim = declared(local)?;
-    if claim == team || base.and_then(declared).as_deref() == Some(claim.as_str()) {
+    // Only a first claim races: it starts from a base with no home. A local
+    // line over a base that names one is a home moved here on purpose (or
+    // the base's own line), and the ordinary merge keeps it when the team
+    // left the line alone.
+    if claim == team || base.and_then(declared).is_some() {
         return None;
     }
     let bare = |text: &str| {
