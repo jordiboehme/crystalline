@@ -248,8 +248,26 @@ jobs:
           echo "tested: the pull request run(s) $runs passed every gated job on the tree $tree, so the test legs only compile and the other heavy jobs are skipped."
           echo "tested=true" >>"$GITHUB_OUTPUT"
 
+  # The Windows leg is the longest by far (about 7.4 min of compile and 15.2
+  # min of tests, measured 2026-10-26, where every other leg is done within
+  # about 10 min), so it runs as two partitions, each on its own runner, with
+  # `cargo nextest --partition hash:1/2` and `hash:2/2`. Both compile the same
+  # build, so the compile is paid twice in parallel and the wall clock falls
+  # by about the half of the test run, not by half of the leg. The other
+  # legs carry no `partition` and run as before. Where the work goes:
+  # - clippy runs in partition 1 only (it is a lint of the tree, not of a
+  #   partition), and that is the one that saves the cache, so the check
+  #   metadata clippy produces is still saved;
+  # - the doctests run in partition 2 only, once on Windows, which also keeps
+  #   partition 1 (compile, clippy and half the tests) from carrying more;
+  # - on a push to main whose tree a pull request already tested, partition 1
+  #   alone compiles and lints so the cache stays seeded, and partition 2 has
+  #   nothing to add (same build, same key) and skips every step, which only
+  #   saves its runner minutes.
+  # `ci-passed` needs `test` as a whole, so every leg of this matrix, both
+  # partitions included, has to pass before the proof is uploaded.
   test:
-    name: test (${{ matrix.os }})
+    name: test (${{ matrix.os }}${{ matrix.partition && format(', {0}', matrix.partition) || '' }})
     timeout-minutes: 90
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
@@ -257,7 +275,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
         include:
           # candle-core pulls in gemm-f16, whose aarch64 NEON kernels emit
           # fullfp16 asm without gating it behind a target-feature check
@@ -265,8 +283,20 @@ jobs:
           # +fp16 by default so only this Linux arm64 leg needs the flag.
           - os: ubuntu-24.04-arm
             rustflags: '-C target-feature=+fp16'
+          # The two Windows partitions. windows-latest is left out of the os
+          # list above so these two entries are its only legs.
+          - os: windows-latest
+            partition: 1/2
+          - os: windows-latest
+            partition: 2/2
     env:
       RUSTFLAGS: ${{ matrix.rustflags }}
+      # nextest's `--partition` argument; empty (no partitioning) on the
+      # three legs that run the whole suite.
+      PARTITION: ${{ matrix.partition }}
+      # True for the one leg with nothing to do on a push to main whose tree a
+      # pull request tested (see the comment above the job).
+      IDLE: ${{ needs.changes.outputs.tested == 'true' && matrix.partition == '2/2' }}
       # Keeps every test off the runner's real OS keychain, the same switch
       # the documented local test command sets. Without it a Windows runner's
       # Credential Manager takes a test's credential write while a Linux or
@@ -275,21 +305,28 @@ jobs:
       CRYSTALLINE_TEST_NO_KEYCHAIN: '1'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: ${{ env.IDLE != 'true' }}
         with:
           persist-credentials: false
 
       - name: Install Rust toolchain
+        if: ${{ env.IDLE != 'true' }}
         run: rustup show
 
       - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
+        if: ${{ env.IDLE != 'true' }}
         with:
           tool: nextest@0.9.150
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: ${{ env.IDLE != 'true' }}
         with:
-          # Named, so fluid-smoke reads this very entry (same job key as before).
+          # Named, so fluid-smoke reads this very entry (same job key as
+          # before). Both Windows partitions share it (the key adds the OS,
+          # not the partition) and they build the same thing, so only
+          # partition 1 saves: two saves of one key would race for nothing.
           shared-key: test
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.ref == 'refs/heads/main' && matrix.partition != '2/2' }}
 
       # On a push to main whose tree a pull request run already passed (see
       # `changes`), the checks below are skipped and the leg only compiles the
@@ -300,11 +337,11 @@ jobs:
       # dependency in check mode. A clippy failure turns main red, which is
       # right: the pull request ran the same clippy on the same tree.
       - name: Compile the tests only (the pull request tested this tree)
-        if: ${{ needs.changes.outputs.tested == 'true' }}
+        if: ${{ needs.changes.outputs.tested == 'true' && env.IDLE != 'true' }}
         run: cargo nextest run --workspace --no-run --locked
 
       - name: cargo clippy (the pull request tested this tree)
-        if: ${{ needs.changes.outputs.tested == 'true' }}
+        if: ${{ needs.changes.outputs.tested == 'true' && env.IDLE != 'true' }}
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       # Formatting does not depend on the OS, so one leg checks it.
@@ -318,8 +355,9 @@ jobs:
           RUSTDOCFLAGS: -D rustdoc::private_intra_doc_links
         run: cargo doc --no-deps --workspace --locked
 
+      # On Windows partition 2 clippy would only repeat partition 1's lint.
       - name: cargo clippy
-        if: ${{ needs.changes.outputs.tested != 'true' }}
+        if: ${{ needs.changes.outputs.tested != 'true' && matrix.partition != '2/2' }}
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       # The feature-gated code paths: without the default features candle,
@@ -382,7 +420,11 @@ jobs:
         run: |
           set -o pipefail
           # The log goes to the runner's temp folder, never the workspace.
-          cargo nextest run --workspace --profile ci --locked 2>&1 | tee "$RUNNER_TEMP/nextest.log"
+          args=()
+          if [ -n "$PARTITION" ]; then
+            args+=(--partition "hash:$PARTITION")
+          fi
+          cargo nextest run --workspace --profile ci --locked "${args[@]}" 2>&1 | tee "$RUNNER_TEMP/nextest.log"
 
       # A test that passed on its retry is FLAKY in the log. Show each as a
       # warning on the run; the job stays green.
@@ -395,8 +437,10 @@ jobs:
             echo "::warning::flaky test: ${line}"
           done || true
 
+      # Once on Windows: partition 2 runs them, partition 1 already carries
+      # clippy.
       - name: cargo test --doc
-        if: ${{ needs.changes.outputs.tested != 'true' }}
+        if: ${{ needs.changes.outputs.tested != 'true' && matrix.partition != '1/2' }}
         run: cargo test --workspace --doc --locked
 
   # Runs chosen tests many times on one runner, on a manual dispatch only:
