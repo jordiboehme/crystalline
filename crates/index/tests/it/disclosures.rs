@@ -63,9 +63,15 @@ async fn set_replace_and_drop(store: &dyn Store) {
             ("b.md".to_string(), "[4]".to_string())
         ]
     );
-    store.set_reflection_disclosures(eng, "a.md", None).await.unwrap();
+    store
+        .set_reflection_disclosures(eng, "a.md", None)
+        .await
+        .unwrap();
     // Dropping a page that has none is fine.
-    store.set_reflection_disclosures(eng, "c.md", None).await.unwrap();
+    store
+        .set_reflection_disclosures(eng, "c.md", None)
+        .await
+        .unwrap();
     assert_eq!(
         store.reflection_disclosures(eng).await.unwrap(),
         vec![("b.md".to_string(), "[4]".to_string())]

@@ -148,6 +148,7 @@ fn resolve_harness_gate_at(harness: Option<&str>, receipt: &Path) -> HarnessGate
     let gate = HarnessGate {
         hook_installed,
         onboarding_verified: hook_installed && kind.profile().onboarding_verified,
+        unattended: false,
     };
     tracing::debug!(
         harness = %id,
@@ -170,6 +171,7 @@ pub async fn run_mcp(
     config_path: Option<&Path>,
     read_only: bool,
     harness: Option<&str>,
+    unattended: bool,
 ) -> anyhow::Result<()> {
     // Log to stderr from the start, for both modes: the relay's takeover and
     // reconnect notices and any embedded startup failure must be visible in the
@@ -181,7 +183,10 @@ pub async fn run_mcp(
     // fixed at startup is invariant for every connection it can ever serve,
     // which is what SEP-2567 needs of a gate that stays on a listing. It is
     // re-sent on each daemon reconnect and never re-derived daemon-side.
-    let harness_gate = resolve_harness_gate(harness);
+    let harness_gate = HarnessGate {
+        unattended,
+        ..resolve_harness_gate(harness)
+    };
 
     // Inside an app package (Claude Desktop's MSIX package on Windows) this
     // process is only a bridge to the daemon outside: every file it wrote
@@ -2821,6 +2826,7 @@ mod tests {
     const VERIFIED: HarnessGate = HarnessGate {
         hook_installed: true,
         onboarding_verified: true,
+        unattended: false,
     };
 
     #[test]
@@ -2865,7 +2871,8 @@ mod tests {
             resolve_harness_gate_at(Some("claude-code"), &receipt),
             HarnessGate {
                 hook_installed: true,
-                onboarding_verified: true
+                onboarding_verified: true,
+                unattended: false,
             }
         );
         for id in ["codex", "copilot"] {
@@ -2882,7 +2889,8 @@ mod tests {
                 resolve_harness_gate_at(Some(id), &receipt),
                 HarnessGate {
                     hook_installed: true,
-                    onboarding_verified: false
+                    onboarding_verified: false,
+                    unattended: false,
                 },
                 "{id} is unverified"
             );

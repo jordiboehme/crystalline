@@ -1660,8 +1660,17 @@ impl Engine {
         // Each source by permalink (this domain) or address (any domain),
         // resolved in the writer's scope, and their facts read one seek
         // each before the page lock.
+        // A person's confirmation lets a source through that the reach rule
+        // alone refuses (`super::disclosure`); nobody behind the caller, no
+        // confirmation.
+        let by = super::disclosure::confirmer(caller).filter(|_| p.disclosed);
         let named = self
-            .resolve_source_names(&p.domain, &caller.scope, p.sources.values().flatten())
+            .resolve_source_names(
+                &p.domain,
+                &caller.scope,
+                p.sources.values().flatten(),
+                by.is_some(),
+            )
             .await?;
         let wanted: Vec<r::SourceRef> = named.values().map(|n| n.source_ref("")).collect();
         let facts = self
@@ -1864,6 +1873,9 @@ impl Engine {
             .collect();
         let changed_ids = changed.clone();
         let mut advanced: Vec<String> = Vec::new();
+        // Each section and source domain this write carries on a person's
+        // confirmation.
+        let mut confirmed: Vec<(String, String)> = Vec::new();
         for (key, engrams) in &p.sources {
             let key = replaced
                 .iter()
@@ -1888,6 +1900,11 @@ impl Engine {
                     })
                 })?;
                 let src = source.source_ref(&fact.checksum);
+                if let (true, Some(domain)) = (source.disclose, src.domain.as_ref())
+                    && !confirmed.iter().any(|(s, d)| *s == id && d == domain)
+                {
+                    confirmed.push((id.clone(), domain.clone()));
+                }
                 // One engram named twice (by permalink and by address) is
                 // one source.
                 if !refs
@@ -2040,6 +2057,15 @@ impl Engine {
                 }),
                 read: false,
             },
+        )
+        .await?;
+        self.record_disclosures(
+            &p.domain,
+            access.domain_id,
+            &p.path,
+            &final_text,
+            &confirmed,
+            by.as_deref(),
         )
         .await?;
         self.mark_reflection_dirty(&p.domain, BackupCause::Settled);
@@ -2596,6 +2622,13 @@ impl Engine {
         let reflected = r::parse_baseline(
             &read_opt(&access.abs(&r::baseline_path(inner)))?.unwrap_or_default(),
         );
+        // Who shared a section's text on purpose, and when: for curators,
+        // who are the ones to settle the page (`super::disclosure`).
+        let disclosures = if access.engrams_visible && access.right >= ReflectionRight::Curate {
+            self.reflection_disclosures(access.domain_id).await?
+        } else {
+            Default::default()
+        };
         let sections: Vec<Value> = r::split_sections(&markdown)
             .iter()
             .filter(|s| s.id.as_deref() != Some(r::TOP_SECTION))
@@ -2624,6 +2657,11 @@ impl Engine {
                     if hidden > 0 {
                         row["hidden_sources"] = json!(hidden);
                     }
+                }
+                if let Some(disclosure) =
+                    s.id.as_deref().and_then(|id| disclosures.newest(inner, id))
+                {
+                    row["disclosed"] = json!({ "by": disclosure.by, "at": disclosure.at });
                 }
                 row
             })
@@ -2948,6 +2986,7 @@ impl Engine {
             OnRefusal::put_back(domain, undo),
         )
         .await?;
+        self.move_disclosures(access.domain_id, from, to).await?;
         drop(_locks);
         // The page has moved: the room's sockets learn its new path now, and
         // the fence lifts.
@@ -3151,6 +3190,7 @@ impl Engine {
             OnRefusal::put_back(domain, undo),
         )
         .await?;
+        self.drop_disclosures(access.domain_id, inner).await?;
         self.mark_reflection_dirty(domain, BackupCause::Settled);
         self.announce_reflection(
             domain,

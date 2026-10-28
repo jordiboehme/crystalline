@@ -1545,7 +1545,10 @@ mod tests {
         let PageReaders::Accounts(readers) = access.page_readers("lab").await.unwrap() else {
             panic!("a private page has named readers");
         };
-        assert!(readers.contains("mem") && readers.contains("keeper"), "{readers:?}");
+        assert!(
+            readers.contains("mem") && readers.contains("keeper"),
+            "{readers:?}"
+        );
         assert!(!readers.contains("ann"), "{readers:?}");
     }
 
@@ -1566,10 +1569,20 @@ mod tests {
             .unwrap();
         assert!(!access.readers_cover("lab", "vault").await.unwrap());
         let confirmed = access.page_readers("lab").await.unwrap();
-        assert!(access.readers_cover_for("lab", "vault", &confirmed).await.unwrap());
+        assert!(
+            access
+                .readers_cover_for("lab", "vault", &confirmed)
+                .await
+                .unwrap()
+        );
         // mem loses vault: mem read the page then, so nothing changes.
         auth.remove_domain_member("vault", "mem").await.unwrap();
-        assert!(access.readers_cover_for("lab", "vault", &confirmed).await.unwrap());
+        assert!(
+            access
+                .readers_cover_for("lab", "vault", &confirmed)
+                .await
+                .unwrap()
+        );
         // A new reader of the page who may not read vault.
         auth.add_user("lee", "lee", None, Role::Viewer, "pw12345678")
             .await
@@ -1577,14 +1590,29 @@ mod tests {
         auth.upsert_domain_member("lab", "lee", MemberLevel::Viewer, None, "keeper")
             .await
             .unwrap();
-        assert!(!access.readers_cover_for("lab", "vault", &confirmed).await.unwrap());
+        assert!(
+            !access
+                .readers_cover_for("lab", "vault", &confirmed)
+                .await
+                .unwrap()
+        );
         // Shared now: anonymous and later accounts read it.
         auth.remove_domain_member("lab", "lee").await.unwrap();
-        assert!(access.readers_cover_for("lab", "vault", &confirmed).await.unwrap());
+        assert!(
+            access
+                .readers_cover_for("lab", "vault", &confirmed)
+                .await
+                .unwrap()
+        );
         auth.set_domain_visibility("lab", false, "keeper")
             .await
             .unwrap();
-        assert!(!access.readers_cover_for("lab", "vault", &confirmed).await.unwrap());
+        assert!(
+            !access
+                .readers_cover_for("lab", "vault", &confirmed)
+                .await
+                .unwrap()
+        );
         assert!(
             access
                 .readers_cover_for("lab", "vault", &PageReaders::Everyone)

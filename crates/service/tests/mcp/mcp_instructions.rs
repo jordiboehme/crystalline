@@ -648,10 +648,12 @@ async fn an_installed_but_unverified_hook_gets_the_conditional_block() {
     let unverified = HarnessGate {
         hook_installed: true,
         onboarding_verified: false,
+        unattended: false,
     };
     let verified = HarnessGate {
         hook_installed: true,
         onboarding_verified: true,
+        unattended: false,
     };
 
     let (client, _server) = h.connect_gated(unverified).await;

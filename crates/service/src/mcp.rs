@@ -259,7 +259,7 @@ use std::sync::Arc;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use rmcp::handler::server::prompt::PromptContext;
-use rmcp::handler::server::tool::InputResponses;
+use rmcp::handler::server::tool::{InputResponses, RequestState};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CacheScope, CallToolResponse, CallToolResult, ContentBlock, DiscoverResult, ElicitRequest,
@@ -555,6 +555,90 @@ fn confirmed(responses: &Option<rmcp::model::InputResponses>) -> Option<bool> {
         None => true,
         Some(value) => *value == json!(true),
     })
+}
+
+/// What [`McpServer::ask_to_disclose`] decided for one write.
+enum Disclosure {
+    /// Put this question to the person; the write waits for the second round.
+    Ask(InputRequiredResult),
+    /// Go on with the write as it stands (confirmed or not).
+    Go,
+    /// A person may be behind the session, and its client cannot ask them:
+    /// the write goes on, and a refusal says how they still can.
+    NobodyToAsk,
+}
+
+/// How long a disclosure question waits for its person: the second round of a
+/// 2026-07-28 peer must come within it, and a legacy peer's elicitation request
+/// is given up after it. Long enough to read the question and think.
+const DISCLOSURE_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// The disclosure questions this process put to a 2026-07-28 peer and that
+/// were not answered yet, by the state handed out with each.
+///
+/// **Why a disclosure is bound when nothing else is.** The other questions
+/// here guard an agent against its own mistake, and a client answering one
+/// itself costs nothing it could not have done anyway. A disclosure is the
+/// one place the answer is the authority: it lets text from a domain fewer
+/// people may read onto a page more people read. So an answer counts only
+/// when it answers a question this process asked, about these very
+/// arguments and this caller, within [`DISCLOSURE_WAIT`], and only once: the
+/// state is a random token kept here, taken on its first use whatever the
+/// answer. An accept sent along with a first call answers nothing and is
+/// asked again. The process is the daemon, or the embedded stack, that served
+/// the first round, which is where the second one arrives.
+static DISCLOSURE_ASKS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// What a disclosure answer must match: the write's arguments and who makes
+/// it.
+fn disclosure_key(p: &WriteReflectionParams, caller: &ReflectionCaller) -> String {
+    let text = json!({ "write": p, "scope": format!("{:?}", caller.scope) }).to_string();
+    crystalline_core::provision::receipt::sha256_hex(text.as_bytes())
+}
+
+/// Remember a disclosure question about `key` and hand out its state.
+fn disclosure_state(key: String) -> String {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).expect("the OS CSPRNG is available");
+    let state: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let mut asks = DISCLOSURE_ASKS.lock().unwrap_or_else(|e| e.into_inner());
+    let now = std::time::Instant::now();
+    asks.retain(|_, (_, until)| *until > now);
+    asks.insert(state.clone(), (key, now + DISCLOSURE_WAIT));
+    state
+}
+
+/// Whether `state` is a live disclosure question about `key`. Taken either
+/// way: a state answers once.
+fn take_disclosure_state(state: &str, key: &str) -> bool {
+    let mut asks = DISCLOSURE_ASKS.lock().unwrap_or_else(|e| e.into_inner());
+    match asks.remove(state) {
+        Some((asked, until)) => asked == key && until > std::time::Instant::now(),
+        None => false,
+    }
+}
+
+/// The form a person answers a disclosure question in: one box, unchecked,
+/// so only a deliberate tick and Accept share the text.
+fn disclosure_schema() -> ElicitationSchema {
+    ElicitationSchema::builder()
+        .required_bool_property(CONFIRM_KEY, |schema| {
+            schema
+                .title("Yes, share it with these readers")
+                .description("Check this box and choose Accept to share the text. Leave it unchecked, or decline, to keep it off this page.")
+                .with_default(false)
+        })
+        .build()
+        .expect("the disclosure schema names the property it requires")
+}
+
+/// Whether a person's answer to a disclosure question is a yes: an accept
+/// whose content carries `true` for the box. Unlike [`confirmed`], an accept
+/// that leaves the box out is a no, because the box starts unchecked.
+fn disclosure_yes(answer: &Value) -> bool {
+    answer["action"] == json!("accept") && answer["content"][CONFIRM_KEY] == json!(true)
 }
 
 /// Attach the SEP-2549 caching hints a modern peer is owed, and nothing to a
@@ -1860,10 +1944,19 @@ impl McpServer {
     /// `true` is the verified gate (hook installed and onboarding verified),
     /// `false` the default gate.
     pub fn with_onboarded_harness(self, onboarded: bool) -> McpServer {
+        let unattended = self.gate.unattended;
         self.with_harness_gate(HarnessGate {
             hook_installed: onboarded,
             onboarding_verified: onboarded,
+            unattended,
         })
+    }
+
+    /// Mark this session unattended (see [`HarnessGate::unattended`]): it
+    /// is never asked to share text on purpose.
+    pub fn with_unattended(mut self, unattended: bool) -> McpServer {
+        self.gate.unattended = unattended;
+        self
     }
 
     /// Who this call is acting as, as the one value every scoped verb on this
@@ -3540,17 +3633,149 @@ impl McpServer {
     async fn write_reflection(
         &self,
         Parameters(p): Parameters<WriteReflectionParams>,
+        responses: InputResponses,
+        state: RequestState,
         ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
+    ) -> Result<CallToolResponse, ErrorData> {
+        // A routed write is answered by the server that holds the domain, and
+        // a confirmation never travels with it: that server cannot know this
+        // machine asked anybody.
         if let Some(answer) = self.mounted("write_reflection", &p, &ctx).await {
-            return answer;
+            return answer.map(CallToolResponse::from);
         }
-        let p = self.localized(p, &ctx).await?;
+        let mut p = self.localized(p, &ctx).await?;
         let caller = self.reflection_caller(&ctx);
+        let asked = self
+            .ask_to_disclose(&mut p, &caller, responses.0, state.0, &ctx)
+            .await;
+        let nobody_asked = match asked {
+            Disclosure::Ask(question) => return Ok(question.into()),
+            Disclosure::NobodyToAsk => true,
+            Disclosure::Go => false,
+        };
         match self.engine.write_reflection(&p, &caller).await {
-            Ok(v) => ok(v),
-            Err(e) => Self::reflection_refused(e),
+            Ok(v) => ok(v).map(CallToolResponse::from),
+            // Refused for reach, by a person whose client could not ask them:
+            // say how they still can.
+            Err(EngineError::Invalid(text)) if nobody_asked => Err(to_error(EngineError::Invalid(
+                format!("{text}; {}", crate::engine::NOBODY_ASKED_NOTE),
+            ))),
+            Err(e) => Self::reflection_refused(e).map(CallToolResponse::from),
         }
+    }
+
+    /// Ask this session's person before a `write_reflection` that the reach
+    /// rule alone would refuse: its sources name a domain fewer people may
+    /// read than the page's, or one not shared through GitHub while the page
+    /// is backed up there ([`Engine::reflection_disclosure_question`]). A yes
+    /// sets [`WriteReflectionParams::disclosed`], the one bit the engine
+    /// takes a person's confirmation from.
+    ///
+    /// Nobody is asked, and the write goes on to be refused as before, when
+    /// there is no person behind the session to ask:
+    ///
+    /// * a session the registration marked unattended (`crystalline mcp
+    ///   --unattended`, which every headless loop run's MCP config carries);
+    /// * a caller that holds a live loop lease ([`Engine::acts_for_a_run`]):
+    ///   a run as the machine owner looks like its person on a local session,
+    ///   and a run's account is the token it connects with;
+    /// * the anonymous caller and the open tier (the engine answers no
+    ///   question for them).
+    ///
+    /// A 2026-07-28 peer that declared elicitation gets `input_required`,
+    /// bound to a single-use state (see [`DISCLOSURE_ASKS`]); a legacy peer
+    /// that declared form elicitation gets an `elicitation/create` request on
+    /// this same call, whose answer is the response to our own request. A
+    /// peer that can do neither cannot ask its person
+    /// ([`Disclosure::NobodyToAsk`]).
+    async fn ask_to_disclose(
+        &self,
+        p: &mut WriteReflectionParams,
+        caller: &ReflectionCaller,
+        responses: Option<rmcp::model::InputResponses>,
+        state: Option<String>,
+        ctx: &RequestContext<RoleServer>,
+    ) -> Disclosure {
+        // An error here is the write's own refusal, and the write gives it.
+        let Ok(Some(question)) = self.engine.reflection_disclosure_question(p, caller).await else {
+            return Disclosure::Go;
+        };
+        if self.gate.unattended
+            || self
+                .engine
+                .acts_for_a_run(&caller.scope)
+                .await
+                .unwrap_or(true)
+        {
+            return Disclosure::Go;
+        }
+        let key = disclosure_key(p, caller);
+        if peer_gets_cache_hints(ctx) {
+            if !confirmation_supported(ctx) {
+                return Disclosure::NobodyToAsk;
+            }
+            let answer = responses
+                .as_ref()
+                .and_then(|responses| responses.get(CONFIRM_KEY))
+                .map(|answer| serde_json::to_value(answer).unwrap_or_default());
+            return match (state, answer) {
+                // A state with an answer: it counts only for the question
+                // asked about this very write, once.
+                (Some(state), Some(answer)) => {
+                    p.disclosed = take_disclosure_state(&state, &key) && disclosure_yes(&answer);
+                    Disclosure::Go
+                }
+                // A state without an answer answers nothing, and is used up.
+                (Some(state), None) => {
+                    take_disclosure_state(&state, &key);
+                    Disclosure::Go
+                }
+                // No state: whatever came along was never asked for.
+                (None, _) => {
+                    let mut requests = InputRequests::new();
+                    requests.insert(
+                        CONFIRM_KEY.to_string(),
+                        InputRequest::Elicitation(ElicitRequest::new(
+                            ElicitRequestParams::FormElicitationParams {
+                                meta: None,
+                                message: question,
+                                requested_schema: disclosure_schema(),
+                            },
+                        )),
+                    );
+                    Disclosure::Ask(InputRequiredResult::new(
+                        Some(requests),
+                        Some(disclosure_state(key)),
+                    ))
+                }
+            };
+        }
+        if !ctx
+            .peer
+            .supported_elicitation_modes()
+            .contains(&rmcp::service::ElicitationMode::Form)
+        {
+            return Disclosure::NobodyToAsk;
+        }
+        let answer = ctx
+            .peer
+            .create_elicitation_with_timeout(
+                ElicitRequestParams::FormElicitationParams {
+                    meta: None,
+                    message: question,
+                    requested_schema: disclosure_schema(),
+                },
+                Some(DISCLOSURE_WAIT),
+            )
+            .await;
+        match answer {
+            Ok(answer) => {
+                let answer = serde_json::to_value(&answer).unwrap_or_default();
+                p.disclosed = disclosure_yes(&answer);
+            }
+            Err(e) => tracing::debug!("a disclosure question got no answer: {e}"),
+        }
+        Disclosure::Go
     }
 
     #[tool(
@@ -7244,14 +7469,17 @@ mod tests {
         HarnessGate {
             hook_installed: false,
             onboarding_verified: false,
+            unattended: false,
         },
         HarnessGate {
             hook_installed: true,
             onboarding_verified: false,
+            unattended: false,
         },
         HarnessGate {
             hook_installed: true,
             onboarding_verified: true,
+            unattended: false,
         },
     ];
 

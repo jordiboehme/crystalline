@@ -131,7 +131,9 @@ pub(super) fn is_refusal(e: &anyhow::Error) -> bool {
         && e.downcast_ref::<serde_json::Error>().is_none()
 }
 
-/// The stdio entry for the local daemon: this binary's `mcp` verb.
+/// The stdio entry for the local daemon: this binary's `mcp` verb, marked
+/// `--unattended`: nobody is behind a headless run to answer a question, so
+/// its session is never asked to share Reflection text on purpose.
 ///
 /// It carries no `--harness`, unlike the entry `crystalline install`
 /// registers. With `--harness claude-code` on a machine where Claude Code's
@@ -144,7 +146,7 @@ pub(super) fn local_mcp_config(exe: &Path) -> Value {
         "mcpServers": {
             "crystalline": {
                 "command": exe.to_string_lossy(),
-                "args": ["mcp"],
+                "args": ["mcp", "--unattended"],
             }
         }
     })
@@ -173,7 +175,7 @@ mod tests {
         assert_eq!(
             local_mcp_config(Path::new("/opt/bin/crystalline")),
             json!({ "mcpServers": { "crystalline": {
-                "command": "/opt/bin/crystalline", "args": ["mcp"] } } })
+                "command": "/opt/bin/crystalline", "args": ["mcp", "--unattended"] } } })
         );
         assert_eq!(
             remote_mcp_config("https://team.example.com/base/", "cmt_secret"),

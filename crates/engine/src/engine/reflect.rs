@@ -295,19 +295,20 @@ impl Engine {
     /// by whom or not. A source whose domain cannot be checked here is not
     /// counted, as in the queue.
     pub(crate) async fn too_wide_pages(&self, domain: &str) -> Result<Vec<String>> {
-        let rows = {
+        let (rows, id) = {
             let store = self.store.lock().await;
             let Some(id) = store.domain_id(domain).await? else {
                 return Ok(Vec::new());
             };
-            store.list_reflections(id).await?
+            (store.list_reflections(id).await?, id)
         };
+        let disclosures = self.reflection_disclosures(id).await?;
         let table = self.name_table_now().await;
         let mut covers: HashMap<String, bool> = HashMap::new();
         let mut out = Vec::new();
         for row in rows {
             let mut wide = false;
-            for record in r::read_provenance(&row.content).into_values() {
+            for (section, record) in r::read_provenance(&row.content) {
                 for src in &record.sources {
                     let Some(name) = src.domain.as_deref() else {
                         continue;
@@ -322,10 +323,20 @@ impl Engine {
                         Some(covered) => *covered,
                         None => {
                             let covered = self.readers_cover(domain, &local).await?;
-                            covers.insert(local, covered);
+                            covers.insert(local.clone(), covered);
                             covered
                         }
                     };
+                    // A person shared it on purpose, for the readers and the
+                    // repository the page has now (`source_covered`).
+                    let covered = covered
+                        || match disclosures.find(&row.path, &section, name) {
+                            Some(disclosure) => {
+                                self.source_covered(domain, &local, Some(disclosure))
+                                    .await?
+                            }
+                            None => false,
+                        };
                     wide |= !covered;
                 }
             }
@@ -403,6 +414,7 @@ impl Engine {
         // Whether this domain's pages may cite each other domain, asked
         // once per domain for the whole scan.
         let mut covers: HashMap<String, bool> = HashMap::new();
+        let disclosures = self.reflection_disclosures(access.domain_id).await?;
         let mut items = Vec::new();
         for (row, prov) in rows.iter().zip(&provenances) {
             // The baseline is read for feedback alone, and the pact's is
@@ -611,6 +623,7 @@ impl Engine {
                 // resolves, and a hidden source tells nothing of itself.
                 let mut wide_shown: Vec<Value> = Vec::new();
                 let mut wide_stamps: Vec<String> = Vec::new();
+                let mut wide_domains: Vec<String> = Vec::new();
                 for src in record.sources.iter().filter(|src| sees(src)) {
                     let Some(local) = facts.checked_domain(src) else {
                         continue;
@@ -626,6 +639,19 @@ impl Engine {
                     if covered {
                         continue;
                     }
+                    // Shared on purpose by a person, for the page's readers
+                    // and repository as they still are.
+                    if let Some(disclosure) = src
+                        .domain
+                        .as_deref()
+                        .and_then(|stored| disclosures.find(&row.path, id, stored))
+                        && self.source_covered(domain, local, Some(disclosure)).await?
+                    {
+                        continue;
+                    }
+                    if !wide_domains.iter().any(|d| d == local) {
+                        wide_domains.push(local.to_string());
+                    }
                     wide_stamps.push(format!(
                         "{}:{}",
                         src.domain.as_deref().unwrap_or_default(),
@@ -637,7 +663,18 @@ impl Engine {
                 }
                 if !wide_stamps.is_empty() {
                     wide_stamps.sort();
-                    let extra = json!({ "sources": wide_shown, "note": TOO_WIDE_NOTE });
+                    wide_domains.sort();
+                    // What a person is asked to share it on purpose (Fluid's
+                    // Review asks it); it names only domains this caller
+                    // may open.
+                    let question = self
+                        .disclosure_question_for(domain, &row.path, &wide_domains)
+                        .await?;
+                    let extra = json!({
+                        "sources": wide_shown,
+                        "note": TOO_WIDE_NOTE,
+                        "question": question,
+                    });
                     items.push(Item {
                         kind: "update",
                         what: "source_too_wide",

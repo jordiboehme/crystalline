@@ -1485,6 +1485,47 @@ impl Engine {
         Ok(lease.is_some_and(|lease| lease.renewed_at.as_str() >= stale_before.as_str()))
     }
 
+    /// Whether `scope` may be a loop run at work right now: it holds a live
+    /// lease of either loop on any domain. A run's account holds its lease;
+    /// a run as the machine owner holds one with no account, and on a local
+    /// session the owner and its run look alike, so while such a lease is
+    /// live every owner session counts as the run. Asked before a person is
+    /// asked to share text on purpose (`super::disclosure`): a run never
+    /// confirms, and an account that runs loops confirms through Fluid while
+    /// its run is going. The anonymous caller has nobody behind it and counts
+    /// as a run.
+    pub async fn acts_for_a_run(&self, scope: &Scope) -> Result<bool> {
+        if matches!(scope, Scope::Anonymous) {
+            return Ok(true);
+        }
+        let (_, stale_before) = self.automation_window();
+        let domains: Vec<String> = self.registered_domain_entries().keys().cloned().collect();
+        let store = self.store.lock().await;
+        for domain in domains {
+            let Some(id) = store.domain_id(&domain).await? else {
+                continue;
+            };
+            for lp in [Loop::Reflect, Loop::Evolve] {
+                let Some(lease) = store.automation_lease(id, lp.as_str()).await? else {
+                    continue;
+                };
+                if lease.renewed_at.as_str() < stale_before.as_str() {
+                    continue;
+                }
+                let held = match scope {
+                    Scope::User { account, .. } => {
+                        lease.holder.account.as_deref() == Some(account.as_str())
+                    }
+                    _ => lease.holder.account.is_none(),
+                };
+                if held {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     /// The name this instance shows people: the label its host locks carry,
     /// else the one it was given, else its id.
     pub fn instance_name(&self) -> String {

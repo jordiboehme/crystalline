@@ -1130,25 +1130,34 @@ async fn accept_loop(listener: interprocess::local_socket::tokio::Listener, shar
     }
 }
 
-/// The harness gate a bridge's `mcp` handshake options carry. `skills=off` is
+/// The harness gate a bridge's `mcp` handshake options carry, with the
+/// `unattended` mark beside it. `skills=off` is
 /// the verified gate and wins if both tokens ever arrive; `routing=conditional`
 /// is a hook that is installed but unverified; neither (a bare `mcp` from an
 /// older bridge, or an option this binary does not know) is the default gate,
 /// which serves everything.
 fn harness_gate_from_options(options: &[&str]) -> crate::instance::HarnessGate {
-    use crate::instance::{HarnessGate, ROUTING_CONDITIONAL_OPTION, SKILLS_OFF_OPTION};
+    use crate::instance::{
+        HarnessGate, ROUTING_CONDITIONAL_OPTION, SKILLS_OFF_OPTION, UNATTENDED_OPTION,
+    };
+    let unattended = options.contains(&UNATTENDED_OPTION);
     if options.contains(&SKILLS_OFF_OPTION) {
         HarnessGate {
             hook_installed: true,
             onboarding_verified: true,
+            unattended,
         }
     } else if options.contains(&ROUTING_CONDITIONAL_OPTION) {
         HarnessGate {
             hook_installed: true,
             onboarding_verified: false,
+            unattended,
         }
     } else {
-        HarnessGate::default()
+        HarnessGate {
+            unattended,
+            ..HarnessGate::default()
+        }
     }
 }
 
@@ -3924,10 +3933,12 @@ mod tests {
         let verified = HarnessGate {
             hook_installed: true,
             onboarding_verified: true,
+            unattended: false,
         };
         let conditional = HarnessGate {
             hook_installed: true,
             onboarding_verified: false,
+            unattended: false,
         };
         assert_eq!(harness_gate_from_options(&["skills=off"]), verified);
         assert_eq!(
@@ -3943,6 +3954,11 @@ mod tests {
             harness_gate_from_options(&["future=1"]),
             HarnessGate::default()
         );
+        // The unattended mark travels beside the harness tokens.
+        let marked = harness_gate_from_options(&["skills=off", "unattended"]);
+        assert!(marked.unattended && marked.verified());
+        assert!(harness_gate_from_options(&["unattended"]).unattended);
+        assert!(!harness_gate_from_options(&["skills=off"]).unattended);
     }
 
     /// The router `run_serve` builds ends an open event stream when the

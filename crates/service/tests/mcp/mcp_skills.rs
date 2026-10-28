@@ -526,6 +526,7 @@ async fn an_installed_but_unverified_hook_keeps_the_whole_surface() {
         .connect_gated(HarnessGate {
             hook_installed: true,
             onboarding_verified: false,
+            unattended: false,
         })
         .await;
     let peer = client.peer();

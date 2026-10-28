@@ -1362,3 +1362,33 @@ async fn a_held_page_goes_back_after_the_recheck_once_nothing_holds_it() {
     assert!(head_paths().contains(&"reflections/wide.md".to_string()));
     assert!(fx.engine.reflection_backup_held_back("eng").is_empty());
 }
+
+/// A local domain's text on a page backed up to GitHub, shared on purpose:
+/// the question names the repository the page is backed up to, and once a
+/// person confirmed it the page is backed up like any other.
+#[tokio::test]
+async fn a_confirmed_local_source_names_the_repository_and_is_backed_up() {
+    let mock = Arc::new(MockProvider::new());
+    main_commit(&mock);
+    let (fx, _) = home_beside_harbor(mock.clone(), false).await;
+    let question = fx
+        .engine
+        .reflection_disclosure_question(&citing_harbor("wide.md"), &agent())
+        .await
+        .unwrap()
+        .expect("a local source on a GitHub page is a question");
+    assert!(question.contains("GitHub repository acme/kb"), "{question}");
+    let mut confirmed = citing_harbor("wide.md");
+    confirmed.disclosed = true;
+    fx.engine
+        .write_reflection(&confirmed, &agent())
+        .await
+        .unwrap();
+    fx.engine.reflection_backup_tick(Instant::now()).await;
+    let head = mock.commit_paths(&mock.branch_commit(BACKUP_BRANCH).unwrap());
+    assert!(
+        head.contains(&"reflections/wide.md".to_string()),
+        "{head:?}"
+    );
+    assert!(fx.engine.reflection_backup_held_back("eng").is_empty());
+}
