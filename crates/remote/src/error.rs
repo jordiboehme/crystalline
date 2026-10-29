@@ -68,6 +68,19 @@ pub enum RemoteError {
         reset: Option<chrono::DateTime<chrono::Utc>>,
     },
 
+    /// A repository-role lookup through the GitHub App found no such login:
+    /// the account is unknown (perhaps renamed) or the repository is not
+    /// visible to the installation. Not the same as a login with no access.
+    #[error(
+        "GitHub knows no collaborator {login} on {repo}: the login may have been renamed, or the repository is not visible to the App."
+    )]
+    UserNotFound {
+        /// The repository, `owner/name`.
+        repo: String,
+        /// The login that was looked up.
+        login: String,
+    },
+
     /// The configured repository does not exist, or is not visible with the
     /// current GitHub connection.
     #[error(
@@ -342,6 +355,7 @@ impl RemoteError {
             | RemoteError::SsoAuthorizationRequired { .. }
             | RemoteError::OauthAppRestricted { .. }
             | RemoteError::RepoNotFound { .. }
+            | RemoteError::UserNotFound { .. }
             | RemoteError::NotADomain { .. }
             | RemoteError::ConflictsPending { .. }
             | RemoteError::ProposalNotFound { .. }
@@ -1020,6 +1034,11 @@ mod tests {
             RemoteError::AppNotInstalled {
                 repo: "acme/knowledge".to_string(),
                 install_url: "https://github.com/apps/acme/installations/new".to_string(),
+            }
+            .to_string(),
+            RemoteError::UserNotFound {
+                repo: "acme/knowledge".to_string(),
+                login: "octocat".to_string(),
             }
             .to_string(),
             RemoteError::EndpointMissing {

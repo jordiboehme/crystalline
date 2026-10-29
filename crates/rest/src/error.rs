@@ -739,6 +739,7 @@ fn remote_to_api_error(e: crystalline_remote::RemoteError, detail: String) -> Ap
         | RemoteError::SsoAuthorizationRequired { .. }
         | RemoteError::OauthAppRestricted { .. }
         | RemoteError::AppNotInstalled { .. }
+        | RemoteError::UserNotFound { .. }
         | RemoteError::ConflictsPending { .. } => unprocessable_error(detail),
     }
 }

@@ -210,6 +210,8 @@ pub struct AppProbe {
 #[derive(Deserialize)]
 struct InstallationListEntry {
     #[serde(default)]
+    id: u64,
+    #[serde(default)]
     account: Option<OwnerResponse>,
 }
 
@@ -277,6 +279,26 @@ impl RepoRole {
 
     /// The role a built-in `role_name` names. A custom role has no entry
     /// here and is read through its base permission instead.
+    /// The legacy base permission word (`admin`, `write`/`push`,
+    /// `read`/`pull`): what a custom role is read through. `maintain` and
+    /// `triage` are not part of the legacy base.
+    fn from_legacy_word(word: &str) -> RepoRole {
+        match RepoRole::from_word(word) {
+            RepoRole::Maintain | RepoRole::Triage => RepoRole::None,
+            role => role,
+        }
+    }
+
+    /// The role of a grant: a built-in `role_name` wins; any other
+    /// `role_name` (a custom role) is read through the legacy base only;
+    /// with no `role_name` the full permission is used.
+    fn resolve(role_name: Option<&str>, full: RepoRole, legacy: RepoRole) -> RepoRole {
+        match role_name {
+            None => full,
+            Some(name) => RepoRole::from_builtin(name).unwrap_or(legacy),
+        }
+    }
+
     fn from_builtin(role_name: &str) -> Option<RepoRole> {
         matches!(
             role_name,
@@ -314,6 +336,38 @@ struct PermissionFlags {
     triage: bool,
     #[serde(default)]
     pull: bool,
+}
+
+impl PermissionFlags {
+    /// The highest flag set, over all five roles.
+    fn full(&self) -> RepoRole {
+        if self.admin {
+            RepoRole::Admin
+        } else if self.maintain {
+            RepoRole::Maintain
+        } else if self.push {
+            RepoRole::Write
+        } else if self.triage {
+            RepoRole::Triage
+        } else if self.pull {
+            RepoRole::Read
+        } else {
+            RepoRole::None
+        }
+    }
+
+    /// The highest legacy flag set: admin, push, pull.
+    fn legacy(&self) -> RepoRole {
+        if self.admin {
+            RepoRole::Admin
+        } else if self.push {
+            RepoRole::Write
+        } else if self.pull {
+            RepoRole::Read
+        } else {
+            RepoRole::None
+        }
+    }
 }
 
 /// One entry of `GET /repos/{o}/{r}/collaborators`.
@@ -686,79 +740,141 @@ impl GithubApp {
         );
         let response = self.get_as_installation(repo, &path).await?;
         if response.status() == StatusCode::NOT_FOUND {
-            return Ok(RepoRole::None);
+            return Err(RemoteError::UserNotFound {
+                repo: repo.to_string(),
+                login: login.to_string(),
+            });
         }
         let response = check_response(response, Some(repo), true, &self.api_url).await?;
         let answer: PermissionResponse = parse_json(response).await?;
-        Ok(answer
-            .role_name
-            .as_deref()
-            .and_then(RepoRole::from_builtin)
-            .unwrap_or_else(|| RepoRole::from_word(answer.permission.as_deref().unwrap_or(""))))
+        let word = answer.permission.as_deref().unwrap_or("");
+        Ok(RepoRole::resolve(
+            answer.role_name.as_deref(),
+            RepoRole::from_word(word),
+            RepoRole::from_legacy_word(word),
+        ))
     }
 
     /// The current login of GitHub account `id` (`GET /user/{id}`), so a
     /// renamed account is still found by the id it was granted under.
     ///
-    /// Goes out on a cached installation's token when one is known, else
-    /// anonymously.
+    /// Always goes out on an installation token, never anonymously: a cached
+    /// installation's when one is known, else the lowest one the App's own
+    /// listing names. No installation at all is
+    /// [`RemoteError::AppNotInstalled`]. An installation whose token cannot
+    /// be minted (a 404, it is gone) is forgotten and the pick is made once
+    /// more.
     pub async fn login_for_id(&self, id: u64) -> Result<String, RemoteError> {
-        let known = lock(&self.installations).values().min().copied();
-        let token = match known {
-            Some(installation) => Some(self.installation_token(installation).await?),
-            None => None,
+        let mut gone = None;
+        let token = match self.any_installation_token(&mut gone).await {
+            Err(RemoteError::Api { status: 404, .. }) => {
+                self.any_installation_token(&mut gone).await?
+            }
+            other => other?,
         };
         let path = format!("/user/{id}");
-        let response = send(self.request(Method::GET, &path, token.as_deref())).await?;
-        let response = check_response(response, None, token.is_some(), &self.api_url).await?;
+        let response = send(self.request(Method::GET, &path, Some(&token))).await?;
+        let response = check_response(response, None, true, &self.api_url).await?;
         let user: LoginResponse = parse_json(response).await?;
         Ok(user.login)
     }
 
-    /// Everyone with access to `repo` (`affiliation=all`), every page of 100.
-    pub async fn collaborators(&self, repo: &str) -> Result<Vec<Collaborator>, RemoteError> {
-        let (owner, name) = split_repo(repo)?;
-        let mut all = Vec::new();
-        for page in 1.. {
-            let path = format!(
-                "/repos/{}/{}/collaborators?affiliation=all&per_page={PAGE_SIZE}&page={page}",
-                segment(owner),
-                segment(name)
-            );
-            let response = self.get_as_installation(repo, &path).await?;
-            let response = check_response(response, Some(repo), true, &self.api_url).await?;
-            let entries: Vec<CollaboratorEntry> = parse_json(response).await?;
-            let last = entries.len() < PAGE_SIZE;
-            all.extend(entries.into_iter().map(|entry| {
-                let flags = &entry.permissions;
-                let by_flags = if flags.admin {
-                    RepoRole::Admin
-                } else if flags.maintain {
-                    RepoRole::Maintain
-                } else if flags.push {
-                    RepoRole::Write
-                } else if flags.triage {
-                    RepoRole::Triage
-                } else if flags.pull {
-                    RepoRole::Read
-                } else {
-                    RepoRole::None
-                };
-                Collaborator {
-                    id: entry.id,
-                    login: entry.login,
-                    role: entry
-                        .role_name
-                        .as_deref()
-                        .and_then(RepoRole::from_builtin)
-                        .unwrap_or(by_flags),
+    /// A token for the lowest installation id known, cached or listed,
+    /// leaving out `gone`. A failed mint (404) evicts that installation and
+    /// records it in `gone`, so a second call picks another one.
+    async fn any_installation_token(&self, gone: &mut Option<u64>) -> Result<String, RemoteError> {
+        let cached = lock(&self.installations)
+            .values()
+            .filter(|id| Some(**id) != *gone)
+            .min()
+            .copied();
+        let installation = match cached {
+            Some(id) => id,
+            None => {
+                let listed = self.listed_installations().await?;
+                match listed.into_iter().filter(|id| Some(*id) != *gone).min() {
+                    Some(id) => id,
+                    None => {
+                        return Err(RemoteError::AppNotInstalled {
+                            repo: "any repository".to_string(),
+                            install_url: self.install_url().await?,
+                        });
+                    }
                 }
-            }));
+            }
+        };
+        let result = self.installation_token(installation).await;
+        if matches!(result, Err(RemoteError::Api { status: 404, .. })) {
+            self.evict_installation(installation);
+            *gone = Some(installation);
+        }
+        result
+    }
+
+    /// The ids of every installation of this App (`GET /app/installations`).
+    async fn listed_installations(&self) -> Result<Vec<u64>, RemoteError> {
+        let mut ids = Vec::new();
+        for page in 1.. {
+            let path = format!("/app/installations?per_page={PAGE_SIZE}&page={page}");
+            let response = self.send_as_app(Method::GET, &path).await?;
+            let response = check_response(response, None, true, &self.api_url).await?;
+            let entries: Vec<InstallationListEntry> = parse_json(response).await?;
+            let last = entries.len() < PAGE_SIZE;
+            ids.extend(entries.into_iter().map(|entry| entry.id));
             if last {
                 break;
             }
         }
-        Ok(all)
+        Ok(ids)
+    }
+
+    /// Everyone with access to `repo` (`affiliation=all`), every page of 100,
+    /// followed through the `Link: rel="next"` header. A next link that
+    /// leaves the API base, or a listing past 1000 pages, is an error: a
+    /// reader set that stops short must not pass for the whole one.
+    pub async fn collaborators(&self, repo: &str) -> Result<Vec<Collaborator>, RemoteError> {
+        const MAX_PAGES: usize = 1000;
+        let (owner, name) = split_repo(repo)?;
+        let mut path = format!(
+            "/repos/{}/{}/collaborators?affiliation=all&per_page={PAGE_SIZE}",
+            segment(owner),
+            segment(name)
+        );
+        let mut all = Vec::new();
+        for _ in 0..MAX_PAGES {
+            let response = self.get_as_installation(repo, &path).await?;
+            let response = check_response(response, Some(repo), true, &self.api_url).await?;
+            let next = header(&response, "link").and_then(|link| next_link(&link));
+            let entries: Vec<CollaboratorEntry> = parse_json(response).await?;
+            all.extend(entries.into_iter().map(|entry| Collaborator {
+                id: entry.id,
+                login: entry.login,
+                role: RepoRole::resolve(
+                    entry.role_name.as_deref(),
+                    entry.permissions.full(),
+                    entry.permissions.legacy(),
+                ),
+            }));
+            let Some(next) = next else {
+                return Ok(all);
+            };
+            path = match next.strip_prefix(&self.api_url) {
+                Some(rest) if rest.starts_with('/') => rest.to_string(),
+                _ => {
+                    return Err(RemoteError::Api {
+                        status: 200,
+                        message: format!(
+                            "the collaborator listing of {repo} pointed at a page outside {}",
+                            self.api_url
+                        ),
+                    });
+                }
+            };
+        }
+        Err(RemoteError::Api {
+            status: 200,
+            message: format!("the collaborator listing of {repo} has more than {MAX_PAGES} pages"),
+        })
     }
 
     /// Whether `repo` is public (`GET /repos/{o}/{r}`, field `private`).
@@ -870,10 +986,33 @@ fn jwt_refused() -> RemoteError {
     )
 }
 
+/// The `rel="next"` target of a `Link` header, if any.
+fn next_link(link: &str) -> Option<String> {
+    link.split(',').find_map(|part| {
+        let (target, params) = part.split_once(';')?;
+        let is_next = params
+            .split(';')
+            .any(|param| param.trim().replace(' ', "") == "rel=\"next\"");
+        let target = target.trim().strip_prefix('<')?.strip_suffix('>')?;
+        is_next.then(|| target.to_string())
+    })
+}
+
 /// Sends a built request, with a transport failure (no answer at all) read
-/// as [`RemoteError::Offline`] the way [`super::GitHubProvider`] does.
+/// as [`RemoteError::Offline`] the way [`super::GitHubProvider`] does. A
+/// redirect that was refused (more than one hop) did get an answer, so it is
+/// an [`RemoteError::Api`] error instead.
 async fn send(builder: reqwest::RequestBuilder) -> Result<Response, RemoteError> {
-    builder.send().await.map_err(|_| RemoteError::Offline)
+    builder.send().await.map_err(|e| {
+        if e.is_redirect() {
+            RemoteError::Api {
+                status: 301,
+                message: "GitHub redirected the request more than once".to_string(),
+            }
+        } else {
+            RemoteError::Offline
+        }
+    })
 }
 
 #[cfg(test)]

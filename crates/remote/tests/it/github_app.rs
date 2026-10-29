@@ -719,6 +719,23 @@ async fn permission_handler(
         "u-triage" => ("read", "triage"),
         "u-read" => ("read", "read"),
         "docs" => ("write", "docs-lead"),
+        "u-none" => ("none", "none"),
+        "forbidden" => {
+            return mock.answer(
+                StatusCode::FORBIDDEN,
+                serde_json::json!({"message": "Resource not accessible by integration"}),
+            );
+        }
+        "throttled" => {
+            let mut response = mock.answer(
+                StatusCode::TOO_MANY_REQUESTS,
+                serde_json::json!({"message": "slow down"}),
+            );
+            response
+                .headers_mut()
+                .insert("retry-after", "30".parse().unwrap());
+            return response;
+        }
         "limited" => {
             let mut response = mock.answer(
                 StatusCode::FORBIDDEN,
@@ -785,13 +802,39 @@ async fn a_custom_role_maps_by_its_base_permission() {
 }
 
 #[tokio::test]
-async fn a_non_collaborator_is_none() {
+async fn permission_none_is_none_and_an_unknown_login_is_user_not_found() {
     let (_mock, _base, app, _clock) =
         serve_with(mock_with(&[("acme/kb", 11)]), permission_routes()).await;
     assert_eq!(
-        app.repo_role("acme/kb", "stranger").await.unwrap(),
+        app.repo_role("acme/kb", "u-none").await.unwrap(),
         RepoRole::None
     );
+    match app.repo_role("acme/kb", "stranger").await.unwrap_err() {
+        RemoteError::UserNotFound { repo, login } => {
+            assert_eq!(repo, "acme/kb");
+            assert_eq!(login, "stranger");
+        }
+        other => panic!("expected UserNotFound, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_forbidden_permission_lookup_is_an_error_not_none() {
+    let (_mock, _base, app, _clock) =
+        serve_with(mock_with(&[("acme/kb", 11)]), permission_routes()).await;
+    let err = app.repo_role("acme/kb", "forbidden").await.unwrap_err();
+    assert!(
+        matches!(err, RemoteError::Api { status: 403, .. }),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_429_on_the_permission_lookup_is_rate_limited() {
+    let (_mock, _base, app, _clock) =
+        serve_with(mock_with(&[("acme/kb", 11)]), permission_routes()).await;
+    let err = app.repo_role("acme/kb", "throttled").await.unwrap_err();
+    assert!(matches!(err, RemoteError::RateLimited { .. }), "{err:?}");
 }
 
 #[tokio::test]
@@ -843,11 +886,11 @@ async fn a_renewed_installation_token_is_tried_once_after_a_401() {
     );
 }
 
-#[tokio::test]
-async fn a_renamed_login_resolves_through_the_id() {
-    let routes = Router::new().route(
+fn user_by_id_routes() -> Router<Arc<Mock>> {
+    Router::new().route(
         "/user/{id}",
-        get(|Path(id): Path<u64>| async move {
+        get(|State(mock): State<Arc<Mock>>, Path(id): Path<u64>, uri: Uri, headers: HeaderMap| async move {
+            mock.record("GET", &uri, &headers);
             if id == 583231 {
                 (
                     StatusCode::OK,
@@ -857,10 +900,63 @@ async fn a_renamed_login_resolves_through_the_id() {
                 (StatusCode::NOT_FOUND, Json(not_found()))
             }
         }),
-    );
-    let (_mock, _base, app, _clock) = serve_with(mock_with(&[("acme/kb", 11)]), routes).await;
+    )
+}
+
+fn installations_route(ids: &'static [u64]) -> Router<Arc<Mock>> {
+    Router::new().route(
+        "/app/installations",
+        get(move || async move {
+            Json(
+                ids.iter()
+                    .map(|id| serde_json::json!({"id": id, "account": {"login": "acme"}}))
+                    .collect::<Vec<_>>(),
+            )
+        }),
+    )
+}
+
+#[tokio::test]
+async fn a_renamed_login_resolves_through_the_id() {
+    // No repository was touched yet: the installation is found through the
+    // App's own listing and its token is what reaches /user/{id}.
+    let routes = user_by_id_routes().merge(installations_route(&[22, 11]));
+    let (mock, _base, app, _clock) = serve_with(mock_with(&[]), routes).await;
     assert_eq!(app.login_for_id(583231).await.unwrap(), "octocat-renamed");
     assert!(app.login_for_id(1).await.is_err());
+    let headers = mock.headers_of("GET /user/");
+    assert_eq!(
+        headers.get("authorization").unwrap().to_str().unwrap(),
+        "Bearer ghs_11_1",
+        "the lowest installation, never anonymous"
+    );
+    assert_eq!(mock.minted(11), 1);
+}
+
+#[tokio::test]
+async fn login_for_id_without_an_installation_is_app_not_installed() {
+    let routes = user_by_id_routes().merge(installations_route(&[]));
+    let (mock, _base, app, _clock) = serve_with(mock_with(&[]), routes).await;
+    let err = app.login_for_id(583231).await.unwrap_err();
+    assert!(
+        matches!(err, RemoteError::AppNotInstalled { .. }),
+        "{err:?}"
+    );
+    assert_eq!(mock.count("GET /user/"), 0, "never asked anonymously");
+}
+
+#[tokio::test]
+async fn login_for_id_picks_again_when_the_installation_is_gone() {
+    // Installation 11 is listed but its token mint 404s; 22 works.
+    let routes = user_by_id_routes()
+        .merge(installations_route(&[11, 22]))
+        .route(
+            "/app/installations/11/access_tokens",
+            post(|| async { (StatusCode::NOT_FOUND, Json(not_found())) }),
+        );
+    let (mock, _base, app, _clock) = serve_with(mock_with(&[]), routes).await;
+    assert_eq!(app.login_for_id(583231).await.unwrap(), "octocat-renamed");
+    assert_eq!(mock.minted(22), 1);
 }
 
 #[tokio::test]
@@ -880,53 +976,105 @@ async fn a_transferred_repository_follows_the_301() {
         )
         .route(
             "/repositories/{id}/collaborators/{login}/permission",
-            get(|| async {
-                Json(serde_json::json!({"permission": "admin", "role_name": "admin"}))
-            }),
+            get(
+                |State(mock): State<Arc<Mock>>, uri: Uri, headers: HeaderMap| async move {
+                    mock.record("GET", &uri, &headers);
+                    Json(serde_json::json!({"permission": "admin", "role_name": "admin"}))
+                },
+            ),
         );
-    let (_mock, _base, app, _clock) = serve_with(mock_with(&[("acme/old", 11)]), routes).await;
+    let (mock, _base, app, _clock) = serve_with(mock_with(&[("acme/old", 11)]), routes).await;
     assert_eq!(
         app.repo_role("acme/old", "u-admin").await.unwrap(),
         RepoRole::Admin
     );
+    let headers = mock.headers_of("GET /repositories/99/");
+    assert_eq!(
+        headers.get("authorization").unwrap().to_str().unwrap(),
+        "Bearer ghs_11_1",
+        "the bearer survives the hop"
+    );
+}
+
+#[tokio::test]
+async fn a_chain_of_redirects_is_an_api_error_not_offline() {
+    let routes = Router::new().route(
+        "/repos/{owner}/{name}/collaborators/{login}/permission",
+        get(|| async {
+            (
+                StatusCode::MOVED_PERMANENTLY,
+                [("Location", "/repos/acme/old/collaborators/x/permission")],
+            )
+        }),
+    );
+    let (_mock, _base, app, _clock) = serve_with(mock_with(&[("acme/old", 11)]), routes).await;
+    let err = app.repo_role("acme/old", "x").await.unwrap_err();
+    assert!(matches!(err, RemoteError::Api { .. }), "{err:?}");
+}
+
+/// A collaborator listing of `total` users, 100 a page, with a `Link:
+/// rel="next"` on every page but the last. `next_host` overrides the host the
+/// link names.
+fn listing_routes(
+    total: u64,
+    next_host: Option<&'static str>,
+    queries: Arc<Mutex<Vec<HashMap<String, String>>>>,
+) -> Router<Arc<Mock>> {
+    Router::new().route(
+        "/repos/{owner}/{name}/collaborators",
+        get(
+            move |Query(query): Query<HashMap<String, String>>, headers: HeaderMap| {
+                let queries = queries.clone();
+                async move {
+                    queries.lock().unwrap().push(query.clone());
+                    let page: u64 = query.get("page").map_or(1, |p| p.parse().unwrap());
+                    let from = (page - 1) * 100 + 1;
+                    let to = (page * 100).min(total);
+                    let users: Vec<_> = (from..=to)
+                        .map(|n| {
+                            let (role, permissions) = match n {
+                                1 => (
+                                    "admin",
+                                    serde_json::json!({"admin": true, "maintain": true, "push": true, "triage": true, "pull": true}),
+                                ),
+                                // A custom role: maintain is set, but the
+                                // legacy base is write.
+                                2 => (
+                                    "docs-lead",
+                                    serde_json::json!({"admin": false, "maintain": true, "push": true, "triage": true, "pull": true}),
+                                ),
+                                _ => (
+                                    "read",
+                                    serde_json::json!({"admin": false, "maintain": false, "push": false, "triage": false, "pull": true}),
+                                ),
+                            };
+                            serde_json::json!({"id": n, "login": format!("user{n}"), "role_name": role, "permissions": permissions})
+                        })
+                        .collect();
+                    let mut response = Json(users).into_response();
+                    if to < total {
+                        let host = next_host
+                            .map(str::to_string)
+                            .unwrap_or_else(|| headers["host"].to_str().unwrap().to_string());
+                        let link = format!(
+                            "<http://{host}/repos/acme/kb/collaborators?affiliation=all&per_page=100&page={}>; rel=\"next\"",
+                            page + 1
+                        );
+                        response
+                            .headers_mut()
+                            .insert("link", link.parse().unwrap());
+                    }
+                    response
+                }
+            },
+        ),
+    )
 }
 
 #[tokio::test]
 async fn collaborators_walk_every_page() {
-    let queries = Arc::new(Mutex::new(Vec::<HashMap<String, String>>::new()));
-    let recorded = queries.clone();
-    let routes = Router::new().route(
-        "/repos/{owner}/{name}/collaborators",
-        get(move |Query(query): Query<HashMap<String, String>>| {
-            let recorded = recorded.clone();
-            async move {
-                recorded.lock().unwrap().push(query.clone());
-                let page: u64 = query.get("page").map_or(1, |p| p.parse().unwrap());
-                let (from, to) = match page {
-                    1 => (1, 100),
-                    2 => (101, 101),
-                    _ => (0, 0),
-                };
-                let users: Vec<_> = (from..=to)
-                    .filter(|n| *n > 0)
-                    .map(|n| {
-                        let role = match n {
-                            1 => "admin",
-                            2 => "docs-lead",
-                            _ => "read",
-                        };
-                        let permissions = if n == 2 {
-                            serde_json::json!({"admin": false, "maintain": false, "push": true, "triage": true, "pull": true})
-                        } else {
-                            serde_json::json!({"admin": n == 1, "maintain": n == 1, "push": n == 1, "triage": true, "pull": true})
-                        };
-                        serde_json::json!({"id": n, "login": format!("user{n}"), "role_name": role, "permissions": permissions})
-                    })
-                    .collect();
-                Json(users)
-            }
-        }),
-    );
+    let queries = Arc::new(Mutex::new(Vec::new()));
+    let routes = listing_routes(101, None, queries.clone());
     let (_mock, _base, app, _clock) = serve_with(mock_with(&[("acme/kb", 11)]), routes).await;
 
     let all = app.collaborators("acme/kb").await.unwrap();
@@ -942,18 +1090,37 @@ async fn collaborators_walk_every_page() {
     assert_eq!(
         all[1].role,
         RepoRole::Write,
-        "a custom role maps by its permissions"
+        "a custom role maps by its legacy base: maintain and triage are ignored"
     );
     assert_eq!(all[100].id, 101);
     assert_eq!(all[100].role, RepoRole::Read);
 
     let queries = queries.lock().unwrap();
-    assert_eq!(queries.len(), 2, "a short page ends the walk");
+    assert_eq!(queries.len(), 2, "no next link ends the walk");
     assert!(
         queries
             .iter()
             .all(|q| q["affiliation"] == "all" && q["per_page"] == "100")
     );
+}
+
+#[tokio::test]
+async fn a_next_link_to_another_host_is_an_error() {
+    let routes = listing_routes(101, Some("evil.example.com"), Arc::default());
+    let (_mock, _base, app, _clock) = serve_with(mock_with(&[("acme/kb", 11)]), routes).await;
+    let err = app.collaborators("acme/kb").await.unwrap_err();
+    assert!(matches!(err, RemoteError::Api { .. }), "{err:?}");
+}
+
+#[tokio::test]
+async fn an_endless_listing_stops_at_the_page_cap() {
+    // Every page links to the next one, forever.
+    let queries = Arc::new(Mutex::new(Vec::new()));
+    let routes = listing_routes(u64::MAX / 2, None, queries.clone());
+    let (_mock, _base, app, _clock) = serve_with(mock_with(&[("acme/kb", 11)]), routes).await;
+    let err = app.collaborators("acme/kb").await.unwrap_err();
+    assert!(matches!(err, RemoteError::Api { .. }), "{err:?}");
+    assert_eq!(queries.lock().unwrap().len(), 1000);
 }
 
 #[tokio::test]

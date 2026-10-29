@@ -6807,6 +6807,7 @@ fn remote_to_error(e: RemoteError) -> ErrorData {
         | RemoteError::SsoAuthorizationRequired { .. }
         | RemoteError::OauthAppRestricted { .. }
         | RemoteError::AppNotInstalled { .. }
+        | RemoteError::UserNotFound { .. }
         | RemoteError::ConflictNotFound { .. } => ErrorData::invalid_params(message, None),
     }
 }
