@@ -355,3 +355,32 @@ fn cli_readers_needs_origin() {
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(stderr.contains("--origin"), "{stderr}");
 }
+
+/// When a GitHub App decides access, `--private --owner` drops the owner
+/// (the connect records the domain private itself), so the account is not
+/// required to exist: the command goes on to the connect, which here fails
+/// only because nothing answers for GitHub.
+#[test]
+fn private_owner_is_not_required_to_exist_when_an_app_decides_access() {
+    let home = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let tokens = work.path().join("tokens");
+    let config = write_config(work.path(), "http://127.0.0.1:1");
+
+    let out = bin(home.path(), &tokens)
+        .env("CRYSTALLINE_GITHUB_TOKEN", "gho_instance")
+        .env("CRYSTALLINE_GITHUB_APP_ID", "7")
+        .env("CRYSTALLINE_GITHUB_APP_CLIENT_ID", "Iv23.test")
+        .env("CRYSTALLINE_GITHUB_APP_PRIVATE_KEY", PEM)
+        .args(["domain", "add", "kb", "--origin", "acme/kb"])
+        .args(["--private", "--owner", "nobody", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        !stderr.contains("nobody"),
+        "the owner was not looked up: {stderr}"
+    );
+}

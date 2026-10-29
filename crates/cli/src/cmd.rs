@@ -5402,6 +5402,17 @@ async fn notify_daemon_app_changed() -> DaemonNotice {
     }
 }
 
+/// Whether a GitHub App decides access to a team domain connected from this
+/// machine: an App configured, usable or not, read from the environment and
+/// the saved App without asking GitHub (the engine's own
+/// `github_app_configured`). An App store that cannot be read counts as
+/// configured, as the engine counts it.
+pub fn github_app_decides_access(config_override: Option<&Path>) -> Result<bool> {
+    let loaded = load(config_override)?;
+    let home = app_home(&loaded, test_token_store_dir().as_deref())?;
+    Ok(!matches!(home.configured(&loaded.overlay), Ok(None)))
+}
+
 /// `crystalline github app status`: the daemon's view when one is running
 /// and no `--config` names another file, else this process's own read of
 /// the environment and the App store. GitHub is asked for the slug and the

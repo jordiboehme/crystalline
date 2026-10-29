@@ -182,6 +182,12 @@ impl Engine {
         // with a GitHub App the answer decides whether the content is open to
         // everyone signed in, so it is never defaulted.
         let readers = self.connect_readers(readers)?;
+        // The answer as given, for a retry that finds the domain connected:
+        // a different answer there is named, never applied.
+        let asked = match readers {
+            ConnectReaders::Governed(chosen) => Some(chosen),
+            _ => None,
+        };
 
         // The name, in order: the caller's own; else the `domain_name` the
         // repository's MANIFEST declares, read through the forge before
@@ -202,7 +208,7 @@ impl Engine {
                 if let Some((name, entry)) =
                     self.connection_matching(repo, path, branch, folder, true)
                 {
-                    return self.origin_already_connected(&name, &entry).await;
+                    return self.origin_already_connected(&name, &entry, asked).await;
                 }
                 // The repository's own name is the fallback, and what holds it
                 // here is known without asking the forge: a domain connected
@@ -217,7 +223,9 @@ impl Engine {
                 let default_refusal =
                     match self.holder_of(&default_name, repo, path, branch, folder) {
                         Ok(Holder::Connected(entry)) => {
-                            return self.origin_already_connected(&default_name, &entry).await;
+                            return self
+                                .origin_already_connected(&default_name, &entry, asked)
+                                .await;
                         }
                         Ok(_) => None,
                         Err(e) => Some(e),
@@ -241,7 +249,7 @@ impl Engine {
                 if let Some((name, entry)) =
                     self.connection_matching(repo, path, Some(&branch_name), folder, false)
                 {
-                    return self.origin_already_connected(&name, &entry).await;
+                    return self.origin_already_connected(&name, &entry, asked).await;
                 }
                 let declared = self
                     .origin_manifest_name(provider.as_ref(), repo, path, &branch_name)
@@ -301,7 +309,9 @@ impl Engine {
             Ok(_) => match self.holder_of(&domain_name, repo, path, branch, folder)? {
                 Holder::Free => None,
                 Holder::Connected(entry) => {
-                    return self.origin_already_connected(&domain_name, &entry).await;
+                    return self
+                        .origin_already_connected(&domain_name, &entry, asked)
+                        .await;
                 }
                 Holder::Adopt(root, entry) => Some((root, entry)),
             },
@@ -324,7 +334,7 @@ impl Engine {
         {
             if Self::origin_matches_request(&entry, origin_cfg, repo, path, branch, folder) {
                 return self
-                    .origin_already_connected_locked(&domain_name, &entry)
+                    .origin_already_connected_locked(&domain_name, &entry, asked)
                     .await;
             }
             return Err(EngineError::Conflict(format!(
@@ -956,10 +966,16 @@ impl Engine {
     /// The response for a connect retry that matches the existing
     /// connection: the same shape `origin_add` returns, marked
     /// `already_connected`, read under the domain's origin lock.
-    async fn origin_already_connected(&self, name: &str, entry: &DomainEntry) -> Result<Value> {
+    async fn origin_already_connected(
+        &self,
+        name: &str,
+        entry: &DomainEntry,
+        asked: Option<Readers>,
+    ) -> Result<Value> {
         let lock = self.origin_lock(name);
         let _guard = lock.lock().await;
-        self.origin_already_connected_locked(name, entry).await
+        self.origin_already_connected_locked(name, entry, asked)
+            .await
     }
 
     /// [`origin_already_connected`](Self::origin_already_connected)'s body,
@@ -967,10 +983,15 @@ impl Engine {
     /// inside `origin_add_with_progress` calls this directly: the origin lock
     /// is a non-reentrant tokio mutex, so re-acquiring it there would
     /// deadlock.
+    ///
+    /// `asked` is the readers answer the retry gave on an instance with a
+    /// GitHub App: one that differs from the domain's own is not applied,
+    /// and the report carries a `readers_note` saying where to change it.
     async fn origin_already_connected_locked(
         &self,
         name: &str,
         entry: &DomainEntry,
+        asked: Option<Readers>,
     ) -> Result<Value> {
         let root = entry.file_path().unwrap_or_default();
         let state_dir = self.origin_state_dir(name)?;
@@ -999,6 +1020,12 @@ impl Engine {
         // readers it was given.
         if let Some(readers) = self.governed_readers_now(name).await {
             result["readers"] = json!(readers.as_str());
+            if asked.is_some_and(|asked| asked != readers) {
+                result["readers_note"] = json!(format!(
+                    "this domain is already connected and its readers are {}; change who may read on its Members card",
+                    readers.as_str()
+                ));
+            }
         }
         self.append_name_fields(&mut result, name).await?;
         Ok(result)
@@ -1254,18 +1281,24 @@ impl Engine {
                 }
                 continue;
             };
+            // Read first: a domain that is already private needs no write,
+            // and a start that finds it so takes no write lock on the
+            // accounts database.
+            let private = access.has_private_record(&name).await.map_err(|e| {
+                EngineError::Internal(format!(
+                    "whether the env-defined team domain '{name}' is private could not be read: {e:#}"
+                ))
+            })?;
             if readers == Some(Readers::Shared) {
                 // Shared never opens a domain that is already private.
-                let private = access.has_private_record(&name).await.map_err(|e| {
-                    EngineError::Internal(format!(
-                        "whether the env-defined team domain '{name}' is private could not be read: {e:#}"
-                    ))
-                })?;
                 if private && !quiet {
                     tracing::warn!(
                         "{var} says shared, but domain '{name}' is private; change who may read on its Members card"
                     );
                 }
+                continue;
+            }
+            if private {
                 continue;
             }
             access

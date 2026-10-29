@@ -7652,6 +7652,11 @@ async fn connect_shared_writes_none() {
         .unwrap();
     assert_eq!(again["already_connected"], true, "{again}");
     assert_eq!(again["readers"], "shared", "{again}");
+    assert_eq!(
+        again["readers_note"],
+        "this domain is already connected and its readers are shared; change who may read on its Members card",
+        "{again}"
+    );
     assert!(auth.domain_visibility("kb").await.unwrap().is_none());
 }
 
@@ -7667,6 +7672,7 @@ async fn an_already_connected_retry_names_private_readers() {
         .unwrap();
     assert_eq!(again["already_connected"], true, "{again}");
     assert_eq!(again["readers"], "private", "{again}");
+    assert!(again.get("readers_note").is_none(), "{again}");
 }
 
 #[tokio::test]
@@ -8184,4 +8190,42 @@ async fn env_readers_without_an_app_change_nothing_and_say_so() {
         "{:?}",
         logs.lines()
     );
+}
+
+#[tokio::test]
+async fn env_readers_quietly_take_no_write_on_a_domain_already_private() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("kb");
+    let root_str = root.to_str().unwrap().to_string();
+    let (_forge, eng, auth) = readers_setup(
+        tmp.path(),
+        true,
+        &[
+            ("CRYSTALLINE_DOMAIN_KB", &root_str),
+            ("CRYSTALLINE_DOMAIN_KB_ORIGIN", "acme/kb"),
+        ],
+    )
+    .await;
+    eng.apply_env_readers_quietly().await.unwrap();
+    assert!(auth.domain_visibility("kb").await.unwrap().is_some());
+
+    // Another connection holds the accounts database's write lock. A second
+    // run that only reads finishes at once; one that took a write lock would
+    // wait out the busy timeout and fail.
+    let db = turso::Builder::new_local(tmp.path().join("auth.db").to_str().unwrap())
+        .experimental_multiprocess_wal(true)
+        .build()
+        .await
+        .unwrap();
+    let holder = db.connect().unwrap();
+    holder.execute("BEGIN IMMEDIATE", ()).await.unwrap();
+    let second = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        eng.apply_env_readers_quietly(),
+    )
+    .await;
+    holder.execute("ROLLBACK", ()).await.unwrap();
+    second
+        .expect("the second run waited for the write lock")
+        .unwrap();
 }

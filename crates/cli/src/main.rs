@@ -4484,7 +4484,13 @@ fn run_domain(command: DomainCommand, db: Option<PathBuf>, json: bool) -> anyhow
             // standing shared - which is the opposite of what was asked for.
             // `--private` requires `--owner` at the clap level, so the pair is
             // either both present or both absent.
+            // A team domain whose access a GitHub App decides drops the owner
+            // anyway (the connect records the domain private itself), so the
+            // account is not required to exist there.
+            let app_decides =
+                origin.is_some() && private && cmd::github_app_decides_access(config.as_deref())?;
             let closing = match (private, owner) {
+                (true, Some(owner)) if app_decides => Some(owner.trim().to_lowercase()),
                 (true, Some(owner)) => Some(members::check_private_owner(&owner).await?),
                 _ => None,
             };
