@@ -1,0 +1,350 @@
+//! A Reflection page on a domain connected to GitHub is backed up to its
+//! repository's `crystalline/reflections` branch, which every reader of that
+//! repository on GitHub reads, with a Crystalline account or without one. So
+//! with the GitHub App in place a page may only cite a domain whose
+//! repository is read by every reader of the page's repository: a public
+//! source repository, or one whose collaborators include every collaborator
+//! of the page's. A listing nobody knows right now fails closed, and a
+//! widening of the page repository's readers names the page in the queue
+//! and asks a person who shared the source on purpose again.
+//!
+//! The forge is the one `origins::github_app` serves, with its collaborator
+//! listing and repository visibility routes.
+
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+
+use crystalline_service::engine::Invalidate;
+use crystalline_service::params::{ReflectParams, WriteReflectionParams};
+use crystalline_service::rest::{AuthStore, Role};
+use crystalline_service::{DomainAccess, Engine, ReflectionCaller, Scope};
+use serde_json::{Value, json};
+
+use super::github_app::{Forge, app_env, connect, engram, files, manifest, spawn_forge};
+use crate::support::MockProvider;
+
+/// An engram of `vault`.
+const ROTA: &str = "crystalline://vault/team/rota";
+
+const OVERVIEW: &str = "# Overview\n\nFor people.\n\n## Team\n\nFive people.\n";
+
+/// The MANIFEST lines that switch the Reflection on and home it here.
+const REFLECTING: &str = "reflection: on\nreflection_home: https://kb.example.com\n";
+
+/// A repository whose `prefix` holds a MANIFEST that switches the
+/// Reflection on and the engram `team/rota`.
+fn tree(prefix: &str) -> BTreeMap<String, Vec<u8>> {
+    files(&[
+        (&format!("{prefix}MANIFEST.md"), manifest(REFLECTING)),
+        (
+            &format!("{prefix}team/rota.md"),
+            engram("Rota", "team/rota", "Five people take turns."),
+        ),
+    ])
+}
+
+fn repo(trees: &[&str]) -> Arc<MockProvider> {
+    let mock = Arc::new(MockProvider::new());
+    let mut all = BTreeMap::new();
+    for prefix in trees {
+        all.extend(tree(prefix));
+    }
+    let head = mock.add_commit(all);
+    mock.set_branch("main", &head);
+    mock
+}
+
+/// An engine with an App pointed at the forge, `acme/kb` connected as `kb`
+/// and `acme/vault` as `vault` (both shared here), and the accounts
+/// resolver with the GitHub governor installed. The only account is the
+/// instance admin `root`, linked to nobody on GitHub, so the accounts half
+/// of the reach rule covers every pair and what a test sees is the
+/// repository half.
+async fn setup(tmp: &Path, env: &[(&str, &str)]) -> (Arc<Forge>, Arc<Engine>, Arc<AuthStore>) {
+    let (forge, url) = spawn_forge(
+        &[("acme/kb", repo(&[""])), ("acme/vault", repo(&[""]))],
+        &[("acme/kb", 1), ("acme/vault", 1)],
+        &[(1, "ghs_test")],
+    )
+    .await;
+    let eng = Arc::new(super::github_app::engine(tmp, &url, env).await);
+    connect(&eng, "acme/kb", "kb", &tmp.join("kb")).await;
+    connect(&eng, "acme/vault", "vault", &tmp.join("vault")).await;
+    let auth = Arc::new(AuthStore::open(&tmp.join("auth.db")).await.unwrap());
+    auth.add_user("root", "Root", None, Role::Admin, "pw12345678")
+        .await
+        .unwrap();
+    eng.set_domain_access(Arc::new(
+        DomainAccess::new(auth.clone()).with_governor(eng.knowledge_governor()),
+    ));
+    (forge, eng, auth)
+}
+
+/// Sets `repo`'s collaborators by GitHub id, each with read.
+fn collaborators(forge: &Forge, repo: &str, ids: &[u64]) {
+    forge.collaborators.lock().unwrap().insert(
+        repo.to_string(),
+        ids.iter()
+            .map(|id| json!({"id": id, "login": format!("gh-{id}"), "role_name": "read"}))
+            .collect(),
+    );
+}
+
+/// The machine owner's agent, which reads every domain: what it is refused
+/// is the reach rule's doing alone.
+fn owner() -> ReflectionCaller {
+    ReflectionCaller::agent(Scope::Unrestricted, "claude-code", false)
+}
+
+/// `overview.md` in `domain` with its `Team` section built from `source`.
+fn cite(domain: &str, source: &str) -> WriteReflectionParams {
+    WriteReflectionParams {
+        domain: domain.into(),
+        path: "overview.md".into(),
+        markdown: Some(OVERVIEW.into()),
+        sources: BTreeMap::from([("Team".to_string(), vec![source.to_string()])]),
+        ..Default::default()
+    }
+}
+
+async fn write(eng: &Engine, p: &WriteReflectionParams) -> Result<Value, String> {
+    eng.write_reflection(p, &owner())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// The `source_too_wide` items of `domain`'s queue.
+async fn too_wide(eng: &Engine, domain: &str) -> Vec<Value> {
+    let queue = eng
+        .reflect(
+            &ReflectParams {
+                domains: vec![domain.into()],
+                limit: Some(100),
+                ..Default::default()
+            },
+            &owner(),
+        )
+        .await
+        .unwrap();
+    queue["queue"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["what"] == "source_too_wide")
+        .cloned()
+        .collect()
+}
+
+#[tokio::test]
+async fn a_page_cannot_cite_a_domain_whose_repository_fewer_people_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (forge, eng, _) = setup(tmp.path(), &app_env()).await;
+    collaborators(&forge, "acme/kb", &[1, 2]);
+    collaborators(&forge, "acme/vault", &[1]);
+    let err = write(&eng, &cite("kb", ROTA)).await.unwrap_err();
+    assert!(err.contains("fewer people may read"), "{err}");
+    // No login and no id of anybody is named.
+    assert!(
+        !err.contains("gh-2") && !err.contains("acme/vault"),
+        "{err}"
+    );
+    assert!(!tmp.path().join("kb/reflections/overview.md").exists());
+}
+
+#[tokio::test]
+async fn a_page_can_cite_a_domain_whose_repository_has_every_reader_of_its_own() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (forge, eng, _) = setup(tmp.path(), &app_env()).await;
+    collaborators(&forge, "acme/kb", &[1, 2]);
+    collaborators(&forge, "acme/vault", &[1, 2, 3]);
+    write(&eng, &cite("kb", ROTA)).await.unwrap();
+    // A public source repository is read by everybody.
+    collaborators(&forge, "acme/vault", &[]);
+    forge
+        .public
+        .lock()
+        .unwrap()
+        .insert("acme/vault".to_string());
+    eng.invalidate_github_access(Invalidate::All);
+    write(&eng, &cite("kb", ROTA)).await.unwrap();
+    assert!(too_wide(&eng, "kb").await.is_empty());
+}
+
+#[tokio::test]
+async fn a_public_repository_page_cannot_cite_a_private_repository_domain() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (forge, eng, auth) = setup(tmp.path(), &app_env()).await;
+    // The page's domain is private here, so on the accounts side only the
+    // instance admin reads it and the accounts half covers: what refuses
+    // is the public backup branch.
+    auth.set_domain_visibility("kb", true, "root")
+        .await
+        .unwrap();
+    forge.public.lock().unwrap().insert("acme/kb".to_string());
+    collaborators(&forge, "acme/kb", &[1]);
+    collaborators(&forge, "acme/vault", &[1]);
+    eng.invalidate_github_access(Invalidate::All);
+    let err = write(&eng, &cite("kb", ROTA)).await.unwrap_err();
+    assert!(err.contains("fewer people may read"), "{err}");
+}
+
+#[tokio::test]
+async fn an_unknown_collaborator_listing_fails_closed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (forge, eng, _) = setup(tmp.path(), &app_env()).await;
+    collaborators(&forge, "acme/kb", &[1]);
+    collaborators(&forge, "acme/vault", &[1]);
+    write(&eng, &cite("kb", ROTA)).await.unwrap();
+    // GitHub stops answering, and nothing old may serve.
+    forge.collaborators_down.store(true, Ordering::SeqCst);
+    eng.invalidate_github_access(Invalidate::All);
+    let err = write(&eng, &cite("kb", ROTA)).await.unwrap_err();
+    assert!(err.contains("fewer people may read"), "{err}");
+    assert_eq!(too_wide(&eng, "kb").await.len(), 1);
+    // The App removed from the source's repository closes it: the same.
+    forge.collaborators_down.store(false, Ordering::SeqCst);
+    forge.uninstall("acme/vault");
+    eng.invalidate_github_access(Invalidate::All);
+    let err = write(&eng, &cite("kb", ROTA)).await.unwrap_err();
+    assert!(err.contains("fewer people may read"), "{err}");
+}
+
+#[tokio::test]
+async fn a_new_collaborator_on_the_page_repository_raises_source_too_wide() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (forge, eng, _) = setup(tmp.path(), &app_env()).await;
+    collaborators(&forge, "acme/kb", &[1]);
+    collaborators(&forge, "acme/vault", &[1]);
+    write(&eng, &cite("kb", ROTA)).await.unwrap();
+    assert!(too_wide(&eng, "kb").await.is_empty());
+    collaborators(&forge, "acme/kb", &[1, 2]);
+    eng.invalidate_github_access(Invalidate::Repo("acme/kb".to_string()));
+    let items = too_wide(&eng, "kb").await;
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert_eq!(items[0]["path"], "overview.md");
+    // The repository made public: the same.
+    collaborators(&forge, "acme/kb", &[1]);
+    forge.public.lock().unwrap().insert("acme/kb".to_string());
+    eng.invalidate_github_access(Invalidate::Repo("acme/kb".to_string()));
+    assert_eq!(too_wide(&eng, "kb").await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_new_collaborator_on_the_page_repository_asks_a_confirmed_source_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (forge, eng, _) = setup(tmp.path(), &app_env()).await;
+    collaborators(&forge, "acme/kb", &[1, 2]);
+    collaborators(&forge, "acme/vault", &[1]);
+    let mut p = cite("kb", ROTA);
+    let err = write(&eng, &p).await.unwrap_err();
+    assert!(err.contains("fewer people may read"), "{err}");
+    // The owner shares it on purpose.
+    let ask = eng
+        .reflection_disclosure_question(&p, &owner())
+        .await
+        .unwrap()
+        .expect("a question");
+    assert!(
+        ask.question
+            .contains("the people who can read the GitHub repository acme/kb"),
+        "{}",
+        ask.question
+    );
+    assert!(!ask.question.contains("is not shared through GitHub"));
+    p.disclosed = Some(ask.basis.clone());
+    write(&eng, &p).await.unwrap();
+    assert!(too_wide(&eng, "kb").await.is_empty());
+    // A later edit by the same person needs no new question.
+    assert!(
+        eng.reflection_disclosure_question(&cite("kb", ROTA), &owner())
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // One more collaborator on the page's repository who may not read the
+    // source: the confirmation was for the readers of that time.
+    collaborators(&forge, "acme/kb", &[1, 2, 3]);
+    eng.invalidate_github_access(Invalidate::Repo("acme/kb".to_string()));
+    assert_eq!(too_wide(&eng, "kb").await.len(), 1);
+    let again = eng
+        .reflection_disclosure_question(&cite("kb", ROTA), &owner())
+        .await
+        .unwrap()
+        .expect("asked again");
+    assert_ne!(again.basis, ask.basis);
+    // The old answer does not land the write.
+    let mut stale = cite("kb", ROTA);
+    stale.disclosed = Some(ask.basis);
+    assert!(write(&eng, &stale).await.is_err());
+
+    // A new collaborator who reads the source as well changes nothing.
+    let mut p = cite("kb", ROTA);
+    p.disclosed = Some(again.basis);
+    write(&eng, &p).await.unwrap();
+    collaborators(&forge, "acme/vault", &[1, 4]);
+    collaborators(&forge, "acme/kb", &[1, 2, 3, 4]);
+    eng.invalidate_github_access(Invalidate::All);
+    assert!(too_wide(&eng, "kb").await.is_empty());
+}
+
+#[tokio::test]
+async fn two_domains_on_one_repository_read_alike() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (forge, url) = spawn_forge(
+        &[("acme/mono", repo(&["a/", "b/"]))],
+        &[("acme/mono", 1)],
+        &[(1, "ghs_test")],
+    )
+    .await;
+    let eng = Arc::new(super::github_app::engine(tmp.path(), &url, &app_env()).await);
+    for d in ["a", "b"] {
+        eng.origin_add(
+            "acme/mono",
+            Some(d),
+            Some(d),
+            None,
+            Some(tmp.path().join(d).to_str().unwrap()),
+            Some(crystalline_service::params::Readers::Shared),
+        )
+        .await
+        .unwrap();
+    }
+    let auth = Arc::new(AuthStore::open(&tmp.path().join("auth.db")).await.unwrap());
+    eng.set_domain_access(Arc::new(
+        DomainAccess::new(auth).with_governor(eng.knowledge_governor()),
+    ));
+    collaborators(&forge, "acme/mono", &[1]);
+    write(&eng, &cite("a", "crystalline://b/team/rota"))
+        .await
+        .unwrap();
+    // Not even a listing is needed: one repository has one set of readers.
+    forge.collaborators_down.store(true, Ordering::SeqCst);
+    eng.invalidate_github_access(Invalidate::All);
+    write(&eng, &cite("a", "crystalline://b/team/rota"))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn without_an_app_the_old_rule_holds() {
+    let tmp = tempfile::tempdir().unwrap();
+    // The instance token alone: no App, so GitHub governs nothing.
+    let (forge, eng, _) = setup(
+        tmp.path(),
+        &[(
+            "CRYSTALLINE_GITHUB_TOKEN",
+            super::github_app::INSTANCE_TOKEN,
+        )],
+    )
+    .await;
+    collaborators(&forge, "acme/kb", &[1, 2, 3]);
+    collaborators(&forge, "acme/vault", &[1]);
+    forge.public.lock().unwrap().insert("acme/kb".to_string());
+    assert!(!eng.github_governs("kb"));
+    // Any two connected domains count as alike, as before.
+    write(&eng, &cite("kb", ROTA)).await.unwrap();
+    assert!(too_wide(&eng, "kb").await.is_empty());
+}

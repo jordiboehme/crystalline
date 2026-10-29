@@ -1,7 +1,7 @@
 //! A person shares text from a domain fewer people may read on a Reflection
 //! page, on purpose.
 //!
-//! The reach rule ([`Engine::readers_cover`], [`Engine::leaves_github`])
+//! The reach rule ([`Engine::readers_cover`], [`Engine::leaves_repository`])
 //! refuses a section that cites a domain fewer people may read. Personal
 //! knowledge may still belong on a shared page, when a person who may read it
 //! decides so. What the rule guards against is a confused deputy: anyone who
@@ -24,7 +24,7 @@
 use crystalline_core::reflection as r;
 use serde::{Deserialize, Serialize};
 
-use super::sources::UNKNOWN_READERS_REFUSAL;
+use super::sources::{RepositoryReach, UNKNOWN_READERS_REFUSAL};
 use super::*;
 use crate::scope::{PageReaders, ReflectionCaller, ReflectionRight, Scope};
 
@@ -82,6 +82,52 @@ pub(crate) struct Disclosure {
     /// The repository the page was backed up to then, when it was.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
+    /// Who read that repository on GitHub then, when a GitHub App knew it.
+    /// A later reader of the repository who was not among them and may not
+    /// read the source's repository makes the page too wide again. Under an
+    /// App a confirmation without it (recorded before it was kept, or while
+    /// the listing was not known) holds for nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_readers: Option<RepositoryReaders>,
+}
+
+/// Who read a page's repository on GitHub when a person confirmed: whether
+/// it was public, and the GitHub ids with read or more, sorted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RepositoryReaders {
+    pub public: bool,
+    pub github_ids: Vec<u64>,
+}
+
+impl RepositoryReaders {
+    fn of(readers: &RepoReaders) -> RepositoryReaders {
+        let mut github_ids: Vec<u64> = readers.github_ids.iter().copied().collect();
+        github_ids.sort_unstable();
+        RepositoryReaders {
+            public: readers.public,
+            github_ids,
+        }
+    }
+}
+
+/// Whether nobody reads the page's repository now (`now`) who did not
+/// when a person confirmed (`confirmed`) and may not read the source's
+/// repository (`source`, `None` when the source is not on GitHub or its
+/// readers are not known). A repository that went public since is read by
+/// everybody, whom nobody confirmed, unless the source's is public too.
+fn repository_widened_by_nobody(
+    confirmed: &RepositoryReaders,
+    now: &RepoReaders,
+    source: Option<&RepoReaders>,
+) -> bool {
+    if confirmed.public || source.is_some_and(|source| source.public) {
+        return true;
+    }
+    !now.public
+        && now.github_ids.iter().all(|id| {
+            confirmed.github_ids.binary_search(id).is_ok()
+                || source.is_some_and(|source| source.github_ids.contains(id))
+        })
 }
 
 /// The confirmations recorded on one domain's Reflection, by page.
@@ -154,18 +200,27 @@ pub(crate) fn section_text(page: &str, id: &str) -> Option<String> {
         .map(|s| s.text)
 }
 
+/// Why the backup half of the rule refuses a page's sources: some source is
+/// not on GitHub, and some is on a repository not every reader of the
+/// page's repository reads (or whose readers are not known right now).
+#[derive(Debug, Clone, Copy, Default)]
+struct BackupGap {
+    not_on_github: bool,
+    narrower_repository: bool,
+}
+
 /// The question a person is asked before `texts` (section texts) drawn from
 /// `sources` (local domain names) go onto page `path` of `page`. `accounts`
 /// names who reads the page when the accounts rule is what the sources
-/// break, `repo` the GitHub repository when the backup is. Plain words: the
-/// readers, the text itself, that it becomes theirs to read, and that the
-/// source's name stays hidden.
+/// break, `repo` the GitHub repository when the backup is, with why. Plain
+/// words: the readers, the text itself, that it becomes theirs to read, and
+/// that the source's name stays hidden.
 fn question(
     page: &str,
     path: &str,
     sources: &[String],
     accounts: Option<&PageReaders>,
-    repo: Option<&str>,
+    repo: Option<(&str, BackupGap)>,
     texts: &[String],
 ) -> String {
     let from = listed(sources);
@@ -186,11 +241,18 @@ fn question(
         });
         why.push(format!("Fewer people may read {from}."));
     }
-    if let Some(repo) = repo {
+    if let Some((repo, gap)) = repo {
         readers.push(format!(
             "the people who can read the GitHub repository {repo}, where this page is backed up"
         ));
-        why.push(format!("{from} is not shared through GitHub."));
+        if gap.not_on_github {
+            why.push(format!("{from} is not shared through GitHub."));
+        }
+        if gap.narrower_repository {
+            why.push(format!(
+                "Not everybody who can read {repo} may read the GitHub repository of {from}."
+            ));
+        }
     }
     let shown: Vec<String> = texts
         .iter()
@@ -240,9 +302,57 @@ impl Engine {
     /// The repository a page of `page` is backed up to, when it is connected
     /// to GitHub.
     fn page_repo(&self, page: &str) -> Option<String> {
-        self.domain_entry(page)
-            .ok()
-            .and_then(|entry| entry.origin.map(|origin| origin.repo))
+        self.repository_of(page)
+    }
+
+    /// Who reads the repository a page of `page` is backed up to now, when
+    /// a GitHub App knows it: what a confirmation is recorded for, beside
+    /// the repository's name.
+    async fn page_repository_readers_now(&self, page: &str) -> Option<RepositoryReaders> {
+        if !self.on_github(page) {
+            return None;
+        }
+        let RepositoryReach::Known(governor) = self.repository_reach() else {
+            return None;
+        };
+        governor
+            .repository_readers(page)
+            .await
+            .map(|readers| RepositoryReaders::of(&readers))
+    }
+
+    /// Whether `disclosure` still holds for the backup half of the rule: the
+    /// page is still backed up to the repository it named and, under a
+    /// GitHub App, nobody reads that repository now who did not then and
+    /// may not read the source's repository. Without an App the repository's
+    /// name is all that is compared, as the rule compares nothing more.
+    async fn backup_still_confirmed(
+        &self,
+        page: &str,
+        source: &str,
+        disclosure: &Disclosure,
+    ) -> bool {
+        let repo = self.page_repo(page);
+        if repo.is_none() || disclosure.repo != repo {
+            return false;
+        }
+        let governor = match self.repository_reach() {
+            RepositoryReach::NoApp => return true,
+            RepositoryReach::Unknown => return false,
+            RepositoryReach::Known(governor) => governor,
+        };
+        let Some(confirmed) = &disclosure.repo_readers else {
+            return false;
+        };
+        let Some(now) = governor.repository_readers(page).await else {
+            return false;
+        };
+        let source_readers = if self.on_github(source) {
+            governor.repository_readers(source).await
+        } else {
+            None
+        };
+        repository_widened_by_nobody(confirmed, &now, source_readers.as_ref())
     }
 
     /// Who reads a page of `page` now, when this instance knows its
@@ -264,9 +374,11 @@ impl Engine {
     ///
     /// The rule alone first ([`Engine::readers_cover`]); then the
     /// confirmation, held against both halves of the rule as they stand now:
-    /// the page must still be backed up to the repository it named, and
-    /// nobody may read the page now who did not then and may not read the
-    /// source ([`crate::scope::DomainAccess::readers_cover_for`]). A source
+    /// the page must still be backed up to the repository it named, with no
+    /// reader of that repository on GitHub who was not one then and may not
+    /// read the source's repository, and nobody may read the page here now
+    /// who did not then and may not read the source
+    /// ([`crate::scope::DomainAccess::readers_cover_for`]). A source
     /// whose readers narrowed since changes nothing: its text reached those
     /// people already. When nobody here knows who reads which domain, no
     /// confirmation covers anything. The one rule [`Engine::too_wide_pages`],
@@ -283,8 +395,8 @@ impl Engine {
         let Some(disclosure) = disclosure else {
             return Ok(false);
         };
-        if self.leaves_github(page, source)
-            && (self.page_repo(page).is_none() || disclosure.repo != self.page_repo(page))
+        if self.leaves_repository(page, source).await?
+            && !self.backup_still_confirmed(page, source, disclosure).await
         {
             return Ok(false);
         }
@@ -365,9 +477,13 @@ impl Engine {
         texts: &[String],
     ) -> Result<DisclosureAsk> {
         let mut accounts_wide = false;
-        let mut github_wide = false;
+        let mut gap = BackupGap::default();
         for source in sources {
-            github_wide |= self.leaves_github(page, source);
+            if self.on_github(page) && !self.on_github(source) {
+                gap.not_on_github = true;
+            } else if self.leaves_repository(page, source).await? {
+                gap.narrower_repository = true;
+            }
             if let Some(access) = self.domain_access.get() {
                 accounts_wide |= !access
                     .readers_cover(page, source)
@@ -377,12 +493,15 @@ impl Engine {
         }
         let readers = self.page_readers_now(page).await?;
         let repo = self.page_repo(page);
+        let repo_readers = self.page_repository_readers_now(page).await;
         let question = question(
             page,
             path,
             sources,
             readers.as_ref().filter(|_| accounts_wide),
-            repo.as_deref().filter(|_| github_wide),
+            repo.as_deref()
+                .filter(|_| gap.not_on_github || gap.narrower_repository)
+                .map(|repo| (repo, gap)),
             texts,
         );
         let basis = sha256_hex(
@@ -392,6 +511,7 @@ impl Engine {
                 "sources": sources,
                 "readers": readers,
                 "repo": repo,
+                "repo_readers": repo_readers,
             })
             .to_string()
             .as_bytes(),
@@ -491,6 +611,7 @@ impl Engine {
         if let (Some(by), false) = (by, confirmed.is_empty()) {
             let readers = self.page_readers_now(domain).await?;
             let repo = self.page_repo(domain);
+            let repo_readers = self.page_repository_readers_now(domain).await;
             let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
             for source in confirmed {
                 list.retain(|d| !(d.source == *source && d.by == by));
@@ -500,6 +621,7 @@ impl Engine {
                     at: at.clone(),
                     readers: readers.clone(),
                     repo: repo.clone(),
+                    repo_readers: repo_readers.clone(),
                 });
             }
         }
@@ -666,7 +788,13 @@ mod tests {
             "overview.md",
             &["harbor".to_string()],
             Some(&PageReaders::Everyone),
-            Some("acme/kb"),
+            Some((
+                "acme/kb",
+                BackupGap {
+                    not_on_github: true,
+                    narrower_repository: false,
+                },
+            )),
             &["## Team\n\nFive people.".to_string()],
         );
         assert!(
@@ -686,5 +814,104 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains('\u{2014}') && !text.contains('\u{2013}'));
+    }
+
+    #[test]
+    fn the_question_says_when_the_source_repository_has_fewer_readers() {
+        let text = question(
+            "eng",
+            "overview.md",
+            &["vault".to_string()],
+            None,
+            Some((
+                "acme/kb",
+                BackupGap {
+                    not_on_github: false,
+                    narrower_repository: true,
+                },
+            )),
+            &["## Team\n\nFive people.".to_string()],
+        );
+        assert!(
+            text.contains(
+                "Not everybody who can read acme/kb may read the GitHub repository of vault."
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("not shared through GitHub"), "{text}");
+    }
+
+    fn repo(public: bool, ids: &[u64]) -> RepoReaders {
+        RepoReaders {
+            public,
+            github_ids: ids.iter().copied().collect(),
+        }
+    }
+
+    #[test]
+    fn a_repository_covers_another_only_when_it_has_no_reader_the_other_lacks() {
+        use super::super::sources::repository_covers;
+        assert!(repository_covers(
+            &repo(false, &[1, 2]),
+            &repo(false, &[1, 2, 3])
+        ));
+        assert!(!repository_covers(
+            &repo(false, &[1, 2]),
+            &repo(false, &[1])
+        ));
+        assert!(repository_covers(&repo(true, &[]), &repo(true, &[])));
+        assert!(repository_covers(&repo(false, &[9]), &repo(true, &[])));
+        assert!(!repository_covers(&repo(true, &[1]), &repo(false, &[1])));
+    }
+
+    #[test]
+    fn a_confirmation_holds_until_a_reader_who_lacks_the_source_joins() {
+        let confirmed = RepositoryReaders::of(&repo(false, &[2, 1]));
+        assert_eq!(confirmed.github_ids, vec![1, 2]);
+        let source = repo(false, &[1, 4]);
+        assert!(repository_widened_by_nobody(
+            &confirmed,
+            &repo(false, &[1, 2]),
+            Some(&source)
+        ));
+        // Fewer readers or a new one who reads the source: still holds.
+        assert!(repository_widened_by_nobody(
+            &confirmed,
+            &repo(false, &[1]),
+            Some(&source)
+        ));
+        assert!(repository_widened_by_nobody(
+            &confirmed,
+            &repo(false, &[1, 2, 4]),
+            Some(&source)
+        ));
+        // A new reader who does not, or a source not on GitHub.
+        assert!(!repository_widened_by_nobody(
+            &confirmed,
+            &repo(false, &[1, 2, 3]),
+            Some(&source)
+        ));
+        assert!(!repository_widened_by_nobody(
+            &confirmed,
+            &repo(false, &[1, 2, 4]),
+            None
+        ));
+        // Made public since: everybody, whom nobody confirmed.
+        assert!(!repository_widened_by_nobody(
+            &confirmed,
+            &repo(true, &[1, 2]),
+            Some(&source)
+        ));
+        assert!(repository_widened_by_nobody(
+            &confirmed,
+            &repo(true, &[1]),
+            Some(&repo(true, &[]))
+        ));
+        let public = RepositoryReaders::of(&repo(true, &[]));
+        assert!(repository_widened_by_nobody(
+            &public,
+            &repo(true, &[7]),
+            None
+        ));
     }
 }

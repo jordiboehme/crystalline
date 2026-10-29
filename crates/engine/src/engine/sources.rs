@@ -35,6 +35,30 @@ pub(crate) const TOO_WIDE_REFUSAL: &str = "this source is in a domain fewer peop
 /// the accounts here, so personal knowledge would reach a repository.
 pub(crate) const NOT_ON_GITHUB_REFUSAL: &str = "this source is in a domain that is not shared through GitHub, and this page is backed up to a GitHub repository; leave out the source and every sentence drawn from it, or cite it from a page in that domain instead";
 
+/// Whether every reader of a repository whose readers are `page` also
+/// reads one whose readers are `source`: a public source repository is read
+/// by everybody; a public page repository is read by everybody, which a
+/// private source repository never is; else each collaborator of the page's
+/// repository must be one of the source's.
+pub(crate) fn repository_covers(page: &RepoReaders, source: &RepoReaders) -> bool {
+    if source.public {
+        return true;
+    }
+    !page.public && page.github_ids.is_subset(&source.github_ids)
+}
+
+/// How this instance knows who reads a GitHub repository
+/// ([`Engine::repository_reach`]).
+pub(crate) enum RepositoryReach {
+    /// No GitHub App: repositories' readers are not compared.
+    NoApp,
+    /// An App may be there but its listings cannot be asked: nothing is
+    /// covered.
+    Unknown,
+    /// The governor's cached listings.
+    Known(Arc<GithubGovernor>),
+}
+
 /// What a write is refused with when it names a source in another domain
 /// on a stack that could not open its accounts store: who reads which
 /// domain is unknown there, so the check fails closed.
@@ -42,7 +66,7 @@ pub(crate) const UNKNOWN_READERS_REFUSAL: &str = "who may read each domain is un
 
 /// What a `source_too_wide` item says to a caller who may open every
 /// domain the item is about.
-pub(crate) const TOO_WIDE_NOTE: &str = "this section cites a domain fewer people may read than this page's domain, or one not shared through GitHub while this page is backed up to a GitHub repository, so its text reaches people who may not read that domain; remove that source and the text drawn from it. The page stays as it is until a curator does";
+pub(crate) const TOO_WIDE_NOTE: &str = "this section cites a domain fewer people may read than this page's domain, or one not shared through GitHub, or one on a GitHub repository not every reader of this page's repository may read, while this page is backed up there, so its text reaches people who may not read that domain; remove that source and the text drawn from it. The page stays as it is until a curator does";
 
 /// What a `source_unavailable` item says to a caller who may open the
 /// domain, with how to clear it.
@@ -218,8 +242,11 @@ impl Engine {
 
     /// Whether a page of domain `page` may carry text drawn from domain
     /// `source` (both local names): whether every reader of the page may
-    /// read text drawn from `source` anyway. The rule and who counts as a
-    /// reader are [`crate::scope::DomainAccess::readers_cover`]'s.
+    /// read text drawn from `source` anyway. Two halves: the page's GitHub
+    /// repository, whose backup branch its readers on GitHub read
+    /// ([`Engine::leaves_repository`]), and the accounts here, whose rule
+    /// and whose idea of a reader are
+    /// [`crate::scope::DomainAccess::readers_cover`]'s.
     ///
     /// It never looks at who asks: the machine owner, who reads every
     /// domain, is held to it too, since the page's readers are the ones the
@@ -231,7 +258,7 @@ impl Engine {
     /// no accounts store is in play) answers that every page covers every
     /// domain.
     pub(crate) async fn readers_cover(&self, page: &str, source: &str) -> Result<bool> {
-        if self.leaves_github(page, source) {
+        if self.leaves_repository(page, source).await? {
             return Ok(false);
         }
         let Some(access) = self.domain_access.get() else {
@@ -245,16 +272,82 @@ impl Engine {
             .map_err(|e| EngineError::Internal(e.to_string()))
     }
 
-    /// Whether a page of `page` citing `source` would carry a domain that
-    /// is not connected to GitHub into the GitHub repository `page` is
-    /// backed up to. Until access follows GitHub, any two connected domains
-    /// count as alike: their repositories' readers are not compared.
-    pub(crate) fn leaves_github(&self, page: &str, source: &str) -> bool {
-        let on_github = |domain: &str| {
-            self.domain_entry(domain)
-                .is_ok_and(|entry| entry.origin.is_some())
+    /// Whether `domain` is connected to GitHub, so its Reflection is backed
+    /// up to its repository.
+    pub(crate) fn on_github(&self, domain: &str) -> bool {
+        self.repository_of(domain).is_some()
+    }
+
+    /// The GitHub repository `domain` is connected to, when it is.
+    pub(crate) fn repository_of(&self, domain: &str) -> Option<String> {
+        self.domain_entry(domain)
+            .ok()
+            .and_then(|entry| entry.origin.map(|origin| origin.repo))
+    }
+
+    /// Whether a page of `page` citing `source` (both local names) would
+    /// carry text into the GitHub repository `page` is backed up to that
+    /// some reader of that repository may not read in `source`. A page is
+    /// backed up to its repository's `crystalline/reflections` branch, which
+    /// every reader of the repository on GitHub reads, with an account here
+    /// or without one. So, for a page on GitHub:
+    ///
+    /// * a source not on GitHub (a local or a virtual domain) leaves it;
+    /// * a source on the same repository (two domains on one repository)
+    ///   does not: one repository has one set of readers;
+    /// * without a GitHub App nobody here knows a repository's readers, and
+    ///   any two connected domains count as alike, as they always did;
+    /// * with one, the source must be on a public repository, or the page's
+    ///   repository must be private and each of its collaborators with read
+    ///   or more a collaborator of the source's repository too. Both come
+    ///   from the governor's cached listing ([`GithubGovernor::repository_readers`]),
+    ///   never a request per check. A listing that is not known (GitHub down
+    ///   past the stale window, the App not installed on either repository,
+    ///   an App that cannot be used) leaves it: the check fails closed.
+    ///
+    /// A page not on GitHub never leaves anything: it has no backup branch.
+    pub(crate) async fn leaves_repository(&self, page: &str, source: &str) -> Result<bool> {
+        let Some(page_repo) = self.repository_of(page) else {
+            return Ok(false);
         };
-        on_github(page) && !on_github(source)
+        let Some(source_repo) = self.repository_of(source) else {
+            return Ok(true);
+        };
+        if page_repo.eq_ignore_ascii_case(&source_repo) {
+            return Ok(false);
+        }
+        let governor = match self.repository_reach() {
+            RepositoryReach::NoApp => return Ok(false),
+            RepositoryReach::Unknown => return Ok(true),
+            RepositoryReach::Known(governor) => governor,
+        };
+        let Some(page_readers) = governor.repository_readers(page).await else {
+            return Ok(true);
+        };
+        let Some(source_readers) = governor.repository_readers(source).await else {
+            return Ok(true);
+        };
+        Ok(!repository_covers(&page_readers, &source_readers))
+    }
+
+    /// Whether a GitHub App decides who reads a repository here, and how
+    /// that is known: [`RepositoryReach::NoApp`] only when this instance
+    /// positively has none (no App is configured, or the origins are served
+    /// by a test provider). An App that may be saved and is still loading,
+    /// or one present without a governor, is [`RepositoryReach::Unknown`].
+    pub(crate) fn repository_reach(&self) -> RepositoryReach {
+        let app = match self.github_app_slot_settled() {
+            Some(super::github_app::AppSlot::Absent) => false,
+            Some(_) => true,
+            None => self.github_app_maybe_saved(),
+        };
+        if !app {
+            return RepositoryReach::NoApp;
+        }
+        match self.github_governor.get() {
+            Some(governor) => RepositoryReach::Known(governor.clone()),
+            None => RepositoryReach::Unknown,
+        }
     }
 
     /// Why nobody here knows who reads which domain, when that is so: no
@@ -345,7 +438,7 @@ impl Engine {
                 // (`super::disclosure`): one confirmation per person, page
                 // and source domain.
                 let shared_here = shared.contains(local);
-                if self.leaves_github(own, local) && !shared_here {
+                if self.on_github(own) && !self.on_github(local) && !shared_here {
                     if !may_disclose {
                         return Err(EngineError::Invalid(format!(
                             "'{name}': {NOT_ON_GITHUB_REFUSAL}"
