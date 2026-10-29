@@ -33,7 +33,7 @@ pub use assets::{
 };
 pub use baseline::{
     ChangeKind, Relinked, SectionChange, advance_baseline, baseline_ids, feedback_changes,
-    parse_baseline, relink, render_baseline, same_but_task_boxes,
+    parse_baseline, relink, render_baseline, same_but_task_boxes, seed_baseline,
 };
 pub use layout::{
     BASELINE_DIR, MATCHES_NO_PAGE, NESTED_NOT_READ, NOT_A_VALID_GLOB, PACT_FILE,

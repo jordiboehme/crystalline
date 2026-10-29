@@ -4276,7 +4276,7 @@ impl Engine {
                 continue;
             }
             // A page that cites a domain fewer people may read than this one
-            // is held back with its threads, its baseline and the files only
+            // is held back with its threads and the files only
             // it links: the branch is read by the repository's people, not
             // by this domain's readers.
             let mut held_pages: Vec<String> = Vec::new();
@@ -4296,19 +4296,14 @@ impl Engine {
                 let held: std::collections::BTreeSet<String> = held_pages
                     .iter()
                     .flat_map(|page| {
+                        // The baselines never go out at all
+                        // (`reflections_backup::collect_backup`).
                         [
                             page.clone(),
                             crystalline_core::reflection::threads_path(page),
-                            crystalline_core::reflection::baseline_path(page),
-                            crystalline_core::reflection::baseline_path(
-                                &crystalline_core::reflection::threads_path(page),
-                            ),
                         ]
                     })
                     .chain(assets)
-                    // A baseline that keeps a removed section's text stays
-                    // off the branch while its page goes out.
-                    .chain(reflect::uncovered_baselines(&spec, &files))
                     .collect();
                 Ok(crystalline_remote::reflections_backup::backup_collected(
                     provider.as_ref(),

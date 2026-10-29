@@ -450,7 +450,9 @@ impl Engine {
             // baseline every section would read as a person's change, so the
             // move's one item stands in for that feedback.
             let no_feedback = baseline.is_none() && host_move.is_some();
-            let baseline = baseline.unwrap_or_default();
+            // Without a baseline file (a restore from the backup branch,
+            // which does not carry them) the page stands for its baseline.
+            let baseline = super::reflection::baseline_or_seed(baseline, Some(&row.content));
             let row_age = secs_since_rfc3339(Some(&row.modified)).unwrap_or(0);
             if row.path == r::PACT_FILE {
                 let changes = if no_feedback {
@@ -1534,46 +1536,4 @@ fn reflection_files<'a>(
         crystalline_remote::reflections_backup::reflection_path(spec, repo_path)
             .map(|inner| (inner, bytes.as_slice()))
     })
-}
-
-/// The baselines among a backup's collected `files` (by path inside
-/// `reflections/`) that keep a section their page's records no longer
-/// cover: a section a curator removed, with the source it was drawn from,
-/// whose last reflected text the baseline still holds. They are held back
-/// while their page goes out. So is a baseline that is not UTF-8, and one
-/// whose page is not among `files` or is not UTF-8 itself. A held page's
-/// baseline is held with the page, whatever this says.
-pub(crate) fn uncovered_baselines(
-    spec: &crystalline_remote::provider::OriginSpec,
-    files: &BTreeMap<String, Vec<u8>>,
-) -> BTreeSet<String> {
-    let by_path: HashMap<&str, &[u8]> = reflection_files(spec, files).collect();
-    let mut out = BTreeSet::new();
-    for (inner, bytes) in &by_path {
-        let r::ReflectionFile::Baseline { of } = r::classify(inner) else {
-            continue;
-        };
-        if r::validate_reflection_path(&of).is_err() {
-            // The baseline of a threads file: its threads hold no sources.
-            continue;
-        }
-        let Ok(baseline) = std::str::from_utf8(bytes) else {
-            out.insert(inner.to_string());
-            continue;
-        };
-        let covered: HashSet<String> = match by_path
-            .get(of.as_str())
-            .and_then(|page| std::str::from_utf8(page).ok())
-        {
-            Some(page) => r::read_provenance(page).into_keys().collect(),
-            None => HashSet::new(),
-        };
-        if r::baseline_ids(baseline)
-            .iter()
-            .any(|id| !covered.contains(id))
-        {
-            out.insert(inner.to_string());
-        }
-    }
-    out
 }

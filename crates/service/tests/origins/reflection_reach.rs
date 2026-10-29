@@ -641,11 +641,8 @@ async fn backed_up_as(files: &[(&str, &[u8])], kb_ids: &[u64]) -> (Vec<String>, 
         .await;
     let head = kb.commit_paths(&kb.branch_commit(BACKUP_BRANCH).unwrap());
     assert!(head.contains(&"reflections/a.md".to_string()), "{head:?}");
-    // A page's baseline covered by its records goes out with it.
-    assert!(
-        head.contains(&"reflections/.reflected/a.md".to_string()),
-        "{head:?}"
-    );
+    // The hidden baselines never go out.
+    assert!(!head.iter().any(|p| p.contains(".reflected")), "{head:?}");
     (head, eng.reflection_backup_held_back("kb"))
 }
 
@@ -675,30 +672,88 @@ async fn a_page_without_frontmatter_goes_out() {
     assert!(held.is_empty(), "{held:?}");
 }
 
-/// A held page's baseline is held with it.
+/// The backup carries no hidden baseline, of a page that goes out or of
+/// one that is held: a baseline is local state.
 #[tokio::test]
-async fn a_baseline_stays_held_with_its_page() {
-    let page: &[u8] = b"---\nreflection:\n  aaaa1111:\n    sources:\n    - domain: vault\n      engram: team/rota\n      checksum: abc\n---\n\n# Forged\n\n## Team\n<!-- r:aaaa1111 -->\n\nFive.\n";
-    let baseline: &[u8] = b"## Team\n<!-- r:aaaa1111 -->\n\nFive people from the vault.\n";
-    // vault's repository has fewer readers than kb's here.
-    let (head, held) =
-        backed_up_with_wide(&[("forged.md", page), (".reflected/forged.md", baseline)]).await;
+async fn a_backup_pushes_no_baseline() {
+    let page: &[u8] = b"---\nreflection:\n  bbbb2222:\n    sources:\n    - engram: team/rota\n      checksum: abc\n---\n\n# B\n\n## Kept\n<!-- r:bbbb2222 -->\n\nOurs.\n";
+    let baseline: &[u8] = b"## Kept\n<!-- r:bbbb2222 -->\n\nOurs.\n\n## Removed\n<!-- r:cccc3333 -->\n\nFive people from the vault.\n";
+    let forged: &[u8] = b"---\nreflection:\n  aaaa1111:\n    sources:\n    - domain: vault\n      engram: team/rota\n      checksum: abc\n---\n\n# Forged\n\n## Team\n<!-- r:aaaa1111 -->\n\nFive.\n";
+    let (head, held) = backed_up_with_wide(&[
+        ("b.md", page),
+        (".reflected/b.md", baseline),
+        ("forged.md", forged),
+        (".reflected/forged.md", baseline),
+    ])
+    .await;
+    assert!(head.contains(&"reflections/b.md".to_string()), "{head:?}");
     assert!(!head.iter().any(|p| p.contains("forged.md")), "{head:?}");
     assert_eq!(held, vec!["forged.md".to_string()]);
 }
 
-/// A curator removed a section together with its narrow source; the
-/// baseline still keeps that section's text. The page goes out, its
-/// baseline does not.
+/// A baseline an earlier backup pushed leaves the branch head with the next
+/// backup; the branch history keeps it.
 #[tokio::test]
-async fn a_baseline_keeping_a_removed_section_is_held_while_the_page_goes_out() {
-    let page: &[u8] = b"---\nreflection:\n  bbbb2222:\n    sources:\n    - engram: team/rota\n      checksum: abc\n---\n\n# B\n\n## Kept\n<!-- r:bbbb2222 -->\n\nOurs.\n";
-    let baseline: &[u8] = b"## Kept\n<!-- r:bbbb2222 -->\n\nOurs.\n\n## Removed\n<!-- r:cccc3333 -->\n\nFive people from the vault.\n";
-    let (head, held) = backed_up_with(&[("b.md", page), (".reflected/b.md", baseline)]).await;
-    assert!(head.contains(&"reflections/b.md".to_string()), "{head:?}");
-    assert!(
-        !head.contains(&"reflections/.reflected/b.md".to_string()),
-        "{head:?}"
+async fn an_earlier_pushed_baseline_leaves_the_head() {
+    use sha2::Digest as _;
+    let tmp = tempfile::tempdir().unwrap();
+    let (forge, eng, _, kb) = setup_with_page_repo(tmp.path(), &app_env()).await;
+    collaborators(&forge, "acme/kb", &[1]);
+    collaborators(&forge, "acme/vault", &[1]);
+    write(
+        &eng,
+        &WriteReflectionParams {
+            domain: "kb".into(),
+            path: "a.md".into(),
+            markdown: Some("# A\n\n## One\n\nText.\n".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let later = || Instant::now() + Duration::from_secs(120);
+    eng.reflection_backup_tick(later()).await;
+    // What an earlier release pushed: the head and the backup state both
+    // hold a baseline.
+    let first = kb.branch_commit(BACKUP_BRANCH).unwrap();
+    let mut files: BTreeMap<String, Vec<u8>> = kb
+        .commit_paths(&first)
+        .into_iter()
+        .map(|p| {
+            let bytes = kb.commit_file(&first, &p).unwrap();
+            (p, bytes)
+        })
+        .collect();
+    let old: &[u8] = b"## One\n<!-- r:aaaa1111 -->\n\nOld text.\n";
+    files.insert("reflections/.reflected/a.md".to_string(), old.to_vec());
+    let second = kb.add_commit_on(files, Some(&first));
+    kb.set_branch(BACKUP_BRANCH, &second);
+    let state_path = walkdir::WalkDir::new(tmp.path())
+        .into_iter()
+        .filter_map(Result::ok)
+        .find(|e| e.file_name() == "reflections-backup.json")
+        .expect("a backup state")
+        .into_path();
+    let mut state: Value = serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+    state["head"] = json!(second);
+    state["files"]["reflections/.reflected/a.md"] = json!(
+        sha2::Sha256::digest(old)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
     );
-    assert!(held.is_empty(), "{held:?}");
+    std::fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+
+    eng.mark_reflection_dirty(
+        "kb",
+        crystalline_service::reflection_backup::BackupCause::Settled,
+    );
+    eng.reflection_backup_tick(later()).await;
+    let head = kb.commit_paths(&kb.branch_commit(BACKUP_BRANCH).unwrap());
+    assert!(head.contains(&"reflections/a.md".to_string()), "{head:?}");
+    assert!(!head.iter().any(|p| p.contains(".reflected")), "{head:?}");
+    assert!(
+        kb.commit_paths(&second)
+            .contains(&"reflections/.reflected/a.md".to_string())
+    );
 }

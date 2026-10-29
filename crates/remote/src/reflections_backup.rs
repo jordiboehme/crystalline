@@ -71,9 +71,12 @@ fn reflection_folders(root: &Path) -> Result<Vec<PathBuf>, RemoteError> {
 
 /// Every file under `root/reflections` the layout backs up
 /// (`PathClass::backs_up` with the Reflection in effect: pages, the pact,
-/// threads, the hidden baseline and the Reflection's files, never a temp or
-/// stray file), by repo path. A walk error is an error: an entry that cannot
-/// be read must never look like a deleted one.
+/// threads and the Reflection's files, never a temp or stray file), by repo
+/// path, less the hidden baselines under `.reflected/`: they are local state
+/// for telling a person's change apart, and a restore takes the pages as
+/// the baseline. A branch head that still holds one from an earlier backup
+/// loses it with the next commit. A walk error is an error: an entry that
+/// cannot be read must never look like a deleted one.
 pub(crate) fn collect(
     root: &Path,
     subpath: Option<&str>,
@@ -100,7 +103,7 @@ pub(crate) fn collect(
                 continue;
             }
             let rel = crystalline_core::slash_rel(root, entry.path());
-            if !layout.classify(&rel).backs_up() {
+            if !layout.classify(&rel).backs_up() || is_baseline(&rel) {
                 continue;
             }
             let repo = match prefix {
@@ -113,6 +116,17 @@ pub(crate) fn collect(
         }
     }
     Ok(out)
+}
+
+/// Whether the domain-relative path `rel` is a hidden baseline: a file
+/// under `.reflected/` in the Reflection folder (any spelling of its name).
+fn is_baseline(rel: &str) -> bool {
+    rel.split_once('/').is_some_and(|(_, inner)| {
+        matches!(
+            crystalline_core::reflection::classify(inner),
+            crystalline_core::reflection::ReflectionFile::Baseline { .. }
+        ) || inner.starts_with(&format!("{}/", crystalline_core::reflection::BASELINE_DIR))
+    })
 }
 
 fn load(state_dir: &Path) -> BackupState {
@@ -334,7 +348,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn repo_paths_carry_the_subpath_and_the_hidden_baseline() {
+    fn repo_paths_carry_the_subpath_and_never_the_hidden_baseline() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         for rel in [
@@ -352,12 +366,8 @@ mod tests {
         let paths: Vec<&str> = files.keys().map(String::as_str).collect();
         assert_eq!(
             paths,
-            [
-                "kb/eng/reflections/.reflected/a.md",
-                "kb/eng/reflections/a.md",
-                "kb/eng/reflections/a.threads.md"
-            ],
-            "the layout's backs_up: the baseline yes, a temp file no"
+            ["kb/eng/reflections/a.md", "kb/eng/reflections/a.threads.md"],
+            "the layout's backs_up less the baselines: a temp file no, the hidden baseline no"
         );
         let root_files = collect(root, None).unwrap();
         assert!(
@@ -377,7 +387,7 @@ mod tests {
         std::fs::write(root.join("reflectionsx/b.md"), "# B\n").unwrap();
         let files = collect(root, None).unwrap();
         let paths: Vec<&str> = files.keys().map(String::as_str).collect();
-        assert_eq!(paths, ["Reflections/.reflected/a.md", "Reflections/a.md"]);
+        assert_eq!(paths, ["Reflections/a.md"]);
     }
 
     #[test]

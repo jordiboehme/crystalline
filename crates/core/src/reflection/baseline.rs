@@ -272,6 +272,28 @@ pub fn advance_baseline(baseline: &str, current: &str, ids: &[String]) -> String
     render_baseline(&reflected)
 }
 
+/// The baseline a page stands for when its baseline file is missing (a
+/// Reflection restored from its backup branch, which does not carry
+/// `.reflected/`): every section whose text is still what was last reflected
+/// by the `reflected` hash its record keeps. A section never reflected, or
+/// changed since, is left out, so it stays a person's change. Empty when no
+/// section qualifies.
+pub fn seed_baseline(page: &str) -> String {
+    let prov = read_provenance(page);
+    let entries: Vec<(String, String)> = split_sections(page)
+        .into_iter()
+        .filter_map(|section| {
+            let id = section.id?;
+            let reflected = prov.get(&id)?.reflected.as_deref()?;
+            (reflected == section_hash(&section.text)).then_some((id, section.text))
+        })
+        .collect();
+    if entries.is_empty() {
+        return String::new();
+    }
+    render_baseline(&entries)
+}
+
 /// A reflection and its baseline after a link rewrite.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Relinked {
@@ -681,5 +703,26 @@ mod tests {
             (Some("_top"), "", ChangeKind::Changed)
         );
         assert!(first.before.contains("Intro.") && first.after.contains("A new intro."));
+    }
+
+    #[test]
+    fn a_missing_baseline_is_seeded_from_the_reflected_hashes() {
+        let body = "# P\n\n## Night\n<!-- r:aaaa1111 -->\n\nAt night.\n\n## Day\n<!-- r:bbbb2222 -->\n\nBy day.\n";
+        let night = split_sections(body)
+            .into_iter()
+            .find(|s| s.id.as_deref() == Some("aaaa1111"))
+            .unwrap();
+        let page = format!(
+            "---\nreflection:\n  aaaa1111:\n    reflected: {}\n  bbbb2222:\n    reflected: stale\n---\n\n{body}",
+            section_hash(&night.text)
+        );
+        let seeded = seed_baseline(&page);
+        assert_eq!(baseline_ids(&seeded), ["aaaa1111".to_string()].into());
+        assert!(
+            feedback_changes(&page, &seeded)
+                .iter()
+                .all(|c| c.id.as_deref() != Some("aaaa1111"))
+        );
+        assert_eq!(seed_baseline("# P\n\n## Idea\n\nNew.\n"), "");
     }
 }
