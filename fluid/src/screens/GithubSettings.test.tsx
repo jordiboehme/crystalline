@@ -175,6 +175,42 @@ describe("the GitHub settings screen", () => {
     ).toBeInTheDocument();
   });
 
+  it("names a GitHub App plainly, even before GitHub named its bot", async () => {
+    serveAs("admin", {
+      "/settings/github": () =>
+        statusPayload({
+          enabled: true,
+          connected: true,
+          token_store: "GitHub App",
+        }),
+    });
+    renderApp("/settings/github");
+
+    expect(
+      await screen.findByText("Connected as GitHub App"),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/did not name/i)).not.toBeInTheDocument();
+  });
+
+  it("names the App's bot once GitHub said it", async () => {
+    serveAs("admin", {
+      "/settings/github": () =>
+        statusPayload({
+          enabled: true,
+          connected: true,
+          user: "crystalline-acme[bot]",
+          token_store: "GitHub App",
+        }),
+    });
+    renderApp("/settings/github");
+
+    expect(
+      await screen.findByText(
+        "Connected as crystalline-acme[bot] (GitHub App)",
+      ),
+    ).toBeInTheDocument();
+  });
+
   it("starts the device flow and shows code, link and polling state", async () => {
     let status = statusPayload();
     serveAs("admin", {

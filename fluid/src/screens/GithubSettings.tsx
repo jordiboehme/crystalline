@@ -24,7 +24,7 @@ import {
   startGithubConnect,
   submitGithubToken,
 } from "../api/admin";
-import type { GithubPending } from "../api/admin";
+import type { GithubPending, GithubStatus } from "../api/admin";
 import { problemDetail } from "../api/client";
 import { useAuth } from "../auth/AuthContext";
 import {
@@ -50,6 +50,25 @@ const CONNECT_BUTTON = `${CONTROL_HEIGHT} ${BUTTON.primary}`;
 const SECONDARY_BUTTON = `${CONTROL_HEIGHT} ${BUTTON.secondary}`;
 
 const DANGER_BUTTON = `${CONTROL_HEIGHT} ${BUTTON.destructive}`;
+
+/**
+ * Who the instance is connected as. A GitHub App is named plainly: before
+ * GitHub has said its bot's name (an App from the environment whose slug was
+ * not read yet) it is just "GitHub App", never "an account GitHub did not
+ * name (GitHub App)".
+ */
+function connectedLine(connection: GithubStatus | null | undefined): string {
+  if (!connection?.connected) {
+    return "Not connected";
+  }
+  if (connection.tokenStore === APP_STORE && connection.user === null) {
+    return `Connected as ${APP_STORE}`;
+  }
+  return `Connected as ${connection.user ?? "an account GitHub did not name"} (${connection.tokenStore ?? "an unnamed store"})`;
+}
+
+/** The store name the server gives an instance connected through its App. */
+const APP_STORE = "GitHub App";
 
 export default function GithubSettings() {
   const { capabilities } = useAuth();
@@ -185,11 +204,7 @@ function GithubPanel() {
             Reading the connection
           </p>
         ) : (
-          <p className="text-sm">
-            {connection?.connected
-              ? `Connected as ${connection.user ?? "an account GitHub did not name"} (${connection.tokenStore ?? "an unnamed store"})`
-              : "Not connected"}
-          </p>
+          <p className="text-sm">{connectedLine(connection)}</p>
         )}
 
         {/*

@@ -485,6 +485,61 @@ test("the same rename dialog also opens from the policies card's 'Change name'",
   await expect(dialog).toBeHidden();
 });
 
+test("the profile links GitHub through the App when one is configured", async ({
+  page,
+}) => {
+  // The scratch daemon has no GitHub App, so the profile keeps the older
+  // identity card: the real link read says so.
+  await page.goto("profile");
+  await expect(
+    page.getByRole("heading", { name: "GitHub identity" }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Connect with GitHub" }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Connect GitHub" }),
+  ).toHaveCount(0);
+
+  // With an App, the link card. GitHub's consent page cannot be reached from
+  // here, so the start answers an authorize url that is the callback's own
+  // landing: the whole-page navigation is real, and so is the landing.
+  let linked = false;
+  await page.route("**/api/v1/me/github-link", (route) =>
+    route.fulfill({
+      json: {
+        linked,
+        login: linked ? "smoke-gh" : null,
+        github_id: linked ? 501 : null,
+        host: linked ? "github.com" : null,
+        linked_at: linked ? "2026-10-28T09:12:44Z" : null,
+        token_live: linked,
+        pending: null,
+        error: null,
+        app_configured: true,
+      },
+    }),
+  );
+  await page.route("**/api/v1/me/github-link/start", (route) => {
+    linked = true;
+    return route.fulfill({
+      json: {
+        authorize_url: new URL("profile?github=linked", page.url()).href,
+      },
+    });
+  });
+  await page.reload();
+  await page.getByRole("button", { name: "Connect GitHub" }).click();
+
+  await expect(page.getByText("Your GitHub account is linked.")).toBeVisible();
+  await expect(page.getByText("Linked to @smoke-gh")).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Unlink GitHub" }),
+  ).toBeVisible();
+  // The landing is read once and taken out of the address.
+  await expect(page).toHaveURL((url) => !url.search.includes("github="));
+});
+
 test("a refused direct share offers to share as a proposal", async ({
   page,
 }) => {

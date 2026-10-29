@@ -35,6 +35,7 @@ import {
   renderApp,
   userFixture,
 } from "../test/harness";
+import { navigateTo } from "../base";
 import { Tooltips } from "../components/primitives";
 import { AgentAccessCard } from "./Profile";
 
@@ -43,7 +44,41 @@ vi.mock("../api/client", async (importOriginal) => {
   return { ...actual, api: vi.fn(), setCsrfToken: vi.fn() };
 });
 
+// A whole-page navigation jsdom cannot follow; the tests assert where it
+// would have gone.
+vi.mock("../base", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../base")>();
+  return { ...actual, navigateTo: vi.fn() };
+});
+
 const apiMock = vi.mocked(api);
+const navigateMock = vi.mocked(navigateTo);
+
+/** The wire shape of the App link, in whichever state a test needs. */
+function linkView(overrides: Record<string, unknown> = {}) {
+  return {
+    linked: false,
+    login: null,
+    github_id: null,
+    host: null,
+    linked_at: null,
+    token_live: false,
+    pending: null,
+    error: null,
+    app_configured: true,
+    ...overrides,
+  };
+}
+
+/** An account linked through the App, with a working token. */
+const LINKED = linkView({
+  linked: true,
+  login: "ada-gh",
+  github_id: 501,
+  host: "github.com",
+  linked_at: "2026-10-28T09:12:44Z",
+  token_live: true,
+});
 
 /** The wire shape of an identity, in whichever state a test needs. */
 function identityPayload(overrides: Record<string, unknown> = {}) {
@@ -85,6 +120,8 @@ function serveAs(
       "/auth/me": () => meResponse({ user: userFixture({ role }), ...me }),
       "/domains": domainsResponse,
       "/me/github-identity": () => identityPayload(),
+      // No GitHub App by default, which keeps the older identity card.
+      "/me/github-link": () => linkView({ app_configured: false }),
       "/me/mcp-tokens": () => [],
       "/me/oauth-grants": () => [],
       // The default is an instance with no provider and an account with no
@@ -142,6 +179,7 @@ function sentBody(path: string, method: string): unknown {
 
 beforeEach(() => {
   apiMock.mockReset();
+  navigateMock.mockReset();
 });
 
 describe("the profile screen", () => {
@@ -1231,5 +1269,196 @@ describe("the SSO identity card", () => {
     ).toBeInTheDocument();
     expect(screen.getByText(/linked by an administrator/i)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Unlink" })).toBeInTheDocument();
+  });
+});
+
+describe("the GitHub App link card", () => {
+  it("shows Connect GitHub when an App is configured and no link exists", async () => {
+    serveAs("editor", {
+      "/me/github-link": () => linkView(),
+      "/me/github-link/start": () => ({
+        authorize_url: "https://github.example/login/oauth/authorize?state=s",
+      }),
+    });
+    renderApp("/profile");
+
+    const connect = await screen.findByRole("button", {
+      name: "Connect GitHub",
+    });
+    // The App replaces the older ways in: no device flow, no pasted token.
+    expect(
+      screen.queryByRole("button", { name: /connect with github/i }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByLabelText(/personal access token/i),
+    ).not.toBeInTheDocument();
+
+    await userEvent.click(connect);
+    await waitFor(() => {
+      expect(navigateMock).toHaveBeenCalledWith(
+        "https://github.example/login/oauth/authorize?state=s",
+      );
+    });
+    expect(
+      apiMock.mock.calls.some(
+        ([path, init]) =>
+          path === "/me/github-link/start" && init?.method === "POST",
+      ),
+    ).toBe(true);
+  });
+
+  it("shows the login and Unlink when linked", async () => {
+    let link = LINKED;
+    serveAs("editor", {
+      "/me/github-link": (_path, init) => {
+        if (init?.method === "DELETE") {
+          link = linkView();
+          return { linked: false, was_linked: true, warning: null };
+        }
+        return link;
+      },
+    });
+    renderApp("/profile");
+
+    expect(await screen.findByText("Linked to @ada-gh")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Connect GitHub" }),
+    ).not.toBeInTheDocument();
+    await userEvent.click(
+      screen.getByRole("button", { name: "Unlink GitHub" }),
+    );
+    expect(
+      await screen.findByRole("button", { name: "Connect GitHub" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Linked to @ada-gh")).not.toBeInTheDocument();
+  });
+
+  it("shows the server's warning when GitHub could not revoke the token", async () => {
+    serveAs("editor", {
+      "/me/github-link": (_path, init) =>
+        init?.method === "DELETE"
+          ? {
+              linked: false,
+              was_linked: true,
+              warning: "unlinked here; revoke it in your GitHub settings",
+            }
+          : LINKED,
+    });
+    renderApp("/profile");
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Unlink GitHub" }),
+    );
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "unlinked here; revoke it in your GitHub settings",
+    );
+  });
+
+  it("asks to connect again when the GitHub access expired", async () => {
+    serveAs("editor", {
+      "/me/github-link": () => linkView({ ...LINKED, token_live: false }),
+    });
+    renderApp("/profile");
+
+    expect(
+      await screen.findByText(
+        "GitHub access expired. Connect again to share as yourself.",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Connect GitHub" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Unlink GitHub" }),
+    ).toBeInTheDocument();
+  });
+
+  it("shows the id-taken sentence from the query string", async () => {
+    serveAs("editor", { "/me/github-link": () => linkView() });
+    renderApp("/profile?github_error=id_taken");
+
+    expect(
+      await screen.findByText(
+        "This GitHub account is already linked to another Crystalline account. An admin can unlink it there.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it.each([
+    ["state", /could not be matched to a link you started/i],
+    ["session", /you were signed out/i],
+    ["denied", /cancelled at GitHub/i],
+    ["failed", /could not be linked/i],
+    ["something-new", /could not be linked/i],
+  ])("says plainly what github_error=%s means", async (code, sentence) => {
+    serveAs("editor", { "/me/github-link": () => linkView() });
+    renderApp(`/profile?github_error=${code}`);
+
+    expect(await screen.findByText(sentence)).toBeInTheDocument();
+  });
+
+  it("confirms a finished link from the query string", async () => {
+    serveAs("editor", { "/me/github-link": () => LINKED });
+    renderApp("/profile?github=linked");
+
+    expect(
+      await screen.findByText("Your GitHub account is linked."),
+    ).toHaveAttribute("role", "status");
+  });
+
+  it("is offered to a viewer too, since a link is who you are at GitHub", async () => {
+    serveAs("viewer", { "/me/github-link": () => linkView() });
+    renderApp("/profile");
+
+    expect(
+      await screen.findByRole("button", { name: "Connect GitHub" }),
+    ).toBeInTheDocument();
+  });
+
+  it("offers no way to link or unlink on a read-only instance", async () => {
+    serveAs("editor", { "/me/github-link": () => LINKED }, { read_only: true });
+    renderApp("/profile");
+
+    expect(await screen.findByText("Linked to @ada-gh")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Unlink GitHub" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Connect GitHub" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("keeps the old identity card without an App", async () => {
+    serveAs("editor");
+    renderApp("/profile");
+
+    expect(
+      await screen.findByRole("button", { name: /connect with github/i }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Connect GitHub" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows the old card's disconnect warning in the server's words", async () => {
+    serveAs("editor", {
+      "/me/github-identity": (_path, init) =>
+        init?.method === "DELETE"
+          ? identityPayload({
+              warning: "unlinked here; revoke it in your GitHub settings",
+            })
+          : CONNECTED,
+    });
+    renderApp("/profile");
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Disconnect" }),
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: /confirm disconnect/i }),
+    );
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "unlinked here; revoke it in your GitHub settings",
+    );
   });
 });

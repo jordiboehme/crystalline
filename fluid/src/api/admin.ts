@@ -28,8 +28,11 @@ import type {
   ArchiveReport as ArchiveReportWire,
   CreateDomainWireBody,
   GithubIdentityResponse,
+  GithubLinkResponse,
   GithubStatusResponse,
+  GithubUnlinkResponse,
   RenameWireBody,
+  StartGithubLinkResponse,
 } from "./model";
 
 /**
@@ -233,6 +236,11 @@ export interface GithubIdentity {
    * exactly one read after the flow ends, then cleared.
    */
   error: string | null;
+  /**
+   * Only on a disconnect that unlinked through the GitHub App and could not
+   * revoke the token at GitHub, in the server's words; null otherwise.
+   */
+  warning: string | null;
 }
 
 /**
@@ -266,6 +274,7 @@ export function readMyGithubIdentity(payload: unknown): GithubIdentity {
     tokenStore: asString(record?.token_store),
     pending: readPending(record?.pending),
     error: asString(record?.error),
+    warning: asString(record?.warning),
   };
 }
 
@@ -327,6 +336,78 @@ export async function disconnectMyGithubIdentity(): Promise<GithubIdentity> {
       method: "DELETE",
     }),
   );
+}
+
+/**
+ * The caller's link to a GitHub account through the instance's GitHub App, as
+ * the profile card renders it. No token material, ever.
+ */
+export interface GithubLink {
+  /** Whether this instance has a GitHub App to link through at all. */
+  appConfigured: boolean;
+  /** Whether the account is linked. */
+  linked: boolean;
+  /** The GitHub login last seen for the linked account. */
+  login: string | null;
+  /** When the link was made, RFC 3339. */
+  linkedAt: string | null;
+  /** False once GitHub no longer takes the link's token; linking again fixes it. */
+  tokenLive: boolean;
+  /** A link device flow started from the command line, waiting for its browser half. */
+  pending: GithubPending | null;
+  /** That device flow's failure, in the server's words, reported once. */
+  error: string | null;
+}
+
+/**
+ * The cache key of the caller's own GitHub link. Its own key, beside the
+ * identity's: the two are read by the same card but answer different routes.
+ */
+export const MY_GITHUB_LINK_KEY = ["me-github-link"] as const;
+
+/**
+ * Read a link payload, whatever arrived. Defensive for the reason
+ * {@link readMyGithubIdentity} is: a missing field leaves the card on "no App"
+ * or "not linked" rather than throwing inside a render.
+ */
+export function readMyGithubLink(payload: unknown): GithubLink {
+  const record = asObject(payload);
+  return {
+    appConfigured: record?.app_configured === true,
+    linked: record?.linked === true,
+    login: asString(record?.login),
+    linkedAt: asString(record?.linked_at),
+    tokenLive: record?.token_live === true,
+    pending: readPending(record?.pending),
+    error: asString(record?.error),
+  };
+}
+
+/** The caller's own link, and whether there is an App to link through. */
+export async function fetchMyGithubLink(): Promise<GithubLink> {
+  return readMyGithubLink(await api<GithubLinkResponse>("/me/github-link"));
+}
+
+/**
+ * Start linking through the App's web flow: answers GitHub's authorize url,
+ * which the page navigates the whole browser to.
+ */
+export async function startMyGithubLink(): Promise<string> {
+  const started = await api<StartGithubLinkResponse>("/me/github-link/start", {
+    method: "POST",
+  });
+  return started.authorize_url;
+}
+
+/**
+ * Unlink the caller's own account. Answers the server's warning when GitHub
+ * could not revoke the token, else null.
+ */
+export async function unlinkMyGithubLink(): Promise<string | null> {
+  const answer = await api<GithubUnlinkResponse>("/me/github-link", {
+    method: "DELETE",
+  });
+  return asString(asObject(answer)?.warning);
 }
 
 /** Which of the three kinds of domain is being registered. */

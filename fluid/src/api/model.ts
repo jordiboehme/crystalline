@@ -62,6 +62,11 @@ export type { GithubStatusResponse } from "./gen";
 
 /** What `GET /me/github-identity` and every identity verb answer with. */
 export type { GithubIdentityResponse } from "./gen";
+export type {
+  GithubLinkResponse,
+  GithubUnlinkResponse,
+  StartGithubLinkResponse,
+} from "./gen";
 
 /** What an archive preview and an archive import both answer with. */
 export type { ArchiveReport } from "./gen";
