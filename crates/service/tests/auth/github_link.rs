@@ -556,6 +556,24 @@ async fn the_callback_needs_a_session() {
     );
     assert_eq!(github.token_hits(), 0);
     assert!(ctx.link_of("ann").await.is_none());
+
+    // The usual way to lose it: a cookie the server has since forgotten.
+    let state = ctx.started_state(&ann).await;
+    let csrf = ctx.csrf(&ann).await;
+    let logout = ctx
+        .client
+        .post(ctx.url("/auth/logout"))
+        .header(reqwest::header::COOKIE, cookie_header(&ann))
+        .header("x-csrf-token", csrf)
+        .send()
+        .await
+        .unwrap();
+    assert!(logout.status().is_success(), "{}", logout.status());
+    let response = ctx.callback(&ann, "code-1", &state).await;
+    assert_eq!(response.status(), 303);
+    assert_eq!(location(&response), "/profile?github_error=session");
+    assert_eq!(github.token_hits(), 0);
+    assert!(ctx.link_of("ann").await.is_none());
 }
 
 /// A callback without a state, or naming one nobody started, lands on the

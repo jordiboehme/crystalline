@@ -238,10 +238,10 @@ const LINK_ERRORS: Record<string, string> = {
 function landingNotice(params: URLSearchParams): Notice | null {
   const code = params.get("github_error");
   if (code !== null) {
-    return {
-      kind: "problem",
-      text: LINK_ERRORS[code] ?? LINK_ERRORS.failed ?? "",
-    };
+    // Own keys only: the code comes from the address, and a name such as
+    // `constructor` must not reach the object's prototype.
+    const known = Object.hasOwn(LINK_ERRORS, code) ? LINK_ERRORS[code] : null;
+    return { kind: "problem", text: known ?? LINK_ERRORS.failed ?? "" };
   }
   if (params.get("github") === "linked") {
     return { kind: "done", text: "Your GitHub account is linked." };

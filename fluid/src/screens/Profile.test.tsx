@@ -1390,6 +1390,7 @@ describe("the GitHub App link card", () => {
     ["denied", /cancelled at GitHub/i],
     ["failed", /could not be linked/i],
     ["something-new", /could not be linked/i],
+    ["constructor", /could not be linked/i],
   ])("says plainly what github_error=%s means", async (code, sentence) => {
     serveAs("editor", { "/me/github-link": () => linkView() });
     renderApp(`/profile?github_error=${code}`);
