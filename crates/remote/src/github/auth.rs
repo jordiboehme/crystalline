@@ -597,8 +597,6 @@ fn auth_client() -> reqwest::Client {
         .expect("the client config here is static and always valid")
 }
 
-/// Parses a device flow response body as JSON, mapping a non-2xx status or
-/// a malformed body to [`RemoteError::Api`].
 /// What a device flow is refused with when the app on GitHub has Device
 /// Flow switched off (GitHub's `device_flow_disabled`). Neutral about the
 /// kind of app: a surface that knows it is a GitHub App names the setting
@@ -639,6 +637,8 @@ async fn parse_device_json<T: serde::de::DeserializeOwned>(
     })
 }
 
+/// Parses a device flow response body as JSON, mapping a non-2xx status or
+/// a malformed body to [`RemoteError::Api`].
 async fn parse_auth_json<T: serde::de::DeserializeOwned>(
     response: reqwest::Response,
 ) -> Result<T, RemoteError> {

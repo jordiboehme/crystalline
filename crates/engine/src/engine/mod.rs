@@ -7388,7 +7388,7 @@ mod github;
 pub use github::OAUTH_IDENTITY_UNDER_APP;
 mod github_app;
 pub use github_app::{
-    APP_FROM_ENV, AppClock, AppHome, AppRemoval, GithubAppStatus, marker_names_host,
+    APP_FROM_ENV, AppClock, AppHome, AppRemoval, GithubAppStatus, UnusableApp, marker_names_host,
 };
 #[cfg(any(test, feature = "testing"))]
 pub use github_app::{AppKeychainSeam, AppLookupFn};

@@ -3663,9 +3663,26 @@ pub async fn connect_github(
             state_dir.clone(),
             token_store_dir.is_some(),
         );
-        if let Some(credentials) = home.configured(&loaded.overlay)? {
-            let app = crystalline_remote::GithubApp::new(api_url.clone(), credentials)
-                .map_err(|e| anyhow!("{e}"))?;
+        let app = match home.configured(&loaded.overlay) {
+            Ok(None) => None,
+            Ok(Some(credentials)) => Some(
+                crystalline_remote::GithubApp::new(api_url.clone(), credentials)
+                    .map_err(|e| e.to_string()),
+            ),
+            // Nothing says an App is configured, only its file store could
+            // not be read: a connect goes on as without an App, as it did
+            // before there were Apps.
+            Err(unusable) if unusable.only_unreadable_store && !disconnect => {
+                tracing::warn!(
+                    "the GitHub App store could not be read ({unusable}); connecting without a GitHub App"
+                );
+                None
+            }
+            // An App that cannot be used refuses a connect, while a
+            // disconnect still removes the link and the token, unrevoked.
+            Err(unusable) => Some(Err(unusable.to_string())),
+        };
+        if let Some(app) = app {
             let person = PersonalApp {
                 app,
                 identity,
@@ -3833,7 +3850,9 @@ const APP_DEVICE_FLOW_DISABLED: &str = "GitHub refused the sign-in because Devic
 /// account linked to another account is refused before a token is stored,
 /// and a failed token save marks the row's token gone.
 struct PersonalApp<'a> {
-    app: crystalline_remote::GithubApp,
+    /// The App, or why it cannot be used: a connect is then refused, and a
+    /// disconnect goes ahead without the revoke.
+    app: std::result::Result<crystalline_remote::GithubApp, String>,
     identity: &'a crystalline_remote::TokenIdentity,
     token_host: Option<&'a str>,
     state_dir: &'a Path,
@@ -3888,9 +3907,10 @@ impl PersonalApp<'_> {
     }
 
     async fn connect(&self, json: bool) -> Result<()> {
+        let app = self.app.as_ref().map_err(|e| anyhow!("{e}"))?;
         let accounts = self.link_target().await?;
-        let credentials = self.app.credentials();
-        let auth_base = self.app.auth_base();
+        let credentials = app.credentials();
+        let auth_base = app.auth_base();
         let grant = device_flow_grant(auth_base, &credentials.client_id, None)
             .await
             .map_err(|e| {
@@ -3901,7 +3921,7 @@ impl PersonalApp<'_> {
                 }
             })?;
         let user =
-            crystalline_remote::github::auth::github_user(self.app.api_url(), &grant.access_token)
+            crystalline_remote::github::auth::github_user(app.api_url(), &grant.access_token)
                 .await
                 .map_err(|e| anyhow!("{e}"))?;
         let name = self.name();
@@ -3995,10 +4015,14 @@ impl PersonalApp<'_> {
     }
 
     /// Revokes the identity's App user token at GitHub, removes its link
-    /// and deletes the token, like `Engine::unlink_github`; the owner has no
-    /// link and only its token goes. The revoke is best effort: when GitHub
-    /// cannot be reached, refuses it or the App has no client secret, the
-    /// rest still happens and the person is told to revoke it themselves.
+    /// and deletes the token; the owner has no link and only its token goes.
+    /// The revoke is best effort: when GitHub cannot be reached, refuses it,
+    /// the App has no client secret or cannot be used at all, the rest still
+    /// happens and the person is told to revoke it themselves. A token that
+    /// cannot be deleted fails the disconnect.
+    ///
+    /// A copy of `Engine::unlink_github` for a terminal, which opens no
+    /// engine (crates/engine/src/engine/github.rs): keep the two aligned.
     async fn disconnect(&self, json: bool) -> Result<()> {
         use crystalline_service::engine::GithubUnlink;
         let name = self.name().to_string();
@@ -4011,19 +4035,19 @@ impl PersonalApp<'_> {
             Some(store) => store.github_link_of(&name).await?.is_some(),
             None => false,
         };
-        let token = match self.token_store_dir {
-            Some(dir) => crystalline_remote::TokenStore::file_fallback_for(self.identity, dir)
-                .and_then(|store| store.load())
-                .map_err(|e| anyhow!("{e}"))?,
-            None => {
-                crystalline_remote::TokenStore::resolve_and_load_for(
-                    self.identity,
-                    self.token_host,
-                    self.state_dir,
-                )
-                .map_err(|e| anyhow!("{e}"))?
-                .1
+        let (store, token) = match self.token_store_dir {
+            Some(dir) => {
+                let store = crystalline_remote::TokenStore::file_fallback_for(self.identity, dir)
+                    .map_err(|e| anyhow!("{e}"))?;
+                let token = store.load().map_err(|e| anyhow!("{e}"))?;
+                (store, token)
             }
+            None => crystalline_remote::TokenStore::resolve_and_load_for(
+                self.identity,
+                self.token_host,
+                self.state_dir,
+            )
+            .map_err(|e| anyhow!("{e}"))?,
         };
         let outcome = match &token {
             Some(token) if self.revoke(&name, &token.access_token).await => GithubUnlink::Unlinked,
@@ -4036,9 +4060,19 @@ impl PersonalApp<'_> {
         if linked && let Some(store) = &accounts {
             store.unlink_github(&name).await?;
         }
-        match self.token_store_dir {
-            Some(dir) => forget_file_credential(self.identity, dir),
-            None => forget_credential(self.identity, self.token_host, self.state_dir),
+        if token.is_some() {
+            store.delete().map_err(|e| {
+                anyhow!("the GitHub token of {name} could not be deleted ({e}); run the disconnect again")
+            })?;
+        }
+        // The file a keychain failure at connect time left behind, which a
+        // keychain that works again would not resolve to.
+        if self.token_store_dir.is_none() {
+            crystalline_remote::TokenStore::file_fallback_for(self.identity, self.state_dir)
+                .and_then(|file| file.delete())
+                .map_err(|e| {
+                    anyhow!("the GitHub token file of {name} could not be deleted ({e}); run the disconnect again")
+                })?;
         }
         let told = notify_daemon_forgot(self.identity).await;
         if json {
@@ -4072,7 +4106,16 @@ impl PersonalApp<'_> {
     /// Revokes `access_token` at GitHub through the App. True when GitHub
     /// revoked it (or no longer knew it).
     async fn revoke(&self, name: &str, access_token: &str) -> bool {
-        let credentials = self.app.credentials();
+        let app = match &self.app {
+            Ok(app) => app,
+            Err(e) => {
+                tracing::warn!(
+                    "the GitHub App cannot be used ({e}), so the GitHub token of {name} could not be revoked"
+                );
+                return false;
+            }
+        };
+        let credentials = app.credentials();
         let Some(secret) = credentials.client_secret.as_deref() else {
             tracing::warn!(
                 "the GitHub App has no client secret, so the GitHub token of {name} could not be revoked"
@@ -4080,7 +4123,7 @@ impl PersonalApp<'_> {
             return false;
         };
         match crystalline_remote::github::auth::revoke_user_token(
-            self.app.api_url(),
+            app.api_url(),
             &credentials.client_id,
             secret,
             access_token,

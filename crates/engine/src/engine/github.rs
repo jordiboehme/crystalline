@@ -1082,6 +1082,10 @@ impl Engine {
     /// The answer says which of the three happened, so a surface can tell
     /// the person to revoke the token themselves when GitHub did not
     /// ([`GithubUnlink::warning`]).
+    ///
+    /// `connect github --personal --disconnect` repeats these steps in the
+    /// CLI, which opens no engine (`PersonalApp::disconnect` in
+    /// crates/cli/src/cmd.rs): keep the two aligned.
     pub async fn unlink_github(&self, account: &str) -> Result<GithubUnlink> {
         let identity = personal_identity(account)?;
         if self.read_only {

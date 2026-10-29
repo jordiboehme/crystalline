@@ -397,3 +397,60 @@ fn without_an_app_the_personal_connect_uses_the_oauth_client() {
     assert_eq!(codes[0]["client_id"], OAUTH_CLIENT_ID);
     assert_eq!(codes[0]["scope"], "repo");
 }
+
+/// An App that is configured but cannot be used (here the environment's
+/// private key is not a key) does not stop a disconnect: the link and the
+/// token go, nothing is revoked, and the person is told to revoke it.
+#[test]
+fn a_disconnect_with_an_unusable_app_still_unlinks_and_says_to_revoke() {
+    let world = World::new();
+    world.add_account("ada");
+    assert!(world.connect(&["--as", "ada"]).status.success());
+
+    let out = world
+        .bin()
+        .env("CRYSTALLINE_GITHUB_APP_PRIVATE_KEY", "not a key")
+        .args([
+            "connect",
+            "github",
+            "--personal",
+            "--as",
+            "ada",
+            "--disconnect",
+        ])
+        .arg("--config")
+        .arg(&world.config)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let stdout = text(&out.stdout);
+    assert!(
+        stdout.contains("GitHub could not be reached to revoke the token"),
+        "{stdout}"
+    );
+    assert!(
+        world.github.seen().revoked.is_empty(),
+        "nothing to revoke with"
+    );
+    assert!(world.links().is_empty(), "the link is gone");
+    assert!(!world.token_file("ada").exists(), "the token is gone");
+}
+
+/// Without an App in the environment and without a keychain marker, an App
+/// file store that cannot be read is no App: the OAuth connect works as it
+/// did before.
+#[test]
+fn an_unreadable_app_store_without_a_marker_leaves_the_oauth_connect_as_it_was() {
+    let world = World::new();
+    std::fs::write(world.tokens.join("github-app.json"), "not json").unwrap();
+    let out = world
+        .bare()
+        .args(["connect", "github", "--personal", "--token", "ghp_pasted"])
+        .arg("--config")
+        .arg(&world.config)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let saved = read_json(&world.token_file("owner"));
+    assert_eq!(saved["access_token"], "ghp_pasted");
+}

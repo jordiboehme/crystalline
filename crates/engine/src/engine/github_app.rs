@@ -130,6 +130,36 @@ pub struct AppHome {
     seam: Option<AppKeychainSeam>,
 }
 
+/// An App that is configured but cannot be used, from
+/// [`AppHome::configured`].
+#[derive(Debug)]
+pub struct UnusableApp {
+    /// Why it cannot be used, as an origin operation is refused.
+    pub error: EngineError,
+    /// Nothing says an App is configured here (no App in the environment,
+    /// no keychain marker for this host): only the App file store could not
+    /// be read. A caller that would otherwise go on without an App may.
+    pub only_unreadable_store: bool,
+}
+
+impl UnusableApp {
+    /// An App the environment or the keychain marker says is configured.
+    fn known(error: EngineError) -> UnusableApp {
+        UnusableApp {
+            error,
+            only_unreadable_store: false,
+        }
+    }
+}
+
+impl std::fmt::Display for UnusableApp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl std::error::Error for UnusableApp {}
+
 /// What [`AppHome::remove`] did.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppRemoval {
@@ -208,13 +238,16 @@ impl AppHome {
     /// environment's, else the saved one, decided the way the engine loads
     /// its App. `Ok(None)` when none is configured, and also when the
     /// keychain could not be read and its marker does not say an App is
-    /// saved there. Refused when the environment's App cannot be used, when
-    /// the App store cannot be read, and while the keychain that holds the
-    /// App does not answer.
-    pub fn configured(&self, overlay: &EnvOverlay) -> Result<Option<AppCredentials>> {
+    /// saved there. An [`UnusableApp`] when the environment's App cannot be
+    /// used, when the App store cannot be read, and while the keychain that
+    /// holds the App does not answer.
+    pub fn configured(
+        &self,
+        overlay: &EnvOverlay,
+    ) -> StdResult<Option<AppCredentials>, UnusableApp> {
         match overlay.github_app(self.api_url.as_deref()) {
             Some(Ok(credentials)) => return Ok(Some(credentials)),
-            Some(Err(detail)) => return Err(app_refusal(detail)),
+            Some(Err(detail)) => return Err(UnusableApp::known(app_refusal(detail))),
             None => {}
         }
         match self.lookup() {
@@ -226,11 +259,18 @@ impl AppHome {
                 keychain_failed: Some(_),
                 marker: Some(marker),
                 ..
-            }) if marker_names_host(&marker, self.api_url.as_deref()) => {
-                Err(app_refusal(KEYCHAIN_REFUSAL.to_string()))
-            }
+            }) if marker_names_host(&marker, self.api_url.as_deref()) => Err(UnusableApp::known(
+                app_refusal(KEYCHAIN_REFUSAL.to_string()),
+            )),
             Ok(_) => Ok(None),
-            Err(e) => Err(app_refusal(detail_of(e))),
+            Err(e) => {
+                let marked = crystalline_remote::read_marker(&self.dir)
+                    .is_some_and(|marker| marker_names_host(&marker, self.api_url.as_deref()));
+                Err(UnusableApp {
+                    error: app_refusal(detail_of(e)),
+                    only_unreadable_store: !marked,
+                })
+            }
         }
     }
 
