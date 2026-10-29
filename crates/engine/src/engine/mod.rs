@@ -4281,7 +4281,15 @@ impl Engine {
             // by this domain's readers.
             let mut held_pages: Vec<String> = Vec::new();
             let attempt: Result<crystalline_remote::reflections_backup::BackupOutcome> = async {
-                held_pages = self.too_wide_pages(&domain).await?;
+                let (spec, root, state_dir) = self.origin_spec_for_domain(&domain)?;
+                // Decided from the bytes that go out as well as from the
+                // index: a file edited on disk before the index read it is
+                // held back too.
+                let files = crystalline_remote::reflections_backup::collect_backup(&spec, &root)?;
+                let mut pages: BTreeSet<String> =
+                    self.too_wide_pages(&domain).await?.into_iter().collect();
+                pages.extend(self.too_wide_in_files(&domain, &spec, &files).await?);
+                held_pages = pages.into_iter().collect();
                 let assets = self.held_assets(&domain, &held_pages).await?;
                 let held: std::collections::BTreeSet<String> = held_pages
                     .iter()
@@ -4294,13 +4302,12 @@ impl Engine {
                     })
                     .chain(assets)
                     .collect();
-                let (spec, root, state_dir) = self.origin_spec_for_domain(&domain)?;
-                Ok(crystalline_remote::reflections_backup::backup_reflections(
+                Ok(crystalline_remote::reflections_backup::backup_collected(
                     provider.as_ref(),
                     &spec,
-                    &root,
                     &state_dir,
                     &format!("Back up the Reflection of {domain}"),
+                    files,
                     &held,
                 )
                 .await?)

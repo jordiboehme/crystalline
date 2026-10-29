@@ -2056,25 +2056,25 @@ impl Engine {
                 needs,
             }));
         }
-        match p.disclosed.as_deref().filter(|_| by.is_some()) {
+        // The readers of the page's repository the person was asked about:
+        // what their confirmation records.
+        let mut asked_repo_readers = None;
+        if by.is_some() && !needs.is_empty() {
+            let shown = super::disclosure::WritePreview {
+                text: final_text.clone(),
+                needs: needs.clone(),
+            };
+            let asked = self.asked_for_preview(&p.domain, &p.path, &shown).await?;
             // The person said yes to these readers: still them?
-            Some(basis) if !needs.is_empty() => {
-                let shown = super::disclosure::WritePreview {
-                    text: final_text.clone(),
-                    needs: needs.clone(),
-                };
-                if self
-                    .ask_for_preview(&p.domain, &p.path, &shown)
-                    .await?
-                    .basis
-                    != basis
-                {
-                    return Err(EngineError::Conflict(
-                        super::disclosure::DISCLOSURE_CHANGED.into(),
-                    ));
-                }
+            if let Some(basis) = p.disclosed.as_deref()
+                && asked.ask.basis != basis
+            {
+                return Err(EngineError::Conflict(
+                    super::disclosure::DISCLOSURE_CHANGED.into(),
+                ));
             }
-            _ => {}
+            self.refuse_unknown_repository_readers(&p.domain, asked.repo_readers.as_ref())?;
+            asked_repo_readers = asked.repo_readers;
         }
         let mut confirmed: Vec<String> = if by.is_some() {
             needs.into_iter().map(|(_, source)| source).collect()
@@ -2146,6 +2146,7 @@ impl Engine {
             &final_text,
             &confirmed,
             by.as_deref(),
+            asked_repo_readers,
         )
         .await?;
         self.mark_reflection_dirty(&p.domain, BackupCause::Settled);

@@ -302,46 +302,57 @@ impl Engine {
             };
             (store.list_reflections(id).await?, id)
         };
-        let disclosures = self.reflection_disclosures(id).await?;
-        let table = self.name_table_now().await;
-        let mut covers: HashMap<String, bool> = HashMap::new();
+        let mut check = TooWide::new(self, domain, id).await?;
         let mut out = Vec::new();
         for row in rows {
-            let mut wide = false;
-            for record in r::read_provenance(&row.content).into_values() {
-                for src in &record.sources {
-                    let Some(name) = src.domain.as_deref() else {
-                        continue;
-                    };
-                    let Some(local) = self.checkable_domain(&table, name) else {
-                        continue;
-                    };
-                    if local == domain {
-                        continue;
-                    }
-                    let covered = match covers.get(&local) {
-                        Some(covered) => *covered,
-                        None => {
-                            let covered = self.readers_cover(domain, &local).await?;
-                            covers.insert(local.clone(), covered);
-                            covered
-                        }
-                    };
-                    // A person shared it on purpose, for the readers and the
-                    // repository the page has now (`source_covered`).
-                    let covered = covered
-                        || self
-                            .source_covered_on_page(domain, &row.path, &local, name, &disclosures)
-                            .await?;
-                    wide |= !covered;
-                }
-            }
-            if wide {
+            if check.text(&row.path, &row.content).await? {
                 out.push(row.path);
             }
         }
         out.sort();
         Ok(out)
+    }
+
+    /// The pages of `domain` (by path inside `reflections/`, sorted) whose
+    /// bytes among `files` (a backup's collected files, by repo path, see
+    /// [`crystalline_remote::reflections_backup::collect_backup`]) cite a
+    /// domain fewer people may read: the page's own file, or its baseline,
+    /// which mirrors it. What [`Engine::too_wide_pages`] says of the index,
+    /// said of what is about to go out, so a file edited on disk before the
+    /// index read it is held back too.
+    pub(crate) async fn too_wide_in_files(
+        &self,
+        domain: &str,
+        spec: &crystalline_remote::provider::OriginSpec,
+        files: &BTreeMap<String, Vec<u8>>,
+    ) -> Result<Vec<String>> {
+        let Some(id) = self.store.lock().await.domain_id(domain).await? else {
+            return Ok(Vec::new());
+        };
+        let mut check = TooWide::new(self, domain, id).await?;
+        let mut out = BTreeSet::new();
+        for (repo_path, bytes) in files {
+            let Some(inner) =
+                crystalline_remote::reflections_backup::reflection_path(spec, repo_path)
+            else {
+                continue;
+            };
+            let page = match r::classify(inner) {
+                r::ReflectionFile::Page(page) => page,
+                r::ReflectionFile::Baseline { of } if r::validate_reflection_path(&of).is_ok() => {
+                    of
+                }
+                _ => continue,
+            };
+            if out.contains(&page) {
+                continue;
+            }
+            let text = String::from_utf8_lossy(bytes);
+            if check.text(&page, &text).await? {
+                out.insert(page);
+            }
+        }
+        Ok(out.into_iter().collect())
     }
 
     /// Every open item of one domain's Reflection, unranked, as `scope`
@@ -1432,5 +1443,65 @@ impl Engine {
             crate::maintenance::record_reflect_open_under(&state_dir, &counts);
         }
         Ok(counts)
+    }
+}
+
+/// One domain's too-wide check, with what it reads once: the confirmations
+/// on its pages, the name table and each source domain's coverage.
+struct TooWide<'a> {
+    engine: &'a Engine,
+    domain: &'a str,
+    disclosures: super::disclosure::Disclosures,
+    table: Arc<crystalline_core::names::NameTable>,
+    covers: HashMap<String, bool>,
+}
+
+impl<'a> TooWide<'a> {
+    async fn new(engine: &'a Engine, domain: &'a str, id: DomainId) -> Result<TooWide<'a>> {
+        Ok(TooWide {
+            engine,
+            domain,
+            disclosures: engine.reflection_disclosures(id).await?,
+            table: engine.name_table_now().await,
+            covers: HashMap::new(),
+        })
+    }
+
+    /// Whether page `path` with `text` has a section citing a domain fewer
+    /// people may read than the page's own. A source whose domain cannot be
+    /// checked here is not counted, as in the queue.
+    async fn text(&mut self, path: &str, text: &str) -> Result<bool> {
+        let (engine, domain) = (self.engine, self.domain);
+        for record in r::read_provenance(text).into_values() {
+            for src in &record.sources {
+                let Some(name) = src.domain.as_deref() else {
+                    continue;
+                };
+                let Some(local) = engine.checkable_domain(&self.table, name) else {
+                    continue;
+                };
+                if local == domain {
+                    continue;
+                }
+                let covered = match self.covers.get(&local) {
+                    Some(covered) => *covered,
+                    None => {
+                        let covered = engine.readers_cover(domain, &local).await?;
+                        self.covers.insert(local.clone(), covered);
+                        covered
+                    }
+                };
+                // A person shared it on purpose, for the readers and the
+                // repository the page has now (`source_covered`).
+                let covered = covered
+                    || engine
+                        .source_covered_on_page(domain, path, &local, name, &self.disclosures)
+                        .await?;
+                if !covered {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 }

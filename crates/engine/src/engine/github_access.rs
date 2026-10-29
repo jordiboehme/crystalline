@@ -134,8 +134,13 @@ pub struct RepoReaders {
     /// Whether it is internal (GitHub Enterprise): every member of the
     /// enterprise reads it, and the listing does not name them.
     pub internal: bool,
-    /// The GitHub ids of every collaborator with read or more.
+    /// The GitHub ids of every collaborator with read or more: who reads it
+    /// for certain, what a source repository counts.
     pub github_ids: HashSet<u64>,
+    /// The GitHub ids of every person the listing names, whatever their
+    /// role resolves to here (a custom role read as no access included):
+    /// who may read it, what a page repository counts.
+    pub listed_ids: HashSet<u64>,
 }
 
 /// What a webhook (or a change here) says is no longer true, so the
@@ -658,6 +663,7 @@ impl GithubGovernor {
                 .filter(|(_, (_, role))| level_for(*role) != MemberLevel::None)
                 .map(|(id, _)| *id)
                 .collect(),
+            listed_ids: snapshot.people.keys().copied().collect(),
         })
     }
 
@@ -1984,6 +1990,7 @@ mod tests {
                 public: true,
                 internal: false,
                 github_ids: [1, 5].into(),
+                listed_ids: [1, 5, 6].into(),
             })
         );
         assert!(rig.governor.repository_public(DOMAIN).await);
@@ -2003,6 +2010,7 @@ mod tests {
                 public: false,
                 internal: true,
                 github_ids: [1].into(),
+                listed_ids: [1].into(),
             })
         );
         assert!(!rig.governor.repository_public(DOMAIN).await);

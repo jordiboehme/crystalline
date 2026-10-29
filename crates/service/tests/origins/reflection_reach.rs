@@ -394,3 +394,166 @@ async fn a_new_collaborator_drops_the_page_from_the_backup_branch() {
         vec!["overview.md".to_string()]
     );
 }
+
+/// What a confirmed write is refused with while nobody knows who reads the
+/// page's repository.
+const REPO_UNKNOWN: &str =
+    "who reads this page's GitHub repository is not known right now; try again later";
+
+/// A person's yes is recorded for the readers of the page's repository. When
+/// they are not known, nothing can be recorded, so the yes is refused and
+/// nothing is written.
+#[tokio::test]
+async fn a_confirmed_write_is_refused_while_the_page_repository_readers_are_unknown() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (forge, eng, _) = setup(tmp.path(), &app_env()).await;
+    collaborators(&forge, "acme/kb", &[1, 2]);
+    collaborators(&forge, "acme/vault", &[1]);
+    forge.collaborators_down.store(true, Ordering::SeqCst);
+    eng.invalidate_github_access(Invalidate::All);
+    let mut p = cite("kb", ROTA);
+    let ask = eng
+        .reflection_disclosure_question(&p, &owner())
+        .await
+        .unwrap()
+        .expect("a question");
+    p.disclosed = Some(ask.basis);
+    let err = write(&eng, &p).await.unwrap_err();
+    assert!(err.contains(REPO_UNKNOWN), "{err}");
+    assert!(!tmp.path().join("kb/reflections/overview.md").exists());
+}
+
+/// The backup pushes bytes, so it decides from them: a page file edited on
+/// disk with a too wide source before the index read it is not pushed.
+#[tokio::test]
+async fn a_page_edited_on_disk_before_the_index_reads_it_is_not_pushed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (forge, eng, _, kb) = setup_with_page_repo(tmp.path(), &app_env()).await;
+    collaborators(&forge, "acme/kb", &[1, 2]);
+    collaborators(&forge, "acme/vault", &[1]);
+    write(
+        &eng,
+        &WriteReflectionParams {
+            domain: "kb".into(),
+            path: "a.md".into(),
+            markdown: Some("# A\n\n## One\n\nText.\n".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("kb/reflections/forged.md"),
+        "---\nreflection:\n  aaaa1111:\n    sources:\n    - domain: vault\n      engram: team/rota\n      checksum: abc\n---\n\n# Forged\n\n## Team\n<!-- r:aaaa1111 -->\n\nFive.\n",
+    )
+    .unwrap();
+    eng.mark_reflection_dirty(
+        "kb",
+        crystalline_service::reflection_backup::BackupCause::Settled,
+    );
+    eng.reflection_backup_tick(Instant::now() + Duration::from_secs(120))
+        .await;
+    let head = kb.commit_paths(&kb.branch_commit(BACKUP_BRANCH).unwrap());
+    assert!(head.contains(&"reflections/a.md".to_string()), "{head:?}");
+    assert!(!head.iter().any(|p| p.contains("forged")), "{head:?}");
+    assert_eq!(
+        eng.reflection_backup_held_back("kb"),
+        vec!["forged.md".to_string()]
+    );
+}
+
+/// A person the page's repository lists with a role this instance does not
+/// read as read access (a custom role) still counts as a reader of the page:
+/// only the source side drops them.
+#[tokio::test]
+async fn every_listed_person_of_the_page_repository_counts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (forge, eng, _) = setup(tmp.path(), &app_env()).await;
+    forge.collaborators.lock().unwrap().insert(
+        "acme/kb".to_string(),
+        vec![
+            json!({"id": 1, "login": "gh-1", "role_name": "read"}),
+            json!({"id": 2, "login": "gh-2", "role_name": "auditor"}),
+        ],
+    );
+    collaborators(&forge, "acme/vault", &[1]);
+    let err = write(&eng, &cite("kb", ROTA)).await.unwrap_err();
+    assert!(err.contains("fewer people may read"), "{err}");
+}
+
+/// Only the page side's listing unknown (the App left the page's
+/// repository): refused.
+#[tokio::test]
+async fn an_unknown_page_repository_listing_alone_fails_closed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (forge, eng, _) = setup(tmp.path(), &app_env()).await;
+    collaborators(&forge, "acme/kb", &[1]);
+    collaborators(&forge, "acme/vault", &[1, 2]);
+    write(&eng, &cite("kb", ROTA)).await.unwrap();
+    forge.uninstall("acme/kb");
+    eng.invalidate_github_access(Invalidate::All);
+    let err = write(&eng, &cite("kb", ROTA)).await.unwrap_err();
+    assert!(err.contains("fewer people may read"), "{err}");
+}
+
+/// Two spellings of one repository are one repository: no listing needed.
+#[tokio::test]
+async fn two_spellings_of_one_repository_read_alike() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mono = repo(&["a/", "b/"]);
+    let (forge, url) = spawn_forge(
+        &[("acme/kb", mono.clone()), ("Acme/KB", mono)],
+        &[("acme/kb", 1), ("Acme/KB", 1)],
+        &[(1, "ghs_test")],
+    )
+    .await;
+    let eng = Arc::new(super::github_app::engine(tmp.path(), &url, &app_env()).await);
+    for (spelled, d) in [("acme/kb", "a"), ("Acme/KB", "b")] {
+        eng.origin_add(
+            spelled,
+            Some(d),
+            Some(d),
+            None,
+            Some(tmp.path().join(d).to_str().unwrap()),
+            Some(crystalline_service::params::Readers::Shared),
+        )
+        .await
+        .unwrap();
+    }
+    let auth = Arc::new(AuthStore::open(&tmp.path().join("auth.db")).await.unwrap());
+    eng.set_domain_access(Arc::new(
+        DomainAccess::new(auth).with_governor(eng.knowledge_governor()),
+    ));
+    forge.collaborators_down.store(true, Ordering::SeqCst);
+    eng.invalidate_github_access(Invalidate::All);
+    write(&eng, &cite("a", "crystalline://b/team/rota"))
+        .await
+        .unwrap();
+    write(&eng, &cite("b", "crystalline://a/team/rota"))
+        .await
+        .unwrap();
+}
+
+/// An unattended run reads only what every reader of the domain it works on
+/// may read, the page repository's readers on GitHub included.
+#[tokio::test]
+async fn an_unattended_run_does_not_read_a_narrower_repository() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (forge, eng, _) = setup(tmp.path(), &app_env()).await;
+    collaborators(&forge, "acme/kb", &[1, 2]);
+    collaborators(&forge, "acme/vault", &[1]);
+    let limit = eng
+        .read_limit_for(&Scope::Unrestricted, true, None)
+        .await
+        .expect("unattended");
+    assert!(limit.hidden.contains("vault"), "{:?}", limit.hidden);
+    assert!(!limit.hidden.contains("kb"), "{:?}", limit.hidden);
+    // Once the source's repository has every reader of the page's, it reads.
+    collaborators(&forge, "acme/vault", &[1, 2]);
+    eng.invalidate_github_access(Invalidate::All);
+    let limit = eng
+        .read_limit_for(&Scope::Unrestricted, true, None)
+        .await
+        .expect("unattended");
+    assert!(limit.hidden.is_empty(), "{:?}", limit.hidden);
+}

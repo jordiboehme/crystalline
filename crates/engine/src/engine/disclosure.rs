@@ -33,6 +33,14 @@ use crate::scope::{PageReaders, ReflectionCaller, ReflectionRight, Scope};
 /// answer: the person agreed to the readers they were shown.
 pub const DISCLOSURE_CHANGED: &str = "who may read this page, or where it is backed up, changed since the person was asked; ask them again";
 
+/// What a confirmed write or a confirmation from Fluid is refused with while
+/// a GitHub App decides who reads the page's repository and nobody knows
+/// that right now (GitHub down past the stale window, the App not installed
+/// there): a confirmation is recorded for those readers, so none can be
+/// recorded.
+pub const REPO_READERS_UNKNOWN: &str =
+    "who reads this page's GitHub repository is not known right now; try again later";
+
 /// A question a person is asked before text from a narrower domain goes
 /// onto a page, with what their yes is bound to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +51,15 @@ pub struct DisclosureAsk {
     /// was asked about. A confirmation carries it back, and it must still be
     /// what the page has when the confirmation lands.
     pub basis: String,
+}
+
+/// A question with the readers of the page's repository it was asked
+/// about: what a confirmation that answers it records, so the record holds
+/// the very readers the person agreed to and not a later read.
+#[derive(Debug, Clone)]
+pub(crate) struct Asked {
+    pub ask: DisclosureAsk,
+    pub repo_readers: Option<RepositoryReaders>,
 }
 
 /// What a write would put on a page, worked out without writing it: the page
@@ -92,7 +109,8 @@ pub(crate) struct Disclosure {
 }
 
 /// Who read a page's repository on GitHub when a person confirmed: whether
-/// it was public, and the GitHub ids with read or more, sorted.
+/// it was public or internal, and every GitHub id its listing named, sorted
+/// (the page side's count, see [`super::sources::repository_covers`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RepositoryReaders {
     pub public: bool,
@@ -104,7 +122,7 @@ pub(crate) struct RepositoryReaders {
 
 impl RepositoryReaders {
     fn of(readers: &RepoReaders) -> RepositoryReaders {
-        let mut github_ids: Vec<u64> = readers.github_ids.iter().copied().collect();
+        let mut github_ids: Vec<u64> = readers.listed_ids.iter().copied().collect();
         github_ids.sort_unstable();
         RepositoryReaders {
             public: readers.public,
@@ -131,7 +149,7 @@ fn repository_widened_by_nobody(
     }
     !now.public
         && (!now.internal || confirmed.internal)
-        && now.github_ids.iter().all(|id| {
+        && now.listed_ids.iter().all(|id| {
             confirmed.github_ids.binary_search(id).is_ok()
                 || source.is_some_and(|source| source.github_ids.contains(id))
         })
@@ -483,6 +501,18 @@ impl Engine {
         sources: &[String],
         texts: &[String],
     ) -> Result<DisclosureAsk> {
+        Ok(self.disclosure_asked(page, path, sources, texts).await?.ask)
+    }
+
+    /// [`Engine::disclosure_ask_for`] with the readers of the page's
+    /// repository the question was worked out for.
+    pub(crate) async fn disclosure_asked(
+        &self,
+        page: &str,
+        path: &str,
+        sources: &[String],
+        texts: &[String],
+    ) -> Result<Asked> {
         let mut accounts_wide = false;
         let mut gap = BackupGap::default();
         for source in sources {
@@ -523,7 +553,28 @@ impl Engine {
             .to_string()
             .as_bytes(),
         );
-        Ok(DisclosureAsk { question, basis })
+        Ok(Asked {
+            ask: DisclosureAsk { question, basis },
+            repo_readers,
+        })
+    }
+
+    /// Refuses recording a confirmation on a page of `page` for
+    /// `repo_readers` (the readers of its repository the question was asked
+    /// about) when a GitHub App decides who reads that repository and they
+    /// are not known ([`REPO_READERS_UNKNOWN`]): such a record would hold
+    /// for nothing, and the write would only be held back.
+    pub(crate) fn refuse_unknown_repository_readers(
+        &self,
+        page: &str,
+        repo_readers: Option<&RepositoryReaders>,
+    ) -> Result<()> {
+        let governed =
+            self.on_github(page) && !matches!(self.repository_reach(), RepositoryReach::NoApp);
+        if governed && repo_readers.is_none() {
+            return Err(EngineError::Invalid(REPO_READERS_UNKNOWN.into()));
+        }
+        Ok(())
     }
 
     /// The question for what `preview` needs confirmed: the local names of
@@ -535,6 +586,17 @@ impl Engine {
         path: &str,
         preview: &WritePreview,
     ) -> Result<DisclosureAsk> {
+        Ok(self.asked_for_preview(page, path, preview).await?.ask)
+    }
+
+    /// [`Engine::ask_for_preview`] with the readers of the page's repository
+    /// the question was worked out for.
+    pub(super) async fn asked_for_preview(
+        &self,
+        page: &str,
+        path: &str,
+        preview: &WritePreview,
+    ) -> Result<Asked> {
         let table = self.name_table_now().await;
         let mut sources: Vec<String> = preview
             .needs
@@ -549,7 +611,7 @@ impl Engine {
             .into_iter()
             .filter_map(|id| section_text(&preview.text, id))
             .collect();
-        self.disclosure_ask_for(page, path, &sources, &texts).await
+        self.disclosure_asked(page, path, &sources, &texts).await
     }
 
     /// The question a person is asked before this write lands, when it
@@ -592,8 +654,11 @@ impl Engine {
     /// Record, after a write of page `path` landed with `text`, the
     /// confirmations it carries (`confirmed`: stored source domains, by
     /// `by`), one per person and domain, and drop every recorded one whose
-    /// domain the page no longer cites anywhere. Called under the page's
+    /// domain the page no longer cites anywhere. `repo_readers` are the
+    /// readers of the page's repository the person's question named (the
+    /// basis check read them), never a later read. Called under the page's
     /// lock.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn record_disclosures(
         &self,
         domain: &str,
@@ -602,6 +667,7 @@ impl Engine {
         text: &str,
         confirmed: &[String],
         by: Option<&str>,
+        repo_readers: Option<RepositoryReaders>,
     ) -> Result<()> {
         let mut list = self
             .reflection_disclosures(id)
@@ -618,7 +684,6 @@ impl Engine {
         if let (Some(by), false) = (by, confirmed.is_empty()) {
             let readers = self.page_readers_now(domain).await?;
             let repo = self.page_repo(domain);
-            let repo_readers = self.page_repository_readers_now(domain).await;
             let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
             for source in confirmed {
                 list.retain(|d| !(d.source == *source && d.by == by));
@@ -748,16 +813,23 @@ impl Engine {
         // still be the question for this page now.
         wide_local.sort();
         let texts: Vec<String> = current.into_iter().collect();
-        if self
-            .disclosure_ask_for(domain, path, &wide_local, &texts)
-            .await?
-            .basis
-            != basis
-        {
+        let asked = self
+            .disclosure_asked(domain, path, &wide_local, &texts)
+            .await?;
+        if asked.ask.basis != basis {
             return Err(EngineError::Conflict(DISCLOSURE_CHANGED.into()));
         }
-        self.record_disclosures(domain, access.domain_id, path, &text, &wide, Some(&by))
-            .await?;
+        self.refuse_unknown_repository_readers(domain, asked.repo_readers.as_ref())?;
+        self.record_disclosures(
+            domain,
+            access.domain_id,
+            path,
+            &text,
+            &wide,
+            Some(&by),
+            asked.repo_readers,
+        )
+        .await?;
         // The page may go to the backup branch now.
         self.mark_reflection_dirty(domain, crate::reflection_backup::BackupCause::Settled);
         let recorded = self.reflection_disclosures(access.domain_id).await?;
@@ -853,6 +925,7 @@ mod tests {
             public,
             internal: false,
             github_ids: ids.iter().copied().collect(),
+            listed_ids: ids.iter().copied().collect(),
         }
     }
 

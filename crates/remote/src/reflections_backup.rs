@@ -203,8 +203,38 @@ pub async fn backup_reflections(
     message: &str,
     held: &BTreeSet<String>,
 ) -> Result<BackupOutcome, RemoteError> {
+    let files = collect_backup(spec, domain_root)?;
+    backup_collected(provider, spec, state_dir, message, files, held).await
+}
+
+/// The files a backup of the domain at `domain_root` pushes, by repo path,
+/// with their bytes: what [`backup_reflections`] reads from disk. A caller
+/// that decides what to hold back from the very bytes that go out reads
+/// them here and hands them to [`backup_collected`].
+pub fn collect_backup(
+    spec: &OriginSpec,
+    domain_root: &Path,
+) -> Result<BTreeMap<String, Vec<u8>>, RemoteError> {
+    collect(domain_root, spec.subpath.as_deref())
+}
+
+/// The path below the Reflection folder of the repo path `path` a backup of
+/// `spec` collected, or `None` when it is not inside it.
+pub fn reflection_path<'a>(spec: &OriginSpec, path: &'a str) -> Option<&'a str> {
+    inner_path(path, prefix(spec))
+}
+
+/// [`backup_reflections`] for `files` read already ([`collect_backup`]):
+/// exactly these bytes go out, less `held`.
+pub async fn backup_collected(
+    provider: &dyn Provider,
+    spec: &OriginSpec,
+    state_dir: &Path,
+    message: &str,
+    mut files: BTreeMap<String, Vec<u8>>,
+    held: &BTreeSet<String>,
+) -> Result<BackupOutcome, RemoteError> {
     let mut state = load(state_dir);
-    let mut files = collect(domain_root, spec.subpath.as_deref())?;
     if !held.is_empty() {
         let sub = prefix(spec);
         files.retain(|path, _| !inner_path(path, sub).is_some_and(|inner| held.contains(inner)));
