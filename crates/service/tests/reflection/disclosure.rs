@@ -1121,3 +1121,36 @@ async fn the_json_api_confirms_a_named_section_for_a_person() {
         "{review}"
     );
 }
+
+/// An unattended request never reuses a person's confirmation. sam shared
+/// harbor on this page; a request under a read limit that still shows it
+/// harbor (and lets it write anywhere, so neither the hidden-domain refusal
+/// nor the write limit answers first) is refused for reach as if nobody had.
+#[tokio::test]
+async fn an_unattended_request_ignores_a_stored_confirmation() {
+    use crystalline_service::read_limit::{Limit, within};
+    let (fx, _auth) = private_harbor().await;
+    fx.engine
+        .write_reflection(&confirmed(&fx, &agent_as("sam")).await, &agent_as("sam"))
+        .await
+        .unwrap();
+    let mut edited = write(
+        "overview.md",
+        "# Overview\n\nFor people.\n\n## Team\n\nFive people and a weekly rota.\n",
+    );
+    edited.sources = BTreeMap::from([("Team".to_string(), vec![TEAM.to_string()])]);
+    let sees_harbor = Limit {
+        hidden: Default::default(),
+        writes: None,
+    };
+    let err = within(
+        Some(sees_harbor),
+        fx.engine.write_reflection(&edited, &agent_as("sam")),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains(TOO_WIDE), "{err}");
+    let text = std::fs::read_to_string(fx.root.join("reflections/overview.md")).unwrap();
+    assert!(!text.contains("weekly rota"), "{text}");
+}
