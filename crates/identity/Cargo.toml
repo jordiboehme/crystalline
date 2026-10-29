@@ -22,6 +22,8 @@ crystalline-index = { workspace = true }
 # `Author` and `sanitize_name` for `ReflectionCaller` (scope.rs).
 crystalline-core = { workspace = true }
 anyhow = { workspace = true }
+# `KnowledgeGovernor` (scope.rs), the engine's GitHub role lookup.
+async-trait = { workspace = true }
 argon2 = { workspace = true }
 chrono = { workspace = true }
 getrandom = { workspace = true }
