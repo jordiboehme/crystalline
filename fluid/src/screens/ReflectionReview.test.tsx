@@ -547,7 +547,7 @@ describe("the review screen", () => {
   it("says so and reads the review again when the readers changed since the question", async () => {
     let reviews = 0;
     const changed =
-      "who may read this page, or where it is backed up, changed since the person was asked; ask them again";
+      "who may read this page, where it is backed up, or the text being shared changed since the person was asked; ask them again";
     apiMock.mockImplementation(
       answersFor({
         "/auth/me": () => meResponse({ user: userFixture() }),
