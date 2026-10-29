@@ -136,19 +136,11 @@ pub struct AppHome {
 pub struct UnusableApp {
     /// Why it cannot be used, as an origin operation is refused.
     pub error: EngineError,
-    /// Nothing says an App is configured here (no App in the environment,
-    /// no keychain marker for this host): only the App file store could not
-    /// be read. A caller that would otherwise go on without an App may.
-    pub only_unreadable_store: bool,
 }
 
 impl UnusableApp {
-    /// An App the environment or the keychain marker says is configured.
     fn known(error: EngineError) -> UnusableApp {
-        UnusableApp {
-            error,
-            only_unreadable_store: false,
-        }
+        UnusableApp { error }
     }
 }
 
@@ -263,14 +255,7 @@ impl AppHome {
                 app_refusal(KEYCHAIN_REFUSAL.to_string()),
             )),
             Ok(_) => Ok(None),
-            Err(e) => {
-                let marked = crystalline_remote::read_marker(&self.dir)
-                    .is_some_and(|marker| marker_names_host(&marker, self.api_url.as_deref()));
-                Err(UnusableApp {
-                    error: app_refusal(detail_of(e)),
-                    only_unreadable_store: !marked,
-                })
-            }
+            Err(e) => Err(UnusableApp::known(app_refusal(detail_of(e)))),
         }
     }
 

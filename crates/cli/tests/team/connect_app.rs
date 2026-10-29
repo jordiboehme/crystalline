@@ -436,11 +436,11 @@ fn a_disconnect_with_an_unusable_app_still_unlinks_and_says_to_revoke() {
     assert!(!world.token_file("ada").exists(), "the token is gone");
 }
 
-/// Without an App in the environment and without a keychain marker, an App
-/// file store that cannot be read is no App: the OAuth connect works as it
-/// did before.
+/// An App saved in the file store (no keychain, so no marker) whose file
+/// cannot be read is still an App: the OAuth personal connect is refused, as
+/// the engine refuses it, instead of saving a token beside the App.
 #[test]
-fn an_unreadable_app_store_without_a_marker_leaves_the_oauth_connect_as_it_was() {
+fn a_corrupt_app_file_without_a_marker_refuses_the_oauth_personal_connect() {
     let world = World::new();
     std::fs::write(world.tokens.join("github-app.json"), "not json").unwrap();
     let out = world
@@ -450,7 +450,6 @@ fn an_unreadable_app_store_without_a_marker_leaves_the_oauth_connect_as_it_was()
         .arg(&world.config)
         .output()
         .unwrap();
-    assert!(out.status.success(), "{out:?}");
-    let saved = read_json(&world.token_file("owner"));
-    assert_eq!(saved["access_token"], "ghp_pasted");
+    assert!(!out.status.success(), "{out:?}");
+    assert!(!world.token_file("owner").exists(), "no token was saved");
 }

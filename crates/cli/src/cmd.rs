@@ -3669,15 +3669,6 @@ pub async fn connect_github(
                 crystalline_remote::GithubApp::new(api_url.clone(), credentials)
                     .map_err(|e| e.to_string()),
             ),
-            // Nothing says an App is configured, only its file store could
-            // not be read: a connect goes on as without an App, as it did
-            // before there were Apps.
-            Err(unusable) if unusable.only_unreadable_store && !disconnect => {
-                tracing::warn!(
-                    "the GitHub App store could not be read ({unusable}); connecting without a GitHub App"
-                );
-                None
-            }
             // An App that cannot be used refuses a connect, while a
             // disconnect still removes the link and the token, unrevoked.
             Err(unusable) => Some(Err(unusable.to_string())),
