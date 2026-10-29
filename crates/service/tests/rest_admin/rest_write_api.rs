@@ -3334,6 +3334,15 @@ fn write_ops() -> Vec<WriteOp> {
         },
         WriteOp {
             method: Method::POST,
+            path: "/api/v1/domains/eng/reflection/disclose",
+            body: Some(
+                serde_json::json!({"path": "guides/a.md", "section": "aaaa1111", "basis": "b1"}),
+            ),
+            min_role: Role::Viewer,
+            read_only_exempt: false,
+        },
+        WriteOp {
+            method: Method::POST,
             path: "/api/v1/domains/eng/reflection/threads",
             body: Some(serde_json::json!({"path": "guides/a.md", "section": "A", "text": "Why?"})),
             min_role: Role::Viewer,

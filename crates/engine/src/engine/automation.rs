@@ -1485,6 +1485,144 @@ impl Engine {
         Ok(lease.is_some_and(|lease| lease.renewed_at.as_str() >= stale_before.as_str()))
     }
 
+    /// Whether `scope` may be a loop run at work right now: it holds a live
+    /// lease of either loop on any domain. A run's account holds its lease;
+    /// a run as the machine owner holds one with no account, and on a local
+    /// session the owner and its run look alike, so while such a lease is
+    /// live every owner session counts as the run. Asked before a person is
+    /// asked to share text on purpose (`super::disclosure`): a run never
+    /// confirms, and an account that runs loops confirms through Fluid while
+    /// its run is going. The anonymous caller has nobody behind it and counts
+    /// as a run.
+    pub async fn acts_for_a_run(&self, scope: &Scope) -> Result<bool> {
+        if matches!(scope, Scope::Anonymous) {
+            return Ok(true);
+        }
+        Ok(!self.run_domains(scope).await?.is_empty())
+    }
+
+    /// The domains `scope` holds a live lease of either loop on: what a run
+    /// as `scope` works on now. For the machine owner, the leases held with
+    /// no account. Sorted.
+    pub async fn run_domains(&self, scope: &Scope) -> Result<Vec<String>> {
+        let mut out: Vec<String> = self
+            .run_leases(scope)
+            .await?
+            .into_iter()
+            .map(|(_, domain)| domain)
+            .collect();
+        out.dedup();
+        Ok(out)
+    }
+
+    /// The live leases `scope` holds, as (loop, domain), sorted by domain:
+    /// [`Engine::run_domains`] with the loop each one runs.
+    pub async fn run_leases(&self, scope: &Scope) -> Result<Vec<(Loop, String)>> {
+        let (_, stale_before) = self.automation_window();
+        let mut domains: Vec<String> = self.registered_domain_entries().keys().cloned().collect();
+        domains.sort();
+        let store = self.store.lock().await;
+        let mut out = Vec::new();
+        for domain in domains {
+            let Some(id) = store.domain_id(&domain).await? else {
+                continue;
+            };
+            for lp in [Loop::Reflect, Loop::Evolve] {
+                let Some(lease) = store.automation_lease(id, lp.as_str()).await? else {
+                    continue;
+                };
+                if lease.renewed_at.as_str() < stale_before.as_str() {
+                    continue;
+                }
+                let held = match scope {
+                    Scope::User { account, .. } => {
+                        lease.holder.account.as_deref() == Some(account.as_str())
+                    }
+                    Scope::Unrestricted => lease.holder.account.is_none(),
+                    Scope::Anonymous => false,
+                };
+                if held {
+                    out.push((lp, domain.clone()));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The domains a request by `scope` may not read because it is
+    /// unattended (`crate::read_limit`), or `None` when it is attended.
+    ///
+    /// A request is unattended when its session says so (`marked`: started
+    /// with `crystalline mcp --unattended`, which every headless loop run's
+    /// MCP config carries, or named a run domain) or when `scope` holds a
+    /// live loop lease ([`Engine::run_domains`]; for the machine owner any
+    /// lease held with no account, since the owner and the owner's own run
+    /// look alike on a local session). It may read a domain X only when
+    /// every reader of the domain D it works on may read X
+    /// (`readers_cover(D, X)`, the GitHub rule included). D is:
+    ///
+    /// * `run_domain`, the domain the run started this session for, while
+    ///   `scope` holds a live lease on it (a name without that lease counts
+    ///   for nothing, so it can only ever narrow);
+    /// * otherwise each domain `scope` holds a live lease on, and X must be
+    ///   covered for all of them (the intersection);
+    /// * otherwise every registered domain: a session marked unattended with
+    ///   no lease may write anywhere, so it reads only what every domain's
+    ///   readers may read (in practice the domains everyone signed in may
+    ///   read, and no local domain while any domain is backed up to GitHub).
+    ///
+    /// It writes only into the domains D it works on (the named one, or each
+    /// leased one); with no lease it may write wherever its rights allow,
+    /// since every reader of every domain may read what it reads. Fails
+    /// safe: an error hides every domain and allows no write.
+    pub async fn read_limit_for(
+        &self,
+        scope: &Scope,
+        marked: bool,
+        run_domain: Option<&str>,
+    ) -> Option<crate::read_limit::Limit> {
+        let all: Vec<String> = self.registered_domain_entries().keys().cloned().collect();
+        let works_on = match self.run_domains(scope).await {
+            Ok(domains) => domains,
+            Err(e) => {
+                tracing::warn!("the loop leases were not read; reading nothing: {e}");
+                return Some(crate::read_limit::Limit {
+                    hidden: all.into_iter().collect(),
+                    writes: Some(Vec::new()),
+                });
+            }
+        };
+        if works_on.is_empty() && !marked && run_domain.is_none() {
+            return None;
+        }
+        // What the run works on, and so may write into. Without a lease it
+        // may write wherever its rights allow: what it reads every reader of
+        // every domain may read, so nothing it writes reaches anyone new.
+        let (targets, writes) = match run_domain {
+            Some(domain) if works_on.iter().any(|d| d == domain) => {
+                (vec![domain.to_string()], Some(vec![domain.to_string()]))
+            }
+            _ if !works_on.is_empty() => (works_on.clone(), Some(works_on)),
+            _ => (all.clone(), None),
+        };
+        let mut hidden = HashSet::new();
+        for source in &all {
+            for target in &targets {
+                if target == source {
+                    continue;
+                }
+                match self.readers_cover(target, source).await {
+                    Ok(true) => {}
+                    Ok(false) | Err(_) => {
+                        hidden.insert(source.clone());
+                        break;
+                    }
+                }
+            }
+        }
+        Some(crate::read_limit::Limit { hidden, writes })
+    }
+
     /// The name this instance shows people: the label its host locks carry,
     /// else the one it was given, else its id.
     pub fn instance_name(&self) -> String {

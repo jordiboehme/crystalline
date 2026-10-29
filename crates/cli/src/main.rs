@@ -485,6 +485,17 @@ enum Command {
         /// start the server.
         #[arg(long)]
         harness: Option<String>,
+        /// Mark this session unattended: nobody is behind it to answer a
+        /// question, so it is never asked to share Reflection text from a
+        /// domain fewer people may read. The MCP config of a headless loop
+        /// run (`crystalline reflect run`, `crystalline evolve run`) passes it.
+        #[arg(long, hide = true)]
+        unattended: bool,
+        /// The domain an unattended run started this session for: its reads
+        /// are limited to what every reader of that domain may read. Implies
+        /// --unattended. `crystalline reflect run` and `evolve run` pass it.
+        #[arg(long, hide = true)]
+        domain: Option<String>,
         /// Load the global config from this file instead of the default path.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -2350,8 +2361,14 @@ fn run() -> anyhow::Result<()> {
             embedded,
             read_only,
             harness,
+            unattended,
+            domain,
             config,
-        }) => on_runtime(move || mcp_dispatch(embedded, read_only, harness, config, cli.db)),
+        }) => on_runtime(move || {
+            mcp_dispatch(
+                embedded, read_only, harness, unattended, domain, config, cli.db,
+            )
+        }),
         Some(Command::Ctl { command }) => on_runtime(move || run_ctl(command, cli.json)),
         Some(Command::Users { command }) => on_runtime(move || users::run(command, cli.json)),
         Some(Command::Kept { command }) => kept::run(command, cli.json),
@@ -4828,6 +4845,8 @@ async fn mcp_dispatch(
     embedded: bool,
     read_only: bool,
     harness: Option<String>,
+    unattended: bool,
+    domain: Option<String>,
     config: Option<PathBuf>,
     db: Option<PathBuf>,
 ) -> anyhow::Result<()> {
@@ -4837,6 +4856,8 @@ async fn mcp_dispatch(
         config.as_deref(),
         read_only,
         harness.as_deref(),
+        unattended,
+        domain.as_deref(),
     )
     .await
 }

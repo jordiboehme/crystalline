@@ -484,6 +484,26 @@ export type DiscardTargetBody = {
 };
 
 /**
+ * What `POST /domains/{domain}/reflection/disclose` takes.
+ */
+export type DiscloseReflectionBody = {
+    /**
+     * The item's `basis`: what the person's yes is bound to. When the
+     * page's readers or its repository changed since the item was read, the
+     * confirmation is refused with 409 and the person is asked again.
+     */
+    basis: string;
+    /**
+     * The reflection's path inside reflections/.
+     */
+    path: string;
+    /**
+     * The id of the section a `source_too_wide` item names.
+     */
+    section: string;
+};
+
+/**
  * A whole domain moved: refetch everything of it.
  */
 export type DomainChanged = {
@@ -4980,6 +5000,54 @@ export type WriteReflectionAssetResponses = {
 
 export type WriteReflectionAssetResponse = WriteReflectionAssetResponses[keyof WriteReflectionAssetResponses];
 
+export type DiscloseReflectionSectionData = {
+    body: DiscloseReflectionBody;
+    path: {
+        /**
+         * The domain.
+         */
+        domain: string;
+    };
+    query?: never;
+    url: '/api/v1/domains/{domain}/reflection/disclose';
+};
+
+export type DiscloseReflectionSectionErrors = {
+    /**
+     * The anonymous viewer: nobody is behind it to confirm.
+     */
+    401: ProblemDetail;
+    /**
+     * Below curate access, a source in a domain this caller may not read (not named), or this instance is read-only.
+     */
+    403: ProblemDetail;
+    /**
+     * No such domain, page or section with sources.
+     */
+    404: ProblemDetail;
+    /**
+     * Who may read the page, or where it is backed up, changed since the item was read: read the queue again and ask the person the new question.
+     */
+    409: ProblemDetail;
+    /**
+     * A bad path, or nobody here knows who reads which domain because the accounts store could not be read.
+     */
+    422: ProblemDetail;
+};
+
+export type DiscloseReflectionSectionError = DiscloseReflectionSectionErrors[keyof DiscloseReflectionSectionErrors];
+
+export type DiscloseReflectionSectionResponses = {
+    /**
+     * Confirmed: `{ domain, path, section, disclosed }`, `disclosed` `{ by, at }`, or null when nothing in the section needed a confirmation.
+     */
+    200: {
+        [key: string]: unknown;
+    };
+};
+
+export type DiscloseReflectionSectionResponse = DiscloseReflectionSectionResponses[keyof DiscloseReflectionSectionResponses];
+
 export type MoveReflectionData = {
     body: MoveReflectionBody;
     path: {
@@ -5112,7 +5180,7 @@ export type GetReflectQueueError = GetReflectQueueErrors[keyof GetReflectQueueEr
 
 export type GetReflectQueueResponses = {
     /**
-     * ReflectQueue. `kind` is `feedback` (`what`: `new`, `changed`, `removed`), `update` (`source_changed`, `source_retired`, `source_missing`, `unreflected`, `off_structure`, `pact_changed`) or `review` (`thread`, with `thread`, the thread's id, and, when its opening comment is a conventional comment, `label` and `blocking`; a blocking thread comes first among the threads of its section). `sources`, an `unreflected` item's `folder` and `engrams`, and an `engram_attachment` item's `targets` are absent for a caller who cannot read engrams. The MCP `reflect` tool answers the same shape with `scope: { domains, kinds }` in place of `domain` and a `domain` member on each row; its `scope` may carry `unreadable`, the names of the domains whose queue could not be read, and `pending`, the names of the domains whose Reflection waits for engrams to leave `reflections/`. An update item's `what` may also be `asset_missing` (per section, with `assets`), `engram_attachment` (per section, with `targets`), `asset_unreferenced` (`path` empty, with `asset`) or `host_moved` (`path` empty, one per domain, after the domain moved to this instance on a shared database and this disk lacks files the previous host wrote: `only_elsewhere` is `{ previous_host, engrams, attachments, pages, files }`, counts only, `previous_host` null when unknown), `source_unavailable` (one per page and domain that cannot be checked here, `section` null, with `source_domain`, `count`, `sections` and `note`) or `source_too_wide` (one per section that cites a domain fewer people may read than the page's domain, with `sources` and `note`; only sources the caller may open count). A source in `sources` may carry `domain`, the local name of another domain than the page's. Sources in a domain the caller may not open are never named. A feedback item and an update item then carry `hidden_sources`, their count, and `note`, one plain sentence whatever their state. A feedback item keeps its own `what`; for update items such sources are always on the section's `source_changed` item, aged by its page. An `off_structure` item carries `structure`, the pact's globs, and `hint` when none of them fits any page; a `pact_changed` item carries `diff` and `sections`, the ids of the changed parts of the pact.
+     * ReflectQueue. `kind` is `feedback` (`what`: `new`, `changed`, `removed`), `update` (`source_changed`, `source_retired`, `source_missing`, `unreflected`, `off_structure`, `pact_changed`) or `review` (`thread`, with `thread`, the thread's id, and, when its opening comment is a conventional comment, `label` and `blocking`; a blocking thread comes first among the threads of its section). `sources`, an `unreflected` item's `folder` and `engrams`, and an `engram_attachment` item's `targets` are absent for a caller who cannot read engrams. The MCP `reflect` tool answers the same shape with `scope: { domains, kinds }` in place of `domain` and a `domain` member on each row; its `scope` may carry `unreadable`, the names of the domains whose queue could not be read, and `pending`, the names of the domains whose Reflection waits for engrams to leave `reflections/`. An update item's `what` may also be `asset_missing` (per section, with `assets`), `engram_attachment` (per section, with `targets`), `asset_unreferenced` (`path` empty, with `asset`) or `host_moved` (`path` empty, one per domain, after the domain moved to this instance on a shared database and this disk lacks files the previous host wrote: `only_elsewhere` is `{ previous_host, engrams, attachments, pages, files }`, counts only, `previous_host` null when unknown), `source_unavailable` (one per page and domain that cannot be checked here, `section` null, with `source_domain`, `count`, `sections` and `note`) or `source_too_wide` (one per section that cites a domain fewer people may read than the page's domain, with `sources`, `note`, `question`, what a person is asked before they share it on purpose through `POST /domains/{domain}/reflection/disclose`, and `basis`, what that call carries back; only sources the caller may open count). A source in `sources` may carry `domain`, the local name of another domain than the page's. Sources in a domain the caller may not open are never named. A feedback item and an update item then carry `hidden_sources`, their count, and `note`, one plain sentence whatever their state. A feedback item keeps its own `what`; for update items such sources are always on the section's `source_changed` item, aged by its page. An `off_structure` item carries `structure`, the pact's globs, and `hint` when none of them fits any page; a `pact_changed` item carries `diff` and `sections`, the ids of the changed parts of the pact.
      */
     200: {
         [key: string]: unknown;

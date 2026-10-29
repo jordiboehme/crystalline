@@ -1690,6 +1690,7 @@ pub use crate::rename::RenameHold;
 pub use crate::rename::RenameStep;
 pub use crate::scope::OWNER_IDENTITY_NAME;
 pub use crystalline_core::threads::ThreadTarget;
+pub use disclosure::{DISCLOSURE_CHANGED, DisclosureAsk, NOBODY_ASKED_NOTE};
 pub use domain_settings::{DOMAIN_SETTINGS_HOW, PolicyEdit, VIRTUAL_NO_RULES};
 #[cfg(any(test, feature = "testing"))]
 pub use names::SpellingPushFault;
@@ -3241,6 +3242,25 @@ impl Engine {
         &self,
         scope: &crate::scope::Scope,
     ) -> Result<Option<HashSet<String>>> {
+        let hidden = self.hidden_domains_by_rights(scope).await?;
+        // An unattended request reads less than its rights allow
+        // (`crate::read_limit`): the limit is added to every answer, also the
+        // machine owner's, whose rights hide nothing.
+        Ok(match (hidden, crate::read_limit::hidden()) {
+            (hidden, None) => hidden,
+            (None, Some(limit)) => Some(limit),
+            (Some(mut hidden), Some(limit)) => {
+                hidden.extend(limit);
+                Some(hidden)
+            }
+        })
+    }
+
+    /// [`Engine::hidden_domains`] by the caller's rights alone.
+    async fn hidden_domains_by_rights(
+        &self,
+        scope: &crate::scope::Scope,
+    ) -> Result<Option<HashSet<String>>> {
         #[cfg(any(test, feature = "testing"))]
         if self
             .fail_hidden_domains
@@ -3798,7 +3818,10 @@ impl Engine {
         scope: &crate::scope::Scope,
     ) -> Result<(HashSet<String>, HashSet<String>)> {
         let Some(access) = self.domain_access.get() else {
-            return Ok((HashSet::new(), HashSet::new()));
+            return Ok((
+                HashSet::new(),
+                crate::read_limit::hidden().unwrap_or_default(),
+            ));
         };
         let visibility = access
             .visibility(scope)
@@ -3814,6 +3837,9 @@ impl Engine {
                     .filter(|name| !visibility.private.contains(name)),
             );
         }
+        // An unattended request reads less than its rights allow, the same
+        // rule [`Engine::hidden_domains`] applies.
+        hidden.extend(crate::read_limit::hidden().unwrap_or_default());
         Ok((visibility.private, hidden))
     }
 
@@ -5427,6 +5453,18 @@ impl Engine {
         name: &str,
         scope: &crate::scope::Scope,
     ) -> Result<()> {
+        // An unattended request writes only into the domains its run works
+        // on (`crate::read_limit`). Asked here because every write path
+        // meets this check.
+        if let Some(limit) = crate::read_limit::current()
+            && let Some(writes) = &limit.writes
+            && !writes.iter().any(|d| d == name)
+        {
+            return Err(EngineError::Refused(format!(
+                "this run works on {} and cannot write to {name}",
+                writes.join(", ")
+            )));
+        }
         self.refuse_read_only_flag(name, scope).await?;
         self.require_file_host(name, scope).await
     }
@@ -7372,6 +7410,7 @@ mod context;
 mod contradictions;
 pub use contradictions::run_contradiction_worker;
 mod delete;
+mod disclosure;
 mod doc_file;
 #[allow(unused_imports)] // the Reflection verbs (Task 12) use the rest
 use doc_file::{

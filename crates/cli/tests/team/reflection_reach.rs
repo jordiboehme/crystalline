@@ -237,3 +237,132 @@ fn the_embedded_stack_refuses_a_local_source_on_a_github_page() {
     );
     assert!(!home.path().join("eng/reflections/overview.md").exists());
 }
+
+/// [`cite_over`] from a legacy client that declared it can put a question to
+/// its user: every `elicitation/create` the server sends is answered with
+/// `yes` (a ticked box and Accept) or a decline. Answers whether a question
+/// came, and the call's answer as text.
+fn cite_eliciting(mut child: Child, yes: bool) -> (bool, String) {
+    let mut stdin = child.stdin.take().unwrap();
+    let mut out = BufReader::new(child.stdout.take().unwrap());
+    let mut send = |msg: Value| writeln!(stdin, "{msg}").unwrap();
+    send(json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": { "elicitation": {} },
+            "clientInfo": { "name": "it", "version": "0" }
+        }
+    }));
+    send(json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }));
+    send(json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {
+            "name": "write_reflection",
+            "arguments": {
+                "domain": "eng",
+                "path": "overview.md",
+                "markdown": "# Overview\n\nFor people.\n\n## Team\n\nFive people.\n",
+                "sources": { "Team": ["crystalline://harbor/team/harbor-team"] }
+            }
+        }
+    }));
+    let mut asked = false;
+    let mut answer = String::new();
+    loop {
+        let mut line = String::new();
+        if out.read_line(&mut line).unwrap() == 0 {
+            break;
+        }
+        let Ok(message) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if message["method"] == "elicitation/create" {
+            asked = true;
+            let result = if yes {
+                json!({ "action": "accept", "content": { "confirm": true } })
+            } else {
+                json!({ "action": "decline" })
+            };
+            send(json!({ "jsonrpc": "2.0", "id": message["id"], "result": result }));
+            continue;
+        }
+        if message["id"] == 2 {
+            answer = line;
+            break;
+        }
+    }
+    drop(stdin);
+    let _ = child.wait();
+    (asked, answer)
+}
+
+/// Start a daemon with HTTP off in `h` and wait until it answers.
+fn daemon(h: &Path) -> Child {
+    let daemon = child(h, &["serve", "--http", "off"]);
+    let start = Instant::now();
+    while !bin(h)
+        .args(["ctl", "status", "--json"])
+        .output()
+        .unwrap()
+        .status
+        .success()
+    {
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "daemon not ready"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    daemon
+}
+
+/// Through the real bridge and daemon relay: the person behind a client that
+/// can ask is asked, and their yes lands the write.
+#[test]
+fn a_person_is_asked_through_the_bridge_and_their_yes_lands_the_write() {
+    let home = workspace();
+    let h = home.path();
+    let mut serving = daemon(h);
+    let (asked, answer) = cite_eliciting(child(h, &["mcp"]), true);
+    let _ = bin(h).args(["ctl", "shutdown"]).output();
+    let _ = serving.wait();
+    assert!(asked, "the question reached the client: {answer}");
+    assert!(!answer.contains("\"error\""), "{answer}");
+    assert!(h.join("eng/reflections/overview.md").exists(), "{answer}");
+}
+
+/// The session a headless run opens (`mcp --unattended`) is never asked,
+/// though its client could, and the write is refused.
+#[test]
+fn an_unattended_session_through_the_bridge_is_never_asked() {
+    let home = workspace();
+    let h = home.path();
+    let mut serving = daemon(h);
+    let (asked, answer) = cite_eliciting(child(h, &["mcp", "--unattended"]), true);
+    let _ = bin(h).args(["ctl", "shutdown"]).output();
+    let _ = serving.wait();
+    assert!(!asked, "{answer}");
+    // It does not even see harbor: refused, as a domain that does not exist.
+    assert!(
+        answer.contains("\"error\"") || answer.contains("\"isError\":true"),
+        "{answer}"
+    );
+    assert!(!h.join("eng/reflections/overview.md").exists());
+}
+
+/// The embedded stack, which a headless run falls back to, keeps the mark.
+#[test]
+fn an_unattended_embedded_session_is_never_asked() {
+    let home = workspace();
+    let (asked, answer) = cite_eliciting(
+        child(home.path(), &["mcp", "--embedded", "--unattended"]),
+        true,
+    );
+    assert!(!asked, "{answer}");
+    // It does not even see harbor: refused, as a domain that does not exist.
+    assert!(
+        answer.contains("\"error\"") || answer.contains("\"isError\":true"),
+        "{answer}"
+    );
+}

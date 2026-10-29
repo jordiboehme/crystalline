@@ -7,6 +7,7 @@
 
 mod automation;
 mod contradictions;
+mod disclosures;
 mod embed;
 mod embed_model;
 mod lead_vectors;

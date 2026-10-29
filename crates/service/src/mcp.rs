@@ -259,7 +259,7 @@ use std::sync::Arc;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use rmcp::handler::server::prompt::PromptContext;
-use rmcp::handler::server::tool::InputResponses;
+use rmcp::handler::server::tool::{InputResponses, RequestState};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CacheScope, CallToolResponse, CallToolResult, ContentBlock, DiscoverResult, ElicitRequest,
@@ -555,6 +555,94 @@ fn confirmed(responses: &Option<rmcp::model::InputResponses>) -> Option<bool> {
         None => true,
         Some(value) => *value == json!(true),
     })
+}
+
+/// What [`McpServer::ask_to_disclose`] decided for one write.
+enum Disclosure {
+    /// Put this question to the person; the write waits for the second round.
+    Ask(InputRequiredResult),
+    /// Go on with the write as it stands (confirmed or not).
+    Go,
+    /// A person may be behind the session, and its client cannot ask them:
+    /// the write goes on, and a refusal says how they still can.
+    NobodyToAsk,
+}
+
+/// How long a disclosure question waits for its person: the second round of a
+/// 2026-07-28 peer must come within it, and a legacy peer's elicitation request
+/// is given up after it. Long enough to read the question and think.
+const DISCLOSURE_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// The disclosure questions this process put to a 2026-07-28 peer and that
+/// were not answered yet, by the state handed out with each.
+///
+/// **Why a disclosure is bound when nothing else is.** The other questions
+/// here guard an agent against its own mistake, and a client answering one
+/// itself costs nothing it could not have done anyway. A disclosure is the
+/// one place the answer is the authority: it lets text from a domain fewer
+/// people may read onto a page more people read. So an answer counts only
+/// when it answers a question this process asked, about these very
+/// arguments and this caller, within [`DISCLOSURE_WAIT`], and only once: the
+/// state is a random token kept here, taken on its first use whatever the
+/// answer. An accept sent along with a first call answers nothing and is
+/// asked again. The process is the daemon, or the embedded stack, that served
+/// the first round, which is where the second one arrives.
+#[allow(clippy::type_complexity)]
+static DISCLOSURE_ASKS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, (String, String, std::time::Instant)>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// What a disclosure answer must match: the write's arguments and who makes
+/// it.
+fn disclosure_key(p: &WriteReflectionParams, caller: &ReflectionCaller) -> String {
+    let text = json!({ "write": p, "scope": format!("{:?}", caller.scope) }).to_string();
+    crystalline_core::provision::receipt::sha256_hex(text.as_bytes())
+}
+
+/// Remember a disclosure question about `key`, asked on `basis`
+/// ([`crate::engine::DisclosureAsk::basis`]), and hand out its state.
+fn disclosure_state(key: String, basis: String) -> String {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).expect("the OS CSPRNG is available");
+    let state: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let mut asks = DISCLOSURE_ASKS.lock().unwrap_or_else(|e| e.into_inner());
+    let now = std::time::Instant::now();
+    asks.retain(|_, (_, _, until)| *until > now);
+    asks.insert(state.clone(), (key, basis, now + DISCLOSURE_WAIT));
+    state
+}
+
+/// The basis of the live disclosure question `state` names, when it was
+/// asked about `key`. Taken either way: a state answers once.
+fn take_disclosure_state(state: &str, key: &str) -> Option<String> {
+    let mut asks = DISCLOSURE_ASKS.lock().unwrap_or_else(|e| e.into_inner());
+    match asks.remove(state) {
+        Some((asked, basis, until)) if asked == key && until > std::time::Instant::now() => {
+            Some(basis)
+        }
+        _ => None,
+    }
+}
+
+/// The form a person answers a disclosure question in: one box, unchecked,
+/// so only a deliberate tick and Accept share the text.
+fn disclosure_schema() -> ElicitationSchema {
+    ElicitationSchema::builder()
+        .required_bool_property(CONFIRM_KEY, |schema| {
+            schema
+                .title("Yes, share it with these readers")
+                .description("Check this box and choose Accept to share the text. Leave it unchecked, or decline, to keep it off this page.")
+                .with_default(false)
+        })
+        .build()
+        .expect("the disclosure schema names the property it requires")
+}
+
+/// Whether a person's answer to a disclosure question is a yes: an accept
+/// whose content carries `true` for the box. Unlike [`confirmed`], an accept
+/// that leaves the box out is a no, because the box starts unchecked.
+fn disclosure_yes(answer: &Value) -> bool {
+    answer["action"] == json!("accept") && answer["content"][CONFIRM_KEY] == json!(true)
 }
 
 /// Attach the SEP-2549 caching hints a modern peer is owed, and nothing to a
@@ -1860,10 +1948,28 @@ impl McpServer {
     /// `true` is the verified gate (hook installed and onboarding verified),
     /// `false` the default gate.
     pub fn with_onboarded_harness(self, onboarded: bool) -> McpServer {
+        let unattended = self.gate.unattended;
+        let run_domain = self.gate.run_domain.clone();
         self.with_harness_gate(HarnessGate {
             hook_installed: onboarded,
             onboarding_verified: onboarded,
+            unattended,
+            run_domain,
         })
+    }
+
+    /// Bind this session to the domain an unattended run started it for
+    /// (see [`HarnessGate::run_domain`]).
+    pub fn with_run_domain(mut self, domain: &str) -> McpServer {
+        self.gate.run_domain = Some(domain.to_string());
+        self
+    }
+
+    /// Mark this session unattended (see [`HarnessGate::unattended`]): it
+    /// is never asked to share text on purpose.
+    pub fn with_unattended(mut self, unattended: bool) -> McpServer {
+        self.gate.unattended = unattended;
+        self
     }
 
     /// Who this call is acting as, as the one value every scoped verb on this
@@ -2060,6 +2166,11 @@ impl McpServer {
     /// narrower in one direction (a private domain's owner may end it without
     /// being an admin) and wider in none.
     fn refuse_instance_change(&self, scope: &Scope) -> Option<&'static str> {
+        // A run works on its domain and never on the instance it runs on,
+        // whoever it runs as (`crystalline_engine::read_limit`).
+        if run_writes_limited() {
+            return Some(RUN_INSTANCE_REFUSAL);
+        }
         match scope {
             Scope::Unrestricted => None,
             Scope::Anonymous if !self.engine.auth_mcp() => None,
@@ -2179,7 +2290,11 @@ impl McpServer {
         p: &P,
         ctx: &RequestContext<RoleServer>,
     ) -> Option<Result<CallToolResult, ErrorData>> {
-        if self.transport != Transport::Stdio {
+        // An unattended session is never routed: whoever reads a connected
+        // server's domains is not known here, so it reads this machine only
+        // (`crystalline_engine::read_limit`).
+        if self.transport != Transport::Stdio || crystalline_engine::read_limit::current().is_some()
+        {
             return None;
         }
         let args = serde_json::to_value(p).ok()?;
@@ -3529,7 +3644,7 @@ impl McpServer {
     #[tool(
         name = "write_reflection",
         title = "Write reflection",
-        description = "Create, change, move or delete a reflection - a document for people under reflections/, where the domain's MANIFEST says reflection: on - or edit PACT.md, the domain's agreement on audience, level of detail, presentation and structure (PACT.md and every write with sources need curate access, which everyone who edits the engrams holds; anyone else proposes a PACT.md change with discuss). Write at the level PACT.md describes. action write (the default) takes the whole markdown: keep each ## heading's <!-- r:... --> id line as it is. Crystalline gives a new heading its id line; never write one yourself. The `reflection:` frontmatter key is Crystalline's bookkeeping; never write it (pass `sources` instead). To change one section instead, pass operation replace_section, insert_before_section or insert_after_section with section (the heading path, for example ## Night deploys, or a section's id) and content, exactly as edit_engram does; the section keeps its id line, and a miss lists the headings the page has. insert_after_section puts content right under the section's heading line, unless the content opens with a heading of the section's own level or a higher one: then it goes after the whole section and the receipt says placed_after_section. Pass sources (a ## section's id or heading text to the engrams it was built from: a permalink for an engram in this domain, a crystalline://<domain>/<permalink> address for one in another domain you can read, as long as everyone who may read this page may read that domain too: a source in a domain fewer people may read is refused, and so is a source in a domain not connected to GitHub when this page's domain is: then leave out that source and every sentence drawn from it, or write that text on a page in that domain instead) for every section you built from engrams: that curates the section and records what it reflects, and the queue notices when those engrams change. Never write sources into the page as HTML comments or text. A heading this same write creates works as a key; the # title and ### headings are not sections, and a heading two sections share needs their ids from the receipt. Without sources a write records no engrams; a person's change it does not take in stays a feedback item in reflect. Sources alone, with no markdown and no operation, curate those sections as the page stands and rewrite none of its text (a heading without an id line still gets one, and addresses are spelled with current domain names). action settle with sections and outcome kept (the person's text stands, sources stay) or taken_in (you changed the engrams to match) settles feedback items; without sections it settles the whole page, so settle PACT.md this way once the pages follow a changed pact. A heading with no id line yet is left out: it gets one on the next write, then settle again. Your own writes never come back as feedback. PACT.md's ## Structure bullets are globs, one per top-level bullet (for example - guides/*.md), and a PACT.md receipt names structure_findings for bullets that are not read as globs or match no page. action move carries the reflection's threads and baseline and rewrites relative links to it (a page open in a co-editing room is saved first, and the room is closed and told the new path), and its receipt carries links_failed when a page that links it could not be rewritten; delete takes both along. action move_asset (path and to) or delete_asset (path) moves or removes a file under reflections/assets/ and needs curate access; a move rewrites every link to the file, and its receipt carries links_failed (pages whose link could not be rewritten) or note (the file moved and its index row did not follow) when that happened. A page that embeds an engram attachment is refused (copy the file into reflections/assets/ first, which a person does). When a person has the page open in a co-editing room, the receipt says landed live (the room took your text in) or landed file with room (conflict or waiting) and room_note: tell the person what room_note says. Needs edit access; sources and settle need curate access. Refuses on a domain without reflection: on, and names the home instance when the Reflection lives on another server. The receipt names unsourced_sections (headings written without sources) when there are any: pass sources for them. The receipt carries markdown_findings (code, severity, message, line) when the text has a status colour or callout kind Crystalline does not know: fix them. Present the page with the crystalline-presentation skill (callouts, status labels, diagrams, tables, math) where they serve the reader; read it with the skills tool if it is not installed.",
+        description = "Create, change, move or delete a reflection - a document for people under reflections/, where the domain's MANIFEST says reflection: on - or edit PACT.md, the domain's agreement on audience, level of detail, presentation and structure (PACT.md and every write with sources need curate access, which everyone who edits the engrams holds; anyone else proposes a PACT.md change with discuss). Write at the level PACT.md describes. action write (the default) takes the whole markdown: keep each ## heading's <!-- r:... --> id line as it is. Crystalline gives a new heading its id line; never write one yourself. The `reflection:` frontmatter key is Crystalline's bookkeeping; never write it (pass `sources` instead). To change one section instead, pass operation replace_section, insert_before_section or insert_after_section with section (the heading path, for example ## Night deploys, or a section's id) and content, exactly as edit_engram does; the section keeps its id line, and a miss lists the headings the page has. insert_after_section puts content right under the section's heading line, unless the content opens with a heading of the section's own level or a higher one: then it goes after the whole section and the receipt says placed_after_section. Pass sources (a ## section's id or heading text to the engrams it was built from: a permalink for an engram in this domain, a crystalline://<domain>/<permalink> address for one in another domain you can read, as long as everyone who may read this page may read that domain too: a source in a domain fewer people may read is refused, and so is a source in a domain not connected to GitHub when this page's domain is: then leave out that source and every sentence drawn from it, or write that text on a page in that domain instead; a person who may read that domain can share it on purpose, disclose or confirm it: when this session's client can put a question to its user, the call asks that person first (input_required on a 2026-07-28 peer, an elicitation request on an older one, one unchecked box) and lands only on their yes, showing the text to share and keeping who confirmed and when on the server; one yes counts once per person, page and source domain, until the page's readers widen; it is a deliberate step for the person, never answer it yourself; a session marked unattended, a headless loop run and a caller holding a loop lease are never asked and do not see such a domain at all) for every section you built from engrams: that curates the section and records what it reflects, and the queue notices when those engrams change. Never write sources into the page as HTML comments or text. A heading this same write creates works as a key; the # title and ### headings are not sections, and a heading two sections share needs their ids from the receipt. Without sources a write records no engrams; a person's change it does not take in stays a feedback item in reflect. Sources alone, with no markdown and no operation, curate those sections as the page stands and rewrite none of its text (a heading without an id line still gets one, and addresses are spelled with current domain names). action settle with sections and outcome kept (the person's text stands, sources stay) or taken_in (you changed the engrams to match) settles feedback items; without sections it settles the whole page, so settle PACT.md this way once the pages follow a changed pact. A heading with no id line yet is left out: it gets one on the next write, then settle again. Your own writes never come back as feedback. PACT.md's ## Structure bullets are globs, one per top-level bullet (for example - guides/*.md), and a PACT.md receipt names structure_findings for bullets that are not read as globs or match no page. action move carries the reflection's threads and baseline and rewrites relative links to it (a page open in a co-editing room is saved first, and the room is closed and told the new path), and its receipt carries links_failed when a page that links it could not be rewritten; delete takes both along. action move_asset (path and to) or delete_asset (path) moves or removes a file under reflections/assets/ and needs curate access; a move rewrites every link to the file, and its receipt carries links_failed (pages whose link could not be rewritten) or note (the file moved and its index row did not follow) when that happened. A page that embeds an engram attachment is refused (copy the file into reflections/assets/ first, which a person does). When a person has the page open in a co-editing room, the receipt says landed live (the room took your text in) or landed file with room (conflict or waiting) and room_note: tell the person what room_note says. Needs edit access; sources and settle need curate access. Refuses on a domain without reflection: on, and names the home instance when the Reflection lives on another server. The receipt names unsourced_sections (headings written without sources) when there are any: pass sources for them. The receipt carries markdown_findings (code, severity, message, line) when the text has a status colour or callout kind Crystalline does not know: fix them. Present the page with the crystalline-presentation skill (callouts, status labels, diagrams, tables, math) where they serve the reader; read it with the skills tool if it is not installed.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -3540,17 +3655,150 @@ impl McpServer {
     async fn write_reflection(
         &self,
         Parameters(p): Parameters<WriteReflectionParams>,
+        responses: InputResponses,
+        state: RequestState,
         ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
+    ) -> Result<CallToolResponse, ErrorData> {
+        // A routed write is answered by the server that holds the domain, and
+        // a confirmation never travels with it: that server cannot know this
+        // machine asked anybody.
         if let Some(answer) = self.mounted("write_reflection", &p, &ctx).await {
-            return answer;
+            return answer.map(CallToolResponse::from);
         }
-        let p = self.localized(p, &ctx).await?;
+        let mut p = self.localized(p, &ctx).await?;
         let caller = self.reflection_caller(&ctx);
+        let asked = self
+            .ask_to_disclose(&mut p, &caller, responses.0, state.0, &ctx)
+            .await;
+        let nobody_asked = match asked {
+            Disclosure::Ask(question) => return Ok(question.into()),
+            Disclosure::NobodyToAsk => true,
+            Disclosure::Go => false,
+        };
         match self.engine.write_reflection(&p, &caller).await {
-            Ok(v) => ok(v),
-            Err(e) => Self::reflection_refused(e),
+            Ok(v) => ok(v).map(CallToolResponse::from),
+            // Refused for reach, by a person whose client could not ask them:
+            // say how they still can.
+            Err(EngineError::Invalid(text)) if nobody_asked => Err(to_error(EngineError::Invalid(
+                format!("{text}; {}", crate::engine::NOBODY_ASKED_NOTE),
+            ))),
+            Err(e) => Self::reflection_refused(e).map(CallToolResponse::from),
         }
+    }
+
+    /// Ask this session's person before a `write_reflection` that the reach
+    /// rule alone would refuse: its sources name a domain fewer people may
+    /// read than the page's, or one not shared through GitHub while the page
+    /// is backed up there ([`Engine::reflection_disclosure_question`]). A yes
+    /// sets [`WriteReflectionParams::disclosed`], the one field the engine
+    /// takes a person's confirmation from, as the basis of the question asked.
+    ///
+    /// Nobody is asked, and the write goes on to be refused as before, when
+    /// there is no person behind the session to ask:
+    ///
+    /// * a session the registration marked unattended (`crystalline mcp
+    ///   --unattended`, which every headless loop run's MCP config carries);
+    /// * a caller that holds a live loop lease ([`Engine::acts_for_a_run`]):
+    ///   a run as the machine owner looks like its person on a local session,
+    ///   and a run's account is the token it connects with;
+    /// * the anonymous caller and the open tier (the engine answers no
+    ///   question for them).
+    ///
+    /// A 2026-07-28 peer that declared elicitation gets `input_required`,
+    /// bound to a single-use state (see [`DISCLOSURE_ASKS`]); a legacy peer
+    /// that declared form elicitation gets an `elicitation/create` request on
+    /// this same call, whose answer is the response to our own request. A
+    /// peer that can do neither cannot ask its person
+    /// ([`Disclosure::NobodyToAsk`]).
+    async fn ask_to_disclose(
+        &self,
+        p: &mut WriteReflectionParams,
+        caller: &ReflectionCaller,
+        responses: Option<rmcp::model::InputResponses>,
+        state: Option<String>,
+        ctx: &RequestContext<RoleServer>,
+    ) -> Disclosure {
+        // An error here is the write's own refusal, and the write gives it.
+        let Ok(Some(ask)) = self.engine.reflection_disclosure_question(p, caller).await else {
+            return Disclosure::Go;
+        };
+        if self.gate.unattended
+            || self
+                .engine
+                .acts_for_a_run(&caller.scope)
+                .await
+                .unwrap_or(true)
+        {
+            return Disclosure::Go;
+        }
+        let key = disclosure_key(p, caller);
+        if peer_gets_cache_hints(ctx) {
+            if !confirmation_supported(ctx) {
+                return Disclosure::NobodyToAsk;
+            }
+            let answer = responses
+                .as_ref()
+                .and_then(|responses| responses.get(CONFIRM_KEY))
+                .map(|answer| serde_json::to_value(answer).unwrap_or_default());
+            return match (state, answer) {
+                // A state with an answer: it counts only for the question
+                // asked about this very write, once.
+                (Some(state), Some(answer)) => {
+                    p.disclosed =
+                        take_disclosure_state(&state, &key).filter(|_| disclosure_yes(&answer));
+                    Disclosure::Go
+                }
+                // A state without an answer answers nothing, and is used up.
+                (Some(state), None) => {
+                    take_disclosure_state(&state, &key);
+                    Disclosure::Go
+                }
+                // No state: whatever came along was never asked for.
+                (None, _) => {
+                    let mut requests = InputRequests::new();
+                    requests.insert(
+                        CONFIRM_KEY.to_string(),
+                        InputRequest::Elicitation(ElicitRequest::new(
+                            ElicitRequestParams::FormElicitationParams {
+                                meta: None,
+                                message: ask.question,
+                                requested_schema: disclosure_schema(),
+                            },
+                        )),
+                    );
+                    Disclosure::Ask(InputRequiredResult::new(
+                        Some(requests),
+                        Some(disclosure_state(key, ask.basis)),
+                    ))
+                }
+            };
+        }
+        if !ctx
+            .peer
+            .supported_elicitation_modes()
+            .contains(&rmcp::service::ElicitationMode::Form)
+        {
+            return Disclosure::NobodyToAsk;
+        }
+        let answer = ctx
+            .peer
+            .create_elicitation_with_timeout(
+                ElicitRequestParams::FormElicitationParams {
+                    meta: None,
+                    message: ask.question,
+                    requested_schema: disclosure_schema(),
+                },
+                Some(DISCLOSURE_WAIT),
+            )
+            .await;
+        match answer {
+            Ok(answer) => {
+                let answer = serde_json::to_value(&answer).unwrap_or_default();
+                p.disclosed = disclosure_yes(&answer).then_some(ask.basis);
+            }
+            Err(e) => tracing::debug!("a disclosure question got no answer: {e}"),
+        }
+        Disclosure::Go
     }
 
     #[tool(
@@ -3813,6 +4061,9 @@ impl McpServer {
             return answer.map(CallToolResponse::from);
         }
         let p = self.localized(p, &ctx).await?;
+        if run_writes_limited() {
+            return refuse(RUN_INSTANCE_REFUSAL).map(CallToolResponse::from);
+        }
         if self.engine.read_only() {
             return Err(to_error(EngineError::ReadOnly));
         }
@@ -4445,7 +4696,7 @@ impl McpServer {
     /// routing block twice.
     fn arrival_info(&self) -> ServerConfig {
         let mut info = self.get_info();
-        let short = match instructions_variant(self.engine.skills_serve(), self.gate) {
+        let short = match instructions_variant(self.engine.skills_serve(), self.gate.clone()) {
             InstructionsVariant::Full => None,
             InstructionsVariant::Minimal => Some(crystalline_core::render_minimal_instructions()),
             InstructionsVariant::Conditional => {
@@ -4476,7 +4727,8 @@ impl McpServer {
     /// what this exists to prevent, and a client that gets an error re-asks.
     async fn arrival_info_scoped(&self, scope: &Scope) -> Result<ServerConfig, ErrorData> {
         let mut info = self.arrival_info();
-        if instructions_variant(self.engine.skills_serve(), self.gate) != InstructionsVariant::Full
+        if instructions_variant(self.engine.skills_serve(), self.gate.clone())
+            != InstructionsVariant::Full
         {
             return Ok(info);
         }
@@ -4496,8 +4748,12 @@ impl McpServer {
     /// (decision D8).
     async fn routing_text_for(&self, scope: &Scope) -> Result<String, EngineError> {
         match self.transport {
-            Transport::Stdio => self.engine.routing_text_scoped_with_mounts(scope).await,
-            Transport::Http => self.engine.routing_text_scoped(scope).await,
+            // A limited session is never routed, so it is not shown the
+            // mounted domains either.
+            Transport::Stdio if crystalline_engine::read_limit::current().is_none() => {
+                self.engine.routing_text_scoped_with_mounts(scope).await
+            }
+            _ => self.engine.routing_text_scoped(scope).await,
         }
     }
 
@@ -4847,12 +5103,162 @@ fn applied_failure(applied: &[String], failed_key: &str, e: EngineError) -> Erro
     ErrorData::new(base.code, message, base.data)
 }
 
-#[tool_handler]
-impl ServerHandler for McpServer {
-    /// Every tool call, read and write verbs alike: the tool router's own
-    /// dispatch (what `#[tool_handler]` would generate), then the pending
-    /// rename line (`McpServer::with_rename_guidance`) on the answer.
-    async fn call_tool(
+/// What a run is refused with when it tries to change the instance it runs
+/// on: register or remove a domain, or change an instance setting.
+const RUN_INSTANCE_REFUSAL: &str = "a run cannot change this instance: it may not add or remove a domain or change an instance setting; ask a person";
+
+/// Whether the current request is a run limited to the domains it works on.
+fn run_writes_limited() -> bool {
+    crystalline_engine::read_limit::current().is_some_and(|limit| limit.writes.is_some())
+}
+
+/// The header a remote loop run sends with its bearer: the domain it started
+/// this session for. Believed only while the bearer's account holds a live
+/// loop lease on that domain, so it can only narrow what the session reads.
+pub const RUN_DOMAIN_HEADER: &str = "X-Crystalline-Run-Domain";
+
+impl McpServer {
+    /// What this request may not read because its session is unattended
+    /// ([`Engine::read_limit_for`]): marked by its registration, by the run
+    /// domain an HTTP run names, or by a live loop lease its caller holds.
+    async fn read_limit(
+        &self,
+        ctx: &RequestContext<RoleServer>,
+    ) -> Option<crystalline_engine::read_limit::Limit> {
+        self.read_limit_marked(ctx).await.0
+    }
+
+    /// [`McpServer::read_limit`], and whether the session itself said it is
+    /// unattended (its registration or an HTTP run header). A limit without
+    /// that mark comes from a lease alone: an interactive session that
+    /// looks like its owner's run.
+    async fn read_limit_marked(
+        &self,
+        ctx: &RequestContext<RoleServer>,
+    ) -> (Option<crystalline_engine::read_limit::Limit>, bool) {
+        let header = match self.transport {
+            Transport::Http => ctx
+                .extensions
+                .get::<axum::http::request::Parts>()
+                .and_then(|parts| parts.headers.get(RUN_DOMAIN_HEADER))
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            Transport::Stdio => None,
+        };
+        let run_domain = header.as_deref().or(self.gate.run_domain.as_deref());
+        let marked = self.gate.unattended || header.is_some() || run_domain.is_some();
+        let limit = self
+            .engine
+            .read_limit_for(&self.scope_of(ctx), marked, run_domain)
+            .await;
+        (limit, marked)
+    }
+
+    /// The note an interactive session limited by a run its caller holds
+    /// gets on every tool answer, so a person is not puzzled by domains
+    /// that are missing: "a reflect run on eng is going; until it ends this
+    /// session reads and writes like that run".
+    async fn run_note(&self, ctx: &RequestContext<RoleServer>) -> Option<String> {
+        let runs = self.engine.run_leases(&self.scope_of(ctx)).await.ok()?;
+        if runs.is_empty() {
+            return None;
+        }
+        let named: Vec<String> = runs
+            .iter()
+            .map(|(lp, domain)| format!("a {} run on {domain}", lp.as_str()))
+            .collect();
+        let (verb, like) = if named.len() == 1 {
+            ("is", "that run")
+        } else {
+            ("are", "those runs")
+        };
+        Some(format!(
+            "{} {verb} going; until it ends this session reads and writes like {like}",
+            named.join(" and ")
+        ))
+    }
+
+    /// [`ServerHandler::read_resource`] inside the request's read limit.
+    async fn read_resource_limited(
+        &self,
+        request: ReadResourceRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, ErrorData> {
+        if let Some(asset) = skill_for_uri(&request.uri) {
+            return Ok(ReadResourceResult::new(vec![
+                ResourceContents::text(asset.content, &request.uri).with_mime_type(SKILL_MIME_TYPE),
+            ])
+            .with_cache_hints(&context)
+            .into());
+        }
+        if let Some(url) = CrystallineUrl::parse(&request.uri) {
+            let url = CrystallineUrl {
+                permalink: decoded_uri_path(&url.permalink)?,
+                ..url
+            };
+            if let Some((kind, path)) = url.asset_ref() {
+                // A file of a mounted domain lives on its server: a stdio
+                // session (this machine's owner, decision D8) reads it from
+                // there, under the account's own rights on that server. An
+                // HTTP session never borrows the owner's sign-in. Asked before
+                // any local name is resolved, so a hidden local copy of the
+                // domain never answers for it.
+                if self.transport == Transport::Stdio
+                    && crystalline_engine::read_limit::current().is_none()
+                    && let Some(routed) =
+                        crate::route::routed_file(&self.engine, &url.domain, &url.permalink).await
+                {
+                    let file = routed.map_err(routed_file_error)?;
+                    return Ok(ReadResourceResult::new(vec![attachment_contents(
+                        &request.uri,
+                        file.bytes,
+                        &file.mime,
+                    )])
+                    .with_cache_hints_as(&context, CacheScope::Private)
+                    .into());
+                }
+                // A file uri names its domain outright, and nothing had to be
+                // read first to learn the name, so this is the one file path
+                // a caller can reach cold. The domain may be spelled by any
+                // of its names; one this caller may not see keeps the
+                // spelling they sent.
+                let scope = self.scope_of(&context);
+                let hidden = self.engine.hidden_for(&scope).await.map_err(to_error)?;
+                let domain = self.engine.localize_visible(&url.domain, &hidden).await;
+                let (bytes, row) = self
+                    .file_bytes(
+                        kind,
+                        &domain,
+                        path,
+                        &scope,
+                        &self.reflection_caller(&context),
+                    )
+                    .await
+                    .map_err(to_error)?;
+                return Ok(ReadResourceResult::new(vec![attachment_contents(
+                    &request.uri,
+                    bytes,
+                    &row.mime,
+                )])
+                // Private: this answer depends on who asked, unlike every
+                // other result this server hints (see [`CACHE_SCOPE`]).
+                .with_cache_hints_as(&context, CacheScope::Private)
+                .into());
+            }
+        }
+        Err(ErrorData::invalid_params(
+            format!(
+                "unknown resource '{}'; this server serves {} and every attachment addressed as {ATTACHMENT_URI_TEMPLATE} or {REFLECTION_ASSET_URI_TEMPLATE}",
+                request.uri,
+                skill_uris()
+            ),
+            None,
+        ))
+    }
+
+    /// [`ServerHandler::call_tool`] inside the request's read limit.
+    async fn call_tool_limited(
         &self,
         request: rmcp::model::CallToolRequestParams,
         context: RequestContext<RoleServer>,
@@ -4876,6 +5282,40 @@ impl ServerHandler for McpServer {
             other => other,
         })
     }
+}
+
+#[tool_handler]
+impl ServerHandler for McpServer {
+    /// Every tool call, read and write verbs alike: the tool router's own
+    /// dispatch (what `#[tool_handler]` would generate), then the pending
+    /// rename line (`McpServer::with_rename_guidance`) on the answer.
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, ErrorData> {
+        // An unattended session reads only what every reader of its run's
+        // domain may read (`crystalline_engine::read_limit`), for the whole
+        // call, whichever tool it is.
+        let (limit, marked) = self.read_limit_marked(&context).await;
+        // An interactive session limited by its owner's run says so, once
+        // per answer, in plain words.
+        let note = if limit.is_some() && !marked {
+            self.run_note(&context).await
+        } else {
+            None
+        };
+        let response =
+            crystalline_engine::read_limit::within(limit, self.call_tool_limited(request, context))
+                .await;
+        match (note, response) {
+            (Some(note), Ok(rmcp::model::CallToolResponse::Complete(mut result))) => {
+                result.content.push(ContentBlock::text(note));
+                Ok(rmcp::model::CallToolResponse::Complete(result))
+            }
+            (_, response) => response,
+        }
+    }
 
     /// The revisions this server serves, narrowed from rmcp's crate-wide
     /// `KNOWN_VERSIONS` default to [`SERVED_PROTOCOL_VERSIONS`].
@@ -4890,7 +5330,6 @@ impl ServerHandler for McpServer {
     fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [ProtocolVersion]> {
         std::borrow::Cow::Borrowed(SERVED_PROTOCOL_VERSIONS)
     }
-
     /// The server handshake: hand the connecting agent the live routing block
     /// as its `instructions`. rmcp calls `get_info` once per connection at
     /// initialize, so [`Engine::routing_text`] renders the currently registered
@@ -5065,6 +5504,18 @@ impl ServerHandler for McpServer {
         }
         context.peer.set_peer_info(request);
 
+        // A limited session is onboarded to the domains it may read only:
+        // the stdio block `get_info` renders names every domain.
+        if let Some(limit) = self.read_limit(&context).await {
+            let scope = self.scope_of(&context);
+            let mut info = crystalline_engine::read_limit::within(
+                Some(limit),
+                self.arrival_info_scoped(&scope),
+            )
+            .await?;
+            info.protocol_version = newest_legacy_handshake_version();
+            return Ok(info);
+        }
         let mut info = self.arrival_info();
         // The HTTP routing block, counted over the domains that are not
         // private (see [`Engine::routing_text_counted`]). Only when the
@@ -5072,7 +5523,7 @@ impl ServerHandler for McpServer {
         // private set that cannot be read keeps `get_info`'s pointer, which
         // names and counts nothing.
         if self.transport == Transport::Http
-            && instructions_variant(self.engine.skills_serve(), self.gate)
+            && instructions_variant(self.engine.skills_serve(), self.gate.clone())
                 == InstructionsVariant::Full
         {
             match self.engine.routing_text_counted().await {
@@ -5153,7 +5604,13 @@ impl ServerHandler for McpServer {
         context: RequestContext<RoleServer>,
     ) -> Result<DiscoverResult, ErrorData> {
         self.engine.refresh_routing_cache().await;
-        let info = self.arrival_info_scoped(&self.scope_of(&context)).await?;
+        // A limited session is onboarded to the domains it may read only.
+        let limit = self.read_limit(&context).await;
+        let info = crystalline_engine::read_limit::within(
+            limit,
+            self.arrival_info_scoped(&self.scope_of(&context)),
+        )
+        .await?;
         Ok(DiscoverResult::from_server_info(
             self.supported_protocol_versions().into_owned(),
             info,
@@ -5294,7 +5751,7 @@ impl ServerHandler for McpServer {
     ) -> Result<ListToolsResult, ErrorData> {
         let read_only = self.engine.read_only();
         let github_enabled = self.engine.github_enabled();
-        let skills_hidden = hidden_skills_surface(self.engine.skills_serve(), self.gate);
+        let skills_hidden = hidden_skills_surface(self.engine.skills_serve(), self.gate.clone());
         let mut tools = Self::tool_router().list_all();
         tools.retain(|t| {
             if is_write_tool(&t.name) && read_only {
@@ -5343,7 +5800,8 @@ impl ServerHandler for McpServer {
         if name == "provision" && hidden_provision_tool(read_only) {
             return None;
         }
-        if name == "skills" && hidden_skills_surface(self.engine.skills_serve(), self.gate) {
+        if name == "skills" && hidden_skills_surface(self.engine.skills_serve(), self.gate.clone())
+        {
             return None;
         }
         let mut tool = Self::tool_router().get(name).cloned()?;
@@ -5362,7 +5820,7 @@ impl ServerHandler for McpServer {
         _request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, ErrorData> {
-        if hidden_skills_surface(self.engine.skills_serve(), self.gate) {
+        if hidden_skills_surface(self.engine.skills_serve(), self.gate.clone()) {
             return Ok(ListResourcesResult::with_all_items(Vec::new()).with_cache_hints(&context));
         }
         let resources = SKILL_ASSETS
@@ -5433,75 +5891,11 @@ impl ServerHandler for McpServer {
         request: ReadResourceRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, ErrorData> {
-        if let Some(asset) = skill_for_uri(&request.uri) {
-            return Ok(ReadResourceResult::new(vec![
-                ResourceContents::text(asset.content, &request.uri).with_mime_type(SKILL_MIME_TYPE),
-            ])
-            .with_cache_hints(&context)
-            .into());
-        }
-        if let Some(url) = CrystallineUrl::parse(&request.uri) {
-            let url = CrystallineUrl {
-                permalink: decoded_uri_path(&url.permalink)?,
-                ..url
-            };
-            if let Some((kind, path)) = url.asset_ref() {
-                // A file of a mounted domain lives on its server: a stdio
-                // session (this machine's owner, decision D8) reads it from
-                // there, under the account's own rights on that server. An
-                // HTTP session never borrows the owner's sign-in. Asked before
-                // any local name is resolved, so a hidden local copy of the
-                // domain never answers for it.
-                if self.transport == Transport::Stdio
-                    && let Some(routed) =
-                        crate::route::routed_file(&self.engine, &url.domain, &url.permalink).await
-                {
-                    let file = routed.map_err(routed_file_error)?;
-                    return Ok(ReadResourceResult::new(vec![attachment_contents(
-                        &request.uri,
-                        file.bytes,
-                        &file.mime,
-                    )])
-                    .with_cache_hints_as(&context, CacheScope::Private)
-                    .into());
-                }
-                // A file uri names its domain outright, and nothing had to be
-                // read first to learn the name, so this is the one file path
-                // a caller can reach cold. The domain may be spelled by any
-                // of its names; one this caller may not see keeps the
-                // spelling they sent.
-                let scope = self.scope_of(&context);
-                let hidden = self.engine.hidden_for(&scope).await.map_err(to_error)?;
-                let domain = self.engine.localize_visible(&url.domain, &hidden).await;
-                let (bytes, row) = self
-                    .file_bytes(
-                        kind,
-                        &domain,
-                        path,
-                        &scope,
-                        &self.reflection_caller(&context),
-                    )
-                    .await
-                    .map_err(to_error)?;
-                return Ok(ReadResourceResult::new(vec![attachment_contents(
-                    &request.uri,
-                    bytes,
-                    &row.mime,
-                )])
-                // Private: this answer depends on who asked, unlike every
-                // other result this server hints (see [`CACHE_SCOPE`]).
-                .with_cache_hints_as(&context, CacheScope::Private)
-                .into());
-            }
-        }
-        Err(ErrorData::invalid_params(
-            format!(
-                "unknown resource '{}'; this server serves {} and every attachment addressed as {ATTACHMENT_URI_TEMPLATE} or {REFLECTION_ASSET_URI_TEMPLATE}",
-                request.uri,
-                skill_uris()
-            ),
-            None,
-        ))
+        // An engram's attachment is engram content: an unattended session
+        // reads it within its read limit, as it does every tool.
+        let limit = self.read_limit(&context).await;
+        crystalline_engine::read_limit::within(limit, self.read_resource_limited(request, context))
+            .await
     }
 
     /// List the two onboarding prompts, empty while `skills.serve` is off.
@@ -5513,7 +5907,7 @@ impl ServerHandler for McpServer {
         _request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListPromptsResult, ErrorData> {
-        let prompts = if hidden_skills_surface(self.engine.skills_serve(), self.gate) {
+        let prompts = if hidden_skills_surface(self.engine.skills_serve(), self.gate.clone()) {
             Vec::new()
         } else {
             Self::prompt_router().list_all()
@@ -5528,14 +5922,19 @@ impl ServerHandler for McpServer {
         request: GetPromptRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<GetPromptResponse, ErrorData> {
-        Self::prompt_router()
-            .get_prompt(PromptContext::new(
+        // The onboarding prompt carries the routing block: a limited session
+        // is shown the domains it may read only.
+        let limit = self.read_limit(&context).await;
+        crystalline_engine::read_limit::within(
+            limit,
+            Self::prompt_router().get_prompt(PromptContext::new(
                 self,
                 request.name,
                 request.arguments,
                 context,
-            ))
-            .await
+            )),
+        )
+        .await
     }
 }
 
@@ -7250,14 +7649,20 @@ mod tests {
         HarnessGate {
             hook_installed: false,
             onboarding_verified: false,
+            unattended: false,
+            run_domain: None,
         },
         HarnessGate {
             hook_installed: true,
             onboarding_verified: false,
+            unattended: false,
+            run_domain: None,
         },
         HarnessGate {
             hook_installed: true,
             onboarding_verified: true,
+            unattended: false,
+            run_domain: None,
         },
     ];
 
@@ -7266,11 +7671,11 @@ mod tests {
         let [serve, conditional, verified] = GATES;
         for gate in GATES {
             assert!(
-                !hidden_skills_surface(SkillsServe::Always, gate),
+                !hidden_skills_surface(SkillsServe::Always, gate.clone()),
                 "true always serves, whoever spawned us"
             );
             assert!(
-                hidden_skills_surface(SkillsServe::Never, gate),
+                hidden_skills_surface(SkillsServe::Never, gate.clone()),
                 "false never serves, whoever spawned us"
             );
         }
@@ -7302,9 +7707,12 @@ mod tests {
         );
         assert_eq!(instructions_variant(SkillsServe::Auto, serve), Full);
         for gate in GATES {
-            assert_eq!(instructions_variant(SkillsServe::Always, gate), Full);
             assert_eq!(
-                instructions_variant(SkillsServe::Never, gate),
+                instructions_variant(SkillsServe::Always, gate.clone()),
+                Full
+            );
+            assert_eq!(
+                instructions_variant(SkillsServe::Never, gate.clone()),
                 Full,
                 "turning the skill surface off must not cost a client its routing block"
             );
@@ -7326,8 +7734,9 @@ mod tests {
     fn the_surface_and_the_instructions_read_the_same_answer() {
         for gate in GATES {
             assert_eq!(
-                hidden_skills_surface(SkillsServe::Auto, gate),
-                instructions_variant(SkillsServe::Auto, gate) == InstructionsVariant::Minimal,
+                hidden_skills_surface(SkillsServe::Auto, gate.clone()),
+                instructions_variant(SkillsServe::Auto, gate.clone())
+                    == InstructionsVariant::Minimal,
                 "auto decides both together for {gate:?}"
             );
         }

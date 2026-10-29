@@ -650,6 +650,110 @@ pub async fn move_to(
         .map_err(reflection_error)
 }
 
+/// What `POST /domains/{domain}/reflection/disclose` takes.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct DiscloseReflectionBody {
+    /// The reflection's path inside reflections/.
+    pub path: String,
+    /// The id of the section a `source_too_wide` item names.
+    pub section: String,
+    /// The item's `basis`: what the person's yes is bound to. When the
+    /// page's readers or its repository changed since the item was read, the
+    /// confirmation is refused with 409 and the person is asked again.
+    pub basis: String,
+}
+
+/// `POST /domains/{domain}/reflection/disclose`
+#[utoipa::path(
+    post,
+    path = "/api/v1/domains/{domain}/reflection/disclose",
+    tag = "reflection",
+    operation_id = "disclose_reflection_section",
+    summary = "Share a section's text from a domain fewer people may read, on purpose.",
+    description = "A person's answer to the `question` of a `source_too_wide` \
+                   item: every source of the section in another domain that \
+                   the page may not carry now is shared with the page's \
+                   readers of this moment (and the repository the page is \
+                   backed up to). The confirmation is kept on the server with \
+                   who gave it and when, never in the page. The queue names \
+                   the section again when the page's readers widen. Needs \
+                   `curate` and the right to read every source's domain; only \
+                   a signed-in person can confirm.",
+    params(("domain" = String, Path, description = "The domain.")),
+    request_body = DiscloseReflectionBody,
+    responses(
+        (
+            status = 200,
+            description = "Confirmed: `{ domain, path, section, disclosed }`, \
+                           `disclosed` `{ by, at }`, or null when nothing in \
+                           the section needed a confirmation.",
+            body = Object,
+            example = json!({ "domain": "eng", "path": "overview.md",
+                "section": "7f3a9c2e",
+                "disclosed": { "by": "keeper", "at": "2026-10-28T09:00:00Z" } }),
+        ),
+        (
+            status = 401,
+            description = "The anonymous viewer: nobody is behind it to confirm.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "Below curate access, a source in a domain this \
+                           caller may not read (not named), or this instance \
+                           is read-only.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "No such domain, page or section with sources.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 409,
+            description = "Who may read the page, or where it is backed up, \
+                           changed since the item was read: read the queue \
+                           again and ask the person the new question.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 422,
+            description = "A bad path, or nobody here knows who reads which \
+                           domain because the accounts store could not be read.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn disclose(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiPath(domain): ApiPath<String>,
+    ApiJson(body): ApiJson<DiscloseReflectionBody>,
+) -> Result<Json<Value>, ApiError> {
+    refuse_anonymous(&state, &identity, &domain, ANONYMOUS_EDIT).await?;
+    refuse_read_only(&state)?;
+    // Every caller of this route is a person: the JSON API is reached with a
+    // browser session (or a proxy that signed a person in), never with an
+    // agent's token, so a confirmation here is that person's.
+    state
+        .engine
+        .confirm_reflection_disclosure(
+            &domain,
+            &body.path,
+            &body.section,
+            &body.basis,
+            &caller(&identity),
+        )
+        .await
+        .map(Json)
+        .map_err(reflection_error)
+}
+
 /// The query of `GET /domains/{domain}/reflection/threads`.
 #[derive(Debug, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
@@ -1000,7 +1104,11 @@ pub struct QueueQuery {
                            with `source_domain`, `count`, `sections` and \
                            `note`) or `source_too_wide` (one per section that \
                            cites a domain fewer people may read than the \
-                           page's domain, with `sources` and `note`; only \
+                           page's domain, with `sources`, `note`, \
+                           `question`, what a person is asked before they \
+                           share it on purpose through \
+                           `POST /domains/{domain}/reflection/disclose`, and \
+                           `basis`, what that call carries back; only \
                            sources the caller may open count). A source in `sources` may carry `domain`, \
                            the local name of another domain than the page's. \
                            Sources in a domain the caller may not open are \

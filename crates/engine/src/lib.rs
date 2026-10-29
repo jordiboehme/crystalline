@@ -22,6 +22,7 @@ pub mod overlay_journal;
 pub mod params;
 #[doc(hidden)]
 pub mod poller;
+pub mod read_limit;
 mod rename;
 #[cfg(any(test, feature = "testing"))]
 pub use rename::RenameHold;

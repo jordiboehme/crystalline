@@ -1025,6 +1025,13 @@ impl Engine {
         if self.domain_entry(domain).is_err() {
             self.require_domain(domain, &caller.scope).await?;
         }
+        // An unattended request may not read this domain at all
+        // (`crate::read_limit`): its Reflection is as unknown to it as the
+        // domain.
+        if crate::read_limit::hides(domain) {
+            let hidden = self.hidden_for(&caller.scope).await?;
+            return Err(self.unknown_domain(domain, &hidden));
+        }
         let engrams_visible = self.engrams_visible(&caller.scope, domain).await?;
         // The MCP open tier curates every domain it can see; a private
         // domain stays as invisible to it as to every anonymous caller.
@@ -1584,7 +1591,12 @@ impl Engine {
         caller: &ReflectionCaller,
     ) -> Result<Value> {
         match p.action.as_deref().unwrap_or("write") {
-            "write" => self.write_reflection_text(p, caller).await,
+            "write" => match self.write_reflection_text(p, caller, false).await? {
+                Written::Receipt(receipt) => Ok(receipt),
+                Written::Preview(_) => Err(EngineError::Internal(
+                    "a write answered with a preview".into(),
+                )),
+            },
             "move" => {
                 let to = p.to.as_deref().ok_or_else(|| {
                     EngineError::Invalid("move needs `to`, the new path inside reflections/".into())
@@ -1621,11 +1633,30 @@ impl Engine {
         }
     }
 
+    /// What `p` would leave on its page and what in it needs a person's
+    /// confirmation (`super::disclosure`), worked out by the write itself and
+    /// stopped before anything is written. `None` for an action that is no
+    /// text write.
+    pub(super) async fn preview_reflection_write(
+        &self,
+        p: &WriteReflectionParams,
+        caller: &ReflectionCaller,
+    ) -> Result<Option<super::disclosure::WritePreview>> {
+        if p.action.as_deref().unwrap_or("write") != "write" {
+            return Ok(None);
+        }
+        match self.write_reflection_text(p, caller, true).await? {
+            Written::Preview(preview) => Ok(Some(preview)),
+            Written::Receipt(_) => Ok(None),
+        }
+    }
+
     async fn write_reflection_text(
         &self,
         p: &WriteReflectionParams,
         caller: &ReflectionCaller,
-    ) -> Result<Value> {
+        preview: bool,
+    ) -> Result<Written> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
@@ -1660,8 +1691,27 @@ impl Engine {
         // Each source by permalink (this domain) or address (any domain),
         // resolved in the writer's scope, and their facts read one seek
         // each before the page lock.
+        // A person's confirmation lets a source through that the reach rule
+        // alone refuses (`super::disclosure`); nobody behind the caller, no
+        // confirmation.
+        let by = super::disclosure::confirmer(caller).filter(|_| p.disclosed.is_some());
+        // The source domains this person shared on this page already, which
+        // they may cite again without a new question.
+        let shared = match super::disclosure::confirmer(caller) {
+            Some(person) if !p.sources.is_empty() => {
+                self.shared_by(&p.domain, access.domain_id, &p.path, &person)
+                    .await?
+            }
+            _ => HashSet::new(),
+        };
         let named = self
-            .resolve_source_names(&p.domain, &caller.scope, p.sources.values().flatten())
+            .resolve_source_names(
+                &p.domain,
+                &caller.scope,
+                p.sources.values().flatten(),
+                by.is_some() || preview,
+                &shared,
+            )
             .await?;
         let wanted: Vec<r::SourceRef> = named.values().map(|n| n.source_ref("")).collect();
         let facts = self
@@ -1864,6 +1914,9 @@ impl Engine {
             .collect();
         let changed_ids = changed.clone();
         let mut advanced: Vec<String> = Vec::new();
+        // Each section and source domain this write carries on a person's
+        // confirmation.
+        let mut confirmed: Vec<(String, String)> = Vec::new();
         for (key, engrams) in &p.sources {
             let key = replaced
                 .iter()
@@ -1888,6 +1941,11 @@ impl Engine {
                     })
                 })?;
                 let src = source.source_ref(&fact.checksum);
+                if let (true, Some(domain)) = (source.disclose, src.domain.as_ref())
+                    && !confirmed.iter().any(|(s, d)| *s == id && d == domain)
+                {
+                    confirmed.push((id.clone(), domain.clone()));
+                }
                 // One engram named twice (by permalink and by address) is
                 // one source.
                 if !refs
@@ -1986,6 +2044,42 @@ impl Engine {
             }
         }
         let final_text = stamp_reflected(&text, &mut prov, &advanced)?;
+        // What a person must confirm (`super::disclosure`): the sources the
+        // reach rule refuses that this person has not shared on this page.
+        let needs = confirmed;
+        if preview {
+            return Ok(Written::Preview(super::disclosure::WritePreview {
+                text: final_text,
+                needs,
+            }));
+        }
+        match p.disclosed.as_deref().filter(|_| by.is_some()) {
+            // The person said yes to these readers: still them?
+            Some(basis) if !needs.is_empty() => {
+                let shown = super::disclosure::WritePreview {
+                    text: final_text.clone(),
+                    needs: needs.clone(),
+                };
+                if self
+                    .ask_for_preview(&p.domain, &p.path, &shown)
+                    .await?
+                    .basis
+                    != basis
+                {
+                    return Err(EngineError::Conflict(
+                        super::disclosure::DISCLOSURE_CHANGED.into(),
+                    ));
+                }
+            }
+            _ => {}
+        }
+        let mut confirmed: Vec<String> = if by.is_some() {
+            needs.into_iter().map(|(_, source)| source).collect()
+        } else {
+            Vec::new()
+        };
+        confirmed.sort();
+        confirmed.dedup();
         // The `##` sections this write created or changed that leave it with
         // no source in their record: provenance alone, whatever else counts
         // a section as reflected. The pact is no page.
@@ -2040,6 +2134,15 @@ impl Engine {
                 }),
                 read: false,
             },
+        )
+        .await?;
+        self.record_disclosures(
+            &p.domain,
+            access.domain_id,
+            &p.path,
+            &final_text,
+            &confirmed,
+            by.as_deref(),
         )
         .await?;
         self.mark_reflection_dirty(&p.domain, BackupCause::Settled);
@@ -2153,8 +2256,15 @@ impl Engine {
                 ),
             }
         }
-        Ok(receipt)
+        Ok(Written::Receipt(receipt))
     }
+}
+
+/// What [`Engine::write_reflection_text`] answers: the receipt of a write,
+/// or what a preview would have written.
+pub(super) enum Written {
+    Receipt(Value),
+    Preview(super::disclosure::WritePreview),
 }
 
 impl Engine {
@@ -2596,6 +2706,13 @@ impl Engine {
         let reflected = r::parse_baseline(
             &read_opt(&access.abs(&r::baseline_path(inner)))?.unwrap_or_default(),
         );
+        // Who shared a section's text on purpose, and when: for curators,
+        // who are the ones to settle the page (`super::disclosure`).
+        let disclosures = if access.engrams_visible && access.right >= ReflectionRight::Curate {
+            self.reflection_disclosures(access.domain_id).await?
+        } else {
+            Default::default()
+        };
         let sections: Vec<Value> = r::split_sections(&markdown)
             .iter()
             .filter(|s| s.id.as_deref() != Some(r::TOP_SECTION))
@@ -2624,6 +2741,17 @@ impl Engine {
                     if hidden > 0 {
                         row["hidden_sources"] = json!(hidden);
                     }
+                }
+                let cited: Vec<&str> = record
+                    .map(|rec| {
+                        rec.sources
+                            .iter()
+                            .filter_map(|src| src.domain.as_deref())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if let Some(disclosure) = disclosures.newest(inner, &cited) {
+                    row["disclosed"] = json!({ "by": disclosure.by, "at": disclosure.at });
                 }
                 row
             })
@@ -2948,6 +3076,7 @@ impl Engine {
             OnRefusal::put_back(domain, undo),
         )
         .await?;
+        self.move_disclosures(access.domain_id, from, to).await?;
         drop(_locks);
         // The page has moved: the room's sockets learn its new path now, and
         // the fence lifts.
@@ -3151,6 +3280,7 @@ impl Engine {
             OnRefusal::put_back(domain, undo),
         )
         .await?;
+        self.drop_disclosures(access.domain_id, inner).await?;
         self.mark_reflection_dirty(domain, BackupCause::Settled);
         self.announce_reflection(
             domain,
