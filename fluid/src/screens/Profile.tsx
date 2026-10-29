@@ -333,10 +333,8 @@ function GithubLinkPanel({
       setNotice({ kind: "problem", text: problemDetail(error) });
     },
   });
-  const olderLogin =
-    sharer && !link.linked && older.data?.connected === true
-      ? (older.data.login ?? "an unnamed account")
-      : null;
+  const olderSignIn = sharer && !link.linked && older.data?.connected === true;
+  const olderLogin = older.data?.login ?? null;
 
   const connect = useMutation({
     // Never retried: each start mints a state, and a second one would leave
@@ -448,9 +446,13 @@ function GithubLinkPanel({
               </button>
             )}
           </div>
-          {olderLogin !== null && (
+          {olderSignIn && (
             <div className="flex flex-wrap items-center gap-3 border-t border-slate-200 pt-4 dark:border-slate-800">
-              <span className="text-sm">{`You still have an older GitHub sign-in as @${olderLogin}.`}</span>
+              <span className="text-sm">
+                {olderLogin === null
+                  ? "You still have an older GitHub sign-in."
+                  : `You still have an older GitHub sign-in as @${olderLogin}.`}
+              </span>
               <button
                 type="button"
                 disabled={forget.isPending}

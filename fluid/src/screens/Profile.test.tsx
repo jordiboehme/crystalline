@@ -1481,9 +1481,7 @@ describe("the GitHub App link card", () => {
       "/me/github-identity": (_path, init) => {
         if (init?.method === "DELETE") {
           forgotten();
-          identity = identityPayload({
-            warning: "unlinked here; revoke it in your GitHub settings",
-          });
+          identity = identityPayload();
           return identity;
         }
         return identity;
@@ -1500,14 +1498,28 @@ describe("the GitHub App link card", () => {
     await waitFor(() => {
       expect(forgotten).toHaveBeenCalled();
     });
-    expect(await screen.findByRole("alert")).toHaveTextContent(
-      "unlinked here; revoke it in your GitHub settings",
-    );
+    expect(
+      await screen.findByText("The older sign-in is forgotten."),
+    ).toHaveAttribute("role", "status");
     await waitFor(() => {
       expect(
         screen.queryByText(/older GitHub sign-in/),
       ).not.toBeInTheDocument();
     });
+  });
+
+  it("names no account for an older sign-in GitHub gave no login for", async () => {
+    serveAs("editor", {
+      "/me/github-link": () => linkView(),
+      "/me/github-identity": () =>
+        identityPayload({ ...CONNECTED, login: null }),
+    });
+    renderApp("/profile");
+
+    expect(
+      await screen.findByText("You still have an older GitHub sign-in."),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/sign-in as @/)).not.toBeInTheDocument();
   });
 
   it("does not offer to forget an older sign-in when linked", async () => {
