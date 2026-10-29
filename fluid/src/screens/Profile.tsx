@@ -190,6 +190,20 @@ function GithubIdentityCard() {
   });
   const app = link.data?.appConfigured === true ? link.data : null;
 
+  // The callback's landing, read once and taken out of the address here, so
+  // it is said whichever card shows: a link read that failed still lands the
+  // person on a sentence, and a reload does not say it again.
+  const [params, setParams] = useSearchParams();
+  const [landing] = useState<Notice | null>(() => landingNotice(params));
+  useEffect(() => {
+    if (params.has("github") || params.has("github_error")) {
+      const rest = new URLSearchParams(params);
+      rest.delete("github");
+      rest.delete("github_error");
+      setParams(rest, { replace: true });
+    }
+  }, [params, setParams]);
+
   return (
     <section
       aria-labelledby="github-identity"
@@ -201,14 +215,17 @@ function GithubIdentityCard() {
         </h2>
         <p className={`mt-1 ${MUTED}`}>
           {app
-            ? "The GitHub account your shared work is opened under. Link it once, and what you share from this instance carries your GitHub name."
+            ? sharer
+              ? "The GitHub account your shared work is opened under. Link it once, and what you share from this instance carries your GitHub name."
+              : "Link your GitHub account once so this instance knows who you are there."
             : "The account your shared work is opened under. Proposals you share from this instance carry your GitHub name, so it needs write access to the repositories your team domains track."}
         </p>
       </div>
+      {landing && <NoticeLine notice={landing} />}
       {link.isPending ? (
         <p className={MUTED}>Reading your GitHub identity</p>
       ) : app ? (
-        <GithubLinkPanel link={app} />
+        <GithubLinkPanel link={app} sharer={sharer} />
       ) : sharer ? (
         <IdentityPanel />
       ) : (
@@ -277,22 +294,49 @@ function NoticeLine({ notice }: { notice: Notice }) {
  * that is read once into the notice and then taken out of the address, so a
  * reload does not say it again.
  */
-function GithubLinkPanel({ link }: { link: GithubLink }) {
+function GithubLinkPanel({
+  link,
+  sharer,
+}: {
+  link: GithubLink;
+  sharer: boolean;
+}) {
   const { capabilities } = useAuth();
   const queryClient = useQueryClient();
-  const [params, setParams] = useSearchParams();
-  const [notice, setNotice] = useState<Notice | null>(() =>
-    landingNotice(params),
-  );
+  const [notice, setNotice] = useState<Notice | null>(null);
 
-  useEffect(() => {
-    if (params.has("github") || params.has("github_error")) {
-      const rest = new URLSearchParams(params);
-      rest.delete("github");
-      rest.delete("github_error");
-      setParams(rest, { replace: true });
-    }
-  }, [params, setParams]);
+  /*
+    An older sign-in (an OAuth token from before the App) keeps working for
+    shares until the person links (ruling R11), so it is shown here with a
+    way to forget it. Only before a link: once linked, the personal slot
+    holds the App's own token, and forgetting it is what Unlink does.
+  */
+  const older = useQuery({
+    queryKey: MY_GITHUB_IDENTITY_KEY,
+    queryFn: fetchMyGithubIdentity,
+    enabled: sharer && !link.linked,
+    retry: false,
+  });
+  const forget = useMutation({
+    retry: false,
+    mutationFn: disconnectMyGithubIdentity,
+    onSuccess: (gone) => {
+      setNotice(
+        gone.warning === null
+          ? { kind: "done", text: "The older sign-in is forgotten." }
+          : { kind: "problem", text: gone.warning },
+      );
+      void queryClient.invalidateQueries({ queryKey: MY_GITHUB_IDENTITY_KEY });
+      void queryClient.invalidateQueries({ queryKey: MY_GITHUB_LINK_KEY });
+    },
+    onError: (error: Error) => {
+      setNotice({ kind: "problem", text: problemDetail(error) });
+    },
+  });
+  const olderLogin =
+    sharer && !link.linked && older.data?.connected === true
+      ? (older.data.login ?? "an unnamed account")
+      : null;
 
   const connect = useMutation({
     // Never retried: each start mints a state, and a second one would leave
@@ -303,9 +347,20 @@ function GithubLinkPanel({ link }: { link: GithubLink }) {
       navigateTo(authorizeUrl);
     },
     onError: (error: Error) => {
-      // Including the two an admin fixes: no public url, no client secret.
-      // The server names the fix in its own words.
-      setNotice({ kind: "problem", text: problemDetail(error) });
+      // A 409 or 422 is the App's setup (no public url, no client secret, an
+      // App that cannot be used), and the server's sentence names the admin
+      // command that fixes it. An admin gets those words; anyone else gets
+      // who to ask.
+      const setup =
+        error instanceof ApiProblem &&
+        (error.status === 409 || error.status === 422);
+      setNotice({
+        kind: "problem",
+        text:
+          setup && capabilities.role !== "admin"
+            ? "Ask an admin to check the GitHub App."
+            : problemDetail(error),
+      });
     },
   });
 
@@ -321,6 +376,9 @@ function GithubLinkPanel({ link }: { link: GithubLink }) {
           : { kind: "problem", text: warning },
       );
       void queryClient.invalidateQueries({ queryKey: MY_GITHUB_LINK_KEY });
+      // The share dialog reads the personal identity, and the unlink took
+      // its token away.
+      void queryClient.invalidateQueries({ queryKey: MY_GITHUB_IDENTITY_KEY });
     },
     onError: (error: Error) => {
       setNotice({ kind: "problem", text: problemDetail(error) });
@@ -390,6 +448,21 @@ function GithubLinkPanel({ link }: { link: GithubLink }) {
               </button>
             )}
           </div>
+          {olderLogin !== null && (
+            <div className="flex flex-wrap items-center gap-3 border-t border-slate-200 pt-4 dark:border-slate-800">
+              <span className="text-sm">{`You still have an older GitHub sign-in as @${olderLogin}.`}</span>
+              <button
+                type="button"
+                disabled={forget.isPending}
+                onClick={() => {
+                  forget.mutate();
+                }}
+                className={SECONDARY_BUTTON}
+              >
+                Forget it
+              </button>
+            </div>
+          )}
         </>
       )}
     </>

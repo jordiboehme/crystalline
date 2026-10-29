@@ -35,7 +35,9 @@ import {
   renderApp,
   userFixture,
 } from "../test/harness";
+import App from "../App";
 import { navigateTo } from "../base";
+import { MemoryRouter, useLocation } from "react-router";
 import { Tooltips } from "../components/primitives";
 import { AgentAccessCard } from "./Profile";
 
@@ -50,6 +52,14 @@ vi.mock("../base", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../base")>();
   return { ...actual, navigateTo: vi.fn() };
 });
+
+/** The address the router is at, for tests that check it was rewritten. */
+function LocationProbe() {
+  const location = useLocation();
+  return (
+    <output data-testid="location">{`${location.pathname}${location.search}`}</output>
+  );
+}
 
 const apiMock = vi.mocked(api);
 const navigateMock = vi.mocked(navigateTo);
@@ -1460,6 +1470,188 @@ describe("the GitHub App link card", () => {
     );
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "unlinked here; revoke it in your GitHub settings",
+    );
+  });
+
+  it("offers to forget an older sign-in when an App is configured and no link exists", async () => {
+    let identity = CONNECTED;
+    const forgotten = vi.fn();
+    serveAs("editor", {
+      "/me/github-link": () => linkView(),
+      "/me/github-identity": (_path, init) => {
+        if (init?.method === "DELETE") {
+          forgotten();
+          identity = identityPayload({
+            warning: "unlinked here; revoke it in your GitHub settings",
+          });
+          return identity;
+        }
+        return identity;
+      },
+    });
+    renderApp("/profile");
+
+    expect(
+      await screen.findByText(
+        "You still have an older GitHub sign-in as @octo.",
+      ),
+    ).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Forget it" }));
+    await waitFor(() => {
+      expect(forgotten).toHaveBeenCalled();
+    });
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "unlinked here; revoke it in your GitHub settings",
+    );
+    await waitFor(() => {
+      expect(
+        screen.queryByText(/older GitHub sign-in/),
+      ).not.toBeInTheDocument();
+    });
+  });
+
+  it("does not offer to forget an older sign-in when linked", async () => {
+    serveAs("editor", {
+      "/me/github-link": () => LINKED,
+      "/me/github-identity": () => CONNECTED,
+    });
+    renderApp("/profile");
+
+    expect(await screen.findByText("Linked to @ada-gh")).toBeInTheDocument();
+    expect(screen.queryByText(/older GitHub sign-in/)).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Forget it" }),
+    ).not.toBeInTheDocument();
+    // The personal slot is the App token then, so it is not even read.
+    expect(identityCalls()).toHaveLength(0);
+  });
+
+  it("re-reads the identity the share dialog uses after an unlink", async () => {
+    serveAs("editor", {
+      "/me/github-link": (_path, init) =>
+        init?.method === "DELETE"
+          ? { linked: false, was_linked: true, warning: null }
+          : LINKED,
+    });
+    const invalidate = vi.spyOn(QueryClient.prototype, "invalidateQueries");
+    renderApp("/profile");
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Unlink GitHub" }),
+    );
+    await waitFor(() => {
+      expect(invalidate).toHaveBeenCalledWith({
+        queryKey: ["me-github-identity"],
+      });
+    });
+    invalidate.mockRestore();
+  });
+
+  it.each([422, 409])(
+    "tells a non-admin to ask an admin when the start is refused %s",
+    async (status) => {
+      serveAs("editor", {
+        "/me/github-link": () => linkView(),
+        "/me/github-link/start": () => {
+          throw new ApiProblem(
+            status,
+            "conflict",
+            "an admin adds it with: crystalline github app set",
+          );
+        },
+      });
+      renderApp("/profile");
+
+      await userEvent.click(
+        await screen.findByRole("button", { name: "Connect GitHub" }),
+      );
+      expect(await screen.findByRole("alert")).toHaveTextContent(
+        "Ask an admin to check the GitHub App.",
+      );
+      expect(
+        screen.queryByText(/crystalline github app set/),
+      ).not.toBeInTheDocument();
+    },
+  );
+
+  it("shows an admin the server's own fix when the start is refused", async () => {
+    serveAs("admin", {
+      "/me/github-link": () => linkView(),
+      "/me/github-link/start": () => {
+        throw new ApiProblem(
+          409,
+          "conflict",
+          "an admin adds it with: crystalline github app set",
+        );
+      },
+    });
+    renderApp("/profile");
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Connect GitHub" }),
+    );
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "an admin adds it with: crystalline github app set",
+    );
+  });
+
+  it("shows and clears a landing even when the link read fails", async () => {
+    serveAs("editor", {
+      "/me/github-link": () => {
+        throw new ApiProblem(500, "internal", "the read failed");
+      },
+    });
+    render(
+      <MemoryRouter initialEntries={["/profile?github_error=id_taken"]}>
+        <App />
+        <LocationProbe />
+      </MemoryRouter>,
+    );
+
+    expect(
+      await screen.findByText(
+        "This GitHub account is already linked to another Crystalline account. An admin can unlink it there.",
+      ),
+    ).toBeInTheDocument();
+    // No App could be read, so the older card shows, and the landing is
+    // still taken out of the address.
+    expect(
+      await screen.findByRole("button", { name: /connect with github/i }),
+    ).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.getByTestId("location")).toHaveTextContent(/^\/profile$/);
+    });
+  });
+
+  it("tells a viewer what linking is for", async () => {
+    serveAs("viewer", { "/me/github-link": () => linkView() });
+    renderApp("/profile");
+
+    expect(
+      await screen.findByText(
+        "Link your GitHub account once so this instance knows who you are there.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("sends a browser without an account back to the sign-in, keeping the landing", async () => {
+    serveAs("editor", {
+      "/auth/me": () => meResponse({ user: null, anonymous: true }),
+      "/auth/providers": () => ({
+        local: true,
+        oidc: { enabled: true, name: "Contoso" },
+      }),
+    });
+    renderApp("/profile?github_error=session");
+
+    // The provider button carries the interrupted destination as return_to,
+    // which is how `from` (with its search) is observable here.
+    const button = await screen.findByRole("link", {
+      name: "Sign in with Contoso",
+    });
+    expect(button).toHaveAttribute(
+      "href",
+      "/api/v1/auth/oidc/login?return_to=%2Fprofile%3Fgithub_error%3Dsession",
     );
   });
 });
