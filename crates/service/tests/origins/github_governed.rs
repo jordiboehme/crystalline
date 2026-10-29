@@ -102,7 +102,7 @@ enum Via {
 }
 
 /// The columns, in the order the expected strings spell them.
-const COLUMNS: [&str; 9] = [
+const COLUMNS: [&str; 10] = [
     "search_engrams",
     "read_engram",
     "write_engram",
@@ -112,23 +112,27 @@ const COLUMNS: [&str; 9] = [
     "/events",
     "read_reflection",
     "write_reflection",
+    "REST reads",
 ];
 
-/// Shorthands for a row on one domain. `y` allowed, `n` refused, `-` not a
+/// Shorthands for a row on one domain. The last column, "REST reads", is
+/// the engram detail, `/search`, `/graph`, the domain tree and `/activity`
+/// together: `y` when all five show the domain's seed engram, `n` when none
+/// does (a mix is `?`, which no row expects). `y` allowed, `n` refused, `-` not a
 /// surface this row has.
-const ALL: &str = "yyyyyyyyy";
-const NOTHING: &str = "nnnnnnnnn";
+const ALL: &str = "yyyyyyyyyy";
+const NOTHING: &str = "nnnnnnnnnn";
 /// Reads engrams and the Reflection, writes neither.
-const READS: &str = "yynynnyyn";
+const READS: &str = "yynynnyyny";
 /// Reads engrams, works the Reflection (instance contributor level).
-const READS_EDITS_REFLECTION: &str = "yynynnyyy";
+const READS_EDITS_REFLECTION: &str = "yynynnyyyy";
 /// No engram, the Reflection read and edited (a Reflection grant).
-const REFLECTION_ONLY: &str = "nnnnnnnyy";
-const MCP_ALL: &str = "yyy----yy";
-const MCP_READS: &str = "yyn----yn";
-const MCP_NOTHING: &str = "nnn----nn";
-const WEB_READS: &str = "---ynny--";
-const WEB_NOTHING: &str = "---nnnn--";
+const REFLECTION_ONLY: &str = "nnnnnnnyyn";
+const MCP_ALL: &str = "yyy----yy-";
+const MCP_READS: &str = "yyn----yn-";
+const MCP_NOTHING: &str = "nnn----nn-";
+const WEB_READS: &str = "---ynny--y";
+const WEB_NOTHING: &str = "---nnnn--n";
 
 struct Row {
     label: &'static str,
@@ -291,7 +295,22 @@ struct Fixture {
 /// seed engram, `seed-<domain>-end`, whose body says `quokka`.
 fn seeded_repo(domain: &str) -> Arc<MockProvider> {
     let mock = Arc::new(MockProvider::new());
-    let head = mock.add_commit(files(&[
+    // One engram per account, `row-<account>`, for the PUT and the collab
+    // columns: in the repository, so they are no unshared change.
+    let rows: Vec<(String, Vec<u8>)> = ACCOUNTS
+        .iter()
+        .map(|(name, _, _)| {
+            (
+                format!("row-{name}.md"),
+                engram(
+                    &format!("Row {name}"),
+                    &format!("row-{name}"),
+                    "A row's own engram.",
+                ),
+            )
+        })
+        .collect();
+    let mut tree = files(&[
         (
             "MANIFEST.md",
             manifest("reflection: on\nreflection_home: https://kb.example.com\n"),
@@ -304,7 +323,9 @@ fn seeded_repo(domain: &str) -> Arc<MockProvider> {
                 "The quokka lives here.",
             ),
         ),
-    ]));
+    ]);
+    tree.extend(rows);
+    let head = mock.add_commit(tree);
     mock.set_branch("main", &head);
     mock
 }
@@ -423,8 +444,7 @@ async fn instance(mcp_auth: bool) -> Fixture {
     eng.write_engram(&row_engram(PLAIN, "vwrite"))
         .await
         .unwrap();
-    // Every domain carries a Reflection page and one engram per row for the
-    // PUT and the collab columns, written by the machine owner.
+    // Every domain carries a Reflection page, written by the machine owner.
     for d in DOMAINS {
         eng.write_reflection(
             &WriteReflectionParams {
@@ -437,9 +457,6 @@ async fn instance(mcp_auth: bool) -> Fixture {
         )
         .await
         .unwrap();
-        for (name, _, _) in ACCOUNTS {
-            eng.write_engram(&row_engram(d, name)).await.unwrap();
-        }
     }
     let router = http_router(
         eng.clone(),
@@ -649,6 +666,7 @@ impl Mcp {
                 "params": { "name": tool, "arguments": arguments },
             }))
             .await;
+        assert!(!answer.is_null(), "{tool}: no answer arrived");
         if let Some(message) = answer["error"]["message"].as_str() {
             return Err(message.to_string());
         }
@@ -656,7 +674,7 @@ impl Mcp {
             .as_str()
             .unwrap_or_default()
             .to_string();
-        if answer["result"]["isError"] == true || answer.is_null() {
+        if answer["result"]["isError"] == true {
             return Err(text);
         }
         Ok(text)
@@ -667,28 +685,57 @@ fn mark(allowed: bool) -> char {
     if allowed { 'y' } else { 'n' }
 }
 
+/// Scores one MCP answer: `y` when it is an answer that shows what was
+/// asked for, `n` for a refusal (kept in `refusals`, which the test checks
+/// are access refusals and not, say, a parameter error), `?` for an answer
+/// that shows nothing.
+fn score(
+    answer: Result<String, String>,
+    shows: impl Fn(&str) -> bool,
+    refusals: &mut Vec<String>,
+    what: String,
+) -> char {
+    match answer {
+        Ok(text) if shows(&text) => 'y',
+        Ok(_) => '?',
+        Err(text) => {
+            refusals.push(format!("{what}: {text}"));
+            'n'
+        }
+    }
+}
+
 /// The five MCP cells of `mcp` on every domain, keyed by domain, as
-/// (search, read, write, read_reflection, write_reflection).
-async fn mcp_cells(mcp: &Mcp, label: &str) -> BTreeMap<&'static str, [char; 5]> {
+/// (search, read, write, read_reflection, write_reflection), and every
+/// refusal text met on the way.
+async fn mcp_cells(mcp: &Mcp, label: &str) -> (BTreeMap<&'static str, [char; 5]>, Vec<String>) {
     let mut cells = BTreeMap::new();
+    let mut refusals = Vec::new();
+    // A search is filtered rather than refused: a domain the caller may not
+    // read is simply absent from the hits.
     let found = mcp
         .call("search_engrams", json!({ "query": "quokka", "limit": 50 }))
         .await
-        .unwrap_or_default();
+        .unwrap_or_else(|e| panic!("{label}: search_engrams answers: {e}"));
     let tag: String = label
         .chars()
         .filter(char::is_ascii_alphanumeric)
         .collect::<String>()
         .to_lowercase();
     for d in DOMAINS {
-        let search = found.contains(&format!("seed-{d}-end"));
+        let search = mark(found.contains(&format!("seed-{d}-end")));
         let read = mcp
             .call(
                 "read_engram",
                 json!({ "identifier": format!("seed-{d}-end"), "domain": d }),
             )
-            .await
-            .is_ok_and(|text| text.contains("quokka"));
+            .await;
+        let read = score(
+            read,
+            |t| t.contains("quokka"),
+            &mut refusals,
+            format!("{label} / {d} / read_engram"),
+        );
         let write = mcp
             .call(
                 "write_engram",
@@ -698,12 +745,22 @@ async fn mcp_cells(mcp: &Mcp, label: &str) -> BTreeMap<&'static str, [char; 5]> 
                     "content": "- [fact] written through MCP",
                 }),
             )
-            .await
-            .is_ok();
+            .await;
+        let write = score(
+            write,
+            |_| true,
+            &mut refusals,
+            format!("{label} / {d} / write_engram"),
+        );
         let read_reflection = mcp
             .call("read_reflection", json!({ "domain": d, "path": "seed.md" }))
-            .await
-            .is_ok_and(|text| text.contains("wombat page"));
+            .await;
+        let read_reflection = score(
+            read_reflection,
+            |t| t.contains("wombat page"),
+            &mut refusals,
+            format!("{label} / {d} / read_reflection"),
+        );
         let write_reflection = mcp
             .call(
                 "write_reflection",
@@ -713,20 +770,16 @@ async fn mcp_cells(mcp: &Mcp, label: &str) -> BTreeMap<&'static str, [char; 5]> 
                     "markdown": format!("# By {tag}\n\n## Note\n\nA note.\n"),
                 }),
             )
-            .await
-            .is_ok();
-        cells.insert(
-            d,
-            [
-                mark(search),
-                mark(read),
-                mark(write),
-                mark(read_reflection),
-                mark(write_reflection),
-            ],
+            .await;
+        let write_reflection = score(
+            write_reflection,
+            |_| true,
+            &mut refusals,
+            format!("{label} / {d} / write_reflection"),
         );
+        cells.insert(d, [search, read, write, read_reflection, write_reflection]);
     }
-    cells
+    (cells, refusals)
 }
 
 // --- the JSON API, collab and events -----------------------------------------
@@ -739,7 +792,7 @@ async fn rest_cells(
     session: Option<&(String, String)>,
     account: &str,
     root: &(String, String),
-) -> BTreeMap<&'static str, [char; 3]> {
+) -> BTreeMap<&'static str, [char; 4]> {
     let listed = with_session(
         client().get(format!("http://{}/api/v1/domains", fx.addr)),
         session,
@@ -753,13 +806,46 @@ async fn rest_cells(
         Value::Null
     };
     let listed = listed.to_string();
+    let get = |path: String| async move {
+        let resp = with_session(client().get(format!("http://{}{path}", fx.addr)), session)
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status().as_u16();
+        (status, resp.text().await.unwrap_or_default())
+    };
+    let (_, searched) = get("/api/v1/search?q=quokka".to_string()).await;
     let mut cells = BTreeMap::new();
     for d in DOMAINS {
         let list = listed.contains(&format!("\"name\":\"{d}\""));
         let permalink = format!("row-{account}");
         let put_status = put_row(fx, session, d, account, root).await;
         let collab = collab_join(fx.addr, session, d, &permalink).await;
-        cells.insert(d, [mark(list), mark(put_status < 300), mark(collab)]);
+        let seed = format!("seed-{d}-end");
+        let (status, detail) = get(format!("/api/v1/domains/{d}/engrams/{seed}")).await;
+        let (graph_status, graph) =
+            get(format!("/api/v1/graph?anchor=crystalline://{d}/{seed}")).await;
+        let (tree_status, tree) = get(format!("/api/v1/domains/{d}/tree")).await;
+        // The seeds were recorded on 2026-01-01.
+        let (_, activity) = get(format!("/api/v1/activity?domains={d}&timeframe=365d")).await;
+        let reads = [
+            status == 200 && detail.contains("quokka"),
+            searched.contains(&seed),
+            graph_status == 200 && graph.contains(&seed),
+            tree_status == 200 && tree.contains(&seed),
+            activity.contains(&seed),
+        ];
+        let reads = if reads.iter().all(|r| *r) {
+            'y'
+        } else if reads.iter().any(|r| *r) {
+            eprintln!(
+                "{account} / {d}: REST reads disagree (detail, search, graph, tree, activity): {reads:?}"
+            );
+            '?'
+        } else {
+            'n'
+        };
+        cells.insert(d, [mark(list), mark(put_status < 300), mark(collab), reads]);
     }
     cells
 }
@@ -885,7 +971,7 @@ async fn heard(resp: Option<reqwest::Response>, within: Duration) -> Vec<String>
 // --- the matrix --------------------------------------------------------------
 
 /// Every actual cell of every row, as the same strings the table spells.
-async fn collect() -> Vec<(String, [String; 5])> {
+async fn collect() -> (Vec<(String, [String; 5])>, Vec<String>) {
     let rows = rows();
     let a = instance(true).await;
     let b = instance(false).await;
@@ -962,9 +1048,10 @@ async fn collect() -> Vec<(String, [String; 5])> {
     let web_beside_agent = rest_cells(&b, None, "root", &root_b).await;
 
     let mut actual = Vec::new();
+    let mut refusals = Vec::new();
     for (row, heard) in rows.iter().zip(events) {
         let mut cells: BTreeMap<&str, Vec<char>> =
-            DOMAINS.iter().map(|d| (*d, vec!['-'; 9])).collect();
+            DOMAINS.iter().map(|d| (*d, vec!['-'; 10])).collect();
         // The MCP columns.
         // Every MCP session opens: a refused token or handshake would read
         // as `n` everywhere and prove nothing.
@@ -990,7 +1077,11 @@ async fn collect() -> Vec<(String, [String; 5])> {
         let mcp_answers = match (&mcp, row.via) {
             (None, Via::WebBesideAgent) => None,
             (None, _) => panic!("{}: the MCP session opens", row.label),
-            (Some(mcp), _) => Some(mcp_cells(mcp, row.label).await),
+            (Some(mcp), _) => {
+                let (cells, met) = mcp_cells(mcp, row.label).await;
+                refusals.extend(met);
+                Some(cells)
+            }
         };
         if let Some(answers) = &mcp_answers {
             for d in DOMAINS {
@@ -1014,18 +1105,35 @@ async fn collect() -> Vec<(String, [String; 5])> {
         };
         if let Some(rest) = rest {
             for d in DOMAINS {
-                let [l, p, c] = rest[d];
+                let [l, p, c, reads] = rest[d];
                 let cell = cells.get_mut(d).unwrap();
                 cell[3] = l;
                 cell[4] = p;
                 cell[5] = c;
+                cell[9] = reads;
                 cell[6] = mark(heard.iter().any(|h| h == d));
             }
         }
         let strings: Vec<String> = DOMAINS.iter().map(|d| cells[d].iter().collect()).collect();
         actual.push((row.label.to_string(), strings.try_into().unwrap()));
     }
-    actual
+    (actual, refusals)
+}
+
+/// Whether an MCP refusal is about access, the only kind of `n` the table
+/// means. A parameter error or a crash would read as a refusal otherwise.
+fn is_access_refusal(text: &str) -> bool {
+    [
+        // A domain the caller may not see answers as one nobody registered.
+        "not registered; registered:",
+        // An engram in a domain the caller may not read is not found.
+        ": no engram '",
+        "and editor access is required to change it",
+        "and edit is needed",
+        "is not on the write list of",
+    ]
+    .iter()
+    .any(|phrase| text.contains(phrase))
 }
 
 /// Renders every mismatching cell as `row / domain / column: expected x, got y`.
@@ -1122,7 +1230,20 @@ async fn github_writers_may_dry_run_what_they_save() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn github_governed_matrix() {
-    let actual = collect().await;
+    let (actual, refusals) = collect().await;
+    let odd: Vec<&String> = refusals
+        .iter()
+        .filter(|text| !is_access_refusal(text))
+        .collect();
+    assert!(
+        odd.is_empty(),
+        "{} MCP refusals are not about access:\n{}",
+        odd.len(),
+        odd.iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
     let mut table = String::new();
     for (label, cells) in &actual {
         table.push_str(&format!("{label:<55} {}\n", cells.join(" ")));
@@ -1365,5 +1486,301 @@ async fn a_rate_limited_lookup_serves_the_cached_role() {
     assert_eq!(
         eng.domain_right(&user("vic"), "kb").await.unwrap(),
         DomainRight::Read
+    );
+}
+
+// --- fix round 1: more surfaces ----------------------------------------------
+
+/// One request as `session` (or nobody); answers the status and the body as
+/// JSON (`null` for an empty or non-JSON one).
+async fn send(
+    fx: &Fixture,
+    session: Option<&(String, String)>,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<Value>,
+) -> (u16, Value) {
+    let mut request = with_session(
+        client().request(method, format!("http://{}{path}", fx.addr)),
+        session,
+    );
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+    let resp = request.send().await.unwrap();
+    let status = resp.status().as_u16();
+    let text = resp.text().await.unwrap_or_default();
+    (status, serde_json::from_str(&text).unwrap_or(Value::Null))
+}
+
+/// The dry run is no oracle: whatever a caller below instance editor may
+/// not do on a governed domain is refused exactly as a name nobody
+/// registered is, so the refusal never says the domain exists.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dry_run_on_a_hidden_governed_domain_answers_like_an_unregistered_name() {
+    let fx = instance(true).await;
+    let validate = |session: (String, String), domain: &'static str| {
+        let fx = &fx;
+        async move {
+            let text = String::from_utf8(engram("Draft", "draft", "A draft.")).unwrap();
+            send(
+                fx,
+                Some(&session),
+                reqwest::Method::POST,
+                "/api/v1/validate",
+                Some(json!({ "content": text, "domain": domain })),
+            )
+            .await
+        }
+    };
+    let unlinked = login(fx.addr, "unlinked").await.unwrap();
+    let hidden = validate(unlinked.clone(), PRIVATE).await;
+    let unknown = validate(unlinked, "nosuch").await;
+    assert_eq!(hidden, unknown, "private vs an unregistered name");
+    let inone = login(fx.addr, "inone").await.unwrap();
+    let hidden = validate(inone.clone(), SHARED).await;
+    let unknown = validate(inone, "nosuch").await;
+    assert_eq!(
+        hidden, unknown,
+        "instance none: shared vs an unregistered name"
+    );
+}
+
+/// GitHub admin and maintain manage a governed domain, GitHub write writes
+/// it, and a surface gated on Manage tells them apart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn github_admins_and_maintainers_manage_and_writers_write() {
+    use crystalline_service::scope::DomainRight;
+    let fx = instance(true).await;
+    let user = |name: &str| crystalline_service::Scope::User {
+        account: name.to_string(),
+        admin: false,
+    };
+    for d in [SHARED, PRIVATE] {
+        for (name, right) in [
+            ("gadmin", DomainRight::Manage),
+            ("gmaint", DomainRight::Manage),
+            ("gwrite", DomainRight::Write),
+            ("vwrite", DomainRight::Write),
+        ] {
+            assert_eq!(
+                fx.eng.domain_right(&user(name), d).await.unwrap(),
+                right,
+                "{name} {d}"
+            );
+        }
+        for (name, allowed) in [("gadmin", true), ("gmaint", true), ("gwrite", false)] {
+            let session = login(fx.addr, name).await.unwrap();
+            let (status, body) = send(
+                &fx,
+                Some(&session),
+                reqwest::Method::PUT,
+                &format!("/api/v1/domains/{d}/reflection-collaborators/rcontrib"),
+                Some(json!({ "level": "reader" })),
+            )
+            .await;
+            assert_eq!(status < 300, allowed, "{name} {d}: {status} {body}");
+        }
+    }
+}
+
+/// R27: on a governed domain sharing, withdrawing and resolving a conflict
+/// follow the same right as a save. An instance viewer with GitHub write
+/// passes the role gate; a GitHub reader does not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sharing_on_a_governed_domain_follows_the_write_right() {
+    let fx = instance(true).await;
+    let root = login(fx.addr, "root").await.unwrap();
+    for name in ["vwrite", "gwrite"] {
+        let session = login(fx.addr, name).await.unwrap();
+        assert_eq!(put_row(&fx, Some(&session), SHARED, name, &root).await, 200);
+        let (status, body) = send(
+            &fx,
+            Some(&session),
+            reqwest::Method::POST,
+            &format!("/api/v1/domains/{SHARED}/sync/share"),
+            Some(json!({})),
+        )
+        .await;
+        assert_eq!(status, 200, "{name} shares: {body}");
+        for (path, body) in [
+            (
+                format!("/api/v1/domains/{SHARED}/sync/proposals/999/withdraw"),
+                json!({}),
+            ),
+            (
+                format!("/api/v1/domains/{SHARED}/sync/conflicts/nope/resolve"),
+                json!({ "resolution": "theirs" }),
+            ),
+        ] {
+            let (status, answer) = send(
+                &fx,
+                Some(&session),
+                reqwest::Method::POST,
+                &path,
+                Some(body),
+            )
+            .await;
+            assert!(
+                ![401, 403].contains(&status),
+                "{name} passes the gate of {path}: {status} {answer}"
+            );
+        }
+    }
+    let gread = login(fx.addr, "gread").await.unwrap();
+    for (path, body) in [
+        (format!("/api/v1/domains/{SHARED}/sync/share"), json!({})),
+        (
+            format!("/api/v1/domains/{SHARED}/sync/proposals/999/withdraw"),
+            json!({}),
+        ),
+        (
+            format!("/api/v1/domains/{SHARED}/sync/conflicts/nope/resolve"),
+            json!({ "resolution": "theirs" }),
+        ),
+    ] {
+        let (status, answer) =
+            send(&fx, Some(&gread), reqwest::Method::POST, &path, Some(body)).await;
+        assert_eq!(status, 403, "a GitHub reader is refused {path}: {answer}");
+    }
+}
+
+/// The JSON API's Reflection and attachment routes for a viewer with GitHub
+/// write (curates, writes attachments) and a GitHub reader (reads and
+/// comments, R17; writes nothing).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reflection_and_attachment_routes_follow_github_on_the_json_api() {
+    let fx = instance(true).await;
+    let mut wrong = Vec::new();
+    for d in [SHARED, PRIVATE] {
+        for (name, writes) in [("vwrite", true), ("gread", false)] {
+            let session = login(fx.addr, name).await.unwrap();
+            let mut check = |what: &str, status: u16, allowed: bool, body: &Value| {
+                if (status < 300) != allowed {
+                    wrong.push(format!("{name} / {d} / {what}: {status} {body}"));
+                }
+            };
+            let (status, body) = send(
+                &fx,
+                Some(&session),
+                reqwest::Method::PUT,
+                &format!("/api/v1/domains/{d}/reflections/twin-{name}.md"),
+                Some(json!({ "markdown": "# Twin\n\n## Part\n\nText.\n", "create": true })),
+            )
+            .await;
+            check("reflection save", status, writes, &body);
+            let (status, thread) = send(
+                &fx,
+                Some(&session),
+                reqwest::Method::POST,
+                &format!("/api/v1/domains/{d}/reflection/threads"),
+                Some(
+                    json!({ "path": "seed.md", "section": "## Wombat", "text": "question: why?" }),
+                ),
+            )
+            .await;
+            check("open a thread", status, true, &thread);
+            if let Some(id) = thread["id"].as_str() {
+                let (status, body) = send(
+                    &fx,
+                    Some(&session),
+                    reqwest::Method::POST,
+                    &format!("/api/v1/domains/{d}/reflection/threads/{id}/answer"),
+                    Some(json!({ "path": "seed.md", "text": "because" })),
+                )
+                .await;
+                check("answer a thread", status, true, &body);
+            }
+            let (status, body) = send(
+                &fx,
+                Some(&session),
+                reqwest::Method::GET,
+                &format!("/api/v1/domains/{d}/reflection/threads?path=seed.md"),
+                None,
+            )
+            .await;
+            check("list threads", status, true, &body);
+            let put = with_session(
+                client().put(format!(
+                    "http://{}/api/v1/domains/{d}/files/assets/twin-{name}.txt",
+                    fx.addr
+                )),
+                Some(&session),
+            )
+            .body("twin bytes")
+            .send()
+            .await
+            .unwrap();
+            let status = put.status().as_u16();
+            let body = Value::String(put.text().await.unwrap_or_default());
+            check("attachment write", status, writes, &body);
+            let (status, body) = send(
+                &fx,
+                Some(&session),
+                reqwest::Method::DELETE,
+                &format!("/api/v1/domains/{d}/files/assets/twin-vwrite.txt"),
+                None,
+            )
+            .await;
+            // vwrite removes its own upload; the reader is refused before
+            // the file is looked at (vwrite has already removed it on
+            // `shared` by then, so a 404 would also mean "allowed").
+            check("attachment remove", status, writes, &body);
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
+/// A governed domain that reviews changes: a GitHub writer's save lands in
+/// its own draft and the reviewed files are not touched; a GitHub reader is
+/// refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn on_a_reviewing_governed_domain_a_writer_drafts_and_a_reader_is_refused() {
+    let fx = instance(true).await;
+    fx.eng
+        .set_review_mode(
+            SHARED,
+            Some(crystalline_core::config::ReviewMode::Overlay),
+            crystalline_service::ReviewModeConfirm::Confirmed { folds: vec![] },
+            &crystalline_service::Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    let root = login(fx.addr, "root").await.unwrap();
+    let on_disk =
+        || std::fs::read_to_string(fx._tmp.path().join(SHARED).join("row-gwrite.md")).unwrap();
+    let before = on_disk();
+    let gwrite = login(fx.addr, "gwrite").await.unwrap();
+    assert_eq!(
+        put_row(&fx, Some(&gwrite), SHARED, "gwrite", &root).await,
+        200
+    );
+    assert_eq!(on_disk(), before, "the reviewed file is not touched");
+    let (_, mine) = send(
+        &fx,
+        Some(&gwrite),
+        reqwest::Method::GET,
+        &format!("/api/v1/domains/{SHARED}/engrams/row-gwrite"),
+        None,
+    )
+    .await;
+    assert!(
+        mine.to_string().contains("Saved through the JSON API"),
+        "{mine}"
+    );
+    let vwrite = login(fx.addr, "vwrite").await.unwrap();
+    assert_eq!(
+        put_row(&fx, Some(&vwrite), SHARED, "vwrite", &root).await,
+        200
+    );
+    let gread = login(fx.addr, "gread").await.unwrap();
+    assert_eq!(
+        put_row(&fx, Some(&gread), SHARED, "gread", &root).await,
+        403
     );
 }
