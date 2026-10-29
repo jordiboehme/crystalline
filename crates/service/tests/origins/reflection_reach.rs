@@ -15,6 +15,9 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
+
+use crystalline_remote::reflections_backup::BACKUP_BRANCH;
 
 use crystalline_service::engine::Invalidate;
 use crystalline_service::params::{ReflectParams, WriteReflectionParams};
@@ -63,8 +66,18 @@ fn repo(trees: &[&str]) -> Arc<MockProvider> {
 /// of the reach rule covers every pair and what a test sees is the
 /// repository half.
 async fn setup(tmp: &Path, env: &[(&str, &str)]) -> (Arc<Forge>, Arc<Engine>, Arc<AuthStore>) {
+    let (forge, eng, auth, _) = setup_with_page_repo(tmp, env).await;
+    (forge, eng, auth)
+}
+
+/// [`setup`], with the repository `acme/kb` as the forge holds it.
+async fn setup_with_page_repo(
+    tmp: &Path,
+    env: &[(&str, &str)],
+) -> (Arc<Forge>, Arc<Engine>, Arc<AuthStore>, Arc<MockProvider>) {
+    let kb = repo(&[""]);
     let (forge, url) = spawn_forge(
-        &[("acme/kb", repo(&[""])), ("acme/vault", repo(&[""]))],
+        &[("acme/kb", kb.clone()), ("acme/vault", repo(&[""]))],
         &[("acme/kb", 1), ("acme/vault", 1)],
         &[(1, "ghs_test")],
     )
@@ -79,7 +92,7 @@ async fn setup(tmp: &Path, env: &[(&str, &str)]) -> (Arc<Forge>, Arc<Engine>, Ar
     eng.set_domain_access(Arc::new(
         DomainAccess::new(auth.clone()).with_governor(eng.knowledge_governor()),
     ));
-    (forge, eng, auth)
+    (forge, eng, auth, kb)
 }
 
 /// Sets `repo`'s collaborators by GitHub id, each with read.
@@ -347,4 +360,37 @@ async fn without_an_app_the_old_rule_holds() {
     // Any two connected domains count as alike, as before.
     write(&eng, &cite("kb", ROTA)).await.unwrap();
     assert!(too_wide(&eng, "kb").await.is_empty());
+}
+
+/// What the rule guards is the backup branch: a page that a new
+/// collaborator on its repository makes too wide is dropped from the
+/// branch head by the next recount and backup, and held back.
+#[tokio::test]
+async fn a_new_collaborator_drops_the_page_from_the_backup_branch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (forge, eng, _, kb) = setup_with_page_repo(tmp.path(), &app_env()).await;
+    collaborators(&forge, "acme/kb", &[1]);
+    collaborators(&forge, "acme/vault", &[1]);
+    write(&eng, &cite("kb", ROTA)).await.unwrap();
+    let later = || Instant::now() + Duration::from_secs(120);
+    eng.reflection_backup_tick(later()).await;
+    let head = || kb.commit_paths(&kb.branch_commit(BACKUP_BRANCH).unwrap());
+    assert!(head().contains(&"reflections/overview.md".to_string()));
+
+    collaborators(&forge, "acme/kb", &[1, 2]);
+    eng.invalidate_github_access(Invalidate::Repo("acme/kb".to_string()));
+    assert_eq!(
+        eng.schedule_too_wide_backups().await,
+        vec!["kb".to_string()]
+    );
+    eng.reflection_backup_tick(later()).await;
+    assert!(
+        !head().iter().any(|p| p.contains("overview.md")),
+        "{:?}",
+        head()
+    );
+    assert_eq!(
+        eng.reflection_backup_held_back("kb"),
+        vec!["overview.md".to_string()]
+    );
 }
