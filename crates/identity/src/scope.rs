@@ -4353,6 +4353,18 @@ mod tests {
         assert!(!screen.admits("gh-vault"));
     }
 
+    /// A Reflection page on an open domain may not cite a closed one (its
+    /// readers are only the admins), and a page on a closed domain may cite
+    /// an open one: its readers, the admins, read that one anyway.
+    #[tokio::test]
+    async fn a_closed_domain_covers_and_is_covered_as_its_readers_say() {
+        let dir = tempfile::tempdir().unwrap();
+        let governor = base_governor().close("gh-vault");
+        let access = governed_access(&dir, governor).await;
+        assert!(!access.readers_cover("gh-open", "gh-vault").await.unwrap());
+        assert!(access.readers_cover("gh-vault", "gh-open").await.unwrap());
+    }
+
     #[tokio::test]
     async fn knowledge_none_account_gets_nothing_with_github_admin() {
         let dir = tempfile::tempdir().unwrap();

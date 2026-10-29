@@ -758,9 +758,20 @@ async fn until_closed(eng: &Engine) {
 async fn a_repository_without_the_app_is_closed_before_anyone_asks() {
     let tmp = tempfile::tempdir().unwrap();
     let (_forge, eng) = closed_setup(tmp.path(), false).await;
-    assert!(eng.github_access_closed().is_empty());
     // What `install_domain_access` does at start.
     eng.preload_github_app();
+    until_closed(&eng).await;
+    assert_closed(&eng).await;
+}
+
+/// The App loaded before the governor existed (a fast load, or a slot an
+/// earlier origin operation settled): building the governor warms it up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_governor_built_after_the_app_loaded_still_warms_up() {
+    let tmp = tempfile::tempdir().unwrap();
+    // `closed_setup` settles the App (`github_app()`) before it builds the
+    // governor, and never preloads.
+    let (_forge, eng) = closed_setup(tmp.path(), false).await;
     until_closed(&eng).await;
     assert_closed(&eng).await;
 }

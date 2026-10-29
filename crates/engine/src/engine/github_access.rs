@@ -560,6 +560,11 @@ impl GithubGovernor {
     /// forgets every failure of an open domain, so nothing is reported
     /// degraded until a lookup fails again.
     pub fn invalidate(&self, what: Invalidate) {
+        // Asked before the lock: `All` with no usable App (it changed, or
+        // the new one is not loaded yet) drops the old App's closed set, so
+        // the base rules apply until the new one answers (R21).
+        let ready =
+            matches!(what, Invalidate::All) && matches!(self.env.app(), GovernorApp::Ready { .. });
         {
             let mut state = lock(&self.state);
             let now = Instant::now();
@@ -588,6 +593,12 @@ impl GithubGovernor {
                         .values_mut()
                         .for_each(|next| *next = now);
                     state.failing.values_mut().for_each(|f| f.last = None);
+                }
+                Invalidate::All if !ready => {
+                    state.global += 1;
+                    state.entries.clear();
+                    state.not_installed.clear();
+                    state.failing.clear();
                 }
                 Invalidate::All => {
                     state.global += 1;
@@ -933,7 +944,17 @@ impl GithubGovernor {
             };
             for (repo, generation, gone) in due {
                 let Some(source) = &source else {
-                    lock(&me.state).rechecking.remove(&repo);
+                    // Nobody to ask: put it off five minutes rather than
+                    // start it again on every question.
+                    let mut state = lock(&me.state);
+                    state.rechecking.remove(&repo);
+                    let now = Instant::now();
+                    if let Some(next) = state.not_installed.get_mut(&repo) {
+                        *next = now + FRESH_FOR;
+                    }
+                    if let Some(failing) = state.failing.get_mut(&repo) {
+                        failing.last = Some(now);
+                    }
                     continue;
                 };
                 if gone {
@@ -1213,14 +1234,25 @@ impl GovernorEnv for EngineEnv {
 impl super::Engine {
     /// The GitHub governor of this engine, built on first use. Every caller
     /// gets the same one, so every [`DomainAccess`] answers from one cache.
+    ///
+    /// When the App slot is already settled (a fast load, or an origin
+    /// operation loaded it), building the governor warms it up at once
+    /// ([`GithubGovernor::warm_up`]), since no later load will.
     pub fn github_governor(self: &Arc<Self>) -> Arc<GithubGovernor> {
-        self.github_governor
+        let mut built = false;
+        let governor = self
+            .github_governor
             .get_or_init(|| {
+                built = true;
                 GithubGovernor::new(Arc::new(EngineEnv {
                     engine: Arc::downgrade(self),
                 }))
             })
-            .clone()
+            .clone();
+        if built && self.github_app_slot_settled().is_some() {
+            governor.warm_up();
+        }
+        governor
     }
 
     /// The governor every [`DomainAccess`] this engine is served through is
@@ -2202,5 +2234,36 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert_eq!(rig.github.listings(), 1);
+    }
+
+    /// Without a usable App a due re-check cannot ask anybody: it is put
+    /// off five minutes instead of being started again on every question.
+    #[tokio::test(start_paused = true)]
+    async fn a_recheck_without_a_usable_app_waits_five_minutes() {
+        let rig = rig().await;
+        rig.github.with(REPO, |r| r.not_installed = true);
+        rig.knowledge("alice").await;
+        tokio::time::advance(FRESH_FOR).await;
+        *lock(&rig.env.app) = GovernorApp::Unusable;
+        rig.governor.governed_domains();
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        let next = lock(&rig.governor.state).not_installed[&repo_key(REPO)];
+        assert_eq!(next, Instant::now() + FRESH_FOR);
+    }
+
+    /// An App that changed and is not usable: the old App's closed set is
+    /// dropped, and the base rules apply (R21).
+    #[tokio::test(start_paused = true)]
+    async fn invalidate_all_without_a_usable_app_drops_the_closed_set() {
+        let rig = rig().await;
+        rig.github.with(REPO, |r| r.not_installed = true);
+        rig.knowledge("alice").await;
+        assert!(rig.governor.closed_domains().contains(DOMAIN));
+        *lock(&rig.env.app) = GovernorApp::Unusable;
+        rig.governor.invalidate(Invalidate::All);
+        assert!(rig.governor.closed_domains().is_empty());
+        assert!(rig.governor.governed_domains().contains(DOMAIN));
     }
 }
