@@ -786,6 +786,11 @@ export type GithubUnlinkResponse = {
 };
 
 /**
+ * Who decides access to a domain.
+ */
+export type Governance = 'github' | 'crystalline';
+
+/**
  * The level a Reflection collaborator holds. Narrower than
  * [`ReflectionLevel`]: `default` would grant nothing, and taking a grant
  * away is `DELETE`.
@@ -1351,24 +1356,26 @@ export type MembersResponse = {
     closed_reason?: string | null;
     /**
      * The people GitHub lists on the repository, with the level their role
-     * gives here and the account linked to them. `null` on a domain GitHub
-     * does not govern and for a caller with no account; an empty list while
-     * GitHub's answer is not known.
+     * gives here and the account linked to them, for a caller who writes
+     * here (GitHub write, maintain or admin, or an instance admin). `null`
+     * for everybody else and on a domain GitHub does not govern; an empty
+     * list while GitHub's answer is not known.
      */
     github_people?: Array<GithubPerson> | null;
     /**
      * `github` when access to this domain follows the GitHub App, else
      * `crystalline`.
      */
-    governance: string;
+    governance: Governance;
     /**
      * Everyone invited, by name. Empty for a shared domain and for a
      * domain GitHub governs.
      */
     members: Array<DomainMember>;
     /**
-     * On a domain GitHub governs: the membership rows set in Crystalline,
-     * which GitHub overrides. Empty everywhere else.
+     * On a domain GitHub governs, for a caller with manager access: the
+     * membership rows set in Crystalline, which GitHub overrides. Empty
+     * everywhere else.
      */
     overridden: Array<DomainMember>;
     /**
@@ -1388,8 +1395,9 @@ export type MembersResponse = {
      */
     visibility: string;
     /**
-     * When who may read this domain is set in the environment, the
-     * sentence that says where; the visibility switch is read-only then.
+     * On a domain GitHub governs whose readers are set in the environment,
+     * the sentence that says where; the visibility switch is read-only
+     * then. `null` everywhere else.
      */
     visibility_fixed_by?: string | null;
 };

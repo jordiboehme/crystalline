@@ -115,16 +115,17 @@ pub struct MembersResponse {
     pub members: Vec<DomainMember>,
     /// `github` when access to this domain follows the GitHub App, else
     /// `crystalline`.
-    #[schema(example = "github")]
-    pub governance: &'static str,
+    pub governance: Governance,
     /// The people GitHub lists on the repository, with the level their role
-    /// gives here and the account linked to them. `null` on a domain GitHub
-    /// does not govern and for a caller with no account; an empty list while
-    /// GitHub's answer is not known.
+    /// gives here and the account linked to them, for a caller who writes
+    /// here (GitHub write, maintain or admin, or an instance admin). `null`
+    /// for everybody else and on a domain GitHub does not govern; an empty
+    /// list while GitHub's answer is not known.
     #[schema(value_type = Option<Vec<super::schemas::GithubPerson>>)]
     pub github_people: Option<Vec<crate::engine::GithubPerson>>,
-    /// On a domain GitHub governs: the membership rows set in Crystalline,
-    /// which GitHub overrides. Empty everywhere else.
+    /// On a domain GitHub governs, for a caller with manager access: the
+    /// membership rows set in Crystalline, which GitHub overrides. Empty
+    /// everywhere else.
     #[schema(value_type = Vec<super::schemas::DomainMember>)]
     pub overridden: Vec<DomainMember>,
     /// The Reflection collaborators of a domain kept as files, for a caller
@@ -132,13 +133,24 @@ pub struct MembersResponse {
     /// in the database.
     #[schema(value_type = Option<Vec<super::schemas::ReflectionGrant>>)]
     pub reflection_collaborators: Option<Vec<ReflectionGrant>>,
-    /// When who may read this domain is set in the environment, the
-    /// sentence that says where; the visibility switch is read-only then.
+    /// On a domain GitHub governs whose readers are set in the environment,
+    /// the sentence that says where; the visibility switch is read-only
+    /// then. `null` everywhere else.
     #[schema(example = "Set by CRYSTALLINE_DOMAIN_KB_READERS; change it there.")]
     pub visibility_fixed_by: Option<String>,
     /// Why this domain is closed (the GitHub App is not installed on its
     /// repository), for an instance admin; `null` otherwise.
     pub closed_reason: Option<String>,
+}
+
+/// Who decides access to a domain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum Governance {
+    /// Access follows the GitHub App: the repository's people decide.
+    Github,
+    /// This instance's own accounts and membership records decide.
+    Crystalline,
 }
 
 /// The one answer every membership change on a domain GitHub governs gets.
@@ -424,30 +436,48 @@ pub async fn list(
         .map_err(|e| ApiError::internal(format!("reading this domain's visibility: {e:#}")))?;
     let visibility = if acl.is_some() { "private" } else { "shared" };
     let governed = state.engine.github_governs(&domain);
-    let reflection_collaborators = reflection_collaborators_for(&state, &identity, &domain).await?;
-    let visibility_fixed_by = state
-        .engine
-        .env_readers_var(&domain)
-        .map(|var| env_readers_sentence(&var));
+    // The caller's right, read once: what of the governed half it is shown
+    // follows from it.
+    let right = state
+        .access
+        .right(&identity.scope(), &domain)
+        .await
+        .map_err(|e| {
+            ApiError::internal(format!("this domain's membership is unreadable: {e:#}"))
+        })?;
+    let reflection_collaborators =
+        reflection_collaborators_for(&state, &identity, &domain, right).await?;
     if governed {
-        // The rows survive a share on a governed domain, so they are read
-        // whatever the visibility. GitHub's people only for a caller with
-        // an account: the anonymous tier sees who reads nothing here.
-        let overridden = state
-            .auth
-            .domain_members(&domain)
-            .await
-            .map_err(|e| ApiError::internal(format!("listing this domain's members: {e:#}")))?;
-        let github_people = match identity.user {
-            Some(_) => Some(
+        // Who GitHub lists is shown to the people who write here (GitHub
+        // write, maintain or admin, or an instance admin), never to a
+        // reader: on a public repository every signed-in account reads the
+        // domain, and the collaborator list is not public on GitHub.
+        let github_people = if right >= DomainRight::Write {
+            Some(
                 state
                     .engine
                     .github_people(&domain)
                     .await
                     .unwrap_or_default(),
-            ),
-            None => None,
+            )
+        } else {
+            None
         };
+        // The rows survive a share on a governed domain, so they are read
+        // whatever the visibility, and only a manager sees them.
+        let overridden =
+            if right >= DomainRight::Manage {
+                state.auth.domain_members(&domain).await.map_err(|e| {
+                    ApiError::internal(format!("listing this domain's members: {e:#}"))
+                })?
+            } else {
+                Vec::new()
+            };
+        // Only where GitHub governs does the environment fix the switch.
+        let visibility_fixed_by = state
+            .engine
+            .env_readers_var(&domain)
+            .map(|var| env_readers_sentence(&var));
         // Only an instance admin gets into a closed domain at all, so only
         // one is told why it is closed.
         let closed_reason = identity
@@ -460,7 +490,7 @@ pub async fn list(
             owner: None,
             visibility,
             members: Vec::new(),
-            governance: "github",
+            governance: Governance::Github,
             github_people,
             overridden,
             reflection_collaborators,
@@ -473,11 +503,11 @@ pub async fn list(
             owner: None,
             visibility,
             members: Vec::new(),
-            governance: "crystalline",
+            governance: Governance::Crystalline,
             github_people: None,
             overridden: Vec::new(),
             reflection_collaborators,
-            visibility_fixed_by,
+            visibility_fixed_by: None,
             closed_reason: None,
         }));
     };
@@ -493,11 +523,11 @@ pub async fn list(
         owner: (!acl.owner.is_empty()).then_some(acl.owner),
         visibility,
         members,
-        governance: "crystalline",
+        governance: Governance::Crystalline,
         github_people: None,
         overridden: Vec::new(),
         reflection_collaborators,
-        visibility_fixed_by,
+        visibility_fixed_by: None,
         closed_reason: None,
     }))
 }
@@ -510,17 +540,11 @@ async fn reflection_collaborators_for(
     state: &RestState,
     identity: &Identity,
     domain: &str,
+    right: DomainRight,
 ) -> Result<Option<Vec<ReflectionGrant>>, ApiError> {
     if identity.user.is_none() || !state.engine.kept_as_files(domain) {
         return Ok(None);
     }
-    let right = state
-        .access
-        .right(&identity.scope(), domain)
-        .await
-        .map_err(|e| {
-            ApiError::internal(format!("this domain's membership is unreadable: {e:#}"))
-        })?;
     if right < DomainRight::Manage {
         return Ok(None);
     }

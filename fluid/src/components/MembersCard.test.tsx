@@ -1075,6 +1075,25 @@ describe("the members card on a domain GitHub governs", () => {
     expect(everyone).toBeDisabled();
   });
 
+  it("draws no people for a reader the server shows none", async () => {
+    serve(
+      {
+        "/domains/eng/members": () => governedResponse({ github_people: null }),
+      },
+      "rea",
+      "editor",
+    );
+
+    renderApp("/d/eng/settings");
+    const card = await membersCard();
+    expect(
+      within(card).getByRole("radio", { name: "Everyone signed in" }),
+    ).toBeDisabled();
+    expect(
+      within(card).queryByRole("table", { name: "People on GitHub" }),
+    ).toBeNull();
+  });
+
   it("renders overridden grants under their heading", async () => {
     serve(
       {

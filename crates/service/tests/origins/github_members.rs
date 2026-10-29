@@ -22,6 +22,7 @@ use super::github_app::{Forge, app_env, connect, engine, repo_with_manifest, spa
 const MAINT_ID: u64 = 2001;
 const WRI_ID: u64 = 2002;
 const NOBODY_ID: u64 = 3003;
+const REA_ID: u64 = 2004;
 
 struct Fixture {
     addr: std::net::SocketAddr,
@@ -54,6 +55,8 @@ async fn serve(tmp: &Path, extra_env: &[(&str, &str)]) -> Fixture {
         ("maint", Role::Editor),
         ("wri", Role::Editor),
         ("ada", Role::Editor),
+        ("vic", Role::Viewer),
+        ("rea", Role::Editor),
     ] {
         auth.add_user(name, name, None, role, "pw12345678")
             .await
@@ -65,12 +68,16 @@ async fn serve(tmp: &Path, extra_env: &[(&str, &str)]) -> Fixture {
     auth.link_github("wri", &host, WRI_ID, "wri-gh")
         .await
         .unwrap();
+    auth.link_github("rea", &host, REA_ID, "rea-gh")
+        .await
+        .unwrap();
     forge.collaborators.lock().unwrap().insert(
         "acme/kb".to_string(),
         vec![
             json!({"id": MAINT_ID, "login": "maint-gh", "role_name": "maintain"}),
             json!({"id": WRI_ID, "login": "wri-gh", "role_name": "write"}),
             json!({"id": NOBODY_ID, "login": "nobody-gh", "role_name": "read"}),
+            json!({"id": REA_ID, "login": "rea-gh", "role_name": "read"}),
         ],
     );
     let router = http_router(
@@ -197,15 +204,19 @@ async fn members_of_a_governed_domain_list_github_people_and_overridden_grants()
         .iter()
         .map(|p| p["login"].as_str().unwrap())
         .collect();
-    assert_eq!(logins, ["maint-gh", "nobody-gh", "wri-gh"], "{body}");
+    assert_eq!(
+        logins,
+        ["maint-gh", "nobody-gh", "rea-gh", "wri-gh"],
+        "{body}"
+    );
     assert_eq!(people[0]["github_role"], "maintain");
     assert_eq!(people[0]["level"], "manager");
     assert_eq!(people[0]["account"], "maint");
     assert_eq!(people[1]["github_role"], "read");
     assert_eq!(people[1]["level"], "viewer");
     assert_eq!(people[1]["account"], Value::Null);
-    assert_eq!(people[2]["level"], "editor");
-    assert_eq!(people[2]["account"], "wri");
+    assert_eq!(people[3]["level"], "editor");
+    assert_eq!(people[3]["account"], "wri");
     // A manager sees the Reflection collaborators.
     assert_eq!(body["reflection_collaborators"], json!([]), "{body}");
 
@@ -220,8 +231,10 @@ async fn members_of_a_governed_domain_list_github_people_and_overridden_grants()
     )
     .await;
     assert_eq!(status, 200, "{body}");
-    assert_eq!(body["github_people"].as_array().unwrap().len(), 3);
+    assert_eq!(body["github_people"].as_array().unwrap().len(), 4);
     assert_eq!(body["reflection_collaborators"], Value::Null, "{body}");
+    // The overridden grants are the managers' to see.
+    assert_eq!(body["overridden"], json!([]), "{body}");
 
     // A domain GitHub does not govern answers as it always did.
     fx.eng.domain_add_virtual("plain").await.unwrap();
@@ -333,7 +346,11 @@ async fn a_github_maintainer_switches_visibility() {
     )
     .await;
     assert_eq!(status, 204, "{body}");
-    assert!(fx.auth.domain_visibility("kb").await.unwrap().is_some());
+    let acl = fx.auth.domain_visibility("kb").await.unwrap().unwrap();
+    assert_eq!(
+        acl.owner, "owner",
+        "the reserved name holds the record, never the maintainer"
+    );
     assert_eq!(fx.auth.domain_members("kb").await.unwrap().len(), 1);
     // The maintainer still reads it: GitHub decides who reads it.
     let (status, body) = call(
@@ -406,6 +423,17 @@ async fn an_env_defined_domain_keeps_its_readers_in_the_environment() {
     .await;
     fx.eng.sync(None).await.unwrap();
     let sentence = "Set by CRYSTALLINE_DOMAIN_KB_READERS; change it there.";
+    // Below manager access the answer is the 403, before the environment.
+    let wri = login(fx.addr, "wri").await;
+    let (status, body) = call(
+        &fx,
+        &wri,
+        reqwest::Method::PUT,
+        "/api/v1/domains/kb/visibility",
+        Some(json!({"private": true})),
+    )
+    .await;
+    assert_eq!(status, 403, "{body}");
     let maint = login(fx.addr, "maint").await;
     let (status, body) = call(
         &fx,
@@ -563,4 +591,108 @@ async fn the_reflection_status_says_github_decides_and_offers_no_leave() {
     assert_eq!(body["private"], true, "{body}");
     // The overridden row cannot be left: the route answers 409 there.
     assert_eq!(body["member"], false, "{body}");
+}
+
+/// Who GitHub lists is shown to the people who write here (GitHub write,
+/// maintain or admin, or an instance admin), never to a reader, and the
+/// overridden grants only to a manager.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn github_people_are_shown_to_writers_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fx = serve(tmp.path(), &[]).await;
+    // Rows that survive on a shared governed domain.
+    old_grants(&fx).await;
+    fx.auth.take_back_governed_private("kb").await.unwrap();
+    // A public repository, so even a plain instance viewer reads the domain.
+    fx.forge
+        .public
+        .lock()
+        .unwrap()
+        .insert("acme/kb".to_string());
+    fx.eng
+        .invalidate_github_access(crystalline_service::engine::Invalidate::All);
+    for (name, people) in [
+        ("vic", false),
+        ("rea", false),
+        ("wri", true),
+        ("root", true),
+    ] {
+        let session = login(fx.addr, name).await;
+        let (status, body) = call(
+            &fx,
+            &session,
+            reqwest::Method::GET,
+            "/api/v1/domains/kb/members",
+            None,
+        )
+        .await;
+        assert_eq!(status, 200, "{name}: {body}");
+        assert_eq!(body["github_people"].is_array(), people, "{name}: {body}");
+        if name != "root" {
+            assert_eq!(body["overridden"], json!([]), "{name}: {body}");
+        } else {
+            assert_eq!(body["overridden"].as_array().unwrap().len(), 1, "{body}");
+        }
+    }
+}
+
+/// Without an App nothing is governed, so an env-defined domain's readers
+/// variable fixes nothing on the Members card.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn visibility_fixed_by_is_only_said_on_a_governed_domain() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("kb");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("MANIFEST.md"), super::github_app::manifest("")).unwrap();
+    let root_str = root.to_str().unwrap().to_string();
+    let (_forge, url) = spawn_forge(&[("acme/kb", repo_with_manifest(""))], &[], &[]).await;
+    let eng = Arc::new(
+        engine(
+            tmp.path(),
+            &url,
+            &[
+                ("CRYSTALLINE_DOMAIN_KB", &root_str),
+                ("CRYSTALLINE_DOMAIN_KB_ORIGIN", "acme/kb"),
+                ("CRYSTALLINE_DOMAIN_KB_READERS", "shared"),
+            ],
+        )
+        .await,
+    );
+    eng.sync(None).await.unwrap();
+    let auth = Arc::new(AuthStore::open(&tmp.path().join("auth.db")).await.unwrap());
+    auth.add_user("root", "root", None, Role::Admin, "pw12345678")
+        .await
+        .unwrap();
+    let router = http_router(
+        eng.clone(),
+        Arc::new(AtomicUsize::new(0)),
+        &[],
+        auth.clone(),
+        None,
+    )
+    .unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    assert!(!eng.github_governs("kb"));
+    let session = login(addr, "root").await;
+    let resp = client()
+        .get(format!("http://{addr}/api/v1/domains/kb/members"))
+        .header("cookie", format!("fluid_session={}", session.0))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["governance"], "crystalline", "{body}");
+    assert_eq!(body["visibility_fixed_by"], Value::Null, "{body}");
 }

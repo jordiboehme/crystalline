@@ -7925,7 +7925,7 @@ async fn env_readers_shared_never_opens_a_private_domain() {
         .filter(|l| {
             l.starts_with("WARN")
                 && l.contains(
-                    "CRYSTALLINE_DOMAIN_KB_READERS says shared, but domain 'kb' is private; change who may read on its Members card",
+                    "CRYSTALLINE_DOMAIN_KB_READERS says shared, but domain 'kb' is private; set the variable to private, or remove the private record with: crystalline domain visibility kb default",
                 )
         })
         .collect();

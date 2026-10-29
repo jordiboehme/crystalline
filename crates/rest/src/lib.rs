@@ -305,6 +305,7 @@ use crate::scope::{DomainAccess, DomainRight};
         schemas::GithubPerson,
         schemas::ClosedDomain,
         members::ReflectionCollaboratorsResponse,
+        members::Governance,
         members::ReflectionCollaboratorBody,
         members::GrantLevel,
         domains_admin::ShareBody,

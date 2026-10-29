@@ -2930,16 +2930,18 @@ pub async fn set_visibility(
 ///
 /// * The gates run in the order the rest of this surface uses: an account,
 ///   the 404 a hidden domain shares with an unregistered name, the
-///   read-only refusal, then the right. A caller who may not see the domain
-///   and asks to make it private is answered exactly as for an unregistered
-///   name, which for a non-admin is the admin refusal of the plain path.
+///   read-only refusal, the right, then the environment. A caller who may
+///   not see the domain and asks to make it private is answered exactly as
+///   for an unregistered name, which for a non-admin is the admin refusal
+///   of the plain path.
 /// * Both directions need [`DomainRight::Manage`]: a GitHub admin or
 ///   maintainer, or an instance admin. Nobody holds a domain here, so
 ///   neither direction hands it to anybody.
 /// * A domain defined in the environment applies its readers again on every
 ///   start, so a change here would not last: it is refused with the
 ///   variable's name.
-/// * Private is recorded through `set_governed_private`, which leaves an
+/// * Private is recorded through `set_governed_private` under the reserved
+///   machine owner's name, never the caller's, and leaves an
 ///   already-private domain as it is. Shared drops the acl row only: the
 ///   membership rows stay for the day the App is removed.
 async fn set_governed_visibility(
@@ -2948,7 +2950,7 @@ async fn set_governed_visibility(
     domain: &str,
     private: bool,
 ) -> Result<StatusCode, ApiError> {
-    let caller = identity.require_account()?;
+    identity.require_account()?;
     if let Err(hidden) = require_domain_read(state, identity, domain).await {
         if private {
             identity.require_admin()?;
@@ -2956,11 +2958,6 @@ async fn set_governed_visibility(
         return Err(hidden);
     }
     refuse_read_only(state)?;
-    if let Some(var) = state.engine.env_readers_var(domain) {
-        return Err(ApiError::conflict(super::members::env_readers_sentence(
-            &var,
-        )));
-    }
     let right = state
         .access
         .right(&identity.scope(), domain)
@@ -2976,10 +2973,18 @@ async fn set_governed_visibility(
             super::member_level_word(right)
         )));
     }
+    if let Some(var) = state.engine.env_readers_var(domain) {
+        return Err(ApiError::conflict(super::members::env_readers_sentence(
+            &var,
+        )));
+    }
     if private {
+        // The reserved name holds the record, as on the connect and env
+        // paths: nobody owns a governed domain, and a caller's name here
+        // would make it an owner the day the App is removed.
         state
             .access
-            .set_governed_private(domain, caller.name.as_str())
+            .set_governed_private(domain, crate::scope::OWNER_IDENTITY_NAME)
             .await
             .map_err(|e| ApiError::internal(format!("setting the domain's visibility: {e:#}")))?;
     } else {

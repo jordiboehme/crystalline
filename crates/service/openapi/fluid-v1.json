@@ -13171,6 +13171,14 @@
           }
         }
       },
+      "Governance": {
+        "type": "string",
+        "description": "Who decides access to a domain.",
+        "enum": [
+          "github",
+          "crystalline"
+        ]
+      },
       "GrantLevel": {
         "type": "string",
         "description": "The level a Reflection collaborator holds. Narrower than\n[`ReflectionLevel`]: `default` would grant nothing, and taking a grant\naway is `DELETE`.",
@@ -13922,12 +13930,11 @@
             "items": {
               "$ref": "#/components/schemas/GithubPerson"
             },
-            "description": "The people GitHub lists on the repository, with the level their role\ngives here and the account linked to them. `null` on a domain GitHub\ndoes not govern and for a caller with no account; an empty list while\nGitHub's answer is not known."
+            "description": "The people GitHub lists on the repository, with the level their role\ngives here and the account linked to them, for a caller who writes\nhere (GitHub write, maintain or admin, or an instance admin). `null`\nfor everybody else and on a domain GitHub does not govern; an empty\nlist while GitHub's answer is not known."
           },
           "governance": {
-            "type": "string",
-            "description": "`github` when access to this domain follows the GitHub App, else\n`crystalline`.",
-            "example": "github"
+            "$ref": "#/components/schemas/Governance",
+            "description": "`github` when access to this domain follows the GitHub App, else\n`crystalline`."
           },
           "members": {
             "type": "array",
@@ -13941,7 +13948,7 @@
             "items": {
               "$ref": "#/components/schemas/DomainMember"
             },
-            "description": "On a domain GitHub governs: the membership rows set in Crystalline,\nwhich GitHub overrides. Empty everywhere else."
+            "description": "On a domain GitHub governs, for a caller with manager access: the\nmembership rows set in Crystalline, which GitHub overrides. Empty\neverywhere else."
           },
           "owner": {
             "type": [
@@ -13971,7 +13978,7 @@
               "string",
               "null"
             ],
-            "description": "When who may read this domain is set in the environment, the\nsentence that says where; the visibility switch is read-only then.",
+            "description": "On a domain GitHub governs whose readers are set in the environment,\nthe sentence that says where; the visibility switch is read-only\nthen. `null` everywhere else.",
             "example": "Set by CRYSTALLINE_DOMAIN_KB_READERS; change it there."
           }
         }

@@ -1293,7 +1293,7 @@ impl Engine {
                 // Shared never opens a domain that is already private.
                 if private && !quiet {
                     tracing::warn!(
-                        "{var} says shared, but domain '{name}' is private; change who may read on its Members card"
+                        "{var} says shared, but domain '{name}' is private; set the variable to private, or remove the private record with: crystalline domain visibility {name} default"
                     );
                 }
                 continue;

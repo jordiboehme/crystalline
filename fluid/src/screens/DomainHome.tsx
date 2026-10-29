@@ -1494,12 +1494,17 @@ function EngramsSection({
    */
   manifestPermalink?: string | null;
 }) {
+  const { user } = useAuth();
   const { canWrite } = useDomainWritable(domain);
   // The same members read the settings and the danger zone make: whether
   // GitHub decides here, and whether the domain is shared.
+  // Only for a signed-in account, and never retried: the hint is for an
+  // account that could link GitHub, and a missing hint is no failure.
   const members = useQuery({
     queryKey: membersKey(domain),
     queryFn: () => fetchMembers(domain),
+    enabled: user !== null,
+    retry: false,
   });
   const sharedGithub =
     members.data !== undefined &&
