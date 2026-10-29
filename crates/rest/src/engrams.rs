@@ -812,7 +812,9 @@ pub struct MoveBody {
         ),
         (
             status = 403,
-            description = "The caller is not an editor, the request did not \
+            description = "The caller may not write this domain (not an \
+                           editor, or on a domain GitHub governs, no GitHub \
+                           write), the request did not \
                            echo its CSRF token, this instance is read-only, or \
                            the trusted-header identity names a disabled account.",
             body = ProblemDetail,
@@ -1073,7 +1075,9 @@ pub async fn create(
         ),
         (
             status = 403,
-            description = "The caller is not an editor, the request did not \
+            description = "The caller may not write this domain (not an \
+                           editor, or on a domain GitHub governs, no GitHub \
+                           write), the request did not \
                            echo its CSRF token, this instance is read-only, or \
                            the trusted-header identity names a disabled \
                            account. A read-only instance answers this ahead of \
@@ -1346,7 +1350,9 @@ pub async fn save(
         ),
         (
             status = 403,
-            description = "The caller is not an editor, the request did not \
+            description = "The caller may not write this domain (not an \
+                           editor, or on a domain GitHub governs, no GitHub \
+                           write), the request did not \
                            echo its CSRF token, this instance is read-only, or \
                            the trusted-header identity names a disabled account.",
             body = ProblemDetail,
@@ -1498,7 +1504,9 @@ pub async fn retire(
         ),
         (
             status = 403,
-            description = "The caller is not an editor, the request did not \
+            description = "The caller may not write this domain (not an \
+                           editor, or on a domain GitHub governs, no GitHub \
+                           write), the request did not \
                            echo its CSRF token, this instance is read-only, or \
                            the trusted-header identity names a disabled account.",
             body = ProblemDetail,
@@ -1707,7 +1715,9 @@ pub struct ValidateResponse {
         ),
         (
             status = 403,
-            description = "The caller is not an editor, the request did not \
+            description = "The caller may not write this domain (not an \
+                           editor, or on a domain GitHub governs, no GitHub \
+                           write), the request did not \
                            echo its CSRF token, this instance is read-only, or \
                            the trusted-header identity names a disabled account.",
             body = ProblemDetail,
@@ -1731,11 +1741,16 @@ pub async fn validate(
     // instance viewer with GitHub write saves (`require_domain_write`), so it
     // may check what it saves; everywhere else, and for every instance
     // editor, the instance role decides as before.
-    // Nobody signed in keeps its 401.
+    // Nobody signed in keeps its 401. Any refusal on the governed path is
+    // the instance role's own 403, so a governed domain the caller may not
+    // see answers exactly like a name nobody registered and the dry run is
+    // no oracle for which domains exist.
     match identity.require_editor() {
         Ok(_) => {}
         Err(e) if e.status == StatusCode::FORBIDDEN && state.access.governs(domain) => {
-            crate::require_domain_write(&state, &identity, domain).await?;
+            crate::require_domain_write(&state, &identity, domain)
+                .await
+                .map_err(|_| e)?;
         }
         Err(e) => return Err(e),
     }
@@ -1864,7 +1879,9 @@ impl ValidateFinding {
         ),
         (
             status = 403,
-            description = "The caller is not an editor, the request did not \
+            description = "The caller may not write this domain (not an \
+                           editor, or on a domain GitHub governs, no GitHub \
+                           write), the request did not \
                            echo its CSRF token, this instance is read-only, or \
                            the trusted-header identity names a disabled \
                            account. A read-only instance answers this ahead of \

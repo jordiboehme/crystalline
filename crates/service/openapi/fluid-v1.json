@@ -892,7 +892,7 @@
             }
           },
           "403": {
-            "description": "Viewer role, read-only instance, or a missing/foreign Origin.",
+            "description": "No write right on the domain (a viewer, or on a domain GitHub governs no GitHub write), a read-only instance, or a missing/foreign Origin.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -1907,7 +1907,7 @@
             }
           },
           "403": {
-            "description": "A viewer, a membership below editor, or a read-only instance.",
+            "description": "No write right on this domain (a viewer, a membership below editor, or on a domain GitHub governs no GitHub write), or a read-only instance.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -2499,7 +2499,7 @@
             }
           },
           "403": {
-            "description": "The caller is not an editor, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "description": "The caller may not write this domain (not an editor, or on a domain GitHub governs, no GitHub write), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -2788,7 +2788,7 @@
             }
           },
           "403": {
-            "description": "The caller is not an editor, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. A read-only instance answers this ahead of the precondition check, so it is never 428. A presented `X-Crystalline-Join` that names no live join of this account's is answered here too: the draft was left, the link ran out or was taken back, or the draft was folded, discarded or renamed, and nothing of the caller's was written.",
+            "description": "The caller may not write this domain (not an editor, or on a domain GitHub governs, no GitHub write), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. A read-only instance answers this ahead of the precondition check, so it is never 428. A presented `X-Crystalline-Join` that names no live join of this account's is answered here too: the draft was left, the link ran out or was taken back, or the draft was folded, discarded or renamed, and nothing of the caller's was written.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -2922,7 +2922,7 @@
             }
           },
           "403": {
-            "description": "The caller is not an editor, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. A read-only instance answers this ahead of the precondition check, so it is never 428.",
+            "description": "The caller may not write this domain (not an editor, or on a domain GitHub governs, no GitHub write), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. A read-only instance answers this ahead of the precondition check, so it is never 428.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -3393,7 +3393,7 @@
             }
           },
           "403": {
-            "description": "The caller is not an editor, the CSRF token is missing or wrong, the instance is read-only, or a presented `X-Crystalline-Join` names no live join of this account's.",
+            "description": "The caller may not write this domain (not an editor, or on a domain GitHub governs, no GitHub write), the CSRF token is missing or wrong, the instance is read-only, or a presented `X-Crystalline-Join` names no live join of this account's.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -3519,7 +3519,7 @@
             }
           },
           "403": {
-            "description": "The caller is not an editor, the CSRF token is missing or wrong, the instance is read-only, or a presented `X-Crystalline-Join` names no live join of this account's.",
+            "description": "The caller may not write this domain (not an editor, or on a domain GitHub governs, no GitHub write), the CSRF token is missing or wrong, the instance is read-only, or a presented `X-Crystalline-Join` names no live join of this account's.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -4765,7 +4765,7 @@
             }
           },
           "403": {
-            "description": "The caller is not an editor, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "description": "The caller may not write this domain (not an editor, or on a domain GitHub governs, no GitHub write), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -7340,7 +7340,7 @@
             }
           },
           "403": {
-            "description": "The caller is not an editor, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "description": "The caller may not write this domain (not an editor, or on a domain GitHub governs, no GitHub write), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -7597,7 +7597,7 @@
             }
           },
           "403": {
-            "description": "The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`), or the trusted-header identity names a disabled account.",
+            "description": "The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`; on a domain GitHub governs, whoever may write it), or the trusted-header identity names a disabled account.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -7805,7 +7805,7 @@
             }
           },
           "403": {
-            "description": "The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`), this instance is read-only, or the trusted-header identity names a disabled account.",
+            "description": "The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`; on a domain GitHub governs, whoever may write it), this instance is read-only, or the trusted-header identity names a disabled account.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -7897,7 +7897,7 @@
             }
           },
           "403": {
-            "description": "The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`), or the trusted-header identity names a disabled account.",
+            "description": "The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`; on a domain GitHub governs, whoever may write it), or the trusted-header identity names a disabled account.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -7993,7 +7993,7 @@
             }
           },
           "403": {
-            "description": "The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "description": "The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`; on a domain GitHub governs, whoever may write it), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -8121,7 +8121,7 @@
             }
           },
           "403": {
-            "description": "The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "description": "The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`; on a domain GitHub governs, whoever may write it), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -8257,7 +8257,7 @@
             }
           },
           "403": {
-            "description": "The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "description": "The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`; on a domain GitHub governs, whoever may write it), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -11886,7 +11886,7 @@
             }
           },
           "403": {
-            "description": "The caller is not an editor, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "description": "The caller may not write this domain (not an editor, or on a domain GitHub governs, no GitHub write), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
             "content": {
               "application/problem+json": {
                 "schema": {

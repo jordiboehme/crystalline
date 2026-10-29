@@ -37,6 +37,9 @@ use crystalline_remote::ops::DiscardTarget;
 /// layers, who authored them, what is wedged - so an editor who may share and
 /// may not read it would be sharing into a card they cannot see.
 ///
+/// On a domain GitHub governs, the six domain routes go through
+/// [`require_share_role_on`] instead, where the GitHub role decides (R27).
+///
 /// The rule itself lives on [`Identity::may_share`], which the `/auth/me`
 /// probe reads too, so what a client draws and what these routes serve can
 /// never disagree. This wrapper is the local reading of the instance's mode,
@@ -45,6 +48,29 @@ use crystalline_remote::ops::DiscardTarget;
 /// rather than at the next restart.
 fn require_share_role(state: &RestState, identity: &Identity) -> Result<Caller, ApiError> {
     identity.may_share(state.engine.share_identity_mode())
+}
+
+/// [`require_share_role`] for the share surfaces of one domain. On a domain
+/// GitHub governs the share follows the same right as a save (R27): the
+/// GitHub role and the write list decide through `require_domain_write`,
+/// whatever the instance role and the share mode say, and the engine's own
+/// checks on the share stay as they are. A caller that also fails that gets
+/// the share role's own refusal, so a governed domain it may not see
+/// answers as every other domain does here.
+async fn require_share_role_on(
+    state: &RestState,
+    identity: &Identity,
+    domain: &str,
+) -> Result<Caller, ApiError> {
+    match require_share_role(state, identity) {
+        Ok(caller) => Ok(caller),
+        Err(e) if e.status == axum::http::StatusCode::FORBIDDEN && state.access.governs(domain) => {
+            crate::require_domain_write(state, identity, domain)
+                .await
+                .map_err(|_| e)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// The account a request is being served as, or `None` for the anonymous
@@ -963,7 +989,8 @@ fn single_domain(
             status = 403,
             description = "The caller may not share on this instance (an \
                            admin, or an editor when \
-                           `github.share_identity` is `personal`), or the \
+                           `github.share_identity` is `personal`; on a domain \
+                           GitHub governs, whoever may write it), or the \
                            trusted-header identity names a disabled account.",
             body = ProblemDetail,
             content_type = "application/problem+json",
@@ -993,7 +1020,7 @@ pub async fn sync_status(
 ) -> Result<Json<Value>, ApiError> {
     // The share verbs' own gate: whoever may share reads the report they would
     // be sharing into. See the doc comment.
-    let caller = require_share_role(&state, &identity)?;
+    let caller = require_share_role_on(&state, &identity, &domain).await?;
     // No refuse_read_only: this is a read. See the doc comment.
     // No connection check either: this route reports the connection rather
     // than refusing over it. See the doc comment.
@@ -1536,7 +1563,8 @@ pub async fn sync_now(
             status = 403,
             description = "The caller may not share on this instance (an \
                            admin, or an editor when \
-                           `github.share_identity` is `personal`), this \
+                           `github.share_identity` is `personal`; on a domain \
+                           GitHub governs, whoever may write it), this \
                            instance is read-only, or the trusted-header \
                            identity names a disabled account.",
             body = ProblemDetail,
@@ -1563,7 +1591,7 @@ pub async fn share_changes_preview(
     identity: Identity,
     ApiPath(domain): ApiPath<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let caller = require_share_role(&state, &identity)?;
+    let caller = require_share_role_on(&state, &identity, &domain).await?;
     refuse_read_only(&state)?;
     // The domain gate `sync_status` explains: a domain the caller may not see
     // is refused as one nobody registered.
@@ -1770,7 +1798,8 @@ pub struct ShareBody {
             status = 403,
             description = "The caller may not share on this instance (an \
                            admin, or an editor when \
-                           `github.share_identity` is `personal`), the \
+                           `github.share_identity` is `personal`; on a domain \
+                           GitHub governs, whoever may write it), the \
                            request did not echo its CSRF token, this instance \
                            is read-only, or the trusted-header identity names \
                            a disabled account.",
@@ -1814,7 +1843,7 @@ pub async fn share_now(
     ApiPath(domain): ApiPath<String>,
     ApiJson(body): ApiJson<ShareBody>,
 ) -> Result<Json<Value>, ApiError> {
-    let caller = require_share_role(&state, &identity)?;
+    let caller = require_share_role_on(&state, &identity, &domain).await?;
     refuse_read_only(&state)?;
     // The same gate one rung higher: this acts on the domain, so a caller who
     // may only read it is refused by level rather than served.
@@ -1926,7 +1955,8 @@ pub struct WithdrawBody {
             status = 403,
             description = "The caller may not share on this instance (an \
                            admin, or an editor when \
-                           `github.share_identity` is `personal`), the \
+                           `github.share_identity` is `personal`; on a domain \
+                           GitHub governs, whoever may write it), the \
                            request did not echo its CSRF token, this instance \
                            is read-only, or the trusted-header identity names \
                            a disabled account.",
@@ -1961,7 +1991,7 @@ pub async fn withdraw_proposal(
     ApiPath((domain, number)): ApiPath<(String, u64)>,
     ApiJson(body): ApiJson<WithdrawBody>,
 ) -> Result<Json<Value>, ApiError> {
-    let caller = require_share_role(&state, &identity)?;
+    let caller = require_share_role_on(&state, &identity, &domain).await?;
     refuse_read_only(&state)?;
     // The same gate one rung higher: this acts on the domain, so a caller who
     // may only read it is refused by level rather than served.
@@ -2036,7 +2066,8 @@ pub async fn withdraw_proposal(
             status = 403,
             description = "The caller may not share on this instance (an \
                            admin, or an editor when \
-                           `github.share_identity` is `personal`), or the \
+                           `github.share_identity` is `personal`; on a domain \
+                           GitHub governs, whoever may write it), or the \
                            trusted-header identity names a disabled \
                            account.",
             body = ProblemDetail,
@@ -2065,7 +2096,7 @@ pub async fn conflict_detail(
     // The same gate the resolve carries, for the same reason: whoever may
     // settle a conflict has to be able to read the three sides they are
     // choosing between first.
-    require_share_role(&state, &identity)?;
+    require_share_role_on(&state, &identity, &domain).await?;
     // No connection check: every side of a conflict is already on this
     // machine. See the doc comment.
     // The domain gate `sync_status` explains: a domain the caller may not see
@@ -2143,7 +2174,8 @@ pub struct ResolveBody {
             status = 403,
             description = "The caller may not share on this instance (an \
                            admin, or an editor when \
-                           `github.share_identity` is `personal`), the \
+                           `github.share_identity` is `personal`; on a domain \
+                           GitHub governs, whoever may write it), the \
                            request did not echo its CSRF token, this instance \
                            is read-only, or the trusted-header identity names \
                            a disabled account.",
@@ -2185,7 +2217,7 @@ pub async fn resolve_conflict(
     ApiPath((domain, id)): ApiPath<(String, String)>,
     ApiJson(body): ApiJson<ResolveBody>,
 ) -> Result<Json<Value>, ApiError> {
-    let caller = require_share_role(&state, &identity)?;
+    let caller = require_share_role_on(&state, &identity, &domain).await?;
     refuse_read_only(&state)?;
     // The same gate one rung higher: this acts on the domain, so a caller who
     // may only read it is refused by level rather than served.
@@ -2399,7 +2431,7 @@ pub struct DiscardBody {
             example = json!({ "domain": "kb", "restored": ["notes/a.md"], "deleted": ["notes/new.md"], "cleared": [], "refused": [{ "path": "notes/b.md", "reason": "changed_since" }], "reindexed": 2 }),
         ),
         (status = 401, description = "No identity, or an anonymous one.", body = ProblemDetail, content_type = "application/problem+json"),
-        (status = 403, description = "A viewer, a membership below editor, or a read-only instance.", body = ProblemDetail, content_type = "application/problem+json"),
+        (status = 403, description = "No write right on this domain (a viewer, a membership below editor, or on a domain GitHub governs no GitHub write), or a read-only instance.", body = ProblemDetail, content_type = "application/problem+json"),
         (status = 404, description = "No such domain, or none this caller may see.", body = ProblemDetail, content_type = "application/problem+json"),
         (status = 409, description = "Not a team domain, or GitHub is switched off on this instance.", body = ProblemDetail, content_type = "application/problem+json"),
         (status = 422, description = "An empty path list.", body = ProblemDetail, content_type = "application/problem+json"),

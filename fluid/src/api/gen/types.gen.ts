@@ -3013,7 +3013,7 @@ export type CollabJoinErrors = {
      */
     401: ProblemDetail;
     /**
-     * Viewer role, read-only instance, or a missing/foreign Origin.
+     * No write right on the domain (a viewer, or on a domain GitHub governs no GitHub write), a read-only instance, or a missing/foreign Origin.
      */
     403: ProblemDetail;
     /**
@@ -3518,7 +3518,7 @@ export type DiscardDomainChangesErrors = {
      */
     401: ProblemDetail;
     /**
-     * A viewer, a membership below editor, or a read-only instance.
+     * No write right on this domain (a viewer, a membership below editor, or on a domain GitHub governs no GitHub write), or a read-only instance.
      */
     403: ProblemDetail;
     /**
@@ -3825,7 +3825,7 @@ export type CreateEngramErrors = {
      */
     401: ProblemDetail;
     /**
-     * The caller is not an editor, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
+     * The caller may not write this domain (not an editor, or on a domain GitHub governs, no GitHub write), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
      */
     403: ProblemDetail;
     /**
@@ -3895,7 +3895,7 @@ export type DeleteEngramErrors = {
      */
     401: ProblemDetail;
     /**
-     * The caller is not an editor, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. A read-only instance answers this ahead of the precondition check, so it is never 428.
+     * The caller may not write this domain (not an editor, or on a domain GitHub governs, no GitHub write), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. A read-only instance answers this ahead of the precondition check, so it is never 428.
      */
     403: ProblemDetail;
     /**
@@ -4015,7 +4015,7 @@ export type SaveEngramErrors = {
      */
     401: ProblemDetail;
     /**
-     * The caller is not an editor, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. A read-only instance answers this ahead of the precondition check, so it is never 428. A presented `X-Crystalline-Join` that names no live join of this account's is answered here too: the draft was left, the link ran out or was taken back, or the draft was folded, discarded or renamed, and nothing of the caller's was written.
+     * The caller may not write this domain (not an editor, or on a domain GitHub governs, no GitHub write), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. A read-only instance answers this ahead of the precondition check, so it is never 428. A presented `X-Crystalline-Join` that names no live join of this account's is answered here too: the draft was left, the link ran out or was taken back, or the draft was folded, discarded or renamed, and nothing of the caller's was written.
      */
     403: ProblemDetail;
     /**
@@ -4187,7 +4187,7 @@ export type DeleteAttachmentErrors = {
      */
     401: ProblemDetail;
     /**
-     * The caller is not an editor, the CSRF token is missing or wrong, the instance is read-only, or a presented `X-Crystalline-Join` names no live join of this account's.
+     * The caller may not write this domain (not an editor, or on a domain GitHub governs, no GitHub write), the CSRF token is missing or wrong, the instance is read-only, or a presented `X-Crystalline-Join` names no live join of this account's.
      */
     403: ProblemDetail;
     /**
@@ -4306,7 +4306,7 @@ export type WriteAttachmentErrors = {
      */
     401: ProblemDetail;
     /**
-     * The caller is not an editor, the CSRF token is missing or wrong, the instance is read-only, or a presented `X-Crystalline-Join` names no live join of this account's.
+     * The caller may not write this domain (not an editor, or on a domain GitHub governs, no GitHub write), the CSRF token is missing or wrong, the instance is read-only, or a presented `X-Crystalline-Join` names no live join of this account's.
      */
     403: ProblemDetail;
     /**
@@ -4841,7 +4841,7 @@ export type MoveEngramErrors = {
      */
     401: ProblemDetail;
     /**
-     * The caller is not an editor, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
+     * The caller may not write this domain (not an editor, or on a domain GitHub governs, no GitHub write), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
      */
     403: ProblemDetail;
     /**
@@ -6101,7 +6101,7 @@ export type RetireEngramErrors = {
      */
     401: ProblemDetail;
     /**
-     * The caller is not an editor, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
+     * The caller may not write this domain (not an editor, or on a domain GitHub governs, no GitHub write), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
      */
     403: ProblemDetail;
     /**
@@ -6201,7 +6201,7 @@ export type GetDomainSyncStatusErrors = {
      */
     401: ProblemDetail;
     /**
-     * The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`), or the trusted-header identity names a disabled account.
+     * The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`; on a domain GitHub governs, whoever may write it), or the trusted-header identity names a disabled account.
      */
     403: ProblemDetail;
     /**
@@ -6295,7 +6295,7 @@ export type GetDomainShareChangesErrors = {
      */
     401: ProblemDetail;
     /**
-     * The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`), this instance is read-only, or the trusted-header identity names a disabled account.
+     * The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`; on a domain GitHub governs, whoever may write it), this instance is read-only, or the trusted-header identity names a disabled account.
      */
     403: ProblemDetail;
     /**
@@ -6343,7 +6343,7 @@ export type GetDomainConflictErrors = {
      */
     401: ProblemDetail;
     /**
-     * The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`), or the trusted-header identity names a disabled account.
+     * The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`; on a domain GitHub governs, whoever may write it), or the trusted-header identity names a disabled account.
      */
     403: ProblemDetail;
     /**
@@ -6391,7 +6391,7 @@ export type ResolveDomainConflictErrors = {
      */
     401: ProblemDetail;
     /**
-     * The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
+     * The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`; on a domain GitHub governs, whoever may write it), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
      */
     403: ProblemDetail;
     /**
@@ -6447,7 +6447,7 @@ export type WithdrawDomainProposalErrors = {
      */
     401: ProblemDetail;
     /**
-     * The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
+     * The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`; on a domain GitHub governs, whoever may write it), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
      */
     403: ProblemDetail;
     /**
@@ -6495,7 +6495,7 @@ export type ShareDomainErrors = {
      */
     401: ProblemDetail;
     /**
-     * The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
+     * The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`; on a domain GitHub governs, whoever may write it), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
      */
     403: ProblemDetail;
     /**
@@ -8444,7 +8444,7 @@ export type ValidateDocumentErrors = {
      */
     401: ProblemDetail;
     /**
-     * The caller is not an editor, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
+     * The caller may not write this domain (not an editor, or on a domain GitHub governs, no GitHub write), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
      */
     403: ProblemDetail;
     /**

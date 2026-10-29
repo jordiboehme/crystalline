@@ -80,7 +80,7 @@ pub struct JoinQuery {
     responses(
         (status = 101, description = "Switching protocols: the session is joined."),
         (status = 401, description = "No identity.", body = ProblemDetail, content_type = "application/problem+json"),
-        (status = 403, description = "Viewer role, read-only instance, or a missing/foreign Origin.", body = ProblemDetail, content_type = "application/problem+json"),
+        (status = 403, description = "No write right on the domain (a viewer, or on a domain GitHub governs no GitHub write), a read-only instance, or a missing/foreign Origin.", body = ProblemDetail, content_type = "application/problem+json"),
         (status = 404, description = "No such engram.", body = ProblemDetail, content_type = "application/problem+json"),
         (status = 409, description = "On a shared database, another instance hosts this file domain and writes it; the detail names it. Or a move of this engram is running.", body = ProblemDetail, content_type = "application/problem+json"),
         (status = 422, description = "`overlay` names somebody whose draft a live share-link shows this caller, and this session has not joined it: seeing a draft and editing it are two steps. The detail is the sentence that says how to take the second.", body = ProblemDetail, content_type = "application/problem+json"),
