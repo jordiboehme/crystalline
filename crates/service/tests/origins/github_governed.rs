@@ -288,6 +288,7 @@ struct Fixture {
     addr: std::net::SocketAddr,
     eng: Arc<Engine>,
     auth: Arc<AuthStore>,
+    forge: Arc<Forge>,
     _tmp: tempfile::TempDir,
 }
 
@@ -514,6 +515,7 @@ async fn instance(mcp_auth: bool) -> Fixture {
         addr,
         eng,
         auth,
+        forge,
         _tmp: tmp,
     }
 }
@@ -814,7 +816,7 @@ async fn rest_cells(
         let status = resp.status().as_u16();
         (status, resp.text().await.unwrap_or_default())
     };
-    let (_, searched) = get("/api/v1/search?q=quokka".to_string()).await;
+    let (search_status, searched) = get("/api/v1/search?q=quokka".to_string()).await;
     let mut cells = BTreeMap::new();
     for d in DOMAINS {
         let list = listed.contains(&format!("\"name\":\"{d}\""));
@@ -826,14 +828,17 @@ async fn rest_cells(
         let (graph_status, graph) =
             get(format!("/api/v1/graph?anchor=crystalline://{d}/{seed}")).await;
         let (tree_status, tree) = get(format!("/api/v1/domains/{d}/tree")).await;
-        // The seeds were recorded on 2026-01-01.
-        let (_, activity) = get(format!("/api/v1/activity?domains={d}&timeframe=365d")).await;
+        // The seeds were recorded on 2026-01-01 (the matrix asserts that the
+        // events phase keeps it), and ten years back from any day this test
+        // runs on still reaches that.
+        let (activity_status, activity) =
+            get(format!("/api/v1/activity?domains={d}&timeframe=3650d")).await;
         let reads = [
             status == 200 && detail.contains("quokka"),
-            searched.contains(&seed),
+            search_status == 200 && searched.contains(&seed),
             graph_status == 200 && graph.contains(&seed),
             tree_status == 200 && tree.contains(&seed),
-            activity.contains(&seed),
+            activity_status == 200 && activity.contains(&seed),
         ];
         let reads = if reads.iter().all(|r| *r) {
             'y'
@@ -1037,6 +1042,14 @@ async fn collect() -> (Vec<(String, [String; 5])>, Vec<String>) {
             .await
             .unwrap();
         }
+    }
+    // The edit keeps the seed's `recorded_at`, which the activity probe
+    // relies on.
+    for d in DOMAINS {
+        let seed = std::fs::read_to_string(a._tmp.path().join(d).join(format!("seed-{d}-end.md")))
+            .unwrap();
+        assert!(seed.contains("an event"), "{seed}");
+        assert!(seed.contains("recorded_at: 2026-01-01"), "{seed}");
     }
     let events: Vec<Vec<String>> = futures::future::join_all(
         streams
@@ -1627,7 +1640,63 @@ async fn sharing_on_a_governed_domain_follows_the_write_right() {
             );
         }
     }
+    // Decision 4, with `github.share_identity` at its default (`instance`):
+    // the share goes out through the App, authored by the person and
+    // committed by the App's bot.
+    let commits = fx.forge.commits();
+    assert_eq!(commits.len(), 2, "{commits:?}");
+    for (commit, name) in commits.iter().zip(["vwrite", "gwrite"]) {
+        assert_eq!(commit["author"]["name"], name, "{commit}");
+        assert_eq!(
+            commit["committer"]["name"], "crystalline-acme[bot]",
+            "{commit}"
+        );
+    }
+    // The three share reads beside them: a GitHub writer passes the gate, a
+    // GitHub reader does not.
+    let vwrite = login(fx.addr, "vwrite").await.unwrap();
     let gread = login(fx.addr, "gread").await.unwrap();
+    for path in [
+        format!("/api/v1/domains/{SHARED}/sync"),
+        format!("/api/v1/domains/{SHARED}/sync/changes"),
+        format!("/api/v1/domains/{SHARED}/sync/conflicts/nope"),
+    ] {
+        let (status, answer) = send(&fx, Some(&vwrite), reqwest::Method::GET, &path, None).await;
+        assert!(
+            ![401, 403].contains(&status),
+            "vwrite passes the gate of {path}: {status} {answer}"
+        );
+        let (status, answer) = send(&fx, Some(&gread), reqwest::Method::GET, &path, None).await;
+        assert_eq!(status, 403, "a GitHub reader is refused {path}: {answer}");
+    }
+    // No oracle: a governed domain the caller may not see answers like a
+    // name nobody registered.
+    let unlinked = login(fx.addr, "unlinked").await.unwrap();
+    let share = |domain: &'static str| {
+        let (fx, unlinked) = (&fx, &unlinked);
+        async move {
+            send(
+                fx,
+                Some(unlinked),
+                reqwest::Method::POST,
+                &format!("/api/v1/domains/{domain}/sync/share"),
+                Some(json!({})),
+            )
+            .await
+        }
+    };
+    assert_eq!(share(PRIVATE).await, share("nosuch").await);
+    // Where GitHub does not govern, the share role still decides: a viewer
+    // with GitHub write is refused there.
+    let (status, answer) = send(
+        &fx,
+        Some(&vwrite),
+        reqwest::Method::POST,
+        &format!("/api/v1/domains/{PLAIN}/sync/share"),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, 403, "{answer}");
     for (path, body) in [
         (format!("/api/v1/domains/{SHARED}/sync/share"), json!({})),
         (
@@ -1655,8 +1724,10 @@ async fn reflection_and_attachment_routes_follow_github_on_the_json_api() {
     for d in [SHARED, PRIVATE] {
         for (name, writes) in [("vwrite", true), ("gread", false)] {
             let session = login(fx.addr, name).await.unwrap();
+            // A refusal is exactly 403: the reader sees the domain.
             let mut check = |what: &str, status: u16, allowed: bool, body: &Value| {
-                if (status < 300) != allowed {
+                let right = if allowed { status < 300 } else { status == 403 };
+                if !right {
                     wrong.push(format!("{name} / {d} / {what}: {status} {body}"));
                 }
             };
