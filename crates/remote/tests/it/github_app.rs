@@ -12,14 +12,14 @@ use std::sync::{Arc, Mutex};
 
 use axum::Json;
 use axum::Router;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{DateTime, Duration, TimeZone, Utc};
-use crystalline_remote::github::app::GithubApp;
+use crystalline_remote::github::app::{Collaborator, GithubApp, RepoRole};
 use crystalline_remote::{AppCredentials, CommitIdentity, RemoteError};
 use tokio::net::TcpListener;
 
@@ -679,4 +679,291 @@ async fn installations_name_the_accounts_the_app_is_installed_on() {
         app.installations().await.unwrap(),
         vec!["acme".to_string(), "octo-org".to_string()]
     );
+}
+
+// --- repository roles, users by id and collaborators -------------------------
+
+/// A stand-in GitHub for the lookups: the installation and token routes of
+/// `router`, plus whatever `extra` adds.
+async fn serve_with(
+    mock: Mock,
+    extra: Router<Arc<Mock>>,
+) -> (Arc<Mock>, String, Arc<GithubApp>, TestClock) {
+    let mock = Arc::new(mock);
+    let routes = extra
+        .route(
+            "/repos/{owner}/{name}/installation",
+            get(installation_handler),
+        )
+        .route("/app/installations/{id}/access_tokens", post(token_handler))
+        .with_state(mock.clone());
+    let base = spawn(routes).await;
+    let clock = TestClock::new();
+    let app = GithubApp::new(Some(base.clone()), creds(&host_of(&base), Some(SLUG))).unwrap();
+    (mock, base, Arc::new(clock.install(app)), clock)
+}
+
+/// `GET /repos/{o}/{r}/collaborators/{login}/permission`: the login picks the
+/// answer. The first field is the legacy `permission`, the second `role_name`.
+async fn permission_handler(
+    State(mock): State<Arc<Mock>>,
+    Path((_owner, _name, login)): Path<(String, String, String)>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    mock.record("GET", &uri, &headers);
+    let (permission, role_name) = match login.as_str() {
+        "u-admin" => ("admin", "admin"),
+        "u-maintain" => ("write", "maintain"),
+        "u-write" => ("write", "write"),
+        "u-triage" => ("read", "triage"),
+        "u-read" => ("read", "read"),
+        "docs" => ("write", "docs-lead"),
+        "limited" => {
+            let mut response = mock.answer(
+                StatusCode::FORBIDDEN,
+                serde_json::json!({"message": "API rate limit exceeded"}),
+            );
+            response
+                .headers_mut()
+                .insert("x-ratelimit-remaining", "0".parse().unwrap());
+            response
+                .headers_mut()
+                .insert("x-ratelimit-reset", "1793188800".parse().unwrap());
+            return response;
+        }
+        _ => return mock.answer(StatusCode::NOT_FOUND, not_found()),
+    };
+    mock.answer(
+        StatusCode::OK,
+        serde_json::json!({"permission": permission, "role_name": role_name, "user": {"login": login}}),
+    )
+}
+
+fn permission_routes() -> Router<Arc<Mock>> {
+    Router::new().route(
+        "/repos/{owner}/{name}/collaborators/{login}/permission",
+        get(permission_handler),
+    )
+}
+
+#[tokio::test]
+async fn repo_role_maps_every_builtin_role() {
+    let (mock, _base, app, _clock) =
+        serve_with(mock_with(&[("acme/kb", 11)]), permission_routes()).await;
+
+    for (login, role) in [
+        ("u-admin", RepoRole::Admin),
+        ("u-maintain", RepoRole::Maintain),
+        ("u-write", RepoRole::Write),
+        ("u-triage", RepoRole::Triage),
+        ("u-read", RepoRole::Read),
+    ] {
+        assert_eq!(
+            app.repo_role("acme/kb", login).await.unwrap(),
+            role,
+            "{login}"
+        );
+    }
+    let headers = mock.headers_of("GET /repos/acme/kb/collaborators/");
+    assert_eq!(
+        headers.get("authorization").unwrap().to_str().unwrap(),
+        "Bearer ghs_11_1"
+    );
+    assert_eq!(headers.get("x-github-api-version").unwrap(), "2022-11-28");
+    assert_eq!(mock.minted(11), 1, "one installation token serves them all");
+}
+
+#[tokio::test]
+async fn a_custom_role_maps_by_its_base_permission() {
+    let (_mock, _base, app, _clock) =
+        serve_with(mock_with(&[("acme/kb", 11)]), permission_routes()).await;
+    assert_eq!(
+        app.repo_role("acme/kb", "docs").await.unwrap(),
+        RepoRole::Write
+    );
+}
+
+#[tokio::test]
+async fn a_non_collaborator_is_none() {
+    let (_mock, _base, app, _clock) =
+        serve_with(mock_with(&[("acme/kb", 11)]), permission_routes()).await;
+    assert_eq!(
+        app.repo_role("acme/kb", "stranger").await.unwrap(),
+        RepoRole::None
+    );
+}
+
+#[tokio::test]
+async fn rate_limit_on_the_permission_lookup_is_rate_limited() {
+    let (_mock, _base, app, _clock) =
+        serve_with(mock_with(&[("acme/kb", 11)]), permission_routes()).await;
+    let err = app.repo_role("acme/kb", "limited").await.unwrap_err();
+    match err {
+        RemoteError::RateLimited { reset } => {
+            assert_eq!(reset, Some(Utc.timestamp_opt(1793188800, 0).unwrap()));
+        }
+        other => panic!("expected RateLimited, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_renewed_installation_token_is_tried_once_after_a_401() {
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let recorded = seen.clone();
+    let routes = Router::new().route(
+        "/repos/{owner}/{name}/collaborators/{login}/permission",
+        get(move |headers: HeaderMap| {
+            let recorded = recorded.clone();
+            async move {
+                let auth = headers["authorization"].to_str().unwrap().to_string();
+                recorded.lock().unwrap().push(auth.clone());
+                if auth == "Bearer ghs_11_1" {
+                    (
+                        StatusCode::UNAUTHORIZED,
+                        Json(serde_json::json!({"message": "Bad credentials"})),
+                    )
+                } else {
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({"permission": "read", "role_name": "read"})),
+                    )
+                }
+            }
+        }),
+    );
+    let (_mock, _base, app, _clock) = serve_with(mock_with(&[("acme/kb", 11)]), routes).await;
+    assert_eq!(
+        app.repo_role("acme/kb", "anyone").await.unwrap(),
+        RepoRole::Read
+    );
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec!["Bearer ghs_11_1".to_string(), "Bearer ghs_11_2".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn a_renamed_login_resolves_through_the_id() {
+    let routes = Router::new().route(
+        "/user/{id}",
+        get(|Path(id): Path<u64>| async move {
+            if id == 583231 {
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({"login": "octocat-renamed", "id": id})),
+                )
+            } else {
+                (StatusCode::NOT_FOUND, Json(not_found()))
+            }
+        }),
+    );
+    let (_mock, _base, app, _clock) = serve_with(mock_with(&[("acme/kb", 11)]), routes).await;
+    assert_eq!(app.login_for_id(583231).await.unwrap(), "octocat-renamed");
+    assert!(app.login_for_id(1).await.is_err());
+}
+
+#[tokio::test]
+async fn a_transferred_repository_follows_the_301() {
+    let routes = Router::new()
+        .route(
+            "/repos/{owner}/{name}/collaborators/{login}/permission",
+            get(|| async {
+                (
+                    StatusCode::MOVED_PERMANENTLY,
+                    [(
+                        "Location",
+                        "/repositories/99/collaborators/u-admin/permission",
+                    )],
+                )
+            }),
+        )
+        .route(
+            "/repositories/{id}/collaborators/{login}/permission",
+            get(|| async {
+                Json(serde_json::json!({"permission": "admin", "role_name": "admin"}))
+            }),
+        );
+    let (_mock, _base, app, _clock) = serve_with(mock_with(&[("acme/old", 11)]), routes).await;
+    assert_eq!(
+        app.repo_role("acme/old", "u-admin").await.unwrap(),
+        RepoRole::Admin
+    );
+}
+
+#[tokio::test]
+async fn collaborators_walk_every_page() {
+    let queries = Arc::new(Mutex::new(Vec::<HashMap<String, String>>::new()));
+    let recorded = queries.clone();
+    let routes = Router::new().route(
+        "/repos/{owner}/{name}/collaborators",
+        get(move |Query(query): Query<HashMap<String, String>>| {
+            let recorded = recorded.clone();
+            async move {
+                recorded.lock().unwrap().push(query.clone());
+                let page: u64 = query.get("page").map_or(1, |p| p.parse().unwrap());
+                let (from, to) = match page {
+                    1 => (1, 100),
+                    2 => (101, 101),
+                    _ => (0, 0),
+                };
+                let users: Vec<_> = (from..=to)
+                    .filter(|n| *n > 0)
+                    .map(|n| {
+                        let role = match n {
+                            1 => "admin",
+                            2 => "docs-lead",
+                            _ => "read",
+                        };
+                        let permissions = if n == 2 {
+                            serde_json::json!({"admin": false, "maintain": false, "push": true, "triage": true, "pull": true})
+                        } else {
+                            serde_json::json!({"admin": n == 1, "maintain": n == 1, "push": n == 1, "triage": true, "pull": true})
+                        };
+                        serde_json::json!({"id": n, "login": format!("user{n}"), "role_name": role, "permissions": permissions})
+                    })
+                    .collect();
+                Json(users)
+            }
+        }),
+    );
+    let (_mock, _base, app, _clock) = serve_with(mock_with(&[("acme/kb", 11)]), routes).await;
+
+    let all = app.collaborators("acme/kb").await.unwrap();
+    assert_eq!(all.len(), 101);
+    assert_eq!(
+        all[0],
+        Collaborator {
+            id: 1,
+            login: "user1".to_string(),
+            role: RepoRole::Admin
+        }
+    );
+    assert_eq!(
+        all[1].role,
+        RepoRole::Write,
+        "a custom role maps by its permissions"
+    );
+    assert_eq!(all[100].id, 101);
+    assert_eq!(all[100].role, RepoRole::Read);
+
+    let queries = queries.lock().unwrap();
+    assert_eq!(queries.len(), 2, "a short page ends the walk");
+    assert!(
+        queries
+            .iter()
+            .all(|q| q["affiliation"] == "all" && q["per_page"] == "100")
+    );
+}
+
+#[tokio::test]
+async fn repository_visibility_reads_the_private_field() {
+    for (private, public) in [(true, false), (false, true)] {
+        let routes = Router::new().route(
+            "/repos/{owner}/{name}",
+            get(move || async move { Json(serde_json::json!({"private": private})) }),
+        );
+        let (_mock, _base, app, _clock) = serve_with(mock_with(&[("acme/kb", 11)]), routes).await;
+        assert_eq!(app.repository_public("acme/kb").await.unwrap(), public);
+    }
 }

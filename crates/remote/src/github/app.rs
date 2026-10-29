@@ -249,6 +249,97 @@ struct UserResponse {
     login: String,
 }
 
+/// What a login may do in one repository.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RepoRole {
+    Admin,
+    Maintain,
+    Write,
+    Triage,
+    Read,
+    /// No access: not a collaborator at all.
+    None,
+}
+
+impl RepoRole {
+    /// A GitHub permission word (`admin`, `maintain`, `write`/`push`,
+    /// `triage`, `read`/`pull`) as a role; anything else is `None`.
+    fn from_word(word: &str) -> RepoRole {
+        match word {
+            "admin" => RepoRole::Admin,
+            "maintain" => RepoRole::Maintain,
+            "write" | "push" => RepoRole::Write,
+            "triage" => RepoRole::Triage,
+            "read" | "pull" => RepoRole::Read,
+            _ => RepoRole::None,
+        }
+    }
+
+    /// The role a built-in `role_name` names. A custom role has no entry
+    /// here and is read through its base permission instead.
+    fn from_builtin(role_name: &str) -> Option<RepoRole> {
+        matches!(
+            role_name,
+            "admin" | "maintain" | "write" | "triage" | "read"
+        )
+        .then(|| RepoRole::from_word(role_name))
+    }
+}
+
+/// One person with access to a repository.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Collaborator {
+    pub id: u64,
+    pub login: String,
+    pub role: RepoRole,
+}
+
+/// `GET /repos/{o}/{r}/collaborators/{login}/permission` response.
+#[derive(Deserialize)]
+struct PermissionResponse {
+    permission: Option<String>,
+    role_name: Option<String>,
+}
+
+/// The `permissions` flags of a collaborator listing entry.
+#[derive(Deserialize, Default)]
+struct PermissionFlags {
+    #[serde(default)]
+    admin: bool,
+    #[serde(default)]
+    maintain: bool,
+    #[serde(default)]
+    push: bool,
+    #[serde(default)]
+    triage: bool,
+    #[serde(default)]
+    pull: bool,
+}
+
+/// One entry of `GET /repos/{o}/{r}/collaborators`.
+#[derive(Deserialize)]
+struct CollaboratorEntry {
+    id: u64,
+    login: String,
+    role_name: Option<String>,
+    #[serde(default)]
+    permissions: PermissionFlags,
+}
+
+/// `GET /user/{id}` and `GET /repos/{o}/{r}` answers, one field each.
+#[derive(Deserialize)]
+struct LoginResponse {
+    login: String,
+}
+
+#[derive(Deserialize)]
+struct VisibilityResponse {
+    private: bool,
+}
+
+/// How many collaborators one page holds (GitHub's maximum).
+const PAGE_SIZE: usize = 100;
+
 /// An installation token and when GitHub said it ends.
 struct CachedToken {
     token: String,
@@ -353,6 +444,9 @@ impl GithubApp {
         let key = AppKey::from_pem(&creds.private_key)?;
         let client = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
+            // A transferred repository answers 301 with the new location;
+            // that one hop is followed and a chain of them is an error.
+            .redirect(reqwest::redirect::Policy::limited(1))
             .build()
             .expect("the client config here is static and always valid");
         let slug = creds.slug.clone().filter(|slug| !slug.trim().is_empty());
@@ -576,6 +670,121 @@ impl GithubApp {
             }
             other => other,
         }
+    }
+
+    /// What `login` may do in `repo`, through the repository's installation
+    /// token. A built-in `role_name` wins; a custom role maps by its base
+    /// `permission`; a login that is no collaborator (404) is
+    /// [`RepoRole::None`].
+    pub async fn repo_role(&self, repo: &str, login: &str) -> Result<RepoRole, RemoteError> {
+        let (owner, name) = split_repo(repo)?;
+        let path = format!(
+            "/repos/{}/{}/collaborators/{}/permission",
+            segment(owner),
+            segment(name),
+            segment(login)
+        );
+        let response = self.get_as_installation(repo, &path).await?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(RepoRole::None);
+        }
+        let response = check_response(response, Some(repo), true, &self.api_url).await?;
+        let answer: PermissionResponse = parse_json(response).await?;
+        Ok(answer
+            .role_name
+            .as_deref()
+            .and_then(RepoRole::from_builtin)
+            .unwrap_or_else(|| RepoRole::from_word(answer.permission.as_deref().unwrap_or(""))))
+    }
+
+    /// The current login of GitHub account `id` (`GET /user/{id}`), so a
+    /// renamed account is still found by the id it was granted under.
+    ///
+    /// Goes out on a cached installation's token when one is known, else
+    /// anonymously.
+    pub async fn login_for_id(&self, id: u64) -> Result<String, RemoteError> {
+        let known = lock(&self.installations).values().min().copied();
+        let token = match known {
+            Some(installation) => Some(self.installation_token(installation).await?),
+            None => None,
+        };
+        let path = format!("/user/{id}");
+        let response = send(self.request(Method::GET, &path, token.as_deref())).await?;
+        let response = check_response(response, None, token.is_some(), &self.api_url).await?;
+        let user: LoginResponse = parse_json(response).await?;
+        Ok(user.login)
+    }
+
+    /// Everyone with access to `repo` (`affiliation=all`), every page of 100.
+    pub async fn collaborators(&self, repo: &str) -> Result<Vec<Collaborator>, RemoteError> {
+        let (owner, name) = split_repo(repo)?;
+        let mut all = Vec::new();
+        for page in 1.. {
+            let path = format!(
+                "/repos/{}/{}/collaborators?affiliation=all&per_page={PAGE_SIZE}&page={page}",
+                segment(owner),
+                segment(name)
+            );
+            let response = self.get_as_installation(repo, &path).await?;
+            let response = check_response(response, Some(repo), true, &self.api_url).await?;
+            let entries: Vec<CollaboratorEntry> = parse_json(response).await?;
+            let last = entries.len() < PAGE_SIZE;
+            all.extend(entries.into_iter().map(|entry| {
+                let flags = &entry.permissions;
+                let by_flags = if flags.admin {
+                    RepoRole::Admin
+                } else if flags.maintain {
+                    RepoRole::Maintain
+                } else if flags.push {
+                    RepoRole::Write
+                } else if flags.triage {
+                    RepoRole::Triage
+                } else if flags.pull {
+                    RepoRole::Read
+                } else {
+                    RepoRole::None
+                };
+                Collaborator {
+                    id: entry.id,
+                    login: entry.login,
+                    role: entry
+                        .role_name
+                        .as_deref()
+                        .and_then(RepoRole::from_builtin)
+                        .unwrap_or(by_flags),
+                }
+            }));
+            if last {
+                break;
+            }
+        }
+        Ok(all)
+    }
+
+    /// Whether `repo` is public (`GET /repos/{o}/{r}`, field `private`).
+    pub async fn repository_public(&self, repo: &str) -> Result<bool, RemoteError> {
+        let (owner, name) = split_repo(repo)?;
+        let path = format!("/repos/{}/{}", segment(owner), segment(name));
+        let response = self.get_as_installation(repo, &path).await?;
+        let response = check_response(response, Some(repo), true, &self.api_url).await?;
+        let answer: VisibilityResponse = parse_json(response).await?;
+        Ok(!answer.private)
+    }
+
+    /// A GET on `path` with `repo`'s installation token. A 401 means the
+    /// cached token was revoked early: the installation is forgotten and the
+    /// request goes out once more on a fresh token. Any other status is
+    /// returned for the caller to read.
+    async fn get_as_installation(&self, repo: &str, path: &str) -> Result<Response, RemoteError> {
+        let token = self.token_for_repo(repo).await?;
+        let response = send(self.request(Method::GET, path, Some(&token))).await?;
+        if response.status() != StatusCode::UNAUTHORIZED {
+            return Ok(response);
+        }
+        let id = self.installation_for(repo).await?;
+        self.evict_installation(id);
+        let token = self.token_for_repo(repo).await?;
+        send(self.request(Method::GET, path, Some(&token))).await
     }
 
     /// Forgets which installation covers `repo`, so the next call looks it
