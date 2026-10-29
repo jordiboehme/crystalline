@@ -19,7 +19,7 @@ use axum::routing::{get, post};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{DateTime, Duration, TimeZone, Utc};
-use crystalline_remote::github::app::{Collaborator, GithubApp, RepoRole};
+use crystalline_remote::github::app::{Collaborator, GithubApp, RepoRole, RepoVisibility};
 use crystalline_remote::{AppCredentials, CommitIdentity, RemoteError};
 use tokio::net::TcpListener;
 
@@ -1141,5 +1141,44 @@ async fn repository_visibility_reads_the_private_field() {
         );
         let (_mock, _base, app, _clock) = serve_with(mock_with(&[("acme/kb", 11)]), routes).await;
         assert_eq!(app.repository_public("acme/kb").await.unwrap(), public);
+    }
+}
+
+/// An internal repository (GitHub Enterprise) answers `private: true` and is
+/// read by every member of the enterprise, whom the collaborator listing
+/// does not name: it is told apart, so no caller takes it for private.
+#[tokio::test]
+async fn repository_visibility_tells_an_internal_repository_apart() {
+    for (body, want) in [
+        (
+            serde_json::json!({"private": true, "visibility": "internal"}),
+            RepoVisibility::Internal,
+        ),
+        (
+            serde_json::json!({"private": true, "visibility": "private"}),
+            RepoVisibility::Private,
+        ),
+        (
+            serde_json::json!({"private": true}),
+            RepoVisibility::Private,
+        ),
+        (
+            serde_json::json!({"private": false, "visibility": "public"}),
+            RepoVisibility::Public,
+        ),
+    ] {
+        let routes = Router::new().route(
+            "/repos/{owner}/{name}",
+            get(move || {
+                let body = body.clone();
+                async move { Json(body) }
+            }),
+        );
+        let (_mock, _base, app, _clock) = serve_with(mock_with(&[("acme/kb", 11)]), routes).await;
+        assert_eq!(app.repository_visibility("acme/kb").await.unwrap(), want);
+        assert_eq!(
+            app.repository_public("acme/kb").await.unwrap(),
+            want == RepoVisibility::Public
+        );
     }
 }

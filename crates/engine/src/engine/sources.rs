@@ -38,13 +38,15 @@ pub(crate) const NOT_ON_GITHUB_REFUSAL: &str = "this source is in a domain that 
 /// Whether every reader of a repository whose readers are `page` also
 /// reads one whose readers are `source`: a public source repository is read
 /// by everybody; a public page repository is read by everybody, which a
-/// private source repository never is; else each collaborator of the page's
-/// repository must be one of the source's.
+/// private source repository never is, and an internal one by members of
+/// its enterprise the listing does not name; else each collaborator of the
+/// page's repository must be one of the source's. An internal source counts
+/// its listed collaborators only, which never covers more than it should.
 pub(crate) fn repository_covers(page: &RepoReaders, source: &RepoReaders) -> bool {
     if source.public {
         return true;
     }
-    !page.public && page.github_ids.is_subset(&source.github_ids)
+    !page.public && !page.internal && page.github_ids.is_subset(&source.github_ids)
 }
 
 /// How this instance knows who reads a GitHub repository

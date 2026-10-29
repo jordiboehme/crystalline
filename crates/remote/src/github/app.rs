@@ -402,6 +402,23 @@ struct LoginResponse {
 #[derive(Deserialize)]
 struct VisibilityResponse {
     private: bool,
+    /// `public`, `private` or `internal`; older GitHub Enterprise Server
+    /// releases leave it out.
+    #[serde(default)]
+    visibility: Option<String>,
+}
+
+/// Who may read a repository on GitHub, as `GET /repos/{o}/{r}` says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepoVisibility {
+    /// Everybody.
+    Public,
+    /// Its collaborators (the listing names every one of them).
+    Private,
+    /// Every member of the GitHub Enterprise it belongs to, whom the
+    /// collaborator listing does not name; GitHub answers `private: true`
+    /// for it.
+    Internal,
 }
 
 /// The most pages a collaborator listing is followed for.
@@ -935,12 +952,24 @@ impl GithubApp {
 
     /// Whether `repo` is public (`GET /repos/{o}/{r}`, field `private`).
     pub async fn repository_public(&self, repo: &str) -> Result<bool, RemoteError> {
+        Ok(self.repository_visibility(repo).await? == RepoVisibility::Public)
+    }
+
+    /// Who may read `repo` (`GET /repos/{o}/{r}`, fields `private` and
+    /// `visibility`). An internal repository answers `private: true` and is
+    /// told apart by its `visibility`; one without that field is public or
+    /// private by `private` alone.
+    pub async fn repository_visibility(&self, repo: &str) -> Result<RepoVisibility, RemoteError> {
         let (owner, name) = split_repo(repo)?;
         let path = format!("/repos/{}/{}", segment(owner), segment(name));
         let response = self.get_as_installation(repo, &path).await?;
         let response = check_response(response, Some(repo), true, &self.api_url).await?;
         let answer: VisibilityResponse = parse_json(response).await?;
-        Ok(!answer.private)
+        Ok(match (answer.private, answer.visibility.as_deref()) {
+            (false, _) => RepoVisibility::Public,
+            (true, Some("internal")) => RepoVisibility::Internal,
+            (true, _) => RepoVisibility::Private,
+        })
     }
 
     /// A GET on `path` with `repo`'s installation token. A 401 means the

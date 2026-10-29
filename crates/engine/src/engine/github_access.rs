@@ -51,7 +51,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use crystalline_remote::{Collaborator, GithubApp, RemoteError, RepoRole};
+use crystalline_remote::{Collaborator, GithubApp, RemoteError, RepoRole, RepoVisibility};
 use tokio::time::Instant;
 
 use crate::auth_store::{GithubLink, MemberLevel};
@@ -125,11 +125,15 @@ pub struct GithubPerson {
 }
 
 /// Who reads a repository on GitHub, for the Reflection source check
-/// (Task 3.7): whether it is public, and the GitHub ids with read or more.
+/// (Task 3.7): whether it is public or internal, and the GitHub ids with
+/// read or more.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepoReaders {
     /// Whether the repository is public, so everybody reads it.
     pub public: bool,
+    /// Whether it is internal (GitHub Enterprise): every member of the
+    /// enterprise reads it, and the listing does not name them.
+    pub internal: bool,
     /// The GitHub ids of every collaborator with read or more.
     pub github_ids: HashSet<u64>,
 }
@@ -165,8 +169,8 @@ pub(crate) trait GithubSource: Send + Sync {
         repo: &str,
         page: Option<&str>,
     ) -> Result<(Vec<Collaborator>, Option<String>), RemoteError>;
-    /// Whether `repo` is public, see [`GithubApp::repository_public`].
-    async fn repository_public(&self, repo: &str) -> Result<bool, RemoteError>;
+    /// Who may read `repo`, see [`GithubApp::repository_visibility`].
+    async fn repository_visibility(&self, repo: &str) -> Result<RepoVisibility, RemoteError>;
     /// The installation that covers `repo`, see [`GithubApp::installation_for`].
     async fn installation_for(&self, repo: &str) -> Result<u64, RemoteError>;
     /// Forget which installation covers `repo`, see [`GithubApp::evict_repo`].
@@ -183,8 +187,8 @@ impl GithubSource for GithubApp {
         GithubApp::collaborators_page(self, repo, page).await
     }
 
-    async fn repository_public(&self, repo: &str) -> Result<bool, RemoteError> {
-        GithubApp::repository_public(self, repo).await
+    async fn repository_visibility(&self, repo: &str) -> Result<RepoVisibility, RemoteError> {
+        GithubApp::repository_visibility(self, repo).await
     }
 
     async fn installation_for(&self, repo: &str) -> Result<u64, RemoteError> {
@@ -232,6 +236,9 @@ pub(crate) trait GovernorEnv: Send + Sync {
 #[derive(Debug)]
 struct Snapshot {
     public: bool,
+    /// Internal (GitHub Enterprise): not public, and read by members of the
+    /// enterprise the listing does not name.
+    internal: bool,
     people: HashMap<u64, (String, RepoRole)>,
 }
 
@@ -644,6 +651,7 @@ impl GithubGovernor {
         let snapshot = self.snapshot(&source, &repo).await?;
         Some(RepoReaders {
             public: snapshot.public,
+            internal: snapshot.internal,
             github_ids: snapshot
                 .people
                 .iter()
@@ -1097,8 +1105,12 @@ async fn fetch(source: &dyn GithubSource, repo: &str) -> Result<Snapshot, FetchE
             crystalline_remote::github::app::too_many_collaborator_pages(repo),
         ));
     }
-    let public = bounded(source.repository_public(repo)).await?;
-    Ok(Snapshot { public, people })
+    let visibility = bounded(source.repository_visibility(repo)).await?;
+    Ok(Snapshot {
+        public: visibility == RepoVisibility::Public,
+        internal: visibility == RepoVisibility::Internal,
+        people,
+    })
 }
 
 #[async_trait]
@@ -1499,6 +1511,8 @@ mod tests {
     struct FakeRepo {
         people: Vec<Collaborator>,
         public: bool,
+        /// Internal (GitHub Enterprise): not public, read by the enterprise.
+        internal: bool,
         /// Every call on the repository fails with this, while set.
         down: Option<fn() -> RemoteError>,
         not_installed: bool,
@@ -1622,13 +1636,15 @@ mod tests {
             answer
         }
 
-        async fn repository_public(&self, repo: &str) -> Result<bool, RemoteError> {
+        async fn repository_visibility(&self, repo: &str) -> Result<RepoVisibility, RemoteError> {
             if let Some(e) = self.refusal(repo) {
                 return Err(e);
             }
-            Ok(lock(&self.repos)
-                .get(&repo_key(repo))
-                .is_some_and(|r| r.public))
+            Ok(match lock(&self.repos).get(&repo_key(repo)) {
+                Some(r) if r.public => RepoVisibility::Public,
+                Some(r) if r.internal => RepoVisibility::Internal,
+                _ => RepoVisibility::Private,
+            })
         }
 
         async fn installation_for(&self, repo: &str) -> Result<u64, RemoteError> {
@@ -1966,11 +1982,30 @@ mod tests {
             rig.governor.repository_readers(DOMAIN).await,
             Some(RepoReaders {
                 public: true,
+                internal: false,
                 github_ids: [1, 5].into(),
             })
         );
         assert!(rig.governor.repository_public(DOMAIN).await);
         assert_eq!(rig.github.listings(), 1);
+    }
+
+    /// An internal repository is read by its enterprise's members, whom the
+    /// listing does not name: its readers say so, and it is not public.
+    #[tokio::test(start_paused = true)]
+    async fn repository_readers_say_when_a_repository_is_internal() {
+        let rig = rig().await;
+        rig.github.grant(REPO, 1, "alice-gh", RepoRole::Read);
+        rig.github.with(REPO, |r| r.internal = true);
+        assert_eq!(
+            rig.governor.repository_readers(DOMAIN).await,
+            Some(RepoReaders {
+                public: false,
+                internal: true,
+                github_ids: [1].into(),
+            })
+        );
+        assert!(!rig.governor.repository_public(DOMAIN).await);
     }
 
     /// An account for the agreement test: its name, its link (host and

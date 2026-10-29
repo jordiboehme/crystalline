@@ -96,6 +96,9 @@ pub(crate) struct Disclosure {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RepositoryReaders {
     pub public: bool,
+    /// Internal (GitHub Enterprise): read by the enterprise's members too.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub internal: bool,
     pub github_ids: Vec<u64>,
 }
 
@@ -105,6 +108,7 @@ impl RepositoryReaders {
         github_ids.sort_unstable();
         RepositoryReaders {
             public: readers.public,
+            internal: readers.internal,
             github_ids,
         }
     }
@@ -114,7 +118,9 @@ impl RepositoryReaders {
 /// when a person confirmed (`confirmed`) and may not read the source's
 /// repository (`source`, `None` when the source is not on GitHub or its
 /// readers are not known). A repository that went public since is read by
-/// everybody, whom nobody confirmed, unless the source's is public too.
+/// everybody, whom nobody confirmed, unless the source's is public too; one
+/// that went internal since is read by its enterprise, whom nobody
+/// confirmed either.
 fn repository_widened_by_nobody(
     confirmed: &RepositoryReaders,
     now: &RepoReaders,
@@ -124,6 +130,7 @@ fn repository_widened_by_nobody(
         return true;
     }
     !now.public
+        && (!now.internal || confirmed.internal)
         && now.github_ids.iter().all(|id| {
             confirmed.github_ids.binary_search(id).is_ok()
                 || source.is_some_and(|source| source.github_ids.contains(id))
@@ -844,8 +851,24 @@ mod tests {
     fn repo(public: bool, ids: &[u64]) -> RepoReaders {
         RepoReaders {
             public,
+            internal: false,
             github_ids: ids.iter().copied().collect(),
         }
+    }
+
+    #[test]
+    fn an_internal_page_repository_covers_only_a_public_source() {
+        use super::super::sources::repository_covers;
+        let internal = |ids: &[u64]| RepoReaders {
+            internal: true,
+            ..repo(false, ids)
+        };
+        // Its enterprise's members read the page and are in no listing.
+        assert!(!repository_covers(&internal(&[1]), &repo(false, &[1, 2])));
+        assert!(!repository_covers(&internal(&[1]), &internal(&[1, 2])));
+        assert!(repository_covers(&internal(&[1]), &repo(true, &[])));
+        // As a source it counts its listed collaborators only.
+        assert!(repository_covers(&repo(false, &[1]), &internal(&[1, 2])));
     }
 
     #[test]
@@ -907,6 +930,18 @@ mod tests {
             &repo(true, &[1]),
             Some(&repo(true, &[]))
         ));
+        // Made internal since: its enterprise, whom nobody confirmed.
+        let internal = RepoReaders {
+            internal: true,
+            ..repo(false, &[1, 2])
+        };
+        assert!(!repository_widened_by_nobody(
+            &confirmed,
+            &internal,
+            Some(&source)
+        ));
+        let was_internal = RepositoryReaders::of(&internal);
+        assert!(repository_widened_by_nobody(&was_internal, &internal, None));
         let public = RepositoryReaders::of(&repo(true, &[]));
         assert!(repository_widened_by_nobody(
             &public,
