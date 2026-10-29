@@ -21,8 +21,10 @@
 //! Beside the engram ladder sits the Reflection's: [`ReflectionRight`],
 //! decided by `decide_reflection` from the knowledge right and the
 //! Reflection level that applies (the account's on a shared domain, the
-//! membership row's on a private one). An explicit level only raises, every
-//! knowledge editor curates, and the write list caps it at Read as well.
+//! membership row's on a private one, and in both cases the higher of that
+//! and the account's per-domain Reflection grant). An explicit level only
+//! raises, every knowledge editor curates, and the write list caps it at Read
+//! as well.
 //!
 //! On a domain connected to GitHub through the GitHub App (a "governed"
 //! domain, named by the [`KnowledgeGovernor`] the engine installs with
@@ -471,6 +473,10 @@ fn instance_cap(principal: &Principal) -> DomainRight {
 /// * the explicit level is the account's instance level on a shared domain
 ///   and the membership row's level on a private one; an account with no
 ///   membership row on a private domain has none;
+/// * `grant` is the account's per-domain Reflection grant
+///   (`AuthStore::reflection_grant`), on any domain: the explicit level is
+///   the higher of it and the level above. `None` for every caller that
+///   holds no grant, the MCP open tier included;
 /// * `off_list`: the account's write list leaves this domain out. The
 ///   answer is then at most `Read`, whatever the knowledge right and the
 ///   explicit level say, and `None` stays `None` (a cap, never a grant).
@@ -481,13 +487,17 @@ fn instance_cap(principal: &Principal) -> DomainRight {
 /// follows the domain's base: read and comment on a shared domain, nothing
 /// on a private one. The explicit level is the account's instance level on
 /// a shared domain and none on a private one: a membership row and its
-/// Reflection level are not read. An account at instance knowledge `none`
-/// gets nothing there at all, its instance Reflection level included.
+/// Reflection level are not read. A per-domain grant is read there as
+/// anywhere: it is Crystalline's own Reflection axis, not an engram grant
+/// GitHub decides. An account at instance knowledge `none` gets nothing
+/// there at all, its instance Reflection level and its grant included, and
+/// on a closed domain a grant opens nothing (only the admins get in).
 fn decide_reflection(
     principal: &Principal,
     acl: Option<&DomainAcl>,
     level: Option<MemberLevel>,
     member_reflection: ReflectionLevel,
+    grant: Option<ReflectionLevel>,
     github: Option<Governed>,
     off_list: bool,
 ) -> ReflectionRight {
@@ -523,6 +533,8 @@ fn decide_reflection(
             (Some(_), None) => ReflectionLevel::Default,
         },
     };
+    // A per-domain grant only raises the explicit level.
+    let reflection = reflection.max(grant.unwrap_or_default());
     let right = if knowledge >= DomainRight::Write {
         ReflectionRight::Curate
     } else {
@@ -1279,6 +1291,7 @@ impl DomainAccess {
         }
         let (acl, level, member_reflection, github) =
             self.reflection_inputs(&principal, domain).await?;
+        let grant = self.grant_of(scope, &principal, domain).await?;
         // `off_list_account` is `None` for an account with no list and
         // for every principal that is not an account.
         let off_list = self.off_list_account(&principal, domain).await?.is_some();
@@ -1287,6 +1300,7 @@ impl DomainAccess {
             acl.as_ref(),
             level,
             member_reflection,
+            grant,
             github,
             off_list,
         ))
@@ -1309,15 +1323,47 @@ impl DomainAccess {
         };
         let (acl, level, member_reflection, github) =
             self.reflection_inputs(&principal, domain).await?;
+        let grant = self.grant_of(scope, &principal, domain).await?;
         let uncapped = decide_reflection(
             &principal,
             acl.as_ref(),
             level,
             member_reflection,
+            grant,
             github,
             false,
         );
         Ok((uncapped >= need).then_some(account))
+    }
+
+    /// The per-domain Reflection grant `scope` holds on `domain`: only a
+    /// signed-in account ([`Scope::User`]) holds one. The MCP open tier
+    /// ([`Scope::Anonymous`], and [`Scope::Agent`] even when the account it
+    /// acts as holds a grant) never does.
+    async fn grant_of(
+        &self,
+        scope: &Scope,
+        principal: &Principal,
+        domain: &str,
+    ) -> Result<Option<ReflectionLevel>> {
+        match (scope, principal) {
+            (Scope::User { .. }, Principal::Account { name, .. }) => {
+                self.auth.reflection_grant(domain, name).await
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Every Reflection grant on `domain`, by account name: the page side of
+    /// a reader loop ([`DomainAccess::page_readers`], `cover`).
+    async fn grants_on(&self, domain: &str) -> Result<HashMap<String, ReflectionLevel>> {
+        Ok(self
+            .auth
+            .reflection_grants(domain)
+            .await?
+            .into_iter()
+            .map(|grant| (grant.account, grant.level))
+            .collect())
     }
 
     /// The domain's acl row and, for an account on a private domain, its
@@ -1722,19 +1768,28 @@ impl DomainAccess {
             Some(side) => side,
             None => ReaderSide::Governed(HashSet::new()),
         };
+        let grants = self.grants_on(page).await?;
         let mut readers = std::collections::BTreeSet::new();
         for user in self.auth.list_users().await? {
             if user.disabled {
                 continue;
             }
             let (level, reflection, github) = side.inputs(&user.name);
+            let grant = grants.get(&user.name).copied();
             let principal = Principal::Account {
                 name: user.name.clone(),
                 role: user.role,
                 reflection: user.reflection,
             };
-            if decide_reflection(&principal, acl.as_ref(), level, reflection, github, false)
-                >= ReflectionRight::Read
+            if decide_reflection(
+                &principal,
+                acl.as_ref(),
+                level,
+                reflection,
+                grant,
+                github,
+                false,
+            ) >= ReflectionRight::Read
             {
                 readers.insert(user.name);
             }
@@ -1817,7 +1872,10 @@ impl DomainAccess {
         else {
             return Ok(false);
         };
-        // Who reads the page: its domain's Reflection readers.
+        // Who reads the page: its domain's Reflection readers, its
+        // Reflection collaborators among them. The source side never reads
+        // a grant: a grant opens pages, never engrams.
+        let page_grants = self.grants_on(page).await?;
         let reads_page = |principal: &Principal, name: &str| {
             let (level, reflection, github) = page_side.inputs(name);
             decide_reflection(
@@ -1825,6 +1883,7 @@ impl DomainAccess {
                 page_acl.as_ref(),
                 level,
                 reflection,
+                page_grants.get(name).copied(),
                 github,
                 false,
             ) >= ReflectionRight::Read
@@ -3359,7 +3418,7 @@ mod tests {
             for (l, want) in levels.iter().zip(want) {
                 let p = acct("mem", role, *l);
                 assert_eq!(
-                    decide_reflection(&p, None, None, L::Default, None, false),
+                    decide_reflection(&p, None, None, L::Default, None, None, false),
                     want,
                     "{name}, {l}"
                 );
@@ -3433,7 +3492,7 @@ mod tests {
             for (l, want) in levels.iter().zip(want) {
                 let p = acct(who, role, L::Contributor);
                 assert_eq!(
-                    decide_reflection(&p, Some(&acl), level, *l, None, false),
+                    decide_reflection(&p, Some(&acl), level, *l, None, None, false),
                     want,
                     "{name}, {l}"
                 );
@@ -3442,7 +3501,15 @@ mod tests {
 
         // Nobody in particular, and the machine owner.
         assert_eq!(
-            decide_reflection(&Principal::Anonymous, None, None, L::Default, None, false),
+            decide_reflection(
+                &Principal::Anonymous,
+                None,
+                None,
+                L::Default,
+                None,
+                None,
+                false
+            ),
             R::Read,
             "anonymous reads a public domain"
         );
@@ -3452,6 +3519,7 @@ mod tests {
                 Some(&acl),
                 None,
                 L::Default,
+                None,
                 None,
                 false
             ),
@@ -3463,6 +3531,7 @@ mod tests {
                 Some(&acl),
                 None,
                 L::Default,
+                None,
                 None,
                 false
             ),
@@ -3480,6 +3549,7 @@ mod tests {
                     None,
                     L::Default,
                     None,
+                    None,
                     true
                 ),
                 R::Read,
@@ -3491,6 +3561,7 @@ mod tests {
                     None,
                     None,
                     L::Default,
+                    None,
                     None,
                     true
                 ),
@@ -3504,6 +3575,7 @@ mod tests {
                     None,
                     l,
                     None,
+                    None,
                     true
                 ),
                 R::Read,
@@ -3515,6 +3587,7 @@ mod tests {
                     Some(&acl),
                     Some(MemberLevel::Editor),
                     l,
+                    None,
                     None,
                     true
                 ),
@@ -3531,6 +3604,7 @@ mod tests {
                 None,
                 L::Default,
                 None,
+                None,
                 true
             ),
             R::Read,
@@ -3542,6 +3616,7 @@ mod tests {
                 Some(&acl),
                 Some(MemberLevel::Viewer),
                 L::Contributor,
+                None,
                 None,
                 true
             ),
@@ -3555,6 +3630,7 @@ mod tests {
                 Some(MemberLevel::None),
                 L::Contributor,
                 None,
+                None,
                 true
             ),
             R::Read,
@@ -3566,6 +3642,7 @@ mod tests {
                 None,
                 None,
                 L::Default,
+                None,
                 None,
                 true
             ),
@@ -3579,6 +3656,7 @@ mod tests {
                 None,
                 L::Default,
                 None,
+                None,
                 true
             ),
             R::Read,
@@ -3591,6 +3669,7 @@ mod tests {
                 None,
                 L::Default,
                 None,
+                None,
                 true
             ),
             R::None,
@@ -3602,6 +3681,7 @@ mod tests {
                 Some(&acl),
                 None,
                 L::Contributor,
+                None,
                 None,
                 true
             ),
@@ -5241,5 +5321,313 @@ mod tests {
                 .unwrap(),
             "a later viewer reads the page and not the source"
         );
+    }
+
+    // ---- Per-domain Reflection collaborators (Task 3.4) ----
+
+    /// A grant raises the Reflection right on a shared domain: an instance
+    /// viewer who reads and comments there edits with `contributor`, and an
+    /// account at instance knowledge `none` reaches the Reflection with
+    /// `reader` while its engrams stay hidden.
+    #[tokio::test]
+    async fn a_grant_raises_reflection_on_a_shared_domain() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = store(&dir).await;
+        cast(&auth).await;
+        auth.add_user("nora", "nora", None, Role::None, "pw12345678")
+            .await
+            .unwrap();
+        let access = DomainAccess::new(auth.clone());
+        assert_eq!(
+            access
+                .reflection_right(&user("mem", false), "shared")
+                .await
+                .unwrap(),
+            ReflectionRight::Read
+        );
+        assert_eq!(
+            access
+                .reflection_right(&user("nora", false), "shared")
+                .await
+                .unwrap(),
+            ReflectionRight::None
+        );
+        auth.set_reflection_grant("shared", "mem", ReflectionLevel::Contributor, "boss")
+            .await
+            .unwrap();
+        auth.set_reflection_grant("shared", "nora", ReflectionLevel::Reader, "boss")
+            .await
+            .unwrap();
+        assert_eq!(
+            access
+                .reflection_right(&user("mem", false), "shared")
+                .await
+                .unwrap(),
+            ReflectionRight::Edit
+        );
+        assert_eq!(
+            access
+                .reflection_right(&user("nora", false), "shared")
+                .await
+                .unwrap(),
+            ReflectionRight::Read
+        );
+        // Only on that one domain, and never an engram.
+        assert_eq!(
+            access
+                .reflection_right(&user("nora", false), "other")
+                .await
+                .unwrap(),
+            ReflectionRight::None
+        );
+        assert_eq!(
+            access.right(&user("nora", false), "shared").await.unwrap(),
+            DomainRight::None
+        );
+        assert!(
+            !access
+                .visibility(&user("nora", false))
+                .await
+                .unwrap()
+                .screen()
+                .admits("shared")
+        );
+    }
+
+    /// A grant only raises: an editor curates whatever it says, and a grant
+    /// below the account's own Reflection level leaves that level standing.
+    #[tokio::test]
+    async fn a_grant_never_lowers_an_editor_who_curates() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = store(&dir).await;
+        cast(&auth).await;
+        auth.set_domain_visibility("lab", true, "keeper")
+            .await
+            .unwrap();
+        auth.set_reflection_level("mem", ReflectionLevel::Contributor)
+            .await
+            .unwrap();
+        for (domain, account) in [("shared", "out"), ("lab", "keeper"), ("shared", "mem")] {
+            auth.set_reflection_grant(domain, account, ReflectionLevel::Reader, "boss")
+                .await
+                .unwrap();
+        }
+        let access = DomainAccess::new(auth);
+        for (domain, account, want) in [
+            ("shared", "out", ReflectionRight::Curate),
+            ("lab", "keeper", ReflectionRight::Curate),
+            ("shared", "mem", ReflectionRight::Edit),
+        ] {
+            assert_eq!(
+                access
+                    .reflection_right(&user(account, false), domain)
+                    .await
+                    .unwrap(),
+                want,
+                "{account} on {domain}"
+            );
+        }
+    }
+
+    /// Old Crystalline grants (a membership row's Reflection level) are
+    /// ignored on a governed domain; a Reflection collaborator is not.
+    #[tokio::test]
+    async fn a_grant_on_a_governed_domain_survives_the_old_grants_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = store(&dir).await;
+        github_cast(&auth).await;
+        auth.upsert_domain_member(
+            "gh-lab",
+            "ann",
+            MemberLevel::None,
+            Some(ReflectionLevel::Contributor),
+            "keeper",
+        )
+        .await
+        .unwrap();
+        auth.set_reflection_grant("gh-lab", "out", ReflectionLevel::Contributor, "boss")
+            .await
+            .unwrap();
+        let access = DomainAccess::new(auth).with_governor(Arc::new(base_governor()));
+        assert_eq!(
+            access
+                .reflection_right(&user("ann", false), "gh-lab")
+                .await
+                .unwrap(),
+            ReflectionRight::None
+        );
+        assert_eq!(
+            access
+                .reflection_right(&user("out", false), "gh-lab")
+                .await
+                .unwrap(),
+            ReflectionRight::Edit
+        );
+        assert_eq!(
+            access.right(&user("out", false), "gh-lab").await.unwrap(),
+            DomainRight::None
+        );
+        let PageReaders::Accounts(readers) = access.page_readers("gh-lab").await.unwrap() else {
+            panic!("a private page has named readers");
+        };
+        assert!(
+            readers.contains("out") && !readers.contains("ann"),
+            "{readers:?}"
+        );
+    }
+
+    /// Ruling R22: a closed domain (the repository lacks the App) stays
+    /// with the admins and the machine owner, a grant included.
+    #[tokio::test]
+    async fn a_grant_on_a_closed_domain_opens_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = store(&dir).await;
+        github_cast(&auth).await;
+        auth.set_reflection_grant("gh-lab", "ann", ReflectionLevel::Contributor, "boss")
+            .await
+            .unwrap();
+        let access =
+            DomainAccess::new(auth).with_governor(Arc::new(base_governor().close("gh-lab")));
+        assert_eq!(
+            access
+                .reflection_right(&user("ann", false), "gh-lab")
+                .await
+                .unwrap(),
+            ReflectionRight::None
+        );
+        assert_eq!(
+            access.page_readers("gh-lab").await.unwrap(),
+            PageReaders::Accounts(names(&["boss"]).into_iter().collect())
+        );
+        // ann reads no lab engram and still keeps no page from covering it.
+        assert!(access.readers_cover("gh-lab", "lab").await.unwrap());
+    }
+
+    /// Ruling R16 stands beside the grants: an account at instance
+    /// knowledge `none` gets nothing on a governed domain, a grant included.
+    #[tokio::test]
+    async fn an_instance_none_account_gets_no_grant_on_a_governed_domain() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = store(&dir).await;
+        github_cast(&auth).await;
+        auth.set_reflection_grant("gh-open", "nora", ReflectionLevel::Contributor, "boss")
+            .await
+            .unwrap();
+        auth.set_reflection_grant("lab", "nora", ReflectionLevel::Contributor, "boss")
+            .await
+            .unwrap();
+        let access = DomainAccess::new(auth).with_governor(Arc::new(base_governor()));
+        assert_eq!(
+            access
+                .reflection_right(&user("nora", false), "gh-open")
+                .await
+                .unwrap(),
+            ReflectionRight::None
+        );
+        // Off GitHub the grant raises as anywhere.
+        assert_eq!(
+            access
+                .reflection_right(&user("nora", false), "lab")
+                .await
+                .unwrap(),
+            ReflectionRight::Edit
+        );
+    }
+
+    /// The MCP open tier never holds a grant, even when it acts as an
+    /// account that does.
+    #[tokio::test]
+    async fn the_open_tier_holds_no_grant() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = store(&dir).await;
+        github_cast(&auth).await;
+        auth.set_reflection_grant("gh-lab", "ann", ReflectionLevel::Contributor, "boss")
+            .await
+            .unwrap();
+        let access = DomainAccess::new(auth).with_governor(Arc::new(base_governor()));
+        assert_eq!(
+            access
+                .reflection_right(&user("ann", false), "gh-lab")
+                .await
+                .unwrap(),
+            ReflectionRight::Edit
+        );
+        let agent = Scope::Agent {
+            account: "ann".into(),
+        };
+        assert_eq!(
+            access.reflection_right(&agent, "gh-lab").await.unwrap(),
+            ReflectionRight::None
+        );
+    }
+
+    /// A grant holder reads the page, so it is among the readers a
+    /// confirmation is recorded for, on a Crystalline domain and on a
+    /// governed one whose reader listing is not known.
+    #[tokio::test]
+    async fn a_grant_holder_counts_as_a_page_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = store(&dir).await;
+        github_cast(&auth).await;
+        auth.set_reflection_grant("lab", "ann", ReflectionLevel::Reader, "boss")
+            .await
+            .unwrap();
+        auth.set_reflection_grant("gh-lab", "out", ReflectionLevel::Reader, "boss")
+            .await
+            .unwrap();
+        let access = DomainAccess::new(auth.clone())
+            .with_governor(Arc::new(base_governor().readers("gh-lab", None)));
+        let PageReaders::Accounts(lab) = access.page_readers("lab").await.unwrap() else {
+            panic!("a private page has named readers");
+        };
+        assert!(lab.contains("ann") && lab.contains("keeper"), "{lab:?}");
+        assert_eq!(
+            access.page_readers("gh-lab").await.unwrap(),
+            PageReaders::Accounts(names(&["boss", "out"]).into_iter().collect())
+        );
+        // Gone with the grant.
+        auth.remove_reflection_grant("lab", "ann").await.unwrap();
+        let PageReaders::Accounts(lab) = access.page_readers("lab").await.unwrap() else {
+            panic!("a private page has named readers");
+        };
+        assert!(!lab.contains("ann"), "{lab:?}");
+    }
+
+    /// The leak rule at work: a grant holder reads the page and not the
+    /// source's engrams, so the page no longer covers that source. A grant
+    /// on the source's domain does not count: it opens pages, never engrams.
+    #[tokio::test]
+    async fn a_grant_holder_who_cannot_read_the_source_makes_the_page_not_cover_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = store(&dir).await;
+        covering(&auth).await;
+        auth.add_user("nora", "nora", None, Role::None, "pw12345678")
+            .await
+            .unwrap();
+        let access = DomainAccess::new(auth.clone());
+        assert!(access.readers_cover("lab", "vault").await.unwrap());
+        assert!(access.readers_cover("shared", "other").await.unwrap());
+        auth.set_reflection_grant("lab", "ann", ReflectionLevel::Reader, "keeper")
+            .await
+            .unwrap();
+        assert!(!access.readers_cover("lab", "vault").await.unwrap());
+        auth.set_reflection_grant("vault", "ann", ReflectionLevel::Contributor, "keeper")
+            .await
+            .unwrap();
+        assert!(!access.readers_cover("lab", "vault").await.unwrap());
+        // A confirmation that named ann covers her.
+        let confirmed = access.page_readers("lab").await.unwrap();
+        assert!(
+            access
+                .readers_cover_for("lab", "vault", &confirmed)
+                .await
+                .unwrap()
+        );
+        // On shared domains: nora reads the shared page through her grant
+        // and no shared engram at all.
+        auth.set_reflection_grant("shared", "nora", ReflectionLevel::Reader, "boss")
+            .await
+            .unwrap();
+        assert!(!access.readers_cover("shared", "other").await.unwrap());
     }
 }

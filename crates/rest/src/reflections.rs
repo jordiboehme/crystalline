@@ -218,11 +218,14 @@ pub async fn domains(
                            nobody holds, and it is `null` in every other \
                            state). `member` is true \
                            when the caller holds a membership row it may \
-                           leave.",
+                           leave; `collaborator` is true when it holds a \
+                           per-domain Reflection grant it may give up \
+                           (`DELETE /domains/{domain}/reflection-collaborators/{account}`).",
             body = Object,
             example = json!({ "domain": "eng", "enabled": true, "state": "on",
                 "home": "here", "home_url": null, "host_label": null, "right": "curate",
-                "engrams_visible": true, "member": false, "pending_engrams": [] }),
+                "engrams_visible": true, "member": false, "collaborator": false,
+                "pending_engrams": [] }),
         ),
         (
             status = 404,
@@ -256,6 +259,21 @@ pub async fn status(
         None => false,
     };
     answer["member"] = Value::Bool(member);
+    // Whether the caller holds a Reflection grant here it may give up.
+    let collaborator = match &identity.user {
+        Some(user) => state
+            .auth
+            .reflection_grant(&domain, &user.name)
+            .await
+            .map_err(|e| {
+                ApiError::internal(format!(
+                    "reading this domain's Reflection collaborators: {e:#}"
+                ))
+            })?
+            .is_some(),
+        None => false,
+    };
+    answer["collaborator"] = Value::Bool(collaborator);
     Ok(Json(answer))
 }
 

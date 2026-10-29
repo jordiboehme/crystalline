@@ -31,9 +31,11 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
-use crystalline_service::rest::{AuthStore, DomainMember, MemberLevel, VisibilityWrite};
+use crystalline_service::rest::{
+    AuthStore, DomainMember, MemberLevel, ReflectionGrant, ReflectionLevel, VisibilityWrite,
+};
 
-use crate::{MembersCommand, VisibilityArg};
+use crate::{MembersCommand, ReflectionGrantCommand, VisibilityArg};
 
 /// Open the accounts database in the state directory, the same file
 /// `crystalline users` writes and the daemon reads.
@@ -55,6 +57,21 @@ fn require_registered(name: &str, config: Option<&Path>) -> Result<String> {
         return Ok(name.to_string());
     }
     bail!("no domain named '{name}' is registered; list them with `crystalline domain list`")
+}
+
+/// [`require_registered`] for a Reflection grant, which only a domain kept
+/// as files takes: a virtual domain keeps no Reflection.
+fn require_kept_as_files(name: &str, config: Option<&Path>) -> Result<String> {
+    let name = require_registered(name, config)?;
+    let loaded = crate::cmd::load(config)?;
+    let entry = &loaded.effective.domains[&name];
+    if entry.is_virtual() || entry.file_path().is_none() {
+        bail!(
+            "Reflection collaborators are for domains kept as files; '{name}' is kept in \
+             the database"
+        );
+    }
+    Ok(name)
 }
 
 /// Refuse an account the store does not have, or has disabled, before any
@@ -166,6 +183,12 @@ pub async fn close_new_domain(
 
 /// `crystalline domain members <domain> ...`.
 pub async fn run(domain: String, command: MembersCommand, json: bool) -> Result<()> {
+    // The Reflection grants resolve the domain themselves: only a domain
+    // kept as files takes one.
+    let command = match command {
+        MembersCommand::Reflection { command } => return reflection(domain, command).await,
+        other => other,
+    };
     // Each subcommand carries its own `--config`, the way every other domain
     // verb does, so it can be typed after the verb rather than between the
     // domain and it.
@@ -173,6 +196,7 @@ pub async fn run(domain: String, command: MembersCommand, json: bool) -> Result<
         MembersCommand::List { config }
         | MembersCommand::Add { config, .. }
         | MembersCommand::Remove { config, .. } => config.clone(),
+        MembersCommand::Reflection { .. } => None,
     };
     let domain = require_registered(&domain, config.as_deref())?;
     let store = store().await?;
@@ -190,6 +214,9 @@ pub async fn run(domain: String, command: MembersCommand, json: bool) -> Result<
                 .as_ref()
                 .map(|acl| acl.owner.clone())
                 .filter(|owner| !owner.is_empty());
+            // Reflection collaborators live on shared and private domains
+            // alike.
+            let grants = store.reflection_grants(&domain).await?;
             if json {
                 crate::print_value(
                     &serde_json::json!({
@@ -197,11 +224,13 @@ pub async fn run(domain: String, command: MembersCommand, json: bool) -> Result<
                         "visibility": if acl.is_some() { "private" } else { "shared" },
                         "owner": owner,
                         "members": members,
+                        "reflection_collaborators": grants,
                     }),
                     true,
                 );
             } else {
                 print_members(&domain, acl.is_some(), owner.as_deref(), &members);
+                print_grants(&domain, &grants);
             }
         }
         MembersCommand::Add {
@@ -219,6 +248,8 @@ pub async fn run(domain: String, command: MembersCommand, json: bool) -> Result<
             let reflection = store.member_reflection(&domain, &user).await?;
             println!("'{user}' is a {level} on domain '{domain}' with Reflection {reflection}.");
         }
+        // Answered before the domain is resolved, above.
+        MembersCommand::Reflection { .. } => {}
         MembersCommand::Remove { user, .. } => {
             let name = user.trim().to_lowercase();
             // The owner holds no membership row, so a plain "not a member"
@@ -239,6 +270,57 @@ pub async fn run(domain: String, command: MembersCommand, json: bool) -> Result<
     }
     readers_changed().await;
     Ok(())
+}
+
+/// `crystalline domain members <domain> reflection add|remove`: a per-domain
+/// Reflection collaborator, on any domain kept as files.
+async fn reflection(domain: String, command: ReflectionGrantCommand) -> Result<()> {
+    match command {
+        ReflectionGrantCommand::Add {
+            user,
+            level,
+            config,
+        } => {
+            let domain = require_kept_as_files(&domain, config.as_deref())?;
+            let store = store().await?;
+            let user = require_account(&store, &user).await?;
+            let level: ReflectionLevel = level.into();
+            store
+                .set_reflection_grant(&domain, &user, level, "cli")
+                .await?;
+            println!(
+                "'{user}' is a Reflection {level} on domain '{domain}'. It sees no engram \
+                 there it could not see before."
+            );
+        }
+        ReflectionGrantCommand::Remove { user, config } => {
+            let domain = require_kept_as_files(&domain, config.as_deref())?;
+            let store = store().await?;
+            let name = user.trim().to_lowercase();
+            if !store.remove_reflection_grant(&domain, &name).await? {
+                bail!("'{name}' holds no Reflection grant on domain '{domain}'");
+            }
+            println!("Took the Reflection grant on domain '{domain}' from '{name}'.");
+        }
+    }
+    readers_changed().await;
+    Ok(())
+}
+
+/// The Reflection collaborators below the membership table, when there are
+/// any.
+fn print_grants(domain: &str, grants: &[ReflectionGrant]) {
+    if grants.is_empty() {
+        return;
+    }
+    println!();
+    println!("Reflection collaborators of '{domain}':");
+    for grant in grants {
+        println!(
+            "  {} ({}, added by {} at {})",
+            grant.account, grant.level, grant.added_by, grant.added_at
+        );
+    }
 }
 
 /// Tell a running daemon that who may read a domain changed, so it looks

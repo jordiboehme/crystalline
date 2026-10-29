@@ -4933,13 +4933,14 @@
         ],
         "responses": {
           "200": {
-            "description": "ReflectionStatus. `state` is `off`, `pending` (then `pending_engrams` lists the engrams still under `reflections/` for a caller with `engrams_visible`, and is empty for anyone else), `homeless`, `on`, `elsewhere` (then `home_url` is set) or `hosted_elsewhere` (another instance on this shared database holds the domain's host lock and serves it; then `host_label` names that instance, or is `null` while a rename pauses a domain whose lock nobody holds, and it is `null` in every other state). `member` is true when the caller holds a membership row it may leave.",
+            "description": "ReflectionStatus. `state` is `off`, `pending` (then `pending_engrams` lists the engrams still under `reflections/` for a caller with `engrams_visible`, and is empty for anyone else), `homeless`, `on`, `elsewhere` (then `home_url` is set) or `hosted_elsewhere` (another instance on this shared database holds the domain's host lock and serves it; then `host_label` names that instance, or is `null` while a rename pauses a domain whose lock nobody holds, and it is `null` in every other state). `member` is true when the caller holds a membership row it may leave; `collaborator` is true when it holds a per-domain Reflection grant it may give up (`DELETE /domains/{domain}/reflection-collaborators/{account}`).",
             "content": {
               "application/json": {
                 "schema": {
                   "type": "object"
                 },
                 "example": {
+                  "collaborator": false,
                   "domain": "eng",
                   "enabled": true,
                   "engrams_visible": true,
@@ -4956,6 +4957,257 @@
           },
           "404": {
             "description": "No such domain, or none this caller may see.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/domains/{domain}/reflection-collaborators": {
+      "get": {
+        "tags": [
+          "domains"
+        ],
+        "summary": "The Reflection collaborators of one domain.",
+        "description": "Needs manager access on the domain: its manager, its owner, an instance admin, or on a domain GitHub governs a GitHub maintainer or admin. A caller who may not see the domain is answered 404, exactly as for a domain nobody registered. A domain kept in the database answers 409.",
+        "operationId": "list_reflection_collaborators",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The registered domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The domain's Reflection collaborators.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReflectionCollaboratorsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or an anonymous one.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not a manager here.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain, or none this caller may see.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The domain is kept in the database, not as files.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/domains/{domain}/reflection-collaborators/{account}": {
+      "put": {
+        "tags": [
+          "domains"
+        ],
+        "summary": "Give an account the Reflection of one domain.",
+        "description": "Needs manager access on the domain. Works on any domain kept as files, shared or private, governed by GitHub or not. A grant only raises the Reflection right and opens no engram: an account that reads no engram here reaches the Reflection and nothing else.\n\nAn account that does not exist or is disabled, and the reserved name `owner`, are a 422, and so is a level other than `reader` or `contributor`. A domain kept in the database answers 409.",
+        "operationId": "set_reflection_collaborator",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The registered domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "account",
+            "in": "path",
+            "description": "The account's login name.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReflectionCollaboratorBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "The account holds that level here."
+          },
+          "401": {
+            "description": "No identity, or an anonymous one.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not a manager here, the request did not echo its CSRF token, or this instance is read-only.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain, or none this caller may see.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The domain is kept in the database, not as files.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body is not `application/json`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "A level other than reader or contributor, or a name that is no enabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "domains"
+        ],
+        "summary": "Take an account's Reflection grant on one domain away.",
+        "description": "Needs manager access on the domain, OR that the account is the caller itself: a collaborator may always take itself off, also where it reads no engram. A name that holds no grant here is a 404. A domain kept in the database answers 409.",
+        "operationId": "remove_reflection_collaborator",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The registered domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "account",
+            "in": "path",
+            "description": "The account's login name.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "That account holds no grant here now."
+          },
+          "401": {
+            "description": "No identity, or an anonymous one.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is neither a manager here nor the account itself, the request did not echo its CSRF token, or this instance is read-only.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain, none this caller may see, or an account that holds no grant on it.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The domain is kept in the database, not as files.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -12777,6 +13029,14 @@
           }
         }
       },
+      "GrantLevel": {
+        "type": "string",
+        "description": "The level a Reflection collaborator holds. Narrower than\n[`ReflectionLevel`]: `default` would grant nothing, and taking a grant\naway is `DELETE`.",
+        "enum": [
+          "reader",
+          "contributor"
+        ]
+      },
       "IdentityLink": {
         "type": "object",
         "description": "One identity an external provider asserts, tied to one account.\n\n`(issuer, subject)` is the durable key: a username, an address and a\ndisplay name are all mutable presentation data, and none of them may move\nan account. An account may hold several links (one per issuer), and a link\npoints at exactly one account.",
@@ -14148,6 +14408,63 @@
           "path": {
             "type": "string",
             "description": "Inside `reflections/`, after the change; empty for `switched`, and\nfor `changed` when a sync found many paths at once (the whole\nReflection, then)."
+          }
+        }
+      },
+      "ReflectionCollaboratorBody": {
+        "type": "object",
+        "description": "`reader` reads the Reflection and comments, `contributor` also edits it. A grant only raises: an engram editor curates whatever it says.",
+        "required": [
+          "level"
+        ],
+        "properties": {
+          "level": {
+            "$ref": "#/components/schemas/GrantLevel",
+            "description": "reader | contributor"
+          }
+        }
+      },
+      "ReflectionCollaboratorsResponse": {
+        "type": "object",
+        "description": "The accounts given the Reflection reader or contributor level on this one domain, beside what their engram access gives them.",
+        "required": [
+          "collaborators"
+        ],
+        "properties": {
+          "collaborators": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ReflectionGrant"
+            },
+            "description": "Every collaborator, by account name."
+          }
+        }
+      },
+      "ReflectionGrant": {
+        "type": "object",
+        "description": "One per-domain Reflection collaborator: an account given the Reflection\nreader or contributor level on one domain. A grant only raises the\nReflection right and never opens an engram.",
+        "required": [
+          "account",
+          "level",
+          "added_by",
+          "added_at"
+        ],
+        "properties": {
+          "account": {
+            "type": "string",
+            "description": "The account's login name, folded."
+          },
+          "added_at": {
+            "type": "string",
+            "description": "RFC 3339, when this grant was last written."
+          },
+          "added_by": {
+            "type": "string",
+            "description": "Who added or last changed this grant."
+          },
+          "level": {
+            "$ref": "#/components/schemas/ReflectionLevel",
+            "description": "`reader` or `contributor`."
           }
         }
       },

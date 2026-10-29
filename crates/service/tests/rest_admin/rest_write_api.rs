@@ -3187,6 +3187,23 @@ fn write_ops() -> Vec<WriteOp> {
             min_role: Role::Admin,
             read_only_exempt: false,
         },
+        // A Reflection collaborator: `Manage`, which on a shared domain
+        // only an admin holds; the admin gets through to the store, which
+        // refuses a name that is no account (422) or holds no grant (404).
+        WriteOp {
+            method: Method::PUT,
+            path: "/api/v1/domains/eng/reflection-collaborators/quinn",
+            body: Some(serde_json::json!({"level": "reader"})),
+            min_role: Role::Admin,
+            read_only_exempt: false,
+        },
+        WriteOp {
+            method: Method::DELETE,
+            path: "/api/v1/domains/eng/reflection-collaborators/quinn",
+            body: None,
+            min_role: Role::Admin,
+            read_only_exempt: false,
+        },
         WriteOp {
             method: Method::PUT,
             path: "/api/v1/domains/eng/owner",
@@ -4005,6 +4022,8 @@ fn canonicalize(path: &str) -> String {
             // The membership rows' target account. Kept apart from the two
             // above because it collapses to a different template.
             "pat" => "{principal}",
+            // A Reflection collaborator's account.
+            "quinn" => "{account}",
             // The share-surface rows: one proposal number and one conflict id.
             "1" => "{number}",
             "abc12345" => "{id}",

@@ -53,6 +53,15 @@
 //! What this does mean is that an instance viewer who owns a private domain
 //! administers it - which is the personal-private-domain case working as
 //! intended.
+//!
+//! **Reflection collaborators** sit beside the membership: an account given
+//! the Reflection `reader` or `contributor` level on one domain, on any
+//! domain kept as files, shared or private, governed by GitHub or not. A
+//! grant only raises the Reflection right and opens no engram, so it is not a
+//! membership row and needs no private domain. Listing and changing them
+//! needs [`DomainRight::Manage`]; a collaborator may always take itself off.
+//! On a shared domain Crystalline decides, only an instance admin holds
+//! `Manage`, so only an admin manages its collaborators there.
 
 use axum::Json;
 use axum::extract::State;
@@ -60,7 +69,8 @@ use axum::http::StatusCode;
 
 use super::auth::Identity;
 use super::auth_store::{
-    DomainMember, MemberLevel, ReflectionLevel, RefusalKind, StoreRefusal, normalize_account_name,
+    DomainMember, MemberLevel, ReflectionGrant, ReflectionLevel, RefusalKind, StoreRefusal,
+    normalize_account_name,
 };
 use super::{
     ApiError, ApiJson, ApiPath, ProblemDetail, RestState, refuse_read_only, require_domain_read,
@@ -681,6 +691,296 @@ pub async fn set_owner(
         .transfer_domain(&domain, &body.owner)
         .await
         .map_err(store_error)?;
+    crate::readers_changed(&state);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// What a domain kept in the database is told when a Reflection
+/// collaborator is asked for: it has no Reflection to share.
+const KEPT_AS_FILES_ONLY: &str = "Reflection collaborators are for domains kept as files";
+
+/// The level a Reflection collaborator holds. Narrower than
+/// [`ReflectionLevel`]: `default` would grant nothing, and taking a grant
+/// away is `DELETE`.
+#[derive(Clone, Copy, Debug, serde::Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum GrantLevel {
+    /// Reads the Reflection and comments on it.
+    Reader,
+    /// Also edits reflection text and creates, moves and deletes reflections.
+    Contributor,
+}
+
+impl From<GrantLevel> for ReflectionLevel {
+    fn from(level: GrantLevel) -> ReflectionLevel {
+        match level {
+            GrantLevel::Reader => ReflectionLevel::Reader,
+            GrantLevel::Contributor => ReflectionLevel::Contributor,
+        }
+    }
+}
+
+/// What `GET /domains/{domain}/reflection-collaborators` answers with.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+#[schema(description = "The accounts given the Reflection reader or \
+                        contributor level on this one domain, beside what \
+                        their engram access gives them.")]
+pub struct ReflectionCollaboratorsResponse {
+    /// Every collaborator, by account name.
+    #[schema(value_type = Vec<super::schemas::ReflectionGrant>)]
+    pub collaborators: Vec<ReflectionGrant>,
+}
+
+/// What `PUT /domains/{domain}/reflection-collaborators/{account}` takes.
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+#[schema(description = "`reader` reads the Reflection and comments, \
+                        `contributor` also edits it. A grant only raises: an \
+                        engram editor curates whatever it says.")]
+pub struct ReflectionCollaboratorBody {
+    /// reader | contributor
+    #[schema(example = "reader")]
+    pub level: GrantLevel,
+}
+
+/// The 409 a domain kept in the database answers.
+fn require_kept_as_files(state: &RestState, domain: &str) -> Result<(), ApiError> {
+    if state.engine.kept_as_files(domain) {
+        Ok(())
+    } else {
+        Err(ApiError::conflict(KEPT_AS_FILES_ONLY))
+    }
+}
+
+/// `GET /domains/{domain}/reflection-collaborators` - who holds a
+/// per-domain Reflection grant here.
+#[utoipa::path(
+    get,
+    path = "/api/v1/domains/{domain}/reflection-collaborators",
+    tag = "domains",
+    operation_id = "list_reflection_collaborators",
+    summary = "The Reflection collaborators of one domain.",
+    description = "Needs manager access on the domain: its manager, its \
+                   owner, an instance admin, or on a domain GitHub governs a \
+                   GitHub maintainer or admin. A caller who may not see the \
+                   domain is answered 404, exactly as for a domain nobody \
+                   registered. A domain kept in the database answers 409.",
+    params(("domain" = String, Path, description = "The registered domain.")),
+    responses(
+        (
+            status = 200,
+            description = "The domain's Reflection collaborators.",
+            body = ReflectionCollaboratorsResponse,
+        ),
+        (
+            status = 401,
+            description = "No identity, or an anonymous one.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The caller is not a manager here.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "No such domain, or none this caller may see.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 409,
+            description = "The domain is kept in the database, not as files.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn list_reflection_collaborators(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiPath(domain): ApiPath<String>,
+) -> Result<Json<ReflectionCollaboratorsResponse>, ApiError> {
+    identity.require_account()?;
+    require_domain_read(&state, &identity, &domain).await?;
+    refuse_below(&state, &identity, &domain, DomainRight::Manage, "manager").await?;
+    require_kept_as_files(&state, &domain)?;
+    let collaborators = state.auth.reflection_grants(&domain).await.map_err(|e| {
+        ApiError::internal(format!(
+            "listing this domain's Reflection collaborators: {e:#}"
+        ))
+    })?;
+    Ok(Json(ReflectionCollaboratorsResponse { collaborators }))
+}
+
+/// `PUT /domains/{domain}/reflection-collaborators/{account}` - give an
+/// account the Reflection reader or contributor level on this domain, or
+/// change the level it holds.
+#[utoipa::path(
+    put,
+    path = "/api/v1/domains/{domain}/reflection-collaborators/{account}",
+    tag = "domains",
+    operation_id = "set_reflection_collaborator",
+    summary = "Give an account the Reflection of one domain.",
+    description = "Needs manager access on the domain. Works on any domain \
+                   kept as files, shared or private, governed by GitHub or \
+                   not. A grant only raises the Reflection right and opens \
+                   no engram: an account that reads no engram here reaches \
+                   the Reflection and nothing else.\n\nAn account that does \
+                   not exist or is disabled, and the reserved name `owner`, \
+                   are a 422, and so is a level other than `reader` or \
+                   `contributor`. A domain kept in the database answers 409.",
+    params(
+        ("domain" = String, Path, description = "The registered domain."),
+        ("account" = String, Path, description = "The account's login name."),
+    ),
+    request_body = ReflectionCollaboratorBody,
+    responses(
+        (status = 204, description = "The account holds that level here."),
+        (
+            status = 401,
+            description = "No identity, or an anonymous one.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The caller is not a manager here, the request did \
+                           not echo its CSRF token, or this instance is \
+                           read-only.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "No such domain, or none this caller may see.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 409,
+            description = "The domain is kept in the database, not as files.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 415,
+            description = "The body is not `application/json`.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 422,
+            description = "A level other than reader or contributor, or a \
+                           name that is no enabled account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn set_reflection_collaborator(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiPath((domain, account)): ApiPath<(String, String)>,
+    ApiJson(body): ApiJson<ReflectionCollaboratorBody>,
+) -> Result<StatusCode, ApiError> {
+    let actor = require_right(&state, &identity, &domain, DomainRight::Manage, "manager").await?;
+    require_kept_as_files(&state, &domain)?;
+    let account = principal_key(&account)?;
+    state
+        .auth
+        .set_reflection_grant(&domain, &account, body.level.into(), &actor)
+        .await
+        .map_err(store_error)?;
+    crate::readers_changed(&state);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `DELETE /domains/{domain}/reflection-collaborators/{account}` - take a
+/// Reflection grant away, or give up one's own.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/domains/{domain}/reflection-collaborators/{account}",
+    tag = "domains",
+    operation_id = "remove_reflection_collaborator",
+    summary = "Take an account's Reflection grant on one domain away.",
+    description = "Needs manager access on the domain, OR that the account \
+                   is the caller itself: a collaborator may always take \
+                   itself off, also where it reads no engram. A name that \
+                   holds no grant here is a 404. A domain kept in the \
+                   database answers 409.",
+    params(
+        ("domain" = String, Path, description = "The registered domain."),
+        ("account" = String, Path, description = "The account's login name."),
+    ),
+    responses(
+        (status = 204, description = "That account holds no grant here now."),
+        (
+            status = 401,
+            description = "No identity, or an anonymous one.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The caller is neither a manager here nor the \
+                           account itself, the request did not echo its CSRF \
+                           token, or this instance is read-only.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "No such domain, none this caller may see, or an \
+                           account that holds no grant on it.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 409,
+            description = "The domain is kept in the database, not as files.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn remove_reflection_collaborator(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiPath((domain, account)): ApiPath<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    let actor = identity.require_account()?;
+    let account = principal_key(&account)?;
+    let leaving = account == actor.name;
+    // A collaborator leaving is gated on its own grant rather than on
+    // engram read, so one that reads no engram here can leave too. Only a
+    // holder takes this branch, and a holder already knows the domain
+    // exists; everybody else meets the 404 an unregistered name answers.
+    let own_grant = leaving
+        && state
+            .auth
+            .reflection_grant(&domain, &actor.name)
+            .await
+            .is_ok_and(|grant| grant.is_some());
+    if !own_grant {
+        require_domain_read(&state, &identity, &domain).await?;
+    }
+    refuse_read_only(&state)?;
+    if !leaving {
+        refuse_below(&state, &identity, &domain, DomainRight::Manage, "manager").await?;
+    }
+    require_kept_as_files(&state, &domain)?;
+    let removed = state
+        .auth
+        .remove_reflection_grant(&domain, &account)
+        .await
+        .map_err(store_error)?;
+    if !removed {
+        return Err(ApiError::not_found(
+            "that account holds no Reflection grant on this domain",
+        ));
+    }
     crate::readers_changed(&state);
     Ok(StatusCode::NO_CONTENT)
 }

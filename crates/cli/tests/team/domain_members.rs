@@ -526,3 +526,99 @@ fn removing_a_file_domain_keeps_its_files_and_says_so() {
         "the files stay exactly where they were"
     );
 }
+
+/// Per-domain Reflection collaborators from the command line: on a shared
+/// domain as on a private one, listed beside the members, refused on a
+/// domain kept in the database.
+#[test]
+fn cli_members_reflection_add_and_remove() {
+    let fx = Fixture::new();
+
+    let added = fx.domain(&[
+        "members",
+        "eng",
+        "reflection",
+        "add",
+        "bob",
+        "--level",
+        "contributor",
+    ]);
+    assert!(added.contains("'bob'"), "{added}");
+    assert!(added.contains("contributor"), "{added}");
+    let listed = fx.domain(&["members", "eng", "list"]);
+    assert!(listed.contains("Reflection collaborators"), "{listed}");
+    assert!(listed.contains("bob"), "{listed}");
+
+    // The level moves with the same verb, and it works on a private domain.
+    fx.domain(&["visibility", "eng", "private", "--owner", "ada"]);
+    fx.domain(&[
+        "members",
+        "eng",
+        "reflection",
+        "add",
+        "bob",
+        "--level",
+        "reader",
+    ]);
+    let mut cmd = bin();
+    isolate(&mut cmd, fx.home.path());
+    let out = cmd
+        .args(["--json", "domain", "members", "eng", "list", "--config"])
+        .arg(&fx.config)
+        .output()
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        value["reflection_collaborators"][0]["account"],
+        serde_json::json!("bob")
+    );
+    assert_eq!(
+        value["reflection_collaborators"][0]["level"],
+        serde_json::json!("reader")
+    );
+    assert!(value["members"].as_array().unwrap().is_empty(), "{value}");
+
+    // `default` grants nothing and is no level here; an unknown account is
+    // refused with the fix.
+    let err = fx.domain_err(&[
+        "members",
+        "eng",
+        "reflection",
+        "add",
+        "bob",
+        "--level",
+        "default",
+    ]);
+    assert!(err.contains("default"), "{err}");
+    let err = fx.domain_err(&[
+        "members",
+        "eng",
+        "reflection",
+        "add",
+        "nobody",
+        "--level",
+        "reader",
+    ]);
+    assert!(err.contains("no account named 'nobody'"), "{err}");
+
+    let removed = fx.domain(&["members", "eng", "reflection", "remove", "bob"]);
+    assert!(removed.contains("'bob'"), "{removed}");
+    let err = fx.domain_err(&["members", "eng", "reflection", "remove", "bob"]);
+    assert!(err.contains("holds no Reflection grant"), "{err}");
+
+    // A domain kept in the database takes none.
+    fx.domain(&["add", "notes", "--virtual", "--no-sync"]);
+    let err = fx.domain_err(&[
+        "members",
+        "notes",
+        "reflection",
+        "add",
+        "bob",
+        "--level",
+        "reader",
+    ]);
+    assert!(
+        err.contains("Reflection collaborators are for domains kept as files"),
+        "{err}"
+    );
+}

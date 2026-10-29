@@ -1595,6 +1595,58 @@ enum MembersCommand {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Give an account the Reflection of this one domain, or take it away:
+    /// a Reflection collaborator reads (reader) or also edits (contributor)
+    /// the Reflection, on a shared or a private domain kept as files, and
+    /// sees no engram it could not see before. A grant only raises.
+    Reflection {
+        #[command(subcommand)]
+        command: ReflectionGrantCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ReflectionGrantCommand {
+    /// Give an account the Reflection reader or contributor level on this
+    /// domain, or change the level it holds.
+    Add {
+        /// The account's login name.
+        user: String,
+        /// reader: reads the Reflection and comments. contributor: also edits
+        /// it.
+        #[arg(long, value_enum)]
+        level: GrantLevelArg,
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Take an account's Reflection grant on this domain away.
+    Remove {
+        /// The account's login name.
+        user: String,
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+}
+
+/// The two levels `domain members reflection add` accepts. `default` is not
+/// one: it would grant nothing, and `remove` takes a grant away.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum GrantLevelArg {
+    /// Reads the Reflection and comments on it.
+    Reader,
+    /// Also edits reflection text and creates, moves and deletes reflections.
+    Contributor,
+}
+
+impl From<GrantLevelArg> for crystalline_service::rest::ReflectionLevel {
+    fn from(arg: GrantLevelArg) -> crystalline_service::rest::ReflectionLevel {
+        match arg {
+            GrantLevelArg::Reader => crystalline_service::rest::ReflectionLevel::Reader,
+            GrantLevelArg::Contributor => crystalline_service::rest::ReflectionLevel::Contributor,
+        }
+    }
 }
 
 /// The two modes `domain review` accepts. `direct` rather than `off` because

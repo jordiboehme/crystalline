@@ -705,7 +705,20 @@ fn member_level_from_db(s: &str) -> MemberLevel {
 /// what the knowledge level gives: `Default` is "as knowledge",
 /// stored as SQL NULL so no sentinel value is written. There is no stored
 /// curator: curating follows from writing the engrams.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// Ordered `Default < Reader < Contributor`, so the higher of two levels is
+/// their `max`.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum ReflectionLevel {
     /// As the knowledge level gives: a viewer reads and comments, `none`
@@ -961,6 +974,22 @@ pub struct DomainMember {
     pub added_at: String,
 }
 
+/// One per-domain Reflection collaborator: an account given the Reflection
+/// reader or contributor level on one domain, beside whatever its engram
+/// access gives it there. A grant only raises the Reflection right; it never
+/// opens an engram.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct ReflectionGrant {
+    /// The account's login name, folded by [`normalize_account_name`].
+    pub account: String,
+    /// `reader` or `contributor`, never `default`.
+    pub level: ReflectionLevel,
+    /// Who added or last changed this grant. An audit field, stored as given.
+    pub added_by: String,
+    /// RFC 3339, when this grant was last written.
+    pub added_at: String,
+}
+
 /// Fold a supplied domain name to the form this store keys on: trimmed, and
 /// otherwise left exactly as given.
 ///
@@ -1019,7 +1048,9 @@ pub struct AuthStore {
 /// Create the tables on first open. `IF NOT EXISTS` throughout, so this is the
 /// same statement on an existing file. `account_write_domain` holds the write
 /// lists (`crystalline users writes`): no rows for an account means it has no
-/// list.
+/// list. `domain_reflection_grant` holds the per-domain Reflection
+/// collaborators ([`AuthStore::set_reflection_grant`]), on any domain kept as
+/// files, shared or private.
 const SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS users (
     name TEXT PRIMARY KEY,
@@ -1127,6 +1158,9 @@ CREATE TABLE IF NOT EXISTS account_write_domain (
     pattern TEXT NOT NULL,
     PRIMARY KEY (account, pattern)
 );
+CREATE TABLE IF NOT EXISTS domain_reflection_grant (
+    domain TEXT NOT NULL, account TEXT NOT NULL, level TEXT NOT NULL,
+    added_by TEXT NOT NULL, added_at TEXT NOT NULL, PRIMARY KEY (domain, account));
 ";
 
 /// The sentence [`AuthStore::link_github`] refuses a GitHub account that is
@@ -1800,6 +1834,7 @@ impl AuthStore {
             self.delete_sessions_of(&name).await?;
             self.delete_mcp_tokens_of(&name).await?;
             self.delete_memberships_of(&name).await?;
+            self.delete_reflection_grants_of(&name).await?;
             self.delete_identity_links_of(&name).await?;
             self.delete_github_link_of(&name).await?;
             self.delete_oauth_grants_of(&name).await?;
@@ -1846,6 +1881,7 @@ impl AuthStore {
             self.delete_sessions_of(&name).await?;
             self.delete_mcp_tokens_of(&name).await?;
             self.delete_memberships_of(&name).await?;
+            self.delete_reflection_grants_of(&name).await?;
             self.delete_identity_links_of(&name).await?;
             self.delete_github_link_of(&name).await?;
             self.delete_oauth_grants_of(&name).await?;
@@ -4469,6 +4505,8 @@ impl AuthStore {
     /// which is how a caller can tell a private domain's records from a shared
     /// domain's absence of them.
     ///
+    /// Its Reflection collaborators go too, in the same transaction.
+    ///
     /// Write-list entries naming the domain are left alone: they match nothing
     /// until a domain of that name exists again.
     pub async fn forget_domain(&self, domain: &str) -> Result<bool> {
@@ -4480,6 +4518,13 @@ impl AuthStore {
         let result = async {
             let was_private = self.acl_of(&domain).await?.is_some();
             self.delete_members_of_domain(&domain).await?;
+            self.conn
+                .execute(
+                    "DELETE FROM domain_reflection_grant WHERE domain = ?1",
+                    vec![Value::Text(domain.clone())],
+                )
+                .await
+                .with_context(|| format!("forgetting the records of domain '{domain}'"))?;
             self.conn
                 .execute(
                     "DELETE FROM domain_acl WHERE domain = ?1",
@@ -4494,9 +4539,9 @@ impl AuthStore {
     }
 
     /// Carry every record of domain `old` over to `new`: its `domain_acl` row,
-    /// its `domain_member` rows and its `overlay_grant` rows (the draft
+    /// its `domain_member` rows, its `overlay_grant` rows (the draft
     /// share-links, revoked ones included, so the history stays with the
-    /// domain), in one transaction. For a domain rename, which has already
+    /// domain) and its Reflection collaborators, in one transaction. For a domain rename, which has already
     /// decided the name changes; this decides nothing.
     ///
     /// The renamed domain's records win. Rows already under `new` while `old`
@@ -4578,6 +4623,8 @@ impl AuthStore {
                 "SELECT 1 FROM domain_acl WHERE domain = ?1",
                 "SELECT 1 FROM domain_member WHERE domain = ?1",
                 "SELECT 1 FROM overlay_grant WHERE domain = ?1",
+                // A shared domain's grants are its only rows here.
+                "SELECT 1 FROM domain_reflection_grant WHERE domain = ?1",
             ] {
                 if self
                     .query_first(sql, vec![Value::Text(old.clone())])
@@ -4599,9 +4646,11 @@ impl AuthStore {
                 "DELETE FROM domain_acl WHERE domain = ?2",
                 "DELETE FROM domain_member WHERE domain = ?2",
                 "DELETE FROM overlay_grant WHERE domain = ?2",
+                "DELETE FROM domain_reflection_grant WHERE domain = ?2",
                 "UPDATE domain_acl SET domain = ?2 WHERE domain = ?1",
                 "UPDATE domain_member SET domain = ?2 WHERE domain = ?1",
                 "UPDATE overlay_grant SET domain = ?2 WHERE domain = ?1",
+                "UPDATE domain_reflection_grant SET domain = ?2 WHERE domain = ?1",
             ] {
                 self.conn
                     .execute(sql, names.clone())
@@ -4895,6 +4944,161 @@ impl AuthStore {
             )
             .await?;
         Ok(reflection_level_from_db(row.and_then(|r| cell_text(&r, 0))))
+    }
+
+    /// Give `account` the Reflection level `level` on `domain`, or change the
+    /// level it holds there. A grant only raises what the account's engram
+    /// access gives (see `crate::scope`); it works on a shared and on a
+    /// private domain alike and opens no engram. The caller checks that the
+    /// domain is kept as files: this store does not know how a domain is
+    /// kept.
+    ///
+    /// Refused, inside the transaction that writes:
+    ///
+    /// * [`ReflectionLevel::Default`], which grants nothing; removing the
+    ///   grant says that ([`RefusalKind::EmptyMembership`]);
+    /// * an account that does not exist or is disabled, and the reserved
+    ///   name [`crate::scope::OWNER_IDENTITY_NAME`], which is the machine
+    ///   owner and curates every domain anyway ([`RefusalKind::NoSuchAccount`]).
+    ///
+    /// `added_by` is recorded as given (trimmed) and may not be empty.
+    pub async fn set_reflection_grant(
+        &self,
+        domain: &str,
+        account: &str,
+        level: ReflectionLevel,
+        added_by: &str,
+    ) -> Result<()> {
+        let domain = normalize_domain(domain)?;
+        let account = normalize_account_name(account)?;
+        let added_by = added_by.trim().to_string();
+        if added_by.is_empty() {
+            bail!("recording a Reflection collaborator needs an actor to record it as");
+        }
+        if level == ReflectionLevel::Default {
+            return Err(refuse(
+                RefusalKind::EmptyMembership,
+                format!(
+                    "a Reflection collaborator needs the level reader or contributor; \
+                     to take '{account}' off domain '{domain}', use remove"
+                ),
+            ));
+        }
+        if account == crate::scope::OWNER_IDENTITY_NAME {
+            return Err(refuse(
+                RefusalKind::NoSuchAccount,
+                format!("'{account}' is the reserved name of the machine owner, not an account"),
+            ));
+        }
+        let now = chrono::Utc::now().to_rfc3339();
+        let context = || format!("giving '{account}' the Reflection of domain '{domain}'");
+        let _guard = self.guard.lock().await;
+        self.begin_immediate().await.with_context(context)?;
+        let result = async {
+            self.require_live_user(&account).await?;
+            self.conn
+                .execute(
+                    "DELETE FROM domain_reflection_grant WHERE domain = ?1 AND account = ?2",
+                    vec![Value::Text(domain.clone()), Value::Text(account.clone())],
+                )
+                .await
+                .with_context(context)?;
+            self.conn
+                .execute(
+                    "INSERT INTO domain_reflection_grant (domain, account, level, added_by, added_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    vec![
+                        Value::Text(domain.clone()),
+                        Value::Text(account.clone()),
+                        Value::Text(level.as_str().to_string()),
+                        Value::Text(added_by.clone()),
+                        Value::Text(now.clone()),
+                    ],
+                )
+                .await
+                .with_context(context)?;
+            Ok(())
+        }
+        .await;
+        self.finish(result).await
+    }
+
+    /// Take `account`'s Reflection grant on `domain` away. Answers whether
+    /// there was one.
+    pub async fn remove_reflection_grant(&self, domain: &str, account: &str) -> Result<bool> {
+        let domain = normalize_domain(domain)?;
+        let account = normalize_account_name(account)?;
+        let _guard = self.guard.lock().await;
+        let changed = self
+            .conn
+            .execute(
+                "DELETE FROM domain_reflection_grant WHERE domain = ?1 AND account = ?2",
+                vec![Value::Text(domain.clone()), Value::Text(account.clone())],
+            )
+            .await
+            .with_context(|| {
+                format!("taking the Reflection of domain '{domain}' from '{account}'")
+            })?;
+        Ok(changed > 0)
+    }
+
+    /// Every Reflection collaborator of `domain`, by account name.
+    pub async fn reflection_grants(&self, domain: &str) -> Result<Vec<ReflectionGrant>> {
+        let domain = normalize_domain(domain)?;
+        let context = || format!("listing the Reflection collaborators of domain '{domain}'");
+        let _guard = self.guard.lock().await;
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT account, level, added_by, added_at FROM domain_reflection_grant
+                 WHERE domain = ?1 ORDER BY account",
+                vec![Value::Text(domain.clone())],
+            )
+            .await
+            .with_context(context)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.with_context(context)? {
+            let Some(account) = cell_text(&row, 0) else {
+                continue;
+            };
+            let level = reflection_level_from_db(cell_text(&row, 1));
+            // An unreadable level grants nothing, so it is not listed as
+            // a grant either.
+            if level == ReflectionLevel::Default {
+                continue;
+            }
+            out.push(ReflectionGrant {
+                account,
+                level,
+                added_by: cell_text(&row, 2).unwrap_or_default(),
+                added_at: cell_text(&row, 3).unwrap_or_default(),
+            });
+        }
+        Ok(out)
+    }
+
+    /// `account`'s Reflection grant on `domain`, or `None` when it holds
+    /// none. A level this build cannot read is none: it fails closed.
+    pub async fn reflection_grant(
+        &self,
+        domain: &str,
+        account: &str,
+    ) -> Result<Option<ReflectionLevel>> {
+        let domain = normalize_domain(domain)?;
+        let account = normalize_account_name(account)?;
+        let _guard = self.guard.lock().await;
+        let row = self
+            .query_first(
+                "SELECT level FROM domain_reflection_grant WHERE domain = ?1 AND account = ?2",
+                vec![Value::Text(domain), Value::Text(account)],
+            )
+            .await?;
+        Ok(
+            match reflection_level_from_db(row.and_then(|r| cell_text(&r, 0))) {
+                ReflectionLevel::Default => None,
+                level => Some(level),
+            },
+        )
     }
 
     /// Every private domain, by name. This is the whole input to the
@@ -5199,6 +5403,20 @@ impl AuthStore {
             )
             .await
             .with_context(|| format!("removing the memberships of user '{name}'"))?;
+        Ok(())
+    }
+
+    /// Drop every Reflection grant `name` holds, for the reason
+    /// [`AuthStore::delete_memberships_of`] drops its membership rows: the
+    /// next account to take the name must not inherit them.
+    async fn delete_reflection_grants_of(&self, name: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM domain_reflection_grant WHERE account = ?1",
+                vec![Value::Text(name.to_string())],
+            )
+            .await
+            .with_context(|| format!("removing the Reflection grants of user '{name}'"))?;
         Ok(())
     }
 
@@ -7346,7 +7564,16 @@ mod tests {
                 .await
                 .unwrap();
             let conn = db.connect().unwrap();
-            let old = SCHEMA.replace("    reflection TEXT,\n", "");
+            // The per-domain grants table came later still (0.30.0).
+            let grants = SCHEMA
+                .find("CREATE TABLE IF NOT EXISTS domain_reflection_grant")
+                .unwrap();
+            let old = format!(
+                "{}{}",
+                &SCHEMA[..grants],
+                SCHEMA[grants..].split_once(";\n").unwrap().1
+            );
+            let old = old.replace("    reflection TEXT,\n", "");
             assert!(!old.contains("reflection"), "both columns are left out");
             conn.execute_batch(&old).await.unwrap();
         }
@@ -7362,6 +7589,10 @@ mod tests {
             ReflectionLevel::Default
         );
         assert_eq!(auth.user("ann").await.unwrap().unwrap().role, Role::None);
+        // The grants table is made on open.
+        auth.set_reflection_grant("eng", "ann", ReflectionLevel::Reader, "keeper")
+            .await
+            .unwrap();
         auth.set_reflection_level("ann", ReflectionLevel::Contributor)
             .await
             .unwrap();
@@ -11028,5 +11259,173 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(auth.github_links().await.unwrap().len(), 1);
+    }
+
+    // ---- Per-domain Reflection collaborators (Task 3.4) ----
+
+    async fn reflection_grant_cast(auth: &AuthStore) {
+        for name in ["ann", "bea"] {
+            auth.add_user(name, name, None, Role::Viewer, "pw12345678")
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reflection_grant_is_stored_listed_and_removed() {
+        let (_dir, auth) = store().await;
+        reflection_grant_cast(&auth).await;
+        auth.set_reflection_grant("eng", "Ann", ReflectionLevel::Reader, "boss")
+            .await
+            .unwrap();
+        auth.set_reflection_grant("eng", "bea", ReflectionLevel::Contributor, "boss")
+            .await
+            .unwrap();
+        // A second write changes the level of the one row.
+        auth.set_reflection_grant("eng", "ann", ReflectionLevel::Contributor, "keeper")
+            .await
+            .unwrap();
+        let grants = auth.reflection_grants("eng").await.unwrap();
+        let seen: Vec<(&str, ReflectionLevel, &str)> = grants
+            .iter()
+            .map(|g| (g.account.as_str(), g.level, g.added_by.as_str()))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                ("ann", ReflectionLevel::Contributor, "keeper"),
+                ("bea", ReflectionLevel::Contributor, "boss"),
+            ]
+        );
+        assert_eq!(
+            auth.reflection_grant("eng", "ann").await.unwrap(),
+            Some(ReflectionLevel::Contributor)
+        );
+        assert_eq!(auth.reflection_grant("ops", "ann").await.unwrap(), None);
+        assert!(auth.remove_reflection_grant("eng", "ANN").await.unwrap());
+        assert!(!auth.remove_reflection_grant("eng", "ann").await.unwrap());
+        assert_eq!(auth.reflection_grant("eng", "ann").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_default_grant_is_refused() {
+        let (_dir, auth) = store().await;
+        reflection_grant_cast(&auth).await;
+        let err = auth
+            .set_reflection_grant("eng", "ann", ReflectionLevel::Default, "boss")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            StoreRefusal::kind_of(&err),
+            Some(RefusalKind::EmptyMembership)
+        );
+        assert!(format!("{err}").contains("use remove"), "{err}");
+        assert!(auth.reflection_grants("eng").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_grant_names_a_live_account() {
+        let (_dir, auth) = store().await;
+        reflection_grant_cast(&auth).await;
+        auth.set_disabled("bea", true).await.unwrap();
+        for name in ["nobody", "bea", crate::scope::OWNER_IDENTITY_NAME] {
+            let err = auth
+                .set_reflection_grant("eng", name, ReflectionLevel::Reader, "boss")
+                .await
+                .unwrap_err();
+            assert_eq!(
+                StoreRefusal::kind_of(&err),
+                Some(RefusalKind::NoSuchAccount),
+                "{name}: {err}"
+            );
+        }
+        assert!(auth.reflection_grants("eng").await.unwrap().is_empty());
+    }
+
+    /// A shared domain has no acl, member or share-link row, so the grants
+    /// alone must carry the rename. Stale grants under the new name go.
+    #[tokio::test]
+    async fn renaming_a_domain_carries_its_grants() {
+        let (_dir, auth) = store().await;
+        reflection_grant_cast(&auth).await;
+        auth.set_reflection_grant("eng", "ann", ReflectionLevel::Reader, "boss")
+            .await
+            .unwrap();
+        auth.set_reflection_grant("ops", "bea", ReflectionLevel::Contributor, "boss")
+            .await
+            .unwrap();
+        auth.rename_domain("eng", "ops").await.unwrap();
+        assert!(auth.reflection_grants("eng").await.unwrap().is_empty());
+        let moved: Vec<String> = auth
+            .reflection_grants("ops")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|g| g.account)
+            .collect();
+        assert_eq!(moved, vec!["ann".to_string()]);
+        // Again after a crash: nothing under the old name, nothing changes.
+        auth.rename_domain("eng", "ops").await.unwrap();
+        assert_eq!(auth.reflection_grants("ops").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn forgetting_a_domain_drops_its_grants() {
+        let (_dir, auth) = store().await;
+        reflection_grant_cast(&auth).await;
+        auth.set_reflection_grant("eng", "ann", ReflectionLevel::Reader, "boss")
+            .await
+            .unwrap();
+        auth.set_reflection_grant("ops", "ann", ReflectionLevel::Reader, "boss")
+            .await
+            .unwrap();
+        assert!(!auth.forget_domain("eng").await.unwrap());
+        assert!(auth.reflection_grants("eng").await.unwrap().is_empty());
+        assert_eq!(auth.reflection_grants("ops").await.unwrap().len(), 1);
+    }
+
+    /// A grant left behind would be inherited by the next account to take
+    /// the name, as a membership row would.
+    #[tokio::test]
+    async fn removing_an_account_drops_its_grants() {
+        let (_dir, auth) = store().await;
+        reflection_grant_cast(&auth).await;
+        for name in ["ann", "bea"] {
+            auth.set_reflection_grant("eng", name, ReflectionLevel::Reader, "boss")
+                .await
+                .unwrap();
+        }
+        auth.remove_user("ann").await.unwrap();
+        auth.remove_user_force("bea").await.unwrap();
+        auth.add_user("ann", "ann", None, Role::Viewer, "pw12345678")
+            .await
+            .unwrap();
+        assert!(auth.reflection_grants("eng").await.unwrap().is_empty());
+        assert_eq!(auth.reflection_grant("eng", "ann").await.unwrap(), None);
+    }
+
+    /// Making a domain shared forgets its members, never its Reflection
+    /// collaborators: a grant does not depend on the visibility.
+    #[tokio::test]
+    async fn a_grant_outlives_a_visibility_change_and_a_transfer() {
+        let (_dir, auth) = store().await;
+        reflection_grant_cast(&auth).await;
+        auth.set_domain_visibility("eng", true, "bea")
+            .await
+            .unwrap();
+        auth.set_reflection_grant("eng", "ann", ReflectionLevel::Reader, "bea")
+            .await
+            .unwrap();
+        auth.add_user("cy", "cy", None, Role::Viewer, "pw12345678")
+            .await
+            .unwrap();
+        auth.transfer_domain("eng", "cy").await.unwrap();
+        auth.set_domain_visibility("eng", false, "cy")
+            .await
+            .unwrap();
+        assert_eq!(
+            auth.reflection_grant("eng", "ann").await.unwrap(),
+            Some(ReflectionLevel::Reader)
+        );
     }
 }

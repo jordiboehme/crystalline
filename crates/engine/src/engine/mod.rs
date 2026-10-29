@@ -5418,6 +5418,15 @@ impl Engine {
         }
     }
 
+    /// Whether `name` is a registered domain kept as files (a folder on
+    /// disk), as opposed to a virtual domain kept in the database. A name
+    /// this engine does not register is not. Per-domain Reflection
+    /// collaborators are given only on a domain kept as files.
+    pub fn kept_as_files(&self, name: &str) -> bool {
+        self.domain_entry(name)
+            .is_ok_and(|entry| matches!(self.source_of(&entry), ContentSource::File { .. }))
+    }
+
     /// Whether this domain reviews changes before they land. A name nobody
     /// registers reviews nothing: the verb that asked is about to refuse it as
     /// unregistered anyway, and answering "yes" here would route a write into a

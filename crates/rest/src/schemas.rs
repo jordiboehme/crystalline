@@ -220,6 +220,21 @@ pub struct DomainMember {
     pub added_at: String,
 }
 
+/// One per-domain Reflection collaborator: an account given the Reflection
+/// reader or contributor level on one domain. A grant only raises the
+/// Reflection right and never opens an engram.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, utoipa::ToSchema)]
+pub struct ReflectionGrant {
+    /// The account's login name, folded.
+    pub account: String,
+    /// `reader` or `contributor`.
+    pub level: ReflectionLevel,
+    /// Who added or last changed this grant.
+    pub added_by: String,
+    /// RFC 3339, when this grant was last written.
+    pub added_at: String,
+}
+
 /// What happened to the engram: the four things the sync engine counts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -470,6 +485,15 @@ mod tests {
                 added_at: s(),
             }]),
             published::<super::DomainMember>()
+        );
+        assert_eq!(
+            keys([auth_store::ReflectionGrant {
+                account: s(),
+                level: ReflectionLevel::Reader,
+                added_by: s(),
+                added_at: s(),
+            }]),
+            published::<super::ReflectionGrant>()
         );
         use crystalline_engine::changes as bus;
         assert_eq!(

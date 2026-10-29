@@ -727,6 +727,13 @@ export type GithubUnlinkResponse = {
 };
 
 /**
+ * The level a Reflection collaborator holds. Narrower than
+ * [`ReflectionLevel`]: `default` would grant nothing, and taking a grant
+ * away is `DELETE`.
+ */
+export type GrantLevel = 'reader' | 'contributor';
+
+/**
  * One identity an external provider asserts, tied to one account.
  *
  * `(issuer, subject)` is the durable key: a username, an address and a
@@ -1735,6 +1742,50 @@ export type ReflectionChanged = {
      * Reflection, then).
      */
     path: string;
+};
+
+/**
+ * `reader` reads the Reflection and comments, `contributor` also edits it. A grant only raises: an engram editor curates whatever it says.
+ */
+export type ReflectionCollaboratorBody = {
+    /**
+     * reader | contributor
+     */
+    level: GrantLevel;
+};
+
+/**
+ * The accounts given the Reflection reader or contributor level on this one domain, beside what their engram access gives them.
+ */
+export type ReflectionCollaboratorsResponse = {
+    /**
+     * Every collaborator, by account name.
+     */
+    collaborators: Array<ReflectionGrant>;
+};
+
+/**
+ * One per-domain Reflection collaborator: an account given the Reflection
+ * reader or contributor level on one domain. A grant only raises the
+ * Reflection right and never opens an engram.
+ */
+export type ReflectionGrant = {
+    /**
+     * The account's login name, folded.
+     */
+    account: string;
+    /**
+     * RFC 3339, when this grant was last written.
+     */
+    added_at: string;
+    /**
+     * Who added or last changed this grant.
+     */
+    added_by: string;
+    /**
+     * `reader` or `contributor`.
+     */
+    level: ReflectionLevel;
 };
 
 /**
@@ -4798,7 +4849,7 @@ export type GetReflectionStatusError = GetReflectionStatusErrors[keyof GetReflec
 
 export type GetReflectionStatusResponses = {
     /**
-     * ReflectionStatus. `state` is `off`, `pending` (then `pending_engrams` lists the engrams still under `reflections/` for a caller with `engrams_visible`, and is empty for anyone else), `homeless`, `on`, `elsewhere` (then `home_url` is set) or `hosted_elsewhere` (another instance on this shared database holds the domain's host lock and serves it; then `host_label` names that instance, or is `null` while a rename pauses a domain whose lock nobody holds, and it is `null` in every other state). `member` is true when the caller holds a membership row it may leave.
+     * ReflectionStatus. `state` is `off`, `pending` (then `pending_engrams` lists the engrams still under `reflections/` for a caller with `engrams_visible`, and is empty for anyone else), `homeless`, `on`, `elsewhere` (then `home_url` is set) or `hosted_elsewhere` (another instance on this shared database holds the domain's host lock and serves it; then `host_label` names that instance, or is `null` while a rename pauses a domain whose lock nobody holds, and it is `null` in every other state). `member` is true when the caller holds a membership row it may leave; `collaborator` is true when it holds a per-domain Reflection grant it may give up (`DELETE /domains/{domain}/reflection-collaborators/{account}`).
      */
     200: {
         [key: string]: unknown;
@@ -4806,6 +4857,148 @@ export type GetReflectionStatusResponses = {
 };
 
 export type GetReflectionStatusResponse = GetReflectionStatusResponses[keyof GetReflectionStatusResponses];
+
+export type ListReflectionCollaboratorsData = {
+    body?: never;
+    path: {
+        /**
+         * The registered domain.
+         */
+        domain: string;
+    };
+    query?: never;
+    url: '/api/v1/domains/{domain}/reflection-collaborators';
+};
+
+export type ListReflectionCollaboratorsErrors = {
+    /**
+     * No identity, or an anonymous one.
+     */
+    401: ProblemDetail;
+    /**
+     * The caller is not a manager here.
+     */
+    403: ProblemDetail;
+    /**
+     * No such domain, or none this caller may see.
+     */
+    404: ProblemDetail;
+    /**
+     * The domain is kept in the database, not as files.
+     */
+    409: ProblemDetail;
+};
+
+export type ListReflectionCollaboratorsError = ListReflectionCollaboratorsErrors[keyof ListReflectionCollaboratorsErrors];
+
+export type ListReflectionCollaboratorsResponses = {
+    /**
+     * The domain's Reflection collaborators.
+     */
+    200: ReflectionCollaboratorsResponse;
+};
+
+export type ListReflectionCollaboratorsResponse = ListReflectionCollaboratorsResponses[keyof ListReflectionCollaboratorsResponses];
+
+export type RemoveReflectionCollaboratorData = {
+    body?: never;
+    path: {
+        /**
+         * The registered domain.
+         */
+        domain: string;
+        /**
+         * The account's login name.
+         */
+        account: string;
+    };
+    query?: never;
+    url: '/api/v1/domains/{domain}/reflection-collaborators/{account}';
+};
+
+export type RemoveReflectionCollaboratorErrors = {
+    /**
+     * No identity, or an anonymous one.
+     */
+    401: ProblemDetail;
+    /**
+     * The caller is neither a manager here nor the account itself, the request did not echo its CSRF token, or this instance is read-only.
+     */
+    403: ProblemDetail;
+    /**
+     * No such domain, none this caller may see, or an account that holds no grant on it.
+     */
+    404: ProblemDetail;
+    /**
+     * The domain is kept in the database, not as files.
+     */
+    409: ProblemDetail;
+};
+
+export type RemoveReflectionCollaboratorError = RemoveReflectionCollaboratorErrors[keyof RemoveReflectionCollaboratorErrors];
+
+export type RemoveReflectionCollaboratorResponses = {
+    /**
+     * That account holds no grant here now.
+     */
+    204: void;
+};
+
+export type RemoveReflectionCollaboratorResponse = RemoveReflectionCollaboratorResponses[keyof RemoveReflectionCollaboratorResponses];
+
+export type SetReflectionCollaboratorData = {
+    body: ReflectionCollaboratorBody;
+    path: {
+        /**
+         * The registered domain.
+         */
+        domain: string;
+        /**
+         * The account's login name.
+         */
+        account: string;
+    };
+    query?: never;
+    url: '/api/v1/domains/{domain}/reflection-collaborators/{account}';
+};
+
+export type SetReflectionCollaboratorErrors = {
+    /**
+     * No identity, or an anonymous one.
+     */
+    401: ProblemDetail;
+    /**
+     * The caller is not a manager here, the request did not echo its CSRF token, or this instance is read-only.
+     */
+    403: ProblemDetail;
+    /**
+     * No such domain, or none this caller may see.
+     */
+    404: ProblemDetail;
+    /**
+     * The domain is kept in the database, not as files.
+     */
+    409: ProblemDetail;
+    /**
+     * The body is not `application/json`.
+     */
+    415: ProblemDetail;
+    /**
+     * A level other than reader or contributor, or a name that is no enabled account.
+     */
+    422: ProblemDetail;
+};
+
+export type SetReflectionCollaboratorError = SetReflectionCollaboratorErrors[keyof SetReflectionCollaboratorErrors];
+
+export type SetReflectionCollaboratorResponses = {
+    /**
+     * The account holds that level here.
+     */
+    204: void;
+};
+
+export type SetReflectionCollaboratorResponse = SetReflectionCollaboratorResponses[keyof SetReflectionCollaboratorResponses];
 
 export type ListReflectionAssetsData = {
     body?: never;

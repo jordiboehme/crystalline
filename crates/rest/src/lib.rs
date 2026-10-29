@@ -162,6 +162,9 @@ use crate::scope::{DomainAccess, DomainRight};
         members::set_member,
         members::remove_member,
         members::set_owner,
+        members::list_reflection_collaborators,
+        members::set_reflection_collaborator,
+        members::remove_reflection_collaborator,
         automation::read,
         kept::list,
         kept::read,
@@ -296,6 +299,10 @@ use crate::scope::{DomainAccess, DomainRight};
         members::MembersResponse,
         members::MemberBody,
         members::OwnerBody,
+        schemas::ReflectionGrant,
+        members::ReflectionCollaboratorsResponse,
+        members::ReflectionCollaboratorBody,
+        members::GrantLevel,
         domains_admin::ShareBody,
         domains_admin::WithdrawBody,
         domains_admin::ResolveBody,
@@ -819,6 +826,19 @@ fn routes(state: RestState) -> Router {
             put(members::set_member).delete(members::remove_member),
         )
         .route("/domains/{domain}/owner", put(members::set_owner))
+        // Who reaches one domain's Reflection beyond what engram access
+        // gives: a per-domain Reflection collaborator, on any domain kept as
+        // files. Listing and changing need `Manage`; a collaborator may always
+        // take itself off. See [`members`].
+        .route(
+            "/domains/{domain}/reflection-collaborators",
+            get(members::list_reflection_collaborators),
+        )
+        .route(
+            "/domains/{domain}/reflection-collaborators/{account}",
+            put(members::set_reflection_collaborator)
+                .delete(members::remove_reflection_collaborator),
+        )
         // When the loops last ran, for the pages that show it; read rights.
         .route("/domains/{domain}/automation", get(automation::read))
         // The texts the server kept when a room could not save. Rights are
