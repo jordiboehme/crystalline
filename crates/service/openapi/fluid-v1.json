@@ -1236,7 +1236,7 @@
             }
           },
           "422": {
-            "description": "An unknown mode, no name for a local or virtual domain (github alone may omit it), a name that could escape the domains root, a github `repo` that is not owner/name or a `path` that is absolute or holds a `..` segment, or a field that does not belong to the mode asked for.",
+            "description": "An unknown mode, no name for a local or virtual domain (github alone may omit it), a name that could escape the domains root, a github `repo` that is not owner/name or a `path` that is absolute or holds a `..` segment, a field that does not belong to the mode asked for, a `readers` that is neither shared nor private or that contradicts `private`, or a team domain without `readers` on an instance with a GitHub App.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -12496,6 +12496,14 @@
             "type": "boolean",
             "description": "Register the domain private, owned by the calling account. Applies to\nevery mode; defaults to false, which is a domain the whole instance\nshares.",
             "example": false
+          },
+          "readers": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Who may read a team domain on an instance with a GitHub App:\n`shared` (everyone signed in) or `private` (only people with access\non GitHub). github mode only. Required there when an App is\nconfigured, since access then follows GitHub and is never defaulted;\n`private: true` answers `private`. Ignored, with a note in the\nreport, without an App.",
+            "example": "private"
           },
           "repo": {
             "type": [

@@ -1014,10 +1014,7 @@ impl Engine {
             token_live: link.as_ref().is_some_and(|l| l.token_live),
             pending,
             error,
-            app_configured: matches!(
-                self.github_app_slot(),
-                super::github_app::AppSlot::Ready(_) | super::github_app::AppSlot::Refused(_)
-            ),
+            app_configured: self.github_app_configured(),
         })
     }
 

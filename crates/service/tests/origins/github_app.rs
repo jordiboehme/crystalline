@@ -35,6 +35,7 @@ use crystalline_remote::state::OriginState;
 use crystalline_remote::{AppCredentials, AppLookup, AppStore, RemoteError};
 use crystalline_service::engine::{AppHome, AppKeychainSeam};
 use crystalline_service::engine::{ConfigureAction, EngineError, ShareActor};
+use crystalline_service::params::Readers;
 use crystalline_service::reflection_backup::BackupCause;
 use crystalline_service::rest::{AuthStore, Role};
 use crystalline_service::{DomainAccess, Engine, EnvOverlay, Scope};
@@ -753,9 +754,16 @@ pub(crate) async fn engine(tmp: &Path, api_url: &str, env: &[(&str, &str)]) -> E
 }
 
 pub(crate) async fn connect(eng: &Engine, repo: &str, name: &str, root: &Path) -> Value {
-    eng.origin_add(repo, Some(name), None, None, Some(root.to_str().unwrap()))
-        .await
-        .unwrap()
+    eng.origin_add(
+        repo,
+        Some(name),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+        Some(Readers::Shared),
+    )
+    .await
+    .unwrap()
 }
 
 /// Every `Authorization` value the repository calls of `repo` carried.
@@ -870,6 +878,7 @@ async fn a_repository_without_the_app_is_refused_naming_the_install_url() {
             None,
             None,
             Some(root.to_str().unwrap()),
+            Some(Readers::Shared),
         )
         .await
         .unwrap_err();
@@ -1224,6 +1233,7 @@ async fn a_saved_app_for_another_host_is_refused_and_nothing_falls_back() {
             None,
             None,
             Some(tmp.path().join("kb").to_str().unwrap()),
+            Some(Readers::Shared),
         )
         .await
         .unwrap_err();
@@ -1449,6 +1459,7 @@ async fn a_failed_keychain_read_with_the_marker_refuses_and_never_uses_the_insta
             None,
             None,
             Some(root.to_str().unwrap()),
+            Some(Readers::Shared),
         )
         .await
         .unwrap_err();
@@ -1487,7 +1498,8 @@ async fn a_failed_keychain_read_with_the_marker_refuses_and_never_uses_the_insta
             Some("kb"),
             None,
             None,
-            Some(root.to_str().unwrap())
+            Some(root.to_str().unwrap()),
+            Some(Readers::Shared),
         )
         .await
         .is_err()

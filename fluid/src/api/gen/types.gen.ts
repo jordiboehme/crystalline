@@ -382,6 +382,15 @@ export type CreateDomainBody = {
      */
     private?: boolean;
     /**
+     * Who may read a team domain on an instance with a GitHub App:
+     * `shared` (everyone signed in) or `private` (only people with access
+     * on GitHub). github mode only. Required there when an App is
+     * configured, since access then follows GitHub and is never defaulted;
+     * `private: true` answers `private`. Ignored, with a note in the
+     * report, without an App.
+     */
+    readers?: string | null;
+    /**
      * owner/name; github mode only.
      */
     repo?: string | null;
@@ -3051,7 +3060,7 @@ export type CreateDomainErrors = {
      */
     415: ProblemDetail;
     /**
-     * An unknown mode, no name for a local or virtual domain (github alone may omit it), a name that could escape the domains root, a github `repo` that is not owner/name or a `path` that is absolute or holds a `..` segment, or a field that does not belong to the mode asked for.
+     * An unknown mode, no name for a local or virtual domain (github alone may omit it), a name that could escape the domains root, a github `repo` that is not owner/name or a `path` that is absolute or holds a `..` segment, a field that does not belong to the mode asked for, a `readers` that is neither shared nor private or that contradicts `private`, or a team domain without `readers` on an instance with a GitHub App.
      */
     422: ProblemDetail;
 };

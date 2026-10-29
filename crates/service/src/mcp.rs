@@ -300,6 +300,10 @@ const WRITE_TOOLS: [&str; 7] = [
 /// None of them is one of the `WRITE_TOOLS`: their rights are the
 /// Reflection's own, decided by the engine's reflection gate, never by
 /// `refuse_unwritable`.
+/// What `add_domain` with `repo` and no `readers` is told on an instance
+/// with a GitHub App.
+const ADD_DOMAIN_NEEDS_READERS: &str = "add_domain needs readers: shared (everyone signed in) or private (only people with access on GitHub)";
+
 const REFLECTION_WRITE_TOOLS: [&str; 3] = ["reflect", "write_reflection", "discuss"];
 
 /// The four Reflection tools, whose engine refusals MCP answers as
@@ -3933,7 +3937,7 @@ impl McpServer {
     #[tool(
         name = "add_domain",
         title = "Add domain",
-        description = "Create or connect a domain to store engrams in - the way to give the agent somewhere to capture knowledge, so it works even on an instance with no domains yet. Three modes follow the arguments: a local domain of markdown files on disk (pass folder, or just domain to use the default root at <domains_root>/<domain>) that is created with a starter MANIFEST when new and adopted in place when it already holds engrams; a virtual database-backed domain with no files (virtual: true with a domain name); or a GitHub team domain that downloads shared knowledge to learn from and share back (repo is owner/name, needs GitHub enabled via configure). repo and virtual are mutually exclusive. Without an explicit domain name, the name defaults to the MANIFEST's domain_name, then the folder or repository name. Available whenever the instance is writable; only the team mode needs GitHub turned on. Connecting a repository this domain is already connected to is safe and simply reports the connected state. Connecting a repository reports progress while it downloads and registers the knowledge, then keeps embedding it for search in the background after the call returns.",
+        description = "Create or connect a domain to store engrams in - the way to give the agent somewhere to capture knowledge, so it works even on an instance with no domains yet. Three modes follow the arguments: a local domain of markdown files on disk (pass folder, or just domain to use the default root at <domains_root>/<domain>) that is created with a starter MANIFEST when new and adopted in place when it already holds engrams; a virtual database-backed domain with no files (virtual: true with a domain name); or a GitHub team domain that downloads shared knowledge to learn from and share back (repo is owner/name, needs GitHub enabled via configure). repo and virtual are mutually exclusive. On an instance with a GitHub App, a team domain also needs readers: shared (everyone signed in reads it) or private (only people with access to the repository on GitHub read it); access to it follows GitHub, so who may read a possibly confidential repository is always said, never defaulted, and a call without readers is refused. Ask the user when you do not know. Without an App, readers is ignored. Without an explicit domain name, the name defaults to the MANIFEST's domain_name, then the folder or repository name. Available whenever the instance is writable; only the team mode needs GitHub turned on. Connecting a repository this domain is already connected to is safe and simply reports the connected state. Connecting a repository reports progress while it downloads and registers the knowledge, then keeps embedding it for search in the background after the call returns.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -3966,6 +3970,20 @@ impl McpServer {
             return Err(to_error(EngineError::Invalid(
                 "add_domain: repo and virtual are mutually exclusive; a team domain is file-backed"
                     .to_string(),
+            )));
+        }
+        if p.repo.is_none() && p.readers.is_some() {
+            return Err(to_error(EngineError::Invalid(
+                "add_domain: readers is for a team domain only; pass it with repo".to_string(),
+            )));
+        }
+        // On an instance with a GitHub App, access to a team domain follows
+        // GitHub and the agent has to say who may read it: asked here in the
+        // tool's own words, before anything is fetched. The engine refuses
+        // the same way for every other surface.
+        if p.repo.is_some() && p.readers.is_none() && self.engine.github_app_configured() {
+            return Err(to_error(EngineError::Invalid(
+                ADD_DOMAIN_NEEDS_READERS.to_string(),
             )));
         }
 
@@ -4020,6 +4038,7 @@ impl McpServer {
                     p.path.as_deref(),
                     p.branch.as_deref(),
                     p.folder.as_deref(),
+                    p.readers,
                     progress,
                     &scope,
                 )

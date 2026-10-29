@@ -474,6 +474,37 @@ async fn a_malformed_repo_or_path_is_refused_before_the_connection_is_asked_abou
     assert_eq!(ready.status(), 409);
 }
 
+/// `readers` belongs to a team domain, takes shared or private, and does not
+/// contradict `private`: each is a 422 naming the field before anything is
+/// asked of the forge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn readers_is_validated_before_the_connection_is_asked_about() {
+    let fx = serve(Options {
+        github: true,
+        ..Options::default()
+    })
+    .await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    for body in [
+        serde_json::json!({"mode": "local", "name": "notes", "readers": "shared"}),
+        serde_json::json!({"mode": "virtual", "name": "notes", "readers": "private"}),
+        serde_json::json!({"mode": "github", "repo": "acme/kb", "readers": "everyone"}),
+        serde_json::json!({"mode": "github", "repo": "acme/kb", "readers": "shared", "private": true}),
+    ] {
+        let resp = as_session(fx.addr, reqwest::Method::POST, "/api/v1/domains", &admin)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 422, "{body} must be refused");
+        let problem: serde_json::Value = resp.json().await.unwrap();
+        assert!(
+            problem["detail"].as_str().unwrap().contains("readers"),
+            "{problem}"
+        );
+    }
+}
+
 /// The GitHub domain-name peek is admin only, refuses a missing `repo` with
 /// the same 422 a nameless team-domain create's own repo check answers, and
 /// is a 409 pointing at the settings screen when no credential is on file -

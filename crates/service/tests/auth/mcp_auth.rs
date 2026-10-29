@@ -300,6 +300,7 @@ async fn serve_personal_share_with_mcp_auth()
             None,
             None,
             Some(root.join("kb").to_str().unwrap()),
+            None,
         )
         .await
         .unwrap();

@@ -1940,6 +1940,29 @@ impl DomainAccess {
         self.auth.forget_domain(domain).await
     }
 
+    /// Record who may read a domain connected to GitHub through the GitHub
+    /// App, as the connect chose it: `private` writes the acl row
+    /// ([`AuthStore::set_governed_private`], naming `set_by`), `shared`
+    /// drops any acl row and membership the name still carried. A write the
+    /// connecting verb makes, beside [`DomainAccess::forget_domain`] for the
+    /// same reason: the engine holds one handle onto the accounts database,
+    /// and this is the narrow door for the one thing a connect decides.
+    #[doc(hidden)]
+    pub async fn set_governed_readers(
+        &self,
+        domain: &str,
+        private: bool,
+        set_by: &str,
+    ) -> Result<crate::auth_store::VisibilityWrite> {
+        if private {
+            self.auth.set_governed_private(domain, set_by).await
+        } else {
+            self.auth
+                .set_domain_visibility(domain, false, OWNER_IDENTITY_NAME)
+                .await
+        }
+    }
+
     /// Carry the visibility, membership and share-link records of domain
     /// `old` over to `new`, for a domain that is being renamed.
     ///

@@ -4425,6 +4425,41 @@ impl AuthStore {
         private: bool,
         owner: &str,
     ) -> Result<VisibilityWrite> {
+        self.write_visibility(domain, private, owner, true).await
+    }
+
+    /// Make a domain whose access follows GitHub private, recording `set_by`
+    /// as the one who chose it: the visibility half of connecting a GitHub
+    /// domain with readers `private` on an instance with a GitHub App.
+    ///
+    /// The same write as [`AuthStore::set_domain_visibility`] with `private =
+    /// true` (an already-private domain is left exactly as it stands), with
+    /// one difference: `set_by` may be the reserved machine owner's name,
+    /// [`crate::scope::OWNER_IDENTITY_NAME`], which no account holds, so the
+    /// live-account check is skipped for it. That is safe here and nowhere
+    /// else: on a governed domain the row means only "private", and its
+    /// `owner` and every membership row are never read (`decide_governed`
+    /// in the scope module). Any other `set_by` must still name a live
+    /// account.
+    pub async fn set_governed_private(
+        &self,
+        domain: &str,
+        set_by: &str,
+    ) -> Result<VisibilityWrite> {
+        let is_owner = normalize_account_name(set_by)? == crate::scope::OWNER_IDENTITY_NAME;
+        self.write_visibility(domain, true, set_by, !is_owner).await
+    }
+
+    /// The write behind [`AuthStore::set_domain_visibility`] and
+    /// [`AuthStore::set_governed_private`]; `check_owner` is whether a
+    /// privatizing write requires `owner` to be a live account.
+    async fn write_visibility(
+        &self,
+        domain: &str,
+        private: bool,
+        owner: &str,
+        check_owner: bool,
+    ) -> Result<VisibilityWrite> {
         let domain = normalize_domain(domain)?;
         let owner = normalize_account_name(owner)?;
         let now = chrono::Utc::now().to_rfc3339();
@@ -4447,7 +4482,9 @@ impl AuthStore {
             if let Some(acl) = self.acl_of(&domain).await? {
                 return Ok(VisibilityWrite::AlreadyPrivate { owner: acl.owner });
             }
-            self.require_live_user(&owner).await?;
+            if check_owner {
+                self.require_live_user(&owner).await?;
+            }
             // Delete then insert rather than an upsert clause: two plain
             // statements inside the transaction that already serializes them,
             // with no dependence on which conflict syntax the embedded
@@ -7001,6 +7038,31 @@ mod tests {
     /// would be acting in that account's drafts too. Every path that names an
     /// account folds through `normalize_account_name`, so every one of them
     /// refuses it, whichever way it is spelled.
+    /// A governed domain made private at connect names who chose it. The
+    /// machine owner holds no account, so its reserved name is taken without
+    /// the live-account check; any other name still needs a live account,
+    /// and an already-private domain is left as it stands.
+    #[tokio::test]
+    async fn set_governed_private_takes_the_owner_name_and_leaves_a_private_domain_alone() {
+        let (_dir, store) = store().await;
+        assert_eq!(
+            store.set_governed_private("kb", "Owner").await.unwrap(),
+            VisibilityWrite::Written
+        );
+        assert_eq!(
+            store.domain_visibility("kb").await.unwrap().unwrap().owner,
+            "owner"
+        );
+        assert!(store.set_governed_private("ops", "nobody").await.is_err());
+        assert!(store.domain_visibility("ops").await.unwrap().is_none());
+        assert_eq!(
+            store.set_governed_private("kb", "owner").await.unwrap(),
+            VisibilityWrite::AlreadyPrivate {
+                owner: "owner".to_string()
+            }
+        );
+    }
+
     #[tokio::test]
     async fn the_machine_owners_name_is_reserved_on_every_path() {
         let (_dir, store) = store().await;

@@ -832,6 +832,21 @@ impl Provider for AppRouter {
 }
 
 impl Engine {
+    /// Whether this instance has a GitHub App configured, usable or not.
+    /// An App that is configured but cannot be used (a saved App for another
+    /// host, a key that does not parse, a keychain that cannot be read while
+    /// the marker says an App is saved there) counts: the governor governs
+    /// every origin domain under it, so a domain connected now is governed
+    /// whatever state the App is in. The one answer `/me/github-link`'s
+    /// `app_configured` and the connect's readers question share. Loads the
+    /// App slot on first use.
+    pub fn github_app_configured(&self) -> bool {
+        matches!(
+            self.github_app_slot(),
+            AppSlot::Ready(_) | AppSlot::Refused(_)
+        )
+    }
+
     /// The GitHub App this instance runs, when one is configured and usable.
     pub fn github_app(&self) -> Option<Arc<GithubApp>> {
         match self.github_app_slot() {

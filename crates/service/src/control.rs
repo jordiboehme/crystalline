@@ -610,9 +610,25 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
             let path = req.get("path").and_then(Value::as_str);
             let branch = req.get("branch").and_then(Value::as_str);
             let folder = req.get("folder").and_then(Value::as_str);
+            // Absent or null is "not said"; a value nobody knows is refused
+            // rather than read as not said, which would be asked again.
+            let readers = match req.get("readers").and_then(Value::as_str) {
+                None => None,
+                Some(value) => match crate::params::Readers::parse(value) {
+                    Some(readers) => Some(readers),
+                    None => {
+                        return (
+                            envelope_err(format!(
+                                "readers must be shared or private, got '{value}'"
+                            )),
+                            false,
+                        );
+                    }
+                },
+            };
             match shared
                 .engine
-                .origin_add(repo, domain, path, branch, folder)
+                .origin_add(repo, domain, path, branch, folder, readers)
                 .await
             {
                 Ok(data) => (envelope_ok(data), false),

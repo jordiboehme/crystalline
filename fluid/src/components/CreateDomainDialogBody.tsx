@@ -30,6 +30,16 @@
  * failed peek leaves the Name field exactly as unplaceholdered as it is
  * before the debounce ever fires.
  *
+ * On an instance with a GitHub App, access to a team domain follows GitHub,
+ * so team mode also asks who may read it: everyone signed in, or only the
+ * people with access on GitHub. Nothing is preselected and the create stays
+ * disabled until one is chosen, because nobody should open a confidential
+ * repository by accident. Whether an App is configured is read from the
+ * caller's own `GET /me/github-link` (`app_configured`), asked only once team
+ * mode is chosen; the question then takes the place of the Private checkbox,
+ * since on such a domain private means GitHub's readers. Without an App the
+ * dialog is unchanged.
+ *
  * Split from `CreateDomainDialog.tsx` behind a lazy import, for the reason the
  * other dialogs are: the Radix dialog is otherwise not in the entry bundle at
  * all, and every visit would pay for a form only an admin ever opens.
@@ -43,11 +53,13 @@ import { Link, useNavigate } from "react-router";
 
 import {
   GITHUB_STATUS_KEY,
+  MY_GITHUB_LINK_KEY,
   createDomain,
   fetchGithubDomainNamePeek,
   fetchGithubStatus,
+  fetchMyGithubLink,
 } from "../api/admin";
-import type { CreateDomainBody, DomainMode } from "../api/admin";
+import type { CreateDomainBody, DomainMode, Readers } from "../api/admin";
 import { problemDetail } from "../api/client";
 import { DOMAINS_QUERY_KEY } from "../api/domains";
 import { useAuth } from "../auth/AuthContext";
@@ -75,6 +87,12 @@ function looksLikeRepo(value: string): boolean {
     (segment) => shape.test(segment) && segment !== "." && segment !== "..",
   );
 }
+
+/** The two answers to who may read a team domain whose access follows GitHub. */
+const READERS: { readers: Readers; label: string }[] = [
+  { readers: "shared", label: "Everyone signed in" },
+  { readers: "private", label: "Only people with access on GitHub" },
+];
 
 /** The three kinds of domain, in the order they are worth considering. */
 const MODES: { mode: DomainMode; label: string; helper: string }[] = [
@@ -113,8 +131,10 @@ export default function CreateDomainDialogBody({
   const [branch, setBranch] = useState("");
   const [path, setPath] = useState("");
   const [private_, setPrivate] = useState(false);
+  const [readers, setReaders] = useState<Readers | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
   const privateField = useId();
+  const readersGroup = useId();
 
   // Asked only once team mode is on the screen, and cached under the settings
   // screen's own key: an admin who came from there pays nothing for it here.
@@ -188,6 +208,19 @@ export default function CreateDomainDialogBody({
     connection.data !== undefined &&
     !connection.data.connected;
 
+  // Whether this instance has a GitHub App, read from the caller's own link
+  // route, which any account may read. Asked only in team mode. A failed
+  // read is "no App": the server still refuses a team domain without
+  // readers when one is configured, so nothing opens by accident either way.
+  const link = useQuery({
+    queryKey: MY_GITHUB_LINK_KEY,
+    queryFn: fetchMyGithubLink,
+    enabled: mode === "github",
+    retry: false,
+  });
+  const linkPending = mode === "github" && link.isPending;
+  const asksReaders = mode === "github" && link.data?.appConfigured === true;
+
   const create = useMutation({
     mutationFn: () => createDomain(requestBody()),
     onSuccess: (created) => {
@@ -230,14 +263,30 @@ export default function CreateDomainDialogBody({
         ...(branch.trim() === "" ? {} : { branch: branch.trim() }),
         ...(path.trim() === "" ? {} : { path: path.trim() }),
         ...(named === "" ? {} : { name: named }),
-        ...(private_ ? { private: true } : {}),
+        // With an App the readers answer says it all, and the Private
+        // checkbox is not on the screen to have been checked.
+        ...(asksReaders
+          ? readers === null
+            ? {}
+            : { readers }
+          : private_
+            ? { private: true }
+            : {}),
       };
     }
     return { mode, name: named, ...(private_ ? { private: true } : {}) };
   }
 
-  /** Whether the one field this mode cannot do without has been filled in. */
-  const ready = mode === "github" ? repo.trim() !== "" : name.trim() !== "";
+  /**
+   * Whether the one field this mode cannot do without has been filled in,
+   * and, for a team domain on an instance with a GitHub App, who may read it
+   * has been chosen. While it is not yet known whether there is an App, team
+   * mode waits.
+   */
+  const ready =
+    mode === "github"
+      ? repo.trim() !== "" && !linkPending && (!asksReaders || readers !== null)
+      : name.trim() !== "";
 
   return (
     <Dialog.Root
@@ -400,32 +449,64 @@ export default function CreateDomainDialogBody({
               </>
             )}
 
+            {asksReaders && (
+              <fieldset
+                role="radiogroup"
+                aria-labelledby={`${readersGroup}-legend`}
+                className="flex flex-col gap-2 text-sm"
+              >
+                <legend id={`${readersGroup}-legend`} className="pb-1">
+                  Who may read this domain?
+                </legend>
+                {READERS.map((option) => (
+                  <label
+                    key={option.readers}
+                    className="flex items-center gap-2"
+                  >
+                    <input
+                      type="radio"
+                      name={readersGroup}
+                      value={option.readers}
+                      checked={readers === option.readers}
+                      onChange={() => {
+                        setReaders(option.readers);
+                      }}
+                    />
+                    <span>{option.label}</span>
+                  </label>
+                ))}
+              </fieldset>
+            )}
+
             {/*
               Every mode alike, so it sits below the mode-specific fields
               rather than inside any one of them: a domain is private or it is
-              not, whatever backs it.
+              not, whatever backs it. Not for a team domain whose access
+              follows GitHub, where the readers question above says it.
             */}
-            <div className="flex flex-col gap-1 text-sm">
-              <label className="flex items-center gap-2">
-                <input
-                  id={privateField}
-                  type="checkbox"
-                  checked={private_}
-                  aria-describedby={`${privateField}-help`}
-                  onChange={(event) => {
-                    setPrivate(event.target.checked);
-                  }}
-                />
-                <span>Private</span>
-              </label>
-              <p
-                id={`${privateField}-help`}
-                className="text-caption pl-6 text-slate-500 dark:text-slate-400"
-              >
-                Only you and this instance's admins can reach it until you
-                invite somebody else in.
-              </p>
-            </div>
+            {!asksReaders && (
+              <div className="flex flex-col gap-1 text-sm">
+                <label className="flex items-center gap-2">
+                  <input
+                    id={privateField}
+                    type="checkbox"
+                    checked={private_}
+                    aria-describedby={`${privateField}-help`}
+                    onChange={(event) => {
+                      setPrivate(event.target.checked);
+                    }}
+                  />
+                  <span>Private</span>
+                </label>
+                <p
+                  id={`${privateField}-help`}
+                  className="text-caption pl-6 text-slate-500 dark:text-slate-400"
+                >
+                  Only you and this instance's admins can reach it until you
+                  invite somebody else in.
+                </p>
+              </div>
+            )}
 
             <div className="flex justify-end gap-2">
               <button

@@ -88,6 +88,7 @@ async fn clone_at(
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();

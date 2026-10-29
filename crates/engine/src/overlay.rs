@@ -35,17 +35,21 @@
 //! GitHub origin to it so a headless node bootstraps the team domain itself on
 //! first contact. `CRYSTALLINE_DOMAIN_<NAME>_REVIEW=overlay` puts that domain
 //! in review mode, so every write on the node joins its author's own draft and
-//! the folder goes on saying what the team reviewed. These domains are merged
+//! the folder goes on saying what the team reviewed.
+//! `CRYSTALLINE_DOMAIN_<NAME>_READERS=shared|private` says who may read a team
+//! domain on an instance with a GitHub App (absent reads as private, with one
+//! startup warning naming the variable). These domains are merged
 //! into the effective config last (env wins over a file entry of the same name)
-//! and are never written back to the file. Three grammar consequences follow
-//! from the two suffix rules and are load-bearing: a domain whose env fragment
+//! and are never written back to the file. Four grammar consequences follow
+//! from the three suffix rules and are load-bearing: a domain whose env fragment
 //! would end in `_ORIGIN` cannot be env-defined (that spelling is always read
 //! as an origin attachment), a domain whose env fragment would end in `_REVIEW`
 //! cannot be env-defined either (so there is no env-defined domain named
 //! `code-review`, because `CRYSTALLINE_DOMAIN_CODE_REVIEW` is review mode for a
-//! domain named `code`), and a file domain whose name contains an underscore
-//! cannot be env-shadowed (env names map `_` to `-`, so they never collide with
-//! an underscore name).
+//! domain named `code`), nor one whose fragment would end in `_READERS` (no
+//! env-defined domain named `team-readers`), and a file domain whose name
+//! contains an underscore cannot be env-shadowed (env names map `_` to `-`, so
+//! they never collide with an underscore name).
 //!
 //! `CRYSTALLINE_GITHUB_TOKEN` carries a GitHub token for a headless node: see
 //! [`GITHUB_TOKEN_ENV`] and [`EnvOverlay::github_token`]. It is never applied
@@ -87,6 +91,13 @@ const DOMAIN_ORIGIN_SUFFIX: &str = "_ORIGIN";
 /// [`DOMAIN_ORIGIN_SUFFIX`] is, and it narrows the grammar the same way: a
 /// domain whose fragment would end in `_REVIEW` cannot be env-defined.
 const DOMAIN_REVIEW_SUFFIX: &str = "_REVIEW";
+
+/// The suffix on the variable that says who may read an env-defined team
+/// domain on an instance with a GitHub App:
+/// `CRYSTALLINE_DOMAIN_<NAME>_READERS=shared|private`. Read exactly the way
+/// [`DOMAIN_ORIGIN_SUFFIX`] is, and it narrows the grammar the same way: a
+/// domain whose fragment would end in `_READERS` cannot be env-defined.
+const DOMAIN_READERS_SUFFIX: &str = "_READERS";
 
 /// The one value [`DOMAIN_REVIEW_SUFFIX`] takes, the env spelling of
 /// [`crystalline_core::config::ReviewMode::Overlay`].
@@ -234,6 +245,19 @@ pub struct EnvDomain {
     /// The file-kind domain entry, carrying its root path and, when a matching
     /// `_ORIGIN` variable was present, its GitHub origin.
     pub entry: DomainEntry,
+    /// Who may read it on an instance with a GitHub App, from a matching
+    /// `_READERS` variable; `None` when the variable is absent, which reads
+    /// as private (see [`EnvDomain::readers_var`]).
+    pub readers: Option<crate::params::Readers>,
+}
+
+impl EnvDomain {
+    /// The variable that says who may read this domain,
+    /// `CRYSTALLINE_DOMAIN_<NAME>_READERS`, for the startup warning that
+    /// names it when it is absent.
+    pub fn readers_var(&self) -> String {
+        format!("{}{DOMAIN_READERS_SUFFIX}", self.var)
+    }
 }
 
 /// The validated environment overlay: the `CRYSTALLINE_*` variables that layer
@@ -387,6 +411,7 @@ impl EnvOverlay {
         let mut domain_vars: Vec<(String, String)> = Vec::new();
         let mut origin_vars: Vec<(String, String)> = Vec::new();
         let mut review_vars: Vec<(String, String)> = Vec::new();
+        let mut readers_vars: Vec<(String, String)> = Vec::new();
 
         for (name, value) in vars {
             // A plain, non-Crystalline variable is not ours to reason about.
@@ -436,9 +461,10 @@ impl EnvOverlay {
                 continue;
             }
             if let Some(fragment) = name.strip_prefix(DOMAIN_ENV_PREFIX) {
-                // Every `_ORIGIN`-suffixed name is an origin attachment and
-                // every `_REVIEW`-suffixed one is a review-mode attachment;
-                // every other is a domain definition. All three are resolved
+                // Every `_ORIGIN`-suffixed name is an origin attachment, every
+                // `_REVIEW`-suffixed one a review-mode attachment and every
+                // `_READERS`-suffixed one a readers attachment; every other
+                // is a domain definition. All four are resolved
                 // below. An empty attachment value reads as "no attachment",
                 // matching the empty-is-unset convention of every other
                 // variable (an empty domain PATH stays an error: the base
@@ -451,6 +477,10 @@ impl EnvOverlay {
                 } else if fragment.ends_with(DOMAIN_REVIEW_SUFFIX) {
                     if !value.is_empty() {
                         review_vars.push((name, value));
+                    }
+                } else if fragment.ends_with(DOMAIN_READERS_SUFFIX) {
+                    if !value.is_empty() {
+                        readers_vars.push((name, value));
                     }
                 } else {
                     domain_vars.push((name, value));
@@ -476,7 +506,7 @@ impl EnvOverlay {
             ))
         })?;
 
-        let domains = resolve_env_domains(domain_vars, origin_vars, review_vars)?;
+        let domains = resolve_env_domains(domain_vars, origin_vars, review_vars, readers_vars)?;
 
         let github_app = github_app_from(&app_vars)?;
         let github_app_vars = GITHUB_APP_ENVS
@@ -799,6 +829,7 @@ fn resolve_env_domains(
     domain_vars: Vec<(String, String)>,
     origin_vars: Vec<(String, String)>,
     review_vars: Vec<(String, String)>,
+    readers_vars: Vec<(String, String)>,
 ) -> Result<IndexMap<String, EnvDomain>, OverlayError> {
     let mut domains: IndexMap<String, EnvDomain> = IndexMap::new();
     // The `<NAME>` fragment (for example `TEAM_KNOWLEDGE`) to the mapped domain
@@ -836,6 +867,7 @@ fn resolve_env_domains(
             EnvDomain {
                 var: var.clone(),
                 entry,
+                readers: None,
             },
         );
     }
@@ -886,6 +918,38 @@ fn resolve_env_domains(
             .expect("name recorded when the base domain was resolved")
             .entry
             .review = Some(ReviewMode::Overlay);
+    }
+
+    for (var, value) in readers_vars {
+        let fragment = var
+            .strip_prefix(DOMAIN_ENV_PREFIX)
+            .expect("collected with the domain prefix");
+        let base = fragment
+            .strip_suffix(DOMAIN_READERS_SUFFIX)
+            .expect("collected by its readers suffix");
+        let Some(name) = fragment_to_name.get(base) else {
+            return Err(OverlayError(format!(
+                "environment variable {var} has no matching {DOMAIN_ENV_PREFIX}{base}"
+            )));
+        };
+        let domain = domains
+            .get_mut(name)
+            .expect("name recorded when the base domain was resolved");
+        // Readers belong to a team domain: on one with no origin the value
+        // would say something nothing reads.
+        if domain.entry.origin.is_none() {
+            return Err(OverlayError(format!(
+                "environment variable {var} has no matching {DOMAIN_ENV_PREFIX}{base}{DOMAIN_ORIGIN_SUFFIX}: \
+                 who may read a domain is said for a team domain only"
+            )));
+        }
+        let Some(readers) = crate::params::Readers::parse(&value) else {
+            return Err(OverlayError(format!(
+                "invalid environment variable {var}: say shared (everyone signed in) or private \
+                 (only people with access on GitHub)"
+            )));
+        };
+        domain.readers = Some(readers);
     }
 
     Ok(domains)
@@ -1781,6 +1845,44 @@ mod tests {
     }
 
     #[test]
+    fn a_readers_variable_is_read_and_a_stray_or_bad_one_is_fatal() {
+        use crate::params::Readers;
+        let ov = overlay(&[
+            ("CRYSTALLINE_DOMAIN_TEAM_READERS", "Shared"),
+            ("CRYSTALLINE_DOMAIN_TEAM", "/k/team"),
+            ("CRYSTALLINE_DOMAIN_TEAM_ORIGIN", "acme/brand"),
+            ("CRYSTALLINE_DOMAIN_OPS", "/k/ops"),
+            ("CRYSTALLINE_DOMAIN_OPS_ORIGIN", "acme/ops"),
+            ("CRYSTALLINE_DOMAIN_OPS_READERS", ""),
+        ])
+        .unwrap();
+        let team = ov.env_domain("team").unwrap();
+        assert_eq!(team.readers, Some(Readers::Shared));
+        assert_eq!(team.readers_var(), "CRYSTALLINE_DOMAIN_TEAM_READERS");
+        // `VAR=` reads as unset.
+        assert_eq!(ov.env_domain("ops").unwrap().readers, None);
+        assert!(ov.env_domain("team-readers").is_none());
+
+        // No base domain, no origin, or a value nobody knows: fatal, naming
+        // the variable.
+        for vars in [
+            vec![("CRYSTALLINE_DOMAIN_TEAM_READERS", "private")],
+            vec![
+                ("CRYSTALLINE_DOMAIN_TEAM", "/k/team"),
+                ("CRYSTALLINE_DOMAIN_TEAM_READERS", "private"),
+            ],
+            vec![
+                ("CRYSTALLINE_DOMAIN_TEAM", "/k/team"),
+                ("CRYSTALLINE_DOMAIN_TEAM_ORIGIN", "acme/brand"),
+                ("CRYSTALLINE_DOMAIN_TEAM_READERS", "everyone"),
+            ],
+        ] {
+            let msg = overlay(&vars).unwrap_err().to_string();
+            assert!(msg.contains("CRYSTALLINE_DOMAIN_TEAM_READERS"), "{msg}");
+        }
+    }
+
+    #[test]
     fn a_domain_whose_fragment_ends_in_review_cannot_be_env_defined() {
         // The suffix is load-bearing: `CRYSTALLINE_DOMAIN_CODE_REVIEW` is read
         // as review mode for a domain named `code`, never as a domain named
@@ -1843,6 +1945,7 @@ mod tests {
                 "CRYSTALLINE_DOMAIN_TEAM_KNOWLEDGE".to_string(),
                 "/tmp/tk".to_string(),
             )],
+            vec![],
             vec![],
             vec![],
         )

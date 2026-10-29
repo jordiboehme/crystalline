@@ -1960,6 +1960,7 @@ async fn share_changes_tool_wires_through_to_origin_share() {
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -2001,6 +2002,7 @@ async fn share_changes_commits_on_a_direct_domain_and_refuses_under_an_open_prop
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -2091,6 +2093,7 @@ async fn share_changes_with_as_proposal_opens_a_proposal_on_a_direct_domain() {
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -2138,6 +2141,7 @@ async fn edited_team_engine(tmp: &tempfile::TempDir) -> (Arc<Engine>, std::path:
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -2330,6 +2334,7 @@ async fn discard_changes_clears_only_the_callers_draft_in_a_reviewing_domain() {
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -2444,6 +2449,7 @@ async fn share_one_engram_over(transport_is_http: bool) -> Value {
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -2558,6 +2564,7 @@ async fn an_http_share_proceeds_on_the_configured_agent_identity() {
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -2600,6 +2607,7 @@ async fn share_changes_forwards_the_proposal_number_to_the_engine() {
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -2649,6 +2657,7 @@ async fn share_changes_forwards_the_file_selection_to_the_engine() {
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -2706,6 +2715,7 @@ async fn update_domain_tool_wires_through_to_origin_update() {
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -2737,6 +2747,7 @@ async fn origin_status_tool_wires_through_to_origin_status() {
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -2795,6 +2806,7 @@ async fn origin_status_names_the_drafts_a_reviewing_domain_holds() {
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -2860,6 +2872,7 @@ async fn resolve_conflict_tool_wires_through_to_origin_resolve() {
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -2940,6 +2953,7 @@ async fn locally_locked_team_engine(
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();

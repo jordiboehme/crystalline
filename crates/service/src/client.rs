@@ -1837,12 +1837,19 @@ pub async fn domain_review(
 /// model download, and the domain is searchable via text immediately either
 /// way; embedding follows whenever the daemon (or a later `sync --embed`)
 /// gets to it.
+///
+/// `readers` says who may read the domain on an instance with a GitHub App
+/// (see [`Engine::origin_add`]); the standalone fallback installs this
+/// machine's accounts store first, so a private answer is recorded there as
+/// the daemon would record it.
+#[allow(clippy::too_many_arguments)]
 pub async fn origin_add(
     repo: &str,
     domain: Option<&str>,
     path: Option<&str>,
     branch: Option<&str>,
     folder: Option<&str>,
+    readers: Option<crate::params::Readers>,
     db: Option<&Path>,
     config_path: Option<&Path>,
 ) -> anyhow::Result<Value> {
@@ -1851,6 +1858,7 @@ pub async fn origin_add(
         && let Some(data) = ctl_if_running(json!({
             "v": 1, "cmd": "origin_add", "repo": repo, "domain": domain,
             "path": path, "branch": branch, "folder": folder,
+            "readers": readers.map(crate::params::Readers::as_str),
         }))
         .await?
     {
@@ -1858,9 +1866,11 @@ pub async fn origin_add(
     }
     let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
-    let engine = open_standalone_reporting(loaded, &db_path, false, db, config_path).await?;
+    let engine =
+        Arc::new(open_standalone_reporting(loaded, &db_path, false, db, config_path).await?);
+    install_domain_access(&engine).await;
     Ok(engine
-        .origin_add(repo, domain, path, branch, folder)
+        .origin_add(repo, domain, path, branch, folder, readers)
         .await?)
 }
 

@@ -366,7 +366,7 @@ async fn pending_team_domain(tmp: &std::path::Path) -> (Engine, std::path::PathB
     .with_origin_provider(mock)
     .with_origins_dir(tmp.join("origins"))
     .with_state_dir(tmp.to_path_buf());
-    eng.origin_add("acme/eng-knowledge", None, None, None, None)
+    eng.origin_add("acme/eng-knowledge", None, None, None, None, None)
         .await
         .unwrap();
     let root = domains_root.join("eng");
@@ -544,7 +544,7 @@ async fn adopting_a_folder_counts_a_pending_engram_as_a_change() {
     .with_origins_dir(tmp.path().join("origins"))
     .with_state_dir(tmp.path().to_path_buf());
     let added = eng
-        .origin_add("acme/eng-knowledge", None, None, None, None)
+        .origin_add("acme/eng-knowledge", None, None, None, None, None)
         .await
         .unwrap();
     assert_eq!(added["adopted"], true, "{added}");

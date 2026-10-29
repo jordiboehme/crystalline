@@ -7466,6 +7466,7 @@ mod move_;
 mod name_report;
 mod names;
 mod origins;
+pub use origins::READERS_REQUIRED;
 mod read;
 mod reflect;
 pub use reflect::{REFLECT_GUIDANCE, STRUCTURE_HINT};

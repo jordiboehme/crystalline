@@ -22,6 +22,7 @@ use super::{
 use crate::engine::{EngineError, PreviewCredential, ShareActor};
 use crate::review::{FoldChoice, ReviewModeConfirm};
 use crate::scope::DomainRight;
+use crystalline_engine::params::Readers;
 use crystalline_remote::ops::DiscardTarget;
 
 /// The caller, when they may drive this instance's share surfaces - the status
@@ -112,6 +113,15 @@ pub struct CreateDomainBody {
     #[serde(default)]
     #[schema(example = false)]
     pub private: bool,
+    /// Who may read a team domain on an instance with a GitHub App:
+    /// `shared` (everyone signed in) or `private` (only people with access
+    /// on GitHub). github mode only. Required there when an App is
+    /// configured, since access then follows GitHub and is never defaulted;
+    /// `private: true` answers `private`. Ignored, with a note in the
+    /// report, without an App.
+    #[serde(default)]
+    #[schema(example = "private")]
+    pub readers: Option<String>,
 }
 
 /// `POST /domains` - register a domain: a local folder under the server's
@@ -199,8 +209,12 @@ pub struct CreateDomainBody {
                            domain (github alone may omit it), a name that \
                            could escape the domains root, a github `repo` \
                            that is not owner/name or a `path` that is \
-                           absolute or holds a `..` segment, or a field \
-                           that does not belong to the mode asked for.",
+                           absolute or holds a `..` segment, a field \
+                           that does not belong to the mode asked for, a \
+                           `readers` that is neither shared nor private or \
+                           that contradicts `private`, or a team domain \
+                           without `readers` on an instance with a GitHub \
+                           App.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -224,6 +238,7 @@ pub async fn create(
             require_absent(&body.repo, "repo", "local")?;
             require_absent(&body.branch, "branch", "local")?;
             require_absent(&body.path, "path", "local")?;
+            require_absent(&body.readers, "readers", "local")?;
             state
                 .engine
                 .domain_add_local_as(Some(name), None, &identity.scope())
@@ -234,6 +249,7 @@ pub async fn create(
             require_absent(&body.repo, "repo", "virtual")?;
             require_absent(&body.branch, "branch", "virtual")?;
             require_absent(&body.path, "path", "virtual")?;
+            require_absent(&body.readers, "readers", "virtual")?;
             state
                 .engine
                 .domain_add_virtual_as(name, &identity.scope())
@@ -252,6 +268,7 @@ pub async fn create(
             if let Some(path) = body.path.as_deref() {
                 validate_github_path(path)?;
             }
+            let readers = github_readers(&body, || state.engine.github_app_configured())?;
             // The TRIMMED name, and it has to be the one that travels on:
             // `origin_add` uses what it is handed verbatim as the config key
             // and as the folder segment under the domains root, so passing
@@ -277,6 +294,7 @@ pub async fn create(
                     // Never from this surface: a team domain lands under the
                     // domains root like a local one, for the same reason.
                     None,
+                    readers,
                     None,
                     &identity.scope(),
                 )
@@ -290,7 +308,10 @@ pub async fn create(
     };
     match report {
         Ok(report) => {
-            if body.private {
+            // A connect that recorded who may read the domain (its access
+            // follows GitHub) has already made it private when asked; its
+            // owner record is never read, so there is nothing left to close.
+            if body.private && report.get("readers").is_none() {
                 close_new_domain(&state, &report, caller.name()).await?;
             }
             Ok((StatusCode::CREATED, Json(report)).into_response())
@@ -300,6 +321,31 @@ pub async fn create(
         // MCP's classification.
         Err(EngineError::Conflict(detail)) => Err(ApiError::conflict(detail)),
         Err(e) => Err(e.into()),
+    }
+}
+
+/// The `readers` a github-mode create passes on: the body's own, validated,
+/// else `private` when the body asked for a private domain on an instance
+/// with a GitHub App (`app_configured`, asked only then), else none. A value
+/// that is neither `shared` nor `private`, or `shared` beside `private:
+/// true`, is a 422 naming the field.
+fn github_readers(
+    body: &CreateDomainBody,
+    app_configured: impl FnOnce() -> bool,
+) -> Result<Option<Readers>, ApiError> {
+    let readers = match body.readers.as_deref() {
+        None => None,
+        Some(value) => Some(Readers::parse(value).ok_or_else(|| {
+            ApiError::unprocessable(format!("readers must be shared or private, got '{value}'"))
+        })?),
+    };
+    match readers {
+        Some(Readers::Shared) if body.private => Err(ApiError::unprocessable(
+            "readers shared and private: true contradict each other; send one of them",
+        )),
+        Some(readers) => Ok(Some(readers)),
+        None if body.private && app_configured() => Ok(Some(Readers::Private)),
+        None => Ok(None),
     }
 }
 

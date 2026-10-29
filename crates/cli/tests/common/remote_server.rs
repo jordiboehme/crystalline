@@ -167,6 +167,7 @@ impl CliServer {
                         None,
                         None,
                         Some(folder.to_str().unwrap()),
+                        None,
                     )
                     .await
                     .unwrap();

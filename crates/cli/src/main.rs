@@ -1398,6 +1398,13 @@ enum DomainCommand {
         /// exist and be enabled.
         #[arg(long, value_name = "ACCOUNT")]
         owner: Option<String>,
+        /// Who may read a team domain on an instance with a GitHub App:
+        /// shared (everyone signed in) or private (only people with access on
+        /// GitHub). Asked on a terminal when not given, and required when
+        /// nobody can be asked; --private answers private. Ignored, with a
+        /// note, on an instance without an App. Only with --origin.
+        #[arg(long, value_enum, requires = "origin", conflicts_with = "private")]
+        readers: Option<ReadersArg>,
         /// Load the global config from this file instead of the default path.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -1669,6 +1676,24 @@ enum VisibilityArg {
     Private,
     /// Every account sees it, which is how a domain starts out.
     Default,
+}
+
+/// Who may read a team domain, as `domain add --origin --readers` takes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum ReadersArg {
+    /// Everyone signed in reads it.
+    Shared,
+    /// Only people with access on GitHub read it.
+    Private,
+}
+
+impl From<ReadersArg> for crystalline_service::params::Readers {
+    fn from(arg: ReadersArg) -> crystalline_service::params::Readers {
+        match arg {
+            ReadersArg::Shared => crystalline_service::params::Readers::Shared,
+            ReadersArg::Private => crystalline_service::params::Readers::Private,
+        }
+    }
 }
 
 /// The membership levels `domain members add` accepts, mirroring
@@ -4447,6 +4472,7 @@ fn run_domain(command: DomainCommand, db: Option<PathBuf>, json: bool) -> anyhow
             no_sync,
             private,
             owner,
+            readers,
             config,
         } => on_runtime(move || async move {
             // The positional path and `--path` are two spellings of the same
@@ -4466,12 +4492,13 @@ fn run_domain(command: DomainCommand, db: Option<PathBuf>, json: bool) -> anyhow
             // caller's own `name`, which may be absent: a nameless add lands
             // on a name worked out from the folder, and that is the name
             // `--private` must close.
-            let (chosen_name, adopted) = domain_add_dispatch(
+            let (chosen_name, adopted, governed) = domain_add_dispatch(
                 name,
                 path,
                 is_virtual,
                 origin,
                 branch,
+                readers.map(Into::into),
                 config.clone(),
                 db,
                 no_sync,
@@ -4479,7 +4506,12 @@ fn run_domain(command: DomainCommand, db: Option<PathBuf>, json: bool) -> anyhow
                 closing.as_deref(),
             )
             .await?;
-            if let Some(owner) = closing {
+            // A domain whose access follows GitHub was made private by the
+            // connect itself; its owner record is never read, so there is
+            // nothing left to close.
+            if let Some(owner) = closing
+                && !governed
+            {
                 // The dispatch refused `--private` on an adopted registration
                 // before it printed anything; a domain that reaches this
                 // point is new.
@@ -4928,6 +4960,10 @@ async fn mcp_dispatch(
 ///
 /// `private_owner` is `--private`'s owner: an adopted registration is refused
 /// with it before anything is printed.
+///
+/// Answers the name registered, whether it was adopted, and whether the
+/// connect recorded who may read it (a team domain on an instance with a
+/// GitHub App, whose access follows GitHub).
 #[allow(clippy::too_many_arguments)]
 async fn domain_add_dispatch(
     name: Option<String>,
@@ -4935,18 +4971,20 @@ async fn domain_add_dispatch(
     is_virtual: bool,
     origin: Option<String>,
     branch: Option<String>,
+    readers: Option<crystalline_service::params::Readers>,
     config: Option<PathBuf>,
     db: Option<PathBuf>,
     no_sync: bool,
     json: bool,
     private_owner: Option<&str>,
-) -> anyhow::Result<(String, bool)> {
+) -> anyhow::Result<(String, bool, bool)> {
     if let Some(origin_spec) = origin {
         return domain_add_origin_dispatch(
             name,
             path,
             origin_spec,
             branch,
+            readers,
             is_virtual,
             no_sync,
             config,
@@ -4985,7 +5023,7 @@ async fn domain_add_dispatch(
         )
         .await?;
         cmd::print_domain_add_virtual(&name, adopted, &scaffold, json);
-        return Ok((name, adopted));
+        return Ok((name, adopted, false));
     }
 
     // An absent path defaults to `<domains_root>/<name>` inside
@@ -5005,7 +5043,7 @@ async fn domain_add_dispatch(
     }
     if no_sync {
         cmd::print_domain_add_no_sync(&chosen_name, &abs, adopted, shadowed.as_deref(), json);
-        return Ok((chosen_name, adopted));
+        return Ok((chosen_name, adopted, false));
     }
 
     // Index over the daemon only when no explicit --config/--db override was
@@ -5039,7 +5077,7 @@ async fn domain_add_dispatch(
         &report,
         json,
     );
-    Ok((chosen_name, adopted))
+    Ok((chosen_name, adopted, false))
 }
 
 /// `domain add --origin`: connects a team domain to a GitHub repository
@@ -5060,13 +5098,14 @@ async fn domain_add_origin_dispatch(
     path: Option<PathBuf>,
     origin_spec: String,
     branch: Option<String>,
+    readers: Option<crystalline_service::params::Readers>,
     is_virtual: bool,
     no_sync: bool,
     config: Option<PathBuf>,
     db: Option<PathBuf>,
     json: bool,
     private_owner: Option<&str>,
-) -> anyhow::Result<(String, bool)> {
+) -> anyhow::Result<(String, bool, bool)> {
     if is_virtual {
         anyhow::bail!("`domain add --origin` cannot be combined with --virtual");
     }
@@ -5096,16 +5135,36 @@ async fn domain_add_origin_dispatch(
     // in place).
     let snapshot = cmd::load(config.as_deref())?.file.domains;
 
-    let data = crystalline_service::origin_add(
-        &repo,
-        name.as_deref(),
-        subpath.as_deref(),
-        branch.as_deref(),
-        folder_str.as_deref(),
-        db.as_deref(),
-        config.as_deref(),
-    )
-    .await?;
+    let connect = |readers: Option<crystalline_service::params::Readers>| {
+        crystalline_service::origin_add(
+            &repo,
+            name.as_deref(),
+            subpath.as_deref(),
+            branch.as_deref(),
+            folder_str.as_deref(),
+            readers,
+            db.as_deref(),
+            config.as_deref(),
+        )
+    };
+    // On an instance with a GitHub App the connect refuses until it is told
+    // who may read the domain, before anything is fetched. `--private`
+    // answers it; a terminal is asked; nobody else can be.
+    let data = match connect(readers).await {
+        Err(e)
+            if readers.is_none()
+                && e.to_string()
+                    .contains(crystalline_service::engine::READERS_REQUIRED) =>
+        {
+            let answer = match private_owner {
+                Some(_) => crystalline_service::params::Readers::Private,
+                None => ask_readers()?,
+            };
+            connect(Some(answer)).await?
+        }
+        other => other?,
+    };
+    let governed = data.get("readers").is_some();
     let chosen_name = data["domain"].as_str().unwrap_or_default().to_string();
     let already_registered = snapshot.contains_key(&chosen_name);
     // Adopted when the name was already registered before this call (a
@@ -5115,8 +5174,10 @@ async fn domain_add_origin_dispatch(
     // now, so the refusal carries its report.
     let already_connected = data["already_connected"].as_bool().unwrap_or(false);
     let adopted = already_registered || already_connected;
+    // A governed connect recorded the domain private itself, adopted or not.
     if let Some(owner) = private_owner
         && adopted
+        && !governed
     {
         return Err(refuse_private_after_connect(
             &repo,
@@ -5127,7 +5188,36 @@ async fn domain_add_origin_dispatch(
         ));
     }
     cmd::print_origin_add(&repo, &data, json);
-    Ok((chosen_name, adopted))
+    Ok((chosen_name, adopted, governed))
+}
+
+/// The refusal a connect gets off a terminal on an instance with a GitHub
+/// App when `--readers` was not given.
+const READERS_FLAG_NEEDED: &str =
+    "say who may read this domain: --readers shared or --readers private";
+
+/// Asks on the terminal who may read a team domain being connected: the
+/// question Fluid's dialog asks, with no answer preselected. Off a terminal
+/// nobody can be asked, so it refuses naming the flag.
+fn ask_readers() -> anyhow::Result<crystalline_service::params::Readers> {
+    use crystalline_service::params::Readers;
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!(READERS_FLAG_NEEDED);
+    }
+    eprintln!("Who may read this domain?");
+    eprintln!("  shared   Everyone signed in");
+    eprintln!("  private  Only people with access on GitHub");
+    loop {
+        eprint!("Type shared or private: ");
+        std::io::stderr().flush()?;
+        let mut answer = String::new();
+        if std::io::stdin().read_line(&mut answer)? == 0 {
+            anyhow::bail!(READERS_FLAG_NEEDED);
+        }
+        if let Some(readers) = Readers::parse(&answer) {
+            return Ok(readers);
+        }
+    }
 }
 
 /// `domain remove`: the engine's own unregistration, over the daemon when one

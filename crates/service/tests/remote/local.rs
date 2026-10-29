@@ -788,7 +788,7 @@ async fn an_origin_added_beside_a_mount_steps_aside_and_a_copy_says_it_is_hidden
 
     let report = machine
         .engine
-        .origin_add("acme/other", Some("open"), None, Some("main"), None)
+        .origin_add("acme/other", Some("open"), None, Some("main"), None, None)
         .await
         .unwrap();
     assert_eq!(report["domain"], "open-local", "{report}");
@@ -800,7 +800,7 @@ async fn an_origin_added_beside_a_mount_steps_aside_and_a_copy_says_it_is_hidden
 
     let report = machine
         .engine
-        .origin_add("acme/platform", None, None, Some("main"), None)
+        .origin_add("acme/platform", None, None, Some("main"), None, None)
         .await
         .unwrap();
     assert_eq!(report["domain"], "platform-local", "{report}");
@@ -875,7 +875,7 @@ async fn a_hidden_team_copy_is_neither_polled_nor_shared() {
     let set = machine.mount();
     let report = machine
         .engine
-        .origin_add("acme/platform", None, None, Some("main"), None)
+        .origin_add("acme/platform", None, None, Some("main"), None, None)
         .await
         .unwrap();
     let root = std::path::PathBuf::from(report["root"].as_str().unwrap());

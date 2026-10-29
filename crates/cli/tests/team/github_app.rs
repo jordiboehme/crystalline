@@ -307,3 +307,51 @@ fn doctor_says_connected_through_a_healthy_app() {
         "{human}"
     );
 }
+
+/// On an instance with a GitHub App a team domain's readers have to be said.
+/// Off a terminal nobody can be asked, so a connect without `--readers`
+/// refuses before anything is fetched or registered.
+#[test]
+fn cli_origin_add_without_readers_off_a_terminal_refuses() {
+    let home = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let tokens = work.path().join("tokens");
+    // Nothing listens here: the refusal comes before GitHub is asked.
+    let config = write_config(work.path(), "http://127.0.0.1:1");
+    let before = std::fs::read_to_string(&config).unwrap();
+
+    let out = bin(home.path(), &tokens)
+        .env("CRYSTALLINE_GITHUB_TOKEN", "gho_instance")
+        .env("CRYSTALLINE_GITHUB_APP_ID", "7")
+        .env("CRYSTALLINE_GITHUB_APP_CLIENT_ID", "Iv23.test")
+        .env("CRYSTALLINE_GITHUB_APP_PRIVATE_KEY", PEM)
+        .args(["domain", "add", "kb", "--origin", "acme/kb", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("say who may read this domain: --readers shared or --readers private"),
+        "{stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&config).unwrap(),
+        before,
+        "nothing was registered"
+    );
+}
+
+/// `--readers` belongs to a team domain.
+#[test]
+fn cli_readers_needs_origin() {
+    let home = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let out = bin(home.path(), &work.path().join("tokens"))
+        .args(["domain", "add", "notes", "--readers", "shared"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("--origin"), "{stderr}");
+}

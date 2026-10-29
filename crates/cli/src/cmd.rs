@@ -1046,6 +1046,15 @@ pub(crate) fn print_origin_add(repo: &str, data: &serde_json::Value, json: bool)
         data["engrams"].as_u64().unwrap_or(0),
         data["base_commit"].as_str().unwrap_or("")
     );
+    // Who may read it, on an instance with a GitHub App.
+    match data["readers"].as_str() {
+        Some("private") => println!("  readers: only people with access on GitHub"),
+        Some("shared") => println!("  readers: everyone signed in"),
+        _ => {}
+    }
+    if let Some(note) = data["readers_note"].as_str() {
+        println!("  {note}");
+    }
     if data["adopted"].as_bool().unwrap_or(false) {
         let changes = data["local_changes"].as_u64().unwrap_or(0);
         println!(

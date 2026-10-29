@@ -616,6 +616,10 @@ pub async fn run_serve(
     // Opened after the two short-lived opens above have closed theirs, and
     // shared with the HTTP surface below, so this process holds one handle.
     let accounts = crate::client::install_domain_access(&engine).await;
+    // Who may read each env-defined team domain on an instance with a GitHub
+    // App, recorded before anything is served so a private one is closed
+    // from its first request on.
+    engine.apply_env_readers().await;
 
     if !daemon_flag {
         if std::io::stderr().is_terminal() {

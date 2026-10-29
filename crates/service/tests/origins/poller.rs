@@ -174,6 +174,7 @@ async fn poller_applies_an_upstream_edit_without_a_user_call() {
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -319,6 +320,7 @@ async fn poller_does_not_repoll_a_domain_before_its_next_due_instant() {
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -371,6 +373,7 @@ async fn disabled_poller_makes_no_calls_and_enabling_mid_run_starts_activity() {
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -442,6 +445,7 @@ async fn unauthenticated_poller_makes_no_calls_and_a_landed_token_starts_activit
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -499,6 +503,7 @@ async fn poller_keeps_polling_with_the_cached_token_after_the_backing_file_disap
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -551,6 +556,7 @@ async fn an_auth_expired_pull_drops_the_cached_token_so_the_gate_rereads() {
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -603,6 +609,7 @@ async fn rate_limited_poller_pauses_every_domain_until_the_reported_reset() {
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -693,6 +700,7 @@ async fn status_report_origins_block_shape_when_enabled() {
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -758,6 +766,7 @@ async fn a_poll_tick_converges_a_merged_draft() {
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -847,6 +856,7 @@ async fn a_poll_tick_adopts_a_pulled_domain_name() {
             None,
             None,
             Some(root.to_str().unwrap()),
+            None,
         )
         .await
         .unwrap();

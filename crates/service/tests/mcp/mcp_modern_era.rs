@@ -206,6 +206,7 @@ impl Harness {
                 None,
                 None,
                 Some(domain_root.to_str().unwrap()),
+                None,
             )
             .await
             .unwrap();
