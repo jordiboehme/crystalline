@@ -544,3 +544,198 @@ async fn a_tool_call_runs_as_an_mcp_request() {
     let answer = serde_json::to_string(&client.peer().call_tool(params).await.unwrap()).unwrap();
     assert!(answer.contains("kb"), "{answer}");
 }
+
+/// An engine with an App pointed at the forge and the domain `kb` on
+/// `acme/kb` registered straight in the configuration (connecting it would
+/// need the App installed), with `vic` (instance viewer, GitHub write),
+/// `boss` (instance admin) and the open tier acting as `vic`.
+async fn closed_setup(tmp: &Path, installed: bool) -> (Arc<Forge>, Arc<Engine>) {
+    use crystalline_core::config::{DomainEntry, OriginConfig};
+    let installed: &[(&str, u64)] = if installed { &[("acme/kb", 1)] } else { &[] };
+    let (forge, url) = spawn_forge(
+        &[("acme/kb", repo_with_manifest(""))],
+        installed,
+        &[(1, "ghs_test")],
+    )
+    .await;
+    collaborators(&forge, "acme/kb", &[(5, "vic-gh", "write")]);
+    let mut domains = std::collections::BTreeMap::new();
+    domains.insert(
+        "kb".to_string(),
+        DomainEntry {
+            path: Some(tmp.join("kb")),
+            origin: Some(OriginConfig {
+                repo: "acme/kb".to_string(),
+                path: None,
+                branch: None,
+                poll_secs: None,
+            }),
+            ..DomainEntry::default()
+        },
+    );
+    let cfg = GlobalConfig {
+        github: Some(GitHubConfig {
+            enabled: Some(true),
+            api_url: Some(url),
+            agent_identity: Some("vic".to_string()),
+            ..GitHubConfig::default()
+        }),
+        domains: domains.into_iter().collect(),
+        ..GlobalConfig::default()
+    };
+    let overlay = EnvOverlay::from_vars(
+        app_env()
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let eng = Arc::new(
+        Engine::new(
+            Arc::new(Mutex::new(TursoStore::open_in_memory().await.unwrap())),
+            cfg,
+            None,
+            Some(tmp.join("config.yaml")),
+        )
+        .with_origins_dir(tmp.join("origins"))
+        .with_state_dir(tmp.to_path_buf())
+        .with_token_store_dir(tmp.join("tokens"))
+        .with_env_overlay(overlay),
+    );
+    let host = eng.github_app().unwrap().credentials().host.clone();
+    let auth = Arc::new(AuthStore::open(&tmp.join("auth.db")).await.unwrap());
+    auth.add_user("vic", "Vic", None, Role::Viewer, "pw12345678")
+        .await
+        .unwrap();
+    auth.add_user("boss", "Boss", None, Role::Admin, "pw12345678")
+        .await
+        .unwrap();
+    auth.link_github("vic", &host, 5, "vic-gh").await.unwrap();
+    eng.set_domain_access(Arc::new(
+        DomainAccess::new(auth).with_governor(eng.knowledge_governor()),
+    ));
+    (forge, eng)
+}
+
+fn vic() -> Scope {
+    Scope::User {
+        account: "vic".to_string(),
+        admin: false,
+    }
+}
+
+/// Asserts `kb` is closed: nothing for the viewer, the open tier as its
+/// agent, the open tier's carve-out or the anonymous caller; Own for the
+/// instance admin and the machine owner.
+async fn assert_closed(eng: &Engine) {
+    assert_eq!(
+        eng.domain_right(&vic(), "kb").await.unwrap(),
+        DomainRight::None
+    );
+    assert!(eng.hidden_for(&vic()).await.unwrap().contains("kb"));
+    as_mcp_call(async {
+        assert_eq!(
+            eng.domain_right(&Scope::Anonymous, "kb").await.unwrap(),
+            DomainRight::None
+        );
+        assert!(
+            eng.hidden_for(&Scope::Anonymous)
+                .await
+                .unwrap()
+                .contains("kb")
+        );
+        assert!(
+            eng.write_access_block(&Scope::Anonymous, "kb")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    })
+    .await;
+    assert_eq!(
+        eng.domain_right(&Scope::Anonymous, "kb").await.unwrap(),
+        DomainRight::None
+    );
+    let boss = Scope::User {
+        account: "boss".to_string(),
+        admin: false,
+    };
+    assert_eq!(
+        eng.domain_right(&boss, "kb").await.unwrap(),
+        DomainRight::Own
+    );
+    assert_eq!(
+        eng.domain_right(&Scope::Unrestricted, "kb").await.unwrap(),
+        DomainRight::Own
+    );
+    let closed = eng.github_access_closed();
+    assert_eq!(closed.len(), 1, "{closed:?}");
+    assert_eq!(closed[0].domain, "kb");
+    assert_eq!(
+        closed[0].reason,
+        "the GitHub App is not installed on acme/kb: install it there or disconnect the domain"
+    );
+}
+
+/// Waits (for real, up to five seconds) until `kb` is no longer closed.
+async fn until_open(eng: &Engine) {
+    for _ in 0..500 {
+        if eng.github_access_closed().is_empty() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("the domain never opened");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_domain_whose_repository_never_had_the_app_is_closed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_forge, eng) = closed_setup(tmp.path(), false).await;
+    // The first question looks the repository up and learns it.
+    eng.domain_right(&vic(), "kb").await.unwrap();
+    assert!(eng.github_governs("kb"));
+    assert_closed(&eng).await;
+    let answer = crystalline_service::control::answer_for_test(
+        eng.clone(),
+        &json!({ "v": 1, "cmd": "status" }),
+    )
+    .await;
+    assert_eq!(
+        answer["data"]["github_access_closed"][0]["domain"],
+        json!("kb"),
+        "{answer}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_domain_whose_app_was_removed_is_closed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (forge, eng) = closed_setup(tmp.path(), true).await;
+    assert_eq!(
+        eng.domain_right(&vic(), "kb").await.unwrap(),
+        DomainRight::Write
+    );
+    forge.uninstall("acme/kb");
+    eng.invalidate_github_access(crystalline_service::engine::Invalidate::Repo(
+        "acme/kb".to_string(),
+    ));
+    eng.domain_right(&vic(), "kb").await.unwrap();
+    assert_closed(&eng).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_domain_opens_when_the_app_is_installed_later() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (forge, eng) = closed_setup(tmp.path(), false).await;
+    eng.domain_right(&vic(), "kb").await.unwrap();
+    assert_closed(&eng).await;
+    forge.install("acme/kb", 1);
+    // The installation webhook: asked again at once, in the background.
+    eng.invalidate_github_access(crystalline_service::engine::Invalidate::Installation(1));
+    until_open(&eng).await;
+    assert_eq!(
+        eng.domain_right(&vic(), "kb").await.unwrap(),
+        DomainRight::Write
+    );
+}

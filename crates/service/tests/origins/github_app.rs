@@ -139,8 +139,13 @@ impl Forge {
     /// Takes the App off `repo`: the lookup answers 404 from now on, and the
     /// tokens of its installation stop working, the way GitHub revokes them
     /// on an uninstall.
-    fn uninstall(&self, repo: &str) {
+    pub(crate) fn uninstall(&self, repo: &str) {
         self.installed.lock().unwrap().remove(repo);
+    }
+
+    /// Puts the App on `repo` as installation `id`.
+    pub(crate) fn install(&self, repo: &str, id: u64) {
+        self.installed.lock().unwrap().insert(repo.to_string(), id);
     }
 
     /// Whether `auth` may read and write `repo`: the instance token always,

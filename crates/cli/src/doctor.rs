@@ -444,6 +444,10 @@ pub struct AppDoctor {
     /// who may use the domains connected through the App. `None` while it
     /// learns, and when no daemon answered.
     pub role_lookup_degraded_since: Option<String>,
+    /// The domains the running daemon keeps closed because the App is not
+    /// installed on their repository (only instance admins get in).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub closed_domains: Vec<String>,
     /// What is wrong, in the words a person acts on; `None` when nothing is.
     pub problem: Option<String>,
 }
@@ -465,21 +469,28 @@ fn note_role_lookup_outage(app: &mut AppDoctor, daemon_status: Option<&serde_jso
                 "GitHub has not said who may use the domains connected through the App since {stale}; each last answer stands for an hour past its five minutes, then GitHub grants nobody anything there until it answers again, so check the network, GitHub's status and the App's installation"
             ));
         }
-        let closed: Vec<&str> = status["github_access_closed"]
-            .as_array()
-            .map(|repos| repos.iter().filter_map(|repo| repo.as_str()).collect())
-            .unwrap_or_default();
-        if !closed.is_empty() {
-            found.push(format!(
-                "GitHub does not show {} to the App, so GitHub grants nobody anything on the domains connected to it until it does; check that the repository still exists and that the App is installed on it",
-                closed.join(", ")
-            ));
-        }
-        if found.is_empty() {
+        if found.is_empty()
+            && status["github_access_closed"]
+                .as_array()
+                .is_none_or(Vec::is_empty)
+        {
             found.push(format!(
                 "GitHub has not said who may use the domains connected through the App since {since}"
             ));
         }
+    }
+    // Each closed domain, with what to do about it.
+    for closed in status["github_access_closed"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        let (Some(domain), Some(reason)) = (closed["domain"].as_str(), closed["reason"].as_str())
+        else {
+            continue;
+        };
+        found.push(format!("{domain}: {reason}"));
+        app.closed_domains.push(domain.to_string());
     }
     if status["github_agent_identity_admin"].as_bool() == Some(true) {
         found.push(
@@ -4161,7 +4172,8 @@ async fn check_github(
 fn saved_app_for_doctor(
     found: Result<crystalline_remote::AppLookup, crystalline_remote::RemoteError>,
     api_url: Option<&str>,
-) -> std::result::Result<(crystalline_remote::AppCredentials, &'static str), Option<AppDoctor>> {
+) -> std::result::Result<(crystalline_remote::AppCredentials, &'static str), Option<Box<AppDoctor>>>
+{
     use crystalline_remote::AppLookup;
     match found {
         Ok(AppLookup {
@@ -4174,20 +4186,20 @@ fn saved_app_for_doctor(
             marker: Some(marker),
             ..
         }) if crystalline_service::engine::marker_names_host(&marker, api_url) => {
-            Err(Some(AppDoctor {
+            Err(Some(Box::new(AppDoctor {
                 source: Some("keyring".to_string()),
                 problem: Some(format!(
                     "the GitHub App is saved in the keychain, which could not be read ({reason}); origin operations are refused until it answers, so unlock it, or run crystalline github app remove"
                 )),
                 keychain_unreadable: Some(reason),
                 ..AppDoctor::default()
-            }))
+            })))
         }
         Ok(_) => Err(None),
-        Err(e) => Err(Some(AppDoctor {
+        Err(e) => Err(Some(Box::new(AppDoctor {
             problem: Some(format!("the saved GitHub App could not be read: {e}")),
             ..AppDoctor::default()
-        })),
+        }))),
     }
 }
 
@@ -4221,7 +4233,7 @@ async fn check_github_app(cfg: &GlobalConfig, overlay: &EnvOverlay) -> Option<Ap
             );
             match saved_app_for_doctor(home.lookup(), api_url.as_deref()) {
                 Ok(found) => found,
-                Err(report) => return report,
+                Err(report) => return report.map(|report| *report),
             }
         }
     };
@@ -6145,7 +6157,11 @@ mod tests {
             serde_json::json!({
                 "github_access_degraded_since": since,
                 "github_access_stale_since": stale,
-                "github_access_closed": closed,
+                "github_access_closed": closed.iter().map(|repo| serde_json::json!({
+                    "domain": "kb",
+                    "repo": repo,
+                    "reason": format!("the GitHub App is not installed on {repo}: install it there or disconnect the domain"),
+                })).collect::<Vec<_>>(),
             })
         };
         let mut app = AppDoctor::default();
@@ -6164,13 +6180,28 @@ mod tests {
         let problem = app.problem.expect("a problem");
         assert!(problem.starts_with("the key does not parse; "), "{problem}");
 
-        // A repository GitHub does not show: closed at once, no hour.
+        // A closed domain is named with its sentence, outage or not.
         let mut app = AppDoctor::default();
         note_role_lookup_outage(&mut app, Some(&status(None, &["acme/kb"])));
         let problem = app.problem.expect("a problem");
-        assert!(problem.contains("acme/kb"), "{problem}");
+        assert!(
+            problem.contains(
+                "kb: the GitHub App is not installed on acme/kb: install it there or disconnect the domain"
+            ),
+            "{problem}"
+        );
         assert!(!problem.contains("stands for an hour"), "{problem}");
-        assert_eq!(app.role_lookup_degraded_since.as_deref(), Some(since));
+        assert_eq!(app.closed_domains, vec!["kb".to_string()]);
+        let mut app = AppDoctor::default();
+        note_role_lookup_outage(
+            &mut app,
+            Some(&serde_json::json!({
+                "github_access_degraded_since": null,
+                "github_access_closed": [{"domain": "kb", "repo": "acme/kb", "reason": "the GitHub App is not installed on acme/kb: install it there or disconnect the domain"}],
+            })),
+        );
+        assert!(app.problem.expect("a problem").contains("acme/kb"));
+        assert_eq!(app.role_lookup_degraded_since, None);
 
         // GitHub answers, or no daemon answered: nothing to say.
         for status in [

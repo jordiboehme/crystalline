@@ -4,12 +4,17 @@
 //!
 //! **What is governed.** A domain is governed when an App is configured
 //! (usable or not) and the domain has an `origin`, decided from the
-//! configuration alone, so a domain is governed from the first request on.
-//! Only a known answer that the App is not installed on the repository
-//! takes a domain out; a repository whose installation was not looked up
-//! yet reads as governed, with no access for anybody, until the lookup
-//! lands. An App that is configured but cannot be used governs every origin
-//! domain and grants nothing on any of them.
+//! configuration alone, so a domain is governed from the first request on,
+//! with no access for anybody until the first lookup lands. Nothing takes
+//! it out again while the App is configured: when the App is not installed
+//! on the repository, or GitHub does not show the repository to the App,
+//! the domain is **closed** ([`KnowledgeGovernor::closed_domains`]): only
+//! the machine owner and instance admins get in, and no member, visibility
+//! or open-tier rule applies. A closed domain is asked about again in the
+//! background every five minutes, and at once after an invalidation, so
+//! installing the App opens it without a restart. An App that is
+//! configured but cannot be used governs every origin domain and grants
+//! nothing on any of them.
 //!
 //! **One listing per repository.** Everything the governor answers about a
 //! repository comes from one snapshot: one paged listing of its
@@ -32,8 +37,8 @@
 //! governor reports itself degraded ([`GithubGovernor::degraded_since`]).
 //!
 //! What a failed lookup does depends on what GitHub said, see
-//! [`Outcome::of`]: the App not being installed is an answer, a repository
-//! GitHub no longer shows is an answer of no access, and everything else is
+//! [`Outcome::of`]: the App not being installed and a repository GitHub no
+//! longer shows are answers that close the domain, and everything else is
 //! a failure to learn, which serves the stale snapshot inside the window.
 //!
 //! Account names and links come from the accounts store on every question,
@@ -88,6 +93,19 @@ pub fn level_for(role: RepoRole) -> MemberLevel {
         RepoRole::Triage | RepoRole::Read => MemberLevel::Viewer,
         RepoRole::None => MemberLevel::None,
     }
+}
+
+/// A domain closed because the App is not installed on its repository (or
+/// GitHub does not show the repository to the App), as the doctor and the
+/// admin banner name it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct ClosedDomain {
+    /// The domain.
+    pub domain: String,
+    /// Its repository, `owner/name`.
+    pub repo: String,
+    /// The sentence a person acts on.
+    pub reason: String,
 }
 
 /// Who reads a repository on GitHub, for the Reflection source check
@@ -228,8 +246,9 @@ struct Entry {
 struct State {
     /// By lowercased `owner/name`.
     entries: HashMap<String, Entry>,
-    /// Repositories GitHub said the App is not installed on, and when it
-    /// said so. Asked again in the background after [`FRESH_FOR`].
+    /// Repositories GitHub said the App is not installed on, and when to
+    /// ask again (in the background, see `GithubGovernor::recheck_closed`).
+    /// Their domains are closed.
     not_installed: HashMap<String, Instant>,
     /// Repositories whose "not installed" answer is being asked again.
     rechecking: HashSet<String>,
@@ -303,11 +322,11 @@ impl std::fmt::Display for FetchError {
 /// What one failed lookup means, decided by [`Outcome::of`].
 #[derive(Debug, PartialEq, Eq)]
 enum Outcome {
-    /// The App is not installed on the repository: the domain is not
-    /// governed. An answer, not a failure.
+    /// The App is not installed on the repository: the domain is closed.
+    /// An answer, not a failure (nothing is reported degraded).
     NotInstalled,
     /// GitHub says the repository is not there (deleted, or not visible to
-    /// the App): an answer of no access for everybody, served at once.
+    /// the App): the domain is closed at once, no stale answer served.
     Gone,
     /// GitHub could not tell: the stale snapshot serves inside the window.
     Failed,
@@ -427,17 +446,44 @@ impl GithubGovernor {
             .min()
     }
 
-    /// The repositories GitHub does not show to the App right now, sorted:
-    /// their domains are closed to everybody until it does.
-    pub fn closed_repositories(&self) -> Vec<String> {
-        let mut closed: Vec<String> = self
-            .connected_failures()
+    /// The closed domains with their repository and the reason, sorted by
+    /// domain: the App is not installed on the repository, or GitHub does
+    /// not show it to the App. Only the machine owner and instance admins
+    /// get into them. For the doctor and the admin banner.
+    pub fn closed(&self) -> Vec<ClosedDomain> {
+        let closed = self.closed_keys();
+        let mut out: Vec<ClosedDomain> = self
+            .env
+            .origins()
             .into_iter()
-            .filter(|(_, failing)| failing.gone)
-            .map(|(repo, _)| repo)
+            .filter(|(_, repo)| closed.contains(&repo_key(repo)))
+            .map(|(domain, repo)| ClosedDomain {
+                reason: format!(
+                    "the GitHub App is not installed on {repo}: install it there or disconnect the domain"
+                ),
+                domain,
+                repo,
+            })
             .collect();
-        closed.sort();
-        closed
+        out.sort_by(|a, b| a.domain.cmp(&b.domain));
+        out
+    }
+
+    /// The repositories whose domains are closed, by cache key.
+    fn closed_keys(&self) -> HashSet<String> {
+        let state = lock(&self.state);
+        state
+            .not_installed
+            .keys()
+            .cloned()
+            .chain(
+                state
+                    .failing
+                    .iter()
+                    .filter(|(_, failing)| failing.gone)
+                    .map(|(repo, _)| repo.clone()),
+            )
+            .collect()
     }
 
     /// The failures of repositories still connected to a domain.
@@ -465,39 +511,55 @@ impl GithubGovernor {
     /// Forget what `what` names, the stale fallback included.
     ///
     /// A lookup in flight when this lands answers its own question but is
-    /// not stored, and the pause after a failed lookup ends, so
-    /// the next question asks GitHub at once. `All` also forgets every
-    /// failure, so nothing is reported degraded until a lookup fails again.
+    /// not stored, and the pause after a failed lookup ends, so the next
+    /// question asks GitHub at once. A closed domain the invalidation names
+    /// stays closed and is asked about again at once, in the background, so
+    /// installing the App opens it without waiting five minutes. `All` also
+    /// forgets every failure of an open domain, so nothing is reported
+    /// degraded until a lookup fails again.
     pub fn invalidate(&self, what: Invalidate) {
-        let mut state = lock(&self.state);
-        match what {
-            Invalidate::Repo(repo) => {
-                let key = repo_key(&repo);
-                *state.generations.entry(key.clone()).or_default() += 1;
-                state.entries.remove(&key);
-                state.not_installed.remove(&key);
-                if let Some(failing) = state.failing.get_mut(&key) {
-                    failing.last = None;
+        {
+            let mut state = lock(&self.state);
+            let now = Instant::now();
+            match what {
+                Invalidate::Repo(repo) => {
+                    let key = repo_key(&repo);
+                    *state.generations.entry(key.clone()).or_default() += 1;
+                    state.entries.remove(&key);
+                    if let Some(next) = state.not_installed.get_mut(&key) {
+                        *next = now;
+                    }
+                    if let Some(failing) = state.failing.get_mut(&key) {
+                        failing.last = None;
+                    }
+                }
+                Invalidate::User(_) => {
+                    state.global += 1;
+                    state.entries.clear();
+                    state.failing.values_mut().for_each(|f| f.last = None);
+                }
+                Invalidate::Installation(_) => {
+                    state.global += 1;
+                    state.entries.clear();
+                    state
+                        .not_installed
+                        .values_mut()
+                        .for_each(|next| *next = now);
+                    state.failing.values_mut().for_each(|f| f.last = None);
+                }
+                Invalidate::All => {
+                    state.global += 1;
+                    state.entries.clear();
+                    state
+                        .not_installed
+                        .values_mut()
+                        .for_each(|next| *next = now);
+                    state.failing.retain(|_, failing| failing.gone);
+                    state.failing.values_mut().for_each(|f| f.last = None);
                 }
             }
-            Invalidate::User(_) => {
-                state.global += 1;
-                state.entries.clear();
-                state.failing.values_mut().for_each(|f| f.last = None);
-            }
-            Invalidate::Installation(_) => {
-                state.global += 1;
-                state.entries.clear();
-                state.not_installed.clear();
-                state.failing.values_mut().for_each(|f| f.last = None);
-            }
-            Invalidate::All => {
-                state.global += 1;
-                state.entries.clear();
-                state.not_installed.clear();
-                state.failing.clear();
-            }
         }
+        self.recheck_closed();
     }
 
     /// Who reads `domain`'s repository on GitHub: whether it is public and
@@ -684,12 +746,12 @@ impl GithubGovernor {
         match outcome {
             Outcome::NotInstalled => {
                 tracing::info!(
-                    "the GitHub App is not installed on {repo}, so its domain's access is decided by Crystalline alone"
+                    "the GitHub App is not installed on {repo}, so its domain is closed to all but instance admins until it is"
                 );
                 if current {
                     state.entries.remove(key);
                     state.failing.remove(key);
-                    state.not_installed.insert(key.to_string(), now);
+                    state.not_installed.insert(key.to_string(), now + FRESH_FOR);
                 }
                 None
             }
@@ -725,11 +787,12 @@ impl GithubGovernor {
         }
     }
 
+    /// Records a failure. A closed repository stays closed through later
+    /// failures to learn: only a good lookup opens it.
     fn mark_failing(state: &mut State, key: &str, now: Instant, gone: bool) {
-        let since = state
-            .failing
-            .get(key)
-            .map_or_else(Utc::now, |failing| failing.since);
+        let earlier = state.failing.get(key).copied();
+        let since = earlier.map_or_else(Utc::now, |failing| failing.since);
+        let gone = gone || earlier.is_some_and(|failing| failing.gone);
         state.failing.insert(
             key.to_string(),
             Failing {
@@ -778,30 +841,41 @@ impl GithubGovernor {
         }
     }
 
-    /// Asks again, in the background, about every "not installed" answer
-    /// older than [`FRESH_FOR`], so an App installed later governs without a
-    /// restart even when no webhook says so.
-    fn recheck_not_installed(&self) {
+    /// Asks again, in the background, about every closed repository that
+    /// is due: a "not installed" answer five minutes old (or named by an
+    /// invalidation), and a repository GitHub did not show, five minutes
+    /// after (or at once after an invalidation). So an App installed later
+    /// opens its domains without a restart, even when no webhook says so.
+    fn recheck_closed(&self) {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
         let now = Instant::now();
-        let due: Vec<(String, Generation)> = {
+        let due: Vec<(String, Generation, bool)> = {
             let mut state = lock(&self.state);
-            let due: Vec<(String, Generation)> = state
+            let not_installed = state
                 .not_installed
                 .iter()
-                .filter(|(_, at)| now >= **at + FRESH_FOR)
-                .map(|(repo, _)| repo.clone())
-                .filter(|repo| !state.rechecking.contains(repo))
-                .map(|repo| {
+                .filter(|(_, next)| now >= **next)
+                .map(|(repo, _)| (repo.clone(), false));
+            let gone = state
+                .failing
+                .iter()
+                .filter(|(_, failing)| {
+                    failing.gone && failing.last.is_none_or(|last| now >= last + FRESH_FOR)
+                })
+                .map(|(repo, _)| (repo.clone(), true));
+            let due: Vec<(String, Generation, bool)> = not_installed
+                .chain(gone)
+                .filter(|(repo, _)| !state.rechecking.contains(repo))
+                .map(|(repo, gone)| {
                     let generation = state.generation(&repo);
-                    (repo, generation)
+                    (repo, generation, gone)
                 })
                 .collect();
             state
                 .rechecking
-                .extend(due.iter().map(|(repo, _)| repo.clone()));
+                .extend(due.iter().map(|(repo, _, _)| repo.clone()));
             due
         };
         if due.is_empty() {
@@ -815,15 +889,23 @@ impl GithubGovernor {
                 GovernorApp::Ready { source, .. } => Some(source),
                 GovernorApp::Absent | GovernorApp::Unusable => None,
             };
-            for (repo, generation) in due {
-                let answer = match &source {
-                    Some(source) => {
-                        tokio::time::timeout(REQUEST_TIMEOUT, source.installation_for(&repo))
-                            .await
-                            .ok()
-                    }
-                    None => None,
+            for (repo, generation, gone) in due {
+                let Some(source) = &source else {
+                    lock(&me.state).rechecking.remove(&repo);
+                    continue;
                 };
+                if gone {
+                    // A plain lookup: a good one opens the domain, another
+                    // "not there" keeps it closed for five more minutes.
+                    me.snapshot(source, &repo).await;
+                    lock(&me.state).rechecking.remove(&repo);
+                    continue;
+                }
+                // Ask GitHub, not the App client's memory of the installation.
+                source.evict_repo(&repo);
+                let answer = tokio::time::timeout(REQUEST_TIMEOUT, source.installation_for(&repo))
+                    .await
+                    .ok();
                 let mut state = lock(&me.state);
                 state.rechecking.remove(&repo);
                 // An invalidation since the question was asked already
@@ -839,11 +921,17 @@ impl GithubGovernor {
                         state.not_installed.remove(&repo);
                     }
                     Some(Err(RemoteError::AppNotInstalled { .. })) => {
-                        state.not_installed.insert(repo, Instant::now());
+                        state
+                            .not_installed
+                            .insert(repo, Instant::now() + FRESH_FOR);
                     }
-                    // Not known either way: the last answer stands and is
-                    // asked about again on the next question.
-                    Some(Err(_)) | None => {}
+                    // Not known either way: it stays closed and is asked
+                    // about again in five minutes.
+                    Some(Err(_)) | None => {
+                        state
+                            .not_installed
+                            .insert(repo, Instant::now() + FRESH_FOR);
+                    }
                 }
             }
         });
@@ -899,11 +987,22 @@ impl KnowledgeGovernor for GithubGovernor {
         if origins.is_empty() || matches!(self.env.app(), GovernorApp::Absent) {
             return HashSet::new();
         }
-        self.recheck_not_installed();
-        let state = lock(&self.state);
-        origins
+        self.recheck_closed();
+        origins.into_iter().map(|(name, _)| name).collect()
+    }
+
+    fn closed_domains(&self) -> HashSet<String> {
+        if matches!(self.env.app(), GovernorApp::Absent) {
+            return HashSet::new();
+        }
+        let closed = self.closed_keys();
+        if closed.is_empty() {
+            return HashSet::new();
+        }
+        self.env
+            .origins()
             .into_iter()
-            .filter(|(_, repo)| !state.not_installed.contains_key(&repo_key(repo)))
+            .filter(|(_, repo)| closed.contains(&repo_key(repo)))
             .map(|(name, _)| name)
             .collect()
     }
@@ -1183,12 +1282,13 @@ impl super::Engine {
         self.github_governor.get()?.stale_since()
     }
 
-    /// The connected repositories GitHub does not show to the App, whose
-    /// domains are closed (see [`GithubGovernor::closed_repositories`]).
-    pub fn github_access_closed(&self) -> Vec<String> {
+    /// The closed domains, each with its repository and the sentence that
+    /// says what to do (see [`GithubGovernor::closed`]). Empty without an
+    /// App.
+    pub fn github_access_closed(&self) -> Vec<ClosedDomain> {
         self.github_governor
             .get()
-            .map(|governor| governor.closed_repositories())
+            .map(|governor| governor.closed())
             .unwrap_or_default()
     }
 
@@ -1584,30 +1684,46 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_domain_on_a_repo_without_the_app_is_not_governed() {
+    async fn a_domain_on_a_repo_without_the_app_is_closed() {
         let rig = rig().await;
         rig.github.with(REPO, |r| r.not_installed = true);
         assert!(rig.governor.governed_domains().contains(DOMAIN));
+        assert!(rig.governor.closed_domains().is_empty(), "not known yet");
         assert_eq!(rig.knowledge("alice").await, level(MemberLevel::None));
-        assert!(!rig.governor.governed_domains().contains(DOMAIN));
+        // Still governed, and closed now.
+        assert!(rig.governor.governed_domains().contains(DOMAIN));
+        assert!(rig.governor.closed_domains().contains(DOMAIN));
+        assert_eq!(
+            rig.governor.closed(),
+            vec![ClosedDomain {
+                domain: DOMAIN.to_string(),
+                repo: REPO.to_string(),
+                reason: format!(
+                    "the GitHub App is not installed on {REPO}: install it there or disconnect the domain"
+                ),
+            }]
+        );
         // Not installed is an answer, not an outage.
         assert_eq!(rig.governor.degraded_since(), None);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn an_app_installed_later_governs_without_a_restart() {
+    async fn an_app_installed_later_opens_the_domain_without_a_restart() {
         let rig = rig().await;
         rig.github.with(REPO, |r| r.not_installed = true);
         rig.knowledge("alice").await;
-        assert!(!rig.governor.governed_domains().contains(DOMAIN));
+        assert!(rig.governor.closed_domains().contains(DOMAIN));
         rig.github.with(REPO, |r| r.not_installed = false);
         tokio::time::advance(FRESH_FOR).await;
-        // The first question past the expiry asks again in the background.
-        assert!(!rig.governor.governed_domains().contains(DOMAIN));
+        // The first question past five minutes asks again in the
+        // background; until it is answered the domain stays closed.
+        rig.governor.governed_domains();
+        assert!(rig.governor.closed_domains().contains(DOMAIN));
         for _ in 0..10 {
             tokio::task::yield_now().await;
         }
         assert_eq!(rig.github.installation_lookups.load(Ordering::SeqCst), 1);
+        assert!(rig.governor.closed_domains().is_empty());
         assert!(rig.governor.governed_domains().contains(DOMAIN));
     }
 
@@ -1801,13 +1917,31 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn invalidate_asks_again_about_an_installation() {
-        let rig = rig().await;
-        rig.github.with(REPO, |r| r.not_installed = true);
-        rig.knowledge("alice").await;
-        assert!(!rig.governor.governed_domains().contains(DOMAIN));
-        rig.governor.invalidate(Invalidate::Installation(7));
-        assert!(rig.governor.governed_domains().contains(DOMAIN));
+    async fn invalidate_asks_again_about_an_installation_at_once() {
+        for what in [
+            Invalidate::Installation(7),
+            Invalidate::Repo(REPO.to_string()),
+            Invalidate::All,
+        ] {
+            let rig = rig().await;
+            rig.github.with(REPO, |r| r.not_installed = true);
+            rig.knowledge("alice").await;
+            assert!(rig.governor.closed_domains().contains(DOMAIN));
+            // Asked at once, and still not installed: stays closed.
+            rig.governor.invalidate(what.clone());
+            assert!(rig.governor.closed_domains().contains(DOMAIN), "{what:?}");
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            assert!(rig.governor.closed_domains().contains(DOMAIN), "{what:?}");
+            // Installed now: the invalidation opens it without five minutes.
+            rig.github.with(REPO, |r| r.not_installed = false);
+            rig.governor.invalidate(what.clone());
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            assert!(rig.governor.closed_domains().is_empty(), "{what:?}");
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -1847,7 +1981,7 @@ mod tests {
         let rig = rig().await;
         rig.github.with(REPO, |r| r.not_installed = true);
         rig.knowledge("alice").await;
-        assert!(!rig.governor.governed_domains().contains(DOMAIN));
+        assert!(rig.governor.closed_domains().contains(DOMAIN));
         tokio::time::advance(FRESH_FOR).await;
         // The re-check asks while the App is still not installed ...
         let gate = rig.github.park();
@@ -1861,7 +1995,13 @@ mod tests {
         for _ in 0..10 {
             tokio::task::yield_now().await;
         }
-        assert!(rig.governor.governed_domains().contains(DOMAIN));
+        // The stale "not installed" was not stored for five more minutes:
+        // the next question asks again at once and the domain opens.
+        rig.governor.governed_domains();
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(rig.governor.closed_domains().is_empty());
     }
 
     #[tokio::test(start_paused = true)]
@@ -1949,16 +2089,24 @@ mod tests {
         });
         assert_eq!(rig.knowledge("alice").await, level(MemberLevel::None));
         assert_eq!(rig.github.evictions.load(Ordering::SeqCst), 1);
-        assert_eq!(rig.governor.closed_repositories(), vec![REPO.to_string()]);
+        assert!(rig.governor.closed_domains().contains(DOMAIN));
+        assert_eq!(rig.governor.closed().len(), 1);
         assert_eq!(rig.governor.stale_since(), None);
         assert!(rig.governor.degraded_since().is_some());
-        // An outage is not a closed repository.
+        // An outage after it keeps it closed: only a good lookup opens it.
         rig.github
             .with(REPO, |r| r.down = Some(|| RemoteError::Offline));
         tokio::time::advance(MIN).await;
         rig.knowledge("alice").await;
-        assert!(rig.governor.closed_repositories().is_empty());
-        assert!(rig.governor.stale_since().is_some());
+        assert!(rig.governor.closed_domains().contains(DOMAIN));
+        // GitHub shows it again: the re-check five minutes on opens it.
+        rig.github.with(REPO, |r| r.down = None);
+        tokio::time::advance(FRESH_FOR).await;
+        rig.governor.governed_domains();
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(rig.governor.closed_domains().is_empty());
     }
 
     /// A large repository: three pages of six seconds each take longer than

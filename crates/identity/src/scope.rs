@@ -249,6 +249,15 @@ pub trait KnowledgeGovernor: Send + Sync {
     /// spelling matches no account and fails closed. `None` when the
     /// listing is not known right now; every caller then fails closed.
     async fn readers(&self, domain: &str) -> Option<HashSet<String>>;
+    /// The governed domains that are closed right now: the App is not
+    /// installed on the repository, or GitHub does not show it to the App.
+    /// Only the machine owner and instance admins get into one; no member,
+    /// visibility or open-tier rule applies, and the anonymous caller gets
+    /// nothing. Every name here is also in
+    /// [`KnowledgeGovernor::governed_domains`]. None by default.
+    fn closed_domains(&self) -> HashSet<String> {
+        HashSet::new()
+    }
 }
 
 /// The GitHub half of [`decide`]'s inputs on a governed domain: what GitHub
@@ -262,6 +271,8 @@ struct Governed {
     /// Whether the repository is public on GitHub. Only read for an
     /// anonymous caller on a shared domain.
     public: bool,
+    /// Whether the domain is closed ([`KnowledgeGovernor::closed_domains`]).
+    closed: bool,
 }
 
 /// The engram right a GitHub grant gives on a governed domain.
@@ -391,6 +402,16 @@ fn decide(
 ///   not cap it either ([`DomainAccess::write_right`] skips the instance
 ///   cap here): an instance viewer with GitHub write writes.
 fn decide_governed(principal: &Principal, private: bool, governed: Governed) -> DomainRight {
+    // Closed: the machine owner and instance admins only.
+    if governed.closed {
+        return match principal {
+            Principal::Unrestricted => DomainRight::Own,
+            Principal::Account {
+                role: Role::Admin, ..
+            } => DomainRight::Own,
+            Principal::Account { .. } | Principal::Anonymous => DomainRight::None,
+        };
+    }
     match principal {
         Principal::Unrestricted => DomainRight::Own,
         Principal::Anonymous => {
@@ -482,6 +503,15 @@ fn decide_reflection(
         }
         Principal::Account { role, .. } if github.is_some() && *role == Role::None => {
             return ReflectionRight::None;
+        }
+        // A closed domain: an instance admin curates, nobody else gets
+        // anything, whatever Reflection level they hold.
+        Principal::Account { .. } if github.is_some_and(|g| g.closed) => {
+            return if knowledge >= DomainRight::Write {
+                ReflectionRight::Curate
+            } else {
+                ReflectionRight::None
+            };
         }
         Principal::Account { reflection, .. } if github.is_some() => match acl {
             None => *reflection,
@@ -822,6 +852,8 @@ struct Governance<'a> {
     governor: Option<&'a dyn KnowledgeGovernor>,
     /// The governed domain names, trimmed as the store trims a name.
     domains: HashSet<String>,
+    /// The closed ones among them, trimmed the same way.
+    closed: HashSet<String>,
 }
 
 impl<'a> Governance<'a> {
@@ -835,7 +867,21 @@ impl<'a> Governance<'a> {
     /// when GitHub does not govern it (see `github_input`).
     async fn input(&self, principal: &Principal, domain: &str, private: bool) -> Option<Governed> {
         let governor = self.of(domain)?;
-        Some(github_input(governor, principal, domain.trim(), private).await)
+        Some(
+            github_input(
+                governor,
+                principal,
+                domain.trim(),
+                private,
+                self.closes(domain),
+            )
+            .await,
+        )
+    }
+
+    /// Whether `domain` is governed and closed.
+    fn closes(&self, domain: &str) -> bool {
+        self.of(domain).is_some() && self.closed.contains(domain.trim())
     }
 
     /// Whether an anonymous caller reads `domain`'s engrams (`private` when
@@ -843,7 +889,7 @@ impl<'a> Governance<'a> {
     /// one GitHub governs whose repository is public. Counted whether or not
     /// the `auth.anonymous` tier is on, so a later switch opens no leak.
     async fn anonymous_reads(&self, domain: &str, private: bool) -> bool {
-        if private {
+        if private || self.closes(domain) {
             return false;
         }
         match self.of(domain) {
@@ -864,6 +910,8 @@ enum ReaderSide {
     /// its repository, empty on a shared one (where the shared base already
     /// reads) and when the listing is not known and the caller fails closed.
     Governed(HashSet<String>),
+    /// A closed domain GitHub governs: nobody but the instance admins.
+    Closed,
 }
 
 impl ReaderSide {
@@ -890,9 +938,19 @@ impl ReaderSide {
                     Some(Governed {
                         knowledge,
                         public: false,
+                        closed: false,
                     }),
                 )
             }
+            ReaderSide::Closed => (
+                None,
+                ReflectionLevel::Default,
+                Some(Governed {
+                    knowledge: GithubKnowledge::Unlinked,
+                    public: false,
+                    closed: true,
+                }),
+            ),
         }
     }
 }
@@ -906,7 +964,16 @@ async fn github_input(
     principal: &Principal,
     domain: &str,
     private: bool,
+    closed: bool,
 ) -> Governed {
+    if closed {
+        // Nothing to ask GitHub: only the owner and admins get in.
+        return Governed {
+            knowledge: GithubKnowledge::Unlinked,
+            public: false,
+            closed: true,
+        };
+    }
     match principal {
         Principal::Account {
             name,
@@ -915,14 +982,17 @@ async fn github_input(
         } => Governed {
             knowledge: governor.knowledge(name, domain).await,
             public: false,
+            closed: false,
         },
         Principal::Anonymous if !private => Governed {
             knowledge: GithubKnowledge::Unlinked,
             public: governor.repository_public(domain).await,
+            closed: false,
         },
         _ => Governed {
             knowledge: GithubKnowledge::Unlinked,
             public: false,
+            closed: false,
         },
     }
 }
@@ -960,10 +1030,16 @@ impl DomainAccess {
                     .iter()
                     .map(|name| name.trim().to_string())
                     .collect(),
+                closed: governor
+                    .closed_domains()
+                    .iter()
+                    .map(|name| name.trim().to_string())
+                    .collect(),
             },
             None => Governance {
                 governor: None,
                 domains: HashSet::new(),
+                closed: HashSet::new(),
             },
         }
     }
@@ -1299,9 +1375,10 @@ impl DomainAccess {
         let governance = self.governance();
         let mut governed = HashMap::new();
         if let Some(governor) = governance.governor {
-            for domain in governance.domains {
+            for domain in governance.domains.clone() {
                 let private = acls.contains_key(&domain);
-                let input = github_input(governor, &principal, &domain, private).await;
+                let closed = governance.closes(&domain);
+                let input = github_input(governor, &principal, &domain, private, closed).await;
                 governed.insert(domain, input);
             }
         }
@@ -1468,8 +1545,10 @@ impl DomainAccess {
     ///   viewer or above instead.
     pub async fn readers_of(&self, domain: &str) -> Result<Option<HashSet<String>>> {
         let acl = self.auth.domain_visibility(domain).await?;
-        if let Some(governor) = self.governance().of(domain) {
+        let governance = self.governance();
+        if let Some(governor) = governance.of(domain) {
             let side = match &acl {
+                _ if governance.closes(domain) => ReaderSide::Closed,
                 None if governor.repository_public(domain.trim()).await => return Ok(None),
                 None => ReaderSide::Governed(HashSet::new()),
                 // Unknown fails closed: nobody is a GitHub reader.
@@ -1538,6 +1617,9 @@ impl DomainAccess {
         private: bool,
     ) -> Result<Option<ReaderSide>> {
         if let Some(governor) = governance.of(domain) {
+            if governance.closes(domain) {
+                return Ok(Some(ReaderSide::Closed));
+            }
             if !private {
                 return Ok(Some(ReaderSide::Governed(HashSet::new())));
             }
@@ -1948,7 +2030,8 @@ impl DomainAccess {
                 acls.iter().map(|acl| (acl.domain.as_str(), acl)).collect();
             for domain in governed {
                 let acl = by_name.get(domain.as_str()).copied();
-                let input = github_input(governor, principal, domain, acl.is_some()).await;
+                let closed = governance.closes(domain);
+                let input = github_input(governor, principal, domain, acl.is_some(), closed).await;
                 if decide(principal, acl, None, Some(input)) < DomainRight::Read {
                     hidden.insert(domain.clone());
                 }
@@ -3736,6 +3819,7 @@ mod tests {
         grants: HashMap<(String, String), GithubKnowledge>,
         public: HashSet<String>,
         readers: HashMap<String, Option<HashSet<String>>>,
+        closed: HashSet<String>,
     }
 
     impl FakeGovernor {
@@ -3757,6 +3841,11 @@ mod tests {
             self
         }
 
+        fn close(mut self, domain: &str) -> Self {
+            self.closed.insert(domain.to_string());
+            self
+        }
+
         fn readers(mut self, domain: &str, readers: Option<&[&str]>) -> Self {
             self.readers.insert(
                 domain.to_string(),
@@ -3770,6 +3859,10 @@ mod tests {
     impl KnowledgeGovernor for FakeGovernor {
         fn governed_domains(&self) -> HashSet<String> {
             self.governed.clone()
+        }
+
+        fn closed_domains(&self) -> HashSet<String> {
+            self.closed.clone()
         }
 
         async fn knowledge(&self, account: &str, domain: &str) -> GithubKnowledge {
@@ -3836,6 +3929,7 @@ mod tests {
         Some(Governed {
             knowledge,
             public: false,
+            closed: false,
         })
     }
 
@@ -4204,6 +4298,61 @@ mod tests {
         assert!(!screen.admits("gh-lab"));
     }
 
+    /// A closed governed domain (the App not installed on its repository):
+    /// only the machine owner and instance admins get in, on a shared and on
+    /// a private domain, whatever GitHub, the members, the visibility or the
+    /// Reflection levels would otherwise say.
+    #[tokio::test]
+    async fn a_closed_domain_lets_in_only_the_owner_and_admins() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = store(&dir).await;
+        github_cast(&auth).await;
+        auth.set_reflection_level("ann", ReflectionLevel::Contributor)
+            .await
+            .unwrap();
+        let governor = base_governor()
+            .public("gh-open")
+            .grant("ann", "gh-open", MemberLevel::Manager)
+            .grant("ann", "gh-lab", MemberLevel::Manager)
+            .close("gh-open")
+            .close("gh-lab");
+        let access = DomainAccess::new(auth).with_governor(Arc::new(governor));
+        for domain in ["gh-open", "gh-lab"] {
+            for scope in [user("ann", false), user("keeper", false), Scope::Anonymous] {
+                assert_eq!(
+                    access.right(&scope, domain).await.unwrap(),
+                    DomainRight::None,
+                    "{scope:?} on {domain}"
+                );
+                assert_eq!(
+                    access.reflection_right(&scope, domain).await.unwrap(),
+                    ReflectionRight::None,
+                    "{scope:?} on {domain}"
+                );
+                let screen = access.visibility(&scope).await.unwrap().screen();
+                assert!(!screen.admits(domain), "{scope:?} on {domain}");
+            }
+            assert_eq!(
+                access.right(&user("boss", false), domain).await.unwrap(),
+                DomainRight::Own
+            );
+            assert_eq!(
+                access.right(&Scope::Unrestricted, domain).await.unwrap(),
+                DomainRight::Own
+            );
+            let readers = access.readers_of(domain).await.unwrap();
+            assert_eq!(readers, Some(names(&["boss"])), "{domain}");
+            assert_eq!(
+                access.page_readers(domain).await.unwrap(),
+                PageReaders::Accounts(["boss".to_string()].into())
+            );
+        }
+        // The open tier's agent sees no closed domain either.
+        let screen = access.open_tier_visibility("ann").await.unwrap().screen();
+        assert!(!screen.admits("gh-open") && !screen.admits("gh-lab"));
+        assert!(!screen.admits("gh-vault"));
+    }
+
     #[tokio::test]
     async fn knowledge_none_account_gets_nothing_with_github_admin() {
         let dir = tempfile::tempdir().unwrap();
@@ -4543,6 +4692,7 @@ mod tests {
                 Some(Governed {
                     knowledge: GithubKnowledge::Level(MemberLevel::Manager),
                     public: true,
+                    closed: false,
                 })
             ),
             DomainRight::Read,
