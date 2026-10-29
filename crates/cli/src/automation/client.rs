@@ -102,15 +102,15 @@ impl AutomationClient {
 
     /// The MCP config the agent connects with. The remote one holds the
     /// bearer, so it is only ever written to [`PrivateConfig`].
-    pub(super) async fn mcp_config(&self) -> anyhow::Result<Value> {
+    pub(super) async fn mcp_config(&self, domain: &str) -> anyhow::Result<Value> {
         match self {
             AutomationClient::Local(_) => {
                 let exe = std::env::current_exe()?;
-                Ok(local_mcp_config(&exe))
+                Ok(local_mcp_config(&exe, domain))
             }
             AutomationClient::Remote(connection) => {
                 let token = connection.bearer().await.map_err(anyhow::Error::new)?;
-                Ok(remote_mcp_config(&connection.source().url, &token))
+                Ok(remote_mcp_config(&connection.source().url, &token, domain))
             }
         }
     }
@@ -131,7 +131,11 @@ pub(super) fn is_refusal(e: &anyhow::Error) -> bool {
         && e.downcast_ref::<serde_json::Error>().is_none()
 }
 
-/// The stdio entry for the local daemon: this binary's `mcp` verb.
+/// The stdio entry for the local daemon: this binary's `mcp` verb, marked
+/// `--unattended` and bound to the run's domain with `--domain`: nobody is
+/// behind a headless run to answer a question, so its session is never
+/// asked to share Reflection text on purpose, and it reads only what every
+/// reader of its domain may read.
 ///
 /// It carries no `--harness`, unlike the entry `crystalline install`
 /// registers. With `--harness claude-code` on a machine where Claude Code's
@@ -139,26 +143,31 @@ pub(super) fn is_refusal(e: &anyhow::Error) -> bool {
 /// its list, since that harness reads the skills from disk. A headless run
 /// loads no settings, hooks or skills from disk (`--setting-sources ""`), and
 /// its prompt starts with the `skills` tool, so it needs the served surface.
-pub(super) fn local_mcp_config(exe: &Path) -> Value {
+pub(super) fn local_mcp_config(exe: &Path, domain: &str) -> Value {
     json!({
         "mcpServers": {
             "crystalline": {
                 "command": exe.to_string_lossy(),
-                "args": ["mcp"],
+                "args": ["mcp", "--unattended", "--domain", domain],
             }
         }
     })
 }
 
 /// The HTTP entry for a server: its MCP endpoint is the root of `url` (the
-/// transport answers there, under any base path), with the bearer header.
-pub(super) fn remote_mcp_config(url: &str, token: &str) -> Value {
+/// transport answers there, under any base path), with the bearer header and
+/// the run's domain, which the server believes only while the bearer's
+/// account holds the run's lease there.
+pub(super) fn remote_mcp_config(url: &str, token: &str, domain: &str) -> Value {
     json!({
         "mcpServers": {
             "crystalline": {
                 "type": "http",
                 "url": format!("{}/", url.trim_end_matches('/')),
-                "headers": { "Authorization": format!("Bearer {token}") },
+                "headers": {
+                    "Authorization": format!("Bearer {token}"),
+                    crystalline_service::mcp::RUN_DOMAIN_HEADER: domain,
+                },
             }
         }
     })
@@ -171,16 +180,19 @@ mod tests {
     #[test]
     fn the_mcp_configs_have_their_pinned_shapes() {
         assert_eq!(
-            local_mcp_config(Path::new("/opt/bin/crystalline")),
+            local_mcp_config(Path::new("/opt/bin/crystalline"), "eng"),
             json!({ "mcpServers": { "crystalline": {
-                "command": "/opt/bin/crystalline", "args": ["mcp"] } } })
+                "command": "/opt/bin/crystalline",
+                "args": ["mcp", "--unattended", "--domain", "eng"] } } })
         );
         assert_eq!(
-            remote_mcp_config("https://team.example.com/base/", "cmt_secret"),
+            remote_mcp_config("https://team.example.com/base/", "cmt_secret", "eng"),
             json!({ "mcpServers": { "crystalline": {
                 "type": "http",
                 "url": "https://team.example.com/base/",
-                "headers": { "Authorization": "Bearer cmt_secret" } } } })
+                "headers": {
+                    "Authorization": "Bearer cmt_secret",
+                    "X-Crystalline-Run-Domain": "eng" } } } })
         );
     }
 }

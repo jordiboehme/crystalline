@@ -195,7 +195,7 @@ pub(super) async fn run_one(
         Err(e) => return lease.fail_and_err(&started, e, stop.clone()).await,
     };
     let config = match client
-        .mcp_config()
+        .mcp_config(domain)
         .await
         .and_then(|c| PrivateConfig::write(&c))
     {

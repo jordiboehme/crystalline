@@ -164,6 +164,11 @@ pub(crate) struct NamedSource {
     /// the domain's canonical name.
     pub domain: Option<String>,
     pub permalink: String,
+    /// Whether the page may carry this source only because a person shares
+    /// it on purpose ([`super::disclosure`]): its domain is one fewer
+    /// people may read, or one not shared through GitHub while the page is
+    /// backed up there.
+    pub disclose: bool,
 }
 
 impl NamedSource {
@@ -255,7 +260,7 @@ impl Engine {
     /// Why nobody here knows who reads which domain, when that is so: no
     /// resolver is installed, and either the accounts store could not be
     /// opened, or none was there at the start and one is there now.
-    fn readers_unknown(&self) -> Option<String> {
+    pub(super) fn readers_unknown(&self) -> Option<String> {
         if self.domain_access.get().is_some() {
             return None;
         }
@@ -281,11 +286,20 @@ impl Engine {
     /// carries text drawn from a domain fewer people may read. That check
     /// comes second, so its refusal only ever names a domain the writer may
     /// open.
+    ///
+    /// With `may_disclose` (a person confirmed this write, see
+    /// [`super::disclosure`]) a source that breaks that second check is not
+    /// refused but marked [`NamedSource::disclose`]. A domain in `shared`
+    /// (local names the writer shared on this page already) passes it. A stack that does not
+    /// know who reads which domain refuses either way: nobody can confirm
+    /// what nobody can see.
     pub(crate) async fn resolve_source_names<'a>(
         &self,
         own: &str,
         scope: &Scope,
         names: impl Iterator<Item = &'a String>,
+        may_disclose: bool,
+        shared: &HashSet<String>,
     ) -> Result<HashMap<String, NamedSource>> {
         let mut out = HashMap::new();
         let mut context: Option<(Arc<NameTable>, HashSet<String>)> = None;
@@ -301,6 +315,7 @@ impl Engine {
                             NamedSource {
                                 domain: None,
                                 permalink,
+                                disclose: false,
                             },
                         );
                         continue;
@@ -317,6 +332,7 @@ impl Engine {
             else {
                 return Err(self.unknown_domain(&spelled, hidden));
             };
+            let mut disclose = false;
             let domain = if local == own {
                 None
             } else {
@@ -325,19 +341,36 @@ impl Engine {
                         "'{name}': {UNKNOWN_READERS_REFUSAL} ({why})"
                     )));
                 }
-                if self.leaves_github(own, local) {
-                    return Err(EngineError::Invalid(format!(
-                        "'{name}': {NOT_ON_GITHUB_REFUSAL}"
-                    )));
+                // A domain this writer shared on this page already passes
+                // (`super::disclosure`): one confirmation per person, page
+                // and source domain.
+                let shared_here = shared.contains(local);
+                if self.leaves_github(own, local) && !shared_here {
+                    if !may_disclose {
+                        return Err(EngineError::Invalid(format!(
+                            "'{name}': {NOT_ON_GITHUB_REFUSAL}"
+                        )));
+                    }
+                    disclose = true;
                 }
-                if !self.readers_cover(own, local).await? {
-                    return Err(EngineError::Invalid(format!(
-                        "'{name}': {TOO_WIDE_REFUSAL}"
-                    )));
+                if !shared_here && !self.readers_cover(own, local).await? {
+                    if !may_disclose {
+                        return Err(EngineError::Invalid(format!(
+                            "'{name}': {TOO_WIDE_REFUSAL}"
+                        )));
+                    }
+                    disclose = true;
                 }
                 Some(table.normalize(&spelled).unwrap_or(&spelled).to_string())
             };
-            out.insert(name.clone(), NamedSource { domain, permalink });
+            out.insert(
+                name.clone(),
+                NamedSource {
+                    domain,
+                    permalink,
+                    disclose,
+                },
+            );
         }
         Ok(out)
     }

@@ -2041,6 +2041,7 @@ impl Store for TursoStore {
                 "DELETE FROM domain_lock WHERE domain_id=?1",
                 "DELETE FROM automation_lease WHERE domain_id=?1",
                 "DELETE FROM automation_run WHERE domain_id=?1",
+                "DELETE FROM reflection_disclosure WHERE domain_id=?1",
                 "DELETE FROM relation WHERE domain_id=?1",
                 "DELETE FROM link WHERE domain_id=?1",
                 "DELETE FROM domain WHERE id=?1",
@@ -4708,6 +4709,52 @@ impl Store for TursoStore {
                 ],
             )
             .await?;
+        Ok(())
+    }
+
+    async fn reflection_disclosures(&self, domain: DomainId) -> Result<Vec<(String, String)>> {
+        let rows = query_all(
+            &self.conn,
+            "SELECT path, records FROM reflection_disclosure WHERE domain_id=?1 ORDER BY path",
+            vec![Value::Integer(domain.0)],
+        )
+        .await?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| Some((cell_text(r, 0)?, cell_text(r, 1)?)))
+            .collect())
+    }
+
+    async fn set_reflection_disclosures(
+        &self,
+        domain: DomainId,
+        path: &str,
+        records: Option<&str>,
+    ) -> Result<()> {
+        match records {
+            Some(records) => {
+                self.conn
+                    .execute(
+                        "INSERT INTO reflection_disclosure (domain_id, path, records) \
+                         VALUES (?1, ?2, ?3) \
+                         ON CONFLICT(domain_id, path) DO UPDATE SET records=excluded.records",
+                        vec![
+                            Value::Integer(domain.0),
+                            Value::Text(path.to_string()),
+                            Value::Text(records.to_string()),
+                        ],
+                    )
+                    .await?;
+            }
+            None => {
+                self.conn
+                    .execute(
+                        "DELETE FROM reflection_disclosure WHERE domain_id=?1 AND path=?2",
+                        vec![Value::Integer(domain.0), Value::Text(path.to_string())],
+                    )
+                    .await?;
+            }
+        }
         Ok(())
     }
 

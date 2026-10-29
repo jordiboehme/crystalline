@@ -1130,25 +1130,42 @@ async fn accept_loop(listener: interprocess::local_socket::tokio::Listener, shar
     }
 }
 
-/// The harness gate a bridge's `mcp` handshake options carry. `skills=off` is
+/// The harness gate a bridge's `mcp` handshake options carry, with the
+/// `unattended` mark beside it. `skills=off` is
 /// the verified gate and wins if both tokens ever arrive; `routing=conditional`
 /// is a hook that is installed but unverified; neither (a bare `mcp` from an
 /// older bridge, or an option this binary does not know) is the default gate,
 /// which serves everything.
 fn harness_gate_from_options(options: &[&str]) -> crate::instance::HarnessGate {
-    use crate::instance::{HarnessGate, ROUTING_CONDITIONAL_OPTION, SKILLS_OFF_OPTION};
+    use crate::instance::{
+        HarnessGate, ROUTING_CONDITIONAL_OPTION, SKILLS_OFF_OPTION, UNATTENDED_OPTION,
+    };
+    let unattended = options.contains(&UNATTENDED_OPTION);
+    let run_domain = options
+        .iter()
+        .find_map(|o| o.strip_prefix(crate::instance::RUN_DOMAIN_OPTION))
+        .filter(|d| !d.is_empty())
+        .map(str::to_string);
     if options.contains(&SKILLS_OFF_OPTION) {
         HarnessGate {
             hook_installed: true,
             onboarding_verified: true,
+            unattended,
+            run_domain,
         }
     } else if options.contains(&ROUTING_CONDITIONAL_OPTION) {
         HarnessGate {
             hook_installed: true,
             onboarding_verified: false,
+            unattended,
+            run_domain,
         }
     } else {
-        HarnessGate::default()
+        HarnessGate {
+            unattended,
+            run_domain,
+            ..HarnessGate::default()
+        }
     }
 }
 
@@ -3924,10 +3941,14 @@ mod tests {
         let verified = HarnessGate {
             hook_installed: true,
             onboarding_verified: true,
+            unattended: false,
+            run_domain: None,
         };
         let conditional = HarnessGate {
             hook_installed: true,
             onboarding_verified: false,
+            unattended: false,
+            run_domain: None,
         };
         assert_eq!(harness_gate_from_options(&["skills=off"]), verified);
         assert_eq!(
@@ -3942,6 +3963,15 @@ mod tests {
         assert_eq!(
             harness_gate_from_options(&["future=1"]),
             HarnessGate::default()
+        );
+        // The unattended mark travels beside the harness tokens.
+        let marked = harness_gate_from_options(&["skills=off", "unattended"]);
+        assert!(marked.unattended && marked.verified());
+        assert!(harness_gate_from_options(&["unattended"]).unattended);
+        assert!(!harness_gate_from_options(&["skills=off"]).unattended);
+        assert_eq!(
+            harness_gate_from_options(&["unattended", "domain=eng"]).run_domain,
+            Some("eng".to_string())
         );
     }
 
