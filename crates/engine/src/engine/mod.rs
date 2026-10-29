@@ -7439,7 +7439,8 @@ mod github;
 pub use github::OAUTH_IDENTITY_UNDER_APP;
 mod github_access;
 pub use github_access::{
-    FRESH_FOR, GithubGovernor, Invalidate, RETRY_AFTER_FAILURE, RepoReaders, STALE_FOR, level_for,
+    FRESH_FOR, GithubGovernor, Invalidate, RETRY_AFTER_FAILURE, RepoReaders, STALE_FOR,
+    as_mcp_call, level_for,
 };
 mod github_app;
 pub use github_app::{

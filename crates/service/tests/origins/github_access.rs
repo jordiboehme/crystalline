@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use crystalline_core::config::{GitHubConfig, GlobalConfig, ServiceConfig};
 use crystalline_index::TursoStore;
-use crystalline_service::engine::WriteBlock;
+use crystalline_service::engine::{WriteBlock, as_mcp_call};
 use crystalline_service::rest::{AuthStore, Role};
 use crystalline_service::scope::{DomainRight, ReflectionCaller};
 use crystalline_service::{DomainAccess, Engine, EnvOverlay, Scope};
@@ -113,46 +113,50 @@ async fn the_open_tier_follows_the_agent_identity_link() {
     let (forge, eng, auth) = setup(tmp.path(), Some("agent")).await;
     collaborators(&forge, "acme/kb", &[(AGENT_ID, "agent-gh", "write")]);
     let open_tier = Scope::Anonymous;
-    assert!(eng.github_governs("kb"));
-    assert!(!eng.github_governs("plain"));
+    // Inside an MCP request, as the server runs every tool call.
+    as_mcp_call(async {
+        assert!(eng.github_governs("kb"));
+        assert!(!eng.github_governs("plain"));
 
-    // The agent account is an instance viewer, and GitHub write is what
-    // lets it write on the governed domain.
-    assert_eq!(
-        eng.domain_right(&open_tier, "kb").await.unwrap(),
-        DomainRight::Write
-    );
-    assert_eq!(
-        eng.write_access_block(&open_tier, "kb").await.unwrap(),
-        None
-    );
-    assert!(eng.hidden_for(&open_tier).await.unwrap().is_empty());
+        // The agent account is an instance viewer, and GitHub write is what
+        // lets it write on the governed domain.
+        assert_eq!(
+            eng.domain_right(&open_tier, "kb").await.unwrap(),
+            DomainRight::Write
+        );
+        assert_eq!(
+            eng.write_access_block(&open_tier, "kb").await.unwrap(),
+            None
+        );
+        assert!(eng.hidden_for(&open_tier).await.unwrap().is_empty());
 
-    // GitHub says read now: the open tier reads and no longer writes.
-    collaborators(&forge, "acme/kb", &[(AGENT_ID, "agent-gh", "read")]);
-    eng.invalidate_github_access(crystalline_service::engine::Invalidate::Repo(
-        "acme/kb".to_string(),
-    ));
-    assert_eq!(
-        eng.domain_right(&open_tier, "kb").await.unwrap(),
-        DomainRight::Read
-    );
-    assert_eq!(
-        eng.write_access_block(&open_tier, "kb").await.unwrap(),
-        Some(WriteBlock::Role)
-    );
+        // GitHub says read now: the open tier reads and no longer writes.
+        collaborators(&forge, "acme/kb", &[(AGENT_ID, "agent-gh", "read")]);
+        eng.invalidate_github_access(crystalline_service::engine::Invalidate::Repo(
+            "acme/kb".to_string(),
+        ));
+        assert_eq!(
+            eng.domain_right(&open_tier, "kb").await.unwrap(),
+            DomainRight::Read
+        );
+        assert_eq!(
+            eng.write_access_block(&open_tier, "kb").await.unwrap(),
+            Some(WriteBlock::Role)
+        );
 
-    // Not a collaborator on a private domain: the domain is hidden.
-    auth.set_domain_visibility("kb", true, "ada").await.unwrap();
-    collaborators(&forge, "acme/kb", &[]);
-    eng.invalidate_github_access(crystalline_service::engine::Invalidate::All);
-    assert!(eng.hidden_for(&open_tier).await.unwrap().contains("kb"));
+        // Not a collaborator on a private domain: the domain is hidden.
+        auth.set_domain_visibility("kb", true, "ada").await.unwrap();
+        collaborators(&forge, "acme/kb", &[]);
+        eng.invalidate_github_access(crystalline_service::engine::Invalidate::All);
+        assert!(eng.hidden_for(&open_tier).await.unwrap().contains("kb"));
 
-    // The domain GitHub does not govern keeps the open tier's carve-out.
-    assert_eq!(
-        eng.write_access_block(&open_tier, "plain").await.unwrap(),
-        None
-    );
+        // The domain GitHub does not govern keeps the open tier's carve-out.
+        assert_eq!(
+            eng.write_access_block(&open_tier, "plain").await.unwrap(),
+            None
+        );
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -172,6 +176,14 @@ async fn the_open_tier_never_writes_a_governed_domain_without_an_agent_identity(
         Some(WriteBlock::Role)
     );
     assert!(!eng.open_tier_carve_out(&open_tier, "kb"));
+    // Inside an MCP request too: there is no agent identity to act as.
+    as_mcp_call(async {
+        assert_eq!(
+            eng.write_access_block(&open_tier, "kb").await.unwrap(),
+            Some(WriteBlock::Role)
+        );
+    })
+    .await;
     // Nor does it curate the governed domain's Reflection, which it still
     // does on the domain GitHub does not govern.
     let caller = ReflectionCaller::agent(Scope::Anonymous, "agent", true);
@@ -267,4 +279,36 @@ async fn the_daemon_status_says_since_when_github_has_not_answered() {
         answer["data"]["github_access_degraded_since"],
         json!(since.to_rfc3339())
     );
+}
+
+/// `Scope::Anonymous` outside an MCP request is the web's anonymous
+/// visitor: it never gets the agent identity's GitHub access, even with
+/// `auth.mcp` off and `github.agent_identity` set.
+#[tokio::test]
+async fn a_web_visitor_never_acts_as_the_agent_identity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (forge, eng, auth) = setup(tmp.path(), Some("agent")).await;
+    collaborators(&forge, "acme/kb", &[(AGENT_ID, "agent-gh", "admin")]);
+    auth.set_domain_visibility("kb", true, "ada").await.unwrap();
+    let anonymous = Scope::Anonymous;
+    assert!(eng.hidden_for(&anonymous).await.unwrap().contains("kb"));
+    assert_eq!(
+        eng.domain_right(&anonymous, "kb").await.unwrap(),
+        DomainRight::None
+    );
+    assert!(
+        eng.write_access_block(&anonymous, "kb")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    // The same call inside an MCP request is the open tier as the agent.
+    as_mcp_call(async {
+        assert!(!eng.hidden_for(&anonymous).await.unwrap().contains("kb"));
+        assert_eq!(
+            eng.write_access_block(&anonymous, "kb").await.unwrap(),
+            None
+        );
+    })
+    .await;
 }

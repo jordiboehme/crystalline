@@ -5311,9 +5311,12 @@ impl ServerHandler for McpServer {
         } else {
             None
         };
-        let response =
-            crystalline_engine::read_limit::within(limit, self.call_tool_limited(request, context))
-                .await;
+        // As one MCP request: only then does the open tier act as
+        // `github.agent_identity` on a domain GitHub governs.
+        let response = crystalline_engine::engine::as_mcp_call(
+            crystalline_engine::read_limit::within(limit, self.call_tool_limited(request, context)),
+        )
+        .await;
         match (note, response) {
             (Some(note), Ok(rmcp::model::CallToolResponse::Complete(mut result))) => {
                 result.content.push(ContentBlock::text(note));
@@ -5900,8 +5903,11 @@ impl ServerHandler for McpServer {
         // An engram's attachment is engram content: an unattended session
         // reads it within its read limit, as it does every tool.
         let limit = self.read_limit(&context).await;
-        crystalline_engine::read_limit::within(limit, self.read_resource_limited(request, context))
-            .await
+        crystalline_engine::engine::as_mcp_call(crystalline_engine::read_limit::within(
+            limit,
+            self.read_resource_limited(request, context),
+        ))
+        .await
     }
 
     /// List the two onboarding prompts, empty while `skills.serve` is off.

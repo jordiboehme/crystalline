@@ -633,13 +633,15 @@ async fn fetch(source: &dyn GithubSource, repo: &str) -> Result<Snapshot, Remote
 #[async_trait]
 impl KnowledgeGovernor for GithubGovernor {
     fn governed_domains(&self) -> HashSet<String> {
-        if matches!(self.env.app(), GovernorApp::Absent) {
+        // No origin, nothing to govern, and the App (whose first read may
+        // ask the keychain) is not looked for at all.
+        let origins = self.env.origins();
+        if origins.is_empty() || matches!(self.env.app(), GovernorApp::Absent) {
             return HashSet::new();
         }
         self.recheck_not_installed();
         let state = lock(&self.state);
-        self.env
-            .origins()
+        origins
             .into_iter()
             .filter(|(_, repo)| !state.not_installed.contains_key(&repo_key(repo)))
             .map(|(name, _)| name)
@@ -723,6 +725,26 @@ impl KnowledgeGovernor for GithubGovernor {
                 .collect(),
         )
     }
+}
+
+tokio::task_local! {
+    /// Set while the MCP server serves one request (see [`as_mcp_call`]).
+    static MCP_CALL: ();
+}
+
+/// Run `work` as one MCP request. Only inside it does an anonymous caller
+/// count as the MCP open tier that acts as `github.agent_identity` on a
+/// governed domain ([`Engine::scope_on`]): the same `Scope::Anonymous` is
+/// also the web's `auth.anonymous` visitor, who never gets the agent's
+/// access. The narrowing (no open-tier carve-out on a governed domain)
+/// holds for every anonymous caller, inside or outside.
+pub async fn as_mcp_call<F: std::future::Future>(work: F) -> F::Output {
+    MCP_CALL.scope((), work).await
+}
+
+/// Whether the current task serves an MCP request.
+fn in_mcp_call() -> bool {
+    MCP_CALL.try_with(|_| ()).is_ok()
 }
 
 /// The governor's view of an engine. A [`Weak`] handle: the engine holds
@@ -828,9 +850,12 @@ impl super::Engine {
     }
 
     /// The account the open tier acts as on the domains GitHub governs:
-    /// `github.agent_identity`, when `scope` is the open tier and it is set.
+    /// `github.agent_identity`, when `scope` is the open tier, the current
+    /// task serves an MCP request ([`as_mcp_call`]) and it is set.
     pub(crate) fn open_tier_agent(&self, scope: &Scope) -> Option<String> {
-        if !self.is_open_tier(scope) {
+        // Only inside an MCP request: the web's anonymous visitor is
+        // `Scope::Anonymous` too and must never act as the agent.
+        if !self.is_open_tier(scope) || !in_mcp_call() {
             return None;
         }
         self.config
@@ -841,9 +866,10 @@ impl super::Engine {
     }
 
     /// The scope a question about `domain` is decided for: `scope` itself,
-    /// except the open tier on a domain GitHub governs, which acts as
-    /// `github.agent_identity` (as `Scope::User` without the admin flag)
-    /// when that is set. Without it the open tier stays anonymous there.
+    /// except the open tier inside an MCP request ([`as_mcp_call`]) on a
+    /// domain GitHub governs, which acts as `github.agent_identity` (as
+    /// `Scope::User` without the admin flag) when that is set. Without it,
+    /// and for every other anonymous caller, it stays anonymous there.
     pub fn scope_on(&self, scope: &Scope, domain: &str) -> Scope {
         match self.open_tier_agent(scope) {
             Some(account) if self.github_governs(domain) => Scope::User {
