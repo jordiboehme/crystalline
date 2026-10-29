@@ -4775,4 +4775,45 @@ mod tests {
                 .unwrap()
         );
     }
+
+    /// A confirmation on a shared GitHub page of a private repository is
+    /// held against the readers of the moment: an account made later at
+    /// instance viewer reads the page and not the private source, so it is
+    /// asked again; one made later at instance knowledge `none` reads
+    /// nothing there and keeps the cover.
+    #[tokio::test]
+    async fn a_later_account_on_a_governed_shared_page_is_asked_for_only_when_it_reads_the_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = store(&dir).await;
+        github_cast(&auth).await;
+        let governor = base_governor().grant("mem", "gh-lab", MemberLevel::Viewer);
+        let access = DomainAccess::new(auth.clone()).with_governor(Arc::new(governor));
+        let confirmed = access.page_readers("gh-open").await.unwrap();
+        assert!(
+            access
+                .readers_cover_for("gh-open", "gh-lab", &confirmed)
+                .await
+                .unwrap()
+        );
+        auth.add_user("nina", "nina", None, Role::None, "pw12345678")
+            .await
+            .unwrap();
+        assert!(
+            access
+                .readers_cover_for("gh-open", "gh-lab", &confirmed)
+                .await
+                .unwrap(),
+            "an instance-none account reads no governed page"
+        );
+        auth.add_user("vic", "vic", None, Role::Viewer, "pw12345678")
+            .await
+            .unwrap();
+        assert!(
+            !access
+                .readers_cover_for("gh-open", "gh-lab", &confirmed)
+                .await
+                .unwrap(),
+            "a later viewer reads the page and not the source"
+        );
+    }
 }
