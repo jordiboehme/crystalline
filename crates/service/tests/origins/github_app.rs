@@ -114,6 +114,11 @@ pub(crate) struct Forge {
     /// When set, a refresh answers only once the test adds a permit here,
     /// instead of after 200 ms.
     pub(crate) refresh_gate: StdMutex<Option<Arc<tokio::sync::Semaphore>>>,
+    /// Repository -> its collaborators as `GET .../collaborators` lists
+    /// them (`id`, `login`, `role_name`).
+    pub(crate) collaborators: StdMutex<HashMap<String, Vec<Value>>>,
+    /// The repositories `GET /repos/{o}/{r}` calls public.
+    pub(crate) public: StdMutex<std::collections::HashSet<String>>,
 }
 
 impl Forge {
@@ -185,6 +190,8 @@ pub(crate) async fn spawn_forge(
         revokes: StdMutex::new(Vec::new()),
         revoke_fails: std::sync::atomic::AtomicBool::new(false),
         refresh_gate: StdMutex::new(None),
+        collaborators: StdMutex::new(HashMap::new()),
+        public: StdMutex::new(std::collections::HashSet::new()),
     });
     let router = Router::new().fallback(handle).with_state(forge.clone());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -398,10 +405,21 @@ async fn repo_route(
     let get = *method == Method::GET;
     let post = *method == Method::POST;
     if tail.is_empty() && get {
+        let private = !forge.public.lock().unwrap().contains(&origin.repo);
         return match mock.default_branch(&origin.repo).await {
-            Ok(branch) => ok(json!({"default_branch": branch})),
+            Ok(branch) => ok(json!({"default_branch": branch, "private": private})),
             Err(e) => failed(e),
         };
+    }
+    if tail == "/collaborators" && get {
+        let people = forge
+            .collaborators
+            .lock()
+            .unwrap()
+            .get(&origin.repo)
+            .cloned()
+            .unwrap_or_default();
+        return ok(Value::Array(people));
     }
     if let Some(branch) = tail.strip_prefix("/git/ref/heads/")
         && get

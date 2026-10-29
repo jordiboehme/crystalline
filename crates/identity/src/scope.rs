@@ -1807,6 +1807,56 @@ impl DomainAccess {
         self.resolve(&principal).await
     }
 
+    /// Whether GitHub decides access on `domain` right now (see
+    /// [`KnowledgeGovernor`]). Always `false` without a governor.
+    pub fn governs(&self, domain: &str) -> bool {
+        self.governance().of(domain).is_some()
+    }
+
+    /// What the MCP open tier sees when it acts as the account `agent` on
+    /// the domains GitHub governs (`github.agent_identity`): what `agent`
+    /// sees on those, and what an anonymous caller sees on every other
+    /// domain. An `agent` that is no live account sees what an anonymous
+    /// caller sees everywhere.
+    pub async fn open_tier_visibility(&self, agent: &str) -> Result<DomainVisibility> {
+        let governed = self.governance().domains;
+        let anonymous = self.visibility(&Scope::Anonymous).await?;
+        let as_agent = self
+            .visibility(&Scope::User {
+                account: agent.to_string(),
+                admin: false,
+            })
+            .await?;
+        let mut hidden: HashSet<String> = anonymous
+            .hidden
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|domain| !governed.contains(domain))
+            .collect();
+        hidden.extend(
+            as_agent
+                .hidden
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|domain| governed.contains(domain)),
+        );
+        // An agent account at knowledge `none` reads no shared domain, and
+        // so no shared governed one.
+        if as_agent.shared_hidden {
+            hidden.extend(
+                governed
+                    .iter()
+                    .filter(|domain| !anonymous.private.contains(*domain))
+                    .cloned(),
+            );
+        }
+        Ok(DomainVisibility {
+            private: anonymous.private,
+            hidden: Some(hidden),
+            shared_hidden: false,
+        })
+    }
+
     /// The whole visibility fold, over an already-resolved principal.
     ///
     /// One read of `domain_acl` and, for an account, one read of its own
@@ -3975,6 +4025,38 @@ mod tests {
                 "{domain}"
             );
         }
+    }
+
+    /// The MCP open tier acting as `github.agent_identity`: that account's
+    /// view on the governed domains, an anonymous caller's on the rest (so
+    /// the agent's own private domain `lab` stays hidden).
+    #[tokio::test]
+    async fn the_open_tier_sees_governed_domains_as_its_agent_and_the_rest_as_anonymous() {
+        let dir = tempfile::tempdir().unwrap();
+        let governor = base_governor()
+            .grant("keeper", "gh-lab", MemberLevel::Viewer)
+            .grant("nora", "gh-lab", MemberLevel::Manager);
+        let access = governed_access(&dir, governor).await;
+        assert!(access.governs("gh-lab") && access.governs(" gh-open "));
+        assert!(!access.governs("lab"));
+        let hidden = |agent: &'static str| {
+            let access = &access;
+            async move { access.open_tier_visibility(agent).await.unwrap().screen() }
+        };
+        let keeper = hidden("keeper").await;
+        assert!(keeper.admits("gh-lab") && keeper.admits("gh-open"));
+        assert!(!keeper.admits("gh-vault"), "no GitHub grant");
+        assert!(!keeper.admits("lab"), "keeper's own, but not governed");
+        assert!(keeper.admits("open"), "shared and not governed");
+        // Instance knowledge `none`: no shared governed domain.
+        let nora = hidden("nora").await;
+        assert!(!nora.admits("gh-open"));
+        assert!(!nora.admits("gh-lab"), "instance none gets nothing");
+        assert!(nora.admits("open"), "anonymous reads shared elsewhere");
+        // No such account: anonymous everywhere.
+        let ghost = hidden("ghost").await;
+        assert!(!ghost.admits("gh-open") && !ghost.admits("gh-lab") && !ghost.admits("lab"));
+        assert!(ghost.admits("open"));
     }
 
     #[tokio::test]

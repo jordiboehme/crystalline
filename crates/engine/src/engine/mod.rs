@@ -3281,8 +3281,8 @@ impl Engine {
         if matches!(scope, crate::scope::Scope::Unrestricted) {
             return Ok(None);
         }
-        let visibility = access
-            .visibility(scope)
+        let visibility = self
+            .visibility_in(access, scope)
             .await
             .map_err(|e| EngineError::Internal(e.to_string()))?;
         let Some(mut hidden) = visibility.hidden else {
@@ -3329,8 +3329,8 @@ impl Engine {
         if matches!(scope, crate::scope::Scope::Unrestricted) {
             return Ok(crate::scope::DomainScreen::All);
         }
-        Ok(access
-            .visibility(scope)
+        Ok(self
+            .visibility_in(access, scope)
             .await
             .map_err(|e| EngineError::Internal(e.to_string()))?
             .screen())
@@ -3356,6 +3356,7 @@ impl Engine {
         let Some(access) = self.domain_access.get() else {
             return Ok(crate::scope::DomainRight::Own);
         };
+        let scope = &self.scope_on(scope, domain);
         access.right(scope, domain).await.map_err(|e| {
             EngineError::Internal(format!("this domain's membership is unreadable: {e:#}"))
         })
@@ -3376,6 +3377,7 @@ impl Engine {
         let Some(access) = self.domain_access.get() else {
             return Ok(crate::scope::DomainRight::Own);
         };
+        let scope = &self.scope_on(scope, domain);
         access.write_right(scope, domain).await.map_err(|e| {
             EngineError::Internal(format!("this domain's membership is unreadable: {e:#}"))
         })
@@ -3655,6 +3657,7 @@ impl Engine {
         let Some(access) = self.domain_access.get() else {
             return Ok(crate::scope::ReflectionRight::Curate);
         };
+        let scope = &self.scope_on(scope, domain);
         access.reflection_right(scope, domain).await.map_err(|e| {
             EngineError::Internal(format!("this domain's membership is unreadable: {e:#}"))
         })
@@ -3672,6 +3675,7 @@ impl Engine {
         let Some(access) = self.domain_access.get() else {
             return Ok(None);
         };
+        let scope = &self.scope_on(scope, domain);
         access
             .reflection_list_refuses(scope, domain, need)
             .await
@@ -3696,6 +3700,7 @@ impl Engine {
         let Some(access) = self.domain_access.get() else {
             return Ok(None);
         };
+        let scope = &self.scope_on(scope, domain);
         let answer = match needed {
             None => access.write_list_excludes(scope, domain).await,
             Some(needed) => access.write_list_refuses(scope, domain, needed).await,
@@ -3830,8 +3835,8 @@ impl Engine {
                 crate::read_limit::hidden().unwrap_or_default(),
             ));
         };
-        let visibility = access
-            .visibility(scope)
+        let visibility = self
+            .visibility_in(access, scope)
             .await
             .map_err(|e| EngineError::Internal(e.to_string()))?;
         let mut hidden = visibility.hidden.unwrap_or_default();

@@ -9,6 +9,7 @@
 #[path = "../support/mod.rs"]
 mod support;
 
+mod github_access;
 mod github_app;
 mod github_link;
 mod origin;

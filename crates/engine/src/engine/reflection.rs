@@ -1035,7 +1035,10 @@ impl Engine {
         let engrams_visible = self.engrams_visible(&caller.scope, domain).await?;
         // The MCP open tier curates every domain it can see; a private
         // domain stays as invisible to it as to every anonymous caller.
-        let right = if caller.open_tier {
+        // Not on a domain GitHub governs: there it is decided like everybody
+        // else, as `github.agent_identity` when that is set
+        // (`Engine::reflection_right` asks through `Engine::scope_on`).
+        let right = if caller.open_tier && !self.github_governs(domain) {
             if engrams_visible {
                 ReflectionRight::Curate
             } else {

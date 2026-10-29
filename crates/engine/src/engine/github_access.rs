@@ -50,7 +50,7 @@ use crystalline_remote::{Collaborator, GithubApp, RemoteError, RepoRole};
 use tokio::time::Instant;
 
 use crate::auth_store::{GithubLink, MemberLevel};
-use crate::scope::{DomainAccess, GithubKnowledge, KnowledgeGovernor};
+use crate::scope::{DomainAccess, DomainVisibility, GithubKnowledge, KnowledgeGovernor, Scope};
 
 /// How long one snapshot of a repository is used before GitHub is asked
 /// again.
@@ -802,6 +802,70 @@ impl super::Engine {
     /// before anything was asked.
     pub fn github_access_degraded(&self) -> Option<DateTime<Utc>> {
         self.github_governor.get()?.degraded_since()
+    }
+
+    /// Whether GitHub decides who reads and writes `domain` in the resolver
+    /// this engine serves through. `false` with no resolver installed or no
+    /// governor in it.
+    pub fn github_governs(&self, domain: &str) -> bool {
+        self.domain_access
+            .get()
+            .is_some_and(|access| access.governs(domain))
+    }
+
+    /// Whether `scope` is the MCP open tier: an anonymous caller on an
+    /// instance with `auth.mcp` off.
+    pub fn is_open_tier(&self, scope: &Scope) -> bool {
+        matches!(scope, Scope::Anonymous) && !self.auth_mcp()
+    }
+
+    /// Whether the open tier's carve-out holds for `scope` on `domain`: the
+    /// open tier writes and curates wherever it reads, except on a domain
+    /// GitHub governs, where it is decided like everybody else (as
+    /// `github.agent_identity` when that is set, see [`Engine::scope_on`]).
+    pub fn open_tier_carve_out(&self, scope: &Scope, domain: &str) -> bool {
+        self.is_open_tier(scope) && !self.github_governs(domain)
+    }
+
+    /// The account the open tier acts as on the domains GitHub governs:
+    /// `github.agent_identity`, when `scope` is the open tier and it is set.
+    pub(crate) fn open_tier_agent(&self, scope: &Scope) -> Option<String> {
+        if !self.is_open_tier(scope) {
+            return None;
+        }
+        self.config
+            .read()
+            .unwrap()
+            .github_agent_identity()
+            .map(str::to_string)
+    }
+
+    /// The scope a question about `domain` is decided for: `scope` itself,
+    /// except the open tier on a domain GitHub governs, which acts as
+    /// `github.agent_identity` (as `Scope::User` without the admin flag)
+    /// when that is set. Without it the open tier stays anonymous there.
+    pub fn scope_on(&self, scope: &Scope, domain: &str) -> Scope {
+        match self.open_tier_agent(scope) {
+            Some(account) if self.github_governs(domain) => Scope::User {
+                account,
+                admin: false,
+            },
+            _ => scope.clone(),
+        }
+    }
+
+    /// What `scope` sees across every domain: [`DomainAccess::visibility`],
+    /// or for the open tier acting as `github.agent_identity`
+    /// [`DomainAccess::open_tier_visibility`].
+    pub(crate) async fn visibility_in(
+        &self,
+        access: &DomainAccess,
+        scope: &Scope,
+    ) -> anyhow::Result<DomainVisibility> {
+        match self.open_tier_agent(scope) {
+            Some(agent) => access.open_tier_visibility(&agent).await,
+            None => access.visibility(scope).await,
+        }
     }
 
     /// Forget what the governor learned about `what`, when it has learned

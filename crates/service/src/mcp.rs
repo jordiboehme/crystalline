@@ -2066,6 +2066,8 @@ impl McpServer {
     /// accounts to hold a level, and every agent reaching it writes exactly
     /// what it always wrote. Step one still runs for it, and a private domain
     /// is invisible to it, so there is nothing there for step two to protect.
+    /// The one exception is a domain GitHub governs: there the open tier is
+    /// decided as `github.agent_identity`, and without one it never writes.
     ///
     /// That carve-out is read from the setting that creates the tier rather
     /// than from the absence of an identity, which are not the same statement.
@@ -2084,7 +2086,11 @@ impl McpServer {
             .require_domain(domain, scope)
             .await
             .map_err(to_error)?;
-        if matches!(scope, Scope::Anonymous) && !self.engine.auth_mcp() {
+        // Not on a domain GitHub governs: there the open tier is decided as
+        // `github.agent_identity`, or as anonymous (which never writes)
+        // without one (`Engine::write_access_block` asks through
+        // `Engine::scope_on`).
+        if self.engine.open_tier_carve_out(scope, domain) {
             return Ok(None);
         }
         // The role and the write list are asked whatever the lock says, so a
