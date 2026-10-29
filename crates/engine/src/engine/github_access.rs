@@ -66,9 +66,16 @@ pub const STALE_FOR: Duration = Duration::from_secs(60 * 60);
 /// lookup gave: the stale snapshot inside the window, else no access.
 pub const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(30);
 
-/// How long one lookup (the collaborator listing and the visibility) may
-/// take. One that takes longer is a failure to learn, like GitHub being
-/// down.
+/// How long one GitHub request of a lookup (one page of the collaborator
+/// listing, the visibility, an installation lookup) may take. One that
+/// takes longer is a failure to learn, like GitHub being down.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a question waits for a lookup. Past it the question is answered
+/// from what is known (the stale snapshot inside the window, else no
+/// access), and the lookup goes on in the background and stores its answer
+/// for later questions, so a large repository whose listing takes many
+/// pages is not closed for good.
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The level a GitHub repository role gives on a governed domain: admin and
@@ -117,8 +124,13 @@ pub enum Invalidate {
 /// the clock jumps while a request waits and its timeout fires).
 #[async_trait]
 pub(crate) trait GithubSource: Send + Sync {
-    /// Everyone with access to `repo`, see [`GithubApp::collaborators`].
-    async fn collaborators(&self, repo: &str) -> Result<Vec<Collaborator>, RemoteError>;
+    /// One page of the people with access to `repo`, and the next page,
+    /// see [`GithubApp::collaborators_page`].
+    async fn collaborators_page(
+        &self,
+        repo: &str,
+        page: Option<&str>,
+    ) -> Result<(Vec<Collaborator>, Option<String>), RemoteError>;
     /// Whether `repo` is public, see [`GithubApp::repository_public`].
     async fn repository_public(&self, repo: &str) -> Result<bool, RemoteError>;
     /// The installation that covers `repo`, see [`GithubApp::installation_for`].
@@ -129,8 +141,12 @@ pub(crate) trait GithubSource: Send + Sync {
 
 #[async_trait]
 impl GithubSource for GithubApp {
-    async fn collaborators(&self, repo: &str) -> Result<Vec<Collaborator>, RemoteError> {
-        GithubApp::collaborators(self, repo).await
+    async fn collaborators_page(
+        &self,
+        repo: &str,
+        page: Option<&str>,
+    ) -> Result<(Vec<Collaborator>, Option<String>), RemoteError> {
+        GithubApp::collaborators_page(self, repo, page).await
     }
 
     async fn repository_public(&self, repo: &str) -> Result<bool, RemoteError> {
@@ -264,7 +280,7 @@ struct Failing {
 enum FetchError {
     /// What GitHub (or the App client) answered.
     Remote(RemoteError),
-    /// No answer within [`FETCH_TIMEOUT`].
+    /// One request got no answer within [`REQUEST_TIMEOUT`].
     TimedOut,
 }
 
@@ -277,8 +293,8 @@ impl std::fmt::Display for FetchError {
             FetchError::Remote(e) => e.fmt(f),
             FetchError::TimedOut => write!(
                 f,
-                "GitHub did not answer within {} seconds",
-                FETCH_TIMEOUT.as_secs()
+                "a request to GitHub timed out after {} seconds",
+                REQUEST_TIMEOUT.as_secs()
             ),
         }
     }
@@ -494,7 +510,7 @@ impl GithubGovernor {
         let GovernorApp::Ready { source, .. } = self.env.app() else {
             return None;
         };
-        let snapshot = self.snapshot(source.as_ref(), &repo).await?;
+        let snapshot = self.snapshot(&source, &repo).await?;
         Some(RepoReaders {
             public: snapshot.public,
             github_ids: snapshot
@@ -542,20 +558,26 @@ impl GithubGovernor {
     ///
     /// One lookup per repository at a time. A caller that finds one in
     /// flight answers from a snapshot inside the window when there is one,
-    /// and waits for the lookup only when there is none.
-    async fn snapshot(&self, source: &dyn GithubSource, repo: &str) -> Option<Arc<Snapshot>> {
+    /// and waits for the lookup only when there is none. No caller waits
+    /// longer than [`FETCH_TIMEOUT`]: the lookup runs as a task of its own
+    /// and stores its answer whenever it comes.
+    async fn snapshot(&self, source: &Arc<dyn GithubSource>, repo: &str) -> Option<Arc<Snapshot>> {
         let key = repo_key(repo);
         if let Some(snapshot) = self.fresh(&key, Instant::now()) {
             return Some(snapshot);
         }
         let gate = lock(&self.fetching).entry(key.clone()).or_default().clone();
-        let _held = match gate.clone().try_lock_owned() {
+        let held = match gate.clone().try_lock_owned() {
             Ok(held) => held,
             Err(_) => {
                 if let Some(snapshot) = Self::stale(&mut lock(&self.state), &key, Instant::now()) {
                     return Some(snapshot);
                 }
-                gate.lock_owned().await
+                match tokio::time::timeout(FETCH_TIMEOUT, gate.lock_owned()).await {
+                    Ok(held) => held,
+                    // Still looking: answer from what is known.
+                    Err(_) => return Self::stale(&mut lock(&self.state), &key, Instant::now()),
+                }
             }
         };
         // Another caller may have looked it up while this one waited.
@@ -577,10 +599,44 @@ impl GithubGovernor {
             }
             state.generation(&key)
         };
-        let result = match tokio::time::timeout(FETCH_TIMEOUT, fetch(source, repo)).await {
-            Ok(result) => result.map_err(FetchError::Remote),
-            Err(_) => Err(FetchError::TimedOut),
-        };
+        let me = self.me.upgrade()?;
+        let source = source.clone();
+        let repo_owned = repo.to_string();
+        let lookup = tokio::spawn(async move {
+            // The gate stays held until the answer is stored.
+            let _held = held;
+            let result = fetch(source.as_ref(), &repo_owned).await;
+            me.settle(source.as_ref(), &repo_owned, result, started, generation)
+                .await
+        });
+        match tokio::time::timeout(FETCH_TIMEOUT, lookup).await {
+            Ok(Ok(answer)) => answer,
+            Ok(Err(e)) => {
+                tracing::warn!("the lookup of who may use {repo} stopped: {e}");
+                None
+            }
+            // The lookup goes on and stores its answer; this question is
+            // answered from what is known now.
+            Err(_) => {
+                tracing::info!(
+                    "GitHub is slow to say who may use {repo}; answering from what is known while the lookup goes on"
+                );
+                Self::stale(&mut lock(&self.state), &key, Instant::now())
+            }
+        }
+    }
+
+    /// Stores what one lookup of `repo` found (only when no invalidation
+    /// landed since `generation`) and answers it.
+    async fn settle(
+        &self,
+        source: &dyn GithubSource,
+        repo: &str,
+        result: Result<Snapshot, FetchError>,
+        started: Instant,
+        generation: Generation,
+    ) -> Option<Arc<Snapshot>> {
+        let key = repo_key(repo);
         match result {
             Ok(snapshot) => {
                 let snapshot = Arc::new(snapshot);
@@ -762,7 +818,7 @@ impl GithubGovernor {
             for (repo, generation) in due {
                 let answer = match &source {
                     Some(source) => {
-                        tokio::time::timeout(FETCH_TIMEOUT, source.installation_for(&repo))
+                        tokio::time::timeout(REQUEST_TIMEOUT, source.installation_for(&repo))
                             .await
                             .ok()
                     }
@@ -794,17 +850,44 @@ impl GithubGovernor {
     }
 }
 
-/// One snapshot of `repo`: its collaborators and whether it is public.
-async fn fetch(source: &dyn GithubSource, repo: &str) -> Result<Snapshot, RemoteError> {
-    let people = source.collaborators(repo).await?;
-    let public = source.repository_public(repo).await?;
-    Ok(Snapshot {
-        public,
-        people: people
-            .into_iter()
-            .map(|person| (person.id, (person.login, person.role)))
-            .collect(),
-    })
+/// One snapshot of `repo`: its collaborators, page by page, and whether it
+/// is public. Each request is bounded by [`REQUEST_TIMEOUT`]; the whole
+/// listing is not, so a large repository is listed however many pages it
+/// takes.
+async fn fetch(source: &dyn GithubSource, repo: &str) -> Result<Snapshot, FetchError> {
+    async fn bounded<T>(
+        request: impl std::future::Future<Output = Result<T, RemoteError>>,
+    ) -> Result<T, FetchError> {
+        match tokio::time::timeout(REQUEST_TIMEOUT, request).await {
+            Ok(answer) => answer.map_err(FetchError::Remote),
+            Err(_) => Err(FetchError::TimedOut),
+        }
+    }
+    let mut people = HashMap::new();
+    let mut page: Option<String> = None;
+    let mut complete = false;
+    for _ in 0..crystalline_remote::github::app::MAX_COLLABORATOR_PAGES {
+        let (listed, next) = bounded(source.collaborators_page(repo, page.as_deref())).await?;
+        people.extend(
+            listed
+                .into_iter()
+                .map(|person| (person.id, (person.login, person.role))),
+        );
+        match next {
+            Some(next) => page = Some(next),
+            None => {
+                complete = true;
+                break;
+            }
+        }
+    }
+    if !complete {
+        return Err(FetchError::Remote(
+            crystalline_remote::github::app::too_many_collaborator_pages(repo),
+        ));
+    }
+    let public = bounded(source.repository_public(repo)).await?;
+    Ok(Snapshot { public, people })
 }
 
 #[async_trait]
@@ -854,7 +937,7 @@ impl KnowledgeGovernor for GithubGovernor {
         let Some(repo) = self.repo_of(domain) else {
             return GithubKnowledge::Level(MemberLevel::None);
         };
-        match self.snapshot(source.as_ref(), &repo).await {
+        match self.snapshot(&source, &repo).await {
             Some(snapshot) => GithubKnowledge::Level(snapshot.level_of(link.github_id)),
             None => GithubKnowledge::Level(MemberLevel::None),
         }
@@ -867,7 +950,7 @@ impl KnowledgeGovernor for GithubGovernor {
         let GovernorApp::Ready { source, .. } = self.env.app() else {
             return false;
         };
-        self.snapshot(source.as_ref(), &repo)
+        self.snapshot(&source, &repo)
             .await
             .is_some_and(|snapshot| snapshot.public)
     }
@@ -878,7 +961,7 @@ impl KnowledgeGovernor for GithubGovernor {
         let GovernorApp::Ready { source, host } = self.env.app() else {
             return None;
         };
-        let snapshot = self.snapshot(source.as_ref(), &repo).await?;
+        let snapshot = self.snapshot(&source, &repo).await?;
         let links = match access.github_links().await {
             Ok(links) => links,
             Err(e) => {
@@ -1056,7 +1139,7 @@ impl super::Engine {
     /// The scope a question about `domain` is decided for: `scope` itself,
     /// except the open tier inside an MCP request ([`as_mcp_call`]) on a
     /// domain GitHub governs, which acts as `github.agent_identity` (as
-    /// `Scope::User` without the admin flag) when that is set. Without it,
+    /// [`Scope::Agent`]: that account, clamped to editor) when that is set. Without it,
     /// and for every other anonymous caller, it stays anonymous there.
     pub fn scope_on(&self, scope: &Scope, domain: &str) -> Scope {
         match self.open_tier_agent(scope) {
@@ -1168,8 +1251,10 @@ mod tests {
         gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
         /// How many calls are waiting at the gate.
         parked: AtomicUsize,
-        /// While set, every listing takes this long before it answers.
+        /// While set, every listing page takes this long before it answers.
         delay: Mutex<Option<Duration>>,
+        /// While set, how many people one listing page holds.
+        page_size: Mutex<Option<usize>>,
     }
 
     impl FakeGithub {
@@ -1234,14 +1319,38 @@ mod tests {
 
     #[async_trait]
     impl GithubSource for FakeGithub {
-        async fn collaborators(&self, repo: &str) -> Result<Vec<Collaborator>, RemoteError> {
-            self.listings.fetch_add(1, Ordering::SeqCst);
+        /// Counts a listing on its first page.
+        async fn collaborators_page(
+            &self,
+            repo: &str,
+            page: Option<&str>,
+        ) -> Result<(Vec<Collaborator>, Option<String>), RemoteError> {
+            let index: usize = page.map_or(0, |page| page.parse().unwrap());
+            if index == 0 {
+                self.listings.fetch_add(1, Ordering::SeqCst);
+            }
             let answer = match self.refusal(repo) {
                 Some(e) => Err(e),
-                None => Ok(lock(&self.repos)
-                    .get(&repo_key(repo))
-                    .map(|r| r.people.clone())
-                    .unwrap_or_default()),
+                None => {
+                    let people = lock(&self.repos)
+                        .get(&repo_key(repo))
+                        .map(|r| r.people.clone())
+                        .unwrap_or_default();
+                    match *lock(&self.page_size) {
+                        None => Ok((people, None)),
+                        Some(size) => {
+                            let chunk: Vec<Collaborator> = people
+                                .iter()
+                                .skip(index * size)
+                                .take(size)
+                                .cloned()
+                                .collect();
+                            let next = ((index + 1) * size < people.len())
+                                .then(|| (index + 1).to_string());
+                            Ok((chunk, next))
+                        }
+                    }
+                }
             };
             self.wait_at_gate().await;
             answer
@@ -1777,7 +1886,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_lookup_that_takes_too_long_is_a_failure() {
+    async fn a_request_that_takes_too_long_is_a_failure() {
         let rig = rig().await;
         rig.github.grant(REPO, 1, "alice-gh", RepoRole::Write);
         assert_eq!(rig.knowledge("alice").await, level(MemberLevel::Editor));
@@ -1787,6 +1896,10 @@ mod tests {
         let before = Instant::now();
         assert_eq!(rig.knowledge("alice").await, level(MemberLevel::Editor));
         assert_eq!(Instant::now() - before, FETCH_TIMEOUT);
+        // The page timed out at the same moment; the lookup records it.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
         assert!(rig.governor.degraded_since().is_some());
         // With nothing known it is no access.
         let rig = self::rig().await;
@@ -1846,5 +1959,27 @@ mod tests {
         rig.knowledge("alice").await;
         assert!(rig.governor.closed_repositories().is_empty());
         assert!(rig.governor.stale_since().is_some());
+    }
+
+    /// A large repository: three pages of six seconds each take longer than
+    /// a question waits, but each page answers in time. The question is
+    /// answered from what is known, and the lookup goes on and stores its
+    /// snapshot for the next one.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_listing_is_stored_after_the_question_that_started_it() {
+        let rig = rig().await;
+        rig.github.grant(REPO, 1, "alice-gh", RepoRole::Write);
+        rig.github.grant(REPO, 2, "bob", RepoRole::Read);
+        rig.github.grant(REPO, 3, "carol", RepoRole::Read);
+        *lock(&rig.github.page_size) = Some(1);
+        *lock(&rig.github.delay) = Some(Duration::from_secs(6));
+        let before = Instant::now();
+        assert_eq!(rig.knowledge("alice").await, level(MemberLevel::None));
+        assert_eq!(Instant::now() - before, FETCH_TIMEOUT);
+        // The lookup finishes in the background.
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert_eq!(rig.knowledge("alice").await, level(MemberLevel::Editor));
+        assert_eq!(rig.github.listings(), 1);
+        assert_eq!(rig.governor.degraded_since(), None);
     }
 }

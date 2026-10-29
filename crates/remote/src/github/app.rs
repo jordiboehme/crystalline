@@ -391,6 +391,19 @@ struct VisibilityResponse {
     private: bool,
 }
 
+/// The most pages a collaborator listing is followed for.
+pub const MAX_COLLABORATOR_PAGES: usize = 1000;
+
+/// The error for a collaborator listing past [`MAX_COLLABORATOR_PAGES`].
+pub fn too_many_collaborator_pages(repo: &str) -> RemoteError {
+    RemoteError::Api {
+        status: 200,
+        message: format!(
+            "the collaborator listing of {repo} has more than {MAX_COLLABORATOR_PAGES} pages"
+        ),
+    }
+}
+
 /// How many collaborators one page holds (GitHub's maximum).
 const PAGE_SIZE: usize = 100;
 
@@ -836,23 +849,50 @@ impl GithubApp {
 
     /// Everyone with access to `repo` (`affiliation=all`), every page of 100,
     /// followed through the `Link: rel="next"` header. A next link that
-    /// leaves the API base, or a listing past 1000 pages, is an error: a
-    /// reader set that stops short must not pass for the whole one.
+    /// leaves the API base, or a listing past [`MAX_COLLABORATOR_PAGES`]
+    /// pages, is an error: a reader set that stops short must not pass for
+    /// the whole one.
     pub async fn collaborators(&self, repo: &str) -> Result<Vec<Collaborator>, RemoteError> {
-        const MAX_PAGES: usize = 1000;
-        let (owner, name) = split_repo(repo)?;
-        let mut path = format!(
-            "/repos/{}/{}/collaborators?affiliation=all&per_page={PAGE_SIZE}",
-            segment(owner),
-            segment(name)
-        );
         let mut all = Vec::new();
-        for _ in 0..MAX_PAGES {
-            let response = self.get_as_installation(repo, &path).await?;
-            let response = check_response(response, Some(repo), true, &self.api_url).await?;
-            let next = header(&response, "link").and_then(|link| next_link(&link));
-            let entries: Vec<CollaboratorEntry> = parse_json(response).await?;
-            all.extend(entries.into_iter().map(|entry| Collaborator {
+        let mut page = None;
+        for _ in 0..MAX_COLLABORATOR_PAGES {
+            let (people, next) = self.collaborators_page(repo, page.as_deref()).await?;
+            all.extend(people);
+            match next {
+                Some(next) => page = Some(next),
+                None => return Ok(all),
+            }
+        }
+        Err(too_many_collaborator_pages(repo))
+    }
+
+    /// One page of [`GithubApp::collaborators`]: the first one for `page`
+    /// `None`, else the page a previous answer named. Answers the people on
+    /// it and the next page, `None` on the last one. One request, so a
+    /// caller can bound each page on its own.
+    pub async fn collaborators_page(
+        &self,
+        repo: &str,
+        page: Option<&str>,
+    ) -> Result<(Vec<Collaborator>, Option<String>), RemoteError> {
+        let path = match page {
+            Some(page) => page.to_string(),
+            None => {
+                let (owner, name) = split_repo(repo)?;
+                format!(
+                    "/repos/{}/{}/collaborators?affiliation=all&per_page={PAGE_SIZE}",
+                    segment(owner),
+                    segment(name)
+                )
+            }
+        };
+        let response = self.get_as_installation(repo, &path).await?;
+        let response = check_response(response, Some(repo), true, &self.api_url).await?;
+        let next = header(&response, "link").and_then(|link| next_link(&link));
+        let entries: Vec<CollaboratorEntry> = parse_json(response).await?;
+        let people = entries
+            .into_iter()
+            .map(|entry| Collaborator {
                 id: entry.id,
                 login: entry.login,
                 role: RepoRole::resolve(
@@ -860,12 +900,12 @@ impl GithubApp {
                     entry.permissions.full(),
                     entry.permissions.legacy(),
                 ),
-            }));
-            let Some(next) = next else {
-                return Ok(all);
-            };
-            path = match next.strip_prefix(&self.api_url) {
-                Some(rest) if rest.starts_with('/') => rest.to_string(),
+            })
+            .collect();
+        let next = match next {
+            None => None,
+            Some(next) => match next.strip_prefix(&self.api_url) {
+                Some(rest) if rest.starts_with('/') => Some(rest.to_string()),
                 _ => {
                     return Err(RemoteError::Api {
                         status: 200,
@@ -875,12 +915,9 @@ impl GithubApp {
                         ),
                     });
                 }
-            };
-        }
-        Err(RemoteError::Api {
-            status: 200,
-            message: format!("the collaborator listing of {repo} has more than {MAX_PAGES} pages"),
-        })
+            },
+        };
+        Ok((people, next))
     }
 
     /// Whether `repo` is public (`GET /repos/{o}/{r}`, field `private`).
