@@ -1166,6 +1166,19 @@ async fn repository_visibility_tells_an_internal_repository_apart() {
             serde_json::json!({"private": false, "visibility": "public"}),
             RepoVisibility::Public,
         ),
+        (
+            serde_json::json!({"private": false}),
+            RepoVisibility::Public,
+        ),
+        // The visibility word wins over the older flag when both are there.
+        (
+            serde_json::json!({"private": false, "visibility": "internal"}),
+            RepoVisibility::Internal,
+        ),
+        (
+            serde_json::json!({"private": false, "visibility": "private"}),
+            RepoVisibility::Private,
+        ),
     ] {
         let routes = Router::new().route(
             "/repos/{owner}/{name}",
@@ -1181,4 +1194,16 @@ async fn repository_visibility_tells_an_internal_repository_apart() {
             want == RepoVisibility::Public
         );
     }
+}
+
+/// A visibility word this client does not know is an error, never a guess.
+#[tokio::test]
+async fn an_unknown_visibility_word_is_an_error() {
+    let routes = Router::new().route(
+        "/repos/{owner}/{name}",
+        get(|| async { Json(serde_json::json!({"private": true, "visibility": "secret"})) }),
+    );
+    let (_mock, _base, app, _clock) = serve_with(mock_with(&[("acme/kb", 11)]), routes).await;
+    assert!(app.repository_visibility("acme/kb").await.is_err());
+    assert!(app.repository_public("acme/kb").await.is_err());
 }

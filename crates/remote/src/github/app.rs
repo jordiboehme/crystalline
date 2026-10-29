@@ -955,21 +955,30 @@ impl GithubApp {
         Ok(self.repository_visibility(repo).await? == RepoVisibility::Public)
     }
 
-    /// Who may read `repo` (`GET /repos/{o}/{r}`, fields `private` and
-    /// `visibility`). An internal repository answers `private: true` and is
-    /// told apart by its `visibility`; one without that field is public or
-    /// private by `private` alone.
+    /// Who may read `repo` (`GET /repos/{o}/{r}`, fields `visibility` and
+    /// `private`). `visibility` decides when it is there (`public`,
+    /// `private` or `internal`; an internal repository also answers
+    /// `private: true`), and any other word is an error, never a guess. Only
+    /// an answer without it (an older GitHub Enterprise Server) is read by
+    /// `private` alone, and such a server's internal repository then counts
+    /// as private.
     pub async fn repository_visibility(&self, repo: &str) -> Result<RepoVisibility, RemoteError> {
         let (owner, name) = split_repo(repo)?;
         let path = format!("/repos/{}/{}", segment(owner), segment(name));
         let response = self.get_as_installation(repo, &path).await?;
         let response = check_response(response, Some(repo), true, &self.api_url).await?;
         let answer: VisibilityResponse = parse_json(response).await?;
-        Ok(match (answer.private, answer.visibility.as_deref()) {
-            (false, _) => RepoVisibility::Public,
-            (true, Some("internal")) => RepoVisibility::Internal,
-            (true, _) => RepoVisibility::Private,
-        })
+        match answer.visibility.as_deref() {
+            Some("public") => Ok(RepoVisibility::Public),
+            Some("private") => Ok(RepoVisibility::Private),
+            Some("internal") => Ok(RepoVisibility::Internal),
+            Some(other) => Err(RemoteError::Api {
+                status: 200,
+                message: format!("{repo} has a visibility this client does not know: {other}"),
+            }),
+            None if answer.private => Ok(RepoVisibility::Private),
+            None => Ok(RepoVisibility::Public),
+        }
     }
 
     /// A GET on `path` with `repo`'s installation token. A 401 means the
