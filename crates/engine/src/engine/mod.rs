@@ -7599,6 +7599,9 @@ pub struct GithubIdentity {
     pub pending: Option<GithubPending>,
     /// The once-reported failure of this account's last device flow.
     pub error: Option<String>,
+    /// Set only by a disconnect that went through the App unlink and could
+    /// not revoke the token at GitHub: [`UNLINKED_NOT_REVOKED`].
+    pub warning: Option<String>,
 }
 
 /// One account's link to a GitHub account, as the profile and the CLI show
@@ -7625,6 +7628,10 @@ pub struct GithubLinkView {
     pub pending: Option<GithubPending>,
     /// The once-reported failure of this account's last link device flow.
     pub error: Option<String>,
+    /// Whether this instance has a GitHub App to link through, usable or
+    /// refused (a refused one still means the person should link, once an
+    /// admin fixes it). The profile picks its GitHub card by this.
+    pub app_configured: bool,
 }
 
 /// What [`Engine::unlink_github`] did, so a surface can tell the person

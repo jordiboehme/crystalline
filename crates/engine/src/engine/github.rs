@@ -743,6 +743,7 @@ impl Engine {
             token_store: token.is_some().then(|| store.kind().to_string()),
             pending,
             error,
+            warning: None,
         })
     }
 
@@ -846,10 +847,13 @@ impl Engine {
             // alone would leave it valid at GitHub and leave a link that
             // claims a live token. The unlink revokes it and drops both.
             let outcome = self.unlink_github(account).await?;
-            if let Some(warning) = outcome.warning() {
+            let warning = outcome.warning();
+            if let Some(warning) = warning {
                 tracing::warn!("disconnecting the GitHub identity of {account}: {warning}");
             }
-            return self.github_identity_status(account).await;
+            let mut status = self.github_identity_status(account).await?;
+            status.warning = warning.map(str::to_string);
+            return Ok(status);
         }
         let host = self.github_token_host();
         let (store, token) = self.github_credential_for(&identity, host.as_deref())?;
@@ -1010,6 +1014,10 @@ impl Engine {
             token_live: link.as_ref().is_some_and(|l| l.token_live),
             pending,
             error,
+            app_configured: matches!(
+                self.github_app_slot(),
+                super::github_app::AppSlot::Ready(_) | super::github_app::AppSlot::Refused(_)
+            ),
         })
     }
 

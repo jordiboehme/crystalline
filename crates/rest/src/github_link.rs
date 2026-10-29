@@ -9,9 +9,12 @@
 //! request comes from the very session that started it, exchanges the code
 //! and links the account, then sends the browser to the profile.
 //!
-//! The callback is NOT a public path: it needs the session, and gets it
-//! because the session cookie is `SameSite=Lax`, which rides GitHub's
-//! top-level redirect back. That is the whole binding. A state carries no
+//! The callback needs the session, and gets it because the session cookie
+//! is `SameSite=Lax`, which rides GitHub's top-level redirect back. That is
+//! the whole binding. It is on the guard's public path list only so a
+//! browser without a session lands on the profile (which asks for a sign-in)
+//! instead of a raw 401; the handler checks the account itself, and every
+//! refusal is a redirect to the profile with a code, never a JSON body. A state carries no
 //! account; the record does, together with a hash of the session that
 //! started the flow (of its CSRF token, the one per-session value every
 //! identity path resolves, never the raw session cookie), so a link can only
@@ -119,6 +122,11 @@ pub struct GithubLinkResponse {
     pub pending: Option<GithubPendingView>,
     /// The last link device flow's failure, reported on exactly one read.
     pub error: Option<String>,
+    /// Whether this instance has a GitHub App to link through. Any account
+    /// may read it, unlike the admin-only settings read, so the profile picks
+    /// its GitHub card by it.
+    #[schema(example = true)]
+    pub app_configured: bool,
 }
 
 fn view(v: GithubLinkView) -> GithubLinkResponse {
@@ -135,6 +143,7 @@ fn view(v: GithubLinkView) -> GithubLinkResponse {
             expires_in_secs: p.expires_in_secs,
         }),
         error: v.error,
+        app_configured: v.app_configured,
     }
 }
 
@@ -339,13 +348,12 @@ pub struct CallbackQuery {
     error: Option<String>,
 }
 
-/// One sentence for a state that could not be used, whatever the reason.
-fn state_refused(reason: &str, account: &str) -> ApiError {
+/// A state that could not be used, whatever the reason: the browser lands
+/// on the profile with `state`, which says to start again. The reason goes to
+/// the log only, so the landing tells a stranger nothing about why.
+fn state_refused(state: &RestState, reason: &str, account: &str) -> Response {
     tracing::warn!("a GitHub link callback for {account} was refused: {reason}");
-    ApiError::bad_request(
-        "this GitHub link could not be matched to one this session started, or it expired; \
-         start again from your profile",
-    )
+    to_profile(state, "github_error=state")
 }
 
 /// A 303 to the profile under the base path.
@@ -374,26 +382,20 @@ fn to_profile(state: &RestState, query: &str) -> Response {
                    sent to `/profile?github=linked`, or to \
                    `/profile?github_error=<code>` with `id_taken` (the GitHub \
                    account is linked to another account), `denied` (the \
-                   person cancelled at GitHub) or `failed` (anything else).",
+                   person cancelled at GitHub), `state` (the state is \
+                   unknown, used, expired or another session's), `session` \
+                   (no signed-in session; the app asks for a sign-in and \
+                   returns to the profile) or `failed` (anything else). It \
+                   is a browser landing, so it never answers JSON.",
     params(CallbackQuery),
     responses(
         (
             status = 303,
             description = "To the profile, with `github=linked` or \
-                           `github_error=<code>`.",
-        ),
-        (
-            status = 400,
-            description = "No state, or a state this session did not start, \
-                           already used, or expired. Nothing reached GitHub.",
-            body = ProblemDetail,
-            content_type = "application/problem+json",
-        ),
-        (
-            status = 401,
-            description = "No session.",
-            body = ProblemDetail,
-            content_type = "application/problem+json",
+                           `github_error=<code>`. `state` is no state, or a \
+                           state this session did not start, already used, or \
+                           expired, and `session` is no signed-in session; in \
+                           both cases nothing reached GitHub.",
         ),
         (
             status = 403,
@@ -408,9 +410,18 @@ pub async fn callback(
     identity: Identity,
     ApiQuery(query): ApiQuery<CallbackQuery>,
 ) -> Result<Response, ApiError> {
-    let user = identity.require_account()?;
+    // A browser landing: a lost session goes to the profile too, which asks
+    // for a sign-in and comes back. The state is not taken, since nothing
+    // proved who sent it.
+    let user = match identity.require_account() {
+        Ok(user) => user,
+        Err(_) => {
+            tracing::warn!("a GitHub link callback arrived without a signed-in session");
+            return Ok(to_profile(&state, "github_error=session"));
+        }
+    };
     let Some(flow_state) = query.state.as_deref() else {
-        return Err(state_refused("no state", &user.name));
+        return Ok(state_refused(&state, "no state", &user.name));
     };
     let now = state.engine.link_clock_now();
     // Taken before anything is compared: a state is spent by the first
@@ -423,9 +434,12 @@ pub async fn callback(
         .take_at(flow_state, now);
     let pending = match taken {
         Ok(pending) => pending,
-        Err(StateMiss::Unknown) => return Err(state_refused("unknown state", &user.name)),
+        Err(StateMiss::Unknown) => {
+            return Ok(state_refused(&state, "unknown state", &user.name));
+        }
         Err(StateMiss::Expired) => {
-            return Err(state_refused(
+            return Ok(state_refused(
+                &state,
                 &format!(
                     "the link was started more than {} minutes ago",
                     PENDING_TTL.as_secs() / 60
@@ -439,7 +453,8 @@ pub async fn callback(
         super::auth::constant_time_eq(hash.as_bytes(), pending.session_hash.as_bytes())
     });
     if !same_session || pending.account != user.name {
-        return Err(state_refused(
+        return Ok(state_refused(
+            &state,
             "the state belongs to another session",
             &user.name,
         ));
@@ -458,7 +473,11 @@ pub async fn callback(
         return Ok(to_profile(&state, &format!("github_error={code}")));
     }
     let Some(code) = query.code.as_deref() else {
-        return Err(state_refused("no code", &user.name));
+        tracing::warn!(
+            "the GitHub link of {} could not finish: GitHub sent no code",
+            user.name
+        );
+        return Ok(to_profile(&state, "github_error=failed"));
     };
     match finish(&state, &pending, code).await {
         Ok(()) => Ok(to_profile(&state, "github=linked")),

@@ -588,12 +588,24 @@ export type GithubIdentityResponse = {
      * environment supplies the machine's credential and never a personal one.
      */
     token_store?: string | null;
+    /**
+     * Set only by a disconnect that unlinked through the GitHub App and
+     * could not revoke the token at GitHub: the person should revoke it in
+     * their GitHub settings.
+     */
+    warning?: string | null;
 };
 
 /**
  * One account's link to a GitHub account through the instance's GitHub App: who it is linked to, since when, and whether the user token still works. No token material, ever.
  */
 export type GithubLinkResponse = {
+    /**
+     * Whether this instance has a GitHub App to link through. Any account
+     * may read it, unlike the admin-only settings read, so the profile picks
+     * its GitHub card by it.
+     */
+    app_configured: boolean;
     /**
      * The last link device flow's failure, reported on exactly one read.
      */
@@ -6590,14 +6602,6 @@ export type FinishGithubLinkData = {
 };
 
 export type FinishGithubLinkErrors = {
-    /**
-     * No state, or a state this session did not start, already used, or expired. Nothing reached GitHub.
-     */
-    400: ProblemDetail;
-    /**
-     * No session.
-     */
-    401: ProblemDetail;
     /**
      * The trusted-header identity names a disabled account.
      */

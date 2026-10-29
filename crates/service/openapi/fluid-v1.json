@@ -8785,7 +8785,7 @@
           "settings"
         ],
         "summary": "Where GitHub sends the browser back to finish a link.",
-        "description": "Needs the session that started the link (the session cookie is SameSite=Lax, so it rides GitHub's redirect). The state must name a link this session started in the last ten minutes and is spent by this call. Then the code is exchanged and the account linked, and the browser is sent to `/profile?github=linked`, or to `/profile?github_error=<code>` with `id_taken` (the GitHub account is linked to another account), `denied` (the person cancelled at GitHub) or `failed` (anything else).",
+        "description": "Needs the session that started the link (the session cookie is SameSite=Lax, so it rides GitHub's redirect). The state must name a link this session started in the last ten minutes and is spent by this call. Then the code is exchanged and the account linked, and the browser is sent to `/profile?github=linked`, or to `/profile?github_error=<code>` with `id_taken` (the GitHub account is linked to another account), `denied` (the person cancelled at GitHub), `state` (the state is unknown, used, expired or another session's), `session` (no signed-in session; the app asks for a sign-in and returns to the profile) or `failed` (anything else). It is a browser landing, so it never answers JSON.",
         "operationId": "finish_github_link",
         "parameters": [
           {
@@ -8818,27 +8818,7 @@
         ],
         "responses": {
           "303": {
-            "description": "To the profile, with `github=linked` or `github_error=<code>`."
-          },
-          "400": {
-            "description": "No state, or a state this session did not start, already used, or expired. Nothing reached GitHub.",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetail"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "No session.",
-            "content": {
-              "application/problem+json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProblemDetail"
-                }
-              }
-            }
+            "description": "To the profile, with `github=linked` or `github_error=<code>`. `state` is no state, or a state this session did not start, already used, or expired, and `session` is no signed-in session; in both cases nothing reached GitHub."
           },
           "403": {
             "description": "The trusted-header identity names a disabled account.",
@@ -12474,6 +12454,13 @@
             ],
             "description": "keyring | file; null when disconnected. Never `environment`: the\nenvironment supplies the machine's credential and never a personal one.",
             "example": "keyring"
+          },
+          "warning": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Set only by a disconnect that unlinked through the GitHub App and\ncould not revoke the token at GitHub: the person should revoke it in\ntheir GitHub settings."
           }
         }
       },
@@ -12482,9 +12469,15 @@
         "description": "One account's link to a GitHub account through the instance's GitHub App: who it is linked to, since when, and whether the user token still works. No token material, ever.",
         "required": [
           "linked",
-          "token_live"
+          "token_live",
+          "app_configured"
         ],
         "properties": {
+          "app_configured": {
+            "type": "boolean",
+            "description": "Whether this instance has a GitHub App to link through. Any account\nmay read it, unlike the admin-only settings read, so the profile picks\nits GitHub card by it.",
+            "example": true
+          },
           "error": {
             "type": [
               "string",

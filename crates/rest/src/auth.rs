@@ -131,7 +131,7 @@ pub const SETUP_PATH: &str = "/auth/setup";
 /// every other `POST`. This list is a path list, so it exempts both; the guard
 /// that matters for the second one lives in the handler rather than here, and
 /// that is the first thing to check when reading this exemption.
-const PUBLIC_PATHS: [&str; 11] = [
+const PUBLIC_PATHS: [&str; 12] = [
     LOGIN_PATH,
     "/auth/logout",
     "/auth/me",
@@ -158,6 +158,13 @@ const PUBLIC_PATHS: [&str; 11] = [
     // Where a client ends a grant it holds. Like the token route, the proof is
     // the token in the body, never a session. See `super::oauth::revoke`.
     super::oauth::REVOKE_PATH,
+    // Where GitHub sends the browser back after a link. It is a browser
+    // landing, so a lost session must not answer a raw 401: the handler
+    // calls `require_account` itself and sends a browser without one to the
+    // profile, which asks for a sign-in. Nothing is taken, exchanged or
+    // linked without the session that started the link. See
+    // `super::github_link::callback`.
+    super::github_link::CALLBACK_PATH,
 ];
 
 /// The three auth settings, resolved once when the HTTP surface is built.

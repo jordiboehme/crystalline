@@ -174,6 +174,7 @@ struct Ctx {
 struct Setup {
     public_url: bool,
     client_secret: bool,
+    app: bool,
 }
 
 impl Default for Setup {
@@ -181,6 +182,7 @@ impl Default for Setup {
         Setup {
             public_url: true,
             client_secret: true,
+            app: true,
         }
     }
 }
@@ -227,7 +229,10 @@ impl Ctx {
             ("CRYSTALLINE_GITHUB_APP_CLIENT_ID", CLIENT_ID),
             ("CRYSTALLINE_GITHUB_APP_PRIVATE_KEY", PEM),
         ];
-        if setup.client_secret {
+        if !setup.app {
+            env.clear();
+        }
+        if setup.app && setup.client_secret {
             env.push(("CRYSTALLINE_GITHUB_APP_CLIENT_SECRET", CLIENT_SECRET));
         }
         let overlay = EnvOverlay::from_vars(
@@ -510,7 +515,8 @@ async fn a_state_from_another_session_is_refused() {
 
     let state = ctx.started_state(&ann).await;
     let response = ctx.callback(&bob, "code-1", &state).await;
-    assert_eq!(response.status(), 400);
+    assert_eq!(response.status(), 303);
+    assert_eq!(location(&response), "/profile?github_error=state");
     assert_eq!(github.token_hits(), 0, "nothing was exchanged");
     assert!(ctx.link_of("ann").await.is_none());
     assert!(ctx.link_of("bob").await.is_none());
@@ -520,22 +526,54 @@ async fn a_state_from_another_session_is_refused() {
     let ann_again = ctx.login("ann").await;
     let state = ctx.started_state(&ann).await;
     let response = ctx.callback(&ann_again, "code-1", &state).await;
-    assert_eq!(response.status(), 400);
+    assert_eq!(response.status(), 303);
+    assert_eq!(location(&response), "/profile?github_error=state");
     assert_eq!(github.token_hits(), 0);
     assert!(ctx.link_of("ann").await.is_none());
 }
 
-/// The callback needs a session: without one it is 401, like any other
-/// closed path.
+/// The callback needs a session. GitHub's redirect is a browser landing, so
+/// without one it sends the browser to the profile with `session` (the app
+/// then asks for a sign-in and returns there) instead of a raw 401, and
+/// nothing is exchanged or linked. The state is left alone: nothing proved
+/// who sent it.
 #[tokio::test]
 async fn the_callback_needs_a_session() {
     let github = FakeGithub::start().await;
     let ctx = Ctx::start(&github).await;
     let ann = ctx.login("ann").await;
+    github.grant("code-1", "ghu_ann", 501, "ann-gh");
     let state = ctx.started_state(&ann).await;
     let response = ctx.callback(&Vec::new(), "code-1", &state).await;
-    assert_eq!(response.status(), 401);
+    assert_eq!(response.status(), 303);
+    assert_eq!(location(&response), "/profile?github_error=session");
+    assert_eq!(
+        response
+            .headers()
+            .get(reqwest::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store")
+    );
     assert_eq!(github.token_hits(), 0);
+    assert!(ctx.link_of("ann").await.is_none());
+}
+
+/// A callback without a state, or naming one nobody started, lands on the
+/// profile with `state` and reaches nothing.
+#[tokio::test]
+async fn an_unknown_or_missing_state_lands_on_the_profile() {
+    let github = FakeGithub::start().await;
+    let ctx = Ctx::start(&github).await;
+    let ann = ctx.login("ann").await;
+    github.grant("code-1", "ghu_ann", 501, "ann-gh");
+    let response = ctx.get("/github/link/callback?code=code-1", &ann).await;
+    assert_eq!(response.status(), 303);
+    assert_eq!(location(&response), "/profile?github_error=state");
+    let response = ctx.callback(&ann, "code-1", "deadbeef").await;
+    assert_eq!(response.status(), 303);
+    assert_eq!(location(&response), "/profile?github_error=state");
+    assert_eq!(github.token_hits(), 0);
+    assert!(ctx.link_of("ann").await.is_none());
 }
 
 /// A state links once; presenting it again is refused.
@@ -549,7 +587,8 @@ async fn a_state_is_single_use() {
     assert_eq!(ctx.callback(&ann, "code-1", &state).await.status(), 303);
     github.grant("code-2", "ghu_ann2", 501, "ann-gh");
     let replay = ctx.callback(&ann, "code-2", &state).await;
-    assert_eq!(replay.status(), 400);
+    assert_eq!(replay.status(), 303);
+    assert_eq!(location(&replay), "/profile?github_error=state");
     assert_eq!(github.token_hits(), 1, "the replay reached nothing");
 }
 
@@ -564,7 +603,8 @@ async fn a_state_expires_after_ten_minutes() {
     let state = ctx.started_state(&ann).await;
     ctx.advance(Duration::from_secs(10 * 60 + 1));
     let late = ctx.callback(&ann, "code-1", &state).await;
-    assert_eq!(late.status(), 400);
+    assert_eq!(late.status(), 303);
+    assert_eq!(location(&late), "/profile?github_error=state");
     assert_eq!(github.token_hits(), 0);
     assert!(ctx.link_of("ann").await.is_none());
 
@@ -829,4 +869,50 @@ async fn the_identity_disconnect_unlinks_through_the_app() {
     assert_eq!(body["connected"], false, "{body}");
     assert!(ctx.link_of("ann").await.is_none());
     assert_eq!(github.revoked(), vec!["ghu_ann".to_string()]);
+}
+
+/// When GitHub cannot revoke the token, the older profile disconnect still
+/// unlinks here and its answer carries the warning, as the link DELETE does.
+#[tokio::test]
+async fn the_identity_disconnect_says_when_github_could_not_revoke() {
+    let github = FakeGithub::start().await;
+    let ctx = Ctx::start(&github).await;
+    let ann = ctx.login("ann").await;
+    link(&ctx, &github, &ann, "ghu_ann", 501, "ann-gh").await;
+    github.state.revoke_broken.store(true, Ordering::SeqCst);
+
+    let response = ctx.delete("/me/github-identity", &ann).await;
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["connected"], false, "{body}");
+    assert_eq!(body["warning"], NOT_REVOKED, "{body}");
+    assert!(ctx.link_of("ann").await.is_none());
+
+    // A disconnect with nothing to revoke carries no warning.
+    let response = ctx.delete("/me/github-identity", &ann).await;
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["warning"], serde_json::Value::Null, "{body}");
+}
+
+/// The link read says whether this instance has a GitHub App, so the profile
+/// can offer the App link to every account (the settings read is admin only).
+#[tokio::test]
+async fn the_link_read_says_whether_an_app_is_configured() {
+    let github = FakeGithub::start().await;
+    let ctx = Ctx::start(&github).await;
+    let vic = ctx.login("vic").await;
+    assert_eq!(ctx.my_link(&vic).await["app_configured"], true);
+
+    let without = Ctx::with(
+        &github,
+        Setup {
+            app: false,
+            ..Setup::default()
+        },
+    )
+    .await;
+    let vic = without.login("vic").await;
+    let mine = without.my_link(&vic).await;
+    assert_eq!(mine["app_configured"], false, "{mine}");
+    assert_eq!(mine["linked"], false, "{mine}");
 }
