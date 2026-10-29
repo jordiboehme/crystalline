@@ -734,7 +734,7 @@ tokio::task_local! {
 
 /// Run `work` as one MCP request. Only inside it does an anonymous caller
 /// count as the MCP open tier that acts as `github.agent_identity` on a
-/// governed domain ([`Engine::scope_on`]): the same `Scope::Anonymous` is
+/// governed domain ([`Engine::scope_on`](super::Engine::scope_on)): the same `Scope::Anonymous` is
 /// also the web's `auth.anonymous` visitor, who never gets the agent's
 /// access. The narrowing (no open-tier carve-out on a governed domain)
 /// holds for every anonymous caller, inside or outside.
@@ -844,7 +844,7 @@ impl super::Engine {
     /// Whether the open tier's carve-out holds for `scope` on `domain`: the
     /// open tier writes and curates wherever it reads, except on a domain
     /// GitHub governs, where it is decided like everybody else (as
-    /// `github.agent_identity` when that is set, see [`Engine::scope_on`]).
+    /// `github.agent_identity` when that is set, see [`Engine::scope_on`](super::Engine::scope_on)).
     pub fn open_tier_carve_out(&self, scope: &Scope, domain: &str) -> bool {
         self.is_open_tier(scope) && !self.github_governs(domain)
     }
