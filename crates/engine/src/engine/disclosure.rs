@@ -28,10 +28,10 @@ use super::sources::UNKNOWN_READERS_REFUSAL;
 use super::*;
 use crate::scope::{PageReaders, ReflectionCaller, ReflectionRight, Scope};
 
-/// What a confirmed write is refused with when the page's readers, the
-/// repository it is backed up to, or the text being shared changed between
-/// the question and the answer: the person agreed to what they were shown.
-pub const DISCLOSURE_CHANGED: &str = "who may read this page, where it is backed up, or the text being shared changed since the person was asked; ask them again";
+/// What a confirmed write is refused with when the page's readers or the
+/// repository it is backed up to changed between the question and the
+/// answer: the person agreed to the readers they were shown.
+pub const DISCLOSURE_CHANGED: &str = "who may read this page, or where it is backed up, changed since the person was asked; ask them again";
 
 /// A question a person is asked before text from a narrower domain goes
 /// onto a page, with what their yes is bound to.
@@ -47,30 +47,28 @@ pub struct DisclosureAsk {
 
 /// What a write would put on a page, worked out without writing it: the page
 /// text, and each section and stored source domain that needs a person's
-/// confirmation (a source the reach rule refuses, or a change to text a
-/// person shared on purpose).
+/// confirmation (a source the reach rule refuses and the writer has not
+/// shared on this page yet).
 #[derive(Debug, Clone)]
 pub(crate) struct WritePreview {
     pub text: String,
     pub needs: Vec<(String, String)>,
 }
 
-/// What an agent's write is refused with when it changes the text of a
-/// section a person shared on purpose and nobody confirmed the new text.
-pub const CONFIRMED_TEXT_CHANGED: &str = "a person shared this section's text on purpose; changing it needs their yes again, so make this write from an MCP client that can ask them, or leave the section for a person";
-
 /// What a refused write adds when nobody could be asked: how a person can
 /// still share the text on purpose. It never points at Fluid, where a
 /// refused write leaves nothing to confirm.
 pub const NOBODY_ASKED_NOTE: &str = "a person who may read that domain can share it on purpose by making this write from an MCP client that can put a question to them; an unattended run never can";
 
-/// One person's confirmation that a section may carry text from the engrams
-/// of one other domain.
+/// One person's confirmation that a page may carry text from the engrams of
+/// one other domain. It counts once per person, page and source domain: the
+/// person's later edits of the page that draw on the same domain need no new
+/// question, another person who cites it on the page confirms for
+/// themselves, and it holds until the page's readers widen or its backup
+/// target changes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Disclosure {
-    /// The section's id.
-    pub section: String,
-    /// The source's domain, by the name the section's sources store.
+    /// The source's domain, by the name the page's sources store.
     pub source: String,
     /// Who confirmed: the account, or the machine owner.
     pub by: String,
@@ -78,16 +76,12 @@ pub(crate) struct Disclosure {
     pub at: String,
     /// Who read the page then, when this instance knows its accounts. A
     /// later reader who was not among them and may not read the source
-    /// makes the section too wide again.
+    /// makes the page too wide again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub readers: Option<PageReaders>,
     /// The repository the page was backed up to then, when it was.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
-    /// The section's text the person shared (`section_hash`): another text
-    /// is not confirmed.
-    #[serde(default)]
-    pub text: String,
 }
 
 /// The confirmations recorded on one domain's Reflection, by page.
@@ -95,21 +89,22 @@ pub(crate) struct Disclosure {
 pub(crate) struct Disclosures(HashMap<String, Vec<Disclosure>>);
 
 impl Disclosures {
-    /// The confirmation for the source domain `source` in section `section`
-    /// of page `path`.
-    pub(crate) fn find(&self, path: &str, section: &str, source: &str) -> Option<&Disclosure> {
+    /// Every confirmation recorded on page `path` for the source domain
+    /// `source` (a stored name), one per person.
+    pub(crate) fn of(&self, path: &str, source: &str) -> Vec<&Disclosure> {
         self.0
-            .get(path)?
-            .iter()
-            .find(|d| d.section == section && d.source == source)
+            .get(path)
+            .map(|list| list.iter().filter(|d| d.source == source).collect())
+            .unwrap_or_default()
     }
 
-    /// The newest confirmation recorded on section `section` of `path`.
-    pub(crate) fn newest(&self, path: &str, section: &str) -> Option<&Disclosure> {
+    /// The newest confirmation recorded on page `path` for any of `sources`
+    /// (stored names): what a section citing them shows its curators.
+    pub(crate) fn newest(&self, path: &str, sources: &[&str]) -> Option<&Disclosure> {
         self.0
             .get(path)?
             .iter()
-            .filter(|d| d.section == section)
+            .filter(|d| sources.contains(&d.source.as_str()))
             .max_by(|a, b| a.at.cmp(&b.at))
     }
 }
@@ -263,9 +258,9 @@ impl Engine {
         }
     }
 
-    /// Whether a section of a page of `page` may carry text drawn from the
-    /// domain `source` (both local names), with `disclosure` the person's
-    /// confirmation recorded on that section for that domain, if any.
+    /// Whether a page of `page` may carry text drawn from the domain `source`
+    /// (both local names), with `disclosure` a person's confirmation recorded
+    /// on that page for that domain, if any.
     ///
     /// The rule alone first ([`Engine::readers_cover`]); then the
     /// confirmation, held against both halves of the rule as they stand now:
@@ -273,16 +268,14 @@ impl Engine {
     /// nobody may read the page now who did not then and may not read the
     /// source ([`crate::scope::DomainAccess::readers_cover_for`]). A source
     /// whose readers narrowed since changes nothing: its text reached those
-    /// people already. The section must still read as the text the person
-    /// shared (`section_hash`, its [`r::section_hash`] now). When nobody here
-    /// knows who reads which domain, no confirmation covers anything. The one
-    /// rule [`Engine::too_wide_pages`], the queue and every write share.
+    /// people already. When nobody here knows who reads which domain, no
+    /// confirmation covers anything. The one rule [`Engine::too_wide_pages`],
+    /// the queue and every write share.
     pub(crate) async fn source_covered(
         &self,
         page: &str,
         source: &str,
         disclosure: Option<&Disclosure>,
-        section_hash: Option<&str>,
     ) -> Result<bool> {
         if self.readers_cover(page, source).await? {
             return Ok(true);
@@ -290,11 +283,6 @@ impl Engine {
         let Some(disclosure) = disclosure else {
             return Ok(false);
         };
-        // The person shared one text: a section that reads otherwise now is
-        // not what they agreed to.
-        if section_hash != Some(disclosure.text.as_str()) {
-            return Ok(false);
-        }
         if self.leaves_github(page, source)
             && (self.page_repo(page).is_none() || disclosure.repo != self.page_repo(page))
         {
@@ -310,11 +298,65 @@ impl Engine {
         covered.map_err(|e| EngineError::Internal(e.to_string()))
     }
 
-    /// The question for `texts` (section texts) drawn from `sources` (local
-    /// names, sorted) on page `path` of `page`, naming each half of the rule
-    /// they break now, with its basis: the question, who reads the page now,
-    /// the repository it is backed up to and the texts, the very facts a
-    /// confirmation records.
+    /// Whether page `path` of `page` may carry text from `source` (local) as
+    /// its pages store it (`stored`): the rule alone, or any person's
+    /// confirmation on the page for that domain that still holds.
+    pub(crate) async fn source_covered_on_page(
+        &self,
+        page: &str,
+        path: &str,
+        source: &str,
+        stored: &str,
+        recorded: &Disclosures,
+    ) -> Result<bool> {
+        if self.readers_cover(page, source).await? {
+            return Ok(true);
+        }
+        for disclosure in recorded.of(path, stored) {
+            if self.source_covered(page, source, Some(disclosure)).await? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// The source domains (local names) `by` shared on page `path` of
+    /// `page` and that still hold: what that person's later writes of the
+    /// page may cite without a new question. Empty for an unattended request,
+    /// which never confirms anything.
+    pub(super) async fn shared_by(
+        &self,
+        page: &str,
+        id: DomainId,
+        path: &str,
+        by: &str,
+    ) -> Result<HashSet<String>> {
+        if crate::read_limit::current().is_some() {
+            return Ok(HashSet::new());
+        }
+        let recorded = self.reflection_disclosures(id).await?;
+        let table = self.name_table_now().await;
+        let mut out = HashSet::new();
+        for d in recorded.0.get(path).into_iter().flatten() {
+            if d.by != by {
+                continue;
+            }
+            let Some(local) = self.checkable_domain(&table, &d.source) else {
+                continue;
+            };
+            if self.source_covered(page, &local, Some(d)).await? {
+                out.insert(local);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The question for `texts` (section texts, shown) drawn from `sources`
+    /// (local names, sorted) on page `path` of `page`, naming each half of the
+    /// rule they break now, with its basis: the page, the sources, who reads
+    /// the page now and the repository it is backed up to, the very facts a
+    /// confirmation records. The texts are shown and not bound: one
+    /// confirmation covers the person's later edits of the page.
     pub(crate) async fn disclosure_ask_for(
         &self,
         page: &str,
@@ -343,11 +385,16 @@ impl Engine {
             repo.as_deref().filter(|_| github_wide),
             texts,
         );
-        let hashes: Vec<String> = texts.iter().map(|text| r::section_hash(text)).collect();
         let basis = sha256_hex(
-            json!({ "question": question, "readers": readers, "repo": repo, "texts": hashes })
-                .to_string()
-                .as_bytes(),
+            json!({
+                "page": page,
+                "path": path,
+                "sources": sources,
+                "readers": readers,
+                "repo": repo,
+            })
+            .to_string()
+            .as_bytes(),
         );
         Ok(DisclosureAsk { question, basis })
     }
@@ -378,51 +425,12 @@ impl Engine {
         self.disclosure_ask_for(page, path, &sources, &texts).await
     }
 
-    /// What a write of page `path` that leaves `text` needs a person to
-    /// confirm, beside the `confirmed` pairs whose source the reach rule
-    /// refuses: every section a person shared on purpose whose text this
-    /// write changes while it still names that source.
-    pub(super) async fn preview_needs(
-        &self,
-        id: DomainId,
-        path: &str,
-        text: &str,
-        confirmed: &[(String, String)],
-    ) -> Result<(Vec<(String, String)>, bool)> {
-        let recorded = self
-            .reflection_disclosures(id)
-            .await?
-            .0
-            .remove(path)
-            .unwrap_or_default();
-        let prov = r::read_provenance(text);
-        let mut needs = confirmed.to_vec();
-        let mut changes_confirmed = false;
-        for d in &recorded {
-            let named = prov.get(&d.section).is_some_and(|record| {
-                record
-                    .sources
-                    .iter()
-                    .any(|src| src.domain.as_deref() == Some(d.source.as_str()))
-            });
-            let same =
-                section_text(text, &d.section).is_some_and(|now| r::section_hash(&now) == d.text);
-            if named && !same {
-                changes_confirmed = true;
-                let pair = (d.section.clone(), d.source.clone());
-                if !needs.contains(&pair) {
-                    needs.push(pair);
-                }
-            }
-        }
-        Ok((needs, changes_confirmed))
-    }
-
     /// The question a person is asked before this write lands, when it
     /// needs one: it names sources in a domain fewer people may read than
     /// the page's, or one not shared through GitHub while the page is backed
-    /// up there, or it changes text a person shared on purpose. The question
-    /// shows that text as the write would leave it. `None` when nothing in
+    /// up there, that this person has not shared on this page yet (or whose
+    /// sharing no longer holds). The question shows the text the write
+    /// leaves in those sections. `None` when nothing in
     /// the write needs a person's confirmation, and when `caller` has nobody
     /// behind it who could give one (the write is then refused as before).
     ///
@@ -440,21 +448,8 @@ impl Engine {
         if confirmer(caller).is_none() {
             return Ok(None);
         }
-        // A write without sources needs a question only on a page with a
-        // confirmation to keep; most pages have none.
         if p.sources.is_empty() {
-            let id = self.store.lock().await.domain_id(&p.domain).await?;
-            let Some(id) = id else {
-                return Ok(None);
-            };
-            if !self
-                .reflection_disclosures(id)
-                .await?
-                .0
-                .contains_key(&p.path)
-            {
-                return Ok(None);
-            }
+            return Ok(None);
         }
         let Some(preview) = self.preview_reflection_write(p, caller).await? else {
             return Ok(None);
@@ -468,17 +463,17 @@ impl Engine {
     }
 
     /// Record, after a write of page `path` landed with `text`, the
-    /// confirmations it carries (`confirmed`: section id and stored source
-    /// domain, by `by`, each for the section's text now), and drop every
-    /// recorded one whose source the page no longer names in that section or
-    /// whose section's text changed. Called under the page's lock.
+    /// confirmations it carries (`confirmed`: stored source domains, by
+    /// `by`), one per person and domain, and drop every recorded one whose
+    /// domain the page no longer cites anywhere. Called under the page's
+    /// lock.
     pub(super) async fn record_disclosures(
         &self,
         domain: &str,
         id: DomainId,
         path: &str,
         text: &str,
-        confirmed: &[(String, String)],
+        confirmed: &[String],
         by: Option<&str>,
     ) -> Result<()> {
         let mut list = self
@@ -488,35 +483,23 @@ impl Engine {
             .remove(path)
             .unwrap_or_default();
         let before = list.clone();
-        let prov = r::read_provenance(text);
-        let named = |section: &str, source: &str| {
-            prov.get(section).is_some_and(|record| {
-                record
-                    .sources
-                    .iter()
-                    .any(|src| src.domain.as_deref() == Some(source))
-            })
-        };
-        // A confirmation holds one text: a section that reads otherwise now
-        // (a person's own edit) is named in the queue again.
-        let hash = |section: &str| section_text(text, section).map(|t| r::section_hash(&t));
-        list.retain(|d| {
-            named(&d.section, &d.source) && hash(&d.section).as_deref() == Some(d.text.as_str())
-        });
+        let cited: HashSet<String> = r::read_provenance(text)
+            .into_values()
+            .flat_map(|record| record.sources.into_iter().filter_map(|src| src.domain))
+            .collect();
+        list.retain(|d| cited.contains(&d.source));
         if let (Some(by), false) = (by, confirmed.is_empty()) {
             let readers = self.page_readers_now(domain).await?;
             let repo = self.page_repo(domain);
             let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-            for (section, source) in confirmed {
-                list.retain(|d| !(d.section == *section && d.source == *source));
+            for source in confirmed {
+                list.retain(|d| !(d.source == *source && d.by == by));
                 list.push(Disclosure {
-                    section: section.clone(),
                     source: source.clone(),
                     by: by.to_string(),
                     at: at.clone(),
                     readers: readers.clone(),
                     repo: repo.clone(),
-                    text: hash(section).unwrap_or_default(),
                 });
             }
         }
@@ -542,9 +525,9 @@ impl Engine {
     }
 
     /// A person's confirmation of a section the queue names as
-    /// `source_too_wide`, from Fluid's Review: every source of the section
-    /// in another domain that the page may not carry now is shared on
-    /// purpose with the page's readers of this moment.
+    /// `source_too_wide`, from Fluid's Review: every source domain of the
+    /// section that the page may not carry now is shared on purpose by this
+    /// person on this page, with the page's readers of this moment.
     ///
     /// The caller needs a person behind it, the right to curate the page and
     /// the right to read every source's domain (one it may not open is
@@ -591,7 +574,6 @@ impl Engine {
             EngineError::NotFound(format!("no section '{section}' with sources in '{path}'"))
         })?;
         let current = section_text(&text, section);
-        let current_hash = current.as_deref().map(r::section_hash);
         let table = self.name_table_now().await;
         let hidden = self.hidden_for(&caller.scope).await?;
         let recorded = self.reflection_disclosures(access.domain_id).await?;
@@ -613,9 +595,8 @@ impl Engine {
             if local == domain {
                 continue;
             }
-            let existing = recorded.find(path, section, stored);
             if !self
-                .source_covered(domain, &local, existing, current_hash.as_deref())
+                .source_covered_on_page(domain, path, &local, stored, &recorded)
                 .await?
             {
                 if !wide.iter().any(|s| s == stored) {
@@ -634,8 +615,8 @@ impl Engine {
                 "disclosed": Value::Null,
             }));
         }
-        // The person answered the question the queue showed them, about the
-        // text it showed; it must still be the question for this page now.
+        // The person answered the question the queue showed them; it must
+        // still be the question for this page now.
         wide_local.sort();
         let texts: Vec<String> = current.into_iter().collect();
         if self
@@ -646,16 +627,17 @@ impl Engine {
         {
             return Err(EngineError::Conflict(DISCLOSURE_CHANGED.into()));
         }
-        let confirmed: Vec<(String, String)> = wide
-            .into_iter()
-            .map(|source| (section.to_string(), source))
-            .collect();
-        self.record_disclosures(domain, access.domain_id, path, &text, &confirmed, Some(&by))
+        self.record_disclosures(domain, access.domain_id, path, &text, &wide, Some(&by))
             .await?;
         // The page may go to the backup branch now.
         self.mark_reflection_dirty(domain, crate::reflection_backup::BackupCause::Settled);
         let recorded = self.reflection_disclosures(access.domain_id).await?;
-        let newest = recorded.newest(path, section);
+        let cited: Vec<&str> = record
+            .sources
+            .iter()
+            .filter_map(|src| src.domain.as_deref())
+            .collect();
+        let newest = recorded.newest(path, &cited);
         Ok(json!({
             "domain": domain,
             "path": path,

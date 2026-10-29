@@ -308,11 +308,7 @@ impl Engine {
         let mut out = Vec::new();
         for row in rows {
             let mut wide = false;
-            let hashes: HashMap<String, String> = r::split_sections(&row.content)
-                .into_iter()
-                .filter_map(|s| Some((s.id?, r::section_hash(&s.text))))
-                .collect();
-            for (section, record) in r::read_provenance(&row.content) {
+            for record in r::read_provenance(&row.content).into_values() {
                 for src in &record.sources {
                     let Some(name) = src.domain.as_deref() else {
                         continue;
@@ -334,18 +330,9 @@ impl Engine {
                     // A person shared it on purpose, for the readers and the
                     // repository the page has now (`source_covered`).
                     let covered = covered
-                        || match disclosures.find(&row.path, &section, name) {
-                            Some(disclosure) => {
-                                self.source_covered(
-                                    domain,
-                                    &local,
-                                    Some(disclosure),
-                                    hashes.get(&section).map(String::as_str),
-                                )
-                                .await?
-                            }
-                            None => false,
-                        };
+                        || self
+                            .source_covered_on_page(domain, &row.path, &local, name, &disclosures)
+                            .await?;
                     wide |= !covered;
                 }
             }
@@ -650,17 +637,9 @@ impl Engine {
                     }
                     // Shared on purpose by a person, for the page's readers
                     // and repository as they still are.
-                    if let Some(disclosure) = src
-                        .domain
-                        .as_deref()
-                        .and_then(|stored| disclosures.find(&row.path, id, stored))
+                    if let Some(stored) = src.domain.as_deref()
                         && self
-                            .source_covered(
-                                domain,
-                                local,
-                                Some(disclosure),
-                                Some(r::section_hash(&section.text).as_str()),
-                            )
+                            .source_covered_on_page(domain, &row.path, local, stored, &disclosures)
                             .await?
                     {
                         continue;

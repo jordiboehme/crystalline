@@ -289,7 +289,8 @@ impl Engine {
     ///
     /// With `may_disclose` (a person confirmed this write, see
     /// [`super::disclosure`]) a source that breaks that second check is not
-    /// refused but marked [`NamedSource::disclose`]. A stack that does not
+    /// refused but marked [`NamedSource::disclose`]. A domain in `shared`
+    /// (local names the writer shared on this page already) passes it. A stack that does not
     /// know who reads which domain refuses either way: nobody can confirm
     /// what nobody can see.
     pub(crate) async fn resolve_source_names<'a>(
@@ -298,6 +299,7 @@ impl Engine {
         scope: &Scope,
         names: impl Iterator<Item = &'a String>,
         may_disclose: bool,
+        shared: &HashSet<String>,
     ) -> Result<HashMap<String, NamedSource>> {
         let mut out = HashMap::new();
         let mut context: Option<(Arc<NameTable>, HashSet<String>)> = None;
@@ -339,7 +341,11 @@ impl Engine {
                         "'{name}': {UNKNOWN_READERS_REFUSAL} ({why})"
                     )));
                 }
-                if self.leaves_github(own, local) {
+                // A domain this writer shared on this page already passes
+                // (`super::disclosure`): one confirmation per person, page
+                // and source domain.
+                let shared_here = shared.contains(local);
+                if self.leaves_github(own, local) && !shared_here {
                     if !may_disclose {
                         return Err(EngineError::Invalid(format!(
                             "'{name}': {NOT_ON_GITHUB_REFUSAL}"
@@ -347,7 +353,7 @@ impl Engine {
                     }
                     disclose = true;
                 }
-                if !self.readers_cover(own, local).await? {
+                if !shared_here && !self.readers_cover(own, local).await? {
                     if !may_disclose {
                         return Err(EngineError::Invalid(format!(
                             "'{name}': {TOO_WIDE_REFUSAL}"

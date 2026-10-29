@@ -1695,12 +1695,22 @@ impl Engine {
         // alone refuses (`super::disclosure`); nobody behind the caller, no
         // confirmation.
         let by = super::disclosure::confirmer(caller).filter(|_| p.disclosed.is_some());
+        // The source domains this person shared on this page already, which
+        // they may cite again without a new question.
+        let shared = match super::disclosure::confirmer(caller) {
+            Some(person) if !p.sources.is_empty() => {
+                self.shared_by(&p.domain, access.domain_id, &p.path, &person)
+                    .await?
+            }
+            _ => HashSet::new(),
+        };
         let named = self
             .resolve_source_names(
                 &p.domain,
                 &caller.scope,
                 p.sources.values().flatten(),
                 by.is_some() || preview,
+                &shared,
             )
             .await?;
         let wanted: Vec<r::SourceRef> = named.values().map(|n| n.source_ref("")).collect();
@@ -2035,11 +2045,8 @@ impl Engine {
         }
         let final_text = stamp_reflected(&text, &mut prov, &advanced)?;
         // What a person must confirm (`super::disclosure`): the sources the
-        // reach rule refuses, and every section a person shared on purpose
-        // whose text this write changes.
-        let (needs, changes_confirmed) = self
-            .preview_needs(access.domain_id, &p.path, &final_text, &confirmed)
-            .await?;
+        // reach rule refuses that this person has not shared on this page.
+        let needs = confirmed;
         if preview {
             return Ok(Written::Preview(super::disclosure::WritePreview {
                 text: final_text,
@@ -2047,7 +2054,7 @@ impl Engine {
             }));
         }
         match p.disclosed.as_deref().filter(|_| by.is_some()) {
-            // The person said yes to these readers and this text: still them?
+            // The person said yes to these readers: still them?
             Some(basis) if !needs.is_empty() => {
                 let shown = super::disclosure::WritePreview {
                     text: final_text.clone(),
@@ -2064,18 +2071,15 @@ impl Engine {
                     ));
                 }
             }
-            Some(_) => {}
-            // An agent may not change text a person shared on purpose
-            // without their yes; a person's own edit lands, and the section
-            // is named in the queue again until somebody confirms it.
-            None if changes_confirmed && caller.author.agent => {
-                return Err(EngineError::Invalid(
-                    super::disclosure::CONFIRMED_TEXT_CHANGED.into(),
-                ));
-            }
-            None => {}
+            _ => {}
         }
-        let confirmed = if by.is_some() { needs } else { Vec::new() };
+        let mut confirmed: Vec<String> = if by.is_some() {
+            needs.into_iter().map(|(_, source)| source).collect()
+        } else {
+            Vec::new()
+        };
+        confirmed.sort();
+        confirmed.dedup();
         // The `##` sections this write created or changed that leave it with
         // no source in their record: provenance alone, whatever else counts
         // a section as reflected. The pact is no page.
@@ -2738,9 +2742,15 @@ impl Engine {
                         row["hidden_sources"] = json!(hidden);
                     }
                 }
-                if let Some(disclosure) =
-                    s.id.as_deref().and_then(|id| disclosures.newest(inner, id))
-                {
+                let cited: Vec<&str> = record
+                    .map(|rec| {
+                        rec.sources
+                            .iter()
+                            .filter_map(|src| src.domain.as_deref())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if let Some(disclosure) = disclosures.newest(inner, &cited) {
                     row["disclosed"] = json!({ "by": disclosure.by, "at": disclosure.at });
                 }
                 row

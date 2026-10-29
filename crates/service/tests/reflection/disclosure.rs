@@ -299,113 +299,149 @@ async fn the_question_shows_the_text_it_shares() {
     assert!(ask.question.contains("Five people."), "{}", ask.question);
 }
 
-/// The section text a person confirmed. An agent's write without sources
-/// that changes it is refused: changing shared text needs their yes again.
-/// Asked again, the new text lands and is what the record holds.
+/// One confirmation counts once per person, page and source domain: the
+/// same person's later write of the page that draws on the same domain,
+/// with other text, lands without a new question.
 #[tokio::test]
-async fn an_agent_changing_a_confirmed_section_is_asked_again() {
+async fn the_same_person_edits_the_page_without_a_new_question() {
     let (fx, _auth) = private_harbor().await;
     fx.engine
         .write_reflection(&confirmed(&fx, &agent_as("sam")).await, &agent_as("sam"))
         .await
         .unwrap();
-    let changed = write(
+    let mut edited = write(
         "overview.md",
-        "# Overview\n\nFor people.\n\n## Team\n\nFive people, and the pager rota.\n",
+        "# Overview\n\nFor people.\n\n## Team\n\nFive people and a weekly rota.\n",
     );
-    let err = fx
-        .engine
-        .write_reflection(&changed, &agent_as("sam"))
-        .await
-        .unwrap_err()
-        .to_string();
+    edited.sources = BTreeMap::from([("Team".to_string(), vec![TEAM.to_string()])]);
     assert!(
-        err.contains("shared this section's text on purpose"),
-        "{err}"
+        fx.engine
+            .reflection_disclosure_question(&edited, &agent_as("sam"))
+            .await
+            .unwrap()
+            .is_none()
     );
-    let text = std::fs::read_to_string(fx.root.join("reflections/overview.md")).unwrap();
-    assert!(!text.contains("pager rota"), "{text}");
-    // The question for the sourceless change names that text.
-    let ask = fx
-        .engine
-        .reflection_disclosure_question(&changed, &agent_as("sam"))
-        .await
-        .unwrap()
-        .expect("a change to a confirmed section is a question");
-    assert!(ask.question.contains("pager rota"), "{}", ask.question);
-    let mut yes = changed.clone();
-    yes.disclosed = Some(ask.basis);
     fx.engine
-        .write_reflection(&yes, &agent_as("sam"))
+        .write_reflection(&edited, &agent_as("sam"))
         .await
         .unwrap();
     assert!(too_wide(&fx, &agent_as("keeper")).await.is_empty());
 }
 
-/// A person's own save of a confirmed section lands, and the section is
-/// named again until somebody confirms the new text.
+/// Another person who cites the same domain on the same page confirms for
+/// themselves.
 #[tokio::test]
-async fn a_person_changing_a_confirmed_section_makes_it_unconfirmed() {
+async fn another_person_citing_the_same_domain_is_asked() {
     let (fx, _auth) = private_harbor().await;
     fx.engine
         .write_reflection(&confirmed(&fx, &agent_as("sam")).await, &agent_as("sam"))
         .await
         .unwrap();
-    let stored = std::fs::read_to_string(fx.root.join("reflections/overview.md")).unwrap();
-    let mut save = write(
-        "overview.md",
-        &stored.replace("Five people.", "Five people and a dog."),
-    );
-    save.expected_checksum = None;
-    fx.engine
-        .write_reflection(&save, &ReflectionCaller::person(user("sam"), "sam"))
-        .await
-        .unwrap();
-    let items = too_wide(&fx, &agent_as("keeper")).await;
-    assert_eq!(items.len(), 1, "{items:?}");
-    assert!(
-        items[0]["question"].as_str().unwrap().contains("a dog"),
-        "{items:?}"
-    );
-}
-
-/// Fluid confirms only the text the person saw: a basis read before the
-/// section's text moved is refused.
-#[tokio::test]
-async fn a_person_confirming_text_that_moved_is_refused() {
-    let (fx, auth) = reach().await;
-    fx.engine
-        .write_reflection(&cite(), &agent_as("keeper"))
-        .await
-        .unwrap();
-    private(&auth, "harbor", &["sam"]).await;
-    let items = too_wide(&fx, &agent_as("keeper")).await;
-    let section = items[0]["section"].as_str().unwrap().to_string();
-    let basis = items[0]["basis"].as_str().unwrap().to_string();
-    let stored = std::fs::read_to_string(fx.root.join("reflections/overview.md")).unwrap();
-    fx.engine
-        .write_reflection(
-            &write(
-                "overview.md",
-                &stored.replace("Five people.", "Six people."),
-            ),
-            &ReflectionCaller::person(user("keeper"), "keeper"),
-        )
-        .await
-        .unwrap();
+    // keeper owns harbor and may read it, and has shared nothing here.
     let err = fx
         .engine
-        .confirm_reflection_disclosure(
-            "eng",
-            "overview.md",
-            &section,
-            &basis,
-            &ReflectionCaller::person(user("sam"), "sam"),
-        )
+        .write_reflection(&cite(), &agent_as("keeper"))
         .await
         .unwrap_err()
         .to_string();
-    assert!(err.contains("changed since"), "{err}");
+    assert!(err.contains(TOO_WIDE), "{err}");
+    assert!(
+        fx.engine
+            .reflection_disclosure_question(&cite(), &agent_as("keeper"))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    fx.engine
+        .write_reflection(
+            &confirmed(&fx, &agent_as("keeper")).await,
+            &agent_as("keeper"),
+        )
+        .await
+        .unwrap();
+}
+
+/// When the page's readers widen, the same person is asked again.
+#[tokio::test]
+async fn widening_the_readers_asks_the_same_person_again() {
+    let (fx, auth) = reach().await;
+    private(&auth, "harbor", &[]).await;
+    private(&auth, "eng", &["sam"]).await;
+    fx.engine
+        .write_reflection(
+            &confirmed(&fx, &agent_as("keeper")).await,
+            &agent_as("keeper"),
+        )
+        .await
+        .unwrap();
+    assert!(
+        fx.engine
+            .reflection_disclosure_question(&cite(), &agent_as("keeper"))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    auth.upsert_domain_member("eng", "ann", MemberLevel::Editor, None, "keeper")
+        .await
+        .unwrap();
+    assert!(
+        fx.engine
+            .reflection_disclosure_question(&cite(), &agent_as("keeper"))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        fx.engine
+            .write_reflection(&cite(), &agent_as("keeper"))
+            .await
+            .is_err()
+    );
+}
+
+/// A confirmation for one source domain does not cover another.
+#[tokio::test]
+async fn a_different_source_domain_is_asked() {
+    let (fx, auth) = reach().await;
+    let vault = fx.tmp.path().join("vault");
+    std::fs::create_dir_all(vault.join("notes")).unwrap();
+    std::fs::write(
+        vault.join("MANIFEST.md"),
+        crystalline_core::manifest_template("vault", "2026-01-01"),
+    )
+    .unwrap();
+    std::fs::write(
+        vault.join("notes/code.md"),
+        crate::fixture::engram("Code", "notes/code", "- [fact] the door code"),
+    )
+    .unwrap();
+    fx.engine
+        .domain_add_local(Some("vault"), vault.to_str())
+        .await
+        .unwrap();
+    fx.engine.sync(None).await.unwrap();
+    private(&auth, "harbor", &["sam"]).await;
+    private(&auth, "vault", &["sam"]).await;
+    fx.engine
+        .write_reflection(&confirmed(&fx, &agent_as("sam")).await, &agent_as("sam"))
+        .await
+        .unwrap();
+    let mut both = cite();
+    both.sources = BTreeMap::from([(
+        "Team".to_string(),
+        vec![
+            TEAM.to_string(),
+            "crystalline://vault/notes/code".to_string(),
+        ],
+    )]);
+    let ask = fx
+        .engine
+        .reflection_disclosure_question(&both, &agent_as("sam"))
+        .await
+        .unwrap()
+        .expect("vault is not shared yet");
+    assert!(ask.question.contains("vault"), "{}", ask.question);
+    assert!(!ask.question.contains("harbor"), "{}", ask.question);
 }
 
 /// Without the confirmation the write is refused exactly as before.
@@ -538,25 +574,6 @@ async fn a_confirmation_in_the_page_file_has_no_effect() {
     .unwrap();
     fx.engine.sync(None).await.unwrap();
     assert_eq!(too_wide(&fx, &agent_as("keeper")).await.len(), 1);
-}
-
-/// A later write that sets the section's sources again without the
-/// confirmation is refused: an unattended update of a shared section would
-/// draw new text from the source that nobody agreed to share.
-#[tokio::test]
-async fn a_later_unconfirmed_write_of_the_source_is_refused() {
-    let (fx, _auth) = private_harbor().await;
-    fx.engine
-        .write_reflection(&confirmed(&fx, &agent_as("sam")).await, &agent_as("sam"))
-        .await
-        .unwrap();
-    let err = fx
-        .engine
-        .write_reflection(&cite(), &agent_as("sam"))
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains(TOO_WIDE), "{err}");
 }
 
 /// The confirmation goes with the page when it moves, and with it when it
@@ -1103,46 +1120,4 @@ async fn the_json_api_confirms_a_named_section_for_a_person() {
             .any(|i| i["what"] == "source_too_wide"),
         "{review}"
     );
-}
-
-/// Over MCP, an agent's sourceless change to a section a person shared on
-/// purpose puts the question again, showing the new text, and lands only on
-/// the person's yes.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_change_to_shared_text_is_asked_about_over_mcp() {
-    let (fx, _auth) = private_harbor().await;
-    fx.engine
-        .write_reflection(
-            &confirmed(&fx, &ReflectionCaller::owner()).await,
-            &ReflectionCaller::owner(),
-        )
-        .await
-        .unwrap();
-    let mut wire = Wire::over(McpServer::new(fx.engine.clone()));
-    let change = json!({ "name": "write_reflection", "arguments": {
-        "domain": "eng", "path": "overview.md",
-        "operation": "replace_section", "section": "## Team",
-        "content": "Five people and the pager rota.",
-    } });
-    let first = wire.call(modern(1, true, change.clone())).await;
-    assert_eq!(
-        first["result"]["resultType"],
-        json!("input_required"),
-        "{first}"
-    );
-    let message = first["result"]["inputRequests"]["confirm"]["params"]["message"]
-        .as_str()
-        .unwrap();
-    assert!(message.contains("pager rota"), "{message}");
-    let state = first["result"]["requestState"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let mut second = change;
-    second["inputResponses"] = answer("accept", json!({ "confirm": true }));
-    second["requestState"] = json!(state);
-    landed(&wire.call(modern(2, true, second)).await);
-    let text = std::fs::read_to_string(fx.root.join("reflections/overview.md")).unwrap();
-    assert!(text.contains("pager rota"), "{text}");
-    assert!(too_wide(&fx, &ReflectionCaller::owner()).await.is_empty());
 }
