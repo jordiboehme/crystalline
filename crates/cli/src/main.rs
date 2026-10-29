@@ -1509,8 +1509,9 @@ enum DomainCommand {
     /// Make a domain private, owned by one account, or share it with every
     /// account again. Private is the personal domain: only its owner, the
     /// accounts invited into it and instance admins see it at all. Sharing it
-    /// again forgets who was invited. The machine operator administers every
-    /// domain.
+    /// again forgets who was invited, except on a domain a GitHub App
+    /// governs, where the membership rows are kept. The machine operator
+    /// administers every domain.
     Visibility {
         /// The registered domain.
         domain: String,

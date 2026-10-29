@@ -59,6 +59,19 @@ fn require_registered(name: &str, config: Option<&Path>) -> Result<String> {
     bail!("no domain named '{name}' is registered; list them with `crystalline domain list`")
 }
 
+/// Whether a GitHub App decides access to the registered domain `name`: an
+/// App is configured (usable or not) and the domain has a GitHub origin,
+/// the rule the engine's governor follows.
+fn governed_by_app(name: &str, config: Option<&Path>) -> Result<bool> {
+    let loaded = crate::cmd::load(config)?;
+    let has_origin = loaded
+        .effective
+        .domains
+        .get(name)
+        .is_some_and(|entry| entry.origin.is_some());
+    Ok(has_origin && crate::cmd::github_app_decides_access(config)?)
+}
+
 /// [`require_registered`] for a Reflection grant, which only a domain kept
 /// as files takes: a virtual domain keeps no Reflection.
 fn require_kept_as_files(name: &str, config: Option<&Path>) -> Result<String> {
@@ -414,15 +427,29 @@ pub async fn visibility(
             // The owner argument is ignored on this side by the store, which
             // is why the line above refuses one rather than passing it along:
             // a caller who supplied one meant something this cannot do.
-            store.set_domain_visibility(&domain, false, "cli").await?;
+            // On a domain a GitHub App governs only the private record goes,
+            // as on the Members card: the membership rows decide nothing
+            // there and are kept for the day the App is removed.
+            let governed = governed_by_app(&domain, config.as_deref())?;
+            if governed {
+                store.take_back_governed_private(&domain).await?;
+            } else {
+                store.set_domain_visibility(&domain, false, "cli").await?;
+            }
             if json {
                 crate::print_value(
                     &serde_json::json!({
                         "domain": domain,
                         "visibility": "shared",
                         "owner": serde_json::Value::Null,
+                        "members_kept": governed,
                     }),
                     true,
+                );
+            } else if governed {
+                println!(
+                    "Domain '{domain}' is shared: everyone signed in reads it. A GitHub \
+                     App decides access here, so its membership rows are kept."
                 );
             } else {
                 println!(

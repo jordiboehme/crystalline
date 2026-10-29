@@ -622,3 +622,50 @@ fn cli_members_reflection_add_and_remove() {
         "{err}"
     );
 }
+
+/// On a domain a GitHub App governs, `domain visibility <name> default`
+/// drops only the private record, the same as the Members card: the
+/// membership rows are kept for the day the App is removed.
+#[test]
+fn cli_shared_on_a_governed_domain_keeps_its_membership_rows() {
+    let fx = Fixture::new();
+    fx.domain(&["visibility", "eng", "private", "--owner", "ada"]);
+    fx.domain(&["members", "eng", "add", "bob", "--level", "viewer"]);
+    // The domain gets a GitHub origin, and the App comes from the
+    // environment: GitHub governs it now.
+    let domain_dir = fx.home.path().join("kb");
+    std::fs::write(
+        &fx.config,
+        format!(
+            "github:\n  enabled: true\n  api_url: http://127.0.0.1:1\ndomains:\n  eng:\n    path: {}\n    origin:\n      repo: acme/kb\n",
+            domain_dir.display()
+        ),
+    )
+    .unwrap();
+    let mut cmd = bin();
+    isolate(&mut cmd, fx.home.path());
+    cmd.env(
+        "CRYSTALLINE_TEST_TOKEN_STORE_DIR",
+        fx.home.path().join("tokens"),
+    )
+    .env("CRYSTALLINE_GITHUB_APP_ID", "7")
+    .env("CRYSTALLINE_GITHUB_APP_CLIENT_ID", "Iv23.test")
+    .env(
+        "CRYSTALLINE_GITHUB_APP_PRIVATE_KEY",
+        include_str!("../../../remote/tests/fixtures/app-key-pkcs1.pem"),
+    )
+    .args(["domain", "visibility", "eng", "default", "--config"])
+    .arg(&fx.config);
+    let out = cmd.output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("kept"), "{stdout}");
+    // Closed again, the domain finds bob where he was.
+    fx.domain(&["visibility", "eng", "private", "--owner", "ada"]);
+    let listed = fx.domain(&["members", "eng", "list"]);
+    assert!(listed.contains("bob"), "{listed}");
+}
