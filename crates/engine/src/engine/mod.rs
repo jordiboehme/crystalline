@@ -1384,6 +1384,9 @@ pub struct Engine {
     // engine is served through (the engine's own and the JSON API's), so
     // they all answer from the same snapshots.
     github_governor: std::sync::OnceLock<Arc<GithubGovernor>>,
+    // Whether a background load of the App slot is running
+    // (`Engine::preload_github_app`), so a request never starts a second one.
+    app_loading: Arc<std::sync::atomic::AtomicBool>,
     // The servers this machine offers domains from (`crystalline connect`),
     // installed once by whoever serves this engine to its owner: the daemon at
     // start, a one-shot CLI command before it routes. Absent everywhere else
@@ -2538,6 +2541,7 @@ impl Engine {
             domain_access_unavailable: std::sync::OnceLock::new(),
             domain_access_absent: std::sync::OnceLock::new(),
             github_governor: std::sync::OnceLock::new(),
+            app_loading: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sources: std::sync::OnceLock::new(),
             web_origin: std::sync::OnceLock::new(),
             joins: Arc::new(crate::join::Joins::default()),

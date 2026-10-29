@@ -191,6 +191,19 @@ impl AppHome {
         origin::token_host(self.api_url.as_deref()).unwrap_or_else(|| "github.com".to_string())
     }
 
+    /// Whether an App may be saved here, from the file and the keychain
+    /// marker alone (no keychain read).
+    pub fn maybe_saved(&self) -> bool {
+        if let AppStore::File { path } = AppStore::file_fallback(&self.dir)
+            && path.exists()
+        {
+            return true;
+        }
+        !self.file_only
+            && crystalline_remote::read_marker(&self.dir)
+                .is_some_and(|marker| marker_names_host(&marker, self.api_url.as_deref()))
+    }
+
     /// One read of the App store for this home.
     pub fn lookup(&self) -> StdResult<AppLookup, RemoteError> {
         #[cfg(any(test, feature = "testing"))]
@@ -967,6 +980,64 @@ impl Engine {
         answer
     }
 
+    /// The App slot when it is settled for the effective `github.api_url`,
+    /// without ever loading it (no store read, no keychain): `None` while
+    /// it has to be looked for.
+    pub(super) fn github_app_slot_settled(&self) -> Option<AppSlot> {
+        if self.origin_provider_override.is_some() {
+            return Some(AppSlot::Absent);
+        }
+        let api_url = self.effective_api_url();
+        let now = (self.app_clock)();
+        // A load holds the write lock for as long as the store read takes:
+        // then the slot is not settled, and this does not wait for it.
+        match self.github_app.try_read() {
+            Ok(state) => state.settled(&api_url, now),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+            Err(std::sync::TryLockError::Poisoned(state)) => {
+                state.into_inner().settled(&api_url, now)
+            }
+        }
+    }
+
+    /// Whether an App may be configured, from what is cheap to read: the
+    /// environment, the keychain marker for this host and the App file. No
+    /// keychain read. Used to fail closed while the App is being loaded.
+    pub(super) fn github_app_maybe_saved(&self) -> bool {
+        let api_url = self.effective_api_url();
+        if self.overlay.github_app(api_url.as_deref()).is_some() {
+            return true;
+        }
+        let Ok(home) = self.app_home() else {
+            // No state directory to look in: assume one is saved.
+            return true;
+        };
+        home.maybe_saved()
+    }
+
+    /// Loads the App slot on a blocking thread, unless a load is running
+    /// already: the keychain read it may make never runs on a request.
+    /// Called at start (`client::install_domain_access`), after the App
+    /// changed, and by the governor when it finds the slot unsettled. A
+    /// no-op outside a tokio runtime.
+    pub fn preload_github_app(self: &Arc<Self>) {
+        use std::sync::atomic::Ordering;
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        if self.app_loading.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let engine = Arc::downgrade(self);
+        let loading = self.app_loading.clone();
+        runtime.spawn_blocking(move || {
+            if let Some(engine) = engine.upgrade() {
+                engine.github_app_slot();
+            }
+            loading.store(false, Ordering::SeqCst);
+        });
+    }
+
     /// Forgets the App and any remembered keychain failure, so the next
     /// origin operation looks for it again. Called after `set` and `remove`
     /// change the saved App, here or (through the control socket) in the CLI
@@ -975,6 +1046,10 @@ impl Engine {
         *self.github_app.write().unwrap() = AppState::new();
         // What the old App's listings said is not the new App's answer.
         self.invalidate_github_access(super::Invalidate::All);
+        // Load the new one off the request path.
+        if let Some(governor) = self.github_governor.get() {
+            governor.preload_app();
+        }
     }
 
     /// Why the keychain that holds the App (the marker says so) could not be

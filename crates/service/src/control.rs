@@ -114,6 +114,15 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                     .engine
                     .github_access_degraded()
                     .map(|since| since.to_rfc3339()),
+                // The part of that outage where the last answers still
+                // serve, and the repositories GitHub does not show to the
+                // App at all (their domains are closed).
+                "github_access_stale_since": shared
+                    .engine
+                    .github_access_stale_since()
+                    .map(|since| since.to_rfc3339()),
+                "github_access_closed": shared.engine.github_access_closed(),
+                "github_agent_identity_admin": shared.engine.github_agent_identity_is_admin().await,
             });
             match shared.engine.status_report().await {
                 Ok(report) => {

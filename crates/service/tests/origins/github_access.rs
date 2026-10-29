@@ -261,6 +261,8 @@ async fn the_daemon_status_says_since_when_github_has_not_answered() {
     let answer = status().await;
     assert_eq!(answer["ok"], json!(true), "{answer}");
     assert_eq!(answer["data"]["github_access_degraded_since"], json!(null));
+    assert_eq!(answer["data"]["github_access_closed"], json!([]));
+    assert_eq!(answer["data"]["github_agent_identity_admin"], json!(false));
     assert_eq!(eng.github_access_degraded(), None);
 
     forge
@@ -277,6 +279,10 @@ async fn the_daemon_status_says_since_when_github_has_not_answered() {
     let answer = status().await;
     assert_eq!(
         answer["data"]["github_access_degraded_since"],
+        json!(since.to_rfc3339())
+    );
+    assert_eq!(
+        answer["data"]["github_access_stale_since"],
         json!(since.to_rfc3339())
     );
 }
@@ -311,4 +317,230 @@ async fn a_web_visitor_never_acts_as_the_agent_identity() {
         );
     })
     .await;
+}
+
+/// An engine whose App store read blocks until the test sends on the
+/// returned channel, then answers a saved App; `kb` is registered with an
+/// origin straight in the configuration, and `ada` (instance editor) is in
+/// the accounts store. No forge: nothing here asks GitHub anything that has
+/// to answer.
+async fn blocked_app_engine(tmp: &Path) -> (Arc<Engine>, std::sync::mpsc::Sender<()>) {
+    use crystalline_core::config::{DomainEntry, OriginConfig};
+    let api_url = "http://127.0.0.1:9";
+    let (release, wait) = std::sync::mpsc::channel::<()>();
+    let wait = std::sync::Mutex::new(wait);
+    let lookup: crystalline_service::engine::AppLookupFn = Arc::new(move || {
+        let _ = wait.lock().unwrap().recv();
+        Ok(crystalline_remote::AppLookup {
+            store: crystalline_remote::AppStore::file_fallback(Path::new("/nonexistent")),
+            credentials: Some(crystalline_remote::AppCredentials {
+                app_id: 7,
+                client_id: "Iv23.test".to_string(),
+                client_secret: None,
+                private_key: super::github_app::PEM.to_string(),
+                webhook_secret: None,
+                slug: Some("crystalline-acme".to_string()),
+                host: "127.0.0.1:9".to_string(),
+            }),
+            keychain_failed: None,
+            marker: None,
+        })
+    });
+    let mut domains = std::collections::BTreeMap::new();
+    domains.insert(
+        "kb".to_string(),
+        DomainEntry {
+            path: Some(tmp.join("kb")),
+            origin: Some(OriginConfig {
+                repo: "acme/kb".to_string(),
+                path: None,
+                branch: None,
+                poll_secs: None,
+            }),
+            ..DomainEntry::default()
+        },
+    );
+    let cfg = GlobalConfig {
+        github: Some(GitHubConfig {
+            enabled: Some(true),
+            api_url: Some(api_url.to_string()),
+            ..GitHubConfig::default()
+        }),
+        domains: domains.into_iter().collect(),
+        ..GlobalConfig::default()
+    };
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let eng = Arc::new(
+        Engine::new(
+            Arc::new(Mutex::new(store)),
+            cfg,
+            None,
+            Some(tmp.join("config.yaml")),
+        )
+        .with_origins_dir(tmp.join("origins"))
+        .with_state_dir(tmp.to_path_buf())
+        .with_token_store_dir(tmp.join("tokens"))
+        .with_app_store_lookup(lookup),
+    );
+    let auth = Arc::new(AuthStore::open(&tmp.join("auth.db")).await.unwrap());
+    auth.add_user("ada", "Ada", None, Role::Editor, "pw12345678")
+        .await
+        .unwrap();
+    eng.set_domain_access(Arc::new(
+        DomainAccess::new(auth).with_governor(eng.knowledge_governor()),
+    ));
+    (eng, release)
+}
+
+/// Waits (for real, up to five seconds) until `kb` is governed.
+async fn until_governed(eng: &Engine) {
+    for _ in 0..500 {
+        if eng.github_governs("kb") {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("the App never loaded");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_never_waits_for_the_app_to_load() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (eng, release) = blocked_app_engine(tmp.path()).await;
+    let ada = Scope::User {
+        account: "ada".to_string(),
+        admin: false,
+    };
+    // The App store read hangs; the request is answered anyway, as on an
+    // instance without an App, since nothing cheap says one is saved.
+    let right = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        eng.domain_right(&ada, "kb"),
+    )
+    .await
+    .expect("answered while the App loads")
+    .unwrap();
+    assert_eq!(right, DomainRight::Write);
+    assert!(!eng.github_governs("kb"));
+    release.send(()).unwrap();
+    until_governed(&eng).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn while_a_saved_app_loads_its_domains_are_closed() {
+    let tmp = tempfile::tempdir().unwrap();
+    // The App file says an App is saved here.
+    std::fs::create_dir_all(tmp.path().join("tokens")).unwrap();
+    let crystalline_remote::AppStore::File { path } =
+        crystalline_remote::AppStore::file_fallback(&tmp.path().join("tokens"))
+    else {
+        unreachable!()
+    };
+    std::fs::write(path, "{}").unwrap();
+    let (eng, release) = blocked_app_engine(tmp.path()).await;
+    let ada = Scope::User {
+        account: "ada".to_string(),
+        admin: false,
+    };
+    // Governed with no access: an instance editor reads the shared domain
+    // and writes nothing until GitHub says otherwise.
+    let right = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        eng.domain_right(&ada, "kb"),
+    )
+    .await
+    .expect("answered while the App loads")
+    .unwrap();
+    assert!(eng.github_governs("kb"));
+    assert_eq!(right, DomainRight::Read);
+    release.send(()).unwrap();
+}
+
+/// An instance admin named as `github.agent_identity` gives the open tier
+/// its GitHub role on a governed domain and nothing more.
+#[tokio::test]
+async fn an_admin_agent_identity_gets_only_its_github_role() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (forge, eng, auth) = setup(tmp.path(), Some("root")).await;
+    let host = eng.github_app().unwrap().credentials().host.clone();
+    auth.add_user("root", "Root", None, Role::Admin, "pw12345678")
+        .await
+        .unwrap();
+    auth.link_github("root", &host, 777, "root-gh")
+        .await
+        .unwrap();
+    collaborators(&forge, "acme/kb", &[(777, "root-gh", "read")]);
+    let open_tier = Scope::Anonymous;
+    as_mcp_call(async {
+        assert_eq!(
+            eng.domain_right(&open_tier, "kb").await.unwrap(),
+            DomainRight::Read
+        );
+        assert_eq!(
+            eng.write_access_block(&open_tier, "kb").await.unwrap(),
+            Some(WriteBlock::Role)
+        );
+        // Private, and no GitHub read: hidden, admin or not.
+        auth.set_domain_visibility("kb", true, "ada").await.unwrap();
+        collaborators(&forge, "acme/kb", &[]);
+        eng.invalidate_github_access(crystalline_service::engine::Invalidate::All);
+        assert!(eng.hidden_for(&open_tier).await.unwrap().contains("kb"));
+        assert_eq!(
+            eng.domain_right(&open_tier, "kb").await.unwrap(),
+            DomainRight::None
+        );
+    })
+    .await;
+    assert!(eng.github_agent_identity_is_admin().await);
+}
+
+/// The open tier comments on a governed domain's threads only as the
+/// agent identity, and only inside an MCP request; elsewhere it keeps
+/// commenting wherever it reads.
+#[tokio::test]
+async fn the_open_tier_comments_on_a_governed_domain_only_as_its_agent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let caller = ReflectionCaller::agent(Scope::Anonymous, "agent", true);
+    let (_forge, eng, _auth) = setup(tmp.path(), None).await;
+    as_mcp_call(async {
+        assert!(!eng.open_tier_may_comment(&caller, "kb"));
+        assert!(eng.open_tier_may_comment(&caller, "plain"));
+    })
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let (_forge, eng, _auth) = setup(tmp.path(), Some("agent")).await;
+    assert!(!eng.open_tier_may_comment(&caller, "kb"), "outside MCP");
+    as_mcp_call(async {
+        assert!(eng.open_tier_may_comment(&caller, "kb"));
+    })
+    .await;
+}
+
+/// Through the MCP server itself: a tool call over an HTTP server with no
+/// signed-in identity is the open tier, and the server runs it as an MCP
+/// request, so it sees the private governed domain its agent identity
+/// reads on GitHub.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tool_call_runs_as_an_mcp_request() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (forge, eng, auth) = setup(tmp.path(), Some("agent")).await;
+    collaborators(&forge, "acme/kb", &[(AGENT_ID, "agent-gh", "read")]);
+    auth.set_domain_visibility("kb", true, "ada").await.unwrap();
+    // Outside an MCP request the anonymous caller does not see it.
+    assert!(
+        eng.hidden_for(&Scope::Anonymous)
+            .await
+            .unwrap()
+            .contains("kb")
+    );
+
+    let server = crystalline_service::mcp::McpServer::new_http(eng.clone());
+    let (client_io, server_io) = tokio::io::duplex(1 << 18);
+    let server_task = tokio::spawn(async move { rmcp::serve_server(server, server_io).await });
+    let client = rmcp::serve_client((), client_io).await.unwrap();
+    let _server = server_task.await.unwrap().unwrap();
+    let mut params = rmcp::model::CallToolRequestParams::new("list_domains".to_string());
+    params = params.with_arguments(serde_json::Map::new());
+    let answer = serde_json::to_string(&client.peer().call_tool(params).await.unwrap()).unwrap();
+    assert!(answer.contains("kb"), "{answer}");
 }

@@ -1662,6 +1662,9 @@ pub use crystalline_engine::machine_rename_owner;
 pub(crate) async fn install_domain_access(
     engine: &Arc<Engine>,
 ) -> Option<Arc<crate::rest::AuthStore>> {
+    // Who reads a domain connected through the GitHub App follows GitHub,
+    // and the App is loaded off the request path, starting now.
+    engine.preload_github_app();
     let opened = match crystalline_core::config::web_auth_db_path() {
         // No store yet: no account and no private domain exist, so nothing
         // is opened (or created, which would change this machine's state

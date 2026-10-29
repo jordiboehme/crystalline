@@ -66,6 +66,11 @@ pub const STALE_FOR: Duration = Duration::from_secs(60 * 60);
 /// lookup gave: the stale snapshot inside the window, else no access.
 pub const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(30);
 
+/// How long one lookup (the collaborator listing and the visibility) may
+/// take. One that takes longer is a failure to learn, like GitHub being
+/// down.
+pub const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// The level a GitHub repository role gives on a governed domain: admin and
 /// maintain manage, write edits, triage and read view, no access is none.
 /// The one home of this table.
@@ -118,6 +123,8 @@ pub(crate) trait GithubSource: Send + Sync {
     async fn repository_public(&self, repo: &str) -> Result<bool, RemoteError>;
     /// The installation that covers `repo`, see [`GithubApp::installation_for`].
     async fn installation_for(&self, repo: &str) -> Result<u64, RemoteError>;
+    /// Forget which installation covers `repo`, see [`GithubApp::evict_repo`].
+    fn evict_repo(&self, repo: &str);
 }
 
 #[async_trait]
@@ -132,6 +139,10 @@ impl GithubSource for GithubApp {
 
     async fn installation_for(&self, repo: &str) -> Result<u64, RemoteError> {
         GithubApp::installation_for(self, repo).await
+    }
+
+    fn evict_repo(&self, repo: &str) {
+        GithubApp::evict_repo(self, repo);
     }
 }
 
@@ -209,6 +220,30 @@ struct State {
     /// Repositories whose last lookup failed: when the failures began, and
     /// when the last one was.
     failing: HashMap<String, Failing>,
+    /// Bumped by every invalidation of one repository.
+    generations: HashMap<String, u64>,
+    /// Bumped by every invalidation of more than one repository.
+    global: u64,
+}
+
+impl State {
+    /// The invalidations `key` has seen so far. A lookup takes this before
+    /// it asks GitHub and stores its answer only when it is unchanged after,
+    /// so an invalidation that lands while GitHub is asked is never undone
+    /// by the answer to the question before it.
+    fn generation(&self, key: &str) -> Generation {
+        Generation {
+            repo: self.generations.get(key).copied().unwrap_or_default(),
+            global: self.global,
+        }
+    }
+}
+
+/// See [`State::generation`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Generation {
+    repo: u64,
+    global: u64,
 }
 
 /// An ongoing failure to learn about one repository.
@@ -216,8 +251,37 @@ struct State {
 struct Failing {
     /// The first failure since the last good lookup, as wall time.
     since: DateTime<Utc>,
-    /// The last failed lookup, for [`RETRY_AFTER_FAILURE`].
-    last: Instant,
+    /// When the last failed lookup failed, for [`RETRY_AFTER_FAILURE`];
+    /// `None` once an invalidation asks for a new lookup at once.
+    last: Option<Instant>,
+    /// Whether the last failure was [`Outcome::Gone`]: no stale answer is
+    /// served, the domain is closed.
+    gone: bool,
+}
+
+/// Why one lookup gave no snapshot.
+#[derive(Debug)]
+enum FetchError {
+    /// What GitHub (or the App client) answered.
+    Remote(RemoteError),
+    /// No answer within [`FETCH_TIMEOUT`].
+    TimedOut,
+}
+
+impl std::fmt::Display for FetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FetchError::Remote(RemoteError::AuthExpired) => {
+                f.write_str("GitHub refused the App's installation token twice")
+            }
+            FetchError::Remote(e) => e.fmt(f),
+            FetchError::TimedOut => write!(
+                f,
+                "GitHub did not answer within {} seconds",
+                FETCH_TIMEOUT.as_secs()
+            ),
+        }
+    }
 }
 
 /// What one failed lookup means, decided by [`Outcome::of`].
@@ -330,6 +394,38 @@ impl GithubGovernor {
     /// repository's last lookup worked. Only repositories still connected to
     /// a domain count.
     pub fn degraded_since(&self) -> Option<DateTime<Utc>> {
+        self.connected_failures()
+            .into_iter()
+            .map(|(_, failing)| failing.since)
+            .min()
+    }
+
+    /// Since when a repository's lookups have been failing while its last
+    /// answer may still serve (GitHub down, a rate limit and the like), or
+    /// `None`.
+    pub fn stale_since(&self) -> Option<DateTime<Utc>> {
+        self.connected_failures()
+            .into_iter()
+            .filter(|(_, failing)| !failing.gone)
+            .map(|(_, failing)| failing.since)
+            .min()
+    }
+
+    /// The repositories GitHub does not show to the App right now, sorted:
+    /// their domains are closed to everybody until it does.
+    pub fn closed_repositories(&self) -> Vec<String> {
+        let mut closed: Vec<String> = self
+            .connected_failures()
+            .into_iter()
+            .filter(|(_, failing)| failing.gone)
+            .map(|(repo, _)| repo)
+            .collect();
+        closed.sort();
+        closed
+    }
+
+    /// The failures of repositories still connected to a domain.
+    fn connected_failures(&self) -> Vec<(String, Failing)> {
         let connected: HashSet<String> = self
             .env
             .origins()
@@ -340,23 +436,50 @@ impl GithubGovernor {
             .failing
             .iter()
             .filter(|(repo, _)| connected.contains(*repo))
-            .map(|(_, failing)| failing.since)
-            .min()
+            .map(|(repo, failing)| (repo.clone(), *failing))
+            .collect()
+    }
+
+    /// Asks for the App once, so an unsettled slot starts loading in the
+    /// background now rather than on the next request.
+    pub fn preload_app(&self) {
+        let _ = self.env.app();
     }
 
     /// Forget what `what` names, the stale fallback included.
+    ///
+    /// A lookup in flight when this lands answers its own question but is
+    /// not stored, and the pause after a failed lookup ends, so
+    /// the next question asks GitHub at once. `All` also forgets every
+    /// failure, so nothing is reported degraded until a lookup fails again.
     pub fn invalidate(&self, what: Invalidate) {
         let mut state = lock(&self.state);
         match what {
             Invalidate::Repo(repo) => {
                 let key = repo_key(&repo);
+                *state.generations.entry(key.clone()).or_default() += 1;
                 state.entries.remove(&key);
                 state.not_installed.remove(&key);
+                if let Some(failing) = state.failing.get_mut(&key) {
+                    failing.last = None;
+                }
             }
-            Invalidate::User(_) => state.entries.clear(),
-            Invalidate::Installation(_) | Invalidate::All => {
+            Invalidate::User(_) => {
+                state.global += 1;
+                state.entries.clear();
+                state.failing.values_mut().for_each(|f| f.last = None);
+            }
+            Invalidate::Installation(_) => {
+                state.global += 1;
                 state.entries.clear();
                 state.not_installed.clear();
+                state.failing.values_mut().for_each(|f| f.last = None);
+            }
+            Invalidate::All => {
+                state.global += 1;
+                state.entries.clear();
+                state.not_installed.clear();
+                state.failing.clear();
             }
         }
     }
@@ -416,41 +539,62 @@ impl GithubGovernor {
 
     /// The snapshot to answer from for `repo`: the fresh one, else a new
     /// lookup, else the stale one inside the window, else `None`.
+    ///
+    /// One lookup per repository at a time. A caller that finds one in
+    /// flight answers from a snapshot inside the window when there is one,
+    /// and waits for the lookup only when there is none.
     async fn snapshot(&self, source: &dyn GithubSource, repo: &str) -> Option<Arc<Snapshot>> {
         let key = repo_key(repo);
         if let Some(snapshot) = self.fresh(&key, Instant::now()) {
             return Some(snapshot);
         }
         let gate = lock(&self.fetching).entry(key.clone()).or_default().clone();
-        let _held = gate.lock().await;
+        let _held = match gate.clone().try_lock_owned() {
+            Ok(held) => held,
+            Err(_) => {
+                if let Some(snapshot) = Self::stale(&mut lock(&self.state), &key, Instant::now()) {
+                    return Some(snapshot);
+                }
+                gate.lock_owned().await
+            }
+        };
         // Another caller may have looked it up while this one waited.
-        let now = Instant::now();
-        if let Some(snapshot) = self.fresh(&key, now) {
+        let started = Instant::now();
+        if let Some(snapshot) = self.fresh(&key, started) {
             return Some(snapshot);
         }
-        {
+        let generation = {
             let mut state = lock(&self.state);
             if state.not_installed.contains_key(&key) {
                 return None;
             }
-            if let Some(failing) = state.failing.get(&key).copied()
-                && now < failing.last + RETRY_AFTER_FAILURE
+            if let Some(Failing {
+                last: Some(last), ..
+            }) = state.failing.get(&key).copied()
+                && started < last + RETRY_AFTER_FAILURE
             {
-                return Self::stale(&mut state, &key, now);
+                return Self::stale(&mut state, &key, started);
             }
-        }
-        match fetch(source, repo).await {
+            state.generation(&key)
+        };
+        let result = match tokio::time::timeout(FETCH_TIMEOUT, fetch(source, repo)).await {
+            Ok(result) => result.map_err(FetchError::Remote),
+            Err(_) => Err(FetchError::TimedOut),
+        };
+        match result {
             Ok(snapshot) => {
                 let snapshot = Arc::new(snapshot);
                 {
                     let mut state = lock(&self.state);
-                    state.entries.insert(
-                        key.clone(),
-                        Entry {
-                            snapshot: snapshot.clone(),
-                            fetched_at: now,
-                        },
-                    );
+                    if state.generation(&key) == generation {
+                        state.entries.insert(
+                            key.clone(),
+                            Entry {
+                                snapshot: snapshot.clone(),
+                                fetched_at: started,
+                            },
+                        );
+                    }
                     if state.failing.remove(&key).is_some() {
                         tracing::info!("GitHub answers again who may use {repo}");
                     }
@@ -458,53 +602,66 @@ impl GithubGovernor {
                 self.refresh_logins(&snapshot).await;
                 Some(snapshot)
             }
-            Err(error) => self.failed(repo, &key, &error, now),
+            // The failure is timed when it happened, not when it was asked.
+            Err(error) => self.failed(source, repo, &key, &error, Instant::now(), generation),
         }
     }
 
-    /// Records a failed lookup of `repo` and answers what is left.
+    /// Records a failed lookup of `repo` and answers what is left. An
+    /// invalidation since `generation` means the failure is about a
+    /// question nobody asks any more: it is answered but not recorded.
     fn failed(
         &self,
+        source: &dyn GithubSource,
         repo: &str,
         key: &str,
-        error: &RemoteError,
+        error: &FetchError,
         now: Instant,
+        generation: Generation,
     ) -> Option<Arc<Snapshot>> {
+        let outcome = match error {
+            FetchError::Remote(e) => Outcome::of(e),
+            FetchError::TimedOut => Outcome::Failed,
+        };
         let mut state = lock(&self.state);
-        match Outcome::of(error) {
+        let current = state.generation(key) == generation;
+        match outcome {
             Outcome::NotInstalled => {
                 tracing::info!(
                     "the GitHub App is not installed on {repo}, so its domain's access is decided by Crystalline alone"
                 );
-                state.entries.remove(key);
-                state.failing.remove(key);
-                state.not_installed.insert(key.to_string(), now);
+                if current {
+                    state.entries.remove(key);
+                    state.failing.remove(key);
+                    state.not_installed.insert(key.to_string(), now);
+                }
                 None
             }
             Outcome::Gone => {
                 tracing::warn!(
                     "GitHub does not show {repo} to the App ({error}), so nobody may use its domain until it does"
                 );
-                state.entries.remove(key);
-                Self::mark_failing(&mut state, key, now);
+                // Look the installation up again next time, as a restart
+                // would.
+                source.evict_repo(repo);
+                if current {
+                    state.entries.remove(key);
+                    Self::mark_failing(&mut state, key, now, true);
+                }
                 None
             }
             Outcome::Failed => {
-                Self::mark_failing(&mut state, key, now);
+                if current {
+                    Self::mark_failing(&mut state, key, now, false);
+                }
                 let stale = Self::stale(&mut state, key, now);
-                let what = match error {
-                    RemoteError::AuthExpired => {
-                        "GitHub refused the App's installation token twice".to_string()
-                    }
-                    other => other.to_string(),
-                };
                 if stale.is_some() {
                     tracing::warn!(
-                        "GitHub could not say who may use {repo} ({what}); the last answer stands for up to an hour"
+                        "GitHub could not say who may use {repo} ({error}); the last answer stands for up to an hour"
                     );
                 } else {
                     tracing::warn!(
-                        "GitHub could not say who may use {repo} ({what}), and no recent answer is known, so nobody may use its domain until it can"
+                        "GitHub could not say who may use {repo} ({error}), and no recent answer is known, so nobody may use its domain until it can"
                     );
                 }
                 stale
@@ -512,14 +669,19 @@ impl GithubGovernor {
         }
     }
 
-    fn mark_failing(state: &mut State, key: &str, now: Instant) {
+    fn mark_failing(state: &mut State, key: &str, now: Instant, gone: bool) {
         let since = state
             .failing
             .get(key)
             .map_or_else(Utc::now, |failing| failing.since);
-        state
-            .failing
-            .insert(key.to_string(), Failing { since, last: now });
+        state.failing.insert(
+            key.to_string(),
+            Failing {
+                since,
+                last: Some(now),
+                gone,
+            },
+        );
     }
 
     /// Stores the login the listing shows for each linked id whose stored
@@ -568,16 +730,22 @@ impl GithubGovernor {
             return;
         };
         let now = Instant::now();
-        let due: Vec<String> = {
+        let due: Vec<(String, Generation)> = {
             let mut state = lock(&self.state);
-            let due: Vec<String> = state
+            let due: Vec<(String, Generation)> = state
                 .not_installed
                 .iter()
                 .filter(|(_, at)| now >= **at + FRESH_FOR)
                 .map(|(repo, _)| repo.clone())
                 .filter(|repo| !state.rechecking.contains(repo))
+                .map(|repo| {
+                    let generation = state.generation(&repo);
+                    (repo, generation)
+                })
                 .collect();
-            state.rechecking.extend(due.iter().cloned());
+            state
+                .rechecking
+                .extend(due.iter().map(|(repo, _)| repo.clone()));
             due
         };
         if due.is_empty() {
@@ -591,13 +759,22 @@ impl GithubGovernor {
                 GovernorApp::Ready { source, .. } => Some(source),
                 GovernorApp::Absent | GovernorApp::Unusable => None,
             };
-            for repo in due {
+            for (repo, generation) in due {
                 let answer = match &source {
-                    Some(source) => Some(source.installation_for(&repo).await),
+                    Some(source) => {
+                        tokio::time::timeout(FETCH_TIMEOUT, source.installation_for(&repo))
+                            .await
+                            .ok()
+                    }
                     None => None,
                 };
                 let mut state = lock(&me.state);
                 state.rechecking.remove(&repo);
+                // An invalidation since the question was asked already
+                // decided what is known about this repository.
+                if state.generation(&repo) != generation {
+                    continue;
+                }
                 match answer {
                     Some(Ok(_)) => {
                         tracing::info!(
@@ -758,7 +935,18 @@ impl GovernorEnv for EngineEnv {
         let Some(engine) = self.engine.upgrade() else {
             return GovernorApp::Unusable;
         };
-        match engine.github_app_slot() {
+        // Never a store or keychain read on a request: an unsettled slot is
+        // loaded in the background, and until it lands an App that may be
+        // saved governs with no access for anybody.
+        let Some(slot) = engine.github_app_slot_settled() else {
+            engine.preload_github_app();
+            return if engine.github_app_maybe_saved() {
+                GovernorApp::Unusable
+            } else {
+                GovernorApp::Absent
+            };
+        };
+        match slot {
             super::github_app::AppSlot::Absent => GovernorApp::Absent,
             super::github_app::AppSlot::Ready(router) => GovernorApp::Ready {
                 host: router.app().credentials().host.clone(),
@@ -872,12 +1060,24 @@ impl super::Engine {
     /// and for every other anonymous caller, it stays anonymous there.
     pub fn scope_on(&self, scope: &Scope, domain: &str) -> Scope {
         match self.open_tier_agent(scope) {
-            Some(account) if self.github_governs(domain) => Scope::User {
-                account,
-                admin: false,
-            },
+            Some(account) if self.github_governs(domain) => Scope::Agent { account },
             _ => scope.clone(),
         }
+    }
+
+    /// Whether `caller` may open or answer a thread on `domain` when it
+    /// holds `Read`: [`crate::scope::ReflectionCaller::may_comment`], except
+    /// the open tier on a domain GitHub governs, which comments only when it
+    /// acts there as `github.agent_identity` ([`Self::scope_on`]).
+    pub fn open_tier_may_comment(
+        &self,
+        caller: &crate::scope::ReflectionCaller,
+        domain: &str,
+    ) -> bool {
+        if caller.open_tier && self.github_governs(domain) {
+            return matches!(self.scope_on(&caller.scope, domain), Scope::Agent { .. });
+        }
+        caller.may_comment()
     }
 
     /// What `scope` sees across every domain: [`DomainAccess::visibility`],
@@ -892,6 +1092,38 @@ impl super::Engine {
             Some(agent) => access.open_tier_visibility(&agent).await,
             None => access.visibility(scope).await,
         }
+    }
+
+    /// Since when a connected repository's lookups have been failing while
+    /// its last answer may still serve (see [`GithubGovernor::stale_since`]).
+    pub fn github_access_stale_since(&self) -> Option<DateTime<Utc>> {
+        self.github_governor.get()?.stale_since()
+    }
+
+    /// The connected repositories GitHub does not show to the App, whose
+    /// domains are closed (see [`GithubGovernor::closed_repositories`]).
+    pub fn github_access_closed(&self) -> Vec<String> {
+        self.github_governor
+            .get()
+            .map(|governor| governor.closed_repositories())
+            .unwrap_or_default()
+    }
+
+    /// Whether `github.agent_identity` names an instance admin. The open
+    /// tier never acts with admin rights (it is clamped to editor), but the
+    /// setting is a mistake worth saying out loud. `false` without a
+    /// resolver or when the store cannot be read.
+    pub async fn github_agent_identity_is_admin(&self) -> bool {
+        let agent = self
+            .config
+            .read()
+            .unwrap()
+            .github_agent_identity()
+            .map(str::to_string);
+        let (Some(agent), Some(access)) = (agent, self.domain_access.get()) else {
+            return false;
+        };
+        access.account_is_admin(&agent).await.unwrap_or(false)
     }
 
     /// Forget what the governor learned about `what`, when it has learned
@@ -930,6 +1162,14 @@ mod tests {
         repos: Mutex<HashMap<String, FakeRepo>>,
         listings: AtomicUsize,
         installation_lookups: AtomicUsize,
+        evictions: AtomicUsize,
+        /// While set, every call works out its answer and then waits here
+        /// before it gives it: GitHub answered, the answer is on its way.
+        gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
+        /// How many calls are waiting at the gate.
+        parked: AtomicUsize,
+        /// While set, every listing takes this long before it answers.
+        delay: Mutex<Option<Duration>>,
     }
 
     impl FakeGithub {
@@ -952,6 +1192,33 @@ mod tests {
             self.listings.load(Ordering::SeqCst)
         }
 
+        /// Holds every call at a gate from now on; returns the gate.
+        fn park(&self) -> Arc<tokio::sync::Notify> {
+            let gate = Arc::new(tokio::sync::Notify::new());
+            *lock(&self.gate) = Some(gate.clone());
+            gate
+        }
+
+        /// Waits (without letting the paused clock run) until `n` calls
+        /// wait at the gate.
+        async fn parked(&self, n: usize) {
+            while self.parked.load(Ordering::SeqCst) < n {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        async fn wait_at_gate(&self) {
+            let gate = lock(&self.gate).clone();
+            if let Some(gate) = gate {
+                self.parked.fetch_add(1, Ordering::SeqCst);
+                gate.notified().await;
+            }
+            let delay = *lock(&self.delay);
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
+        }
+
         fn refusal(&self, repo: &str) -> Option<RemoteError> {
             let repos = lock(&self.repos);
             let r = repos.get(&repo_key(repo))?;
@@ -969,13 +1236,15 @@ mod tests {
     impl GithubSource for FakeGithub {
         async fn collaborators(&self, repo: &str) -> Result<Vec<Collaborator>, RemoteError> {
             self.listings.fetch_add(1, Ordering::SeqCst);
-            if let Some(e) = self.refusal(repo) {
-                return Err(e);
-            }
-            Ok(lock(&self.repos)
-                .get(&repo_key(repo))
-                .map(|r| r.people.clone())
-                .unwrap_or_default())
+            let answer = match self.refusal(repo) {
+                Some(e) => Err(e),
+                None => Ok(lock(&self.repos)
+                    .get(&repo_key(repo))
+                    .map(|r| r.people.clone())
+                    .unwrap_or_default()),
+            };
+            self.wait_at_gate().await;
+            answer
         }
 
         async fn repository_public(&self, repo: &str) -> Result<bool, RemoteError> {
@@ -989,10 +1258,16 @@ mod tests {
 
         async fn installation_for(&self, repo: &str) -> Result<u64, RemoteError> {
             self.installation_lookups.fetch_add(1, Ordering::SeqCst);
-            match self.refusal(repo) {
+            let answer = match self.refusal(repo) {
                 Some(e) => Err(e),
                 None => Ok(7),
-            }
+            };
+            self.wait_at_gate().await;
+            answer
+        }
+
+        fn evict_repo(&self, _repo: &str) {
+            self.evictions.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -1433,5 +1708,143 @@ mod tests {
         assert_eq!(rig.knowledge("alice").await, level(MemberLevel::Editor));
         let link = rig.auth.github_link_of("alice").await.unwrap().unwrap();
         assert_eq!(link.login, "alice-renamed");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_invalidation_during_a_lookup_is_not_undone_by_its_answer() {
+        let rig = rig().await;
+        rig.github.grant(REPO, 1, "alice-gh", RepoRole::Write);
+        assert_eq!(rig.knowledge("alice").await, level(MemberLevel::Editor));
+        tokio::time::advance(6 * MIN).await;
+        // GitHub answers "write" and the answer is on its way ...
+        let gate = rig.github.park();
+        let governor = rig.governor.clone();
+        let asking = tokio::spawn(async move { governor.knowledge("alice", DOMAIN).await });
+        rig.github.parked(1).await;
+        // ... when a webhook says alice was removed.
+        rig.github.with(REPO, |r| r.people.clear());
+        rig.governor.invalidate(Invalidate::Repo(REPO.to_string()));
+        *lock(&rig.github.gate) = None;
+        gate.notify_one();
+        // The answer in flight serves the question it was asked for ...
+        assert_eq!(asking.await.unwrap(), level(MemberLevel::Editor));
+        // ... and is not kept: the next question asks GitHub again.
+        assert_eq!(rig.knowledge("alice").await, level(MemberLevel::None));
+        assert_eq!(rig.github.listings(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_invalidation_during_an_installation_recheck_is_not_undone() {
+        let rig = rig().await;
+        rig.github.with(REPO, |r| r.not_installed = true);
+        rig.knowledge("alice").await;
+        assert!(!rig.governor.governed_domains().contains(DOMAIN));
+        tokio::time::advance(FRESH_FOR).await;
+        // The re-check asks while the App is still not installed ...
+        let gate = rig.github.park();
+        rig.governor.governed_domains();
+        rig.github.parked(1).await;
+        // ... and the installation webhook lands before its answer.
+        rig.github.with(REPO, |r| r.not_installed = false);
+        rig.governor.invalidate(Invalidate::Installation(7));
+        *lock(&rig.github.gate) = None;
+        gate.notify_one();
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(rig.governor.governed_domains().contains(DOMAIN));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_caller_answers_from_a_recent_snapshot_while_a_lookup_is_in_flight() {
+        let rig = rig().await;
+        rig.github.grant(REPO, 1, "alice-gh", RepoRole::Write);
+        assert_eq!(rig.knowledge("alice").await, level(MemberLevel::Editor));
+        tokio::time::advance(6 * MIN).await;
+        let gate = rig.github.park();
+        let governor = rig.governor.clone();
+        let asking = tokio::spawn(async move { governor.knowledge("alice", DOMAIN).await });
+        rig.github.parked(1).await;
+        let before = Instant::now();
+        let answer = tokio::time::timeout(Duration::from_secs(1), rig.knowledge("alice"))
+            .await
+            .expect("answered without waiting for the lookup");
+        assert_eq!(answer, level(MemberLevel::Editor));
+        assert_eq!(Instant::now(), before);
+        *lock(&rig.github.gate) = None;
+        gate.notify_one();
+        asking.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lookup_that_takes_too_long_is_a_failure() {
+        let rig = rig().await;
+        rig.github.grant(REPO, 1, "alice-gh", RepoRole::Write);
+        assert_eq!(rig.knowledge("alice").await, level(MemberLevel::Editor));
+        tokio::time::advance(6 * MIN).await;
+        // GitHub never answers: the last answer stands, and it is degraded.
+        let _gate = rig.github.park();
+        let before = Instant::now();
+        assert_eq!(rig.knowledge("alice").await, level(MemberLevel::Editor));
+        assert_eq!(Instant::now() - before, FETCH_TIMEOUT);
+        assert!(rig.governor.degraded_since().is_some());
+        // With nothing known it is no access.
+        let rig = self::rig().await;
+        let _gate = rig.github.park();
+        assert_eq!(rig.knowledge("alice").await, level(MemberLevel::None));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_pause_after_a_failure_counts_from_when_it_failed() {
+        let rig = rig().await;
+        rig.github
+            .with(REPO, |r| r.down = Some(|| RemoteError::Offline));
+        *lock(&rig.github.delay) = Some(Duration::from_secs(8));
+        rig.knowledge("alice").await;
+        // Failed at 8 s. At 33 s the pause (30 s from the failure) holds.
+        tokio::time::advance(Duration::from_secs(25)).await;
+        rig.knowledge("alice").await;
+        assert_eq!(rig.github.listings(), 1);
+        tokio::time::advance(Duration::from_secs(6)).await;
+        rig.knowledge("alice").await;
+        assert_eq!(rig.github.listings(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_invalidation_ends_the_pause_after_a_failure() {
+        let rig = rig().await;
+        rig.github
+            .with(REPO, |r| r.down = Some(|| RemoteError::Offline));
+        rig.knowledge("alice").await;
+        rig.governor.invalidate(Invalidate::Repo(REPO.to_string()));
+        rig.knowledge("alice").await;
+        assert_eq!(rig.github.listings(), 2);
+        // Still degraded: the second lookup failed too.
+        assert!(rig.governor.degraded_since().is_some());
+        // `All` forgets the outage until a lookup fails again.
+        rig.governor.invalidate(Invalidate::All);
+        assert_eq!(rig.governor.degraded_since(), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_gone_repository_is_closed_and_its_installation_looked_up_again() {
+        let rig = rig().await;
+        rig.github.with(REPO, |r| {
+            r.down = Some(|| RemoteError::RepoNotFound {
+                repo: REPO.to_string(),
+            })
+        });
+        assert_eq!(rig.knowledge("alice").await, level(MemberLevel::None));
+        assert_eq!(rig.github.evictions.load(Ordering::SeqCst), 1);
+        assert_eq!(rig.governor.closed_repositories(), vec![REPO.to_string()]);
+        assert_eq!(rig.governor.stale_since(), None);
+        assert!(rig.governor.degraded_since().is_some());
+        // An outage is not a closed repository.
+        rig.github
+            .with(REPO, |r| r.down = Some(|| RemoteError::Offline));
+        tokio::time::advance(MIN).await;
+        rig.knowledge("alice").await;
+        assert!(rig.governor.closed_repositories().is_empty());
+        assert!(rig.governor.stale_since().is_some());
     }
 }

@@ -30,8 +30,15 @@ const PLAIN_WORDS: &str = "thread text is read by people who may not see engrams
 /// Reading and commenting are one level, with one exception that comes from
 /// being anonymous, not from a level: the anonymous visitor of a public
 /// domain reads threads and never writes one.
-fn refuse_anonymous_comment(caller: &ReflectionCaller) -> Result<()> {
-    if caller.may_comment() {
+///
+/// On a domain GitHub governs the open tier comments only as the account
+/// `github.agent_identity` names ([`Engine::open_tier_may_comment`](super::Engine::open_tier_may_comment)).
+fn refuse_anonymous_comment(
+    engine: &Engine,
+    domain: &str,
+    caller: &ReflectionCaller,
+) -> Result<()> {
+    if engine.open_tier_may_comment(caller, domain) {
         return Ok(());
     }
     Err(EngineError::Forbidden(
@@ -207,7 +214,7 @@ impl Engine {
         let access = self.target_access(domain, target, caller, need).await?;
         self.refuse_read_only_domain(domain, &crate::scope::Scope::Unrestricted)
             .await?;
-        refuse_anonymous_comment(caller)?;
+        refuse_anonymous_comment(self, domain, caller)?;
         let key = p.section.as_deref().ok_or_else(|| {
             EngineError::Invalid("open needs `section`, an id or a heading".into())
         })?;
@@ -401,7 +408,7 @@ impl Engine {
             .await?;
         self.refuse_read_only_domain(domain, &crate::scope::Scope::Unrestricted)
             .await?;
-        refuse_anonymous_comment(caller)?;
+        refuse_anonymous_comment(self, domain, caller)?;
         let text = text.trim();
         if kind == EntryKind::Comment && text.is_empty() {
             return Err(EngineError::Invalid("answer needs `text`".into()));

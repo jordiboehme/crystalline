@@ -119,7 +119,7 @@ pub(crate) fn confirmer(caller: &ReflectionCaller) -> Option<String> {
     match &caller.scope {
         Scope::User { account, .. } => Some(account.clone()),
         Scope::Unrestricted => Some(crate::scope::OWNER_IDENTITY_NAME.to_string()),
-        Scope::Anonymous => None,
+        Scope::Anonymous | Scope::Agent { .. } => None,
     }
 }
 

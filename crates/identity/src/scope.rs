@@ -77,6 +77,16 @@ pub enum Scope {
     /// Nobody in particular: the `auth.anonymous` viewer tier, and an HTTP MCP
     /// session on an instance that has MCP authentication switched off.
     Anonymous,
+    /// The MCP open tier acting as the account `github.agent_identity`
+    /// names, on a domain GitHub governs. Never resolved at an edge: the
+    /// engine puts it in place of [`Scope::Anonymous`] for one question
+    /// about one governed domain. It is that account with an instance role
+    /// of at most editor, so an admin named here gives the unauthenticated
+    /// open tier its GitHub grant and nothing more.
+    Agent {
+        /// The login name, as the auth store keys it.
+        account: String,
+    },
 }
 
 /// Whose draft overlay a caller acts in on a domain that reviews changes
@@ -101,7 +111,9 @@ pub fn overlay_actor(scope: &Scope) -> Option<String> {
     match scope {
         Scope::Unrestricted => Some(OWNER_IDENTITY_NAME.to_string()),
         Scope::User { account, .. } => Some(account.clone()),
-        Scope::Anonymous => None,
+        // The open tier's writes run as anonymous; the agent stand-in only
+        // answers rights questions, so it holds no draft.
+        Scope::Anonymous | Scope::Agent { .. } => None,
     }
 }
 
@@ -1085,6 +1097,15 @@ impl DomainAccess {
         self.auth.set_github_login(account, login).await
     }
 
+    /// Whether `account` names an enabled instance admin.
+    pub async fn account_is_admin(&self, account: &str) -> Result<bool> {
+        Ok(self
+            .auth
+            .user(account)
+            .await?
+            .is_some_and(|user| !user.disabled && user.role == Role::Admin))
+    }
+
     /// Whether `account` names an account that is not disabled.
     pub async fn account_enabled(&self, account: &str) -> Result<bool> {
         Ok(self
@@ -1819,14 +1840,17 @@ impl DomainAccess {
     /// domain. An `agent` that is no live account sees what an anonymous
     /// caller sees everywhere.
     pub async fn open_tier_visibility(&self, agent: &str) -> Result<DomainVisibility> {
-        let governed = self.governance().domains;
-        let anonymous = self.visibility(&Scope::Anonymous).await?;
-        let as_agent = self
-            .visibility(&Scope::User {
+        // One snapshot of the governed set for both folds and the merge, so
+        // a domain that leaves it meanwhile is decided one way throughout.
+        let governance = self.governance();
+        let anonymous = self.resolve_in(&Principal::Anonymous, &governance).await?;
+        let principal = self
+            .principal(&Scope::Agent {
                 account: agent.to_string(),
-                admin: false,
             })
             .await?;
+        let as_agent = self.resolve_in(&principal, &governance).await?;
+        let governed = &governance.domains;
         let mut hidden: HashSet<String> = anonymous
             .hidden
             .unwrap_or_default()
@@ -1865,6 +1889,16 @@ impl DomainAccess {
     /// [`DomainAccess::right`] gives it, which is what keeps the bulk answer
     /// and the per-domain one from drifting apart.
     async fn resolve(&self, principal: &Principal) -> Result<DomainVisibility> {
+        self.resolve_in(principal, &self.governance()).await
+    }
+
+    /// [`DomainAccess::resolve`] under one given snapshot of which domains
+    /// GitHub governs, so two folds can share it.
+    async fn resolve_in(
+        &self,
+        principal: &Principal,
+        governance: &Governance<'_>,
+    ) -> Result<DomainVisibility> {
         let shared_hidden = matches!(
             principal,
             Principal::Account {
@@ -1881,7 +1915,6 @@ impl DomainAccess {
                 shared_hidden: false,
             });
         }
-        let governance = self.governance();
         let governed = &governance.domains;
         if acls.is_empty() && governed.is_empty() {
             return Ok(DomainVisibility {
@@ -1948,6 +1981,26 @@ impl DomainAccess {
                     return Ok(Principal::Anonymous);
                 }
                 let role = if *admin { Role::Admin } else { user.role };
+                Ok(Principal::Account {
+                    name: user.name,
+                    role,
+                    reflection: user.reflection,
+                })
+            }
+            // The open tier as `github.agent_identity`: an admin is clamped
+            // to editor, so on a governed domain it gets its GitHub grant
+            // and never the instance admin's `Own`.
+            Scope::Agent { account } => {
+                let Some(user) = self.auth.user(account).await? else {
+                    return Ok(Principal::Anonymous);
+                };
+                if user.disabled {
+                    return Ok(Principal::Anonymous);
+                }
+                let role = match user.role {
+                    Role::Admin => Role::Editor,
+                    role => role,
+                };
                 Ok(Principal::Account {
                     name: user.name,
                     role,
@@ -4057,6 +4110,98 @@ mod tests {
         let ghost = hidden("ghost").await;
         assert!(!ghost.admits("gh-open") && !ghost.admits("gh-lab") && !ghost.admits("lab"));
         assert!(ghost.admits("open"));
+    }
+
+    /// An instance admin named as `github.agent_identity` gives the open
+    /// tier its GitHub grant and nothing more: as `Scope::Agent` it is an
+    /// editor, so it never owns a governed domain and never sees a private
+    /// one it has no GitHub read on.
+    #[tokio::test]
+    async fn an_admin_agent_identity_gets_only_its_github_role() {
+        let dir = tempfile::tempdir().unwrap();
+        let governor = base_governor().grant("boss", "gh-lab", MemberLevel::Viewer);
+        let access = governed_access(&dir, governor).await;
+        let agent = Scope::Agent {
+            account: "boss".to_string(),
+        };
+        assert_eq!(
+            access.right(&agent, "gh-lab").await.unwrap(),
+            DomainRight::Read
+        );
+        assert_eq!(
+            access.write_right(&agent, "gh-lab").await.unwrap(),
+            DomainRight::Read
+        );
+        assert_eq!(
+            access.right(&agent, "gh-vault").await.unwrap(),
+            DomainRight::None
+        );
+        assert_eq!(
+            access.right(&agent, "gh-open").await.unwrap(),
+            DomainRight::Read
+        );
+        assert!(
+            access.reflection_right(&agent, "gh-vault").await.unwrap() == ReflectionRight::None
+        );
+        let screen = access.open_tier_visibility("boss").await.unwrap().screen();
+        assert!(screen.admits("gh-lab"));
+        assert!(!screen.admits("gh-vault"), "no GitHub read");
+        // The same account signed in is the admin it is.
+        assert_eq!(
+            access
+                .right(&user("boss", false), "gh-vault")
+                .await
+                .unwrap(),
+            DomainRight::Own
+        );
+    }
+
+    /// A governor whose governed set is `gh-lab` on the first ask and empty
+    /// after: the App found out mid-answer that it is not installed there.
+    struct FlippingGovernor {
+        inner: FakeGovernor,
+        asked: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl KnowledgeGovernor for FlippingGovernor {
+        fn governed_domains(&self) -> HashSet<String> {
+            if self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                self.inner.governed_domains()
+            } else {
+                HashSet::new()
+            }
+        }
+        async fn knowledge(&self, account: &str, domain: &str) -> GithubKnowledge {
+            self.inner.knowledge(account, domain).await
+        }
+        async fn repository_public(&self, domain: &str) -> bool {
+            self.inner.repository_public(domain).await
+        }
+        async fn readers(&self, domain: &str) -> Option<HashSet<String>> {
+            KnowledgeGovernor::readers(&self.inner, domain).await
+        }
+    }
+
+    /// The open tier's view decides every domain under one governed set:
+    /// `gh-lab` is keeper's own private domain, governed when the answer
+    /// began, and keeper has no GitHub read on it, so it stays hidden even
+    /// though the governed set changes while the answer is put together.
+    #[tokio::test]
+    async fn the_open_tier_view_takes_one_governed_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = store(&dir).await;
+        github_cast(&auth).await;
+        let access = DomainAccess::new(auth).with_governor(Arc::new(FlippingGovernor {
+            inner: FakeGovernor::default().govern("gh-lab"),
+            asked: std::sync::atomic::AtomicUsize::new(0),
+        }));
+        let screen = access
+            .open_tier_visibility("keeper")
+            .await
+            .unwrap()
+            .screen();
+        assert!(!screen.admits("gh-lab"));
     }
 
     #[tokio::test]

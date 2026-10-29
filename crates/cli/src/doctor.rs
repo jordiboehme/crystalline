@@ -448,24 +448,52 @@ pub struct AppDoctor {
     pub problem: Option<String>,
 }
 
-/// Records on `app` the running daemon's GitHub access outage, from its
-/// `status` answer: since when GitHub has not said who may use the connected
-/// domains, as a field and as a problem.
+/// Records on `app` what the running daemon's `status` says about access
+/// on the domains connected through the App: since when GitHub has not
+/// answered (with what that means, which differs for an outage and for a
+/// repository GitHub does not show at all), and whether
+/// `github.agent_identity` names an instance admin.
 fn note_role_lookup_outage(app: &mut AppDoctor, daemon_status: Option<&serde_json::Value>) {
-    let Some(since) = daemon_status
-        .and_then(|status| status["github_access_degraded_since"].as_str())
-        .map(str::to_string)
-    else {
+    let Some(status) = daemon_status else {
         return;
     };
-    let outage = format!(
-        "GitHub has not said who may use the domains connected through the App since {since}; each last answer stands for an hour past its five minutes, then GitHub grants nobody anything there until it answers again, so check the network, GitHub's status and the App's installation"
-    );
+    let mut found = Vec::new();
+    if let Some(since) = status["github_access_degraded_since"].as_str() {
+        app.role_lookup_degraded_since = Some(since.to_string());
+        if let Some(stale) = status["github_access_stale_since"].as_str() {
+            found.push(format!(
+                "GitHub has not said who may use the domains connected through the App since {stale}; each last answer stands for an hour past its five minutes, then GitHub grants nobody anything there until it answers again, so check the network, GitHub's status and the App's installation"
+            ));
+        }
+        let closed: Vec<&str> = status["github_access_closed"]
+            .as_array()
+            .map(|repos| repos.iter().filter_map(|repo| repo.as_str()).collect())
+            .unwrap_or_default();
+        if !closed.is_empty() {
+            found.push(format!(
+                "GitHub does not show {} to the App, so GitHub grants nobody anything on the domains connected to it until it does; check that the repository still exists and that the App is installed on it",
+                closed.join(", ")
+            ));
+        }
+        if found.is_empty() {
+            found.push(format!(
+                "GitHub has not said who may use the domains connected through the App since {since}"
+            ));
+        }
+    }
+    if status["github_agent_identity_admin"].as_bool() == Some(true) {
+        found.push(
+            "github.agent_identity names an instance admin; the MCP open tier acts as it with no more than its GitHub role, so name an account that is not an admin".to_string(),
+        );
+    }
+    if found.is_empty() {
+        return;
+    }
+    let found = found.join("; ");
     app.problem = Some(match app.problem.take() {
-        Some(problem) => format!("{problem}; {outage}"),
-        None => outage,
+        Some(problem) => format!("{problem}; {found}"),
+        None => found,
     });
-    app.role_lookup_degraded_since = Some(since);
 }
 
 /// One connected server, as doctor checks it.
@@ -6113,26 +6141,36 @@ mod tests {
     #[test]
     fn doctor_names_the_outage_since() {
         let since = "2026-10-29T08:15:00+00:00";
+        let status = |stale: Option<&str>, closed: &[&str]| {
+            serde_json::json!({
+                "github_access_degraded_since": since,
+                "github_access_stale_since": stale,
+                "github_access_closed": closed,
+            })
+        };
         let mut app = AppDoctor::default();
-        note_role_lookup_outage(
-            &mut app,
-            Some(&serde_json::json!({ "github_access_degraded_since": since })),
-        );
+        note_role_lookup_outage(&mut app, Some(&status(Some(since), &[])));
         assert_eq!(app.role_lookup_degraded_since.as_deref(), Some(since));
         let problem = app.problem.expect("a problem");
         assert!(problem.contains(since), "{problem}");
+        assert!(problem.contains("stands for an hour"), "{problem}");
 
         // An earlier problem is kept, the outage is added to it.
         let mut app = AppDoctor {
             problem: Some("the key does not parse".to_string()),
             ..AppDoctor::default()
         };
-        note_role_lookup_outage(
-            &mut app,
-            Some(&serde_json::json!({ "github_access_degraded_since": since })),
-        );
+        note_role_lookup_outage(&mut app, Some(&status(Some(since), &[])));
         let problem = app.problem.expect("a problem");
         assert!(problem.starts_with("the key does not parse; "), "{problem}");
+
+        // A repository GitHub does not show: closed at once, no hour.
+        let mut app = AppDoctor::default();
+        note_role_lookup_outage(&mut app, Some(&status(None, &["acme/kb"])));
+        let problem = app.problem.expect("a problem");
+        assert!(problem.contains("acme/kb"), "{problem}");
+        assert!(!problem.contains("stands for an hour"), "{problem}");
+        assert_eq!(app.role_lookup_degraded_since.as_deref(), Some(since));
 
         // GitHub answers, or no daemon answered: nothing to say.
         for status in [
@@ -6144,6 +6182,23 @@ mod tests {
             assert_eq!(app.role_lookup_degraded_since, None);
             assert_eq!(app.problem, None);
         }
+    }
+
+    #[test]
+    fn doctor_warns_when_the_agent_identity_is_an_admin() {
+        let mut app = AppDoctor::default();
+        note_role_lookup_outage(
+            &mut app,
+            Some(&serde_json::json!({ "github_agent_identity_admin": true })),
+        );
+        let problem = app.problem.expect("a problem");
+        assert!(problem.contains("github.agent_identity"), "{problem}");
+        let mut app = AppDoctor::default();
+        note_role_lookup_outage(
+            &mut app,
+            Some(&serde_json::json!({ "github_agent_identity_admin": false })),
+        );
+        assert_eq!(app.problem, None);
     }
 
     /// A failed keychain read beside the file store, with `marker`.

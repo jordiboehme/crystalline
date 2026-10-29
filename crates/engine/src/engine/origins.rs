@@ -1104,7 +1104,9 @@ impl Engine {
         let share_actor = match scope {
             crate::scope::Scope::Unrestricted => ShareActor::Owner,
             crate::scope::Scope::User { account, .. } => ShareActor::Account(account.clone()),
-            crate::scope::Scope::Anonymous => ShareActor::HttpAgent,
+            crate::scope::Scope::Anonymous | crate::scope::Scope::Agent { .. } => {
+                ShareActor::HttpAgent
+            }
         };
         // A refusal is recorded per login, so the status reads it under the
         // login this caller's shares go out on. Resolved once, outside every
