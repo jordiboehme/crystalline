@@ -973,6 +973,8 @@ impl Engine {
     /// process.
     pub fn reset_github_app(&self) {
         *self.github_app.write().unwrap() = AppState::new();
+        // What the old App's listings said is not the new App's answer.
+        self.invalidate_github_access(super::Invalidate::All);
     }
 
     /// Why the keychain that holds the App (the marker says so) could not be

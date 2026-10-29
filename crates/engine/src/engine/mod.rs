@@ -1378,6 +1378,12 @@ pub struct Engine {
     // file appear while the stack runs, the readers are unknown again and
     // the check fails closed until a restart installs the resolver.
     domain_access_absent: std::sync::OnceLock<std::path::PathBuf>,
+    // Who reads and writes the domains connected to GitHub through the
+    // GitHub App: one governor and one cache per engine, built on the first
+    // `Engine::knowledge_governor` and handed to every `DomainAccess` this
+    // engine is served through (the engine's own and the JSON API's), so
+    // they all answer from the same snapshots.
+    github_governor: std::sync::OnceLock<Arc<GithubGovernor>>,
     // The servers this machine offers domains from (`crystalline connect`),
     // installed once by whoever serves this engine to its owner: the daemon at
     // start, a one-shot CLI command before it routes. Absent everywhere else
@@ -2531,6 +2537,7 @@ impl Engine {
             domain_access: std::sync::OnceLock::new(),
             domain_access_unavailable: std::sync::OnceLock::new(),
             domain_access_absent: std::sync::OnceLock::new(),
+            github_governor: std::sync::OnceLock::new(),
             sources: std::sync::OnceLock::new(),
             web_origin: std::sync::OnceLock::new(),
             joins: Arc::new(crate::join::Joins::default()),
@@ -7425,6 +7432,10 @@ mod evolve;
 mod fence;
 mod github;
 pub use github::OAUTH_IDENTITY_UNDER_APP;
+mod github_access;
+pub use github_access::{
+    FRESH_FOR, GithubGovernor, Invalidate, RETRY_AFTER_FAILURE, RepoReaders, STALE_FOR, level_for,
+};
 mod github_app;
 pub use github_app::{
     APP_FROM_ENV, AppClock, AppHome, AppRemoval, GithubAppStatus, UnusableApp, marker_names_host,

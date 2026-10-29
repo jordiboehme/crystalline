@@ -488,6 +488,10 @@ impl RestState {
             // [`oauth::prune_at_start`].
             oauth::prune_at_start(auth.clone());
         }
+        // The JSON API's resolver asks the engine's own governor, so it
+        // answers from the same GitHub snapshots as every other surface.
+        let access =
+            Arc::new(DomainAccess::new(auth.clone()).with_governor(engine.knowledge_governor()));
         let collab = crate::collab::session::CollabSessions::new(engine.clone());
         // The engine closes co-editing rooms itself when it unregisters a
         // domain, whichever surface asked for the removal, so it needs the
@@ -501,7 +505,7 @@ impl RestState {
             github_links: Arc::default(),
             oauth,
             oidc,
-            access: Arc::new(DomainAccess::new(auth.clone())),
+            access,
             auth,
             auth_cfg,
             setup_token: None,

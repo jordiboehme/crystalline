@@ -1498,6 +1498,7 @@ pub async fn domain_remove(
                 config_file.display()
             )
         })?;
+    let engine = std::sync::Arc::new(engine);
     // This machine's sources, as the daemon has them: a local copy a
     // connected server hides is refused here too (decision D19).
     if use_daemon(db, config_path) {
@@ -1509,7 +1510,9 @@ pub async fn domain_remove(
         && auth_path.exists()
     {
         let auth = std::sync::Arc::new(crate::rest::AuthStore::open(&auth_path).await?);
-        engine.set_domain_access(std::sync::Arc::new(crate::scope::DomainAccess::new(auth)));
+        engine.set_domain_access(std::sync::Arc::new(
+            crate::scope::DomainAccess::new(auth).with_governor(engine.knowledge_governor()),
+        ));
     }
     let report = engine
         .unregister_domain(name, &Scope::Unrestricted, purge, end_drafts)
@@ -1656,7 +1659,9 @@ pub use crystalline_engine::machine_rename_owner;
 /// ([`Engine::set_domain_access_unavailable`]) and then
 /// refuses every Reflection source outside its page's domain, never lets
 /// one through.
-pub(crate) async fn install_domain_access(engine: &Engine) -> Option<Arc<crate::rest::AuthStore>> {
+pub(crate) async fn install_domain_access(
+    engine: &Arc<Engine>,
+) -> Option<Arc<crate::rest::AuthStore>> {
     let opened = match crystalline_core::config::web_auth_db_path() {
         // No store yet: no account and no private domain exist, so nothing
         // is opened (or created, which would change this machine's state
@@ -1674,7 +1679,10 @@ pub(crate) async fn install_domain_access(engine: &Engine) -> Option<Arc<crate::
     match opened {
         Ok(auth) => {
             let auth = Arc::new(auth);
-            engine.set_domain_access(Arc::new(crate::scope::DomainAccess::new(auth.clone())));
+            engine.set_domain_access(Arc::new(
+                crate::scope::DomainAccess::new(auth.clone())
+                    .with_governor(engine.knowledge_governor()),
+            ));
             Some(auth)
         }
         Err(why) => {

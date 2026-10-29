@@ -1065,9 +1065,46 @@ impl DomainAccess {
     ///
     /// The link delegations below are narrow for the same reason as every
     /// delegation here: the engine links, reads, marks and unlinks one
-    /// account's row and never lists the table.
+    /// account's row. Only the GitHub governor lists the table
+    /// ([`DomainAccess::github_links`]), to join a repository's
+    /// collaborators to accounts in one read.
     pub async fn github_link_of(&self, account: &str) -> Result<Option<GithubLink>> {
         self.auth.github_link_of(account).await
+    }
+
+    /// Every GitHub link, by account. For the GitHub governor, which joins
+    /// one listing of a repository's collaborators to the accounts by GitHub
+    /// id.
+    pub async fn github_links(&self) -> Result<Vec<GithubLink>> {
+        self.auth.github_links().await
+    }
+
+    /// Store `login` as the login last seen for the GitHub id `account` is
+    /// linked to (a renamed GitHub account). Answers whether a row changed.
+    pub async fn set_github_login(&self, account: &str, login: &str) -> Result<bool> {
+        self.auth.set_github_login(account, login).await
+    }
+
+    /// Whether `account` names an account that is not disabled.
+    pub async fn account_enabled(&self, account: &str) -> Result<bool> {
+        Ok(self
+            .auth
+            .user(account)
+            .await?
+            .is_some_and(|user| !user.disabled))
+    }
+
+    /// The names of every account that is not disabled, in the store's own
+    /// spelling.
+    pub async fn enabled_accounts(&self) -> Result<HashSet<String>> {
+        Ok(self
+            .auth
+            .list_users()
+            .await?
+            .into_iter()
+            .filter(|user| !user.disabled)
+            .map(|user| user.name)
+            .collect())
     }
 
     /// Link `account` to the GitHub account `github_id` on `host` (see

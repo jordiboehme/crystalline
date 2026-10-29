@@ -2415,7 +2415,9 @@ fn http_base(
     // to anybody who could reach the port. It is a no-op on a second call, so
     // an integration test that builds two routers over one engine keeps the
     // first store.
-    engine.set_domain_access(Arc::new(crate::scope::DomainAccess::new(auth.clone())));
+    engine.set_domain_access(Arc::new(
+        crate::scope::DomainAccess::new(auth.clone()).with_governor(engine.knowledge_governor()),
+    ));
 
     // And the same rule answers where this instance's pages are, for an HTTP
     // caller from its own headers and for a local one from the address this
