@@ -119,6 +119,8 @@ pub(crate) struct Forge {
     pub(crate) collaborators: StdMutex<HashMap<String, Vec<Value>>>,
     /// The repositories `GET /repos/{o}/{r}` calls public.
     pub(crate) public: StdMutex<std::collections::HashSet<String>>,
+    /// When set, every collaborator listing answers 503.
+    pub(crate) collaborators_down: std::sync::atomic::AtomicBool,
 }
 
 impl Forge {
@@ -192,6 +194,7 @@ pub(crate) async fn spawn_forge(
         refresh_gate: StdMutex::new(None),
         collaborators: StdMutex::new(HashMap::new()),
         public: StdMutex::new(std::collections::HashSet::new()),
+        collaborators_down: std::sync::atomic::AtomicBool::new(false),
     });
     let router = Router::new().fallback(handle).with_state(forge.clone());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -412,6 +415,13 @@ async fn repo_route(
         };
     }
     if tail == "/collaborators" && get {
+        if forge.collaborators_down.load(Ordering::SeqCst) {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                axum::Json(json!({"message": "unavailable"})),
+            )
+                .into_response();
+        }
         let people = forge
             .collaborators
             .lock()

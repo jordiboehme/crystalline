@@ -107,6 +107,13 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                 // on Windows, its job and package identity. `crystalline
                 // status` prints it as one line, `doctor` in full.
                 "runs_in": crate::runs_in::RunsIn::here(),
+                // Since when GitHub has not said who may use the domains
+                // connected through the GitHub App (RFC 3339), null while it
+                // answers. `doctor` names it.
+                "github_access_degraded_since": shared
+                    .engine
+                    .github_access_degraded()
+                    .map(|since| since.to_rfc3339()),
             });
             match shared.engine.status_report().await {
                 Ok(report) => {

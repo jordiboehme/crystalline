@@ -229,3 +229,42 @@ async fn an_mcp_token_agent_follows_its_account() {
         Some(WriteBlock::Role)
     );
 }
+
+#[tokio::test]
+async fn the_daemon_status_says_since_when_github_has_not_answered() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (forge, eng, _auth) = setup(tmp.path(), None).await;
+    let ada = Scope::User {
+        account: "ada".to_string(),
+        admin: false,
+    };
+    let status = || {
+        let eng = eng.clone();
+        async move {
+            crystalline_service::control::answer_for_test(eng, &json!({ "v": 1, "cmd": "status" }))
+                .await
+        }
+    };
+    eng.domain_right(&ada, "kb").await.unwrap();
+    let answer = status().await;
+    assert_eq!(answer["ok"], json!(true), "{answer}");
+    assert_eq!(answer["data"]["github_access_degraded_since"], json!(null));
+    assert_eq!(eng.github_access_degraded(), None);
+
+    forge
+        .collaborators_down
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    eng.invalidate_github_access(crystalline_service::engine::Invalidate::All);
+    // GitHub down and nothing known: ada, an instance editor, reads the
+    // shared domain and writes nothing.
+    assert_eq!(
+        eng.domain_right(&ada, "kb").await.unwrap(),
+        DomainRight::Read
+    );
+    let since = eng.github_access_degraded().expect("degraded");
+    let answer = status().await;
+    assert_eq!(
+        answer["data"]["github_access_degraded_since"],
+        json!(since.to_rfc3339())
+    );
+}

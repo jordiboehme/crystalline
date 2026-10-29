@@ -440,8 +440,32 @@ pub struct AppDoctor {
     /// Why the keychain could not be read, when it holds the App and could
     /// not be read.
     pub keychain_unreadable: Option<String>,
+    /// Since when (RFC 3339) the running daemon has not learned from GitHub
+    /// who may use the domains connected through the App. `None` while it
+    /// learns, and when no daemon answered.
+    pub role_lookup_degraded_since: Option<String>,
     /// What is wrong, in the words a person acts on; `None` when nothing is.
     pub problem: Option<String>,
+}
+
+/// Records on `app` the running daemon's GitHub access outage, from its
+/// `status` answer: since when GitHub has not said who may use the connected
+/// domains, as a field and as a problem.
+fn note_role_lookup_outage(app: &mut AppDoctor, daemon_status: Option<&serde_json::Value>) {
+    let Some(since) = daemon_status
+        .and_then(|status| status["github_access_degraded_since"].as_str())
+        .map(str::to_string)
+    else {
+        return;
+    };
+    let outage = format!(
+        "GitHub has not said who may use the domains connected through the App since {since}; each last answer stands for an hour past its five minutes, then GitHub grants nobody anything there until it answers again, so check the network, GitHub's status and the App's installation"
+    );
+    app.problem = Some(match app.problem.take() {
+        Some(problem) => format!("{problem}; {outage}"),
+        None => outage,
+    });
+    app.role_lookup_degraded_since = Some(since);
 }
 
 /// One connected server, as doctor checks it.
@@ -1974,7 +1998,7 @@ pub async fn run(
 
     let environment = check_environment(&loaded.overlay);
 
-    let github = if cfg.github_enabled() {
+    let mut github = if cfg.github_enabled() {
         Some(check_github(cfg, &loaded.overlay, &targets).await?)
     } else {
         None
@@ -2010,6 +2034,11 @@ pub async fn run(
     } else {
         None
     };
+    // Who may use a domain connected through the App is learned by the
+    // daemon; it says since when GitHub has not answered.
+    if let Some(app) = github.as_mut().and_then(|g| g.app.as_mut()) {
+        note_role_lookup_outage(app, daemon_status.as_ref());
+    }
     // The daemon's loaded model wins over the probe: only it knows about a
     // warm-up or runtime failure on the GPU.
     let embedding_device = live_device(
@@ -6080,6 +6109,42 @@ mod tests {
     use super::*;
     use crystalline_core::config::EvolveConfig;
     use crystalline_index::{TursoStore, sync_domain};
+
+    #[test]
+    fn doctor_names_the_outage_since() {
+        let since = "2026-10-29T08:15:00+00:00";
+        let mut app = AppDoctor::default();
+        note_role_lookup_outage(
+            &mut app,
+            Some(&serde_json::json!({ "github_access_degraded_since": since })),
+        );
+        assert_eq!(app.role_lookup_degraded_since.as_deref(), Some(since));
+        let problem = app.problem.expect("a problem");
+        assert!(problem.contains(since), "{problem}");
+
+        // An earlier problem is kept, the outage is added to it.
+        let mut app = AppDoctor {
+            problem: Some("the key does not parse".to_string()),
+            ..AppDoctor::default()
+        };
+        note_role_lookup_outage(
+            &mut app,
+            Some(&serde_json::json!({ "github_access_degraded_since": since })),
+        );
+        let problem = app.problem.expect("a problem");
+        assert!(problem.starts_with("the key does not parse; "), "{problem}");
+
+        // GitHub answers, or no daemon answered: nothing to say.
+        for status in [
+            Some(serde_json::json!({ "github_access_degraded_since": null })),
+            None,
+        ] {
+            let mut app = AppDoctor::default();
+            note_role_lookup_outage(&mut app, status.as_ref());
+            assert_eq!(app.role_lookup_degraded_since, None);
+            assert_eq!(app.problem, None);
+        }
+    }
 
     /// A failed keychain read beside the file store, with `marker`.
     fn unreadable(marker: Option<&str>) -> crystalline_remote::AppLookup {
