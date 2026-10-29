@@ -10,6 +10,10 @@
 //! carry onto its pages did not exist ([`crate::engine::Engine::read_limit_for`]
 //! decides which).
 //!
+//! An unattended request also writes only into the domains its run works
+//! on ([`Limit::writes`]): a run on a private domain reads that domain, and
+//! writing what it read into a shared one would carry it to more readers.
+//!
 //! The limit travels as a task-local value the serving surface sets around
 //! each request it serves ([`within`]). [`crate::engine::Engine::hidden_domains`]
 //! adds it to whatever the caller's own rights hide, so every read that
@@ -21,21 +25,40 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::sync::Arc;
 
-tokio::task_local! {
-    static LIMIT: Arc<HashSet<String>>;
+/// What one unattended request may read and write.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Limit {
+    /// The local domains it may not read.
+    pub hidden: HashSet<String>,
+    /// The domains it may write into, sorted: the domains its run works on.
+    /// `None` when it may write wherever its rights allow, because what it
+    /// reads every reader of every domain may read anyway.
+    pub writes: Option<Vec<String>>,
 }
 
-/// Run `work` with `hidden` (local domain names) out of every read it makes,
-/// or as it is when `hidden` is `None`.
-pub async fn within<F: Future>(hidden: Option<HashSet<String>>, work: F) -> F::Output {
-    match hidden {
-        Some(hidden) => LIMIT.scope(Arc::new(hidden), work).await,
+tokio::task_local! {
+    static LIMIT: Arc<Limit>;
+}
+
+/// Run `work` within `limit`, or as it is when `limit` is `None`.
+pub async fn within<F: Future>(limit: Option<Limit>, work: F) -> F::Output {
+    match limit {
+        Some(limit) => LIMIT.scope(Arc::new(limit), work).await,
         None => work.await,
     }
 }
 
-/// The domains the current request may not read because it is unattended,
-/// or `None` when no limit is set.
-pub fn current() -> Option<Arc<HashSet<String>>> {
+/// The limit of the current request, when it is unattended.
+pub fn current() -> Option<Arc<Limit>> {
     LIMIT.try_with(Arc::clone).ok()
+}
+
+/// The domains the current request may not read, when it is unattended.
+pub fn hidden() -> Option<HashSet<String>> {
+    current().map(|limit| limit.hidden.clone())
+}
+
+/// Whether the current request may not read `domain`.
+pub fn hides(domain: &str) -> bool {
+    current().is_some_and(|limit| limit.hidden.contains(domain))
 }

@@ -3158,11 +3158,11 @@ impl Engine {
         // An unattended request reads less than its rights allow
         // (`crate::read_limit`): the limit is added to every answer, also the
         // machine owner's, whose rights hide nothing.
-        Ok(match (hidden, crate::read_limit::current()) {
+        Ok(match (hidden, crate::read_limit::hidden()) {
             (hidden, None) => hidden,
-            (None, Some(limit)) => Some(limit.as_ref().clone()),
+            (None, Some(limit)) => Some(limit),
             (Some(mut hidden), Some(limit)) => {
-                hidden.extend(limit.iter().cloned());
+                hidden.extend(limit);
                 Some(hidden)
             }
         })
@@ -5323,6 +5323,18 @@ impl Engine {
         name: &str,
         scope: &crate::scope::Scope,
     ) -> Result<()> {
+        // An unattended request writes only into the domains its run works
+        // on (`crate::read_limit`). Asked here because every write path
+        // meets this check.
+        if let Some(limit) = crate::read_limit::current()
+            && let Some(writes) = &limit.writes
+            && !writes.iter().any(|d| d == name)
+        {
+            return Err(EngineError::Refused(format!(
+                "this run works on {} and cannot write to {name}",
+                writes.join(", ")
+            )));
+        }
         self.refuse_read_only_flag(name, scope).await?;
         self.require_file_host(name, scope).await
     }

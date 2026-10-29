@@ -1505,8 +1505,22 @@ impl Engine {
     /// as `scope` works on now. For the machine owner, the leases held with
     /// no account. Sorted.
     pub async fn run_domains(&self, scope: &Scope) -> Result<Vec<String>> {
+        let mut out: Vec<String> = self
+            .run_leases(scope)
+            .await?
+            .into_iter()
+            .map(|(_, domain)| domain)
+            .collect();
+        out.dedup();
+        Ok(out)
+    }
+
+    /// The live leases `scope` holds, as (loop, domain), sorted by domain:
+    /// [`Engine::run_domains`] with the loop each one runs.
+    pub async fn run_leases(&self, scope: &Scope) -> Result<Vec<(Loop, String)>> {
         let (_, stale_before) = self.automation_window();
-        let domains: Vec<String> = self.registered_domain_entries().keys().cloned().collect();
+        let mut domains: Vec<String> = self.registered_domain_entries().keys().cloned().collect();
+        domains.sort();
         let store = self.store.lock().await;
         let mut out = Vec::new();
         for domain in domains {
@@ -1527,12 +1541,11 @@ impl Engine {
                     Scope::Unrestricted => lease.holder.account.is_none(),
                     Scope::Anonymous => false,
                 };
-                if held && !out.contains(&domain) {
-                    out.push(domain.clone());
+                if held {
+                    out.push((lp, domain.clone()));
                 }
             }
         }
-        out.sort();
         Ok(out)
     }
 
@@ -1558,28 +1571,39 @@ impl Engine {
     ///   readers may read (in practice the domains everyone signed in may
     ///   read, and no local domain while any domain is backed up to GitHub).
     ///
-    /// Fails safe: an error hides every domain.
+    /// It writes only into the domains D it works on (the named one, or each
+    /// leased one); with no lease it may write wherever its rights allow,
+    /// since every reader of every domain may read what it reads. Fails
+    /// safe: an error hides every domain and allows no write.
     pub async fn read_limit_for(
         &self,
         scope: &Scope,
         marked: bool,
         run_domain: Option<&str>,
-    ) -> Option<HashSet<String>> {
+    ) -> Option<crate::read_limit::Limit> {
         let all: Vec<String> = self.registered_domain_entries().keys().cloned().collect();
         let works_on = match self.run_domains(scope).await {
             Ok(domains) => domains,
             Err(e) => {
                 tracing::warn!("the loop leases were not read; reading nothing: {e}");
-                return Some(all.into_iter().collect());
+                return Some(crate::read_limit::Limit {
+                    hidden: all.into_iter().collect(),
+                    writes: Some(Vec::new()),
+                });
             }
         };
         if works_on.is_empty() && !marked && run_domain.is_none() {
             return None;
         }
-        let targets = match run_domain {
-            Some(domain) if works_on.iter().any(|d| d == domain) => vec![domain.to_string()],
-            _ if !works_on.is_empty() => works_on,
-            _ => all.clone(),
+        // What the run works on, and so may write into. Without a lease it
+        // may write wherever its rights allow: what it reads every reader of
+        // every domain may read, so nothing it writes reaches anyone new.
+        let (targets, writes) = match run_domain {
+            Some(domain) if works_on.iter().any(|d| d == domain) => {
+                (vec![domain.to_string()], Some(vec![domain.to_string()]))
+            }
+            _ if !works_on.is_empty() => (works_on.clone(), Some(works_on)),
+            _ => (all.clone(), None),
         };
         let mut hidden = HashSet::new();
         for source in &all {
@@ -1596,7 +1620,7 @@ impl Engine {
                 }
             }
         }
-        Some(hidden)
+        Some(crate::read_limit::Limit { hidden, writes })
     }
 
     /// The name this instance shows people: the label its host locks carry,

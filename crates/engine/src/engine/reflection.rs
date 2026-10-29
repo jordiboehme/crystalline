@@ -1028,7 +1028,7 @@ impl Engine {
         // An unattended request may not read this domain at all
         // (`crate::read_limit`): its Reflection is as unknown to it as the
         // domain.
-        if crate::read_limit::current().is_some_and(|limit| limit.contains(domain)) {
+        if crate::read_limit::hides(domain) {
             let hidden = self.hidden_for(&caller.scope).await?;
             return Err(self.unknown_domain(domain, &hidden));
         }

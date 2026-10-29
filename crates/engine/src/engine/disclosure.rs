@@ -31,7 +31,7 @@ use crate::scope::{PageReaders, ReflectionCaller, ReflectionRight, Scope};
 /// What a confirmed write is refused with when the page's readers, the
 /// repository it is backed up to, or the text being shared changed between
 /// the question and the answer: the person agreed to what they were shown.
-pub const DISCLOSURE_CHANGED: &str = "who may read this page, or where it is backed up, changed since the person was asked; ask them again";
+pub const DISCLOSURE_CHANGED: &str = "who may read this page, where it is backed up, or the text being shared changed since the person was asked; ask them again";
 
 /// A question a person is asked before text from a narrower domain goes
 /// onto a page, with what their yes is bound to.

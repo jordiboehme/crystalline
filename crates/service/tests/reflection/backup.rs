@@ -1410,7 +1410,8 @@ async fn a_run_on_a_github_domain_reads_no_local_domain() {
         .engine
         .read_limit_for(&owner, true, Some("eng"))
         .await
-        .unwrap();
+        .unwrap()
+        .hidden;
     assert!(limit.contains("harbor"), "{limit:?}");
     assert!(!limit.contains("eng"), "{limit:?}");
 }

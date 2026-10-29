@@ -254,7 +254,6 @@
 //! `add_domain` through team mode, `share_changes`, `update_domain`,
 //! `origin_status` and `withdraw_proposal`.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use base64::Engine as _;
@@ -4741,8 +4740,12 @@ impl McpServer {
     /// (decision D8).
     async fn routing_text_for(&self, scope: &Scope) -> Result<String, EngineError> {
         match self.transport {
-            Transport::Stdio => self.engine.routing_text_scoped_with_mounts(scope).await,
-            Transport::Http => self.engine.routing_text_scoped(scope).await,
+            // A limited session is never routed, so it is not shown the
+            // mounted domains either.
+            Transport::Stdio if crystalline_engine::read_limit::current().is_none() => {
+                self.engine.routing_text_scoped_with_mounts(scope).await
+            }
+            _ => self.engine.routing_text_scoped(scope).await,
         }
     }
 
@@ -5101,7 +5104,21 @@ impl McpServer {
     /// What this request may not read because its session is unattended
     /// ([`Engine::read_limit_for`]): marked by its registration, by the run
     /// domain an HTTP run names, or by a live loop lease its caller holds.
-    async fn read_limit(&self, ctx: &RequestContext<RoleServer>) -> Option<HashSet<String>> {
+    async fn read_limit(
+        &self,
+        ctx: &RequestContext<RoleServer>,
+    ) -> Option<crystalline_engine::read_limit::Limit> {
+        self.read_limit_marked(ctx).await.0
+    }
+
+    /// [`McpServer::read_limit`], and whether the session itself said it is
+    /// unattended (its registration or an HTTP run header). A limit without
+    /// that mark comes from a lease alone: an interactive session that
+    /// looks like its owner's run.
+    async fn read_limit_marked(
+        &self,
+        ctx: &RequestContext<RoleServer>,
+    ) -> (Option<crystalline_engine::read_limit::Limit>, bool) {
         let header = match self.transport {
             Transport::Http => ctx
                 .extensions
@@ -5113,13 +5130,36 @@ impl McpServer {
             Transport::Stdio => None,
         };
         let run_domain = header.as_deref().or(self.gate.run_domain.as_deref());
-        self.engine
-            .read_limit_for(
-                &self.scope_of(ctx),
-                self.gate.unattended || header.is_some(),
-                run_domain,
-            )
-            .await
+        let marked = self.gate.unattended || header.is_some() || run_domain.is_some();
+        let limit = self
+            .engine
+            .read_limit_for(&self.scope_of(ctx), marked, run_domain)
+            .await;
+        (limit, marked)
+    }
+
+    /// The note an interactive session limited by a run its caller holds
+    /// gets on every tool answer, so a person is not puzzled by domains
+    /// that are missing: "a reflect run on eng is going; until it ends this
+    /// session reads and writes like that run".
+    async fn run_note(&self, ctx: &RequestContext<RoleServer>) -> Option<String> {
+        let runs = self.engine.run_leases(&self.scope_of(ctx)).await.ok()?;
+        if runs.is_empty() {
+            return None;
+        }
+        let named: Vec<String> = runs
+            .iter()
+            .map(|(lp, domain)| format!("a {} run on {domain}", lp.as_str()))
+            .collect();
+        let (verb, like) = if named.len() == 1 {
+            ("is", "that run")
+        } else {
+            ("are", "those runs")
+        };
+        Some(format!(
+            "{} {verb} going; until it ends this session reads and writes like {like}",
+            named.join(" and ")
+        ))
     }
 
     /// [`ServerHandler::read_resource`] inside the request's read limit.
@@ -5240,9 +5280,24 @@ impl ServerHandler for McpServer {
         // An unattended session reads only what every reader of its run's
         // domain may read (`crystalline_engine::read_limit`), for the whole
         // call, whichever tool it is.
-        let limit = self.read_limit(&context).await;
-        crystalline_engine::read_limit::within(limit, self.call_tool_limited(request, context))
-            .await
+        let (limit, marked) = self.read_limit_marked(&context).await;
+        // An interactive session limited by its owner's run says so, once
+        // per answer, in plain words.
+        let note = if limit.is_some() && !marked {
+            self.run_note(&context).await
+        } else {
+            None
+        };
+        let response =
+            crystalline_engine::read_limit::within(limit, self.call_tool_limited(request, context))
+                .await;
+        match (note, response) {
+            (Some(note), Ok(rmcp::model::CallToolResponse::Complete(mut result))) => {
+                result.content.push(ContentBlock::text(note));
+                Ok(rmcp::model::CallToolResponse::Complete(result))
+            }
+            (_, response) => response,
+        }
     }
 
     /// The revisions this server serves, narrowed from rmcp's crate-wide
@@ -5432,6 +5487,18 @@ impl ServerHandler for McpServer {
         }
         context.peer.set_peer_info(request);
 
+        // A limited session is onboarded to the domains it may read only:
+        // the stdio block `get_info` renders names every domain.
+        if let Some(limit) = self.read_limit(&context).await {
+            let scope = self.scope_of(&context);
+            let mut info = crystalline_engine::read_limit::within(
+                Some(limit),
+                self.arrival_info_scoped(&scope),
+            )
+            .await?;
+            info.protocol_version = newest_legacy_handshake_version();
+            return Ok(info);
+        }
         let mut info = self.arrival_info();
         // The HTTP routing block, counted over the domains that are not
         // private (see [`Engine::routing_text_counted`]). Only when the
@@ -5520,7 +5587,13 @@ impl ServerHandler for McpServer {
         context: RequestContext<RoleServer>,
     ) -> Result<DiscoverResult, ErrorData> {
         self.engine.refresh_routing_cache().await;
-        let info = self.arrival_info_scoped(&self.scope_of(&context)).await?;
+        // A limited session is onboarded to the domains it may read only.
+        let limit = self.read_limit(&context).await;
+        let info = crystalline_engine::read_limit::within(
+            limit,
+            self.arrival_info_scoped(&self.scope_of(&context)),
+        )
+        .await?;
         Ok(DiscoverResult::from_server_info(
             self.supported_protocol_versions().into_owned(),
             info,
@@ -5832,14 +5905,19 @@ impl ServerHandler for McpServer {
         request: GetPromptRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<GetPromptResponse, ErrorData> {
-        Self::prompt_router()
-            .get_prompt(PromptContext::new(
+        // The onboarding prompt carries the routing block: a limited session
+        // is shown the domains it may read only.
+        let limit = self.read_limit(&context).await;
+        crystalline_engine::read_limit::within(
+            limit,
+            Self::prompt_router().get_prompt(PromptContext::new(
                 self,
                 request.name,
                 request.arguments,
                 context,
-            ))
-            .await
+            )),
+        )
+        .await
     }
 }
 
