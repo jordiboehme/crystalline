@@ -62,9 +62,11 @@ fn require_registered(name: &str, config: Option<&Path>) -> Result<String> {
 /// [`require_registered`] for a Reflection grant, which only a domain kept
 /// as files takes: a virtual domain keeps no Reflection.
 fn require_kept_as_files(name: &str, config: Option<&Path>) -> Result<String> {
-    let name = require_registered(name, config)?;
     let loaded = crate::cmd::load(config)?;
-    let entry = &loaded.effective.domains[&name];
+    let name = name.trim().to_string();
+    let Some(entry) = loaded.effective.domains.get(&name) else {
+        bail!("no domain named '{name}' is registered; list them with `crystalline domain list`")
+    };
     if entry.is_virtual() || entry.file_path().is_none() {
         bail!(
             "Reflection collaborators are for domains kept as files; '{name}' is kept in \
@@ -196,7 +198,7 @@ pub async fn run(domain: String, command: MembersCommand, json: bool) -> Result<
         MembersCommand::List { config }
         | MembersCommand::Add { config, .. }
         | MembersCommand::Remove { config, .. } => config.clone(),
-        MembersCommand::Reflection { .. } => None,
+        MembersCommand::Reflection { .. } => unreachable!("answered above"),
     };
     let domain = require_registered(&domain, config.as_deref())?;
     let store = store().await?;
@@ -248,8 +250,7 @@ pub async fn run(domain: String, command: MembersCommand, json: bool) -> Result<
             let reflection = store.member_reflection(&domain, &user).await?;
             println!("'{user}' is a {level} on domain '{domain}' with Reflection {reflection}.");
         }
-        // Answered before the domain is resolved, above.
-        MembersCommand::Reflection { .. } => {}
+        MembersCommand::Reflection { .. } => unreachable!("answered above"),
         MembersCommand::Remove { user, .. } => {
             let name = user.trim().to_lowercase();
             // The owner holds no membership row, so a plain "not a member"

@@ -124,7 +124,9 @@ pub(crate) fn reflection_error(e: EngineError) -> ApiError {
     description = "Every registered domain whose Reflection is not off and \
                    where the caller's reflection right is at least `read`, \
                    including domains the caller cannot see as engrams \
-                   (knowledge `none` with a Reflection level): this is how \
+                   (knowledge `none` with a Reflection level, and \
+                   Reflection collaborators, who hold a per-domain \
+                   Reflection grant): this is how \
                    Fluid finds them, since `GET /domains` leaves them out. \
                    The anonymous viewer gets the public domains, at `read`. \
                    Sorted by name.",

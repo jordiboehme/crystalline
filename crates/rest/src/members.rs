@@ -970,7 +970,12 @@ pub async fn remove_reflection_collaborator(
     if !leaving {
         refuse_below(&state, &identity, &domain, DomainRight::Manage, "manager").await?;
     }
-    require_kept_as_files(&state, &domain)?;
+    // A holder giving up its own grant always gets the row deleted, also
+    // one left on a name no longer registered as a domain kept as files:
+    // refusing would keep a grant its holder asked to drop.
+    if !own_grant {
+        require_kept_as_files(&state, &domain)?;
+    }
     let removed = state
         .auth
         .remove_reflection_grant(&domain, &account)

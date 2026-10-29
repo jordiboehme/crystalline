@@ -1288,7 +1288,9 @@ impl DomainAccess {
     /// What `scope` may do with `domain`'s Reflection (the private
     /// `decide_reflection`). One read of the visibility and, for an account
     /// on a private domain, its membership level and its Reflection level;
-    /// for an account, its write list (off the list, at most Read).
+    /// for a signed-in account, its per-domain Reflection grant (only
+    /// raises; the open tier holds none); for an account, its write list
+    /// (off the list, at most Read).
     pub async fn reflection_right(&self, scope: &Scope, domain: &str) -> Result<ReflectionRight> {
         let principal = self.principal(scope).await?;
         if matches!(principal, Principal::Unrestricted) {
@@ -5648,10 +5650,21 @@ mod tests {
         let access = DomainAccess::new(auth.clone());
         assert!(access.readers_cover("lab", "vault").await.unwrap());
         assert!(access.readers_cover("shared", "other").await.unwrap());
+        // A person shared text from vault on a lab page before ann was
+        // given the Reflection there.
+        let before = access.page_readers("lab").await.unwrap();
         auth.set_reflection_grant("lab", "ann", ReflectionLevel::Reader, "keeper")
             .await
             .unwrap();
         assert!(!access.readers_cover("lab", "vault").await.unwrap());
+        // The grant widened the page's readers, so that confirmation is
+        // asked again.
+        assert!(
+            !access
+                .readers_cover_for("lab", "vault", &before)
+                .await
+                .unwrap()
+        );
         auth.set_reflection_grant("vault", "ann", ReflectionLevel::Contributor, "keeper")
             .await
             .unwrap();

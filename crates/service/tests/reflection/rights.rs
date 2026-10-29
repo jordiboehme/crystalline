@@ -948,14 +948,40 @@ async fn a_reflection_only_collaborator_sees_no_engram_on_any_surface() {
         )
         .await;
     assert!(browsed.is_err(), "{browsed:?}");
+    // The graph answers a hidden anchor exactly as one in a domain nobody
+    // registered.
     let graph = fx
         .engine
         .graph_neighborhood("crystalline://eng/runbooks/deploy", 2, 50, &ann)
         .await
         .map(|v| v.to_string())
-        .unwrap_or_default();
-    assert!(!graph.contains("deploys run at night"), "{graph}");
-    assert!(!graph.contains("\"Deploy\""), "{graph}");
+        .map_err(|e| e.to_string());
+    let ghost = fx
+        .engine
+        .graph_neighborhood("crystalline://ghost/runbooks/deploy", 2, 50, &ann)
+        .await
+        .map(|v| v.to_string())
+        .map_err(|e| e.to_string());
+    assert_eq!(
+        graph,
+        ghost
+            .map(|v| v.replace("ghost", "eng"))
+            .map_err(|e| e.replace("ghost", "eng")),
+        "a hidden anchor answers like an unregistered one"
+    );
+    // The control: the machine owner finds the engram there.
+    let owner = fx
+        .engine
+        .graph_neighborhood(
+            "crystalline://eng/runbooks/deploy",
+            2,
+            50,
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap()
+        .to_string();
+    assert!(owner.contains("runbooks/deploy"), "{owner}");
     let listed = fx
         .engine
         .list_domains(
@@ -1104,6 +1130,22 @@ async fn reflection_collaborators_are_managed_over_rest() {
         .await;
     assert_eq!(status, 404);
     assert!(s.auth.reflection_grants("eng").await.unwrap().is_empty());
+
+    // A grant left on a name nobody registers any more: its holder still
+    // gives it up, and the row goes.
+    s.auth
+        .set_reflection_grant("gone", "nora", ReflectionLevel::Reader, "boss")
+        .await
+        .unwrap();
+    let (status, body) = nora
+        .send(
+            reqwest::Method::DELETE,
+            "/api/v1/domains/gone/reflection-collaborators/nora",
+            None,
+        )
+        .await;
+    assert_eq!(status, 204, "{body}");
+    assert!(s.auth.reflection_grants("gone").await.unwrap().is_empty());
 }
 
 /// A virtual domain has no Reflection kept as files, so it takes no grant.
