@@ -609,13 +609,13 @@ pub async fn set_member(
     ApiPath((domain, principal)): ApiPath<(String, String)>,
     ApiJson(body): ApiJson<MemberBody>,
 ) -> Result<StatusCode, ApiError> {
-    identity.require_account()?;
+    let actor = identity.require_account()?.name;
     require_domain_read(&state, &identity, &domain).await?;
     refuse_read_only(&state)?;
     // GitHub decides who is here: a row written now would come back the day
     // the App is removed, so none is written.
     refuse_governed(&state, &domain)?;
-    let actor = require_right(&state, &identity, &domain, DomainRight::Manage, "manager").await?;
+    refuse_below(&state, &identity, &domain, DomainRight::Manage, "manager").await?;
     let principal = principal_key(&principal)?;
     state
         .auth
@@ -843,7 +843,7 @@ pub async fn set_owner(
     refuse_read_only(&state)?;
     // A domain GitHub governs has no owner to hand on.
     refuse_governed(&state, &domain)?;
-    require_right(&state, &identity, &domain, DomainRight::Own, "owner").await?;
+    refuse_below(&state, &identity, &domain, DomainRight::Own, "owner").await?;
     require_private(&state, &domain, "owner to hand on").await?;
     state
         .auth
