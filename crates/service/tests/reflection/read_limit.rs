@@ -261,3 +261,76 @@ async fn two_owner_runs_each_read_by_their_own_domain() {
     .await;
     assert!(quotes_harbor(&reads(&mut on_harbor).await));
 }
+
+/// A reflect run answering a thread: its answer lands, and in the same
+/// session it cannot read the private domain it would have to quote.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_answers_a_thread_without_seeing_a_private_domain() {
+    let (fx, _auth) = private_harbor().await;
+    let owner = crystalline_service::ReflectionCaller::owner();
+    fx.engine
+        .write_reflection(
+            &crate::docs::write("overview.md", "# Overview\n\n## Team\n\nA team.\n"),
+            &owner,
+        )
+        .await
+        .unwrap();
+    let opened = fx
+        .engine
+        .discuss(
+            &crystalline_service::params::DiscussParams {
+                domain: "eng".into(),
+                action: Some("open".into()),
+                path: Some("overview.md".into()),
+                section: Some("Team".into()),
+                text: Some("question: what does harbor know about the team?".into()),
+                ..Default::default()
+            },
+            &crystalline_service::ReflectionCaller::person(
+                Scope::User {
+                    account: "ann".into(),
+                    admin: false,
+                },
+                "ann",
+            ),
+        )
+        .await
+        .unwrap();
+    let thread = opened["thread"]["id"]
+        .as_str()
+        .or(opened["id"].as_str())
+        .expect("the thread's id")
+        .to_string();
+    fx.engine
+        .automation_lease_take(Loop::Reflect, "eng", "cli", &Scope::Unrestricted)
+        .await
+        .unwrap();
+    let mut wire = session(
+        McpServer::new(fx.engine.clone())
+            .with_unattended(true)
+            .with_run_domain("eng"),
+    )
+    .await;
+    let read = wire
+        .call(request(
+            40,
+            "tools/call",
+            json!({ "name": "read_engram", "arguments": { "identifier": "crystalline://harbor/team/harbor-team" } }),
+        ))
+        .await;
+    assert!(!quotes_harbor(&read.to_string()), "{read}");
+    let answered = wire
+        .call(request(
+            41,
+            "tools/call",
+            json!({ "name": "discuss", "arguments": {
+                "domain": "eng", "action": "answer", "path": "overview.md", "thread": thread,
+                "text": "note: I cannot see anything about that here."
+            } }),
+        ))
+        .await;
+    assert!(
+        answered["error"].is_null() && answered["result"]["isError"] != json!(true),
+        "{answered}"
+    );
+}

@@ -308,6 +308,10 @@ impl Engine {
         let mut out = Vec::new();
         for row in rows {
             let mut wide = false;
+            let hashes: HashMap<String, String> = r::split_sections(&row.content)
+                .into_iter()
+                .filter_map(|s| Some((s.id?, r::section_hash(&s.text))))
+                .collect();
             for (section, record) in r::read_provenance(&row.content) {
                 for src in &record.sources {
                     let Some(name) = src.domain.as_deref() else {
@@ -332,8 +336,13 @@ impl Engine {
                     let covered = covered
                         || match disclosures.find(&row.path, &section, name) {
                             Some(disclosure) => {
-                                self.source_covered(domain, &local, Some(disclosure))
-                                    .await?
+                                self.source_covered(
+                                    domain,
+                                    &local,
+                                    Some(disclosure),
+                                    hashes.get(&section).map(String::as_str),
+                                )
+                                .await?
                             }
                             None => false,
                         };
@@ -645,7 +654,14 @@ impl Engine {
                         .domain
                         .as_deref()
                         .and_then(|stored| disclosures.find(&row.path, id, stored))
-                        && self.source_covered(domain, local, Some(disclosure)).await?
+                        && self
+                            .source_covered(
+                                domain,
+                                local,
+                                Some(disclosure),
+                                Some(r::section_hash(&section.text).as_str()),
+                            )
+                            .await?
                     {
                         continue;
                     }
@@ -668,7 +684,12 @@ impl Engine {
                     // Review asks it), and the basis their yes carries back;
                     // it names only domains this caller may open.
                     let ask = self
-                        .disclosure_ask_for(domain, &row.path, &wide_domains)
+                        .disclosure_ask_for(
+                            domain,
+                            &row.path,
+                            &wide_domains,
+                            std::slice::from_ref(&section.text),
+                        )
                         .await?;
                     let extra = json!({
                         "sources": wide_shown,

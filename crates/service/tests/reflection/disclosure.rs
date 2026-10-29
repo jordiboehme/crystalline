@@ -286,6 +286,128 @@ async fn a_person_confirming_a_stale_question_is_refused() {
     assert_eq!(too_wide(&fx, &agent_as("keeper")).await.len(), 1);
 }
 
+/// The question shows the text being shared.
+#[tokio::test]
+async fn the_question_shows_the_text_it_shares() {
+    let (fx, _auth) = private_harbor().await;
+    let ask = fx
+        .engine
+        .reflection_disclosure_question(&cite(), &agent_as("sam"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(ask.question.contains("Five people."), "{}", ask.question);
+}
+
+/// The section text a person confirmed. An agent's write without sources
+/// that changes it is refused: changing shared text needs their yes again.
+/// Asked again, the new text lands and is what the record holds.
+#[tokio::test]
+async fn an_agent_changing_a_confirmed_section_is_asked_again() {
+    let (fx, _auth) = private_harbor().await;
+    fx.engine
+        .write_reflection(&confirmed(&fx, &agent_as("sam")).await, &agent_as("sam"))
+        .await
+        .unwrap();
+    let changed = write(
+        "overview.md",
+        "# Overview\n\nFor people.\n\n## Team\n\nFive people, and the pager rota.\n",
+    );
+    let err = fx
+        .engine
+        .write_reflection(&changed, &agent_as("sam"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("shared this section's text on purpose"),
+        "{err}"
+    );
+    let text = std::fs::read_to_string(fx.root.join("reflections/overview.md")).unwrap();
+    assert!(!text.contains("pager rota"), "{text}");
+    // The question for the sourceless change names that text.
+    let ask = fx
+        .engine
+        .reflection_disclosure_question(&changed, &agent_as("sam"))
+        .await
+        .unwrap()
+        .expect("a change to a confirmed section is a question");
+    assert!(ask.question.contains("pager rota"), "{}", ask.question);
+    let mut yes = changed.clone();
+    yes.disclosed = Some(ask.basis);
+    fx.engine
+        .write_reflection(&yes, &agent_as("sam"))
+        .await
+        .unwrap();
+    assert!(too_wide(&fx, &agent_as("keeper")).await.is_empty());
+}
+
+/// A person's own save of a confirmed section lands, and the section is
+/// named again until somebody confirms the new text.
+#[tokio::test]
+async fn a_person_changing_a_confirmed_section_makes_it_unconfirmed() {
+    let (fx, _auth) = private_harbor().await;
+    fx.engine
+        .write_reflection(&confirmed(&fx, &agent_as("sam")).await, &agent_as("sam"))
+        .await
+        .unwrap();
+    let stored = std::fs::read_to_string(fx.root.join("reflections/overview.md")).unwrap();
+    let mut save = write(
+        "overview.md",
+        &stored.replace("Five people.", "Five people and a dog."),
+    );
+    save.expected_checksum = None;
+    fx.engine
+        .write_reflection(&save, &ReflectionCaller::person(user("sam"), "sam"))
+        .await
+        .unwrap();
+    let items = too_wide(&fx, &agent_as("keeper")).await;
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert!(
+        items[0]["question"].as_str().unwrap().contains("a dog"),
+        "{items:?}"
+    );
+}
+
+/// Fluid confirms only the text the person saw: a basis read before the
+/// section's text moved is refused.
+#[tokio::test]
+async fn a_person_confirming_text_that_moved_is_refused() {
+    let (fx, auth) = reach().await;
+    fx.engine
+        .write_reflection(&cite(), &agent_as("keeper"))
+        .await
+        .unwrap();
+    private(&auth, "harbor", &["sam"]).await;
+    let items = too_wide(&fx, &agent_as("keeper")).await;
+    let section = items[0]["section"].as_str().unwrap().to_string();
+    let basis = items[0]["basis"].as_str().unwrap().to_string();
+    let stored = std::fs::read_to_string(fx.root.join("reflections/overview.md")).unwrap();
+    fx.engine
+        .write_reflection(
+            &write(
+                "overview.md",
+                &stored.replace("Five people.", "Six people."),
+            ),
+            &ReflectionCaller::person(user("keeper"), "keeper"),
+        )
+        .await
+        .unwrap();
+    let err = fx
+        .engine
+        .confirm_reflection_disclosure(
+            "eng",
+            "overview.md",
+            &section,
+            &basis,
+            &ReflectionCaller::person(user("sam"), "sam"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("changed since"), "{err}");
+}
+
 /// Without the confirmation the write is refused exactly as before.
 #[tokio::test]
 async fn an_unconfirmed_write_is_refused_as_before() {
@@ -785,15 +907,20 @@ async fn a_state_does_not_carry_over_to_another_call() {
 async fn a_flag_in_the_arguments_confirms_nothing() {
     let (fx, _auth) = private_harbor().await;
     let mut wire = Wire::over(McpServer::new(fx.engine.clone()));
+    // An eliciting client, so the feature is live: the flags do not skip the
+    // question, and nothing lands on the first call.
     let done = wire
         .call(modern(
             1,
-            false,
-            citing(json!({ "disclosed": true, "disclose": true, "confirm": true })),
+            true,
+            citing(json!({ "disclosed": true, "disclose": true, "confirm": true, "basis": "x" })),
         ))
         .await;
-    let text = refused_text(&done);
-    assert!(text.contains(TOO_WIDE), "{text}");
+    assert_eq!(
+        done["result"]["resultType"],
+        json!("input_required"),
+        "{done}"
+    );
     assert!(!page_exists(&fx));
 }
 
@@ -976,4 +1103,46 @@ async fn the_json_api_confirms_a_named_section_for_a_person() {
             .any(|i| i["what"] == "source_too_wide"),
         "{review}"
     );
+}
+
+/// Over MCP, an agent's sourceless change to a section a person shared on
+/// purpose puts the question again, showing the new text, and lands only on
+/// the person's yes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_change_to_shared_text_is_asked_about_over_mcp() {
+    let (fx, _auth) = private_harbor().await;
+    fx.engine
+        .write_reflection(
+            &confirmed(&fx, &ReflectionCaller::owner()).await,
+            &ReflectionCaller::owner(),
+        )
+        .await
+        .unwrap();
+    let mut wire = Wire::over(McpServer::new(fx.engine.clone()));
+    let change = json!({ "name": "write_reflection", "arguments": {
+        "domain": "eng", "path": "overview.md",
+        "operation": "replace_section", "section": "## Team",
+        "content": "Five people and the pager rota.",
+    } });
+    let first = wire.call(modern(1, true, change.clone())).await;
+    assert_eq!(
+        first["result"]["resultType"],
+        json!("input_required"),
+        "{first}"
+    );
+    let message = first["result"]["inputRequests"]["confirm"]["params"]["message"]
+        .as_str()
+        .unwrap();
+    assert!(message.contains("pager rota"), "{message}");
+    let state = first["result"]["requestState"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut second = change;
+    second["inputResponses"] = answer("accept", json!({ "confirm": true }));
+    second["requestState"] = json!(state);
+    landed(&wire.call(modern(2, true, second)).await);
+    let text = std::fs::read_to_string(fx.root.join("reflections/overview.md")).unwrap();
+    assert!(text.contains("pager rota"), "{text}");
+    assert!(too_wide(&fx, &ReflectionCaller::owner()).await.is_empty());
 }

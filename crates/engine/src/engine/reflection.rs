@@ -1591,7 +1591,12 @@ impl Engine {
         caller: &ReflectionCaller,
     ) -> Result<Value> {
         match p.action.as_deref().unwrap_or("write") {
-            "write" => self.write_reflection_text(p, caller).await,
+            "write" => match self.write_reflection_text(p, caller, false).await? {
+                Written::Receipt(receipt) => Ok(receipt),
+                Written::Preview(_) => Err(EngineError::Internal(
+                    "a write answered with a preview".into(),
+                )),
+            },
             "move" => {
                 let to = p.to.as_deref().ok_or_else(|| {
                     EngineError::Invalid("move needs `to`, the new path inside reflections/".into())
@@ -1628,11 +1633,30 @@ impl Engine {
         }
     }
 
+    /// What `p` would leave on its page and what in it needs a person's
+    /// confirmation (`super::disclosure`), worked out by the write itself and
+    /// stopped before anything is written. `None` for an action that is no
+    /// text write.
+    pub(super) async fn preview_reflection_write(
+        &self,
+        p: &WriteReflectionParams,
+        caller: &ReflectionCaller,
+    ) -> Result<Option<super::disclosure::WritePreview>> {
+        if p.action.as_deref().unwrap_or("write") != "write" {
+            return Ok(None);
+        }
+        match self.write_reflection_text(p, caller, true).await? {
+            Written::Preview(preview) => Ok(Some(preview)),
+            Written::Receipt(_) => Ok(None),
+        }
+    }
+
     async fn write_reflection_text(
         &self,
         p: &WriteReflectionParams,
         caller: &ReflectionCaller,
-    ) -> Result<Value> {
+        preview: bool,
+    ) -> Result<Written> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
@@ -1676,7 +1700,7 @@ impl Engine {
                 &p.domain,
                 &caller.scope,
                 p.sources.values().flatten(),
-                by.is_some(),
+                by.is_some() || preview,
             )
             .await?;
         let wanted: Vec<r::SourceRef> = named.values().map(|n| n.source_ref("")).collect();
@@ -1686,11 +1710,6 @@ impl Engine {
         let abs = access.abs(&p.path);
         let baseline_abs = access.abs(&r::baseline_path(&p.path));
         let _lock = self.lock_file(&abs).await;
-        // The person said yes to the readers the question named: still them?
-        if let (Some(_), Some(basis)) = (&by, p.disclosed.as_deref()) {
-            self.hold_disclosure_to_its_question(&p.domain, &p.path, &named, basis)
-                .await?;
-        }
 
         let current = read_opt(&abs)?;
         // Rule 0: a create never replaces a page, and a stale checksum is
@@ -2015,6 +2034,48 @@ impl Engine {
             }
         }
         let final_text = stamp_reflected(&text, &mut prov, &advanced)?;
+        // What a person must confirm (`super::disclosure`): the sources the
+        // reach rule refuses, and every section a person shared on purpose
+        // whose text this write changes.
+        let (needs, changes_confirmed) = self
+            .preview_needs(access.domain_id, &p.path, &final_text, &confirmed)
+            .await?;
+        if preview {
+            return Ok(Written::Preview(super::disclosure::WritePreview {
+                text: final_text,
+                needs,
+            }));
+        }
+        match p.disclosed.as_deref().filter(|_| by.is_some()) {
+            // The person said yes to these readers and this text: still them?
+            Some(basis) if !needs.is_empty() => {
+                let shown = super::disclosure::WritePreview {
+                    text: final_text.clone(),
+                    needs: needs.clone(),
+                };
+                if self
+                    .ask_for_preview(&p.domain, &p.path, &shown)
+                    .await?
+                    .basis
+                    != basis
+                {
+                    return Err(EngineError::Conflict(
+                        super::disclosure::DISCLOSURE_CHANGED.into(),
+                    ));
+                }
+            }
+            Some(_) => {}
+            // An agent may not change text a person shared on purpose
+            // without their yes; a person's own edit lands, and the section
+            // is named in the queue again until somebody confirms it.
+            None if changes_confirmed && caller.author.agent => {
+                return Err(EngineError::Invalid(
+                    super::disclosure::CONFIRMED_TEXT_CHANGED.into(),
+                ));
+            }
+            None => {}
+        }
+        let confirmed = if by.is_some() { needs } else { Vec::new() };
         // The `##` sections this write created or changed that leave it with
         // no source in their record: provenance alone, whatever else counts
         // a section as reflected. The pact is no page.
@@ -2191,8 +2252,15 @@ impl Engine {
                 ),
             }
         }
-        Ok(receipt)
+        Ok(Written::Receipt(receipt))
     }
+}
+
+/// What [`Engine::write_reflection_text`] answers: the receipt of a write,
+/// or what a preview would have written.
+pub(super) enum Written {
+    Receipt(Value),
+    Preview(super::disclosure::WritePreview),
 }
 
 impl Engine {
