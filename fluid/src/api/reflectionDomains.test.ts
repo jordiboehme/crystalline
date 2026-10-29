@@ -20,6 +20,8 @@ describe("reflection status", () => {
           right: "read",
           engrams_visible: true,
           member: true,
+          governance: "github",
+          private: true,
           pending_engrams: [],
         },
         "eng",
@@ -33,6 +35,8 @@ describe("reflection status", () => {
       right: "read",
       engramsVisible: true,
       member: true,
+      governance: "github",
+      private: true,
       pendingEngrams: [],
     });
   });

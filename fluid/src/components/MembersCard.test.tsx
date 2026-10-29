@@ -1008,3 +1008,249 @@ describe("the members card", () => {
     expect(within(card).getByLabelText("New owner")).toHaveValue("");
   });
 });
+
+/** GitHub's people on a governed `eng`: maint manages, wri writes, one unlinked reader. */
+function githubPeople() {
+  return [
+    {
+      login: "maint-gh",
+      github_role: "maintain",
+      level: "manager",
+      account: "maint",
+    },
+    {
+      login: "nobody-gh",
+      github_role: "read",
+      level: "viewer",
+      account: null,
+    },
+    { login: "wri-gh", github_role: "write", level: "editor", account: "wri" },
+  ];
+}
+
+/** The members read of a governed `eng`, shared by default. */
+function governedResponse(overrides: Record<string, unknown> = {}) {
+  return membersResponse({
+    governance: "github",
+    github_people: githubPeople(),
+    overridden: [],
+    reflection_collaborators: null,
+    ...overrides,
+  });
+}
+
+describe("the members card on a domain GitHub governs", () => {
+  it("renders People on GitHub read-only", async () => {
+    serve(
+      { "/domains/eng/members": () => governedResponse() },
+      "wri",
+      "editor",
+    );
+
+    renderApp("/d/eng/settings");
+    const card = await membersCard();
+    const people = within(card).getByRole("table", {
+      name: "People on GitHub",
+    });
+    expect(
+      within(people).getByRole("rowheader", { name: "maint-gh" }),
+    ).toBeVisible();
+    const nobody = within(people)
+      .getByRole("rowheader", { name: "nobody-gh" })
+      .closest("tr") as HTMLElement;
+    expect(within(nobody).getByText("read")).toBeVisible();
+    expect(within(nobody).getByText("viewer")).toBeVisible();
+    expect(within(nobody).getByText("Not linked")).toBeVisible();
+    // Nothing here changes what GitHub says, and nothing hands the domain on.
+    expect(within(card).queryAllByRole("combobox")).toEqual([]);
+    expect(within(card).queryByRole("button", { name: "Invite" })).toBeNull();
+    expect(
+      within(card).queryByRole("button", { name: "Transfer ownership" }),
+    ).toBeNull();
+    // A writer sees who may read, and cannot change it.
+    const everyone = within(card).getByRole("radio", {
+      name: "Everyone signed in",
+    });
+    expect(everyone).toBeChecked();
+    expect(everyone).toBeDisabled();
+  });
+
+  it("renders overridden grants under their heading", async () => {
+    serve(
+      {
+        "/domains/eng/members": () =>
+          governedResponse({
+            visibility: "private",
+            // The old acl owner is never sent: GitHub decides.
+            owner: null,
+            overridden: [memberFixture({ principal: "wri", level: "viewer" })],
+          }),
+      },
+      "maint",
+      "editor",
+    );
+
+    renderApp("/d/eng/settings");
+    const card = await membersCard();
+    const overridden = within(card).getByRole("table", {
+      name: "Set in Crystalline, overridden by GitHub",
+    });
+    expect(
+      within(overridden).getByRole("rowheader", { name: "wri" }),
+    ).toBeVisible();
+    // Read-only: GitHub decides, so no row offers a change or a removal.
+    expect(within(overridden).queryAllByRole("combobox")).toEqual([]);
+    expect(within(overridden).queryAllByRole("button")).toEqual([]);
+  });
+
+  it("adds and removes a Reflection collaborator", async () => {
+    let grants = [
+      {
+        account: "ann",
+        level: "reader",
+        added_by: "maint",
+        added_at: "2026-10-01T00:00:00Z",
+      },
+    ];
+    serve(
+      {
+        "/domains/eng/members": () =>
+          governedResponse({ reflection_collaborators: grants }),
+        "/domains/eng/reflection-collaborators/bob": (_path, init) => {
+          if (init?.method === "PUT") {
+            grants = [
+              ...grants,
+              {
+                account: "bob",
+                level: "contributor",
+                added_by: "maint",
+                added_at: "2026-10-02T00:00:00Z",
+              },
+            ];
+          }
+          return undefined;
+        },
+        "/domains/eng/reflection-collaborators/ann": (_path, init) => {
+          if (init?.method === "DELETE") {
+            grants = grants.filter((grant) => grant.account !== "ann");
+          }
+          return undefined;
+        },
+      },
+      "maint",
+      "editor",
+    );
+
+    renderApp("/d/eng/settings");
+    const card = await membersCard();
+    const section = within(card).getByRole("region", {
+      name: "Reflection collaborators",
+    });
+    expect(
+      within(section).getByRole("rowheader", { name: "ann" }),
+    ).toBeVisible();
+
+    await userEvent.type(
+      within(section).getByRole("textbox", { name: "Collaborator" }),
+      "bob",
+    );
+    await userEvent.selectOptions(
+      within(section).getByRole("combobox", { name: "Reflection access" }),
+      "contributor",
+    );
+    await userEvent.click(
+      within(section).getByRole("button", { name: "Add collaborator" }),
+    );
+    await waitFor(() => {
+      expect(
+        sentBody("/domains/eng/reflection-collaborators/bob", "PUT"),
+      ).toEqual({ level: "contributor" });
+    });
+    expect(
+      await within(section).findByRole("rowheader", { name: "bob" }),
+    ).toBeVisible();
+
+    await userEvent.click(
+      within(section).getByRole("button", { name: "Remove ann" }),
+    );
+    await userEvent.click(
+      within(section).getByRole("button", { name: "Confirm remove ann" }),
+    );
+    await waitFor(() => {
+      expect(
+        within(section).queryByRole("rowheader", { name: "ann" }),
+      ).toBeNull();
+    });
+    expect(
+      apiMock.mock.calls.some(
+        ([path, init]) =>
+          path === "/domains/eng/reflection-collaborators/ann" &&
+          init?.method === "DELETE",
+      ),
+    ).toBe(true);
+  });
+
+  it("lets a GitHub maintainer switch who may read", async () => {
+    serve(
+      {
+        "/domains/eng/members": () => governedResponse(),
+        "/domains/eng/visibility": () => undefined,
+      },
+      "maint",
+      "editor",
+    );
+
+    renderApp("/d/eng/settings");
+    const card = await membersCard();
+    const github = within(card).getByRole("radio", {
+      name: "Only people with access on GitHub",
+    });
+    expect(github).toBeEnabled();
+    await userEvent.click(github);
+    await waitFor(() => {
+      expect(sentBody("/domains/eng/visibility", "PUT")).toEqual({
+        private: true,
+      });
+    });
+  });
+
+  it("keeps the switch read-only where the environment sets who may read", async () => {
+    const sentence = "Set by CRYSTALLINE_DOMAIN_ENG_READERS; change it there.";
+    serve(
+      {
+        "/domains/eng/members": () =>
+          governedResponse({ visibility_fixed_by: sentence }),
+      },
+      "root",
+      "admin",
+    );
+
+    renderApp("/d/eng/settings");
+    const card = await membersCard();
+    expect(
+      within(card).getByRole("radio", { name: "Everyone signed in" }),
+    ).toBeDisabled();
+    expect(within(card).getByText(sentence)).toBeVisible();
+  });
+
+  it("tells an admin why a closed domain is closed", async () => {
+    const reason =
+      "the GitHub App is not installed on acme/eng: install it there or disconnect the domain";
+    serve(
+      {
+        "/domains/eng/members": () =>
+          governedResponse({ closed_reason: reason, github_people: [] }),
+      },
+      "root",
+      "admin",
+    );
+
+    renderApp("/d/eng/settings");
+    const card = await membersCard();
+    expect(
+      within(card).getByText(
+        "Closed. The GitHub App is not installed on acme/eng: install it there or disconnect the domain.",
+      ),
+    ).toBeVisible();
+  });
+});

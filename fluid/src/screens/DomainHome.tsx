@@ -78,6 +78,9 @@ import { fetchReflectionTree, reflectionTreeKey } from "../api/reflection";
 import type { TreeNode } from "../api/reflection";
 import { DomainLockChip } from "../components/DomainLockChip";
 import { useDomainWritable } from "../domainWritable";
+import { fetchMembers, governanceOf, membersKey } from "../api/members";
+import { GithubLinkHint } from "../components/GithubLinkHint";
+import { useUnlinkedFromGithub } from "../githubLink";
 import type {
   EngramFilters,
   EngramPage,
@@ -1492,6 +1495,17 @@ function EngramsSection({
   manifestPermalink?: string | null;
 }) {
   const { canWrite } = useDomainWritable(domain);
+  // The same members read the settings and the danger zone make: whether
+  // GitHub decides here, and whether the domain is shared.
+  const members = useQuery({
+    queryKey: membersKey(domain),
+    queryFn: () => fetchMembers(domain),
+  });
+  const sharedGithub =
+    members.data !== undefined &&
+    governanceOf(members.data).github &&
+    members.data.visibility !== "private";
+  const unlinked = useUnlinkedFromGithub(sharedGithub && !canWrite);
   const newEngramReasonId = useId();
   const filterId = useId();
   const newEngramDisabledReason = renaming ? RENAMING_REASON : undefined;
@@ -1575,6 +1589,7 @@ function EngramsSection({
           )}
         </div>
       </div>
+      {!canWrite && unlinked && <GithubLinkHint />}
       {creating && (
         <CreateEngramDialog
           domain={domain}

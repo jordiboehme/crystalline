@@ -101,6 +101,7 @@ import {
 } from "../paths";
 import { PREFETCH } from "../prefetch";
 import { useWide } from "../useWide";
+import { GithubAccessBanner } from "./GithubAccessBanner";
 import { OutlineSlotContext } from "./outlineSlot";
 import { CommandPalette, openPalette } from "./CommandPalette";
 import { CreateDomainDialog } from "./CreateDomainDialog";
@@ -913,6 +914,7 @@ export function Layout() {
                       data-text={largeText ? "large" : undefined}
                       className="relative min-w-0 flex-1 py-6 focus:outline-none"
                     >
+                      {capabilities.canAdminister && <GithubAccessBanner />}
                       <Outlet />
                       <ReadyFlash />
                     </main>

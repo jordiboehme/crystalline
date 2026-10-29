@@ -61,6 +61,7 @@ import { problemDetail } from "../api/client";
 import { DOMAINS_QUERY_KEY } from "../api/domains";
 import {
   fetchMembers,
+  governanceOf,
   membersKey,
   removeMember,
   sameAccount,
@@ -71,7 +72,9 @@ import type { DomainMember, MemberLevel, ReflectionLevel } from "../api/model";
 import { useAuth } from "../auth/AuthContext";
 import { formatDay } from "../format";
 import { DestructiveAction, READ_ONLY_REASON } from "./DestructiveAction";
+import { GovernedMembers } from "./GovernedMembers";
 import { BUTTON, FIELD, Field } from "./primitives";
+import { ReflectionCollaborators } from "./ReflectionCollaborators";
 import { ReflectionLevelSelect } from "./ReflectionLevelSelect";
 import {
   raiseForNone,
@@ -243,6 +246,19 @@ export function MembersCard({ domain }: { domain: string }) {
     user?.name ?? null,
   );
   const isPrivate = data.visibility === "private";
+  const governance = governanceOf(data);
+  // On a domain GitHub governs, manager access comes from GitHub (admin or
+  // maintain) or from being an instance admin; nobody owns such a domain.
+  const governedManager =
+    capabilities.canAdminister ||
+    (user !== null &&
+      (governance.githubPeople ?? []).some(
+        (person) =>
+          person.level === "manager" &&
+          person.account !== null &&
+          person.account !== undefined &&
+          sameAccount(person.account, user.name),
+      ));
   // `readOnly` is a certainty this side already holds, not a derived right -
   // see the constant's own doc for why that earns a different treatment
   // (disabled and explained, never simply offered and left to be refused).
@@ -271,7 +287,18 @@ export function MembersCard({ domain }: { domain: string }) {
           {problem}
         </p>
       )}
-      {isPrivate ? (
+      {governance.github ? (
+        <GovernedMembers
+          domain={domain}
+          isPrivate={isPrivate}
+          people={governance.githubPeople}
+          overridden={governance.overridden}
+          mayChoose={governedManager}
+          fixedBy={governance.visibilityFixedBy}
+          closedReason={governance.closedReason}
+          disabledReason={disabledReason}
+        />
+      ) : isPrivate ? (
         <>
           <OwnerRow
             owner={owner}
@@ -318,6 +345,13 @@ export function MembersCard({ domain }: { domain: string }) {
         <p className="text-sm text-slate-500 dark:text-slate-400">
           Every account on this instance can read this domain.
         </p>
+      )}
+      {governance.reflectionCollaborators !== null && (
+        <ReflectionCollaborators
+          domain={domain}
+          grants={governance.reflectionCollaborators}
+          disabledReason={disabledReason}
+        />
       )}
     </section>
   );

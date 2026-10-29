@@ -16,6 +16,10 @@
  * exactly that reason: administering a team is one thing, and deciding who
  * may see everything in a domain is another.
  *
+ * On a domain GitHub governs, the visibility control is not drawn here:
+ * the members card carries that domain's "who may read" switch, and
+ * opening it forgets nobody.
+ *
  * Who sees what follows the server's own gates rather than one flag for the
  * card. Both verbs need `Own`: an instance admin, or the owner of a private
  * domain. `DELETE /domains/{domain}` checks exactly that in the engine, and
@@ -41,6 +45,7 @@ import { problemDetail } from "../api/client";
 import { DOMAINS_QUERY_KEY } from "../api/domains";
 import {
   fetchMembers,
+  governanceOf,
   membersKey,
   sameAccount,
   setVisibility,
@@ -157,6 +162,10 @@ export function DangerZoneCard({
     capabilities.canAdminister ||
     (user !== null && owner !== null && sameAccount(owner, user.name));
   const isPrivate = members.data?.visibility === "private";
+  // On a domain GitHub governs, who may read it is the members card's
+  // switch, and nothing there is forgotten when it opens.
+  const governed =
+    members.data !== undefined && governanceOf(members.data).github;
   // `readOnly` is a certainty this side already holds, unlike a per-domain
   // right: the control is shown shut, with the reason as its accessible
   // description, rather than removed. See `READ_ONLY_REASON` itself.
@@ -255,7 +264,7 @@ export function DangerZoneCard({
         answer: offering "Make private" over a domain that already is one
         would be the card guessing in place of asking.
       */}
-      {own && members.data !== undefined && (
+      {own && members.data !== undefined && !governed && (
         <div className="flex flex-col gap-1">
           <DestructiveAction
             label={visibilityLabel}
