@@ -343,7 +343,11 @@ fn an_unattended_session_through_the_bridge_is_never_asked() {
     let _ = bin(h).args(["ctl", "shutdown"]).output();
     let _ = serving.wait();
     assert!(!asked, "{answer}");
-    assert!(answer.contains(TOO_WIDE), "{answer}");
+    // It does not even see harbor: refused, as a domain that does not exist.
+    assert!(
+        answer.contains("\"error\"") || answer.contains("\"isError\":true"),
+        "{answer}"
+    );
     assert!(!h.join("eng/reflections/overview.md").exists());
 }
 
@@ -356,5 +360,9 @@ fn an_unattended_embedded_session_is_never_asked() {
         true,
     );
     assert!(!asked, "{answer}");
-    assert!(answer.contains(TOO_WIDE), "{answer}");
+    // It does not even see harbor: refused, as a domain that does not exist.
+    assert!(
+        answer.contains("\"error\"") || answer.contains("\"isError\":true"),
+        "{answer}"
+    );
 }

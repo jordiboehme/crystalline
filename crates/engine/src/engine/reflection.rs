@@ -1025,6 +1025,13 @@ impl Engine {
         if self.domain_entry(domain).is_err() {
             self.require_domain(domain, &caller.scope).await?;
         }
+        // An unattended request may not read this domain at all
+        // (`crate::read_limit`): its Reflection is as unknown to it as the
+        // domain.
+        if crate::read_limit::current().is_some_and(|limit| limit.contains(domain)) {
+            let hidden = self.hidden_for(&caller.scope).await?;
+            return Err(self.unknown_domain(domain, &hidden));
+        }
         let engrams_visible = self.engrams_visible(&caller.scope, domain).await?;
         // The MCP open tier curates every domain it can see; a private
         // domain stays as invisible to it as to every anonymous caller.

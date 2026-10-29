@@ -1141,21 +1141,29 @@ fn harness_gate_from_options(options: &[&str]) -> crate::instance::HarnessGate {
         HarnessGate, ROUTING_CONDITIONAL_OPTION, SKILLS_OFF_OPTION, UNATTENDED_OPTION,
     };
     let unattended = options.contains(&UNATTENDED_OPTION);
+    let run_domain = options
+        .iter()
+        .find_map(|o| o.strip_prefix(crate::instance::RUN_DOMAIN_OPTION))
+        .filter(|d| !d.is_empty())
+        .map(str::to_string);
     if options.contains(&SKILLS_OFF_OPTION) {
         HarnessGate {
             hook_installed: true,
             onboarding_verified: true,
             unattended,
+            run_domain,
         }
     } else if options.contains(&ROUTING_CONDITIONAL_OPTION) {
         HarnessGate {
             hook_installed: true,
             onboarding_verified: false,
             unattended,
+            run_domain,
         }
     } else {
         HarnessGate {
             unattended,
+            run_domain,
             ..HarnessGate::default()
         }
     }
@@ -3934,11 +3942,13 @@ mod tests {
             hook_installed: true,
             onboarding_verified: true,
             unattended: false,
+            run_domain: None,
         };
         let conditional = HarnessGate {
             hook_installed: true,
             onboarding_verified: false,
             unattended: false,
+            run_domain: None,
         };
         assert_eq!(harness_gate_from_options(&["skills=off"]), verified);
         assert_eq!(
@@ -3959,6 +3969,10 @@ mod tests {
         assert!(marked.unattended && marked.verified());
         assert!(harness_gate_from_options(&["unattended"]).unattended);
         assert!(!harness_gate_from_options(&["skills=off"]).unattended);
+        assert_eq!(
+            harness_gate_from_options(&["unattended", "domain=eng"]).run_domain,
+            Some("eng".to_string())
+        );
     }
 
     /// The router `run_serve` builds ends an open event stream when the

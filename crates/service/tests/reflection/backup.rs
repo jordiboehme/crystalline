@@ -1396,3 +1396,21 @@ async fn a_confirmed_local_source_names_the_repository_and_is_backed_up() {
     );
     assert!(fx.engine.reflection_backup_held_back("eng").is_empty());
 }
+
+/// A run on a domain backed up to GitHub reads no domain that is not
+/// connected to GitHub, though the accounts would let it: its pages go to a
+/// repository whose readers are not the accounts here.
+#[tokio::test]
+async fn a_run_on_a_github_domain_reads_no_local_domain() {
+    let mock = Arc::new(MockProvider::new());
+    main_commit(&mock);
+    let (fx, _) = home_beside_harbor(mock, false).await;
+    let owner = crystalline_service::Scope::Unrestricted;
+    let limit = fx
+        .engine
+        .read_limit_for(&owner, true, Some("eng"))
+        .await
+        .unwrap();
+    assert!(limit.contains("harbor"), "{limit:?}");
+    assert!(!limit.contains("eng"), "{limit:?}");
+}

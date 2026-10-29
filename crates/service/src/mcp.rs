@@ -254,6 +254,7 @@
 //! `add_domain` through team mode, `share_changes`, `update_domain`,
 //! `origin_status` and `withdraw_proposal`.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use base64::Engine as _;
@@ -1949,11 +1950,20 @@ impl McpServer {
     /// `false` the default gate.
     pub fn with_onboarded_harness(self, onboarded: bool) -> McpServer {
         let unattended = self.gate.unattended;
+        let run_domain = self.gate.run_domain.clone();
         self.with_harness_gate(HarnessGate {
             hook_installed: onboarded,
             onboarding_verified: onboarded,
             unattended,
+            run_domain,
         })
+    }
+
+    /// Bind this session to the domain an unattended run started it for
+    /// (see [`HarnessGate::run_domain`]).
+    pub fn with_run_domain(mut self, domain: &str) -> McpServer {
+        self.gate.run_domain = Some(domain.to_string());
+        self
     }
 
     /// Mark this session unattended (see [`HarnessGate::unattended`]): it
@@ -2276,7 +2286,11 @@ impl McpServer {
         p: &P,
         ctx: &RequestContext<RoleServer>,
     ) -> Option<Result<CallToolResult, ErrorData>> {
-        if self.transport != Transport::Stdio {
+        // An unattended session is never routed: whoever reads a connected
+        // server's domains is not known here, so it reads this machine only
+        // (`crystalline_engine::read_limit`).
+        if self.transport != Transport::Stdio || crystalline_engine::read_limit::current().is_some()
+        {
             return None;
         }
         let args = serde_json::to_value(p).ok()?;
@@ -4675,7 +4689,7 @@ impl McpServer {
     /// routing block twice.
     fn arrival_info(&self) -> ServerConfig {
         let mut info = self.get_info();
-        let short = match instructions_variant(self.engine.skills_serve(), self.gate) {
+        let short = match instructions_variant(self.engine.skills_serve(), self.gate.clone()) {
             InstructionsVariant::Full => None,
             InstructionsVariant::Minimal => Some(crystalline_core::render_minimal_instructions()),
             InstructionsVariant::Conditional => {
@@ -4706,7 +4720,8 @@ impl McpServer {
     /// what this exists to prevent, and a client that gets an error re-asks.
     async fn arrival_info_scoped(&self, scope: &Scope) -> Result<ServerConfig, ErrorData> {
         let mut info = self.arrival_info();
-        if instructions_variant(self.engine.skills_serve(), self.gate) != InstructionsVariant::Full
+        if instructions_variant(self.engine.skills_serve(), self.gate.clone())
+            != InstructionsVariant::Full
         {
             return Ok(info);
         }
@@ -5077,12 +5092,116 @@ fn applied_failure(applied: &[String], failed_key: &str, e: EngineError) -> Erro
     ErrorData::new(base.code, message, base.data)
 }
 
-#[tool_handler]
-impl ServerHandler for McpServer {
-    /// Every tool call, read and write verbs alike: the tool router's own
-    /// dispatch (what `#[tool_handler]` would generate), then the pending
-    /// rename line (`McpServer::with_rename_guidance`) on the answer.
-    async fn call_tool(
+/// The header a remote loop run sends with its bearer: the domain it started
+/// this session for. Believed only while the bearer's account holds a live
+/// loop lease on that domain, so it can only narrow what the session reads.
+pub const RUN_DOMAIN_HEADER: &str = "X-Crystalline-Run-Domain";
+
+impl McpServer {
+    /// What this request may not read because its session is unattended
+    /// ([`Engine::read_limit_for`]): marked by its registration, by the run
+    /// domain an HTTP run names, or by a live loop lease its caller holds.
+    async fn read_limit(&self, ctx: &RequestContext<RoleServer>) -> Option<HashSet<String>> {
+        let header = match self.transport {
+            Transport::Http => ctx
+                .extensions
+                .get::<axum::http::request::Parts>()
+                .and_then(|parts| parts.headers.get(RUN_DOMAIN_HEADER))
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            Transport::Stdio => None,
+        };
+        let run_domain = header.as_deref().or(self.gate.run_domain.as_deref());
+        self.engine
+            .read_limit_for(
+                &self.scope_of(ctx),
+                self.gate.unattended || header.is_some(),
+                run_domain,
+            )
+            .await
+    }
+
+    /// [`ServerHandler::read_resource`] inside the request's read limit.
+    async fn read_resource_limited(
+        &self,
+        request: ReadResourceRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, ErrorData> {
+        if let Some(asset) = skill_for_uri(&request.uri) {
+            return Ok(ReadResourceResult::new(vec![
+                ResourceContents::text(asset.content, &request.uri).with_mime_type(SKILL_MIME_TYPE),
+            ])
+            .with_cache_hints(&context)
+            .into());
+        }
+        if let Some(url) = CrystallineUrl::parse(&request.uri) {
+            let url = CrystallineUrl {
+                permalink: decoded_uri_path(&url.permalink)?,
+                ..url
+            };
+            if let Some((kind, path)) = url.asset_ref() {
+                // A file of a mounted domain lives on its server: a stdio
+                // session (this machine's owner, decision D8) reads it from
+                // there, under the account's own rights on that server. An
+                // HTTP session never borrows the owner's sign-in. Asked before
+                // any local name is resolved, so a hidden local copy of the
+                // domain never answers for it.
+                if self.transport == Transport::Stdio
+                    && crystalline_engine::read_limit::current().is_none()
+                    && let Some(routed) =
+                        crate::route::routed_file(&self.engine, &url.domain, &url.permalink).await
+                {
+                    let file = routed.map_err(routed_file_error)?;
+                    return Ok(ReadResourceResult::new(vec![attachment_contents(
+                        &request.uri,
+                        file.bytes,
+                        &file.mime,
+                    )])
+                    .with_cache_hints_as(&context, CacheScope::Private)
+                    .into());
+                }
+                // A file uri names its domain outright, and nothing had to be
+                // read first to learn the name, so this is the one file path
+                // a caller can reach cold. The domain may be spelled by any
+                // of its names; one this caller may not see keeps the
+                // spelling they sent.
+                let scope = self.scope_of(&context);
+                let hidden = self.engine.hidden_for(&scope).await.map_err(to_error)?;
+                let domain = self.engine.localize_visible(&url.domain, &hidden).await;
+                let (bytes, row) = self
+                    .file_bytes(
+                        kind,
+                        &domain,
+                        path,
+                        &scope,
+                        &self.reflection_caller(&context),
+                    )
+                    .await
+                    .map_err(to_error)?;
+                return Ok(ReadResourceResult::new(vec![attachment_contents(
+                    &request.uri,
+                    bytes,
+                    &row.mime,
+                )])
+                // Private: this answer depends on who asked, unlike every
+                // other result this server hints (see [`CACHE_SCOPE`]).
+                .with_cache_hints_as(&context, CacheScope::Private)
+                .into());
+            }
+        }
+        Err(ErrorData::invalid_params(
+            format!(
+                "unknown resource '{}'; this server serves {} and every attachment addressed as {ATTACHMENT_URI_TEMPLATE} or {REFLECTION_ASSET_URI_TEMPLATE}",
+                request.uri,
+                skill_uris()
+            ),
+            None,
+        ))
+    }
+
+    /// [`ServerHandler::call_tool`] inside the request's read limit.
+    async fn call_tool_limited(
         &self,
         request: rmcp::model::CallToolRequestParams,
         context: RequestContext<RoleServer>,
@@ -5106,6 +5225,25 @@ impl ServerHandler for McpServer {
             other => other,
         })
     }
+}
+
+#[tool_handler]
+impl ServerHandler for McpServer {
+    /// Every tool call, read and write verbs alike: the tool router's own
+    /// dispatch (what `#[tool_handler]` would generate), then the pending
+    /// rename line (`McpServer::with_rename_guidance`) on the answer.
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, ErrorData> {
+        // An unattended session reads only what every reader of its run's
+        // domain may read (`crystalline_engine::read_limit`), for the whole
+        // call, whichever tool it is.
+        let limit = self.read_limit(&context).await;
+        crystalline_engine::read_limit::within(limit, self.call_tool_limited(request, context))
+            .await
+    }
 
     /// The revisions this server serves, narrowed from rmcp's crate-wide
     /// `KNOWN_VERSIONS` default to [`SERVED_PROTOCOL_VERSIONS`].
@@ -5120,7 +5258,6 @@ impl ServerHandler for McpServer {
     fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [ProtocolVersion]> {
         std::borrow::Cow::Borrowed(SERVED_PROTOCOL_VERSIONS)
     }
-
     /// The server handshake: hand the connecting agent the live routing block
     /// as its `instructions`. rmcp calls `get_info` once per connection at
     /// initialize, so [`Engine::routing_text`] renders the currently registered
@@ -5302,7 +5439,7 @@ impl ServerHandler for McpServer {
         // private set that cannot be read keeps `get_info`'s pointer, which
         // names and counts nothing.
         if self.transport == Transport::Http
-            && instructions_variant(self.engine.skills_serve(), self.gate)
+            && instructions_variant(self.engine.skills_serve(), self.gate.clone())
                 == InstructionsVariant::Full
         {
             match self.engine.routing_text_counted().await {
@@ -5524,7 +5661,7 @@ impl ServerHandler for McpServer {
     ) -> Result<ListToolsResult, ErrorData> {
         let read_only = self.engine.read_only();
         let github_enabled = self.engine.github_enabled();
-        let skills_hidden = hidden_skills_surface(self.engine.skills_serve(), self.gate);
+        let skills_hidden = hidden_skills_surface(self.engine.skills_serve(), self.gate.clone());
         let mut tools = Self::tool_router().list_all();
         tools.retain(|t| {
             if is_write_tool(&t.name) && read_only {
@@ -5573,7 +5710,8 @@ impl ServerHandler for McpServer {
         if name == "provision" && hidden_provision_tool(read_only) {
             return None;
         }
-        if name == "skills" && hidden_skills_surface(self.engine.skills_serve(), self.gate) {
+        if name == "skills" && hidden_skills_surface(self.engine.skills_serve(), self.gate.clone())
+        {
             return None;
         }
         let mut tool = Self::tool_router().get(name).cloned()?;
@@ -5592,7 +5730,7 @@ impl ServerHandler for McpServer {
         _request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, ErrorData> {
-        if hidden_skills_surface(self.engine.skills_serve(), self.gate) {
+        if hidden_skills_surface(self.engine.skills_serve(), self.gate.clone()) {
             return Ok(ListResourcesResult::with_all_items(Vec::new()).with_cache_hints(&context));
         }
         let resources = SKILL_ASSETS
@@ -5663,75 +5801,11 @@ impl ServerHandler for McpServer {
         request: ReadResourceRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, ErrorData> {
-        if let Some(asset) = skill_for_uri(&request.uri) {
-            return Ok(ReadResourceResult::new(vec![
-                ResourceContents::text(asset.content, &request.uri).with_mime_type(SKILL_MIME_TYPE),
-            ])
-            .with_cache_hints(&context)
-            .into());
-        }
-        if let Some(url) = CrystallineUrl::parse(&request.uri) {
-            let url = CrystallineUrl {
-                permalink: decoded_uri_path(&url.permalink)?,
-                ..url
-            };
-            if let Some((kind, path)) = url.asset_ref() {
-                // A file of a mounted domain lives on its server: a stdio
-                // session (this machine's owner, decision D8) reads it from
-                // there, under the account's own rights on that server. An
-                // HTTP session never borrows the owner's sign-in. Asked before
-                // any local name is resolved, so a hidden local copy of the
-                // domain never answers for it.
-                if self.transport == Transport::Stdio
-                    && let Some(routed) =
-                        crate::route::routed_file(&self.engine, &url.domain, &url.permalink).await
-                {
-                    let file = routed.map_err(routed_file_error)?;
-                    return Ok(ReadResourceResult::new(vec![attachment_contents(
-                        &request.uri,
-                        file.bytes,
-                        &file.mime,
-                    )])
-                    .with_cache_hints_as(&context, CacheScope::Private)
-                    .into());
-                }
-                // A file uri names its domain outright, and nothing had to be
-                // read first to learn the name, so this is the one file path
-                // a caller can reach cold. The domain may be spelled by any
-                // of its names; one this caller may not see keeps the
-                // spelling they sent.
-                let scope = self.scope_of(&context);
-                let hidden = self.engine.hidden_for(&scope).await.map_err(to_error)?;
-                let domain = self.engine.localize_visible(&url.domain, &hidden).await;
-                let (bytes, row) = self
-                    .file_bytes(
-                        kind,
-                        &domain,
-                        path,
-                        &scope,
-                        &self.reflection_caller(&context),
-                    )
-                    .await
-                    .map_err(to_error)?;
-                return Ok(ReadResourceResult::new(vec![attachment_contents(
-                    &request.uri,
-                    bytes,
-                    &row.mime,
-                )])
-                // Private: this answer depends on who asked, unlike every
-                // other result this server hints (see [`CACHE_SCOPE`]).
-                .with_cache_hints_as(&context, CacheScope::Private)
-                .into());
-            }
-        }
-        Err(ErrorData::invalid_params(
-            format!(
-                "unknown resource '{}'; this server serves {} and every attachment addressed as {ATTACHMENT_URI_TEMPLATE} or {REFLECTION_ASSET_URI_TEMPLATE}",
-                request.uri,
-                skill_uris()
-            ),
-            None,
-        ))
+        // An engram's attachment is engram content: an unattended session
+        // reads it within its read limit, as it does every tool.
+        let limit = self.read_limit(&context).await;
+        crystalline_engine::read_limit::within(limit, self.read_resource_limited(request, context))
+            .await
     }
 
     /// List the two onboarding prompts, empty while `skills.serve` is off.
@@ -5743,7 +5817,7 @@ impl ServerHandler for McpServer {
         _request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListPromptsResult, ErrorData> {
-        let prompts = if hidden_skills_surface(self.engine.skills_serve(), self.gate) {
+        let prompts = if hidden_skills_surface(self.engine.skills_serve(), self.gate.clone()) {
             Vec::new()
         } else {
             Self::prompt_router().list_all()
@@ -7475,16 +7549,19 @@ mod tests {
             hook_installed: false,
             onboarding_verified: false,
             unattended: false,
+            run_domain: None,
         },
         HarnessGate {
             hook_installed: true,
             onboarding_verified: false,
             unattended: false,
+            run_domain: None,
         },
         HarnessGate {
             hook_installed: true,
             onboarding_verified: true,
             unattended: false,
+            run_domain: None,
         },
     ];
 
@@ -7493,11 +7570,11 @@ mod tests {
         let [serve, conditional, verified] = GATES;
         for gate in GATES {
             assert!(
-                !hidden_skills_surface(SkillsServe::Always, gate),
+                !hidden_skills_surface(SkillsServe::Always, gate.clone()),
                 "true always serves, whoever spawned us"
             );
             assert!(
-                hidden_skills_surface(SkillsServe::Never, gate),
+                hidden_skills_surface(SkillsServe::Never, gate.clone()),
                 "false never serves, whoever spawned us"
             );
         }
@@ -7529,9 +7606,12 @@ mod tests {
         );
         assert_eq!(instructions_variant(SkillsServe::Auto, serve), Full);
         for gate in GATES {
-            assert_eq!(instructions_variant(SkillsServe::Always, gate), Full);
             assert_eq!(
-                instructions_variant(SkillsServe::Never, gate),
+                instructions_variant(SkillsServe::Always, gate.clone()),
+                Full
+            );
+            assert_eq!(
+                instructions_variant(SkillsServe::Never, gate.clone()),
                 Full,
                 "turning the skill surface off must not cost a client its routing block"
             );
@@ -7553,8 +7633,9 @@ mod tests {
     fn the_surface_and_the_instructions_read_the_same_answer() {
         for gate in GATES {
             assert_eq!(
-                hidden_skills_surface(SkillsServe::Auto, gate),
-                instructions_variant(SkillsServe::Auto, gate) == InstructionsVariant::Minimal,
+                hidden_skills_surface(SkillsServe::Auto, gate.clone()),
+                instructions_variant(SkillsServe::Auto, gate.clone())
+                    == InstructionsVariant::Minimal,
                 "auto decides both together for {gate:?}"
             );
         }

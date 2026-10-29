@@ -149,6 +149,7 @@ fn resolve_harness_gate_at(harness: Option<&str>, receipt: &Path) -> HarnessGate
         hook_installed,
         onboarding_verified: hook_installed && kind.profile().onboarding_verified,
         unattended: false,
+        run_domain: None,
     };
     tracing::debug!(
         harness = %id,
@@ -172,6 +173,7 @@ pub async fn run_mcp(
     read_only: bool,
     harness: Option<&str>,
     unattended: bool,
+    run_domain: Option<&str>,
 ) -> anyhow::Result<()> {
     // Log to stderr from the start, for both modes: the relay's takeover and
     // reconnect notices and any embedded startup failure must be visible in the
@@ -184,7 +186,8 @@ pub async fn run_mcp(
     // which is what SEP-2567 needs of a gate that stays on a listing. It is
     // re-sent on each daemon reconnect and never re-derived daemon-side.
     let harness_gate = HarnessGate {
-        unattended,
+        unattended: unattended || run_domain.is_some(),
+        run_domain: run_domain.map(str::to_string),
         ..resolve_harness_gate(harness)
     };
 
@@ -231,7 +234,7 @@ pub async fn run_mcp(
         // as a client while the client is still composing its first request.
         let (opened, daemon) = tokio::join!(read_session_opener(&mut stdin), async {
             let conn = ensure_daemon(true, db, config_path, read_only).await?;
-            conn.into_mcp(harness_gate)
+            conn.into_mcp(harness_gate.clone())
                 .await
                 .map_err(|e| anyhow::Error::new(e).context("daemon MCP handshake failed"))
         });
@@ -683,7 +686,7 @@ where
             // `McpServer` per accepted socket (`daemon.rs`), so a restart
             // would otherwise flip an onboarded harness back to served in the
             // middle of a live session.
-            let Ok(stream) = conn.into_mcp(harness_gate).await else {
+            let Ok(stream) = conn.into_mcp(harness_gate.clone()).await else {
                 continue;
             };
             session = Session::new(stream);
@@ -2827,6 +2830,7 @@ mod tests {
         hook_installed: true,
         onboarding_verified: true,
         unattended: false,
+        run_domain: None,
     };
 
     #[test]
@@ -2873,6 +2877,7 @@ mod tests {
                 hook_installed: true,
                 onboarding_verified: true,
                 unattended: false,
+                run_domain: None,
             }
         );
         for id in ["codex", "copilot"] {
@@ -2891,6 +2896,7 @@ mod tests {
                     hook_installed: true,
                     onboarding_verified: false,
                     unattended: false,
+                    run_domain: None,
                 },
                 "{id} is unverified"
             );

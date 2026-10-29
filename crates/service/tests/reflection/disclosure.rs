@@ -58,7 +58,7 @@ async fn reach() -> (Fx, Arc<AuthStore>) {
 
 /// [`reach`] with harbor private to keeper and sam: a shared page of `eng`
 /// citing harbor is too wide.
-async fn private_harbor() -> (Fx, Arc<AuthStore>) {
+pub(crate) async fn private_harbor() -> (Fx, Arc<AuthStore>) {
     let (fx, auth) = reach().await;
     private(&auth, "harbor", &["sam"]).await;
     (fx, auth)
@@ -553,14 +553,14 @@ async fn a_caller_holding_a_live_lease_acts_for_a_run() {
 const ERA: &str = "2026-07-28";
 const LEGACY: &str = "2025-11-25";
 
-struct Wire {
+pub(crate) struct Wire {
     write: tokio::io::WriteHalf<tokio::io::DuplexStream>,
     lines: tokio::io::Lines<tokio::io::BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>,
     server: ServedSession<McpServer>,
 }
 
 impl Wire {
-    fn over(server: McpServer) -> Wire {
+    pub(crate) fn over(server: McpServer) -> Wire {
         let (client_io, server_io) = tokio::io::duplex(1 << 18);
         let server = ServedSession::spawn(server, server_io);
         let (read, write) = tokio::io::split(client_io);
@@ -571,7 +571,7 @@ impl Wire {
         }
     }
 
-    async fn send(&mut self, message: Value) {
+    pub(crate) async fn send(&mut self, message: Value) {
         let line = format!("{message}\n");
         self.write.write_all(line.as_bytes()).await.unwrap();
         self.write.flush().await.unwrap();
@@ -585,7 +585,7 @@ impl Wire {
     }
 
     /// Send `message` and read the next message the server sends.
-    async fn call(&mut self, message: Value) -> Value {
+    pub(crate) async fn call(&mut self, message: Value) -> Value {
         let chooses = !self.server.is_started() && chooses_lifecycle(&message);
         self.send(message).await;
         let answer = self.recv().await.expect("the server answered");
@@ -596,7 +596,7 @@ impl Wire {
     }
 }
 
-fn request(id: u32, method: &str, params: Value) -> Value {
+pub(crate) fn request(id: u32, method: &str, params: Value) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
 }
 
@@ -817,8 +817,14 @@ async fn an_unattended_session_is_never_asked() {
     let (fx, _auth) = private_harbor().await;
     let mut wire = Wire::over(McpServer::new(fx.engine.clone()).with_unattended(true));
     let done = wire.call(modern(1, true, citing(json!({})))).await;
+    // It does not even see harbor (`read_limit`): the source is refused as
+    // a domain that does not exist, and nobody is asked.
+    assert_ne!(
+        done["result"]["resultType"],
+        json!("input_required"),
+        "{done}"
+    );
     let text = refused_text(&done);
-    assert!(text.contains(TOO_WIDE), "{text}");
     assert!(!text.contains(NOBODY_ASKED), "{text}");
     assert!(!page_exists(&fx));
 }
@@ -834,7 +840,12 @@ async fn the_owner_is_not_asked_while_its_run_holds_a_lease() {
         .unwrap();
     let mut wire = Wire::over(McpServer::new(fx.engine.clone()));
     let done = wire.call(modern(1, true, citing(json!({})))).await;
-    assert!(refused_text(&done).contains(TOO_WIDE), "{done}");
+    assert_ne!(
+        done["result"]["resultType"],
+        json!("input_required"),
+        "{done}"
+    );
+    refused_text(&done);
     assert!(!page_exists(&fx));
 }
 

@@ -1498,9 +1498,17 @@ impl Engine {
         if matches!(scope, Scope::Anonymous) {
             return Ok(true);
         }
+        Ok(!self.run_domains(scope).await?.is_empty())
+    }
+
+    /// The domains `scope` holds a live lease of either loop on: what a run
+    /// as `scope` works on now. For the machine owner, the leases held with
+    /// no account. Sorted.
+    pub async fn run_domains(&self, scope: &Scope) -> Result<Vec<String>> {
         let (_, stale_before) = self.automation_window();
         let domains: Vec<String> = self.registered_domain_entries().keys().cloned().collect();
         let store = self.store.lock().await;
+        let mut out = Vec::new();
         for domain in domains {
             let Some(id) = store.domain_id(&domain).await? else {
                 continue;
@@ -1516,14 +1524,79 @@ impl Engine {
                     Scope::User { account, .. } => {
                         lease.holder.account.as_deref() == Some(account.as_str())
                     }
-                    _ => lease.holder.account.is_none(),
+                    Scope::Unrestricted => lease.holder.account.is_none(),
+                    Scope::Anonymous => false,
                 };
-                if held {
-                    return Ok(true);
+                if held && !out.contains(&domain) {
+                    out.push(domain.clone());
                 }
             }
         }
-        Ok(false)
+        out.sort();
+        Ok(out)
+    }
+
+    /// The domains a request by `scope` may not read because it is
+    /// unattended (`crate::read_limit`), or `None` when it is attended.
+    ///
+    /// A request is unattended when its session says so (`marked`: started
+    /// with `crystalline mcp --unattended`, which every headless loop run's
+    /// MCP config carries, or named a run domain) or when `scope` holds a
+    /// live loop lease ([`Engine::run_domains`]; for the machine owner any
+    /// lease held with no account, since the owner and the owner's own run
+    /// look alike on a local session). It may read a domain X only when
+    /// every reader of the domain D it works on may read X
+    /// (`readers_cover(D, X)`, the GitHub rule included). D is:
+    ///
+    /// * `run_domain`, the domain the run started this session for, while
+    ///   `scope` holds a live lease on it (a name without that lease counts
+    ///   for nothing, so it can only ever narrow);
+    /// * otherwise each domain `scope` holds a live lease on, and X must be
+    ///   covered for all of them (the intersection);
+    /// * otherwise every registered domain: a session marked unattended with
+    ///   no lease may write anywhere, so it reads only what every domain's
+    ///   readers may read (in practice the domains everyone signed in may
+    ///   read, and no local domain while any domain is backed up to GitHub).
+    ///
+    /// Fails safe: an error hides every domain.
+    pub async fn read_limit_for(
+        &self,
+        scope: &Scope,
+        marked: bool,
+        run_domain: Option<&str>,
+    ) -> Option<HashSet<String>> {
+        let all: Vec<String> = self.registered_domain_entries().keys().cloned().collect();
+        let works_on = match self.run_domains(scope).await {
+            Ok(domains) => domains,
+            Err(e) => {
+                tracing::warn!("the loop leases were not read; reading nothing: {e}");
+                return Some(all.into_iter().collect());
+            }
+        };
+        if works_on.is_empty() && !marked && run_domain.is_none() {
+            return None;
+        }
+        let targets = match run_domain {
+            Some(domain) if works_on.iter().any(|d| d == domain) => vec![domain.to_string()],
+            _ if !works_on.is_empty() => works_on,
+            _ => all.clone(),
+        };
+        let mut hidden = HashSet::new();
+        for source in &all {
+            for target in &targets {
+                if target == source {
+                    continue;
+                }
+                match self.readers_cover(target, source).await {
+                    Ok(true) => {}
+                    Ok(false) | Err(_) => {
+                        hidden.insert(source.clone());
+                        break;
+                    }
+                }
+            }
+        }
+        Some(hidden)
     }
 
     /// The name this instance shows people: the label its host locks carry,

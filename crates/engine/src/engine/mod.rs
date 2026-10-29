@@ -3154,6 +3154,25 @@ impl Engine {
         &self,
         scope: &crate::scope::Scope,
     ) -> Result<Option<HashSet<String>>> {
+        let hidden = self.hidden_domains_by_rights(scope).await?;
+        // An unattended request reads less than its rights allow
+        // (`crate::read_limit`): the limit is added to every answer, also the
+        // machine owner's, whose rights hide nothing.
+        Ok(match (hidden, crate::read_limit::current()) {
+            (hidden, None) => hidden,
+            (None, Some(limit)) => Some(limit.as_ref().clone()),
+            (Some(mut hidden), Some(limit)) => {
+                hidden.extend(limit.iter().cloned());
+                Some(hidden)
+            }
+        })
+    }
+
+    /// [`Engine::hidden_domains`] by the caller's rights alone.
+    async fn hidden_domains_by_rights(
+        &self,
+        scope: &crate::scope::Scope,
+    ) -> Result<Option<HashSet<String>>> {
         #[cfg(any(test, feature = "testing"))]
         if self
             .fail_hidden_domains
