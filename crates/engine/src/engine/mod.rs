@@ -4290,7 +4290,9 @@ impl Engine {
                     self.too_wide_pages(&domain).await?.into_iter().collect();
                 pages.extend(self.too_wide_in_files(&domain, &spec, &files).await?);
                 held_pages = pages.into_iter().collect();
-                let assets = self.held_assets(&domain, &held_pages).await?;
+                let assets = self
+                    .held_assets(&domain, &held_pages, &spec, &files)
+                    .await?;
                 let held: std::collections::BTreeSet<String> = held_pages
                     .iter()
                     .flat_map(|page| {

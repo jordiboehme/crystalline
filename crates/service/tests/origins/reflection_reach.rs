@@ -557,3 +557,41 @@ async fn an_unattended_run_does_not_read_a_narrower_repository() {
         .expect("unattended");
     assert!(limit.hidden.is_empty(), "{:?}", limit.hidden);
 }
+
+/// A file only a held page links stays off the branch, also when that page
+/// is known only from its bytes on disk.
+#[tokio::test]
+async fn a_file_only_a_page_on_disk_links_is_held_with_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (forge, eng, _, kb) = setup_with_page_repo(tmp.path(), &app_env()).await;
+    collaborators(&forge, "acme/kb", &[1, 2]);
+    collaborators(&forge, "acme/vault", &[1]);
+    write(
+        &eng,
+        &WriteReflectionParams {
+            domain: "kb".into(),
+            path: "a.md".into(),
+            markdown: Some("# A\n\n## One\n\nText.\n".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let assets = tmp.path().join("kb/reflections/assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    std::fs::write(assets.join("rota.png"), b"\x89PNG secret").unwrap();
+    std::fs::write(
+        tmp.path().join("kb/reflections/forged.md"),
+        "---\nreflection:\n  aaaa1111:\n    sources:\n    - domain: vault\n      engram: team/rota\n      checksum: abc\n---\n\n# Forged\n\n## Team\n<!-- r:aaaa1111 -->\n\n![rota](assets/rota.png)\n",
+    )
+    .unwrap();
+    eng.mark_reflection_dirty(
+        "kb",
+        crystalline_service::reflection_backup::BackupCause::Settled,
+    );
+    eng.reflection_backup_tick(Instant::now() + Duration::from_secs(120))
+        .await;
+    let head = kb.commit_paths(&kb.branch_commit(BACKUP_BRANCH).unwrap());
+    assert!(head.contains(&"reflections/a.md".to_string()), "{head:?}");
+    assert!(!head.iter().any(|p| p.contains("rota.png")), "{head:?}");
+}

@@ -223,11 +223,19 @@ impl Engine {
     /// The files under `reflections/assets/` (by path inside
     /// `reflections/`) that only `held` pages of `domain` link: they carry
     /// what those pages show, so the backup holds them back with them. A
-    /// file a page that is not held links too stays.
+    /// file a page that goes out links too stays.
+    ///
+    /// The links are read from `files`, the bytes the backup is about to
+    /// push (by repo path, see
+    /// [`crystalline_remote::reflections_backup::collect_backup`]), so a
+    /// page known only from its file on disk counts; a held page's links in
+    /// the index count as well.
     pub(crate) async fn held_assets(
         &self,
         domain: &str,
         held: &[String],
+        spec: &crystalline_remote::provider::OriginSpec,
+        files: &BTreeMap<String, Vec<u8>>,
     ) -> Result<BTreeSet<String>> {
         if held.is_empty() {
             return Ok(BTreeSet::new());
@@ -240,10 +248,23 @@ impl Engine {
             store.list_reflections(id).await?
         };
         let mut by_held = BTreeSet::new();
-        let mut by_others = BTreeSet::new();
         for row in &rows {
-            let refs = r::reflection_asset_refs(&row.content, &row.path);
             if held.contains(&row.path) {
+                by_held.extend(r::reflection_asset_refs(&row.content, &row.path));
+            }
+        }
+        let mut by_others = BTreeSet::new();
+        for (repo_path, bytes) in files {
+            let Some(inner) =
+                crystalline_remote::reflections_backup::reflection_path(spec, repo_path)
+            else {
+                continue;
+            };
+            let r::ReflectionFile::Page(page) = r::classify(inner) else {
+                continue;
+            };
+            let refs = r::reflection_asset_refs(&String::from_utf8_lossy(bytes), &page);
+            if held.contains(&page) {
                 by_held.extend(refs);
             } else {
                 by_others.extend(refs);
