@@ -95,6 +95,10 @@ enum Via {
     /// collab socket and `/events`, and the MCP open tier with no
     /// `github.agent_identity` for the MCP columns.
     Anonymous,
+    /// The anonymous web visitor on the open-tier instance while
+    /// `github.agent_identity` names a GitHub writer: the JSON API, the
+    /// collab socket and `/events` only. It must never act as the agent.
+    WebBesideAgent,
 }
 
 /// The columns, in the order the expected strings spell them.
@@ -123,6 +127,8 @@ const REFLECTION_ONLY: &str = "nnnnnnnyy";
 const MCP_ALL: &str = "yyy----yy";
 const MCP_READS: &str = "yyn----yn";
 const MCP_NOTHING: &str = "nnn----nn";
+const WEB_READS: &str = "---ynny--";
+const WEB_NOTHING: &str = "---nnnn--";
 
 struct Row {
     label: &'static str,
@@ -257,6 +263,17 @@ fn rows() -> Vec<Row> {
             label: "anonymous",
             via: Via::Anonymous,
             expected: [NOTHING, READS, NOTHING, NOTHING, NOTHING],
+        },
+        Row {
+            label: "anonymous web visitor beside an agent identity",
+            via: Via::WebBesideAgent,
+            expected: [
+                WEB_NOTHING,
+                WEB_READS,
+                WEB_NOTHING,
+                WEB_NOTHING,
+                WEB_NOTHING,
+            ],
         },
     ]
 }
@@ -651,16 +668,9 @@ fn mark(allowed: bool) -> char {
 }
 
 /// The five MCP cells of `mcp` on every domain, keyed by domain, as
-/// (search, read, write, read_reflection, write_reflection). `None` (no
-/// session) answers all `n`.
-async fn mcp_cells(mcp: Option<&Mcp>, label: &str) -> BTreeMap<&'static str, [char; 5]> {
+/// (search, read, write, read_reflection, write_reflection).
+async fn mcp_cells(mcp: &Mcp, label: &str) -> BTreeMap<&'static str, [char; 5]> {
     let mut cells = BTreeMap::new();
-    let Some(mcp) = mcp else {
-        for d in DOMAINS {
-            cells.insert(d, ['n'; 5]);
-        }
-        return cells;
-    };
     let found = mcp
         .call("search_engrams", json!({ "query": "quokka", "limit": 50 }))
         .await
@@ -880,30 +890,58 @@ async fn collect() -> Vec<(String, [String; 5])> {
     let a = instance(true).await;
     let b = instance(false).await;
     let root = login(a.addr, "root").await.expect("root logs in");
+    let root_b = login(b.addr, "root").await.expect("root logs in");
+    // The open-tier instance acts as a GitHub writer while the web
+    // visitor's columns are collected there.
+    let set_agent = |agent: Option<&'static str>| {
+        let eng = b.eng.clone();
+        async move {
+            let action = match agent {
+                Some(agent) => ConfigureAction::Set {
+                    key: "github.agent_identity".to_string(),
+                    value: agent.to_string(),
+                },
+                None => ConfigureAction::Unset {
+                    key: "github.agent_identity".to_string(),
+                },
+            };
+            eng.configure(&action).await.unwrap();
+        }
+    };
+    set_agent(Some("bot")).await;
 
     // Sessions first, then every `/events` stream, then one change per
-    // domain, so a stream hears exactly the changes it may hear.
-    let mut sessions: BTreeMap<&str, Option<(String, String)>> = BTreeMap::new();
+    // domain, so a stream hears exactly the changes it may hear. Every
+    // person signs in: a refusal here would read as `n` everywhere and
+    // prove nothing.
+    let mut sessions: BTreeMap<&str, (String, String)> = BTreeMap::new();
     for row in &rows {
         if let Via::Person(account) = row.via {
-            sessions.insert(account, login(a.addr, account).await);
+            let session = login(a.addr, account).await;
+            sessions.insert(
+                account,
+                session.unwrap_or_else(|| panic!("{account} signs in")),
+            );
         }
     }
     let mut streams = Vec::new();
     for row in &rows {
-        let stream = match row.via {
-            Via::Person(account) => match &sessions[account] {
-                Some(session) => open_events(a.addr, Some(session)).await,
-                None => None,
-            },
-            Via::Anonymous => open_events(a.addr, None).await,
-            _ => None,
+        let (addr, session) = match row.via {
+            Via::Person(account) => (a.addr, Some(&sessions[account])),
+            Via::Anonymous => (a.addr, None),
+            Via::WebBesideAgent => (b.addr, None),
+            Via::Token(_) | Via::OpenTier(_) => {
+                streams.push(None);
+                continue;
+            }
         };
+        let stream = open_events(addr, session).await;
+        assert!(stream.is_some(), "{}: the stream opens", row.label);
         streams.push(stream);
     }
-    for d in DOMAINS {
-        a.eng
-            .edit_engram(&EditParams {
+    for eng in [&a.eng, &b.eng] {
+        for d in DOMAINS {
+            eng.edit_engram(&EditParams {
                 identifier: format!("seed-{d}-end"),
                 domain: d.to_string(),
                 operation: "append".to_string(),
@@ -912,6 +950,7 @@ async fn collect() -> Vec<(String, [String; 5])> {
             })
             .await
             .unwrap();
+        }
     }
     let events: Vec<Vec<String>> = futures::future::join_all(
         streams
@@ -919,63 +958,61 @@ async fn collect() -> Vec<(String, [String; 5])> {
             .map(|stream| heard(stream, Duration::from_secs(3))),
     )
     .await;
+    // The web visitor beside the agent identity, while it is still set.
+    let web_beside_agent = rest_cells(&b, None, "root", &root_b).await;
 
     let mut actual = Vec::new();
     for (row, heard) in rows.iter().zip(events) {
         let mut cells: BTreeMap<&str, Vec<char>> =
             DOMAINS.iter().map(|d| (*d, vec!['-'; 9])).collect();
         // The MCP columns.
+        // Every MCP session opens: a refused token or handshake would read
+        // as `n` everywhere and prove nothing.
         let mcp = match row.via {
             Via::Person(account) | Via::Token(account) => {
-                match a.auth.issue_mcp_token(account, "agent").await {
-                    Ok(issued) => Mcp::open(a.addr, Some(issued.token)).await,
-                    Err(_) => None,
-                }
+                let issued = a
+                    .auth
+                    .issue_mcp_token(account, "agent")
+                    .await
+                    .unwrap_or_else(|e| panic!("{account} gets a token: {e}"));
+                Mcp::open(a.addr, Some(issued.token)).await
             }
             Via::OpenTier(agent) => {
-                b.eng
-                    .configure(&ConfigureAction::Set {
-                        key: "github.agent_identity".to_string(),
-                        value: agent.to_string(),
-                    })
-                    .await
-                    .unwrap();
+                set_agent(Some(agent)).await;
                 Mcp::open(b.addr, None).await
             }
             Via::Anonymous => {
-                b.eng
-                    .configure(&ConfigureAction::Unset {
-                        key: "github.agent_identity".to_string(),
-                    })
-                    .await
-                    .unwrap();
+                set_agent(None).await;
                 Mcp::open(b.addr, None).await
             }
+            Via::WebBesideAgent => None,
         };
-        let mcp_answers = mcp_cells(mcp.as_ref(), row.label).await;
-        for d in DOMAINS {
-            let [s, r, w, rr, rw] = mcp_answers[d];
-            let cell = cells.get_mut(d).unwrap();
-            cell[0] = s;
-            cell[1] = r;
-            cell[2] = w;
-            cell[7] = rr;
-            cell[8] = rw;
+        let mcp_answers = match (&mcp, row.via) {
+            (None, Via::WebBesideAgent) => None,
+            (None, _) => panic!("{}: the MCP session opens", row.label),
+            (Some(mcp), _) => Some(mcp_cells(mcp, row.label).await),
+        };
+        if let Some(answers) = &mcp_answers {
+            for d in DOMAINS {
+                let [s, r, w, rr, rw] = answers[d];
+                let cell = cells.get_mut(d).unwrap();
+                cell[0] = s;
+                cell[1] = r;
+                cell[2] = w;
+                cell[7] = rr;
+                cell[8] = rw;
+            }
         }
         // The JSON API, collab and events columns.
         let rest = match row.via {
-            Via::Person(account) => Some((sessions[account].as_ref(), account)),
-            Via::Anonymous => Some((None, "root")),
-            _ => None,
+            Via::Person(account) => {
+                Some(rest_cells(&a, Some(&sessions[account]), account, &root).await)
+            }
+            Via::Anonymous => Some(rest_cells(&a, None, "root", &root).await),
+            Via::WebBesideAgent => Some(web_beside_agent.clone()),
+            Via::Token(_) | Via::OpenTier(_) => None,
         };
-        if let Some((session, account)) = rest {
-            // A refused login reaches nothing.
-            let refused_login = matches!(row.via, Via::Person(_)) && session.is_none();
-            let rest = if refused_login {
-                DOMAINS.iter().map(|d| (*d, ['n'; 3])).collect()
-            } else {
-                rest_cells(&a, session, account, &root).await
-            };
+        if let Some(rest) = rest {
             for d in DOMAINS {
                 let [l, p, c] = rest[d];
                 let cell = cells.get_mut(d).unwrap();
