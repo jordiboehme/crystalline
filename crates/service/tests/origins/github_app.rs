@@ -122,6 +122,9 @@ pub(crate) struct Forge {
     pub(crate) public: StdMutex<std::collections::HashSet<String>>,
     /// When set, every collaborator listing answers 503.
     pub(crate) collaborators_down: std::sync::atomic::AtomicBool,
+    /// When set, every collaborator listing answers GitHub's rate limit
+    /// (403 with `x-ratelimit-remaining: 0`).
+    pub(crate) collaborators_rate_limited: std::sync::atomic::AtomicBool,
 }
 
 impl Forge {
@@ -201,6 +204,7 @@ pub(crate) async fn spawn_forge(
         collaborators: StdMutex::new(HashMap::new()),
         public: StdMutex::new(std::collections::HashSet::new()),
         collaborators_down: std::sync::atomic::AtomicBool::new(false),
+        collaborators_rate_limited: std::sync::atomic::AtomicBool::new(false),
     });
     let router = Router::new().fallback(handle).with_state(forge.clone());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -425,6 +429,18 @@ async fn repo_route(
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 axum::Json(json!({"message": "unavailable"})),
+            )
+                .into_response();
+        }
+        if forge.collaborators_rate_limited.load(Ordering::SeqCst) {
+            let reset = (chrono::Utc::now().timestamp() + 3600).to_string();
+            return (
+                StatusCode::FORBIDDEN,
+                [
+                    ("x-ratelimit-remaining", "0".to_string()),
+                    ("x-ratelimit-reset", reset),
+                ],
+                axum::Json(json!({"message": "API rate limit exceeded"})),
             )
                 .into_response();
         }
