@@ -934,6 +934,15 @@ async fn a_renamed_login_resolves_through_the_id() {
 }
 
 #[tokio::test]
+async fn an_installation_entry_without_an_id_is_skipped() {
+    let routes = user_by_id_routes().merge(installations_route(&[0, 11]));
+    let (mock, _base, app, _clock) = serve_with(mock_with(&[]), routes).await;
+    assert_eq!(app.login_for_id(583231).await.unwrap(), "octocat-renamed");
+    assert_eq!(mock.minted(0), 0);
+    assert_eq!(mock.minted(11), 1);
+}
+
+#[tokio::test]
 async fn login_for_id_without_an_installation_is_app_not_installed() {
     let routes = user_by_id_routes().merge(installations_route(&[]));
     let (mock, _base, app, _clock) = serve_with(mock_with(&[]), routes).await;

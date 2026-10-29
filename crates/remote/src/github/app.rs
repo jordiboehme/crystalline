@@ -277,8 +277,6 @@ impl RepoRole {
         }
     }
 
-    /// The role a built-in `role_name` names. A custom role has no entry
-    /// here and is read through its base permission instead.
     /// The legacy base permission word (`admin`, `write`/`push`,
     /// `read`/`pull`): what a custom role is read through. `maintain` and
     /// `triage` are not part of the legacy base.
@@ -299,6 +297,8 @@ impl RepoRole {
         }
     }
 
+    /// The role a built-in `role_name` names. A custom role has no entry
+    /// here and is read through its base permission instead.
     fn from_builtin(role_name: &str) -> Option<RepoRole> {
         matches!(
             role_name,
@@ -820,7 +820,13 @@ impl GithubApp {
             let response = check_response(response, None, true, &self.api_url).await?;
             let entries: Vec<InstallationListEntry> = parse_json(response).await?;
             let last = entries.len() < PAGE_SIZE;
-            ids.extend(entries.into_iter().map(|entry| entry.id));
+            // An entry without an id deserializes as 0, which is no installation.
+            ids.extend(
+                entries
+                    .into_iter()
+                    .map(|entry| entry.id)
+                    .filter(|id| *id != 0),
+            );
             if last {
                 break;
             }

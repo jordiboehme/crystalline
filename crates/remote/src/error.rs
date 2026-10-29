@@ -72,7 +72,7 @@ pub enum RemoteError {
     /// the account is unknown (perhaps renamed) or the repository is not
     /// visible to the installation. Not the same as a login with no access.
     #[error(
-        "GitHub knows no collaborator {login} on {repo}: the login may have been renamed, or the repository is not visible to the App."
+        "GitHub has no account named {login} (it may have been renamed), or {repo} is not visible to the App."
     )]
     UserNotFound {
         /// The repository, `owner/name`.
