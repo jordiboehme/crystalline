@@ -3981,7 +3981,13 @@ impl McpServer {
         // GitHub and the agent has to say who may read it: asked here in the
         // tool's own words, before anything is fetched. The engine refuses
         // the same way for every other surface.
-        if p.repo.is_some() && p.readers.is_none() && self.engine.github_app_configured() {
+        // Only once collaboration is on: off, the engine's own refusal says
+        // that first, which is the thing to fix.
+        if p.repo.is_some()
+            && p.readers.is_none()
+            && self.engine.config().github_enabled()
+            && self.engine.github_app_configured()
+        {
             return Err(to_error(EngineError::Invalid(
                 ADD_DOMAIN_NEEDS_READERS.to_string(),
             )));

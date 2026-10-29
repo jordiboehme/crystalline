@@ -1182,7 +1182,8 @@ impl Engine {
     /// should open a confidential repository by accident.
     ///
     /// Does nothing without an App, where who may read follows this
-    /// instance's own accounts. Without an accounts store there is no
+    /// instance's own accounts; a variable set anyway is named in an info
+    /// line saying so. Without an accounts store there is no
     /// record to write: a private domain then says so in a warning, since
     /// it would be open to everyone signed in once accounts exist and the
     /// server has not been restarted.
@@ -1193,7 +1194,17 @@ impl Engine {
             .filter(|(_, env)| env.entry.origin.is_some())
             .map(|(name, env)| (name.clone(), env.readers, env.readers_var()))
             .collect();
-        if targets.is_empty() || !self.github_app_configured() {
+        if targets.is_empty() {
+            return;
+        }
+        if !self.github_app_configured() {
+            for (_, readers, var) in &targets {
+                if readers.is_some() {
+                    tracing::info!(
+                        "{var} changes nothing on an instance without a GitHub App: who may read the domain follows this instance's own accounts"
+                    );
+                }
+            }
             return;
         }
         let access = self.domain_access.get();

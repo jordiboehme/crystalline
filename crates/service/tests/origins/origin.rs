@@ -7962,3 +7962,33 @@ async fn mcp_add_domain_with_repo_without_readers_refuses() {
     .unwrap_err();
     assert!(err.contains("readers"), "{err}");
 }
+
+#[tokio::test]
+async fn env_readers_without_an_app_change_nothing_and_say_so() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("kb");
+    let root_str = root.to_str().unwrap().to_string();
+    let eng = engine_with_env(
+        &tmp.path().join("config.yaml"),
+        &tmp.path().join("origins"),
+        Arc::new(MockProvider::new()),
+        &[
+            ("CRYSTALLINE_DOMAIN_KB", &root_str),
+            ("CRYSTALLINE_DOMAIN_KB_ORIGIN", "acme/kb"),
+            ("CRYSTALLINE_DOMAIN_KB_READERS", "private"),
+        ],
+    )
+    .await;
+    let auth = Arc::new(AuthStore::open(&tmp.path().join("auth.db")).await.unwrap());
+    eng.set_domain_access(Arc::new(DomainAccess::new(auth.clone())));
+    let (logs, _guard) = crate::support::capture_logs();
+    eng.apply_env_readers().await;
+    assert!(auth.domain_visibility("kb").await.unwrap().is_none());
+    assert!(
+        logs.lines()
+            .iter()
+            .any(|l| l.starts_with("INFO") && l.contains("CRYSTALLINE_DOMAIN_KB_READERS")),
+        "{:?}",
+        logs.lines()
+    );
+}
