@@ -739,3 +739,28 @@ async fn a_domain_opens_when_the_app_is_installed_later() {
         DomainRight::Write
     );
 }
+
+/// Waits (for real, up to five seconds) until `kb` is closed.
+async fn until_closed(eng: &Engine) {
+    for _ in 0..500 {
+        if !eng.github_access_closed().is_empty() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("the domain never closed");
+}
+
+/// At stack start the App is loaded in the background and then every
+/// governed repository is looked up once: a repository without the App is
+/// closed without any caller asking about it first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_repository_without_the_app_is_closed_before_anyone_asks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_forge, eng) = closed_setup(tmp.path(), false).await;
+    assert!(eng.github_access_closed().is_empty());
+    // What `install_domain_access` does at start.
+    eng.preload_github_app();
+    until_closed(&eng).await;
+    assert_closed(&eng).await;
+}

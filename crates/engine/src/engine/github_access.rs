@@ -502,6 +502,48 @@ impl GithubGovernor {
             .collect()
     }
 
+    /// Starts one background lookup for every governed repository that has
+    /// no fresh snapshot and is not known to lack the App, so a repository
+    /// without the App is closed before anybody asks about it, and the
+    /// first questions find a snapshot. Each lookup takes the per-repo gate
+    /// and the generation check like any other; nothing waits on them.
+    /// Called when the App has been loaded (at start and after it changed).
+    /// A no-op without a usable App or outside a tokio runtime.
+    pub fn warm_up(&self) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let GovernorApp::Ready { source, .. } = self.env.app() else {
+            return;
+        };
+        let now = Instant::now();
+        let repos: HashSet<String> = {
+            let state = lock(&self.state);
+            self.env
+                .origins()
+                .into_iter()
+                .map(|(_, repo)| repo)
+                .filter(|repo| {
+                    let key = repo_key(repo);
+                    !state.not_installed.contains_key(&key)
+                        && !state
+                            .entries
+                            .get(&key)
+                            .is_some_and(|entry| now < entry.fetched_at + FRESH_FOR)
+                })
+                .collect()
+        };
+        for repo in repos {
+            let Some(me) = self.me.upgrade() else {
+                return;
+            };
+            let source = source.clone();
+            runtime.spawn(async move {
+                me.snapshot(&source, &repo).await;
+            });
+        }
+    }
+
     /// Asks for the App once, so an unsettled slot starts loading in the
     /// background now rather than on the next request.
     pub fn preload_app(&self) {
@@ -2129,5 +2171,36 @@ mod tests {
         assert_eq!(rig.knowledge("alice").await, level(MemberLevel::Editor));
         assert_eq!(rig.github.listings(), 1);
         assert_eq!(rig.governor.degraded_since(), None);
+    }
+
+    /// At start every governed repository is looked up once in the
+    /// background: one without the App is closed before anybody asks, and
+    /// one with it has a snapshot for the first question.
+    #[tokio::test(start_paused = true)]
+    async fn the_warm_up_closes_a_repository_without_the_app_before_anyone_asks() {
+        let rig = rig().await;
+        rig.github.with(REPO, |r| r.not_installed = true);
+        rig.governor.warm_up();
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(rig.governor.closed_domains().contains(DOMAIN));
+        assert_eq!(rig.github.listings(), 1);
+
+        let rig = self::rig().await;
+        rig.github.grant(REPO, 1, "alice-gh", RepoRole::Write);
+        rig.governor.warm_up();
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(rig.github.listings(), 1);
+        assert_eq!(rig.knowledge("alice").await, level(MemberLevel::Editor));
+        assert_eq!(rig.github.listings(), 1, "answered from the warm-up");
+        // A second warm-up while the snapshot is fresh asks nothing.
+        rig.governor.warm_up();
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(rig.github.listings(), 1);
     }
 }

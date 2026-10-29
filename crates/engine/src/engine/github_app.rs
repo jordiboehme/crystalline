@@ -1016,7 +1016,9 @@ impl Engine {
     }
 
     /// Loads the App slot on a blocking thread, unless a load is running
-    /// already: the keychain read it may make never runs on a request.
+    /// already: the keychain read it may make never runs on a request. Once
+    /// loaded, the governor looks every governed repository up in the
+    /// background ([`GithubGovernor::warm_up`]).
     /// Called at start (`client::install_domain_access`), after the App
     /// changed, and by the governor when it finds the slot unsettled. A
     /// no-op outside a tokio runtime.
@@ -1030,9 +1032,17 @@ impl Engine {
         }
         let engine = Arc::downgrade(self);
         let loading = self.app_loading.clone();
+        let handle = runtime.clone();
         runtime.spawn_blocking(move || {
             if let Some(engine) = engine.upgrade() {
                 engine.github_app_slot();
+                // The App is known now: look every governed repository up
+                // once, so one without the App is closed before anybody
+                // asks about it.
+                if let Some(governor) = engine.github_governor.get().cloned() {
+                    let _entered = handle.enter();
+                    governor.warm_up();
+                }
             }
             loading.store(false, Ordering::SeqCst);
         });
