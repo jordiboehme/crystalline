@@ -489,9 +489,10 @@ fn instance_cap(principal: &Principal) -> DomainRight {
 /// a shared domain and none on a private one: a membership row and its
 /// Reflection level are not read. A per-domain grant is read there as
 /// anywhere: it is Crystalline's own Reflection axis, not an engram grant
-/// GitHub decides. An account at instance knowledge `none` gets nothing
-/// there at all, its instance Reflection level and its grant included, and
-/// on a closed domain a grant opens nothing (only the admins get in).
+/// GitHub decides. An account at instance knowledge `none` reads no engram
+/// there and its instance Reflection level counts for nothing; a grant
+/// gives it the Reflection at the granted level. On a closed domain a grant
+/// opens nothing (only the admins get in).
 fn decide_reflection(
     principal: &Principal,
     acl: Option<&DomainAcl>,
@@ -511,17 +512,21 @@ fn decide_reflection(
                 ReflectionRight::None
             };
         }
-        Principal::Account { role, .. } if github.is_some() && *role == Role::None => {
-            return ReflectionRight::None;
-        }
         // A closed domain: an instance admin curates, nobody else gets
-        // anything, whatever Reflection level they hold.
+        // anything, whatever Reflection level or grant they hold (R22).
         Principal::Account { .. } if github.is_some_and(|g| g.closed) => {
             return if knowledge >= DomainRight::Write {
                 ReflectionRight::Curate
             } else {
                 ReflectionRight::None
             };
+        }
+        // Instance knowledge `none` on a governed domain: its instance
+        // Reflection level counts for nothing there, a per-domain grant
+        // still raises (R23: instance `none` is how a Reflection-only
+        // collaborator is made; R16 is about engrams).
+        Principal::Account { role, .. } if github.is_some() && *role == Role::None => {
+            ReflectionLevel::Default
         }
         Principal::Account { reflection, .. } if github.is_some() => match acl {
             None => *reflection,
@@ -5503,34 +5508,70 @@ mod tests {
         assert!(access.readers_cover("gh-lab", "lab").await.unwrap());
     }
 
-    /// Ruling R16 stands beside the grants: an account at instance
-    /// knowledge `none` gets nothing on a governed domain, a grant included.
+    /// Ruling R23: instance knowledge `none` is how a Reflection-only
+    /// collaborator is made, so a grant on a governed (not closed) domain
+    /// gives such an account the Reflection at the granted level; its
+    /// instance Reflection level still counts for nothing there, and its
+    /// engrams stay hidden. It reads the page, so it is a page reader and
+    /// keeps the page from covering a source it may not read.
     #[tokio::test]
-    async fn an_instance_none_account_gets_no_grant_on_a_governed_domain() {
+    async fn an_instance_none_account_with_a_grant_reaches_a_governed_reflection() {
         let dir = tempfile::tempdir().unwrap();
         let auth = store(&dir).await;
         github_cast(&auth).await;
+        auth.set_reflection_level("nora", ReflectionLevel::Contributor)
+            .await
+            .unwrap();
+        let access = DomainAccess::new(auth.clone()).with_governor(Arc::new(
+            base_governor().grant("mem", "gh-vault", MemberLevel::Viewer),
+        ));
+        let nora = user("nora", false);
+        for domain in ["gh-open", "gh-lab"] {
+            assert_eq!(
+                access.reflection_right(&nora, domain).await.unwrap(),
+                ReflectionRight::None,
+                "the instance level alone: {domain}"
+            );
+        }
+        assert!(access.readers_cover("gh-lab", "gh-vault").await.unwrap());
         auth.set_reflection_grant("gh-open", "nora", ReflectionLevel::Contributor, "boss")
             .await
             .unwrap();
-        auth.set_reflection_grant("lab", "nora", ReflectionLevel::Contributor, "boss")
+        auth.set_reflection_grant("gh-lab", "nora", ReflectionLevel::Reader, "boss")
             .await
             .unwrap();
-        let access = DomainAccess::new(auth).with_governor(Arc::new(base_governor()));
         assert_eq!(
-            access
-                .reflection_right(&user("nora", false), "gh-open")
-                .await
-                .unwrap(),
-            ReflectionRight::None
-        );
-        // Off GitHub the grant raises as anywhere.
-        assert_eq!(
-            access
-                .reflection_right(&user("nora", false), "lab")
-                .await
-                .unwrap(),
+            access.reflection_right(&nora, "gh-open").await.unwrap(),
             ReflectionRight::Edit
+        );
+        assert_eq!(
+            access.reflection_right(&nora, "gh-lab").await.unwrap(),
+            ReflectionRight::Read
+        );
+        for domain in ["gh-open", "gh-lab"] {
+            assert_eq!(
+                access.right(&nora, domain).await.unwrap(),
+                DomainRight::None,
+                "{domain}"
+            );
+        }
+        let screen = access.visibility(&nora).await.unwrap().screen();
+        assert!(!screen.admits("gh-open") && !screen.admits("gh-lab"));
+        let PageReaders::Accounts(readers) = access.page_readers("gh-lab").await.unwrap() else {
+            panic!("a private page has named readers");
+        };
+        assert!(readers.contains("nora"), "{readers:?}");
+        let PageReaders::Accounts(shared) = access.page_readers("gh-open").await.unwrap() else {
+            panic!("no anonymous caller reads a private repository's page");
+        };
+        assert!(shared.contains("nora"), "{shared:?}");
+        assert!(!access.readers_cover("gh-lab", "gh-vault").await.unwrap());
+        // Closed stays with the admins (R22).
+        let closed =
+            DomainAccess::new(auth).with_governor(Arc::new(base_governor().close("gh-lab")));
+        assert_eq!(
+            closed.reflection_right(&nora, "gh-lab").await.unwrap(),
+            ReflectionRight::None
         );
     }
 
