@@ -108,6 +108,22 @@ pub struct ClosedDomain {
     pub reason: String,
 }
 
+/// One person GitHub lists on a governed domain's repository, as the Members
+/// card draws them (see [`Engine::github_people`](super::Engine::github_people)).
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct GithubPerson {
+    /// The login GitHub lists.
+    pub login: String,
+    /// Their role on the repository: `admin`, `maintain`, `write`,
+    /// `triage` or `read`.
+    pub github_role: String,
+    /// The level that role gives here ([`level_for`]).
+    pub level: MemberLevel,
+    /// The enabled account linked to that GitHub id on this App's host, or
+    /// `None` when nobody here is linked to it.
+    pub account: Option<String>,
+}
+
 /// Who reads a repository on GitHub, for the Reflection source check
 /// (Task 3.7): whether it is public, and the GitHub ids with read or more.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -635,6 +651,50 @@ impl GithubGovernor {
                 .map(|(id, _)| *id)
                 .collect(),
         })
+    }
+
+    /// The people GitHub lists on `domain`'s repository, each joined to the
+    /// enabled account linked to its GitHub id on this App's host, sorted by
+    /// login, from the same snapshot as every other answer (so the five
+    /// minute cache holds: no extra request to GitHub). `None` when that is
+    /// not known right now, as for [`GithubGovernor::repository_readers`].
+    pub async fn repository_people(&self, domain: &str) -> Option<Vec<GithubPerson>> {
+        let repo = self.repo_of(domain)?;
+        let GovernorApp::Ready { source, host } = self.env.app() else {
+            return None;
+        };
+        let snapshot = self.snapshot(&source, &repo).await?;
+        let mut accounts: HashMap<u64, String> = HashMap::new();
+        if let Some(access) = self.env.access() {
+            let links = access
+                .github_links()
+                .await
+                .inspect_err(|e| tracing::warn!("the GitHub links could not be read: {e:#}"))
+                .unwrap_or_default();
+            let enabled = access
+                .enabled_accounts()
+                .await
+                .inspect_err(|e| tracing::warn!("the accounts could not be read: {e:#}"))
+                .unwrap_or_default();
+            for link in links {
+                if on_host(&link, &host) && enabled.contains(&link.account) {
+                    accounts.insert(link.github_id, link.account);
+                }
+            }
+        }
+        let mut people: Vec<GithubPerson> = snapshot
+            .people
+            .iter()
+            .filter(|(_, (_, role))| level_for(*role) != MemberLevel::None)
+            .map(|(id, (login, role))| GithubPerson {
+                login: login.clone(),
+                github_role: role.as_str().to_string(),
+                level: level_for(*role),
+                account: accounts.get(id).cloned(),
+            })
+            .collect();
+        people.sort_by_key(|person| person.login.to_lowercase());
+        Some(people)
     }
 
     /// The repository of the registered domain `domain`, when it has an
@@ -1364,6 +1424,38 @@ impl super::Engine {
             .get()
             .map(|governor| governor.closed())
             .unwrap_or_default()
+    }
+
+    /// Why `domain` is closed (see [`GithubGovernor::closed`]), or `None`
+    /// when it is open or not governed.
+    pub fn github_closed_reason(&self, domain: &str) -> Option<String> {
+        self.github_access_closed()
+            .into_iter()
+            .find(|closed| closed.domain == domain)
+            .map(|closed| closed.reason)
+    }
+
+    /// The people GitHub lists on `domain`'s repository, joined to the
+    /// accounts linked to them (see [`GithubGovernor::repository_people`]).
+    /// `None` for a domain GitHub does not govern, and while GitHub's answer
+    /// is not known.
+    pub async fn github_people(self: &Arc<Self>, domain: &str) -> Option<Vec<GithubPerson>> {
+        if !self.github_governs(domain) {
+            return None;
+        }
+        self.github_governor().repository_people(domain).await
+    }
+
+    /// The `CRYSTALLINE_DOMAIN_<NAME>_READERS` variable that decides who may
+    /// read `domain`, when `domain` is defined in the environment with an
+    /// origin. Such a domain's readers are applied again on every start
+    /// (see [`Engine::apply_env_readers`](super::Engine::apply_env_readers)),
+    /// so a change made anywhere else would not last.
+    pub fn env_readers_var(&self, domain: &str) -> Option<String> {
+        self.overlay
+            .env_domains()
+            .find(|(name, env)| name.as_str() == domain && env.entry.origin.is_some())
+            .map(|(_, env)| env.readers_var())
     }
 
     /// Whether `github.agent_identity` names an instance admin. The open

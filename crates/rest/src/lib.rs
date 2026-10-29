@@ -237,6 +237,7 @@ use crate::scope::{DomainAccess, DomainRight};
         users_api::reset_password,
         users_api::remove,
         github_settings::status,
+        github_settings::access,
         github_settings::connect,
         github_settings::token,
         github_settings::disconnect,
@@ -301,6 +302,8 @@ use crate::scope::{DomainAccess, DomainRight};
         members::MemberBody,
         members::OwnerBody,
         schemas::ReflectionGrant,
+        schemas::GithubPerson,
+        schemas::ClosedDomain,
         members::ReflectionCollaboratorsResponse,
         members::ReflectionCollaboratorBody,
         members::GrantLevel,
@@ -344,6 +347,7 @@ use crate::scope::{DomainAccess, DomainRight};
         users_api::UsersResponse,
         github_settings::TokenBody,
         github_settings::GithubStatusResponse,
+        github_settings::GithubAccessResponse,
         github_settings::GithubPendingView,
         github_identity::GithubIdentityResponse,
         github_link::GithubLinkResponse,
@@ -1086,6 +1090,12 @@ fn routes(state: RestState) -> Router {
             "/settings/github",
             get(github_settings::status).delete(github_settings::disconnect),
         )
+        // Admin only too, and a pure read: who may use the domains connected
+        // through the GitHub App cannot be learned from GitHub right now, or
+        // which of them are closed. The admin banner reads it on every page,
+        // so it is its own route rather than `GET /settings/github`, whose
+        // read consumes a device flow's failure.
+        .route("/github/access", get(github_settings::access))
         .route("/settings/github/connect", post(github_settings::connect))
         .route("/settings/github/token", post(github_settings::token))
         // The same admin gate a team-domain create answers to, and a pure

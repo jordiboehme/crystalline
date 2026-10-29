@@ -2809,7 +2809,13 @@ pub struct VisibilityBody {
                    invite people and change their levels; deciding who holds \
                    the domain is not one domain's administration to \
                    settle.\n\nMaking a domain shared again forgets its \
-                   membership list.",
+                   membership list.\n\nOn a domain GitHub governs, \
+                   both directions need manager access: a GitHub admin or \
+                   maintainer, or an instance admin. Private means only \
+                   the people with access on GitHub read it; shared means \
+                   everyone signed in. The membership list is kept there, \
+                   and a domain whose readers are set in the environment \
+                   answers 409.",
     params(("domain" = String, Path, description = "The registered domain.")),
     request_body = VisibilityBody,
     responses(
@@ -2842,6 +2848,13 @@ pub struct VisibilityBody {
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
+        (
+            status = 409,
+            description = "Who may read this domain is set in the \
+                           environment (`CRYSTALLINE_DOMAIN_<NAME>_READERS`).",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
     ),
 )]
 pub async fn set_visibility(
@@ -2850,6 +2863,9 @@ pub async fn set_visibility(
     ApiPath(domain): ApiPath<String>,
     ApiJson(body): ApiJson<VisibilityBody>,
 ) -> Result<StatusCode, ApiError> {
+    if state.engine.github_governs(&domain) {
+        return set_governed_visibility(&state, &identity, &domain, body.private).await;
+    }
     if body.private {
         let caller = identity.require_admin()?;
         refuse_read_only(&state)?;
@@ -2905,6 +2921,75 @@ pub async fn set_visibility(
         .await
         .map_err(|e| ApiError::internal(format!("setting the domain's visibility: {e:#}")))?;
     crate::readers_changed(&state);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// [`set_visibility`] on a domain GitHub governs, where "who may read" is
+/// one switch: everyone signed in, or only the people with access on
+/// GitHub.
+///
+/// * The gates run in the order the rest of this surface uses: an account,
+///   the 404 a hidden domain shares with an unregistered name, the
+///   read-only refusal, then the right. A caller who may not see the domain
+///   and asks to make it private is answered exactly as for an unregistered
+///   name, which for a non-admin is the admin refusal of the plain path.
+/// * Both directions need [`DomainRight::Manage`]: a GitHub admin or
+///   maintainer, or an instance admin. Nobody holds a domain here, so
+///   neither direction hands it to anybody.
+/// * A domain defined in the environment applies its readers again on every
+///   start, so a change here would not last: it is refused with the
+///   variable's name.
+/// * Private is recorded through `set_governed_private`, which leaves an
+///   already-private domain as it is. Shared drops the acl row only: the
+///   membership rows stay for the day the App is removed.
+async fn set_governed_visibility(
+    state: &RestState,
+    identity: &Identity,
+    domain: &str,
+    private: bool,
+) -> Result<StatusCode, ApiError> {
+    let caller = identity.require_account()?;
+    if let Err(hidden) = require_domain_read(state, identity, domain).await {
+        if private {
+            identity.require_admin()?;
+        }
+        return Err(hidden);
+    }
+    refuse_read_only(state)?;
+    if let Some(var) = state.engine.env_readers_var(domain) {
+        return Err(ApiError::conflict(super::members::env_readers_sentence(
+            &var,
+        )));
+    }
+    let right = state
+        .access
+        .right(&identity.scope(), domain)
+        .await
+        .map_err(|e| {
+            ApiError::internal(format!("this domain's membership is unreadable: {e:#}"))
+        })?;
+    if right < DomainRight::Manage {
+        crate::refuse_off_write_list(state, identity, domain, Some(DomainRight::Manage)).await?;
+        return Err(ApiError::forbidden(format!(
+            "your access to this domain is {}, and only a GitHub admin or \
+             maintainer, or an instance admin, may change who reads it",
+            super::member_level_word(right)
+        )));
+    }
+    if private {
+        state
+            .access
+            .set_governed_private(domain, caller.name.as_str())
+            .await
+            .map_err(|e| ApiError::internal(format!("setting the domain's visibility: {e:#}")))?;
+    } else {
+        state
+            .access
+            .take_back_governed_private(domain)
+            .await
+            .map_err(|e| ApiError::internal(format!("setting the domain's visibility: {e:#}")))?;
+    }
+    crate::readers_changed(state);
     Ok(StatusCode::NO_CONTENT)
 }
 

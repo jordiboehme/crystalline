@@ -163,6 +163,68 @@ pub async fn status(
     Ok(Json(view(state.engine.github_connection().await?)))
 }
 
+/// What `GET /github/access` answers with.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+#[schema(description = "How access to the domains connected through the \
+                        GitHub App stands: since when GitHub has not said \
+                        who may use them while the last known roles still \
+                        serve, and which domains are closed.")]
+pub struct GithubAccessResponse {
+    /// RFC 3339: since when GitHub has not answered while the last known
+    /// roles still serve, or `null` while it answers.
+    #[schema(example = "2026-10-29T08:00:00Z")]
+    pub stale_since: Option<String>,
+    /// The closed domains, each with its repository and what to do.
+    #[schema(value_type = Vec<super::schemas::ClosedDomain>)]
+    pub closed: Vec<crate::engine::ClosedDomain>,
+}
+
+/// `GET /github/access` - for the admin banner: whether GitHub can be
+/// asked who may use the connected domains, and which of them are closed.
+///
+/// A pure read of what the GitHub governor already knows: it asks GitHub
+/// nothing, so it is cheap enough to read on every page.
+#[utoipa::path(
+    get,
+    path = "/api/v1/github/access",
+    tag = "settings",
+    operation_id = "get_github_access",
+    summary = "Whether GitHub answers who may use the connected domains.",
+    description = "Admin only. A pure read, served even on a read-only \
+                   instance, that asks GitHub nothing. `stale_since` is set \
+                   while GitHub cannot be reached and access uses the last \
+                   known roles; `closed` lists the domains whose repository \
+                   lacks the GitHub App, each with what to do.",
+    responses(
+        (status = 200, description = "How access stands.", body = GithubAccessResponse),
+        (
+            status = 401,
+            description = "No identity.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The caller is not an admin.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn access(
+    State(state): State<RestState>,
+    identity: Identity,
+) -> Result<Json<GithubAccessResponse>, ApiError> {
+    identity.require_admin()?;
+    Ok(Json(GithubAccessResponse {
+        stale_since: state
+            .engine
+            .github_access_stale_since()
+            .map(|since| since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+        closed: state.engine.github_access_closed(),
+    }))
+}
+
 /// `POST /settings/github/connect` - start a device-code sign-in, answering
 /// 202 with the code to confirm in a browser.
 ///

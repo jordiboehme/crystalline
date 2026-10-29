@@ -69,7 +69,7 @@ use axum::http::StatusCode;
 
 use super::auth::Identity;
 use super::auth_store::{
-    DomainMember, MemberLevel, ReflectionGrant, ReflectionLevel, RefusalKind, StoreRefusal,
+    DomainMember, MemberLevel, ReflectionGrant, ReflectionLevel, RefusalKind, Role, StoreRefusal,
     normalize_account_name,
 };
 use super::{
@@ -84,23 +84,78 @@ use crate::scope::DomainRight;
 /// owned (`AuthStore::remove_user`), leaving a domain only an instance admin
 /// can administer. An empty string there would read as an account whose name
 /// is empty, so the absence is spelled as one.
+///
+/// **On a domain GitHub governs** (`governance: "github"`) the people come
+/// from GitHub: `github_people` lists them with the level their role gives,
+/// `owner` is `null` and `members` is empty, because neither decides
+/// anything there. The membership rows Crystalline still holds for the
+/// domain are listed under `overridden`: they are kept for the day the App
+/// is removed, and nothing reads them until then.
 #[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 #[schema(description = "Who may reach one domain. `visibility` is `private` \
                         or `shared`; a shared domain has no owner and no \
                         members, because membership only decides anything \
-                        while a domain is private.")]
+                        while a domain is private. On a domain GitHub \
+                        governs (`governance` is `github`), the people on \
+                        GitHub decide: `github_people` lists them, `owner` \
+                        is null, `members` is empty, and the membership rows \
+                        kept from before are listed under `overridden`.")]
 pub struct MembersResponse {
     /// The account that owns this domain, or `null`: a shared domain has no
-    /// owner, and a private one whose owner's account was removed has none
-    /// either.
+    /// owner, a private one whose owner's account was removed has none
+    /// either, and on a domain GitHub governs the owner decides nothing.
     #[schema(example = "ada")]
     pub owner: Option<String>,
     /// `private` or `shared`.
     #[schema(example = "private")]
     pub visibility: &'static str,
-    /// Everyone invited, by name. Empty for a shared domain.
+    /// Everyone invited, by name. Empty for a shared domain and for a
+    /// domain GitHub governs.
     #[schema(value_type = Vec<super::schemas::DomainMember>)]
     pub members: Vec<DomainMember>,
+    /// `github` when access to this domain follows the GitHub App, else
+    /// `crystalline`.
+    #[schema(example = "github")]
+    pub governance: &'static str,
+    /// The people GitHub lists on the repository, with the level their role
+    /// gives here and the account linked to them. `null` on a domain GitHub
+    /// does not govern and for a caller with no account; an empty list while
+    /// GitHub's answer is not known.
+    #[schema(value_type = Option<Vec<super::schemas::GithubPerson>>)]
+    pub github_people: Option<Vec<crate::engine::GithubPerson>>,
+    /// On a domain GitHub governs: the membership rows set in Crystalline,
+    /// which GitHub overrides. Empty everywhere else.
+    #[schema(value_type = Vec<super::schemas::DomainMember>)]
+    pub overridden: Vec<DomainMember>,
+    /// The Reflection collaborators of a domain kept as files, for a caller
+    /// with manager access; `null` for everybody else and on a domain kept
+    /// in the database.
+    #[schema(value_type = Option<Vec<super::schemas::ReflectionGrant>>)]
+    pub reflection_collaborators: Option<Vec<ReflectionGrant>>,
+    /// When who may read this domain is set in the environment, the
+    /// sentence that says where; the visibility switch is read-only then.
+    #[schema(example = "Set by CRYSTALLINE_DOMAIN_KB_READERS; change it there.")]
+    pub visibility_fixed_by: Option<String>,
+    /// Why this domain is closed (the GitHub App is not installed on its
+    /// repository), for an instance admin; `null` otherwise.
+    pub closed_reason: Option<String>,
+}
+
+/// The one answer every membership change on a domain GitHub governs gets.
+pub(crate) const FOLLOWS_GITHUB: &str = "access to this domain follows GitHub; change it on GitHub";
+
+/// The sentence a domain whose readers are set in the environment answers a
+/// visibility change with, naming the variable.
+pub(crate) fn env_readers_sentence(var: &str) -> String {
+    format!("Set by {var}; change it there.")
+}
+
+/// The 409 every membership change answers on a domain GitHub governs.
+fn refuse_governed(state: &RestState, domain: &str) -> Result<(), ApiError> {
+    if state.engine.github_governs(domain) {
+        return Err(ApiError::conflict(FOLLOWS_GITHUB));
+    }
+    Ok(())
 }
 
 /// What `PUT /domains/{domain}/members/{principal}` takes.
@@ -367,11 +422,63 @@ pub async fn list(
         .domain_visibility(&domain)
         .await
         .map_err(|e| ApiError::internal(format!("reading this domain's visibility: {e:#}")))?;
+    let visibility = if acl.is_some() { "private" } else { "shared" };
+    let governed = state.engine.github_governs(&domain);
+    let reflection_collaborators = reflection_collaborators_for(&state, &identity, &domain).await?;
+    let visibility_fixed_by = state
+        .engine
+        .env_readers_var(&domain)
+        .map(|var| env_readers_sentence(&var));
+    if governed {
+        // The rows survive a share on a governed domain, so they are read
+        // whatever the visibility. GitHub's people only for a caller with
+        // an account: the anonymous tier sees who reads nothing here.
+        let overridden = state
+            .auth
+            .domain_members(&domain)
+            .await
+            .map_err(|e| ApiError::internal(format!("listing this domain's members: {e:#}")))?;
+        let github_people = match identity.user {
+            Some(_) => Some(
+                state
+                    .engine
+                    .github_people(&domain)
+                    .await
+                    .unwrap_or_default(),
+            ),
+            None => None,
+        };
+        // Only an instance admin gets into a closed domain at all, so only
+        // one is told why it is closed.
+        let closed_reason = identity
+            .user
+            .as_ref()
+            .is_some_and(|user| user.role == Role::Admin)
+            .then(|| state.engine.github_closed_reason(&domain))
+            .flatten();
+        return Ok(Json(MembersResponse {
+            owner: None,
+            visibility,
+            members: Vec::new(),
+            governance: "github",
+            github_people,
+            overridden,
+            reflection_collaborators,
+            visibility_fixed_by,
+            closed_reason,
+        }));
+    }
     let Some(acl) = acl else {
         return Ok(Json(MembersResponse {
             owner: None,
-            visibility: "shared",
+            visibility,
             members: Vec::new(),
+            governance: "crystalline",
+            github_people: None,
+            overridden: Vec::new(),
+            reflection_collaborators,
+            visibility_fixed_by,
+            closed_reason: None,
         }));
     };
     let members = state
@@ -384,9 +491,45 @@ pub async fn list(
         // removed, which is the one value no live account can hold. It reaches
         // a client as `null` rather than as an empty name.
         owner: (!acl.owner.is_empty()).then_some(acl.owner),
-        visibility: "private",
+        visibility,
         members,
+        governance: "crystalline",
+        github_people: None,
+        overridden: Vec::new(),
+        reflection_collaborators,
+        visibility_fixed_by,
+        closed_reason: None,
     }))
+}
+
+/// The Reflection collaborators of `domain` when the caller manages it and
+/// it is kept as files, else `None`: the same gate
+/// `GET /domains/{domain}/reflection-collaborators` answers behind, so
+/// carrying them here widens nothing.
+async fn reflection_collaborators_for(
+    state: &RestState,
+    identity: &Identity,
+    domain: &str,
+) -> Result<Option<Vec<ReflectionGrant>>, ApiError> {
+    if identity.user.is_none() || !state.engine.kept_as_files(domain) {
+        return Ok(None);
+    }
+    let right = state
+        .access
+        .right(&identity.scope(), domain)
+        .await
+        .map_err(|e| {
+            ApiError::internal(format!("this domain's membership is unreadable: {e:#}"))
+        })?;
+    if right < DomainRight::Manage {
+        return Ok(None);
+    }
+    let grants = state.auth.reflection_grants(domain).await.map_err(|e| {
+        ApiError::internal(format!(
+            "listing this domain's Reflection collaborators: {e:#}"
+        ))
+    })?;
+    Ok(Some(grants))
 }
 
 /// `PUT /domains/{domain}/members/{principal}` - invite an account, or move
@@ -439,7 +582,8 @@ pub async fn list(
         ),
         (
             status = 409,
-            description = "The domain is shared, or the principal owns it.",
+            description = "The domain is shared, the principal owns it, or \
+                           access to this domain follows GitHub.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -465,6 +609,12 @@ pub async fn set_member(
     ApiPath((domain, principal)): ApiPath<(String, String)>,
     ApiJson(body): ApiJson<MemberBody>,
 ) -> Result<StatusCode, ApiError> {
+    identity.require_account()?;
+    require_domain_read(&state, &identity, &domain).await?;
+    refuse_read_only(&state)?;
+    // GitHub decides who is here: a row written now would come back the day
+    // the App is removed, so none is written.
+    refuse_governed(&state, &domain)?;
     let actor = require_right(&state, &identity, &domain, DomainRight::Manage, "manager").await?;
     let principal = principal_key(&principal)?;
     state
@@ -529,7 +679,8 @@ pub async fn set_member(
         ),
         (
             status = 409,
-            description = "The domain is shared, or the principal owns it.",
+            description = "The domain is shared, the principal owns it, or \
+                           access to this domain follows GitHub.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -571,6 +722,8 @@ pub async fn remove_member(
         require_domain_read(&state, &identity, &domain).await?;
     }
     refuse_read_only(&state)?;
+    // A leaver too: the row is kept for the day the App is removed.
+    refuse_governed(&state, &domain)?;
     if !leaving {
         refuse_below(&state, &identity, &domain, DomainRight::Manage, "manager").await?;
     }
@@ -660,7 +813,8 @@ pub async fn remove_member(
         ),
         (
             status = 409,
-            description = "The domain is shared, so it has no owner.",
+            description = "The domain is shared, so it has no owner, or access \
+                           to this domain follows GitHub.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -684,6 +838,11 @@ pub async fn set_owner(
     ApiPath(domain): ApiPath<String>,
     ApiJson(body): ApiJson<OwnerBody>,
 ) -> Result<StatusCode, ApiError> {
+    identity.require_account()?;
+    require_domain_read(&state, &identity, &domain).await?;
+    refuse_read_only(&state)?;
+    // A domain GitHub governs has no owner to hand on.
+    refuse_governed(&state, &domain)?;
     require_right(&state, &identity, &domain, DomainRight::Own, "owner").await?;
     require_private(&state, &domain, "owner to hand on").await?;
     state

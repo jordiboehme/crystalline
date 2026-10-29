@@ -307,6 +307,25 @@ export type AutomationResponse = {
 export type ChangeKind = 'added' | 'modified' | 'deleted' | 'moved';
 
 /**
+ * A domain closed because the GitHub App is not installed on its
+ * repository, or GitHub does not show the repository to the App.
+ */
+export type ClosedDomain = {
+    /**
+     * The domain.
+     */
+    domain: string;
+    /**
+     * What to do about it, in one sentence.
+     */
+    reason: string;
+    /**
+     * Its repository, `owner/name`.
+     */
+    repo: string;
+};
+
+/**
  * The wire form of a 412: a problem detail carrying the version the server
  * holds now, so a client can show a merge view instead of just failing.
  */
@@ -579,6 +598,21 @@ export type EngramChanged = {
 export type FoldArg = 'fold' | 'discard';
 
 /**
+ * How access to the domains connected through the GitHub App stands: since when GitHub has not said who may use them while the last known roles still serve, and which domains are closed.
+ */
+export type GithubAccessResponse = {
+    /**
+     * The closed domains, each with its repository and what to do.
+     */
+    closed: Array<ClosedDomain>;
+    /**
+     * RFC 3339: since when GitHub has not answered while the last known
+     * roles still serve, or `null` while it answers.
+     */
+    stale_since?: string | null;
+};
+
+/**
  * One account's own GitHub identity: whose it is, whether a credential is on file, the login it authenticated as, since when and where it lives. No token material, ever.
  */
 export type GithubIdentityResponse = {
@@ -678,6 +712,30 @@ export type GithubPendingView = {
      * Where the user confirms the code.
      */
     verification_url: string;
+};
+
+/**
+ * One person GitHub lists on a governed domain's repository.
+ */
+export type GithubPerson = {
+    /**
+     * The account linked to that GitHub login here, or `null` when nobody
+     * here is linked to it.
+     */
+    account?: string | null;
+    /**
+     * Their role on the repository: `admin`, `maintain`, `write`,
+     * `triage` or `read`.
+     */
+    github_role: string;
+    /**
+     * The level that role gives on this domain.
+     */
+    level: MemberLevel;
+    /**
+     * The login GitHub lists.
+     */
+    login: string;
 };
 
 /**
@@ -1283,23 +1341,57 @@ export type MemberBody = {
 export type MemberLevel = 'none' | 'viewer' | 'editor' | 'manager';
 
 /**
- * Who may reach one domain. `visibility` is `private` or `shared`; a shared domain has no owner and no members, because membership only decides anything while a domain is private.
+ * Who may reach one domain. `visibility` is `private` or `shared`; a shared domain has no owner and no members, because membership only decides anything while a domain is private. On a domain GitHub governs (`governance` is `github`), the people on GitHub decide: `github_people` lists them, `owner` is null, `members` is empty, and the membership rows kept from before are listed under `overridden`.
  */
 export type MembersResponse = {
     /**
-     * Everyone invited, by name. Empty for a shared domain.
+     * Why this domain is closed (the GitHub App is not installed on its
+     * repository), for an instance admin; `null` otherwise.
+     */
+    closed_reason?: string | null;
+    /**
+     * The people GitHub lists on the repository, with the level their role
+     * gives here and the account linked to them. `null` on a domain GitHub
+     * does not govern and for a caller with no account; an empty list while
+     * GitHub's answer is not known.
+     */
+    github_people?: Array<GithubPerson> | null;
+    /**
+     * `github` when access to this domain follows the GitHub App, else
+     * `crystalline`.
+     */
+    governance: string;
+    /**
+     * Everyone invited, by name. Empty for a shared domain and for a
+     * domain GitHub governs.
      */
     members: Array<DomainMember>;
     /**
+     * On a domain GitHub governs: the membership rows set in Crystalline,
+     * which GitHub overrides. Empty everywhere else.
+     */
+    overridden: Array<DomainMember>;
+    /**
      * The account that owns this domain, or `null`: a shared domain has no
-     * owner, and a private one whose owner's account was removed has none
-     * either.
+     * owner, a private one whose owner's account was removed has none
+     * either, and on a domain GitHub governs the owner decides nothing.
      */
     owner?: string | null;
+    /**
+     * The Reflection collaborators of a domain kept as files, for a caller
+     * with manager access; `null` for everybody else and on a domain kept
+     * in the database.
+     */
+    reflection_collaborators?: Array<ReflectionGrant> | null;
     /**
      * `private` or `shared`.
      */
     visibility: string;
+    /**
+     * When who may read this domain is set in the environment, the
+     * sentence that says where; the visibility switch is read-only then.
+     */
+    visibility_fixed_by?: string | null;
 };
 
 /**
@@ -4653,7 +4745,7 @@ export type RemoveDomainMemberErrors = {
      */
     404: ProblemDetail;
     /**
-     * The domain is shared, or the principal owns it.
+     * The domain is shared, the principal owns it, or access to this domain follows GitHub.
      */
     409: ProblemDetail;
 };
@@ -4699,7 +4791,7 @@ export type SetDomainMemberErrors = {
      */
     404: ProblemDetail;
     /**
-     * The domain is shared, or the principal owns it.
+     * The domain is shared, the principal owns it, or access to this domain follows GitHub.
      */
     409: ProblemDetail;
     /**
@@ -4809,7 +4901,7 @@ export type SetDomainOwnerErrors = {
      */
     404: ProblemDetail;
     /**
-     * The domain is shared, so it has no owner.
+     * The domain is shared, so it has no owner, or access to this domain follows GitHub.
      */
     409: ProblemDetail;
     /**
@@ -4856,7 +4948,7 @@ export type GetReflectionStatusError = GetReflectionStatusErrors[keyof GetReflec
 
 export type GetReflectionStatusResponses = {
     /**
-     * ReflectionStatus. `state` is `off`, `pending` (then `pending_engrams` lists the engrams still under `reflections/` for a caller with `engrams_visible`, and is empty for anyone else), `homeless`, `on`, `elsewhere` (then `home_url` is set) or `hosted_elsewhere` (another instance on this shared database holds the domain's host lock and serves it; then `host_label` names that instance, or is `null` while a rename pauses a domain whose lock nobody holds, and it is `null` in every other state). `member` is true when the caller holds a membership row it may leave; `collaborator` is true when it holds a per-domain Reflection grant it may give up (`DELETE /domains/{domain}/reflection-collaborators/{account}`).
+     * ReflectionStatus. `state` is `off`, `pending` (then `pending_engrams` lists the engrams still under `reflections/` for a caller with `engrams_visible`, and is empty for anyone else), `homeless`, `on`, `elsewhere` (then `home_url` is set) or `hosted_elsewhere` (another instance on this shared database holds the domain's host lock and serves it; then `host_label` names that instance, or is `null` while a rename pauses a domain whose lock nobody holds, and it is `null` in every other state). `member` is true when the caller holds a membership row it may leave; `collaborator` is true when it holds a per-domain Reflection grant it may give up (`DELETE /domains/{domain}/reflection-collaborators/{account}`). `governance` is `github` when access to the domain follows the GitHub App (then `member` is always false), else `crystalline`; `private` says whether the domain is private.
      */
     200: {
         [key: string]: unknown;
@@ -6521,6 +6613,10 @@ export type SetDomainVisibilityErrors = {
      * No such domain, or none this caller may see.
      */
     404: ProblemDetail;
+    /**
+     * Who may read this domain is set in the environment (`CRYSTALLINE_DOMAIN_<NAME>_READERS`).
+     */
+    409: ProblemDetail;
 };
 
 export type SetDomainVisibilityError = SetDomainVisibilityErrors[keyof SetDomainVisibilityErrors];
@@ -6789,6 +6885,35 @@ export type GetEvolveQueueResponses = {
 };
 
 export type GetEvolveQueueResponse = GetEvolveQueueResponses[keyof GetEvolveQueueResponses];
+
+export type GetGithubAccessData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/v1/github/access';
+};
+
+export type GetGithubAccessErrors = {
+    /**
+     * No identity.
+     */
+    401: ProblemDetail;
+    /**
+     * The caller is not an admin.
+     */
+    403: ProblemDetail;
+};
+
+export type GetGithubAccessError = GetGithubAccessErrors[keyof GetGithubAccessErrors];
+
+export type GetGithubAccessResponses = {
+    /**
+     * How access stands.
+     */
+    200: GithubAccessResponse;
+};
+
+export type GetGithubAccessResponse = GetGithubAccessResponses[keyof GetGithubAccessResponses];
 
 export type GithubDomainNameData = {
     body?: never;

@@ -264,6 +264,19 @@ pub enum RepoRole {
 }
 
 impl RepoRole {
+    /// The role as GitHub names it: `admin`, `maintain`, `write`, `triage`,
+    /// `read`, or `none` for no access.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RepoRole::Admin => "admin",
+            RepoRole::Maintain => "maintain",
+            RepoRole::Write => "write",
+            RepoRole::Triage => "triage",
+            RepoRole::Read => "read",
+            RepoRole::None => "none",
+        }
+    }
+
     /// A GitHub permission word (`admin`, `maintain`, `write`/`push`,
     /// `triage`, `read`/`pull`) as a role; anything else is `None`.
     fn from_word(word: &str) -> RepoRole {

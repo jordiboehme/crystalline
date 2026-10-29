@@ -209,6 +209,7 @@ pub const MOUNTED_OPERATIONS: &[&str] = &[
     "POST /api/v1/users/{name}/password",
     "DELETE /api/v1/users/{name}/github-link",
     "GET /api/v1/settings/github",
+    "GET /api/v1/github/access",
     "DELETE /api/v1/settings/github",
     "POST /api/v1/settings/github/connect",
     "POST /api/v1/settings/github/token",

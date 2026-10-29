@@ -12,6 +12,7 @@ mod support;
 mod github_access;
 mod github_app;
 mod github_link;
+mod github_members;
 mod origin;
 mod origin_names;
 mod poller;

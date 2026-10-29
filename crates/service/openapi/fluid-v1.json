@@ -4586,7 +4586,7 @@
             }
           },
           "409": {
-            "description": "The domain is shared, or the principal owns it.",
+            "description": "The domain is shared, the principal owns it, or access to this domain follows GitHub.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -4679,7 +4679,7 @@
             }
           },
           "409": {
-            "description": "The domain is shared, or the principal owns it.",
+            "description": "The domain is shared, the principal owns it, or access to this domain follows GitHub.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -4881,7 +4881,7 @@
             }
           },
           "409": {
-            "description": "The domain is shared, so it has no owner.",
+            "description": "The domain is shared, so it has no owner, or access to this domain follows GitHub.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -4933,7 +4933,7 @@
         ],
         "responses": {
           "200": {
-            "description": "ReflectionStatus. `state` is `off`, `pending` (then `pending_engrams` lists the engrams still under `reflections/` for a caller with `engrams_visible`, and is empty for anyone else), `homeless`, `on`, `elsewhere` (then `home_url` is set) or `hosted_elsewhere` (another instance on this shared database holds the domain's host lock and serves it; then `host_label` names that instance, or is `null` while a rename pauses a domain whose lock nobody holds, and it is `null` in every other state). `member` is true when the caller holds a membership row it may leave; `collaborator` is true when it holds a per-domain Reflection grant it may give up (`DELETE /domains/{domain}/reflection-collaborators/{account}`).",
+            "description": "ReflectionStatus. `state` is `off`, `pending` (then `pending_engrams` lists the engrams still under `reflections/` for a caller with `engrams_visible`, and is empty for anyone else), `homeless`, `on`, `elsewhere` (then `home_url` is set) or `hosted_elsewhere` (another instance on this shared database holds the domain's host lock and serves it; then `host_label` names that instance, or is `null` while a rename pauses a domain whose lock nobody holds, and it is `null` in every other state). `member` is true when the caller holds a membership row it may leave; `collaborator` is true when it holds a per-domain Reflection grant it may give up (`DELETE /domains/{domain}/reflection-collaborators/{account}`). `governance` is `github` when access to the domain follows the GitHub App (then `member` is always false), else `crystalline`; `private` says whether the domain is private.",
             "content": {
               "application/json": {
                 "schema": {
@@ -4944,11 +4944,13 @@
                   "domain": "eng",
                   "enabled": true,
                   "engrams_visible": true,
+                  "governance": "crystalline",
                   "home": "here",
                   "home_url": null,
                   "host_label": null,
                   "member": false,
                   "pending_engrams": [],
+                  "private": false,
                   "right": "curate",
                   "state": "on"
                 }
@@ -8448,7 +8450,7 @@
           "domains"
         ],
         "summary": "Make a domain private, or share it with the instance again.",
-        "description": "Making a domain PRIVATE is admin only: it gives the domain an owner - the calling account - and hides it from every account that is not invited into it. A domain nobody may see is answered exactly as a domain nobody registered, so a stranger's request for it is a 404 rather than a 403.\n\nMaking a domain SHARED again is served to the domain's own owner as well as to an admin: they already see everything in it, and opening what they closed takes nothing from anybody.\n\nPrivatizing a domain that is already private changes nothing: it keeps the owner and the members it has, and does not become the caller's. Transfer ownership with PUT /domains/{domain}/owner.\n\nA manager may do neither. It may invite people and change their levels; deciding who holds the domain is not one domain's administration to settle.\n\nMaking a domain shared again forgets its membership list.",
+        "description": "Making a domain PRIVATE is admin only: it gives the domain an owner - the calling account - and hides it from every account that is not invited into it. A domain nobody may see is answered exactly as a domain nobody registered, so a stranger's request for it is a 404 rather than a 403.\n\nMaking a domain SHARED again is served to the domain's own owner as well as to an admin: they already see everything in it, and opening what they closed takes nothing from anybody.\n\nPrivatizing a domain that is already private changes nothing: it keeps the owner and the members it has, and does not become the caller's. Transfer ownership with PUT /domains/{domain}/owner.\n\nA manager may do neither. It may invite people and change their levels; deciding who holds the domain is not one domain's administration to settle.\n\nMaking a domain shared again forgets its membership list.\n\nOn a domain GitHub governs, both directions need manager access: a GitHub admin or maintainer, or an instance admin. Private means only the people with access on GitHub read it; shared means everyone signed in. The membership list is kept there, and a domain whose readers are set in the environment answers 409.",
         "operationId": "set_domain_visibility",
         "parameters": [
           {
@@ -8497,6 +8499,16 @@
           },
           "404": {
             "description": "No such domain, or none this caller may see.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Who may read this domain is set in the environment (`CRYSTALLINE_DOMAIN_<NAME>_READERS`).",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -9014,6 +9026,48 @@
           },
           "422": {
             "description": "`families`, `rules` or `class` names something the catalog does not have.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/github/access": {
+      "get": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "Whether GitHub answers who may use the connected domains.",
+        "description": "Admin only. A pure read, served even on a read-only instance, that asks GitHub nothing. `stale_since` is set while GitHub cannot be reached and access uses the last known roles; `closed` lists the domains whose repository lacks the GitHub App, each with what to do.",
+        "operationId": "get_github_access",
+        "responses": {
+          "200": {
+            "description": "How access stands.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GithubAccessResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -12368,6 +12422,29 @@
           "moved"
         ]
       },
+      "ClosedDomain": {
+        "type": "object",
+        "description": "A domain closed because the GitHub App is not installed on its\nrepository, or GitHub does not show the repository to the App.",
+        "required": [
+          "domain",
+          "repo",
+          "reason"
+        ],
+        "properties": {
+          "domain": {
+            "type": "string",
+            "description": "The domain."
+          },
+          "reason": {
+            "type": "string",
+            "description": "What to do about it, in one sentence."
+          },
+          "repo": {
+            "type": "string",
+            "description": "Its repository, `owner/name`."
+          }
+        }
+      },
       "ConflictDetail": {
         "type": "object",
         "description": "The wire form of a 412: a problem detail carrying the version the server\nholds now, so a client can show a merge view instead of just failing.",
@@ -12783,6 +12860,30 @@
           "discard"
         ]
       },
+      "GithubAccessResponse": {
+        "type": "object",
+        "description": "How access to the domains connected through the GitHub App stands: since when GitHub has not said who may use them while the last known roles still serve, and which domains are closed.",
+        "required": [
+          "closed"
+        ],
+        "properties": {
+          "closed": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ClosedDomain"
+            },
+            "description": "The closed domains, each with its repository and what to do."
+          },
+          "stale_since": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "RFC 3339: since when GitHub has not answered while the last known\nroles still serve, or `null` while it answers.",
+            "example": "2026-10-29T08:00:00Z"
+          }
+        }
+      },
       "GithubIdentityResponse": {
         "type": "object",
         "description": "One account's own GitHub identity: whose it is, whether a credential is on file, the login it authenticated as, since when and where it lives. No token material, ever.",
@@ -12955,6 +13056,36 @@
             "type": "string",
             "description": "Where the user confirms the code.",
             "example": "https://github.com/login/device"
+          }
+        }
+      },
+      "GithubPerson": {
+        "type": "object",
+        "description": "One person GitHub lists on a governed domain's repository.",
+        "required": [
+          "login",
+          "github_role",
+          "level"
+        ],
+        "properties": {
+          "account": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The account linked to that GitHub login here, or `null` when nobody\nhere is linked to it."
+          },
+          "github_role": {
+            "type": "string",
+            "description": "Their role on the repository: `admin`, `maintain`, `write`,\n`triage` or `read`."
+          },
+          "level": {
+            "$ref": "#/components/schemas/MemberLevel",
+            "description": "The level that role gives on this domain."
+          },
+          "login": {
+            "type": "string",
+            "description": "The login GitHub lists."
           }
         }
       },
@@ -13768,31 +13899,80 @@
       },
       "MembersResponse": {
         "type": "object",
-        "description": "Who may reach one domain. `visibility` is `private` or `shared`; a shared domain has no owner and no members, because membership only decides anything while a domain is private.",
+        "description": "Who may reach one domain. `visibility` is `private` or `shared`; a shared domain has no owner and no members, because membership only decides anything while a domain is private. On a domain GitHub governs (`governance` is `github`), the people on GitHub decide: `github_people` lists them, `owner` is null, `members` is empty, and the membership rows kept from before are listed under `overridden`.",
         "required": [
           "visibility",
-          "members"
+          "members",
+          "governance",
+          "overridden"
         ],
         "properties": {
+          "closed_reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why this domain is closed (the GitHub App is not installed on its\nrepository), for an instance admin; `null` otherwise."
+          },
+          "github_people": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/GithubPerson"
+            },
+            "description": "The people GitHub lists on the repository, with the level their role\ngives here and the account linked to them. `null` on a domain GitHub\ndoes not govern and for a caller with no account; an empty list while\nGitHub's answer is not known."
+          },
+          "governance": {
+            "type": "string",
+            "description": "`github` when access to this domain follows the GitHub App, else\n`crystalline`.",
+            "example": "github"
+          },
           "members": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/DomainMember"
             },
-            "description": "Everyone invited, by name. Empty for a shared domain."
+            "description": "Everyone invited, by name. Empty for a shared domain and for a\ndomain GitHub governs."
+          },
+          "overridden": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DomainMember"
+            },
+            "description": "On a domain GitHub governs: the membership rows set in Crystalline,\nwhich GitHub overrides. Empty everywhere else."
           },
           "owner": {
             "type": [
               "string",
               "null"
             ],
-            "description": "The account that owns this domain, or `null`: a shared domain has no\nowner, and a private one whose owner's account was removed has none\neither.",
+            "description": "The account that owns this domain, or `null`: a shared domain has no\nowner, a private one whose owner's account was removed has none\neither, and on a domain GitHub governs the owner decides nothing.",
             "example": "ada"
+          },
+          "reflection_collaborators": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/ReflectionGrant"
+            },
+            "description": "The Reflection collaborators of a domain kept as files, for a caller\nwith manager access; `null` for everybody else and on a domain kept\nin the database."
           },
           "visibility": {
             "type": "string",
             "description": "`private` or `shared`.",
             "example": "private"
+          },
+          "visibility_fixed_by": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "When who may read this domain is set in the environment, the\nsentence that says where; the visibility switch is read-only then.",
+            "example": "Set by CRYSTALLINE_DOMAIN_KB_READERS; change it there."
           }
         }
       },

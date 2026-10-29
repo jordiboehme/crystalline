@@ -5618,6 +5618,7 @@ async fn no_rest_response_carries_an_operator_setting() {
         "/api/v1/reflection/domains",
         "/api/v1/users",
         "/api/v1/settings/github",
+        "/api/v1/github/access",
         "/api/v1/github/domain-name?repo=acme/kb",
         "/api/v1/me/github-identity",
         "/api/v1/me/github-link",
