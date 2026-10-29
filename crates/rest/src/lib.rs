@@ -1380,7 +1380,11 @@ pub(crate) async fn refuse_off_write_list(
 ///    what a stranger writing to a domain nobody registered learns;
 /// 2. then the instance role, unchanged: a domain invitation widens what an
 ///    account may *reach*, never what its instance role lets it *do*, so a
-///    domain editor who is an instance viewer is still refused here;
+///    domain editor who is an instance viewer is still refused here. On a
+///    domain GitHub governs only a signed-in account is required instead,
+///    because there the GitHub role decides and the instance role does not
+///    cap it (an instance viewer with GitHub write writes); step 3 refuses
+///    everybody else, instance `none` included;
 /// 3. then the capped right (`DomainAccess::write_right`), which carries the
 ///    membership level, what a private domain adds, and the write list. A
 ///    caller off the write list is refused with the sentence that names the
@@ -1388,9 +1392,10 @@ pub(crate) async fn refuse_off_write_list(
 ///    the caller holds, because "forbidden" on a domain they can see and read
 ///    is otherwise indistinguishable from a bug.
 ///
-/// Step 3 can only fire on a private domain. On a shared one the right is the
-/// instance role's own (the policy in `crate::scope`), so a caller past step 2
-/// holds `Write` or better by construction.
+/// Off a governed domain, step 3 can only fire on a private domain. On a
+/// shared one the right is the instance role's own (the policy in
+/// `crate::scope`), so a caller past step 2 holds `Write` or better by
+/// construction.
 ///
 /// Saving a domain's MANIFEST, privatizing a domain and the archive import are
 /// `require_admin` and carry no membership gate, since an admin resolves to
@@ -1412,7 +1417,13 @@ pub(crate) async fn require_domain_write(
 ) -> Result<Caller, ApiError> {
     let scope = identity.scope();
     state.engine.require_domain(domain, &scope).await?;
-    let caller = identity.require_editor()?;
+    // A signed-in account is still required on a governed domain, so the
+    // anonymous visitor gets the 401 every other write gives it.
+    let caller = if state.access.governs(domain) {
+        Caller::Account(identity.require_account()?)
+    } else {
+        identity.require_editor()?
+    };
     // The capped right rather than the bare domain answer, so this gate and the
     // MCP one are one rule with one spelling (`DomainAccess::write_right`). It
     // carries the write list too, so the list is asked again only to word a
