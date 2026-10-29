@@ -226,9 +226,16 @@ pub trait KnowledgeGovernor: Send + Sync {
     /// is not known.
     async fn repository_public(&self, domain: &str) -> bool;
     /// The linked accounts with GitHub read or more on `domain`'s
-    /// repository, by their account names, from one listing of the
-    /// repository's collaborators. `None` when that is not known right now;
-    /// every caller then fails closed.
+    /// repository, from one listing of the repository's collaborators.
+    ///
+    /// It must equal the set of accounts whose
+    /// [`KnowledgeGovernor::knowledge`] on `domain` is
+    /// `Level(Viewer | Editor | Manager)`, answered from the same cached
+    /// snapshot, so the reader sets and the per-account answers never
+    /// disagree. Names are the accounts store's own folded spelling: they
+    /// are compared byte for byte with the store's names, so any other
+    /// spelling matches no account and fails closed. `None` when the
+    /// listing is not known right now; every caller then fails closed.
     async fn readers(&self, domain: &str) -> Option<HashSet<String>>;
 }
 
@@ -796,6 +803,44 @@ impl DomainVisibility {
     }
 }
 
+/// Which domains GitHub governs, read once from the governor for one
+/// public answer (`DomainAccess::governance`), and the governor to ask
+/// about them. Without a governor it governs nothing.
+struct Governance<'a> {
+    governor: Option<&'a dyn KnowledgeGovernor>,
+    /// The governed domain names, trimmed as the store trims a name.
+    domains: HashSet<String>,
+}
+
+impl<'a> Governance<'a> {
+    /// The governor, when it governs `domain`.
+    fn of(&self, domain: &str) -> Option<&'a dyn KnowledgeGovernor> {
+        self.governor
+            .filter(|_| self.domains.contains(domain.trim()))
+    }
+
+    /// The GitHub input to [`decide`] for `principal` on `domain`, or `None`
+    /// when GitHub does not govern it (see `github_input`).
+    async fn input(&self, principal: &Principal, domain: &str, private: bool) -> Option<Governed> {
+        let governor = self.of(domain)?;
+        Some(github_input(governor, principal, domain.trim(), private).await)
+    }
+
+    /// Whether an anonymous caller reads `domain`'s engrams (`private` when
+    /// it has an acl row): a shared domain Crystalline decides, or a shared
+    /// one GitHub governs whose repository is public. Counted whether or not
+    /// the `auth.anonymous` tier is on, so a later switch opens no leak.
+    async fn anonymous_reads(&self, domain: &str, private: bool) -> bool {
+        if private {
+            return false;
+        }
+        match self.of(domain) {
+            Some(governor) => governor.repository_public(domain.trim()).await,
+            None => true,
+        }
+    }
+}
+
 /// What a per-account loop over one domain's readers reads for each
 /// account ([`DomainAccess::readers_of`], [`DomainAccess::page_readers`],
 /// [`DomainAccess::readers_cover`]).
@@ -892,40 +937,23 @@ impl DomainAccess {
         }
     }
 
-    /// The names of the domains GitHub governs right now, trimmed as the
-    /// store trims a name; empty without a governor.
-    fn governed_domains(&self) -> HashSet<String> {
+    /// One snapshot of which domains GitHub governs, taken once per public
+    /// answer so every step of that answer sees the same set.
+    fn governance(&self) -> Governance<'_> {
         match &self.governor {
-            Some(governor) => governor
-                .governed_domains()
-                .iter()
-                .map(|name| name.trim().to_string())
-                .collect(),
-            None => HashSet::new(),
+            Some(governor) => Governance {
+                governor: Some(governor.as_ref()),
+                domains: governor
+                    .governed_domains()
+                    .iter()
+                    .map(|name| name.trim().to_string())
+                    .collect(),
+            },
+            None => Governance {
+                governor: None,
+                domains: HashSet::new(),
+            },
         }
-    }
-
-    /// The governor, when it governs `domain`.
-    fn governor_of(&self, domain: &str) -> Option<&Arc<dyn KnowledgeGovernor>> {
-        let governor = self.governor.as_ref()?;
-        self.governed_domains()
-            .contains(domain.trim())
-            .then_some(governor)
-    }
-
-    /// The GitHub input to [`decide`] for `principal` on `domain`, or `None`
-    /// when GitHub does not govern it. Asks GitHub only what the ladder
-    /// reads (`decide_governed`): an account's grant when its instance role
-    /// is viewer or editor, and whether the repository is public for an
-    /// anonymous caller on a shared domain.
-    async fn governed_input(
-        &self,
-        principal: &Principal,
-        domain: &str,
-        private: bool,
-    ) -> Option<Governed> {
-        let governor = self.governor_of(domain)?;
-        Some(github_input(governor.as_ref(), principal, domain.trim(), private).await)
     }
 
     /// Whose draft `account` was granted at one path, or `None` for the
@@ -1172,7 +1200,10 @@ impl DomainAccess {
         Option<Governed>,
     )> {
         let acl = self.auth.domain_visibility(domain).await?;
-        let github = self.governed_input(principal, domain, acl.is_some()).await;
+        let github = self
+            .governance()
+            .input(principal, domain, acl.is_some())
+            .await;
         if github.is_some() {
             return Ok((acl, None, ReflectionLevel::Default, github));
         }
@@ -1207,11 +1238,12 @@ impl DomainAccess {
             .into_iter()
             .map(|acl| (acl.domain.clone(), acl))
             .collect();
+        let governance = self.governance();
         let mut governed = HashMap::new();
-        if let Some(governor) = &self.governor {
-            for domain in self.governed_domains() {
+        if let Some(governor) = governance.governor {
+            for domain in governance.domains {
                 let private = acls.contains_key(&domain);
-                let input = github_input(governor.as_ref(), &principal, &domain, private).await;
+                let input = github_input(governor, &principal, &domain, private).await;
                 governed.insert(domain, input);
             }
         }
@@ -1335,7 +1367,10 @@ impl DomainAccess {
             return Ok((principal, DomainRight::Own, false));
         }
         let acl = self.auth.domain_visibility(domain).await?;
-        let github = self.governed_input(&principal, domain, acl.is_some()).await;
+        let github = self
+            .governance()
+            .input(&principal, domain, acl.is_some())
+            .await;
         // A governed domain's membership rows are not read at all.
         let level = match (&acl, &principal, github) {
             (Some(_), Principal::Account { name, .. }, None) => self.level_of(name, domain).await?,
@@ -1375,7 +1410,7 @@ impl DomainAccess {
     ///   viewer or above instead.
     pub async fn readers_of(&self, domain: &str) -> Result<Option<HashSet<String>>> {
         let acl = self.auth.domain_visibility(domain).await?;
-        if let Some(governor) = self.governor_of(domain) {
+        if let Some(governor) = self.governance().of(domain) {
             let side = match &acl {
                 None if governor.repository_public(domain.trim()).await => return Ok(None),
                 None => ReaderSide::Governed(HashSet::new()),
@@ -1438,8 +1473,13 @@ impl DomainAccess {
     /// governor's reader listing (one call, and only for a private domain:
     /// on a shared one the GitHub grant cannot lower the shared base).
     /// `None` when that listing is not known.
-    async fn reader_side(&self, domain: &str, private: bool) -> Result<Option<ReaderSide>> {
-        if let Some(governor) = self.governor_of(domain) {
+    async fn reader_side(
+        &self,
+        governance: &Governance<'_>,
+        domain: &str,
+        private: bool,
+    ) -> Result<Option<ReaderSide>> {
+        if let Some(governor) = governance.of(domain) {
             if !private {
                 return Ok(Some(ReaderSide::Governed(HashSet::new())));
             }
@@ -1453,20 +1493,6 @@ impl DomainAccess {
         } else {
             HashMap::new()
         })))
-    }
-
-    /// Whether an anonymous caller reads `domain`'s engrams (`private` when
-    /// it has an acl row): a shared domain Crystalline decides, or a shared
-    /// one GitHub governs whose repository is public. Counted whether or not
-    /// the `auth.anonymous` tier is on, so a later switch opens no leak.
-    async fn anonymous_reads(&self, domain: &str, private: bool) -> bool {
-        if private {
-            return false;
-        }
-        match self.governor_of(domain) {
-            Some(governor) => governor.repository_public(domain.trim()).await,
-            None => true,
-        }
     }
 
     /// Whether a Reflection page of domain `page` may carry text drawn from
@@ -1540,14 +1566,19 @@ impl DomainAccess {
     /// governor lists as GitHub readers and the instance admins (not the
     /// owner, not the members); when the listing is not known, only the
     /// instance admins. A shared domain GitHub governs is
-    /// [`PageReaders::Everyone`] too, whether or not its repository is
-    /// public.
+    /// [`PageReaders::Everyone`] while its repository is public; while it is
+    /// not, no anonymous caller reads the page, so the page names the
+    /// enabled accounts that read its Reflection (every account at instance
+    /// viewer or above). A confirmation for those is asked again once the
+    /// repository goes public ([`DomainAccess::readers_cover_for`]).
     pub async fn page_readers(&self, page: &str) -> Result<PageReaders> {
-        let Some(acl) = self.auth.domain_visibility(page).await? else {
+        let governance = self.governance();
+        let acl = self.auth.domain_visibility(page).await?;
+        if governance.anonymous_reads(page, acl.is_some()).await {
             return Ok(PageReaders::Everyone);
-        };
+        }
         // Unknown fails closed: nobody is a GitHub reader.
-        let side = match self.reader_side(page, true).await? {
+        let side = match self.reader_side(&governance, page, acl.is_some()).await? {
             Some(side) => side,
             None => ReaderSide::Governed(HashSet::new()),
         };
@@ -1562,7 +1593,7 @@ impl DomainAccess {
                 role: user.role,
                 reflection: user.reflection,
             };
-            if decide_reflection(&principal, Some(&acl), level, reflection, github, false)
+            if decide_reflection(&principal, acl.as_ref(), level, reflection, github, false)
                 >= ReflectionRight::Read
             {
                 readers.insert(user.name);
@@ -1577,9 +1608,11 @@ impl DomainAccess {
     /// someone reads the page now who was not among `confirmed` and may not
     /// read the source's engrams: the person agreed to the readers of that
     /// time, so a widening asks again. A reader who lost the source since
-    /// changes nothing, since the text reached them already. A page shared
-    /// since a confirmation for named accounts is never covered by it: its
-    /// readers now include anonymous callers and accounts not made yet.
+    /// changes nothing, since the text reached them already. A page an
+    /// anonymous caller may read now (shared since, or a shared GitHub
+    /// domain whose repository went public since) is never covered by a
+    /// confirmation for named accounts: its readers include anonymous
+    /// callers, and none of them was named.
     pub async fn readers_cover_for(
         &self,
         page: &str,
@@ -1603,33 +1636,45 @@ impl DomainAccess {
         if page.trim() == source.trim() {
             return Ok(true);
         }
+        let governance = self.governance();
         let page_acl = self.auth.domain_visibility(page).await?;
         let source_acl = self.auth.domain_visibility(source).await?;
-        // A confirmation for named accounts never covers a shared page:
-        // anonymous callers and accounts made later read it, and none of
-        // them was named.
-        if page_acl.is_none() && confirmed.is_some() {
+        let anonymous_reads_page = governance.anonymous_reads(page, page_acl.is_some()).await;
+        // A confirmation for named accounts never covers a page anonymous
+        // callers read: none of them was named. Without a governor that is
+        // every shared page.
+        if anonymous_reads_page && confirmed.is_some() {
             return Ok(false);
         }
-        // A shared page reaches anonymous callers and accounts not made
-        // yet, who never read a private domain.
-        if page_acl.is_none() && source_acl.is_some() {
+        // A shared page reaches accounts not made yet, who never read a
+        // private domain. A confirmation for named accounts (possible on a
+        // shared page only while anonymous callers cannot read it) is held
+        // against the readers of the moment instead, in the loop below.
+        if page_acl.is_none() && source_acl.is_some() && confirmed.is_none() {
             return Ok(false);
         }
-        // Nor a shared source anonymous callers may not read (one GitHub
-        // governs whose repository is not public). Without a governor both
-        // sides are shared domains anonymous callers read.
-        if self.anonymous_reads(page, page_acl.is_some()).await
-            && !self.anonymous_reads(source, source_acl.is_some()).await
+        // A page anonymous callers read never covers a source they may not
+        // read (a shared one GitHub governs whose repository is not public).
+        // Without a governor both sides are shared domains they read.
+        if anonymous_reads_page
+            && !governance
+                .anonymous_reads(source, source_acl.is_some())
+                .await
         {
             return Ok(false);
         }
         // A reader listing GitHub cannot give right now covers nothing,
         // on either side.
-        let Some(page_side) = self.reader_side(page, page_acl.is_some()).await? else {
+        let Some(page_side) = self
+            .reader_side(&governance, page, page_acl.is_some())
+            .await?
+        else {
             return Ok(false);
         };
-        let Some(source_side) = self.reader_side(source, source_acl.is_some()).await? else {
+        let Some(source_side) = self
+            .reader_side(&governance, source, source_acl.is_some())
+            .await?
+        else {
             return Ok(false);
         };
         // Who reads the page: its domain's Reflection readers.
@@ -1749,7 +1794,8 @@ impl DomainAccess {
                 shared_hidden: false,
             });
         }
-        let governed = self.governed_domains();
+        let governance = self.governance();
+        let governed = &governance.domains;
         if acls.is_empty() && governed.is_empty() {
             return Ok(DomainVisibility {
                 private,
@@ -1777,15 +1823,14 @@ impl DomainAccess {
         // without a GitHub grant, and for an anonymous caller a shared one
         // whose repository is not public. An account at viewer or above
         // reads every shared one.
-        if let Some(governor) = &self.governor {
+        if let Some(governor) = governance.governor {
             let by_name: HashMap<&str, &DomainAcl> =
                 acls.iter().map(|acl| (acl.domain.as_str(), acl)).collect();
             for domain in governed {
                 let acl = by_name.get(domain.as_str()).copied();
-                let input =
-                    github_input(governor.as_ref(), principal, &domain, acl.is_some()).await;
+                let input = github_input(governor, principal, domain, acl.is_some()).await;
                 if decide(principal, acl, None, Some(input)) < DomainRight::Read {
-                    hidden.insert(domain);
+                    hidden.insert(domain.clone());
                 }
             }
         }
@@ -4389,6 +4434,34 @@ mod tests {
                     "{at}"
                 );
                 assert_eq!(a.write_right(domain), b.write_right(domain), "{at}");
+                for needed in [DomainRight::Write, DomainRight::Manage, DomainRight::Own] {
+                    assert_eq!(
+                        plain
+                            .write_list_refuses(scope, domain, needed)
+                            .await
+                            .unwrap(),
+                        idle.write_list_refuses(scope, domain, needed)
+                            .await
+                            .unwrap(),
+                        "{at}, {needed:?}"
+                    );
+                }
+                for need in [
+                    ReflectionRight::Read,
+                    ReflectionRight::Edit,
+                    ReflectionRight::Curate,
+                ] {
+                    assert_eq!(
+                        plain
+                            .reflection_list_refuses(scope, domain, need)
+                            .await
+                            .unwrap(),
+                        idle.reflection_list_refuses(scope, domain, need)
+                            .await
+                            .unwrap(),
+                        "{at}, {need:?}"
+                    );
+                }
                 assert_eq!(
                     a.write_list_excludes(domain),
                     b.write_list_excludes(domain),
@@ -4418,6 +4491,27 @@ mod tests {
                     idle.readers_cover(page, source).await.unwrap(),
                     "{page} <- {source}"
                 );
+                for confirmed in [
+                    PageReaders::Everyone,
+                    PageReaders::Accounts(Default::default()),
+                    PageReaders::Accounts(
+                        ["ann", "mem", "out"]
+                            .into_iter()
+                            .map(str::to_string)
+                            .collect(),
+                    ),
+                ] {
+                    assert_eq!(
+                        plain
+                            .readers_cover_for(page, source, &confirmed)
+                            .await
+                            .unwrap(),
+                        idle.readers_cover_for(page, source, &confirmed)
+                            .await
+                            .unwrap(),
+                        "{page} <- {source}, {confirmed:?}"
+                    );
+                }
             }
         }
     }
@@ -4530,9 +4624,15 @@ mod tests {
                     .collect()
             )
         );
-        assert_eq!(
-            access.page_readers("gh-open").await.unwrap(),
-            PageReaders::Everyone
+        // A shared one of a private repository names its readers too (see
+        // `a_confirmation_on_a_governed_shared_page_is_asked_again_...`):
+        // every account at instance viewer or above, never nora.
+        let PageReaders::Accounts(shared) = access.page_readers("gh-open").await.unwrap() else {
+            panic!("no anonymous caller reads a private repository's page");
+        };
+        assert!(
+            shared.contains("out") && !shared.contains("nora"),
+            "{shared:?}"
         );
     }
 
@@ -4627,5 +4727,52 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A confirmation on a shared GitHub page of a private repository names
+    /// the accounts that read it then, and covers only while anonymous
+    /// callers still cannot read the page: once the repository is public,
+    /// the person is asked again.
+    #[tokio::test]
+    async fn a_confirmation_on_a_governed_shared_page_is_asked_again_when_its_repository_goes_public()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = store(&dir).await;
+        github_cast(&auth).await;
+        let governor = base_governor().grant("mem", "gh-lab", MemberLevel::Viewer);
+        let access = DomainAccess::new(auth.clone()).with_governor(Arc::new(governor));
+        let confirmed = access.page_readers("gh-open").await.unwrap();
+        assert_eq!(
+            confirmed,
+            PageReaders::Accounts(
+                ["keeper", "boss", "mem", "out", "ann"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect()
+            ),
+            "every enabled account at viewer or above, never instance none"
+        );
+        assert!(!access.readers_cover("gh-open", "gh-lab").await.unwrap());
+        assert!(
+            access
+                .readers_cover_for("gh-open", "gh-lab", &confirmed)
+                .await
+                .unwrap()
+        );
+        let public = DomainAccess::new(auth).with_governor(Arc::new(
+            base_governor()
+                .grant("mem", "gh-lab", MemberLevel::Viewer)
+                .public("gh-open"),
+        ));
+        assert_eq!(
+            public.page_readers("gh-open").await.unwrap(),
+            PageReaders::Everyone
+        );
+        assert!(
+            !public
+                .readers_cover_for("gh-open", "gh-lab", &confirmed)
+                .await
+                .unwrap()
+        );
     }
 }
