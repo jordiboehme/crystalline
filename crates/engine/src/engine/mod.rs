@@ -1816,6 +1816,13 @@ const REVIEW_PROPOSAL_IS_ANOTHERS: &str = "a proposal by {actor} is open, and th
 /// that can say something sharper says it in its own layer.
 const PERSONAL_TOKEN_MISSING: &str = "This instance shares with personal GitHub identities. Connect yours in Fluid (profile > GitHub identity) or run 'crystalline connect github --personal', then share again.";
 
+/// [`PERSONAL_TOKEN_MISSING`] on an instance with a GitHub App, where a
+/// person links GitHub through the App instead of connecting a token: what a
+/// `personal` share by an identity without an App user token is refused
+/// with. The machine owner has no account to link and connects without
+/// `--as`; its token alone is what its shares go out on.
+const PERSONAL_LINK_MISSING: &str = "This instance shares with personal GitHub identities through its GitHub App. Link yours in Fluid (profile > GitHub identity) or run 'crystalline connect github --personal --as <account>' (without --as for this machine's owner), then share again.";
+
 /// The refusal an HTTP-MCP write gets when this instance shares personally and
 /// no agent identity is configured. HTTP MCP carries no user auth, so there is
 /// nobody to resolve a credential for until an admin names the account those
@@ -1870,12 +1877,15 @@ fn credential_cache_key(identity: &TokenIdentity, host: Option<&str>) -> String 
 ///
 /// Matched on the frozen text rather than on a variant of its own, because that
 /// text IS the distinguishing fact - [`PERSONAL_TOKEN_MISSING`] is produced at
-/// exactly one place ([`Engine::resolve_share_credential`]) and every other
+/// exactly one place ([`Engine::resolve_share_credential`]), its App
+/// counterpart [`PERSONAL_LINK_MISSING`] only where an App user token is
+/// missing or gone (`Engine::personal_user_token`), and every other
 /// refusal a preview can meet (an unset agent identity, a name no credential can
 /// be addressed under, no instance connection at all, an unreadable store) has
 /// to keep standing for both kinds of caller.
 fn is_personal_token_missing(e: &EngineError) -> bool {
-    matches!(e, EngineError::Remote(RemoteError::Refused(text)) if text == PERSONAL_TOKEN_MISSING)
+    matches!(e, EngineError::Remote(RemoteError::Refused(text))
+        if text == PERSONAL_TOKEN_MISSING || text == PERSONAL_LINK_MISSING)
 }
 
 /// Turns a write failure on a PERSONAL credential into the teaching error that
@@ -7375,6 +7385,7 @@ mod edit;
 mod evolve;
 mod fence;
 mod github;
+pub use github::OAUTH_IDENTITY_UNDER_APP;
 mod github_app;
 pub use github_app::{
     APP_FROM_ENV, AppClock, AppHome, AppRemoval, GithubAppStatus, marker_names_host,

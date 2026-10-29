@@ -204,6 +204,36 @@ impl AppHome {
         AppStore::keyring(origin::token_host(self.api_url.as_deref()).as_deref()).delete()
     }
 
+    /// The App this home runs, read afresh and without asking GitHub: the
+    /// environment's, else the saved one, decided the way the engine loads
+    /// its App. `Ok(None)` when none is configured, and also when the
+    /// keychain could not be read and its marker does not say an App is
+    /// saved there. Refused when the environment's App cannot be used, when
+    /// the App store cannot be read, and while the keychain that holds the
+    /// App does not answer.
+    pub fn configured(&self, overlay: &EnvOverlay) -> Result<Option<AppCredentials>> {
+        match overlay.github_app(self.api_url.as_deref()) {
+            Some(Ok(credentials)) => return Ok(Some(credentials)),
+            Some(Err(detail)) => return Err(app_refusal(detail)),
+            None => {}
+        }
+        match self.lookup() {
+            Ok(AppLookup {
+                credentials: Some(credentials),
+                ..
+            }) => Ok(Some(credentials)),
+            Ok(AppLookup {
+                keychain_failed: Some(_),
+                marker: Some(marker),
+                ..
+            }) if marker_names_host(&marker, self.api_url.as_deref()) => {
+                Err(app_refusal(KEYCHAIN_REFUSAL.to_string()))
+            }
+            Ok(_) => Ok(None),
+            Err(e) => Err(app_refusal(detail_of(e))),
+        }
+    }
+
     /// The App as this home finds it, read afresh, with GitHub asked for
     /// its slug and installations. What the CLI reports when no daemon is
     /// running.

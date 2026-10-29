@@ -13,8 +13,9 @@ use axum::http::HeaderMap;
 use axum::routing::{get, post};
 use crystalline_remote::RemoteError;
 use crystalline_remote::github::auth::{
-    DeviceFlowStart, DevicePoll, authorize_url, exchange_code, github_user, poll_device_flow_once,
-    refresh_user_token, revoke_user_token, run_device_flow, start_device_flow, validate_token,
+    DeviceFlowStart, DevicePoll, authorize_url, exchange_code, github_user,
+    is_device_flow_disabled, poll_device_flow_once, refresh_user_token, revoke_user_token,
+    run_device_flow, start_device_flow, validate_token,
 };
 use tokio::net::TcpListener;
 
@@ -116,6 +117,53 @@ async fn start_device_flow_maps_a_non_success_status_to_api() {
         }
         other => panic!("expected Api, got {other:?}"),
     }
+}
+
+/// GitHub answers `device_flow_disabled` when the App (or OAuth App) has
+/// Device Flow switched off. The code is kept whatever the status, so a
+/// surface can name the setting.
+#[tokio::test]
+async fn start_device_flow_recognizes_device_flow_disabled_whatever_the_status() {
+    for status in [
+        axum::http::StatusCode::BAD_REQUEST,
+        axum::http::StatusCode::OK,
+    ] {
+        let app = Router::new().route(
+            "/login/device/code",
+            post(move || async move {
+                (
+                    status,
+                    Json(serde_json::json!({
+                        "error": "device_flow_disabled",
+                        "error_description": "Device Flow must be explicitly enabled for this App",
+                    })),
+                )
+            }),
+        );
+        let base = spawn(app).await;
+
+        let err = start_device_flow(&base, "client", None).await.unwrap_err();
+        assert!(is_device_flow_disabled(&err), "{status}: {err:?}");
+    }
+}
+
+#[tokio::test]
+async fn poll_device_flow_once_recognizes_device_flow_disabled() {
+    let app = Router::new().route(
+        "/login/oauth/access_token",
+        post(|| async {
+            Json(serde_json::json!({
+                "error": "device_flow_disabled",
+                "error_description": "Device Flow must be explicitly enabled for this App",
+            }))
+        }),
+    );
+    let base = spawn(app).await;
+
+    let err = poll_device_flow_once(&base, "client", "dc")
+        .await
+        .unwrap_err();
+    assert!(is_device_flow_disabled(&err), "{err:?}");
 }
 
 #[tokio::test]

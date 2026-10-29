@@ -15,6 +15,7 @@ mod forge;
 mod remote_server;
 
 mod connect;
+mod connect_app;
 mod domain_members;
 mod domain_rename;
 mod domain_review;

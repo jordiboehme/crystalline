@@ -1183,7 +1183,7 @@ impl Engine {
     /// GitHub refuses (`bad_refresh_token`: revoked, or the refresh token
     /// expired after six months) marks the link's token gone, deletes the
     /// token and keeps the link, and the share is refused with
-    /// [`PERSONAL_TOKEN_MISSING`]; any other failure (offline, a GitHub
+    /// [`PERSONAL_LINK_MISSING`]; any other failure (offline, a GitHub
     /// error) refuses this share and keeps the token for the next one.
     ///
     /// The renewal and the save of the new pair run in a task of their own,
@@ -1290,7 +1290,7 @@ impl Engine {
         host: Option<&str>,
     ) -> Result<StoredToken> {
         let (_store, token) = self.github_credential_for(identity, host)?;
-        token.ok_or_else(|| RemoteError::Refused(PERSONAL_TOKEN_MISSING.to_string()).into())
+        token.ok_or_else(|| RemoteError::Refused(PERSONAL_LINK_MISSING.to_string()).into())
     }
 
     /// GitHub refused to renew the token of `account`: mark the link's token
@@ -1314,13 +1314,13 @@ impl Engine {
         if let Err(e) = self.forget_personal_token(identity, host) {
             tracing::warn!("the GitHub token of {account} could not be deleted: {e}");
         }
-        RemoteError::Refused(PERSONAL_TOKEN_MISSING.to_string()).into()
+        RemoteError::Refused(PERSONAL_LINK_MISSING.to_string()).into()
     }
 }
 
 /// What the OAuth App way of connecting a person's GitHub identity is
 /// refused with while a GitHub App is configured.
-const OAUTH_IDENTITY_UNDER_APP: &str =
+pub const OAUTH_IDENTITY_UNDER_APP: &str =
     "this instance uses a GitHub App: connect GitHub from your profile";
 
 /// What a link is refused with when no GitHub App is configured.

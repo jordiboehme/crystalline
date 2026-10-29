@@ -162,7 +162,7 @@ pub async fn start_device_flow(
         .send()
         .await
         .map_err(|_| RemoteError::Offline)?;
-    let body: DeviceCodeResponse = parse_auth_json(response).await?;
+    let body: DeviceCodeResponse = parse_device_json(response).await?;
     Ok(DeviceFlowStart {
         device_code: body.device_code,
         user_code: body.user_code,
@@ -291,7 +291,7 @@ pub async fn poll_device_flow_once(
         .send()
         .await
         .map_err(|_| RemoteError::Offline)?;
-    let body: AccessTokenResponse = parse_auth_json(response).await?;
+    let body: AccessTokenResponse = parse_device_json(response).await?;
     let error = body.error.clone();
     let error_description = body.error_description.clone();
     if let Some(grant) = body.into_grant() {
@@ -599,6 +599,46 @@ fn auth_client() -> reqwest::Client {
 
 /// Parses a device flow response body as JSON, mapping a non-2xx status or
 /// a malformed body to [`RemoteError::Api`].
+/// What a device flow is refused with when the app on GitHub has Device
+/// Flow switched off (GitHub's `device_flow_disabled`). Neutral about the
+/// kind of app: a surface that knows it is a GitHub App names the setting
+/// (see [`is_device_flow_disabled`]).
+pub const DEVICE_FLOW_DISABLED: &str =
+    "GitHub refused the sign-in because Device Flow is switched off for this app";
+
+/// Whether `e` is GitHub's `device_flow_disabled`, from the device code
+/// request or a poll.
+pub fn is_device_flow_disabled(e: &RemoteError) -> bool {
+    matches!(e, RemoteError::Refused(text) if text == DEVICE_FLOW_DISABLED)
+}
+
+/// [`parse_auth_json`] for the two device flow endpoints, which first
+/// looks for GitHub's `device_flow_disabled` code, whatever the status:
+/// [`parse_auth_json`] keeps only the description of a failed response,
+/// and a successful one with only an error would not parse at all.
+async fn parse_device_json<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+) -> Result<T, RemoteError> {
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+    let code = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|v| v.get("error")?.as_str().map(str::to_string));
+    if code.as_deref() == Some("device_flow_disabled") {
+        return Err(RemoteError::Refused(DEVICE_FLOW_DISABLED.to_string()));
+    }
+    if !status.is_success() {
+        return Err(RemoteError::Api {
+            status: status.as_u16(),
+            message: safe_error_message(Some(&text)),
+        });
+    }
+    serde_json::from_str::<T>(&text).map_err(|e| RemoteError::Api {
+        status: status.as_u16(),
+        message: format!("could not parse the response body: {e}"),
+    })
+}
+
 async fn parse_auth_json<T: serde::de::DeserializeOwned>(
     response: reqwest::Response,
 ) -> Result<T, RemoteError> {

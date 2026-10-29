@@ -1757,14 +1757,19 @@ enum ConnectCommand {
         /// Connect a personal identity for sharing, instead of this machine's
         /// own credential. Sharing runs on it wherever github.share_identity
         /// is personal; reading and pulling always stay on the machine's.
+        /// With a GitHub App configured, this signs in through the App and
+        /// a pasted --token is refused.
         #[arg(long)]
         personal: bool,
         /// Connect on behalf of another Crystalline account (admin use), for
         /// example a bot account remote agents share as. Requires --personal.
+        /// With a GitHub App configured, this links the account to GitHub.
         #[arg(long = "as", value_name = "ACCOUNT", requires = "personal")]
         as_account: Option<String>,
         /// Forget the addressed credential instead of connecting one. With
-        /// --personal it forgets that identity; on its own, this machine's.
+        /// --personal it forgets that identity (with a GitHub App it also
+        /// revokes the token and unlinks the account); on its own, this
+        /// machine's.
         #[arg(long, conflicts_with = "token")]
         disconnect: bool,
         /// Load the global config from this file instead of the default path.

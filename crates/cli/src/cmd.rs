@@ -3642,7 +3642,7 @@ pub async fn connect_github(
             "this machine's GitHub identity comes from CRYSTALLINE_GITHUB_TOKEN; unset it to sign in interactively"
         );
     }
-    let cfg = loaded.effective;
+    let cfg = &loaded.effective;
     let api_url = host
         .map(|h| format!("https://{h}/api/v3"))
         .or_else(|| cfg.github.as_ref().and_then(|g| g.api_url.clone()));
@@ -3653,6 +3653,36 @@ pub async fn connect_github(
         None => config::origins_state_dir()
             .map_err(|e| anyhow!("could not resolve the state directory: {e}"))?,
     };
+
+    // On an instance with a GitHub App a person links GitHub through the
+    // App's device flow, and the OAuth ways of connecting a person do not
+    // hold. The machine's own credential is not a person's and keeps them.
+    if !instance {
+        let home = crystalline_service::engine::AppHome::new(
+            api_url.clone(),
+            state_dir.clone(),
+            token_store_dir.is_some(),
+        );
+        if let Some(credentials) = home.configured(&loaded.overlay)? {
+            let app = crystalline_remote::GithubApp::new(api_url.clone(), credentials)
+                .map_err(|e| anyhow!("{e}"))?;
+            let person = PersonalApp {
+                app,
+                identity,
+                token_host: token_host.as_deref(),
+                state_dir: &state_dir,
+                token_store_dir,
+                cfg,
+            };
+            if disconnect {
+                return person.disconnect(json).await;
+            }
+            if token.is_some() {
+                bail!("{}", crystalline_service::engine::OAUTH_IDENTITY_UNDER_APP);
+            }
+            return person.connect(json).await;
+        }
+    }
 
     if disconnect {
         match token_store_dir {
@@ -3698,8 +3728,6 @@ pub async fn connect_github(
         None => device_flow_sign_in(&auth_base, &client_id, api_url.as_deref()).await?,
     };
 
-    // One keychain write, no read: `save_resolving_for` writes straight through
-    // and lands in the file store only if the keychain write itself fails.
     let stored = crystalline_remote::StoredToken {
         access_token,
         host: token_host
@@ -3711,21 +3739,13 @@ pub async fn connect_github(
         expires_at: None,
         refresh_expires_at: None,
     };
-    let store = match token_store_dir {
-        Some(dir) => {
-            let store = crystalline_remote::TokenStore::file_fallback_for(identity, dir)
-                .map_err(|e| anyhow!("{e}"))?;
-            store.save(&stored).map_err(|e| anyhow!("{e}"))?;
-            store
-        }
-        None => crystalline_remote::TokenStore::save_resolving_for(
-            identity,
-            token_host.as_deref(),
-            &state_dir,
-            &stored,
-        )
-        .map_err(|e| anyhow!("{e}"))?,
-    };
+    let store = save_credential(
+        identity,
+        token_host.as_deref(),
+        &state_dir,
+        token_store_dir,
+        &stored,
+    )?;
 
     // A personal connect that lands on an instance-mode installation is a
     // credential nothing will use yet, so the mode is named where it is
@@ -3769,6 +3789,321 @@ pub async fn connect_github(
         }
     }
     Ok(())
+}
+
+/// Saves `stored` as `identity`'s credential: under `token_store_dir` when
+/// the test seam names one, else with one keychain write and no read
+/// (`save_resolving_for` writes straight through and lands in the file store
+/// only if the keychain write itself fails).
+fn save_credential(
+    identity: &crystalline_remote::TokenIdentity,
+    token_host: Option<&str>,
+    state_dir: &Path,
+    token_store_dir: Option<&Path>,
+    stored: &crystalline_remote::StoredToken,
+) -> Result<crystalline_remote::TokenStore> {
+    match token_store_dir {
+        Some(dir) => {
+            let store = crystalline_remote::TokenStore::file_fallback_for(identity, dir)
+                .map_err(|e| anyhow!("{e}"))?;
+            store.save(stored).map_err(|e| anyhow!("{e}"))?;
+            Ok(store)
+        }
+        None => crystalline_remote::TokenStore::save_resolving_for(
+            identity, token_host, state_dir, stored,
+        )
+        .map_err(|e| anyhow!("{e}")),
+    }
+}
+
+/// What `connect github --personal` prints when GitHub answers the App's
+/// device flow with `device_flow_disabled`.
+const APP_DEVICE_FLOW_DISABLED: &str = "GitHub refused the sign-in because Device Flow is switched off for the GitHub App: enable Device Flow in the GitHub App's settings on GitHub, then run this again.";
+
+/// A person's GitHub on an instance with a GitHub App: `connect github
+/// --personal` signs in through the App's device flow and keeps the whole
+/// grant (the refresh token too, so a share renews it), and `--as` links the
+/// account it names. The machine owner has no account to link: its token
+/// alone is what its `personal` shares go out on, and the same holds for
+/// `github.agent_identity` when it names no account.
+///
+/// The link is written to the accounts database directly, the way `users`
+/// edits it, because a connect from a terminal opens no engine. The order
+/// is the engine's (`Engine::link_github`): the row first, so a GitHub
+/// account linked to another account is refused before a token is stored,
+/// and a failed token save marks the row's token gone.
+struct PersonalApp<'a> {
+    app: crystalline_remote::GithubApp,
+    identity: &'a crystalline_remote::TokenIdentity,
+    token_host: Option<&'a str>,
+    state_dir: &'a Path,
+    token_store_dir: Option<&'a Path>,
+    cfg: &'a crystalline_core::config::GlobalConfig,
+}
+
+impl PersonalApp<'_> {
+    /// The personal identity's name: the account, or the owner's fixed one.
+    fn name(&self) -> &str {
+        match self.identity {
+            crystalline_remote::TokenIdentity::Personal(name) => name,
+            crystalline_remote::TokenIdentity::Instance => {
+                crystalline_service::engine::OWNER_IDENTITY_NAME
+            }
+        }
+    }
+
+    /// The accounts database, when this machine has one. Never created
+    /// here: a machine without accounts has nothing to link.
+    async fn accounts(&self) -> Result<Option<crystalline_service::rest::AuthStore>> {
+        let path = config::web_auth_db_path()
+            .map_err(|e| anyhow!("could not resolve the state directory: {e}"))?;
+        if !path.exists() {
+            return Ok(None);
+        }
+        Ok(Some(
+            crystalline_service::rest::AuthStore::open(&path).await?,
+        ))
+    }
+
+    /// The accounts database when this connect links an account, `None`
+    /// when it saves the token alone (the owner, or the agent identity
+    /// without an account). An account Crystalline does not know is refused
+    /// here, before any sign-in.
+    async fn link_target(&self) -> Result<Option<crystalline_service::rest::AuthStore>> {
+        let name = self.name();
+        if name == crystalline_service::engine::OWNER_IDENTITY_NAME {
+            return Ok(None);
+        }
+        if let Some(store) = self.accounts().await?
+            && store.user(name).await?.is_some()
+        {
+            return Ok(Some(store));
+        }
+        if self.cfg.github_agent_identity() == Some(name) {
+            return Ok(None);
+        }
+        bail!(
+            "no account named '{name}' to link GitHub to; name an account Crystalline knows (crystalline users list), or leave out --as to connect this machine's owner"
+        )
+    }
+
+    async fn connect(&self, json: bool) -> Result<()> {
+        let accounts = self.link_target().await?;
+        let credentials = self.app.credentials();
+        let auth_base = self.app.auth_base();
+        let grant = device_flow_grant(auth_base, &credentials.client_id, None)
+            .await
+            .map_err(|e| {
+                if crystalline_remote::github::auth::is_device_flow_disabled(&e) {
+                    anyhow!(APP_DEVICE_FLOW_DISABLED)
+                } else {
+                    device_flow_error(auth_base, e)
+                }
+            })?;
+        let user =
+            crystalline_remote::github::auth::github_user(self.app.api_url(), &grant.access_token)
+                .await
+                .map_err(|e| anyhow!("{e}"))?;
+        let name = self.name();
+        if let Some(store) = &accounts {
+            store
+                .link_github(name, &credentials.host, user.id, &user.login)
+                .await?;
+        }
+        let stored = crystalline_remote::StoredToken {
+            access_token: grant.access_token,
+            host: self
+                .token_host
+                .map(str::to_string)
+                .unwrap_or_else(|| "github.com".to_string()),
+            user: user.login.clone(),
+            created_at: chrono::Utc::now(),
+            refresh_token: grant.refresh_token,
+            expires_at: grant.expires_at,
+            refresh_expires_at: grant.refresh_expires_at,
+        };
+        let saved = save_credential(
+            self.identity,
+            self.token_host,
+            self.state_dir,
+            self.token_store_dir,
+            &stored,
+        );
+        let store = match saved {
+            Ok(store) => store,
+            Err(e) => {
+                if let Some(accounts) = &accounts
+                    && let Err(mark) = accounts.mark_github_token_gone(name).await
+                {
+                    tracing::warn!(
+                        "the GitHub link of {name} could not be marked after a failed token save: {mark}"
+                    );
+                }
+                return Err(e);
+            }
+        };
+        // A running daemon may hold an older token of this identity in its
+        // cache; a relink replaces it.
+        let told = notify_daemon_forgot(self.identity).await;
+        let personal_mode = matches!(
+            self.cfg.github_share_identity(),
+            crystalline_core::config::ShareIdentityMode::Personal
+        );
+        if json {
+            let mut report = serde_json::json!({
+                "connected": user.login,
+                "token_store": store.kind(),
+                "github_enabled": self.cfg.github_enabled(),
+                "identity": "personal",
+                "account": identity_label(self.identity),
+                "share_identity": self.cfg.github_share_identity().as_str(),
+                "github_app": true,
+                "linked": accounts.is_some(),
+                "daemon": told.as_str(),
+            });
+            if let DaemonNotice::Refused(e) = &told {
+                report["daemon_error"] = serde_json::json!(e);
+            }
+            println!("{report}");
+            return Ok(());
+        }
+        let how = if accounts.is_some() {
+            format!(
+                "Linked {} to GitHub as {} through the GitHub App",
+                identity_phrase(self.identity),
+                user.login
+            )
+        } else {
+            format!(
+                "Connected {} as {} through the GitHub App",
+                identity_phrase(self.identity),
+                user.login
+            )
+        };
+        println!("{how} ({} token store).", store.kind());
+        if !personal_mode {
+            println!(
+                "Run: crystalline config set github.share_identity personal to share with personal identities"
+            );
+        }
+        if let DaemonNotice::Refused(e) = &told {
+            println!(
+                "A running daemon could not be told ({e}); restart it so it shares with the new token."
+            );
+        }
+        Ok(())
+    }
+
+    /// Revokes the identity's App user token at GitHub, removes its link
+    /// and deletes the token, like `Engine::unlink_github`; the owner has no
+    /// link and only its token goes. The revoke is best effort: when GitHub
+    /// cannot be reached, refuses it or the App has no client secret, the
+    /// rest still happens and the person is told to revoke it themselves.
+    async fn disconnect(&self, json: bool) -> Result<()> {
+        use crystalline_service::engine::GithubUnlink;
+        let name = self.name().to_string();
+        let accounts = if name == crystalline_service::engine::OWNER_IDENTITY_NAME {
+            None
+        } else {
+            self.accounts().await?
+        };
+        let linked = match &accounts {
+            Some(store) => store.github_link_of(&name).await?.is_some(),
+            None => false,
+        };
+        let token = match self.token_store_dir {
+            Some(dir) => crystalline_remote::TokenStore::file_fallback_for(self.identity, dir)
+                .and_then(|store| store.load())
+                .map_err(|e| anyhow!("{e}"))?,
+            None => {
+                crystalline_remote::TokenStore::resolve_and_load_for(
+                    self.identity,
+                    self.token_host,
+                    self.state_dir,
+                )
+                .map_err(|e| anyhow!("{e}"))?
+                .1
+            }
+        };
+        let outcome = match &token {
+            Some(token) if self.revoke(&name, &token.access_token).await => GithubUnlink::Unlinked,
+            Some(_) => GithubUnlink::NotRevoked,
+            None if linked => GithubUnlink::Unlinked,
+            None => GithubUnlink::NotLinked,
+        };
+        // The row before the token, as the engine does: a failure in between
+        // leaves a token without a link, never a link without its token.
+        if linked && let Some(store) = &accounts {
+            store.unlink_github(&name).await?;
+        }
+        match self.token_store_dir {
+            Some(dir) => forget_file_credential(self.identity, dir),
+            None => forget_credential(self.identity, self.token_host, self.state_dir),
+        }
+        let told = notify_daemon_forgot(self.identity).await;
+        if json {
+            let mut report = serde_json::json!({
+                "disconnected": identity_label(self.identity),
+                "unlinked": linked,
+                "revoked": outcome != GithubUnlink::NotRevoked && token.is_some(),
+                "daemon": told.as_str(),
+            });
+            if let Some(warning) = outcome.warning() {
+                report["warning"] = serde_json::json!(warning);
+            }
+            if let DaemonNotice::Refused(e) = &told {
+                report["daemon_error"] = serde_json::json!(e);
+            }
+            println!("{report}");
+            return Ok(());
+        }
+        println!("Disconnected {}.", identity_phrase(self.identity));
+        if let Some(warning) = outcome.warning() {
+            println!("{}", upper_first(warning));
+        }
+        if let DaemonNotice::Refused(e) = &told {
+            println!(
+                "A running daemon could not be told ({e}); restart it so it stops sharing with the credential this just deleted."
+            );
+        }
+        Ok(())
+    }
+
+    /// Revokes `access_token` at GitHub through the App. True when GitHub
+    /// revoked it (or no longer knew it).
+    async fn revoke(&self, name: &str, access_token: &str) -> bool {
+        let credentials = self.app.credentials();
+        let Some(secret) = credentials.client_secret.as_deref() else {
+            tracing::warn!(
+                "the GitHub App has no client secret, so the GitHub token of {name} could not be revoked"
+            );
+            return false;
+        };
+        match crystalline_remote::github::auth::revoke_user_token(
+            self.app.api_url(),
+            &credentials.client_id,
+            secret,
+            access_token,
+        )
+        .await
+        {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!("the GitHub token of {name} could not be revoked at GitHub: {e}");
+                false
+            }
+        }
+    }
+}
+
+/// `text` with its first letter upper case, for a sentence the engine
+/// words to follow another.
+fn upper_first(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
 }
 
 /// Deletes `identity`'s credential wherever this machine keeps it: the backend
@@ -3922,10 +4257,28 @@ async fn device_flow_sign_in(
     client_id: &str,
     api_url: Option<&str>,
 ) -> Result<(String, String)> {
+    let access_token = device_flow_grant(auth_base, client_id, Some("repo"))
+        .await
+        .map(|grant| grant.access_token)
+        .map_err(|e| device_flow_error(auth_base, e))?;
+
+    let login = crystalline_remote::github::auth::validate_token(api_url, &access_token)
+        .await
+        .map_err(|e| anyhow!("{e}"))?;
+    Ok((access_token, login))
+}
+
+/// The device flow itself, for the OAuth App (`scope` `repo`) and the
+/// GitHub App (no scope): prints the user code and verification url, ticks
+/// a progress indicator while waiting for it to be confirmed in the browser,
+/// and returns the grant GitHub issued.
+async fn device_flow_grant(
+    auth_base: &str,
+    client_id: &str,
+    scope: Option<&str>,
+) -> std::result::Result<crystalline_remote::UserTokenGrant, crystalline_remote::RemoteError> {
     let start =
-        crystalline_remote::github::auth::start_device_flow(auth_base, client_id, Some("repo"))
-            .await
-            .map_err(|e| anyhow!("{e}"))?;
+        crystalline_remote::github::auth::start_device_flow(auth_base, client_id, scope).await?;
     print_device_code(&start, auth_base);
 
     let ticker = tokio::spawn(async {
@@ -3951,14 +4304,7 @@ async fn device_flow_sign_in(
         crystalline_remote::github::auth::run_device_flow(auth_base, client_id, &start).await;
     ticker.abort();
     eprintln!();
-    let access_token = poll
-        .map(|grant| grant.access_token)
-        .map_err(|e| device_flow_error(auth_base, e))?;
-
-    let login = crystalline_remote::github::auth::validate_token(api_url, &access_token)
-        .await
-        .map_err(|e| anyhow!("{e}"))?;
-    Ok((access_token, login))
+    poll
 }
 
 /// Prints the device flow's user code and verification url unmissably: this
