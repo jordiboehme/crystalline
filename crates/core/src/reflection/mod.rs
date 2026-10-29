@@ -45,8 +45,8 @@ pub use layout::{
 pub use links::{rebase_links, relative_to, rewrite_asset_links, rewrite_links_to};
 pub use provenance::{
     PROVENANCE_KEY, Provenance, SectionRecord, SourceName, SourceRef, block_as_written,
-    parse_source_name, read_provenance, respell_source_domains, source_domains_named, text_changed,
-    title_of, write_provenance,
+    parse_source_name, provenance_unreadable, read_provenance, respell_source_domains,
+    source_domains_named, text_changed, title_of, write_provenance,
 };
 pub use sections::{
     Section, SectionKeyMiss, TOP_SECTION, WrittenIds, assign_ids, drop_written_ids, edit_section,

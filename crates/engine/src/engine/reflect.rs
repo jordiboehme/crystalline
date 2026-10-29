@@ -337,10 +337,11 @@ impl Engine {
     /// The pages of `domain` (by path inside `reflections/`, sorted) whose
     /// bytes among `files` (a backup's collected files, by repo path, see
     /// [`crystalline_remote::reflections_backup::collect_backup`]) cite a
-    /// domain fewer people may read: the page's own file, or its baseline,
-    /// which mirrors it. What [`Engine::too_wide_pages`] says of the index,
-    /// said of what is about to go out, so a file edited on disk before the
-    /// index read it is held back too.
+    /// domain fewer people may read, or may and cannot be read: bytes that
+    /// are not UTF-8, or records [`r::provenance_unreadable`] says so of.
+    /// What [`Engine::too_wide_pages`] says of the index, said of what is
+    /// about to go out, so a file edited on disk before the index read it is
+    /// held back too.
     pub(crate) async fn too_wide_in_files(
         &self,
         domain: &str,
@@ -351,29 +352,21 @@ impl Engine {
             return Ok(Vec::new());
         };
         let mut check = TooWide::new(self, domain, id).await?;
-        let mut out = BTreeSet::new();
-        for (repo_path, bytes) in files {
-            let Some(inner) =
-                crystalline_remote::reflections_backup::reflection_path(spec, repo_path)
-            else {
+        let mut out = Vec::new();
+        for (inner, bytes) in reflection_files(spec, files) {
+            let r::ReflectionFile::Page(page) = r::classify(inner) else {
                 continue;
             };
-            let page = match r::classify(inner) {
-                r::ReflectionFile::Page(page) => page,
-                r::ReflectionFile::Baseline { of } if r::validate_reflection_path(&of).is_ok() => {
-                    of
-                }
-                _ => continue,
+            let wide = match std::str::from_utf8(bytes) {
+                Ok(text) => check.text(&page, text).await?,
+                Err(_) => true,
             };
-            if out.contains(&page) {
-                continue;
-            }
-            let text = String::from_utf8_lossy(bytes);
-            if check.text(&page, &text).await? {
-                out.insert(page);
+            if wide {
+                out.push(page);
             }
         }
-        Ok(out.into_iter().collect())
+        out.sort();
+        Ok(out)
     }
 
     /// Every open item of one domain's Reflection, unranked, as `scope`
@@ -1489,9 +1482,13 @@ impl<'a> TooWide<'a> {
     }
 
     /// Whether page `path` with `text` has a section citing a domain fewer
-    /// people may read than the page's own. A source whose domain cannot be
-    /// checked here is not counted, as in the queue.
+    /// people may read than the page's own, or records that cannot be read
+    /// in full ([`r::provenance_unreadable`]), which may hide one. A source
+    /// whose domain cannot be checked here is not counted, as in the queue.
     async fn text(&mut self, path: &str, text: &str) -> Result<bool> {
+        if r::provenance_unreadable(text) {
+            return Ok(true);
+        }
         let (engine, domain) = (self.engine, self.domain);
         for record in r::read_provenance(text).into_values() {
             for src in &record.sources {
@@ -1525,4 +1522,58 @@ impl<'a> TooWide<'a> {
         }
         Ok(false)
     }
+}
+
+/// The files of a backup's collected `files` (by repo path) inside the
+/// Reflection folder of `spec`'s domain, by their path inside it.
+fn reflection_files<'a>(
+    spec: &'a crystalline_remote::provider::OriginSpec,
+    files: &'a BTreeMap<String, Vec<u8>>,
+) -> impl Iterator<Item = (&'a str, &'a [u8])> + 'a {
+    files.iter().filter_map(move |(repo_path, bytes)| {
+        crystalline_remote::reflections_backup::reflection_path(spec, repo_path)
+            .map(|inner| (inner, bytes.as_slice()))
+    })
+}
+
+/// The baselines among a backup's collected `files` (by path inside
+/// `reflections/`) that keep a section their page's records no longer
+/// cover: a section a curator removed, with the source it was drawn from,
+/// whose last reflected text the baseline still holds. They are held back
+/// while their page goes out. So is a baseline that is not UTF-8, and one
+/// whose page is not among `files` or is not UTF-8 itself. A held page's
+/// baseline is held with the page, whatever this says.
+pub(crate) fn uncovered_baselines(
+    spec: &crystalline_remote::provider::OriginSpec,
+    files: &BTreeMap<String, Vec<u8>>,
+) -> BTreeSet<String> {
+    let by_path: HashMap<&str, &[u8]> = reflection_files(spec, files).collect();
+    let mut out = BTreeSet::new();
+    for (inner, bytes) in &by_path {
+        let r::ReflectionFile::Baseline { of } = r::classify(inner) else {
+            continue;
+        };
+        if r::validate_reflection_path(&of).is_err() {
+            // The baseline of a threads file: its threads hold no sources.
+            continue;
+        }
+        let Ok(baseline) = std::str::from_utf8(bytes) else {
+            out.insert(inner.to_string());
+            continue;
+        };
+        let covered: HashSet<String> = match by_path
+            .get(of.as_str())
+            .and_then(|page| std::str::from_utf8(page).ok())
+        {
+            Some(page) => r::read_provenance(page).into_keys().collect(),
+            None => HashSet::new(),
+        };
+        if r::baseline_ids(baseline)
+            .iter()
+            .any(|id| !covered.contains(id))
+        {
+            out.insert(inner.to_string());
+        }
+    }
+    out
 }

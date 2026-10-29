@@ -173,6 +173,31 @@ pub fn read_provenance(source: &str) -> Provenance {
         .collect()
 }
 
+/// Whether `source` may hold section records that [`read_provenance`]
+/// cannot read, so a check that must see every source cannot trust what it
+/// reads: a leading `---` that never closes, frontmatter that is not a YAML
+/// mapping, a [`PROVENANCE_KEY`] that is not a mapping, or a record that
+/// does not read. A page with no frontmatter, with empty frontmatter or
+/// without the key reads fine.
+pub fn provenance_unreadable(source: &str) -> bool {
+    let Some(parts) = split_frontmatter(source) else {
+        let first = source.split('\n').next().unwrap_or("");
+        return first.trim_end_matches('\r') == "---";
+    };
+    let map = match serde_yaml_ng::from_str::<serde_yaml_ng::Value>(parts.yaml) {
+        Ok(serde_yaml_ng::Value::Mapping(map)) => map,
+        Ok(serde_yaml_ng::Value::Null) => return false,
+        _ => return true,
+    };
+    match map.get(PROVENANCE_KEY) {
+        None => false,
+        Some(serde_yaml_ng::Value::Mapping(records)) => records
+            .values()
+            .any(|record| serde_yaml_ng::from_value::<SectionRecord>(record.clone()).is_err()),
+        Some(_) => true,
+    }
+}
+
 /// The [`PROVENANCE_KEY`] block of `source` as YAML, in whatever shape it
 /// was written, or `None` when there is none. A write holds the block it was
 /// sent against the stored page's this way: a block a writer made up (`for:`,
@@ -264,6 +289,37 @@ mod tests {
     use crate::reflection::sections::split_sections;
 
     const PAGE: &str = "---\ntitle: Deploying\ntags: [ops]\n---\n\n# Deploying\n\n## Night deploys\n<!-- r:7f3a9c2e -->\n\nDeploys run at night.\n";
+
+    /// What [`read_provenance`] cannot read in full is said: a check that
+    /// must not miss a source fails closed on it, while a page with no
+    /// frontmatter, or none with records, reads fine.
+    #[test]
+    fn unreadable_records_are_told_apart_from_none() {
+        let ok = [
+            "# A\n\nNo frontmatter.\n",
+            PAGE,
+            "---\nreflection:\n  aaaa1111:\n    sources:\n    - engram: team/rota\n      checksum: abc\n---\n\n# A\n",
+            "---\nreflection: {}\n---\n\n# A\n",
+            "---\n---\n\n# A\n",
+        ];
+        for page in ok {
+            assert!(!provenance_unreadable(page), "{page}");
+        }
+        let unreadable = [
+            // A leading fence that never closes.
+            "---\nreflection:\n  aaaa1111:\n    sources: []\n\n# A\n",
+            // Frontmatter that is no mapping, or no YAML at all.
+            "---\n- a\n- b\n---\n\n# A\n",
+            "---\nreflection: [\n---\n\n# A\n",
+            // The key there, but no mapping.
+            "---\nreflection: 5\n---\n\n# A\n",
+            // One record that does not read.
+            "---\nreflection:\n  aaaa1111:\n    sources: 5\n---\n\n# A\n",
+        ];
+        for page in unreadable {
+            assert!(provenance_unreadable(page), "{page}");
+        }
+    }
 
     /// The block as it stands, in any shape: what a writer's block is held
     /// against, so a page sent back as it was read is told nothing.

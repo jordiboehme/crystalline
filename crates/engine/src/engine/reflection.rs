@@ -2065,6 +2065,9 @@ impl Engine {
                 needs: needs.clone(),
             };
             let asked = self.asked_for_preview(&p.domain, &p.path, &shown).await?;
+            // Nothing to record a yes for while the repository's readers are
+            // unknown, whatever the person answered.
+            self.refuse_unknown_repository_readers(&p.domain, asked.repo_readers.as_ref())?;
             // The person said yes to these readers: still them?
             if let Some(basis) = p.disclosed.as_deref()
                 && asked.ask.basis != basis
@@ -2073,7 +2076,6 @@ impl Engine {
                     super::disclosure::DISCLOSURE_CHANGED.into(),
                 ));
             }
-            self.refuse_unknown_repository_readers(&p.domain, asked.repo_readers.as_ref())?;
             asked_repo_readers = asked.repo_readers;
         }
         let mut confirmed: Vec<String> = if by.is_some() {

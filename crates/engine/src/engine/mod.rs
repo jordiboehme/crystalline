@@ -1699,7 +1699,7 @@ pub use crate::rename::RenameHold;
 pub use crate::rename::RenameStep;
 pub use crate::scope::OWNER_IDENTITY_NAME;
 pub use crystalline_core::threads::ThreadTarget;
-pub use disclosure::{DISCLOSURE_CHANGED, DisclosureAsk, NOBODY_ASKED_NOTE};
+pub use disclosure::{DISCLOSURE_CHANGED, DisclosureAsk, NOBODY_ASKED_NOTE, REPO_READERS_UNKNOWN};
 pub use domain_settings::{DOMAIN_SETTINGS_HOW, PolicyEdit, VIRTUAL_NO_RULES};
 #[cfg(any(test, feature = "testing"))]
 pub use names::SpellingPushFault;
@@ -4300,9 +4300,15 @@ impl Engine {
                             page.clone(),
                             crystalline_core::reflection::threads_path(page),
                             crystalline_core::reflection::baseline_path(page),
+                            crystalline_core::reflection::baseline_path(
+                                &crystalline_core::reflection::threads_path(page),
+                            ),
                         ]
                     })
                     .chain(assets)
+                    // A baseline that keeps a removed section's text stays
+                    // off the branch while its page goes out.
+                    .chain(reflect::uncovered_baselines(&spec, &files))
                     .collect();
                 Ok(crystalline_remote::reflections_backup::backup_collected(
                     provider.as_ref(),

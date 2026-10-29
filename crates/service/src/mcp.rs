@@ -570,6 +570,10 @@ enum Disclosure {
     /// A person may be behind the session, and its client cannot ask them:
     /// the write goes on, and a refusal says how they still can.
     NobodyToAsk,
+    /// A yes could not be recorded (who reads the page's GitHub repository
+    /// is not known right now): nobody is asked, and the write is refused
+    /// with why.
+    Refused(EngineError),
 }
 
 /// How long a disclosure question waits for its person: the second round of a
@@ -3684,6 +3688,9 @@ impl McpServer {
             Disclosure::Ask(question) => return Ok(question.into()),
             Disclosure::NobodyToAsk => true,
             Disclosure::Go => false,
+            Disclosure::Refused(e) => {
+                return Self::reflection_refused(e).map(CallToolResponse::from);
+            }
         };
         match self.engine.write_reflection(&p, &caller).await {
             Ok(v) => ok(v).map(CallToolResponse::from),
@@ -3728,9 +3735,15 @@ impl McpServer {
         state: Option<String>,
         ctx: &RequestContext<RoleServer>,
     ) -> Disclosure {
-        // An error here is the write's own refusal, and the write gives it.
-        let Ok(Some(ask)) = self.engine.reflection_disclosure_question(p, caller).await else {
-            return Disclosure::Go;
+        // An error here is the write's own refusal, and the write gives it;
+        // except a yes nobody could record, which a person is told instead
+        // of the reach refusal.
+        let ask = match self.engine.reflection_disclosure_question(p, caller).await {
+            Ok(Some(ask)) => Ok(ask),
+            Err(EngineError::Invalid(text)) if text == crate::engine::REPO_READERS_UNKNOWN => {
+                Err(EngineError::Invalid(text))
+            }
+            Ok(None) | Err(_) => return Disclosure::Go,
         };
         if self.gate.unattended
             || self
@@ -3741,6 +3754,10 @@ impl McpServer {
         {
             return Disclosure::Go;
         }
+        let ask = match ask {
+            Ok(ask) => ask,
+            Err(e) => return Disclosure::Refused(e),
+        };
         let key = disclosure_key(p, caller);
         if peer_gets_cache_hints(ctx) {
             if !confirmation_supported(ctx) {

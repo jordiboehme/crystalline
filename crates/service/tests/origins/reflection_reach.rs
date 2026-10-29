@@ -412,12 +412,15 @@ async fn a_confirmed_write_is_refused_while_the_page_repository_readers_are_unkn
     forge.collaborators_down.store(true, Ordering::SeqCst);
     eng.invalidate_github_access(Invalidate::All);
     let mut p = cite("kb", ROTA);
-    let ask = eng
+    // Nobody is asked a question whose yes would be refused.
+    let err = eng
         .reflection_disclosure_question(&p, &owner())
         .await
-        .unwrap()
-        .expect("a question");
-    p.disclosed = Some(ask.basis);
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains(REPO_UNKNOWN), "{err}");
+    // A yes that arrives anyway is refused.
+    p.disclosed = Some("a basis from before".to_string());
     let err = write(&eng, &p).await.unwrap_err();
     assert!(err.contains(REPO_UNKNOWN), "{err}");
     assert!(!tmp.path().join("kb/reflections/overview.md").exists());
@@ -594,4 +597,108 @@ async fn a_file_only_a_page_on_disk_links_is_held_with_it() {
     let head = kb.commit_paths(&kb.branch_commit(BACKUP_BRANCH).unwrap());
     assert!(head.contains(&"reflections/a.md".to_string()), "{head:?}");
     assert!(!head.iter().any(|p| p.contains("rota.png")), "{head:?}");
+}
+
+/// `kb` with one page that goes out (`a.md`), then `files` dropped into its
+/// `reflections/` folder by hand and one backup tick: the paths on the
+/// branch head and what the backup says it held back.
+async fn backed_up_with(files: &[(&str, &[u8])]) -> (Vec<String>, Vec<String>) {
+    backed_up_as(files, &[1]).await
+}
+
+/// [`backed_up_with`] with a second collaborator on kb's repository, who may
+/// not read vault's: a page citing vault is too wide.
+async fn backed_up_with_wide(files: &[(&str, &[u8])]) -> (Vec<String>, Vec<String>) {
+    backed_up_as(files, &[1, 2]).await
+}
+
+async fn backed_up_as(files: &[(&str, &[u8])], kb_ids: &[u64]) -> (Vec<String>, Vec<String>) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (forge, eng, _, kb) = setup_with_page_repo(tmp.path(), &app_env()).await;
+    collaborators(&forge, "acme/kb", kb_ids);
+    collaborators(&forge, "acme/vault", &[1]);
+    write(
+        &eng,
+        &WriteReflectionParams {
+            domain: "kb".into(),
+            path: "a.md".into(),
+            markdown: Some("# A\n\n## One\n\nText.\n".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    for (rel, bytes) in files {
+        let abs = tmp.path().join("kb/reflections").join(rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(abs, bytes).unwrap();
+    }
+    eng.mark_reflection_dirty(
+        "kb",
+        crystalline_service::reflection_backup::BackupCause::Settled,
+    );
+    eng.reflection_backup_tick(Instant::now() + Duration::from_secs(120))
+        .await;
+    let head = kb.commit_paths(&kb.branch_commit(BACKUP_BRANCH).unwrap());
+    assert!(head.contains(&"reflections/a.md".to_string()), "{head:?}");
+    // A page's baseline covered by its records goes out with it.
+    assert!(
+        head.contains(&"reflections/.reflected/a.md".to_string()),
+        "{head:?}"
+    );
+    (head, eng.reflection_backup_held_back("kb"))
+}
+
+/// A page whose records cannot be read may hide any source: held.
+#[tokio::test]
+async fn a_page_whose_records_cannot_be_read_is_held() {
+    let pages: [&[u8]; 3] = [
+        b"---\nreflection:\n  aaaa1111:\n    sources: 5\n---\n\n# Bad\n\n## Team\n<!-- r:aaaa1111 -->\n\nFive.\n",
+        b"---\nreflection:\n  aaaa1111:\n    sources:\n    - domain: vault\n      engram: team/rota\n      checksum: abc\n\n# Bad\n\n## Team\n<!-- r:aaaa1111 -->\n\nFive.\n",
+        b"---\nreflection:\n  aaaa1111:\n    sources:\n    - domain: vault\n      engram: team/rota\n      checksum: abc\n---\n\n# Bad \xff\xfe\n\n## Team\n<!-- r:aaaa1111 -->\n\nFive.\n",
+    ];
+    for page in pages {
+        let (head, held) = backed_up_with(&[("bad.md", page)]).await;
+        assert!(!head.iter().any(|p| p.contains("bad.md")), "{head:?}");
+        assert_eq!(held, vec!["bad.md".to_string()]);
+    }
+}
+
+/// A page without frontmatter has no records to read and goes out.
+#[tokio::test]
+async fn a_page_without_frontmatter_goes_out() {
+    let (head, held) = backed_up_with(&[("plain.md", b"# Plain\n\n## One\n\nText.\n")]).await;
+    assert!(
+        head.contains(&"reflections/plain.md".to_string()),
+        "{head:?}"
+    );
+    assert!(held.is_empty(), "{held:?}");
+}
+
+/// A held page's baseline is held with it.
+#[tokio::test]
+async fn a_baseline_stays_held_with_its_page() {
+    let page: &[u8] = b"---\nreflection:\n  aaaa1111:\n    sources:\n    - domain: vault\n      engram: team/rota\n      checksum: abc\n---\n\n# Forged\n\n## Team\n<!-- r:aaaa1111 -->\n\nFive.\n";
+    let baseline: &[u8] = b"## Team\n<!-- r:aaaa1111 -->\n\nFive people from the vault.\n";
+    // vault's repository has fewer readers than kb's here.
+    let (head, held) =
+        backed_up_with_wide(&[("forged.md", page), (".reflected/forged.md", baseline)]).await;
+    assert!(!head.iter().any(|p| p.contains("forged.md")), "{head:?}");
+    assert_eq!(held, vec!["forged.md".to_string()]);
+}
+
+/// A curator removed a section together with its narrow source; the
+/// baseline still keeps that section's text. The page goes out, its
+/// baseline does not.
+#[tokio::test]
+async fn a_baseline_keeping_a_removed_section_is_held_while_the_page_goes_out() {
+    let page: &[u8] = b"---\nreflection:\n  bbbb2222:\n    sources:\n    - engram: team/rota\n      checksum: abc\n---\n\n# B\n\n## Kept\n<!-- r:bbbb2222 -->\n\nOurs.\n";
+    let baseline: &[u8] = b"## Kept\n<!-- r:bbbb2222 -->\n\nOurs.\n\n## Removed\n<!-- r:cccc3333 -->\n\nFive people from the vault.\n";
+    let (head, held) = backed_up_with(&[("b.md", page), (".reflected/b.md", baseline)]).await;
+    assert!(head.contains(&"reflections/b.md".to_string()), "{head:?}");
+    assert!(
+        !head.contains(&"reflections/.reflected/b.md".to_string()),
+        "{head:?}"
+    );
+    assert!(held.is_empty(), "{held:?}");
 }

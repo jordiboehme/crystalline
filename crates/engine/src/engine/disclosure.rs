@@ -579,18 +579,8 @@ impl Engine {
 
     /// The question for what `preview` needs confirmed: the local names of
     /// its source domains and the texts of its sections as the write leaves
-    /// them.
-    pub(super) async fn ask_for_preview(
-        &self,
-        page: &str,
-        path: &str,
-        preview: &WritePreview,
-    ) -> Result<DisclosureAsk> {
-        Ok(self.asked_for_preview(page, path, preview).await?.ask)
-    }
-
-    /// [`Engine::ask_for_preview`] with the readers of the page's repository
-    /// the question was worked out for.
+    /// them, with the readers of the page's repository the question was
+    /// worked out for.
     pub(super) async fn asked_for_preview(
         &self,
         page: &str,
@@ -646,9 +636,10 @@ impl Engine {
         if preview.needs.is_empty() {
             return Ok(None);
         }
-        self.ask_for_preview(&p.domain, &p.path, &preview)
-            .await
-            .map(Some)
+        let asked = self.asked_for_preview(&p.domain, &p.path, &preview).await?;
+        // A yes could not be recorded: no question is put.
+        self.refuse_unknown_repository_readers(&p.domain, asked.repo_readers.as_ref())?;
+        Ok(Some(asked.ask))
     }
 
     /// Record, after a write of page `path` landed with `text`, the
@@ -816,10 +807,10 @@ impl Engine {
         let asked = self
             .disclosure_asked(domain, path, &wide_local, &texts)
             .await?;
+        self.refuse_unknown_repository_readers(domain, asked.repo_readers.as_ref())?;
         if asked.ask.basis != basis {
             return Err(EngineError::Conflict(DISCLOSURE_CHANGED.into()));
         }
-        self.refuse_unknown_repository_readers(domain, asked.repo_readers.as_ref())?;
         self.record_disclosures(
             domain,
             access.domain_id,
