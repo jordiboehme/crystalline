@@ -4509,9 +4509,18 @@ fn run_domain(command: DomainCommand, db: Option<PathBuf>, json: bool) -> anyhow
             // A domain whose access follows GitHub was made private by the
             // connect itself; its owner record is never read, so there is
             // nothing left to close.
-            if let Some(owner) = closing
-                && !governed
+            if let Some(owner) = closing.as_deref()
+                && governed
             {
+                // Said rather than dropped silently: the account asked for
+                // was not recorded anywhere.
+                let line = owner_dropped_note(owner);
+                if json {
+                    eprintln!("{line}");
+                } else {
+                    println!("{line}");
+                }
+            } else if let Some(owner) = closing {
                 // The dispatch refused `--private` on an adopted registration
                 // before it printed anything; a domain that reaches this
                 // point is new.
@@ -5189,6 +5198,16 @@ async fn domain_add_origin_dispatch(
     }
     cmd::print_origin_add(&repo, &data, json);
     Ok((chosen_name, adopted, governed))
+}
+
+/// The note `domain add --origin --private --owner` prints when a GitHub App
+/// decides who may read the domain: the domain is private, and the owner is
+/// not recorded, because access follows GitHub.
+fn owner_dropped_note(owner: &str) -> String {
+    format!(
+        "Note: --owner {} was not recorded. A GitHub App decides access to this domain, so it is private to the people with access on GitHub.",
+        owner.trim().to_lowercase()
+    )
 }
 
 /// The refusal a connect gets off a terminal on an instance with a GitHub
@@ -6079,6 +6098,13 @@ fn to_core_format(f: OutputFormat) -> verify::Format {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_dropped_owner_is_named_with_the_reason() {
+        let note = owner_dropped_note(" Ada ");
+        assert!(note.contains("--owner ada was not recorded"), "{note}");
+        assert!(note.contains("A GitHub App decides access"), "{note}");
+    }
 
     /// `domain import` groups the links it did not take by why, as
     /// `crystalline import` does, instead of printing the raw answer.

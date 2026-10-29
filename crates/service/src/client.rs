@@ -771,6 +771,9 @@ async fn build_embedded(
     // Reflection page this stack writes reaches every reader of its domain
     // and the backup branch, whether or not anybody reads it over HTTP here.
     install_domain_access(&engine).await;
+    // Env-defined team domains that should be private are closed here too,
+    // without a word: the daemon's start says it once.
+    engine.apply_env_readers_quietly().await?;
     tokio::spawn(crate::engine::run_embed_worker(engine.clone(), embed_rx));
     // A rename a stopped daemon left half done is finished before the first
     // sync and before the routing cache reads a name, as the daemon does.
@@ -1104,6 +1107,7 @@ pub async fn run_tool(
     // A tool run here can write a Reflection page, which reaches every
     // reader of its domain: this command knows them as a daemon would.
     install_domain_access(&engine).await;
+    engine.apply_env_readers_quietly().await?;
     if use_daemon(db, config_path) {
         crate::route::install_sources(&engine);
     }
@@ -1869,6 +1873,7 @@ pub async fn origin_add(
     let engine =
         Arc::new(open_standalone_reporting(loaded, &db_path, false, db, config_path).await?);
     install_domain_access(&engine).await;
+    engine.apply_env_readers_quietly().await?;
     Ok(engine
         .origin_add(repo, domain, path, branch, folder, readers)
         .await?)

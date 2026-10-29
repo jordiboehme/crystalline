@@ -7639,14 +7639,80 @@ async fn connect_private_writes_an_acl_row() {
 async fn connect_shared_writes_none() {
     let tmp = tempfile::tempdir().unwrap();
     let (_forge, eng, auth) = readers_setup(tmp.path(), true, &[]).await;
-    // A record an earlier registration of the name left behind does not
-    // make a shared choice private.
-    auth.set_domain_visibility("kb", true, "ada").await.unwrap();
     let report = connect_kb(&eng, &tmp.path().join("kb"), Some(Readers::Shared))
         .await
         .unwrap();
     assert_eq!(report["readers"], "shared", "{report}");
     assert!(auth.domain_visibility("kb").await.unwrap().is_none());
+
+    // A retry of the same connect answers the connected state and names who
+    // reads it.
+    let again = connect_kb(&eng, &tmp.path().join("kb"), Some(Readers::Private))
+        .await
+        .unwrap();
+    assert_eq!(again["already_connected"], true, "{again}");
+    assert_eq!(again["readers"], "shared", "{again}");
+    assert!(auth.domain_visibility("kb").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn an_already_connected_retry_names_private_readers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_forge, eng, _auth) = readers_setup(tmp.path(), true, &[]).await;
+    connect_kb(&eng, &tmp.path().join("kb"), Some(Readers::Private))
+        .await
+        .unwrap();
+    let again = connect_kb(&eng, &tmp.path().join("kb"), Some(Readers::Private))
+        .await
+        .unwrap();
+    assert_eq!(again["already_connected"], true, "{again}");
+    assert_eq!(again["readers"], "private", "{again}");
+}
+
+#[tokio::test]
+async fn connect_shared_on_a_private_domain_refuses_and_keeps_its_members() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (forge, eng, auth) = readers_setup(tmp.path(), true, &[]).await;
+    auth.add_user("bea", "Bea", None, Role::Viewer, "pw12345678")
+        .await
+        .unwrap();
+    // A record an earlier registration of the name left behind, with a
+    // member: the name is private, whether or not a domain holds it now.
+    auth.set_domain_visibility("kb", true, "ada").await.unwrap();
+    auth.upsert_domain_member(
+        "kb",
+        "bea",
+        crystalline_service::rest::MemberLevel::Viewer,
+        None,
+        "ada",
+    )
+    .await
+    .unwrap();
+
+    let err = connect_kb(&eng, &tmp.path().join("kb"), Some(Readers::Shared))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EngineError::Invalid(_)), "{err:?}");
+    assert_eq!(
+        err.to_string(),
+        "this domain is private; connect it as private, then change who may read on its Members card"
+    );
+    assert_eq!(
+        auth.domain_visibility("kb").await.unwrap().unwrap().owner,
+        "ada"
+    );
+    assert_eq!(auth.domain_members("kb").await.unwrap().len(), 1);
+    assert!(
+        !forge
+            .hits()
+            .iter()
+            .any(super::github_app::Hit::is_repo_call),
+        "nothing was asked of the repository"
+    );
+    assert!(
+        eng.config().domains.get("kb").is_none(),
+        "nothing registered"
+    );
 }
 
 #[tokio::test]
@@ -7786,7 +7852,7 @@ async fn env_origin_without_readers_is_private_and_warns() {
     )
     .await;
     let (logs, _guard) = crate::support::capture_logs();
-    eng.apply_env_readers().await;
+    eng.apply_env_readers().await.unwrap();
     assert!(
         auth.domain_visibility("kb").await.unwrap().is_some(),
         "absent readers is private"
@@ -7818,11 +7884,138 @@ async fn env_origin_with_readers_shared_writes_none_and_says_nothing() {
         ],
     )
     .await;
-    auth.set_domain_visibility("kb", true, "ada").await.unwrap();
     let (logs, _guard) = crate::support::capture_logs();
-    eng.apply_env_readers().await;
+    eng.apply_env_readers().await.unwrap();
     assert!(auth.domain_visibility("kb").await.unwrap().is_none());
     assert!(!logs.any_contains("CRYSTALLINE_DOMAIN_KB_READERS"));
+}
+
+#[tokio::test]
+async fn env_readers_shared_never_opens_a_private_domain() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("kb");
+    let root_str = root.to_str().unwrap().to_string();
+    let (_forge, eng, auth) = readers_setup(
+        tmp.path(),
+        true,
+        &[
+            ("CRYSTALLINE_DOMAIN_KB", &root_str),
+            ("CRYSTALLINE_DOMAIN_KB_ORIGIN", "acme/kb"),
+            ("CRYSTALLINE_DOMAIN_KB_READERS", "shared"),
+        ],
+    )
+    .await;
+    auth.set_domain_visibility("kb", true, "ada").await.unwrap();
+    let (logs, _guard) = crate::support::capture_logs();
+    eng.apply_env_readers().await.unwrap();
+    assert_eq!(
+        auth.domain_visibility("kb").await.unwrap().unwrap().owner,
+        "ada",
+        "left private, exactly as it stood"
+    );
+    let warnings: Vec<String> = logs
+        .lines()
+        .into_iter()
+        .filter(|l| {
+            l.starts_with("WARN")
+                && l.contains(
+                    "CRYSTALLINE_DOMAIN_KB_READERS says shared, but domain 'kb' is private; change who may read on its Members card",
+                )
+        })
+        .collect();
+    assert_eq!(warnings.len(), 1, "{:?}", logs.lines());
+}
+
+#[tokio::test]
+async fn env_readers_quietly_close_without_a_word() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("kb");
+    let root_str = root.to_str().unwrap().to_string();
+    let (_forge, eng, auth) = readers_setup(
+        tmp.path(),
+        true,
+        &[
+            ("CRYSTALLINE_DOMAIN_KB", &root_str),
+            ("CRYSTALLINE_DOMAIN_KB_ORIGIN", "acme/kb"),
+        ],
+    )
+    .await;
+    let (logs, _guard) = crate::support::capture_logs();
+    eng.apply_env_readers_quietly().await.unwrap();
+    assert!(auth.domain_visibility("kb").await.unwrap().is_some());
+    assert!(
+        !logs.any_contains("CRYSTALLINE_DOMAIN_KB_READERS"),
+        "{:?}",
+        logs.lines()
+    );
+}
+
+#[tokio::test]
+async fn env_readers_without_an_accounts_store_warn_once() {
+    use super::github_app::{app_env, engine, repo_with_manifest, spawn_forge};
+    let tmp = tempfile::tempdir().unwrap();
+    let (_forge, url) = spawn_forge(
+        &[("acme/kb", repo_with_manifest(""))],
+        &[("acme/kb", 1)],
+        &[(1, "ghs_test")],
+    )
+    .await;
+    let mut env = app_env();
+    let a = tmp.path().join("a").to_str().unwrap().to_string();
+    let b = tmp.path().join("b").to_str().unwrap().to_string();
+    env.extend_from_slice(&[
+        ("CRYSTALLINE_DOMAIN_A", a.as_str()),
+        ("CRYSTALLINE_DOMAIN_A_ORIGIN", "acme/a"),
+        ("CRYSTALLINE_DOMAIN_A_READERS", "private"),
+        ("CRYSTALLINE_DOMAIN_B", b.as_str()),
+        ("CRYSTALLINE_DOMAIN_B_ORIGIN", "acme/b"),
+        ("CRYSTALLINE_DOMAIN_B_READERS", "private"),
+    ]);
+    let eng = engine(tmp.path(), &url, &env).await;
+    let (logs, _guard) = crate::support::capture_logs();
+    eng.apply_env_readers().await.unwrap();
+    let warnings: Vec<String> = logs
+        .lines()
+        .into_iter()
+        .filter(|l| l.starts_with("WARN") && l.contains("accounts"))
+        .collect();
+    assert_eq!(warnings.len(), 1, "{:?}", logs.lines());
+}
+
+#[tokio::test]
+async fn a_failed_env_private_write_stops_the_start_naming_the_domain() {
+    let tmp = tempfile::tempdir().unwrap();
+    // The accounts database refuses every private record before the store
+    // opens it: its acl table takes no row.
+    {
+        let path = tmp.path().join("auth.db");
+        let db = turso::Builder::new_local(path.to_str().unwrap())
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "CREATE TABLE domain_acl (domain TEXT PRIMARY KEY NOT NULL, visibility TEXT NOT NULL, owner TEXT NOT NULL, updated_at TEXT NOT NULL, CHECK (owner = 'nobody at all'))",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+    let root = tmp.path().join("kb");
+    let root_str = root.to_str().unwrap().to_string();
+    let (_forge, eng, _auth) = readers_setup(
+        tmp.path(),
+        true,
+        &[
+            ("CRYSTALLINE_DOMAIN_KB", &root_str),
+            ("CRYSTALLINE_DOMAIN_KB_ORIGIN", "acme/kb"),
+            ("CRYSTALLINE_DOMAIN_KB_READERS", "private"),
+        ],
+    )
+    .await;
+    let result = eng.apply_env_readers().await;
+    let err = result.unwrap_err();
+    assert!(err.to_string().contains("'kb'"), "{err}");
 }
 
 #[cfg(unix)]
@@ -7982,7 +8175,7 @@ async fn env_readers_without_an_app_change_nothing_and_say_so() {
     let auth = Arc::new(AuthStore::open(&tmp.path().join("auth.db")).await.unwrap());
     eng.set_domain_access(Arc::new(DomainAccess::new(auth.clone())));
     let (logs, _guard) = crate::support::capture_logs();
-    eng.apply_env_readers().await;
+    eng.apply_env_readers().await.unwrap();
     assert!(auth.domain_visibility("kb").await.unwrap().is_none());
     assert!(
         logs.lines()

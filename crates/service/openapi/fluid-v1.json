@@ -12498,12 +12498,15 @@
             "example": false
           },
           "readers": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Who may read a team domain on an instance with a GitHub App:\n`shared` (everyone signed in) or `private` (only people with access\non GitHub). github mode only. Required there when an App is\nconfigured, since access then follows GitHub and is never defaulted;\n`private: true` answers `private`. Ignored, with a note in the\nreport, without an App.",
-            "example": "private"
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Readers",
+                "description": "Who may read a team domain on an instance with a GitHub App:\n`shared` (everyone signed in) or `private` (only people with access\non GitHub). github mode only. Required there when an App is\nconfigured, since access then follows GitHub and is never defaulted;\n`private: true` answers `private`. Ignored, with a note in the\nreport, without an App."
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "repo": {
             "type": [
@@ -14355,6 +14358,14 @@
             "description": "The bullets that did not parse, or lost to an earlier duplicate."
           }
         }
+      },
+      "Readers": {
+        "type": "string",
+        "description": "Who may read a team domain on an instance with a GitHub App: `shared`\n(everyone signed in) or `private` (only people with access on GitHub).",
+        "enum": [
+          "shared",
+          "private"
+        ]
       },
       "ReflectionAssetsResponse": {
         "type": "object",

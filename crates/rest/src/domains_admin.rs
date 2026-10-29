@@ -22,7 +22,7 @@ use super::{
 use crate::engine::{EngineError, PreviewCredential, ShareActor};
 use crate::review::{FoldChoice, ReviewModeConfirm};
 use crate::scope::DomainRight;
-use crystalline_engine::params::Readers;
+use crystalline_engine::params::Readers as EngineReaders;
 use crystalline_remote::ops::DiscardTarget;
 
 /// The caller, when they may drive this instance's share surfaces - the status
@@ -120,8 +120,27 @@ pub struct CreateDomainBody {
     /// `private: true` answers `private`. Ignored, with a note in the
     /// report, without an App.
     #[serde(default)]
-    #[schema(example = "private")]
-    pub readers: Option<String>,
+    pub readers: Option<Readers>,
+}
+
+/// Who may read a team domain on an instance with a GitHub App: `shared`
+/// (everyone signed in) or `private` (only people with access on GitHub).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum Readers {
+    /// Everyone signed in reads it.
+    Shared,
+    /// Only people with access to the repository on GitHub read it.
+    Private,
+}
+
+impl From<Readers> for EngineReaders {
+    fn from(readers: Readers) -> EngineReaders {
+        match readers {
+            Readers::Shared => EngineReaders::Shared,
+            Readers::Private => EngineReaders::Private,
+        }
+    }
 }
 
 /// `POST /domains` - register a domain: a local folder under the server's
@@ -238,7 +257,7 @@ pub async fn create(
             require_absent(&body.repo, "repo", "local")?;
             require_absent(&body.branch, "branch", "local")?;
             require_absent(&body.path, "path", "local")?;
-            require_absent(&body.readers, "readers", "local")?;
+            require_no_readers(&body, "local")?;
             state
                 .engine
                 .domain_add_local_as(Some(name), None, &identity.scope())
@@ -249,7 +268,7 @@ pub async fn create(
             require_absent(&body.repo, "repo", "virtual")?;
             require_absent(&body.branch, "branch", "virtual")?;
             require_absent(&body.path, "path", "virtual")?;
-            require_absent(&body.readers, "readers", "virtual")?;
+            require_no_readers(&body, "virtual")?;
             state
                 .engine
                 .domain_add_virtual_as(name, &identity.scope())
@@ -324,27 +343,32 @@ pub async fn create(
     }
 }
 
-/// The `readers` a github-mode create passes on: the body's own, validated,
-/// else `private` when the body asked for a private domain on an instance
-/// with a GitHub App (`app_configured`, asked only then), else none. A value
-/// that is neither `shared` nor `private`, or `shared` beside `private:
-/// true`, is a 422 naming the field.
+/// `readers` on a mode that is not github: a 422 naming the field, the way
+/// [`require_absent`] answers the other github-only fields.
+fn require_no_readers(body: &CreateDomainBody, mode: &str) -> Result<(), ApiError> {
+    match body.readers {
+        Some(_) => Err(ApiError::unprocessable(format!(
+            "readers does not apply to a {mode} domain"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// The `readers` a github-mode create passes on: the body's own, else
+/// `private` when the body asked for a private domain on an instance with a
+/// GitHub App (`app_configured`, asked only then), else none. `shared`
+/// beside `private: true` is a 422 naming the field; a value that is
+/// neither is refused by the body's own schema.
 fn github_readers(
     body: &CreateDomainBody,
     app_configured: impl FnOnce() -> bool,
-) -> Result<Option<Readers>, ApiError> {
-    let readers = match body.readers.as_deref() {
-        None => None,
-        Some(value) => Some(Readers::parse(value).ok_or_else(|| {
-            ApiError::unprocessable(format!("readers must be shared or private, got '{value}'"))
-        })?),
-    };
-    match readers {
+) -> Result<Option<EngineReaders>, ApiError> {
+    match body.readers {
         Some(Readers::Shared) if body.private => Err(ApiError::unprocessable(
             "readers shared and private: true contradict each other; send one of them",
         )),
-        Some(readers) => Ok(Some(readers)),
-        None if body.private && app_configured() => Ok(Some(Readers::Private)),
+        Some(readers) => Ok(Some(readers.into())),
+        None if body.private && app_configured() => Ok(Some(EngineReaders::Private)),
         None => Ok(None),
     }
 }

@@ -381,15 +381,7 @@ export type CreateDomainBody = {
      * shares.
      */
     private?: boolean;
-    /**
-     * Who may read a team domain on an instance with a GitHub App:
-     * `shared` (everyone signed in) or `private` (only people with access
-     * on GitHub). github mode only. Required there when an App is
-     * configured, since access then follows GitHub and is never defaulted;
-     * `private: true` answers `private`. Ignored, with a note in the
-     * report, without an App.
-     */
-    readers?: string | null;
+    readers?: Readers | null;
     /**
      * owner/name; github mode only.
      */
@@ -1710,6 +1702,12 @@ export type ProvisioningView = {
      */
     problems: Array<ManifestProblem>;
 };
+
+/**
+ * Who may read a team domain on an instance with a GitHub App: `shared`
+ * (everyone signed in) or `private` (only people with access on GitHub).
+ */
+export type Readers = 'shared' | 'private';
 
 /**
  * Every file of a domain's Reflection.

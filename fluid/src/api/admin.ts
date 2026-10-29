@@ -432,21 +432,16 @@ export interface CreateDomainBody {
   // variable, as opposed to an object literal, is not flagged). Indexing it
   // is what turns that removal into a compile error here too.
   private?: NonNullable<CreateDomainWireBody["private"]>;
-  /**
-   * Who may read a team domain on an instance with a GitHub App, narrowed to
-   * the two values the server takes. Indexed off the generated schema for the
-   * reason `private` is: its removal there is then a compile error here.
-   */
-  readers?: NonNullable<CreateDomainWireBody["readers"]> extends string
-    ? Readers
-    : never;
+  /** Who may read a team domain on an instance with a GitHub App. */
+  readers?: Readers;
 }
 
 /**
  * Who may read a team domain whose access follows GitHub: everyone signed in,
- * or only the people with access to the repository on GitHub.
+ * or only the people with access to the repository on GitHub. The generated
+ * schema's own enum.
  */
-export type Readers = "shared" | "private";
+export type Readers = NonNullable<CreateDomainWireBody["readers"]>;
 
 /** What a registration reports back: the name it took, and where it landed. */
 export interface CreatedDomain {

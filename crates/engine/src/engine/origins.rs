@@ -14,6 +14,10 @@ pub const READERS_REQUIRED: &str = "say who may read this domain: shared (everyo
 /// open to everyone signed in the moment accounts exist.
 const PRIVATE_NEEDS_ACCOUNTS: &str = "a private domain is recorded in this instance's accounts, and none are set up yet: add the first account with `crystalline users add` and restart the server, or connect it with readers shared";
 
+/// Why a shared connect is refused on a name that is already private.
+const SHARED_ON_PRIVATE: &str =
+    "this domain is private; connect it as private, then change who may read on its Members card";
+
 /// The note a connect carries when it was given readers on an instance
 /// without a GitHub App.
 const READERS_IGNORED: &str = "this instance has no GitHub App, so readers was ignored: who may read this domain follows this instance's own accounts, as for any other domain";
@@ -95,11 +99,14 @@ impl Engine {
     /// GitHub. There it is required, and refused with [`READERS_REQUIRED`]
     /// before anything is fetched when absent; `private` also needs the
     /// accounts store installed. `private` is recorded before the domain is
-    /// registered and taken back when the registration fails; `shared`
-    /// drops any record the name carried once it is registered. A fresh
-    /// connect then reports `readers` (`shared` or `private`). Without an
-    /// App the answer is ignored and the report carries a `readers_note`
-    /// saying so. An already-connected retry changes no record.
+    /// registered, and only the acl row it wrote is taken back when the
+    /// registration fails. `shared` writes and deletes nothing, and is
+    /// refused before the download on a name that already carries a private
+    /// record (a private domain is made shared on its Members card, never by
+    /// a connect). A fresh connect then reports `readers` (`shared` or
+    /// `private`). Without an App the answer is ignored and the report
+    /// carries a `readers_note` saying so. An already-connected retry changes
+    /// no record and reports the readers as they stand.
     pub async fn origin_add(
         &self,
         repo: &str,
@@ -325,6 +332,17 @@ impl Engine {
                 origin_cfg.repo
             )));
         }
+        // A shared answer never opens a name that is already private: a
+        // private domain being adopted, or the record an earlier
+        // registration of the name left. Asked once the name is final and
+        // before the download (a nameless connect has only read the MANIFEST
+        // by now), so nothing is fetched or registered, and nothing is
+        // written or deleted for it.
+        if matches!(readers, ConnectReaders::Governed(Readers::Shared))
+            && self.name_is_private(&domain_name).await?
+        {
+            return Err(EngineError::Invalid(SHARED_ON_PRIVATE.to_string()));
+        }
 
         let adopts_registered = existing.is_some();
         if !adopts_registered {
@@ -438,14 +456,8 @@ impl Engine {
             }
             return Err(e);
         }
-        // A shared domain drops any record the name still carried only now
-        // that it is registered: dropped earlier, a failed registration of a
-        // name that was already private would have opened it.
         let readers_note = match readers {
-            ConnectReaders::Governed(Readers::Shared) => {
-                self.record_shared_readers(&domain_name).await
-            }
-            ConnectReaders::Ignored => Some(READERS_IGNORED.to_string()),
+            ConnectReaders::Ignored => Some(READERS_IGNORED),
             _ => None,
         };
         // Its origin may make it a copy of a mounted domain, hidden from now on.
@@ -489,14 +501,7 @@ impl Engine {
             "local_changes": report.local_changes,
         });
         if let ConnectReaders::Governed(chosen) = readers {
-            // A shared choice whose record could not be dropped stays
-            // private, and says so.
-            let landed = if readers_note.is_some() {
-                Readers::Private
-            } else {
-                chosen
-            };
-            result["readers"] = json!(landed.as_str());
+            result["readers"] = json!(chosen.as_str());
         }
         if let Some(note) = readers_note {
             result["readers_note"] = json!(note);
@@ -527,6 +532,35 @@ impl Engine {
         }
     }
 
+    /// Whether `domain` carries a private record, registered or not. `false`
+    /// without an accounts store, where no record can exist. A record that
+    /// cannot be read refuses: the answer decides whether a shared connect
+    /// would open it.
+    async fn name_is_private(&self, domain: &str) -> Result<bool> {
+        let Some(access) = self.domain_access.get() else {
+            return Ok(false);
+        };
+        access.has_private_record(domain).await.map_err(|e| {
+            EngineError::Internal(format!(
+                "whether domain '{domain}' is private could not be read, so it was not connected: {e:#}"
+            ))
+        })
+    }
+
+    /// Who reads a governed domain as it stands: `private` with a private
+    /// record, else `shared`. `None` without an App, where the question is
+    /// not asked, or when the record cannot be read.
+    async fn governed_readers_now(&self, domain: &str) -> Option<Readers> {
+        if !self.github_app_configured() {
+            return None;
+        }
+        match self.name_is_private(domain).await {
+            Ok(true) => Some(Readers::Private),
+            Ok(false) => Some(Readers::Shared),
+            Err(_) => None,
+        }
+    }
+
     /// Records `domain` private for a governed connect, naming who chose
     /// it: the signed-in account, else the machine owner's reserved name.
     async fn record_private_readers(
@@ -547,7 +581,7 @@ impl Engine {
             .get()
             .ok_or_else(|| EngineError::Invalid(PRIVATE_NEEDS_ACCOUNTS.to_string()))?;
         access
-            .set_governed_readers(domain, true, set_by)
+            .set_governed_private(domain, set_by)
             .await
             .map_err(|e| {
                 EngineError::Internal(format!(
@@ -557,40 +591,17 @@ impl Engine {
     }
 
     /// Takes back the private record [`Engine::record_private_readers`]
-    /// wrote for a connect whose registration failed. Best effort: a record
-    /// left behind keeps the name private, which closes rather than opens.
+    /// wrote for a connect whose registration failed: the acl row only, never
+    /// a membership. Best effort: a record left behind keeps the name
+    /// private, which closes rather than opens.
     async fn take_back_private_readers(&self, domain: &str) {
         let Some(access) = self.domain_access.get() else {
             return;
         };
-        if let Err(e) = access
-            .set_governed_readers(domain, false, crate::scope::OWNER_IDENTITY_NAME)
-            .await
-        {
+        if let Err(e) = access.take_back_governed_private(domain).await {
             tracing::warn!(
                 "domain '{domain}' was not connected, but its private record could not be taken back: {e:#}"
             );
-        }
-    }
-
-    /// Drops any private record `domain` still carried, for a governed
-    /// connect with readers `shared`. Answers a note when it could not: the
-    /// domain is connected and stays private until somebody makes it shared.
-    async fn record_shared_readers(&self, domain: &str) -> Option<String> {
-        let access = self.domain_access.get()?;
-        match access
-            .set_governed_readers(domain, false, crate::scope::OWNER_IDENTITY_NAME)
-            .await
-        {
-            Ok(_) => None,
-            Err(e) => {
-                tracing::warn!(
-                    "domain '{domain}' was connected but could not be made shared: {e:#}"
-                );
-                Some(format!(
-                    "the domain was connected but could not be made shared, so it stays private: {e:#}"
-                ))
-            }
         }
     }
 
@@ -984,6 +995,11 @@ impl Engine {
             "base_commit": base_commit,
             "already_connected": true,
         });
+        // Who reads it, as it stands: a retry changes no record, whatever
+        // readers it was given.
+        if let Some(readers) = self.governed_readers_now(name).await {
+            result["readers"] = json!(readers.as_str());
+        }
         self.append_name_fields(&mut result, name).await?;
         Ok(result)
     }
@@ -1173,21 +1189,36 @@ impl Engine {
 
     /// Records who may read every env-defined team domain, from its
     /// `CRYSTALLINE_DOMAIN_<NAME>_READERS` variable, on an instance with a
-    /// GitHub App. Called once at startup, after the accounts store is
-    /// installed and before anything is served, so a domain is closed before
-    /// its first request. The environment states the answer on every start,
-    /// as it states the domain itself: `private` writes the private record
-    /// (left as it stands when there is one), `shared` drops it. An absent
-    /// variable reads as private, with one warning naming it, since nobody
-    /// should open a confidential repository by accident.
+    /// GitHub App. The daemon calls this once at startup, after the accounts
+    /// store is installed and before anything is served, so a domain is
+    /// closed before its first request.
     ///
-    /// Does nothing without an App, where who may read follows this
-    /// instance's own accounts; a variable set anyway is named in an info
-    /// line saying so. Without an accounts store there is no
-    /// record to write: a private domain then says so in a warning, since
-    /// it would be open to everyone signed in once accounts exist and the
-    /// server has not been restarted.
-    pub async fn apply_env_readers(&self) {
+    /// It only ever closes: `private`, or an absent variable, writes the
+    /// private record (left as it stands when there is one); `shared` writes
+    /// nothing, and on a domain that is already private it says so in one
+    /// warning and leaves it private, since who may read a private domain is
+    /// changed on its Members card. An absent variable reads as private,
+    /// with one warning naming it, since nobody should open a confidential
+    /// repository by accident. Applied whether or not `github.enabled` is on,
+    /// because closing a domain is never wrong.
+    ///
+    /// Without an App it writes nothing, and a variable set anyway is named
+    /// in an info line. Without an accounts store there is no record to
+    /// write, and one warning says so for every domain that should be
+    /// private. A private record that cannot be written stops the start,
+    /// naming the domain.
+    pub async fn apply_env_readers(&self) -> Result<()> {
+        self.apply_env_readers_with(false).await
+    }
+
+    /// [`Engine::apply_env_readers`] for the standalone stdio and one-shot
+    /// stacks: the private records are written the same way, and nothing is
+    /// said, since the daemon's start already says it once.
+    pub async fn apply_env_readers_quietly(&self) -> Result<()> {
+        self.apply_env_readers_with(true).await
+    }
+
+    async fn apply_env_readers_with(&self, quiet: bool) -> Result<()> {
         let targets: Vec<(String, Option<Readers>, String)> = self
             .overlay
             .env_domains()
@@ -1195,43 +1226,68 @@ impl Engine {
             .map(|(name, env)| (name.clone(), env.readers, env.readers_var()))
             .collect();
         if targets.is_empty() {
-            return;
+            return Ok(());
         }
         if !self.github_app_configured() {
-            for (_, readers, var) in &targets {
-                if readers.is_some() {
-                    tracing::info!(
-                        "{var} changes nothing on an instance without a GitHub App: who may read the domain follows this instance's own accounts"
-                    );
+            if !quiet {
+                for (_, readers, var) in &targets {
+                    if readers.is_some() {
+                        tracing::info!(
+                            "{var} changes nothing on an instance without a GitHub App: who may read the domain follows this instance's own accounts"
+                        );
+                    }
                 }
             }
-            return;
+            return Ok(());
         }
         let access = self.domain_access.get();
+        let mut unrecorded: Vec<String> = Vec::new();
         for (name, readers, var) in targets {
-            if readers.is_none() {
+            if readers.is_none() && !quiet {
                 tracing::warn!(
                     "{var} is not set, so the env-defined team domain '{name}' is private: only people with access on GitHub read it. Set {var} to shared or private to say who may read it"
                 );
             }
-            let private = readers != Some(Readers::Shared);
             let Some(access) = access else {
-                if private {
-                    tracing::warn!(
-                        "the env-defined team domain '{name}' should be private, but this instance has no accounts yet to record it in; restart the server after adding the first account"
-                    );
+                if readers != Some(Readers::Shared) {
+                    unrecorded.push(name);
                 }
                 continue;
             };
-            if let Err(e) = access
-                .set_governed_readers(&name, private, crate::scope::OWNER_IDENTITY_NAME)
-                .await
-            {
-                tracing::warn!(
-                    "who may read the env-defined team domain '{name}' could not be recorded: {e:#}"
-                );
+            if readers == Some(Readers::Shared) {
+                // Shared never opens a domain that is already private.
+                let private = access.has_private_record(&name).await.map_err(|e| {
+                    EngineError::Internal(format!(
+                        "whether the env-defined team domain '{name}' is private could not be read: {e:#}"
+                    ))
+                })?;
+                if private && !quiet {
+                    tracing::warn!(
+                        "{var} says shared, but domain '{name}' is private; change who may read on its Members card"
+                    );
+                }
+                continue;
             }
+            access
+                .set_governed_private(&name, crate::scope::OWNER_IDENTITY_NAME)
+                .await
+                .map_err(|e| {
+                    EngineError::Internal(format!(
+                        "the env-defined team domain '{name}' could not be made private: {e:#}"
+                    ))
+                })?;
         }
+        if !unrecorded.is_empty() && !quiet {
+            tracing::warn!(
+                "the env-defined team domains {} should be private, but this instance has no accounts yet to record it in; restart the server after adding the first account",
+                unrecorded
+                    .iter()
+                    .map(|n| format!("'{n}'"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        Ok(())
     }
 
     /// Bootstraps every env-defined team domain that carries an origin but

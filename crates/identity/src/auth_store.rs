@@ -4450,6 +4450,25 @@ impl AuthStore {
         self.write_visibility(domain, true, set_by, !is_owner).await
     }
 
+    /// Delete the acl row of `domain` and nothing else: the undo of
+    /// [`AuthStore::set_governed_private`] for a connect whose registration
+    /// failed after the row was written. No membership row is touched, so it
+    /// can never drop a member somebody else invited. Answers whether there
+    /// was a row.
+    pub async fn take_back_governed_private(&self, domain: &str) -> Result<bool> {
+        let domain = normalize_domain(domain)?;
+        let _guard = self.guard.lock().await;
+        let had = self.acl_of(&domain).await?.is_some();
+        self.conn
+            .execute(
+                "DELETE FROM domain_acl WHERE domain = ?1",
+                vec![Value::Text(domain.clone())],
+            )
+            .await
+            .with_context(|| format!("taking back the private record of domain '{domain}'"))?;
+        Ok(had)
+    }
+
     /// The write behind [`AuthStore::set_domain_visibility`] and
     /// [`AuthStore::set_governed_private`]; `check_owner` is whether a
     /// privatizing write requires `owner` to be a live account.
@@ -7029,15 +7048,6 @@ mod tests {
         assert_eq!(store.list_users().await.unwrap()[0].name, "ada");
     }
 
-    /// The machine owner's own name is not a login.
-    ///
-    /// `owner` is the actor key every private draft the CLI, the control socket
-    /// and a local stdio agent write is filed under. An account holding it
-    /// would read, edit, share and fold the machine owner's unshared work in
-    /// every reviewing domain at once - in both directions, since the owner
-    /// would be acting in that account's drafts too. Every path that names an
-    /// account folds through `normalize_account_name`, so every one of them
-    /// refuses it, whichever way it is spelled.
     /// A governed domain made private at connect names who chose it. The
     /// machine owner holds no account, so its reserved name is taken without
     /// the live-account check; any other name still needs a live account,
@@ -7063,6 +7073,42 @@ mod tests {
         );
     }
 
+    /// Taking back a connect's private record deletes the acl row and no
+    /// membership row.
+    #[tokio::test]
+    async fn take_back_governed_private_deletes_only_the_acl_row() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Editor, "pw12345678")
+            .await
+            .unwrap();
+        store
+            .add_user("bea", "Bea", None, Role::Viewer, "pw12345678")
+            .await
+            .unwrap();
+        store
+            .set_domain_visibility("kb", true, "ada")
+            .await
+            .unwrap();
+        store
+            .upsert_domain_member("kb", "bea", MemberLevel::Viewer, None, "ada")
+            .await
+            .unwrap();
+        assert!(store.take_back_governed_private("kb").await.unwrap());
+        assert!(store.domain_visibility("kb").await.unwrap().is_none());
+        assert_eq!(store.domain_members("kb").await.unwrap().len(), 1);
+        assert!(!store.take_back_governed_private("kb").await.unwrap());
+    }
+
+    /// The machine owner's own name is not a login.
+    ///
+    /// `owner` is the actor key every private draft the CLI, the control socket
+    /// and a local stdio agent write is filed under. An account holding it
+    /// would read, edit, share and fold the machine owner's unshared work in
+    /// every reviewing domain at once - in both directions, since the owner
+    /// would be acting in that account's drafts too. Every path that names an
+    /// account folds through `normalize_account_name`, so every one of them
+    /// refuses it, whichever way it is spelled.
     #[tokio::test]
     async fn the_machine_owners_name_is_reserved_on_every_path() {
         let (_dir, store) = store().await;

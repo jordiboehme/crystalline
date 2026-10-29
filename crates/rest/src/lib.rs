@@ -288,6 +288,7 @@ use crate::scope::{DomainAccess, DomainRight};
         domains::PolicyView,
         domains::SetPoliciesBody,
         domains_admin::CreateDomainBody,
+        domains_admin::Readers,
         domains_admin::RenameBody,
         domains_admin::FoldArg,
         domains_admin::ReviewBody,

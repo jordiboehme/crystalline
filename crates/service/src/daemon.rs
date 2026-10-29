@@ -618,8 +618,12 @@ pub async fn run_serve(
     let accounts = crate::client::install_domain_access(&engine).await;
     // Who may read each env-defined team domain on an instance with a GitHub
     // App, recorded before anything is served so a private one is closed
-    // from its first request on.
-    engine.apply_env_readers().await;
+    // from its first request on. A private record that cannot be written
+    // stops the start: serving the domain open is the one thing not to do.
+    engine
+        .apply_env_readers()
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     if !daemon_flag {
         if std::io::stderr().is_terminal() {

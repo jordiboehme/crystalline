@@ -294,16 +294,16 @@ const WRITE_TOOLS: [&str; 7] = [
     "remove_domain",
 ];
 
+/// What `add_domain` with `repo` and no `readers` is told on an instance
+/// with a GitHub App.
+const ADD_DOMAIN_NEEDS_READERS: &str = "add_domain needs readers: shared (everyone signed in) or private (only people with access on GitHub)";
+
 /// The Reflection tools hidden in read-only mode: `reflect` for the reason
 /// `evolve_engrams` is (every item it returns prescribes a write), the other
 /// two because they write. `read_reflection` is a read and stays listed.
 /// None of them is one of the `WRITE_TOOLS`: their rights are the
 /// Reflection's own, decided by the engine's reflection gate, never by
 /// `refuse_unwritable`.
-/// What `add_domain` with `repo` and no `readers` is told on an instance
-/// with a GitHub App.
-const ADD_DOMAIN_NEEDS_READERS: &str = "add_domain needs readers: shared (everyone signed in) or private (only people with access on GitHub)";
-
 const REFLECTION_WRITE_TOOLS: [&str; 3] = ["reflect", "write_reflection", "discuss"];
 
 /// The four Reflection tools, whose engine refusals MCP answers as

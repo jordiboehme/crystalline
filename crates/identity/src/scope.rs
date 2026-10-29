@@ -1940,27 +1940,34 @@ impl DomainAccess {
         self.auth.forget_domain(domain).await
     }
 
-    /// Record who may read a domain connected to GitHub through the GitHub
-    /// App, as the connect chose it: `private` writes the acl row
-    /// ([`AuthStore::set_governed_private`], naming `set_by`), `shared`
-    /// drops any acl row and membership the name still carried. A write the
-    /// connecting verb makes, beside [`DomainAccess::forget_domain`] for the
-    /// same reason: the engine holds one handle onto the accounts database,
-    /// and this is the narrow door for the one thing a connect decides.
+    /// Record a domain connected to GitHub through the GitHub App private,
+    /// as the connect chose it ([`AuthStore::set_governed_private`], naming
+    /// `set_by`). A write the connecting verb makes, beside
+    /// [`DomainAccess::forget_domain`] for the same reason: the engine holds
+    /// one handle onto the accounts database, and this is the narrow door
+    /// for the one thing a connect decides.
     #[doc(hidden)]
-    pub async fn set_governed_readers(
+    pub async fn set_governed_private(
         &self,
         domain: &str,
-        private: bool,
         set_by: &str,
     ) -> Result<crate::auth_store::VisibilityWrite> {
-        if private {
-            self.auth.set_governed_private(domain, set_by).await
-        } else {
-            self.auth
-                .set_domain_visibility(domain, false, OWNER_IDENTITY_NAME)
-                .await
-        }
+        self.auth.set_governed_private(domain, set_by).await
+    }
+
+    /// Take back the acl row [`DomainAccess::set_governed_private`] wrote
+    /// for a connect whose registration then failed: that row only, never a
+    /// membership. Answers whether there was a row.
+    #[doc(hidden)]
+    pub async fn take_back_governed_private(&self, domain: &str) -> Result<bool> {
+        self.auth.take_back_governed_private(domain).await
+    }
+
+    /// Whether `domain` carries an acl row, registered or not: a private
+    /// domain, or the record an earlier registration of the name left.
+    #[doc(hidden)]
+    pub async fn has_private_record(&self, domain: &str) -> Result<bool> {
+        Ok(self.auth.domain_visibility(domain).await?.is_some())
     }
 
     /// Carry the visibility, membership and share-link records of domain
