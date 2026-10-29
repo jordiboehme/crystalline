@@ -1899,6 +1899,19 @@ impl Engine {
             // above (or, for a dry run, is previewed as it stands).
             let mut elsewhere: Vec<String> = Vec::new();
             if domain.is_none() {
+                // An unattended request sweeps only the domains its run works
+                // on (`crate::read_limit`); a named domain meets the same rule
+                // in `refuse_read_only_domain` above.
+                if let Some(limit) = crate::read_limit::current()
+                    && let Some(writes) = &limit.writes
+                {
+                    if writes.is_empty() {
+                        return Err(EngineError::Refused(
+                            "this run works on no domain and cannot write to any".into(),
+                        ));
+                    }
+                    found.retain(|d| writes.contains(&d.domain));
+                }
                 let mut here: HashMap<String, bool> = HashMap::new();
                 let mut kept = Vec::with_capacity(found.len());
                 for d in found {

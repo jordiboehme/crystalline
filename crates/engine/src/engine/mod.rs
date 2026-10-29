@@ -3730,7 +3730,10 @@ impl Engine {
         scope: &crate::scope::Scope,
     ) -> Result<(HashSet<String>, HashSet<String>)> {
         let Some(access) = self.domain_access.get() else {
-            return Ok((HashSet::new(), HashSet::new()));
+            return Ok((
+                HashSet::new(),
+                crate::read_limit::hidden().unwrap_or_default(),
+            ));
         };
         let visibility = access
             .visibility(scope)
@@ -3746,6 +3749,9 @@ impl Engine {
                     .filter(|name| !visibility.private.contains(name)),
             );
         }
+        // An unattended request reads less than its rights allow, the same
+        // rule [`Engine::hidden_domains`] applies.
+        hidden.extend(crate::read_limit::hidden().unwrap_or_default());
         Ok((visibility.private, hidden))
     }
 

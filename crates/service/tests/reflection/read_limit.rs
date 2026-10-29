@@ -572,3 +572,119 @@ async fn an_interactive_session_limited_by_a_run_says_so() {
     let answer = tool(&mut run, 71, "list_domains", json!({})).await;
     assert!(!answer.to_string().contains("is going"), "{answer}");
 }
+
+/// A run on harbor that retags with no domain named rewrites only harbor's
+/// tags; with nothing it may write, the sweep is refused.
+#[tokio::test]
+async fn a_run_retags_only_the_domain_it_works_on() {
+    use crystalline_service::read_limit::{Limit, within};
+    let (fx, _auth) = private_harbor().await;
+    let on_harbor = Limit {
+        hidden: Default::default(),
+        writes: Some(vec!["harbor".to_string()]),
+    };
+    within(
+        Some(on_harbor),
+        fx.engine.retag("eng", "renamed", None, false, false, false),
+    )
+    .await
+    .unwrap();
+    let eng = std::fs::read_to_string(fx.root.join("runbooks/deploy.md")).unwrap();
+    assert!(eng.contains("  - eng"), "{eng}");
+    let harbor =
+        std::fs::read_to_string(crate::fixture::root_of(&fx, "harbor").join("team/harbor-team.md"))
+            .unwrap();
+    assert!(harbor.contains("renamed"), "{harbor}");
+    let nowhere = Limit {
+        hidden: Default::default(),
+        writes: Some(Vec::new()),
+    };
+    let err = within(
+        Some(nowhere),
+        fx.engine.retag("eng", "again", None, false, false, false),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("cannot write"), "{err}");
+}
+
+/// A limited session's domain listing names no domain it may not read, with
+/// or without the routing block.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_limited_session_lists_no_hidden_domain() {
+    let (fx, _auth) = private_harbor().await;
+    fx.engine
+        .automation_lease_take(Loop::Reflect, "eng", "cli", &Scope::Unrestricted)
+        .await
+        .unwrap();
+    let mut wire = session(
+        McpServer::new(fx.engine.clone())
+            .with_unattended(true)
+            .with_run_domain("eng"),
+    )
+    .await;
+    for (id, arguments) in [(80, json!({})), (81, json!({ "include_routing": true }))] {
+        let listed = tool(&mut wire, id, "list_domains", arguments).await;
+        assert!(listed.to_string().contains("eng"), "{listed}");
+        assert!(!listed.to_string().contains("harbor"), "{listed}");
+    }
+}
+
+/// A run cannot change the instance: no domain added or removed, no
+/// instance setting changed. Its own domain's settings stay its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_cannot_change_the_instance() {
+    let (fx, _auth) = private_harbor().await;
+    fx.engine
+        .automation_lease_take(Loop::Reflect, "eng", "cli", &Scope::Unrestricted)
+        .await
+        .unwrap();
+    let mut wire = session(
+        McpServer::new(fx.engine.clone())
+            .with_unattended(true)
+            .with_run_domain("eng"),
+    )
+    .await;
+    let refusal = "a run cannot change this instance";
+    let added = tool(
+        &mut wire,
+        90,
+        "add_domain",
+        json!({
+            "domain": "extra", "folder": fx.tmp.path().join("extra").to_string_lossy(),
+        }),
+    )
+    .await;
+    assert!(refused(&added).contains(refusal), "{added}");
+    let removed = tool(&mut wire, 91, "remove_domain", json!({ "domain": "eng" })).await;
+    assert!(refused(&removed).contains(refusal), "{removed}");
+    let configured = tool(
+        &mut wire,
+        92,
+        "configure",
+        json!({
+            "set": { "github.enabled": true },
+        }),
+    )
+    .await;
+    assert!(refused(&configured).contains(refusal), "{configured}");
+    let own = tool(
+        &mut wire,
+        93,
+        "configure",
+        json!({
+            "domain": "eng", "set": { "sharing": "direct" },
+        }),
+    )
+    .await;
+    assert!(!refused_or_empty(&own).contains(refusal), "{own}");
+}
+
+fn refused_or_empty(answer: &Value) -> String {
+    answer["error"]["message"]
+        .as_str()
+        .or(answer["result"]["content"][0]["text"].as_str())
+        .unwrap_or_default()
+        .to_string()
+}

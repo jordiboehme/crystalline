@@ -2166,6 +2166,11 @@ impl McpServer {
     /// narrower in one direction (a private domain's owner may end it without
     /// being an admin) and wider in none.
     fn refuse_instance_change(&self, scope: &Scope) -> Option<&'static str> {
+        // A run works on its domain and never on the instance it runs on,
+        // whoever it runs as (`crystalline_engine::read_limit`).
+        if run_writes_limited() {
+            return Some(RUN_INSTANCE_REFUSAL);
+        }
         match scope {
             Scope::Unrestricted => None,
             Scope::Anonymous if !self.engine.auth_mcp() => None,
@@ -4056,6 +4061,9 @@ impl McpServer {
             return answer.map(CallToolResponse::from);
         }
         let p = self.localized(p, &ctx).await?;
+        if run_writes_limited() {
+            return refuse(RUN_INSTANCE_REFUSAL).map(CallToolResponse::from);
+        }
         if self.engine.read_only() {
             return Err(to_error(EngineError::ReadOnly));
         }
@@ -5093,6 +5101,15 @@ fn applied_failure(applied: &[String], failed_key: &str, e: EngineError) -> Erro
         )
     };
     ErrorData::new(base.code, message, base.data)
+}
+
+/// What a run is refused with when it tries to change the instance it runs
+/// on: register or remove a domain, or change an instance setting.
+const RUN_INSTANCE_REFUSAL: &str = "a run cannot change this instance: it may not add or remove a domain or change an instance setting; ask a person";
+
+/// Whether the current request is a run limited to the domains it works on.
+fn run_writes_limited() -> bool {
+    crystalline_engine::read_limit::current().is_some_and(|limit| limit.writes.is_some())
 }
 
 /// The header a remote loop run sends with its bearer: the domain it started
