@@ -1520,7 +1520,8 @@ enum DomainCommand {
         #[arg(value_enum)]
         visibility: VisibilityArg,
         /// The account that owns the domain once it is private. Required with
-        /// `private`, and meaningless with `default`.
+        /// `private`, and meaningless with `default`. Not used on a domain a
+        /// GitHub App governs, where GitHub decides access.
         #[arg(long, value_name = "ACCOUNT")]
         owner: Option<String>,
         /// Load the global config from this file instead of the default path.

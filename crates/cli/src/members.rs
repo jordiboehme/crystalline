@@ -61,7 +61,10 @@ fn require_registered(name: &str, config: Option<&Path>) -> Result<String> {
 
 /// Whether a GitHub App decides access to the registered domain `name`: an
 /// App is configured (usable or not) and the domain has a GitHub origin,
-/// the rule the engine's governor follows.
+/// the rule the engine's governor follows. The engine counts the domains
+/// in its start-up config and the ones registered in the config file since
+/// (its discovered domains); this command loads the file fresh, with the
+/// environment overlay on top, so the effective config already holds both.
 fn governed_by_app(name: &str, config: Option<&Path>) -> Result<bool> {
     let loaded = crate::cmd::load(config)?;
     let has_origin = loaded
@@ -360,6 +363,43 @@ pub async fn visibility(
     let domain = require_registered(&domain, config.as_deref())?;
     let store = store().await?;
     match visibility {
+        VisibilityArg::Private if governed_by_app(&domain, config.as_deref())? => {
+            // GitHub decides access here: the record names the reserved
+            // machine owner, as the connect, the env readers and the Members
+            // card record it, and no account becomes an owner.
+            let written = store
+                .set_governed_private(&domain, crystalline_service::engine::OWNER_IDENTITY_NAME)
+                .await?;
+            let changed = matches!(written, VisibilityWrite::Written);
+            let note = owner.map(|owner| {
+                format!(
+                    "--owner {} was not used: GitHub decides access to domain '{domain}'.",
+                    owner.trim().to_lowercase()
+                )
+            });
+            if json {
+                if let Some(note) = &note {
+                    eprintln!("Note: {note}");
+                }
+                crate::print_value(
+                    &serde_json::json!({
+                        "domain": domain,
+                        "visibility": "private",
+                        "owner": serde_json::Value::Null,
+                        "changed": changed,
+                    }),
+                    true,
+                );
+            } else {
+                if let Some(note) = &note {
+                    println!("Note: {note}");
+                }
+                println!(
+                    "Domain '{domain}' is private: only the people with access on GitHub \
+                     read it."
+                );
+            }
+        }
         VisibilityArg::Private => {
             // The store needs a live account to name as the owner, and there
             // is no calling account here to fall back on: the CLI is the

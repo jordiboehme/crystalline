@@ -642,20 +642,9 @@ fn cli_shared_on_a_governed_domain_keeps_its_membership_rows() {
         ),
     )
     .unwrap();
-    let mut cmd = bin();
-    isolate(&mut cmd, fx.home.path());
-    cmd.env(
-        "CRYSTALLINE_TEST_TOKEN_STORE_DIR",
-        fx.home.path().join("tokens"),
-    )
-    .env("CRYSTALLINE_GITHUB_APP_ID", "7")
-    .env("CRYSTALLINE_GITHUB_APP_CLIENT_ID", "Iv23.test")
-    .env(
-        "CRYSTALLINE_GITHUB_APP_PRIVATE_KEY",
-        include_str!("../../../remote/tests/fixtures/app-key-pkcs1.pem"),
-    )
-    .args(["domain", "visibility", "eng", "default", "--config"])
-    .arg(&fx.config);
+    let mut cmd = with_app(&fx);
+    cmd.args(["domain", "visibility", "eng", "default", "--config"])
+        .arg(&fx.config);
     let out = cmd.output().unwrap();
     assert!(
         out.status.success(),
@@ -668,4 +657,107 @@ fn cli_shared_on_a_governed_domain_keeps_its_membership_rows() {
     fx.domain(&["visibility", "eng", "private", "--owner", "ada"]);
     let listed = fx.domain(&["members", "eng", "list"]);
     assert!(listed.contains("bob"), "{listed}");
+}
+
+/// A `crystalline` child in the fixture's home with a GitHub App taken from
+/// the environment, so every domain with an origin is governed.
+fn with_app(fx: &Fixture) -> Command {
+    let mut cmd = bin();
+    isolate(&mut cmd, fx.home.path());
+    cmd.env(
+        "CRYSTALLINE_TEST_TOKEN_STORE_DIR",
+        fx.home.path().join("tokens"),
+    )
+    .env("CRYSTALLINE_GITHUB_APP_ID", "7")
+    .env("CRYSTALLINE_GITHUB_APP_CLIENT_ID", "Iv23.test")
+    .env(
+        "CRYSTALLINE_GITHUB_APP_PRIVATE_KEY",
+        include_str!("../../../remote/tests/fixtures/app-key-pkcs1.pem"),
+    );
+    cmd
+}
+
+/// On a governed domain, `private` records the reserved machine owner, never
+/// an account: GitHub decides access. An `--owner` is not used, and the
+/// command says so.
+#[test]
+fn cli_private_on_a_governed_domain_names_no_account() {
+    let fx = Fixture::new();
+    let domain_dir = fx.home.path().join("kb");
+    std::fs::write(
+        &fx.config,
+        format!(
+            "github:\n  enabled: true\n  api_url: http://127.0.0.1:1\ndomains:\n  eng:\n    path: {}\n    origin:\n      repo: acme/kb\n",
+            domain_dir.display()
+        ),
+    )
+    .unwrap();
+    let out = with_app(&fx)
+        .args([
+            "domain",
+            "visibility",
+            "eng",
+            "private",
+            "--owner",
+            "ada",
+            "--config",
+        ])
+        .arg(&fx.config)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("--owner ada was not used"), "{stdout}");
+    let mut list = with_app(&fx);
+    list.args(["--json", "domain", "members", "eng", "list", "--config"])
+        .arg(&fx.config);
+    let out = list.output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let listed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(listed["owner"], "owner", "{listed}");
+}
+
+/// A domain defined in the environment with an origin is governed too (the
+/// engine counts every domain with an origin it knows, whether the config
+/// file or the environment brought it), and needs no `--owner`.
+#[test]
+fn cli_private_on_an_env_defined_governed_domain_needs_no_owner() {
+    let fx = Fixture::new();
+    let team = fx.home.path().join("team");
+    fx.run(
+        &["domain", "init"],
+        &[team.to_str().unwrap(), "--name", "team"],
+    );
+    let mut cmd = with_app(&fx);
+    cmd.env("CRYSTALLINE_DOMAIN_TEAM", &team)
+        .env("CRYSTALLINE_DOMAIN_TEAM_ORIGIN", "acme/team")
+        .args(["domain", "visibility", "team", "private", "--config"])
+        .arg(&fx.config);
+    let out = cmd.output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut list = with_app(&fx);
+    list.env("CRYSTALLINE_DOMAIN_TEAM", &team)
+        .env("CRYSTALLINE_DOMAIN_TEAM_ORIGIN", "acme/team")
+        .args(["--json", "domain", "members", "team", "list", "--config"])
+        .arg(&fx.config);
+    let out = list.output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let listed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(listed["owner"], "owner", "{listed}");
 }
