@@ -1687,7 +1687,7 @@ impl super::Engine {
     /// asked of the App store and the domain's origin rather than of the
     /// resolver: an App is configured (usable or not) and `domain` has a
     /// GitHub origin, the rule the governor follows. Unlike
-    /// [`Engine::github_governs`] it holds on a daemon that serves no HTTP
+    /// [`Self::github_governs`] it holds on a daemon that serves no HTTP
     /// too, where the stored records still decide the day it does. The
     /// CLI's `domain visibility` and `domain members` ask a running daemon
     /// this, so a daemon that has the App from its own environment decides
