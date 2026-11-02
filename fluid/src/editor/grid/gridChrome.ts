@@ -30,7 +30,7 @@ import {
   tableMoveColumn,
   tableMoveRow,
 } from "../tableVerbs";
-import { noteUndoLanding } from "./cellEditor";
+import { activeCell, noteUndoLanding } from "./cellEditor";
 import { closeUndoGroup } from "./gridKeys";
 import {
   cellElement,
@@ -43,6 +43,7 @@ import {
   closeCell,
   gridWritable,
   openCellField,
+  openCellRange,
   setOpenCell,
 } from "./openCell";
 import type { GridTable } from "./structure";
@@ -139,6 +140,17 @@ const ACTIONS: Action[] = [
 
 const chromes = new WeakMap<HTMLElement, () => void>();
 
+/** Each grid root's menu opener, for the floating bar's "More table actions". */
+const openers = new WeakMap<
+  HTMLElement,
+  (
+    row: number,
+    column: number,
+    anchor: { x: number; y: number },
+    back?: HTMLElement,
+  ) => void
+>();
+
 /** Tears down a grid root's chrome (the widget's `destroy` calls it). */
 export function disposeChrome(root: HTMLElement): void {
   chromes.get(root)?.();
@@ -168,6 +180,74 @@ function rootAt(main: EditorView, from: number): HTMLElement | null {
     if (tableOf(main, root)?.from === from) return root;
   }
   return null;
+}
+
+/**
+ * Runs `run` on the cell at `row`/`column` between two closed undo groups,
+ * then opens the cell `land` names. `restoreFocus` is where the focus goes
+ * when no cell opens.
+ */
+function performAt(
+  main: EditorView,
+  root: HTMLElement,
+  row: number,
+  column: number,
+  run: (at: number) => boolean,
+  land: [number, number] | null,
+  restoreFocus: HTMLElement | null,
+  reshapes = true,
+): void {
+  const table = tableOf(main, root);
+  const cell = table?.rows[row]?.[column];
+  if (!table || !cell || !gridWritable(main.state)) return;
+  const open = main.state.field(openCellField, false);
+  const before = main.state.doc;
+  // A change of shape can take the open cell's pipes with it, and a cell
+  // that goes that way hands the focus to the main view. Close it first,
+  // here, with the focus nowhere; the landing (or an undo) opens one again.
+  if (open && reshapes) closeCell(main, "user", "none");
+  closeUndoGroup(main, "before");
+  if (!run(cell.content.from)) return;
+  closeUndoGroup(main, "after");
+  const after = main.state.doc;
+  if (open) {
+    const left = { anchor: open.anchor, head: open.head, focused: true };
+    noteUndoLanding(main, {
+      before,
+      after,
+      restore: () => {
+        main.dispatch({ effects: setOpenCell.of(left) });
+        hostOpenCell(main, "now");
+      },
+    });
+  }
+  const grown = gridTableAt(main.state, table.from);
+  const target = land ? grown?.rows[land[0]]?.[land[1]] : undefined;
+  if (target) {
+    main.dispatch({
+      effects: setOpenCell.of({
+        anchor: target.content.to,
+        head: target.content.to,
+        focused: true,
+      }),
+    });
+    hostOpenCell(main, "now");
+    return;
+  }
+  // No new cell: focus goes back where it was, or to the nearest cell.
+  if (restoreFocus?.isConnected) {
+    restoreFocus.focus();
+    return;
+  }
+  const newRoot = grown ? rootAt(main, grown.from) : null;
+  if (!grown || !newRoot) return;
+  const r = Math.min(row, grown.rows.length - 1);
+  const c = Math.min(column, (grown.rows[r]?.length ?? 1) - 1);
+  const el = cellElement(newRoot, r, c);
+  if (el) {
+    rove(el);
+    el.focus();
+  }
 }
 
 /** Draws the hover buttons and the cell menu for one grid root. */
@@ -241,11 +321,6 @@ export function mountChrome(root: HTMLElement, main: EditorView): void {
     closeMenu(false);
   }
 
-  /**
-   * Runs `run` on the cell at `row`/`column` between two closed undo groups,
-   * then opens the cell `land` names. `restoreFocus` is where the focus goes
-   * when no cell opens.
-   */
   const perform = (
     row: number,
     column: number,
@@ -254,69 +329,21 @@ export function mountChrome(root: HTMLElement, main: EditorView): void {
     restoreFocus: HTMLElement | null,
     reshapes = true,
   ): void => {
-    const table = tableOf(main, root);
-    const cell = table?.rows[row]?.[column];
-    if (!table || !cell || !gridWritable(main.state)) return;
-    const open = main.state.field(openCellField, false);
-    const before = main.state.doc;
-    // A change of shape can take the open cell's pipes with it, and a cell
-    // that goes that way hands the focus to the main view. Close it first,
-    // here, with the focus nowhere; the landing (or an undo) opens one again.
-    if (open && reshapes) closeCell(main, "user", "none");
-    closeUndoGroup(main, "before");
-    if (!run(cell.content.from)) return;
-    closeUndoGroup(main, "after");
-    const after = main.state.doc;
-    if (open) {
-      const left = { anchor: open.anchor, head: open.head, focused: true };
-      noteUndoLanding(main, {
-        before,
-        after,
-        restore: () => {
-          main.dispatch({ effects: setOpenCell.of(left) });
-          hostOpenCell(main, "now");
-        },
-      });
-    }
-    const grown = gridTableAt(main.state, table.from);
-    const target = land ? grown?.rows[land[0]]?.[land[1]] : undefined;
-    if (target) {
-      main.dispatch({
-        effects: setOpenCell.of({
-          anchor: target.content.to,
-          head: target.content.to,
-          focused: true,
-        }),
-      });
-      hostOpenCell(main, "now");
-      return;
-    }
-    // No new cell: focus goes back where it was, or to the nearest cell.
-    if (restoreFocus?.isConnected) {
-      restoreFocus.focus();
-      return;
-    }
-    const newRoot = grown ? rootAt(main, grown.from) : null;
-    if (!grown || !newRoot) return;
-    const r = Math.min(row, grown.rows.length - 1);
-    const c = Math.min(column, (grown.rows[r]?.length ?? 1) - 1);
-    const el = cellElement(newRoot, r, c);
-    if (el) {
-      rove(el);
-      el.focus();
-    }
+    performAt(main, root, row, column, run, land, restoreFocus, reshapes);
   };
 
   const openMenu = (
     row: number,
     column: number,
     anchor: { x: number; y: number },
+    back?: HTMLElement,
   ): void => {
     if (!gridWritable(main.state)) return;
     const table = tableOf(main, root);
     if (!table?.rows[row]?.[column]) return;
     const active = document.activeElement;
-    if (!menu) {
+    if (back) returnTo = back;
+    else if (!menu) {
       returnTo =
         active instanceof HTMLElement &&
         active !== document.body &&
@@ -547,7 +574,81 @@ export function mountChrome(root: HTMLElement, main: EditorView): void {
     );
   });
 
+  openers.set(root, openMenu);
   chromes.set(root, () => {
+    openers.delete(root);
     closeMenu(false);
   });
+}
+
+/** Where `main`'s open cell is drawn: its grid root, row and column. */
+function openPlace(
+  main: EditorView,
+): { root: HTMLElement; table: GridTable; row: number; column: number } | null {
+  const cell = openCellRange(main.state);
+  if (!cell) return null;
+  const table = gridTableAt(main.state, cell.span.from);
+  const root = table ? rootAt(main, table.from) : null;
+  if (!table || !root) return null;
+  return { root, table, row: cell.row, column: cell.column };
+}
+
+/** The Cell actions entry called `label`. */
+function actionNamed(label: string): Action | null {
+  return ACTIONS.find((action) => action.label === label) ?? null;
+}
+
+/**
+ * Whether the Cell actions entry called `label` can apply to `main`'s open
+ * cell (Delete row is off on the header, and so on).
+ */
+export function cellActionApplies(main: EditorView, label: string): boolean {
+  const place = openPlace(main);
+  const action = actionNamed(label);
+  if (!place || !action || !gridWritable(main.state)) return false;
+  return action.applies(place.table, place.row, place.column);
+}
+
+/**
+ * Runs the Cell actions entry called `label` on `main`'s open cell, exactly
+ * as the menu runs it (R14 undo groups, R15 no focus to main, the landing
+ * cell opened). When no cell opens afterwards the focus goes back to the
+ * open cell's editor if it is still there.
+ */
+export function runCellAction(main: EditorView, label: string): boolean {
+  const place = openPlace(main);
+  const action = actionNamed(label);
+  if (!place || !action || !cellActionApplies(main, label)) return false;
+  const { root, row, column } = place;
+  performAt(
+    main,
+    root,
+    row,
+    column,
+    (at) => action.run(main, at, row, column),
+    action.land(row, column),
+    activeCell(main)?.view.contentDOM ?? null,
+    action.align === undefined,
+  );
+  return true;
+}
+
+/**
+ * Opens the Cell actions menu for `main`'s open cell at `anchor` (viewport
+ * coordinates); closing it hands the focus back to the cell's editor.
+ */
+export function openCellActions(
+  main: EditorView,
+  anchor: { x: number; y: number },
+): boolean {
+  const place = openPlace(main);
+  const open = place ? openers.get(place.root) : undefined;
+  if (!place || !open) return false;
+  open(
+    place.row,
+    place.column,
+    anchor,
+    activeCell(main)?.view.contentDOM ?? undefined,
+  );
+  return true;
 }

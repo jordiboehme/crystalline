@@ -34,6 +34,7 @@ import {
 } from "@codemirror/view";
 
 import type { WikilinkResolver } from "../../wikilinks";
+import { floatingCell } from "../floatingContext";
 import { parseAdvanced } from "../parseProgress";
 import { wikilinkResolverFacet } from "../wikilinkChips";
 import type { CellEditor } from "./cellEditor";
@@ -236,7 +237,11 @@ function host(
   el.replaceChildren();
   drawnOf.delete(el);
   el.classList.add(HOSTING);
-  const editor = mountCellEditor(main, el, [cellPaste, cellKeymap]);
+  const editor = mountCellEditor(main, el, [
+    cellPaste,
+    cellKeymap,
+    floatingCell(main),
+  ]);
   hostOf.set(main, el);
   rove(el);
   // The mount tore down whatever hosted before, in this table or another

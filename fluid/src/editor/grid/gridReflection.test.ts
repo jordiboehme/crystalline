@@ -61,6 +61,7 @@ function reflection(): EditorView {
             onTableContext: () => {},
             onImageContext: () => {},
             onElementContext: () => {},
+            onFloatingContext: () => {},
           }),
         ],
       }),

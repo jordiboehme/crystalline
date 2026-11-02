@@ -64,6 +64,8 @@ import CmEditor from "../editor/CmEditor";
 import { ConfirmLeaveDialog } from "../editor/ConfirmLeaveDialog";
 import { ConflictDialog } from "../editor/ConflictDialog";
 import { EditorToolbar } from "../editor/EditorToolbar";
+import { FloatingBarSlot } from "../editor/FloatingBarSlot";
+import type { FloatingContext } from "../editor/floatingContext";
 import { imagePreviews } from "../editor/imagePreviews";
 import { FindingsPanel, jumpToLine } from "../editor/FindingsPanel";
 import { FrontmatterForm } from "../editor/FrontmatterForm";
@@ -226,6 +228,8 @@ interface EngramSurfaceOptions {
   onImageContext: (onImage: boolean) => void;
   /** Told what callout or label the caret is in; see `SurfaceOptions`. */
   onElementContext: (face: ElementFace) => void;
+  /** Told what the floating bar stands by; see `SurfaceOptions`. */
+  onFloatingContext: (context: FloatingContext) => void;
 }
 
 /**
@@ -283,6 +287,7 @@ function engramSurface(options: EngramSurfaceOptions): Extension[] {
       onTableContext: options.onTableContext,
       onImageContext: options.onImageContext,
       onElementContext: options.onElementContext,
+      onFloatingContext: options.onFloatingContext,
     }),
   ];
 }
@@ -475,6 +480,8 @@ function Surface({
   const [imageActive, setImageActive] = useState(false);
   /** The callout or status label the caret is in, for their segments. */
   const [element, setElement] = useState<ElementFace>(null);
+  /** What the floating action bar stands by: a selection, a cell, nothing. */
+  const [floating, setFloating] = useState<FloatingContext>(null);
   /**
    * WHICH conflict this tab has the resolution view open on, rather than a
    * bare open flag. The conflict itself is the server's - it stands until
@@ -605,6 +612,7 @@ function Surface({
       onTableContext: setTableContext,
       onImageContext: setImageActive,
       onElementContext: setElement,
+      onFloatingContext: setFloating,
     });
 
   /**
@@ -893,6 +901,7 @@ function Surface({
         onTableContext: setTableContext,
         onImageContext: setImageActive,
         onElementContext: setElement,
+        onFloatingContext: setFloating,
       }),
     // Read once: `CmEditor` snapshots the extensions at mount, so a later
     // theme change reaches the buffer through a remount rather than through
@@ -1319,7 +1328,7 @@ function Surface({
             }}
           />
         </div>
-        <div className="edit-column order-3 min-w-0 lg:col-start-1 lg:row-start-2">
+        <div className="edit-column relative order-3 min-w-0 lg:col-start-1 lg:row-start-2">
           {/*
               The format bar is a sticky row on the column, above the text it
               edits, and takes the live view rather than the session: what it
@@ -1378,6 +1387,16 @@ function Surface({
               setView(ready);
             }}
             onDocChanged={session.setBuffer}
+          />
+          {/*
+            The floating action bar, placed inside this column. Raw is the
+            source view: no grid to stand by, and no bar on a selection there
+            either.
+          */}
+          <FloatingBarSlot
+            main={view}
+            context={raw ? null : floating}
+            wikilinks={adapter.wikilinks}
           />
         </div>
         <EditorDetails hasHardErrors={session.hardErrors > 0}>

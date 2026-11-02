@@ -18,6 +18,8 @@ import { elementContextListener } from "./elementContext";
 import { elementPreviews } from "./elementPreviews";
 import { fenceMono } from "./fenceMono";
 import { fencePreviews } from "./fencePreviews";
+import type { FloatingContext } from "./floatingContext";
+import { floatingContextListener } from "./floatingContext";
 import { cellPreviewLayers } from "./grid/draws";
 import { tableGrid } from "./grid/loader";
 import { imageContextListener } from "./imageVerbs";
@@ -83,6 +85,12 @@ export interface SurfaceOptions {
    * segment for it. It travels with the listeners above for their reason.
    */
   onElementContext: (face: ElementFace) => void;
+  /**
+   * Told what the floating action bar stands by: a text selection, the open
+   * table cell, or nothing. It travels with the listeners above for their
+   * reason.
+   */
+  onFloatingContext: (context: FloatingContext) => void;
 }
 
 /**
@@ -156,6 +164,10 @@ export function surfaceExtensions(options: SurfaceOptions): Extension[] {
     // And for the callout and status segments: a callout's kind is text in
     // Raw mode too.
     elementContextListener(options.onElementContext),
+    // And for the floating action bar. Outside the preview compartment: a
+    // selection is a selection in Raw mode too, and the screen decides
+    // there whether the bar draws.
+    floatingContextListener(options.onFloatingContext),
     // A pasted screenshot and a dropped deck are attachments in Raw mode too,
     // so these sit outside the compartment beside it.
     options.uploads,

@@ -74,6 +74,8 @@ import {
   writeDraft,
 } from "../editor/drafts";
 import { EditorToolbar } from "../editor/EditorToolbar";
+import { FloatingBarSlot } from "../editor/FloatingBarSlot";
+import type { FloatingContext } from "../editor/floatingContext";
 import { KeptTextNotice } from "../editor/KeptTextNotice";
 import { imagePreviews } from "../editor/imagePreviews";
 import { readScalar } from "../editor/frontmatterFields";
@@ -614,6 +616,8 @@ function Surface({
   const [imageActive, setImageActive] = useState(false);
   /** The callout or status label the caret is in, for their segments. */
   const [element, setElement] = useState<ElementFace>(null);
+  /** What the floating action bar stands by: a selection, a cell, nothing. */
+  const [floating, setFloating] = useState<FloatingContext>(null);
   const extensions = useMemo(() => {
     const undoManager = new Y.UndoManager(ytext);
     return [
@@ -639,6 +643,7 @@ function Surface({
         onTableContext: setTableContext,
         onImageContext: setImageActive,
         onElementContext: setElement,
+        onFloatingContext: setFloating,
       }),
     ];
   }, [
@@ -1043,7 +1048,7 @@ function Surface({
           </button>
         </aside>
       )}
-      <div>
+      <div className="relative">
         {/*
           The engram editor's format bar, in the same sticky row. Its block
           verbs know the hidden section ids through the adapter: a block
@@ -1081,6 +1086,12 @@ function Surface({
               ready.focus();
             }
           }}
+        />
+        {/* The floating action bar; none once the room has ended (R17). */}
+        <FloatingBarSlot
+          main={view}
+          context={ended ? null : floating}
+          wikilinks={adapter.wikilinks}
         />
       </div>
       {collab.conflict !== null && resolving && (
