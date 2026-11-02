@@ -53,7 +53,7 @@ mod members;
 mod oauth;
 mod oauth_grants;
 mod oidc;
-mod pending;
+use crystalline_engine::pending;
 mod reflections;
 mod users_api;
 

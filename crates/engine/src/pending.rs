@@ -1,13 +1,15 @@
 //! Browser round trips in flight: a record per state this process generated,
 //! held until the browser comes back with it or it expires.
 //!
-//! Two flows use it. The single sign-on relying party ([`super::oidc`]) keeps
-//! a sign-in's nonce, PKCE verifier and redirect uri here, and the GitHub App
-//! link ([`super::github_link`]) keeps the account and the session that
-//! started a link. Both need the same properties, which is why they share one
-//! store: a record is taken rather than read, so a state authorizes exactly
-//! one code exchange; it lives [`PENDING_TTL`]; and the map is bounded in a
-//! way a flood cannot turn into evicting a real person mid-consent.
+//! Three flows use it. The single sign-on relying party (the REST crate's
+//! `oidc` module) keeps a sign-in's nonce, PKCE verifier and redirect uri
+//! here, the GitHub App link (its `github_link` module) keeps the account and
+//! the session that started a link, and the engine keeps the single-use links
+//! an agent session hands its person ([`crate::engine::Engine::mint_github_link`]).
+//! All need the same properties, which is why they share one store: a record
+//! is taken rather than read, so a state authorizes exactly one use; it lives
+//! [`PENDING_TTL`]; and the map is bounded in a way a flood cannot turn into
+//! evicting a real person mid-consent.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -15,7 +17,7 @@ use std::time::{Duration, Instant};
 /// How long a started sign-in may take to come back. Long enough for a person
 /// to read a consent screen and type a second factor, short enough that an
 /// abandoned attempt is forgotten while its tab is still open.
-pub(crate) const PENDING_TTL: Duration = Duration::from_secs(10 * 60);
+pub const PENDING_TTL: Duration = Duration::from_secs(10 * 60);
 
 /// How many sign-ins may be in flight at once.
 ///
@@ -25,7 +27,7 @@ pub(crate) const PENDING_TTL: Duration = Duration::from_secs(10 * 60);
 /// so a full map is single-digit megabytes; the number is generous next to
 /// any real instance's concurrent logins and small next to what a flood would
 /// want.
-pub(crate) const MAX_PENDING: usize = 10_000;
+pub const MAX_PENDING: usize = 10_000;
 
 /// How old a record must be before a full map may drop it to make room.
 ///
@@ -34,23 +36,23 @@ pub(crate) const MAX_PENDING: usize = 10_000;
 /// pressed the button a few seconds ago - would go. With it, a full map of
 /// records younger than this refuses the newcomer instead, which costs a
 /// flood its own next request and costs the person mid-consent nothing.
-pub(crate) const MIN_EVICT_AGE: Duration = Duration::from_secs(30);
+pub const MIN_EVICT_AGE: Duration = Duration::from_secs(30);
 
 /// How much slack the chronological order may carry over the records it
 /// indexes before a whole-order sweep is worth its cost. Small enough that the
 /// order cannot grow by much on a quiet instance, large enough that a store
 /// holding a handful of sign-ins never sweeps at all. See
-/// [`PendingStore::compact_if_slack`].
-pub(crate) const COMPACT_SLACK: usize = 16;
+/// `PendingStore::compact_if_slack`.
+pub const COMPACT_SLACK: usize = 16;
 
 /// A record the store can age: when the flow it belongs to started.
-pub(crate) trait PendingRecord {
+pub trait PendingRecord {
     /// When the record was made, for the TTL and for the eviction order.
     fn started(&self) -> Instant;
 }
 
 /// The round trips in flight, keyed by state.
-pub(crate) struct PendingStore<T> {
+pub struct PendingStore<T> {
     records: HashMap<String, T>,
     /// Every state inserted, oldest first. Records are only ever inserted
     /// with a fresh `started`, so this is chronological, and expiry and
@@ -70,14 +72,14 @@ impl<T> Default for PendingStore<T> {
 
 /// The map is full of sign-ins too young to evict. See [`MIN_EVICT_AGE`].
 #[derive(Debug)]
-pub(crate) struct PendingFull;
+pub struct PendingFull;
 
 /// Why a state had no record to take: it names none, or it named one that
 /// outlived [`PENDING_TTL`]. Both answer the same sentence; they warn
 /// differently, because an operator reading "expired" checks the provider's
 /// consent screen and one reading "unknown" checks for a replay.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum StateMiss {
+pub enum StateMiss {
     Unknown,
     Expired,
 }
@@ -96,7 +98,7 @@ impl<T: PendingRecord> PendingStore<T> {
     }
 
     /// [`PendingStore::insert_at`] on the system clock.
-    pub(crate) fn insert(&mut self, state: String, pending: T) -> Result<(), PendingFull> {
+    pub fn insert(&mut self, state: String, pending: T) -> Result<(), PendingFull> {
         self.insert_at(state, pending, Instant::now())
     }
 
@@ -109,7 +111,7 @@ impl<T: PendingRecord> PendingStore<T> {
     /// `now` and the record's `started` come from the same clock, which is
     /// the system clock for a sign-in and the engine's link clock for a
     /// GitHub link (a test steps that one past the TTL).
-    pub(crate) fn insert_at(
+    pub fn insert_at(
         &mut self,
         state: String,
         pending: T,
@@ -134,7 +136,7 @@ impl<T: PendingRecord> PendingStore<T> {
     }
 
     /// [`PendingStore::take_at`] on the system clock.
-    pub(crate) fn take(&mut self, state: &str) -> Result<T, StateMiss> {
+    pub fn take(&mut self, state: &str) -> Result<T, StateMiss> {
         self.take_at(state, Instant::now())
     }
 
@@ -146,7 +148,7 @@ impl<T: PendingRecord> PendingStore<T> {
     /// removed before the exchange runs and a replay finds nothing. Expired
     /// records are purged here too, so an idle instance does not hold them
     /// until the next login happens to insert.
-    pub(crate) fn take_at(&mut self, state: &str, now: Instant) -> Result<T, StateMiss> {
+    pub fn take_at(&mut self, state: &str, now: Instant) -> Result<T, StateMiss> {
         // Looked up before the purge, so an expired record is reported as
         // expired rather than as never having existed.
         let taken = self.records.remove(state);
