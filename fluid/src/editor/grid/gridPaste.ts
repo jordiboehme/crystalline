@@ -21,12 +21,14 @@ import { EditorView } from "@codemirror/view";
 import { transferFiles } from "../attachments";
 import type { SpanChange } from "../tableModel";
 import { addColumnAfter, addRowBelow, parseTable } from "../tableModel";
+import { noteUndoLanding } from "./cellEditor";
 import { closeUndoGroup } from "./gridKeys";
 import { hostOpenCell } from "./gridWidget";
 import {
   cellMain,
   gridWritable,
   isDestroyed,
+  mountedCell,
   openCellField,
   openCellRange,
   setOpenCell,
@@ -119,6 +121,31 @@ function fill(main: EditorView, rows: string[][]): boolean {
     apply(absolute(from, changes));
   }
 
+  // A ragged row shorter than the paste reaches grows in the same change set,
+  // in its own spelling, so no pasted value is dropped.
+  const extend: ChangeSpec[] = [];
+  const shaped = model();
+  rows.forEach((values, r) => {
+    const index = cell.row + r === 0 ? 0 : cell.row + r + 1;
+    const line = shaped.lines[index];
+    const last = line?.cells.at(-1);
+    if (!line || !last) return;
+    const missing = cell.column + values.length - line.cells.length;
+    if (missing <= 0) return;
+    if (line.trailingPipe) {
+      extend.push({
+        from: from + line.start + last.to + 1,
+        insert: "  |".repeat(missing),
+      });
+    } else {
+      extend.push({
+        from: from + line.start + last.to,
+        insert: ` |${"  |".repeat(missing)}`,
+      });
+    }
+  });
+  if (extend.length > 0) apply(extend);
+
   const grown = tableIn(doc, from, to);
   const fills: ChangeSpec[] = [];
   rows.forEach((values, r) => {
@@ -141,6 +168,7 @@ function fill(main: EditorView, rows: string[][]): boolean {
   const reshaped =
     final.model.columns !== table.model.columns ||
     final.rows.length !== table.rows.length;
+  const before = state.doc;
   closeUndoGroup(main, "before");
   main.dispatch({
     changes: total,
@@ -152,7 +180,18 @@ function fill(main: EditorView, rows: string[][]): boolean {
     userEvent: "input.paste",
   });
   closeUndoGroup(main, "after");
-  if (reshaped) hostOpenCell(main, "now");
+  if (reshaped) {
+    const left = { anchor: open.anchor, head: open.head, focused: true };
+    noteUndoLanding(main, {
+      before,
+      after: main.state.doc,
+      restore: () => {
+        main.dispatch({ effects: setOpenCell.of(left) });
+        hostOpenCell(main, "now");
+      },
+    });
+    hostOpenCell(main, "now");
+  }
   return true;
 }
 
@@ -183,6 +222,12 @@ export const cellPaste: Extension = Prec.highest(
         if (html.trim() === "") return true;
         loadConverter().then(
           (converter) => {
+            if (
+              isDestroyed(main) ||
+              !gridWritable(main.state) ||
+              mountedCell(main)?.view !== view
+            )
+              return;
             typed(view, converter.htmlToMarkdown(html));
           },
           () => undefined,
@@ -194,7 +239,7 @@ export const cellPaste: Extension = Prec.highest(
         typed(view, rows?.[0]?.[0] ?? plain);
         return true;
       }
-      fill(main, rows);
+      if (!fill(main, rows)) typed(view, plain);
       return true;
     },
   }),

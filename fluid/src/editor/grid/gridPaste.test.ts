@@ -208,3 +208,48 @@ describe("paste of a block", () => {
     expect(bytes(main.state)).toBe(DOC);
   });
 });
+
+describe("ragged rows, CRLF and the undo landing", () => {
+  test("a short row with outer pipes grows to hold the paste", () => {
+    const main = soloMain("| a | b |\n| - | - |\n| 1 |\n", layers());
+    const view = open(main, 1, 0);
+    paste(view, { plain: "x\ty" });
+    const table = gridTables(main.state)[0];
+    expect(table?.rows[1]?.map((c) => c.text)).toEqual(["x", "y"]);
+    expect(bytes(main.state)).toBe("| a | b |\n| - | - |\n| x | y |\n");
+  });
+
+  test("a row without a closing pipe keeps its spelling and every value", () => {
+    const doc = "| a | b | c |\n| - | - | - |\n| 1 | 2\n";
+    const main = soloMain(doc, layers());
+    const view = open(main, 1, 0);
+    paste(view, { plain: "x\ty\tz" });
+    const table = gridTables(main.state)[0];
+    expect(table?.rows[1]?.map((c) => c.text)).toEqual(["x", "y", "z"]);
+    expect(bytes(main.state)).not.toContain("||");
+    undo(main, activeCell(main)?.view ?? view);
+    expect(bytes(main.state)).toBe(doc);
+  });
+
+  test("a CRLF document: exact bytes and one undo", () => {
+    const doc = "| a | b |\r\n| - | - |\r\n| 1 | 2 |\r\n";
+    const main = soloMain(doc, layers());
+    const view = open(main, 1, 0);
+    paste(view, { plain: "x\ty\nz\tw" });
+    expect(bytes(main.state)).toBe(
+      "| a | b |\r\n| - | - |\r\n| x | y |\r\n| z | w |\r\n",
+    );
+    undo(main, activeCell(main)?.view ?? view);
+    expect(bytes(main.state)).toBe(doc);
+  });
+
+  test("undo of a reshaping paste reopens the start cell", () => {
+    const main = soloMain(DOC, layers());
+    const view = open(main, 1, 1);
+    paste(view, { plain: "x\ty\nz\tw" });
+    undo(main, activeCell(main)?.view ?? view);
+    expect(bytes(main.state)).toBe(DOC);
+    expect(where(main)).toEqual([1, 1]);
+    expect(activeCell(main)).not.toBeNull();
+  });
+});
