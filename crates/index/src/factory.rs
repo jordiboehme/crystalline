@@ -38,11 +38,29 @@ pub async fn open_store(
     db_override: Option<&Path>,
     resilient: bool,
 ) -> Result<Arc<Mutex<dyn Store>>> {
+    open_store_in(cfg, db_override, resilient, config::write_fence::fence()).await
+}
+
+/// [`open_store`] under `fence`, the process's own one in production.
+async fn open_store_in(
+    cfg: &DatabaseConfig,
+    db_override: Option<&Path>,
+    resilient: bool,
+    fence: Option<&config::WriteFence>,
+) -> Result<Arc<Mutex<dyn Store>>> {
     cfg.validate()
         .map_err(|e| IndexError::Invalid(e.to_string()))?;
     match cfg.backend {
         DatabaseBackend::Turso => {
             let path = turso_path(cfg, db_override)?;
+            // Before the folder is created: inside an app package a new
+            // folder or file under AppData lands in the package's copy.
+            if let Some(fence) = fence {
+                fence.check(&path).map_err(|e| IndexError::Io {
+                    path: path.display().to_string(),
+                    source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, e),
+                })?;
+            }
             if let Some(parent) = path.parent()
                 && !parent.as_os_str().is_empty()
             {
@@ -152,6 +170,29 @@ mod tests {
         let info = store.lock().await.store_info().await.unwrap();
         assert!(named.is_some());
         assert_eq!(named, info.db_path);
+    }
+
+    /// A packaged process (the write fence is up) opens no index under a
+    /// fenced root: a new database file there would land in the package's
+    /// private copy. The folder is not created either. An index outside
+    /// the fence still opens.
+    #[tokio::test]
+    async fn a_fenced_open_refuses_an_index_under_appdata() {
+        let home = tempfile::tempdir().unwrap();
+        let roaming = home.path().join("roaming");
+        let fence = config::WriteFence::new("inside a package", vec![roaming.clone()], vec![]);
+        let cfg = DatabaseConfig::default();
+        let db = roaming.join("crystalline").join("index.db");
+        let err = match open_store_in(&cfg, Some(&db), false, Some(&fence)).await {
+            Ok(_) => panic!("the fenced open went ahead"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("inside a package"), "{err}");
+        assert!(!roaming.exists(), "nothing was created under the fence");
+        let outside = home.path().join("data").join("index.db");
+        open_store_in(&cfg, Some(&outside), false, Some(&fence))
+            .await
+            .unwrap();
     }
 
     /// A Postgres location is the url's host, port and database, with the

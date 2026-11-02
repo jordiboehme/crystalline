@@ -63,7 +63,7 @@ use crystalline_core::config::{self, ConfigError};
 use serde::{Deserialize, Serialize};
 
 /// The file name under the state directory's `hooks` folder.
-pub const MAINTENANCE_FILE: &str = "maintenance.json";
+pub const MAINTENANCE_FILE: &str = crystalline_core::config::write_fence::MAINTENANCE_FILE;
 
 /// The folder the hook-facing state files live in, beside the daemon's own
 /// state rather than mixed into it. The same folder the Stop hook already

@@ -8,7 +8,7 @@
 //! sessions, holder, tool, configure, domain_rename, origin_add,
 //! origin_update, origin_status,
 //! origin_share, origin_withdraw, origin_changes, origin_discard, origin_resolve,
-//! provision, forget_domain,
+//! provision, domain_register, routing_config, maintenance_stamp, forget_domain,
 //! forget_credential, sources_reload, mounted_routing, shutdown. This is the
 //! operator channel plus the `tool` command, which
 //! dispatches a daemon-attached CLI data verb to the shared engine and
@@ -831,6 +831,114 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
             }
         }
         "shutdown" => (envelope_ok(json!({ "stopping": true })), true),
+        // The Stop hook's stamps in this machine's maintenance state, for a
+        // hook inside Claude Desktop's app package: the file is the daemon's
+        // and a packaged write would create a private copy that shadows it.
+        "maintenance_stamp" => {
+            let at = req
+                .get("at")
+                .and_then(Value::as_str)
+                .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                .map(|t| t.with_timezone(&chrono::Utc))
+                .unwrap_or_else(chrono::Utc::now);
+            match req.get("stamp").and_then(Value::as_str).unwrap_or("") {
+                "first_seen" => crate::maintenance::record_first_seen(at),
+                "nudge" => crate::maintenance::record_nudge(at),
+                "reflect_nudge" => crate::maintenance::record_reflect_nudge(at),
+                other => {
+                    return (
+                        envelope_err(format!(
+                            "unknown maintenance stamp '{other}'; expected first_seen, nudge or reflect_nudge"
+                        )),
+                        false,
+                    );
+                }
+            }
+            (envelope_ok(json!({ "stamped": true })), false)
+        }
+        // The configuration `prompt system` builds its routing block from,
+        // for a CLI inside Claude Desktop's app package: its own read of the
+        // config file can open the package's private copy (issue 153).
+        "routing_config" => {
+            let (config, env_domains) = shared.engine.routing_config();
+            match serde_json::to_value(&config) {
+                Ok(config) => (
+                    envelope_ok(json!({ "config": config, "env_domains": env_domains })),
+                    false,
+                ),
+                Err(e) => (envelope_err(e.to_string()), false),
+            }
+        }
+        // Register a local file domain or a virtual domain the way `domain
+        // add` does on the CLI's own side, for a CLI that may not write the
+        // config itself: one inside Claude Desktop's app package, where a
+        // new file under AppData lands in the package's private copy. The
+        // same code and rules (a MANIFEST is required, nothing is
+        // scaffolded); the CLI sends an absolute path and syncs afterwards.
+        "domain_register" => {
+            if shared.engine.read_only() {
+                return (
+                    envelope_err(crate::engine::EngineError::ReadOnly.to_string()),
+                    false,
+                );
+            }
+            let kind = req.get("kind").and_then(Value::as_str).unwrap_or("file");
+            let name = req.get("name").and_then(Value::as_str);
+            let path = req
+                .get("path")
+                .and_then(Value::as_str)
+                .map(std::path::PathBuf::from);
+            // The daemon works in a folder of its own, so a relative path
+            // would name another place here than where the client stood.
+            if let Some(relative) = path.as_ref().filter(|p| p.is_relative()) {
+                return (
+                    envelope_err(format!(
+                        "domain_register needs an absolute folder, and {} is relative",
+                        relative.display()
+                    )),
+                    false,
+                );
+            }
+            let _admin = shared.engine.domain_admin().await;
+            let config = shared
+                .engine
+                .config_override()
+                .map(std::path::Path::to_path_buf);
+            let kept = shared.engine.kept_folder();
+            let registered = match kind {
+                "file" => crystalline_engine::registration::register_file_domain(
+                    name,
+                    path.as_deref(),
+                    config.as_deref(),
+                    kept.as_deref(),
+                ),
+                "virtual" => match name {
+                    Some(name) => crystalline_engine::registration::register_virtual_domain(
+                        name,
+                        config.as_deref(),
+                        kept.as_deref(),
+                    ),
+                    None => Err(anyhow::anyhow!(
+                        "`domain add --virtual` needs a name; there is no folder to derive one from"
+                    )),
+                },
+                other => Err(anyhow::anyhow!(
+                    "unknown domain_register kind '{other}'; expected file or virtual"
+                )),
+            };
+            match registered {
+                Ok(done) => {
+                    if !done.adopted {
+                        shared.engine.discover_registered_domain(&done.name);
+                    }
+                    match serde_json::to_value(&done) {
+                        Ok(data) => (envelope_ok(data), false),
+                        Err(e) => (envelope_err(e.to_string()), false),
+                    }
+                }
+                Err(e) => (envelope_err(format!("{e:#}")), false),
+            }
+        }
         // Best-effort: `domain remove` calls this so a live daemon stops
         // watching the removed path right away instead of on its next
         // restart. Index rows are never touched here, only the watcher and
@@ -848,7 +956,7 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                  name_report, fix_local_spellings, finish_rename_questions, configure, \
                  origin_add, origin_update, \
                  origin_status, origin_share, origin_withdraw, origin_changes, origin_discard, \
-                 origin_resolve, provision, forget_domain or shutdown"
+                 origin_resolve, provision, domain_register, routing_config, maintenance_stamp, forget_domain or shutdown"
             )),
             false,
         ),

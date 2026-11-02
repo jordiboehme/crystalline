@@ -1,10 +1,9 @@
-//! The private state an old Claude Desktop extension left inside Claude
-//! Desktop's package on Windows (`%LOCALAPPDATA%\Packages\Claude_*\
-//! LocalCache\Roaming\crystalline`): found, described and, with
-//! `doctor --fix --merge-desktop-state`, merged into the real one.
-//!
-//! The scan reads `LOCALAPPDATA` on every platform: Windows always sets it,
-//! nothing else does unless a person or a test sets it.
+//! The second Crystalline state Claude Desktop's app package keeps on
+//! Windows (`%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\
+//! crystalline`): described for `doctor` and `status` and, with
+//! `doctor --fix --merge-desktop-state`, merged into the real one. The scan
+//! itself lives in `crystalline_service::desktop_state`, where the MCP
+//! bridge reads it too.
 
 use std::path::{Path, PathBuf};
 
@@ -12,99 +11,10 @@ use crystalline_core::config::registration::canonical_root;
 use crystalline_core::config::{DomainEntry, GitHubConfig, GlobalConfig};
 use serde::Serialize;
 
-/// One private state folder and what it holds.
-#[derive(Debug, Clone, Serialize)]
-pub struct DesktopState {
-    pub folder: PathBuf,
-    /// How many domains its `config.yaml` registers.
-    pub domains: usize,
-    /// `index.db` plus its write-ahead log, when there is one.
-    pub index_bytes: Option<u64>,
-    /// The newest change to a file directly in the folder.
-    pub last_change: Option<String>,
-    /// The pid of a Crystalline daemon its record names that still runs.
-    pub daemon_alive: Option<u32>,
-}
+pub use crystalline_service::desktop_state::{DesktopState, scan_here};
 
-/// Every private state folder under `local_appdata` that holds state (see
-/// [`holds_state`]), sorted by path.
-pub fn scan(local_appdata: Option<&Path>) -> Vec<DesktopState> {
-    let Some(root) = local_appdata else {
-        return Vec::new();
-    };
-    let Ok(entries) = std::fs::read_dir(root.join("Packages")) else {
-        return Vec::new();
-    };
-    let mut found: Vec<DesktopState> = entries
-        .filter_map(Result::ok)
-        .filter(|e| e.file_name().to_string_lossy().starts_with("Claude_"))
-        .map(|e| {
-            e.path()
-                .join("LocalCache")
-                .join("Roaming")
-                .join("crystalline")
-        })
-        .filter(|folder| holds_state(folder))
-        .map(|folder| describe(&folder))
-        .collect();
-    found.sort_by(|a, b| a.folder.cmp(&b.folder));
-    found
-}
-
-/// Whether `folder` holds Crystalline state: a `config.yaml` or an
-/// `index.db`. An empty folder an old extension left behind holds none.
-fn holds_state(folder: &Path) -> bool {
-    ["config.yaml", "index.db"]
-        .iter()
-        .any(|name| folder.join(name).is_file())
-}
-
-/// [`scan`] of this machine's `LOCALAPPDATA`.
-pub fn scan_here() -> Vec<DesktopState> {
-    scan(
-        std::env::var_os("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .as_deref(),
-    )
-}
-
-fn describe(folder: &Path) -> DesktopState {
-    let domains = crystalline_core::config::load_yaml::<crystalline_core::config::GlobalConfig>(
-        &folder.join("config.yaml"),
-    )
-    .map(|cfg| cfg.domains.len())
-    .unwrap_or(0);
-    let index_bytes = ["index.db", "index.db-wal"]
-        .iter()
-        .filter_map(|name| std::fs::metadata(folder.join(name)).ok())
-        .map(|meta| meta.len())
-        .reduce(|a, b| a + b);
-    let last_change = std::fs::read_dir(folder)
-        .ok()
-        .into_iter()
-        .flatten()
-        .filter_map(Result::ok)
-        .filter_map(|e| e.metadata().ok()?.modified().ok())
-        .max()
-        .map(|time| {
-            chrono::DateTime::<chrono::Utc>::from(time)
-                .to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
-        });
-    let daemon_alive = std::fs::read_to_string(folder.join("service.json"))
-        .ok()
-        .and_then(|text| {
-            serde_json::from_str::<crystalline_service::instance::LockInfo>(&text).ok()
-        })
-        .map(|record| record.pid)
-        .filter(|pid| crystalline_service::instance::process_is_crystalline(*pid));
-    DesktopState {
-        folder: folder.to_path_buf(),
-        domains,
-        index_bytes,
-        last_change,
-        daemon_alive,
-    }
-}
+#[cfg(test)]
+use crystalline_service::desktop_state::scan;
 
 fn megabytes(bytes: u64) -> String {
     format!("{} MB", bytes.div_ceil(1024 * 1024))
@@ -113,7 +23,7 @@ fn megabytes(bytes: u64) -> String {
 /// What one state says, for doctor and status alike.
 pub fn describe_line(state: &DesktopState) -> String {
     let mut line = format!(
-        "Claude Desktop kept its own Crystalline state in {}: {} domain{} in its config",
+        "Claude Desktop's app package keeps a second Crystalline state in {}, apart from this machine's own: {} domain{} in its config",
         state.folder.display(),
         state.domains,
         if state.domains == 1 { "" } else { "s" }
@@ -124,6 +34,9 @@ pub fn describe_line(state: &DesktopState) -> String {
     if let Some(when) = &state.last_change {
         line.push_str(&format!(", last changed {when}"));
     }
+    line.push_str(
+        ". Every command run inside Claude Desktop before 0.30.0 could write there, an old extension too",
+    );
     if let Some(pid) = state.daemon_alive {
         line.push_str(&format!(
             ". A daemon from there still runs (pid {pid}), so two engines write the same knowledge folders"
@@ -132,11 +45,27 @@ pub fn describe_line(state: &DesktopState) -> String {
     line
 }
 
+/// The finding of the comparison with the daemon: the domains the private
+/// state registers that the daemon does not serve, which a routing block
+/// read inside Claude Desktop lists while its searches miss them. `None`
+/// when the daemon was not asked or serves them all.
+pub fn unserved_line(state: &DesktopState) -> Option<String> {
+    let unserved = state.unserved.as_ref().filter(|u| !u.is_empty())?;
+    Some(format!(
+        "Claude Desktop's private state registers {} domain{} the daemon does not serve ({}): searches from Claude Desktop miss {} while its routing block can list {}",
+        unserved.len(),
+        if unserved.len() == 1 { "" } else { "s" },
+        unserved.join(", "),
+        if unserved.len() == 1 { "it" } else { "them" },
+        if unserved.len() == 1 { "it" } else { "them" },
+    ))
+}
+
 /// The one line `crystalline status` prints, `None` without a split state.
 pub fn status_line(states: &[DesktopState]) -> Option<String> {
     let first = states.first()?;
-    Some(format!(
-        "Desktop state: {} ({} domain{}{}). Run crystalline doctor for the details.",
+    let mut line = format!(
+        "Desktop state: {} ({} domain{}{}",
         first.folder.display(),
         first.domains,
         if first.domains == 1 { "" } else { "s" },
@@ -144,7 +73,12 @@ pub fn status_line(states: &[DesktopState]) -> Option<String> {
             .index_bytes
             .map(|b| format!(", {}", megabytes(b)))
             .unwrap_or_default()
-    ))
+    );
+    if let Some(unserved) = first.unserved.as_ref().filter(|u| !u.is_empty()) {
+        line.push_str(&format!(", {} not served by the daemon", unserved.len()));
+    }
+    line.push_str("). Run crystalline doctor for the details.");
+    Some(line)
 }
 
 /// What a merge did, for the doctor report.
@@ -524,6 +458,17 @@ pub async fn merge_into(
             state.folder.display()
         );
     }
+    // A folder that shares a state file with this machine's own (the same
+    // index or record under two names) is never merged or renamed: the
+    // rename would take the real file's other name with it.
+    if let Ok(real) = crystalline_core::config::state_dir()
+        && crystalline_service::desktop_state::shares_a_file(&state.folder, &real)
+    {
+        anyhow::bail!(
+            "{} shares files with this machine's own state folder, so it is not merged or renamed",
+            state.folder.display()
+        );
+    }
     let private_config = state.folder.join("config.yaml");
     let private: GlobalConfig = if private_config.is_file() {
         crystalline_core::config::load_yaml(&private_config)?
@@ -829,9 +774,11 @@ mod tests {
                 r"C:\u\AppData\Local\Packages\Claude_x\LocalCache\Roaming\crystalline",
             ),
             domains: 3,
+            domain_names: vec!["a".into(), "b".into(), "c".into()],
             index_bytes: Some(12 * 1024 * 1024),
             last_change: Some("2026-10-06T12:00:00+00:00".to_string()),
             daemon_alive: None,
+            unserved: None,
         };
         let line = status_line(&[state]).unwrap();
         assert!(line.starts_with("Desktop state: "), "{line}");
@@ -862,9 +809,12 @@ mod tests {
     /// left behind holds no knowledge. The states come back sorted by folder.
     #[test]
     fn the_scan_finds_only_crystalline_state_in_claude_packages() {
-        assert!(scan(None).is_empty());
+        assert!(scan(None, None).is_empty());
         let local = tempfile::tempdir().unwrap();
-        assert!(scan(Some(local.path())).is_empty(), "no Packages folder");
+        assert!(
+            scan(Some(local.path()), None).is_empty(),
+            "no Packages folder"
+        );
         let state = |package: &str| {
             local
                 .path()
@@ -889,7 +839,7 @@ mod tests {
         std::fs::write(state("Claude_log").join("index.db-wal"), [0u8; 5]).unwrap();
         std::fs::write(state("Other_x").join("index.db"), [0u8; 5]).unwrap();
         std::fs::create_dir_all(local.path().join("Packages").join("Claude_c")).unwrap();
-        let found = scan(Some(local.path()));
+        let found = scan(Some(local.path()), None);
         let folders: Vec<&Path> = found.iter().map(|s| s.folder.as_path()).collect();
         assert_eq!(
             folders,

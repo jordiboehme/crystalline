@@ -15,6 +15,33 @@ use std::path::{Path, PathBuf};
 
 use super::{DomainEntry, NameOrigin};
 
+/// What a registration did: the answer of the CLI's local `domain add`
+/// registration and of the daemon's `domain_register` ctl command (both in
+/// `crystalline_engine::registration`). Here because it names no type of a
+/// higher crate.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Registered {
+    /// The name the domain is registered under.
+    pub name: String,
+    /// A file domain's canonical root; `None` for a virtual domain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<PathBuf>,
+    /// Whether an existing registration was adopted rather than written.
+    pub adopted: bool,
+    /// The MANIFEST-declared name this registration could not take, when a
+    /// derived name stands in for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadowed: Option<String>,
+    /// A virtual domain's MANIFEST, to scaffold into the database.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<String>,
+    /// Lines for the person, which the CLI prints to stderr: a MANIFEST name
+    /// write-back that was skipped or failed, kept texts that could not be
+    /// set aside.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+}
+
 /// The longest domain name, in characters (not bytes). The cap is about a
 /// readable folder segment and a readable piece of a `crystalline://`
 /// address; the operating system's own segment limit is larger and separate.

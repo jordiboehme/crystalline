@@ -371,6 +371,60 @@ fn launcher_note_from_env() -> Option<&'static str> {
     launcher_too_old(version.as_deref(), channel.as_deref()).then_some(LAUNCHER_NOTE)
 }
 
+/// How long the bridge waits for the daemon's `status` behind the split
+/// note.
+const SPLIT_NOTE_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// The split note for this session, when Claude Desktop's package keeps a
+/// second state with domains: the daemon this bridge attached to is asked
+/// (passively, a second connection) which domains it serves, so the note
+/// names only the private ones it does not. When it cannot be asked the
+/// note says what may be wrong.
+async fn split_note_here() -> Option<String> {
+    let states = crate::desktop_state::scan_here();
+    if !states.iter().any(|s| s.domains > 0) {
+        return None;
+    }
+    // Bounded: a daemon that accepts and never answers must not hold up
+    // the session's onboarding; no answer reads as "could not be asked".
+    let registered: Option<Vec<String>> = tokio::time::timeout(
+        SPLIT_NOTE_WAIT,
+        ctl_if_running_passive(serde_json::json!({ "v": 1, "cmd": "status" })),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .flatten()
+    .and_then(|status| serde_json::from_value(status.get("registered")?.clone()).ok());
+    crate::desktop_state::split_note(&states, registered.as_deref())
+}
+
+/// What a command says when the daemon it reached is older than the
+/// command and does not know `cmd`: an "unknown ctl command" answer turned
+/// into a plain sentence. Any other error is kept as it is.
+pub fn older_daemon_words(error: anyhow::Error, cmd: &str) -> anyhow::Error {
+    if format!("{error:#}").contains(&format!("unknown ctl command '{cmd}'")) {
+        return anyhow::anyhow!(
+            "the running Crystalline daemon is older than this command and cannot do this yet. Restart it from a terminal outside Claude Desktop: crystalline ctl shutdown, then crystalline status"
+        );
+    }
+    error
+}
+
+/// The note this bridge adds to the session's onboarding instructions: the
+/// launcher note and, when Claude Desktop's app package keeps a second
+/// state that registers domains, the split note
+/// ([`crate::desktop_state::split_note`]), a blank line apart. `None`
+/// when there is neither.
+fn onboarding_note(launcher: Option<&str>, split: Option<String>) -> Option<String> {
+    let parts: Vec<String> = launcher
+        .map(str::to_string)
+        .into_iter()
+        .chain(split)
+        .collect();
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
+}
+
 /// `line` with `note` added after a blank line at the end of
 /// `result.instructions`, where both an `initialize` answer and a
 /// `server/discover` answer carry the onboarding text. `None` when the line is
@@ -407,7 +461,9 @@ struct RelayState {
     outstanding: std::collections::HashMap<String, Value>,
     /// The line to add to the onboarding instructions, set when the launcher
     /// that started this bridge is too old (see [`launcher_too_old`]).
-    launcher_note: Option<&'static str>,
+    /// With the split note after it when there is one (see
+    /// [`onboarding_note`]).
+    launcher_note: Option<String>,
     /// The ids of `initialize` and `server/discover` requests still waiting
     /// for their answer, keyed like `outstanding`.
     onboarding: HashSet<String>,
@@ -471,7 +527,7 @@ impl RelayState {
             let key = id.to_string();
             self.outstanding.remove(&key);
             if self.onboarding.remove(&key)
-                && let Some(note) = self.launcher_note
+                && let Some(note) = &self.launcher_note
             {
                 return with_launcher_note(line, note);
             }
@@ -650,7 +706,7 @@ where
     R: AsyncRead + Unpin,
 {
     let mut relay = RelayState {
-        launcher_note: launcher_note_from_env(),
+        launcher_note: onboarding_note(launcher_note_from_env(), split_note_here().await),
         ..RelayState::default()
     };
     let mut stdout = tokio::io::stdout();
@@ -982,6 +1038,11 @@ async fn open_standalone_noting(
     } else {
         "the configured database".to_string()
     };
+    // Inside an app package no local engine is opened, not even for a read
+    // or with an override outside AppData: see `ctl_routed`.
+    if crate::runs_in::PackageContext::here().is_packaged() {
+        anyhow::bail!(packaged_local_engine_refusal());
+    }
     // An explicit --db or --config never asked the daemon in the first place,
     // which changes the remedy rather than the diagnosis.
     let bypassed = !use_daemon(db, config_path);
@@ -1084,7 +1145,7 @@ pub async fn run_tool(
     // call in the session's response format (TOON by default), which neither
     // the `--json` byte contract nor the human renderers can consume.
     if use_daemon(db, config_path)
-        && let Some(data) = ctl_if_running(json!({
+        && let Some(data) = ctl_routed(json!({
             "v": 1, "cmd": "tool", "tool": tool, "args": args.clone(),
         }))
         .await?
@@ -1135,7 +1196,7 @@ pub async fn scaffold_virtual_manifest(
 ) -> anyhow::Result<Value> {
     use serde_json::json;
     if use_daemon(db, config_path)
-        && let Some(data) = ctl_if_running(json!({
+        && let Some(data) = ctl_routed(json!({
             "v": 1, "cmd": "scaffold_manifest", "domain": domain, "markdown": markdown,
         }))
         .await?
@@ -1164,7 +1225,7 @@ pub async fn domain_import(
 ) -> anyhow::Result<Value> {
     use serde_json::json;
     if use_daemon(db, config_path)
-        && let Some(data) = ctl_if_running(json!({
+        && let Some(data) = ctl_routed(json!({
             "v": 1, "cmd": "domain_import", "domain": domain,
             "path": src.display().to_string(), "overwrite": overwrite, "dry_run": dry_run,
             "complete": complete,
@@ -1197,7 +1258,7 @@ pub async fn tags_retag(
 ) -> anyhow::Result<Value> {
     use serde_json::json;
     if use_daemon(db, config_path)
-        && let Some(data) = ctl_if_running(json!({
+        && let Some(data) = ctl_routed(json!({
             "v": 1, "cmd": "retag", "old": old, "new": new,
             "domain": domain, "merge": merge, "dry_run": dry_run, "no_alias": no_alias,
         }))
@@ -1229,7 +1290,7 @@ pub async fn domain_export(
 ) -> anyhow::Result<Value> {
     use serde_json::json;
     if use_daemon(db, config_path)
-        && let Some(data) = ctl_if_running(json!({
+        && let Some(data) = ctl_routed(json!({
             "v": 1, "cmd": "domain_export", "domain": domain,
             "path": dest.display().to_string(), "force": force, "dry_run": dry_run,
         }))
@@ -1280,7 +1341,7 @@ pub async fn collect_orphaned_domains(
 ) -> anyhow::Result<Value> {
     use serde_json::json;
     if use_daemon(db, config_path)
-        && let Some(data) = ctl_if_running(json!({
+        && let Some(data) = ctl_routed(json!({
             "v": 1, "cmd": "collect_orphaned_domains", "dry_run": dry_run,
         }))
         .await?
@@ -1313,7 +1374,7 @@ pub async fn name_report(
     use serde_json::json;
     if use_daemon(db, config_path) {
         let renamed = if fix {
-            match ctl_if_running(json!({ "v": 1, "cmd": "finish_rename_questions" })).await {
+            match ctl_routed(json!({ "v": 1, "cmd": "finish_rename_questions" })).await {
                 Ok(answer) => answer.map(Ok),
                 Err(e) => Some(Err(format!("{e:#}"))),
             }
@@ -1321,7 +1382,7 @@ pub async fn name_report(
             None
         };
         let fixed = if fix {
-            match ctl_if_running(json!({ "v": 1, "cmd": "fix_local_spellings" })).await {
+            match ctl_routed(json!({ "v": 1, "cmd": "fix_local_spellings" })).await {
                 Ok(answer) => {
                     answer.map(|data| Ok(data.get("fixed").and_then(Value::as_u64).unwrap_or(0)))
                 }
@@ -1331,7 +1392,7 @@ pub async fn name_report(
             None
         };
         if (!fix || fixed.is_some())
-            && let Some(mut data) = ctl_if_running(json!({ "v": 1, "cmd": "name_report" })).await?
+            && let Some(mut data) = ctl_routed(json!({ "v": 1, "cmd": "name_report" })).await?
         {
             attach_fix_outcome(&mut data, fixed);
             attach_rename_outcome(&mut data, renamed);
@@ -1477,7 +1538,7 @@ pub async fn domain_remove(
 ) -> anyhow::Result<Value> {
     use serde_json::json;
     if use_daemon(db, config_path)
-        && let Some(data) = ctl_if_running(json!({
+        && let Some(data) = ctl_routed(json!({
             "v": 1, "cmd": "domain_remove", "domain": name, "purge": purge,
             "end_drafts": end_drafts,
         }))
@@ -1547,7 +1608,7 @@ pub async fn domain_rename(
 ) -> anyhow::Result<Value> {
     use serde_json::json;
     if use_daemon(db, config_path)
-        && let Some(data) = ctl_if_running(json!({
+        && let Some(data) = ctl_routed(json!({
             "v": 1, "cmd": "domain_rename", "domain": domain, "new": new,
             "local_only": local_only,
         }))
@@ -1782,8 +1843,7 @@ pub async fn domain_review(
     config_path: Option<&Path>,
 ) -> anyhow::Result<Value> {
     if use_daemon(db, config_path)
-        && let Some(data) =
-            ctl_if_running(review_request(name, overlay_mode, preview, folds)).await?
+        && let Some(data) = ctl_routed(review_request(name, overlay_mode, preview, folds)).await?
     {
         return Ok(data);
     }
@@ -1835,7 +1895,7 @@ pub async fn origin_add(
 ) -> anyhow::Result<Value> {
     use serde_json::json;
     if use_daemon(db, config_path)
-        && let Some(data) = ctl_if_running(json!({
+        && let Some(data) = ctl_routed(json!({
             "v": 1, "cmd": "origin_add", "repo": repo, "domain": domain,
             "path": path, "branch": branch, "folder": folder,
         }))
@@ -1910,7 +1970,7 @@ pub async fn origin_update(
     use serde_json::json;
     if use_daemon(db, config_path)
         && let Some(data) =
-            ctl_if_running(json!({ "v": 1, "cmd": "origin_update", "domain": domain })).await?
+            ctl_routed(json!({ "v": 1, "cmd": "origin_update", "domain": domain })).await?
     {
         return Ok(data);
     }
@@ -1943,7 +2003,7 @@ pub async fn origin_status(
 ) -> anyhow::Result<Value> {
     use serde_json::json;
     if use_daemon(db, config_path)
-        && let Some(data) = ctl_if_running(json!({
+        && let Some(data) = ctl_routed(json!({
             "v": 1,
             "cmd": "origin_status",
             "domain": domain,
@@ -1986,7 +2046,7 @@ pub async fn origin_share(
     config_path: Option<&Path>,
 ) -> anyhow::Result<Value> {
     if use_daemon(db, config_path)
-        && let Some(data) = ctl_if_running(origin_share_request(
+        && let Some(data) = ctl_routed(origin_share_request(
             domain,
             title,
             description,
@@ -2045,7 +2105,7 @@ pub async fn origin_withdraw(
 ) -> anyhow::Result<Value> {
     use serde_json::json;
     if use_daemon(db, config_path)
-        && let Some(data) = ctl_if_running(json!({
+        && let Some(data) = ctl_routed(json!({
             "v": 1, "cmd": "origin_withdraw", "domain": domain,
             "proposal": proposal, "revert": revert,
         }))
@@ -2074,7 +2134,7 @@ pub async fn origin_changes(
 ) -> anyhow::Result<Value> {
     use serde_json::json;
     if use_daemon(db, config_path)
-        && let Some(data) = ctl_if_running(json!({
+        && let Some(data) = ctl_routed(json!({
             "v": 1, "cmd": "origin_changes", "domain": domain, "path": path, "sides": sides,
         }))
         .await?
@@ -2107,7 +2167,7 @@ pub async fn origin_discard(
         .map(|(path, sha)| json!({ "path": path, "sha": sha }))
         .collect();
     if use_daemon(db, config_path)
-        && let Some(data) = ctl_if_running(json!({
+        && let Some(data) = ctl_routed(json!({
             "v": 1, "cmd": "origin_discard", "domain": domain, "targets": wire,
         }))
         .await?
@@ -2148,7 +2208,7 @@ pub async fn origin_resolve(
     use serde_json::json;
     let content_b64 = content.map(|c| BASE64.encode(c));
     if use_daemon(db, config_path)
-        && let Some(data) = ctl_if_running(json!({
+        && let Some(data) = ctl_routed(json!({
             "v": 1, "cmd": "origin_resolve", "domain": domain, "path": path,
             "keep": keep, "content_b64": content_b64,
         }))
@@ -2183,7 +2243,7 @@ pub async fn configure(
     // one entirely, so the override always takes the direct path and the
     // daemon is only consulted about the default config it actually serves.
     if config_path.is_none()
-        && let Some(data) = ctl_if_running(json!({
+        && let Some(data) = ctl_routed(json!({
             "v": 1, "cmd": "configure", "action": action, "key": key, "value": value,
         }))
         .await?
@@ -2277,7 +2337,7 @@ pub async fn provision(
     // same reasoning `configure` documents: a running daemon serves ITS OWN
     // default config, which may be a different one entirely.
     if config_path.is_none()
-        && let Some(data) = ctl_if_running(json!({
+        && let Some(data) = ctl_routed(json!({
             "v": 1, "cmd": "provision", "action": action, "domain": domain,
         }))
         .await?
@@ -2429,6 +2489,11 @@ pub async fn virtual_routing_bullets(
         && let Ok(map) = serde_json::from_value(data)
     {
         return split_routing_answer(map);
+    }
+    // Inside an app package the index is never opened here (see
+    // `ctl_routed`): the routing block goes out without these bullets.
+    if crate::runs_in::PackageContext::here().is_packaged() {
+        return VirtualRouting::default();
     }
     let db_path = match resolve_db(db) {
         Ok(p) => p,
@@ -2628,6 +2693,72 @@ pub async fn ctl_if_running(cmd: Value) -> anyhow::Result<Option<Value>> {
         (None, None) => return Ok(None),
     };
     Ok(Some(ctl_exchange(conn, cmd).await?))
+}
+
+/// Send a ctl command the way this process may: outside an app package this
+/// is [`ctl_if_running`], a running daemon's answer or `None`, and the
+/// caller falls back to its local path as before.
+///
+/// Inside an app package (Claude Desktop's MSIX package on Windows) a
+/// daemon is required, because every new file this process writes under
+/// AppData lands in the package's private copy. So it attaches, or runs the
+/// daemon task and waits for the daemon the way a packaged bridge does
+/// ([`crate::instance::ensure_daemon`]), and answers the daemon's reply. It
+/// never answers `None` there: without a daemon it fails with
+/// [`packaged_refusal`], and the caller never opens a local engine.
+pub async fn ctl_routed(cmd: Value) -> anyhow::Result<Option<Value>> {
+    ctl_routed_waiting(cmd, crate::instance::PACKAGED_TASK_WAIT).await
+}
+
+/// [`ctl_routed`], waiting at most `wait` for the daemon the task starts
+/// inside a package: `prompt system` runs in a SessionStart hook with a
+/// budget shorter than [`crate::instance::PACKAGED_TASK_WAIT`].
+///
+/// A process that found no daemon once says so again at once on every
+/// later call, so a command that asks several times (doctor) does not wait
+/// out the task each time.
+pub async fn ctl_routed_waiting(
+    cmd: Value,
+    wait: std::time::Duration,
+) -> anyhow::Result<Option<Value>> {
+    static NO_DAEMON: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let here = crate::runs_in::PackageContext::here();
+    if !here.is_packaged() {
+        return ctl_if_running(cmd).await;
+    }
+    if let Some(refusal) = NO_DAEMON.get() {
+        anyhow::bail!(refusal.clone());
+    }
+    let task = crate::daemon_task::for_this_process();
+    let options = crate::instance::SpawnOptions::default();
+    let conn = match crate::instance::ensure_daemon_in(here, &*task, &options, wait).await {
+        Ok(conn) => conn,
+        Err(e) => {
+            let bridge = crate::daemon_task::BridgeFailure::of(&e);
+            let refusal = NO_DAEMON.get_or_init(|| packaged_refusal(&bridge));
+            anyhow::bail!(refusal.clone());
+        }
+    };
+    Ok(Some(ctl_exchange(conn, cmd).await?))
+}
+
+/// What a command inside an app package says when no daemon answers: why,
+/// the fix and the terminal outside Claude Desktop.
+pub fn packaged_refusal(bridge: &crate::daemon_task::BridgeFailure) -> String {
+    let fix = crate::stub::StubStatus::for_bridge(bridge.to_string(), bridge.clone()).fix();
+    format!(
+        "Crystalline cannot run this command here: {bridge}. A command inside Claude Desktop's app package works only through the Crystalline daemon outside it. {fix} Or run the command in a terminal outside Claude Desktop."
+    )
+}
+
+/// The refusal of a local engine (or a direct index open) inside an app
+/// package: it would create a private index, write-ahead log and ownership
+/// record, and index the same knowledge folders as the daemon outside.
+pub fn packaged_local_engine_refusal() -> String {
+    format!(
+        "Crystalline does not open its index from here: {}.",
+        crate::runs_in::PACKAGED_WRITE_REASON
+    )
 }
 
 /// [`ctl_if_running`] over a passive attach: the answer of a daemon that is
@@ -3007,7 +3138,7 @@ mod tests {
     #[test]
     fn an_old_launcher_adds_its_note_to_the_initialize_and_discover_answers() {
         let mut relay = RelayState {
-            launcher_note: Some(LAUNCHER_NOTE),
+            launcher_note: Some(LAUNCHER_NOTE.to_string()),
             ..RelayState::default()
         };
         relay.note_client_line(LAUNCHER_INIT);
@@ -3040,6 +3171,24 @@ mod tests {
     }
 
     #[test]
+    fn the_onboarding_note_joins_the_launcher_note_and_the_split_note() {
+        assert_eq!(onboarding_note(None, None), None);
+        assert_eq!(
+            onboarding_note(Some(LAUNCHER_NOTE), None).as_deref(),
+            Some(LAUNCHER_NOTE)
+        );
+        let split = "Claude Desktop keeps a second Crystalline state".to_string();
+        assert_eq!(
+            onboarding_note(None, Some(split.clone())),
+            Some(split.clone())
+        );
+        assert_eq!(
+            onboarding_note(Some(LAUNCHER_NOTE), Some(split.clone())),
+            Some(format!("{LAUNCHER_NOTE}\n\n{split}"))
+        );
+    }
+
+    #[test]
     fn the_launcher_note_leaves_other_answers_alone() {
         // No note held: the initialize answer is forwarded as it is.
         let mut relay = RelayState::default();
@@ -3051,7 +3200,7 @@ mod tests {
         );
         // A note held, but the answer has no instructions or is an error.
         let mut relay = RelayState {
-            launcher_note: Some(LAUNCHER_NOTE),
+            launcher_note: Some(LAUNCHER_NOTE.to_string()),
             ..RelayState::default()
         };
         relay.note_client_line(LAUNCHER_INIT);
@@ -3096,7 +3245,7 @@ mod tests {
             .await
             .unwrap();
         let mut relay = RelayState {
-            launcher_note: Some(LAUNCHER_NOTE),
+            launcher_note: Some(LAUNCHER_NOTE.to_string()),
             ..RelayState::default()
         };
         let mut stdin = BoundedLines::new(stdin_read, STDIO_LINE_LIMIT);
@@ -3162,7 +3311,7 @@ mod tests {
     #[test]
     fn relay_state_leaves_a_batch_untracked() {
         let mut relay = RelayState {
-            launcher_note: Some(LAUNCHER_NOTE),
+            launcher_note: Some(LAUNCHER_NOTE.to_string()),
             ..RelayState::default()
         };
         relay.note_client_line(

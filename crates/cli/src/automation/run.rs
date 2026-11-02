@@ -547,6 +547,9 @@ pub(super) fn open_log(
         Some(dir) => dir.to_path_buf(),
         None => crystalline_core::config::state_dir()?.join("runs"),
     };
+    // Inside an app package a new log under AppData would land in the
+    // package's private copy: refused like every other write there.
+    crystalline_core::config::check_write(&dir)?;
     std::fs::create_dir_all(&dir)?;
     let prefix = format!("{lp}-{}-", file_safe(domain));
     let path = dir.join(format!(
