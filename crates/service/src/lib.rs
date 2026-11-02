@@ -74,6 +74,7 @@ pub use crystalline_engine::origin::{
 };
 pub use crystalline_engine::overlay::{EnvDomain, EnvOverlay, LoadedConfig};
 pub use crystalline_engine::reflection_backup;
+pub use crystalline_engine::registration;
 pub use crystalline_engine::review::{FoldChoice, ReviewModeConfirm};
 pub use crystalline_engine::similar::{SIMILAR_GUIDANCE, SimilarEngram, SimilarProbe};
 pub use crystalline_identity::join::{Holder, Join, Joins};

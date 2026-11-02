@@ -280,3 +280,134 @@ fn a_packaged_command_with_a_db_override_opens_no_local_engine() {
     assert!(!db.exists(), "no index was created");
     assert_eq!(before, snapshot_state(home.path()));
 }
+
+/// A folder with a MANIFEST under `parent`, ready for `domain add`.
+fn domain_folder(parent: &Path, name: &str) -> PathBuf {
+    let dir = parent.join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("MANIFEST.md"),
+        "---\ntitle: kb\ntype: manifest\nstatus: stable\n---\n# kb\n",
+    )
+    .unwrap();
+    dir
+}
+
+/// A packaged `domain add` registers through the daemon: the file domain
+/// with a relative `--path` (sent as an absolute one) and a virtual domain,
+/// both served by the daemon afterwards. The client runs fenced, so it
+/// could not have written the config itself.
+#[test]
+fn a_packaged_domain_add_registers_through_the_daemon() {
+    let home = short_home();
+    let work = tempfile::tempdir().unwrap();
+    domain_folder(work.path(), "kb");
+    let file = crystalline(home.path(), true, "serve")
+        .current_dir(work.path())
+        .args(["domain", "add", "kb", "--path", "kb", "--json"])
+        .output()
+        .unwrap();
+    let virtual_add = crystalline(home.path(), true, "serve")
+        .args(["domain", "add", "notes", "--virtual", "--json"])
+        .output()
+        .unwrap();
+    let status = crystalline(home.path(), false, "missing")
+        .args(["ctl", "status", "--json"])
+        .output()
+        .unwrap();
+    stop_daemon(home.path());
+    assert!(file.status.success(), "{}", text(&file));
+    assert!(virtual_add.status.success(), "{}", text(&virtual_add));
+    let config: crystalline_core::config::GlobalConfig =
+        crystalline_core::config::load_yaml(&config_path(home.path())).unwrap();
+    let canonical = std::fs::canonicalize(work.path().join("kb")).unwrap();
+    let kb = &config.domains["kb"];
+    assert_eq!(
+        std::fs::canonicalize(kb.file_path().unwrap()).unwrap(),
+        canonical,
+        "the absolute folder was registered: {config:?}"
+    );
+    assert!(config.domains["notes"].is_virtual(), "{config:?}");
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    let registered = status["registered"].to_string();
+    assert!(registered.contains("\"kb\""), "{status}");
+    assert!(registered.contains("\"notes\""), "{status}");
+}
+
+/// The daemon keeps the CLI's rule: a folder without a MANIFEST is refused
+/// naming `domain init`, never scaffolded.
+#[test]
+fn a_packaged_domain_add_still_needs_a_manifest() {
+    let home = short_home();
+    let work = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(work.path().join("bare")).unwrap();
+    let out = crystalline(home.path(), true, "serve")
+        .current_dir(work.path())
+        .args(["domain", "add", "bare", "--path", "bare"])
+        .output()
+        .unwrap();
+    stop_daemon(home.path());
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no MANIFEST.md"),
+        "{}",
+        text(&out)
+    );
+    assert!(!work.path().join("bare").join("MANIFEST.md").exists());
+}
+
+/// Without a daemon a packaged `domain add` refuses and registers nothing.
+#[test]
+fn a_packaged_domain_add_without_a_daemon_registers_nothing() {
+    let home = short_home();
+    let work = tempfile::tempdir().unwrap();
+    let dir = domain_folder(work.path(), "kb");
+    let before = snapshot_state(home.path());
+    for args in [
+        vec!["domain", "add", "kb", "--path", dir.to_str().unwrap()],
+        vec!["domain", "add", "notes", "--virtual"],
+    ] {
+        let out = crystalline(home.path(), true, "missing")
+            .args(&args)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {}", text(&out));
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("outside Claude Desktop"),
+            "{args:?}: {}",
+            text(&out)
+        );
+    }
+    assert_eq!(before, snapshot_state(home.path()));
+}
+
+/// The terminal setup steps refuse inside a package and name the terminal:
+/// each writes Crystalline's state on this machine.
+#[test]
+fn setup_steps_refuse_inside_a_package() {
+    for args in [
+        &["connect", "https://kb.example.com"][..],
+        &["connect", "github"][..],
+        &["disconnect", "kb"][..],
+        &["install", "claude-code"][..],
+        &["uninstall", "claude-code"][..],
+        &["daemon-task", "register"][..],
+        &["doctor", "--fix"][..],
+        &["doctor", "--discard-rename"][..],
+    ] {
+        let home = short_home();
+        let before = snapshot_state(home.path());
+        let out = crystalline(home.path(), true, "missing")
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {}", text(&out));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("in a terminal outside Claude Desktop"),
+            "{args:?}: {}",
+            text(&out)
+        );
+        assert_eq!(before, snapshot_state(home.path()), "{args:?}");
+    }
+}

@@ -8,7 +8,7 @@
 //! sessions, holder, tool, configure, domain_rename, origin_add,
 //! origin_update, origin_status,
 //! origin_share, origin_withdraw, origin_changes, origin_discard, origin_resolve,
-//! provision, forget_domain,
+//! provision, domain_register, forget_domain,
 //! forget_credential, sources_reload, mounted_routing, shutdown. This is the
 //! operator channel plus the `tool` command, which
 //! dispatches a daemon-attached CLI data verb to the shared engine and
@@ -835,6 +835,65 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
         // watching the removed path right away instead of on its next
         // restart. Index rows are never touched here, only the watcher and
         // the engine's discovered-domain cache.
+        // Register a local file domain or a virtual domain the way `domain
+        // add` does on the CLI's own side, for a CLI that may not write the
+        // config itself: one inside Claude Desktop's app package, where a
+        // new file under AppData lands in the package's private copy. The
+        // same code and rules (a MANIFEST is required, nothing is
+        // scaffolded); the CLI sends an absolute path and syncs afterwards.
+        "domain_register" => {
+            if shared.engine.read_only() {
+                return (
+                    envelope_err(crate::engine::EngineError::ReadOnly.to_string()),
+                    false,
+                );
+            }
+            let kind = req.get("kind").and_then(Value::as_str).unwrap_or("file");
+            let name = req.get("name").and_then(Value::as_str);
+            let path = req
+                .get("path")
+                .and_then(Value::as_str)
+                .map(std::path::PathBuf::from);
+            let _admin = shared.engine.domain_admin().await;
+            let config = shared
+                .engine
+                .config_override()
+                .map(std::path::Path::to_path_buf);
+            let kept = shared.engine.kept_folder();
+            let registered = match kind {
+                "file" => crystalline_engine::registration::register_file_domain(
+                    name,
+                    path.as_deref(),
+                    config.as_deref(),
+                    kept.as_deref(),
+                ),
+                "virtual" => match name {
+                    Some(name) => crystalline_engine::registration::register_virtual_domain(
+                        name,
+                        config.as_deref(),
+                        kept.as_deref(),
+                    ),
+                    None => Err(anyhow::anyhow!(
+                        "`domain add --virtual` needs a name; there is no folder to derive one from"
+                    )),
+                },
+                other => Err(anyhow::anyhow!(
+                    "unknown domain_register kind '{other}'; expected file or virtual"
+                )),
+            };
+            match registered {
+                Ok(done) => {
+                    if !done.adopted {
+                        shared.engine.discover_registered_domain(&done.name);
+                    }
+                    match serde_json::to_value(&done) {
+                        Ok(data) => (envelope_ok(data), false),
+                        Err(e) => (envelope_err(e.to_string()), false),
+                    }
+                }
+                Err(e) => (envelope_err(format!("{e:#}")), false),
+            }
+        }
         "forget_domain" => {
             let domain = req.get("domain").and_then(Value::as_str).unwrap_or("");
             shared.engine.forget_domain(domain);
@@ -848,7 +907,7 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                  name_report, fix_local_spellings, finish_rename_questions, configure, \
                  origin_add, origin_update, \
                  origin_status, origin_share, origin_withdraw, origin_changes, origin_discard, \
-                 origin_resolve, provision, forget_domain or shutdown"
+                 origin_resolve, provision, domain_register, forget_domain or shutdown"
             )),
             false,
         ),

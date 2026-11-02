@@ -6499,6 +6499,28 @@ impl Engine {
         reread_config_at(self.config_file_path(), &self.overlay)
     }
 
+    /// The `--config` override this engine started with, `None` for the
+    /// default resolution (`CRYSTALLINE_CONFIG`, else the global path): what
+    /// a registration this engine runs for a client hands
+    /// [`crate::overlay::load`], so it writes the file this engine reads.
+    pub fn config_override(&self) -> Option<&Path> {
+        self.config_path.as_deref()
+    }
+
+    /// This machine's `<state>/kept` folder as this engine knows it, `None`
+    /// without a state folder (see [`Engine::kept_dir`]).
+    pub fn kept_folder(&self) -> Option<PathBuf> {
+        self.kept_dir()
+    }
+
+    /// Pick up a domain a registration just wrote to the config file, the
+    /// way a sync of a domain this engine has not seen yet does: cached and,
+    /// for a file domain on the daemon, watched. `false` when the file does
+    /// not hold the name.
+    pub fn discover_registered_domain(&self, name: &str) -> bool {
+        self.refresh_domain(name).is_some()
+    }
+
     /// The configuration file this engine reads and persists to: its
     /// `--config` override, else the default global path. `None` when the
     /// default path cannot be resolved at all (no home directory to put it

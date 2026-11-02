@@ -2047,6 +2047,11 @@ fn run() -> anyhow::Result<()> {
     // in the package's private copy, so from here on a write there that was
     // not sent to the daemon fails loudly instead of splitting the state.
     crystalline_service::runs_in::fence_packaged_writes();
+    if crystalline_service::runs_in::PackageContext::here().is_packaged()
+        && let Some(step) = cli.command.as_ref().and_then(packaged_setup_step)
+    {
+        anyhow::bail!(crystalline_service::runs_in::packaged_setup_refusal(step));
+    }
     match cli.command {
         None => {
             Cli::command().print_help()?;
@@ -2363,6 +2368,34 @@ fn run() -> anyhow::Result<()> {
                 Ok(())
             }
         },
+    }
+}
+
+/// The terminal setup step `command` is, when it is one that a process
+/// inside an app package must not run: each writes Crystalline's state on
+/// this machine itself (`sources.json`, `installs.json`, the rename
+/// journal, a repaired config) and no daemon does it for it. The merge of
+/// Claude Desktop's state keeps its own, older refusal in `doctor`.
+fn packaged_setup_step(command: &Command) -> Option<&'static str> {
+    match command {
+        Command::Connect { .. } => Some("connect"),
+        Command::Disconnect { .. } => Some("disconnect"),
+        Command::Install { .. } => Some("install"),
+        Command::Uninstall { .. } => Some("uninstall"),
+        Command::DaemonTask {
+            action: DaemonTaskAction::Register { .. },
+        } => Some("daemon-task register"),
+        Command::Doctor {
+            merge_desktop_state: false,
+            discard_rename: true,
+            ..
+        } => Some("doctor --discard-rename"),
+        Command::Doctor {
+            merge_desktop_state: false,
+            fix: true,
+            ..
+        } => Some("doctor --fix"),
+        _ => None,
     }
 }
 
@@ -4822,7 +4855,13 @@ async fn domain_add_dispatch(
                 "`domain add --virtual` needs a name; there is no folder to derive one from"
             )
         })?;
-        let (markdown, adopted) = cmd::domain_add_register_virtual(&name, config.as_deref())?;
+        let (markdown, adopted) = if cmd::registers_through_daemon(db.as_deref(), config.as_deref())
+        {
+            let done = cmd::register_through_daemon("virtual", Some(&name), None).await?;
+            (done.manifest.unwrap_or_default(), done.adopted)
+        } else {
+            cmd::domain_add_register_virtual(&name, config.as_deref())?
+        };
         if let Some(owner) = private_owner
             && adopted
         {
@@ -4846,7 +4885,16 @@ async fn domain_add_dispatch(
     // given name to place it under. Either way the resolved directory still
     // needs a pre-scaffolded MANIFEST.md.
     let (chosen_name, abs, adopted, shadowed) =
-        cmd::domain_add_register(name.as_deref(), path.as_deref(), config.as_deref())?;
+        if cmd::registers_through_daemon(db.as_deref(), config.as_deref()) {
+            let done =
+                cmd::register_through_daemon("file", name.as_deref(), path.as_deref()).await?;
+            let root = done.root.ok_or_else(|| {
+                anyhow::anyhow!("the daemon registered '{}' with no folder", done.name)
+            })?;
+            (done.name, root, done.adopted, done.shadowed)
+        } else {
+            cmd::domain_add_register(name.as_deref(), path.as_deref(), config.as_deref())?
+        };
     // Before the `--no-sync` print and before the sync, so a refused
     // `--private` prints nothing and indexes nothing.
     if let Some(owner) = private_owner
