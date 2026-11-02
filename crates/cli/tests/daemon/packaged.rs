@@ -311,12 +311,19 @@ fn a_packaged_domain_add_registers_through_the_daemon() {
         .args(["domain", "add", "notes", "--virtual", "--json"])
         .output()
         .unwrap();
+    // A later setting through the daemon keeps the registration: the
+    // daemon writes the file it reads again, never a copy from its start.
+    let setting = crystalline(home.path(), true, "serve")
+        .args(["config", "set", "github.poll_secs", "120"])
+        .output()
+        .unwrap();
     let status = crystalline(home.path(), false, "missing")
         .args(["ctl", "status", "--json"])
         .output()
         .unwrap();
     stop_daemon(home.path());
     assert!(file.status.success(), "{}", text(&file));
+    assert!(setting.status.success(), "{}", text(&setting));
     assert!(virtual_add.status.success(), "{}", text(&virtual_add));
     let config: crystalline_core::config::GlobalConfig =
         crystalline_core::config::load_yaml(&config_path(home.path())).unwrap();
@@ -557,4 +564,22 @@ fn the_launcher_variables_alone_do_not_make_a_process_packaged() {
     let config = std::fs::read_to_string(config_path(home.path())).unwrap();
     assert!(config.contains("kb:"), "registered locally: {config}");
     assert!(!daemon_answers(home.path()), "no daemon was asked to start");
+}
+
+/// `doctor` inside a package with no daemon is still a report, the command
+/// a person runs to find out why: it says it runs inside the package and
+/// why the index was not read, and never stops with an error.
+#[test]
+fn a_packaged_doctor_without_a_daemon_still_reports() {
+    let home = short_home();
+    let before = snapshot_state(home.path());
+    let out = crystalline(home.path(), true, "missing")
+        .args(["doctor"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("Error:"), "{}", text(&out));
+    assert!(stdout.contains("inside Claude Desktop:"), "{}", text(&out));
+    assert_eq!(before, snapshot_state(home.path()));
 }

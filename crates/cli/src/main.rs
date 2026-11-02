@@ -5657,15 +5657,23 @@ fn run_prompt(
 /// serve.
 const PACKAGED_PROMPT_NOTE: &str = "Note: this session runs inside Claude Desktop's app package and no Crystalline daemon answered, so this routing block was read from Claude Desktop's private copy of the configuration. It can list domains the daemon does not serve; `crystalline status` in a terminal outside Claude Desktop shows the daemon's view.";
 
+/// How long `prompt system` inside a package waits for the daemon the task
+/// starts: the SessionStart hook runs under a ten second limit, and a
+/// killed hook gives the session no routing block at all, which is worse
+/// than the local read with its note.
+const PACKAGED_PROMPT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// The configuration and env-defined domain names the daemon builds a
 /// routing block from (the `routing_config` ctl command), for a prompt run
 /// inside an app package. `None` when no daemon answered or the answer
 /// does not read.
 async fn daemon_routing_config() -> Option<(crystalline_core::config::GlobalConfig, Vec<String>)> {
-    let data =
-        crystalline_service::ctl_routed(serde_json::json!({ "v": 1, "cmd": "routing_config" }))
-            .await
-            .ok()??;
+    let data = crystalline_service::ctl_routed_waiting(
+        serde_json::json!({ "v": 1, "cmd": "routing_config" }),
+        PACKAGED_PROMPT_WAIT,
+    )
+    .await
+    .ok()??;
     let config = serde_json::from_value(data.get("config")?.clone()).ok()?;
     let env = serde_json::from_value(data.get("env_domains")?.clone()).unwrap_or_default();
     Some((config, env))

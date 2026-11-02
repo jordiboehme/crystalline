@@ -12,6 +12,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::overlay::LoadedConfig;
 use anyhow::{Result, anyhow, bail};
 use crystalline_core::config::{
     self, DomainEntry, GlobalConfig, NameOrigin,
@@ -22,33 +23,8 @@ use crystalline_core::config::{
     },
 };
 use crystalline_core::names::{NameInput, NameTable};
-use serde::{Deserialize, Serialize};
 
-use crate::overlay::LoadedConfig;
-
-/// What a registration did.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Registered {
-    /// The name the domain is registered under.
-    pub name: String,
-    /// A file domain's canonical root; `None` for a virtual domain.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub root: Option<PathBuf>,
-    /// Whether an existing registration was adopted rather than written.
-    pub adopted: bool,
-    /// The MANIFEST-declared name this registration could not take, when a
-    /// derived name stands in for it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub shadowed: Option<String>,
-    /// A virtual domain's MANIFEST, to scaffold into the database.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub manifest: Option<String>,
-    /// Lines for the person, which the CLI prints to stderr: a MANIFEST name
-    /// write-back that was skipped or failed, kept texts that could not be
-    /// set aside.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub notes: Vec<String>,
-}
+pub use crystalline_core::config::registration::Registered;
 
 /// Register the local file domain `name` at `path` (or, without a path, at
 /// `<domains_root>/<name>`), or without a name the folder at `path` under a

@@ -2665,14 +2665,36 @@ pub async fn ctl_if_running(cmd: Value) -> anyhow::Result<Option<Value>> {
 /// never answers `None` there: without a daemon it fails with
 /// [`packaged_refusal`], and the caller never opens a local engine.
 pub async fn ctl_routed(cmd: Value) -> anyhow::Result<Option<Value>> {
-    if !crate::runs_in::PackageContext::here().is_packaged() {
+    ctl_routed_waiting(cmd, crate::instance::PACKAGED_TASK_WAIT).await
+}
+
+/// [`ctl_routed`], waiting at most `wait` for the daemon the task starts
+/// inside a package: `prompt system` runs in a SessionStart hook with a
+/// budget shorter than [`crate::instance::PACKAGED_TASK_WAIT`].
+///
+/// A process that found no daemon once says so again at once on every
+/// later call, so a command that asks several times (doctor) does not wait
+/// out the task each time.
+pub async fn ctl_routed_waiting(
+    cmd: Value,
+    wait: std::time::Duration,
+) -> anyhow::Result<Option<Value>> {
+    static NO_DAEMON: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let here = crate::runs_in::PackageContext::here();
+    if !here.is_packaged() {
         return ctl_if_running(cmd).await;
     }
-    let conn = match crate::instance::ensure_daemon(true, None, None, false).await {
+    if let Some(refusal) = NO_DAEMON.get() {
+        anyhow::bail!(refusal.clone());
+    }
+    let task = crate::daemon_task::for_this_process();
+    let options = crate::instance::SpawnOptions::default();
+    let conn = match crate::instance::ensure_daemon_in(here, &*task, &options, wait).await {
         Ok(conn) => conn,
         Err(e) => {
             let bridge = crate::daemon_task::BridgeFailure::of(&e);
-            return Err(anyhow::anyhow!(packaged_refusal(&bridge)));
+            let refusal = NO_DAEMON.get_or_init(|| packaged_refusal(&bridge));
+            anyhow::bail!(refusal.clone());
         }
     };
     Ok(Some(ctl_exchange(conn, cmd).await?))
