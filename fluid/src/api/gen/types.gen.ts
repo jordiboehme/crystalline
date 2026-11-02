@@ -3196,6 +3196,8 @@ export type ListDomainsResponses = {
      *
      * Every domain also carries `canonical_name` (the name its content carries), `aliases` (its former local names, still accepted as input), `name_origin` (`explicit` or `derived`, `null` for a legacy entry nothing has inferred yet), `shadowed` (whether another domain's local name already holds this one's canonical name - a bool, never naming the other domain), `renaming` (whether a rename has this domain paused right now; always present, so every row keeps the same columns) and `rename_pending` (`{from, to, seen_at}` when a sync saw this domain's MANIFEST `domain_name` change and nobody has finished the rename or kept the links yet, `null` otherwise).
      *
+     * Every domain carries `may_share`: whether this session may drive the domain's share surfaces (its sync status, the preview, the share, a withdrawal and a conflict), answered by the gate those routes use. On a domain GitHub governs it follows the GitHub role, so it can be true for an instance viewer. A row's `read_only`, sent only when true, says this session cannot write into the domain; on a domain GitHub governs it follows the GitHub role too.
+     *
      * For an instance admin, `mounted` lists the domains this machine offers from connected servers (`crystalline connect`): each one's local `name`, its `source`, the server's `source_url`, its `remote_name` there and the `web_url` of its page on that server (`null` unless the address is http or https). They are not served here.
      */
     200: {

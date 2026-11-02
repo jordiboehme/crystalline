@@ -57,7 +57,7 @@ fn require_share_role(state: &RestState, identity: &Identity) -> Result<Caller, 
 /// checks on the share stay as they are. A caller that also fails that gets
 /// the share role's own refusal, so a governed domain it may not see
 /// answers as every other domain does here.
-async fn require_share_role_on(
+pub(crate) async fn require_share_role_on(
     state: &RestState,
     identity: &Identity,
     domain: &str,

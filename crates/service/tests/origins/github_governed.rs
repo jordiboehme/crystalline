@@ -1918,3 +1918,88 @@ async fn a_move_leaves_links_alone_in_a_governed_domain_the_mover_only_reads() {
         "{moved}"
     );
 }
+
+/// The listing tells a client, per domain, what the routes serve: the
+/// row's `may_share` is exactly whether the share routes let this session
+/// through, and the row's `read_only` follows the GitHub role on a governed
+/// domain and carries the instance role cap on one GitHub does not govern.
+/// Fluid draws its edit and share controls from these two.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_listing_says_per_domain_what_the_write_and_share_routes_serve() {
+    let fx = instance(true).await;
+    let mut wrong = Vec::new();
+    for name in [
+        Some("vwrite"),
+        Some("gread"),
+        Some("gwrite"),
+        Some("root"),
+        None,
+    ] {
+        let session = match name {
+            Some(name) => Some(login(fx.addr, name).await.unwrap()),
+            None => None,
+        };
+        let who = name.unwrap_or("anonymous");
+        let (status, listing) = send(
+            &fx,
+            session.as_ref(),
+            reqwest::Method::GET,
+            "/api/v1/domains",
+            None,
+        )
+        .await;
+        assert_eq!(status, 200, "{who}: {listing}");
+        for d in [SHARED, PUBLIC, PLAIN] {
+            // The anonymous visitor sees only the public one of the
+            // governed domains.
+            let Some(row) = listing["domains"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["name"] == d)
+                .cloned()
+            else {
+                assert!(name.is_none() && d == SHARED, "{who} sees {d}: {listing}");
+                continue;
+            };
+            let (status, _) = send(
+                &fx,
+                session.as_ref(),
+                reqwest::Method::GET,
+                &format!("/api/v1/domains/{d}/sync"),
+                None,
+            )
+            .await;
+            let served = ![401, 403].contains(&status);
+            if row["may_share"] != json!(served) {
+                wrong.push(format!(
+                    "{who} / {d}: may_share {} but the sync route answered {status}",
+                    row["may_share"]
+                ));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    let vwrite = login(fx.addr, "vwrite").await.unwrap();
+    let (_, listing) = send(
+        &fx,
+        Some(&vwrite),
+        reqwest::Method::GET,
+        "/api/v1/domains",
+        None,
+    )
+    .await;
+    let row = |d: &str| {
+        listing["domains"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["name"] == d)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(row(SHARED)["read_only"], Value::Null, "{listing}");
+    assert_eq!(row(SHARED)["may_share"], true, "{listing}");
+    assert_eq!(row(PLAIN)["read_only"], true, "{listing}");
+    assert_eq!(row(PLAIN)["may_share"], false, "{listing}");
+}
