@@ -562,7 +562,7 @@ describe("a Reflection's files", () => {
     expect(home.resolve("../../assets/x.png")).toBeNull();
     expect(home.resolve("peer.md")).toBeNull();
     expect(home.refused("../../assets/x.png")).toBe(
-      "This file is not in the Reflection. A curator copies it into the Reflection's files.",
+      "This file is not in the Reflection. A curator or an agent copies it into the Reflection's files.",
     );
     expect(home.refused("../assets/x.png")).toBeNull();
     expect(home.url("assets/x.png")).toMatch(/\/reflection\/assets\/x\.png$/);

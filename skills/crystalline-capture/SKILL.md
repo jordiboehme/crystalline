@@ -115,6 +115,8 @@ The optional `folder` files the engram where its topic's neighbours already live
 
 When the body shows an attachment image, the target may carry a comma-separated formatting fragment - `left`, `right`, `center`, `full` and `w=NN` or `w=NN%`, as in `![Chart](assets/chart.png#right,w=50%)` - which Fluid honors and plain markdown viewers simply ignore.
 
+To add or change an attachment yourself, use `write_engram` with `path` under `assets/` and exactly one of `content` (text, SVG included) or `base64`, and `overwrite: true` to replace a file; read a file back with `read_engram` on its `assets/` path, so editing a picture is read it, change it, write it back.
+
 Exceptionally valuable knowledge - a hard-won debugging insight, the decision that keeps paying off - can carry a numeric `salience` key (0 to 10) in `metadata`. Hybrid search adds a small bounded lift for it, so a salient engram ranks above equally relevant unmarked ones while relevance still dominates and nothing is ever filtered out by it. Most engrams need none; reserve it for knowledge that clearly outranks its neighbours, and when an engram later proves to be the key to a task, raise its salience with `set_frontmatter`, `key: "salience"` and the new number as `value`.
 
 ## Splitting a large capture

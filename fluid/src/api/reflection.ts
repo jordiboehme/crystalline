@@ -868,7 +868,7 @@ export async function moveReflectionAsset(
 
 /** Said when a page links an engram attachment (proposal; see the B9 plan, open question 4). */
 export const ENGRAM_FILE =
-  "This file is not in the Reflection. A curator copies it into the Reflection's files.";
+  "This file is not in the Reflection. A curator or an agent copies it into the Reflection's files.";
 
 /** How much of a file's sha256 its URL carries: enough to tell versions apart. */
 const VERSION_CHARS = 12;
