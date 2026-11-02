@@ -1830,11 +1830,9 @@ async fn a_renamed_permalink_rewrites_a_heading_link() {
     assert_eq!(receipt["references_rewritten"], 1, "{receipt}");
     let linker = read(f.notes(), "linker.md");
     assert!(linker.contains("See [[newb#setup|t]]."), "{linker}");
-    assert!(
-        edges(&read_receipt(&f, "notes", "linker").await)
-            .iter()
-            .all(|(_, resolved, _)| *resolved)
-    );
+    let edges = edges(&read_receipt(&f, "notes", "linker").await);
+    assert!(!edges.is_empty(), "the linker has no edges");
+    assert!(edges.iter().all(|(_, resolved, _)| *resolved), "{edges:?}");
 }
 
 /// A relative link with an anchor becomes a wikilink with the domain and keeps
