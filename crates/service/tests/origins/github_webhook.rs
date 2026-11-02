@@ -28,7 +28,7 @@ use serde_json::{Value, json};
 use super::github_app::{Forge, app_env, connect, engram, files, manifest, spawn_forge};
 use crate::support::MockProvider;
 
-const SECRET: &str = "a webhook secret only the tests know";
+pub(crate) const SECRET: &str = "a webhook secret only the tests know";
 const ADA_ID: u64 = 1001;
 const PATH: &str = "/api/v1/github/webhook";
 
@@ -66,14 +66,17 @@ fn reflecting_repo() -> Arc<MockProvider> {
     mock
 }
 
-struct Fx {
-    forge: Arc<Forge>,
-    eng: Arc<Engine>,
-    auth: Arc<AuthStore>,
+pub(crate) struct Fx {
+    pub(crate) forge: Arc<Forge>,
+    pub(crate) eng: Arc<Engine>,
+    pub(crate) auth: Arc<AuthStore>,
     kb: Arc<MockProvider>,
     addr: std::net::SocketAddr,
     url: String,
-    tmp: tempfile::TempDir,
+    pub(crate) tmp: tempfile::TempDir,
+    /// The engine's environment, for an engine started again on the same
+    /// state.
+    pub(crate) env: Vec<(&'static str, &'static str)>,
 }
 
 impl Fx {
@@ -86,7 +89,7 @@ impl Fx {
 /// secret, when given), `acme/kb` connected as `kb` and `acme/vault` as
 /// `vault`, the account `ada` linked to GitHub id 1001 and `root` an admin,
 /// and the JSON API served on loopback.
-async fn setup(secret: Option<&str>) -> Fx {
+pub(crate) async fn setup(secret: Option<&'static str>) -> Fx {
     let tmp = tempfile::tempdir().unwrap();
     let kb = reflecting_repo();
     let (forge, api) = spawn_forge(
@@ -101,6 +104,7 @@ async fn setup(secret: Option<&str>) -> Fx {
         env.push(("CRYSTALLINE_GITHUB_APP_WEBHOOK_SECRET", secret));
     }
     let eng = Arc::new(super::github_app::engine(tmp.path(), &api, &env).await);
+    let engine_env = env.clone();
     connect(&eng, "acme/kb", "kb", &tmp.path().join("kb")).await;
     connect(&eng, "acme/vault", "vault", &tmp.path().join("vault")).await;
     let host = eng.github_app().unwrap().credentials().host.clone();
@@ -135,11 +139,12 @@ async fn setup(secret: Option<&str>) -> Fx {
         addr,
         url: format!("http://{addr}"),
         tmp,
+        env: engine_env,
     }
 }
 
 /// Sets `repo`'s collaborators: (id, login, role).
-fn collaborators(forge: &Forge, repo: &str, people: &[(u64, &str, &str)]) {
+pub(crate) fn collaborators(forge: &Forge, repo: &str, people: &[(u64, &str, &str)]) {
     forge.collaborators.lock().unwrap().insert(
         repo.to_string(),
         people
@@ -213,7 +218,7 @@ fn member_event(repo: &str) -> Value {
 }
 
 /// Asks the governor about `kb`, so it holds a snapshot (or uses it).
-async fn ask(fx: &Fx) -> Vec<crystalline_service::engine::GithubPerson> {
+pub(crate) async fn ask(fx: &Fx) -> Vec<crystalline_service::engine::GithubPerson> {
     fx.eng.github_people("kb").await.unwrap()
 }
 
@@ -608,7 +613,7 @@ async fn a_transferred_repository_closes_its_domain() {
     assert_eq!(fx.eng.github_access_closed().len(), 1);
 }
 
-fn origin_repo(eng: &Engine, domain: &str) -> String {
+pub(crate) fn origin_repo(eng: &Engine, domain: &str) -> String {
     eng.config().domains[domain]
         .origin
         .as_ref()

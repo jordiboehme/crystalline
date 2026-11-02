@@ -186,6 +186,19 @@ impl Forge {
         }
     }
 
+    /// Moves `old` to `new` on another owner, the way GitHub transfers a
+    /// repository: like a rename, and the owner's id is the new owner's.
+    pub(crate) fn transfer(&self, old: &str, new: &str) {
+        self.rename(old, new);
+    }
+
+    /// Gives the name `repo` to a new repository: a new id, the same name.
+    pub(crate) fn reuse(&self, repo: &str) {
+        let mut ids = self.ids.lock().unwrap();
+        let next = ids.values().max().copied().unwrap_or(100) + 1;
+        ids.insert(repo.to_string(), next);
+    }
+
     /// The numeric id GitHub gives `repo` now.
     pub(crate) fn id_of(&self, repo: &str) -> Option<u64> {
         self.ids.lock().unwrap().get(repo).copied()
@@ -266,6 +279,18 @@ pub(crate) async fn spawn_forge(
         axum::serve(listener, router).await.unwrap();
     });
     (forge, format!("http://{addr}"))
+}
+
+/// The numeric id of the GitHub account `login`: fixed for each login, and
+/// different for different ones (case does not matter, as on GitHub).
+pub(crate) fn owner_id(login: &str) -> u64 {
+    login
+        .to_ascii_lowercase()
+        .bytes()
+        .fold(1469598103934665603u64, |hash, b| {
+            (hash ^ u64::from(b)).wrapping_mul(1099511628211)
+        })
+        % 1_000_000
 }
 
 fn not_found() -> Response {
@@ -513,6 +538,10 @@ async fn repo_route(
                 "private": private,
                 "id": forge.id_of(&origin.repo).unwrap_or_default(),
                 "full_name": origin.repo,
+                "owner": {
+                    "login": origin.repo.split('/').next().unwrap_or_default(),
+                    "id": owner_id(origin.repo.split('/').next().unwrap_or_default()),
+                },
             })),
             Err(e) => failed(e),
         };

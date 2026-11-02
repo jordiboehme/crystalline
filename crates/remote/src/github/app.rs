@@ -399,6 +399,37 @@ struct LoginResponse {
     login: String,
 }
 
+/// What `GET /repos/{o}/{r}` says about a repository, as
+/// [`GithubApp::repository_facts`] reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepositoryFacts {
+    /// Who may read it.
+    pub visibility: RepoVisibility,
+    /// Its id and its owner's id, when GitHub sent both.
+    pub ids: Option<crate::state::RepositoryIds>,
+    /// Its current `owner/name` (a renamed one answers under its new name),
+    /// when GitHub sent it.
+    pub full_name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct FactsResponse {
+    #[serde(default)]
+    id: Option<u64>,
+    #[serde(default)]
+    full_name: Option<String>,
+    #[serde(default)]
+    owner: Option<FactsOwner>,
+    #[serde(flatten)]
+    visibility: VisibilityResponse,
+}
+
+#[derive(Deserialize)]
+struct FactsOwner {
+    #[serde(default)]
+    id: Option<u64>,
+}
+
 /// `GET /repos/{o}/{r}` and `GET /repositories/{id}`, read for who a
 /// repository is.
 #[derive(Deserialize)]
@@ -414,6 +445,21 @@ struct VisibilityResponse {
     /// releases leave it out.
     #[serde(default)]
     visibility: Option<String>,
+}
+
+/// Who may read `repo`, from what `GET /repos/{o}/{r}` said.
+fn visibility_of(repo: &str, answer: &VisibilityResponse) -> Result<RepoVisibility, RemoteError> {
+    match answer.visibility.as_deref() {
+        Some("public") => Ok(RepoVisibility::Public),
+        Some("private") => Ok(RepoVisibility::Private),
+        Some("internal") => Ok(RepoVisibility::Internal),
+        Some(other) => Err(RemoteError::Api {
+            status: 200,
+            message: format!("{repo} has a visibility this client does not know: {other}"),
+        }),
+        None if answer.private => Ok(RepoVisibility::Private),
+        None => Ok(RepoVisibility::Public),
+    }
 }
 
 /// Who may read a repository on GitHub, as `GET /repos/{o}/{r}` says.
@@ -976,17 +1022,31 @@ impl GithubApp {
         let response = self.get_as_installation(repo, &path).await?;
         let response = check_response(response, Some(repo), true, &self.api_url).await?;
         let answer: VisibilityResponse = parse_json(response).await?;
-        match answer.visibility.as_deref() {
-            Some("public") => Ok(RepoVisibility::Public),
-            Some("private") => Ok(RepoVisibility::Private),
-            Some("internal") => Ok(RepoVisibility::Internal),
-            Some(other) => Err(RemoteError::Api {
-                status: 200,
-                message: format!("{repo} has a visibility this client does not know: {other}"),
-            }),
-            None if answer.private => Ok(RepoVisibility::Private),
-            None => Ok(RepoVisibility::Public),
-        }
+        visibility_of(repo, &answer)
+    }
+
+    /// Who may read `repo`, its id, its owner's id and its current name,
+    /// from one `GET /repos/{o}/{r}` with the repository's installation
+    /// token (GitHub redirects a renamed or transferred repository's old
+    /// name, and the client follows one hop).
+    pub async fn repository_facts(&self, repo: &str) -> Result<RepositoryFacts, RemoteError> {
+        let (owner, name) = split_repo(repo)?;
+        let path = format!("/repos/{}/{}", segment(owner), segment(name));
+        let response = self.get_as_installation(repo, &path).await?;
+        let response = check_response(response, Some(repo), true, &self.api_url).await?;
+        let answer: FactsResponse = parse_json(response).await?;
+        let visibility = visibility_of(repo, &answer.visibility)?;
+        let ids = match (answer.id, answer.owner.and_then(|o| o.id)) {
+            (Some(repository), Some(owner)) => {
+                Some(crate::state::RepositoryIds { repository, owner })
+            }
+            _ => None,
+        };
+        Ok(RepositoryFacts {
+            visibility,
+            ids,
+            full_name: answer.full_name,
+        })
     }
 
     /// What GitHub says `repo` is now: its numeric id and its current

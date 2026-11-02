@@ -51,7 +51,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use crystalline_remote::{Collaborator, GithubApp, RemoteError, RepoRole, RepoVisibility};
+use crystalline_remote::state::RepositoryIds;
+use crystalline_remote::{
+    Collaborator, GithubApp, RemoteError, RepoRole, RepoVisibility, RepositoryFacts,
+};
 use tokio::time::Instant;
 
 use crate::auth_store::{GithubLink, MemberLevel};
@@ -186,8 +189,9 @@ pub(crate) trait GithubSource: Send + Sync {
         repo: &str,
         page: Option<&str>,
     ) -> Result<(Vec<Collaborator>, Option<String>), RemoteError>;
-    /// Who may read `repo`, see [`GithubApp::repository_visibility`].
-    async fn repository_visibility(&self, repo: &str) -> Result<RepoVisibility, RemoteError>;
+    /// Who may read `repo`, its ids and its current name, see
+    /// [`GithubApp::repository_facts`].
+    async fn repository_facts(&self, repo: &str) -> Result<RepositoryFacts, RemoteError>;
     /// The installation that covers `repo`, see [`GithubApp::installation_for`].
     async fn installation_for(&self, repo: &str) -> Result<u64, RemoteError>;
     /// Forget which installation covers `repo`, see [`GithubApp::evict_repo`].
@@ -204,8 +208,8 @@ impl GithubSource for GithubApp {
         GithubApp::collaborators_page(self, repo, page).await
     }
 
-    async fn repository_visibility(&self, repo: &str) -> Result<RepoVisibility, RemoteError> {
-        GithubApp::repository_visibility(self, repo).await
+    async fn repository_facts(&self, repo: &str) -> Result<RepositoryFacts, RemoteError> {
+        GithubApp::repository_facts(self, repo).await
     }
 
     async fn installation_for(&self, repo: &str) -> Result<u64, RemoteError> {
@@ -250,6 +254,18 @@ pub(crate) trait GovernorEnv: Send + Sync {
     /// again, so its domain is open: who reads it changed. The engine runs
     /// the Reflection rescan a visibility change runs.
     fn reopened(&self) {}
+    /// Every domain connected to `repo`, with the repository ids recorded
+    /// for it (`None` while none are). A domain with no origin state at all
+    /// is left out.
+    fn recorded_ids(&self, _repo: &str) -> Vec<(String, Option<RepositoryIds>)> {
+        Vec::new()
+    }
+    /// Record `ids` for `domain`, which had none: trust on first use, for a
+    /// domain connected before the ids were recorded at connect.
+    fn record_ids(&self, _domain: &str, _ids: RepositoryIds) {}
+    /// GitHub answers `old` under the name `live` (renamed within its owner,
+    /// the ids unchanged): the engine may connect the domains to `live`.
+    fn renamed(&self, _old: &str, _live: &str) {}
 }
 
 /// One listing of a repository: whether it is public and, by GitHub id,
@@ -261,6 +277,10 @@ struct Snapshot {
     /// enterprise the listing does not name.
     internal: bool,
     people: HashMap<u64, (String, RepoRole)>,
+    /// The repository's id and its owner's id, when GitHub sent them.
+    ids: Option<RepositoryIds>,
+    /// Its current name, when GitHub sent it.
+    live_name: Option<String>,
 }
 
 impl Snapshot {
@@ -303,6 +323,11 @@ struct State {
     /// no recheck and no invalidation opens them, only a reconnect (which
     /// names another repository).
     moved: HashMap<String, String>,
+    /// Repositories whose last lookup found ids other than the ones
+    /// recorded for their domain (transferred, or a reused name), with the
+    /// reason and when to ask again. Closed; decided again on every lookup,
+    /// so a restart closes them again on the first one.
+    mismatched: HashMap<String, (String, Instant)>,
     /// Repositories whose "not installed" answer is being asked again.
     rechecking: HashSet<String>,
     /// Repositories whose last lookup failed: when the failures began, and
@@ -507,7 +532,11 @@ impl GithubGovernor {
         let closed = self.closed_keys();
         let (reasons, moved) = {
             let state = lock(&self.state);
-            (state.reasons.clone(), state.moved.clone())
+            let mut moved = state.moved.clone();
+            for (key, (reason, _)) in &state.mismatched {
+                moved.entry(key.clone()).or_insert_with(|| reason.clone());
+            }
+            (state.reasons.clone(), moved)
         };
         let mut out: Vec<ClosedDomain> = self
             .env
@@ -543,6 +572,7 @@ impl GithubGovernor {
             .not_installed
             .keys()
             .chain(state.moved.keys())
+            .chain(state.mismatched.keys())
             .cloned()
             .chain(
                 state
@@ -647,6 +677,9 @@ impl GithubGovernor {
                     if let Some(failing) = state.failing.get_mut(&key) {
                         failing.last = None;
                     }
+                    if let Some((_, next)) = state.mismatched.get_mut(&key) {
+                        *next = now;
+                    }
                 }
                 Invalidate::User(_) => {
                     state.global += 1;
@@ -656,6 +689,10 @@ impl GithubGovernor {
                 Invalidate::Installation(_) => {
                     state.global += 1;
                     state.entries.clear();
+                    state
+                        .mismatched
+                        .values_mut()
+                        .for_each(|(_, next)| *next = now);
                     state
                         .not_installed
                         .values_mut()
@@ -667,11 +704,16 @@ impl GithubGovernor {
                     state.entries.clear();
                     state.not_installed.clear();
                     state.reasons.clear();
+                    state.mismatched.clear();
                     state.failing.clear();
                 }
                 Invalidate::All => {
                     state.global += 1;
                     state.entries.clear();
+                    state
+                        .mismatched
+                        .values_mut()
+                        .for_each(|(_, next)| *next = now);
                     state
                         .not_installed
                         .values_mut()
@@ -710,8 +752,11 @@ impl GithubGovernor {
 
     /// Close `repo`'s domain for good, because the repository moved to
     /// another owner on GitHub (Ruling R32: a transfer is never followed on
-    /// a payload's word). No recheck and no invalidation opens it again;
-    /// an admin reconnects the domain to the repository where it is now.
+    /// a payload's word). No recheck and no invalidation opens it again in
+    /// this process; an admin reconnects the domain to the repository where
+    /// it is now. This is the webhook's fast path, held in memory: what
+    /// keeps the domain closed across a restart is the comparison of the
+    /// recorded repository and owner ids on every lookup (Ruling R33).
     pub fn close_moved(&self, repo: &str, reason: String) {
         let mut state = lock(&self.state);
         let key = repo_key(repo);
@@ -859,6 +904,13 @@ impl GithubGovernor {
             if state.not_installed.contains_key(&key) || state.moved.contains_key(&key) {
                 return None;
             }
+            if state
+                .mismatched
+                .get(&key)
+                .is_some_and(|(_, next)| started < *next)
+            {
+                return None;
+            }
             if let Some(Failing {
                 last: Some(last), ..
             }) = state.failing.get(&key).copied()
@@ -908,9 +960,30 @@ impl GithubGovernor {
         let key = repo_key(repo);
         match result {
             Ok(snapshot) => {
+                if let Some(reason) = self.identity_differs(repo, &snapshot) {
+                    let mut state = lock(&self.state);
+                    state.failing.remove(&key);
+                    state.entries.remove(&key);
+                    if state.generation(&key) == generation {
+                        if !state.mismatched.contains_key(&key) {
+                            tracing::warn!(
+                                "{reason}; the domain of {repo} is closed to all but instance admins"
+                            );
+                        }
+                        state
+                            .mismatched
+                            .insert(key, (reason, Instant::now() + FRESH_FOR));
+                    }
+                    return None;
+                }
                 let snapshot = Arc::new(snapshot);
                 {
                     let mut state = lock(&self.state);
+                    if state.mismatched.remove(&key).is_some() {
+                        tracing::info!(
+                            "GitHub shows the repository recorded for {repo} again, so its domain is open"
+                        );
+                    }
                     if state.generation(&key) == generation {
                         state.entries.insert(
                             key.clone(),
@@ -930,6 +1003,63 @@ impl GithubGovernor {
             // The failure is timed when it happened, not when it was asked.
             Err(error) => self.failed(source, repo, &key, &error, Instant::now(), generation),
         }
+    }
+
+    /// Whether the repository GitHub answered for `repo` is not the one its
+    /// domains were connected to: the reason when it is not, `None` when it
+    /// is (or nothing is recorded or answered to compare). A domain with no
+    /// recorded ids records the answered ones (trust on first use). A
+    /// rename within the owner (the same ids under another name) is not a
+    /// difference: the engine is told, and may follow it, but only when
+    /// every domain on `repo` had its ids recorded and they match.
+    fn identity_differs(&self, repo: &str, snapshot: &Snapshot) -> Option<String> {
+        let live = snapshot.ids?;
+        let mut all_matched = true;
+        for (domain, recorded) in self.env.recorded_ids(repo) {
+            match recorded {
+                None => {
+                    all_matched = false;
+                    tracing::info!(
+                        "the repository ids of {repo} are recorded for the domain {domain} on its first lookup"
+                    );
+                    self.env.record_ids(&domain, live);
+                }
+                Some(recorded) if recorded.repository != live.repository => {
+                    return Some(format!(
+                        "the name {repo} now belongs to another repository on GitHub; an admin must reconnect the domain"
+                    ));
+                }
+                Some(recorded) if recorded.owner != live.owner => {
+                    let to = snapshot.live_name.as_deref().unwrap_or(repo);
+                    return Some(format!(
+                        "the repository moved to {to} on GitHub; an admin must reconnect the domain"
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+        if all_matched
+            && let Some(live_name) = &snapshot.live_name
+            && repo_key(live_name) != repo_key(repo)
+        {
+            self.env.renamed(repo, live_name);
+        }
+        None
+    }
+
+    /// An admin connected a domain to `repo` again (and its ids were
+    /// recorded anew): whatever closed it is forgotten and the next
+    /// question asks GitHub.
+    pub fn reconnected(&self, repo: &str) {
+        {
+            let mut state = lock(&self.state);
+            let key = repo_key(repo);
+            state.moved.remove(&key);
+            state.mismatched.remove(&key);
+            state.reasons.remove(&key);
+            state.not_installed.remove(&key);
+        }
+        self.invalidate(Invalidate::Repo(repo.to_string()));
     }
 
     /// Records a failed lookup of `repo` and answers what is left. An
@@ -1201,11 +1331,13 @@ async fn fetch(source: &dyn GithubSource, repo: &str) -> Result<Snapshot, FetchE
             crystalline_remote::github::app::too_many_collaborator_pages(repo),
         ));
     }
-    let visibility = bounded(source.repository_visibility(repo)).await?;
+    let facts = bounded(source.repository_facts(repo)).await?;
     Ok(Snapshot {
-        public: visibility == RepoVisibility::Public,
-        internal: visibility == RepoVisibility::Internal,
+        public: facts.visibility == RepoVisibility::Public,
+        internal: facts.visibility == RepoVisibility::Internal,
         people,
+        ids: facts.ids,
+        live_name: facts.full_name,
     })
 }
 
@@ -1382,6 +1514,72 @@ impl GovernorEnv for EngineEnv {
 
     fn access(&self) -> Option<Arc<DomainAccess>> {
         self.engine.upgrade()?.domain_access.get().cloned()
+    }
+
+    fn recorded_ids(&self, repo: &str) -> Vec<(String, Option<RepositoryIds>)> {
+        let Some(engine) = self.engine.upgrade() else {
+            return Vec::new();
+        };
+        let key = repo_key(repo);
+        engine
+            .github_origins()
+            .into_iter()
+            .filter(|(_, connected)| repo_key(connected) == key)
+            .filter_map(|(domain, _)| {
+                let dir = engine.origin_state_dir(&domain).ok()?;
+                match crystalline_remote::state::OriginState::load(&dir) {
+                    Ok(Some(state)) => Some((domain, state.repository_ids)),
+                    Ok(None) => None,
+                    Err(e) => {
+                        tracing::warn!(
+                            "the origin state of the domain {domain} could not be read to compare its repository ids: {e}"
+                        );
+                        None
+                    }
+                }
+            })
+            .collect()
+    }
+
+    fn record_ids(&self, domain: &str, ids: RepositoryIds) {
+        let (Some(engine), Ok(runtime)) =
+            (self.engine.upgrade(), tokio::runtime::Handle::try_current())
+        else {
+            return;
+        };
+        let Ok(dir) = engine.origin_state_dir(domain) else {
+            return;
+        };
+        let lock = engine.origin_lock(domain);
+        let domain = domain.to_string();
+        runtime.spawn(async move {
+            let _held = lock.lock().await;
+            if let Err(e) = write_repository_ids(&dir, ids, false) {
+                tracing::warn!(
+                    "the repository ids of the domain {domain} could not be recorded: {e}"
+                );
+            }
+        });
+    }
+
+    fn renamed(&self, old: &str, live: &str) {
+        let (Some(engine), Ok(runtime)) =
+            (self.engine.upgrade(), tokio::runtime::Handle::try_current())
+        else {
+            return;
+        };
+        if engine.read_only {
+            return;
+        }
+        let old_key = repo_key(old);
+        let live = live.to_string();
+        runtime.spawn(async move {
+            if let Err(e) = engine.move_origin_repo(&old_key, &live) {
+                tracing::warn!(
+                    "the domains of {old_key} could not be connected to its new name {live}: {e}"
+                );
+            }
+        });
     }
 
     /// A domain opened again: look for Reflection pages its readers now
@@ -1610,6 +1808,42 @@ impl super::Engine {
             }
         }
         origins
+    }
+
+    /// Records the ids of `repo` (and its owner) for `domain`, just
+    /// connected, in its origin state under `state_dir`, replacing any
+    /// recorded before, and tells the governor the domain was connected
+    /// again, so whatever closed it is forgotten. Called by a connect that
+    /// holds the domain's origin lock. Without a loaded App, or when GitHub
+    /// does not answer, nothing is recorded and the first good lookup
+    /// records them instead (trust on first use).
+    pub(super) async fn record_repository_ids_at_connect(
+        &self,
+        domain: &str,
+        repo: &str,
+        state_dir: &std::path::Path,
+    ) {
+        if let Some(super::github_app::AppSlot::Ready(router)) = self.github_app_slot_settled() {
+            match tokio::time::timeout(REQUEST_TIMEOUT, router.app().repository_facts(repo)).await {
+                Ok(Ok(RepositoryFacts { ids: Some(ids), .. })) => {
+                    if let Err(e) = write_repository_ids(state_dir, ids, true) {
+                        tracing::warn!(
+                            "the repository ids of the domain {domain} could not be recorded at connect: {e}"
+                        );
+                    }
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => tracing::info!(
+                    "the repository ids of {repo} could not be read at connect ({e}); the first lookup records them"
+                ),
+                Err(_) => tracing::info!(
+                    "GitHub was slow to answer the repository ids of {repo} at connect; the first lookup records them"
+                ),
+            }
+        }
+        if let Some(governor) = self.github_governor.get() {
+            governor.reconnected(repo);
+        }
     }
 
     /// Whether a registered domain is connected to `repo` (GitHub names are
@@ -2011,6 +2245,20 @@ impl super::Engine {
                 }
             }
             if moved.is_empty() {
+                // Another process (a CLI next to the daemon) may have moved
+                // them in the file already: take the file as it is, so this
+                // engine does not keep serving the old name.
+                let stale = self.config.read().unwrap().domains.values().any(|entry| {
+                    entry
+                        .origin
+                        .as_ref()
+                        .is_some_and(|origin| repo_key(&origin.repo) == old_key)
+                });
+                if stale {
+                    let effective = self.overlay.apply(&file);
+                    *file_guard = file;
+                    *self.config.write().unwrap() = effective;
+                }
                 return Ok(moved);
             }
             self.persist_config(&file)?;
@@ -2086,6 +2334,25 @@ impl super::Engine {
             None => Ok(()),
         }
     }
+}
+
+/// Stores `ids` in the origin state under `dir`: always when `replace`,
+/// else only when none are recorded yet. Answers whether it wrote. A domain
+/// without an origin state has nothing to record into.
+fn write_repository_ids(
+    dir: &std::path::Path,
+    ids: RepositoryIds,
+    replace: bool,
+) -> Result<bool, RemoteError> {
+    let Some(mut state) = crystalline_remote::state::OriginState::load(dir)? else {
+        return Ok(false);
+    };
+    if state.repository_ids.is_some() && !replace {
+        return Ok(false);
+    }
+    state.repository_ids = Some(ids);
+    state.save(dir)?;
+    Ok(true)
 }
 
 /// What handling one GitHub App webhook event did, for the surface that
@@ -2171,6 +2438,10 @@ mod tests {
         /// Every call on the repository fails with this, while set.
         down: Option<fn() -> RemoteError>,
         not_installed: bool,
+        /// Its id and its owner's id, as `GET /repos/{o}/{r}` answers them.
+        ids: Option<RepositoryIds>,
+        /// Its current name, when GitHub answers another one (renamed).
+        full_name: Option<String>,
     }
 
     /// GitHub, answering from tables and counting the collaborator listings
@@ -2291,14 +2562,24 @@ mod tests {
             answer
         }
 
-        async fn repository_visibility(&self, repo: &str) -> Result<RepoVisibility, RemoteError> {
+        async fn repository_facts(&self, repo: &str) -> Result<RepositoryFacts, RemoteError> {
             if let Some(e) = self.refusal(repo) {
                 return Err(e);
             }
-            Ok(match lock(&self.repos).get(&repo_key(repo)) {
-                Some(r) if r.public => RepoVisibility::Public,
-                Some(r) if r.internal => RepoVisibility::Internal,
-                _ => RepoVisibility::Private,
+            let repos = lock(&self.repos);
+            let found = repos.get(&repo_key(repo));
+            Ok(RepositoryFacts {
+                visibility: match found {
+                    Some(r) if r.public => RepoVisibility::Public,
+                    Some(r) if r.internal => RepoVisibility::Internal,
+                    _ => RepoVisibility::Private,
+                },
+                ids: found.and_then(|r| r.ids),
+                full_name: Some(
+                    found
+                        .and_then(|r| r.full_name.clone())
+                        .unwrap_or_else(|| repo.to_string()),
+                ),
             })
         }
 
@@ -2324,6 +2605,10 @@ mod tests {
         access: Option<Arc<DomainAccess>>,
         /// How many times a recheck opened a closed domain.
         reopened: AtomicUsize,
+        /// The ids recorded for each domain.
+        recorded: Mutex<HashMap<String, RepositoryIds>>,
+        /// Every rename the governor reported: (old, live).
+        renames: Mutex<Vec<(String, String)>>,
     }
 
     impl GovernorEnv for FakeEnv {
@@ -2338,6 +2623,20 @@ mod tests {
         }
         fn reopened(&self) {
             self.reopened.fetch_add(1, Ordering::SeqCst);
+        }
+        fn recorded_ids(&self, repo: &str) -> Vec<(String, Option<RepositoryIds>)> {
+            let recorded = lock(&self.recorded);
+            lock(&self.origins)
+                .iter()
+                .filter(|(_, r)| repo_key(r) == repo_key(repo))
+                .map(|(domain, _)| (domain.clone(), recorded.get(domain).copied()))
+                .collect()
+        }
+        fn record_ids(&self, domain: &str, ids: RepositoryIds) {
+            lock(&self.recorded).insert(domain.to_string(), ids);
+        }
+        fn renamed(&self, old: &str, live: &str) {
+            lock(&self.renames).push((old.to_string(), live.to_string()));
         }
     }
 
@@ -2380,6 +2679,8 @@ mod tests {
             origins: Mutex::new(vec![(DOMAIN.to_string(), REPO.to_string())]),
             access: Some(Arc::new(DomainAccess::new(auth.clone()))),
             reopened: AtomicUsize::new(0),
+            recorded: Mutex::new(HashMap::new()),
+            renames: Mutex::new(Vec::new()),
         });
         let governor = GithubGovernor::new(env.clone());
         Rig {
@@ -2568,6 +2869,104 @@ mod tests {
         assert_eq!(rig.github.installation_lookups.load(Ordering::SeqCst), 1);
         assert!(rig.governor.closed_domains().is_empty());
         assert!(rig.governor.governed_domains().contains(DOMAIN));
+    }
+
+    const IDS: RepositoryIds = RepositoryIds {
+        repository: 55,
+        owner: 7,
+    };
+
+    #[tokio::test(start_paused = true)]
+    async fn a_repository_without_recorded_ids_records_them_on_its_first_lookup() {
+        let rig = rig().await;
+        rig.github.grant(REPO, 1, "alice-gh", RepoRole::Write);
+        rig.github.with(REPO, |r| r.ids = Some(IDS));
+        assert_eq!(rig.knowledge("alice").await, level(MemberLevel::Editor));
+        assert_eq!(lock(&rig.env.recorded).get(DOMAIN), Some(&IDS));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_transferred_repository_is_closed_on_every_lookup() {
+        let rig = rig().await;
+        rig.github.grant(REPO, 1, "alice-gh", RepoRole::Write);
+        lock(&rig.env.recorded).insert(DOMAIN.to_string(), IDS);
+        rig.github.with(REPO, |r| {
+            r.ids = Some(RepositoryIds {
+                repository: 55,
+                owner: 8,
+            });
+            r.full_name = Some("other/handbook".to_string());
+        });
+        assert_eq!(rig.knowledge("alice").await, level(MemberLevel::None));
+        assert!(rig.governor.closed_domains().contains(DOMAIN));
+        assert_eq!(
+            rig.governor.closed()[0].reason,
+            "the repository moved to other/handbook on GitHub; an admin must reconnect the domain"
+        );
+        // Asked again later, it is decided again, and the same.
+        tokio::time::advance(FRESH_FOR).await;
+        assert_eq!(rig.knowledge("alice").await, level(MemberLevel::None));
+        assert_eq!(rig.github.listings(), 2);
+        assert!(rig.governor.closed_domains().contains(DOMAIN));
+        assert!(lock(&rig.env.renames).is_empty());
+        assert_eq!(lock(&rig.env.recorded).get(DOMAIN), Some(&IDS));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reused_name_is_closed() {
+        let rig = rig().await;
+        rig.github.grant(REPO, 1, "alice-gh", RepoRole::Write);
+        lock(&rig.env.recorded).insert(DOMAIN.to_string(), IDS);
+        rig.github.with(REPO, |r| {
+            r.ids = Some(RepositoryIds {
+                repository: 56,
+                owner: 7,
+            })
+        });
+        assert_eq!(rig.knowledge("alice").await, level(MemberLevel::None));
+        assert_eq!(
+            rig.governor.closed()[0].reason,
+            format!(
+                "the name {REPO} now belongs to another repository on GitHub; an admin must reconnect the domain"
+            )
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_rename_within_the_owner_stays_open_and_tells_the_engine() {
+        let rig = rig().await;
+        rig.github.grant(REPO, 1, "alice-gh", RepoRole::Write);
+        lock(&rig.env.recorded).insert(DOMAIN.to_string(), IDS);
+        rig.github.with(REPO, |r| {
+            r.ids = Some(IDS);
+            r.full_name = Some("acme/guide".to_string());
+        });
+        assert_eq!(rig.knowledge("alice").await, level(MemberLevel::Editor));
+        assert!(rig.governor.closed_domains().is_empty());
+        assert_eq!(
+            *lock(&rig.env.renames),
+            vec![(REPO.to_string(), "acme/guide".to_string())]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reconnected_repository_is_asked_at_once_and_opens() {
+        let rig = rig().await;
+        rig.github.grant(REPO, 1, "alice-gh", RepoRole::Write);
+        lock(&rig.env.recorded).insert(DOMAIN.to_string(), IDS);
+        let moved = RepositoryIds {
+            repository: 55,
+            owner: 8,
+        };
+        rig.github.with(REPO, |r| r.ids = Some(moved));
+        rig.knowledge("alice").await;
+        assert!(rig.governor.closed_domains().contains(DOMAIN));
+        // An admin reconnects: the new ids are recorded and the governor
+        // told.
+        lock(&rig.env.recorded).insert(DOMAIN.to_string(), moved);
+        rig.governor.reconnected(REPO);
+        assert_eq!(rig.knowledge("alice").await, level(MemberLevel::Editor));
+        assert!(rig.governor.closed_domains().is_empty());
     }
 
     /// Lets the background tasks the governor spawned run.

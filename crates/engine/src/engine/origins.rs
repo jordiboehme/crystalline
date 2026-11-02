@@ -466,6 +466,10 @@ impl Engine {
             }
             return Err(e);
         }
+        // Who the repository is on GitHub, so a later transfer or a reused
+        // name is told apart from a rename (still under the origin lock).
+        self.record_repository_ids_at_connect(&domain_name, repo, &state_dir)
+            .await;
         let readers_note = match readers {
             ConnectReaders::Ignored => Some(READERS_IGNORED),
             _ => None,

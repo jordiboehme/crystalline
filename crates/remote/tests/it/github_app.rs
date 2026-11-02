@@ -1262,3 +1262,29 @@ async fn repositories_of_an_installation_are_the_ones_looked_up_for_it() {
     assert_eq!(repos, vec!["acme/kb".to_string(), "acme/vault".to_string()]);
     assert!(app.repositories_of_installation(99).is_empty());
 }
+
+/// One `GET /repos/{o}/{r}` answers everything the governor checks: who may
+/// read it, its id, its owner's id and its current name.
+#[tokio::test]
+async fn repository_facts_read_the_ids_the_name_and_the_visibility() {
+    let routes = Router::new().route(
+        "/repos/{owner}/{name}",
+        get(|| async {
+            Json(serde_json::json!({
+                "id": 55, "full_name": "acme/handbook", "private": false,
+                "visibility": "public", "owner": {"id": 7, "login": "acme"},
+            }))
+        }),
+    );
+    let (_mock, _base, app, _clock) = serve_with(mock_with(&[("acme/kb", 11)]), routes).await;
+    let facts = app.repository_facts("acme/kb").await.unwrap();
+    assert_eq!(facts.visibility, RepoVisibility::Public);
+    assert_eq!(
+        facts.ids,
+        Some(crystalline_remote::state::RepositoryIds {
+            repository: 55,
+            owner: 7
+        })
+    );
+    assert_eq!(facts.full_name.as_deref(), Some("acme/handbook"));
+}

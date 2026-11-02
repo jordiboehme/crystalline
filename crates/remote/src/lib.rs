@@ -46,7 +46,7 @@ pub use fanout::{
 pub use github::GitHubProvider;
 pub use github::app::{
     AppInfo, AppProbe, Collaborator, CommitIdentities, CommitIdentity, GithubApp, RepoRole,
-    RepoVisibility,
+    RepoVisibility, RepositoryFacts,
 };
 pub use github::app_store::{AppCredentials, AppLookup, AppStore, read_marker};
 pub use github::auth::{DeviceFlowStart, DevicePoll, GITHUB_CLIENT_ID, GithubUser, UserTokenGrant};
