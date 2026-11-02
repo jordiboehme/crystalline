@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use crystalline_core::frontmatter::{MergedText, merge_text_with};
 use diffy::{ConflictStyle, MergeOptions};
-use similar::{Algorithm, DiffOp, capture_diff_slices};
+use similar::{Algorithm, DiffOp, capture_diff_slices, diff_ratio};
 use unicode_segmentation::UnicodeSegmentation;
 use yrs::{Text, TextRef, TransactionMut};
 
@@ -76,16 +76,62 @@ fn body_merge(base: &str, mine: &str, theirs: &str) -> Option<String> {
 /// Equal line counts alone do not say that: a side that dropped the first
 /// line and added a last one has as many lines, each paired with the wrong
 /// one.
+///
+/// A run of one line replaced by one line pairs as it stands. A longer run
+/// pairs only when position and likeness agree ([`closest_in_place`]); a run
+/// whose lines were swapped, or dropped at one end and added at the other,
+/// does not, and the hunk stays a conflict.
 fn pairs_line_for_line(base: &[&str], side: &[&str]) -> bool {
     capture_diff_slices(Algorithm::Myers, base, side)
         .iter()
         .all(|op| match *op {
             DiffOp::Equal { .. } => true,
             DiffOp::Replace {
-                old_len, new_len, ..
-            } => old_len == new_len,
+                old_index,
+                old_len,
+                new_index,
+                new_len,
+            } => {
+                old_len == new_len
+                    && (old_len == 1
+                        || closest_in_place(
+                            &base[old_index..old_index + old_len],
+                            &side[new_index..new_index + new_len],
+                        ))
+            }
             DiffOp::Delete { .. } | DiffOp::Insert { .. } => false,
         })
+}
+
+/// Whether every line of a replaced run is mutually and strictly closest to
+/// the line at its own position on the other side: side line `i` is more
+/// like base line `i` than like any other base line of the run, and base
+/// line `i` more like side line `i` than like any other side line. Likeness
+/// is similar's ratio over grapheme clusters; a tie is no evidence, so it
+/// fails.
+fn closest_in_place(base: &[&str], side: &[&str]) -> bool {
+    let n = base.len();
+    let ratio: Vec<Vec<f32>> = base
+        .iter()
+        .map(|b| side.iter().map(|s| grapheme_ratio(b, s)).collect())
+        .collect();
+    (0..n).all(|i| {
+        (0..n)
+            .filter(|&k| k != i)
+            .all(|k| ratio[i][i] > ratio[k][i] && ratio[i][i] > ratio[i][k])
+    })
+}
+
+/// similar's diff ratio of two lines over their grapheme clusters: 1.0 for
+/// the same line, 0.0 for lines with no cluster in common.
+fn grapheme_ratio(a: &str, b: &str) -> f32 {
+    let a: Vec<&str> = a.graphemes(true).collect();
+    let b: Vec<&str> = b.graphemes(true).collect();
+    diff_ratio(
+        &capture_diff_slices(Algorithm::Myers, &a, &b),
+        a.len(),
+        b.len(),
+    )
 }
 
 /// The character fallback of [`line_merge`]: diffy's conflicting hunks, read
@@ -658,6 +704,38 @@ mod tests {
         assert!(matches!(
             three_way(base, mine, theirs),
             MergeOutcome::Conflict
+        ));
+    }
+
+    #[test]
+    fn two_rows_one_side_swapped_are_a_conflict() {
+        let base = "| 1 | same text |\n| 2 | same text |\n";
+        let mine = "| 2 | same text. |\n| 1 | same text. |\n";
+        let theirs = "| 1 | same text |\n| 2 | sameY text |\n";
+        assert!(matches!(
+            three_way(base, mine, theirs),
+            MergeOutcome::Conflict
+        ));
+    }
+
+    #[test]
+    fn two_rows_one_side_dropped_at_the_top_and_added_at_the_bottom_are_a_conflict() {
+        let base = "| 1 | aa | bb |\n| 4 | aa | bb |\n";
+        let mine = "| 4 | aa | bbx |\n| 7 | aa | bb |\n";
+        let theirs = "| 1 | aaY | bb |\n| 4 | aa | bb |\n";
+        assert!(matches!(
+            three_way(base, mine, theirs),
+            MergeOutcome::Conflict
+        ));
+    }
+
+    #[test]
+    fn a_tie_in_likeness_pairs_nothing() {
+        // Both base lines are equally like both side lines: no evidence.
+        assert!(!closest_in_place(&["ab\n", "ab\n"], &["abx\n", "aby\n"]));
+        assert!(closest_in_place(
+            &["| 1 | 2 |\n", "| 3 | 4 |\n"],
+            &["| 1x | 2 |\n", "| 3x | 4 |\n"]
         ));
     }
 

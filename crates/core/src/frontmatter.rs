@@ -697,7 +697,9 @@ pub fn merge_text(
 ///
 /// A body merge may be finer than a line merge (per character, say); a
 /// frontmatter value is never merged finer than its lines, so two changes to
-/// one date never make a date nobody wrote.
+/// one date never make a date nobody wrote. When the frontmatter merge steps
+/// aside and any side has a frontmatter, the body gets the plain line merge
+/// too, since the whole text is merged as one.
 pub fn merge_text_with(
     base: Option<&str>,
     local: &str,
