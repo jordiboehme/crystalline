@@ -125,6 +125,15 @@ pub(crate) struct Forge {
     /// When set, every collaborator listing answers GitHub's rate limit
     /// (403 with `x-ratelimit-remaining: 0`).
     pub(crate) collaborators_rate_limited: std::sync::atomic::AtomicBool,
+    /// Repository (its current name) -> its numeric id, as
+    /// `GET /repos/{o}/{r}` and `GET /repositories/{id}` answer it.
+    ids: StdMutex<HashMap<String, u64>>,
+    /// Old name -> new name of every renamed repository: GitHub answers the
+    /// old name with a redirect to the new one.
+    redirects: StdMutex<HashMap<String, String>>,
+    /// Current name -> the name the repository was served under at first
+    /// (the key of `repos`), for a renamed one.
+    first_names: StdMutex<HashMap<String, String>>,
 }
 
 impl Forge {
@@ -145,6 +154,41 @@ impl Forge {
     /// on an uninstall.
     pub(crate) fn uninstall(&self, repo: &str) {
         self.installed.lock().unwrap().remove(repo);
+    }
+
+    /// Renames `old` to `new` the way GitHub does: the id, the
+    /// installation, the collaborators and the visibility go with it, and
+    /// the old name redirects to the new one from now on.
+    pub(crate) fn rename(&self, old: &str, new: &str) {
+        let mut ids = self.ids.lock().unwrap();
+        if let Some(id) = ids.remove(old) {
+            ids.insert(new.to_string(), id);
+        }
+        let mut redirects = self.redirects.lock().unwrap();
+        redirects.remove(new);
+        redirects.insert(old.to_string(), new.to_string());
+        let mut first = self.first_names.lock().unwrap();
+        let original = first.remove(old).unwrap_or_else(|| old.to_string());
+        if original != new {
+            first.insert(new.to_string(), original);
+        }
+        let mut installed = self.installed.lock().unwrap();
+        if let Some(id) = installed.remove(old) {
+            installed.insert(new.to_string(), id);
+        }
+        let mut collaborators = self.collaborators.lock().unwrap();
+        if let Some(people) = collaborators.remove(old) {
+            collaborators.insert(new.to_string(), people);
+        }
+        let mut public = self.public.lock().unwrap();
+        if public.remove(old) {
+            public.insert(new.to_string());
+        }
+    }
+
+    /// The numeric id GitHub gives `repo` now.
+    pub(crate) fn id_of(&self, repo: &str) -> Option<u64> {
+        self.ids.lock().unwrap().get(repo).copied()
     }
 
     /// Puts the App on `repo` as installation `id`.
@@ -205,6 +249,15 @@ pub(crate) async fn spawn_forge(
         public: StdMutex::new(std::collections::HashSet::new()),
         collaborators_down: std::sync::atomic::AtomicBool::new(false),
         collaborators_rate_limited: std::sync::atomic::AtomicBool::new(false),
+        ids: StdMutex::new(
+            repos
+                .iter()
+                .enumerate()
+                .map(|(i, (name, _))| (name.to_string(), 100 + i as u64))
+                .collect(),
+        ),
+        redirects: StdMutex::new(HashMap::new()),
+        first_names: StdMutex::new(HashMap::new()),
     });
     let router = Router::new().fallback(handle).with_state(forge.clone());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -332,9 +385,37 @@ async fn handle(
             .into_owned();
         return ok(json!({"login": login, "id": 41898282, "type": "Bot"}));
     }
+    if let Some(id) = path.strip_prefix("/repositories/")
+        && method == Method::GET
+    {
+        if auth.is_none() {
+            return (
+                StatusCode::UNAUTHORIZED,
+                axum::Json(json!({"message": "Requires authentication"})),
+            )
+                .into_response();
+        }
+        let id: u64 = id.parse().unwrap_or(0);
+        let found = forge
+            .ids
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(_, i)| **i == id)
+            .map(|(name, _)| name.clone());
+        return match found {
+            Some(name) => ok(json!({"id": id, "full_name": name})),
+            None => not_found(),
+        };
+    }
     let Some(repo) = hit.repo() else {
         return not_found();
     };
+    let redirect = forge.redirects.lock().unwrap().get(&repo).cloned();
+    if let Some(new) = redirect {
+        let to = path.replacen(&format!("/repos/{repo}"), &format!("/repos/{new}"), 1);
+        return (StatusCode::MOVED_PERMANENTLY, [("location", to)]).into_response();
+    }
     let tail = path
         .strip_prefix(&format!("/repos/{repo}"))
         .unwrap_or_default()
@@ -345,7 +426,14 @@ async fn handle(
             None => not_found(),
         };
     }
-    let Some(mock) = forge.repos.get(&repo).cloned() else {
+    let served_as = forge
+        .first_names
+        .lock()
+        .unwrap()
+        .get(&repo)
+        .cloned()
+        .unwrap_or_else(|| repo.clone());
+    let Some(mock) = forge.repos.get(&served_as).cloned() else {
         return not_found();
     };
     if !forge.authorized(&repo, auth.as_deref()) {
@@ -420,7 +508,12 @@ async fn repo_route(
     if tail.is_empty() && get {
         let private = !forge.public.lock().unwrap().contains(&origin.repo);
         return match mock.default_branch(&origin.repo).await {
-            Ok(branch) => ok(json!({"default_branch": branch, "private": private})),
+            Ok(branch) => ok(json!({
+                "default_branch": branch,
+                "private": private,
+                "id": forge.id_of(&origin.repo).unwrap_or_default(),
+                "full_name": origin.repo,
+            })),
             Err(e) => failed(e),
         };
     }

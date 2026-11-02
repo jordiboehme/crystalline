@@ -1207,3 +1207,58 @@ async fn an_unknown_visibility_word_is_an_error() {
     assert!(app.repository_visibility("acme/kb").await.is_err());
     assert!(app.repository_public("acme/kb").await.is_err());
 }
+
+/// What GitHub says a repository is: its numeric id and its current
+/// `owner/name`, read with the repository's installation token. A renamed
+/// repository answers under its new name through GitHub's redirect.
+#[tokio::test]
+async fn repository_identity_reads_the_id_and_the_current_name() {
+    let routes = Router::new()
+        .route(
+            "/repos/{owner}/{name}",
+            get(|Path((owner, name)): Path<(String, String)>| async move {
+                if name == "kb" {
+                    return (
+                        StatusCode::MOVED_PERMANENTLY,
+                        [("location", format!("/repos/{owner}/handbook"))],
+                    )
+                        .into_response();
+                }
+                Json(serde_json::json!({"id": 55, "full_name": format!("{owner}/{name}")}))
+                    .into_response()
+            }),
+        )
+        .route(
+            "/repositories/{id}",
+            get(|Path(id): Path<u64>| async move {
+                Json(serde_json::json!({"id": id, "full_name": "acme/handbook"}))
+            }),
+        );
+    let (_mock, _base, app, _clock) = serve_with(mock_with(&[("acme/kb", 11)]), routes).await;
+    assert_eq!(
+        app.repository_identity("acme/kb").await.unwrap(),
+        (55, "acme/handbook".to_string())
+    );
+    assert_eq!(
+        app.repository_by_id("acme/kb", 55).await.unwrap(),
+        (55, "acme/handbook".to_string())
+    );
+}
+
+/// The repositories the client has looked an installation up for, so an
+/// uninstalled installation's domains can all be closed.
+#[tokio::test]
+async fn repositories_of_an_installation_are_the_ones_looked_up_for_it() {
+    let (_mock, _base, app, _clock) = serve_with(
+        mock_with(&[("acme/kb", 11), ("acme/vault", 11), ("other/x", 12)]),
+        Router::new(),
+    )
+    .await;
+    for repo in ["acme/kb", "acme/vault", "other/x"] {
+        app.installation_for(repo).await.unwrap();
+    }
+    let mut repos = app.repositories_of_installation(11);
+    repos.sort();
+    assert_eq!(repos, vec!["acme/kb".to_string(), "acme/vault".to_string()]);
+    assert!(app.repositories_of_installation(99).is_empty());
+}

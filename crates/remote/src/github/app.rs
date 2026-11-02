@@ -399,6 +399,14 @@ struct LoginResponse {
     login: String,
 }
 
+/// `GET /repos/{o}/{r}` and `GET /repositories/{id}`, read for who a
+/// repository is.
+#[derive(Deserialize)]
+struct IdentityResponse {
+    id: u64,
+    full_name: String,
+}
+
 #[derive(Deserialize)]
 struct VisibilityResponse {
     private: bool,
@@ -981,6 +989,34 @@ impl GithubApp {
         }
     }
 
+    /// What GitHub says `repo` is now: its numeric id and its current
+    /// `owner/name`, from `GET /repos/{o}/{r}` with the repository's
+    /// installation token. A renamed repository is answered under its new
+    /// name (GitHub redirects the old one, and the client follows one hop).
+    pub async fn repository_identity(&self, repo: &str) -> Result<(u64, String), RemoteError> {
+        let (owner, name) = split_repo(repo)?;
+        let path = format!("/repos/{}/{}", segment(owner), segment(name));
+        let response = self.get_as_installation(repo, &path).await?;
+        let response = check_response(response, Some(repo), true, &self.api_url).await?;
+        let answer: IdentityResponse = parse_json(response).await?;
+        Ok((answer.id, answer.full_name))
+    }
+
+    /// What GitHub says the repository with numeric id `id` is now: its id
+    /// and its current `owner/name`, from `GET /repositories/{id}` with the
+    /// installation token of `repo` (a name the same installation covers).
+    pub async fn repository_by_id(
+        &self,
+        repo: &str,
+        id: u64,
+    ) -> Result<(u64, String), RemoteError> {
+        let path = format!("/repositories/{id}");
+        let response = self.get_as_installation(repo, &path).await?;
+        let response = check_response(response, Some(repo), true, &self.api_url).await?;
+        let answer: IdentityResponse = parse_json(response).await?;
+        Ok((answer.id, answer.full_name))
+    }
+
     /// A GET on `path` with `repo`'s installation token. A 401 means the
     /// cached token was revoked early: the installation is forgotten and the
     /// request goes out once more on a fresh token. Any other status is
@@ -1008,6 +1044,16 @@ impl GithubApp {
     pub fn evict_installation(&self, id: u64) {
         lock(&self.tokens).remove(&id);
         lock(&self.installations).retain(|_, installation| *installation != id);
+    }
+
+    /// The repositories (lowercased `owner/name`) this client has looked
+    /// installation `id` up for: the ones it knows that installation covers.
+    pub fn repositories_of_installation(&self, id: u64) -> Vec<String> {
+        lock(&self.installations)
+            .iter()
+            .filter(|(_, installation)| **installation == id)
+            .map(|(repo, _)| repo.clone())
+            .collect()
     }
 
     /// Forgets every installation and every token, so the next call for any

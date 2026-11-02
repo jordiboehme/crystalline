@@ -200,6 +200,18 @@ impl ApiError {
         }
     }
 
+    /// A 413 for a body larger than the route takes.
+    pub fn payload_too_large(detail: impl Into<String>) -> ApiError {
+        ApiError {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            title: "payload too large",
+            detail: detail.into(),
+            token_required: None,
+            retry_after: None,
+            home_url: None,
+        }
+    }
+
     /// A 503 for a caller the server cannot serve right now but expects to
     /// serve shortly. Distinct from the 429 above: that one is aimed at this
     /// caller, this one is about the instance.

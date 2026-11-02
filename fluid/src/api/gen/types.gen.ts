@@ -7029,17 +7029,21 @@ export type ReceiveGithubWebhookErrors = {
      */
     400: ProblemDetail;
     /**
-     * No webhook secret is configured, or the signature is missing or wrong. Nothing happened.
+     * No webhook secret is configured, or the signature is missing, not `sha256=` and 64 lowercase hex digits, or wrong. Nothing happened, and the first three are answered before the body is read.
      */
     401: ProblemDetail;
     /**
      * A body over 25 MiB, refused before the signature is checked.
      */
-    413: unknown;
+    413: ProblemDetail;
     /**
-     * A change could not be saved. The delivery is not remembered, so GitHub's redelivery is handled.
+     * A change could not be saved. The delivery is not remembered, so GitHub's redelivery is handled. The answer is one fixed sentence; the server log says why.
      */
     500: ProblemDetail;
+    /**
+     * Too many deliveries at once (four are read and handled at a time). Nothing happened.
+     */
+    503: ProblemDetail;
 };
 
 export type ReceiveGithubWebhookError = ReceiveGithubWebhookErrors[keyof ReceiveGithubWebhookErrors];

@@ -473,6 +473,9 @@ pub struct RestState {
     /// whole process: every clone of this state shares it. See
     /// [`events::STREAMS_PER_ACCOUNT`].
     streams: Arc<events::StreamSlots>,
+    /// How many GitHub webhook deliveries are read and handled at once. One
+    /// count for the whole process. See [`github_webhook::CONCURRENT`].
+    pub(crate) webhook_slots: Arc<Semaphore>,
 }
 
 impl RestState {
@@ -528,6 +531,7 @@ impl RestState {
             login_throttle: Arc::new(LoginThrottle::new(login_free_attempts, login_max_delay)),
             shutdown: None,
             streams: Arc::new(events::StreamSlots::default()),
+            webhook_slots: Arc::new(Semaphore::new(github_webhook::CONCURRENT)),
         })
     }
 
@@ -1138,16 +1142,13 @@ fn routes(state: RestState) -> Router {
         .route(github_link::CALLBACK_PATH, get(github_link::callback))
         // The GitHub App's webhook, public by path: GitHub has no session
         // and no CSRF token, and the guard hands it to the handler without
-        // looking for either. The proof is the signature over the body,
-        // checked before anything else is read. Its own body limit, larger
-        // than the mount's: GitHub sends deliveries of up to 25 MB, and the
-        // limit refuses anything larger before a byte of HMAC runs. See
-        // [`github_webhook`].
-        .route(
-            github_webhook::PATH,
-            post(github_webhook::receive)
-                .layer(DefaultBodyLimit::max(github_webhook::WEBHOOK_BODY_BYTES)),
-        )
+        // looking for either. The proof is the signature over the body. The
+        // handler takes the raw body and reads it only once a secret is
+        // configured and a well-formed signature header is there, up to its
+        // own limit (larger than the mount's: GitHub sends deliveries of up
+        // to 25 MB), and checks the signature before it parses anything.
+        // See [`github_webhook`].
+        .route(github_webhook::PATH, post(github_webhook::receive))
         // The other half of the same self-service idea: the tokens this
         // account's AGENTS authenticate with when `auth.mcp` is on. Open to
         // every signed-in account, viewers included - an agent acts as the

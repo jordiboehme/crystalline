@@ -9247,7 +9247,7 @@
           "settings"
         ],
         "summary": "Where the GitHub App delivers its webhook events.",
-        "description": "Called by GitHub, never by a browser. Public: no session, no CSRF token. The only proof is `X-Hub-Signature-256`, the HMAC-SHA256 of the raw body under the App's webhook secret, checked before anything else is read. A delivery id seen in the last day is answered 200 and does nothing. An event only makes the instance forget what it knew about a repository, a person or an installation (or close a domain whose repository the App lost); the next request asks GitHub. Nothing in a payload is believed about who may do what.",
+        "description": "Called by GitHub, never by a browser. Public: no session, no CSRF token. The only proof is `X-Hub-Signature-256`, the HMAC-SHA256 of the raw body under the App's webhook secret, checked before anything in the body is read. A delivery id seen in the last day is answered 200 and does nothing; a body sent again under a fresh id is harmless because every event only narrows access. An event only makes the instance forget what it knew about a repository, a person or an installation (or close a domain whose repository the App lost, or follow a rename GitHub itself confirms); the next request asks GitHub. Nothing in a payload is believed about who may do what.",
         "operationId": "receive_github_webhook",
         "requestBody": {
           "description": "The event's payload, as GitHub sends it, at most 25 MiB.",
@@ -9275,7 +9275,7 @@
             }
           },
           "401": {
-            "description": "No webhook secret is configured, or the signature is missing or wrong. Nothing happened.",
+            "description": "No webhook secret is configured, or the signature is missing, not `sha256=` and 64 lowercase hex digits, or wrong. Nothing happened, and the first three are answered before the body is read.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -9285,10 +9285,27 @@
             }
           },
           "413": {
-            "description": "A body over 25 MiB, refused before the signature is checked."
+            "description": "A body over 25 MiB, refused before the signature is checked.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
           },
           "500": {
-            "description": "A change could not be saved. The delivery is not remembered, so GitHub's redelivery is handled.",
+            "description": "A change could not be saved. The delivery is not remembered, so GitHub's redelivery is handled. The answer is one fixed sentence; the server log says why.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Too many deliveries at once (four are read and handled at a time). Nothing happened.",
             "content": {
               "application/problem+json": {
                 "schema": {

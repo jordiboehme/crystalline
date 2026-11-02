@@ -6,25 +6,43 @@
 //! token and no account: the guard lets it through untouched
 //! (`auth::guard`), and the only proof a delivery came from GitHub is its
 //! `X-Hub-Signature-256`, the HMAC-SHA256 of the raw body under the App's
-//! webhook secret. That is checked before anything else is read:
+//! webhook secret. The steps, in order:
 //!
-//! 1. A body over [`WEBHOOK_BODY_BYTES`] is refused (413) before it is read
-//!    to the end, so no HMAC runs over it.
-//! 2. No webhook secret configured (or a blank one), no signature, or a
-//!    signature that does not match: 401, and nothing else happens.
-//! 3. No `X-GitHub-Delivery`: 400.
-//! 4. A delivery id seen in the last day: 200, and no work (a replay).
-//! 5. Only then is the body parsed and the event handled
-//!    ([`Engine::apply_github_event`](crate::engine::Engine::apply_github_event)),
-//!    which only ever makes the governor forget or close something. No role
-//!    is ever read from a payload.
+//! 1. No webhook secret configured (or a blank one), or a signature header
+//!    that is not exactly `sha256=` and 64 lowercase hex digits: 401, before
+//!    a byte of the body is read.
+//! 2. At most [`CONCURRENT`] deliveries are read and handled at once; one
+//!    that finds no slot within [`SLOT_WAIT`] gets 503.
+//! 3. The body is read up to [`WEBHOOK_BODY_BYTES`]; a larger one is 413,
+//!    and no HMAC runs over it.
+//! 4. A signature that does not match: 401, and nothing else happens.
+//! 5. No `X-GitHub-Delivery` or `X-GitHub-Event`: 400.
+//! 6. A delivery id seen in the last day: 200, and no work.
+//! 7. Only then is the body parsed and the event handled
+//!    ([`Engine::apply_github_event`](crate::engine::Engine::apply_github_event)).
+//!
+//! What the delivery id does not do: the signature covers the body only, so
+//! a captured delivery can be sent again under a fresh id, and step 6 does
+//! not catch that. What makes a resent body harmless is that every event is
+//! idempotent and only ever narrows access: `member`, `team`, `membership`,
+//! `organization` and `repository` privatized/publicized make the governor
+//! forget (the next question asks GitHub); `repository` deleted,
+//! `installation_repositories` removed and `installation` deleted/suspend
+//! close domains; `repository` transferred to another owner closes the
+//! domain for good; `installation` and `installation_repositories` added
+//! only let the governor ask GitHub again; `repository` renamed moves a
+//! domain only when GitHub itself confirms the new name; and
+//! `github_app_authorization` revoked deletes a token. No role is ever read
+//! from a payload. A new event handled here must keep to that.
 //!
 //! The host a delivery comes from does not matter, so the route works for an
 //! App on GitHub Enterprise Server unchanged. Log lines carry the delivery
 //! id and the event name only, never the payload, the secret or the
 //! signature.
 
-use axum::body::Bytes;
+use std::time::Duration;
+
+use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -39,6 +57,18 @@ pub const PATH: &str = "/github/webhook";
 /// The largest delivery this route takes, 25 MiB: GitHub caps a webhook
 /// payload at 25 MB and drops a larger one itself.
 pub const WEBHOOK_BODY_BYTES: usize = 25 * 1024 * 1024;
+
+/// How many deliveries are read and handled at once: each may hold up to
+/// [`WEBHOOK_BODY_BYTES`] in memory.
+pub const CONCURRENT: usize = 4;
+
+/// How long a delivery waits for one of the [`CONCURRENT`] slots before it
+/// is answered 503, well inside the ten seconds GitHub waits.
+pub const SLOT_WAIT: Duration = Duration::from_secs(3);
+
+/// What a delivery that could not be handled is answered. The details are in
+/// the log only.
+const NOT_HANDLED: &str = "the delivery could not be handled; the server log says why";
 
 /// How much of a header value a log line carries: a delivery id is a UUID,
 /// and before the signature is checked anybody can send anything.
@@ -55,6 +85,18 @@ pub fn signature(secret: &[u8], body: &[u8]) -> String {
     format!("sha256={}", crystalline_index::hex_lower(&code))
 }
 
+/// Whether `presented` has the shape of a signature: exactly `sha256=` and
+/// 64 lowercase hex digits. Anything else is refused before the body is
+/// read.
+fn well_formed(presented: &str) -> bool {
+    presented.strip_prefix("sha256=").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
 /// Whether `presented` is the signature of `body` under `secret`, compared
 /// in constant time. A blank secret verifies nothing: anybody can compute an
 /// HMAC under an empty key.
@@ -63,7 +105,7 @@ fn verified(secret: &str, presented: &str, body: &[u8]) -> bool {
         return false;
     }
     let expected = signature(secret.as_bytes(), body);
-    constant_time_eq(presented.trim().as_bytes(), expected.as_bytes())
+    constant_time_eq(presented.as_bytes(), expected.as_bytes())
 }
 
 /// A header's value as text, if it has one.
@@ -91,11 +133,14 @@ fn for_log(value: Option<&str>) -> String {
     description = "Called by GitHub, never by a browser. Public: no session, \
                    no CSRF token. The only proof is `X-Hub-Signature-256`, \
                    the HMAC-SHA256 of the raw body under the App's webhook \
-                   secret, checked before anything else is read. A delivery \
-                   id seen in the last day is answered 200 and does nothing. \
+                   secret, checked before anything in the body is read. A \
+                   delivery id seen in the last day is answered 200 and \
+                   does nothing; a body sent again under a fresh id is \
+                   harmless because every event only narrows access. \
                    An event only makes the instance forget what it knew \
                    about a repository, a person or an installation (or \
-                   close a domain whose repository the App lost); the next \
+                   close a domain whose repository the App lost, or follow \
+                   a rename GitHub itself confirms); the next \
                    request asks GitHub. Nothing in a payload is believed \
                    about who may do what.",
     request_body(
@@ -120,7 +165,9 @@ fn for_log(value: Option<&str>) -> String {
         (
             status = 401,
             description = "No webhook secret is configured, or the signature \
-                           is missing or wrong. Nothing happened.",
+                           is missing, not `sha256=` and 64 lowercase hex \
+                           digits, or wrong. Nothing happened, and the first \
+                           three are answered before the body is read.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -128,11 +175,22 @@ fn for_log(value: Option<&str>) -> String {
             status = 413,
             description = "A body over 25 MiB, refused before the signature \
                            is checked.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
         ),
         (
             status = 500,
             description = "A change could not be saved. The delivery is not \
-                           remembered, so GitHub's redelivery is handled.",
+                           remembered, so GitHub's redelivery is handled. \
+                           The answer is one fixed sentence; the server log \
+                           says why.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 503,
+            description = "Too many deliveries at once (four are read and \
+                           handled at a time). Nothing happened.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -141,7 +199,7 @@ fn for_log(value: Option<&str>) -> String {
 pub async fn receive(
     State(state): State<RestState>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Result<Response, ApiError> {
     let delivery = header(&headers, "x-github-delivery");
     let event = header(&headers, "x-github-event");
@@ -162,20 +220,57 @@ pub async fn receive(
             "this instance has no GitHub App webhook secret to check the delivery with",
         ));
     };
-    let signed = header(&headers, "x-hub-signature-256")
-        .is_some_and(|presented| verified(&secret, presented, &body));
+    let presented = headers
+        .get("x-hub-signature-256")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| well_formed(v));
+    let Some(presented) = presented else {
+        tracing::warn!(
+            delivery = ?for_log(delivery),
+            event = ?for_log(event),
+            "a GitHub webhook delivery was refused: it carries no well-formed signature"
+        );
+        return Err(ApiError::unauthorized(
+            "the delivery's X-Hub-Signature-256 is missing or not sha256= and 64 lowercase hex digits",
+        ));
+    };
+    let Ok(Ok(_slot)) =
+        tokio::time::timeout(SLOT_WAIT, state.webhook_slots.clone().acquire_owned()).await
+    else {
+        tracing::warn!(
+            delivery = ?for_log(delivery),
+            event = ?for_log(event),
+            "a GitHub webhook delivery was refused: too many deliveries at once"
+        );
+        return Err(ApiError::service_unavailable(
+            "too many GitHub webhook deliveries at once; try again",
+        )
+        .retry_after(10));
+    };
+    let Ok(body) = axum::body::to_bytes(body, WEBHOOK_BODY_BYTES).await else {
+        tracing::warn!(
+            delivery = ?for_log(delivery),
+            event = ?for_log(event),
+            "a GitHub webhook delivery was refused: its body is over the limit or did not arrive whole"
+        );
+        return Err(ApiError::payload_too_large(
+            "the delivery's body is over 25 MiB or did not arrive whole",
+        ));
+    };
+    let signed = verified(&secret, presented, &body);
     drop(secret);
     if !signed {
         tracing::warn!(
             delivery = ?for_log(delivery),
             event = ?for_log(event),
-            "a GitHub webhook delivery was refused: its signature is missing or wrong"
+            "a GitHub webhook delivery was refused: its signature does not match"
         );
         return Err(ApiError::unauthorized(
-            "the delivery's X-Hub-Signature-256 is missing or does not match",
+            "the delivery's X-Hub-Signature-256 does not match",
         ));
     }
-    // From here on GitHub sent it.
+    // From here on GitHub sent it (though perhaps not just now: see the
+    // module documentation).
     let Some(delivery) = delivery else {
         tracing::warn!(event = ?for_log(event), "a signed GitHub webhook delivery carried no delivery id");
         return Err(ApiError::bad_request(
@@ -196,10 +291,17 @@ pub async fn receive(
         );
         ApiError::bad_request("the delivery's body is not JSON")
     })?;
-    let new =
-        state.auth.remember_delivery(delivery).await.map_err(|e| {
-            ApiError::internal(format!("the delivery could not be recorded: {e:#}"))
-        })?;
+    let new = match state.auth.remember_delivery(delivery).await {
+        Ok(new) => new,
+        Err(e) => {
+            tracing::warn!(
+                delivery = ?for_log(Some(delivery)),
+                event = ?for_log(Some(event)),
+                "a GitHub webhook delivery could not be recorded: {e:#}"
+            );
+            return Err(ApiError::internal(NOT_HANDLED));
+        }
+    };
     if !new {
         tracing::info!(
             delivery = ?for_log(Some(delivery)),
@@ -233,9 +335,7 @@ pub async fn receive(
                 event = ?for_log(Some(event)),
                 "a GitHub webhook delivery could not be handled: {e}"
             );
-            Err(ApiError::internal(format!(
-                "the delivery could not be handled: {e}"
-            )))
+            Err(ApiError::internal(NOT_HANDLED))
         }
     }
 }
@@ -266,6 +366,18 @@ mod tests {
         assert!(!verified("another", &good, body));
         assert!(!verified("s3cret", &good.replace("sha256=", "sha1="), body));
         assert!(!verified("s3cret", "", body));
+    }
+
+    #[test]
+    fn only_sha256_and_64_lowercase_hex_digits_are_well_formed() {
+        assert!(well_formed(&signature(b"s3cret", b"{}")));
+        assert!(!well_formed(&format!("sha256={}", "a".repeat(63))));
+        assert!(!well_formed(&format!("sha256={}", "a".repeat(65))));
+        assert!(!well_formed(&format!("sha256={}", "A".repeat(64))));
+        assert!(!well_formed(&format!("sha256={}", "g".repeat(64))));
+        assert!(!well_formed(&format!(" sha256={}", "a".repeat(64))));
+        assert!(!well_formed(&format!("sha1={}", "a".repeat(40))));
+        assert!(!well_formed(""));
     }
 
     #[test]

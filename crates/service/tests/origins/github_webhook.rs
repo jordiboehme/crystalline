@@ -71,6 +71,7 @@ struct Fx {
     eng: Arc<Engine>,
     auth: Arc<AuthStore>,
     kb: Arc<MockProvider>,
+    addr: std::net::SocketAddr,
     url: String,
     tmp: tempfile::TempDir,
 }
@@ -131,6 +132,7 @@ async fn setup(secret: Option<&str>) -> Fx {
         eng,
         auth,
         kb,
+        addr,
         url: format!("http://{addr}"),
         tmp,
     }
@@ -472,36 +474,138 @@ async fn a_role_in_the_payload_is_never_used() {
     );
 }
 
+/// A `repository` `renamed` body: `from` (a name on `owner`) is now
+/// `owner/to`, with the id the payload claims.
+fn renamed(owner: &str, from: &str, to: &str, id: u64) -> Value {
+    json!({
+        "action": "renamed",
+        "changes": {"repository": {"name": {"from": from}}},
+        "repository": {"id": id, "full_name": format!("{owner}/{to}"), "name": to, "owner": {"login": owner}},
+        "installation": {"id": 1},
+    })
+}
+
 #[tokio::test]
 async fn a_renamed_repository_updates_the_origin() {
     let fx = setup(Some(SECRET)).await;
-    let payload = json!({
-        "action": "renamed",
-        "changes": {"repository": {"name": {"from": "kb"}}},
-        "repository": {"full_name": "acme/handbook", "name": "handbook", "owner": {"login": "acme"}},
-        "installation": {"id": 1},
-    });
-    let resp = deliver(&fx, Delivery::signed("repository", "d-rename", &payload)).await;
+    let id = fx.forge.id_of("acme/kb").unwrap();
+    fx.forge.rename("acme/kb", "acme/handbook");
+    let resp = deliver(
+        &fx,
+        Delivery::signed(
+            "repository",
+            "d-rename",
+            &renamed("acme", "kb", "handbook", id),
+        ),
+    )
+    .await;
     assert_eq!(resp.status(), 200);
     assert_eq!(origin_repo(&fx.eng, "kb"), "acme/handbook");
     assert_eq!(origin_repo(&fx.eng, "vault"), "acme/vault");
     let saved = std::fs::read_to_string(fx.tmp.path().join("config.yaml")).unwrap();
     assert!(saved.contains("acme/handbook"), "{saved}");
     assert!(!saved.contains("acme/kb"), "{saved}");
+    // GitHub was asked, by id and by the old name.
+    let hits = fx.forge.hits();
+    assert!(hits.iter().any(|h| h.path == format!("/repositories/{id}")));
+    assert!(hits.iter().any(|h| h.path == "/repos/acme/kb"));
 }
 
+/// A signed body can be sent again with a fresh delivery id. One that says
+/// what is no longer true moves nothing: GitHub is asked, and says
+/// otherwise.
 #[tokio::test]
-async fn a_transferred_repository_updates_the_origin() {
+async fn a_stale_renamed_body_sent_again_with_a_fresh_id_moves_nothing() {
     let fx = setup(Some(SECRET)).await;
+    let id = fx.forge.id_of("acme/kb").unwrap();
+    let forward = renamed("acme", "kb", "handbook", id);
+    fx.forge.rename("acme/kb", "acme/handbook");
+    deliver(&fx, Delivery::signed("repository", "d-forward", &forward)).await;
+    assert_eq!(origin_repo(&fx.eng, "kb"), "acme/handbook");
+    // And back again.
+    fx.forge.rename("acme/handbook", "acme/kb");
+    deliver(
+        &fx,
+        Delivery::signed(
+            "repository",
+            "d-back",
+            &renamed("acme", "handbook", "kb", id),
+        ),
+    )
+    .await;
+    assert_eq!(origin_repo(&fx.eng, "kb"), "acme/kb");
+    // The first body once more, under a new id.
+    let resp = deliver(
+        &fx,
+        Delivery::signed("repository", "d-forward-again", &forward),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(origin_repo(&fx.eng, "kb"), "acme/kb");
+}
+
+/// A rename GitHub does not confirm (here: the id names another
+/// repository, and the old name was never renamed) moves nothing.
+#[tokio::test]
+async fn a_rename_github_does_not_confirm_moves_nothing() {
+    let fx = setup(Some(SECRET)).await;
+    let vault = fx.forge.id_of("acme/vault").unwrap();
+    let kb = fx.forge.id_of("acme/kb").unwrap();
+    for (id, delivery) in [(vault, "d-other-id"), (kb, "d-not-renamed")] {
+        let resp = deliver(
+            &fx,
+            Delivery::signed(
+                "repository",
+                delivery,
+                &renamed("acme", "kb", "handbook", id),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        assert_eq!(origin_repo(&fx.eng, "kb"), "acme/kb");
+    }
+    // No id at all: nothing to confirm with.
+    let mut payload = renamed("acme", "kb", "handbook", kb);
+    payload["repository"].as_object_mut().unwrap().remove("id");
+    deliver(&fx, Delivery::signed("repository", "d-no-id", &payload)).await;
+    assert_eq!(origin_repo(&fx.eng, "kb"), "acme/kb");
+}
+
+/// Ruling R32: a move to another owner is never followed. The domain is
+/// closed until an admin reconnects it, whatever GitHub says later.
+#[tokio::test]
+async fn a_transferred_repository_closes_its_domain() {
+    let fx = setup(Some(SECRET)).await;
+    ask(&fx).await;
     let payload = json!({
         "action": "transferred",
         "changes": {"owner": {"from": {"organization": {"login": "ACME"}}}},
-        "repository": {"full_name": "newco/kb", "name": "kb", "owner": {"login": "newco"}},
+        "repository": {"id": 100, "full_name": "newco/kb", "name": "kb", "owner": {"login": "newco"}},
         "installation": {"id": 1},
     });
     let resp = deliver(&fx, Delivery::signed("repository", "d-transfer", &payload)).await;
     assert_eq!(resp.status(), 200);
-    assert_eq!(origin_repo(&fx.eng, "kb"), "newco/kb");
+    assert_eq!(origin_repo(&fx.eng, "kb"), "acme/kb");
+    let closed = fx.eng.github_access_closed();
+    assert_eq!(closed.len(), 1, "{closed:?}");
+    assert_eq!(closed[0].domain, "kb");
+    assert_eq!(
+        closed[0].reason,
+        "the repository moved to newco/kb on GitHub; an admin must reconnect the domain"
+    );
+    // An installation event that rechecks closed domains does not open it.
+    let resp = deliver(
+        &fx,
+        Delivery::signed(
+            "installation",
+            "d-new-perms",
+            &json!({"action": "new_permissions_accepted", "installation": {"id": 1}}),
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(fx.eng.github_access_closed().len(), 1);
 }
 
 fn origin_repo(eng: &Engine, domain: &str) -> String {
@@ -643,6 +747,10 @@ async fn a_removed_installation_repository_closes_its_domain() {
     let closed = fx.eng.github_access_closed();
     assert_eq!(closed.len(), 1, "{closed:?}");
     assert_eq!(closed[0].domain, "kb");
+    assert_eq!(
+        closed[0].reason,
+        "acme/kb was removed from the GitHub App's installation: add it back there or disconnect the domain"
+    );
     assert!(fx.eng.github_people("kb").await.is_none());
 
     // Added back: the recheck opens it again.
@@ -684,6 +792,10 @@ async fn a_deleted_repository_closes_its_domain() {
     let closed = fx.eng.github_access_closed();
     assert_eq!(closed.len(), 1, "{closed:?}");
     assert_eq!(closed[0].domain, "kb");
+    assert_eq!(
+        closed[0].reason,
+        "acme/kb was deleted on GitHub: disconnect the domain or connect it to another repository"
+    );
 }
 
 #[tokio::test]
@@ -719,4 +831,196 @@ async fn an_event_for_an_unconnected_repository_does_nothing() {
         &fx.forge.hits()[before..]
     );
     assert!(fx.eng.github_access_closed().is_empty());
+}
+
+/// An uninstalled (or suspended) installation closes every connected
+/// repository the App client knows it covers, not only those the payload
+/// lists.
+#[tokio::test]
+async fn an_uninstalled_installation_closes_every_repository_it_covers() {
+    let fx = setup(Some(SECRET)).await;
+    ask(&fx).await;
+    fx.eng.github_people("vault").await.unwrap();
+    fx.forge.uninstall("acme/kb");
+    fx.forge.uninstall("acme/vault");
+    let payload = json!({
+        "action": "deleted",
+        "installation": {"id": 1},
+        "repositories": [{"full_name": "acme/kb"}],
+    });
+    let resp = deliver(
+        &fx,
+        Delivery::signed("installation", "d-uninstall", &payload),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let closed: Vec<String> = fx
+        .eng
+        .github_access_closed()
+        .into_iter()
+        .map(|c| c.domain)
+        .collect();
+    assert_eq!(closed, vec!["kb".to_string(), "vault".to_string()]);
+}
+
+/// When the recheck opens a closed domain again, the Reflection is looked
+/// at again too: a page whose repository now has more readers than its
+/// source is held back from the backup branch.
+#[tokio::test]
+async fn a_reopened_domain_rescans_the_reflection() {
+    let fx = setup(Some(SECRET)).await;
+    let page = WriteReflectionParams {
+        domain: "kb".into(),
+        path: "overview.md".into(),
+        markdown: Some(OVERVIEW.into()),
+        sources: BTreeMap::from([("Team".to_string(), vec![ROTA.to_string()])]),
+        ..Default::default()
+    };
+    fx.eng.write_reflection(&page, &owner()).await.unwrap();
+    let later = || Instant::now() + Duration::from_secs(120);
+    fx.eng.reflection_backup_tick(later()).await;
+    assert!(fx.eng.reflection_backup_held_back("kb").is_empty());
+
+    // Closed without a rescan (as at start, before anybody asked), and
+    // wider on GitHub meanwhile.
+    fx.eng
+        .github_governor()
+        .close("acme/kb", "removed from the App's installation".into());
+    collaborators(
+        &fx.forge,
+        "acme/kb",
+        &[(ADA_ID, "ada-gh", "read"), (2, "bob-gh", "read")],
+    );
+    let payload = json!({
+        "action": "added",
+        "installation": {"id": 1},
+        "repository_selection": "selected",
+        "repositories_added": [{"id": 100, "full_name": "acme/kb", "name": "kb"}],
+        "repositories_removed": [],
+    });
+    let resp = deliver(
+        &fx,
+        Delivery::signed("installation_repositories", "d-back", &payload),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let mut held = Vec::new();
+    for _ in 0..100 {
+        fx.eng.reflection_backup_tick(later()).await;
+        held = fx.eng.reflection_backup_held_back("kb");
+        if !held.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(fx.eng.github_access_closed().is_empty());
+    assert_eq!(held, vec!["overview.md".to_string()]);
+}
+
+/// Sends a POST to the webhook that declares a body of `declared` bytes and
+/// sends only a few of them, and answers the status line, or `None` when
+/// the server waits for the rest of the body.
+async fn status_without_the_body(
+    fx: &Fx,
+    headers: &[(&str, &str)],
+    declared: usize,
+) -> Option<u16> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(fx.addr).await.unwrap();
+    let mut head = format!(
+        "POST {PATH} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {declared}\r\n",
+        fx.addr
+    );
+    for (name, value) in headers {
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    head.push_str("\r\n{\"zen\":");
+    stream.write_all(head.as_bytes()).await.unwrap();
+    let mut answer = Vec::new();
+    let mut buf = [0u8; 1024];
+    let read = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let n = stream.read(&mut buf).await.unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            answer.extend_from_slice(&buf[..n]);
+            if answer.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+    })
+    .await;
+    read.ok()?;
+    let text = String::from_utf8_lossy(&answer);
+    text.split_whitespace().nth(1)?.parse().ok()
+}
+
+#[tokio::test]
+async fn an_unconfigured_instance_answers_401_without_reading_the_body() {
+    let fx = setup(None).await;
+    let status = status_without_the_body(
+        &fx,
+        &[
+            ("x-github-event", "ping"),
+            ("x-github-delivery", "d-raw"),
+            ("x-hub-signature-256", &format!("sha256={}", "a".repeat(64))),
+        ],
+        20 * 1024 * 1024,
+    )
+    .await;
+    assert_eq!(status, Some(401));
+}
+
+#[tokio::test]
+async fn a_missing_or_malformed_signature_header_is_401_without_reading_the_body() {
+    let fx = setup(Some(SECRET)).await;
+    let short = format!("sha256={}", "a".repeat(63));
+    let upper = format!("sha256={}", "A".repeat(64));
+    let sha1 = format!("sha1={}", "a".repeat(40));
+    let long = format!("sha256={}", "a".repeat(65));
+    for signature in [
+        None,
+        Some(short.as_str()),
+        Some(upper.as_str()),
+        Some(sha1.as_str()),
+        Some(long.as_str()),
+    ] {
+        let mut headers = vec![("x-github-event", "ping"), ("x-github-delivery", "d-raw")];
+        if let Some(signature) = signature {
+            headers.push(("x-hub-signature-256", signature));
+        }
+        let status = status_without_the_body(&fx, &headers, 20 * 1024 * 1024).await;
+        assert_eq!(status, Some(401), "{signature:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_large_signed_body_is_taken() {
+    let fx = setup(Some(SECRET)).await;
+    let payload = json!({"zen": "x".repeat(12 * 1024 * 1024)});
+    let resp = deliver(&fx, Delivery::signed("ping", "d-large", &payload)).await;
+    assert_eq!(resp.status(), 200);
+}
+
+/// The same delivery twice at once does the work once.
+#[tokio::test]
+async fn two_identical_deliveries_at_once_do_the_work_once() {
+    let fx = setup(Some(SECRET)).await;
+    let id = fx.forge.id_of("acme/kb").unwrap();
+    fx.forge.rename("acme/kb", "acme/handbook");
+    let body = renamed("acme", "kb", "handbook", id);
+    let (a, b) = tokio::join!(
+        deliver(&fx, Delivery::signed("repository", "d-twice", &body)),
+        deliver(&fx, Delivery::signed("repository", "d-twice", &body)),
+    );
+    assert_eq!((a.status().as_u16(), b.status().as_u16()), (200, 200));
+    assert_eq!(origin_repo(&fx.eng, "kb"), "acme/handbook");
+    let asked = fx
+        .forge
+        .hits()
+        .iter()
+        .filter(|h| h.path == format!("/repositories/{id}"))
+        .count();
+    assert_eq!(asked, 1, "GitHub was asked once");
 }
