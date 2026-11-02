@@ -38,6 +38,29 @@ export const cellMain = Facet.define<EditorView, EditorView | null>({
   combine: (values) => values[0] ?? null,
 });
 
+/** Main views running a search command sent from a focused cell. */
+const searchingFromCell = new WeakSet<EditorView>();
+
+/**
+ * Runs `command` on `main` marked as a search from a focused cell. The hit
+ * may scroll that cell's table out of the viewport in the same update, which
+ * takes the focus with it, so the search listener asks this instead of the
+ * focus to know where the focus belongs.
+ */
+export function searchFromCell<T>(main: EditorView, command: () => T): T {
+  searchingFromCell.add(main);
+  try {
+    return command();
+  } finally {
+    searchingFromCell.delete(main);
+  }
+}
+
+/** Whether `main` is running a search command sent from a focused cell. */
+export function isSearchFromCell(main: EditorView): boolean {
+  return searchingFromCell.has(main);
+}
+
 /** Main-doc positions inside one cell's content. */
 export interface OpenCell {
   anchor: number;

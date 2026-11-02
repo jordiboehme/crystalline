@@ -16,6 +16,7 @@ import {
   searchPanelOpen,
   setSearchQuery,
 } from "@codemirror/search";
+import { syntaxTree } from "@codemirror/language";
 import type { Extension } from "@codemirror/state";
 import { EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
@@ -33,6 +34,7 @@ import {
   typeIn,
 } from "../../test/cellKit";
 import { fencePreviews } from "../fencePreviews";
+import { baseExtensions } from "../setup";
 import { activeCell } from "./cellEditor";
 import { GridWidget, gridField } from "./gridWidget";
 import { gridExtension } from "./index";
@@ -242,6 +244,58 @@ describe("a hit inside a cell", () => {
   });
 });
 
+describe("replacing inside cells (R20)", () => {
+  test("replaceNext of 2 with a|b keeps the columns and stores a\\|b", () => {
+    const text = "| a | b |\n| - | - |\n| 1 | 2 |\n";
+    const main = soloMain(text, layers());
+    query(main, "2", "a|b");
+    findNext(main);
+    replaceNext(main);
+    expect(bytes(main.state)).toBe("| a | b |\n| - | - |\n| 1 | a\\|b |\n");
+    expect(shape(main.state)).toEqual([2, 2]);
+  });
+
+  test("replaceAll with a line break inside two tables keeps both shapes", () => {
+    const text =
+      "| a | b |\n| - | - |\n| 1 | 2 |\n\nmid\n\n| c |\n| - |\n| 2 |\n";
+    const main = soloMain(text, layers());
+    main.dispatch({
+      effects: setSearchQuery.of(
+        new SearchQuery({ search: "2", replace: "x\\ny" }),
+      ),
+    });
+    replaceAll(main);
+    expect(bytes(main.state)).toBe(
+      "| a | b |\n| - | - |\n| 1 | x y |\n\nmid\n\n| c |\n| - |\n| x y |\n",
+    );
+    expect(shape(main.state)).toEqual([2, 2, 1, 1]);
+  });
+
+  test("a replace outside every table is left as it is", () => {
+    const text = "| a |\n| - |\n| 1 |\n\nsome 2 here\n";
+    const main = soloMain(text, layers());
+    main.dispatch({
+      effects: setSearchQuery.of(
+        new SearchQuery({ search: "2", replace: "p|q\\nr" }),
+      ),
+    });
+    replaceAll(main);
+    expect(bytes(main.state)).toBe("| a |\n| - |\n| 1 |\n\nsome p|q\nr here\n");
+  });
+
+  test("a backslash right before the closing pipe gets the one it needs", () => {
+    const text = "|a|\n|-|\n|2|\n";
+    const main = soloMain(text, layers());
+    query(main, "2", "x\\");
+    replaceAll(main);
+    // A lone `\` before the closing pipe would escape it and merge the
+    // cell with what follows: it is stored doubled, an even run.
+    const table = gridTables(main.state)[0];
+    expect(table?.rows.map((row) => row.length)).toEqual([1, 1]);
+    expect(table?.rows[1]?.[0]?.text).toBe("x\\\\");
+  });
+});
+
 describe("a hit outside every table", () => {
   test("closes the open cell, with focus left in the panel", () => {
     const main = soloMain(DOC, layers());
@@ -273,6 +327,32 @@ describe("a hit outside every table", () => {
 });
 
 describe("search keys inside a cell", () => {
+  const FAR = "\n\n".repeat(3000);
+
+  test("F3 from a focused cell to a far table's cell opens it with the focus", () => {
+    const text = `| a | b |\n| - | - |\n| 1 | 2 |\n${FAR}| c |\n| - |\n| zz |\n`;
+    const main = soloMain(text, layers());
+    query(main, "zz");
+    mouseDown(cellEl(main, 1, 0));
+    expect(press(hosted(main).view, "F3")).toBe(true);
+    const open = openCellRange(main.state);
+    expect(open?.span.from).toBeGreaterThan(text.indexOf("| c |"));
+    expect(selected(main)).toBe("zz");
+    expect(hosted(main).view.dom.contains(document.activeElement)).toBe(true);
+  });
+
+  test("F3 from a focused cell to far text gives main the focus on the hit", () => {
+    const text = `| a | b |\n| - | - |\n| 1 | 2 |\n${FAR}far zz\n`;
+    const main = soloMain(text, layers());
+    query(main, "zz");
+    mouseDown(cellEl(main, 1, 0));
+    expect(press(hosted(main).view, "F3")).toBe(true);
+    expect(activeCell(main)).toBeNull();
+    expect(document.activeElement).toBe(main.contentDOM);
+    const sel = main.state.selection.main;
+    expect(main.state.doc.sliceString(sel.from, sel.to)).toBe("zz");
+  });
+
   test("Mod-f opens the main view's search panel with the cell's selection", () => {
     const main = soloMain(DOC, layers());
     mouseDown(cellEl(main, 1, 0));
@@ -423,6 +503,37 @@ describe("read-only (R17)", () => {
     });
     expect(main.state.selection.main.head > table.to).toBe(true);
     expect(activeCell(main)).toBeNull();
+  });
+
+  test("a hit the parse has not reached yet is marked once it has", async () => {
+    // Built without a finished parse: the far table is past the frontier.
+    const text =
+      "word *x* ".repeat(20).concat("\n\n").repeat(4000) +
+      "| a | b |\n| - | - |\n| 1 | qq |\n";
+    const main = new EditorView({
+      state: EditorState.create({
+        doc: text,
+        extensions: [baseExtensions(false), ...layers(), READ_ONLY],
+      }),
+      parent: document.body,
+    });
+    try {
+      query(main, "qq");
+      openPanel(main);
+      findNext(main);
+      expect(syntaxTree(main.state).length).toBeLessThan(text.indexOf("| a |"));
+      expect(main.dom.querySelector(".cm-grid-hit")).toBeNull();
+      await vi.waitFor(
+        () => {
+          expect(main.dom.querySelector(".cm-grid-hit")?.textContent).toBe(
+            "qq",
+          );
+        },
+        { timeout: 4000 },
+      );
+    } finally {
+      main.destroy();
+    }
   });
 
   test("the mark survives the table being drawn again", async () => {

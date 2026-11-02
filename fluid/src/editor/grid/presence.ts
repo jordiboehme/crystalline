@@ -32,11 +32,14 @@ import { ySyncFacet } from "y-codemirror.next";
 import type { Awareness } from "y-protocols/awareness";
 import * as Y from "yjs";
 
+import { parseAdvanced } from "../parseProgress";
 import {
   cellMain,
   inUpdate,
   isDestroyed,
   mountedCell,
+  onCellClosed,
+  openCellField,
   openCellRange,
 } from "./openCell";
 import type { GridCell, GridTable } from "./structure";
@@ -114,6 +117,8 @@ function caretElement(color: string, name: string): HTMLElement {
   const caret = document.createElement("span");
   caret.className = "cm-ySelectionCaret cm-grid-presence";
   caret.setAttribute("aria-hidden", "true");
+  // Copying a cell's text never takes a peer's name with it.
+  caret.style.userSelect = "none";
   caret.style.backgroundColor = color;
   caret.style.borderColor = color;
   const dot = document.createElement("div");
@@ -159,6 +164,18 @@ function elementOf(
   return null;
 }
 
+/** The grid's tables per state, so one state is walked once. */
+const tablesCache = new WeakMap<EditorState, GridTable[]>();
+
+function tablesOf(state: EditorState): GridTable[] {
+  let tables = tablesCache.get(state);
+  if (!tables) {
+    tables = gridTables(state);
+    tablesCache.set(state, tables);
+  }
+  return tables;
+}
+
 interface Drawn {
   el: HTMLElement;
   color: string;
@@ -176,10 +193,24 @@ class GridPresence {
     this.draw([...added, ...updated, ...removed]);
   };
 
+  readonly stopClosed: () => void;
+
   constructor(main: EditorView) {
     this.main = main;
     this.room = roomOf(main.state);
     this.room?.awareness.on("change", this.listener);
+    // A close may give a host cell back after main's last update.
+    this.stopClosed = onCellClosed(main, () => {
+      queueMicrotask(() => {
+        this.draw();
+      });
+    });
+  }
+
+  /** Whether a redraw took a marker out of the document. */
+  detached(): boolean {
+    for (const { el } of this.drawn.values()) if (!el.isConnected) return true;
+    return false;
   }
 
   /**
@@ -202,7 +233,7 @@ class GridPresence {
     for (const client of ids) {
       if (client === room.doc.clientID) continue;
       const peer = synced ? peerOf(room, client, states.get(client)) : null;
-      if (peer) tables ??= gridTables(main.state);
+      if (peer) tables ??= tablesOf(main.state);
       const target = peer && tables ? this.targetOf(tables, peer.head) : null;
       const drawn = this.drawn.get(client);
       if (!peer || !target) {
@@ -237,6 +268,7 @@ class GridPresence {
   }
 
   destroy(): void {
+    this.stopClosed();
     this.room?.awareness.off("change", this.listener);
     for (const { el } of this.drawn.values()) el.remove();
     this.drawn.clear();
@@ -254,7 +286,21 @@ const gridPresencePlugin = ViewPlugin.fromClass(GridPresence);
 export const gridPresence: Extension = [
   gridPresencePlugin,
   EditorView.updateListener.of((update) => {
-    update.view.plugin(gridPresencePlugin)?.draw();
+    const plugin = update.view.plugin(gridPresencePlugin);
+    if (!plugin) return;
+    // Only an update that can move a cell or redraw one: the document, the
+    // viewport, the parse (tables drawn), the open cell (a host taken or
+    // given back), or a marker a redraw took away.
+    if (
+      update.docChanged ||
+      update.viewportChanged ||
+      parseAdvanced(update) ||
+      update.startState.field(openCellField, false) !==
+        update.state.field(openCellField, false) ||
+      plugin.detached()
+    ) {
+      plugin.draw();
+    }
   }),
 ];
 

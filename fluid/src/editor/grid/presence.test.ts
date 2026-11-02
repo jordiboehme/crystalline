@@ -119,6 +119,8 @@ describe("peers' carets in static cells", () => {
     expect(more).toEqual([]);
     expect(marker?.textContent).toContain("Grace");
     expect(marker?.style.borderColor).toBe("rgb(255, 0, 0)");
+    // Copying the cell's text never takes the peer's name with it.
+    expect(marker?.style.userSelect).toBe("none");
     expect(markers(cellEl(main, 1, 0))).toEqual([]);
     dispatch.mockRestore();
   });
@@ -145,6 +147,21 @@ describe("peers' carets in static cells", () => {
     const el = cellEl(main, 1, 1);
     expect(el.textContent).toContain("2x");
     expect(markers(el)).toHaveLength(1);
+  });
+
+  test("a main update that moves nothing in the grid does not look for cells", () => {
+    const { main, rtext, remoteAwareness } = roomMain(DOC, layers());
+    peerCursor(remoteAwareness, rtext, DOC.indexOf("2"));
+    expect(markers(cellEl(main, 1, 1))).toHaveLength(1);
+    const lookups = vi.spyOn(main.contentDOM, "querySelectorAll");
+    main.dispatch({ selection: { anchor: DOC.indexOf("after") } });
+    main.dispatch({ selection: { anchor: DOC.indexOf("after") + 2 } });
+    const gridLookups = lookups.mock.calls.filter(
+      ([sel]) => sel === ".cm-grid",
+    );
+    lookups.mockRestore();
+    expect(gridLookups).toEqual([]);
+    expect(markers(cellEl(main, 1, 1))).toHaveLength(1);
   });
 
   test("a remote cursor outside every table draws no marker", () => {

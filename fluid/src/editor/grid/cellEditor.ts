@@ -71,6 +71,7 @@ import {
   openCellField,
   openCellRange,
   registerCell,
+  searchFromCell,
   setOpenCell,
   unregisterCell,
 } from "./openCell";
@@ -285,7 +286,7 @@ function cellChange(
  * typed `\` at the end is stored `\\`, a `|` typed after a literal `\` is
  * stored `\\\|`. Returns `changes` itself when nothing was needed.
  */
-function withEscapes(
+export function withEscapes(
   doc: EditorState["doc"],
   range: CellRange,
   changes: ChangeSet,
@@ -479,7 +480,8 @@ function onMain(command: (main: EditorView) => boolean) {
         annotations: [fromCell.of(true)],
       });
     }
-    return command(main);
+    if (!view.hasFocus) return command(main);
+    return searchFromCell(main, () => command(main));
   };
 }
 

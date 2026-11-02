@@ -22,23 +22,34 @@
  *   on the last hit): the focus goes on to the cell there, so main never
  *   publishes a caret inside a table; see `handBack`.
  *
+ * - **Replace inside a cell (R20)** escapes pipes and flattens line breaks
+ *   in the same transaction, so a replacement never changes a table's shape.
+ *
  * The cell view's own search keys (Mod-f, F3, Mod-g) live in `cellEditor.ts`.
  */
 
 import { syntaxTree } from "@codemirror/language";
-import type { Extension } from "@codemirror/state";
+import type { Extension, TransactionSpec } from "@codemirror/state";
+import {
+  ChangeSet,
+  EditorState,
+  StateEffect,
+  Transaction,
+} from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 
-import { fromCell } from "./cellEditor";
+import { fromCell, withEscapes } from "./cellEditor";
 import { cellElement, hostOpenCell, tableOf } from "./gridWidget";
 import {
   closeCell,
   gridWritable,
+  isSearchFromCell,
   mountedCell,
   openCellField,
   openCellRange,
   setOpenCell,
 } from "./openCell";
+import type { GridCell } from "./structure";
 import { cellAt, gridTableAt } from "./structure";
 
 const HIT = "cm-grid-hit";
@@ -62,7 +73,7 @@ function leaveTables(main: EditorView): void {
   hits.delete(main);
   const mounted = mountedCell(main);
   if (!mounted && !main.state.field(openCellField, false)) return;
-  const hadFocus = mounted?.view.hasFocus ?? false;
+  const hadFocus = isSearchFromCell(main) || (mounted?.view.hasFocus ?? false);
   closeCell(main, "user", "none");
   if (hadFocus) main.focus();
 }
@@ -84,11 +95,12 @@ function onHit(main: EditorView): void {
       return;
     }
     hits.set(main, range.head);
-  }
+  } else hits.set(main, range.head); // not parsed yet: pending
   if (!gridWritable(main.state)) return; // R17: marked, never opened
   const mounted = mountedCell(main);
   const active = document.activeElement;
   const focus =
+    isSearchFromCell(main) ||
     active === main.contentDOM ||
     (mounted !== null && mounted.view.dom.contains(active))
       ? "now"
@@ -162,7 +174,10 @@ function hitElement(main: EditorView, pos: number): HTMLElement | null {
 /** Puts the hit mark where the hit is now, and takes it off elsewhere. */
 function mark(main: EditorView): void {
   let hit = hits.get(main);
-  if (hit !== undefined && gridWritable(main.state)) {
+  // A hit the parse has not reached yet stays pending: its cell is marked
+  // once the table is parsed and drawn.
+  const pending = hit !== undefined && !parsedAt(main, hit);
+  if (hit !== undefined && !pending && gridWritable(main.state)) {
     // On a writable page the mark rings the open cell holding the hit only.
     const open = openCellRange(main.state);
     if (!open || hit < open.span.from || hit > open.span.to) {
@@ -170,7 +185,7 @@ function mark(main: EditorView): void {
       hit = undefined;
     }
   }
-  const target = hit === undefined ? null : hitElement(main, hit);
+  const target = hit === undefined || pending ? null : hitElement(main, hit);
   const before = marked.get(main);
   if (before && before !== target) before.classList.remove(HIT);
   if (target) {
@@ -206,6 +221,80 @@ const searchListener = EditorView.updateListener.of((update) => {
   mark(main);
 });
 
+/** The cell whose content holds all of `[from, to]` in `state`, or null. */
+function cellHolding(
+  state: EditorState,
+  from: number,
+  to: number,
+): GridCell | null {
+  const table = gridTableAt(state, from);
+  const cell = table ? cellAt(table, from) : null;
+  if (!cell || from < cell.content.from || to > cell.content.to) return null;
+  return cell;
+}
+
+/**
+ * R20: a replace from the search panel that lands inside a cell keeps the
+ * table's shape, as typing in the cell does (R8). Its line breaks become
+ * spaces, and every pipe in the cell's new content is escaped by the parity
+ * rule, with an even backslash run before the closing pipe. A replace
+ * outside every cell, or on a read-only page, is left alone.
+ */
+const replaceInCells = EditorState.transactionFilter.of(
+  (tr: Transaction): TransactionSpec | readonly TransactionSpec[] => {
+    if (!tr.docChanged || !tr.isUserEvent("input.replace")) return tr;
+    const start = tr.startState;
+    if (!gridWritable(start)) return tr;
+    const lb = start.lineBreak;
+    const kept: { from: number; to: number; insert: string }[] = [];
+    const cells: GridCell[] = [];
+    let altered = false;
+    tr.changes.iterChanges((fromA, toA, _fromB, _toB, inserted) => {
+      const text = inserted.sliceString(0, inserted.length, "\n");
+      const cell = cellHolding(start, fromA, toA);
+      if (!cell) {
+        kept.push({ from: fromA, to: toA, insert: text });
+        return;
+      }
+      const flat = text.replace(/\r\n|\r|\n/g, " ");
+      if (flat !== text) altered = true;
+      kept.push({ from: fromA, to: toA, insert: flat });
+      if (!cells.some((c) => c.span.from === cell.span.from)) cells.push(cell);
+    });
+    if (cells.length === 0) return tr;
+    const plain = ChangeSet.of(
+      kept.map((c) => ({ ...c, insert: start.toText(c.insert) })),
+      start.doc.length,
+      lb,
+    );
+    let changes = plain;
+    for (const cell of cells) {
+      changes = withEscapes(start.doc, cell.content, changes, lb);
+    }
+    if (!altered && changes === plain) return tr;
+    // The selection and the effects are in the coordinates of the changes
+    // given: take them back to the start document, then through these.
+    const back = tr.changes.invertedDesc;
+    const selection = tr.selection
+      ? tr.selection.map(back, 1).map(changes, 1)
+      : undefined;
+    const effects = StateEffect.mapEffects(
+      StateEffect.mapEffects(tr.effects, back),
+      changes,
+    );
+    const userEvent = tr.annotation(Transaction.userEvent);
+    return [
+      {
+        changes,
+        ...(selection ? { selection } : {}),
+        effects,
+        scrollIntoView: tr.scrollIntoView,
+        ...(userEvent === undefined ? {} : { userEvent }),
+      },
+    ];
+  },
+);
+
 const searchTheme = EditorView.baseTheme({
   ".cm-grid .cm-grid-hit": {
     outline: "2px solid var(--color-amber-700)",
@@ -214,4 +303,8 @@ const searchTheme = EditorView.baseTheme({
 });
 
 /** Search and replace inside the grid, on the main view. */
-export const gridSearch: Extension = [searchListener, searchTheme];
+export const gridSearch: Extension = [
+  searchListener,
+  replaceInCells,
+  searchTheme,
+];
