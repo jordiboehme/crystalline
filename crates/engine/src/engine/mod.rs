@@ -6513,6 +6513,26 @@ impl Engine {
         self.kept_dir()
     }
 
+    /// The configuration a routing block is built from, as this engine sees
+    /// it now: the file re-read with the environment overlay, every
+    /// registered domain (a domain registered after start included), and
+    /// the names of the domains an environment variable defines. The
+    /// database block is left out: a routing block never needs it, and a
+    /// Postgres url can carry a password. For `crystalline prompt system`
+    /// run inside an app package, whose own read of the config file can
+    /// open the package's private copy.
+    pub fn routing_config(&self) -> (GlobalConfig, Vec<String>) {
+        let mut cfg = self.reread_config().unwrap_or_else(|| self.config());
+        cfg.domains = self.registered_domain_entries();
+        cfg.database = None;
+        let env = self
+            .overlay
+            .env_domains()
+            .map(|(name, _)| name.clone())
+            .collect();
+        (cfg, env)
+    }
+
     /// Pick up a domain a registration just wrote to the config file, the
     /// way a sync of a domain this engine has not seen yet does: cached and,
     /// for a file domain on the daemon, watched. `false` when the file does

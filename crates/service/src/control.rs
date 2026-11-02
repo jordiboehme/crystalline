@@ -8,7 +8,7 @@
 //! sessions, holder, tool, configure, domain_rename, origin_add,
 //! origin_update, origin_status,
 //! origin_share, origin_withdraw, origin_changes, origin_discard, origin_resolve,
-//! provision, domain_register, forget_domain,
+//! provision, domain_register, routing_config, forget_domain,
 //! forget_credential, sources_reload, mounted_routing, shutdown. This is the
 //! operator channel plus the `tool` command, which
 //! dispatches a daemon-attached CLI data verb to the shared engine and
@@ -835,6 +835,19 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
         // watching the removed path right away instead of on its next
         // restart. Index rows are never touched here, only the watcher and
         // the engine's discovered-domain cache.
+        // The configuration `prompt system` builds its routing block from,
+        // for a CLI inside Claude Desktop's app package: its own read of the
+        // config file can open the package's private copy (issue 153).
+        "routing_config" => {
+            let (config, env_domains) = shared.engine.routing_config();
+            match serde_json::to_value(&config) {
+                Ok(config) => (
+                    envelope_ok(json!({ "config": config, "env_domains": env_domains })),
+                    false,
+                ),
+                Err(e) => (envelope_err(e.to_string()), false),
+            }
+        }
         // Register a local file domain or a virtual domain the way `domain
         // add` does on the CLI's own side, for a CLI that may not write the
         // config itself: one inside Claude Desktop's app package, where a
@@ -907,7 +920,7 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                  name_report, fix_local_spellings, finish_rename_questions, configure, \
                  origin_add, origin_update, \
                  origin_status, origin_share, origin_withdraw, origin_changes, origin_discard, \
-                 origin_resolve, provision, domain_register, forget_domain or shutdown"
+                 origin_resolve, provision, domain_register, routing_config, forget_domain or shutdown"
             )),
             false,
         ),

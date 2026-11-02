@@ -190,6 +190,45 @@ fn a_packaged_bridge_whose_task_query_is_refused_says_why() {
     bridge.finish();
 }
 
+/// When Claude Desktop's package keeps a second state that registers
+/// domains, the bridge says so in the onboarding instructions: the person
+/// is in the chat, not in a terminal.
+#[test]
+fn a_packaged_bridge_names_a_split_state_in_the_instructions() {
+    let home = short_home();
+    let folder = home
+        .path()
+        .join("local")
+        .join("Packages")
+        .join("Claude_pzs8sxrjxfjjc")
+        .join("LocalCache")
+        .join("Roaming")
+        .join("crystalline");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(
+        folder.join("config.yaml"),
+        "domains:\n  notes:\n    path: /nonexistent/notes\n",
+    )
+    .unwrap();
+    let mut bridge = Bridge::start(home.path(), "serve");
+    let opened = bridge.open();
+    bridge.finish();
+    let mut stop = Command::new(assert_cmd::cargo::cargo_bin("crystalline"));
+    for (name, value) in crate::common::isolation_env(home.path()) {
+        stop.env(name, value);
+    }
+    let _ = stop.args(["ctl", "shutdown"]).output();
+    let instructions = opened["result"]["instructions"].as_str().unwrap();
+    assert!(
+        instructions.contains("Claude Desktop keeps a second Crystalline state"),
+        "{instructions}"
+    );
+    assert!(
+        instructions.contains("--merge-desktop-state"),
+        "{instructions}"
+    );
+}
+
 #[test]
 fn a_packaged_bridge_runs_the_task_and_serves_the_daemon() {
     let home = short_home();

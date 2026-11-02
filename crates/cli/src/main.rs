@@ -2564,6 +2564,23 @@ async fn status_dispatch(
             _ => Vec::new(),
         };
         sources::with_daemon_failures(&mut source_rows, &data["sources"]);
+        // Claude Desktop's second state, compared with what the daemon
+        // serves: its domains the daemon does not know are the ones a
+        // routing block read inside Claude Desktop lists and searches miss.
+        let registered: Vec<String> = data["registered"]
+            .as_array()
+            .map(|names| {
+                names
+                    .iter()
+                    .filter_map(|n| n.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut desktop_states = desktop_state::scan_here();
+        for state in &mut desktop_states {
+            state.compare_with(&registered);
+        }
+        let packaged_line = crystalline_service::desktop_state::packaged_read_line();
         if json {
             let mut data = data;
             if let serde_json::Value::Object(map) = &mut data {
@@ -2575,8 +2592,11 @@ async fn status_dispatch(
                 map.insert("sources".to_string(), serde_json::to_value(&source_rows)?);
                 map.insert(
                     "desktop_states".to_string(),
-                    serde_json::to_value(desktop_state::scan_here())?,
+                    serde_json::to_value(&desktop_states)?,
                 );
+                if let Some(line) = &packaged_line {
+                    map.insert("inside_package".to_string(), json!(line));
+                }
                 insert_kept_count(map);
                 // Present only when something differs, as doctor --json does.
                 if !mismatches.is_empty() {
@@ -2602,7 +2622,16 @@ async fn status_dispatch(
                 data["version"].as_str().unwrap_or("unknown"),
                 format_uptime(data["uptime_secs"].as_u64().unwrap_or(0)),
             );
-            if let Some(line) = desktop_state::status_line(&desktop_state::scan_here()) {
+            if let Some(line) = &packaged_line {
+                println!("{line}");
+            }
+            if let Some(line) = desktop_state::status_line(&desktop_states) {
+                println!("{line}");
+            }
+            for line in desktop_states
+                .iter()
+                .filter_map(desktop_state::unserved_line)
+            {
                 println!("{line}");
             }
             if let Some(line) = kept::status_line(&kept::scan_here()) {
@@ -5425,21 +5454,41 @@ fn run_prompt(
     // so the routing prompt reflects env-configured settings.
     let loaded_config = crystalline_service::overlay::load(config_path.as_deref())?;
     let mut global = loaded_config.effective;
+    let mut env_domain_names: Vec<String> = loaded_config
+        .overlay
+        .env_domains()
+        .map(|(name, _)| name.clone())
+        .collect();
+    // Inside Claude Desktop's app package this read of the config file can
+    // open the package's private copy, so the daemon's configuration is
+    // asked first; the local one is used only when no daemon answers, and
+    // the block then says so.
+    let mut package_note = None;
+    if crystalline_service::runs_in::PackageContext::here().is_packaged()
+        && config_path.is_none()
+        && db.is_none()
+    {
+        match on_runtime_value(daemon_routing_config) {
+            Ok(Some((config, env))) => {
+                global = config;
+                env_domain_names = env;
+            }
+            Ok(None) | Err(_) => package_note = Some(PACKAGED_PROMPT_NOTE.to_string()),
+        }
+    }
     // Domains from connected servers: a local copy a server replaces leaves
     // the block, the server's copy joins it under its local name. A name the
     // daemon's fresher table mounts leaves it too, so no name is listed twice.
-    let (shadowed, mounted_rows, stale) =
+    let (shadowed, mounted_rows, mut stale) =
         mounted_part(&global, config_path.is_some() || db.is_some());
+    stale.extend(package_note);
     global.domains.retain(|name, _| {
         !shadowed.contains(name) && !mounted_rows.iter().any(|m| &m.name == name)
     });
     // Named so an env-defined domain never nags the pending block for a
     // decision it can never record - see `session_notices`'s doc comment.
-    let env_domains: std::collections::HashSet<&str> = loaded_config
-        .overlay
-        .env_domains()
-        .map(|(name, _)| name.as_str())
-        .collect();
+    let env_domains: std::collections::HashSet<&str> =
+        env_domain_names.iter().map(String::as_str).collect();
 
     // Session-start provisioning: reconcile opted-in domains' file artifacts
     // and surface undecided domains, joining the same notice channel as the
@@ -5600,6 +5649,26 @@ fn run_prompt(
         eprintln!("{note}");
     }
     Ok(())
+}
+
+/// The line a routing block read inside Claude Desktop's app package
+/// carries when no daemon answered: it comes from the package's private
+/// copy of the configuration, which can list domains the daemon does not
+/// serve.
+const PACKAGED_PROMPT_NOTE: &str = "Note: this session runs inside Claude Desktop's app package and no Crystalline daemon answered, so this routing block was read from Claude Desktop's private copy of the configuration. It can list domains the daemon does not serve; `crystalline status` in a terminal outside Claude Desktop shows the daemon's view.";
+
+/// The configuration and env-defined domain names the daemon builds a
+/// routing block from (the `routing_config` ctl command), for a prompt run
+/// inside an app package. `None` when no daemon answered or the answer
+/// does not read.
+async fn daemon_routing_config() -> Option<(crystalline_core::config::GlobalConfig, Vec<String>)> {
+    let data =
+        crystalline_service::ctl_routed(serde_json::json!({ "v": 1, "cmd": "routing_config" }))
+            .await
+            .ok()??;
+    let config = serde_json::from_value(data.get("config")?.clone()).ok()?;
+    let env = serde_json::from_value(data.get("env_domains")?.clone()).unwrap_or_default();
+    Some((config, env))
 }
 
 /// The text block with each stale source's line after it.

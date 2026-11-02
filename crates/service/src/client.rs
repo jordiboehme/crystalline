@@ -371,6 +371,20 @@ fn launcher_note_from_env() -> Option<&'static str> {
     launcher_too_old(version.as_deref(), channel.as_deref()).then_some(LAUNCHER_NOTE)
 }
 
+/// The note this bridge adds to the session's onboarding instructions: the
+/// launcher note and, when Claude Desktop's app package keeps a second
+/// state that registers domains, the split note
+/// ([`crate::desktop_state::split_note`]), a blank line apart. `None`
+/// when there is neither.
+fn onboarding_note(launcher: Option<&str>, split: Option<String>) -> Option<String> {
+    let parts: Vec<String> = launcher
+        .map(str::to_string)
+        .into_iter()
+        .chain(split)
+        .collect();
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
+}
+
 /// `line` with `note` added after a blank line at the end of
 /// `result.instructions`, where both an `initialize` answer and a
 /// `server/discover` answer carry the onboarding text. `None` when the line is
@@ -407,7 +421,9 @@ struct RelayState {
     outstanding: std::collections::HashMap<String, Value>,
     /// The line to add to the onboarding instructions, set when the launcher
     /// that started this bridge is too old (see [`launcher_too_old`]).
-    launcher_note: Option<&'static str>,
+    /// With the split note after it when there is one (see
+    /// [`onboarding_note`]).
+    launcher_note: Option<String>,
     /// The ids of `initialize` and `server/discover` requests still waiting
     /// for their answer, keyed like `outstanding`.
     onboarding: HashSet<String>,
@@ -471,7 +487,7 @@ impl RelayState {
             let key = id.to_string();
             self.outstanding.remove(&key);
             if self.onboarding.remove(&key)
-                && let Some(note) = self.launcher_note
+                && let Some(note) = &self.launcher_note
             {
                 return with_launcher_note(line, note);
             }
@@ -650,7 +666,10 @@ where
     R: AsyncRead + Unpin,
 {
     let mut relay = RelayState {
-        launcher_note: launcher_note_from_env(),
+        launcher_note: onboarding_note(
+            launcher_note_from_env(),
+            crate::desktop_state::split_note(&crate::desktop_state::scan_here()),
+        ),
         ..RelayState::default()
     };
     let mut stdout = tokio::io::stdout();
@@ -3055,7 +3074,7 @@ mod tests {
     #[test]
     fn an_old_launcher_adds_its_note_to_the_initialize_and_discover_answers() {
         let mut relay = RelayState {
-            launcher_note: Some(LAUNCHER_NOTE),
+            launcher_note: Some(LAUNCHER_NOTE.to_string()),
             ..RelayState::default()
         };
         relay.note_client_line(LAUNCHER_INIT);
@@ -3088,6 +3107,24 @@ mod tests {
     }
 
     #[test]
+    fn the_onboarding_note_joins_the_launcher_note_and_the_split_note() {
+        assert_eq!(onboarding_note(None, None), None);
+        assert_eq!(
+            onboarding_note(Some(LAUNCHER_NOTE), None).as_deref(),
+            Some(LAUNCHER_NOTE)
+        );
+        let split = "Claude Desktop keeps a second Crystalline state".to_string();
+        assert_eq!(
+            onboarding_note(None, Some(split.clone())),
+            Some(split.clone())
+        );
+        assert_eq!(
+            onboarding_note(Some(LAUNCHER_NOTE), Some(split.clone())),
+            Some(format!("{LAUNCHER_NOTE}\n\n{split}"))
+        );
+    }
+
+    #[test]
     fn the_launcher_note_leaves_other_answers_alone() {
         // No note held: the initialize answer is forwarded as it is.
         let mut relay = RelayState::default();
@@ -3099,7 +3136,7 @@ mod tests {
         );
         // A note held, but the answer has no instructions or is an error.
         let mut relay = RelayState {
-            launcher_note: Some(LAUNCHER_NOTE),
+            launcher_note: Some(LAUNCHER_NOTE.to_string()),
             ..RelayState::default()
         };
         relay.note_client_line(LAUNCHER_INIT);
@@ -3144,7 +3181,7 @@ mod tests {
             .await
             .unwrap();
         let mut relay = RelayState {
-            launcher_note: Some(LAUNCHER_NOTE),
+            launcher_note: Some(LAUNCHER_NOTE.to_string()),
             ..RelayState::default()
         };
         let mut stdin = BoundedLines::new(stdin_read, STDIO_LINE_LIMIT);
@@ -3210,7 +3247,7 @@ mod tests {
     #[test]
     fn relay_state_leaves_a_batch_untracked() {
         let mut relay = RelayState {
-            launcher_note: Some(LAUNCHER_NOTE),
+            launcher_note: Some(LAUNCHER_NOTE.to_string()),
             ..RelayState::default()
         };
         relay.note_client_line(

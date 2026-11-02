@@ -61,7 +61,7 @@ fn doctor_reports_a_split_state_as_a_problem() {
     let human = run(home.path(), &["doctor"]);
     let text = String::from_utf8_lossy(&human.stdout);
     assert!(
-        text.contains("[problem] Claude Desktop kept its own Crystalline state"),
+        text.contains("[problem] Claude Desktop's app package keeps a second Crystalline state"),
         "{text}"
     );
     assert!(text.contains("--merge-desktop-state"), "{text}");
@@ -77,6 +77,42 @@ fn status_names_a_split_state_in_one_line() {
     let json: Value =
         serde_json::from_slice(&run(home.path(), &["status", "--json"]).stdout).unwrap();
     assert_eq!(json["desktop_states"][0]["domains"], 1);
+}
+
+/// A private folder that is only another name for the real state folder
+/// (its config is the real one, hard linked: the same file ID the 0.22.1
+/// report showed) is no split. Doctor reports nothing and the merge leaves
+/// the folder alone.
+#[test]
+fn a_private_folder_that_is_a_view_of_the_real_one_is_neither_reported_nor_merged() {
+    let home = tempfile::tempdir().unwrap();
+    let real = crate::common::isolated_state_dir(home.path());
+    std::fs::create_dir_all(&real).unwrap();
+    std::fs::write(real.join("index.db"), vec![0u8; 4096]).unwrap();
+    let folder = private_folder(home.path());
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::hard_link(real.join("index.db"), folder.join("index.db")).unwrap();
+    let report: Value =
+        serde_json::from_slice(&run(home.path(), &["doctor", "--json"]).stdout).unwrap();
+    assert_eq!(report["desktop_states"], serde_json::json!([]), "{report}");
+    let merged = run(
+        home.path(),
+        &["doctor", "--fix", "--merge-desktop-state", "--json"],
+    );
+    assert!(
+        folder.join("index.db").exists(),
+        "{}",
+        String::from_utf8_lossy(&merged.stderr)
+    );
+    std::fs::remove_file(folder.join("index.db")).unwrap();
+    std::fs::write(folder.join("index.db"), vec![0u8; 4096]).unwrap();
+    let report: Value =
+        serde_json::from_slice(&run(home.path(), &["doctor", "--json"]).stdout).unwrap();
+    assert_eq!(
+        report["desktop_states"].as_array().map(Vec::len),
+        Some(1),
+        "a separate file is reported: {report}"
+    );
 }
 
 #[test]

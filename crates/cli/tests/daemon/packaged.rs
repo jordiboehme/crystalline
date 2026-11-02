@@ -411,3 +411,126 @@ fn setup_steps_refuse_inside_a_package() {
         assert_eq!(before, snapshot_state(home.path()), "{args:?}");
     }
 }
+
+/// A second state in Claude Desktop's package, the way a packaged writer
+/// left it before 0.30.0: a config that registers `domains`.
+fn plant_private_state(home: &Path, domains: &[&str]) -> PathBuf {
+    let folder = home
+        .join("local")
+        .join("Packages")
+        .join("Claude_pzs8sxrjxfjjc")
+        .join("LocalCache")
+        .join("Roaming")
+        .join("crystalline");
+    std::fs::create_dir_all(&folder).unwrap();
+    let mut yaml = String::from("domains:\n");
+    for name in domains {
+        yaml.push_str(&format!("  {name}:\n    path: /nonexistent/{name}\n"));
+    }
+    std::fs::write(folder.join("config.yaml"), yaml).unwrap();
+    folder
+}
+
+/// A packaged `status` says it reads the package's private copy first and
+/// names the private state's domains the daemon does not serve.
+#[test]
+fn a_packaged_status_names_what_the_daemon_does_not_serve() {
+    let home = short_home();
+    plant_private_state(home.path(), &["notes", "work"]);
+    let out = crystalline(home.path(), true, "serve")
+        .args(["status"])
+        .output()
+        .unwrap();
+    let json = crystalline(home.path(), true, "serve")
+        .args(["status", "--json"])
+        .output()
+        .unwrap();
+    stop_daemon(home.path());
+    assert!(out.status.success(), "{}", text(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("runs inside Claude Desktop's app package"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("registers 2 domains the daemon does not serve (notes, work)"),
+        "{stdout}"
+    );
+    let json: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(
+        json["desktop_states"][0]["unserved"],
+        serde_json::json!(["notes", "work"]),
+        "{json}"
+    );
+    assert!(json["inside_package"].is_string(), "{json}");
+}
+
+/// A packaged `doctor` says the same, as a warning first and the
+/// comparison as a problem.
+#[test]
+fn a_packaged_doctor_says_it_reads_the_private_copy() {
+    let home = short_home();
+    plant_private_state(home.path(), &["notes"]);
+    let out = crystalline(home.path(), true, "serve")
+        .args(["doctor"])
+        .output()
+        .unwrap();
+    stop_daemon(home.path());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("[warning] This command runs inside Claude Desktop's app package"),
+        "{}",
+        text(&out)
+    );
+    assert!(
+        stdout.contains("[problem] Claude Desktop's private state registers 1 domain the daemon does not serve (notes)"),
+        "{}",
+        text(&out)
+    );
+}
+
+/// `prompt system` inside a package reads the daemon's configuration; with
+/// no daemon it falls back to its own read and says where that came from.
+#[test]
+fn a_packaged_routing_block_comes_from_the_daemon_or_says_it_does_not() {
+    let home = short_home();
+    let work = tempfile::tempdir().unwrap();
+    domain_folder(work.path(), "kb");
+    let config = config_path(home.path());
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(
+        &config,
+        format!(
+            "domains:\n  kb:\n    path: {}\n",
+            work.path()
+                .join("kb")
+                .display()
+                .to_string()
+                .replace('\\', "/")
+        ),
+    )
+    .unwrap();
+    let alone = crystalline(home.path(), true, "missing")
+        .args(["prompt", "system"])
+        .output()
+        .unwrap();
+    let served = crystalline(home.path(), true, "serve")
+        .args(["prompt", "system"])
+        .output()
+        .unwrap();
+    stop_daemon(home.path());
+    assert!(alone.status.success(), "{}", text(&alone));
+    let alone_text = String::from_utf8_lossy(&alone.stdout);
+    assert!(alone_text.contains("kb"), "{alone_text}");
+    assert!(
+        alone_text.contains("no Crystalline daemon answered"),
+        "{alone_text}"
+    );
+    assert!(served.status.success(), "{}", text(&served));
+    let served_text = String::from_utf8_lossy(&served.stdout);
+    assert!(served_text.contains("kb"), "{served_text}");
+    assert!(
+        !served_text.contains("no Crystalline daemon answered"),
+        "{served_text}"
+    );
+}

@@ -1432,6 +1432,11 @@ pub struct DoctorReport {
     pub desktop_states: Vec<crate::desktop_state::DesktopState>,
     /// What `--merge-desktop-state` did. `None` without that flag.
     pub merge: Option<crate::desktop_state::MergeReport>,
+    /// Said when doctor runs inside Claude Desktop's app package: what it
+    /// reads from the state folder comes from the package's private copy
+    /// first. Absent outside a package.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inside_package: Option<String>,
     /// Why `--merge-desktop-state` stopped, such as a daemon from the
     /// private folder that still runs.
     pub merge_error: Option<String>,
@@ -1976,6 +1981,20 @@ pub async fn run(
     } else {
         None
     };
+    // Claude Desktop's second state, compared with what the daemon serves,
+    // when this run reached the daemon.
+    if let Some(registered) = daemon_status
+        .as_ref()
+        .and_then(|status| status["registered"].as_array())
+    {
+        let registered: Vec<String> = registered
+            .iter()
+            .filter_map(|n| n.as_str().map(str::to_string))
+            .collect();
+        for state in &mut desktop_states {
+            state.compare_with(&registered);
+        }
+    }
     // The daemon's loaded model wins over the probe: only it knows about a
     // warm-up or runtime failure on the GPU.
     let embedding_device = live_device(
@@ -2033,6 +2052,7 @@ pub async fn run(
         daemon_task,
         desktop_states,
         merge,
+        inside_package: crystalline_service::desktop_state::packaged_read_line(),
         merge_error,
         kept,
         case_twins,
@@ -4535,6 +4555,13 @@ pub fn render_human(report: &DoctorReport) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
 
+    // Inside Claude Desktop's app package first: every line below may read
+    // the package's private copy of the state folder.
+    if let Some(line) = &report.inside_package {
+        let _ = writeln!(out, "inside Claude Desktop:");
+        let _ = writeln!(out, "  [warning] {line}");
+    }
+
     // The index route first, so a reader meets the reason before the thin
     // domain sections it explains. A plain direct open, and a machine with no
     // index yet, say nothing here: only a route worth knowing about does.
@@ -5027,6 +5054,9 @@ pub fn render_human(report: &DoctorReport) -> String {
                 "  [problem] {}",
                 crate::desktop_state::describe_line(state)
             );
+            if let Some(line) = crate::desktop_state::unserved_line(state) {
+                let _ = writeln!(out, "  [problem] {line}");
+            }
         }
         // A merge stopped before its first folder has nothing to say but
         // the reason it stopped.
