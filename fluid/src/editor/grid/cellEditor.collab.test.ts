@@ -20,6 +20,7 @@ import {
   typeIn,
 } from "../../test/cellKit";
 import { activeCell } from "./cellEditor";
+import { gridTables } from "./structure";
 import { closeCell, onCellClosed, openCellField } from "./openCell";
 
 const DOC = "| a | b |\n| - | - |\n| 1 | 2 |\n";
@@ -122,6 +123,65 @@ describe("cell editor under co-editing", () => {
     expect(openText(main)).toBe("xy");
     typeIn(cell, "z");
     expect(rtext.toJSON()).toBe("| a | b |\n| - | - |\n| 1|xyz | 2 |\n");
+  });
+
+  test("after a gone close with focus to main the peer sees no cursor in the table", async () => {
+    const { main, rtext, remoteAwareness, local } = roomMain(DOC);
+    openAt(main, cellOf(main, 1, 0).content.to);
+    rtext.delete(rtext.toJSON().indexOf("| 1 |"), "| 1 | 2 |\n".length);
+    await Promise.resolve();
+    expect(document.activeElement).toBe(main.contentDOM);
+    // Any later update of main publishes its caret while it has focus.
+    main.dispatch({ selection: main.state.selection });
+    const table = gridTables(main.state)[0];
+    if (!table) throw new Error("the header table is gone");
+    const cursor = (
+      remoteAwareness.getStates().get(local.clientID) as
+        { cursor?: { head: Y.RelativePosition } | null } | undefined
+    )?.cursor;
+    if (cursor) {
+      const head = Y.createAbsolutePositionFromRelativePosition(
+        cursor.head,
+        local,
+      );
+      expect(head?.index).toBeGreaterThan(table.to);
+    }
+    expect(main.state.selection.main.head).toBeGreaterThan(table.to);
+  });
+
+  test("a remote row delete in a table without edge pipes closes the cell as gone", async () => {
+    const { main, rtext } = roomMain("a | b\n--|--\n1 | 2\n3 | 4\n");
+    openAt(main, cellOf(main, 1, 0).content.to);
+    const heard = vi.fn();
+    onCellClosed(main, heard);
+    rtext.delete(rtext.toJSON().indexOf("1 | 2"), "1 | 2\n".length);
+    await Promise.resolve();
+    expect(heard).toHaveBeenCalledWith("gone");
+    expect(activeCell(main)).toBeNull();
+  });
+
+  test("a remote row delete takes the pipeless last cell too", async () => {
+    const { main, rtext } = roomMain("a | b\n--|--\n1 | 2\n3 | 4\n");
+    openAt(main, cellOf(main, 1, 1).content.to);
+    const heard = vi.fn();
+    onCellClosed(main, heard);
+    rtext.delete(rtext.toJSON().indexOf("1 | 2"), "1 | 2\n".length);
+    await Promise.resolve();
+    expect(heard).toHaveBeenCalledWith("gone");
+  });
+
+  test("a peer clearing a compact cell leaves it open", async () => {
+    const { main, rtext } = roomMain("|A|B|\n|-|-|\n|1|2|\n");
+    const cell = openAt(main, cellOf(main, 1, 0).content.to);
+    const heard = vi.fn();
+    onCellClosed(main, heard);
+    rtext.delete(cellOf(main, 1, 0).content.from, 1);
+    await Promise.resolve();
+    expect(heard).not.toHaveBeenCalled();
+    expect(activeCell(main)).toBe(cell);
+    expect(openText(main)).toBe("");
+    typeIn(cell, "q");
+    expect(rtext.toJSON()).toBe("|A|B|\n|-|-|\n|q|2|\n");
   });
 
   test("closeCell clears the local cursor the peer sees", () => {

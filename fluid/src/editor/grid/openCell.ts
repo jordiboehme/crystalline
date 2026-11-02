@@ -16,8 +16,12 @@
  */
 
 import { syntaxTree } from "@codemirror/language";
-import type { EditorState } from "@codemirror/state";
-import { StateEffect, StateField } from "@codemirror/state";
+import type {
+  ChangeDesc,
+  EditorState,
+  TransactionSpec,
+} from "@codemirror/state";
+import { MapMode, StateEffect, StateField } from "@codemirror/state";
 import type { EditorView } from "@codemirror/view";
 import type { YSyncConfig } from "y-codemirror.next";
 import { ySyncFacet } from "y-codemirror.next";
@@ -67,6 +71,26 @@ function settle(state: EditorState, value: OpenCell): OpenCell | null {
   return { ...value, anchor, head };
 }
 
+/**
+ * R7: whether `changes` deleted the cell's closing delimiter - its pipe, or
+ * for a last cell without one the line break that ends its row. Clearing the
+ * cell's content never counts.
+ */
+function closingDeleted(
+  state: EditorState,
+  cell: GridCell,
+  changes: ChangeDesc,
+): boolean {
+  const end = cell.span.to;
+  const doc = state.doc;
+  if (doc.sliceString(end, end + 1) === "|") {
+    return changes.mapPos(end, 1, MapMode.TrackAfter) === null;
+  }
+  const line = doc.lineAt(end);
+  if (end !== line.to || line.to >= doc.length) return false;
+  return changes.mapPos(line.to, 1, MapMode.TrackAfter) === null;
+}
+
 export const openCellField = StateField.define<OpenCell | null>({
   create: () => null,
   update(value, tr) {
@@ -81,6 +105,10 @@ export const openCellField = StateField.define<OpenCell | null>({
     if (next === null) return null;
     if (!set) {
       if (!tr.docChanged) return value;
+      const before = cellAtHead(tr.startState, next.head);
+      if (before && closingDeleted(tr.startState, before, tr.changes)) {
+        return null;
+      }
       next = {
         anchor: tr.changes.mapPos(next.anchor),
         head: tr.changes.mapPos(next.head),
@@ -108,6 +136,23 @@ export interface MountedCell {
 }
 
 const mountedOn = new WeakMap<EditorView, MountedCell>();
+/**
+ * Bumped on every mount and every outside `setOpenCell` that opens a cell, so
+ * a close that waits for a microtask can tell whether a newer cell took over
+ * in the meantime.
+ */
+const generations = new WeakMap<EditorView, number>();
+/** The generation a close still waiting for its microtask belongs to. */
+const pendingOn = new WeakMap<EditorView, number>();
+
+function generation(main: EditorView): number {
+  return generations.get(main) ?? 0;
+}
+
+/** Marks that a newer cell was opened on `main`. */
+export function bumpGeneration(main: EditorView): void {
+  generations.set(main, generation(main) + 1);
+}
 const listenersOn = new WeakMap<EditorView, Set<(r: CloseReason) => void>>();
 
 /** The cell editor mounted on `main`, if any. */
@@ -119,6 +164,7 @@ export function mountedCell(main: EditorView): MountedCell | null {
 export function registerCell(main: EditorView, cell: MountedCell): void {
   const previous = mountedOn.get(main);
   mountedOn.set(main, cell);
+  bumpGeneration(main);
   if (previous && previous !== cell) previous.teardown();
 }
 
@@ -174,11 +220,36 @@ export function onCellClosed(
 }
 
 /**
+ * Where main's caret goes when a cell closes with focus to main (R6): out of
+ * the table, to the start of the line after it (the table's end when it is
+ * the last line), or the position itself when no table is there any more. In
+ * Raw the table is text, so the caret stays at the cell's head.
+ */
+function caretAfterClose(
+  state: EditorState,
+  reason: CloseReason,
+  head: number,
+): number {
+  const pos = Math.max(0, Math.min(head, state.doc.length));
+  if (reason === "raw") return pos;
+  const table = gridTableAt(state, pos);
+  if (!table) return pos;
+  const last = state.doc.lineAt(table.to);
+  return last.number < state.doc.lines
+    ? state.doc.line(last.number + 1).from
+    : table.to;
+}
+
+/**
  * Closes `main`'s open cell: destroys the cell view, clears the published
  * cursor in a room, sets `openCellField` to null, notifies the listeners and
- * moves focus. A no-op when nothing is open. Inside an update of `main` the
- * dispatch, the notifying and the focus move wait for a microtask; on the
- * main view's destroy there is no dispatch and no focus move at all.
+ * moves focus. With focus to main, main's caret first leaves the table (see
+ * `caretAfterClose`), so main never publishes a caret inside one. A no-op
+ * when nothing is open, and while a close of the same cell still waits for
+ * its microtask. Inside an update of `main` the dispatch, the notifying and
+ * the focus move wait for a microtask; if a newer cell was opened by then,
+ * the close only notifies and leaves the field and the focus to the new one.
+ * On the main view's destroy there is no dispatch and no focus move at all.
  * `"grid"` focuses the nearest ancestor of the cell's element with a
  * `tabindex`, or the main view when there is none.
  */
@@ -187,9 +258,25 @@ export function closeCell(
   reason: CloseReason,
   focusTo: "main" | "grid" | "none",
 ): void {
+  const open = main.state.field(openCellField, false) ?? null;
+  closeCellAt(main, reason, focusTo, open?.head ?? null);
+}
+
+/**
+ * `closeCell` with the caret position known to the caller: the gone check
+ * passes the mapped head of a cell the field already dropped, and Raw the
+ * head from before the reconfigure.
+ */
+export function closeCellAt(
+  main: EditorView,
+  reason: CloseReason,
+  focusTo: "main" | "grid" | "none",
+  head: number | null,
+): void {
   const mounted = mountedOn.get(main) ?? null;
   const open = main.state.field(openCellField, false) ?? null;
-  if (!mounted && !open) return;
+  const gen = generation(main);
+  if (!mounted && (!open || pendingOn.get(main) === gen)) return;
   const parent = mounted?.parent ?? null;
   if (mounted) {
     mountedOn.delete(main);
@@ -201,11 +288,24 @@ export function closeCell(
     return;
   }
   const finish = () => {
+    if (pendingOn.get(main) === gen) pendingOn.delete(main);
     if (isDestroyed(main)) return;
-    if (main.state.field(openCellField, false)) {
-      main.dispatch({ effects: setOpenCell.of(null) });
+    const current = generation(main) === gen;
+    if (current) {
+      const spec: TransactionSpec = {
+        ...(main.state.field(openCellField, false)
+          ? { effects: setOpenCell.of(null) }
+          : {}),
+        ...(focusTo === "main" && head !== null
+          ? { selection: { anchor: caretAfterClose(main.state, reason, head) } }
+          : {}),
+      };
+      if (spec.effects !== undefined || spec.selection !== undefined) {
+        main.dispatch(spec);
+      }
     }
     notify(main, reason);
+    if (!current) return; // the newer cell owns the focus
     if (focusTo === "main") main.focus();
     else if (focusTo === "grid") {
       const grid = parent?.parentElement?.closest<HTMLElement>("[tabindex]");
@@ -213,8 +313,10 @@ export function closeCell(
       else main.focus();
     }
   };
-  if (inUpdate(main)) queueMicrotask(finish);
-  else finish();
+  if (inUpdate(main)) {
+    pendingOn.set(main, gen);
+    queueMicrotask(finish);
+  } else finish();
 }
 
 function notify(main: EditorView, reason: CloseReason): void {

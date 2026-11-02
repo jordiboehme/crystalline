@@ -27,7 +27,7 @@ import { baseExtensions, lineSeparatorFor } from "../setup";
 import { previewConfig } from "../surface";
 import { activeCell, cellForwarding } from "./cellEditor";
 import { cellPreviewLayers } from "./draws";
-import { closeCell, onCellClosed } from "./openCell";
+import { closeCell, onCellClosed, openCellField } from "./openCell";
 import { gridTables } from "./structure";
 
 const ENGRAMS = import.meta.glob<string>("../fixtures/**/*.md", {
@@ -143,8 +143,11 @@ describe("one teardown path", () => {
   test("Raw on while a cell holds focus keeps the text and focuses main", async () => {
     const { main, editor, preview, heard } = focusedCell();
     expect(document.activeElement).toBe(editor.view.contentDOM);
+    const head = main.state.field(openCellField)?.head;
     main.dispatch({ effects: preview.reconfigure(layers(true)) });
     await Promise.resolve();
+    // In Raw the table is text: main's caret takes over at the cell's head.
+    expect(main.state.selection.main.head).toBe(head);
     expect(bytes(main.state)).toBe(
       "Intro\n\n| a | b |\n| - | - |\n| 1x | 2 |\n",
     );

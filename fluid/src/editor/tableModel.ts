@@ -96,15 +96,19 @@ const MIN_DASHES = 3;
 const NEW_HEADER_CELL = "Column";
 
 /**
- * Positions of every pipe not escaped by a preceding backslash. One scan, no
- * backtracking. Knowingly simpler than GFM in one spelling: a literal escaped
- * backslash before a real boundary (`\\|`) reads as content here, where GFM
- * would split. The one-character look-back is what keeps the scan linear.
+ * Positions of every pipe not escaped by a preceding backslash. A pipe is
+ * escaped when the run of backslashes right before it is odd, as GFM and the
+ * Lezer table parser read it: `\|` is an escaped pipe, `\\|` an escaped
+ * backslash followed by a real boundary. One scan that tracks the escape
+ * state, so it stays linear.
  */
 function unescapedPipes(text: string): number[] {
   const found: number[] = [];
+  let escaped = false;
   for (let i = 0; i < text.length; i += 1) {
-    if (text[i] === "|" && text[i - 1] !== "\\") found.push(i);
+    const char = text[i];
+    if (char === "|" && !escaped) found.push(i);
+    escaped = char === "\\" && !escaped;
   }
   return found;
 }

@@ -66,6 +66,16 @@ describe("parseTable", () => {
     expect(model?.lines[0]?.cells[0]?.raw).toContain("\\|");
   });
 
+  test("an odd backslash run escapes the pipe, an even one does not", () => {
+    const one = parseTable("| a\\|b |\n| --- |\n| 1 |");
+    expect(one?.lines[0]?.cells.map((c) => c.raw.trim())).toEqual(["a\\|b"]);
+    const two = parseTable("| a\\\\|b |\n| --- | --- |\n| 1 | 2 |");
+    expect(two?.lines[0]?.cells.map((c) => c.raw.trim())).toEqual([
+      "a\\\\",
+      "b",
+    ]);
+  });
+
   test("rows without edge pipes parse", () => {
     const model = parseTable("a | b\n--- | ---\n1 | 2");
     expect(model?.columns).toBe(2);

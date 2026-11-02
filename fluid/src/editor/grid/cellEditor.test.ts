@@ -5,7 +5,8 @@
  * history) and in a room (Y.UndoManager).
  */
 
-import { EditorState } from "@codemirror/state";
+import { EditorState, StateEffect } from "@codemirror/state";
+import { EditorView, ViewPlugin } from "@codemirror/view";
 import type { MockInstance } from "vitest";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
@@ -20,7 +21,17 @@ import {
   soloMain,
   typeIn,
 } from "../../test/cellKit";
-import { activeCell, cellForwarding, fromCell } from "./cellEditor";
+import type { CellEditor } from "./cellEditor";
+import {
+  activeCell,
+  cellForwarding,
+  fromCell,
+  mountCellEditor,
+  runMainUndo,
+} from "./cellEditor";
+import { baseExtensions } from "../setup";
+import { parsedState } from "../../test/parse";
+import { gridTables } from "./structure";
 import { closeCell, onCellClosed, openCellField } from "./openCell";
 
 const DOC = "| a | b |\n| - | - |\n| 1 | 2 |\n";
@@ -137,6 +148,25 @@ describe.each(Object.entries(setups))("cell editor (%s)", (_, make) => {
     expect(openText(main)).toBe("q");
   });
 
+  test("a backslash typed at the end of an unpadded cell is doubled", () => {
+    const { main, cell } = open("|A|B|\n|-|-|\n|1|2|\n");
+    typeIn(cell, "\\");
+    expect(bytes(main.state)).toBe("|A|B|\n|-|-|\n|1\\\\|2|\n");
+    expect(gridTables(main.state)[0]?.rows[1]?.length).toBe(2);
+    expect(cell.view.contentDOM.textContent).toBe("1\\");
+    // Backspace over the visible backslash removes the pair.
+    expect(press(cell.view, "Backspace")).toBe(true);
+    expect(bytes(main.state)).toBe("|A|B|\n|-|-|\n|1|2|\n");
+  });
+
+  test("a deletion that exposes a backslash before the pipe doubles it", () => {
+    const { main, cell } = open("|A|B|\n|-|-|\n|a\\b|2|\n");
+    expect(press(cell.view, "Backspace")).toBe(true);
+    expect(bytes(main.state)).toBe("|A|B|\n|-|-|\n|a\\\\|2|\n");
+    expect(gridTables(main.state)[0]?.rows[1]?.length).toBe(2);
+    expect(cell.view.contentDOM.textContent).toBe("a\\");
+  });
+
   test("a second mount destroys the first", () => {
     const { main, cell } = open();
     expect(activeCell(main)).toBe(cell);
@@ -204,5 +234,91 @@ describe("cell editor resync", () => {
     typeIn(cell, "x");
     expect(bytes(main.state)).toBe("| a | b |\n| - | - |\n| 1x | 2 |\n");
     expect(cell.view.state.doc.eq(main.state.doc)).toBe(true);
+  });
+});
+
+describe("closeCell while its dispatch waits", () => {
+  const poke = StateEffect.define<"twice" | "reopen">();
+
+  function withProbe() {
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    let reopened: CellEditor | null = null;
+    const probe = ViewPlugin.fromClass(
+      class {
+        update(update: {
+          view: EditorView;
+          transactions: readonly { effects: readonly StateEffect<unknown>[] }[];
+        }) {
+          for (const tr of update.transactions) {
+            for (const effect of tr.effects) {
+              if (!effect.is(poke)) continue;
+              closeCell(update.view, "user", "none");
+              if (effect.value === "twice")
+                closeCell(update.view, "user", "none");
+              else reopened = mountCellEditor(update.view, host);
+            }
+          }
+        }
+      },
+    );
+    const main = soloMain(DOC, [cellForwarding, probe]);
+    const cell = openAt(main, cellOf(main, 1, 0).content.to);
+    const heard = vi.fn();
+    onCellClosed(main, heard);
+    return { main, cell, heard, reopened: () => reopened, host };
+  }
+
+  test("two closes inside one update notify once", async () => {
+    const { main, heard } = withProbe();
+    main.dispatch({ effects: poke.of("twice") });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(heard).toHaveBeenCalledTimes(1);
+    expect(main.state.field(openCellField)).toBeNull();
+  });
+
+  test("open, close and open again within one update keeps the new cell", async () => {
+    const { main, cell, heard, reopened, host } = withProbe();
+    main.dispatch({ effects: poke.of("reopen") });
+    await Promise.resolve();
+    await Promise.resolve();
+    const fresh = reopened();
+    expect(fresh).not.toBeNull();
+    expect(activeCell(main)).toBe(fresh);
+    expect(cell.view.dom.isConnected).toBe(false);
+    expect(main.state.field(openCellField)).not.toBeNull();
+    expect(heard).toHaveBeenCalledTimes(1);
+    if (fresh) typeIn(fresh, "w");
+    expect(bytes(main.state)).toBe("| a | b |\n| - | - |\n| 1w | 2 |\n");
+    fresh?.destroy();
+    host.remove();
+  });
+});
+
+describe("undo with no stack", () => {
+  test("Mod-z with neither history nor a room returns false", () => {
+    const main = new EditorView({
+      state: parsedState(
+        EditorState.create({
+          doc: DOC,
+          extensions: [
+            EditorState.lineSeparator.of("\n"),
+            ...baseExtensions(false, { history: false }),
+            cellForwarding,
+          ],
+        }),
+      ),
+      parent: document.body,
+    });
+    const cell = openAt(main, cellOf(main, 1, 0).content.to);
+    typeIn(cell, "x");
+    expect(runMainUndo(main, "undo")).toBe(false);
+    expect(runMainUndo(main, "redo")).toBe(false);
+    // The key is still taken (preventDefault), so the browser's own undo
+    // never runs on the cell's content; it changes nothing and never throws.
+    expect(() => press(cell.view, "z", { mod: true })).not.toThrow();
+    expect(bytes(main.state)).toBe("| a | b |\n| - | - |\n| 1x | 2 |\n");
+    main.destroy();
   });
 });

@@ -27,7 +27,7 @@ import {
   redo as historyRedo,
   undo as historyUndo,
 } from "@codemirror/commands";
-import type { Extension, TransactionSpec } from "@codemirror/state";
+import type { Extension, Text, TransactionSpec } from "@codemirror/state";
 import {
   Annotation,
   ChangeSet,
@@ -54,7 +54,9 @@ import { formattingKeymap } from "../toolbar";
 import { cellPreviewLayers } from "./draws";
 import type { MountedCell, OpenCell } from "./openCell";
 import {
+  bumpGeneration,
   closeCell,
+  closeCellAt,
   inUpdate,
   isDestroyed,
   mountedCell,
@@ -171,8 +173,24 @@ const cellMarks = atomicField((state) => {
         : lineBreak.range(at, at + match[0].length),
     );
   }
-  return Decoration.set(ranges);
+  // The trailing backslash pairs before the closing pipe: the escaping half
+  // of each is hidden, so `\\` reads as one `\`.
+  const run = trailingRun(state.doc, { from, to });
+  for (let at = run; at < to; at += 2) ranges.push(hidden.range(at, at + 1));
+  return Decoration.set(ranges, true);
 });
+
+/**
+ * Where the run of backslashes ending at the cell's end starts, when the
+ * cell's closing pipe follows right after it; `range.to` otherwise (no run).
+ */
+function trailingRun(doc: EditorState["doc"], range: CellRange): number {
+  if (doc.sliceString(range.to, range.to + 1) !== "|") return range.to;
+  let start = range.to;
+  while (start > range.from && doc.sliceString(start - 1, start) === "\\")
+    start -= 1;
+  return start;
+}
 
 function clampSelection(
   selection: EditorSelection,
@@ -197,7 +215,8 @@ function userEventOf(tr: Transaction): { userEvent?: string } {
  * One local change, made safe for the cell: line breaks out, every pipe
  * escaped, and an escaped pair never split - a deletion that takes one half
  * of a `\|` takes the other half too, and an insert between the two halves
- * moves in front of the backslash.
+ * moves in front of the backslash. The same holds for the backslash pairs
+ * right before the closing pipe (see `closingParity`).
  */
 function cellChange(
   doc: EditorState["doc"],
@@ -222,7 +241,43 @@ function cellChange(
       to = from;
     }
   }
+  const run = trailingRun(doc, range);
+  if (run < range.to && (range.to - run) % 2 === 0) {
+    const pairStart = (pos: number) => run + Math.floor((pos - run) / 2) * 2;
+    if (from < to && to > run && from < range.to) {
+      if (from > run) from = Math.max(pairStart(from), floor);
+      to = Math.min(range.to, run + Math.ceil((to - run) / 2) * 2);
+    } else if (from === to && from > run && from < range.to) {
+      from = Math.max(pairStart(from), floor);
+      to = from;
+    }
+  }
   return { from, to, insert };
+}
+
+/**
+ * R8: a local edit must never leave an odd run of backslashes right before
+ * the cell's closing pipe, where the last one would escape the pipe and the
+ * row would lose a column. When it would, one more `\` goes in at the cell's
+ * end in the same change: a typed `\` at the end is stored `\\`, and a
+ * deletion that exposes a `\` there doubles it.
+ */
+function closingParity(
+  doc: EditorState["doc"],
+  range: CellRange,
+  kept: { from: number; to: number; insert: string }[],
+  lineBreak: string,
+): boolean {
+  const changes = ChangeSet.of(kept, doc.length, lineBreak);
+  const next = changes.apply(doc);
+  const from = changes.mapPos(range.from, -1);
+  const to = Math.max(from, changes.mapPos(range.to, 1));
+  const run = trailingRun(next, { from, to });
+  if ((to - run) % 2 === 0) return false;
+  const last = kept.at(-1);
+  if (last && last.to === range.to) last.insert += "\\";
+  else kept.push({ from: range.to, to: range.to, insert: "\\" });
+  return true;
 }
 
 /**
@@ -263,6 +318,8 @@ const clampToCell = EditorState.transactionFilter.of(
       if (change.insert.length === 0 && change.from === change.to) return;
       kept.push(change);
     });
+    if (closingParity(doc, range, kept, tr.startState.lineBreak))
+      altered = true;
     if (!altered) {
       if (!tr.selection) return tr;
       const clamped = clampSelection(tr.selection, tr.state.field(rangeField));
@@ -298,7 +355,7 @@ const clampToCell = EditorState.transactionFilter.of(
 );
 
 /** The undo stack of `main`: CodeMirror's history solo, Y.UndoManager in a room. */
-function runMainUndo(main: EditorView, which: "undo" | "redo"): boolean {
+export function runMainUndo(main: EditorView, which: "undo" | "redo"): boolean {
   if (main.state.field(historyField, false) !== undefined) {
     return (which === "undo" ? historyUndo : historyRedo)(main);
   }
@@ -365,28 +422,37 @@ const forwardingOn = Facet.define<boolean, boolean>({
 /** Feeds main changes into the mounted cell and runs the gone check. */
 class Forwarding {
   readonly main: EditorView;
+  /** The open cell's head as of the last update, for a close after it. */
+  head: number | null;
 
   constructor(main: EditorView) {
     this.main = main;
+    this.head = main.state.field(openCellField, false)?.head ?? null;
   }
 
   update(update: ViewUpdate): void {
     const main = update.view;
     const was = update.startState.field(openCellField, false) ?? null;
     const now = update.state.field(openCellField, false) ?? null;
+    this.head = now?.head ?? null;
+    const outside = update.transactions.filter(
+      (tr) => !tr.annotation(fromCell),
+    );
+    const opened = outside.some((tr) =>
+      tr.effects.some((e) => e.is(setOpenCell) && e.value !== null),
+    );
+    if (opened && now) bumpGeneration(main);
     if (was && !now) {
-      const explicit = update.transactions.some((tr) =>
-        tr.effects.some((effect) => effect.is(setOpenCell)),
+      const closedOnPurpose = update.transactions.some((tr) =>
+        tr.effects.some((e) => e.is(setOpenCell) && e.value === null),
       );
-      closeCell(main, explicit ? "user" : "gone", explicit ? "none" : "main");
+      if (closedOnPurpose) closeCell(main, "user", "none");
+      else closeCellAt(main, "gone", "main", update.changes.mapPos(was.head));
       return;
     }
     const cell = mountedCell(main);
     if (!cell || !now) return;
     const view = cell.view;
-    // The cell is mid-update when this main update is its own forwarded
-    // change; it checks the documents itself once it is done.
-    if (inUpdate(view)) return;
     let touched = false;
     for (const tr of update.transactions) {
       if (tr.annotation(fromCell)) continue;
@@ -428,7 +494,12 @@ class Forwarding {
       : main.state.facet(forwardingOn)
         ? "swap"
         : "raw";
-    closeCell(main, reason, reason === "destroy" ? "none" : "main");
+    closeCellAt(
+      main,
+      reason,
+      reason === "destroy" ? "none" : "main",
+      main.state.field(openCellField, false)?.head ?? this.head,
+    );
   }
 }
 
@@ -470,10 +541,22 @@ export function mountCellEditor(
   const separator = main.state.facet(EditorState.lineSeparator);
   let closing = false;
 
-  const tellMain = (spec: TransactionSpec) => {
+  /**
+   * Dispatches into main, after a microtask when main is mid-update. `start`
+   * is the document a forwarded change applies to: when main has moved on
+   * by the time a deferred one runs, the change is dropped and the cell is
+   * resynced from main instead.
+   */
+  const tellMain = (spec: TransactionSpec, start?: Text) => {
     if (closing || isDestroyed(main)) return;
-    if (inUpdate(main)) queueMicrotask(() => tellMain(spec));
-    else main.dispatch(spec);
+    if (!inUpdate(main)) {
+      if (start && !main.state.doc.eq(start)) resync(view, main);
+      else main.dispatch(spec);
+      return;
+    }
+    queueMicrotask(() => {
+      tellMain(spec, start);
+    });
   };
 
   const forward = EditorView.updateListener.of((update) => {
@@ -488,12 +571,15 @@ export function mountCellEditor(
     for (const tr of local) {
       if (!tr.docChanged) continue;
       sent = true;
-      tellMain({
-        changes: tr.changes,
-        effects: setOpenCell.of(own(tr.state)),
-        annotations: [fromCell.of(true)],
-        ...userEventOf(tr),
-      });
+      tellMain(
+        {
+          changes: tr.changes,
+          effects: setOpenCell.of(own(tr.state)),
+          annotations: [fromCell.of(true)],
+          ...userEventOf(tr),
+        },
+        tr.startState.doc,
+      );
     }
     if (sent) {
       if (!main.state.doc.eq(update.state.doc))
