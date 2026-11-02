@@ -43,6 +43,7 @@ mod files;
 mod github_identity;
 mod github_link;
 mod github_settings;
+pub mod github_webhook;
 mod graph;
 mod identity_links;
 mod kept;
@@ -249,6 +250,7 @@ use crate::scope::{DomainAccess, DomainRight};
         github_link::start,
         github_link::callback,
         github_link::unlink,
+        github_webhook::receive,
         users_api::unlink_github,
         mcp_tokens::list,
         mcp_tokens::issue,
@@ -1134,6 +1136,18 @@ fn routes(state: RestState) -> Router {
         )
         .route("/me/github-link/start", post(github_link::start))
         .route(github_link::CALLBACK_PATH, get(github_link::callback))
+        // The GitHub App's webhook, public by path: GitHub has no session
+        // and no CSRF token, and the guard hands it to the handler without
+        // looking for either. The proof is the signature over the body,
+        // checked before anything else is read. Its own body limit, larger
+        // than the mount's: GitHub sends deliveries of up to 25 MB, and the
+        // limit refuses anything larger before a byte of HMAC runs. See
+        // [`github_webhook`].
+        .route(
+            github_webhook::PATH,
+            post(github_webhook::receive)
+                .layer(DefaultBodyLimit::max(github_webhook::WEBHOOK_BODY_BYTES)),
+        )
         // The other half of the same self-service idea: the tokens this
         // account's AGENTS authenticate with when `auth.mcp` is on. Open to
         // every signed-in account, viewers included - an agent acts as the

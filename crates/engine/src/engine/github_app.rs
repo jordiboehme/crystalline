@@ -855,6 +855,20 @@ impl Engine {
         }
     }
 
+    /// The webhook secret of the GitHub App this instance runs, when one is
+    /// configured, usable and has a secret that is not blank. Only the
+    /// webhook route asks, to check a delivery's signature; it is never
+    /// logged and never part of any answer. Loads the App slot on first use,
+    /// which may read the keychain, so an async caller asks from a blocking
+    /// thread.
+    pub fn github_webhook_secret(&self) -> Option<String> {
+        let app = self.github_app()?;
+        app.credentials()
+            .webhook_secret
+            .clone()
+            .filter(|secret| !secret.trim().is_empty())
+    }
+
     /// The router an `instance` share by `actor` on `repo` goes out through.
     ///
     /// Reads the App's slug first when the credentials carried none (an App

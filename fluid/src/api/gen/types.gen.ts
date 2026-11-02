@@ -7011,6 +7011,46 @@ export type FinishGithubLinkErrors = {
 
 export type FinishGithubLinkError = FinishGithubLinkErrors[keyof FinishGithubLinkErrors];
 
+export type ReceiveGithubWebhookData = {
+    /**
+     * The event's payload, as GitHub sends it, at most 25 MiB.
+     */
+    body: {
+        [key: string]: unknown;
+    };
+    path?: never;
+    query?: never;
+    url: '/api/v1/github/webhook';
+};
+
+export type ReceiveGithubWebhookErrors = {
+    /**
+     * Signed, but without `X-GitHub-Delivery` or `X-GitHub-Event`, or a body that is not JSON.
+     */
+    400: ProblemDetail;
+    /**
+     * No webhook secret is configured, or the signature is missing or wrong. Nothing happened.
+     */
+    401: ProblemDetail;
+    /**
+     * A body over 25 MiB, refused before the signature is checked.
+     */
+    413: unknown;
+    /**
+     * A change could not be saved. The delivery is not remembered, so GitHub's redelivery is handled.
+     */
+    500: ProblemDetail;
+};
+
+export type ReceiveGithubWebhookError = ReceiveGithubWebhookErrors[keyof ReceiveGithubWebhookErrors];
+
+export type ReceiveGithubWebhookResponses = {
+    /**
+     * Handled, a replay, or an event this instance does not act on.
+     */
+    200: unknown;
+};
+
 export type GetGraphData = {
     body?: never;
     path?: never;

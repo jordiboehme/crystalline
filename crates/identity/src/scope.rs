@@ -1184,6 +1184,12 @@ impl DomainAccess {
         self.auth.github_links().await
     }
 
+    /// The account linked to GitHub id `github_id` on `host`, if any. For a
+    /// GitHub App webhook that names a person only by their id.
+    pub async fn account_for_github(&self, host: &str, github_id: u64) -> Result<Option<String>> {
+        self.auth.account_for_github(host, github_id).await
+    }
+
     /// Store `login` as the login last seen for the GitHub id `account` is
     /// linked to (a renamed GitHub account). Answers whether a row changed.
     pub async fn set_github_login(&self, account: &str, login: &str) -> Result<bool> {

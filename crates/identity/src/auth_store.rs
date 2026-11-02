@@ -1050,7 +1050,9 @@ pub struct AuthStore {
 /// lists (`crystalline users writes`): no rows for an account means it has no
 /// list. `domain_reflection_grant` holds the per-domain Reflection
 /// collaborators ([`AuthStore::set_reflection_grant`]), on any domain kept as
-/// files, shared or private.
+/// files, shared or private. `github_delivery` holds the GitHub App webhook
+/// deliveries of the last day ([`AuthStore::remember_delivery`]), so a
+/// replayed one does no work.
 const SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS users (
     name TEXT PRIMARY KEY,
@@ -1161,7 +1163,12 @@ CREATE TABLE IF NOT EXISTS account_write_domain (
 CREATE TABLE IF NOT EXISTS domain_reflection_grant (
     domain TEXT NOT NULL, account TEXT NOT NULL, level TEXT NOT NULL,
     added_by TEXT NOT NULL, added_at TEXT NOT NULL, PRIMARY KEY (domain, account));
+CREATE TABLE IF NOT EXISTS github_delivery (id TEXT PRIMARY KEY, received_at INTEGER NOT NULL);
 ";
+
+/// How long a GitHub webhook delivery id is remembered, one day in seconds:
+/// a replay inside it does no work (see [`AuthStore::remember_delivery`]).
+pub const DELIVERY_KEPT_SECS: i64 = 86_400;
 
 /// The sentence [`AuthStore::link_github`] refuses a GitHub account that is
 /// already linked to another Crystalline account with
@@ -2407,6 +2414,62 @@ impl AuthStore {
             .await
             .context("removing the GitHub link")?;
         Ok(changed > 0)
+    }
+
+    /// Remember the GitHub webhook delivery `id`, received now. True when it
+    /// is new, false when a delivery with this id was received in the last
+    /// day (a replay, which does no work). See
+    /// [`AuthStore::remember_delivery_at`].
+    pub async fn remember_delivery(&self, id: &str) -> Result<bool> {
+        self.remember_delivery_at(id, chrono::Utc::now().timestamp())
+            .await
+    }
+
+    /// [`AuthStore::remember_delivery`] at `now` (unix seconds). Deliveries
+    /// received more than [`DELIVERY_KEPT_SECS`] before `now` are pruned
+    /// first, in the same transaction, so the table holds one day and an id
+    /// older than that counts as new. The id is GitHub's
+    /// `X-GitHub-Delivery`, stored as given.
+    pub async fn remember_delivery_at(&self, id: &str, now: i64) -> Result<bool> {
+        let _guard = self.guard.lock().await;
+        self.begin_immediate()
+            .await
+            .context("remembering a GitHub delivery")?;
+        let result = async {
+            self.conn
+                .execute(
+                    "DELETE FROM github_delivery WHERE received_at < ?1",
+                    vec![Value::Integer(now.saturating_sub(DELIVERY_KEPT_SECS))],
+                )
+                .await
+                .context("pruning the GitHub deliveries")?;
+            let inserted = self
+                .conn
+                .execute(
+                    "INSERT INTO github_delivery (id, received_at) VALUES (?1, ?2)
+                     ON CONFLICT (id) DO NOTHING",
+                    vec![Value::Text(id.to_string()), Value::Integer(now)],
+                )
+                .await
+                .context("remembering a GitHub delivery")?;
+            Ok(inserted > 0)
+        }
+        .await;
+        self.finish(result).await
+    }
+
+    /// Forget the GitHub webhook delivery `id`, so a redelivery of it is
+    /// handled: called when handling it failed.
+    pub async fn forget_delivery(&self, id: &str) -> Result<()> {
+        let _guard = self.guard.lock().await;
+        self.conn
+            .execute(
+                "DELETE FROM github_delivery WHERE id = ?1",
+                vec![Value::Text(id.to_string())],
+            )
+            .await
+            .context("forgetting a GitHub delivery")?;
+        Ok(())
     }
 
     /// Create an account for an identity nobody has seen before, and link it,
@@ -5994,6 +6057,48 @@ mod tests {
             .await
             .unwrap();
         (dir, store)
+    }
+
+    /// A GitHub delivery id is new once: the second time within a day it is
+    /// a replay.
+    #[tokio::test]
+    async fn a_delivery_is_remembered_once() {
+        let (_dir, store) = store().await;
+        assert!(store.remember_delivery("d-1").await.unwrap());
+        assert!(!store.remember_delivery("d-1").await.unwrap());
+        assert!(store.remember_delivery("d-2").await.unwrap());
+    }
+
+    /// A delivery older than a day is pruned, so its id counts as new again;
+    /// one younger than a day stays.
+    #[tokio::test]
+    async fn a_delivery_older_than_a_day_is_forgotten() {
+        let (_dir, store) = store().await;
+        let now = chrono::Utc::now().timestamp();
+        assert!(
+            store
+                .remember_delivery_at("old", now - 86_401)
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .remember_delivery_at("young", now - 86_399)
+                .await
+                .unwrap()
+        );
+        assert!(store.remember_delivery_at("old", now).await.unwrap());
+        assert!(!store.remember_delivery_at("young", now).await.unwrap());
+    }
+
+    /// A delivery whose handling failed is forgotten, so GitHub's redelivery
+    /// is handled.
+    #[tokio::test]
+    async fn a_forgotten_delivery_is_new_again() {
+        let (_dir, store) = store().await;
+        assert!(store.remember_delivery("d-1").await.unwrap());
+        store.forget_delivery("d-1").await.unwrap();
+        assert!(store.remember_delivery("d-1").await.unwrap());
     }
 
     #[tokio::test]

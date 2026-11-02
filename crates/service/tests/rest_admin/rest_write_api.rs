@@ -4222,6 +4222,12 @@ async fn review_mode_route_is_owner_only_and_in_the_matrix() {
 /// The revocation endpoint is the same case again: the grant it ends comes off
 /// the token in the body, not off the caller, and it is pinned by
 /// `tests/remote/revoke.rs`.
+/// The GitHub App's webhook, `POST /api/v1/github/webhook`, has neither
+/// dimension: it is called by GitHub, never by a browser, so no role and no
+/// CSRF token count there (the guard hands it to the handler untouched), and
+/// what bounds it is the signature over the body under the App's webhook
+/// secret. Its refusals (no secret, no or a wrong signature, a session in
+/// place of one) are pinned by `tests/origins/github_webhook.rs`.
 /// The rename row's admin leg really renames `eng` (see its own comment in
 /// `write_ops()`), so every row that still addresses `eng` by that name has
 /// to run before it - an invariant a comment alone cannot enforce. A row
@@ -4252,6 +4258,7 @@ fn write_ops_covers_every_mutating_route_mounted() {
         "POST /api/v1/oauth/register",
         "POST /api/v1/oauth/token",
         "POST /api/v1/oauth/revoke",
+        "POST /api/v1/github/webhook",
     ];
 
     let mutating: BTreeSet<String> = crate::support::MOUNTED_OPERATIONS

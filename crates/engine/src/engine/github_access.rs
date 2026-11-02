@@ -643,6 +643,26 @@ impl GithubGovernor {
         self.recheck_closed();
     }
 
+    /// Close `repo`'s domain at once, because GitHub said the App lost it
+    /// (the repository was deleted, or taken out of the installation): its
+    /// snapshot is forgotten, a lookup in flight is not stored, and the
+    /// repository counts as not installed from now on, so only the machine
+    /// owner and instance admins get in. The usual recheck then asks GitHub
+    /// in the background whether the App is installed on it, and opens the
+    /// domain again only when GitHub says so, so a webhook payload can
+    /// narrow access but never widen it.
+    pub fn close(&self, repo: &str) {
+        {
+            let mut state = lock(&self.state);
+            let key = repo_key(repo);
+            *state.generations.entry(key.clone()).or_default() += 1;
+            state.entries.remove(&key);
+            state.failing.remove(&key);
+            state.not_installed.insert(key, Instant::now());
+        }
+        self.recheck_closed();
+    }
+
     /// Who reads `domain`'s repository on GitHub: whether it is public and
     /// the GitHub ids with read or more, from the same snapshot as every
     /// other answer. `None` when that is not known right now (no usable
@@ -1284,24 +1304,10 @@ impl GovernorEnv for EngineEnv {
     }
 
     fn origins(&self) -> Vec<(String, String)> {
-        let Some(engine) = self.engine.upgrade() else {
-            return Vec::new();
-        };
-        let config = engine.config.read().unwrap();
-        let mut origins: Vec<(String, String)> = config
-            .domains
-            .iter()
-            .filter_map(|(name, entry)| Some((name.clone(), entry.origin.as_ref()?.repo.clone())))
-            .collect();
-        for (name, entry) in engine.discovered_domains.read().unwrap().iter() {
-            if config.domains.contains_key(name) {
-                continue;
-            }
-            if let Some(origin) = &entry.origin {
-                origins.push((name.clone(), origin.repo.clone()));
-            }
+        match self.engine.upgrade() {
+            Some(engine) => engine.github_origins(),
+            None => Vec::new(),
         }
-        origins
     }
 
     fn access(&self) -> Option<Arc<DomainAccess>> {
@@ -1499,6 +1505,431 @@ impl super::Engine {
         if let Some(governor) = self.github_governor.get() {
             governor.invalidate(what);
         }
+    }
+
+    /// Every registered domain with an origin, with its repository
+    /// (`owner/name`): the configured ones, then the discovered ones the
+    /// configuration does not name.
+    pub(crate) fn github_origins(&self) -> Vec<(String, String)> {
+        let config = self.config.read().unwrap();
+        let mut origins: Vec<(String, String)> = config
+            .domains
+            .iter()
+            .filter_map(|(name, entry)| Some((name.clone(), entry.origin.as_ref()?.repo.clone())))
+            .collect();
+        for (name, entry) in self.discovered_domains.read().unwrap().iter() {
+            if config.domains.contains_key(name) {
+                continue;
+            }
+            if let Some(origin) = &entry.origin {
+                origins.push((name.clone(), origin.repo.clone()));
+            }
+        }
+        origins
+    }
+
+    /// Whether a registered domain is connected to `repo` (GitHub names are
+    /// case insensitive).
+    fn github_repo_connected(&self, repo: &str) -> bool {
+        let key = repo_key(repo);
+        self.github_origins()
+            .iter()
+            .any(|(_, connected)| repo_key(connected) == key)
+    }
+
+    /// Handle one verified GitHub App webhook delivery: event `event` (the
+    /// `X-GitHub-Event` header) with its JSON `payload`.
+    ///
+    /// An event only ever makes the governor forget what it knew, or close
+    /// a domain at once; the next question asks GitHub. Nothing in a payload
+    /// is believed about who may do what: no role, permission or visibility
+    /// is ever read from it, only which repository, person or installation
+    /// to forget. Events about repositories no domain is connected to do
+    /// nothing. What is handled:
+    ///
+    /// * `member`, `team` (`added_to_repository`, `removed_from_repository`,
+    ///   `edited`, `deleted`) and `repository` `privatized`/`publicized`:
+    ///   the repository is forgotten ([`Invalidate::Repo`]); a team event
+    ///   that names no repository forgets every connected one.
+    /// * `membership` (`added`, `removed`) and `organization`
+    ///   (`member_added`, `member_removed`): the person is forgotten
+    ///   ([`Invalidate::User`]).
+    /// * `repository` `renamed`/`transferred`: every configured domain
+    ///   connected to the old name is connected to the new one
+    ///   (`repository.full_name`), and both names are forgotten.
+    /// * `repository` `deleted`, `installation_repositories` with
+    ///   repositories removed, and `installation` `deleted`/`suspend`: the
+    ///   domains of the named repositories are closed at once
+    ///   ([`GithubGovernor::close`]).
+    /// * `installation` (any other action) and `installation_repositories`
+    ///   with repositories added: the App client forgets the installation
+    ///   and the governor rechecks every closed domain at once
+    ///   ([`Invalidate::Installation`]), which opens the ones GitHub now
+    ///   shows the App.
+    /// * `github_app_authorization` `revoked`: the person's user token is
+    ///   deleted and their link kept (`sender.id` names them).
+    ///
+    /// The answer says whether who reads a connected domain may have
+    /// changed, so the surface runs the Reflection rescan a visibility
+    /// change runs. Fails only when a change could not be saved (the
+    /// configuration after a rename, the token store after a revocation).
+    pub async fn apply_github_event(
+        self: &Arc<Self>,
+        event: &str,
+        payload: &serde_json::Value,
+    ) -> super::Result<GithubEventOutcome> {
+        let action = payload
+            .get("action")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let governor = self.github_governor();
+        let readers_changed = match (event, action) {
+            ("member", _) | ("repository", "privatized" | "publicized") => {
+                match repository_of(payload) {
+                    Some(repo) => self.forget_github_repo(&governor, &repo),
+                    None => self.forget_every_github_repo(&governor),
+                }
+            }
+            ("team", "added_to_repository" | "removed_from_repository" | "edited" | "deleted") => {
+                match repository_of(payload) {
+                    Some(repo) => self.forget_github_repo(&governor, &repo),
+                    None => self.forget_every_github_repo(&governor),
+                }
+            }
+            ("membership", "added" | "removed") => {
+                self.forget_github_user(&governor, payload.pointer("/member/id"))
+            }
+            ("organization", "member_added" | "member_removed") => {
+                self.forget_github_user(&governor, payload.pointer("/membership/user/id"))
+            }
+            ("repository", "renamed" | "transferred") => {
+                self.follow_github_rename(&governor, action, payload)?
+            }
+            ("repository", "deleted") => match repository_of(payload) {
+                Some(repo) => self.close_github_repos(&governor, [repo]),
+                None => false,
+            },
+            ("installation", _) => {
+                let installation = installation_of(payload);
+                self.evict_github_installation(installation);
+                let closed = if matches!(action, "deleted" | "suspend") {
+                    self.close_github_repos(&governor, repositories_in(payload, "repositories"))
+                } else {
+                    false
+                };
+                governor.invalidate(match installation {
+                    Some(id) => Invalidate::Installation(id),
+                    None => Invalidate::All,
+                });
+                closed
+            }
+            ("installation_repositories", _) => {
+                let installation = installation_of(payload);
+                let removed = self.close_github_repos(
+                    &governor,
+                    repositories_in(payload, "repositories_removed"),
+                );
+                let added: Vec<String> = repositories_in(payload, "repositories_added")
+                    .into_iter()
+                    .filter(|repo| self.github_repo_connected(repo))
+                    .collect();
+                if !added.is_empty() {
+                    self.evict_github_installation(installation);
+                    governor.invalidate(match installation {
+                        Some(id) => Invalidate::Installation(id),
+                        None => Invalidate::All,
+                    });
+                }
+                removed || !added.is_empty()
+            }
+            ("github_app_authorization", "revoked") => {
+                self.github_app_revoked_by(payload.pointer("/sender/id"))
+                    .await?;
+                false
+            }
+            _ => false,
+        };
+        Ok(GithubEventOutcome { readers_changed })
+    }
+
+    /// Forgets `repo` when a domain is connected to it. Answers whether one
+    /// is.
+    fn forget_github_repo(&self, governor: &GithubGovernor, repo: &str) -> bool {
+        if !self.github_repo_connected(repo) {
+            return false;
+        }
+        governor.invalidate(Invalidate::Repo(repo.to_string()));
+        true
+    }
+
+    /// Forgets every connected repository, for an event that may change
+    /// access but does not say where. Answers whether any is connected.
+    fn forget_every_github_repo(&self, governor: &GithubGovernor) -> bool {
+        let origins = self.github_origins();
+        for (_, repo) in &origins {
+            governor.invalidate(Invalidate::Repo(repo.clone()));
+        }
+        !origins.is_empty()
+    }
+
+    /// Forgets the GitHub user `id` names, or every connected repository
+    /// when the payload carries no usable id. Answers whether any domain is
+    /// connected.
+    fn forget_github_user(
+        &self,
+        governor: &GithubGovernor,
+        id: Option<&serde_json::Value>,
+    ) -> bool {
+        match id.and_then(serde_json::Value::as_u64) {
+            Some(id) => {
+                governor.invalidate(Invalidate::User(id));
+                !self.github_origins().is_empty()
+            }
+            None => self.forget_every_github_repo(governor),
+        }
+    }
+
+    /// Closes the domains of every connected repository in `repos` at once.
+    /// Answers whether any was connected.
+    fn close_github_repos(
+        &self,
+        governor: &GithubGovernor,
+        repos: impl IntoIterator<Item = String>,
+    ) -> bool {
+        let mut closed = false;
+        for repo in repos {
+            if self.github_repo_connected(&repo) {
+                tracing::info!(
+                    "GitHub says the App no longer reaches {repo}, so its domain is closed to all but instance admins"
+                );
+                governor.close(&repo);
+                closed = true;
+            }
+        }
+        closed
+    }
+
+    /// The App client forgets installation `id` (its token and the
+    /// repositories it was recorded for), or every installation when the
+    /// payload names none. Only an App that is loaded already is told: one
+    /// that is not has nothing to forget.
+    fn evict_github_installation(&self, id: Option<u64>) {
+        if let Some(super::github_app::AppSlot::Ready(router)) = self.github_app_slot_settled() {
+            match id {
+                Some(id) => router.app().evict_installation(id),
+                None => router.app().evict_all(),
+            }
+        }
+    }
+
+    /// A repository was renamed or transferred: every configured domain
+    /// connected to its old name is connected to `repository.full_name`
+    /// (one atomic configuration write), and both names are forgotten.
+    /// Answers whether who reads a connected domain may have changed: a
+    /// transfer moves the repository to another owner's people, a rename
+    /// does not.
+    fn follow_github_rename(
+        &self,
+        governor: &GithubGovernor,
+        action: &str,
+        payload: &serde_json::Value,
+    ) -> super::Result<bool> {
+        let Some(new) = repository_of(payload) else {
+            return Ok(false);
+        };
+        let Some(old) = renamed_from(action, payload, &new) else {
+            // The old name cannot be told: forget the new one, which a
+            // domain may already follow through GitHub's redirect.
+            return Ok(self.forget_github_repo(governor, &new));
+        };
+        let old_key = repo_key(&old);
+        let connected: Vec<String> = self
+            .github_origins()
+            .into_iter()
+            .filter(|(_, repo)| repo_key(repo) == old_key)
+            .map(|(domain, _)| domain)
+            .collect();
+        if connected.is_empty() {
+            return Ok(false);
+        }
+        let moved = if self.read_only {
+            tracing::warn!(
+                "GitHub says {old} is now {new}, but this instance is read-only, so its domains keep the old name; GitHub redirects it"
+            );
+            Vec::new()
+        } else {
+            self.move_origin_repo(&old_key, &new)?
+        };
+        for domain in connected.iter().filter(|d| !moved.contains(d)) {
+            if !self.read_only {
+                tracing::warn!(
+                    "GitHub says {old} is now {new}, but the domain {domain} is not defined in the configuration file, so it keeps the old name; GitHub redirects it"
+                );
+            }
+        }
+        governor.invalidate(Invalidate::Repo(old));
+        governor.invalidate(Invalidate::Repo(new));
+        Ok(action == "transferred")
+    }
+
+    /// Connects every domain of the configuration file whose origin is the
+    /// repository `old_key` (lowercased) to `new`, in one write under the
+    /// configuration lock, and then records the new name in each domain's
+    /// origin state. Answers the domains moved.
+    fn move_origin_repo(&self, old_key: &str, new: &str) -> super::Result<Vec<String>> {
+        let moved = {
+            let mut file_guard = self.file_config.write().unwrap();
+            let mut file = self.fresh_file_config(&file_guard)?;
+            let mut moved = Vec::new();
+            for (name, entry) in file.domains.iter_mut() {
+                if let Some(origin) = entry.origin.as_mut()
+                    && repo_key(&origin.repo) == old_key
+                {
+                    tracing::info!(
+                        "the repository of the domain {name} moved on GitHub from {} to {new}",
+                        origin.repo
+                    );
+                    origin.repo = new.to_string();
+                    moved.push(name.clone());
+                }
+            }
+            if moved.is_empty() {
+                return Ok(moved);
+            }
+            self.persist_config(&file)?;
+            let effective = self.overlay.apply(&file);
+            *file_guard = file;
+            *self.config.write().unwrap() = effective;
+            moved
+        };
+        for domain in &moved {
+            self.record_origin_repo(domain, new);
+        }
+        Ok(moved)
+    }
+
+    /// Stores `repo` as the repository in `domain`'s origin state, which
+    /// `origin status` reports, under the domain's origin lock so a pull in
+    /// flight does not write the old name back. In the background: a pull
+    /// may hold the lock for a while, and the webhook answers at once. Best
+    /// effort; a pull reads its repository from the configuration, never
+    /// from here.
+    fn record_origin_repo(&self, domain: &str, repo: &str) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let Ok(dir) = self.origin_state_dir(domain) else {
+            return;
+        };
+        let lock = self.origin_lock(domain);
+        let domain = domain.to_string();
+        let repo = repo.to_string();
+        runtime.spawn(async move {
+            let _held = lock.lock().await;
+            match crystalline_remote::state::OriginState::load(&dir) {
+                Ok(Some(mut state)) if state.repo != repo => {
+                    state.repo = repo;
+                    if let Err(e) = state.save(&dir) {
+                        tracing::warn!(
+                            "the new repository name of the domain {domain} could not be stored in its origin state: {e}"
+                        );
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(
+                    "the origin state of the domain {domain} could not be read to store its new repository name: {e}"
+                ),
+            }
+        });
+    }
+
+    /// The person GitHub id `id` names revoked the App: the account linked
+    /// to that id on this App's host loses its user token and keeps its
+    /// link. Nothing happens without a loaded App, an accounts store or a
+    /// linked account.
+    async fn github_app_revoked_by(&self, id: Option<&serde_json::Value>) -> super::Result<()> {
+        let Some(id) = id.and_then(serde_json::Value::as_u64) else {
+            return Ok(());
+        };
+        let host = match self.github_app_slot_settled() {
+            Some(super::github_app::AppSlot::Ready(router)) => {
+                router.app().credentials().host.clone()
+            }
+            _ => return Ok(()),
+        };
+        let Some(access) = self.domain_access.get().cloned() else {
+            return Ok(());
+        };
+        let account = access
+            .account_for_github(&host, id)
+            .await
+            .map_err(|e| super::EngineError::Internal(e.to_string()))?;
+        match account {
+            Some(account) => self.github_authorization_revoked(&account).await,
+            None => Ok(()),
+        }
+    }
+}
+
+/// What handling one GitHub App webhook event did, for the surface that
+/// received it ([`Engine::apply_github_event`](super::Engine::apply_github_event)).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GithubEventOutcome {
+    /// Whether who reads a connected domain may have changed, so the
+    /// surface runs the Reflection rescan a visibility change runs.
+    pub readers_changed: bool,
+}
+
+/// The `full_name` (`owner/name`) of a repository object, when it has one.
+fn full_name(repository: &serde_json::Value) -> Option<String> {
+    let name = repository.get("full_name")?.as_str()?.trim();
+    (name.split('/').count() == 2 && !name.starts_with('/') && !name.ends_with('/'))
+        .then(|| name.to_string())
+}
+
+/// The repository a payload is about (`repository.full_name`).
+fn repository_of(payload: &serde_json::Value) -> Option<String> {
+    full_name(payload.get("repository")?)
+}
+
+/// The installation a payload is about (`installation.id`).
+fn installation_of(payload: &serde_json::Value) -> Option<u64> {
+    payload.pointer("/installation/id")?.as_u64()
+}
+
+/// The `full_name` of every repository in the array `field` of `payload`.
+fn repositories_in(payload: &serde_json::Value, field: &str) -> Vec<String> {
+    payload
+        .get(field)
+        .and_then(serde_json::Value::as_array)
+        .map(|repos| repos.iter().filter_map(full_name).collect())
+        .unwrap_or_default()
+}
+
+/// The name a renamed or transferred repository, now `new`, had before:
+/// the old name on the same owner (`changes.repository.name.from`), or the
+/// same name on the old owner (`changes.owner.from.user.login`, or
+/// `.organization.login`).
+fn renamed_from(action: &str, payload: &serde_json::Value, new: &str) -> Option<String> {
+    let (owner, name) = new.split_once('/')?;
+    let text = |pointer: &str| {
+        payload
+            .pointer(pointer)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.contains('/'))
+    };
+    match action {
+        "renamed" => Some(format!(
+            "{owner}/{}",
+            text("/changes/repository/name/from")?
+        )),
+        "transferred" => {
+            let from = text("/changes/owner/from/user/login")
+                .or_else(|| text("/changes/owner/from/organization/login"))?;
+            Some(format!("{from}/{name}"))
+        }
+        _ => None,
     }
 }
 
@@ -1913,6 +2344,38 @@ mod tests {
         assert_eq!(rig.github.installation_lookups.load(Ordering::SeqCst), 1);
         assert!(rig.governor.closed_domains().is_empty());
         assert!(rig.governor.governed_domains().contains(DOMAIN));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn close_closes_an_open_domain_at_once_and_its_recheck_keeps_it_closed() {
+        let rig = rig().await;
+        rig.github.grant(REPO, 1, "alice-gh", RepoRole::Write);
+        assert_eq!(rig.knowledge("alice").await, level(MemberLevel::Editor));
+        rig.github.with(REPO, |r| r.not_installed = true);
+        rig.governor.close("ACME/Handbook");
+        assert!(rig.governor.closed_domains().contains(DOMAIN));
+        assert_eq!(rig.knowledge("alice").await, level(MemberLevel::None));
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(rig.github.installation_lookups.load(Ordering::SeqCst), 1);
+        assert!(rig.governor.closed_domains().contains(DOMAIN));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn close_is_undone_by_the_recheck_when_the_app_is_still_installed() {
+        let rig = rig().await;
+        rig.github.grant(REPO, 1, "alice-gh", RepoRole::Write);
+        rig.knowledge("alice").await;
+        rig.governor.close(REPO);
+        assert!(rig.governor.closed_domains().contains(DOMAIN));
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(rig.governor.closed_domains().is_empty());
+        // Nothing old is served: the next question asks GitHub.
+        assert_eq!(rig.knowledge("alice").await, level(MemberLevel::Editor));
+        assert_eq!(rig.github.listings(), 2);
     }
 
     #[tokio::test(start_paused = true)]

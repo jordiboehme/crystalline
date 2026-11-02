@@ -14,6 +14,7 @@ mod github_app;
 mod github_governed;
 mod github_link;
 mod github_members;
+mod github_webhook;
 mod origin;
 mod origin_names;
 mod poller;

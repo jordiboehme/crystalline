@@ -131,7 +131,7 @@ pub const SETUP_PATH: &str = "/auth/setup";
 /// every other `POST`. This list is a path list, so it exempts both; the guard
 /// that matters for the second one lives in the handler rather than here, and
 /// that is the first thing to check when reading this exemption.
-const PUBLIC_PATHS: [&str; 12] = [
+const PUBLIC_PATHS: [&str; 13] = [
     LOGIN_PATH,
     "/auth/logout",
     "/auth/me",
@@ -165,6 +165,15 @@ const PUBLIC_PATHS: [&str; 12] = [
     // linked without the session that started the link. See
     // `super::github_link::callback`.
     super::github_link::CALLBACK_PATH,
+    // Where GitHub delivers the App's webhook events. The proof is the
+    // signature over the body (`X-Hub-Signature-256` under the App's
+    // webhook secret), never a session: GitHub has none, and a browser's
+    // session is worth nothing here. Listed for completeness only: `guard`
+    // hands a POST to this path to the handler before it resolves anybody
+    // or checks CSRF, and the handler refuses every delivery whose
+    // signature does not verify before it reads anything else. See
+    // `super::github_webhook::receive`.
+    super::github_webhook::PATH,
 ];
 
 /// The three auth settings, resolved once when the HTTP surface is built.
@@ -515,6 +524,14 @@ pub async fn guard(
     mut req: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
+    // The GitHub App's webhook: no identity is resolved (a header mode
+    // could otherwise provision an account) and no CSRF token is asked for.
+    // GitHub carries neither; the handler's signature check is the gate,
+    // and it extracts no `Identity`. Only the POST: any other method goes
+    // through the guard like every other path.
+    if req.method() == axum::http::Method::POST && req.uri().path() == super::github_webhook::PATH {
+        return Ok(next.run(req).await);
+    }
     // The domain-path step ahead of routing may have resolved the caller
     // already; its answer, success or refusal, is this request's answer.
     let identity = match req

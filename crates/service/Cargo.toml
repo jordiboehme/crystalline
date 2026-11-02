@@ -139,6 +139,9 @@ tar = { workspace = true }
 # The fake GitHub in tests/origins/github_app.rs answers and reads blobs in
 # base64, as the real API does.
 base64 = { workspace = true }
+# tests/origins/github_webhook.rs signs its deliveries the way GitHub does, on
+# its own rather than with the server's helper.
+hmac = { workspace = true }
 tiktoken-rs = { workspace = true }
 tokio-tungstenite = { workspace = true }
 # The fake identity provider in tests/auth/oidc.rs: `jsonwebtoken` signs its ID

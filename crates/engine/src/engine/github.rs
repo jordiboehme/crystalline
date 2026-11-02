@@ -1179,6 +1179,25 @@ impl Engine {
         Ok(())
     }
 
+    /// `account` revoked the GitHub App's authorization at GitHub (a
+    /// `github_app_authorization` webhook): its user token no longer works,
+    /// so it is deleted here and the link is marked as without a token. The
+    /// link itself stays, so linking again restores everything.
+    pub(super) async fn github_authorization_revoked(&self, account: &str) -> Result<()> {
+        let identity = personal_identity(account)?;
+        let host = self.github_token_host();
+        tracing::info!(
+            "{account} revoked the GitHub App at GitHub; their GitHub token is deleted and the link stays"
+        );
+        if let Some(access) = self.domain_access.get() {
+            access
+                .mark_github_token_gone(account)
+                .await
+                .map_err(|e| EngineError::Internal(e.to_string()))?;
+        }
+        self.forget_personal_token(&identity, host.as_deref())
+    }
+
     /// The App user token a `personal` share by `account` goes out on,
     /// renewed first when it expires within [`REFRESH_BEFORE`].
     ///

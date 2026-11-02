@@ -9241,6 +9241,65 @@
         }
       }
     },
+    "/api/v1/github/webhook": {
+      "post": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "Where the GitHub App delivers its webhook events.",
+        "description": "Called by GitHub, never by a browser. Public: no session, no CSRF token. The only proof is `X-Hub-Signature-256`, the HMAC-SHA256 of the raw body under the App's webhook secret, checked before anything else is read. A delivery id seen in the last day is answered 200 and does nothing. An event only makes the instance forget what it knew about a repository, a person or an installation (or close a domain whose repository the App lost); the next request asks GitHub. Nothing in a payload is believed about who may do what.",
+        "operationId": "receive_github_webhook",
+        "requestBody": {
+          "description": "The event's payload, as GitHub sends it, at most 25 MiB.",
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Handled, a replay, or an event this instance does not act on."
+          },
+          "400": {
+            "description": "Signed, but without `X-GitHub-Delivery` or `X-GitHub-Event`, or a body that is not JSON.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No webhook secret is configured, or the signature is missing or wrong. Nothing happened.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "A body over 25 MiB, refused before the signature is checked."
+          },
+          "500": {
+            "description": "A change could not be saved. The delivery is not remembered, so GitHub's redelivery is handled.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/graph": {
       "get": {
         "tags": [
