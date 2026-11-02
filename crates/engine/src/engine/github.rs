@@ -909,6 +909,11 @@ impl Engine {
             .unwrap()
             .retain(|key, _| !key.starts_with(&prefix));
         self.clear_pending_for(&identity);
+        // The CLI sends this when it removes an account, so a single-use
+        // link that account still holds goes with it.
+        if let Some(name) = account {
+            self.forget_github_link_invites(name);
+        }
         Ok(())
     }
 
@@ -1000,9 +1005,14 @@ impl Engine {
         getrandom::fill(&mut bytes).expect("the OS CSPRNG is available");
         let nonce = crystalline_index::hex_lower(&bytes);
         let now = self.link_clock_now();
-        self.github_link_invites
+        let mut invites = self
+            .github_link_invites
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // At most one live link per account: the new one replaces the last.
+        invites.forget(account, now);
+        invites
+            .store
             .insert_at(
                 nonce.clone(),
                 LinkInvite {
@@ -1017,7 +1027,21 @@ impl Engine {
                         .to_string(),
                 )
             })?;
+        invites
+            .by_account
+            .insert(account.to_string(), nonce.clone());
         Ok(nonce)
+    }
+
+    /// Drop the single-use link `account` holds, if any: the account was
+    /// removed, or its GitHub credential forgotten. A later account under
+    /// the same name never inherits it.
+    pub fn forget_github_link_invites(&self, account: &str) {
+        let now = self.link_clock_now();
+        self.github_link_invites
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .forget(account, now);
     }
 
     /// Spend a nonce [`Engine::mint_github_link`] handed out: the account it
@@ -1029,11 +1053,15 @@ impl Engine {
         nonce: &str,
     ) -> std::result::Result<String, crate::pending::StateMiss> {
         let now = self.link_clock_now();
-        self.github_link_invites
+        let mut invites = self
+            .github_link_invites
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take_at(nonce, now)
-            .map(|invite| invite.account)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let invite = invites.store.take_at(nonce, now)?;
+        if invites.by_account.get(&invite.account).map(String::as_str) == Some(nonce) {
+            invites.by_account.remove(&invite.account);
+        }
+        Ok(invite.account)
     }
 
     /// The accounts store a link is kept in. Only a process that serves
@@ -1418,6 +1446,27 @@ impl Engine {
 /// refused with while a GitHub App is configured.
 pub const OAUTH_IDENTITY_UNDER_APP: &str =
     "this instance uses a GitHub App: connect GitHub from your profile";
+
+/// The single-use links waiting to be opened, and which one each account
+/// holds, so a new link replaces an account's earlier one.
+#[derive(Default)]
+pub(crate) struct LinkInvites {
+    /// The links, keyed by nonce.
+    store: crate::pending::PendingStore<LinkInvite>,
+    /// Each account's live nonce. An entry whose record the store has
+    /// already dropped (expired or evicted) only misses when it is taken;
+    /// there is at most one entry per account name.
+    by_account: std::collections::HashMap<String, String>,
+}
+
+impl LinkInvites {
+    /// Spend `account`'s link, if it holds one.
+    fn forget(&mut self, account: &str, now: std::time::Instant) {
+        if let Some(nonce) = self.by_account.remove(account) {
+            let _ = self.store.take_at(&nonce, now);
+        }
+    }
+}
 
 /// One single-use link waiting to be opened (see [`Engine::mint_github_link`]).
 pub(crate) struct LinkInvite {

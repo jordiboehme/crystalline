@@ -1191,7 +1191,7 @@ pub struct Engine {
     link_clock: github_app::AppClock,
     // The single-use links an agent session handed its person, keyed by
     // nonce and aged on the link clock (see `Engine::mint_github_link`).
-    github_link_invites: std::sync::Mutex<crate::pending::PendingStore<github::LinkInvite>>,
+    github_link_invites: std::sync::Mutex<github::LinkInvites>,
     // Test-only: answers the App store read in place of the keychain and the
     // file, so a test can stage a keychain that fails and then recovers.
     #[cfg(any(test, feature = "testing"))]
@@ -2506,7 +2506,7 @@ impl Engine {
             github_app: std::sync::RwLock::new(github_app::AppState::new()),
             app_clock: Arc::new(Instant::now),
             link_clock: Arc::new(Instant::now),
-            github_link_invites: std::sync::Mutex::new(crate::pending::PendingStore::default()),
+            github_link_invites: std::sync::Mutex::new(github::LinkInvites::default()),
             #[cfg(any(test, feature = "testing"))]
             app_store_lookup: None,
             backup_marks: Default::default(),

@@ -4004,7 +4004,6 @@ impl McpServer {
             return ok(json!({
                 "connected": false,
                 "url": Value::Null,
-                "profile": "/profile",
                 "next_steps": GITHUB_LINK_NO_PUBLIC_URL,
             }));
         };
@@ -6399,7 +6398,7 @@ const GITHUB_LINK_ANONYMOUS_STEPS: &str = "This session is not signed in as an a
 
 /// What an agent is told when there is no public address to build a link
 /// with.
-const GITHUB_LINK_NO_PUBLIC_URL: &str = "This instance has no service.public_url, so it cannot make a link to hand out. The person opens their profile on this instance (/profile) and connects GitHub there. An admin sets service.public_url to make links work.";
+const GITHUB_LINK_NO_PUBLIC_URL: &str = "Linking GitHub through the App needs service.public_url, which this instance does not have. An admin sets it (crystalline config set service.public_url <url>), then ask again.";
 
 /// Why a call naming a domain refuses a connect.
 const CONFIGURE_DOMAIN_NO_CONNECT: &str = "connect, token, host and restart are about this instance's GitHub sign-in, not about a domain; call configure without domain to connect";

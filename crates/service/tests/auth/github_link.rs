@@ -1261,3 +1261,96 @@ async fn an_unattended_session_cannot_mint_a_link() {
     .expect_err("refused");
     assert!(answer.contains("unattended"), "{answer}");
 }
+
+/// One account holds at most one live link: a new one replaces the earlier
+/// one, which stops working, and another account's link is untouched.
+#[tokio::test]
+async fn a_new_link_replaces_the_accounts_earlier_one() {
+    let github = FakeGithub::start().await;
+    let ctx = Ctx::start(&github).await;
+    let ann = ctx.login("ann").await;
+    let bob = ctx.login("bob").await;
+    let first = ctx.engine.mint_github_link("ann").unwrap();
+    let bobs = ctx.engine.mint_github_link("bob").unwrap();
+    let second = ctx.engine.mint_github_link("ann").unwrap();
+    assert_html_page(ctx.go(&first, &ann).await, 404).await;
+    assert_authorize(&ctx.go(&second, &ann).await, &github, &ctx);
+    assert_authorize(&ctx.go(&bobs, &bob).await, &github, &ctx);
+}
+
+/// A removed account's link dies with it, so an account created later under
+/// the same name cannot use it.
+#[tokio::test]
+async fn removing_an_account_drops_its_link() {
+    let github = FakeGithub::start().await;
+    let ctx = Ctx::start(&github).await;
+    let root = ctx.login("root").await;
+    let nonce = ctx.engine.mint_github_link("bob").unwrap();
+    let removed = ctx.delete("/users/bob", &root).await;
+    assert_eq!(removed.status(), 204);
+    ctx.auth
+        .add_user("bob", "bob", None, Role::Editor, PASSWORD)
+        .await
+        .unwrap();
+    let bob = ctx.login("bob").await;
+    assert_html_page(ctx.go(&nonce, &bob).await, 404).await;
+
+    // The CLI removes an account in its own process and tells the daemon to
+    // forget that person's credential; the link goes with it.
+    let nonce = ctx.engine.mint_github_link("ann").unwrap();
+    ctx.engine.forget_cached_credential(Some("ann")).unwrap();
+    let ann = ctx.login("ann").await;
+    assert_html_page(ctx.go(&nonce, &ann).await, 404).await;
+}
+
+/// An agent that is not signed in as an account (an instance that does not
+/// make agents authenticate) has nothing to link: it is told how the person
+/// links from their profile, and no link is made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_anonymous_agent_is_told_to_link_from_the_profile() {
+    let github = FakeGithub::start().await;
+    let ctx = Ctx::start(&github).await;
+    let session = crate::support::McpTestSession::open(&ctx.addr, None).await;
+    let answer = session
+        .call_tool("configure", serde_json::json!({ "connect": "github" }))
+        .await;
+    assert!(answer.contains("not signed in as an account"), "{answer}");
+    assert!(!answer.contains(GO_PATH), "{answer}");
+    assert!(!answer.contains("user_code"), "no device flow: {answer}");
+}
+
+/// Without `service.public_url` there is no address to build a link with:
+/// nothing is minted, and the answer says what an admin sets.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn without_a_public_url_the_answer_names_the_setting() {
+    let github = FakeGithub::start().await;
+    let ctx = Ctx::with(
+        &github,
+        Setup {
+            mcp_auth: true,
+            public_url: false,
+            ..Setup::default()
+        },
+    )
+    .await;
+    let token = ctx
+        .auth
+        .issue_mcp_token("ann", "agent")
+        .await
+        .unwrap()
+        .token;
+    let session = crate::support::McpTestSession::open(&ctx.addr, Some(&token)).await;
+    let answer = session
+        .call_tool("configure", serde_json::json!({ "connect": "github" }))
+        .await;
+    assert!(
+        answer.contains(
+            "Linking GitHub through the App needs service.public_url, which this instance does \
+             not have. An admin sets it (crystalline config set service.public_url <url>), then \
+             ask again."
+        ),
+        "{answer}"
+    );
+    assert!(!answer.contains("profile"), "{answer}");
+    assert!(!answer.contains(GO_PATH), "{answer}");
+}

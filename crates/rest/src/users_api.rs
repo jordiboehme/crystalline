@@ -610,6 +610,11 @@ pub async fn remove(
         .remove_user(&name)
         .await
         .map_err(|e| store_error(e, &name))?;
+    // A single-use GitHub link the account still holds goes with it, so an
+    // account made later under the same name cannot open it.
+    if let Ok(account) = crate::auth_store::normalize_account_name(&name) {
+        state.engine.forget_github_link_invites(&account);
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
