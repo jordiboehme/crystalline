@@ -1,0 +1,210 @@
+/**
+ * Pasting into the open cell: text as typed, blocks of cells (TSV) filling
+ * cells rightward and downward and growing the table, one undo step.
+ */
+
+import type { Extension } from "@codemirror/state";
+import { EditorState, StateEffect } from "@codemirror/state";
+import { EditorView } from "@codemirror/view";
+import type { MockInstance } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+
+import { bytes, cleanupCells, roomMain, soloMain } from "../../test/cellKit";
+import { fencePreviews } from "../fencePreviews";
+import { activeCell } from "./cellEditor";
+import { hostOpenCell } from "./gridWidget";
+import { gridExtension } from "./index";
+import { openCellField, openCellRange, setOpenCell } from "./openCell";
+import { gridTables } from "./structure";
+import { cellForwarding } from "./cellEditor";
+
+const DOC = "| a | b |\n| - | - |\n| 1 | 2 |\n";
+
+let errors: MockInstance<typeof console.error>;
+
+beforeEach(() => {
+  errors = vi.spyOn(console, "error");
+});
+
+afterEach(() => {
+  cleanupCells();
+  expect(errors).not.toHaveBeenCalled();
+  errors.mockRestore();
+});
+
+function layers(): Extension[] {
+  return [gridExtension(), fencePreviews(false)];
+}
+
+function open(main: EditorView, row: number, column: number): EditorView {
+  const cell = gridTables(main.state)[0]?.rows[row]?.[column];
+  if (!cell) throw new Error("no cell");
+  const pos = cell.content.to;
+  main.dispatch({
+    effects: setOpenCell.of({ anchor: pos, head: pos, focused: true }),
+  });
+  const editor = hostOpenCell(main, "now");
+  if (!editor) throw new Error("not hosted");
+  return editor.view;
+}
+
+interface Clip {
+  plain?: string;
+  html?: string;
+  files?: File[];
+}
+
+/** Fires a paste on `view`; returns whether the default was prevented. */
+function paste(view: EditorView, clip: Clip): boolean {
+  const event = new Event("paste", { bubbles: true, cancelable: true });
+  const data = {
+    getData: (type: string) =>
+      type === "text/plain"
+        ? (clip.plain ?? "")
+        : type === "text/html"
+          ? (clip.html ?? "")
+          : "",
+    files: clip.files ?? [],
+    items: [],
+    types: [],
+  };
+  Object.defineProperty(event, "clipboardData", { value: data });
+  view.contentDOM.dispatchEvent(event);
+  return event.defaultPrevented;
+}
+
+function where(main: EditorView): [number, number] | null {
+  const cell = openCellRange(main.state);
+  return cell ? [cell.row, cell.column] : null;
+}
+
+function undo(main: EditorView, view: EditorView): void {
+  const event = new KeyboardEvent("keydown", {
+    key: "z",
+    keyCode: 90,
+    ctrlKey: !/Mac/.test(navigator.platform),
+    metaKey: /Mac/.test(navigator.platform),
+    bubbles: true,
+    cancelable: true,
+  });
+  view.contentDOM.dispatchEvent(event);
+  expect(main.state.doc.length).toBeGreaterThan(0);
+}
+
+describe("paste of one value", () => {
+  test("plain text goes in as typed", () => {
+    const main = soloMain(DOC, layers());
+    const view = open(main, 1, 0);
+    paste(view, { plain: "a" });
+    expect(bytes(main.state)).toBe("| a | b |\n| - | - |\n| 1a | 2 |\n");
+  });
+
+  test("a pipe is escaped", () => {
+    const main = soloMain(DOC, layers());
+    const view = open(main, 1, 0);
+    paste(view, { plain: "a|b" });
+    expect(bytes(main.state)).toContain("| 1a\\|b | 2 |");
+  });
+
+  test("HTML only is converted with line breaks as spaces", async () => {
+    const main = soloMain(DOC, layers());
+    const view = open(main, 1, 0);
+    paste(view, { html: "<p>one</p><p>two</p>" });
+    await vi.waitFor(() => {
+      expect(bytes(main.state)).toContain("| 1one two |");
+    });
+  });
+
+  test("files alone change nothing", () => {
+    const main = soloMain(DOC, layers());
+    const view = open(main, 1, 0);
+    const file = new File(["x"], "x.png", { type: "image/png" });
+    expect(paste(view, { files: [file] })).toBe(true);
+    expect(bytes(main.state)).toBe(DOC);
+  });
+});
+
+describe("paste of a block", () => {
+  test("fills rightward and adds a row", () => {
+    const main = soloMain(DOC, layers());
+    const view = open(main, 1, 0);
+    paste(view, { plain: "x\ty\nz\tw" });
+    expect(bytes(main.state)).toBe(
+      "| a | b |\n| - | - |\n| x | y |\n| z | w |\n",
+    );
+  });
+
+  test("adds rows at the bottom, one per extra line", () => {
+    const main = soloMain(DOC, layers());
+    const view = open(main, 1, 0);
+    paste(view, { plain: "x\ty\nz\tw" });
+    const text = bytes(main.state);
+    expect(text).toBe("| a | b |\n| - | - |\n| x | y |\n| z | w |\n");
+    expect(gridTables(main.state)[0]?.rows).toHaveLength(3);
+  });
+
+  test("adds a column for a wide block", () => {
+    const main = soloMain(DOC, layers());
+    const view = open(main, 1, 0);
+    paste(view, { plain: "x\ty\tz" });
+    const table = gridTables(main.state)[0];
+    expect(table?.model.columns).toBe(3);
+    expect(table?.rows[1]?.map((c) => c.text)).toEqual(["x", "y", "z"]);
+    expect(table?.rows[0]?.map((c) => c.text)).toEqual(["a", "b", "Column"]);
+  });
+
+  test("a CRLF clipboard gives two rows, the trailing empty line is dropped", () => {
+    const main = soloMain(DOC, layers());
+    const view = open(main, 1, 0);
+    paste(view, { plain: "x\r\ny\r\n" });
+    const table = gridTables(main.state)[0];
+    expect(table?.rows.map((r) => r[0]?.text)).toEqual(["a", "x", "y"]);
+  });
+
+  test("pipes are escaped and cells hold no line break", () => {
+    const main = soloMain(DOC, layers());
+    const view = open(main, 1, 0);
+    paste(view, { plain: "p|q\tr\\" });
+    const table = gridTables(main.state)[0];
+    expect(table?.rows[1]?.map((c) => c.text)).toEqual(["p\\|q", "r\\"]);
+    expect(table?.model.columns).toBe(2);
+  });
+
+  test("keeps the cell open where the paste started, caret at its end", () => {
+    const main = soloMain(DOC, layers());
+    const view = open(main, 1, 0);
+    paste(view, { plain: "x\ty\nz\tw" });
+    expect(where(main)).toEqual([1, 0]);
+    const cell = openCellRange(main.state);
+    expect(main.state.field(openCellField)?.head).toBe(cell?.content.to);
+    expect(activeCell(main)).not.toBeNull();
+  });
+
+  test("one undo restores the exact bytes", () => {
+    const main = soloMain(DOC, layers());
+    const view = open(main, 1, 1);
+    paste(view, { plain: "x\ty\tz\nq\tr\ts" });
+    expect(bytes(main.state)).not.toBe(DOC);
+    undo(main, activeCell(main)?.view ?? view);
+    expect(bytes(main.state)).toBe(DOC);
+  });
+
+  test("one undo in a room restores the exact bytes", () => {
+    const { main } = roomMain(DOC, [cellForwarding, ...layers()]);
+    const view = open(main, 1, 1);
+    paste(view, { plain: "x\ty\tz\nq\tr\ts" });
+    expect(bytes(main.state)).not.toBe(DOC);
+    undo(main, activeCell(main)?.view ?? view);
+    expect(bytes(main.state)).toBe(DOC);
+  });
+
+  test("a read-only page changes nothing", () => {
+    const main = soloMain(DOC, layers());
+    const view = open(main, 1, 0);
+    main.dispatch({
+      effects: StateEffect.appendConfig.of(EditorState.readOnly.of(true)),
+    });
+    expect(paste(view, { plain: "x\ty\nz\tw" })).toBe(true);
+    expect(bytes(main.state)).toBe(DOC);
+  });
+});

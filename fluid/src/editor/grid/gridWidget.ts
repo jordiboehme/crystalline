@@ -41,6 +41,7 @@ import { activeCell, mountCellEditor } from "./cellEditor";
 import { renderCellContent } from "./cellRender";
 import { disposeChrome, mountChrome } from "./gridChrome";
 import { cellKeymap, gridNavKeys } from "./gridKeys";
+import { cellPaste } from "./gridPaste";
 import {
   gridWritable,
   mountedCell,
@@ -235,7 +236,7 @@ function host(
   el.replaceChildren();
   drawnOf.delete(el);
   el.classList.add(HOSTING);
-  const editor = mountCellEditor(main, el, [cellKeymap]);
+  const editor = mountCellEditor(main, el, [cellPaste, cellKeymap]);
   hostOf.set(main, el);
   rove(el);
   // The mount tore down whatever hosted before, in this table or another

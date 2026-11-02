@@ -8,7 +8,7 @@
  */
 
 import { syntaxTree } from "@codemirror/language";
-import type { EditorState } from "@codemirror/state";
+import type { EditorState, Text } from "@codemirror/state";
 
 import type { Align, TableModel } from "../tableModel";
 import { parseTable } from "../tableModel";
@@ -33,8 +33,11 @@ export interface GridTable {
   rows: GridCell[][];
 }
 
-function buildTable(state: EditorState, from: number, to: number): GridTable {
-  const { doc } = state;
+/**
+ * The cells of the table spanning `from` to `to` of `doc`, in document
+ * positions. Works on any document, so a caller can read a scratch copy.
+ */
+export function tableIn(doc: Text, from: number, to: number): GridTable {
   const model = parseTable(doc.sliceString(from, to));
   if (!model) throw new Error("gridDraws accepted a table parseTable refuses");
   const firstLine = doc.lineAt(from).number;
@@ -72,7 +75,7 @@ export function gridTables(state: EditorState): GridTable[] {
   syntaxTree(state).iterate({
     enter: (node) => {
       if (node.name === "Table" && gridDraws(node, state.doc)) {
-        found.push(buildTable(state, node.from, node.to));
+        found.push(tableIn(state.doc, node.from, node.to));
       }
     },
   });
