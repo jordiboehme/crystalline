@@ -7483,6 +7483,7 @@ mod automation;
 pub use asset_home::{ASSET_EXISTS, MOVE_ONTO_A_FILE};
 pub(crate) use asset_home::{AssetHome, ReplaceRule, WrittenAsset};
 pub use automation::{Delivery, WEBHOOK_NO_SECRET, WebhookTarget};
+pub use uploads::{file_answer, is_text_file_mime, upload_bytes};
 mod attachments;
 mod close_folders;
 pub use close_folders::FolderProbe;
@@ -7547,6 +7548,7 @@ mod sources;
 mod sync;
 mod threads;
 mod transfer;
+mod uploads;
 mod validate;
 mod write;
 mod write_block;
@@ -9072,6 +9074,10 @@ pub struct WrittenAttachment {
     /// Whether the bytes landed in the writer's own files overlay rather than
     /// in the folder the team reviewed.
     pub draft: bool,
+    /// Whether the path showed no file before, as the writer sees the
+    /// domain: in an overlay, neither its own bytes nor a reviewed file it
+    /// has not deleted.
+    pub created: bool,
 }
 
 /// The metadata row describing these bytes at this path. The mime comes from
@@ -9398,12 +9404,15 @@ fn unknown_rule_message(rule: &str) -> String {
 /// [`crystalline_core::canonical_asset_path`], so `./Assets/deck.png` and
 /// `assets/deck.png` are the same file. Only the prefix decides: an engram
 /// never lives under the reserved folder, which is what makes one verb able to
-/// serve both without guessing.
-fn attachment_identifier(identifier: &str) -> Option<String> {
+/// serve both without guessing. A bare `assets` names no file: it is the
+/// root engram `assets.md`'s permalink or title.
+pub fn attachment_identifier(identifier: &str) -> Option<String> {
     let raw = identifier.trim().trim_start_matches("./");
-    crystalline_core::is_under_assets(raw)
-        .then(|| crystalline_core::canonical_asset_path(raw))
-        .flatten()
+    // Something has to follow the folder: a bare `assets` (or `Assets`) is
+    // the permalink or title of a root engram `assets.md`, which is ordinary
+    // knowledge, never the folder itself.
+    crystalline_core::canonical_asset_path(raw)
+        .filter(|path| path.len() > crystalline_core::ASSETS_PREFIX.len())
 }
 
 /// The acknowledgments an engram's markdown carries.
@@ -11009,9 +11018,11 @@ mod lock_tests {
         let task = tokio::spawn(async move {
             creator
                 .write_engram(&WriteParams {
+                    path: None,
+                    base64: None,
                     domain: "eng".to_string(),
                     title: "Beta".to_string(),
-                    content: "Mine.".to_string(),
+                    content: Some("Mine.".to_string()),
                     folder: None,
                     engram_type: None,
                     tags: Vec::new(),

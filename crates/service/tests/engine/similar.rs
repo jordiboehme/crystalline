@@ -129,9 +129,11 @@ fn retry_receipt() -> serde_json::Value {
 
 fn write(domain: &str, title: &str, content: &str, status: Option<&str>) -> WriteParams {
     WriteParams {
+        path: None,
+        base64: None,
         domain: domain.to_string(),
         title: title.to_string(),
-        content: content.to_string(),
+        content: Some(content.to_string()),
         folder: None,
         engram_type: None,
         tags: vec!["t".to_string()],
@@ -806,7 +808,7 @@ async fn a_drafts_receipt_never_lists_its_own_base_row() {
                 identifier: "retry-queue-gotcha".to_string(),
                 domain: Some("team".to_string()),
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &alice,
         )

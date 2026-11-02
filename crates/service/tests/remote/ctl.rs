@@ -284,7 +284,7 @@ async fn declared_post(server: &RemoteServer, declared: usize) -> String {
 #[tokio::test]
 async fn the_body_is_read_only_after_the_bearer_check() {
     let server = RemoteServer::start(Options::TOKENS).await;
-    let oversized = crystalline_service::rest::MAX_BODY_BYTES + 1;
+    let oversized = crystalline_service::rest::MAX_TOOL_BODY_BYTES + 1;
     let status = declared_post(&server, oversized).await;
     assert!(status.starts_with("HTTP/1.1 401"), "{status}");
 }

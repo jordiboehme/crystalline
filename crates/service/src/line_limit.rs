@@ -6,7 +6,7 @@
 //! (`AsyncRwTransport::receive`, since rmcp 3.6.0). The client is never told:
 //! it waits for an answer that never comes, so a large `write_engram` from a
 //! local agent hangs the session. Over HTTP the same message meets a `413`
-//! from the body ceiling ([`crate::rest::MAX_BODY_BYTES`]); stdio had no
+//! from the body ceiling ([`crate::rest::MAX_TOOL_BODY_BYTES`]); stdio had no
 //! counterpart.
 //!
 //! [`BoundedLines`] closes that gap. It reads stdin in lines exactly the way
@@ -44,11 +44,12 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 /// transport (the metadata index only leaves out an oversized frontmatter
 /// key or value, it refuses no write), so such a call is bounded by the
 /// transport alone, which on stdio is rmcp's 16 MiB line. Attachments are
-/// not the deciding case: no MCP tool takes attachment bytes in, they only
-/// travel out, in a resource read or a remote file answer, base64-encoded at
-/// up to
+/// not the deciding case either: an agent uploads a file with `write_engram`
+/// (`path`) or `write_reflection` (`write_asset`), base64-encoded at up to
 /// `4 * ceil(MAX_ATTACHMENT_BYTES / 3)` = 13,981,016 bytes (13.33 MiB) plus
-/// the JSON-RPC envelope, which is also under this limit. So the limit is
+/// the JSON-RPC envelope, which is under this limit; a file travels out the
+/// same way in a read. The HTTP counterpart is
+/// [`crate::rest::MAX_TOOL_BODY_BYTES`] (15 MiB). So the limit is
 /// exactly the line rmcp would drop: every message that is served today is
 /// still served, and every message rmcp would drop silently is answered.
 ///

@@ -110,7 +110,7 @@ impl Fixture {
                     identifier: identifier.to_string(),
                     domain: Some(domain.to_string()),
                     share_link: None,
-                    include_images: false,
+                    include_images: None,
                 },
                 &Scope::Unrestricted,
             )
@@ -126,7 +126,7 @@ impl Fixture {
                     identifier: identifier.to_string(),
                     domain: Some(domain.to_string()),
                     share_link: None,
-                    include_images: false,
+                    include_images: None,
                 },
                 &Scope::Unrestricted,
             )
@@ -618,9 +618,11 @@ async fn virtual_domains_rewrite_at_both_ends() {
     ] {
         f.engine
             .write_engram(&WriteParams {
+                path: None,
+                base64: None,
                 domain: "vault".to_string(),
                 title: title.to_string(),
-                content: body.to_string(),
+                content: Some(body.to_string()),
                 folder: None,
                 engram_type: None,
                 tags: Vec::new(),
@@ -979,9 +981,11 @@ async fn a_refused_swap_leaves_a_virtual_linker_as_it_was() {
     ] {
         f.engine
             .write_engram(&WriteParams {
+                path: None,
+                base64: None,
                 domain: "vault".to_string(),
                 title: title.to_string(),
-                content: body.to_string(),
+                content: Some(body.to_string()),
                 folder: None,
                 engram_type: None,
                 tags: Vec::new(),
@@ -1080,9 +1084,11 @@ async fn a_lost_swap_of_a_virtual_linker_is_applied_again() {
     ] {
         f.engine
             .write_engram(&WriteParams {
+                path: None,
+                base64: None,
                 domain: "vault".to_string(),
                 title: title.to_string(),
-                content: body.to_string(),
+                content: Some(body.to_string()),
                 folder: None,
                 engram_type: None,
                 tags: Vec::new(),
@@ -1180,7 +1186,7 @@ async fn read_receipt(f: &Fixture, domain: &str, identifier: &str) -> Value {
                 identifier: identifier.to_string(),
                 domain: Some(domain.to_string()),
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &Scope::Unrestricted,
         )

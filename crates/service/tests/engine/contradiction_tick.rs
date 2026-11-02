@@ -141,9 +141,11 @@ async fn an_embed_pass_with_a_rejected_batch_still_hands_over() {
     let engine = Arc::new(engine.with_embed_channel(embed_tx));
     engine
         .write_engram(&WriteParams {
+            path: None,
+            base64: None,
             domain: "notes".to_string(),
             title: "Note".to_string(),
-            content: "The retry queue.\n\n- [fact] The build uses Node 18".to_string(),
+            content: Some("The retry queue.\n\n- [fact] The build uses Node 18".to_string()),
             folder: None,
             engram_type: None,
             tags: Vec::new(),

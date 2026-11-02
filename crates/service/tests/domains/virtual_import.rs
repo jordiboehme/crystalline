@@ -78,7 +78,7 @@ async fn stored_text_in(engine: &Engine, domain: &str, identifier: &str) -> Stri
                 identifier: identifier.to_string(),
                 domain: Some(domain.to_string()),
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &Scope::Unrestricted,
         )

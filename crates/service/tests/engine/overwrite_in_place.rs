@@ -64,9 +64,11 @@ async fn fixture(
 
 fn capture(title: &str, folder: Option<&str>, content: &str, overwrite: bool) -> WriteParams {
     WriteParams {
+        path: None,
+        base64: None,
         domain: "notes".to_string(),
         title: title.to_string(),
-        content: content.to_string(),
+        content: Some(content.to_string()),
         folder: folder.map(str::to_string),
         engram_type: None,
         tags: Vec::new(),
@@ -83,7 +85,7 @@ fn read_as(identifier: &str) -> ReadParams {
         identifier: identifier.to_string(),
         domain: Some("notes".to_string()),
         share_link: None,
-        include_images: false,
+        include_images: None,
     }
 }
 

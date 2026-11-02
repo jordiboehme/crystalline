@@ -51,10 +51,18 @@ impl Engine {
                     "expected_checksum guards an engram edit and has no meaning for the attachment '{path}'; delete it without one"
                 )));
             }
+            // The screen REST's delete makes without a join
+            // (`Engine::attachment_delete_joined`), ahead of the delete: a
+            // path a share-link shows as somebody else's draft is refused in
+            // the save's words rather than deleted under this caller's name.
+            self.screen_granted_path(&p.domain, &path, scope, None)
+                .await?;
             // Through the view this verb already built, so an attachment
             // delete lands where an engram delete lands: in review mode as
             // this actor's own deletion, with the folder untouched.
-            let draft = self.attachment_delete_in(&view, &path).await?;
+            let draft = self
+                .attachment_delete_in(&view, &path, crate::changes::change_label(scope))
+                .await?;
             let mut receipt = json!({
                 "domain": p.domain,
                 "path": path,

@@ -262,7 +262,8 @@ pub struct ClosedDomain {
     pub reason: String,
 }
 
-/// What happened to the engram: the four things the sync engine counts.
+/// What happened to the engram: the four things the sync engine counts, and
+/// `files` for an attachment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ChangeKind {
@@ -270,6 +271,9 @@ pub enum ChangeKind {
     Modified,
     Deleted,
     Moved,
+    /// An attachment under `assets/` was written, replaced or deleted; the
+    /// event's `path` and `permalink` both carry the attachment path.
+    Files,
 }
 
 /// Where a moved engram came from.
@@ -545,7 +549,8 @@ mod tests {
                 bus::ChangeKind::Added,
                 bus::ChangeKind::Modified,
                 bus::ChangeKind::Deleted,
-                bus::ChangeKind::Moved
+                bus::ChangeKind::Moved,
+                bus::ChangeKind::Files
             ]),
             published::<super::ChangeKind>()
         );

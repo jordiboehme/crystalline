@@ -1169,6 +1169,61 @@ async fn a_held_page_holds_back_the_files_only_it_links() {
     assert!(head_paths().contains(&"reflections/assets/only.png".to_string()));
 }
 
+/// A file an agent uploaded through `write_reflection` `write_asset` is held
+/// back with the held page that alone links it, exactly as a person's upload
+/// is (docs/reflection.md, the backup branch): the upload is the same write.
+#[tokio::test]
+async fn a_file_an_agent_uploaded_is_held_back_with_the_page_that_alone_links_it() {
+    use base64::Engine as _;
+    let mock = Arc::new(MockProvider::new());
+    main_commit(&mock);
+    let (fx, auth) = home_beside_harbor(mock.clone(), true).await;
+    for asset in ["assets/only.png", "assets/shared.png"] {
+        let up = crystalline_service::params::WriteReflectionParams {
+            domain: "eng".into(),
+            action: Some("write_asset".into()),
+            path: asset.into(),
+            base64: Some(base64::engine::general_purpose::STANDARD.encode(crate::assets::PNG)),
+            ..Default::default()
+        };
+        fx.engine.write_reflection(&up, &agent()).await.unwrap();
+    }
+    let mut wide = write(
+        "wide.md",
+        "# Wide\n\nFor people.\n\n## Team\n\nFive people.\n\n![only](assets/only.png)\n\n![shared](assets/shared.png)\n",
+    );
+    wide.sources = BTreeMap::from([(
+        "Team".to_string(),
+        vec!["crystalline://harbor/team/harbor-team".to_string()],
+    )]);
+    fx.engine.write_reflection(&wide, &agent()).await.unwrap();
+    fx.engine
+        .write_reflection(
+            &write("a.md", "# A\n\n## One\n\n![shared](assets/shared.png)\n"),
+            &agent(),
+        )
+        .await
+        .unwrap();
+    let head_paths = || mock.commit_paths(&mock.branch_commit(BACKUP_BRANCH).unwrap());
+    fx.engine.reflection_backup_tick(Instant::now()).await;
+    assert!(head_paths().contains(&"reflections/assets/only.png".to_string()));
+
+    auth.set_domain_visibility("harbor", true, "keeper")
+        .await
+        .unwrap();
+    fx.engine.mark_reflection_dirty("eng", BackupCause::Settled);
+    fx.engine.reflection_backup_tick(Instant::now()).await;
+    let paths = head_paths();
+    assert!(
+        !paths.contains(&"reflections/assets/only.png".to_string()),
+        "{paths:?}"
+    );
+    assert!(
+        paths.contains(&"reflections/assets/shared.png".to_string()),
+        "{paths:?}"
+    );
+}
+
 /// Serve `fx`'s engine over HTTP with `auth`, adding `boss`, an instance
 /// admin: the JSON API whose accounts routes run the narrowing hook.
 async fn serve_backup_home(

@@ -27,9 +27,11 @@ const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\x00binary\x00bytes";
 /// A minimal `write_engram` request into `eng`, optionally filed in a folder.
 fn write_params(title: &str, folder: Option<&str>) -> WriteParams {
     WriteParams {
+        path: None,
+        base64: None,
         domain: "eng".to_string(),
         title: title.to_string(),
-        content: "body".to_string(),
+        content: Some("body".to_string()),
         folder: folder.map(str::to_string),
         engram_type: None,
         tags: vec!["eng".to_string()],
@@ -1532,7 +1534,7 @@ async fn a_cross_domain_move_with_an_unreadable_source_file_fails_loudly() {
                     identifier: "note".to_string(),
                     domain: Some("into".to_string()),
                     share_link: None,
-                    include_images: false,
+                    include_images: None,
                 },
                 &Scope::Unrestricted
             )
@@ -1846,9 +1848,11 @@ async fn an_attachment_read_in_review_mode_answers_the_reviewed_folder_for_every
     engine
         .write_engram_as(
             &WriteParams {
+                path: None,
+                base64: None,
                 domain: "team".to_string(),
                 title: "Fresh".to_string(),
-                content: "- [idea] a page only alice has #team".to_string(),
+                content: Some("- [idea] a page only alice has #team".to_string()),
                 folder: None,
                 engram_type: None,
                 tags: vec!["team".to_string()],

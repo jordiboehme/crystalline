@@ -646,7 +646,7 @@ async fn an_index_wipe_keeps_drafts_through_the_journal() {
                 identifier: "plan".to_string(),
                 domain: Some("team".to_string()),
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &Scope::Unrestricted,
         )
@@ -1558,9 +1558,11 @@ fn scope_of(actor: &str) -> Scope {
 
 fn write_params(domain: &str, title: &str, content: &str) -> WriteParams {
     WriteParams {
+        path: None,
+        base64: None,
         domain: domain.to_string(),
         title: title.to_string(),
-        content: content.to_string(),
+        content: Some(content.to_string()),
         folder: None,
         engram_type: None,
         tags: vec!["team".to_string()],
@@ -1577,7 +1579,7 @@ fn read(identifier: &str) -> ReadParams {
         identifier: identifier.to_string(),
         domain: Some("team".to_string()),
         share_link: None,
-        include_images: false,
+        include_images: None,
     }
 }
 
@@ -2956,7 +2958,7 @@ async fn a_tombstoned_url_miss_names_the_bare_permalink() {
                 identifier: "crystalline://team/plan".to_string(),
                 domain: None,
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &alice,
         )
@@ -3110,7 +3112,7 @@ async fn a_draft_in_an_unregistered_domain_is_not_an_answer() {
                     identifier: "plan".to_string(),
                     domain: Some("ghost".to_string()),
                     share_link: None,
-                    include_images: false,
+                    include_images: None,
                 },
                 scope,
             )
@@ -3824,7 +3826,7 @@ async fn a_tombstone_is_honoured_for_an_identifier_that_names_no_domain() {
         identifier: identifier.to_string(),
         domain: None,
         share_link: None,
-        include_images: false,
+        include_images: None,
     };
 
     assert!(
@@ -3877,7 +3879,7 @@ async fn a_draft_shadows_a_base_row_for_an_identifier_that_names_no_domain() {
         identifier: identifier.to_string(),
         domain: None,
         share_link: None,
-        include_images: false,
+        include_images: None,
     };
 
     assert!(
@@ -8681,7 +8683,7 @@ async fn a_joined_remove_v112_stays_on_the_joined_page() {
                 identifier: "meeting/kickoff".to_string(),
                 domain: Some("team".to_string()),
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &alice,
         )
@@ -8775,7 +8777,7 @@ async fn a_failed_holder_is_named_and_the_take_back_goes_on() {
                 identifier: "meeting/intro".to_string(),
                 domain: Some("team".to_string()),
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &alice,
         )
@@ -8983,7 +8985,7 @@ async fn a_review_read_of_an_engram_whose_file_is_missing_answers_the_body() {
                 identifier: "plan".to_string(),
                 domain: Some("team".to_string()),
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &alice(),
         )
@@ -9074,7 +9076,7 @@ async fn no_draft_write_starts_from_the_body_of_a_missing_file() {
                 identifier: "plan".to_string(),
                 domain: Some("team".to_string()),
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &alice(),
         )

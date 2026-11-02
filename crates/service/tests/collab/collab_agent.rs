@@ -452,7 +452,7 @@ async fn a_guarded_split_of_a_live_engram_takes_the_live_checksum() {
                 identifier: "alpha".to_string(),
                 domain: Some("eng".to_string()),
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &crystalline_service::Scope::Unrestricted,
         )
@@ -524,7 +524,7 @@ async fn a_guarded_delete_of_a_live_engram_takes_the_live_checksum() {
                 identifier: "alpha".to_string(),
                 domain: Some("eng".to_string()),
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &crystalline_service::Scope::Unrestricted,
         )
@@ -910,9 +910,11 @@ async fn a_capture_titled_after_an_open_manifest_is_refused() {
 
     let err = engine
         .write_engram(&WriteParams {
+            path: None,
+            base64: None,
             domain: "eng".to_string(),
             title: "MANIFEST".to_string(),
-            content: "## Scope\n\n- Everything about eng\n".to_string(),
+            content: Some("## Scope\n\n- Everything about eng\n".to_string()),
             folder: None,
             engram_type: None,
             tags: vec![],
@@ -3176,9 +3178,11 @@ async fn a_wholesale_overwrite_in_a_reviewing_domain_lands_in_the_draft_room() {
     let receipt = engine
         .write_engram_present(
             &WriteParams {
+                path: None,
+                base64: None,
                 domain: "eng".to_string(),
                 title: "Alpha".to_string(),
-                content: REPLACEMENT.to_string(),
+                content: Some(REPLACEMENT.to_string()),
                 folder: None,
                 engram_type: None,
                 tags: Vec::new(),
@@ -3327,9 +3331,11 @@ async fn a_legacy_peer_is_refused_the_wholesale_overwrite_too() {
 /// One engram written straight into a helper for the capture tests below.
 fn wholesale_capture(title: &str, content: &str, overwrite: bool) -> WriteParams {
     WriteParams {
+        path: None,
+        base64: None,
         domain: "eng".to_string(),
         title: title.to_string(),
-        content: content.to_string(),
+        content: Some(content.to_string()),
         folder: None,
         engram_type: None,
         tags: Vec::new(),
@@ -3791,9 +3797,11 @@ async fn a_live_preview_for_a_domain_with_no_row_answers_none_and_registers_noth
     let sessions = CollabSessions::new(engine.clone());
     engine.set_collab_sessions(&sessions);
     let capture = WriteParams {
+        path: None,
+        base64: None,
         domain: "cold".to_string(),
         title: "Gamma".to_string(),
-        content: "x".to_string(),
+        content: Some("x".to_string()),
         folder: None,
         engram_type: None,
         tags: Vec::new(),

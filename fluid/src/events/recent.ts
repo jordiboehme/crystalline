@@ -37,6 +37,9 @@ export class RecentChanges {
     for (const [entry, value] of this.entries) {
       if (at - value.at >= RECENT_TTL_MS) this.entries.delete(entry);
     }
+    // A file under `assets/` is not an engram: its event names the file, so
+    // it would record a change for a page that does not exist.
+    if (change.kind === "files") return;
     if (change.kind === "moved" && change.from) {
       this.entries.set(key(change.domain, change.permalink), {
         kind: "moved_here",

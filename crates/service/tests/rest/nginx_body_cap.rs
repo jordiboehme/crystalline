@@ -216,6 +216,36 @@ fn the_webhook_location_carries_the_webhook_cap() {
     );
 }
 
+/// The remote tool door carries a file as base64, so the daemon takes
+/// `MAX_TOOL_BODY_BYTES` there and the proxy's location for it must too.
+#[test]
+fn the_ctl_location_carries_the_tool_body_cap() {
+    let Some(template) = template() else {
+        return;
+    };
+    let cap = crystalline_service::rest::MAX_TOOL_BODY_BYTES;
+    let mut lines = template.lines().map(str::trim);
+    lines
+        .find(|line| line.starts_with("location ") && line.contains("/api/v1/ctl"))
+        .unwrap_or_else(|| {
+            panic!(
+                "fluid/nginx.conf.template has no location for the remote tool door; \
+                 the server-level client_max_body_size would cap a file upload below \
+                 MAX_TOOL_BODY_BYTES ({cap} bytes)"
+            )
+        });
+    let directive = lines
+        .take_while(|line| *line != "}")
+        .find(|line| line.starts_with("client_max_body_size"))
+        .expect("the ctl location sets its own client_max_body_size");
+    let bytes = directive_bytes(directive);
+    assert!(
+        bytes >= cap,
+        "the ctl location's client_max_body_size ({bytes} bytes) is below \
+         MAX_TOOL_BODY_BYTES ({cap} bytes)"
+    );
+}
+
 #[test]
 fn parses_binary_nginx_size_suffixes() {
     assert_eq!(parse_nginx_size("10m"), Some(10 * 1024 * 1024));

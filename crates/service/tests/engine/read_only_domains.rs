@@ -86,9 +86,11 @@ pub(crate) fn sha256(text: &str) -> String {
 
 pub(crate) fn write_params(domain: &str, title: &str) -> WriteParams {
     WriteParams {
+        path: None,
+        base64: None,
         domain: domain.into(),
         title: title.into(),
-        content: "- [fact] new #eng".into(),
+        content: Some("- [fact] new #eng".into()),
         folder: None,
         engram_type: None,
         tags: vec!["eng".into()],
@@ -107,7 +109,7 @@ async fn checksum(engine: &Engine, domain: &str, id: &str) -> String {
                 identifier: id.into(),
                 domain: Some(domain.into()),
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &Scope::Unrestricted,
         )
@@ -675,7 +677,7 @@ async fn the_listing_browse_read_and_routing_say_read_only() {
         identifier: "alpha".into(),
         domain: Some(domain.into()),
         share_link: None,
-        include_images: false,
+        include_images: None,
     };
     let locked = engine.read_engram(&read("archive"), &scope).await.unwrap();
     assert_eq!(locked["read_only"], true);

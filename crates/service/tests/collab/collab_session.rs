@@ -474,7 +474,7 @@ async fn draft_alpha(engine: &Engine, account: &str, body: &str) {
                 identifier: "alpha".to_string(),
                 domain: Some("team".to_string()),
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &scope,
         )

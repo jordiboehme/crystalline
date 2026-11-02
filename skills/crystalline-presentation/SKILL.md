@@ -121,6 +121,10 @@ Send the refund from the order page.
 - Use the PACT's terms, and use each term the same way everywhere.
 - Write short plain sentences. Explain a term the first time you use it.
 
+## Pictures
+
+To put an image into a reflection, upload it with `write_reflection` action `write_asset` (a `path` under `assets/` plus `content` for SVG text or `base64` for a binary picture), then embed it as `![alt](assets/name.png)` relative to the page's folder.
+
 ## Feedback
 
 When a comment says "how does X work?" or "I don't follow", more words are not always the answer. A flow that is hard to follow in prose is often easy to follow in a `flowchart` or a `sequenceDiagram`, and a comparison in a table. Then answer the thread in plain words and say what you changed.

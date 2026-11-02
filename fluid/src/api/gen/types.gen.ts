@@ -302,9 +302,10 @@ export type AutomationResponse = {
 };
 
 /**
- * What happened to the engram: the four things the sync engine counts.
+ * What happened to the engram: the four things the sync engine counts, and
+ * `files` for an attachment.
  */
-export type ChangeKind = 'added' | 'modified' | 'deleted' | 'moved';
+export type ChangeKind = 'added' | 'modified' | 'deleted' | 'moved' | 'files';
 
 /**
  * A domain closed because the GitHub App is not installed on its

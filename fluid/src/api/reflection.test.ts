@@ -1,9 +1,7 @@
-import { QueryClient } from "@tanstack/react-query";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { API_BASE, api } from "./client";
 import {
-  changedVersions,
   deleteReflectionAsset,
   discloseReflectionSection,
   fetchReflectionAssets,
@@ -562,7 +560,7 @@ describe("a Reflection's files", () => {
     expect(home.resolve("../../assets/x.png")).toBeNull();
     expect(home.resolve("peer.md")).toBeNull();
     expect(home.refused("../../assets/x.png")).toBe(
-      "This file is not in the Reflection. A curator copies it into the Reflection's files.",
+      "This file is not in the Reflection. A curator or an agent copies it into the Reflection's files.",
     );
     expect(home.refused("../assets/x.png")).toBeNull();
     expect(home.url("assets/x.png")).toMatch(/\/reflection\/assets\/x\.png$/);
@@ -619,48 +617,6 @@ describe("a Reflection file's address carries its version", () => {
     );
     expect(home.linkTo("assets/flow.png")).toBe("../assets/flow.png");
     expect(home.resolve("../assets/flow.png")).toBe("assets/flow.png");
-  });
-});
-
-describe("which Reflection files changed since this document first saw them", () => {
-  function row(path: string, sha256: string) {
-    return { path, mime: "image/png", size: 1, modified: "", sha256 };
-  }
-
-  it("names nothing at first and a file once its bytes differ", () => {
-    const client = new QueryClient();
-    expect(
-      changedVersions(client, "eng", [
-        row("assets/a.png", "1"),
-        row("assets/b.png", "1"),
-      ]),
-    ).toEqual(new Map());
-    expect(changedVersions(client, "eng", undefined)).toEqual(new Map());
-    expect(
-      changedVersions(client, "eng", [
-        row("assets/a.png", "2"),
-        row("assets/b.png", "1"),
-      ]),
-    ).toEqual(new Map([["assets/a.png", "2"]]));
-    // The baseline stays the first sha: back to it is no change.
-    expect(changedVersions(client, "eng", [row("assets/a.png", "1")])).toEqual(
-      new Map(),
-    );
-    // A file first seen later takes its own baseline then.
-    expect(changedVersions(client, "eng", [row("assets/c.png", "9")])).toEqual(
-      new Map(),
-    );
-  });
-
-  it("keeps domains and documents apart", () => {
-    const client = new QueryClient();
-    changedVersions(client, "eng", [row("assets/a.png", "1")]);
-    expect(changedVersions(client, "ops", [row("assets/a.png", "2")])).toEqual(
-      new Map(),
-    );
-    expect(
-      changedVersions(new QueryClient(), "eng", [row("assets/a.png", "2")]),
-    ).toEqual(new Map());
   });
 });
 

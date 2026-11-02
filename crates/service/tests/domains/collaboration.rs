@@ -60,9 +60,11 @@ fn engram(title: &str, permalink: &str, body: &str) -> String {
 
 fn write_params(domain: &str, title: &str, content: &str) -> WriteParams {
     WriteParams {
+        path: None,
+        base64: None,
         domain: domain.to_string(),
         title: title.to_string(),
-        content: content.to_string(),
+        content: Some(content.to_string()),
         folder: None,
         engram_type: None,
         tags: Vec::new(),
@@ -177,7 +179,7 @@ async fn collaboration_flow(store: Arc<Mutex<dyn Store>>) {
                 identifier: "alpha".to_string(),
                 domain: Some("eng".to_string()),
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &Scope::Unrestricted,
         )
@@ -220,7 +222,7 @@ async fn collaboration_flow(store: Arc<Mutex<dyn Store>>) {
                 identifier: "shared-insight".to_string(),
                 domain: Some("notes".to_string()),
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &Scope::Unrestricted,
         )
