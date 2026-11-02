@@ -250,6 +250,89 @@ describe("cell editor under co-editing", () => {
     expect(rtext.toJSON()).toBe("|A|B|\n|-|-|\n|q|2|\n");
   });
 
+  // An agent's change to another cell of the open cell's row, in the two
+  // shapes a server can send it: the characters it changed, or a delete of
+  // the whole row line with the new line inserted (the old line-based edit
+  // script). The agent's doc is a third peer that forked before the local
+  // keystroke, so its change is concurrent with it.
+  function agentFork(remote: Y.Doc) {
+    const agent = new Y.Doc();
+    Y.applyUpdate(agent, Y.encodeStateAsUpdate(remote));
+    const since = Y.encodeStateVector(agent);
+    return {
+      atext: agent.getText("content"),
+      deliver: () =>
+        Y.applyUpdate(remote, Y.encodeStateAsUpdate(agent, since), "agent"),
+    };
+  }
+
+  test("an agent's character script for another cell of the row leaves the cell open", async () => {
+    const { main, ytext, rtext, remote } = roomMain(DOC);
+    const cell = openAt(main, cellOf(main, 1, 0).content.to);
+    const heard = vi.fn();
+    onCellClosed(main, heard);
+    const { atext, deliver } = agentFork(remote);
+    typeIn(cell, "x");
+    atext.insert(atext.toJSON().indexOf("| 2 |") + 3, "Z");
+    deliver();
+    await Promise.resolve();
+    expect(heard).not.toHaveBeenCalled();
+    expect(activeCell(main)).toBe(cell);
+    expect(openText(main)).toBe("1x");
+    const content = cellOf(main, 1, 0).content;
+    expect(cell.view.state.selection.main.head).toBe(content.to);
+    expect(main.state.field(openCellField)?.head).toBe(content.to);
+    expect(ytext.toJSON()).toBe("| a | b |\n| - | - |\n| 1x | 2Z |\n");
+    expect(rtext.toJSON()).toBe(ytext.toJSON());
+    typeIn(cell, "y");
+    expect(rtext.toJSON()).toBe("| a | b |\n| - | - |\n| 1xy | 2Z |\n");
+  });
+
+  test("an agent's row line replace closes the cell and keeps every character", async () => {
+    const { main, ytext, rtext, remote } = roomMain(DOC);
+    const cell = openAt(main, cellOf(main, 1, 0).content.to);
+    typeIn(cell, "x");
+    const heard = vi.fn();
+    onCellClosed(main, heard);
+    const row = rtext.toJSON().indexOf("| 1x |");
+    remote.transact(() => {
+      rtext.delete(row, "| 1x | 2 |\n".length);
+      rtext.insert(row, "| 1x | 2Z |\n");
+    }, "agent");
+    await Promise.resolve();
+    expect(heard).toHaveBeenCalledTimes(1);
+    expect(heard).toHaveBeenCalledWith("gone");
+    expect(activeCell(main)).toBeNull();
+    expect(ytext.toJSON()).toBe("| a | b |\n| - | - |\n| 1x | 2Z |\n");
+    expect(main.state.doc.toString()).toBe(ytext.toJSON());
+  });
+
+  test("a keystroke concurrent with an agent's row line replace is kept once", async () => {
+    // Yjs keeps an insert into a deleted range next to the deleted text, so
+    // the keystroke outlives the old row but not in its cell: this is why
+    // the server sends the character script instead (Task 11).
+    const { main, ytext, rtext, remote } = roomMain(DOC);
+    const cell = openAt(main, cellOf(main, 1, 0).content.to);
+    const heard = vi.fn();
+    onCellClosed(main, heard);
+    const { atext, deliver } = agentFork(remote);
+    typeIn(cell, "x");
+    const row = atext.toJSON().indexOf("| 1 |");
+    atext.doc?.transact(() => {
+      atext.delete(row, "| 1 | 2 |\n".length);
+      atext.insert(row, "| 1 | 2Z |\n");
+    });
+    deliver();
+    await Promise.resolve();
+    expect(heard).toHaveBeenCalledWith("gone");
+    expect(activeCell(main)).toBeNull();
+    const text = ytext.toJSON();
+    expect(text.split("x").length - 1).toBe(1);
+    expect(text).toContain("| 1 | 2Z |\n");
+    expect(rtext.toJSON()).toBe(text);
+    expect(main.state.doc.toString()).toBe(text);
+  });
+
   test("closeCell clears the local cursor the peer sees", () => {
     const { main, ytext, awareness, remoteAwareness, local } = roomMain(DOC);
     openAt(main, cellOf(main, 1, 0).content.to);

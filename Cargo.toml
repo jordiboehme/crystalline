@@ -99,6 +99,10 @@ axum = { version = "0.8.9", features = ["ws"] }
 yrs = { version = "0.28.0", features = ["sync"] }
 # Text diffing for collaborative merge conflict surfacing (crates/engine).
 similar = "3.2.1"
+# Extended grapheme clusters, the token the collab merge and edit script work
+# in inside a line, so neither ever splits a surrogate pair or a compound
+# emoji (crates/engine). Already in the graph through other crates.
+unicode-segmentation = "1.13.3"
 # Cheaply cloned byte buffers for the collab broadcast fan-out; also the shape
 # axum's WebSocket binary frames take, so a frame crosses the seam without a
 # copy. Already in the graph through axum and tokio.
