@@ -584,21 +584,29 @@ async fn a_root_engram_named_assets_is_read_and_deleted_as_an_engram() {
     assert!(!h.root.join("eng/assets.md").exists());
 }
 
-/// An engram still needs its body; a file's text may be empty.
+/// An engram needs its `content` field, but an empty body is accepted as it
+/// always was; a file's text may be empty too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_engram_needs_content_and_an_empty_text_file_uploads() {
+async fn an_engram_needs_content_but_an_empty_body_is_accepted_and_an_empty_text_file_uploads() {
     let h = Harness::new().await;
     let (client, _server) = h.connect().await;
-    for args in [
+    let err = try_call(
+        client.peer(),
+        "write_engram",
         json!({ "domain": "eng", "title": "No Body" }),
-        json!({ "domain": "eng", "title": "No Body", "content": "" }),
-    ] {
-        let err = try_call(client.peer(), "write_engram", args.clone())
-            .await
-            .unwrap_err();
-        assert!(err.contains("content"), "{args}: {err}");
-    }
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("content"), "{err}");
     assert!(!h.root.join("eng/no-body.md").exists());
+    try_call(
+        client.peer(),
+        "write_engram",
+        json!({ "domain": "eng", "title": "Empty Body", "content": "" }),
+    )
+    .await
+    .unwrap();
+    assert!(h.root.join("eng/empty-body.md").exists());
     let up = body(
         &try_call(
             client.peer(),

@@ -97,6 +97,18 @@ pub const DOWN_WINDOW: Duration = Duration::from_secs(30);
 /// The ctl command that reads one file of a mounted domain (0.27.0).
 pub const FILE_COMMAND: &str = "file";
 
+/// The capability a server lists in its `status` answer once an agent can send
+/// a file through it: `write_engram` with `path` and `base64` or `content`,
+/// `write_reflection` `write_asset`, and `read_engram` / `read_reflection` on
+/// an `assets/` path. A server without it ignores `path` and `base64` on a
+/// write, and with a title beside them writes an engram instead of a file, so
+/// a call that carries a file is not sent to one.
+pub const AGENT_FILES_CAPABILITY: &str = "agent_files";
+
+/// The first release that lists [`AGENT_FILES_CAPABILITY`], named in the
+/// sentence an agent reads when its server is older.
+pub const AGENT_FILES_RELEASE: &str = "0.31.0";
+
 /// The largest answer to a [`FILE_COMMAND`] this client reads: the base64 of
 /// the largest file a domain holds ([`crystalline_core::MAX_ATTACHMENT_BYTES`],
 /// which is also the JSON API's body ceiling) plus room for the envelope.
@@ -988,6 +1000,16 @@ impl Connection {
             request["agent"] = json!({ "client": client });
         }
         self.ctl_data_within(request, limit, budget).await
+    }
+
+    /// Whether the server lists [`AGENT_FILES_CAPABILITY`] in its `status`
+    /// answer. A server that answers no capability list, which every release
+    /// before [`AGENT_FILES_RELEASE`] does, does not.
+    pub async fn takes_agent_files(&self) -> Result<bool, RemoteFailure> {
+        let status = self.ctl_data(json!({ "v": 1, "cmd": "status" })).await?;
+        Ok(status["capabilities"]
+            .as_array()
+            .is_some_and(|all| all.iter().any(|c| c == AGENT_FILES_CAPABILITY)))
     }
 
     /// One file of a domain on the server, by its domain-relative path

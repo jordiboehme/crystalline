@@ -1230,3 +1230,150 @@ async fn an_invalid_file_argument_is_an_input_error_and_keeps_the_source_up() {
         SHOT
     );
 }
+
+/// Every content block of one tool call, as JSON, and whether it was an error.
+async fn call_blocks(peer: &Peer<RoleClient>, tool: &str, args: Value) -> (Vec<Value>, bool) {
+    let mut params = CallToolRequestParams::new(tool.to_string());
+    if let Value::Object(map) = args {
+        params = params.with_arguments(map);
+    }
+    let result = serde_json::to_value(peer.call_tool(params).await.unwrap()).unwrap();
+    (
+        result["content"].as_array().cloned().unwrap_or_default(),
+        result["isError"] == true,
+    )
+}
+
+fn used_tool(server: &RemoteServer, tool: &str) -> bool {
+    server
+        .ctl_requests()
+        .iter()
+        .any(|r| r["cmd"] == "tool" && r["tool"] == tool)
+}
+
+/// A server that predates agent files ignores `path` and `base64` on a write.
+/// With a title beside them it would write an engram instead of a file, so the
+/// call is refused here, before anything is sent, naming the server and the
+/// release it needs. A download by path is refused the same way: such a server
+/// would look for an engram of that name.
+#[tokio::test]
+async fn a_server_before_agent_files_is_refused_before_anything_is_sent() {
+    let server = RemoteServer::start(Options::TOKENS).await;
+    server.with_files_in_open().await;
+    server.play(Play::BeforeAgentFiles);
+    let machine = LocalMachine::start(false).await;
+    machine.connect(&server, "acme", "keeper").await;
+    machine.mount();
+    let (client, _s) = connect(McpServer::new(machine.engine.clone())).await;
+    server.clear_ctl_log();
+    let upload = "runs an older Crystalline that cannot take files from agents yet; \
+                  update it to 0.31.0 or later.";
+    let download = "runs an older Crystalline that cannot hand files to agents yet; \
+                    update it to 0.31.0 or later.";
+    let png = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(PIC)
+    };
+    for (tool, args, expected) in [
+        (
+            "write_engram",
+            json!({ "domain": "open", "path": "assets/a.png", "base64": png, "title": "Odd" }),
+            upload,
+        ),
+        (
+            "write_reflection",
+            json!({ "domain": "open", "action": "write_asset", "path": "assets/a.png", "base64": png }),
+            upload,
+        ),
+        (
+            "read_engram",
+            json!({ "domain": "open", "identifier": "assets/shot.png" }),
+            download,
+        ),
+        (
+            "read_reflection",
+            json!({ "domain": "open", "path": "assets/pic.png" }),
+            download,
+        ),
+    ] {
+        let refused = call(client.peer(), tool, args).await.unwrap_err();
+        assert!(
+            refused.starts_with("The server at http"),
+            "{tool}: {refused}"
+        );
+        assert!(refused.ends_with(expected), "{tool}: {refused}");
+        assert!(
+            !used_tool(&server, tool),
+            "{tool} was sent: {:?}",
+            server.ctl_requests()
+        );
+    }
+    assert!(!server.file("open", "odd.md").exists());
+    assert!(!server.file("open", "assets/a.png").exists());
+
+    // An ordinary write and an ordinary read are not held back.
+    call(
+        client.peer(),
+        "write_engram",
+        json!({ "domain": "open", "title": "Plain Old", "content": "- [fact] fine" }),
+    )
+    .await
+    .unwrap();
+    assert!(server.file("open", "plain-old.md").exists());
+}
+
+/// A server that has agent files takes the upload through a mount, and the
+/// routed answers for a file render as the local ones do: plain JSON (also
+/// under a TOON configuration) and, for a picture, one image block with no
+/// base64 beside it in the JSON.
+#[tokio::test]
+async fn a_mounted_upload_and_download_render_as_local_files_do() {
+    use base64::Engine as _;
+    let server = RemoteServer::start(Options::TOKENS).await;
+    server.with_files_in_open().await;
+    let machine = LocalMachine::start(false).await;
+    machine.connect(&server, "acme", "keeper").await;
+    machine.mount();
+    let (client, _s) = connect(McpServer::new(machine.engine.clone())).await;
+    let png = base64::engine::general_purpose::STANDARD.encode(PIC);
+    let up = call(
+        client.peer(),
+        "write_engram",
+        json!({ "domain": "open", "path": "assets/up.png", "base64": png }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(up["path"], "assets/up.png", "{up}");
+    assert_eq!(
+        std::fs::read(server.file("open", "assets/up.png")).unwrap(),
+        PIC
+    );
+    call(
+        client.peer(),
+        "configure",
+        json!({ "set": { "service.response_format": "toon" } }),
+    )
+    .await
+    .unwrap();
+    for (tool, args) in [
+        (
+            "read_engram",
+            json!({ "domain": "open", "identifier": "assets/up.png" }),
+        ),
+        (
+            "read_reflection",
+            json!({ "domain": "open", "path": "assets/pic.png" }),
+        ),
+    ] {
+        let (blocks, is_error) = call_blocks(client.peer(), tool, args).await;
+        assert!(!is_error, "{tool}: {blocks:?}");
+        let body: Value = serde_json::from_str(blocks[0]["text"].as_str().unwrap())
+            .unwrap_or_else(|_| panic!("{tool} answered JSON: {blocks:?}"));
+        assert_eq!(body["mime"], "image/png", "{tool}: {body}");
+        assert!(body.get("base64").is_none(), "{tool}: {body}");
+        assert!(body["note"].is_string(), "{tool}: {body}");
+        let images: Vec<&Value> = blocks.iter().filter(|b| b["type"] == "image").collect();
+        assert_eq!(images.len(), 1, "{tool}: {blocks:?}");
+        assert_eq!(images[0]["data"], png, "{tool}");
+    }
+}

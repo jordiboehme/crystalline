@@ -411,6 +411,26 @@ pub async fn routed(
                 return Some(Err(RouteError::Local(EngineError::ReadOnly.into())));
             }
             let forwarded = forwarded_args(args, &names, false);
+            if let Some(transfer) = file_transfer(tool, args) {
+                // An older server ignores the fields that make this a file;
+                // with a title beside them it would write an engram instead.
+                match sources.takes_agent_files(&source, ONE_DOMAIN_LIMIT).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        let url = sources.source_url(&source).unwrap_or_default();
+                        return Some(Err(RouteError::Refused(older_server_sentence(
+                            &url, transfer,
+                        ))));
+                    }
+                    Err(failure) => {
+                        return Some(Err(RouteError::Source {
+                            source,
+                            domain,
+                            failure: within(failure, ONE_DOMAIN_LIMIT),
+                        }));
+                    }
+                }
+            }
             let limit = if tool == crate::EVOLVE_TOOL_NAME {
                 CTL_TIMEOUT
             } else {
@@ -460,6 +480,46 @@ pub async fn routed(
             )
         }
     }
+}
+
+/// Which way a file moves in a call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Transfer {
+    /// An agent sends a file: `write_engram` with `path`, `write_reflection`
+    /// `write_asset`.
+    Upload,
+    /// An agent reads a file by its `assets/` path.
+    Download,
+}
+
+/// Whether this call moves a file, and which way. Only the cases an older
+/// server would misread: the write verbs with the fields that make them
+/// uploads, and the read verbs on an `assets/` path.
+fn file_transfer(tool: &str, args: &Value) -> Option<Transfer> {
+    let text = |key: &str| args.get(key).and_then(Value::as_str);
+    match tool {
+        "write_engram" if args.get("path").is_some_and(|p| !p.is_null()) => Some(Transfer::Upload),
+        "write_reflection" if text("action") == Some("write_asset") => Some(Transfer::Upload),
+        "read_engram" => text("identifier")
+            .and_then(crate::engine::attachment_identifier)
+            .map(|_| Transfer::Download),
+        "read_reflection" if args.get("query").is_none_or(Value::is_null) => text("path")
+            .and_then(crate::engine::attachment_identifier)
+            .map(|_| Transfer::Download),
+        _ => None,
+    }
+}
+
+/// What an agent reads when the server behind its call predates agent files.
+fn older_server_sentence(url: &str, transfer: Transfer) -> String {
+    let what = match transfer {
+        Transfer::Upload => "take files from agents",
+        Transfer::Download => "hand files to agents",
+    };
+    format!(
+        "The server at {url} runs an older Crystalline that cannot {what} yet; update it to {} or later.",
+        crystalline_remote::AGENT_FILES_RELEASE
+    )
 }
 
 /// One file of a mounted domain, as its server answered it.

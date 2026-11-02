@@ -53,6 +53,7 @@ fn without_a_base_path_the_locations_are_the_0_23_0_ones() {
             "location /api/v1/collab/",
             "location ~ ^/api/v1/domains/[^/]+/archive(/|$)",
             "location = /api/v1/github/webhook",
+            "location = /api/v1/ctl",
             "location /api/",
             "location /",
         ]
@@ -78,6 +79,7 @@ fn with_a_base_path_every_location_sits_under_it() {
             "location /crystalline/api/v1/collab/",
             "location ~ ^/crystalline/api/v1/domains/[^/]+/archive(/|$)",
             "location = /crystalline/api/v1/github/webhook",
+            "location = /crystalline/api/v1/ctl",
             "location /crystalline/api/",
             "location /crystalline/",
         ]

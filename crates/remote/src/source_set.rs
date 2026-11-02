@@ -909,6 +909,19 @@ impl SourceSet {
             .await
     }
 
+    /// Whether `source`'s server takes files from agents
+    /// ([`crate::Connection::takes_agent_files`]), within `deadline`.
+    pub async fn takes_agent_files(
+        &self,
+        source: &str,
+        deadline: Duration,
+    ) -> Result<bool, RemoteFailure> {
+        self.connection(source, deadline)
+            .await?
+            .takes_agent_files()
+            .await
+    }
+
     /// One file of `domain` (the source's own name) by its domain-relative
     /// path, from `source`, within `deadline` overall: the server's
     /// `{mime, size, base64}`. A source inside its down window answers its

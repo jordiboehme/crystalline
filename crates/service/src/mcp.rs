@@ -2373,6 +2373,13 @@ impl McpServer {
     /// [`McpServer::render_routed`] without the file links.
     fn render_routed_value(&self, tool: &str, value: Value) -> Result<CallToolResult, ErrorData> {
         match tool {
+            // A file a mounted read answered ([`crate::engine::file_answer`]):
+            // rendered as the local read renders it, with the image block.
+            "read_engram" | "read_reflection"
+                if value.get("sha256").is_some() && value.get("mime").is_some() =>
+            {
+                file_result(value)
+            }
             "write_engram" | "edit_engram" => ok_written(value),
             "move_engram" => ok_moved(value),
             "split_engram" => ok_split(value),
@@ -2546,7 +2553,9 @@ impl McpServer {
                 "write_engram needs title for an engram (or path to upload a file)".into(),
             )));
         }
-        if p.content.as_deref().is_none_or(str::is_empty) {
+        // An empty body is an engram body as it always was; only a missing
+        // `content` is refused.
+        if p.content.is_none() {
             return Err(to_error(EngineError::Invalid(
                 "write_engram needs content, the engram's markdown body (or path to upload a file)"
                     .into(),

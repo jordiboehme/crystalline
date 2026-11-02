@@ -400,3 +400,65 @@ async fn a_root_engram_named_assets_is_an_engram_through_the_remote_door() {
     assert!(reply["data"].get("attachment").is_none(), "{reply}");
     assert!(!server.file("open", "assets.md").exists());
 }
+
+/// A body is read up to `MAX_TOOL_BODY_BYTES` (15 MiB): a 10 MiB file as base64
+/// (13,981,016 bytes) and the envelope fit, and a body one byte over the cap
+/// is refused by the door before a verb runs.
+#[tokio::test]
+async fn a_full_size_file_fits_the_ctl_body_and_one_byte_over_the_cap_is_refused() {
+    let server = RemoteServer::start(Options::TOKENS).await;
+    let keeper = server.token_for("keeper").await;
+    let cap = crystalline_core::MAX_ATTACHMENT_BYTES as usize;
+    let (_, up) = server
+        .ctl(
+            Some(&keeper),
+            tool(
+                "write_engram",
+                json!({ "domain": "open", "path": "assets/big.pdf", "base64": BASE64.encode(vec![7u8; cap]) }),
+            ),
+        )
+        .await;
+    assert_eq!(up["ok"], true, "{up}");
+    assert_eq!(up["data"]["size"], cap, "{up}");
+    assert_eq!(
+        std::fs::metadata(server.file("open", "assets/big.pdf"))
+            .unwrap()
+            .len(),
+        cap as u64
+    );
+
+    let limit = crystalline_service::rest::MAX_TOOL_BODY_BYTES;
+    let with_padding =
+        |pad: usize| tool("search_engrams", json!({ "query": "x".repeat(pad) })).to_string();
+    let envelope = with_padding(0).len();
+    let at_the_limit = with_padding(limit - envelope);
+    assert_eq!(at_the_limit.len(), limit);
+    let post = |body: String| {
+        let request = server
+            .http
+            .post(format!("{}/api/v1/ctl", server.base()))
+            .header("content-type", "application/json")
+            .bearer_auth(&keeper)
+            .body(body);
+        async move {
+            let text = request.send().await.unwrap().text().await.unwrap();
+            serde_json::from_str::<Value>(&text).unwrap()
+        }
+    };
+    let served = post(at_the_limit).await;
+    assert!(
+        served["error"]
+            .as_str()
+            .is_none_or(|e| !e.starts_with("invalid body")),
+        "a body of exactly the cap is read: {served}"
+    );
+    let refused = post(with_padding(limit - envelope + 1)).await;
+    assert_eq!(refused["ok"], false, "{refused}");
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("invalid body"),
+        "{refused}"
+    );
+}
