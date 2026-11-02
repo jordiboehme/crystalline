@@ -170,6 +170,46 @@ describe("cell editor under co-editing", () => {
     expect(heard).toHaveBeenCalledWith("gone");
   });
 
+  test("a remote delete of the last row with the break before closes its pipeless last cell", async () => {
+    const { main, rtext } = roomMain("a | b\n--|--\n0 | 9\n1 | 2");
+    const cell = openAt(main, cellOf(main, 2, 1).content.to);
+    const heard = vi.fn();
+    onCellClosed(main, heard);
+    rtext.delete(rtext.toJSON().indexOf("\n1 | 2"), "\n1 | 2".length);
+    await Promise.resolve();
+    expect(heard).toHaveBeenCalledWith("gone");
+    expect(activeCell(main)).toBeNull();
+    expect(cell.view.dom.isConnected).toBe(false);
+    expect(rtext.toJSON()).toBe("a | b\n--|--\n0 | 9");
+  });
+
+  test("a remote row delete closes a pipeless last cell with trailing spaces", async () => {
+    const { main, rtext } = roomMain("a | b\n--|--\n1 | 2  \n3 | 4\n");
+    openAt(main, cellOf(main, 1, 1).content.to);
+    const heard = vi.fn();
+    onCellClosed(main, heard);
+    rtext.delete(rtext.toJSON().indexOf("1 | 2"), "1 | 2  \n".length);
+    await Promise.resolve();
+    expect(heard).toHaveBeenCalledWith("gone");
+    expect(activeCell(main)).toBeNull();
+  });
+
+  test("a peer deleting text in a pipeless last cell leaves it open", async () => {
+    // Emptying it fully is another matter: "1 | " ends in a trailing pipe,
+    // so the parse has no last cell any more (see the report).
+    const { main, rtext } = roomMain("a | b\n--|--\n0 | 9\n1 | 23");
+    const cell = openAt(main, cellOf(main, 2, 1).content.to);
+    const heard = vi.fn();
+    onCellClosed(main, heard);
+    rtext.delete(cellOf(main, 2, 1).content.from, 1);
+    await Promise.resolve();
+    expect(heard).not.toHaveBeenCalled();
+    expect(activeCell(main)).toBe(cell);
+    expect(openText(main)).toBe("3");
+    typeIn(cell, "q");
+    expect(rtext.toJSON()).toBe("a | b\n--|--\n0 | 9\n1 | 3q");
+  });
+
   test("a peer clearing a compact cell leaves it open", async () => {
     const { main, rtext } = roomMain("|A|B|\n|-|-|\n|1|2|\n");
     const cell = openAt(main, cellOf(main, 1, 0).content.to);

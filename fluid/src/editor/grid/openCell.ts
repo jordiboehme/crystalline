@@ -72,9 +72,11 @@ function settle(state: EditorState, value: OpenCell): OpenCell | null {
 }
 
 /**
- * R7: whether `changes` deleted the cell's closing delimiter - its pipe, or
- * for a last cell without one the line break that ends its row. Clearing the
- * cell's content never counts.
+ * R7: whether `changes` deleted the cell's closing delimiter. With a closing
+ * pipe that is the pipe. A last cell without one is gone when one deletion
+ * takes the line break on either side of its row together with its content,
+ * measured to the line's end (trailing spaces included). Clearing the cell's
+ * content never counts.
  */
 function closingDeleted(
   state: EditorState,
@@ -87,8 +89,16 @@ function closingDeleted(
     return changes.mapPos(end, 1, MapMode.TrackAfter) === null;
   }
   const line = doc.lineAt(end);
-  if (end !== line.to || line.to >= doc.length) return false;
-  return changes.mapPos(line.to, 1, MapMode.TrackAfter) === null;
+  const before = line.from > 0 ? line.from - 1 : null;
+  const after = line.to < doc.length ? line.to + 1 : null;
+  let gone = false;
+  changes.iterChangedRanges((fromA, toA) => {
+    if (fromA === toA) return;
+    if (before !== null && fromA <= before && toA >= line.to) gone = true;
+    if (after !== null && fromA <= cell.content.from && toA >= after)
+      gone = true;
+  });
+  return gone;
 }
 
 export const openCellField = StateField.define<OpenCell | null>({
@@ -244,7 +254,8 @@ function caretAfterClose(
  * Closes `main`'s open cell: destroys the cell view, clears the published
  * cursor in a room, sets `openCellField` to null, notifies the listeners and
  * moves focus. With focus to main, main's caret first leaves the table (see
- * `caretAfterClose`), so main never publishes a caret inside one. A no-op
+ * `caretAfterClose`), so main never publishes a caret inside one; a swap
+ * keeps the new state's own selection. A no-op
  * when nothing is open, and while a close of the same cell still waits for
  * its microtask. Inside an update of `main` the dispatch, the notifying and
  * the focus move wait for a microtask; if a newer cell was opened by then,
@@ -296,7 +307,9 @@ export function closeCellAt(
         ...(main.state.field(openCellField, false)
           ? { effects: setOpenCell.of(null) }
           : {}),
-        ...(focusTo === "main" && head !== null
+        // A swap leaves the selection to the new state: the head belongs
+        // to the old document (R9).
+        ...(focusTo === "main" && head !== null && reason !== "swap"
           ? { selection: { anchor: caretAfterClose(main.state, reason, head) } }
           : {}),
       };

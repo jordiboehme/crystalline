@@ -154,43 +154,78 @@ class LineBreakWidget extends WidgetType {
 
 const lineBreak = Decoration.replace({ widget: new LineBreakWidget() });
 
-/** A `\|` or a `<br>` tag inside the cell's text. */
-const MARKS = /\\\||<br\s*\/?>/gi;
+/** A `<br>` tag inside the cell's text. */
+const LINE_BREAK_TAG = /<br\s*\/?>/gi;
 
 /**
- * Inside the cell: the backslash of each `\|` hidden, each `<br>` drawn as a
- * line break. Both atomic.
+ * One unit of the cell's text the caret and a deletion never split, in
+ * document positions. A backslash run right before a pipe (an inner `\|`, or
+ * the cell's closing pipe) is read in pairs, `\\` being one escaped
+ * backslash, and an odd last backslash belongs to the pipe it escapes. `hide`
+ * is the escaping backslash the cell view hides, if any.
+ */
+interface Unit {
+  from: number;
+  to: number;
+  hide: number | null;
+}
+
+function cellUnits(doc: EditorState["doc"], range: CellRange): Unit[] {
+  const text = doc.sliceString(range.from, range.to);
+  const closing = doc.sliceString(range.to, range.to + 1) === "|";
+  const base = range.from;
+  const units: Unit[] = [];
+  const single = (at: number) =>
+    units.push({ from: base + at, to: base + at + 1, hide: null });
+  let i = 0;
+  while (i < text.length) {
+    if (text[i] !== "\\") {
+      single(i);
+      i += 1;
+      continue;
+    }
+    let j = i;
+    while (j < text.length && text[j] === "\\") j += 1;
+    const piped = j < text.length ? text[j] === "|" : closing;
+    if (!piped) {
+      for (let k = i; k < j; k += 1) single(k);
+      i = j;
+      continue;
+    }
+    const length = j - i;
+    for (let k = i; k + 1 < j; k += 2) {
+      units.push({ from: base + k, to: base + k + 2, hide: base + k });
+    }
+    if (length % 2 === 1 && j < text.length) {
+      // The last backslash escapes the inner pipe after it.
+      units.push({ from: base + j - 1, to: base + j + 1, hide: base + j - 1 });
+      i = j + 1;
+      continue;
+    }
+    if (length % 2 === 1) single(j - 1); // only an edit in flight is odd here
+    i = j;
+  }
+  return units;
+}
+
+/**
+ * Inside the cell: every escaping backslash hidden (an escaped `\|` shows
+ * `|`, a `\\` before a pipe shows `\`), each `<br>` drawn as a line break.
+ * Both atomic.
  */
 const cellMarks = atomicField((state) => {
-  const { from, to } = state.field(rangeField);
-  const text = state.doc.sliceString(from, to);
+  const range = state.field(rangeField);
+  const text = state.doc.sliceString(range.from, range.to);
   const ranges = [];
-  for (const match of text.matchAll(MARKS)) {
-    const at = from + match.index;
-    ranges.push(
-      match[0] === "\\|"
-        ? hidden.range(at, at + 1)
-        : lineBreak.range(at, at + match[0].length),
-    );
+  for (const unit of cellUnits(state.doc, range)) {
+    if (unit.hide !== null) ranges.push(hidden.range(unit.hide, unit.hide + 1));
   }
-  // The trailing backslash pairs before the closing pipe: the escaping half
-  // of each is hidden, so `\\` reads as one `\`.
-  const run = trailingRun(state.doc, { from, to });
-  for (let at = run; at < to; at += 2) ranges.push(hidden.range(at, at + 1));
+  for (const match of text.matchAll(LINE_BREAK_TAG)) {
+    const at = range.from + match.index;
+    ranges.push(lineBreak.range(at, at + match[0].length));
+  }
   return Decoration.set(ranges, true);
 });
-
-/**
- * Where the run of backslashes ending at the cell's end starts, when the
- * cell's closing pipe follows right after it; `range.to` otherwise (no run).
- */
-function trailingRun(doc: EditorState["doc"], range: CellRange): number {
-  if (doc.sliceString(range.to, range.to + 1) !== "|") return range.to;
-  let start = range.to;
-  while (start > range.from && doc.sliceString(start - 1, start) === "\\")
-    start -= 1;
-  return start;
-}
 
 function clampSelection(
   selection: EditorSelection,
@@ -213,71 +248,55 @@ function userEventOf(tr: Transaction): { userEvent?: string } {
 
 /**
  * One local change, made safe for the cell: line breaks out, every pipe
- * escaped, and an escaped pair never split - a deletion that takes one half
- * of a `\|` takes the other half too, and an insert between the two halves
- * moves in front of the backslash. The same holds for the backslash pairs
- * right before the closing pipe (see `closingParity`).
+ * escaped, and no unit split (see `cellUnits`) - a deletion that takes part
+ * of one takes all of it, and an insert inside one moves to its start.
  */
 function cellChange(
-  doc: EditorState["doc"],
-  range: CellRange,
+  units: Unit[],
   fromA: number,
   toA: number,
   text: string,
   floor: number,
 ): { from: number; to: number; insert: string } {
   const insert = text.replace(/\r\n|\r|\n/g, "").replaceAll("|", "\\|");
-  let from = fromA;
-  let to = toA;
-  const at = (pos: number) => doc.sliceString(pos, pos + 1);
-  if (from < to) {
-    if (at(from) === "|" && from - 1 >= Math.max(range.from, floor)) {
-      if (at(from - 1) === "\\") from -= 1;
-    }
-    if (at(to - 1) === "\\" && to + 1 <= range.to && at(to) === "|") to += 1;
-  } else if (from - 1 >= Math.max(range.from, floor)) {
-    if (at(from - 1) === "\\" && at(from) === "|") {
-      from -= 1;
-      to = from;
-    }
-  }
-  const run = trailingRun(doc, range);
-  if (run < range.to && (range.to - run) % 2 === 0) {
-    const pairStart = (pos: number) => run + Math.floor((pos - run) / 2) * 2;
-    if (from < to && to > run && from < range.to) {
-      if (from > run) from = Math.max(pairStart(from), floor);
-      to = Math.min(range.to, run + Math.ceil((to - run) / 2) * 2);
-    } else if (from === to && from > run && from < range.to) {
-      from = Math.max(pairStart(from), floor);
-      to = from;
-    }
-  }
-  return { from, to, insert };
+  const inside = (pos: number) =>
+    units.find((unit) => unit.from < pos && pos < unit.to);
+  let from = inside(fromA)?.from ?? fromA;
+  let to = fromA === toA ? from : (inside(toA)?.to ?? toA);
+  from = Math.max(from, floor);
+  if (fromA === toA) to = from;
+  return { from, to: Math.max(from, to), insert };
 }
 
 /**
- * R8: a local edit must never leave an odd run of backslashes right before
- * the cell's closing pipe, where the last one would escape the pipe and the
- * row would lose a column. When it would, one more `\` goes in at the cell's
- * end in the same change: a typed `\` at the end is stored `\\`, and a
- * deletion that exposes a `\` there doubles it.
+ * R8: after a local edit the cell's content holds no unescaped pipe (each
+ * `|` has an odd backslash run before it) and an even run right before the
+ * closing pipe. The one `\` each place needs goes into the same change: a
+ * typed `\` at the end is stored `\\`, a `|` typed after a literal `\` is
+ * stored `\\\|`. Returns `changes` itself when nothing was needed.
  */
-function closingParity(
+function withEscapes(
   doc: EditorState["doc"],
   range: CellRange,
-  kept: { from: number; to: number; insert: string }[],
+  changes: ChangeSet,
   lineBreak: string,
-): boolean {
-  const changes = ChangeSet.of(kept, doc.length, lineBreak);
+): ChangeSet {
   const next = changes.apply(doc);
   const from = changes.mapPos(range.from, -1);
   const to = Math.max(from, changes.mapPos(range.to, 1));
-  const run = trailingRun(next, { from, to });
-  if ((to - run) % 2 === 0) return false;
-  const last = kept.at(-1);
-  if (last && last.to === range.to) last.insert += "\\";
-  else kept.push({ from: range.to, to: range.to, insert: "\\" });
-  return true;
+  const text = next.sliceString(from, to);
+  const fixes: { from: number; insert: string }[] = [];
+  let run = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    if (text[i] === "|" && run % 2 === 0)
+      fixes.push({ from: from + i, insert: "\\" });
+    run = text[i] === "\\" ? run + 1 : 0;
+  }
+  if (next.sliceString(to, to + 1) === "|" && run % 2 === 1) {
+    fixes.push({ from: to, insert: "\\" });
+  }
+  if (fixes.length === 0) return changes;
+  return changes.compose(ChangeSet.of(fixes, next.length, lineBreak));
 }
 
 /**
@@ -303,6 +322,7 @@ const clampToCell = EditorState.transactionFilter.of(
       ];
     }
     const doc = tr.startState.doc;
+    const units = cellUnits(doc, range);
     const kept: { from: number; to: number; insert: string }[] = [];
     let altered = false;
     tr.changes.iterChanges((fromA, toA, _fromB, _toB, inserted) => {
@@ -312,14 +332,16 @@ const clampToCell = EditorState.transactionFilter.of(
       }
       const text = inserted.sliceString(0, inserted.length, "\n");
       const floor = kept.at(-1)?.to ?? 0;
-      const change = cellChange(doc, range, fromA, toA, text, floor);
+      const change = cellChange(units, fromA, toA, text, floor);
       if (change.insert !== text || change.from !== fromA || change.to !== toA)
         altered = true;
       if (change.insert.length === 0 && change.from === change.to) return;
       kept.push(change);
     });
-    if (closingParity(doc, range, kept, tr.startState.lineBreak))
-      altered = true;
+    const lb = tr.startState.lineBreak;
+    const plain = ChangeSet.of(kept, doc.length, lb);
+    const changes = withEscapes(doc, range, plain, lb);
+    if (changes !== plain) altered = true;
     if (!altered) {
       if (!tr.selection) return tr;
       const clamped = clampSelection(tr.selection, tr.state.field(rangeField));
@@ -334,7 +356,6 @@ const clampToCell = EditorState.transactionFilter.of(
         },
       ];
     }
-    const changes = ChangeSet.of(kept, doc.length, tr.startState.lineBreak);
     const from = changes.mapPos(range.from, -1);
     const mapped = { from, to: Math.max(from, changes.mapPos(range.to, 1)) };
     // An explicit selection is in the coordinates of the refused changes:
@@ -344,11 +365,11 @@ const clampToCell = EditorState.transactionFilter.of(
       : tr.startState.selection;
     return [
       {
-        ...(kept.length > 0 ? { changes } : {}),
+        ...(changes.empty ? {} : { changes }),
         selection: clampSelection(base.map(changes, 1), mapped),
         effects: tr.effects,
         scrollIntoView: tr.scrollIntoView,
-        ...(kept.length > 0 ? userEventOf(tr) : {}),
+        ...(changes.empty ? {} : userEventOf(tr)),
       },
     ];
   },

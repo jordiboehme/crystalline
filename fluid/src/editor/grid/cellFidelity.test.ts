@@ -158,6 +158,28 @@ describe("one teardown path", () => {
     expect(heard).toHaveBeenCalledWith("raw");
   });
 
+  test("setState with a new document keeps the new state's selection", async () => {
+    const { main, preview, heard } = focusedCell();
+    const next = "Other\n\n| x | y |\n| - | - |\n| 7 | 8 |\n";
+    main.setState(
+      parsedState(
+        EditorState.create({
+          doc: next,
+          selection: { anchor: 3 },
+          extensions: [
+            ...baseExtensions(false),
+            preview.of([layers(false), cellForwarding]),
+          ],
+        }),
+      ),
+    );
+    await Promise.resolve();
+    expect(heard).toHaveBeenCalledWith("swap");
+    expect(bytes(main.state)).toBe(next);
+    expect(main.state.selection.main.anchor).toBe(3);
+    expect(main.state.selection.main.head).toBe(3);
+  });
+
   test("setState while a cell holds focus keeps the text and focuses main", async () => {
     const { main, editor, preview, heard } = focusedCell();
     main.setState(

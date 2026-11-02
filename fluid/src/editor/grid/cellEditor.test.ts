@@ -167,6 +167,27 @@ describe.each(Object.entries(setups))("cell editor (%s)", (_, make) => {
     expect(cell.view.contentDOM.textContent).toBe("a\\");
   });
 
+  test("a pipe typed after a literal backslash stays inside the cell", () => {
+    const { main } = open("| a | b |\n| - | - |\n| x\\y | 2 |\n");
+    const content = cellOf(main, 1, 0).content;
+    const cell = openAt(main, content.from + 2);
+    typeIn(cell, "|");
+    expect(bytes(main.state)).toBe("| a | b |\n| - | - |\n| x\\\\\\|y | 2 |\n");
+    expect(gridTables(main.state)[0]?.rows[1]?.length).toBe(2);
+    expect(cell.view.contentDOM.textContent).toBe("x\\|y");
+  });
+
+  test("deleting between a backslash and an escaped pipe keeps the cell", () => {
+    const { main } = open("| a | b |\n| - | - |\n| a\\x\\|b | 2 |\n");
+    const content = cellOf(main, 1, 0).content;
+    const cell = openAt(main, content.from + 3);
+    expect(cell.view.contentDOM.textContent).toBe("a\\x|b");
+    expect(press(cell.view, "Backspace")).toBe(true);
+    expect(bytes(main.state)).toBe("| a | b |\n| - | - |\n| a\\\\\\|b | 2 |\n");
+    expect(gridTables(main.state)[0]?.rows[1]?.length).toBe(2);
+    expect(cell.view.contentDOM.textContent).toBe("a\\|b");
+  });
+
   test("a second mount destroys the first", () => {
     const { main, cell } = open();
     expect(activeCell(main)).toBe(cell);
