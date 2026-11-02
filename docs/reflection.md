@@ -160,6 +160,17 @@ Access has two axes. They are set side by side: per account for every shared dom
 - A source of another domain is shown only to a reader who may read engrams in that domain. Anyone else sees a count, for example "2 sources in a domain you cannot open", with no name and no state. The `reflection:` block they get leaves those sources out, and a write by them keeps those sources as they were. An agent that may not open the domain gets the queue item with the words "a source in a domain you cannot open has changed", so it asks a person instead of updating blind. Taking feedback into the engrams of another domain needs the right to write there. Without it, the agent answers in a thread or settles the item as kept.
 - A version before 0.26.0 does not know the knowledge level `none` and reads it as `viewer`. So before you go back to an older version, give those accounts and members a level that is right for the older version.
 
+**Reflection collaborators of one domain.** An account can also get the Reflection of one domain only, as `reader` or `contributor`, without any other change to its access. This works on a shared and on a private domain kept as files (not on a virtual domain). The grant only raises: it shows no engram the account could not see before, and the write list still caps it. It also works for an account with the instance role `none`, which is how a person works on one domain's Reflection and sees nothing else. A manager of the domain gives and takes grants: its owner or a manager, an instance admin, and on a domain connected through a GitHub App a GitHub admin or maintainer. In Fluid they are on the Members card, under "Reflection collaborators".
+
+**On a domain connected through a GitHub App** the knowledge level comes from the person's role on the repository (see [Access that follows GitHub](teams.md#access-that-follows-github)):
+
+- GitHub write, maintain or admin curates.
+- GitHub read or triage reads and comments.
+- No link, or no access on GitHub: on a shared domain, read and comment; on a private domain, nothing.
+- The account's instance Reflection level still raises on a shared domain, so an instance `contributor` edits the Reflection there without access on GitHub. On a private domain it does not count, and the Reflection levels of the old members are not read.
+- An account with the instance role `none` gets nothing from its instance Reflection level there, but a Reflection collaborator grant on the domain works.
+- A closed domain (the repository does not have the App) is open to instance admins only. A grant does not open it.
+
 The commands:
 
 ```bash
@@ -169,6 +180,9 @@ crystalline users add ada --role none --reflection contributor
 crystalline users reflection ada reader
 # a member of a private domain who reads its Reflection only
 crystalline domain members eng add ada --level none --reflection reader
+# the Reflection of this one domain, as contributor; remove takes it away again
+crystalline domain members eng reflection add ada --level contributor
+crystalline domain members eng reflection remove ada
 ```
 
 ## The reflect queue
