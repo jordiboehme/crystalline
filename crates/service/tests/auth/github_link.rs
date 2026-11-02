@@ -1127,10 +1127,9 @@ async fn a_link_opened_by_another_account_is_refused() {
     assert!(ctx.link_of("bob").await.is_none());
 }
 
-/// Without a session the link sends the browser to sign in and back, and is
-/// not spent by that: the sign-in page carries the nonce and nothing else,
-/// and with single sign-on the provider's sign-in comes back to this very
-/// link through the checked return address.
+/// Without a session the link sends the browser to the sign-in page and
+/// back, and is not spent by that: the sign-in page carries the nonce and
+/// nothing else, with or without single sign-on.
 #[tokio::test]
 async fn a_link_without_a_session_goes_to_sign_in_and_back() {
     let github = FakeGithub::start().await;
@@ -1157,10 +1156,10 @@ async fn a_link_without_a_session_goes_to_sign_in_and_back() {
     let nonce = sso.engine.mint_github_link("ann").unwrap();
     let response = sso.go(&nonce, &Vec::new()).await;
     assert_eq!(response.status(), 303);
-    assert_eq!(
-        location(&response),
-        format!("/api/v1/auth/oidc/login?return_to=%2Fapi%2Fv1%2Fgithub%2Flink%2Fgo%3Fn%3D{nonce}")
-    );
+    // With single sign-on too it is the sign-in page, so a person on an
+    // instance with both passwords and a provider can choose; the page's
+    // provider button carries the same return.
+    assert_eq!(location(&response), format!("/login?github_link={nonce}"));
     let ann = sso.login("ann").await;
     assert_authorize(&sso.go(&nonce, &ann).await, &github, &sso);
 }

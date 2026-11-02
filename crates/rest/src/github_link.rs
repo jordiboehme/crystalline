@@ -415,25 +415,16 @@ fn see_other(location: String) -> Response {
 }
 
 /// Where a browser without a session goes to sign in and come back to the
-/// link `nonce`. With single sign-on it is the provider's sign-in, which
-/// lands back on the link through its checked `return_to`; without it the
-/// sign-in page, which carries the nonce and nothing else and opens the link
-/// again once somebody is signed in. The nonce is not spent: nothing proved
-/// who sent it.
-fn to_sign_in(state: &RestState, nonce: &str, sso: bool) -> Response {
-    let base = state.base_path.href();
-    if sso && state.oidc.is_some() {
-        let link = format!("{base}api/v1{GO_PATH}?n={nonce}");
-        let return_to = super::oidc::safe_return_path(&link, &state.base_path)
-            .expect("a link under the base path is a safe return path");
-        let encoded =
-            percent_encoding::utf8_percent_encode(&return_to, percent_encoding::NON_ALPHANUMERIC);
-        return see_other(format!(
-            "{base}api/v1{}?return_to={encoded}",
-            super::oidc::LOGIN_PATH
-        ));
-    }
-    see_other(format!("{base}login?github_link={nonce}"))
+/// link `nonce`: the sign-in page, with the nonce and nothing else. It opens
+/// the link again once somebody is signed in, and its single sign-on button
+/// carries the link as the provider's return, so a person on an instance
+/// with both passwords and single sign-on can choose. The nonce is not
+/// spent: nothing proved who sent it.
+fn to_sign_in(state: &RestState, nonce: &str) -> Response {
+    see_other(format!(
+        "{}login?github_link={nonce}",
+        state.base_path.href()
+    ))
 }
 
 /// Where the single-use link an agent session hands out lives, under
@@ -454,12 +445,14 @@ pub const GO_PATH: &str = "/github/link/go";
                    browser goes on to GitHub's authorize url, exactly as \
                    `POST /me/github-link/start` would send it, so the \
                    callback and its landing on the profile are the same. \
-                   Without a session the browser is sent to sign in (the \
-                   single sign-on provider when one is configured, else the \
-                   sign-in page) and back, and the link is not spent. \
+                   Without a session the browser is sent to the sign-in \
+                   page (`/login?github_link=<nonce>`, whose single sign-on \
+                   button carries the same return) and back, and the link is \
+                   not spent. \
                    Opened by another account it is refused and spent, so a \
                    forwarded link never links somebody else's GitHub account. \
-                   It lives ten minutes. It is a browser landing, so every \
+                   It lives ten minutes, in the server's memory, so a \
+                   restart ends it. It is a browser landing, so every \
                    refusal is an HTML page, never JSON.",
     params(GoQuery),
     responses(
@@ -510,13 +503,13 @@ pub async fn go(
         return page(StatusCode::NOT_FOUND, LINK_GONE);
     };
     let Ok(user) = identity.require_account() else {
-        return to_sign_in(&state, &nonce, true);
+        return to_sign_in(&state, &nonce);
     };
     // An account without a CSRF token yet is a trusted-header identity that
     // has not loaded the app: the sign-in page loads it, which mints one,
     // and opens the link again.
     let Some(csrf) = identity.csrf.as_deref() else {
-        return to_sign_in(&state, &nonce, false);
+        return to_sign_in(&state, &nonce);
     };
     // Taken before anything is compared: a link is spent by the first
     // signed-in browser that opens it, whoever that is.
