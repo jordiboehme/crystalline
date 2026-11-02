@@ -57,6 +57,7 @@ import {
   bumpGeneration,
   closeCell,
   closeCellAt,
+  gridWritable,
   inUpdate,
   isDestroyed,
   mountedCell,
@@ -531,7 +532,9 @@ class Forwarding {
       const closedOnPurpose = update.transactions.some((tr) =>
         tr.effects.some((e) => e.is(setOpenCell) && e.value === null),
       );
-      if (closedOnPurpose) closeCell(main, "user", "none");
+      // Turned read-only (an ended room): the cell steps out to the grid.
+      if (!gridWritable(update.state)) closeCell(main, "user", "grid");
+      else if (closedOnPurpose) closeCell(main, "user", "none");
       else closeCellAt(main, "gone", "main", update.changes.mapPos(was.head));
       return;
     }

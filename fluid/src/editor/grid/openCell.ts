@@ -22,7 +22,7 @@ import type {
   TransactionSpec,
 } from "@codemirror/state";
 import { MapMode, StateEffect, StateField } from "@codemirror/state";
-import type { EditorView } from "@codemirror/view";
+import { EditorView } from "@codemirror/view";
 import type { YSyncConfig } from "y-codemirror.next";
 import { ySyncFacet } from "y-codemirror.next";
 
@@ -101,9 +101,20 @@ function closingDeleted(
   return gone;
 }
 
+/**
+ * Whether the grid may change `state`'s document: the view is editable and
+ * the state not read-only (an ended Reflection is neither). `dispatch` does
+ * not enforce either, so every grid path that opens a cell or edits asks.
+ */
+export function gridWritable(state: EditorState): boolean {
+  return state.facet(EditorView.editable) && !state.readOnly;
+}
+
 export const openCellField = StateField.define<OpenCell | null>({
   create: () => null,
   update(value, tr) {
+    // A read-only buffer opens no cell, and one turning read-only closes it.
+    if (!gridWritable(tr.state)) return null;
     let next = value;
     let set = false;
     for (const effect of tr.effects) {

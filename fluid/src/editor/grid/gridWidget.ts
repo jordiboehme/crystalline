@@ -41,6 +41,7 @@ import { activeCell, mountCellEditor } from "./cellEditor";
 import { renderCellContent } from "./cellRender";
 import { cellKeymap, gridNavKeys } from "./gridKeys";
 import {
+  gridWritable,
   mountedCell,
   onCellClosed,
   openCellField,
@@ -222,7 +223,11 @@ function host(
   el: HTMLElement,
   focus: "now" | "later" | "none",
 ): CellEditor | null {
-  if (!main.state.field(openCellField, false) || !openCellRange(main.state)) {
+  if (
+    !gridWritable(main.state) ||
+    !main.state.field(openCellField, false) ||
+    !openCellRange(main.state)
+  ) {
     return null;
   }
   const previous = hostOf.get(main);
@@ -393,6 +398,8 @@ export class GridWidget extends WidgetType {
       const el = target.closest<HTMLElement>("[aria-colindex]");
       if (!el || !root.contains(el)) return;
       if (hosts(view, el)) return; // the cell view handles its own clicks
+      // Read-only: no cell opens, and the text stays selectable.
+      if (!gridWritable(view.state)) return;
       // Mod-click on a link opens the link; anything else opens the cell.
       if ((event.metaKey || event.ctrlKey) && target.closest("a")) return;
       event.preventDefault();

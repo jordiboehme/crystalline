@@ -48,6 +48,7 @@ import {
 } from "./gridWidget";
 import {
   closeCell,
+  gridWritable,
   mountedCell,
   openCellField,
   openCellRange,
@@ -179,7 +180,11 @@ function toGrid(main: EditorView): boolean {
   if (el?.isConnected) {
     rove(el);
     el.focus();
-  } else main.focus();
+  } else {
+    // The cell's element is gone, so main is the one place left: a narrow
+    // exception to R15, and the cell is already closed.
+    main.focus();
+  }
   return true;
 }
 
@@ -193,7 +198,7 @@ function onCell(
 ): Command {
   return (view) => {
     const main = view.state.facet(cellMain);
-    if (!main) return false;
+    if (!main || !gridWritable(main.state)) return false;
     const at = current(main);
     return at ? run(main, view, at) : false;
   };
@@ -300,7 +305,10 @@ const mac =
 
 /** A key that types one character: no Ctrl, Cmd or Alt-Ctrl chord. */
 function printable(event: KeyboardEvent): boolean {
-  if (event.ctrlKey || event.metaKey) return false;
+  if (event.metaKey) return false;
+  // AltGr on Windows and Linux reports Ctrl and Alt together: on a German
+  // layout that is how `|`, `@`, `\`, `[`, `{` and `~` are typed.
+  if (event.ctrlKey && !event.altKey) return false;
   return [...event.key].length === 1;
 }
 
@@ -349,8 +357,12 @@ function navigate(
   const last = table.rows.length - 1;
   // The main view never sees a key inside the grid (the widget ignores
   // events), so its undo keys are bound here too.
+  // Reading is allowed on a read-only buffer (moving between cells, leaving
+  // the table); nothing below that changes the document or opens a cell is.
+  const writable = gridWritable(main.state);
   const letter = event.key.toLowerCase();
   if (mod && !event.altKey && (letter === "z" || letter === "y")) {
+    if (!writable) return false;
     runMainUndo(main, letter === "z" && !event.shiftKey ? "undo" : "redo");
     return true;
   }
@@ -379,18 +391,22 @@ function navigate(
     case "F2":
       if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey)
         return false;
+      if (!writable) return false;
       openAt(main, cell, "end");
       return true;
     case "Delete":
     case "Backspace": {
-      if (mod || event.altKey) return false;
+      if (mod || event.altKey || !writable) return false;
       const { from, to } = cell.content;
       if (from < to) {
+        // Its own undo step, never joined to typing just before or after.
+        closeUndoGroup(main, "before");
         main.dispatch({
           changes: { from, to },
           userEvent:
             event.key === "Delete" ? "delete.forward" : "delete.backward",
         });
+        closeUndoGroup(main, "after");
       }
       return true;
     }
@@ -400,11 +416,13 @@ function navigate(
     default:
       break;
   }
-  if (!printable(event)) return false;
+  if (!printable(event) || !writable) return false;
   // The character goes through the cell view, so its filter escapes a `|`
   // and keeps a `\` before the closing pipe even.
   const editor = openAt(main, cell, "all");
   if (!editor) return true;
+  // The replacement starts its own undo step; what is typed after it joins.
+  closeUndoGroup(main, "before");
   const { from, to } = editor.view.state.selection.main;
   editor.view.dispatch({
     changes: { from, to, insert: event.key },
@@ -455,6 +473,7 @@ function tableBeside(
 function enter(dir: -1 | 1, atEdge: boolean): Command {
   return (view) => {
     const { selection } = view.state;
+    if (!gridWritable(view.state)) return false;
     if (selection.ranges.length > 1 || !selection.main.empty) return false;
     const head = selection.main.head;
     const line = view.state.doc.lineAt(head);

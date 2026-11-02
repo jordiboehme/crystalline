@@ -5,7 +5,8 @@
  */
 
 import type { Extension } from "@codemirror/state";
-import type { EditorView } from "@codemirror/view";
+import { Compartment, EditorState } from "@codemirror/state";
+import { EditorView } from "@codemirror/view";
 import type { MockInstance } from "vitest";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
@@ -644,5 +645,180 @@ describe("from the main view", () => {
     main.dispatch({ selection: { anchor: 0, head: 5 } });
     press(main, "ArrowRight");
     expect(main.state.field(openCellField)).toBeNull();
+  });
+});
+
+const READ_ONLY: Extension = [
+  EditorView.editable.of(false),
+  EditorState.readOnly.of(true),
+];
+
+describe("read-only (R17)", () => {
+  /** A writable buffer that a compartment can turn read-only. */
+  function switchable(text = DOC) {
+    const lock = new Compartment();
+    const main = soloMain(text, [...layers(), lock.of([])]);
+    const freeze = () => {
+      main.dispatch({ effects: lock.reconfigure(READ_ONLY) });
+    };
+    return { main, freeze };
+  }
+
+  /** Grid navigation on a read-only buffer, on cell `row`/`column`. */
+  function frozenNav(row: number, column: number, text = DOC) {
+    const { main, freeze } = switchable(text);
+    const el = navOn(main, row, column);
+    freeze();
+    el.focus();
+    return { main, el };
+  }
+
+  test("a mousedown opens no cell and leaves the text selectable", () => {
+    const main = soloMain(DOC, [...layers(), READ_ONLY]);
+    const event = new MouseEvent("mousedown", {
+      bubbles: true,
+      cancelable: true,
+      button: 0,
+    });
+    cellEl(main, 1, 0).dispatchEvent(event);
+    expect(event.defaultPrevented).toBe(false);
+    expect(main.state.field(openCellField)).toBeNull();
+    expect(activeCell(main)).toBeNull();
+  });
+
+  test("an outside setOpenCell opens nothing and hostOpenCell hosts nothing", () => {
+    const main = soloMain(DOC, [...layers(), READ_ONLY]);
+    const at = cellAt(main, 1, 0).content.to;
+    main.dispatch({
+      effects: setOpenCell.of({ anchor: at, head: at, focused: true }),
+    });
+    expect(main.state.field(openCellField)).toBeNull();
+    expect(hostOpenCell(main, "now")).toBeNull();
+    expect(activeCell(main)).toBeNull();
+  });
+
+  test("turning read-only closes an open cell to the grid", async () => {
+    const { main, freeze } = switchable();
+    open(main, 1, 1);
+    freeze();
+    expect(main.state.field(openCellField)).toBeNull();
+    expect(activeCell(main)).toBeNull();
+    await flush();
+    expect(grid(main).contains(document.activeElement)).toBe(true);
+    expect(bytes(main.state)).toBe(DOC);
+  });
+
+  test("Enter and F2 open no cell", () => {
+    const { main, el } = frozenNav(1, 1);
+    expect(keyOn(el, "Enter").defaultPrevented).toBe(false);
+    expect(keyOn(el, "F2").defaultPrevented).toBe(false);
+    expect(main.state.field(openCellField)).toBeNull();
+    expect(activeCell(main)).toBeNull();
+  });
+
+  test("a printable character changes nothing", () => {
+    const { main, el } = frozenNav(1, 1);
+    expect(
+      keyOn(el, "Z", { shiftKey: true, keyCode: 90 }).defaultPrevented,
+    ).toBe(false);
+    expect(main.state.field(openCellField)).toBeNull();
+    expect(bytes(main.state)).toBe(DOC);
+  });
+
+  test("Delete, Backspace and Mod-z change nothing", () => {
+    const { main, el } = frozenNav(1, 1);
+    keyOn(el, "Delete");
+    keyOn(el, "Backspace");
+    keyOn(el, "z", { ...modKey, keyCode: 90 });
+    expect(bytes(main.state)).toBe(DOC);
+  });
+
+  test("arrows still move between cells", () => {
+    const { main, el } = frozenNav(1, 0);
+    keyOn(el, "ArrowRight");
+    expect(focused(main)).toEqual([1, 1]);
+  });
+
+  test("Tab in the last cell adds no row: the cell is closed first", () => {
+    const { main, freeze } = switchable();
+    const view = open(main, 1, 1);
+    freeze();
+    // The frozen buffer closed the cell; its old view runs no grid key.
+    expect(press(view, "Tab")).toBe(false);
+    expect(bytes(main.state)).toBe(DOC);
+    expect(gridTables(main.state)[0]?.rows.length).toBe(2);
+  });
+
+  test("the main view's entry keys open nothing", () => {
+    const main = soloMain(DOC, [...layers(), READ_ONLY]);
+    // The key is not swallowed: the default move runs.
+    main.dispatch({ selection: { anchor: main.state.doc.line(2).to } });
+    press(main, "ArrowRight");
+    expect(main.state.selection.main.head).not.toBe(main.state.doc.line(2).to);
+    for (const [line, key] of [
+      [2, "ArrowDown"],
+      [6, "ArrowUp"],
+      [6, "ArrowLeft"],
+    ] as const) {
+      main.dispatch({ selection: { anchor: main.state.doc.line(line).from } });
+      press(main, key);
+      expect(main.state.field(openCellField)).toBeNull();
+    }
+    main.dispatch({ selection: { anchor: main.state.doc.line(2).to } });
+    press(main, "ArrowRight");
+    expect(main.state.field(openCellField)).toBeNull();
+    expect(activeCell(main)).toBeNull();
+  });
+});
+
+describe("AltGr (R18a)", () => {
+  test("Ctrl and Alt together with one character replace the cell", () => {
+    const main = solo(WIDE);
+    const el = navOn(main, 1, 1);
+    const event = keyOn(el, "|", { ctrlKey: true, altKey: true });
+    expect(event.defaultPrevented).toBe(true);
+    expect(bytes(main.state)).toBe(WIDE.replace("| 2 |", "| \\| |"));
+    expectOpen(main, 1, 1);
+  });
+
+  test("@ through AltGr replaces the cell too", () => {
+    const main = solo(WIDE);
+    const el = navOn(main, 1, 1);
+    keyOn(el, "@", { ctrlKey: true, altKey: true });
+    expect(bytes(main.state)).toBe(WIDE.replace("| 2 |", "| @ |"));
+  });
+});
+
+describe("grid-nav edits are their own undo step (R18b)", () => {
+  function typeEscapeDelete(main: EditorView) {
+    const view = open(main, 1, 1);
+    typeIn({ view, destroy: () => undefined }, "x");
+    press(view, "Escape");
+    const el = cellEl(main, 1, 1);
+    expect(document.activeElement).toBe(el);
+    keyOn(el, "Delete");
+    expect(bytes(main.state)).toBe(DOC.replace("| 2 |", "|  |"));
+    keyOn(el, "z", { ...modKey, keyCode: 90 });
+    expect(bytes(main.state)).toBe(DOC.replace("| 2 |", "| 2x |"));
+  }
+
+  test("solo: Mod-z after type, Escape, Delete restores only the cleared text", () => {
+    typeEscapeDelete(solo());
+  });
+
+  test("room: Mod-z after type, Escape, Delete restores only the cleared text", () => {
+    const { main } = roomMain(DOC, layers());
+    typeEscapeDelete(main);
+  });
+
+  test("room: a printable replacement is its own undo step", () => {
+    const { main } = roomMain(DOC, layers());
+    const view = open(main, 1, 1);
+    typeIn({ view, destroy: () => undefined }, "x");
+    press(view, "Escape");
+    keyOn(cellEl(main, 1, 1), "Q", { shiftKey: true, keyCode: 81 });
+    expect(bytes(main.state)).toBe(DOC.replace("| 2 |", "| Q |"));
+    press(cellView(main), "z", { mod: true });
+    expect(bytes(main.state)).toBe(DOC.replace("| 2 |", "| 2x |"));
   });
 });
