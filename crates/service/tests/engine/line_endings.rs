@@ -179,7 +179,7 @@ async fn write_engram_content_with_crlf_is_stored_lf() {
                 base64: None,
                 domain: domain.to_string(),
                 title: "Captured".to_string(),
-                content: "line one\r\nline two\r\n\r\n- [fact] a fact\r\n".to_string(),
+                content: Some("line one\r\nline two\r\n\r\n- [fact] a fact\r\n".to_string()),
                 folder: None,
                 engram_type: None,
                 tags: vec!["eng".to_string()],

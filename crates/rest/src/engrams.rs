@@ -883,7 +883,7 @@ pub async fn create(
         base64: None,
         domain: domain.clone(),
         title: body.title,
-        content: body.content,
+        content: Some(body.content),
         folder: body.folder,
         engram_type: body.engram_type,
         tags: body.tags,

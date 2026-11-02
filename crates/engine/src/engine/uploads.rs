@@ -144,8 +144,7 @@ impl Engine {
                 if set.len() == 1 { "it" } else { "them" },
             )));
         }
-        let content = (!p.content.is_empty()).then_some(p.content.as_str());
-        let bytes = upload_bytes(path, content, p.base64.as_deref())?;
+        let bytes = upload_bytes(path, p.content.as_deref(), p.base64.as_deref())?;
         let written = self
             .attachment_write_joined(&p.domain, path, bytes, scope, join, !p.overwrite)
             .await?;

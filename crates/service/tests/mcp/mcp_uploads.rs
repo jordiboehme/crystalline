@@ -227,11 +227,18 @@ async fn a_picture_round_trips_byte_for_byte_and_comes_back_as_an_image_too() {
     .await
     .unwrap();
     let file = body(&down);
-    assert_eq!(
-        BASE64.decode(file["base64"].as_str().unwrap()).unwrap(),
-        PNG
+    assert!(
+        file.get("base64").is_none(),
+        "the bytes travel once, as the image: {file}"
     );
     assert!(file.get("text").is_none(), "{file}");
+    assert!(
+        file["note"].as_str().is_some_and(|n| n.contains("image")),
+        "{file}"
+    );
+    assert_eq!(file["mime"], "image/png");
+    assert_eq!(file["size"], PNG.len());
+    assert!(file["sha256"].as_str().is_some());
     let images = image_blocks(&down);
     assert_eq!(images.len(), 1, "{down}");
     assert_eq!(images[0]["mimeType"], "image/png");
@@ -510,4 +517,110 @@ async fn a_reflection_file_round_trips_through_the_reflection_verbs() {
     assert_eq!(file["text"], "x\n", "{file}");
     assert_eq!(file["sha256"], replaced["sha256"]);
     assert_eq!(file["path"], "assets/data.csv");
+}
+
+/// A binary file that is no picture comes back as base64 and with no image.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pdf_comes_back_as_base64_without_an_image() {
+    let h = Harness::new().await;
+    let (client, _server) = h.connect().await;
+    let pdf = b"%PDF-1.4 \xff\x00 bytes";
+    try_call(
+        client.peer(),
+        "write_engram",
+        json!({ "domain": "eng", "path": "assets/deck.pdf", "base64": BASE64.encode(pdf) }),
+    )
+    .await
+    .unwrap();
+    let down = try_call(
+        client.peer(),
+        "read_engram",
+        json!({ "identifier": "assets/deck.pdf", "domain": "eng" }),
+    )
+    .await
+    .unwrap();
+    let file = body(&down);
+    assert_eq!(
+        BASE64.decode(file["base64"].as_str().unwrap()).unwrap(),
+        pdf
+    );
+    assert!(file.get("note").is_none(), "{file}");
+    assert!(image_blocks(&down).is_empty(), "{down}");
+}
+
+const ASSETS_ENGRAM: &str = "---\ntype: engram\ntitle: Assets\npermalink: assets\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# Assets\n\n- [fact] what the team owns\n";
+
+/// A root engram called `assets` is knowledge, not the folder: it is read
+/// and deleted by its permalink and its title as any engram is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_root_engram_named_assets_is_read_and_deleted_as_an_engram() {
+    let h = Harness::new().await;
+    std::fs::write(h.root.join("eng/assets.md"), ASSETS_ENGRAM).unwrap();
+    h.engine.sync(None).await.unwrap();
+    let (client, _server) = h.connect().await;
+    for identifier in ["assets", "Assets"] {
+        let read = body(
+            &try_call(
+                client.peer(),
+                "read_engram",
+                json!({ "identifier": identifier, "domain": "eng" }),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(read["permalink"], "assets", "{identifier}: {read}");
+        assert!(read.get("sha256").is_none(), "{read}");
+    }
+    let gone = body(
+        &try_call(
+            client.peer(),
+            "delete_engram",
+            json!({ "identifier": "assets", "domain": "eng" }),
+        )
+        .await
+        .unwrap(),
+    );
+    assert!(gone.get("attachment").is_none(), "an engram delete: {gone}");
+    assert!(!h.root.join("eng/assets.md").exists());
+}
+
+/// An engram still needs its body; a file's text may be empty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_engram_needs_content_and_an_empty_text_file_uploads() {
+    let h = Harness::new().await;
+    let (client, _server) = h.connect().await;
+    for args in [
+        json!({ "domain": "eng", "title": "No Body" }),
+        json!({ "domain": "eng", "title": "No Body", "content": "" }),
+    ] {
+        let err = try_call(client.peer(), "write_engram", args.clone())
+            .await
+            .unwrap_err();
+        assert!(err.contains("content"), "{args}: {err}");
+    }
+    assert!(!h.root.join("eng/no-body.md").exists());
+    let up = body(
+        &try_call(
+            client.peer(),
+            "write_engram",
+            json!({ "domain": "eng", "path": "assets/empty.txt", "content": "" }),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(up["size"], 0, "{up}");
+    assert_eq!(
+        std::fs::read(h.root.join("eng/assets/empty.txt")).unwrap(),
+        b""
+    );
+    let up = body(
+        &try_call(
+            client.peer(),
+            "write_engram",
+            json!({ "domain": "eng", "path": "assets/empty.csv", "base64": "" }),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(up["size"], 0, "{up}");
 }

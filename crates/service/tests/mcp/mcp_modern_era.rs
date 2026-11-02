@@ -3558,7 +3558,7 @@ async fn serve_review_instance() -> ReviewInstance {
                 base64: None,
                 domain: "team".to_string(),
                 title: "Fresh".to_string(),
-                content: "A page only alice has.".to_string(),
+                content: Some("A page only alice has.".to_string()),
                 folder: None,
                 engram_type: None,
                 tags: vec!["team".to_string()],

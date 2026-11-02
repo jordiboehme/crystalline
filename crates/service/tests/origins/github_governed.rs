@@ -528,7 +528,7 @@ fn row_engram(domain: &str, account: &str) -> WriteParams {
         base64: None,
         domain: domain.to_string(),
         title: format!("Row {account}"),
-        content: "- [fact] a row's own engram".to_string(),
+        content: Some("- [fact] a row's own engram".to_string()),
         folder: None,
         engram_type: None,
         tags: Vec::new(),
@@ -1876,7 +1876,7 @@ async fn a_move_leaves_links_alone_in_a_governed_domain_the_mover_only_reads() {
     let linker = WriteParams {
         domain: "ref".to_string(),
         title: "Linker".to_string(),
-        content: "See [[src:seed-src-end]] for the quokka.".to_string(),
+        content: Some("See [[src:seed-src-end]] for the quokka.".to_string()),
         ..row_engram("ref", "vic")
     };
     eng.write_engram(&linker).await.unwrap();

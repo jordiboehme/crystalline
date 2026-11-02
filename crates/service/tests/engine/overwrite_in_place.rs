@@ -68,7 +68,7 @@ fn capture(title: &str, folder: Option<&str>, content: &str, overwrite: bool) ->
         base64: None,
         domain: "notes".to_string(),
         title: title.to_string(),
-        content: content.to_string(),
+        content: Some(content.to_string()),
         folder: folder.map(str::to_string),
         engram_type: None,
         tags: Vec::new(),

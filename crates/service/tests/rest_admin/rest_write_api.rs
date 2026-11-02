@@ -4467,7 +4467,7 @@ async fn a_hidden_domains_engram_never_reaches_a_strangers_receipt() {
             base64: None,
             domain: "scrap".to_string(),
             title: "Retry secrets".to_string(),
-            content: RETRY.to_string(),
+            content: Some(RETRY.to_string()),
             folder: None,
             engram_type: None,
             tags: vec!["t".to_string()],

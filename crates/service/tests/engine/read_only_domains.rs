@@ -90,7 +90,7 @@ pub(crate) fn write_params(domain: &str, title: &str) -> WriteParams {
         base64: None,
         domain: domain.into(),
         title: title.into(),
-        content: "- [fact] new #eng".into(),
+        content: Some("- [fact] new #eng".into()),
         folder: None,
         engram_type: None,
         tags: vec!["eng".into()],

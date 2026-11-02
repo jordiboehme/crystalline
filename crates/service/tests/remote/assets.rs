@@ -362,3 +362,41 @@ async fn an_upload_by_the_lease_account_is_noted_for_the_run() {
         ]
     );
 }
+
+/// A root engram called `assets` is knowledge through the remote door too.
+#[tokio::test]
+async fn a_root_engram_named_assets_is_an_engram_through_the_remote_door() {
+    let server = RemoteServer::start(Options::TOKENS).await;
+    std::fs::write(
+        server.file("open", "assets.md"),
+        crate::fixture::engram("Assets", "assets", "what the team owns"),
+    )
+    .unwrap();
+    server.engine.sync(Some("open")).await.unwrap();
+    let keeper = server.token_for("keeper").await;
+    for identifier in ["assets", "Assets"] {
+        let (_, reply) = server
+            .ctl(
+                Some(&keeper),
+                tool(
+                    "read_engram",
+                    json!({ "identifier": identifier, "domain": "open" }),
+                ),
+            )
+            .await;
+        assert_eq!(reply["ok"], true, "{identifier}: {reply}");
+        assert_eq!(reply["data"]["permalink"], "assets", "{reply}");
+    }
+    let (_, reply) = server
+        .ctl(
+            Some(&keeper),
+            tool(
+                "delete_engram",
+                json!({ "identifier": "assets", "domain": "open" }),
+            ),
+        )
+        .await;
+    assert_eq!(reply["ok"], true, "{reply}");
+    assert!(reply["data"].get("attachment").is_none(), "{reply}");
+    assert!(!server.file("open", "assets.md").exists());
+}

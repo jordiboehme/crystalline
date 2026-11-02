@@ -9404,12 +9404,15 @@ fn unknown_rule_message(rule: &str) -> String {
 /// [`crystalline_core::canonical_asset_path`], so `./Assets/deck.png` and
 /// `assets/deck.png` are the same file. Only the prefix decides: an engram
 /// never lives under the reserved folder, which is what makes one verb able to
-/// serve both without guessing.
+/// serve both without guessing. A bare `assets` names no file: it is the
+/// root engram `assets.md`'s permalink or title.
 pub fn attachment_identifier(identifier: &str) -> Option<String> {
     let raw = identifier.trim().trim_start_matches("./");
-    crystalline_core::is_under_assets(raw)
-        .then(|| crystalline_core::canonical_asset_path(raw))
-        .flatten()
+    // Something has to follow the folder: a bare `assets` (or `Assets`) is
+    // the permalink or title of a root engram `assets.md`, which is ordinary
+    // knowledge, never the folder itself.
+    crystalline_core::canonical_asset_path(raw)
+        .filter(|path| path.len() > crystalline_core::ASSETS_PREFIX.len())
 }
 
 /// The acknowledgments an engram's markdown carries.
@@ -11019,7 +11022,7 @@ mod lock_tests {
                     base64: None,
                     domain: "eng".to_string(),
                     title: "Beta".to_string(),
-                    content: "Mine.".to_string(),
+                    content: Some("Mine.".to_string()),
                     folder: None,
                     engram_type: None,
                     tags: Vec::new(),

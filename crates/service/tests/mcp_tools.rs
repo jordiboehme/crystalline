@@ -7866,7 +7866,7 @@ async fn a_hidden_domains_engram_is_a_neighbour_only_to_a_caller_who_may_see_it(
             base64: None,
             domain: "lab".to_string(),
             title: "Retry secrets".to_string(),
-            content: RETRY.to_string(),
+            content: Some(RETRY.to_string()),
             folder: None,
             engram_type: None,
             tags: vec!["t".to_string()],

@@ -39,7 +39,7 @@ async fn write(engine: &Engine, title: &str, status: &str, body: &str) {
             base64: None,
             domain: "notes".to_string(),
             title: title.to_string(),
-            content: body.to_string(),
+            content: Some(body.to_string()),
             folder: None,
             engram_type: Some("engram".to_string()),
             tags: vec!["chain".to_string()],

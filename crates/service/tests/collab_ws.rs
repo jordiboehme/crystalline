@@ -1234,7 +1234,7 @@ impl Review {
                     base64: None,
                     domain: "team".to_string(),
                     title: title.to_string(),
-                    content: body.to_string(),
+                    content: Some(body.to_string()),
                     folder: None,
                     engram_type: None,
                     tags: vec!["team".to_string()],

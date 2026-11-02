@@ -2456,13 +2456,17 @@ impl McpServer {
         caller: &Caller,
     ) -> Result<Value, EngineError> {
         let value = self.engine.write_reflection(p, rc).await?;
+        // The stored spelling, off the receipt: what the file listing and
+        // the backup name the file by.
         let changed: Vec<&str> = match p.action.as_deref().unwrap_or("write") {
-            "write_asset" => vec![value["path"].as_str().unwrap_or(&p.path)],
-            "delete_asset" => vec![p.path.as_str()],
-            "move_asset" => [Some(p.path.as_str()), p.to.as_deref()]
-                .into_iter()
-                .flatten()
-                .collect(),
+            "write_asset" | "delete_asset" => vec![value["path"].as_str().unwrap_or(&p.path)],
+            "move_asset" => [
+                value["from"].as_str().or(Some(p.path.as_str())),
+                value["to"].as_str().or(p.to.as_deref()),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
             _ => Vec::new(),
         };
         for path in changed {
@@ -2540,6 +2544,12 @@ impl McpServer {
         if p.title.trim().is_empty() {
             return Err(to_error(EngineError::Invalid(
                 "write_engram needs title for an engram (or path to upload a file)".into(),
+            )));
+        }
+        if p.content.as_deref().is_none_or(str::is_empty) {
+            return Err(to_error(EngineError::Invalid(
+                "write_engram needs content, the engram's markdown body (or path to upload a file)"
+                    .into(),
             )));
         }
         let actor = caller.actor();
@@ -6224,7 +6234,6 @@ const MAX_INLINE_IMAGES: usize = 8;
 /// one reply.
 const MAX_INLINE_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
 
-/// A picture a model can look at: the raster formats vision reads.
 /// Whether a `read_reflection` names one of the Reflection's files rather
 /// than a page.
 fn names_reflection_file(p: &ReadReflectionParams) -> bool {
@@ -6235,24 +6244,45 @@ fn names_reflection_file(p: &ReadReflectionParams) -> bool {
             .is_some()
 }
 
-/// A file a read answered ([`crate::engine::file_answer`]) as a tool result:
-/// the answer, and for a picture (png, jpeg, gif, webp, at most
-/// [`MAX_INLINE_IMAGE_BYTES`]) the same bytes as an image block too, so a
-/// model with vision sees it.
-fn file_result(answer: Value) -> Result<CallToolResult, ErrorData> {
-    let image = (|| {
-        let mime = answer["mime"].as_str()?;
-        if !inlinable_image(mime) || answer["size"].as_u64()? > MAX_INLINE_IMAGE_BYTES {
-            return None;
-        }
-        let data = answer["base64"].as_str()?;
-        Some(ContentBlock::image(data.to_string(), mime.to_string()))
-    })();
+/// What a picture's answer says in place of its base64, which travels once,
+/// as the image block beside it.
+const FILE_IMAGE_NOTE: &str = "the picture is attached as an image";
+
+/// A file a read answered ([`crate::engine::file_answer`]) as a tool result.
+/// A picture (png, jpeg, gif, webp, at most [`MAX_INLINE_IMAGE_BYTES`]) goes
+/// as an image block a model with vision sees, and its JSON keeps the
+/// metadata with a `note` instead of the same bytes again as base64; any
+/// other file is the answer as it stands (`text`, or `base64`).
+fn file_result(mut answer: Value) -> Result<CallToolResult, ErrorData> {
+    let picture = answer["mime"]
+        .as_str()
+        .filter(|mime| inlinable_image(mime))
+        .map(str::to_string)
+        .filter(|_| {
+            answer["size"]
+                .as_u64()
+                .is_some_and(|size| size <= MAX_INLINE_IMAGE_BYTES)
+        });
+    let image = match (picture, answer.as_object_mut()) {
+        (Some(mime), Some(fields)) => match fields.remove("base64") {
+            Some(Value::String(data)) => {
+                fields.insert("note".into(), json!(FILE_IMAGE_NOTE));
+                Some(ContentBlock::image(data, mime))
+            }
+            Some(other) => {
+                fields.insert("base64".into(), other);
+                None
+            }
+            None => None,
+        },
+        _ => None,
+    };
     let mut result = ok(answer)?;
     result.content.extend(image);
     Ok(result)
 }
 
+/// A picture a model can look at: the raster formats vision reads.
 fn inlinable_image(mime: &str) -> bool {
     matches!(
         mime,

@@ -133,7 +133,7 @@ fn write(domain: &str, title: &str, content: &str, status: Option<&str>) -> Writ
         base64: None,
         domain: domain.to_string(),
         title: title.to_string(),
-        content: content.to_string(),
+        content: Some(content.to_string()),
         folder: None,
         engram_type: None,
         tags: vec!["t".to_string()],

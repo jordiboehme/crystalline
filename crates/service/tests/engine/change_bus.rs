@@ -139,7 +139,7 @@ fn write_params(title: &str, overwrite: bool) -> WriteParams {
         base64: None,
         domain: "notes".to_string(),
         title: title.to_string(),
-        content: "the body".to_string(),
+        content: Some("the body".to_string()),
         folder: None,
         engram_type: None,
         tags: Vec::new(),

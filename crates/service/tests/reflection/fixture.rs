@@ -48,7 +48,7 @@ pub fn write_params(title: &str, folder: Option<&str>, content: &str) -> WritePa
         base64: None,
         domain: "eng".into(),
         title: title.into(),
-        content: content.into(),
+        content: Some(content.into()),
         folder: folder.map(str::to_string),
         engram_type: None,
         tags: Vec::new(),

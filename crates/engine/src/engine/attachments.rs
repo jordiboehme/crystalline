@@ -1173,7 +1173,7 @@ impl Engine {
                     base64: None,
                     domain: p.domain.clone(),
                     title: title.clone(),
-                    content: body,
+                    content: Some(body),
                     folder: p.folder.clone(),
                     engram_type: Some(engram.frontmatter.engram_type.clone()),
                     tags: engram.frontmatter.tags.clone(),

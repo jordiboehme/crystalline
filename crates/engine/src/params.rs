@@ -65,11 +65,12 @@ pub struct WriteParams {
     #[serde(default)]
     pub title: String,
     /// The markdown body. Observations `- [category] text` and relations
-    /// `- rel_type [[Target]]` in the body are parsed and indexed. With
-    /// `path`: the file's text, for a text file (svg, txt, csv, json, yaml,
-    /// toml, xml); send any other file as `base64` instead.
+    /// `- rel_type [[Target]]` in the body are parsed and indexed. Required
+    /// for an engram. With `path`: the file's text, for a text file (svg,
+    /// txt, csv, json, yaml, toml, xml); send any other file as `base64`
+    /// instead.
     #[serde(default)]
-    pub content: String,
+    pub content: Option<String>,
     /// Upload a file instead of writing an engram: its path under `assets/`,
     /// for example `assets/diagrams/flow.svg`, ending in an allowed extension
     /// (png, jpg, gif, webp, svg, pdf, pptx, docx, xlsx, odp, odt, ods, txt,
@@ -1229,8 +1230,14 @@ fn lf_opt(text: &mut Option<String>) {
 impl WriteParams {
     /// These parameters with every text in them as LF.
     pub(crate) fn lf_only(mut self) -> Self {
-        lf(&mut self.content);
+        lf_opt(&mut self.content);
         self
+    }
+
+    /// The engram body: `content`, or empty when it was left out (an
+    /// engram write refuses that before it reads the body).
+    pub fn body(&self) -> &str {
+        self.content.as_deref().unwrap_or_default()
     }
 }
 

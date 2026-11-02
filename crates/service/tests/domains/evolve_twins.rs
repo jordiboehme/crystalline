@@ -54,7 +54,7 @@ fn write(title: &str, content: &str) -> WriteParams {
         base64: None,
         domain: "notes".to_string(),
         title: title.to_string(),
-        content: content.to_string(),
+        content: Some(content.to_string()),
         folder: None,
         engram_type: None,
         tags: vec!["t".to_string()],
