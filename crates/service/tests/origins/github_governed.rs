@@ -1855,3 +1855,66 @@ async fn on_a_reviewing_governed_domain_a_writer_drafts_and_a_reader_is_refused(
         403
     );
 }
+
+/// A move rewrites the links that followed the engram only in domains the
+/// mover may write: on a governed domain where GitHub lets the mover only
+/// read, the linking engram is left as it was and the receipt names it in
+/// `links_failed`. That domain is later shared through the App, so a reader
+/// must not change it as a side effect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_move_leaves_links_alone_in_a_governed_domain_the_mover_only_reads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (forge, eng, _auth) = small_instance(tmp.path(), &["src", "ref"], true).await;
+    // vic writes `src` on GitHub and only reads `ref`.
+    forge.collaborators.lock().unwrap().insert(
+        "acme/ref".to_string(),
+        vec![json!({"id": 5, "login": "vic-gh", "role_name": "read"})],
+    );
+    eng.invalidate_github_access(Invalidate::All);
+    let linker = WriteParams {
+        domain: "ref".to_string(),
+        title: "Linker".to_string(),
+        content: "See [[src:seed-src-end]] for the quokka.".to_string(),
+        ..row_engram("ref", "vic")
+    };
+    eng.write_engram(&linker).await.unwrap();
+    let linker_path = tmp.path().join("ref").join("linker.md");
+    let before = std::fs::read_to_string(&linker_path).unwrap();
+    assert_eq!(
+        eng.write_right(&user("vic"), "ref").await.unwrap(),
+        crystalline_service::scope::DomainRight::Read
+    );
+
+    let moved = eng
+        .move_engram(
+            &crystalline_service::params::MoveParams {
+                identifier: "seed-src-end".to_string(),
+                domain: "src".to_string(),
+                destination: "moved.md".to_string(),
+                destination_domain: None,
+                permalink: None,
+                update_links: None,
+            },
+            &user("vic"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&linker_path).unwrap(),
+        before,
+        "the reader's move wrote nothing in ref: {moved}"
+    );
+    assert_eq!(moved["links_rewritten"], 0, "{moved}");
+    let failed = moved["links_failed"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        failed.iter().any(|f| f["domain"] == "ref"
+            && f["path"] == "linker.md"
+            && f["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("only read"))),
+        "{moved}"
+    );
+}

@@ -364,7 +364,7 @@ pub struct MoveParams {
     pub permalink: Option<String>,
     /// Rewrite every reference to the moved engram when its address changes:
     /// `[[old]]` and `[[domain:old]]` links, relations and `crystalline://domain/old`
-    /// URLs (a #fragment is kept), in every domain you can see. A relative
+    /// URLs (a #fragment is kept), in every domain you may write. A relative
     /// Markdown link ([text](../path.md)) follows the file instead: when the
     /// path changes inside the domain, links to it and its own relative links
     /// are rewritten so they land on the same files. Defaults to true; false
