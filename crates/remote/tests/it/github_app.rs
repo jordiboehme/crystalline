@@ -20,7 +20,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use crystalline_remote::github::app::{
-    Collaborator, GithubApp, ManifestParams, RepoRole, RepoVisibility, app_manifest,
+    AppInfo, Collaborator, GithubApp, ManifestParams, RepoRole, RepoVisibility, app_manifest,
     convert_manifest, manifest_post_url,
 };
 use crystalline_remote::{AppCredentials, CommitIdentity, RemoteError};
@@ -662,6 +662,56 @@ async fn the_probe_answers_the_app_and_githubs_clock() {
     assert_eq!(probe.info.unwrap().slug, SLUG);
     assert_eq!(probe.server_date, Some(t0()));
     assert_eq!(app.known_slug().as_deref(), Some(SLUG), "the slug is kept");
+}
+
+/// `GET /app` with `permissions` as given (`None` leaves the field out).
+async fn app_with_permissions(permissions: Option<serde_json::Value>) -> AppInfo {
+    let mut body = serde_json::json!({"id": 7, "slug": SLUG, "owner": {"login": "acme"}});
+    if let Some(permissions) = permissions {
+        body["permissions"] = permissions;
+    }
+    let answering = Router::new().route("/app", get(move || async move { Json(body) }));
+    let base = spawn(answering).await;
+    let app = GithubApp::new(Some(base.clone()), creds(&host_of(&base), None)).unwrap();
+    app.probe().await.info.unwrap()
+}
+
+#[tokio::test]
+async fn the_app_names_the_permissions_it_lacks() {
+    let info = app_with_permissions(Some(serde_json::json!({
+        "contents": "read",
+        "metadata": "read",
+        "pull_requests": "admin",
+        "issues": "write",
+    })))
+    .await;
+    assert_eq!(
+        info.missing_permissions(),
+        Some(vec![
+            "contents: write".to_string(),
+            "members: read".to_string()
+        ])
+    );
+
+    let info = app_with_permissions(Some(serde_json::json!({
+        "contents": "write",
+        "pull_requests": "write",
+        "metadata": "read",
+        "members": "write",
+    })))
+    .await;
+    assert_eq!(
+        info.missing_permissions(),
+        Some(Vec::new()),
+        "write covers read"
+    );
+
+    let info = app_with_permissions(None).await;
+    assert_eq!(
+        info.missing_permissions(),
+        None,
+        "nothing said, nothing judged"
+    );
 }
 
 #[tokio::test]

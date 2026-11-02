@@ -13,7 +13,7 @@
 //! advisory on the ground that Crystalline never signs with a private key
 //! through `rsa`, and that has to stay true.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use aws_lc_rs::rand::SystemRandom;
@@ -191,6 +191,37 @@ pub struct AppInfo {
     pub owner_login: String,
     /// The App's public page.
     pub html_url: String,
+    /// The permissions the App is set up with on GitHub (`contents` ->
+    /// `write`, ...), `None` when GitHub's answer had none.
+    pub permissions: Option<BTreeMap<String, String>>,
+}
+
+impl AppInfo {
+    /// The permissions the App needs and lacks, each as `name: level`
+    /// (`contents: write`), in the order the manifest asks for them. A
+    /// higher level covers a lower one (`write` covers `read`, `admin`
+    /// covers both). `None` when GitHub did not say which permissions the
+    /// App has, so nothing can be judged.
+    pub fn missing_permissions(&self) -> Option<Vec<String>> {
+        fn rank(level: &str) -> u8 {
+            match level {
+                "read" => 1,
+                "write" => 2,
+                "admin" => 3,
+                _ => 0,
+            }
+        }
+        let granted = self.permissions.as_ref()?;
+        Some(
+            MANIFEST_PERMISSIONS
+                .iter()
+                .filter(|(name, needed)| {
+                    granted.get(*name).map_or(0, |level| rank(level)) < rank(needed)
+                })
+                .map(|(name, needed)| format!("{name}: {needed}"))
+                .collect(),
+        )
+    }
 }
 
 /// What one `GET /app` said, for `doctor`: the App (or why not), and
@@ -224,6 +255,10 @@ struct AppResponse {
     owner: Option<OwnerResponse>,
     #[serde(default)]
     html_url: String,
+    /// Read loosely: a value that is not a string is left out rather than
+    /// failing the whole answer.
+    #[serde(default)]
+    permissions: Option<BTreeMap<String, serde_json::Value>>,
 }
 
 #[derive(Deserialize)]
@@ -726,6 +761,14 @@ impl GithubApp {
             slug: app.slug,
             owner_login: app.owner.map(|owner| owner.login).unwrap_or_default(),
             html_url: app.html_url,
+            permissions: app.permissions.map(|permissions| {
+                permissions
+                    .into_iter()
+                    .filter_map(|(name, level)| {
+                        level.as_str().map(|level| (name, level.to_string()))
+                    })
+                    .collect()
+            }),
         })
     }
 

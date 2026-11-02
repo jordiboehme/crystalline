@@ -28,6 +28,10 @@ fn key_body() -> &'static str {
     PEM.lines().nth(1).unwrap()
 }
 
+/// The four permissions the App needs, as `GET /app` names them.
+const ALL_PERMISSIONS: &str =
+    r#"{"contents":"write","pull_requests":"write","metadata":"read","members":"read"}"#;
+
 /// A stand-in GitHub answering the App routes, its `Date` header
 /// `skew_secs` away from this machine's clock.
 struct FakeGithub {
@@ -37,6 +41,11 @@ struct FakeGithub {
 
 impl FakeGithub {
     fn start(skew_secs: i64) -> FakeGithub {
+        FakeGithub::with_permissions(skew_secs, ALL_PERMISSIONS)
+    }
+
+    /// The stand-in, its `GET /app` naming `permissions` (a JSON object).
+    fn with_permissions(skew_secs: i64, permissions: &'static str) -> FakeGithub {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let thread = std::thread::spawn(move || {
@@ -49,7 +58,9 @@ impl FakeGithub {
                 let body = if path.starts_with("/app/installations") {
                     r#"[{"id":1,"account":{"login":"acme"}}]"#.to_string()
                 } else if path == "/app" {
-                    format!(r#"{{"id":7,"slug":"{SLUG}","owner":{{"login":"acme"}}}}"#)
+                    format!(
+                        r#"{{"id":7,"slug":"{SLUG}","owner":{{"login":"acme"}},"permissions":{permissions}}}"#
+                    )
                 } else {
                     r#"{"message":"Not Found"}"#.to_string()
                 };
@@ -272,10 +283,34 @@ fn doctor_flags_a_public_url_without_webhook_secret() {
 }
 
 #[test]
+fn doctor_names_the_permissions_the_app_lacks() {
+    let github = FakeGithub::with_permissions(
+        0,
+        r#"{"contents":"read","pull_requests":"write","metadata":"read"}"#,
+    );
+    let report = doctor_with_app(&github, &[]);
+    let app = &report["github"]["app"];
+    assert_eq!(
+        app["missing_permissions"],
+        serde_json::json!(["contents: write", "members: read"]),
+        "{app}"
+    );
+    let problem = app["problem"].as_str().unwrap_or_default();
+    assert!(problem.contains("contents: write"), "{app}");
+    assert!(problem.contains("members: read"), "{app}");
+    assert!(problem.contains("settings on GitHub"), "{app}");
+}
+
+#[test]
 fn doctor_says_connected_through_a_healthy_app() {
     let github = FakeGithub::start(0);
     let report = doctor_with_app(&github, &[]);
     assert_eq!(report["github"]["app"]["problem"], Value::Null, "{report}");
+    assert_eq!(
+        report["github"]["app"]["missing_permissions"],
+        Value::Null,
+        "{report}"
+    );
     assert_eq!(report["github"]["connected"], serde_json::json!(true));
     assert_eq!(
         report["github"]["connected_through_app"],

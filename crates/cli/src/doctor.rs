@@ -444,6 +444,11 @@ pub struct AppDoctor {
     /// who may use the domains connected through the App. `None` while it
     /// learns, and when no daemon answered.
     pub role_lookup_degraded_since: Option<String>,
+    /// The permissions the App needs and lacks on GitHub, each as
+    /// `name: level` (`contents: write`). Empty when it has them all, or
+    /// when GitHub did not say.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub missing_permissions: Vec<String>,
     /// The domains the running daemon keeps closed because the App is not
     /// installed on their repository (only instance admins get in).
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -4209,7 +4214,8 @@ fn saved_app_for_doctor(
 const MAX_CLOCK_SKEW_SECS: i64 = 60;
 
 /// The GitHub App checks: the credentials make an App, GitHub accepts its
-/// signed token (`GET /app`), the installations can be listed, the clocks
+/// signed token (`GET /app`), the App has the four permissions it needs,
+/// the installations can be listed, the clocks
 /// agree within a minute, and a webhook secret is set when
 /// `service.public_url` lets webhooks in. `None` when no App is configured.
 async fn check_github_app(cfg: &GlobalConfig, overlay: &EnvOverlay) -> Option<AppDoctor> {
@@ -4253,7 +4259,16 @@ async fn check_github_app(cfg: &GlobalConfig, overlay: &EnvOverlay) -> Option<Ap
                 .server_date
                 .map(|date| (date - chrono::Utc::now()).num_seconds());
             match &probe.info {
-                Ok(_) => doctor.jwt_accepted = Some(true),
+                Ok(info) => {
+                    doctor.jwt_accepted = Some(true);
+                    doctor.missing_permissions = info.missing_permissions().unwrap_or_default();
+                    if !doctor.missing_permissions.is_empty() {
+                        problems.push(format!(
+                            "the GitHub App lacks the permissions {}; change them in the App's settings on GitHub (Permissions & events), then accept the new permissions on each installation",
+                            doctor.missing_permissions.join(", ")
+                        ));
+                    }
+                }
                 Err(e @ RemoteError::AppCredential(_)) => {
                     doctor.jwt_accepted = Some(false);
                     problems.push(e.to_string());
