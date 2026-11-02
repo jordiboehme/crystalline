@@ -88,7 +88,7 @@ fn read_params(identifier: &str, domain: &str) -> ReadParams {
         identifier: identifier.to_string(),
         domain: Some(domain.to_string()),
         share_link: None,
-        include_images: false,
+        include_images: None,
     }
 }
 

@@ -85,7 +85,7 @@ fn read_as(identifier: &str) -> ReadParams {
         identifier: identifier.to_string(),
         domain: Some("notes".to_string()),
         share_link: None,
-        include_images: false,
+        include_images: None,
     }
 }
 

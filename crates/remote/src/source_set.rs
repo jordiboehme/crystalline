@@ -918,10 +918,10 @@ impl SourceSet {
         deadline: Duration,
         budget: Budget,
     ) -> Result<bool, RemoteFailure> {
-        self.connection(source, deadline)
-            .await?
-            .takes_agent_files(deadline, budget)
-            .await
+        let started = std::time::Instant::now();
+        let connection = self.connection(source, deadline).await?;
+        let left = deadline.saturating_sub(started.elapsed());
+        connection.takes_agent_files(left, budget).await
     }
 
     /// One file of `domain` (the source's own name) by its domain-relative

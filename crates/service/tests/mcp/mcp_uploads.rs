@@ -632,3 +632,78 @@ async fn an_engram_needs_content_but_an_empty_body_is_accepted_and_an_empty_text
     );
     assert_eq!(up["size"], 0, "{up}");
 }
+
+/// `include_images` decides how a picture comes back: by default as an image
+/// block with no base64, with `include_images: false` as base64 in the JSON
+/// with no image block. The base64 is what a copy into the Reflection takes:
+/// `read_engram` with `include_images: false`, then `write_reflection`
+/// `write_asset` with that base64, gives the same bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn include_images_false_hands_a_picture_back_as_base64_for_a_copy() {
+    let h = Harness::new().await;
+    let (client, _server) = h.connect().await;
+    try_call(
+        client.peer(),
+        "write_engram",
+        json!({ "domain": "eng", "path": "assets/shot.png", "base64": BASE64.encode(PNG) }),
+    )
+    .await
+    .unwrap();
+    try_call(
+        client.peer(),
+        "write_reflection",
+        json!({ "domain": "eng", "action": "write_asset", "path": "assets/pic.png", "base64": BASE64.encode(PNG) }),
+    )
+    .await
+    .unwrap();
+    for (tool, args) in [
+        (
+            "read_engram",
+            json!({ "identifier": "assets/shot.png", "domain": "eng" }),
+        ),
+        (
+            "read_reflection",
+            json!({ "domain": "eng", "path": "assets/pic.png" }),
+        ),
+    ] {
+        let mut given = args.clone();
+        given["include_images"] = json!(true);
+        for args in [args.clone(), given] {
+            let down = try_call(client.peer(), tool, args.clone()).await.unwrap();
+            let file = body(&down);
+            assert!(file.get("base64").is_none(), "{tool} {args}: {file}");
+            assert_eq!(image_blocks(&down).len(), 1, "{tool} {args}: {down}");
+        }
+        let mut raw = args.clone();
+        raw["include_images"] = json!(false);
+        let down = try_call(client.peer(), tool, raw).await.unwrap();
+        let file = body(&down);
+        assert_eq!(
+            file["base64"].as_str(),
+            Some(BASE64.encode(PNG).as_str()),
+            "{tool}: {file}"
+        );
+        assert!(file.get("note").is_none(), "{tool}: {file}");
+        assert!(image_blocks(&down).is_empty(), "{tool}: {down}");
+    }
+
+    let down = try_call(
+        client.peer(),
+        "read_engram",
+        json!({ "identifier": "assets/shot.png", "domain": "eng", "include_images": false }),
+    )
+    .await
+    .unwrap();
+    let copied = body(&down)["base64"].as_str().unwrap().to_string();
+    try_call(
+        client.peer(),
+        "write_reflection",
+        json!({ "domain": "eng", "action": "write_asset", "path": "assets/copy.png", "base64": copied }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        std::fs::read(h.root.join("eng/reflections/assets/copy.png")).unwrap(),
+        std::fs::read(h.root.join("eng/assets/shot.png")).unwrap()
+    );
+}

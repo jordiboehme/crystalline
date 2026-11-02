@@ -1537,7 +1537,7 @@ async fn a_new_engram_binds_a_waiting_link_in_another_domain_and_announces_it_bo
                 identifier: "guide".to_string(),
                 domain: Some("notes".to_string()),
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &Scope::Unrestricted,
         )
@@ -1587,7 +1587,7 @@ async fn a_draft_write_binds_nothing_elsewhere_body(store: Arc<Mutex<dyn Store>>
                 identifier: "guide".to_string(),
                 domain: Some("oak".to_string()),
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &Scope::Unrestricted,
         )
@@ -1608,7 +1608,7 @@ async fn guide_resolved(engine: &Engine) -> serde_json::Value {
                 identifier: "guide".to_string(),
                 domain: Some("notes".to_string()),
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &Scope::Unrestricted,
         )
@@ -1685,7 +1685,7 @@ async fn a_save_that_retitles_binds_a_waiting_link_in_another_domain_body(
                 identifier: "runbook".to_string(),
                 domain: Some("oak".to_string()),
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &Scope::Unrestricted,
         )

@@ -63,7 +63,7 @@ async fn checksum_of(engine: &Engine, domain: &str, identifier: &str) -> (String
                 identifier: identifier.to_string(),
                 domain: Some(domain.to_string()),
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &Scope::Unrestricted,
         )
@@ -557,7 +557,7 @@ async fn the_supersede_pair_links_by_permalink_so_a_colon_in_a_title_cannot_brea
                     identifier: identifier.to_string(),
                     domain: Some("eng".to_string()),
                     share_link: None,
-                    include_images: false,
+                    include_images: None,
                 },
                 &Scope::Unrestricted,
             )
@@ -603,7 +603,7 @@ async fn a_hand_written_colon_title_resolves_through_read_engram() {
                 identifier: "reader".to_string(),
                 domain: Some("eng".to_string()),
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &Scope::Unrestricted,
         )
@@ -637,7 +637,7 @@ async fn a_hand_written_colon_title_resolves_through_read_engram() {
                 identifier: "log-weekly".to_string(),
                 domain: Some("eng".to_string()),
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &Scope::Unrestricted,
         )
@@ -955,7 +955,7 @@ async fn split_links_by_permalink_so_a_colon_in_a_title_cannot_break_the_pair() 
                     identifier: identifier.to_string(),
                     domain: Some("eng".to_string()),
                     share_link: None,
-                    include_images: false,
+                    include_images: None,
                 },
                 &Scope::Unrestricted,
             )
@@ -1487,7 +1487,7 @@ async fn observation_lines(engine: &Engine, identifier: &str, needles: &[&str]) 
                 identifier: identifier.to_string(),
                 domain: Some("eng".to_string()),
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &Scope::Unrestricted,
         )
@@ -1573,7 +1573,7 @@ async fn split_moves_the_selected_observations_and_wires_the_pair_both_ways() {
                     identifier: identifier.to_string(),
                     domain: Some("eng".to_string()),
                     share_link: None,
-                    include_images: false,
+                    include_images: None,
                 },
                 &Scope::Unrestricted,
             )
@@ -1638,7 +1638,7 @@ async fn split_moves_every_line_of_a_wrapped_bullet() {
                 identifier: "coolant-bundle".to_string(),
                 domain: Some("eng".to_string()),
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &Scope::Unrestricted,
         )
@@ -1801,7 +1801,7 @@ async fn split_works_on_a_virtual_domain_too() {
                 identifier: "scratch-bundle".to_string(),
                 domain: Some("scratch".to_string()),
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &Scope::Unrestricted,
         )
@@ -2052,7 +2052,7 @@ async fn a_virtual_split_that_loses_the_compare_and_swap_is_a_conflict_with_no_o
                 identifier: "scratch-bundle".to_string(),
                 domain: Some("scratch".to_string()),
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &Scope::Unrestricted,
         )

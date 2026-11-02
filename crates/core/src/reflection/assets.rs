@@ -132,7 +132,7 @@ pub fn refuse_engram_attachments(source: &str, reflection_path: &str) -> Result<
     let name = first.rsplit(['/', '\\']).next().unwrap_or(first);
     let suggestion = relative_to(reflection_path, &format!("{ASSETS_PREFIX}{name}"));
     Err(format!(
-        "a reflection cannot embed an engram attachment ({}); copy the file into reflections/assets/ and link it from there, for example {suggestion} (read it with read_engram, then write it with write_reflection action write_asset)",
+        "a reflection cannot embed an engram attachment ({}); copy the file into reflections/assets/ and link it from there, for example {suggestion} (read it with read_engram, then write it with write_reflection action write_asset; to copy a picture, read it with include_images: false, then write_asset with that base64)",
         found.join(", ")
     ))
 }

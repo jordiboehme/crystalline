@@ -367,7 +367,7 @@ async fn import_files_walks_the_classification_on_a_file_domain() {
                 identifier: "beta".to_string(),
                 domain: Some("eng".to_string()),
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &Scope::Unrestricted,
         )
@@ -477,7 +477,7 @@ async fn import_files_lands_in_a_virtual_domain_too() {
                     identifier: "beta".to_string(),
                     domain: Some("pad".to_string()),
                     share_link: None,
-                    include_images: false,
+                    include_images: None,
                 },
                 &Scope::Unrestricted
             )
@@ -502,7 +502,7 @@ async fn import_files_lands_in_a_virtual_domain_too() {
                 identifier: "beta".to_string(),
                 domain: Some("pad".to_string()),
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &Scope::Unrestricted,
         )

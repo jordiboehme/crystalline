@@ -2307,6 +2307,69 @@ describe("the reading page follows the stream", () => {
     expect(src("Second")).toMatch(/assets\/b\.png$/);
   });
 
+  it("keeps the drawn body mounted when the listing lands and when an event about another file refetches it", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    let listed = 0;
+    // The first listing waits, so the image is drawn before it lands.
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    serve({
+      "/domains/eng/engrams/alpha": () =>
+        detailResponse({ content: `${BODY}\n![First](assets/a.png)\n` }),
+      "/domains/eng/attachments": async () => {
+        await gate;
+        listed += 1;
+        return {
+          attachments: [
+            {
+              path: "assets/a.png",
+              mime: "image/png",
+              size: 10,
+              modified: "2026-01-01T00:00:00Z",
+              sha256: "1".repeat(64),
+            },
+          ],
+        };
+      },
+    });
+    renderApp(engramRoute("eng", "alpha"));
+    const article = await screen.findByRole("article");
+    const drawn = await within(article).findByRole("img", { name: "First" });
+    expect(listed).toBe(0);
+    release();
+    await waitFor(() => {
+      expect(listed).toBeGreaterThan(0);
+    });
+    await act(async () => {
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+    });
+    // The listing landed: the same image element, not a remounted one.
+    expect(within(article).getByRole("img", { name: "First" })).toBe(drawn);
+    const before = listed;
+    await connected();
+    act(() => {
+      stream().emit(
+        "engram",
+        frame({
+          kind: "files",
+          permalink: "assets/other.png",
+          path: "assets/other.png",
+          checksum: "9".repeat(64),
+        }),
+        "1:1",
+      );
+    });
+    await waitFor(() => {
+      expect(listed).toBeGreaterThan(before);
+    });
+    await act(async () => {
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+    });
+    expect(within(article).getByRole("img", { name: "First" })).toBe(drawn);
+  });
+
   it("names the actor the way the details panel does", async () => {
     serve();
     renderApp(engramRoute("eng", "alpha"));

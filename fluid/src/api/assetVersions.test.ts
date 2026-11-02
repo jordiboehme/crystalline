@@ -51,4 +51,30 @@ describe("which files changed since this document first saw them", () => {
       changedVersions(new QueryClient(), "eng", [row("assets/a.png", "2")]),
     ).toEqual(new Map());
   });
+
+  it("hands back the same map while nothing changes, so a page does not redraw", () => {
+    const client = new QueryClient();
+    const none = changedVersions(client, "eng", [row("assets/a.png", "1")]);
+    // Nothing changed: one shared empty map, for every scope and client.
+    expect(changedVersions(client, "eng", undefined)).toBe(none);
+    expect(changedVersions(new QueryClient(), "ops", [])).toBe(none);
+    const first = changedVersions(client, "eng", [
+      row("assets/a.png", "2"),
+      row("assets/b.png", "1"),
+    ]);
+    // An equal listing (a refetch, an event about another file) keeps it.
+    expect(
+      changedVersions(client, "eng", [
+        row("assets/b.png", "1"),
+        row("assets/a.png", "2"),
+      ]),
+    ).toBe(first);
+    // New bytes give a new map.
+    const second = changedVersions(client, "eng", [row("assets/a.png", "3")]);
+    expect(second).not.toBe(first);
+    expect(second).toEqual(new Map([["assets/a.png", "3"]]));
+    expect(changedVersions(client, "eng", [row("assets/a.png", "3")])).toBe(
+      second,
+    );
+  });
 });

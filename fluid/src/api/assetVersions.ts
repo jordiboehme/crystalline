@@ -24,6 +24,35 @@ export function versionedUrl(plain: string, sha: string | undefined): string {
 const baselines = new WeakMap<QueryClient, Map<string, string>>();
 
 /**
+ * The map `changedVersions` last handed out for each scope, so an equal
+ * answer comes back as the same map. One per QueryClient, like the baselines.
+ */
+const lastHanded = new WeakMap<
+  QueryClient,
+  Map<string, ReadonlyMap<string, string>>
+>();
+
+/** What `changedVersions` hands out whenever no file changed: always this one. */
+const NONE: ReadonlyMap<string, string> = Object.freeze(
+  new Map<string, string>(),
+);
+
+function sameEntries(
+  a: ReadonlyMap<string, string>,
+  b: ReadonlyMap<string, string>,
+): boolean {
+  if (a.size !== b.size) {
+    return false;
+  }
+  for (const [path, sha] of a) {
+    if (b.get(path) !== sha) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
  * Path to sha256 for every file whose bytes changed since this document
  * first listed it, for the asset homes of Reflections and of engrams. A file
  * seen for the first time sets its baseline and is left out, so its address
@@ -35,6 +64,12 @@ const baselines = new WeakMap<QueryClient, Map<string, string>>();
  * `key` names the file store: a Reflection passes its domain, the engram
  * files of a domain pass `engram:<domain>`, so the two never share a
  * baseline for a path they both hold.
+ *
+ * The answer keeps its identity while its entries stay the same: one shared
+ * empty map when nothing changed, and the map handed out last for `key`
+ * when it holds the same paths and shas. A reading body builds its component
+ * map from it, and a new map would remount every image, close an open full
+ * window and redraw every diagram each time the listing lands or refetches.
  *
  * The rare race: the plain image loads, then somebody replaces the file
  * before this document's first listing arrives. The baseline is then the
@@ -60,5 +95,18 @@ export function changedVersions(
       changed.set(row.path, row.sha256);
     }
   }
+  if (changed.size === 0) {
+    return NONE;
+  }
+  let handed = lastHanded.get(queryClient);
+  if (handed === undefined) {
+    handed = new Map();
+    lastHanded.set(queryClient, handed);
+  }
+  const previous = handed.get(key);
+  if (previous !== undefined && sameEntries(previous, changed)) {
+    return previous;
+  }
+  handed.set(key, changed);
   return changed;
 }

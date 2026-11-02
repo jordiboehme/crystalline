@@ -110,7 +110,7 @@ impl Fixture {
                     identifier: identifier.to_string(),
                     domain: Some(domain.to_string()),
                     share_link: None,
-                    include_images: false,
+                    include_images: None,
                 },
                 &Scope::Unrestricted,
             )
@@ -126,7 +126,7 @@ impl Fixture {
                     identifier: identifier.to_string(),
                     domain: Some(domain.to_string()),
                     share_link: None,
-                    include_images: false,
+                    include_images: None,
                 },
                 &Scope::Unrestricted,
             )
@@ -1186,7 +1186,7 @@ async fn read_receipt(f: &Fixture, domain: &str, identifier: &str) -> Value {
                 identifier: identifier.to_string(),
                 domain: Some(domain.to_string()),
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &Scope::Unrestricted,
         )

@@ -1534,7 +1534,7 @@ async fn a_cross_domain_move_with_an_unreadable_source_file_fails_loudly() {
                     identifier: "note".to_string(),
                     domain: Some("into".to_string()),
                     share_link: None,
-                    include_images: false,
+                    include_images: None,
                 },
                 &Scope::Unrestricted
             )

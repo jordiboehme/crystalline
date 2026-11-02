@@ -808,7 +808,7 @@ async fn a_drafts_receipt_never_lists_its_own_base_row() {
                 identifier: "retry-queue-gotcha".to_string(),
                 domain: Some("team".to_string()),
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &alice,
         )

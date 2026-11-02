@@ -172,9 +172,14 @@ pub struct ReadParams {
     /// Also return the pictures the engram links to (png, jpeg, gif, webp) as
     /// image content, so you can look at them. At most 8 pictures and 5 MiB
     /// in all; the rest stay resource links. Pass it when a picture is marked
-    /// as needing vision. Only for a domain on this machine.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub include_images: bool,
+    /// as needing vision. Only for a domain on this machine. For an
+    /// identifier under assets/ it decides how a picture comes back: left
+    /// out or true, as an image block with no base64; false, as base64 in
+    /// the JSON with no image block. To copy a picture, read it with false,
+    /// then write_reflection write_asset (or write_engram path) with that
+    /// base64.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_images: Option<bool>,
 }
 
 /// Parameters for `edit_engram`.
@@ -623,7 +628,8 @@ pub struct ReadReflectionParams {
     /// or PACT.md. Omit for the tree of every reflection with titles and open
     /// thread counts. A file's path inside reflections/ (assets/flow.png)
     /// returns that file itself: its mime, size and sha256 with `text` for a
-    /// text file and `base64` otherwise.
+    /// text file, an image block for a picture (see include_images) and
+    /// `base64` otherwise.
     #[serde(default)]
     pub path: Option<String>,
     /// Words to search the Reflection for, instead of reading one page or the
@@ -641,6 +647,12 @@ pub struct ReadReflectionParams {
     /// With query: one-based page, default 1.
     #[serde(default)]
     pub page: Option<usize>,
+    /// For a file path under assets/: how a picture (png, jpeg, gif, webp up
+    /// to 5 MiB) comes back. Left out or true, as an image block you can look
+    /// at, with no base64; false, as base64 in the JSON with no image block.
+    /// Pass false to copy a picture: write_asset takes that base64.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_images: Option<bool>,
 }
 
 /// Parameters for `write_reflection`.

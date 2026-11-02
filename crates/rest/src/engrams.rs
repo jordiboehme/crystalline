@@ -421,7 +421,7 @@ pub async fn detail(
                 // same reason its checksum is an ETag: see
                 // `Engine::read_engram_stored`.
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &identity.scope(),
         )
@@ -618,7 +618,7 @@ pub async fn inbound(
                 // same reason its checksum is an ETag: see
                 // `Engine::read_engram_stored`.
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             query.q.as_deref(),
             query.rel.as_deref(),
@@ -1287,7 +1287,7 @@ pub async fn save(
                         // checksum is an ETag: see
                         // `Engine::read_engram_stored`.
                         share_link: None,
-                        include_images: false,
+                        include_images: None,
                     },
                     &scope,
                 )
@@ -1971,7 +1971,7 @@ pub async fn remove(
                         // checksum is an ETag: see
                         // `Engine::read_engram_stored`.
                         share_link: None,
-                        include_images: false,
+                        include_images: None,
                     },
                     &identity.scope(),
                 )
@@ -2027,7 +2027,7 @@ async fn detail_response(
                 // same reason its checksum is an ETag: see
                 // `Engine::read_engram_stored`.
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             scope,
         )

@@ -1361,7 +1361,7 @@ async fn a_room_in_a_reviewing_domain_still_opens_on_the_reviewed_text() {
                 identifier: "alpha".to_string(),
                 domain: Some("team".to_string()),
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &crystalline_service::Scope::Unrestricted,
         )

@@ -235,11 +235,11 @@ The sections of each page are cut into chunks and embedded beside the engrams, i
 
 A page can show images and other files. They live in `reflections/assets/`, for example `reflections/assets/diagrams/flow.png`. The rules for what may be stored are the ones for engram attachments: the same file types and the same size limit.
 
-An agent uploads a file with `write_reflection` and `action: write_asset`: a `path` under `assets/`, exactly one of `content` (text, SVG included) or `base64`, and `overwrite` (by default the write refuses an existing file). Creating a file needs edit access and replacing one needs curate access. `read_reflection` with a `path` under `assets/` downloads a file. To edit a picture, download it, change it and write it back with `overwrite: true`.
+An agent uploads a file with `write_reflection` and `action: write_asset`: a `path` under `assets/`, exactly one of `content` (text, SVG included) or `base64`, and `overwrite` (by default the write refuses an existing file). Creating a file needs edit access and replacing one needs curate access. `read_reflection` with a `path` under `assets/` downloads a file. A picture comes back as an image block by default and as base64 with `include_images: false`. To edit a picture, download it with `include_images: false`, change it and write it back with `overwrite: true`.
 
 A page links a file relative to its own folder. A page in `reflections/` writes `![Flow](assets/diagrams/flow.png)`, and a page in `reflections/guides/` writes `![Flow](../assets/diagrams/flow.png)`. A link may carry the same formatting fragment as an image on an engram, for example `#right,w=50%`.
 
-A page may not embed an engram attachment from the domain's own `assets/` folder. Copy the file into `reflections/assets/` first and link the copy. An agent copies it with `read_engram` on the `assets/` path and `write_reflection` with `action: write_asset`. A write through Crystalline that embeds an engram attachment is refused, and `reflect` reports one that came in another way.
+A page may not embed an engram attachment from the domain's own `assets/` folder. Copy the file into `reflections/assets/` first and link the copy. An agent copies it with `read_engram` on the `assets/` path and `write_reflection` with `action: write_asset`. To copy a picture, read it with `include_images: false`, then `write_asset` with that base64. A write through Crystalline that embeds an engram attachment is refused, and `reflect` reports one that came in another way.
 
 The Reflection's rights decide, and the knowledge rights play no part:
 

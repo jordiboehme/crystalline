@@ -411,21 +411,36 @@ pub async fn routed(
                 return Some(Err(RouteError::Local(EngineError::ReadOnly.into())));
             }
             let forwarded = forwarded_args(args, &names, false);
-            let limit = if tool == crate::EVOLVE_TOOL_NAME {
+            let transfer = file_transfer(tool, args);
+            // A forwarded sweep and a file transfer get the long ctl limit:
+            // a sweep runs long on the server, and a full-size file over a
+            // slow uplink outlasts ten seconds (the proxy allows two minutes).
+            let own = if tool == crate::EVOLVE_TOOL_NAME || transfer.is_some() {
                 CTL_TIMEOUT
             } else {
                 ONE_DOMAIN_LIMIT
             };
-            let own = limit;
             let limit = deadline.map_or(own, |d| d.min(own));
-            let budget = crystalline_remote::Budget::of(limit, own);
+            // Running out of time on one file says nothing about the source,
+            // so a file transfer never opens the down window (as
+            // `Connection::file_within`); a refused connection still counts.
+            let budget = if transfer.is_some() {
+                crystalline_remote::Budget::Cut
+            } else {
+                crystalline_remote::Budget::of(limit, own)
+            };
             let started = std::time::Instant::now();
-            if let Some(transfer) = file_transfer(tool, args) {
+            if let Some(transfer) = transfer {
                 // An older server ignores the fields that make this a file;
                 // with a title beside them it would write an engram instead.
-                // The status question is part of the caller's limit and
-                // budget, so a short budget never opens the down window.
-                match sources.takes_agent_files(&source, limit, budget).await {
+                // The status question has a short cut of its own, taken from
+                // the transfer's limit, and its timeout refuses the transfer
+                // without marking the source down.
+                let asked = limit.min(ONE_DOMAIN_LIMIT);
+                match sources
+                    .takes_agent_files(&source, asked, crystalline_remote::Budget::Cut)
+                    .await
+                {
                     Ok(true) => {}
                     Ok(false) => {
                         let url = sources
@@ -440,14 +455,15 @@ pub async fn routed(
                         return Some(Err(RouteError::Source {
                             source,
                             domain,
-                            failure: within(failure, limit),
+                            failure: within(failure, asked),
                         }));
                     }
                 }
             }
             let left = limit.saturating_sub(started.elapsed());
             // A caller's shorter budget running out says nothing about the
-            // source, so it never opens the down window (Budget::Cut).
+            // source, so it never opens the down window (Budget::Cut), and
+            // neither does a file transfer's.
             let answer = sources
                 .forward_as(&source, tool, forwarded, agent, left, budget)
                 .await;

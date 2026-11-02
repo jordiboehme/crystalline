@@ -109,7 +109,7 @@ async fn checksum(engine: &Engine, domain: &str, id: &str) -> String {
                 identifier: id.into(),
                 domain: Some(domain.into()),
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &Scope::Unrestricted,
         )
@@ -677,7 +677,7 @@ async fn the_listing_browse_read_and_routing_say_read_only() {
         identifier: "alpha".into(),
         domain: Some(domain.into()),
         share_link: None,
-        include_images: false,
+        include_images: None,
     };
     let locked = engine.read_engram(&read("archive"), &scope).await.unwrap();
     assert_eq!(locked["read_only"], true);

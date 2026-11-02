@@ -179,7 +179,7 @@ async fn collaboration_flow(store: Arc<Mutex<dyn Store>>) {
                 identifier: "alpha".to_string(),
                 domain: Some("eng".to_string()),
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &Scope::Unrestricted,
         )
@@ -222,7 +222,7 @@ async fn collaboration_flow(store: Arc<Mutex<dyn Store>>) {
                 identifier: "shared-insight".to_string(),
                 domain: Some("notes".to_string()),
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &Scope::Unrestricted,
         )

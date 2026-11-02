@@ -1322,6 +1322,158 @@ async fn a_server_before_agent_files_is_refused_before_anything_is_sent() {
     assert!(server.file("open", "plain-old.md").exists());
 }
 
+/// Through a mount, `include_images` decides a picture's shape as it does
+/// locally: by default an image block and no base64, with `false` base64 and
+/// no image block. A copy from an engram attachment into the Reflection with
+/// that base64 lands byte for byte.
+#[tokio::test]
+async fn a_mounted_picture_comes_as_base64_with_include_images_false_and_copies() {
+    use base64::Engine as _;
+    let server = RemoteServer::start(Options::TOKENS).await;
+    server.with_files_in_open().await;
+    let machine = LocalMachine::start(false).await;
+    machine.connect(&server, "acme", "keeper").await;
+    machine.mount();
+    let (client, _s) = connect(McpServer::new(machine.engine.clone())).await;
+    let png = base64::engine::general_purpose::STANDARD.encode(SHOT);
+    for (tool, args, bytes) in [
+        (
+            "read_engram",
+            json!({ "domain": "open", "identifier": "assets/shot.png" }),
+            SHOT,
+        ),
+        (
+            "read_reflection",
+            json!({ "domain": "open", "path": "assets/pic.png" }),
+            PIC,
+        ),
+    ] {
+        let (blocks, is_error) = call_blocks(client.peer(), tool, args.clone()).await;
+        assert!(!is_error, "{tool}: {blocks:?}");
+        let body: Value = serde_json::from_str(blocks[0]["text"].as_str().unwrap()).unwrap();
+        assert!(body.get("base64").is_none(), "{tool}: {body}");
+        assert_eq!(
+            blocks.iter().filter(|b| b["type"] == "image").count(),
+            1,
+            "{tool}: {blocks:?}"
+        );
+        let mut raw = args;
+        raw["include_images"] = json!(false);
+        let (blocks, is_error) = call_blocks(client.peer(), tool, raw).await;
+        assert!(!is_error, "{tool}: {blocks:?}");
+        let body: Value = serde_json::from_str(blocks[0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            body["base64"].as_str(),
+            Some(
+                base64::engine::general_purpose::STANDARD
+                    .encode(bytes)
+                    .as_str()
+            ),
+            "{tool}: {body}"
+        );
+        assert!(
+            blocks.iter().all(|b| b["type"] != "image"),
+            "{tool}: {blocks:?}"
+        );
+    }
+    let (blocks, _) = call_blocks(
+        client.peer(),
+        "read_engram",
+        json!({ "domain": "open", "identifier": "assets/shot.png", "include_images": false }),
+    )
+    .await;
+    let body: Value = serde_json::from_str(blocks[0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(body["base64"].as_str(), Some(png.as_str()));
+    call(
+        client.peer(),
+        "write_reflection",
+        json!({ "domain": "open", "action": "write_asset", "path": "assets/copy.png", "base64": body["base64"] }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        std::fs::read(server.file("open", "reflections/assets/copy.png")).unwrap(),
+        SHOT
+    );
+}
+
+/// A routed file transfer has the long ctl limit, not the ten seconds of a
+/// one-domain call: a full-size file over a slow uplink takes longer than
+/// that, and the proxy in front of a server allows two minutes.
+#[tokio::test]
+async fn a_routed_upload_slower_than_a_one_domain_call_still_lands() {
+    use base64::Engine as _;
+    let server = RemoteServer::start(Options::TOKENS).await;
+    server.with_files_in_open().await;
+    let machine = LocalMachine::start(false).await;
+    machine.connect(&server, "acme", "keeper").await;
+    machine.mount();
+    let (client, _s) = connect(McpServer::new(machine.engine.clone())).await;
+    server.play(Play::SlowTool(
+        crystalline_remote::ONE_DOMAIN_LIMIT + Duration::from_secs(1),
+    ));
+    let png = base64::engine::general_purpose::STANDARD.encode(PIC);
+    let up = call(
+        client.peer(),
+        "write_engram",
+        json!({ "domain": "open", "path": "assets/slow.png", "base64": png }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(up["path"], "assets/slow.png", "{up}");
+    assert_eq!(
+        std::fs::read(server.file("open", "assets/slow.png")).unwrap(),
+        PIC
+    );
+}
+
+/// The capability question before a file transfer has a short cut of its
+/// own. When it runs out the transfer is refused and nothing is sent, but the
+/// source is not marked down: the next call is asked.
+#[tokio::test]
+async fn a_status_timeout_refuses_the_upload_and_keeps_the_source_up() {
+    use base64::Engine as _;
+    let server = RemoteServer::start(Options::TOKENS).await;
+    server.with_files_in_open().await;
+    let machine = LocalMachine::start(false).await;
+    machine.connect(&server, "acme", "keeper").await;
+    machine.mount();
+    let (client, _s) = connect(McpServer::new(machine.engine.clone())).await;
+    server.play(Play::SlowStatus(
+        crystalline_remote::ONE_DOMAIN_LIMIT + Duration::from_secs(2),
+    ));
+    server.clear_ctl_log();
+    let png = base64::engine::general_purpose::STANDARD.encode(PIC);
+    let started = std::time::Instant::now();
+    let refused = call(
+        client.peer(),
+        "write_engram",
+        json!({ "domain": "open", "path": "assets/late.png", "base64": png }),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        started.elapsed() < crystalline_remote::ONE_DOMAIN_LIMIT + Duration::from_secs(2),
+        "the status question had its own short cut"
+    );
+    assert!(refused.contains("cannot be reached right now"), "{refused}");
+    assert!(
+        !used_tool(&server, "write_engram"),
+        "{:?}",
+        server.ctl_requests()
+    );
+    assert!(!server.file("open", "assets/late.png").exists());
+    server.play(Play::Honest);
+    let page = call(
+        client.peer(),
+        "read_engram",
+        json!({ "identifier": "open-note", "domain": "open" }),
+    )
+    .await
+    .unwrap();
+    assert!(page.to_string().contains("open-note"), "{page}");
+}
+
 /// A server that has agent files takes the upload through a mount, and the
 /// routed answers for a file render as the local ones do: plain JSON (also
 /// under a TOON configuration) and, for a picture, one image block with no

@@ -2192,7 +2192,7 @@ async fn the_gate_refuses_an_unconnected_team_domain_that_says_on() {
                 identifier: "manifest".into(),
                 domain: Some("eng".into()),
                 share_link: None,
-                include_images: false,
+                include_images: None,
             },
             &Scope::Unrestricted,
         )

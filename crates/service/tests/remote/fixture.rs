@@ -189,6 +189,11 @@ pub enum Play {
     /// A server that finds the argument of a `file` request invalid: it
     /// answers [`INVALID_FILE`] with `kind: invalid`, as 0.27.0 does.
     InvalidFile,
+    /// An honest server that takes this long before it handles a `tool`
+    /// command: a large file over a slow link.
+    SlowTool(std::time::Duration),
+    /// An honest server that takes this long before it answers `status`.
+    SlowStatus(std::time::Duration),
 }
 
 /// The argument error [`Play::InvalidFile`] answers.
@@ -253,6 +258,9 @@ async fn record_ctl(
             )
             .into_response();
         }
+        (Play::SlowTool(delay), "tool") | (Play::SlowStatus(delay), "status") => {
+            tokio::time::sleep(delay).await;
+        }
         _ => {}
     }
     let response = next
@@ -263,7 +271,11 @@ async fn record_ctl(
         .await;
     if matches!(
         play,
-        Play::Honest | Play::HostedElsewhere | Play::InvalidFile
+        Play::Honest
+            | Play::HostedElsewhere
+            | Play::InvalidFile
+            | Play::SlowTool(_)
+            | Play::SlowStatus(_)
     ) {
         return response;
     }
