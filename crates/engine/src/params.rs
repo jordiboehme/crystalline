@@ -343,8 +343,11 @@ pub struct MoveParams {
     /// The new domain-relative path (with or without the `.md` suffix). Pass
     /// the engram's own current path to change only its permalink.
     pub destination: String,
-    /// Move to a different domain. Bare links from the domain it leaves gain
-    /// the domain prefix, `[[domain:Target]]`, so they still resolve.
+    /// Move to a different domain. The moved engram's bare links and
+    /// relations that resolved in the domain it leaves gain that domain's
+    /// prefix, `[[domain:permalink]]`, so they still resolve; a prefix that
+    /// names the destination is dropped. The receipt's `links_dead` names any
+    /// of its links that does not resolve after the move.
     #[serde(default)]
     pub destination_domain: Option<String>,
     /// The permalink the engram answers to after the move. Omit it and the
