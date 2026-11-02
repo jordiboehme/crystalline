@@ -545,6 +545,20 @@ impl TursoStore {
             None => self.conn.last_insert_rowid(),
         };
 
+        // A base row whose title holds a `#`: references that name it whole
+        // and were bound through their split target before it existed are
+        // unbound, so the resolve pass after this write binds them here.
+        if actor.is_empty() && record.title.contains('#') {
+            for table in ["relation", "link"] {
+                self.conn
+                    .execute(
+                        &crate::store::unbind_shadowed_by_title_sql(table, "?1", "?2"),
+                        vec![Value::Integer(domain.0), Value::Text(record.title.clone())],
+                    )
+                    .await?;
+            }
+        }
+
         // The body, in the same write: its own row keyed by the engram's id, so
         // every seek into `engram` reads about a kilobyte instead of dragging a
         // multi-megabyte payload through the row cache.

@@ -5622,6 +5622,20 @@ impl PostgresStore {
             delete_children(&mut *c, engram_id).await?;
         }
 
+        // A base row whose title holds a `#`: references that name it whole
+        // and were bound through their split target before it existed are
+        // unbound, so the resolve pass after this write binds them here.
+        if actor.is_empty() && record.title.contains('#') {
+            for table in ["relation", "link"] {
+                exec(
+                    &mut *c,
+                    &crate::store::unbind_shadowed_by_title_sql(table, "$1", "$2"),
+                    vec![Param::Int(domain.0), Param::Text(record.title.clone())],
+                )
+                .await?;
+            }
+        }
+
         // Observations: insert in chunks and read each new row's id back joined
         // on its source line (unique within one engram), so observation tags map
         // to the right observation without relying on RETURNING row order.

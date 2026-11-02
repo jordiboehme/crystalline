@@ -248,6 +248,34 @@ pub fn resolve_pending_sql(table: &str, placeholder: &str) -> String {
     )
 }
 
+/// The unbind a base write runs, one statement per reference table, when the
+/// engram it writes carries a title that a `[[C# Basics]]` reference may name
+/// whole: every row whose whole text (`to_whole`) is that title, whose target
+/// domain is `domain` (the caller's placeholder, the written engram's domain)
+/// and which is bound to an engram that does not carry that title. Such a row
+/// was bound through its split target (`C`) before the title existed; the
+/// resolve passes that follow the write (`resolve_pending_*` in a sync, the
+/// engine's `bind_references_to` across domains) bind it again through the
+/// whole-text arm of [`reference_match`].
+///
+/// Seeks the partial `lower(to_whole)` index of the table. A row bound to an
+/// engram that carries the title already, in any dimension, is left as it is,
+/// so writing the same engram again changes nothing.
+#[doc(hidden)]
+pub fn unbind_shadowed_by_title_sql(table: &str, domain: &str, title: &str) -> String {
+    // -- actor: all - the bound engram already carrying the title settles the
+    // row whoever's row it is; this asks nothing else of it.
+    format!(
+        "UPDATE {table} SET to_id = NULL \
+         WHERE {table}.to_whole IS NOT NULL AND lower({table}.to_whole) = lower({title}) \
+         AND {table}.to_id IS NOT NULL \
+         AND (CASE WHEN {table}.to_domain IS NULL THEN {table}.domain_id \
+              ELSE (SELECT s.domain_id FROM domain_spelling s WHERE s.spelling = {table}.to_domain) END) = {domain} \
+         AND NOT EXISTS (SELECT 1 FROM engram b WHERE b.id = {table}.to_id \
+              AND lower(b.title) = lower({title}))"
+    )
+}
+
 /// The `$contains` / `$contains_any` predicate over `engram_meta_value`, as
 /// postgres issues it: `key` and `values` are the caller's `$n` bind
 /// placeholders, and `values` is never empty (an empty filter is answered

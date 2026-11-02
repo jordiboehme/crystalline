@@ -305,13 +305,13 @@ fn find_close(chars: &[char], from: usize) -> Option<usize> {
 }
 
 /// Where the `#fragment` of the wikilink whose target part `inner` runs from
-/// `from` to `end` starts, as a char index: at its first `#`, the split
-/// [`crate::engram::split_fragment`] makes, or at `end` when it has none. A
-/// rewrite replaces only the text before it and keeps the fragment exactly as
-/// it was written.
+/// `from` to `end` starts, as a char index: at the whitespace before its first
+/// `#`, the split [`crate::engram::split_fragment`] makes, or at `end` when it
+/// has none. A rewrite replaces only the trimmed target before it and keeps
+/// the fragment, and the spacing before its `#`, exactly as written.
 fn fragment_start(inner: &str, from: usize, end: usize) -> usize {
     match crate::engram::split_fragment(inner) {
-        (before, Some(_)) => from + before.chars().count(),
+        (before, Some(_)) => from + before.trim_end().chars().count(),
         _ => end,
     }
 }
@@ -1281,7 +1281,7 @@ mod tests {
         let (out, n) = relink(&source, "eng", "eng", &renamed);
         assert_eq!(n, 3, "{out}");
         assert!(
-            out.contains("See [[newb#setup|t]], [[newb# Setup Guide ]] and [[eng:newb#x:y]]."),
+            out.contains("See [[newb#setup|t]], [[newb # Setup Guide ]] and [[eng:newb#x:y]]."),
             "{out}"
         );
 
@@ -1296,6 +1296,25 @@ mod tests {
         let (out, n) = relink(&doc("See [[b#setup|t]].\n"), "eng", "eng", &across);
         assert_eq!(n, 1, "{out}");
         assert!(out.contains("See [[notes:b#setup|t]]."), "{out}");
+
+        // The spacing before the `#` stays as written.
+        let spaced = Relink {
+            from_permalink: "c",
+            title: "C",
+            to_permalink: "c",
+            ..across
+        };
+        let (out, n) = relink(
+            &doc("See [[C # Basics]] and [[c #intro|i]].\n"),
+            "eng",
+            "eng",
+            &spaced,
+        );
+        assert_eq!(n, 2, "{out}");
+        assert!(
+            out.contains("See [[notes:C # Basics]] and [[notes:c #intro|i]]."),
+            "{out}"
+        );
     }
 
     #[test]

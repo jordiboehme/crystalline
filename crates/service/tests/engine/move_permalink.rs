@@ -1871,6 +1871,40 @@ async fn a_title_holding_a_hash_is_never_read_as_its_split_target_by_a_move() {
     );
 }
 
+/// An engram titled `C# Basics`, written after a linker's `[[C# Basics]]`
+/// was bound to `C` through its split target, takes the link over: the
+/// index then answers what core's resolver answers, read from both ends.
+#[tokio::test]
+async fn a_later_hash_title_takes_over_a_bound_link() {
+    let f = Fixture::new().await;
+    seed(
+        f.notes(),
+        "linker.md",
+        &engram("Linker", "linker", "See [[C# Basics]]."),
+    );
+    seed(f.notes(), "c.md", &engram("C", "c", "C."));
+    f.sync().await;
+    let inbound = |v: &Value| v["inbound"]["count"].as_u64().unwrap_or(0);
+    assert_eq!(inbound(&read_receipt(&f, "notes", "c").await), 1);
+
+    let write: WriteParams = serde_json::from_value(serde_json::json!({
+        "domain": "notes", "title": "C# Basics", "content": "Basics."
+    }))
+    .unwrap();
+    let written = f.engine.write_engram(&write).await.unwrap();
+    let permalink = written["permalink"]
+        .as_str()
+        .unwrap_or("c-basics")
+        .to_string();
+    assert_eq!(inbound(&read_receipt(&f, "notes", "c").await), 0);
+    assert_eq!(inbound(&read_receipt(&f, "notes", &permalink).await), 1);
+    assert!(
+        edges(&read_receipt(&f, "notes", "linker").await)
+            .iter()
+            .all(|(_, resolved, _)| *resolved)
+    );
+}
+
 /// A move inside one domain leaves bare links bare and carries no
 /// `links_dead`, and `update_links: false` skips the cross-domain rewrite
 /// of the moved engram's own links as it skips every other.

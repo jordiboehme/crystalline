@@ -1549,7 +1549,7 @@ impl Engine {
             return Ok(Vec::new());
         };
         let moved_title = spec.title.trim().to_lowercase();
-        let mut out: Vec<String> = Vec::new();
+        let mut asked: Vec<&String> = Vec::new();
         for target in engram
             .links
             .iter()
@@ -1564,14 +1564,22 @@ impl Engine {
                 None => read_in == spec.from_domain,
             };
             let lower = whole.to_lowercase();
-            if !read_there || lower == moved_title || out.iter().any(|o| o.to_lowercase() == lower)
+            if read_there
+                && lower != moved_title
+                && !asked.iter().any(|a| a.to_lowercase() == lower)
             {
-                continue;
+                asked.push(whole);
             }
-            let found = {
-                let store = self.store.lock().await;
-                store.find_engram(spec.from_domain, whole).await?
-            };
+        }
+        if asked.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Every text asked under one store lock.
+        let store = self.store.lock().await;
+        let mut out: Vec<String> = Vec::new();
+        for whole in asked {
+            let lower = whole.to_lowercase();
+            let found = store.find_engram(spec.from_domain, whole).await?;
             if found.is_some_and(|f| f.title.to_lowercase() == lower) {
                 out.push(whole.clone());
             }

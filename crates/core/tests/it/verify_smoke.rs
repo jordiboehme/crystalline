@@ -1934,7 +1934,7 @@ fn a_heading_fragment_is_checked_by_its_target_and_quoted_with_it() {
     write(
         &notes,
         "linker.md",
-        "---\ntype: engram\ntitle: Linker\npermalink: linker\ntags:\n- ops\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\n---\n\n# Linker\n\nSee [[b#setup]] and [[ghost#x]] for the details here.\n\nAlso crystalline://notes/b#setup and crystalline://notes/ghost#x for more.\n",
+        "---\ntype: engram\ntitle: Linker\npermalink: linker\ntags:\n- ops\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\n---\n\n# Linker\n\nSee [[b#setup]] and [[ghost#x]] for the details here, and [[linker#more]] below.\n\nAlso crystalline://notes/b#setup and crystalline://notes/ghost#x for more.\n\n## More\n\nThe rest.\n",
     );
 
     let report = verify::verify_paths([notes.as_path()], &VerifyOptions::default()).unwrap();
@@ -1958,4 +1958,6 @@ fn a_heading_fragment_is_checked_by_its_target_and_quoted_with_it() {
         "{:#?}",
         report.issues
     );
+    // A link to a heading of the engram itself is no self-link.
+    assert!(messages("L004").is_empty(), "{:#?}", report.issues);
 }

@@ -1834,6 +1834,79 @@ parity!(
     a_heading_fragment_binds_to_its_target
 );
 
+/// A `[[C# Basics]]` synced while only `C` exists binds to `c` through its
+/// split target. Once an engram titled `C# Basics` is written, the link names
+/// that one, at home through the sync's own pass and across domains through
+/// `resolve_references_to`, as core's resolver says.
+async fn a_later_hash_title_takes_over_the_link(store: &dyn Store) {
+    let (home, ops) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    write(
+        home.path(),
+        "c.md",
+        &engram("C", "c", "engram", "", "body\n"),
+    );
+    write(home.path(), "a.md", &source_engram("A", "a", "C# Basics"));
+    write(
+        home.path(),
+        "x.md",
+        &source_engram("X", "x", "ops:C# Basics"),
+    );
+    write(
+        ops.path(),
+        "c.md",
+        &engram("C", "c", "engram", "", "body\n"),
+    );
+    sync_domain(store, "ops", ops.path()).await.unwrap();
+    sync_domain(store, "home", home.path()).await.unwrap();
+    let a = store.lookup_id("home", "a").await.unwrap().unwrap();
+    let x = store.lookup_id("home", "x").await.unwrap().unwrap();
+    let pair = |d: &str, p: &str| Some((d.to_string(), p.to_string()));
+    assert_eq!(bound_target(store, a).await, pair("home", "c"));
+    assert_eq!(bound_target(store, x).await, pair("ops", "c"));
+
+    write(
+        home.path(),
+        "c-basics.md",
+        &engram("C# Basics", "c-basics", "engram", "", "body\n"),
+    );
+    sync_domain(store, "home", home.path()).await.unwrap();
+    assert_eq!(bound_target(store, a).await, pair("home", "c-basics"));
+
+    let found = ids(store, &["home", "ops"]).await;
+    let (home_id, ops_id) = (found[0], found[1]);
+    store
+        .upsert_engram(
+            ops_id,
+            &titled_record("c-basics.md", "c-basics", "C# Basics"),
+        )
+        .await
+        .unwrap();
+    let bound = store
+        .resolve_references_to(
+            ops_id,
+            &["ops".to_string()],
+            &["c-basics".to_string(), "C# Basics".to_string()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(bound, vec![(home_id, 2)]);
+    assert_eq!(bound_target(store, x).await, pair("ops", "c-basics"));
+
+    // Written again, nothing moves: the row is bound to the title already.
+    store
+        .upsert_engram(
+            ops_id,
+            &titled_record("c-basics.md", "c-basics", "C# Basics"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bound_target(store, x).await, pair("ops", "c-basics"));
+}
+parity!(
+    a_later_hash_title_takes_over_the_link_on_both_backends,
+    a_later_hash_title_takes_over_the_link
+);
+
 /// A pending `[[ops:C# Basics]]` stores the split target `C`, so the pass a
 /// later write in `ops` runs reads the whole text too, and binds it to the
 /// engram whose title holds the `#`.
@@ -12648,7 +12721,7 @@ fn every_engram_reading_sql_carries_an_actor_predicate() {
         census.failures.join("\n")
     );
     assert_eq!(
-        census.sites, 190,
+        census.sites, 191,
         "the engram statement census moved; every new one needs a predicate or a waiver. \
          78 per backend in mod.rs (`BASE_PATH_SQL`, the folder counts' existence probe of one path, is the newest, on the base rows; before it `CITED_ENGRAM_SQL`, one cited engram by permalink, on the base rows; before it `ENGRAM_COVERAGE_SQL`, the coverage of one domain's engram chunks, waived below; before it the Reflection gate's two probes, \
          `ENGRAM_ROWS_UNDER_REFLECTIONS_SQL` and `HAS_ENGRAM_ROWS_SQL`, are the newest, \
@@ -12663,8 +12736,9 @@ fn every_engram_reading_sql_carries_an_actor_predicate() {
          pair write, waived by id; before them the emptiness probe of \
          `drop_empty_domain_row`, waived because a draft keeps the row too; before it the URL half \
          of `engrams_referencing_domains`, the move's `readdress_engram` and \
-         `engrams_mentioning`, all three on the base rows), 9 per backend in search.rs, 16 in the shared \
-         statement builders in store.rs: the reference-resolution expression's six \
+         `engrams_mentioning`, all three on the base rows), 9 per backend in search.rs, 17 in the shared \
+         statement builders in store.rs: the `NOT EXISTS` of the unbind a base write runs for a \
+         title holding a `#` (`unbind_shadowed_by_title_sql`, waived), the reference-resolution expression's six \
          arms (the whole-title arm for a link whose title holds a `#` is the newest, \
          before it the path arm for a relative note link), the three engram hops of each of the two graph frontiers, the two \
          arms of the edge half of `engrams_referencing_domains` and the two arms of \
@@ -12683,9 +12757,11 @@ fn every_engram_reading_sql_carries_an_actor_predicate() {
          that the reference now points at nothing"
     );
     assert_eq!(
-        census.waived, 32,
+        census.waived, 33,
         "the waiver list is meant to be short and deliberate; a new one needs its reason read. \
-         Sixteen per backend: `ENGRAM_COVERAGE_SQL`, `-- actor: all` because a draft's chunks count toward coverage as they do toward the backlog, the two statements of `clear_domain` that unbind the references \
+         One in store.rs: the `NOT EXISTS` of `unbind_shadowed_by_title_sql`, `-- actor: all` \
+         because a row bound to an engram that carries the title already is right whoever's row \
+         that is. Sixteen per backend: `ENGRAM_COVERAGE_SQL`, `-- actor: all` because a draft's chunks count toward coverage as they do toward the backlog, the two statements of `clear_domain` that unbind the references \
          from other domains into the rows about to go, `-- actor: all` because the clear takes \
          every actor's rows, the two `EXISTS` probes of `replace_contradictions`' pair \
          write, `-- actor: by id` because both ids are base rows (drafts are never \

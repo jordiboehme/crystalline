@@ -266,7 +266,12 @@ fn check_target(
     own_title: &str,
     sink: &mut Sink,
 ) {
-    if target.domain.is_none() {
+    // A link to a heading of the engram itself (`[[own#section]]`) is how a
+    // page points into its own text, never a self-link to warn about. A
+    // title that holds a `#` and is the engram's own is still one.
+    let own_heading = target.fragment.is_some()
+        && target.whole.as_deref().map(str::to_lowercase).as_deref() != Some(own_title);
+    if target.domain.is_none() && !own_heading {
         let text = target.target.to_lowercase();
         if text == own_permalink.to_lowercase() || text == own_title {
             sink.emit(
@@ -283,7 +288,10 @@ fn check_target(
 
     match address::resolve(target, &domain.name, lookup) {
         Resolution::Resolved(r) => {
-            if r.domain == domain.name && r.permalink.eq_ignore_ascii_case(own_permalink) {
+            if r.domain == domain.name
+                && r.permalink.eq_ignore_ascii_case(own_permalink)
+                && !own_heading
+            {
                 sink.emit(
                     &file.path,
                     line,
