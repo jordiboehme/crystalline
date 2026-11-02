@@ -9,7 +9,7 @@
 pub mod registration;
 pub mod write_fence;
 
-pub use write_fence::{WriteFence, check_write, refuse_appdata_writes};
+pub use write_fence::{WriteFence, check_write, fence, refuse_appdata_writes};
 
 use std::path::{Path, PathBuf};
 

@@ -392,7 +392,27 @@ fn a_packaged_domain_add_without_a_daemon_registers_nothing() {
 /// each writes Crystalline's state on this machine.
 #[test]
 fn setup_steps_refuse_inside_a_package() {
+    let work = tempfile::tempdir().unwrap();
+    let key = work.path().join("app.pem");
+    std::fs::write(
+        &key,
+        "-----BEGIN RSA PRIVATE KEY-----\n-----END RSA PRIVATE KEY-----\n",
+    )
+    .unwrap();
+    let key = key.display().to_string();
     for args in [
+        &[
+            "github",
+            "app",
+            "set",
+            "--app-id",
+            "1",
+            "--client-id",
+            "Iv23test",
+            "--private-key-file",
+            key.as_str(),
+        ][..],
+        &["github", "app", "remove"][..],
         &["connect", "https://kb.example.com"][..],
         &["connect", "github"][..],
         &["disconnect", "kb"][..],

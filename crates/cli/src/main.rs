@@ -2536,6 +2536,18 @@ fn packaged_setup_step(command: &Command) -> Option<&'static str> {
             action: DaemonTaskAction::Register { .. },
         } => Some("daemon-task register"),
         Command::Users { .. } => Some("users"),
+        Command::Github {
+            command:
+                GithubCommand::App {
+                    command: GithubAppCommand::Set { .. },
+                },
+        } => Some("github app set"),
+        Command::Github {
+            command:
+                GithubCommand::App {
+                    command: GithubAppCommand::Remove { .. },
+                },
+        } => Some("github app remove"),
         Command::Kept {
             command: KeptCommand::Drop { .. },
         } => Some("kept drop"),

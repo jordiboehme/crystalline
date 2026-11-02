@@ -14,6 +14,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crystalline_core::config::WriteFence;
 use serde::{Deserialize, Serialize};
 
 use crate::error::RemoteError;
@@ -51,13 +52,20 @@ impl AppStoreLock {
     /// Waits for and takes the lock of the App store in `dir`. Blocking: the
     /// holders are short (a store read and a write).
     pub fn acquire(dir: &Path) -> Result<AppStoreLock, RemoteError> {
+        AppStoreLock::acquire_in(dir, process_fence())
+    }
+
+    /// [`AppStoreLock::acquire`] under `fence`.
+    fn acquire_in(dir: &Path, fence: Option<&WriteFence>) -> Result<AppStoreLock, RemoteError> {
+        let path = dir.join(LOCK_FILE_NAME);
+        fenced(fence, &path)?;
         std::fs::create_dir_all(dir)?;
         let file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
-            .open(dir.join(LOCK_FILE_NAME))?;
+            .open(path)?;
         fs4::FileExt::lock(&file)?;
         Ok(AppStoreLock { file })
     }
@@ -252,11 +260,23 @@ impl AppStore {
 
     /// Saves `credentials`, replacing whatever was saved before.
     pub fn save(&self, credentials: &AppCredentials) -> Result<(), RemoteError> {
+        self.save_in(credentials, process_fence())
+    }
+
+    /// [`AppStore::save`] under `fence`.
+    fn save_in(
+        &self,
+        credentials: &AppCredentials,
+        fence: Option<&WriteFence>,
+    ) -> Result<(), RemoteError> {
         match self {
             AppStore::Keyring { account } => {
                 keyring_write(account, to_json(credentials)?, KEYRING_TIMEOUT)
             }
-            AppStore::File { path } => write_secret_file(path, &to_json(credentials)?),
+            AppStore::File { path } => {
+                fenced(fence, path)?;
+                write_secret_file(path, &to_json(credentials)?)
+            }
             AppStore::Env => Err(env_read_only()),
         }
     }
@@ -324,9 +344,17 @@ impl AppStore {
     /// Deletes the saved credentials. Deleting when nothing is saved is not
     /// an error.
     pub fn delete(&self) -> Result<(), RemoteError> {
+        self.delete_in(process_fence())
+    }
+
+    /// [`AppStore::delete`] under `fence`.
+    fn delete_in(&self, fence: Option<&WriteFence>) -> Result<(), RemoteError> {
         match self {
             AppStore::Keyring { account } => keyring_delete(account, KEYRING_TIMEOUT),
-            AppStore::File { path } => delete_file(path),
+            AppStore::File { path } => {
+                fenced(fence, path)?;
+                delete_file(path)
+            }
             AppStore::Env => Err(env_read_only()),
         }
     }
@@ -372,7 +400,13 @@ pub fn read_marker(dir: &Path) -> Option<String> {
 /// Writes the marker for `host` into `dir`, through a temporary file and a
 /// rename, so a crash never leaves a half-written marker behind.
 fn write_marker(dir: &Path, host: &str) -> Result<(), RemoteError> {
+    write_marker_in(dir, host, process_fence())
+}
+
+/// [`write_marker`] under `fence`.
+fn write_marker_in(dir: &Path, host: &str, fence: Option<&WriteFence>) -> Result<(), RemoteError> {
     let path = marker_path(dir);
+    fenced(fence, &path)?;
     let tmp = path.with_extension(format!("present.tmp.{}", std::process::id()));
     std::fs::create_dir_all(dir)
         .and_then(|()| std::fs::write(&tmp, format!("{host}\n")))
@@ -387,7 +421,14 @@ fn write_marker(dir: &Path, host: &str) -> Result<(), RemoteError> {
 
 /// Deletes the marker in `dir`; a missing one is not an error.
 fn delete_marker(dir: &Path) -> Result<(), RemoteError> {
-    match std::fs::remove_file(marker_path(dir)) {
+    delete_marker_in(dir, process_fence())
+}
+
+/// [`delete_marker`] under `fence`.
+fn delete_marker_in(dir: &Path, fence: Option<&WriteFence>) -> Result<(), RemoteError> {
+    let path = marker_path(dir);
+    fenced(fence, &path)?;
+    match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(RemoteError::Credential {
@@ -425,6 +466,23 @@ fn delete_keyring_marked(
 ) -> Result<(), RemoteError> {
     delete(account)?;
     delete_marker(marker_dir)
+}
+
+/// The write fence this process runs under: inside an app package (Claude
+/// Desktop on Windows) a new file under AppData would land in the package's
+/// private copy, where the daemon outside never sees it.
+fn process_fence() -> Option<&'static WriteFence> {
+    crystalline_core::config::fence()
+}
+
+/// `Ok` when `fence` lets this process write `path`, else the refusal.
+fn fenced(fence: Option<&WriteFence>, path: &Path) -> Result<(), RemoteError> {
+    match fence {
+        Some(fence) => fence.check(path).map_err(|e| {
+            RemoteError::Io(std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))
+        }),
+        None => Ok(()),
+    }
 }
 
 fn env_read_only() -> RemoteError {
@@ -657,6 +715,46 @@ mod tests {
         store.delete_marked(dir.path()).unwrap();
         assert_eq!(store.load().unwrap(), None);
         assert_eq!(read_marker(dir.path()), None, "a remove leaves no marker");
+    }
+
+    /// A fence over `dir`, as a packaged process runs under for AppData.
+    fn fence_over(dir: &Path) -> crystalline_core::config::WriteFence {
+        crystalline_core::config::WriteFence::new(
+            "inside a package",
+            vec![dir.to_path_buf()],
+            vec![],
+        )
+    }
+
+    /// Inside an app package a write under AppData lands in the package's
+    /// private copy, so every writer of the App store asks the write fence
+    /// first: the file, the marker, the lock and both deletes.
+    #[test]
+    fn every_app_store_write_is_refused_under_the_write_fence() {
+        let dir = tempfile::tempdir().unwrap();
+        let fence = fence_over(dir.path());
+        let store = AppStore::file_fallback(dir.path());
+        let refused = |e: RemoteError| e.to_string().contains("inside a package");
+        assert!(refused(store.save_in(&sample(), Some(&fence)).unwrap_err()));
+        assert!(refused(store.delete_in(Some(&fence)).unwrap_err()));
+        assert!(refused(
+            write_marker_in(dir.path(), "github.com", Some(&fence)).unwrap_err()
+        ));
+        assert!(refused(
+            delete_marker_in(dir.path(), Some(&fence)).unwrap_err()
+        ));
+        assert!(refused(
+            AppStoreLock::acquire_in(dir.path(), Some(&fence)).unwrap_err()
+        ));
+        let left: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert!(left.is_empty(), "the fenced writers wrote nothing");
+        // Outside the fence the same calls go through.
+        let open = fence_over(&dir.path().join("elsewhere"));
+        store.save_in(&sample(), Some(&open)).unwrap();
+        write_marker_in(dir.path(), "github.com", Some(&open)).unwrap();
+        drop(AppStoreLock::acquire_in(dir.path(), Some(&open)).unwrap());
+        delete_marker_in(dir.path(), Some(&open)).unwrap();
+        store.delete_in(Some(&open)).unwrap();
     }
 
     #[test]
