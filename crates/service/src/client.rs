@@ -371,6 +371,10 @@ fn launcher_note_from_env() -> Option<&'static str> {
     launcher_too_old(version.as_deref(), channel.as_deref()).then_some(LAUNCHER_NOTE)
 }
 
+/// How long the bridge waits for the daemon's `status` behind the split
+/// note.
+const SPLIT_NOTE_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// The split note for this session, when Claude Desktop's package keeps a
 /// second state with domains: the daemon this bridge attached to is asked
 /// (passively, a second connection) which domains it serves, so the note
@@ -381,12 +385,17 @@ async fn split_note_here() -> Option<String> {
     if !states.iter().any(|s| s.domains > 0) {
         return None;
     }
-    let registered: Option<Vec<String>> =
-        ctl_if_running_passive(serde_json::json!({ "v": 1, "cmd": "status" }))
-            .await
-            .ok()
-            .flatten()
-            .and_then(|status| serde_json::from_value(status.get("registered")?.clone()).ok());
+    // Bounded: a daemon that accepts and never answers must not hold up
+    // the session's onboarding; no answer reads as "could not be asked".
+    let registered: Option<Vec<String>> = tokio::time::timeout(
+        SPLIT_NOTE_WAIT,
+        ctl_if_running_passive(serde_json::json!({ "v": 1, "cmd": "status" })),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .flatten()
+    .and_then(|status| serde_json::from_value(status.get("registered")?.clone()).ok());
     crate::desktop_state::split_note(&states, registered.as_deref())
 }
 

@@ -929,6 +929,9 @@ fn stop_payload(harness: Option<HarnessKind>, reason: &str) -> serde_json::Value
     payload
 }
 
+/// How long a packaged Stop hook waits for the daemon to take a stamp.
+const MAINTENANCE_STAMP_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// One of the Stop hook's stamps in this machine's maintenance state.
 #[derive(Clone, Copy)]
 enum Stamp {
@@ -960,7 +963,15 @@ fn stamp_maintenance(stamp: Stamp, now: chrono::DateTime<chrono::Utc>) {
             .enable_all()
             .build()
         {
-            let _ = runtime.block_on(crystalline_service::ctl_if_running_passive(request));
+            // Bounded: a daemon that accepts and never answers must not
+            // hold the Stop hook past its budget. The stamp is then lost.
+            let _ = runtime.block_on(async {
+                tokio::time::timeout(
+                    MAINTENANCE_STAMP_WAIT,
+                    crystalline_service::ctl_if_running_passive(request),
+                )
+                .await
+            });
         }
         return;
     }

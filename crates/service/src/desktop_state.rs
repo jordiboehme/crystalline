@@ -236,12 +236,8 @@ pub fn packaged_read_line() -> Option<String> {
     else {
         return None;
     };
-    let private = std::env::var_os("LOCALAPPDATA")
-        .map(|local| {
-            private_folder_of(full_name, Path::new(&local))
-                .display()
-                .to_string()
-        })
+    let private = crystalline_core::config::local_appdata()
+        .map(|local| private_folder_of(full_name, &local).display().to_string())
         .unwrap_or_else(|| "the package's LocalCache folder".to_string());
     Some(format!(
         "This command runs inside Claude Desktop's app package ({full_name}), so what it reads from the Crystalline state folder comes from the package's private copy first ({private}). Run it in a terminal outside Claude Desktop for this machine's own view."

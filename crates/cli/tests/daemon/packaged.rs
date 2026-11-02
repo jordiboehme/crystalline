@@ -669,3 +669,63 @@ fn a_packaged_domain_add_with_an_override_and_a_sync_refuses_up_front() {
     assert!(alone.status.success(), "{}", text(&alone));
     assert!(other.is_file());
 }
+
+/// A daemon that accepts the hook's connection and never answers must not
+/// hold the Stop hook: the stamp is given up after a short wait and the
+/// hook finishes well inside its budget.
+#[cfg(unix)]
+#[test]
+fn a_packaged_stop_hook_does_not_wait_on_a_silent_daemon() {
+    let home = short_home();
+    let work = tempfile::tempdir().unwrap();
+    let config = config_path(home.path());
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(&config, "domains:\n  test:\n    path: /nonexistent/test\n").unwrap();
+    let state = crate::common::isolated_state_dir(home.path());
+    std::fs::create_dir_all(&state).unwrap();
+    // Accepts every connection and keeps it open without a word.
+    let listener = std::os::unix::net::UnixListener::bind(state.join("service.sock")).unwrap();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for stream in listener.incoming().flatten() {
+            held.push(stream);
+        }
+    });
+    let transcript = work.path().join("t.jsonl");
+    std::fs::write(&transcript, "{}\n".repeat(25)).unwrap();
+    let payload = serde_json::json!({
+        "session_id": "packaged-silent",
+        "transcript_path": transcript.display().to_string(),
+        "hook_event_name": "Stop",
+    });
+    let started = std::time::Instant::now();
+    let mut child = crystalline(home.path(), true, "missing")
+        .args(["hook", "stop"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write as _;
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(payload.to_string().as_bytes()).unwrap();
+    }
+    let deadline = started + std::time::Duration::from_secs(8);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("the Stop hook still waits on a daemon that never answers");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "took {:?}",
+        started.elapsed()
+    );
+}
