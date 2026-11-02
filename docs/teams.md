@@ -86,7 +86,7 @@ github:
   enabled: true                     # turns team domains on; absent means off
   stacks: true                      # stack each share on the open proposal where the forge supports it; absent means on
   share_identity: personal          # instance (default) shares on this machine's credential; personal shares on each person's own
-  agent_identity: share-bot         # the account whose connected identity unauthenticated HTTP agents share as in personal mode; absent refuses those shares
+  agent_identity: share-bot         # the account unauthenticated agents act as: in personal mode they share as its connected identity (absent refuses those shares), and with a GitHub App they get its GitHub reads and writes on connected domains, private ones included
   poll_secs: 300                    # background poll interval in seconds; minimum 60
   api_url: https://github.example.com/api/v3   # GitHub Enterprise Server only
   oauth_client_id: abc123                       # a self-hosted OAuth App, GitHub Enterprise Server only
@@ -177,14 +177,14 @@ On a server with a GitHub App (see [Team server with a GitHub App](deployment.md
 **Who reads.** Crystalline's own shared or private switch still says who the domain is for:
 
 - A **shared** domain is read by every signed-in account with the instance role viewer or above, linked or not, whatever its role on GitHub.
-- A **private** domain is read only by linked accounts with read access or more on the repository.
+- A **private** domain is read only by linked accounts with read access or more on the repository. That access must come from the repository's list of collaborators: the members of a GitHub Enterprise who read an internal repository without being listed there do not read a private domain connected to it.
 - An anonymous visitor reads a shared domain only when its repository is public on GitHub.
 
 **Who writes.** These rules are applied in this order:
 
 1. The machine owner and instance admins may do everything, whatever GitHub says.
 2. An account with the instance role `none` gets nothing, not even where an anonymous visitor reads.
-3. Every other account needs a GitHub link and write access or more on the repository. The instance role does not cap this: an instance viewer who has write access on GitHub writes here. An instance editor without a link, or with only read access, reads a shared domain and writes nothing.
+3. Every other account needs a GitHub link and write access or more on the repository. The instance role does not cap this: an instance viewer who has write access on GitHub writes here, in Fluid too. An instance editor without a link, or with only read access, reads a shared domain and writes nothing.
 4. The account's write list still applies: a domain it leaves out is read only.
 
 GitHub roles map like this:
@@ -200,7 +200,7 @@ A custom repository role counts as the base role GitHub reports for it: admin, w
 
 **Shares.** On such a domain, sharing, withdrawing a proposal and resolving a conflict need the same right as saving: GitHub write or more. Under the default `github.share_identity` (`instance`), the App opens each proposal, so a person who shares may also approve it on GitHub. A team whose branch protection requires the approval of another person sets `github.share_identity` to `personal`: then each proposal is opened by the person who shares.
 
-**Agents.** An agent with its own account (`auth.mcp` on) has that account's rights. The open tier (`auth.mcp` off) acts on such a domain as the account `github.agent_identity` names, with that account's GitHub role, but never more than editor: name an account that is not an instance admin. `crystalline doctor` warns when it is one. Without `github.agent_identity`, the open tier is an anonymous visitor there.
+**Agents.** An agent with its own account (`auth.mcp` on) has that account's rights. The open tier (`auth.mcp` off) acts on such a domain as the account `github.agent_identity` names, with that account's GitHub role, but never more than editor: name an account that is not an instance admin. `crystalline doctor` warns when it is one. Without `github.agent_identity`, the open tier is an anonymous visitor there. So with `github.agent_identity` set, every MCP client that reaches the instance without signing in gets that account's GitHub reads and writes on such domains, private ones included. This also holds for an `agent_identity` set earlier for sharing in personal mode, as soon as an App is added. Turn `auth.mcp` on to avoid it.
 
 **Connecting a domain asks who may read it.** Fluid's connect dialog has no answer chosen in advance. `crystalline domain add <name> --origin <owner>/<repo>` asks on a terminal and refuses without `--readers shared|private` when nobody can be asked. MCP `add_domain` with `repo` needs `readers`. A domain defined in the environment reads `CRYSTALLINE_DOMAIN_<NAME>_READERS`, and without it the domain is private. Nobody opens a confidential repository by accident. A shared connect never opens a domain that is already private: it is refused with "this domain is private; connect it as private, then change who may read on its Members card". Connecting never deletes the members of a private domain, so they are still there if the App is removed later. A domain whose readers come from the environment changes them only there.
 
@@ -212,7 +212,7 @@ With a GitHub App, a domain follows its repository, not only its name. When a do
 
 **How fresh it is.** Crystalline asks GitHub once per repository for the whole list of collaborators and whether the repository is public, and uses that answer for five minutes. A webhook from GitHub (a member added or removed, a team changed, a repository made public or private, renamed, transferred or deleted, the App installed or removed) makes it ask again at once. A change on GitHub also takes effect within seconds for the Reflection: a page that now reaches too many people is held back from the backup. Each request to GitHub may take ten seconds. A question that waits longer is answered from what is known, and the lookup goes on in the background. When GitHub cannot be reached or refuses for a while, the last answer stands for one more hour past its five minutes, and the admin banner says since when. After that GitHub grants nothing on that repository until it answers again: a shared domain is still read by everyone signed in, a private one only by the admins. Unlinking or disabling an account takes effect on the next request, since names and links are never cached.
 
-**The Reflection** follows GitHub too, on its own axis: a GitHub writer curates, a GitHub reader reads and comments, and per-domain Reflection collaborators work there as on any domain. See [Who may do what](reflection.md#who-may-do-what).
+**The Reflection** follows GitHub too, on its own axis: a GitHub writer curates, a GitHub reader reads and comments, and per-domain Reflection collaborators work there as on any domain. See [Who may do what](reflection.md#who-may-do-what). Threads are backed up to the repository's `crystalline/reflections` branch like pages, without a source check, so a thread on a page reaches every reader of that repository.
 
 ### Private domains
 

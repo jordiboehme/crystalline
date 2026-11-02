@@ -89,7 +89,7 @@ The queue notices when an engram of another domain changes, is retired or is gon
 
 #### What an unattended run may read
 
-The rule sees only the sources a write names, and a thread answer or a sentence written without sources names none. So the guard against a confused deputy sits on what an unattended agent may read. Anyone who may comment on a shared page can ask a question in a thread; an agent that runs on its own and could read a private domain would answer it from there into a page everyone reads, and no check on the answer could catch that.
+The rule sees only the sources a write names, and a thread answer or a sentence written without sources names none. Threads go to the `crystalline/reflections` backup branch with their page, without a source check of their own, so a thread on a page reaches every reader of that page's repository. So the guard against a confused deputy sits on what an unattended agent may read. Anyone who may comment on a shared page can ask a question in a thread; an agent that runs on its own and could read a private domain would answer it from there into a page everyone reads, and no check on the answer could catch that.
 
 So while a session is unattended, every read (search, `read_engram`, `build_context`, `browse_domain`, `recent_activity`, `list_domains`, the sources a page names, attachments, and the Reflection of other domains) answers as if the domains it may not carry onto its pages did not exist. A session is unattended when:
 
