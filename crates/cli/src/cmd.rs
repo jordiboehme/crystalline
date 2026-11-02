@@ -467,7 +467,8 @@ pub(crate) async fn register_through_daemon(
 ) -> Result<crystalline_service::registration::Registered> {
     let request = register_request(kind, name, path)?;
     let data = crystalline_service::ctl_routed(request)
-        .await?
+        .await
+        .map_err(|e| crystalline_service::client::older_daemon_words(e, "domain_register"))?
         .ok_or_else(|| anyhow!("no Crystalline daemon answered the registration"))?;
     let done: crystalline_service::registration::Registered = serde_json::from_value(data)
         .map_err(|e| anyhow!("could not read the daemon's registration answer: {e}"))?;

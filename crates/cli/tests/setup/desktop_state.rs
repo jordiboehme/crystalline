@@ -81,37 +81,49 @@ fn status_names_a_split_state_in_one_line() {
 
 /// A private folder that is only another name for the real state folder
 /// (its config is the real one, hard linked: the same file ID the 0.22.1
-/// report showed) is no split. Doctor reports nothing and the merge leaves
-/// the folder alone.
+/// report showed) is no split: doctor reports nothing. A folder with a
+/// config of its own that shares the real index is reported, and the merge
+/// still leaves it alone, so the real file never loses its other name.
 #[test]
 fn a_private_folder_that_is_a_view_of_the_real_one_is_neither_reported_nor_merged() {
     let home = tempfile::tempdir().unwrap();
     let real = crate::common::isolated_state_dir(home.path());
     std::fs::create_dir_all(&real).unwrap();
-    std::fs::write(real.join("index.db"), vec![0u8; 4096]).unwrap();
+    let real_config = real_config_path(home.path());
+    std::fs::create_dir_all(real_config.parent().unwrap()).unwrap();
+    std::fs::write(&real_config, "domains: {}\n").unwrap();
     let folder = private_folder(home.path());
     std::fs::create_dir_all(&folder).unwrap();
-    std::fs::hard_link(real.join("index.db"), folder.join("index.db")).unwrap();
+    // The view: on unix the config lives apart from the state folder, so
+    // the state folder's own config.yaml is the one compared.
+    std::fs::write(real.join("config.yaml"), "domains: {}\n").unwrap();
+    std::fs::hard_link(real.join("config.yaml"), folder.join("config.yaml")).unwrap();
     let report: Value =
         serde_json::from_slice(&run(home.path(), &["doctor", "--json"]).stdout).unwrap();
     assert_eq!(report["desktop_states"], serde_json::json!([]), "{report}");
-    let merged = run(
-        home.path(),
-        &["doctor", "--fix", "--merge-desktop-state", "--json"],
-    );
-    assert!(
-        folder.join("index.db").exists(),
-        "{}",
-        String::from_utf8_lossy(&merged.stderr)
-    );
-    std::fs::remove_file(folder.join("index.db")).unwrap();
-    std::fs::write(folder.join("index.db"), vec![0u8; 4096]).unwrap();
+
+    // A config of its own, the real index shared.
+    std::fs::remove_file(folder.join("config.yaml")).unwrap();
+    std::fs::write(folder.join("config.yaml"), "domains: {}\n").unwrap();
+    std::fs::write(real.join("index.db"), vec![0u8; 4096]).unwrap();
+    std::fs::hard_link(real.join("index.db"), folder.join("index.db")).unwrap();
     let report: Value =
         serde_json::from_slice(&run(home.path(), &["doctor", "--json"]).stdout).unwrap();
     assert_eq!(
         report["desktop_states"].as_array().map(Vec::len),
         Some(1),
-        "a separate file is reported: {report}"
+        "{report}"
+    );
+    let merged = run(home.path(), &["doctor", "--fix", "--merge-desktop-state"]);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&merged.stdout),
+        String::from_utf8_lossy(&merged.stderr)
+    );
+    assert!(folder.join("index.db").exists(), "{said}");
+    assert!(
+        said.contains("shares files with this machine's own state folder"),
+        "{said}"
     );
 }
 

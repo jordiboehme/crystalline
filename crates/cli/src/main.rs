@@ -2374,7 +2374,8 @@ fn run() -> anyhow::Result<()> {
 /// The terminal setup step `command` is, when it is one that a process
 /// inside an app package must not run: each writes Crystalline's state on
 /// this machine itself (`sources.json`, `installs.json`, the rename
-/// journal, a repaired config) and no daemon does it for it. The merge of
+/// journal, a repaired config, the accounts database, the kept folder, the
+/// model cache) and no daemon does it for it. The merge of
 /// Claude Desktop's state keeps its own, older refusal in `doctor`.
 fn packaged_setup_step(command: &Command) -> Option<&'static str> {
     match command {
@@ -2385,6 +2386,13 @@ fn packaged_setup_step(command: &Command) -> Option<&'static str> {
         Command::DaemonTask {
             action: DaemonTaskAction::Register { .. },
         } => Some("daemon-task register"),
+        Command::Users { .. } => Some("users"),
+        Command::Kept {
+            command: KeptCommand::Drop { .. },
+        } => Some("kept drop"),
+        Command::Model {
+            command: ModelCommand::Download { .. },
+        } => Some("model download"),
         Command::Doctor {
             merge_desktop_state: false,
             discard_rename: true,
@@ -4872,6 +4880,17 @@ async fn domain_add_dispatch(
     if branch.is_some() {
         anyhow::bail!("`domain add --branch` requires --origin");
     }
+    // Inside an app package an override keeps the registration local, and
+    // the sync after it would need a local engine, which is never opened
+    // there: refused before anything is registered.
+    if crystalline_service::runs_in::PackageContext::here().is_packaged()
+        && !crystalline_service::use_daemon(db.as_deref(), config.as_deref())
+        && !no_sync
+    {
+        anyhow::bail!(
+            "inside Claude Desktop's app package `domain add` with --config or --db can only register the domain, not index it. Add --no-sync, or run the command in a terminal outside Claude Desktop"
+        );
+    }
 
     if is_virtual {
         if path.is_some() {
@@ -5652,10 +5671,12 @@ fn run_prompt(
 }
 
 /// The line a routing block read inside Claude Desktop's app package
-/// carries when no daemon answered: it comes from the package's private
+/// carries when the daemon gave no configuration (none answered, or an
+/// older one that does not know `routing_config`): it comes from the
+/// package's private
 /// copy of the configuration, which can list domains the daemon does not
 /// serve.
-const PACKAGED_PROMPT_NOTE: &str = "Note: this session runs inside Claude Desktop's app package and no Crystalline daemon answered, so this routing block was read from Claude Desktop's private copy of the configuration. It can list domains the daemon does not serve; `crystalline status` in a terminal outside Claude Desktop shows the daemon's view.";
+const PACKAGED_PROMPT_NOTE: &str = "Note: this session runs inside Claude Desktop's app package, and the Crystalline daemon did not give its configuration, so this routing block was read from Claude Desktop's private copy of the configuration. It can list domains the daemon does not serve; `crystalline status` in a terminal outside Claude Desktop shows the daemon's view.";
 
 /// How long `prompt system` inside a package waits for the daemon the task
 /// starts: the SessionStart hook runs under a ten second limit, and a

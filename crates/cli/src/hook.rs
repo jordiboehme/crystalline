@@ -778,7 +778,7 @@ pub fn run_stop(harness: Option<&str>) {
     let now = chrono::Utc::now();
     let mut maintenance_state = maintenance::load();
     if maintenance_state.first_seen.is_none() {
-        maintenance::record_first_seen(now);
+        stamp_maintenance(Stamp::FirstSeen, now);
         // Mirrored into the copy this call decides from, so the seeding and the
         // decision agree without re-reading the file.
         maintenance_state.first_seen = Some(now);
@@ -817,7 +817,7 @@ pub fn run_stop(harness: Option<&str>) {
     // one. The write goes through the same serialized, atomic writer the daemon
     // uses, and a failure is silent like every other bail.
     if evolve.is_some() {
-        maintenance::record_nudge(now);
+        stamp_maintenance(Stamp::Nudge, now);
     }
 
     // The second ride-along, and the same rule: only a call that already earned
@@ -868,7 +868,7 @@ pub fn run_stop(harness: Option<&str>) {
         _ => None,
     };
     if reflect.is_some() {
-        maintenance::record_reflect_nudge(now);
+        stamp_maintenance(Stamp::ReflectNudge, now);
     }
 
     sweep_stale_state();
@@ -927,6 +927,48 @@ fn stop_payload(harness: Option<HarnessKind>, reason: &str) -> serde_json::Value
         payload["systemMessage"] = serde_json::json!(STOP_SYSTEM_MESSAGE);
     }
     payload
+}
+
+/// One of the Stop hook's stamps in this machine's maintenance state.
+#[derive(Clone, Copy)]
+enum Stamp {
+    FirstSeen,
+    Nudge,
+    ReflectNudge,
+}
+
+/// Stamp `stamp` at `now` in this machine's maintenance state. That file is
+/// the daemon's, machine wide: inside Claude Desktop's app package a write
+/// here would create a private copy that shadows it, so there the stamp
+/// goes to a daemon that already runs (a passive attach, the hook's budget
+/// allows no start) and is dropped when none answers. Best effort either
+/// way, like every recorder.
+fn stamp_maintenance(stamp: Stamp, now: chrono::DateTime<chrono::Utc>) {
+    if crystalline_service::runs_in::PackageContext::here().is_packaged() {
+        let name = match stamp {
+            Stamp::FirstSeen => "first_seen",
+            Stamp::Nudge => "nudge",
+            Stamp::ReflectNudge => "reflect_nudge",
+        };
+        let request = serde_json::json!({
+            "v": 1,
+            "cmd": "maintenance_stamp",
+            "stamp": name,
+            "at": now.to_rfc3339(),
+        });
+        if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            let _ = runtime.block_on(crystalline_service::ctl_if_running_passive(request));
+        }
+        return;
+    }
+    match stamp {
+        Stamp::FirstSeen => maintenance::record_first_seen(now),
+        Stamp::Nudge => maintenance::record_nudge(now),
+        Stamp::ReflectNudge => maintenance::record_reflect_nudge(now),
+    }
 }
 
 /// The state file path for a session, `<state_dir>/hooks/<session_id>.json`.

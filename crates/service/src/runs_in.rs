@@ -228,7 +228,7 @@ pub const TEST_PACKAGE_ENV: &str = "CRYSTALLINE_TEST_PACKAGE";
 pub const PACKAGED_WRITE_REASON: &str = "this command runs inside Claude Desktop's app package, where Windows keeps every new file under AppData in the package's private copy, which the Crystalline daemon never sees. Run the command in a terminal outside Claude Desktop";
 
 /// Why `crystalline serve` does not run inside an app package.
-pub const PACKAGED_SERVE_REFUSAL: &str = "crystalline serve does not run inside Claude Desktop's app package: the daemon would keep its state in the package's private copy, apart from every process outside it. Start the daemon from a terminal outside Claude Desktop, or let the Windows task \\Crystalline\\Daemon start it";
+pub const PACKAGED_SERVE_REFUSAL: &str = "crystalline serve does not run inside Claude Desktop's app package: the daemon would keep its state in the package's private copy, apart from every process outside it. Start the daemon from a terminal outside Claude Desktop, or let the Crystalline sign-in task start it (crystalline doctor names it)";
 
 /// The refusal of a terminal setup step (`connect`, `install`, `doctor
 /// --fix` and the like) inside an app package: each writes Crystalline's

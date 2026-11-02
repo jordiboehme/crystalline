@@ -22,12 +22,19 @@ use std::sync::OnceLock;
 /// and cheap to lose.
 pub const HOOKS_DIR: &str = "hooks";
 
+/// The one file in [`HOOKS_DIR`] that is no per-session hook file: the
+/// daemon's machine-wide maintenance state. A packaged writer would create
+/// a private copy that shadows it, so it stays fenced.
+pub const MAINTENANCE_FILE: &str = "maintenance.json";
+
 /// Where a process may not write, and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriteFence {
     reason: String,
     roots: Vec<PathBuf>,
     exempt: Vec<PathBuf>,
+    /// Files inside an exempt folder that stay fenced all the same.
+    still_fenced: Vec<PathBuf>,
 }
 
 impl WriteFence {
@@ -38,7 +45,14 @@ impl WriteFence {
             reason: reason.into(),
             roots,
             exempt,
+            still_fenced: Vec::new(),
         }
+    }
+
+    /// This fence, with `files` inside an exempt folder fenced all the same.
+    pub fn still_fencing(mut self, files: Vec<PathBuf>) -> Self {
+        self.still_fenced = files;
+        self
     }
 
     /// The sentence a refused write carries.
@@ -47,12 +61,14 @@ impl WriteFence {
     }
 
     /// Whether a write to `path` is refused: it lies under one of the roots
-    /// and under none of the exempt folders. A relative path is read against
-    /// the current directory first.
+    /// and under none of the exempt folders, or it is one of the files
+    /// fenced all the same. A relative path is read against the current
+    /// directory first.
     pub fn refuses(&self, path: &Path) -> bool {
         let path = absolute(path);
         let under = |root: &PathBuf| within(&path, &absolute(root));
-        self.roots.iter().any(under) && !self.exempt.iter().any(under)
+        self.roots.iter().any(under)
+            && (!self.exempt.iter().any(under) || self.still_fenced.iter().any(under))
     }
 
     /// `Ok` when a write to `path` may go ahead, else the refusal.
@@ -74,15 +90,17 @@ static FENCE: OnceLock<WriteFence> = OnceLock::new();
 /// read now: the roaming and local AppData folders, and this machine's
 /// config and state folders on every OS, so a test that makes a process
 /// packaged through the debug seam sees the same refusal on macOS and
-/// Linux. `<state_dir>/hooks` stays writable. Only the first call counts.
+/// Linux. The per-session files in `<state_dir>/hooks` stay writable, the
+/// machine-wide [`MAINTENANCE_FILE`] there does not. Only the first call
+/// counts.
 pub fn refuse_appdata_writes(reason: impl Into<String>) {
     let mut roots = appdata_roots();
     roots.extend(super::config_dir().ok());
     roots.extend(super::state_dir().ok());
-    let exempt = super::state_dir()
-        .map(|dir| vec![dir.join(HOOKS_DIR)])
-        .unwrap_or_default();
-    let _ = FENCE.set(WriteFence::new(reason, roots, exempt));
+    let hooks = super::state_dir().ok().map(|dir| dir.join(HOOKS_DIR));
+    let exempt: Vec<PathBuf> = hooks.iter().cloned().collect();
+    let still: Vec<PathBuf> = hooks.iter().map(|h| h.join(MAINTENANCE_FILE)).collect();
+    let _ = FENCE.set(WriteFence::new(reason, roots, exempt).still_fencing(still));
 }
 
 /// The fence this process runs under, `None` for an ordinary process.
@@ -111,8 +129,8 @@ pub(crate) fn check_io(fence: Option<&WriteFence>, path: &Path) -> std::io::Resu
 
 /// The real roaming and local AppData folders, read the way
 /// [`super::config_dir`] reads them: the `APPDATA` value unless it names a
-/// package's private store, then the known folder, and `LOCALAPPDATA` as it
-/// is. Empty on every other OS.
+/// package's private store, then the known folder, and the same for
+/// `LOCALAPPDATA` ([`super::local_appdata`]). Empty on every other OS.
 fn appdata_roots() -> Vec<PathBuf> {
     #[cfg(windows)]
     {
@@ -121,11 +139,7 @@ fn appdata_roots() -> Vec<PathBuf> {
             std::env::var_os("APPDATA").as_deref(),
             super::known_roaming_folder,
         ));
-        roots.extend(
-            std::env::var_os("LOCALAPPDATA")
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from),
-        );
+        roots.extend(super::local_appdata());
         roots
     }
     #[cfg(not(windows))]
@@ -218,6 +232,20 @@ mod tests {
         assert!(!f.refuses(Path::new("/home/a/roaming/crystalline/hooks/session.json")));
         assert!(f.refuses(Path::new("/home/a/roaming/crystalline/hooks.json")));
         assert!(f.refuses(Path::new("/home/a/roaming/crystalline/config.yaml")));
+    }
+
+    #[test]
+    fn the_maintenance_file_in_the_hooks_folder_stays_fenced() {
+        let f = fence_over(&["/home/a/roaming"], &["/home/a/roaming/crystalline/hooks"])
+            .still_fencing(vec![PathBuf::from(
+                "/home/a/roaming/crystalline/hooks/maintenance.json",
+            )]);
+        assert!(f.refuses(Path::new(
+            "/home/a/roaming/crystalline/hooks/maintenance.json"
+        )));
+        assert!(!f.refuses(Path::new(
+            "/home/a/roaming/crystalline/hooks/session-1.json"
+        )));
     }
 
     #[test]

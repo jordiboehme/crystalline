@@ -458,6 +458,17 @@ pub async fn merge_into(
             state.folder.display()
         );
     }
+    // A folder that shares a state file with this machine's own (the same
+    // index or record under two names) is never merged or renamed: the
+    // rename would take the real file's other name with it.
+    if let Ok(real) = crystalline_core::config::state_dir()
+        && crystalline_service::desktop_state::shares_a_file(&state.folder, &real)
+    {
+        anyhow::bail!(
+            "{} shares files with this machine's own state folder, so it is not merged or renamed",
+            state.folder.display()
+        );
+    }
     let private_config = state.folder.join("config.yaml");
     let private: GlobalConfig = if private_config.is_file() {
         crystalline_core::config::load_yaml(&private_config)?

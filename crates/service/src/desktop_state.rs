@@ -49,16 +49,14 @@ impl DesktopState {
 }
 
 /// The state files a private folder and the real one can share: when one
-/// of them is the same file on both sides, the private folder is only a
-/// view of the real one.
-const STATE_FILES: [&str; 3] = ["config.yaml", "index.db", "service.json"];
+/// of them is the same file on both sides, the merge leaves the folder
+/// alone ([`shares_a_file`]).
+pub const STATE_FILES: [&str; 3] = ["config.yaml", "index.db", "service.json"];
 
 /// Every private state folder under `local_appdata` that holds state (a
-/// `config.yaml` or an `index.db`), sorted by path. With `real` set, a folder that is only
-/// a view of the real state folder (one of its state files is the same
-/// file, by volume and file index on Windows, device and inode elsewhere)
-/// is left out: nothing is split there, and a merge would rename the real
-/// files' only other name.
+/// `config.yaml` or an `index.db`), sorted by path. With `real` set, a
+/// folder that is only a view of the real state folder ([`is_view_of`]) is
+/// left out: nothing is split there.
 pub fn scan(local_appdata: Option<&Path>, real: Option<&Path>) -> Vec<DesktopState> {
     let Some(root) = local_appdata else {
         return Vec::new();
@@ -84,15 +82,30 @@ pub fn scan(local_appdata: Option<&Path>, real: Option<&Path>) -> Vec<DesktopSta
 }
 
 /// Whether the private `folder` is only another name for the real state
-/// folder `real`: one of `config.yaml`, `index.db` and `service.json` exists on both sides and is the
-/// same file.
+/// folder `real`: the folder itself is the real one, or its `config.yaml`
+/// is the real `config.yaml` (by volume and file index on Windows, device
+/// and inode elsewhere). The config decides, because it is what a reader
+/// of the routing block sees.
 pub fn is_view_of(folder: &Path, real: &Path) -> bool {
-    STATE_FILES.iter().any(|name| {
-        let (private, own) = (folder.join(name), real.join(name));
-        private.is_file()
-            && own.is_file()
-            && same_file::is_same_file(&private, &own).unwrap_or(false)
-    })
+    if same_file::is_same_file(folder, real).unwrap_or(false) {
+        return true;
+    }
+    let (private, own) = (folder.join("config.yaml"), real.join("config.yaml"));
+    private.is_file() && own.is_file() && same_file::is_same_file(&private, &own).unwrap_or(false)
+}
+
+/// Whether the private `folder` and the real state folder `real` share any
+/// state file (one of [`STATE_FILES`] is the same file on both sides). The
+/// guard of the merge: a folder that shares a file with the real one is
+/// never merged or renamed, even when its config is its own.
+pub fn shares_a_file(folder: &Path, real: &Path) -> bool {
+    is_view_of(folder, real)
+        || STATE_FILES.iter().any(|name| {
+            let (private, own) = (folder.join(name), real.join(name));
+            private.is_file()
+                && own.is_file()
+                && same_file::is_same_file(&private, &own).unwrap_or(false)
+        })
 }
 
 /// Whether `folder` holds Crystalline state: a `config.yaml` or an
@@ -112,9 +125,7 @@ pub fn scan_here() -> Vec<DesktopState> {
         .then(|| crystalline_core::config::state_dir().ok())
         .flatten();
     scan(
-        std::env::var_os("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .as_deref(),
+        crystalline_core::config::local_appdata().as_deref(),
         real.as_deref(),
     )
 }
@@ -160,15 +171,42 @@ fn describe(folder: &Path) -> DesktopState {
 /// The line the MCP bridge adds to a session's onboarding instructions when
 /// Claude Desktop's package keeps a second state that registers domains:
 /// the person is in the chat, not in a terminal, and that state is why the
-/// routing block and the searches can disagree. `None` without one.
-pub fn split_note(states: &[DesktopState]) -> Option<String> {
+/// routing block and the searches can disagree. With `registered` (the
+/// daemon's `registered` list) the note names the private domains the
+/// daemon does not serve, and there is none when it serves them all;
+/// without it (the daemon could not be asked) it says what may be wrong.
+/// `None` without a state that registers domains.
+pub fn split_note(states: &[DesktopState], registered: Option<&[String]>) -> Option<String> {
     let state = states.iter().find(|s| s.domains > 0)?;
-    Some(format!(
-        "Claude Desktop keeps a second Crystalline state in its app package ({}, {} domain{}), apart from the one the Crystalline daemon serves, so a routing block read inside Claude Desktop can list domains the searches do not find. Ask the user to quit Claude Desktop and run `crystalline doctor --fix --merge-desktop-state` in a terminal, which merges it into the daemon's state.",
-        state.folder.display(),
-        state.domains,
-        if state.domains == 1 { "" } else { "s" }
-    ))
+    let ask = "Ask the user to quit Claude Desktop and run `crystalline doctor --fix --merge-desktop-state` in a terminal, which merges it into the daemon's state.";
+    match registered {
+        Some(registered) => {
+            let unserved: Vec<&str> = states
+                .iter()
+                .flat_map(|s| s.domain_names.iter())
+                .filter(|name| !registered.contains(name))
+                .map(String::as_str)
+                .collect();
+            if unserved.is_empty() {
+                return None;
+            }
+            Some(format!(
+                "Claude Desktop keeps a second Crystalline state in its app package ({}), and it registers {} domain{} the Crystalline daemon does not serve ({}), so a routing block read inside Claude Desktop can list {} while the searches do not find {}. {ask}",
+                state.folder.display(),
+                unserved.len(),
+                if unserved.len() == 1 { "" } else { "s" },
+                unserved.join(", "),
+                if unserved.len() == 1 { "it" } else { "them" },
+                if unserved.len() == 1 { "it" } else { "them" },
+            ))
+        }
+        None => Some(format!(
+            "Claude Desktop keeps a second Crystalline state in its app package ({}, {} domain{}). It may register domains the Crystalline daemon does not serve: if the searches miss a domain the routing block lists, that is why. {ask}",
+            state.folder.display(),
+            state.domains,
+            if state.domains == 1 { "" } else { "s" }
+        )),
+    }
 }
 
 /// The private state folder of the package `full_name` (a package full
@@ -286,15 +324,55 @@ mod tests {
     fn the_split_note_needs_a_state_with_domains() {
         let local = tempfile::tempdir().unwrap();
         plant(local.path(), "Claude_x", "domains: {}\n");
-        assert!(split_note(&scan(Some(local.path()), None)).is_none());
+        assert!(split_note(&scan(Some(local.path()), None), None).is_none());
         plant(
             local.path(),
             "Claude_y",
             "domains:\n  notes:\n    path: /n\n",
         );
-        let note = split_note(&scan(Some(local.path()), None)).unwrap();
+        let note = split_note(&scan(Some(local.path()), None), None).unwrap();
         assert!(note.contains("1 domain)"), "{note}");
+        assert!(note.contains("It may register"), "{note}");
         assert!(note.contains("--merge-desktop-state"), "{note}");
+    }
+
+    #[test]
+    fn the_split_note_names_only_what_the_daemon_does_not_serve() {
+        let local = tempfile::tempdir().unwrap();
+        plant(
+            local.path(),
+            "Claude_y",
+            "domains:\n  notes:\n    path: /n\n  work:\n    path: /w\n",
+        );
+        let states = scan(Some(local.path()), None);
+        let note = split_note(&states, Some(&["work".to_string()])).unwrap();
+        assert!(
+            note.contains("1 domain the Crystalline daemon does not serve (notes)"),
+            "{note}"
+        );
+        assert!(
+            split_note(&states, Some(&["notes".to_string(), "work".to_string()])).is_none(),
+            "nothing to say when the daemon serves them all"
+        );
+    }
+
+    /// A private folder whose config is its own but whose index is the real
+    /// one is reported, and the merge guard still sees the shared file.
+    #[test]
+    fn a_shared_index_alone_is_no_view_but_guards_the_merge() {
+        let local = tempfile::tempdir().unwrap();
+        let real = tempfile::tempdir().unwrap();
+        std::fs::write(real.path().join("index.db"), [0u8; 8]).unwrap();
+        std::fs::write(real.path().join("config.yaml"), "domains: {}\n").unwrap();
+        let folder = plant(
+            local.path(),
+            "Claude_z",
+            "domains:\n  notes:\n    path: /n\n",
+        );
+        std::fs::hard_link(real.path().join("index.db"), folder.join("index.db")).unwrap();
+        assert!(!is_view_of(&folder, real.path()));
+        assert!(shares_a_file(&folder, real.path()));
+        assert_eq!(scan(Some(local.path()), Some(real.path())).len(), 1);
     }
 
     #[test]

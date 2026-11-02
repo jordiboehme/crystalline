@@ -371,6 +371,37 @@ fn launcher_note_from_env() -> Option<&'static str> {
     launcher_too_old(version.as_deref(), channel.as_deref()).then_some(LAUNCHER_NOTE)
 }
 
+/// The split note for this session, when Claude Desktop's package keeps a
+/// second state with domains: the daemon this bridge attached to is asked
+/// (passively, a second connection) which domains it serves, so the note
+/// names only the private ones it does not. When it cannot be asked the
+/// note says what may be wrong.
+async fn split_note_here() -> Option<String> {
+    let states = crate::desktop_state::scan_here();
+    if !states.iter().any(|s| s.domains > 0) {
+        return None;
+    }
+    let registered: Option<Vec<String>> =
+        ctl_if_running_passive(serde_json::json!({ "v": 1, "cmd": "status" }))
+            .await
+            .ok()
+            .flatten()
+            .and_then(|status| serde_json::from_value(status.get("registered")?.clone()).ok());
+    crate::desktop_state::split_note(&states, registered.as_deref())
+}
+
+/// What a command says when the daemon it reached is older than the
+/// command and does not know `cmd`: an "unknown ctl command" answer turned
+/// into a plain sentence. Any other error is kept as it is.
+pub fn older_daemon_words(error: anyhow::Error, cmd: &str) -> anyhow::Error {
+    if format!("{error:#}").contains(&format!("unknown ctl command '{cmd}'")) {
+        return anyhow::anyhow!(
+            "the running Crystalline daemon is older than this command and cannot do this yet. Restart it from a terminal outside Claude Desktop: crystalline ctl shutdown, then crystalline status"
+        );
+    }
+    error
+}
+
 /// The note this bridge adds to the session's onboarding instructions: the
 /// launcher note and, when Claude Desktop's app package keeps a second
 /// state that registers domains, the split note
@@ -666,10 +697,7 @@ where
     R: AsyncRead + Unpin,
 {
     let mut relay = RelayState {
-        launcher_note: onboarding_note(
-            launcher_note_from_env(),
-            crate::desktop_state::split_note(&crate::desktop_state::scan_here()),
-        ),
+        launcher_note: onboarding_note(launcher_note_from_env(), split_note_here().await),
         ..RelayState::default()
     };
     let mut stdout = tokio::io::stdout();
@@ -2452,6 +2480,11 @@ pub async fn virtual_routing_bullets(
         && let Ok(map) = serde_json::from_value(data)
     {
         return split_routing_answer(map);
+    }
+    // Inside an app package the index is never opened here (see
+    // `ctl_routed`): the routing block goes out without these bullets.
+    if crate::runs_in::PackageContext::here().is_packaged() {
+        return VirtualRouting::default();
     }
     let db_path = match resolve_db(db) {
         Ok(p) => p,

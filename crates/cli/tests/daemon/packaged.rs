@@ -401,6 +401,9 @@ fn setup_steps_refuse_inside_a_package() {
         &["daemon-task", "register"][..],
         &["doctor", "--fix"][..],
         &["doctor", "--discard-rename"][..],
+        &["users", "list"][..],
+        &["kept", "drop", "k1", "--yes"][..],
+        &["model", "download"][..],
     ] {
         let home = short_home();
         let before = snapshot_state(home.path());
@@ -530,14 +533,14 @@ fn a_packaged_routing_block_comes_from_the_daemon_or_says_it_does_not() {
     let alone_text = String::from_utf8_lossy(&alone.stdout);
     assert!(alone_text.contains("kb"), "{alone_text}");
     assert!(
-        alone_text.contains("no Crystalline daemon answered"),
+        alone_text.contains("did not give its configuration"),
         "{alone_text}"
     );
     assert!(served.status.success(), "{}", text(&served));
     let served_text = String::from_utf8_lossy(&served.stdout);
     assert!(served_text.contains("kb"), "{served_text}");
     assert!(
-        !served_text.contains("no Crystalline daemon answered"),
+        !served_text.contains("did not give its configuration"),
         "{served_text}"
     );
 }
@@ -582,4 +585,87 @@ fn a_packaged_doctor_without_a_daemon_still_reports() {
     assert!(!stderr.contains("Error:"), "{}", text(&out));
     assert!(stdout.contains("inside Claude Desktop:"), "{}", text(&out));
     assert_eq!(before, snapshot_state(home.path()));
+}
+
+/// The daemon's machine-wide `hooks/maintenance.json` is not a per-session
+/// hook file: a packaged Stop hook would create a private copy that shadows
+/// it. So the hook leaves it as it is (the stamps go to the daemon when one
+/// answers), while its own session file is still kept.
+#[test]
+fn a_packaged_stop_hook_leaves_the_maintenance_file_alone() {
+    let home = short_home();
+    let work = tempfile::tempdir().unwrap();
+    let config = config_path(home.path());
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(&config, "domains:\n  test:\n    path: /nonexistent/test\n").unwrap();
+    let hooks = crate::common::isolated_state_dir(home.path()).join("hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    let maintenance = hooks.join("maintenance.json");
+    std::fs::write(&maintenance, b"{\"v\":1}").unwrap();
+    let before = std::fs::read(&maintenance).unwrap();
+    let transcript = work.path().join("t.jsonl");
+    std::fs::write(&transcript, "{}\n".repeat(25)).unwrap();
+    let payload = serde_json::json!({
+        "session_id": "packaged-maintenance",
+        "transcript_path": transcript.display().to_string(),
+        "hook_event_name": "Stop",
+    });
+    let mut child = crystalline(home.path(), true, "missing")
+        .args(["hook", "stop"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write as _;
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(payload.to_string().as_bytes()).unwrap();
+    }
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        hooks.join("packaged-maintenance.json").is_file(),
+        "{}",
+        text(&out)
+    );
+    assert_eq!(
+        std::fs::read(&maintenance).unwrap(),
+        before,
+        "the maintenance file is untouched"
+    );
+}
+
+/// `domain add` with a `--config` outside AppData inside a package would
+/// register and then fail its sync (no local engine): refused up front,
+/// unless `--no-sync` asks for the registration alone.
+#[test]
+fn a_packaged_domain_add_with_an_override_and_a_sync_refuses_up_front() {
+    let home = short_home();
+    let work = tempfile::tempdir().unwrap();
+    let dir = domain_folder(work.path(), "kb");
+    let other = work.path().join("other.yaml");
+    let out = crystalline(home.path(), true, "missing")
+        .args(["domain", "add", "kb", "--path"])
+        .arg(&dir)
+        .arg("--config")
+        .arg(&other)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--no-sync"),
+        "{}",
+        text(&out)
+    );
+    assert!(!other.exists(), "nothing was registered");
+    let alone = crystalline(home.path(), true, "missing")
+        .args(["domain", "add", "kb", "--no-sync", "--path"])
+        .arg(&dir)
+        .arg("--config")
+        .arg(&other)
+        .output()
+        .unwrap();
+    assert!(alone.status.success(), "{}", text(&alone));
+    assert!(other.is_file());
 }

@@ -227,6 +227,10 @@ fn a_packaged_bridge_names_a_split_state_in_the_instructions() {
         instructions.contains("--merge-desktop-state"),
         "{instructions}"
     );
+    assert!(
+        instructions.contains("1 domain the Crystalline daemon does not serve (notes)"),
+        "{instructions}"
+    );
 }
 
 #[test]

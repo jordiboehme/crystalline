@@ -8,7 +8,7 @@
 //! sessions, holder, tool, configure, domain_rename, origin_add,
 //! origin_update, origin_status,
 //! origin_share, origin_withdraw, origin_changes, origin_discard, origin_resolve,
-//! provision, domain_register, routing_config, forget_domain,
+//! provision, domain_register, routing_config, maintenance_stamp, forget_domain,
 //! forget_credential, sources_reload, mounted_routing, shutdown. This is the
 //! operator channel plus the `tool` command, which
 //! dispatches a daemon-attached CLI data verb to the shared engine and
@@ -831,10 +831,31 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
             }
         }
         "shutdown" => (envelope_ok(json!({ "stopping": true })), true),
-        // Best-effort: `domain remove` calls this so a live daemon stops
-        // watching the removed path right away instead of on its next
-        // restart. Index rows are never touched here, only the watcher and
-        // the engine's discovered-domain cache.
+        // The Stop hook's stamps in this machine's maintenance state, for a
+        // hook inside Claude Desktop's app package: the file is the daemon's
+        // and a packaged write would create a private copy that shadows it.
+        "maintenance_stamp" => {
+            let at = req
+                .get("at")
+                .and_then(Value::as_str)
+                .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                .map(|t| t.with_timezone(&chrono::Utc))
+                .unwrap_or_else(chrono::Utc::now);
+            match req.get("stamp").and_then(Value::as_str).unwrap_or("") {
+                "first_seen" => crate::maintenance::record_first_seen(at),
+                "nudge" => crate::maintenance::record_nudge(at),
+                "reflect_nudge" => crate::maintenance::record_reflect_nudge(at),
+                other => {
+                    return (
+                        envelope_err(format!(
+                            "unknown maintenance stamp '{other}'; expected first_seen, nudge or reflect_nudge"
+                        )),
+                        false,
+                    );
+                }
+            }
+            (envelope_ok(json!({ "stamped": true })), false)
+        }
         // The configuration `prompt system` builds its routing block from,
         // for a CLI inside Claude Desktop's app package: its own read of the
         // config file can open the package's private copy (issue 153).
@@ -867,6 +888,17 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                 .get("path")
                 .and_then(Value::as_str)
                 .map(std::path::PathBuf::from);
+            // The daemon works in a folder of its own, so a relative path
+            // would name another place here than where the client stood.
+            if let Some(relative) = path.as_ref().filter(|p| p.is_relative()) {
+                return (
+                    envelope_err(format!(
+                        "domain_register needs an absolute folder, and {} is relative",
+                        relative.display()
+                    )),
+                    false,
+                );
+            }
             let _admin = shared.engine.domain_admin().await;
             let config = shared
                 .engine
@@ -907,6 +939,10 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                 Err(e) => (envelope_err(format!("{e:#}")), false),
             }
         }
+        // Best-effort: `domain remove` calls this so a live daemon stops
+        // watching the removed path right away instead of on its next
+        // restart. Index rows are never touched here, only the watcher and
+        // the engine's discovered-domain cache.
         "forget_domain" => {
             let domain = req.get("domain").and_then(Value::as_str).unwrap_or("");
             shared.engine.forget_domain(domain);
@@ -920,7 +956,7 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                  name_report, fix_local_spellings, finish_rename_questions, configure, \
                  origin_add, origin_update, \
                  origin_status, origin_share, origin_withdraw, origin_changes, origin_discard, \
-                 origin_resolve, provision, domain_register, routing_config, forget_domain or shutdown"
+                 origin_resolve, provision, domain_register, routing_config, maintenance_stamp, forget_domain or shutdown"
             )),
             false,
         ),
