@@ -78,17 +78,18 @@ const FOLLOWS_GITHUB: &str = "access to this domain follows GitHub; change it on
 /// answer, since it may have the App or the domain from an environment this
 /// command does not share (a service manager's environment file), and this
 /// process's own read only when no daemon runs or `--config` names another
-/// file, as `crystalline github app status` decides.
+/// file, as `crystalline github app status` decides. A daemon that cannot
+/// answer the question (one from before it existed) is read locally too.
 ///
 /// The local read loads the file fresh, with the environment overlay on
 /// top, so the effective config holds the domains the engine counts: its
 /// start-up config and the ones registered in the file since.
 async fn access_rule(name: &str, config: Option<&Path>) -> Result<AccessRule> {
     if config.is_none()
-        && let Some(answer) = crystalline_service::client::ctl_if_running(serde_json::json!({
+        && let Ok(Some(answer)) = crystalline_service::client::ctl_if_running(serde_json::json!({
             "v": 1, "cmd": "github_governs", "domain": name,
         }))
-        .await?
+        .await
     {
         return Ok(AccessRule {
             governed: answer
