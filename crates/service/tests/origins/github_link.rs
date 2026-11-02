@@ -17,8 +17,11 @@ use chrono::Utc;
 use crystalline_core::config::{GitHubConfig, GlobalConfig, ServiceConfig};
 use crystalline_index::TursoStore;
 use crystalline_remote::UserTokenGrant;
+use crystalline_service::Scope;
 use crystalline_service::engine::{EngineError, GithubUnlink, ShareActor};
+use crystalline_service::params::WriteParams;
 use crystalline_service::rest::{AuthStore, Role};
+use crystalline_service::scope::DomainRight;
 use crystalline_service::{DomainAccess, Engine, EnvOverlay};
 use serde_json::Value;
 use tokio::sync::Mutex;
@@ -65,6 +68,20 @@ async fn engine_with(
     env: &[(&str, &str)],
     email: Option<&str>,
 ) -> Engine {
+    let (eng, auth) = engine_and_auth(tmp, api_url, share_identity, env, email).await;
+    eng.set_domain_access(Arc::new(DomainAccess::new(auth)));
+    eng
+}
+
+/// [`engine_with`] without a domain access resolver, and the accounts store
+/// a caller builds one from.
+async fn engine_and_auth(
+    tmp: &Path,
+    api_url: &str,
+    share_identity: &str,
+    env: &[(&str, &str)],
+    email: Option<&str>,
+) -> (Engine, Arc<AuthStore>) {
     let store = TursoStore::open_in_memory().await.unwrap();
     let cfg = GlobalConfig {
         github: Some(GitHubConfig {
@@ -102,8 +119,7 @@ async fn engine_with(
     auth.add_user("bob", "Bob", None, Role::Editor, "pw12345678")
         .await
         .unwrap();
-    eng.set_domain_access(Arc::new(DomainAccess::new(auth)));
-    eng
+    (eng, auth)
 }
 
 /// The forge with the repositories `acme/kb` and `acme/kb2`, both covered by
@@ -291,6 +307,114 @@ async fn a_revoked_refresh_keeps_the_link_and_refuses_the_share() {
     let err = share_as_ada(&eng, "kb").await.unwrap_err();
     assert!(is_personal_token_missing(&err), "{err}");
     assert_eq!(refreshes(&forge).len(), 1, "no second refresh");
+}
+
+/// An engine whose domain access is governed by GitHub, with `kb` connected
+/// and private (readable only through the governor), `ada` a `write`
+/// collaborator of `acme/kb` and the forge refusing every refresh.
+async fn governed_ada(tmp: &Path) -> (Arc<Forge>, Arc<Engine>) {
+    let (forge, url) = forge_with_ada("ghu_old").await;
+    forge.collaborators.lock().unwrap().insert(
+        "acme/kb".to_string(),
+        vec![serde_json::json!({"id": ADA_ID, "login": ADA_LOGIN, "role_name": "write"})],
+    );
+    let (eng, auth) =
+        engine_and_auth(tmp, &url, "personal", &app_env(), Some("ada@example.com")).await;
+    let eng = Arc::new(eng);
+    eng.set_domain_access(Arc::new(
+        DomainAccess::new(auth.clone()).with_governor(eng.knowledge_governor()),
+    ));
+    connect_with_change(&eng, tmp, "acme/kb", "kb").await;
+    auth.set_governed_private("kb", crystalline_service::scope::OWNER_IDENTITY_NAME)
+        .await
+        .unwrap();
+    (forge, eng)
+}
+
+fn ada_scope() -> Scope {
+    Scope::User {
+        account: "ada".to_string(),
+        admin: false,
+    }
+}
+
+/// What a linked account without a live user token must still have: the
+/// GitHub role that comes from the link's `github_id`, never from the token.
+async fn assert_ada_keeps_her_role(eng: &Engine, title: &str) {
+    let status = eng.github_link_status("ada").await.unwrap();
+    assert!(status.linked, "the link stays");
+    assert!(!status.token_live, "the token is gone");
+    assert_eq!(
+        eng.write_right(&ada_scope(), "kb").await.unwrap(),
+        DomainRight::Write
+    );
+    assert!(
+        eng.domain_right(&ada_scope(), "kb").await.unwrap() >= DomainRight::Read,
+        "the private governed domain still reads"
+    );
+    let written = eng
+        .write_engram_as(
+            &WriteParams {
+                domain: "kb".to_string(),
+                title: title.to_string(),
+                content: "- [fact] written without a user token".to_string(),
+                folder: None,
+                engram_type: None,
+                tags: Vec::new(),
+                status: None,
+                metadata: None,
+                overwrite: false,
+                share_link: None,
+                model: None,
+            },
+            None,
+            &ada_scope(),
+        )
+        .await
+        .unwrap();
+    assert!(written.get("error").is_none(), "{written}");
+}
+
+#[tokio::test]
+async fn a_dead_user_token_keeps_the_github_role() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (forge, eng) = governed_ada(tmp.path()).await;
+    // The forge knows no refresh token: the renewal is refused.
+    eng.link_github(
+        "ada",
+        grant(
+            "ghu_old",
+            Some("ghr_old"),
+            Some(chrono::Duration::minutes(2)),
+        ),
+    )
+    .await
+    .unwrap();
+
+    let err = share_as_ada(&eng, "kb").await.unwrap_err();
+    assert!(is_personal_token_missing(&err), "{err}");
+    assert_eq!(refreshes(&forge).len(), 1);
+    assert_ada_keeps_her_role(&eng, "Dead token note").await;
+}
+
+#[tokio::test]
+async fn a_revoked_authorization_keeps_the_github_role() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_forge, eng) = governed_ada(tmp.path()).await;
+    eng.link_github("ada", grant("ghu_old", None, None))
+        .await
+        .unwrap();
+
+    eng.apply_github_event(
+        "github_app_authorization",
+        &serde_json::json!({"action": "revoked", "sender": {"id": ADA_ID}}),
+    )
+    .await
+    .unwrap();
+
+    let err = share_as_ada(&eng, "kb").await.unwrap_err();
+    assert!(is_personal_token_missing(&err), "{err}");
+    assert_ada_keeps_her_role(&eng, "Revoked note").await;
 }
 
 #[tokio::test]
