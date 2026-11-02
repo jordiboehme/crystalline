@@ -301,16 +301,29 @@ pub async fn backup_collected(
             commit
         }
         Some(head) => {
-            for path in state.files.keys().filter(|p| !hashes.contains_key(*p)) {
-                // A head this instance did not write may no longer hold the
-                // path (the commit a crash kept from the state removed it
-                // already): a delete goes out only for a path the head holds,
-                // never a delete of nothing.
-                if lost && provider.read_file(spec, &head, path).await?.is_none() {
-                    continue;
-                }
+            // What goes: every file of this Reflection the head holds and
+            // this backup does not send. A head this instance did not write
+            // (a new home, a lost state) is listed, since the state says
+            // nothing of it: a page an earlier home pushed and this one holds
+            // back, or a baseline from before baselines stayed local, must
+            // not stay on it. A delete goes out only for a path the head
+            // holds, never a delete of nothing.
+            let gone: Vec<String> = if lost {
+                crate::archive::tarball_paths(&provider.tarball(spec, &head).await?)?
+                    .into_iter()
+                    .filter(|path| is_ours(path, prefix(spec)) && !hashes.contains_key(path))
+                    .collect()
+            } else {
+                state
+                    .files
+                    .keys()
+                    .filter(|p| !hashes.contains_key(*p))
+                    .cloned()
+                    .collect()
+            };
+            for path in gone {
                 writes.push(TreeWrite {
-                    path: path.clone(),
+                    path,
                     blob_sha: None,
                 });
             }

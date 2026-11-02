@@ -258,11 +258,11 @@ To move the home to a new `service.public_url` or to another server, copy the `r
 
 1. Stop the daemon.
 2. Download the branch: `git clone --branch crystalline/reflections --single-branch <repo> /tmp/reflection-backup`, or use the forge's "Download ZIP" for that branch.
-3. Copy its `reflections/` folder over the domain's `reflections/` folder. The copy includes the threads and `PACT.md`. The branch has no `.reflected/` folder: the restored pages become the new baseline. A section that is still as it was last reflected is no person's change, and open feedback from before the restore (a person's change the agent had not taken in yet) is not restored.
+3. Copy its `reflections/` folder over the domain's `reflections/` folder. The copy includes the threads and `PACT.md`. The branch has no `.reflected/` folder: remove a local `.reflected/` folder first, or it stays the baseline. The restored pages then become the new baseline. A section that is still as it was last reflected is no person's change, and open feedback from before the restore (a person's change the agent had not taken in yet) is not restored.
 4. Start the daemon.
 5. Run `crystalline reindex` to bring the reflection index back.
 
-The next backup commits whatever differs from the head of the branch. Files deleted locally while the backup state was lost may stay on the branch until such a restore.
+The next backup commits whatever differs from the head of the branch. When the backup state is lost (a new home, a lost state folder), the next backup lists the branch head and removes every file of this Reflection it does not send.
 
 A domain export (the archive download in Fluid or `crystalline domain export`) also carries the Reflection while the switch is on: its pages, threads, files and the hidden baseline in `.reflected/`. An import leaves `reflections/` out where a Reflection keeps that folder, because its pages are not engrams. Restore a Reflection from its backup branch as above.
 
