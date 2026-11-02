@@ -39,6 +39,7 @@ import { wikilinkResolverFacet } from "../wikilinkChips";
 import type { CellEditor } from "./cellEditor";
 import { activeCell, mountCellEditor } from "./cellEditor";
 import { renderCellContent } from "./cellRender";
+import { cellKeymap, gridNavKeys } from "./gridKeys";
 import {
   mountedCell,
   onCellClosed,
@@ -89,7 +90,7 @@ function holds(table: GridTable, cell: GridCell): boolean {
 }
 
 /** A cell element's row (0 is the header) and column. */
-function placeOf(el: HTMLElement): [number, number] {
+export function placeOf(el: HTMLElement): [number, number] {
   return [
     Number(el.getAttribute("aria-rowindex")) - 1,
     Number(el.getAttribute("aria-colindex")) - 1,
@@ -102,7 +103,8 @@ function cellElements(root: HTMLElement): HTMLElement[] {
   ];
 }
 
-function cellElement(
+/** The cell element at `row` (0 is the header) and `column` of a grid root. */
+export function cellElement(
   root: HTMLElement,
   row: number,
   column: number,
@@ -110,6 +112,19 @@ function cellElement(
   return root.querySelector<HTMLElement>(
     `[aria-rowindex="${String(row + 1)}"][aria-colindex="${String(column + 1)}"]`,
   );
+}
+
+/**
+ * Makes `el` the grid's one tab stop (the roving `tabindex`): the cell Tab
+ * comes back to and the one grid navigation starts from.
+ */
+export function rove(el: HTMLElement): void {
+  const root = el.closest<HTMLElement>(".cm-grid");
+  if (!root) return;
+  for (const other of cellElements(root)) {
+    const value = other === el ? 0 : -1;
+    if (other.tabIndex !== value) other.tabIndex = value;
+  }
 }
 
 function setAlign(el: HTMLElement, table: GridTable, column: number): void {
@@ -214,8 +229,9 @@ function host(
   el.replaceChildren();
   drawnOf.delete(el);
   el.classList.add(HOSTING);
-  const editor = mountCellEditor(main, el);
+  const editor = mountCellEditor(main, el, [cellKeymap]);
   hostOf.set(main, el);
+  rove(el);
   // The mount tore down whatever hosted before, in this table or another
   // one; that cell is text again.
   if (previous && previous !== el) restore(main, previous);
@@ -252,7 +268,7 @@ function rootFor(main: EditorView, cell: GridCell): HTMLElement | null {
 }
 
 /** The table a grid root stands for, read from the current state. */
-function tableOf(main: EditorView, root: HTMLElement): GridTable | null {
+export function tableOf(main: EditorView, root: HTMLElement): GridTable | null {
   let pos: number;
   try {
     pos = main.posAtDOM(root);
@@ -269,7 +285,7 @@ function tableOf(main: EditorView, root: HTMLElement): GridTable | null {
 
 /**
  * Mounts the cell editor where `main`'s open-cell intent points, when that
- * table is drawn: the one rule a mouse, a key (Task 5) or a search hit moves
+ * table is drawn: the one rule a mouse, a key or a search hit moves
  * the editor by. Returns the mounted editor, or null when the cell is not on
  * screen (the table's `toDOM` mounts it once it is).
  */
@@ -358,13 +374,14 @@ export class GridWidget extends WidgetType {
         el.setAttribute("role", r === 0 ? "columnheader" : "gridcell");
         el.setAttribute("aria-rowindex", String(r + 1));
         el.setAttribute("aria-colindex", String(c + 1));
-        // The roving tab stop; the keyboard (Task 5) moves it.
+        // The roving tab stop; `rove` moves it.
         el.tabIndex = r === 0 && c === 0 ? 0 : -1;
         tr.appendChild(el);
       });
       (r === 0 ? head : body).appendChild(tr);
     });
     grid.append(head, body);
+    gridNavKeys(view, grid);
     root.appendChild(grid);
     mainOf.set(root, view);
     shownOf.set(root, this.table);

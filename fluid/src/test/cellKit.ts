@@ -20,6 +20,7 @@ import {
 import * as Y from "yjs";
 
 import { normalizePastedEndings } from "../collab/pastedEndings";
+import { roomUndo } from "../editor/roomUndo";
 import type { CellEditor } from "../editor/grid/cellEditor";
 import { cellForwarding, mountCellEditor } from "../editor/grid/cellEditor";
 import { openCellRange, setOpenCell } from "../editor/grid/openCell";
@@ -67,6 +68,7 @@ export function roomMain(text: string, extra: Extension[] = [cellForwarding]) {
   const ytext = local.getText("content");
   const rtext = remote.getText("content");
   rtext.insert(0, text); // the room's text arrives from the other peer
+  const undoManager = new Y.UndoManager(ytext);
   const awareness = new Awareness(local);
   const remoteAwareness = new Awareness(remote);
   awareness.on(
@@ -91,7 +93,8 @@ export function roomMain(text: string, extra: Extension[] = [cellForwarding]) {
         extensions: [
           EditorState.lineSeparator.of("\n"),
           ...baseExtensions(false, { history: false }),
-          yCollab(ytext, awareness, { undoManager: new Y.UndoManager(ytext) }),
+          yCollab(ytext, awareness, { undoManager }),
+          roomUndo.of(undoManager),
           keymap.of(yUndoManagerKeymap),
           normalizePastedEndings,
           ...extra,

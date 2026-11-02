@@ -68,6 +68,7 @@ import { imagePreviews } from "../editor/imagePreviews";
 import { FindingsPanel, jumpToLine } from "../editor/FindingsPanel";
 import { FrontmatterForm } from "../editor/FrontmatterForm";
 import { KeptTextNotice } from "../editor/KeptTextNotice";
+import { roomUndo } from "../editor/roomUndo";
 import { docText, lineSeparatorFor } from "../editor/setup";
 import type { ElementFace } from "../editor/elementContext";
 import { previewConfig, surfaceExtensions } from "../editor/surface";
@@ -227,6 +228,18 @@ interface EngramSurfaceOptions {
 }
 
 /**
+ * The room's binding with its undo manager, which `roomUndo` hands to the
+ * grid as the same instance `yCollab` uses.
+ */
+function roomUndoStack(room: Room): Extension[] {
+  const undoManager = new Y.UndoManager(room.ytext);
+  return [
+    yCollab(room.ytext, room.awareness, { undoManager }),
+    roomUndo.of(undoManager),
+  ];
+}
+
+/**
  * The whole extension set of one buffer, in the one place this screen spells
  * it: the shared surface plus what only this screen adds.
  *
@@ -253,9 +266,7 @@ function engramSurface(options: EngramSurfaceOptions): Extension[] {
       screen: [
         ...(room !== null
           ? [
-              yCollab(room.ytext, room.awareness, {
-                undoManager: new Y.UndoManager(room.ytext),
-              }),
+              ...roomUndoStack(room),
               keymap.of(yUndoManagerKeymap),
               normalizePastedEndings,
               cursorFlags,

@@ -263,6 +263,16 @@ function absolute(from: number, changes: SpanChange[]): ChangeSpec[] {
  * may have moved the caret out of a folded frontmatter block - the same order
  * every command in `toolbar.ts` uses.
  */
+/**
+ * How a verb runs. `focus: false` leaves the focus where it is: the table
+ * grid edits from its own cell editor, and the main view must not take the
+ * focus with its caret inside a table it draws (it would publish that caret
+ * to a room).
+ */
+export interface VerbOptions {
+  focus?: boolean;
+}
+
 function target(
   view: EditorView,
   at?: number,
@@ -286,12 +296,13 @@ function dispatch(
   view: EditorView,
   from: number,
   changes: SpanChange[] | null,
+  options: VerbOptions,
 ): boolean {
   if (changes === null || changes.length === 0) {
     return false;
   }
   view.dispatch({ changes: absolute(from, changes), userEvent: "input" });
-  view.focus();
+  if (options.focus ?? true) view.focus();
   return true;
 }
 
@@ -323,7 +334,11 @@ function indentWidth(text: string): number {
  * land the caret AT the second line's `|` - the last position still inside
  * the first cell, so typing there gives `|  X|` - on every added row.
  */
-export function tableAddRowBelow(view: EditorView, at?: number): boolean {
+export function tableAddRowBelow(
+  view: EditorView,
+  at?: number,
+  options: VerbOptions = {},
+): boolean {
   const found = target(view, at);
   if (found === null) {
     return false;
@@ -345,12 +360,16 @@ export function tableAddRowBelow(view: EditorView, at?: number): boolean {
     selection: EditorSelection.cursor(line.from + indentWidth(line.text) + 2),
     userEvent: "input",
   });
-  view.focus();
+  if (options.focus ?? true) view.focus();
   return true;
 }
 
 /** A new column after the caret's, one insertion per line of the table. */
-export function tableAddColumnAfter(view: EditorView, at?: number): boolean {
+export function tableAddColumnAfter(
+  view: EditorView,
+  at?: number,
+  options: VerbOptions = {},
+): boolean {
   const found = target(view, at);
   if (found === null) {
     return false;
@@ -359,11 +378,16 @@ export function tableAddColumnAfter(view: EditorView, at?: number): boolean {
     view,
     found.context.from,
     addColumnAfter(found.model, found.context.column),
+    options,
   );
 }
 
 /** The caret's row. The header and the rule refuse: a GFM table needs both. */
-export function tableDeleteRow(view: EditorView, at?: number): boolean {
+export function tableDeleteRow(
+  view: EditorView,
+  at?: number,
+  options: VerbOptions = {},
+): boolean {
   const found = target(view, at);
   if (found === null) {
     return false;
@@ -372,11 +396,16 @@ export function tableDeleteRow(view: EditorView, at?: number): boolean {
     view,
     found.context.from,
     deleteRow(found.model, found.context.row, view.state.lineBreak),
+    options,
   );
 }
 
 /** The caret's column. The last column refuses: a table needs one. */
-export function tableDeleteColumn(view: EditorView, at?: number): boolean {
+export function tableDeleteColumn(
+  view: EditorView,
+  at?: number,
+  options: VerbOptions = {},
+): boolean {
   const found = target(view, at);
   if (found === null) {
     return false;
@@ -385,6 +414,7 @@ export function tableDeleteColumn(view: EditorView, at?: number): boolean {
     view,
     found.context.from,
     deleteColumn(found.model, found.context.column),
+    options,
   );
 }
 
@@ -393,6 +423,7 @@ export function tableAlignColumn(
   view: EditorView,
   align: Align,
   at?: number,
+  options: VerbOptions = {},
 ): boolean {
   const found = target(view, at);
   if (found === null) {
@@ -402,11 +433,16 @@ export function tableAlignColumn(
     view,
     found.context.from,
     setAlignment(found.model, found.context.column, align),
+    options,
   );
 }
 
 /** Every pipe lined up. The one verb that rewrites lines, by request. */
-export function tablePrettify(view: EditorView, at?: number): boolean {
+export function tablePrettify(
+  view: EditorView,
+  at?: number,
+  options: VerbOptions = {},
+): boolean {
   const found = target(view, at);
   if (found === null) {
     return false;
@@ -415,6 +451,7 @@ export function tablePrettify(view: EditorView, at?: number): boolean {
     view,
     found.context.from,
     prettify(found.model, view.state.lineBreak),
+    options,
   );
 }
 
@@ -437,6 +474,7 @@ function dispatchInCell(
   changes: SpanChange[] | null,
   row: number,
   column: number,
+  options: VerbOptions,
 ): boolean {
   if (changes === null || changes.length === 0) {
     return false;
@@ -461,7 +499,7 @@ function dispatchInCell(
       userEvent: "input",
     });
   }
-  view.focus();
+  if (options.focus ?? true) view.focus();
   return true;
 }
 
@@ -469,7 +507,11 @@ function dispatchInCell(
  * A new empty row above the caret's, with the caret in its first cell. The
  * header and the delimiter refuse: nothing goes above either.
  */
-export function tableAddRowAbove(view: EditorView, at?: number): boolean {
+export function tableAddRowAbove(
+  view: EditorView,
+  at?: number,
+  options: VerbOptions = {},
+): boolean {
   const found = target(view, at);
   if (found === null) {
     return false;
@@ -480,11 +522,16 @@ export function tableAddRowAbove(view: EditorView, at?: number): boolean {
     addRowAbove(found.model, found.context.row, view.state.lineBreak),
     found.context.row,
     0,
+    options,
   );
 }
 
 /** A new column before the caret's, the caret in the new cell of its row. */
-export function tableAddColumnBefore(view: EditorView, at?: number): boolean {
+export function tableAddColumnBefore(
+  view: EditorView,
+  at?: number,
+  options: VerbOptions = {},
+): boolean {
   const found = target(view, at);
   if (found === null) {
     return false;
@@ -495,6 +542,7 @@ export function tableAddColumnBefore(view: EditorView, at?: number): boolean {
     addColumnBefore(found.model, found.context.column),
     found.context.row,
     found.context.column,
+    options,
   );
 }
 
@@ -506,6 +554,7 @@ export function tableMoveRow(
   view: EditorView,
   delta: -1 | 1,
   at?: number,
+  options: VerbOptions = {},
 ): boolean {
   const found = target(view, at);
   if (found === null) {
@@ -518,6 +567,7 @@ export function tableMoveRow(
     moveRow(found.model, row, row + delta, view.state.lineBreak),
     row + delta,
     column,
+    options,
   );
 }
 
@@ -526,6 +576,7 @@ export function tableMoveColumn(
   view: EditorView,
   delta: -1 | 1,
   at?: number,
+  options: VerbOptions = {},
 ): boolean {
   const found = target(view, at);
   if (found === null) {
@@ -538,5 +589,6 @@ export function tableMoveColumn(
     moveColumn(found.model, column, column + delta),
     row,
     column + delta,
+    options,
   );
 }

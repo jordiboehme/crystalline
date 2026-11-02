@@ -508,3 +508,43 @@ describe("insert-before and move verbs in a room", () => {
     });
   }
 });
+
+describe("focus option", () => {
+  const verbs: [string, (v: EditorView, focus?: boolean) => boolean][] = [
+    ["add row below", (v, f) => tableAddRowBelow(v, IN_TABLE, opts(f))],
+    ["add row above", (v, f) => tableAddRowAbove(v, IN_TABLE, opts(f))],
+    ["add column after", (v, f) => tableAddColumnAfter(v, IN_TABLE, opts(f))],
+    ["add column before", (v, f) => tableAddColumnBefore(v, IN_TABLE, opts(f))],
+    ["delete column", (v, f) => tableDeleteColumn(v, IN_TABLE, opts(f))],
+    ["align", (v, f) => tableAlignColumn(v, "center", IN_TABLE, opts(f))],
+    ["prettify", (v, f) => tablePrettify(v, IN_TABLE, opts(f))],
+  ];
+
+  function opts(focus: boolean | undefined) {
+    return focus === undefined ? {} : { focus };
+  }
+
+  test.each(verbs)("%s focuses the view by default", (_name, run) => {
+    const v = editor(DOC, 0);
+    const outside = document.createElement("input");
+    document.body.appendChild(outside);
+    outside.focus();
+    expect(run(v)).toBe(true);
+    expect(v.hasFocus).toBe(true);
+    outside.remove();
+  });
+
+  test.each(verbs)(
+    "%s leaves the focus alone with focus: false",
+    (_name, run) => {
+      const v = editor(DOC, 0);
+      const outside = document.createElement("input");
+      document.body.appendChild(outside);
+      outside.focus();
+      expect(run(v, false)).toBe(true);
+      expect(v.hasFocus).toBe(false);
+      expect(document.activeElement).toBe(outside);
+      outside.remove();
+    },
+  );
+});

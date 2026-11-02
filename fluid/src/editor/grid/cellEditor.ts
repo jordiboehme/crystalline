@@ -377,8 +377,30 @@ const clampToCell = EditorState.transactionFilter.of(
   },
 );
 
-/** The undo stack of `main`: CodeMirror's history solo, Y.UndoManager in a room. */
-export function runMainUndo(main: EditorView, which: "undo" | "redo"): boolean {
+/**
+ * Where an undo should put the open cell back: a key that moved the cell and
+ * changed the document in one step (Tab or Enter adding a row) records the
+ * document it left and the cell it left from. Neither CodeMirror's history
+ * nor Y.UndoManager keeps the open cell, so the undo that brings exactly
+ * that document back reopens it.
+ */
+export interface UndoLanding {
+  /** The document before the step. */
+  before: Text;
+  /** The document right after it. */
+  after: Text;
+  /** Reopens the cell the step left from. */
+  restore(): void;
+}
+
+const landings = new WeakMap<EditorView, UndoLanding>();
+
+/** Records `landing` as the one an undo on `main` may land on. */
+export function noteUndoLanding(main: EditorView, landing: UndoLanding): void {
+  landings.set(main, landing);
+}
+
+function stackUndo(main: EditorView, which: "undo" | "redo"): boolean {
   if (main.state.field(historyField, false) !== undefined) {
     return (which === "undo" ? historyUndo : historyRedo)(main);
   }
@@ -391,6 +413,46 @@ export function runMainUndo(main: EditorView, which: "undo" | "redo"): boolean {
     // A room built without an undo manager has no stack to run.
     return false;
   }
+}
+
+/**
+ * The undo stack of `main`: CodeMirror's history solo, Y.UndoManager in a
+ * room. An undo that takes the document from a recorded landing's `after`
+ * back to its `before` reopens the landing's cell.
+ */
+export function runMainUndo(main: EditorView, which: "undo" | "redo"): boolean {
+  const start = main.state.doc;
+  const done = stackUndo(main, which);
+  const landing = landings.get(main);
+  if (!done || which !== "undo" || !landing) return done;
+  if (start.eq(landing.after) && main.state.doc.eq(landing.before)) {
+    landings.delete(main);
+    landing.restore();
+  }
+  return done;
+}
+
+/** The main view a cell view edits a cell of. */
+export const cellMain = Facet.define<EditorView, EditorView | null>({
+  combine: (values) => values[0] ?? null,
+});
+
+/**
+ * Whether the cell view's caret is empty and at the visible start (`side`
+ * -1) or end (1) of the cell's content: only hidden escapes lie between it
+ * and the edge. A leading `\|` hides its `\`, so the caret after it still
+ * looks like the start.
+ */
+export function atCellEdge(view: EditorView, side: -1 | 1): boolean {
+  const { selection } = view.state;
+  if (selection.ranges.length > 1 || !selection.main.empty) return false;
+  const head = selection.main.head;
+  const range = view.state.field(rangeField, false);
+  if (!range) return false;
+  if (side === 1) return head >= range.to;
+  if (head <= range.from) return true;
+  const first = cellUnits(view.state.doc, range)[0];
+  return first?.hide === range.from && head === range.from + 1;
 }
 
 function insertLineBreakTag(view: EditorView): boolean {
@@ -624,6 +686,7 @@ export function mountCellEditor(
       selection: selectionFor(open, range),
       extensions: [
         ...(separator ? [EditorState.lineSeparator.of(separator)] : []),
+        cellMain.of(main),
         rangeField.init(() => range),
         Prec.highest([hideOutside, cellMarks]),
         clampToCell,

@@ -80,6 +80,7 @@ import { readScalar } from "../editor/frontmatterFields";
 import type { SaveStateKind } from "../editor/SaveState";
 import { SaveState } from "../editor/SaveState";
 import type { ElementFace } from "../editor/elementContext";
+import { roomUndo } from "../editor/roomUndo";
 import { surfaceExtensions } from "../editor/surface";
 import {
   UploadScreenContext,
@@ -609,8 +610,9 @@ function Surface({
   const [imageActive, setImageActive] = useState(false);
   /** The callout or status label the caret is in, for their segments. */
   const [element, setElement] = useState<ElementFace>(null);
-  const extensions = useMemo(
-    () => [
+  const extensions = useMemo(() => {
+    const undoManager = new Y.UndoManager(ytext);
+    return [
       // The shared text is LF space by construction (see EngramEditor).
       EditorState.lineSeparator.of("\n"),
       ...surfaceExtensions({
@@ -619,7 +621,8 @@ function Surface({
         // The room's own undo stack replaces CodeMirror's.
         history: false,
         screen: [
-          yCollab(ytext, awareness, { undoManager: new Y.UndoManager(ytext) }),
+          yCollab(ytext, awareness, { undoManager }),
+          roomUndo.of(undoManager),
           keymap.of(yUndoManagerKeymap),
           normalizePastedEndings,
           cursorFlags,
@@ -633,20 +636,19 @@ function Surface({
         onImageContext: setImageActive,
         onElementContext: setElement,
       }),
-    ],
-    [
-      ytext,
-      awareness,
-      resolved,
-      adapter,
-      preview,
-      editable,
-      mountEnded,
-      uploads.extension,
-      home,
-      previews,
-    ],
-  );
+    ];
+  }, [
+    ytext,
+    awareness,
+    resolved,
+    adapter,
+    preview,
+    editable,
+    mountEnded,
+    uploads.extension,
+    home,
+    previews,
+  ]);
   useEffect(() => {
     view?.dispatch({
       effects: previews.reconfigure(imagePreviews(previewHome)),
