@@ -60,6 +60,9 @@ export type { SaveManifestBody } from "./gen";
 /** What `GET /settings/github` and every GitHub settings verb answer with. */
 export type { GithubStatusResponse } from "./gen";
 
+/** What `POST /settings/github/app/manifest` answers: the form to post. */
+export type { GithubAppManifestResponse } from "./gen";
+
 /** What `GET /me/github-identity` and every identity verb answer with. */
 export type { GithubIdentityResponse } from "./gen";
 export type {

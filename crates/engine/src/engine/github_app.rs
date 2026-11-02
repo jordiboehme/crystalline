@@ -46,6 +46,10 @@ pub(crate) const KEYCHAIN_REFUSAL: &str = "the GitHub App is saved in the keycha
 /// the App.
 pub const APP_FROM_ENV: &str = "the GitHub App comes from the CRYSTALLINE_GITHUB_APP_* environment variables, which win over a saved App; unset them to set or remove a saved one";
 
+/// Why an App is not created from the browser: one is configured already,
+/// and creating another would overwrite it.
+pub const APP_ALREADY_CONFIGURED: &str = "a GitHub App is already configured on this instance; remove it first with crystalline github app remove, then create a new one";
+
 /// A GitHub App as `crystalline github app status` and the `configure` tool
 /// report it. It names the App and says which secrets are set; it never
 /// holds a secret.
@@ -1170,6 +1174,29 @@ impl Engine {
         let saved = self.app_home()?.save(&self.overlay, credentials).await;
         self.reset_github_app();
         saved
+    }
+
+    /// Saves an App GitHub just created from this instance's manifest,
+    /// through [`Engine::set_github_app`]. Refused while any App is
+    /// configured (saved, from the environment, or held by a keychain that
+    /// cannot be read): a created App never overwrites another one.
+    pub async fn create_github_app(&self, credentials: AppCredentials) -> Result<GithubAppStatus> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        if self.github_app_local_status().configured {
+            return Err(EngineError::Conflict(APP_ALREADY_CONFIGURED.to_string()));
+        }
+        self.set_github_app(credentials).await
+    }
+
+    /// Where an owner installs the App, when it is usable and its slug is
+    /// known, without asking GitHub: the settings screen polls it.
+    pub fn github_app_install_url(&self) -> Option<String> {
+        match self.github_app_slot() {
+            AppSlot::Ready(router) => router.app().known_install_url(),
+            _ => None,
+        }
     }
 
     /// Removes the saved App (see [`AppHome::remove`]) and drops the App the

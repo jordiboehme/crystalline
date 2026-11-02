@@ -9079,6 +9079,80 @@
         }
       }
     },
+    "/api/v1/github/app/created": {
+      "get": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "Where GitHub sends the browser back after creating the GitHub App.",
+        "description": "Needs the admin session that asked for the manifest form (the session cookie is SameSite=Lax, so it rides GitHub's redirect). The state must name a form this session was handed in the last hour and is spent by this call. Then the code is converted into the App's credentials, which are stored as `crystalline github app set` stores them, and the browser is sent to `/settings/github?app=created`. Refused without converting the code when a GitHub App is already configured. It is a browser landing, so every refusal is an HTML page, never JSON, and no answer carries a secret.",
+        "operationId": "finish_github_app_manifest",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "query",
+            "description": "The code GitHub converts into the App's credentials, once.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "state",
+            "in": "query",
+            "description": "The state the form was handed out with.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "303": {
+            "description": "The App is stored: to `/settings/github?app=created`."
+          },
+          "401": {
+            "description": "An HTML page: no signed-in session. The state is not spent.",
+            "content": {
+              "text/html": {}
+            }
+          },
+          "403": {
+            "description": "An HTML page: the caller is not an admin, this instance is read-only, or the state is missing, unknown, used, expired or another session's.",
+            "content": {
+              "text/html": {}
+            }
+          },
+          "409": {
+            "description": "An HTML page: a GitHub App is already configured, and the code was not converted.",
+            "content": {
+              "text/html": {}
+            }
+          },
+          "502": {
+            "description": "An HTML page: GitHub did not convert the code, or the App it answered could not be stored. The text says why, with the GitHub Enterprise Server version when the server lacks the endpoint.",
+            "content": {
+              "text/html": {}
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/github/app/setup": {
+      "get": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "Where GitHub sends the browser after the GitHub App was installed.",
+        "description": "The manifest's `setup_url`. Changes nothing and reads nothing GitHub sent: it sends the browser to `/settings/github?app=installed`.",
+        "operationId": "github_app_installed",
+        "responses": {
+          "303": {
+            "description": "To `/settings/github?app=installed`."
+          }
+        }
+      }
+    },
     "/api/v1/github/domain-name": {
       "get": {
         "tags": [
@@ -11254,6 +11328,88 @@
         }
       }
     },
+    "/api/v1/settings/github/app/manifest": {
+      "post": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "The manifest form that creates this instance's GitHub App on GitHub.",
+        "description": "Admin only, and refused on a read-only instance. Answers the GitHub App manifest and the url to post it to (as the form field `manifest`): GitHub's new-App page for the admin's account or for `org`, on the Enterprise Server host on GHES. GitHub creates the App there and sends the browser back to `GET /github/app/created` with a code and the state, which is good for one callback, for an hour, from this session only. The manifest asks for Contents and Pull requests write, Metadata and Members read and nothing else, and sets up the webhook only when `service.public_url` is reachable from GitHub.",
+        "operationId": "start_github_app_manifest",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GithubAppManifestBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The form to post.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GithubAppManifestResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin, a cookie session did not echo its CSRF token, the request carries no session to bind the state to, or this instance is read-only.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A GitHub App is already configured (remove it first with `crystalline github app remove`), or `service.public_url` is not set. The detail names the fix.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`org` is not a GitHub organization name.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Too many forms are in flight at once; try again in a moment.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/settings/github/connect": {
       "post": {
         "tags": [
@@ -13026,6 +13182,100 @@
           }
         }
       },
+      "GithubAppManifestBody": {
+        "type": "object",
+        "description": "What `POST /settings/github/app/manifest` takes.",
+        "properties": {
+          "org": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The GitHub organization the App is created for. Absent: the admin's\nown GitHub account.",
+            "example": "acme-corp"
+          }
+        }
+      },
+      "GithubAppManifestResponse": {
+        "type": "object",
+        "description": "What `POST /settings/github/app/manifest` answers: the form to post.",
+        "required": [
+          "post_url",
+          "manifest",
+          "state"
+        ],
+        "properties": {
+          "manifest": {
+            "type": "object",
+            "description": "The manifest. The page posts it JSON-encoded as the form field\n`manifest`."
+          },
+          "post_url": {
+            "type": "string",
+            "description": "Where to post the form: GitHub's new-App page for the account or the\norganization, on the GitHub Enterprise Server host on GHES. Carries\nthe state.",
+            "example": "https://github.com/settings/apps/new?state=4f2a..."
+          },
+          "state": {
+            "type": "string",
+            "description": "The state GitHub sends back with the code. Good for one callback,\nfor an hour, from this session only.",
+            "example": "4f2a..."
+          }
+        }
+      },
+      "GithubAppView": {
+        "type": "object",
+        "description": "The instance's GitHub App: which App it is, where it comes from and where an owner installs it. No secret, ever: only whether the webhook secret is set.",
+        "required": [
+          "webhook_secret_set"
+        ],
+        "properties": {
+          "app_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The numeric App id, when the App could be read.",
+            "example": 123456,
+            "minimum": 0
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the App cannot be used, when it cannot."
+          },
+          "install_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Where an owner installs the App on repositories. Null while the App\ncannot be used or its slug is not known yet.",
+            "example": "https://github.com/apps/crystalline-kb-example-com/installations/new"
+          },
+          "slug": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The App's slug, when known.",
+            "example": "crystalline-kb-example-com"
+          },
+          "source": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "keyring | file | environment.",
+            "example": "keyring"
+          },
+          "webhook_secret_set": {
+            "type": "boolean",
+            "description": "Whether a webhook secret is set, so deliveries can be verified.",
+            "example": true
+          }
+        }
+      },
       "GithubIdentityResponse": {
         "type": "object",
         "description": "One account's own GitHub identity: whose it is, whether a credential is on file, the login it authenticated as, since when and where it lives. No token material, ever.",
@@ -13239,6 +13489,17 @@
           "connected"
         ],
         "properties": {
+          "app": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/GithubAppView",
+                "description": "The instance's GitHub App, when one is configured; null otherwise.\nNames the App and where to install it, never a secret."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "connected": {
             "type": "boolean",
             "description": "Whether a credential is on file for this instance.",

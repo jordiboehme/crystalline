@@ -59,13 +59,26 @@ pub struct PendingStore<T> {
     /// eviction both walk it from the front in O(1) per record. An entry
     /// whose record was already taken is skipped when it is reached.
     order: VecDeque<(Instant, String)>,
+    /// How long a record lives: [`PENDING_TTL`] unless the store was made
+    /// with [`PendingStore::with_ttl`].
+    ttl: Duration,
 }
 
 impl<T> Default for PendingStore<T> {
     fn default() -> PendingStore<T> {
+        PendingStore::with_ttl(PENDING_TTL)
+    }
+}
+
+impl<T> PendingStore<T> {
+    /// A store whose records live `ttl` instead of [`PENDING_TTL`]: for a
+    /// round trip that takes longer than a sign-in, such as creating a
+    /// GitHub App, where GitHub gives the person an hour.
+    pub fn with_ttl(ttl: Duration) -> PendingStore<T> {
         PendingStore {
             records: HashMap::new(),
             order: VecDeque::new(),
+            ttl,
         }
     }
 }
@@ -141,7 +154,7 @@ impl<T: PendingRecord> PendingStore<T> {
     }
 
     /// Take the record for `state`, if it exists and has not expired by
-    /// `now`.
+    /// `now` (it lives the store's TTL).
     ///
     /// Taking rather than reading is the whole point: an authorization code
     /// may be presented once, so the record that authorizes presenting it is
@@ -154,13 +167,13 @@ impl<T: PendingRecord> PendingStore<T> {
         let taken = self.records.remove(state);
         self.purge_expired(now);
         match taken {
-            Some(pending) if now.duration_since(pending.started()) < PENDING_TTL => Ok(pending),
+            Some(pending) if now.duration_since(pending.started()) < self.ttl => Ok(pending),
             Some(_) => Err(StateMiss::Expired),
             None => Err(StateMiss::Unknown),
         }
     }
 
-    /// Forget every record older than [`PENDING_TTL`], from the front of the
+    /// Forget every record older than the store's TTL, from the front of the
     /// chronological order until the first one that is still live, and drop
     /// the spent entries met on the way.
     ///
@@ -173,7 +186,7 @@ impl<T: PendingRecord> PendingStore<T> {
     fn purge_expired(&mut self, now: Instant) {
         while let Some((started, key)) = self.order.front() {
             let spent = !self.records.contains_key(key);
-            if !spent && now.duration_since(*started) < PENDING_TTL {
+            if !spent && now.duration_since(*started) < self.ttl {
                 break;
             }
             let (_, key) = self.order.pop_front().expect("checked just above");
@@ -200,9 +213,13 @@ impl<T: PendingRecord> PendingStore<T> {
         if self.order.len() <= self.records.len() * 2 + COMPACT_SLACK {
             return;
         }
-        let PendingStore { records, order } = self;
+        let PendingStore {
+            records,
+            order,
+            ttl,
+        } = self;
         order.retain(|(started, key)| {
-            if now.duration_since(*started) >= PENDING_TTL {
+            if now.duration_since(*started) >= *ttl {
                 records.remove(key);
                 return false;
             }
@@ -377,6 +394,37 @@ mod tests {
         );
         // And it is still takeable: compaction forgets nothing that is live.
         assert!(store.take("abandoned").is_ok());
+    }
+
+    /// A store made for a longer round trip keeps its records that long, and
+    /// expires them past it, by every path: a take, an insert's purge and
+    /// the whole-order sweep.
+    #[test]
+    fn a_store_with_its_own_ttl_keeps_records_that_long() {
+        let hour = Duration::from_secs(60 * 60);
+        let base = Instant::now();
+        let mut store = PendingStore::with_ttl(hour);
+        store
+            .insert_at("in".to_string(), Rec { started: base }, base)
+            .unwrap();
+        store
+            .insert_at("out".to_string(), Rec { started: base }, base)
+            .unwrap();
+        // Past the default ten minutes, an insert purges nothing.
+        let later = base + PENDING_TTL + Duration::from_secs(60);
+        store
+            .insert_at("other".to_string(), Rec { started: later }, later)
+            .unwrap();
+        assert!(
+            store
+                .take_at("in", base + hour - Duration::from_secs(1))
+                .is_ok(),
+            "a record is live for the store's own TTL"
+        );
+        assert_eq!(
+            miss(store.take_at("out", base + hour + Duration::from_secs(1))),
+            StateMiss::Expired
+        );
     }
 
     /// The explicit clock: a record is live just inside the TTL and expired

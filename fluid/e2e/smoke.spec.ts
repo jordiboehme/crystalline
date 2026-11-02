@@ -540,6 +540,75 @@ test("the profile links GitHub through the App when one is configured", async ({
   await expect(page).toHaveURL((url) => !url.search.includes("github="));
 });
 
+test("an admin creates the GitHub App with a real form post to GitHub", async ({
+  page,
+}) => {
+  // The scratch daemon has no App and no public url, so the real answer to
+  // the manifest request is a refusal. GitHub's page cannot be reached from
+  // here either, so both are canned: what is real is the form the browser
+  // posts, and the landing GitHub sends it back to.
+  await page.route("**/api/v1/settings/github/app/manifest", (route) =>
+    route.fulfill({
+      json: {
+        post_url: "https://github.example/settings/apps/new?state=s1",
+        manifest: { name: "Crystalline smoke", public: false },
+        state: "s1",
+      },
+    }),
+  );
+  let posted: string | null = null;
+  await page.route("https://github.example/**", (route) => {
+    posted = route.request().postData();
+    return route.fulfill({
+      contentType: "text/html",
+      body: "<!doctype html><title>GitHub</title><p>New GitHub App</p>",
+    });
+  });
+  await page.goto("settings/github");
+  await expect(page.getByRole("heading", { name: "GitHub App" })).toBeVisible();
+  await page.getByRole("button", { name: "Create GitHub App" }).click();
+
+  await expect(page.getByText("New GitHub App")).toBeVisible();
+  const form = new URLSearchParams(posted ?? "");
+  expect(JSON.parse(form.get("manifest") ?? "null")).toEqual({
+    name: "Crystalline smoke",
+    public: false,
+  });
+
+  // Back from GitHub with the App stored: the install button, and the
+  // landing read once and taken out of the address.
+  await page.route("**/api/v1/settings/github", (route) =>
+    route.fulfill({
+      json: {
+        enabled: true,
+        connected: true,
+        user: null,
+        token_store: "GitHub App",
+        pending: null,
+        error: null,
+        app: {
+          app_id: 7,
+          slug: "crystalline-smoke",
+          source: "file",
+          install_url:
+            "https://github.example/apps/crystalline-smoke/installations/new",
+          webhook_secret_set: false,
+          error: null,
+        },
+      },
+    }),
+  );
+  await page.goto("settings/github?app=created");
+  await expect(
+    page.getByRole("link", { name: "Install on repositories" }),
+  ).toHaveAttribute(
+    "href",
+    "https://github.example/apps/crystalline-smoke/installations/new",
+  );
+  await expect(page.getByText(/The GitHub App is created/)).toBeVisible();
+  await expect(page).toHaveURL((url) => !url.search.includes("app="));
+});
+
 test("a refused direct share offers to share as a proposal", async ({
   page,
 }) => {

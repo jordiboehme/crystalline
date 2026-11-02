@@ -40,6 +40,7 @@ mod error;
 mod events;
 mod evolve;
 mod files;
+mod github_app_create;
 mod github_identity;
 mod github_link;
 mod github_settings;
@@ -246,6 +247,9 @@ use crate::scope::{DomainAccess, DomainRight};
         github_identity::connect,
         github_identity::token,
         github_identity::disconnect,
+        github_app_create::manifest,
+        github_app_create::created,
+        github_app_create::setup,
         github_link::status,
         github_link::start,
         github_link::callback,
@@ -353,7 +357,10 @@ use crate::scope::{DomainAccess, DomainRight};
         github_settings::GithubStatusResponse,
         github_settings::GithubAccessResponse,
         github_settings::GithubPendingView,
+        github_settings::GithubAppView,
         github_identity::GithubIdentityResponse,
+        github_app_create::GithubAppManifestBody,
+        github_app_create::GithubAppManifestResponse,
         github_link::GithubLinkResponse,
         github_link::StartGithubLinkResponse,
         github_link::GithubUnlinkResponse,
@@ -444,6 +451,9 @@ pub struct RestState {
     /// The GitHub App web-flow links in flight, one store for this process.
     /// See [`github_link`].
     pub(crate) github_links: Arc<github_link::GithubLinkFlows>,
+    /// The GitHub App manifest forms handed out and not yet come back, one
+    /// store for this process. See [`github_app_create`].
+    pub(crate) github_app_manifests: Arc<github_app_create::GithubAppManifests>,
     /// The path this instance is served under, from `service.public_url`:
     /// every cookie is scoped to it, so two instances on one host keep
     /// separate sessions, and the sign-in landing and `return_to` are built
@@ -522,6 +532,7 @@ impl RestState {
             collab,
             engine,
             github_links: Arc::default(),
+            github_app_manifests: Arc::default(),
             oauth,
             oidc,
             access,
@@ -1106,6 +1117,21 @@ fn routes(state: RestState) -> Router {
         .route("/github/access", get(github_settings::access))
         .route("/settings/github/connect", post(github_settings::connect))
         .route("/settings/github/token", post(github_settings::token))
+        // Creating the instance's GitHub App through GitHub's manifest flow:
+        // the form is admin only under the CSRF check; the two landings are
+        // where GitHub sends the browser back, public by path so a lost
+        // session gets a page rather than a raw 401. The created landing
+        // checks the admin and the session the form was handed to itself.
+        // See [`github_app_create`].
+        .route(
+            "/settings/github/app/manifest",
+            post(github_app_create::manifest),
+        )
+        .route(
+            github_app_create::CREATED_PATH,
+            get(github_app_create::created),
+        )
+        .route(github_app_create::SETUP_PATH, get(github_app_create::setup))
         // The same admin gate a team-domain create answers to, and a pure
         // read: a peek at a repository's MANIFEST that never registers
         // anything. See [`domains_admin::github_domain_name`].

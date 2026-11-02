@@ -5631,8 +5631,9 @@ async fn no_rest_response_carries_an_operator_setting() {
     const REFUSED: &[&str] = &["/api/v1/sync", "/api/v1/github/domain-name?repo=acme/kb"];
     // A stream, two redirects into the identity provider, the OAuth consent
     // redirect, the GitHub link callback (a redirect to the profile) and the
-    // single-use GitHub link (a redirect or an HTML page): none of them
-    // answers with a JSON body to read.
+    // single-use GitHub link (a redirect or an HTML page) and the two
+    // landings of the GitHub App's creation (a redirect or an HTML page):
+    // none of them answers with a JSON body to read.
     const SKIPPED: &[&str] = &[
         "GET /api/v1/events",
         "GET /api/v1/auth/oidc/login",
@@ -5640,6 +5641,8 @@ async fn no_rest_response_carries_an_operator_setting() {
         "GET /api/v1/oauth/authorize",
         "GET /api/v1/github/link/callback",
         "GET /api/v1/github/link/go",
+        "GET /api/v1/github/app/created",
+        "GET /api/v1/github/app/setup",
     ];
     for op in crate::support::MOUNTED_OPERATIONS
         .iter()

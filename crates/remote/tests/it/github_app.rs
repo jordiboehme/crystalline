@@ -19,7 +19,10 @@ use axum::routing::{get, post};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{DateTime, Duration, TimeZone, Utc};
-use crystalline_remote::github::app::{Collaborator, GithubApp, RepoRole, RepoVisibility};
+use crystalline_remote::github::app::{
+    Collaborator, GithubApp, ManifestParams, RepoRole, RepoVisibility, app_manifest,
+    convert_manifest, manifest_post_url,
+};
 use crystalline_remote::{AppCredentials, CommitIdentity, RemoteError};
 use tokio::net::TcpListener;
 
@@ -1287,4 +1290,211 @@ async fn repository_facts_read_the_ids_the_name_and_the_visibility() {
         })
     );
     assert_eq!(facts.full_name.as_deref(), Some("acme/handbook"));
+}
+
+// --- the manifest flow --------------------------------------------------------
+
+fn manifest_params(webhook_public: bool) -> ManifestParams {
+    ManifestParams {
+        instance_label: "kb.example.com".to_string(),
+        public_url: "https://kb.example.com/".to_string(),
+        webhook_public,
+        org: None,
+    }
+}
+
+#[test]
+fn the_manifest_has_exactly_four_permissions() {
+    let manifest = app_manifest(&manifest_params(true));
+    assert_eq!(
+        manifest["default_permissions"],
+        serde_json::json!({
+            "contents": "write",
+            "pull_requests": "write",
+            "metadata": "read",
+            "members": "read",
+        })
+    );
+    assert_eq!(manifest["name"], "Crystalline kb.example.com");
+    assert_eq!(manifest["url"], "https://kb.example.com");
+    assert_eq!(
+        manifest["redirect_url"],
+        "https://kb.example.com/api/v1/github/app/created"
+    );
+    assert_eq!(
+        manifest["callback_urls"],
+        serde_json::json!(["https://kb.example.com/api/v1/github/link/callback"])
+    );
+    assert_eq!(
+        manifest["setup_url"],
+        "https://kb.example.com/api/v1/github/app/setup"
+    );
+    assert_eq!(manifest["public"], false);
+    assert_eq!(manifest["request_oauth_on_install"], false);
+    // The events a manifest may list; installation, installation_repositories
+    // and github_app_authorization reach every App without being asked for.
+    assert_eq!(
+        manifest["default_events"],
+        serde_json::json!(["member", "membership", "organization", "repository", "team"])
+    );
+    assert_eq!(
+        manifest["hook_attributes"],
+        serde_json::json!({
+            "url": "https://kb.example.com/api/v1/github/webhook",
+            "active": true,
+        })
+    );
+}
+
+#[test]
+fn a_public_url_under_a_path_keeps_its_prefix() {
+    let manifest = app_manifest(&ManifestParams {
+        public_url: "https://example.com/kb".to_string(),
+        ..manifest_params(false)
+    });
+    assert_eq!(
+        manifest["redirect_url"],
+        "https://example.com/kb/api/v1/github/app/created"
+    );
+}
+
+#[test]
+fn no_hook_attributes_without_a_public_url() {
+    let manifest = app_manifest(&manifest_params(false));
+    assert!(
+        manifest.get("hook_attributes").is_none(),
+        "GitHub cannot reach this instance, so no webhook: {manifest}"
+    );
+    // The events stay: they are what the App would get once a webhook is set.
+    assert!(manifest["default_events"].as_array().is_some());
+}
+
+#[test]
+fn the_org_form_posts_to_the_org_settings_page() {
+    assert_eq!(
+        manifest_post_url("https://github.com", None, "s1"),
+        "https://github.com/settings/apps/new?state=s1"
+    );
+    assert_eq!(
+        manifest_post_url("https://github.com", Some("acme-corp"), "s1"),
+        "https://github.com/organizations/acme-corp/settings/apps/new?state=s1"
+    );
+}
+
+#[test]
+fn ghes_manifest_posts_to_the_ghes_web_host() {
+    let auth_base =
+        crystalline_remote::github::auth::auth_base(Some("https://ghe.example.com/api/v3"));
+    assert_eq!(
+        manifest_post_url(&auth_base, Some("acme"), "s1"),
+        "https://ghe.example.com/organizations/acme/settings/apps/new?state=s1"
+    );
+}
+
+/// What GitHub answers a conversion with: the App and every secret of it.
+fn conversion_body() -> serde_json::Value {
+    serde_json::json!({
+        "id": 7,
+        "slug": SLUG,
+        "node_id": "A_1",
+        "owner": {"login": "acme"},
+        "name": "Crystalline kb.example.com",
+        "client_id": "Iv23.created",
+        "client_secret": "the-client-secret",
+        "webhook_secret": "the-webhook-secret",
+        "pem": PEM,
+        "html_url": format!("https://github.com/apps/{SLUG}"),
+    })
+}
+
+#[tokio::test]
+async fn the_conversion_answers_every_credential() {
+    let seen: Arc<Mutex<Vec<(String, HeaderMap)>>> = Arc::default();
+    let record = seen.clone();
+    let routes = Router::new().route(
+        "/app-manifests/{code}/conversions",
+        post(move |uri: Uri, headers: HeaderMap| {
+            let record = record.clone();
+            async move {
+                record
+                    .lock()
+                    .unwrap()
+                    .push((uri.path().to_string(), headers));
+                (StatusCode::CREATED, Json(conversion_body()))
+            }
+        }),
+    );
+    let base = spawn(routes).await;
+
+    let creds = convert_manifest(Some(&base), "abc123").await.unwrap();
+    assert_eq!(creds.app_id, 7);
+    assert_eq!(creds.slug.as_deref(), Some(SLUG));
+    assert_eq!(creds.client_id, "Iv23.created");
+    assert_eq!(creds.client_secret.as_deref(), Some("the-client-secret"));
+    assert_eq!(creds.webhook_secret.as_deref(), Some("the-webhook-secret"));
+    assert_eq!(creds.private_key, PEM);
+    assert_eq!(creds.host, host_of(&base));
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].0, "/app-manifests/abc123/conversions");
+    assert!(
+        seen[0].1.get("authorization").is_none(),
+        "the code is the only proof the conversion takes"
+    );
+    assert_eq!(seen[0].1["x-github-api-version"], "2022-11-28");
+}
+
+#[tokio::test]
+async fn a_ghes_without_the_conversion_endpoint_names_its_version() {
+    let routes = Router::new().route(
+        "/api/v3/app-manifests/{code}/conversions",
+        post(|| async {
+            (
+                StatusCode::NOT_FOUND,
+                [("X-GitHub-Enterprise-Version", "3.9.0")],
+                Json(not_found()),
+            )
+        }),
+    );
+    let base = spawn(routes).await;
+
+    let err = convert_manifest(Some(&format!("{base}/api/v3")), "secretcode")
+        .await
+        .unwrap_err();
+    match &err {
+        RemoteError::EndpointMissing {
+            endpoint,
+            ghes_version,
+        } => {
+            assert_eq!(endpoint, "POST /app-manifests/{code}/conversions");
+            assert_eq!(ghes_version.as_deref(), Some("3.9.0"));
+        }
+        other => panic!("expected EndpointMissing, got {other:?}"),
+    }
+    let text = err.to_string();
+    assert!(text.contains("3.9.0"), "{text}");
+    assert!(
+        !text.contains("secretcode"),
+        "the code is never echoed: {text}"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_code_on_github_com_says_to_create_the_app_again() {
+    let routes = Router::new().route(
+        "/app-manifests/{code}/conversions",
+        post(|| async { (StatusCode::NOT_FOUND, Json(not_found())) }),
+    );
+    let base = spawn(routes).await;
+
+    let err = convert_manifest(Some(&base), "secretcode")
+        .await
+        .unwrap_err();
+    assert!(
+        !matches!(err, RemoteError::EndpointMissing { .. }),
+        "github.com has the endpoint: {err:?}"
+    );
+    let text = err.to_string();
+    assert!(text.contains("an hour"), "{text}");
+    assert!(!text.contains("secretcode"), "{text}");
 }

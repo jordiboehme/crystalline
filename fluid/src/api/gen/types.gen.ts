@@ -613,6 +613,72 @@ export type GithubAccessResponse = {
 };
 
 /**
+ * What `POST /settings/github/app/manifest` takes.
+ */
+export type GithubAppManifestBody = {
+    /**
+     * The GitHub organization the App is created for. Absent: the admin's
+     * own GitHub account.
+     */
+    org?: string | null;
+};
+
+/**
+ * What `POST /settings/github/app/manifest` answers: the form to post.
+ */
+export type GithubAppManifestResponse = {
+    /**
+     * The manifest. The page posts it JSON-encoded as the form field
+     * `manifest`.
+     */
+    manifest: {
+        [key: string]: unknown;
+    };
+    /**
+     * Where to post the form: GitHub's new-App page for the account or the
+     * organization, on the GitHub Enterprise Server host on GHES. Carries
+     * the state.
+     */
+    post_url: string;
+    /**
+     * The state GitHub sends back with the code. Good for one callback,
+     * for an hour, from this session only.
+     */
+    state: string;
+};
+
+/**
+ * The instance's GitHub App: which App it is, where it comes from and where an owner installs it. No secret, ever: only whether the webhook secret is set.
+ */
+export type GithubAppView = {
+    /**
+     * The numeric App id, when the App could be read.
+     */
+    app_id?: number | null;
+    /**
+     * Why the App cannot be used, when it cannot.
+     */
+    error?: string | null;
+    /**
+     * Where an owner installs the App on repositories. Null while the App
+     * cannot be used or its slug is not known yet.
+     */
+    install_url?: string | null;
+    /**
+     * The App's slug, when known.
+     */
+    slug?: string | null;
+    /**
+     * keyring | file | environment.
+     */
+    source?: string | null;
+    /**
+     * Whether a webhook secret is set, so deliveries can be verified.
+     */
+    webhook_secret_set: boolean;
+};
+
+/**
  * One account's own GitHub identity: whose it is, whether a credential is on file, the login it authenticated as, since when and where it lives. No token material, ever.
  */
 export type GithubIdentityResponse = {
@@ -742,6 +808,7 @@ export type GithubPerson = {
  * The GitHub connection as the settings screen renders and polls it. No token material, ever: only whether the feature is on, whether a credential is on file, whose it is and where it lives.
  */
 export type GithubStatusResponse = {
+    app?: GithubAppView | null;
     /**
      * Whether a credential is on file for this instance.
      */
@@ -6923,6 +6990,48 @@ export type GetGithubAccessResponses = {
 
 export type GetGithubAccessResponse = GetGithubAccessResponses[keyof GetGithubAccessResponses];
 
+export type FinishGithubAppManifestData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * The code GitHub converts into the App's credentials, once.
+         */
+        code?: string;
+        /**
+         * The state the form was handed out with.
+         */
+        state?: string;
+    };
+    url: '/api/v1/github/app/created';
+};
+
+export type FinishGithubAppManifestErrors = {
+    /**
+     * An HTML page: no signed-in session. The state is not spent.
+     */
+    401: unknown;
+    /**
+     * An HTML page: the caller is not an admin, this instance is read-only, or the state is missing, unknown, used, expired or another session's.
+     */
+    403: unknown;
+    /**
+     * An HTML page: a GitHub App is already configured, and the code was not converted.
+     */
+    409: unknown;
+    /**
+     * An HTML page: GitHub did not convert the code, or the App it answered could not be stored. The text says why, with the GitHub Enterprise Server version when the server lacks the endpoint.
+     */
+    502: unknown;
+};
+
+export type GithubAppInstalledData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/v1/github/app/setup';
+};
+
 export type GithubDomainNameData = {
     body?: never;
     path?: never;
@@ -8136,6 +8245,47 @@ export type GetGithubSettingsResponses = {
 };
 
 export type GetGithubSettingsResponse = GetGithubSettingsResponses[keyof GetGithubSettingsResponses];
+
+export type StartGithubAppManifestData = {
+    body: GithubAppManifestBody;
+    path?: never;
+    query?: never;
+    url: '/api/v1/settings/github/app/manifest';
+};
+
+export type StartGithubAppManifestErrors = {
+    /**
+     * No identity.
+     */
+    401: ProblemDetail;
+    /**
+     * The caller is not an admin, a cookie session did not echo its CSRF token, the request carries no session to bind the state to, or this instance is read-only.
+     */
+    403: ProblemDetail;
+    /**
+     * A GitHub App is already configured (remove it first with `crystalline github app remove`), or `service.public_url` is not set. The detail names the fix.
+     */
+    409: ProblemDetail;
+    /**
+     * `org` is not a GitHub organization name.
+     */
+    422: ProblemDetail;
+    /**
+     * Too many forms are in flight at once; try again in a moment.
+     */
+    503: ProblemDetail;
+};
+
+export type StartGithubAppManifestError = StartGithubAppManifestErrors[keyof StartGithubAppManifestErrors];
+
+export type StartGithubAppManifestResponses = {
+    /**
+     * The form to post.
+     */
+    200: GithubAppManifestResponse;
+};
+
+export type StartGithubAppManifestResponse = StartGithubAppManifestResponses[keyof StartGithubAppManifestResponses];
 
 export type ConnectGithubDeviceData = {
     body?: never;

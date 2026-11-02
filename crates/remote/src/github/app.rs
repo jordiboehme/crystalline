@@ -1136,6 +1136,17 @@ impl GithubApp {
         ))
     }
 
+    /// [`GithubApp::install_url`] without a request: `None` while the slug
+    /// is not known yet. For a screen that is polled.
+    pub fn known_install_url(&self) -> Option<String> {
+        let slug = self.known_slug()?;
+        Some(format!(
+            "{}/apps/{}/installations/new",
+            self.auth_base,
+            segment(&slug)
+        ))
+    }
+
     /// The App's slug when it is already known (saved with the credentials,
     /// or read by an earlier `GET /app`), without a request.
     pub fn known_slug(&self) -> Option<String> {
@@ -1177,6 +1188,188 @@ impl GithubApp {
         }
         Ok(response)
     }
+}
+
+/// Where GitHub sends the browser back after it created an App from a
+/// manifest, under `service.public_url`. The REST crate serves it.
+pub const MANIFEST_CREATED_PATH: &str = "/api/v1/github/app/created";
+
+/// Where GitHub sends the browser after the App was installed, under
+/// `service.public_url`.
+pub const MANIFEST_SETUP_PATH: &str = "/api/v1/github/app/setup";
+
+/// The person link's callback, under `service.public_url`: the App's one
+/// callback url. The REST crate pins its own constant against this one.
+pub const LINK_CALLBACK_PATH: &str = "/api/v1/github/link/callback";
+
+/// Where GitHub delivers the App's webhook events, under
+/// `service.public_url`. The REST crate pins its own constant against this
+/// one.
+pub const WEBHOOK_PATH: &str = "/api/v1/github/webhook";
+
+/// The permissions the App asks for, and nothing else: it reads and writes
+/// the knowledge, opens pull requests for proposals, and reads who may use a
+/// repository (the organization's members too, for team-based access).
+const MANIFEST_PERMISSIONS: [(&str, &str); 4] = [
+    ("contents", "write"),
+    ("pull_requests", "write"),
+    ("metadata", "read"),
+    ("members", "read"),
+];
+
+/// The events the webhook subscribes to: every event that changes who may
+/// use a repository and that a manifest may list. `installation`,
+/// `installation_repositories` and `github_app_authorization` reach every
+/// App without being asked for, so they are not (and cannot be) listed.
+const MANIFEST_EVENTS: [&str; 5] = ["member", "membership", "organization", "repository", "team"];
+
+/// What the App created from a manifest is made of.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestParams {
+    /// The instance's name, as it shows people (the host of
+    /// `service.public_url`). The App is named `Crystalline <label>`; the
+    /// admin may change the name on GitHub's form.
+    pub instance_label: String,
+    /// `service.public_url`: every url in the manifest is built under it.
+    pub public_url: String,
+    /// Whether GitHub can reach `public_url`. Only then does the manifest
+    /// set up a webhook; without one the role cache's five minutes apply.
+    pub webhook_public: bool,
+    /// The organization the App is created for, or `None` for the admin's
+    /// own account. Only decides where the form is posted
+    /// ([`manifest_post_url`]).
+    pub org: Option<String>,
+}
+
+/// The GitHub App manifest for this instance (GitHub's "registering a GitHub
+/// App from a manifest"). GitHub fills its creation form from it; the admin
+/// confirms there.
+///
+/// GitHub's manifest has no field that switches the device flow on, so an
+/// App created from it has it off until the admin enables it on GitHub.
+pub fn app_manifest(p: &ManifestParams) -> serde_json::Value {
+    let base = p.public_url.trim().trim_end_matches('/');
+    let at = |path: &str| format!("{base}{path}");
+    let permissions: serde_json::Map<String, serde_json::Value> = MANIFEST_PERMISSIONS
+        .iter()
+        .map(|(name, access)| (name.to_string(), serde_json::Value::from(*access)))
+        .collect();
+    let mut manifest = serde_json::json!({
+        "name": format!("Crystalline {}", p.instance_label.trim()),
+        "url": base,
+        "redirect_url": at(MANIFEST_CREATED_PATH),
+        "callback_urls": [at(LINK_CALLBACK_PATH)],
+        "setup_url": at(MANIFEST_SETUP_PATH),
+        "public": false,
+        "request_oauth_on_install": false,
+        "default_permissions": permissions,
+        "default_events": MANIFEST_EVENTS,
+    });
+    if p.webhook_public {
+        manifest["hook_attributes"] = serde_json::json!({
+            "url": at(WEBHOOK_PATH),
+            "active": true,
+        });
+    }
+    manifest
+}
+
+/// Where the manifest form is posted: GitHub's new-App page for the admin's
+/// own account, or for `org`, on the web host `auth_base` names (the
+/// Enterprise Server host on GHES, never its API host). `state` comes back
+/// with the code.
+pub fn manifest_post_url(auth_base: &str, org: Option<&str>, state: &str) -> String {
+    let base = auth_base.trim_end_matches('/');
+    let state = segment(state);
+    match org {
+        Some(org) => format!(
+            "{base}/organizations/{}/settings/apps/new?state={state}",
+            segment(org)
+        ),
+        None => format!("{base}/settings/apps/new?state={state}"),
+    }
+}
+
+/// Whether `name` can be a GitHub organization login: letters, digits and
+/// single hyphens, not at either end, at most 39 characters.
+pub fn valid_org_login(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 39
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && !name.contains("--")
+}
+
+/// What `POST /app-manifests/{code}/conversions` answers: the App and its
+/// secrets. No `Debug`: it holds the private key.
+#[derive(Deserialize)]
+struct ConversionResponse {
+    id: u64,
+    slug: String,
+    client_id: String,
+    #[serde(default)]
+    client_secret: Option<String>,
+    #[serde(default)]
+    webhook_secret: Option<String>,
+    pem: String,
+}
+
+/// Exchanges the code GitHub sent back after creating an App from a
+/// manifest for that App's credentials: `POST
+/// /app-manifests/{code}/conversions` on `api_url` (the effective
+/// `github.api_url`). The code is the only proof, so the request carries no
+/// credential. It works once, within an hour of the App's creation.
+///
+/// A 404 from an Enterprise Server (it sends `X-GitHub-Enterprise-Version`)
+/// is [`RemoteError::EndpointMissing`] naming its version; a 404 from
+/// github.com means the code is unknown, used or too old. The code is never
+/// part of an error.
+pub async fn convert_manifest(
+    api_url: Option<&str>,
+    code: &str,
+) -> Result<AppCredentials, RemoteError> {
+    let api_url = api_url
+        .map(|url| url.trim().trim_end_matches('/'))
+        .filter(|url| !url.is_empty())
+        .unwrap_or(DEFAULT_API_URL);
+    let client = reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("the client config here is static and always valid");
+    let request = client
+        .post(format!(
+            "{api_url}/app-manifests/{}/conversions",
+            segment(code)
+        ))
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", API_VERSION)
+        .header("User-Agent", "crystalline");
+    let response = send(request).await?;
+    if response.status() == StatusCode::NOT_FOUND {
+        if let Some(version) = header(&response, "x-github-enterprise-version") {
+            return Err(RemoteError::EndpointMissing {
+                endpoint: "POST /app-manifests/{code}/conversions".to_string(),
+                ghes_version: Some(version),
+            });
+        }
+        return Err(RemoteError::Api {
+            status: 404,
+            message: "GitHub does not know the code it sent back: it was already used or is more than an hour old. Delete the new App in GitHub's developer settings and create it again".to_string(),
+        });
+    }
+    let response = check_response(response, None, false, api_url).await?;
+    let app: ConversionResponse = parse_json(response).await?;
+    Ok(AppCredentials {
+        app_id: app.id,
+        client_id: app.client_id,
+        client_secret: app.client_secret.filter(|s| !s.is_empty()),
+        private_key: app.pem,
+        webhook_secret: app.webhook_secret.filter(|s| !s.is_empty()),
+        slug: Some(app.slug),
+        host: api_host(api_url).unwrap_or_else(|| "github.com".to_string()),
+    })
 }
 
 /// GitHub refused the App's signed token.
@@ -1313,6 +1506,26 @@ mod tests {
             noreply_domain(Some("[2001:db8::1]:8443")),
             "users.noreply.[2001:db8::1]"
         );
+    }
+
+    #[test]
+    fn an_org_login_is_letters_digits_and_single_inner_hyphens() {
+        for good in ["acme", "acme-corp", "a", "A1-b2", &"x".repeat(39)] {
+            assert!(valid_org_login(good), "{good}");
+        }
+        for bad in [
+            "",
+            "-acme",
+            "acme-",
+            "ac--me",
+            "acme/evil",
+            "acme?x=1",
+            "ac me",
+            "äcme",
+            &"x".repeat(40),
+        ] {
+            assert!(!valid_org_login(bad), "{bad}");
+        }
     }
 
     /// Signed with the PKCS#1 fixture and cross-checked against `openssl dgst

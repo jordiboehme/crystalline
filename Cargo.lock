@@ -1579,6 +1579,7 @@ dependencies = [
  "tokio",
  "tower-service",
  "tracing",
+ "url",
  "utoipa",
  "yrs",
  "zip 9.1.3",

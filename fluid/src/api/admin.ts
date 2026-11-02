@@ -27,6 +27,7 @@ import {
 import type {
   ArchiveReport as ArchiveReportWire,
   CreateDomainWireBody,
+  GithubAppManifestResponse,
   GithubIdentityResponse,
   GithubLinkResponse,
   GithubStatusResponse,
@@ -75,6 +76,22 @@ export interface GithubStatus {
    * status read after the flow ends, then cleared.
    */
   error: string | null;
+  /** The instance's GitHub App, or null when none is configured. */
+  app: GithubApp | null;
+}
+
+/** The instance's GitHub App. No secret: the server sends none. */
+export interface GithubApp {
+  /** The numeric App id, when the App could be read. */
+  appId: number | null;
+  /** The App's slug, when known. */
+  slug: string | null;
+  /** `keyring`, `file` or `environment`. */
+  source: string | null;
+  /** Where an owner installs the App, when it is usable and its slug known. */
+  installUrl: string | null;
+  /** Why the App cannot be used, in the server's words. */
+  error: string | null;
 }
 
 /** The cache key of the GitHub connection. */
@@ -97,6 +114,22 @@ export function readGithubStatus(payload: unknown): GithubStatus {
     tokenStore: asString(record?.token_store),
     pending: readPending(record?.pending),
     error: asString(record?.error),
+    app: readApp(record?.app),
+  };
+}
+
+/** The App block, or null when the instance has no App. */
+function readApp(value: unknown): GithubApp | null {
+  const record = asObject(value);
+  if (record === null) {
+    return null;
+  }
+  return {
+    appId: asNumber(record.app_id),
+    slug: asString(record.slug),
+    source: asString(record.source),
+    installUrl: asString(record.install_url),
+    error: asString(record.error),
   };
 }
 
@@ -145,6 +178,50 @@ export async function submitGithubToken(token: string): Promise<GithubStatus> {
       body: JSON.stringify({ token }),
     }),
   );
+}
+
+/** The form that creates the instance's GitHub App on GitHub. */
+export interface GithubAppManifestForm {
+  /** GitHub's new-App page, carrying the state. */
+  postUrl: string;
+  /** The manifest, posted JSON-encoded as the field `manifest`. */
+  manifest: unknown;
+}
+
+/**
+ * Ask for the manifest form. `org` names the organization the App is made
+ * for; without it the App belongs to the admin's own GitHub account.
+ */
+export async function startGithubAppManifest(
+  org: string | null,
+): Promise<GithubAppManifestForm> {
+  const answer = await api<GithubAppManifestResponse>(
+    "/settings/github/app/manifest",
+    {
+      method: "POST",
+      body: JSON.stringify(org === null ? {} : { org }),
+    },
+  );
+  return { postUrl: answer.post_url, manifest: answer.manifest };
+}
+
+/**
+ * Send the browser to GitHub with the manifest: a real form POST, the only
+ * way GitHub's new-App page takes one. The page is left for GitHub's, so
+ * nothing runs after this.
+ */
+export function postGithubAppManifest(form: GithubAppManifestForm): void {
+  const element = document.createElement("form");
+  element.method = "post";
+  element.action = form.postUrl;
+  element.hidden = true;
+  const field = document.createElement("input");
+  field.type = "hidden";
+  field.name = "manifest";
+  field.value = JSON.stringify(form.manifest);
+  element.appendChild(field);
+  document.body.appendChild(element);
+  element.submit();
 }
 
 /** Forget the stored credential. Leaves the feature itself switched on. */

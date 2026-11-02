@@ -3462,6 +3462,17 @@ fn write_ops() -> Vec<WriteOp> {
             min_role: Role::Admin,
             read_only_exempt: false,
         },
+        // The form that creates the instance's GitHub App. Admin only and
+        // refused read-only: the App it leads to is the instance's
+        // credential. Its allowed leg answers past authorization with the
+        // form, or 409 where the fixture has no public url.
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/settings/github/app/manifest",
+            body: Some(serde_json::json!({})),
+            min_role: Role::Admin,
+            read_only_exempt: false,
+        },
         // The self-service identity surface: the one settings-shaped write
         // group an editor may drive, because the credential it manages is the
         // caller's own rather than the instance's. A viewer is still refused

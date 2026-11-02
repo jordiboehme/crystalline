@@ -115,6 +115,36 @@ describe("the admin client layer", () => {
         expiresInSecs: 900,
       },
       error: null,
+      app: null,
+    });
+  });
+
+  it("reads the App block without a secret field in sight", () => {
+    expect(
+      readGithubStatus({
+        enabled: true,
+        connected: true,
+        user: null,
+        token_store: "GitHub App",
+        pending: null,
+        error: null,
+        app: {
+          app_id: 7,
+          slug: "crystalline-kb",
+          source: "keyring",
+          install_url:
+            "https://github.example/apps/crystalline-kb/installations/new",
+          webhook_secret_set: true,
+          error: null,
+        },
+      }).app,
+    ).toEqual({
+      appId: 7,
+      slug: "crystalline-kb",
+      source: "keyring",
+      installUrl:
+        "https://github.example/apps/crystalline-kb/installations/new",
+      error: null,
     });
   });
 
@@ -135,6 +165,7 @@ describe("the admin client layer", () => {
       tokenStore: "keyring",
       pending: null,
       error: "authorization denied",
+      app: null,
     });
   });
 
@@ -192,6 +223,7 @@ describe("the admin client layer", () => {
       tokenStore: null,
       pending: null,
       error: null,
+      app: null,
     });
   });
 

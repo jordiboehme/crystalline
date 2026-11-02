@@ -131,7 +131,7 @@ pub const SETUP_PATH: &str = "/auth/setup";
 /// every other `POST`. This list is a path list, so it exempts both; the guard
 /// that matters for the second one lives in the handler rather than here, and
 /// that is the first thing to check when reading this exemption.
-const PUBLIC_PATHS: [&str; 14] = [
+const PUBLIC_PATHS: [&str; 16] = [
     LOGIN_PATH,
     "/auth/logout",
     "/auth/me",
@@ -181,6 +181,16 @@ const PUBLIC_PATHS: [&str; 14] = [
     // signature does not verify before it reads anything else. See
     // `super::github_webhook::receive`.
     super::github_webhook::PATH,
+    // Where GitHub sends the browser back after creating the instance's App
+    // from a manifest. A browser landing like the link callback: a lost
+    // session gets a page, never a raw 401. The handler requires an admin
+    // itself, and stores nothing without the state that admin's own session
+    // was handed with the form. See `super::github_app_create::created`.
+    super::github_app_create::CREATED_PATH,
+    // Where GitHub sends the browser after the App was installed. It only
+    // redirects to the settings page and reads nothing GitHub sent. See
+    // `super::github_app_create::setup`.
+    super::github_app_create::SETUP_PATH,
 ];
 
 /// The three auth settings, resolved once when the HTTP surface is built.
