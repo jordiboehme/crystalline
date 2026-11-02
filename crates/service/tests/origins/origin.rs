@@ -8211,7 +8211,12 @@ async fn env_readers_quietly_take_no_write_on_a_domain_already_private() {
 
     // Another connection holds the accounts database's write lock. A second
     // run that only reads finishes at once; one that took a write lock would
-    // wait out the busy timeout and fail.
+    // wait out the busy timeout and fail. The second connection needs
+    // turso's multiprocess WAL, which its Windows IO backend does not offer;
+    // the read-before-write path it pins is the same on every OS.
+    if cfg!(windows) {
+        return;
+    }
     let db = turso::Builder::new_local(tmp.path().join("auth.db").to_str().unwrap())
         .experimental_multiprocess_wal(true)
         .build()
