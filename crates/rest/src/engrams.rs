@@ -812,7 +812,9 @@ pub struct MoveBody {
         ),
         (
             status = 403,
-            description = "The caller is not an editor, the request did not \
+            description = "The caller may not write this domain (not an \
+                           editor, or on a domain GitHub governs, no GitHub \
+                           write), the request did not \
                            echo its CSRF token, this instance is read-only, or \
                            the trusted-header identity names a disabled account.",
             body = ProblemDetail,
@@ -1073,7 +1075,9 @@ pub async fn create(
         ),
         (
             status = 403,
-            description = "The caller is not an editor, the request did not \
+            description = "The caller may not write this domain (not an \
+                           editor, or on a domain GitHub governs, no GitHub \
+                           write), the request did not \
                            echo its CSRF token, this instance is read-only, or \
                            the trusted-header identity names a disabled \
                            account. A read-only instance answers this ahead of \
@@ -1346,7 +1350,9 @@ pub async fn save(
         ),
         (
             status = 403,
-            description = "The caller is not an editor, the request did not \
+            description = "The caller may not write this domain (not an \
+                           editor, or on a domain GitHub governs, no GitHub \
+                           write), the request did not \
                            echo its CSRF token, this instance is read-only, or \
                            the trusted-header identity names a disabled account.",
             body = ProblemDetail,
@@ -1498,7 +1504,9 @@ pub async fn retire(
         ),
         (
             status = 403,
-            description = "The caller is not an editor, the request did not \
+            description = "The caller may not write this domain (not an \
+                           editor, or on a domain GitHub governs, no GitHub \
+                           write), the request did not \
                            echo its CSRF token, this instance is read-only, or \
                            the trusted-header identity names a disabled account.",
             body = ProblemDetail,
@@ -1707,7 +1715,9 @@ pub struct ValidateResponse {
         ),
         (
             status = 403,
-            description = "The caller is not an editor, the request did not \
+            description = "The caller may not write this domain (not an \
+                           editor, or on a domain GitHub governs, no GitHub \
+                           write), the request did not \
                            echo its CSRF token, this instance is read-only, or \
                            the trusted-header identity names a disabled account.",
             body = ProblemDetail,
@@ -1726,7 +1736,24 @@ pub async fn validate(
     identity: Identity,
     ApiJson(body): ApiJson<ValidateBody>,
 ) -> Result<Json<ValidateResponse>, ApiError> {
-    identity.require_editor()?;
+    let domain = body.domain.as_deref().unwrap_or("draft");
+    // The dry run follows the save it checks. On a domain GitHub governs an
+    // instance viewer with GitHub write saves (`require_domain_write`), so it
+    // may check what it saves; everywhere else, and for every instance
+    // editor, the instance role decides as before.
+    // Nobody signed in keeps its 401. Any refusal on the governed path is
+    // the instance role's own 403, so a governed domain the caller may not
+    // see answers exactly like a name nobody registered and the dry run is
+    // no oracle for which domains exist.
+    match identity.require_editor() {
+        Ok(_) => {}
+        Err(e) if e.status == StatusCode::FORBIDDEN && state.access.governs(domain) => {
+            crate::require_domain_write(&state, &identity, domain)
+                .await
+                .map_err(|_| e)?;
+        }
+        Err(e) => return Err(e),
+    }
     // No engine verb runs here, so nothing else answers read-only; the
     // handler makes the check itself, ahead of running the rule engine, for
     // the same reason `save` and `remove` answer it before their own
@@ -1737,7 +1764,6 @@ pub async fn validate(
             "this instance is read-only; content mutations are disabled",
         ));
     }
-    let domain = body.domain.as_deref().unwrap_or("draft");
     let rel = body.path.as_deref().unwrap_or("draft.md");
     // The named domain's own overrides, the same ones `crystalline verify`
     // and `validate_engrams` apply. A domain nobody registered, or one this
@@ -1853,7 +1879,9 @@ impl ValidateFinding {
         ),
         (
             status = 403,
-            description = "The caller is not an editor, the request did not \
+            description = "The caller may not write this domain (not an \
+                           editor, or on a domain GitHub governs, no GitHub \
+                           write), the request did not \
                            echo its CSRF token, this instance is read-only, or \
                            the trusted-header identity names a disabled \
                            account. A read-only instance answers this ahead of \

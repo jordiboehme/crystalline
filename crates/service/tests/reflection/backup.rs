@@ -563,7 +563,7 @@ async fn two_subpaths_on_one_branch_upload_only_their_own_changes() {
             .count()
     };
     // `ops` moved the branch after `eng`'s backup; `eng` changes one page.
-    // An agent's write is reflected, so the page's baseline moves with it.
+    // Its baseline moves too, but baselines stay on this disk.
     let before = blobs(&mock);
     fx.engine
         .write_reflection(&in_domain("eng", "one.md", "# Changed\n"), &agent())
@@ -573,15 +573,11 @@ async fn two_subpaths_on_one_branch_upload_only_their_own_changes() {
     assert!(
         matches!(
             again[..],
-            [(_, Ok(BackupOutcome::Committed { files: 2, .. }))]
+            [(_, Ok(BackupOutcome::Committed { files: 1, .. }))]
         ),
         "{again:?}"
     );
-    assert_eq!(
-        blobs(&mock),
-        before + 2,
-        "the changed page and its baseline alone"
-    );
+    assert_eq!(blobs(&mock), before + 1, "the changed page alone");
     // And `ops`, whose head `eng` just moved, has nothing to send.
     fx.engine.mark_reflection_dirty("ops", BackupCause::Settled);
     let ops = fx.engine.reflection_backup_tick(Instant::now()).await;
@@ -589,7 +585,7 @@ async fn two_subpaths_on_one_branch_upload_only_their_own_changes() {
         matches!(ops[..], [(_, Ok(BackupOutcome::NothingToBackUp))]),
         "{ops:?}"
     );
-    assert_eq!(blobs(&mock), before + 2, "no upload for ops");
+    assert_eq!(blobs(&mock), before + 1, "no upload for ops");
     let head = mock.branch_commit(BACKUP_BRANCH).unwrap();
     let paths = mock.commit_paths(&head);
     assert!(
@@ -811,4 +807,653 @@ async fn the_backup_branch_carries_the_reflection_files_byte_for_byte() {
         !paths.iter().any(|p| p.starts_with("reflections/assets/")),
         "{paths:?}"
     );
+}
+
+/// [`home`] beside a shared `harbor` with one engram, keeper as an
+/// account, and the resolver installed. With `harbor_on_github`, `harbor`
+/// is connected to its own repository too.
+async fn home_beside_harbor(
+    mock: Arc<MockProvider>,
+    harbor_on_github: bool,
+) -> (Fx, Arc<crystalline_service::rest::AuthStore>) {
+    let fx = fixture_with(
+        &[
+            (
+                "MANIFEST.md",
+                &manifest(&format!("reflection: on\nreflection_home: {HOME}\n")),
+            ),
+            (
+                "runbooks/deploy.md",
+                &engram("Deploy", "runbooks/deploy", "- [fact] deploys run at night"),
+            ),
+        ],
+        |cfg, base| {
+            cfg.domains.get_mut("eng").unwrap().origin = Some(OriginConfig {
+                repo: "acme/kb".into(),
+                path: None,
+                branch: Some("main".into()),
+                poll_secs: None,
+            });
+            cfg.service = Some(ServiceConfig {
+                public_url: Some(HOME.into()),
+                ..Default::default()
+            });
+            cfg.github = Some(GitHubConfig {
+                enabled: Some(true),
+                ..Default::default()
+            });
+            let root = base.join("harbor");
+            std::fs::create_dir_all(root.join("team")).unwrap();
+            std::fs::write(
+                root.join("MANIFEST.md"),
+                crystalline_core::manifest_template("harbor", "2026-01-01"),
+            )
+            .unwrap();
+            std::fs::write(
+                root.join("team/harbor-team.md"),
+                engram("Harbor team", "team/harbor-team", "- [fact] five people"),
+            )
+            .unwrap();
+            let mut entry = crystalline_core::config::DomainEntry::file(root);
+            if harbor_on_github {
+                entry.origin = Some(OriginConfig {
+                    repo: "acme/harbor".into(),
+                    path: None,
+                    branch: Some("main".into()),
+                    poll_secs: None,
+                });
+            }
+            cfg.domains.insert("harbor".into(), entry);
+        },
+    )
+    .await;
+    let engine = Arc::try_unwrap(fx.engine).ok().expect("one handle");
+    let engine = engine.with_origin_provider(mock);
+    let auth = Arc::new(
+        crystalline_service::rest::AuthStore::open(&fx.tmp.path().join("web-auth.db"))
+            .await
+            .unwrap(),
+    );
+    auth.add_user(
+        "keeper",
+        "keeper",
+        None,
+        crystalline_service::rest::Role::Editor,
+        "pw12345678",
+    )
+    .await
+    .unwrap();
+    engine.set_domain_access(Arc::new(crystalline_service::DomainAccess::new(
+        auth.clone(),
+    )));
+    (
+        Fx {
+            engine: Arc::new(engine),
+            ..fx
+        },
+        auth,
+    )
+}
+
+/// A page that cites a domain fewer people may read than its own is held
+/// back from the backup branch (with its baseline), and the branch head
+/// loses the copy it had; the hold is said. Once a curator takes the source
+/// out, the page goes to the branch again.
+#[tokio::test]
+async fn a_page_with_a_too_wide_source_is_held_back_until_it_is_settled() {
+    let mock = Arc::new(MockProvider::new());
+    main_commit(&mock);
+    let (fx, auth) = home_beside_harbor(mock.clone(), true).await;
+    let page = "# Wide\n\nFor people.\n\n## Team\n\nFive people.\n";
+    let mut wide = write("wide.md", page);
+    wide.sources = BTreeMap::from([(
+        "Team".to_string(),
+        vec!["crystalline://harbor/team/harbor-team".to_string()],
+    )]);
+    fx.engine.write_reflection(&wide, &agent()).await.unwrap();
+    fx.engine
+        .write_reflection(&write("a.md", "# A\n\n## One\n\nText.\n"), &agent())
+        .await
+        .unwrap();
+    let head_paths = || mock.commit_paths(&mock.branch_commit(BACKUP_BRANCH).unwrap());
+    fx.engine.reflection_backup_tick(Instant::now()).await;
+    assert!(head_paths().contains(&"reflections/wide.md".to_string()));
+    assert!(fx.engine.reflection_backup_held_back("eng").is_empty());
+
+    // harbor narrows: the next backup leaves the page and its baseline out.
+    auth.set_domain_visibility("harbor", true, "keeper")
+        .await
+        .unwrap();
+    fx.engine.mark_reflection_dirty("eng", BackupCause::Settled);
+    let now = Instant::now();
+    let held = fx.engine.reflection_backup_tick(now).await;
+    assert_eq!(held.len(), 1, "{held:?}");
+    let paths = head_paths();
+    assert!(!paths.iter().any(|p| p.contains("wide.md")), "{paths:?}");
+    assert!(paths.contains(&"reflections/a.md".to_string()), "{paths:?}");
+    assert_eq!(
+        fx.engine.reflection_backup_held_back("eng"),
+        vec!["wide.md".to_string()]
+    );
+    // The hold is looked at again later without a new change.
+    assert!(fx.engine.reflection_backup_tick(now).await.is_empty());
+    assert_eq!(
+        fx.engine
+            .reflection_backup_tick(now + Duration::from_secs(3600))
+            .await
+            .len(),
+        1
+    );
+
+    // Settled: the source and its text are out, and the page goes back.
+    let mut settled = write("wide.md", "# Wide\n\nFor people.\n\n## Team\n\nA team.\n");
+    settled.sources = BTreeMap::from([("Team".to_string(), vec!["runbooks/deploy".to_string()])]);
+    fx.engine
+        .write_reflection(&settled, &agent())
+        .await
+        .unwrap();
+    let done = fx.engine.reflection_backup_tick(Instant::now()).await;
+    assert!(
+        matches!(done[..], [(_, Ok(BackupOutcome::Committed { .. }))]),
+        "{done:?}"
+    );
+    assert!(head_paths().contains(&"reflections/wide.md".to_string()));
+    assert!(fx.engine.reflection_backup_held_back("eng").is_empty());
+}
+
+/// The page of `eng` (connected to GitHub) whose `Team` section cites
+/// harbor's engram.
+fn citing_harbor(path: &str) -> crystalline_service::params::WriteReflectionParams {
+    let mut p = write(path, "# Wide\n\nFor people.\n\n## Team\n\nFive people.\n");
+    p.sources = BTreeMap::from([(
+        "Team".to_string(),
+        vec!["crystalline://harbor/team/harbor-team".to_string()],
+    )]);
+    p
+}
+
+/// A page of a domain backed up to a GitHub repository may not cite a
+/// domain that is not connected to GitHub, even when the accounts allow it
+/// (both domains are shared here): personal knowledge never reaches a
+/// repository.
+#[tokio::test]
+async fn a_github_page_cannot_cite_a_local_domain() {
+    let mock = Arc::new(MockProvider::new());
+    main_commit(&mock);
+    let (fx, _) = home_beside_harbor(mock, false).await;
+    let err = fx
+        .engine
+        .write_reflection(&citing_harbor("wide.md"), &agent())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("this source is in a domain that is not shared through GitHub, and this page is backed up to a GitHub repository"),
+        "{err}"
+    );
+    assert!(!fx.root.join("reflections/wide.md").exists());
+}
+
+#[tokio::test]
+async fn a_github_page_can_cite_another_github_domain() {
+    let mock = Arc::new(MockProvider::new());
+    main_commit(&mock);
+    let (fx, _) = home_beside_harbor(mock, true).await;
+    fx.engine
+        .write_reflection(&citing_harbor("wide.md"), &agent())
+        .await
+        .unwrap();
+}
+
+/// A page that cites a local domain from a GitHub domain anyway (here
+/// edited on disk) is named in the queue and held back from the backup.
+#[tokio::test]
+async fn an_existing_github_page_citing_a_local_domain_is_named_and_held_back() {
+    let mock = Arc::new(MockProvider::new());
+    main_commit(&mock);
+    let (fx, _) = home_beside_harbor(mock.clone(), false).await;
+    fx.engine
+        .write_reflection(&write("a.md", "# A\n\n## One\n\nText.\n"), &agent())
+        .await
+        .unwrap();
+    std::fs::write(
+        fx.root.join("reflections/forged.md"),
+        "---\nreflection:\n  aaaa1111:\n    sources:\n    - domain: harbor\n      engram: team/harbor-team\n      checksum: abc\n---\n\n# Forged\n\n## Team\n<!-- r:aaaa1111 -->\n\nFive.\n",
+    )
+    .unwrap();
+    fx.engine.sync(None).await.unwrap();
+    let queue = fx
+        .engine
+        .reflect(
+            &crystalline_service::params::ReflectParams {
+                domains: vec!["eng".into()],
+                limit: Some(100),
+                ..Default::default()
+            },
+            &agent(),
+        )
+        .await
+        .unwrap();
+    let items: Vec<&serde_json::Value> = queue["queue"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["what"] == "source_too_wide")
+        .collect();
+    assert_eq!(items.len(), 1, "{queue}");
+    assert_eq!(items[0]["path"], "forged.md", "{queue}");
+
+    fx.engine.mark_reflection_dirty("eng", BackupCause::Settled);
+    fx.engine.reflection_backup_tick(Instant::now()).await;
+    let paths = mock.commit_paths(&mock.branch_commit(BACKUP_BRANCH).unwrap());
+    assert!(paths.contains(&"reflections/a.md".to_string()), "{paths:?}");
+    assert!(!paths.iter().any(|p| p.contains("forged.md")), "{paths:?}");
+    assert_eq!(
+        fx.engine.reflection_backup_held_back("eng"),
+        vec!["forged.md".to_string()]
+    );
+}
+
+/// A narrowing marks nothing in the Reflection, so the daemon's periodic
+/// recount (and every accounts change through the JSON API) looks for pages
+/// that newly cite a domain fewer people may read and schedules a backup,
+/// which drops them off the branch head at once.
+#[tokio::test]
+async fn a_narrowing_schedules_a_backup_that_drops_the_page() {
+    let mock = Arc::new(MockProvider::new());
+    main_commit(&mock);
+    let (fx, auth) = home_beside_harbor(mock.clone(), true).await;
+    fx.engine
+        .write_reflection(&citing_harbor("wide.md"), &agent())
+        .await
+        .unwrap();
+    fx.engine.reflection_backup_tick(Instant::now()).await;
+    let head_paths = || mock.commit_paths(&mock.branch_commit(BACKUP_BRANCH).unwrap());
+    assert!(head_paths().contains(&"reflections/wide.md".to_string()));
+
+    auth.set_domain_visibility("harbor", true, "keeper")
+        .await
+        .unwrap();
+    assert!(
+        fx.engine
+            .reflection_backup_tick(Instant::now())
+            .await
+            .is_empty(),
+        "nothing marked by the narrowing itself"
+    );
+    assert_eq!(
+        fx.engine.schedule_too_wide_backups().await,
+        vec!["eng".to_string()]
+    );
+    let done = fx.engine.reflection_backup_tick(Instant::now()).await;
+    assert_eq!(done.len(), 1, "{done:?}");
+    assert!(!head_paths().iter().any(|p| p.contains("wide.md")));
+    // Held now: the next look schedules nothing new.
+    assert!(fx.engine.schedule_too_wide_backups().await.is_empty());
+
+    // The periodic recount runs the same look.
+    let (fx, auth) = home_beside_harbor(mock.clone(), true).await;
+    fx.engine
+        .write_reflection(&citing_harbor("wide.md"), &agent())
+        .await
+        .unwrap();
+    fx.engine.reflection_backup_tick(Instant::now()).await;
+    auth.set_domain_visibility("harbor", true, "keeper")
+        .await
+        .unwrap();
+    fx.engine.record_reflect_counts().await.unwrap();
+    assert_eq!(
+        fx.engine.reflection_backup_tick(Instant::now()).await.len(),
+        1
+    );
+}
+
+/// The files only a held page links are held back with it and go out again
+/// with it; a file a page that is not held links too stays on the branch.
+#[tokio::test]
+async fn a_held_page_holds_back_the_files_only_it_links() {
+    let mock = Arc::new(MockProvider::new());
+    main_commit(&mock);
+    let (fx, auth) = home_beside_harbor(mock.clone(), true).await;
+    for asset in ["assets/only.png", "assets/shared.png"] {
+        fx.engine
+            .reflection_asset_write("eng", asset, crate::assets::PNG.to_vec(), &agent())
+            .await
+            .unwrap();
+    }
+    let mut wide = write(
+        "wide.md",
+        "# Wide\n\nFor people.\n\n## Team\n\nFive people.\n\n![only](assets/only.png)\n\n![shared](assets/shared.png)\n",
+    );
+    wide.sources = BTreeMap::from([(
+        "Team".to_string(),
+        vec!["crystalline://harbor/team/harbor-team".to_string()],
+    )]);
+    fx.engine.write_reflection(&wide, &agent()).await.unwrap();
+    fx.engine
+        .write_reflection(
+            &write("a.md", "# A\n\n## One\n\n![shared](assets/shared.png)\n"),
+            &agent(),
+        )
+        .await
+        .unwrap();
+    let head_paths = || mock.commit_paths(&mock.branch_commit(BACKUP_BRANCH).unwrap());
+    fx.engine.reflection_backup_tick(Instant::now()).await;
+    assert!(head_paths().contains(&"reflections/assets/only.png".to_string()));
+
+    auth.set_domain_visibility("harbor", true, "keeper")
+        .await
+        .unwrap();
+    fx.engine.mark_reflection_dirty("eng", BackupCause::Settled);
+    fx.engine.reflection_backup_tick(Instant::now()).await;
+    let paths = head_paths();
+    assert!(
+        !paths.contains(&"reflections/assets/only.png".to_string()),
+        "{paths:?}"
+    );
+    assert!(
+        paths.contains(&"reflections/assets/shared.png".to_string()),
+        "{paths:?}"
+    );
+
+    let mut settled = write(
+        "wide.md",
+        "# Wide\n\nFor people.\n\n## Team\n\nA team.\n\n![only](assets/only.png)\n",
+    );
+    settled.sources = BTreeMap::from([("Team".to_string(), vec!["runbooks/deploy".to_string()])]);
+    fx.engine
+        .write_reflection(&settled, &agent())
+        .await
+        .unwrap();
+    fx.engine.reflection_backup_tick(Instant::now()).await;
+    assert!(head_paths().contains(&"reflections/assets/only.png".to_string()));
+}
+
+/// Serve `fx`'s engine over HTTP with `auth`, adding `boss`, an instance
+/// admin: the JSON API whose accounts routes run the narrowing hook.
+async fn serve_backup_home(
+    fx: &Fx,
+    auth: Arc<crystalline_service::rest::AuthStore>,
+) -> std::net::SocketAddr {
+    auth.add_user(
+        "boss",
+        "boss",
+        None,
+        crystalline_service::rest::Role::Admin,
+        "pw12345678",
+    )
+    .await
+    .unwrap();
+    let router = crystalline_service::daemon::http_router(
+        fx.engine.clone(),
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        &[],
+        auth,
+        None,
+    )
+    .unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    addr
+}
+
+/// Tick until a backup ran (the hook schedules it off the request), for at
+/// most five seconds; the paths of the branch head then.
+async fn backed_up_after_hook(fx: &Fx, mock: &MockProvider) -> Vec<String> {
+    let start = Instant::now();
+    while fx
+        .engine
+        .reflection_backup_tick(Instant::now())
+        .await
+        .is_empty()
+    {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "no backup was scheduled"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    mock.commit_paths(&mock.branch_commit(BACKUP_BRANCH).unwrap())
+}
+
+/// A domain made private through the JSON API schedules the backup that
+/// drops a page citing it from the branch head, with no edit and no wait.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_visibility_change_through_the_api_drops_the_page() {
+    let mock = Arc::new(MockProvider::new());
+    main_commit(&mock);
+    let (fx, auth) = home_beside_harbor(mock.clone(), true).await;
+    fx.engine
+        .write_reflection(&citing_harbor("wide.md"), &agent())
+        .await
+        .unwrap();
+    fx.engine.reflection_backup_tick(Instant::now()).await;
+    let addr = serve_backup_home(&fx, auth).await;
+    let boss = crate::rest::Session::login(addr, "boss").await;
+    let (status, body) = boss
+        .send(
+            reqwest::Method::PUT,
+            "/api/v1/domains/harbor/visibility",
+            Some(serde_json::json!({ "private": true })),
+        )
+        .await;
+    assert_eq!(status, 204, "{body}");
+    let paths = backed_up_after_hook(&fx, &mock).await;
+    assert!(!paths.iter().any(|p| p.contains("wide.md")), "{paths:?}");
+}
+
+/// A member added through the JSON API to the page's private domain, who
+/// may not read the cited domain, schedules the backup that drops the page.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_membership_change_through_the_api_drops_the_page() {
+    let mock = Arc::new(MockProvider::new());
+    main_commit(&mock);
+    let (fx, auth) = home_beside_harbor(mock.clone(), true).await;
+    auth.add_user(
+        "sam",
+        "sam",
+        None,
+        crystalline_service::rest::Role::Viewer,
+        "pw12345678",
+    )
+    .await
+    .unwrap();
+    for domain in ["eng", "harbor"] {
+        auth.set_domain_visibility(domain, true, "keeper")
+            .await
+            .unwrap();
+    }
+    fx.engine
+        .write_reflection(&citing_harbor("wide.md"), &agent())
+        .await
+        .unwrap();
+    fx.engine.reflection_backup_tick(Instant::now()).await;
+    let addr = serve_backup_home(&fx, auth).await;
+    let keeper = crate::rest::Session::login(addr, "keeper").await;
+    let (status, body) = keeper
+        .send(
+            reqwest::Method::PUT,
+            "/api/v1/domains/eng/members/sam",
+            Some(serde_json::json!({ "level": "viewer" })),
+        )
+        .await;
+    assert_eq!(status, 204, "{body}");
+    let paths = backed_up_after_hook(&fx, &mock).await;
+    assert!(!paths.iter().any(|p| p.contains("wide.md")), "{paths:?}");
+}
+
+/// The CLI's accounts commands run in their own process and tell a running
+/// daemon over the control socket (`readers_changed`), which schedules the
+/// backup that drops the page.
+#[tokio::test]
+async fn the_control_socket_hook_drops_the_page() {
+    let mock = Arc::new(MockProvider::new());
+    main_commit(&mock);
+    let (fx, auth) = home_beside_harbor(mock.clone(), true).await;
+    fx.engine
+        .write_reflection(&citing_harbor("wide.md"), &agent())
+        .await
+        .unwrap();
+    fx.engine.reflection_backup_tick(Instant::now()).await;
+    auth.set_domain_visibility("harbor", true, "keeper")
+        .await
+        .unwrap();
+    let answer = crystalline_service::control::answer_for_test(
+        fx.engine.clone(),
+        &serde_json::json!({ "v": 1, "cmd": "readers_changed" }),
+    )
+    .await;
+    assert_eq!(answer["ok"], true, "{answer}");
+    let paths = backed_up_after_hook(&fx, &mock).await;
+    assert!(!paths.iter().any(|p| p.contains("wide.md")), "{paths:?}");
+}
+
+/// A held page is looked at again after the recheck wait with no change
+/// marked: once its source domain is shared again it goes back.
+#[tokio::test]
+async fn a_held_page_goes_back_after_the_recheck_once_nothing_holds_it() {
+    let mock = Arc::new(MockProvider::new());
+    main_commit(&mock);
+    let (fx, auth) = home_beside_harbor(mock.clone(), true).await;
+    fx.engine
+        .write_reflection(&citing_harbor("wide.md"), &agent())
+        .await
+        .unwrap();
+    fx.engine
+        .write_reflection(&write("a.md", "# A\n\n## One\n\nText.\n"), &agent())
+        .await
+        .unwrap();
+    auth.set_domain_visibility("harbor", true, "keeper")
+        .await
+        .unwrap();
+    let now = Instant::now();
+    fx.engine.reflection_backup_tick(now).await;
+    let head_paths = || mock.commit_paths(&mock.branch_commit(BACKUP_BRANCH).unwrap());
+    assert!(!head_paths().iter().any(|p| p.contains("wide.md")));
+    auth.set_domain_visibility("harbor", false, "keeper")
+        .await
+        .unwrap();
+    let recheck = crystalline_service::reflection_backup::HELD_RECHECK;
+    assert!(
+        fx.engine
+            .reflection_backup_tick(now + recheck - Duration::from_secs(1))
+            .await
+            .is_empty(),
+        "not before the wait"
+    );
+    assert_eq!(
+        fx.engine.reflection_backup_tick(now + recheck).await.len(),
+        1
+    );
+    assert!(head_paths().contains(&"reflections/wide.md".to_string()));
+    assert!(fx.engine.reflection_backup_held_back("eng").is_empty());
+}
+
+/// A local domain's text on a page backed up to GitHub, shared on purpose:
+/// the question names the repository the page is backed up to, and once a
+/// person confirmed it the page is backed up like any other.
+#[tokio::test]
+async fn a_confirmed_local_source_names_the_repository_and_is_backed_up() {
+    let mock = Arc::new(MockProvider::new());
+    main_commit(&mock);
+    let (fx, _) = home_beside_harbor(mock.clone(), false).await;
+    let ask = fx
+        .engine
+        .reflection_disclosure_question(&citing_harbor("wide.md"), &agent())
+        .await
+        .unwrap()
+        .expect("a local source on a GitHub page is a question");
+    assert!(
+        ask.question.contains("GitHub repository acme/kb"),
+        "{}",
+        ask.question
+    );
+    let mut confirmed = citing_harbor("wide.md");
+    confirmed.disclosed = Some(ask.basis);
+    fx.engine
+        .write_reflection(&confirmed, &agent())
+        .await
+        .unwrap();
+    fx.engine.reflection_backup_tick(Instant::now()).await;
+    let head = mock.commit_paths(&mock.branch_commit(BACKUP_BRANCH).unwrap());
+    assert!(
+        head.contains(&"reflections/wide.md".to_string()),
+        "{head:?}"
+    );
+    assert!(fx.engine.reflection_backup_held_back("eng").is_empty());
+}
+
+/// A run on a domain backed up to GitHub reads no domain that is not
+/// connected to GitHub, though the accounts would let it: its pages go to a
+/// repository whose readers are not the accounts here.
+#[tokio::test]
+async fn a_run_on_a_github_domain_reads_no_local_domain() {
+    let mock = Arc::new(MockProvider::new());
+    main_commit(&mock);
+    let (fx, _) = home_beside_harbor(mock, false).await;
+    let owner = crystalline_service::Scope::Unrestricted;
+    let limit = fx
+        .engine
+        .read_limit_for(&owner, true, Some("eng"))
+        .await
+        .unwrap()
+        .hidden;
+    assert!(limit.contains("harbor"), "{limit:?}");
+    assert!(!limit.contains("eng"), "{limit:?}");
+}
+
+/// A new home (or one that lost its backup state) knows nothing of what the
+/// branch head holds. It lists the head and removes every file of this
+/// Reflection it does not send: a held page an earlier home pushed, and a
+/// baseline from before baselines stayed local.
+#[tokio::test]
+async fn a_lost_state_removes_held_pages_and_baselines_from_the_head() {
+    let mock = Arc::new(MockProvider::new());
+    main_commit(&mock);
+    let (fx, _) = home_beside_harbor(mock.clone(), false).await;
+    fx.engine
+        .write_reflection(&write("a.md", "# A\n\n## One\n\nText.\n"), &agent())
+        .await
+        .unwrap();
+    // A page citing a local domain from this GitHub domain: held back.
+    let forged = "---\nreflection:\n  aaaa1111:\n    sources:\n    - domain: harbor\n      engram: team/harbor-team\n      checksum: abc\n---\n\n# Forged\n\n## Team\n<!-- r:aaaa1111 -->\n\nFive.\n";
+    std::fs::write(fx.root.join("reflections/forged.md"), forged).unwrap();
+    // What the branch head holds from an earlier home, with no state here.
+    let head = mock.add_commit(BTreeMap::from([
+        (
+            "reflections/forged.md".to_string(),
+            forged.as_bytes().to_vec(),
+        ),
+        (
+            "reflections/.reflected/a.md".to_string(),
+            b"## One\n<!-- r:bbbb2222 -->\n\nOld.\n".to_vec(),
+        ),
+        ("notes/other.md".to_string(), b"not ours".to_vec()),
+    ]));
+    mock.set_branch(BACKUP_BRANCH, &head);
+    fx.engine.mark_reflection_dirty("eng", BackupCause::Settled);
+    let done = fx
+        .engine
+        .reflection_backup_tick(Instant::now() + Duration::from_secs(120))
+        .await;
+    assert!(
+        matches!(done[..], [(_, Ok(BackupOutcome::Committed { .. }))]),
+        "{done:?}"
+    );
+    let paths = mock.commit_paths(&mock.branch_commit(BACKUP_BRANCH).unwrap());
+    assert!(paths.contains(&"reflections/a.md".to_string()), "{paths:?}");
+    assert!(!paths.iter().any(|p| p.contains("forged")), "{paths:?}");
+    assert!(!paths.iter().any(|p| p.contains(".reflected")), "{paths:?}");
+    // A path outside this Reflection is never touched.
+    assert!(paths.contains(&"notes/other.md".to_string()), "{paths:?}");
 }

@@ -474,6 +474,37 @@ async fn a_malformed_repo_or_path_is_refused_before_the_connection_is_asked_abou
     assert_eq!(ready.status(), 409);
 }
 
+/// `readers` belongs to a team domain, takes shared or private, and does not
+/// contradict `private`: each is a 422 naming the field before anything is
+/// asked of the forge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn readers_is_validated_before_the_connection_is_asked_about() {
+    let fx = serve(Options {
+        github: true,
+        ..Options::default()
+    })
+    .await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    for body in [
+        serde_json::json!({"mode": "local", "name": "notes", "readers": "shared"}),
+        serde_json::json!({"mode": "virtual", "name": "notes", "readers": "private"}),
+        serde_json::json!({"mode": "github", "repo": "acme/kb", "readers": "everyone"}),
+        serde_json::json!({"mode": "github", "repo": "acme/kb", "readers": "shared", "private": true}),
+    ] {
+        let resp = as_session(fx.addr, reqwest::Method::POST, "/api/v1/domains", &admin)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 422, "{body} must be refused");
+        let problem: serde_json::Value = resp.json().await.unwrap();
+        assert!(
+            problem["detail"].as_str().unwrap().contains("readers"),
+            "{problem}"
+        );
+    }
+}
+
 /// The GitHub domain-name peek is admin only, refuses a missing `repo` with
 /// the same 422 a nameless team-domain create's own repo check answers, and
 /// is a 409 pointing at the settings screen when no credential is on file -
@@ -829,7 +860,9 @@ const KB_MANIFEST: &[u8] = b"---\ntype: manifest\ntitle: kb\npermalink: manifest
 
 /// The same MANIFEST declaring `sharing: direct`, so a share of this domain
 /// commits straight onto the connected branch.
-const KB_MANIFEST_DIRECT: &[u8] = b"---\ntype: manifest\ntitle: kb\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\nsharing: direct\n---\n\n# kb\n\n## Scope\n\n- shared knowledge\n\n## When to Use\n\n- Route here for team questions\n";
+/// Carries the team marker, as every team repository does after its first
+/// share from 0.30.0 on, so a direct share's commit message is the share's own.
+const KB_MANIFEST_DIRECT: &[u8] = b"---\ntype: manifest\ntitle: kb\nteam: github\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\nsharing: direct\n---\n\n# kb\n\n## Scope\n\n- shared knowledge\n\n## When to Use\n\n- Route here for team questions\n";
 
 /// [`serve_team_with_mock`] with this instance's share-identity mode chosen:
 /// `personal` makes a share run as the acting account's own GitHub identity,
@@ -1339,7 +1372,9 @@ async fn the_manifest_read_carries_the_policies_and_the_patch_writes_one() {
             { "key": "reflection", "kind": "choice", "declared": null, "effective": "off", "values": ["off", "on"], "default": "off", "meaning": "Whether this domain keeps a Reflection: documents for people under reflections/.", "changed_by": "owner" },
             { "key": "reflection_home", "kind": "text", "declared": null, "effective": "", "values": [], "default": "", "meaning": "The address of the one server this domain's Reflection lives on; filled in when Reflection is switched on.", "changed_by": "owner" },
             { "key": "reflect_trigger", "kind": "choice", "declared": null, "effective": "off", "values": ["off", "webhook"], "default": "off", "meaning": "Send a signed webhook when reflect work is waiting.", "changed_by": "owner" },
-            { "key": "evolve_trigger", "kind": "choice", "declared": null, "effective": "off", "values": ["off", "webhook"], "default": "off", "meaning": "Send a signed webhook when maintenance findings pile up.", "changed_by": "owner" }
+            { "key": "evolve_trigger", "kind": "choice", "declared": null, "effective": "off", "values": ["off", "webhook"], "default": "off", "meaning": "Send a signed webhook when maintenance findings pile up.", "changed_by": "owner" },
+            { "key": "team", "kind": "text", "declared": null, "effective": "", "values": [], "default": "", "meaning": "Marks a team domain shared through GitHub; its Reflection is switched on only at the team server.", "changed_by": "owner" },
+            { "key": "evolve_home", "kind": "text", "declared": null, "effective": "", "values": [], "default": "", "meaning": "The address of the one server whose scheduled evolve runs work this team domain; filled in by its first scheduled evolve run.", "changed_by": "owner" }
         ]),
         "{body}"
     );
@@ -2058,11 +2093,16 @@ async fn a_share_carries_only_the_chosen_files_and_the_plan_names_their_authors(
     // along with it in a domain that declares `generated_indexes: shared`;
     // this one declares nothing, so the listing stays on this machine.
     assert_eq!(shared["added"], serde_json::json!(["mine.md"]), "{shared}");
+    // The file nobody ticked stays behind. This repository has no team
+    // marker yet, so the MANIFEST joins the share with that one line; the
+    // refused share above took back the line it had written, so it rides
+    // here as the only other file.
     assert_eq!(
         shared["updated"],
-        serde_json::json!([]),
-        "the file nobody ticked stays behind: {shared}"
+        serde_json::json!(["MANIFEST.md"]),
+        "{shared}"
     );
+    assert_eq!(shared["team_marker"]["path"], "MANIFEST.md", "{shared}");
 }
 
 /// The stacked half of the share route. `the_share_routes_walk_the_loop`
@@ -5578,8 +5618,10 @@ async fn no_rest_response_carries_an_operator_setting() {
         "/api/v1/reflection/domains",
         "/api/v1/users",
         "/api/v1/settings/github",
+        "/api/v1/github/access",
         "/api/v1/github/domain-name?repo=acme/kb",
         "/api/v1/me/github-identity",
+        "/api/v1/me/github-link",
         "/api/v1/me/mcp-tokens",
         "/api/v1/me/oauth-grants",
     ];
@@ -5587,13 +5629,20 @@ async fn no_rest_response_carries_an_operator_setting() {
     // saying so; every other read must answer 2xx, so an error body cannot
     // stand in for the route's real answer.
     const REFUSED: &[&str] = &["/api/v1/sync", "/api/v1/github/domain-name?repo=acme/kb"];
-    // A stream, two redirects into the identity provider and the OAuth
-    // consent redirect: none of them answers with a JSON body to read.
+    // A stream, two redirects into the identity provider, the OAuth consent
+    // redirect, the GitHub link callback (a redirect to the profile) and the
+    // single-use GitHub link (a redirect or an HTML page) and the two
+    // landings of the GitHub App's creation (a redirect or an HTML page):
+    // none of them answers with a JSON body to read.
     const SKIPPED: &[&str] = &[
         "GET /api/v1/events",
         "GET /api/v1/auth/oidc/login",
         "GET /api/v1/auth/oidc/callback",
         "GET /api/v1/oauth/authorize",
+        "GET /api/v1/github/link/callback",
+        "GET /api/v1/github/link/go",
+        "GET /api/v1/github/app/created",
+        "GET /api/v1/github/app/setup",
     ];
     for op in crate::support::MOUNTED_OPERATIONS
         .iter()

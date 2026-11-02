@@ -32,6 +32,7 @@ import {
   readDiscardReceipt,
   readGithubStatus,
   readMyGithubIdentity,
+  readMyGithubLink,
   readStackPlacement,
   refusalSentence,
   renameDomain,
@@ -114,6 +115,37 @@ describe("the admin client layer", () => {
         expiresInSecs: 900,
       },
       error: null,
+      app: null,
+    });
+  });
+
+  it("reads the App block without a secret field in sight", () => {
+    expect(
+      readGithubStatus({
+        enabled: true,
+        connected: true,
+        user: null,
+        token_store: "GitHub App",
+        pending: null,
+        error: null,
+        app: {
+          app_id: 7,
+          slug: "crystalline-kb",
+          source: "keyring",
+          install_url:
+            "https://github.example/apps/crystalline-kb/installations/new",
+          webhook_secret_set: true,
+          error: null,
+        },
+      }).app,
+    ).toEqual({
+      appId: 7,
+      slug: "crystalline-kb",
+      source: "keyring",
+      installUrl:
+        "https://github.example/apps/crystalline-kb/installations/new",
+      error: null,
+      loading: false,
     });
   });
 
@@ -134,6 +166,7 @@ describe("the admin client layer", () => {
       tokenStore: "keyring",
       pending: null,
       error: "authorization denied",
+      app: null,
     });
   });
 
@@ -191,6 +224,7 @@ describe("the admin client layer", () => {
       tokenStore: null,
       pending: null,
       error: null,
+      app: null,
     });
   });
 
@@ -224,7 +258,46 @@ describe("the admin client layer", () => {
         expiresInSecs: 900,
       },
       error: null,
+      warning: null,
     });
+  });
+
+  it("reads a disconnect's warning in the server's words", () => {
+    expect(
+      readMyGithubIdentity({
+        account: "ada",
+        connected: false,
+        warning: "unlinked here; revoke it in your GitHub settings",
+      }).warning,
+    ).toBe("unlinked here; revoke it in your GitHub settings");
+  });
+
+  it("reads my GitHub link, and takes a payload without the App flag as no App", () => {
+    expect(
+      readMyGithubLink({
+        linked: true,
+        login: "ada-gh",
+        github_id: 501,
+        host: "github.com",
+        linked_at: "2026-10-28T09:12:44Z",
+        token_live: true,
+        pending: null,
+        error: null,
+        app_configured: true,
+      }),
+    ).toEqual({
+      appConfigured: true,
+      linked: true,
+      login: "ada-gh",
+      linkedAt: "2026-10-28T09:12:44Z",
+      tokenLive: true,
+      pending: null,
+      error: null,
+    });
+    // An older server says nothing about an App: the profile keeps its
+    // older card rather than offering a link that cannot start.
+    expect(readMyGithubLink({ linked: false }).appConfigured).toBe(false);
+    expect(readMyGithubLink("nonsense").linked).toBe(false);
   });
 
   it("reads a connected identity, and a report that left fields out", () => {
@@ -246,6 +319,7 @@ describe("the admin client layer", () => {
       tokenStore: "keyring",
       pending: null,
       error: "the code expired before it was confirmed",
+      warning: null,
     });
 
     // This one is the card's poll as well as its read, so a field that is
@@ -259,6 +333,7 @@ describe("the admin client layer", () => {
       tokenStore: null,
       pending: null,
       error: null,
+      warning: null,
     };
     expect(readMyGithubIdentity({})).toEqual(bare);
     expect(readMyGithubIdentity("nonsense")).toEqual(bare);
@@ -1047,6 +1122,8 @@ describe("the admin client layer", () => {
       own: true,
       // No note: the plain share needs no sentence about how it will go.
       note: null,
+      // No marker: the share adds nothing of its own.
+      teamMarker: null,
     });
     // And the key it is cached under, which is deliberately not one of the
     // `["domains", ...]` keys every other read of a domain is filed under:

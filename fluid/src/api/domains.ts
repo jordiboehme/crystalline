@@ -105,6 +105,17 @@ export interface DomainSummary {
    * its `read_only` policy row (see `useDomainWritable`), never this.
    */
   writeBlocked: boolean;
+  /**
+   * Whether this session may drive this domain's share surfaces (its sync
+   * status, the preview, the share, a withdrawal and a conflict): the
+   * share routes' own gate, asked per domain. On a domain GitHub governs it
+   * follows the GitHub role, so it can be true for an instance viewer.
+   * Null for a listing that predates the field (before 0.30.0), and its
+   * presence is also how a client knows the row's `read_only` follows the
+   * GitHub role (see `mayWriteIn`): the mark is sent only when true, so it
+   * cannot tell an older server from a writable row by itself.
+   */
+  mayShare: boolean | null;
 }
 
 /** An open rename question on a domain, as the listing names it. */
@@ -217,6 +228,7 @@ function readDomain(value: unknown): DomainSummary | null {
     renaming: record?.renaming === true,
     renamePending: readRenamePending(record?.rename_pending),
     writeBlocked: record?.read_only === true,
+    mayShare: typeof record?.may_share === "boolean" ? record.may_share : null,
   };
 }
 

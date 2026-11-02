@@ -6595,3 +6595,38 @@ impl Drop for PgScratch {
         let _ = self.run(&format!("DROP SCHEMA IF EXISTS {} CASCADE", self.schema));
     }
 }
+
+/// When rmcp ends the embedded session on its own, the process leaves at
+/// once, stdin still open. The session here is a modern `server/discover`
+/// with every SEP-2575 key, then a notification, which the stdio start-up
+/// loop refuses (`ExpectedInitializeRequest`, pinned in `mcp_modern_era.rs`).
+/// Nothing the runtime waits for at its drop may be parked in a read of
+/// stdin: the bounded reader reads it on a thread of its own, which the
+/// process exit ends.
+#[test]
+fn the_embedded_stack_exits_when_rmcp_ends_the_session_with_stdin_open() {
+    let env = Env::new("gone");
+    let mut mcp = Mcp::spawn_embedded(&env);
+    mcp.send(&json!({
+        "jsonrpc": "2.0", "id": 1, "method": "server/discover",
+        "params": { "_meta": {
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientInfo": { "name": "it", "version": "0" },
+            "io.modelcontextprotocol/clientCapabilities": {},
+        }},
+    }));
+    let answer = mcp.read();
+    assert!(answer.get("result").is_some(), "discover: {answer}");
+    mcp.send(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }));
+    let start = Instant::now();
+    loop {
+        if mcp.child.try_wait().unwrap().is_some() {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(15),
+            "the embedded stack is still running with its session over"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}

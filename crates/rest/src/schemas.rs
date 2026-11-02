@@ -220,6 +220,48 @@ pub struct DomainMember {
     pub added_at: String,
 }
 
+/// One per-domain Reflection collaborator: an account given the Reflection
+/// reader or contributor level on one domain. A grant only raises the
+/// Reflection right and never opens an engram.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, utoipa::ToSchema)]
+pub struct ReflectionGrant {
+    /// The account's login name, folded.
+    pub account: String,
+    /// `reader` or `contributor`.
+    pub level: ReflectionLevel,
+    /// Who added or last changed this grant.
+    pub added_by: String,
+    /// RFC 3339, when this grant was last written.
+    pub added_at: String,
+}
+
+/// One person GitHub lists on a governed domain's repository.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, utoipa::ToSchema)]
+pub struct GithubPerson {
+    /// The login GitHub lists.
+    pub login: String,
+    /// Their role on the repository: `admin`, `maintain`, `write`,
+    /// `triage` or `read`.
+    pub github_role: String,
+    /// The level that role gives on this domain.
+    pub level: MemberLevel,
+    /// The account linked to that GitHub login here, or `null` when nobody
+    /// here is linked to it.
+    pub account: Option<String>,
+}
+
+/// A domain closed because the GitHub App is not installed on its
+/// repository, or GitHub does not show the repository to the App.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, utoipa::ToSchema)]
+pub struct ClosedDomain {
+    /// The domain.
+    pub domain: String,
+    /// Its repository, `owner/name`.
+    pub repo: String,
+    /// What to do about it, in one sentence.
+    pub reason: String,
+}
+
 /// What happened to the engram: the four things the sync engine counts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -470,6 +512,32 @@ mod tests {
                 added_at: s(),
             }]),
             published::<super::DomainMember>()
+        );
+        assert_eq!(
+            keys([auth_store::ReflectionGrant {
+                account: s(),
+                level: ReflectionLevel::Reader,
+                added_by: s(),
+                added_at: s(),
+            }]),
+            published::<super::ReflectionGrant>()
+        );
+        assert_eq!(
+            keys([crystalline_engine::engine::GithubPerson {
+                login: s(),
+                github_role: s(),
+                level: MemberLevel::Viewer,
+                account: None,
+            }]),
+            published::<super::GithubPerson>()
+        );
+        assert_eq!(
+            keys([crystalline_engine::engine::ClosedDomain {
+                domain: s(),
+                repo: s(),
+                reason: s(),
+            }]),
+            published::<super::ClosedDomain>()
         );
         use crystalline_engine::changes as bus;
         assert_eq!(

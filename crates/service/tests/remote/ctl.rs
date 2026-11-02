@@ -103,6 +103,9 @@ async fn every_command_off_the_allow_list_is_refused_remotely() {
         "origin_resolve",
         "forget_domain",
         "forget_credential",
+        "github_app_status",
+        "github_app_changed",
+        "github_governs",
         "a_command_from_the_future",
     ] {
         let (code, reply) = server.ctl(Some(&boss), json!({ "v": 1, "cmd": cmd })).await;

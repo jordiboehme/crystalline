@@ -80,8 +80,19 @@ async fn the_view_of_a_file_domain_names_every_policy_section_and_part() {
             "reflection",
             "reflection_home",
             "reflect_trigger",
-            "evolve_trigger"
+            "evolve_trigger",
+            "team",
+            "evolve_home"
         ]
+    );
+    let team = row(&view["policies"], "key", "team");
+    assert_eq!(team["can_change"], false);
+    assert!(
+        team["how"]
+            .as_str()
+            .unwrap()
+            .contains("added by the next share from an instance connected to GitHub"),
+        "{team}"
     );
     let home = row(&view["policies"], "key", "reflection_home");
     assert_eq!(home["can_change"], false);
@@ -128,7 +139,7 @@ async fn the_view_of_a_file_domain_names_every_policy_section_and_part() {
     assert_eq!(view["rules"]["available"], true);
     assert_eq!(view["rules"]["file_present"], false);
     assert_eq!(view["rules"]["overrides"], json!([]));
-    assert_eq!(view["rules"]["catalog"].as_array().unwrap().len(), 63);
+    assert_eq!(view["rules"]["catalog"].as_array().unwrap().len(), 69);
     assert_eq!(view["how"].as_array().unwrap().len(), 4);
 }
 
@@ -175,6 +186,26 @@ async fn the_rules_part_reads_the_file_as_written() {
     assert_eq!(rules["token_budgets"]["notes/a.md"], 900);
     assert_eq!(rules["problems"].as_array().unwrap().len(), 1, "{rules}");
     assert!(rules["problems"][0].as_str().unwrap().contains("T001"));
+}
+
+/// The team marker is the engine's to write, never a person's: the policy
+/// surfaces refuse it the way they refuse `reflection_home`.
+#[tokio::test]
+async fn the_team_marker_is_never_set_by_hand() {
+    let (_tmp, engine) = settings_engine(EVERY_SECTION, |_, _| {}).await;
+    let err = engine
+        .set_manifest_policies(
+            "eng",
+            &[("team".into(), "github".into())],
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("added by the next share from an instance connected to GitHub"),
+        "{err}"
+    );
 }
 
 #[tokio::test]

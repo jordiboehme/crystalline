@@ -132,6 +132,9 @@ pub const MOUNTED_OPERATIONS: &[&str] = &[
     "GET /api/v1/domains/{domain}/members",
     "PUT /api/v1/domains/{domain}/members/{principal}",
     "DELETE /api/v1/domains/{domain}/members/{principal}",
+    "GET /api/v1/domains/{domain}/reflection-collaborators",
+    "PUT /api/v1/domains/{domain}/reflection-collaborators/{account}",
+    "DELETE /api/v1/domains/{domain}/reflection-collaborators/{account}",
     "PUT /api/v1/domains/{domain}/owner",
     "GET /api/v1/domains/{domain}/kept",
     "GET /api/v1/domains/{domain}/kept/{id}",
@@ -183,6 +186,7 @@ pub const MOUNTED_OPERATIONS: &[&str] = &[
     "GET /api/v1/domains/{domain}/reflection",
     "GET /api/v1/domains/{domain}/reflection/tree",
     "POST /api/v1/domains/{domain}/reflection/move",
+    "POST /api/v1/domains/{domain}/reflection/disclose",
     "GET /api/v1/domains/{domain}/reflection/threads",
     "POST /api/v1/domains/{domain}/reflection/threads",
     "POST /api/v1/domains/{domain}/reflection/threads/{id}/{action}",
@@ -203,15 +207,26 @@ pub const MOUNTED_OPERATIONS: &[&str] = &[
     "PATCH /api/v1/users/{name}",
     "DELETE /api/v1/users/{name}",
     "POST /api/v1/users/{name}/password",
+    "DELETE /api/v1/users/{name}/github-link",
     "GET /api/v1/settings/github",
+    "GET /api/v1/github/access",
     "DELETE /api/v1/settings/github",
     "POST /api/v1/settings/github/connect",
     "POST /api/v1/settings/github/token",
+    "POST /api/v1/settings/github/app/manifest",
+    "GET /api/v1/github/app/created",
+    "GET /api/v1/github/app/setup",
     "GET /api/v1/github/domain-name",
     "GET /api/v1/me/github-identity",
     "DELETE /api/v1/me/github-identity",
     "POST /api/v1/me/github-identity/connect",
     "PUT /api/v1/me/github-identity/token",
+    "GET /api/v1/me/github-link",
+    "DELETE /api/v1/me/github-link",
+    "POST /api/v1/me/github-link/start",
+    "GET /api/v1/github/link/callback",
+    "GET /api/v1/github/link/go",
+    "POST /api/v1/github/webhook",
     "GET /api/v1/me/mcp-tokens",
     "POST /api/v1/me/mcp-tokens",
     "POST /api/v1/me/mcp-tokens/{id}/rotate",
@@ -334,6 +349,9 @@ struct Inner {
     /// by a retargeting `update_proposal`. This is the base half of the
     /// branch-head bookkeeping a stacked chain is read off.
     proposal_bases: HashMap<u64, String>,
+    /// The body each proposal carries, filled by `create_proposal` and
+    /// replaced by an `update_proposal` that sends one.
+    proposal_bodies: HashMap<u64, String>,
     /// The stack registry: stack number to its members, bottom layer first.
     /// Numbers come off `proposal_counter`, the way the forge hands stack and
     /// pull-request numbers out of one series.
@@ -781,6 +799,15 @@ impl MockProvider {
     /// The branch proposal `number` targets, as its opening request or a later
     /// retarget left it. This is how a test reads which layer a stacked
     /// proposal was actually opened against.
+    pub fn proposal_body(&self, number: u64) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .proposal_bodies
+            .get(&number)
+            .cloned()
+    }
+
     pub fn proposal_base(&self, number: u64) -> Option<String> {
         self.inner
             .lock()
@@ -1194,11 +1221,14 @@ impl Provider for MockProvider {
         _origin: &OriginSpec,
         number: u64,
         _title: Option<&str>,
-        _body: Option<&str>,
+        body: Option<&str>,
         base: Option<&str>,
     ) -> Result<(), RemoteError> {
         let mut inner = self.inner.lock().unwrap();
         inner.calls.push(format!("update_proposal:{number}"));
+        if let Some(body) = body {
+            inner.proposal_bodies.insert(number, body.to_string());
+        }
         // A retarget is recorded as its own line, mirroring the remote crate's
         // mock: an amend re-bases the layers above it, and the only evidence
         // that reached this double is the base each `update_proposal` carried.
@@ -1295,6 +1325,7 @@ impl Provider for MockProvider {
         inner.proposal_states.insert(number, ProposalState::Open);
         inner.proposal_branches.insert(number, req.branch.clone());
         inner.proposal_bases.insert(number, req.base_branch.clone());
+        inner.proposal_bodies.insert(number, req.body.clone());
         inner.calls.push(format!("create_proposal:{}", req.branch));
         Ok(ProposalHandle {
             number,

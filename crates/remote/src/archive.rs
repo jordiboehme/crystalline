@@ -23,6 +23,44 @@ use crate::error::RemoteError;
 /// [`MAX_SHARED_FILE_BYTES`], each with its size.
 pub type ExtractedFiles = (BTreeMap<String, Vec<u8>>, Vec<(String, u64)>);
 
+/// The repository paths of every regular file in a gzipped tarball, its
+/// single top-level directory stripped, hidden paths included: what a
+/// commit holds, for a caller that must remove files it did not write and
+/// has no record of (no tree listing exists on the provider). An entry that
+/// would escape the archive root is an error, as in [`extract_tarball`].
+pub fn tarball_paths(bytes: &[u8]) -> Result<Vec<String>, RemoteError> {
+    let mut archive = Archive::new(GzDecoder::new(bytes));
+    let entries = archive
+        .entries()
+        .map_err(|e| RemoteError::State(format!("could not read the tarball: {e}")))?;
+    let mut out = Vec::new();
+    for entry in entries {
+        let entry = entry
+            .map_err(|e| RemoteError::State(format!("could not read a tarball entry: {e}")))?;
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+        let path = entry
+            .path()
+            .map_err(|e| RemoteError::State(format!("invalid tarball entry path: {e}")))?;
+        let path = path.to_string_lossy().replace('\\', "/");
+        if path
+            .split('/')
+            .any(|component| component == ".." || component.contains(':'))
+        {
+            return Err(RemoteError::State(format!(
+                "tarball entry escapes its root: {path}"
+            )));
+        }
+        if let Some((_top, rest)) = path.split_once('/')
+            && !rest.is_empty()
+        {
+            out.push(rest.to_string());
+        }
+    }
+    Ok(out)
+}
+
 /// Extracts the files under `subpath` (`None` for the whole tree) from a
 /// gzipped tarball, stripping the tarball's single top-level directory.
 ///

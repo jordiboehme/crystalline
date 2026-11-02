@@ -275,6 +275,40 @@ describe("the reflection page", () => {
     ).toBeVisible();
   });
 
+  it("names who shared a section's source on purpose, for curators", async () => {
+    serve("curate", true, {
+      "/domains/eng/reflections/guides/deploying.md": () =>
+        doc({
+          sections: [
+            {
+              id: "7f3a9c2e",
+              heading: "Night deploys",
+              line: 14,
+              changed: false,
+              sources: [
+                {
+                  permalink: "team/harbor-team",
+                  title: "Harbor team",
+                  state: "current",
+                  domain: "harbor",
+                },
+              ],
+              disclosed: { by: "keeper", at: "2026-10-28T09:00:00Z" },
+            },
+          ],
+        }),
+    });
+    renderApp("/d/eng/reflection/guides/deploying.md");
+    await userEvent.click(
+      await screen.findByRole("button", {
+        name: "1 source for Night deploys",
+      }),
+    );
+    expect(
+      screen.getByText("Shared on purpose by keeper on 2026-10-28"),
+    ).toBeVisible();
+  });
+
   it("shows a contributor no sources at all", async () => {
     serve("edit", false, {
       "/domains/eng/reflections/guides/deploying.md": () =>

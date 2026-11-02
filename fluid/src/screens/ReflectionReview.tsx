@@ -10,13 +10,17 @@
  * page or the engram to do it. The queue's review rows are the threads
  * above, so they are not drawn twice.
  *
- * Nothing here writes, so the thread cards carry no Answer or Resolve. The
+ * Nothing here writes but one thing: a person may share a section the queue
+ * names as citing a domain fewer people read, on purpose, after answering
+ * the server's question (Share on purpose). The thread cards carry no Answer
+ * or Resolve. The
  * screen draws the server's `anchor.state` as it is: it has no section text
  * to judge an anchor against.
  */
 
 import { useQuery } from "@tanstack/react-query";
 import type { ReactElement } from "react";
+import { useState } from "react";
 import { Link, useParams } from "react-router";
 
 import { problemDetail } from "../api/client";
@@ -35,7 +39,8 @@ import { ThreadCard } from "../components/ReflectionThreads";
 import { SourceRow } from "../components/SourceRow";
 import { ReviewDiff } from "../components/ReviewDiff";
 import { Loading } from "../components/Loading";
-import { Chip, RAIL_LABEL } from "../components/primitives";
+import { DiscloseDialog } from "../components/DiscloseDialog";
+import { BUTTON, Chip, RAIL_LABEL } from "../components/primitives";
 import { plural } from "../format";
 import { reflectionPageRoute } from "../paths";
 import { ageText } from "../reflectionText";
@@ -57,6 +62,7 @@ const WHAT_LABEL: Record<string, string> = {
   source_retired: "A source was retired",
   source_missing: "A source is gone",
   source_unavailable: "Sources not checked here",
+  source_too_wide: "Cites a domain fewer people read",
   off_structure: "Outside the pact's structure",
   asset_missing: "Missing file",
   engram_attachment: "Links to an engram file",
@@ -334,6 +340,53 @@ function Queue({
   );
 }
 
+/**
+ * A too wide section may also stay, when a person who may read its source
+ * shares it with the page's readers on purpose. The button opens the
+ * server's question; the server refuses anyone who may not read the source
+ * or curate the page, and says so in the dialog.
+ */
+function ShareOnPurpose({
+  domain,
+  path,
+  section,
+  question,
+  basis,
+}: {
+  domain: string;
+  path: string;
+  section: string;
+  question: string;
+  basis: string;
+}): ReactElement {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="mt-1">
+      <button
+        type="button"
+        onClick={() => {
+          setOpen(true);
+        }}
+        className={BUTTON.secondary}
+      >
+        Share on purpose
+      </button>
+      {open && (
+        <DiscloseDialog
+          domain={domain}
+          path={path}
+          section={section}
+          question={question}
+          basis={basis}
+          onClose={() => {
+            setOpen(false);
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
 function QueueRow({
   domain,
   item,
@@ -370,6 +423,25 @@ function QueueRow({
           {`This page is not in a folder the pact names (${structureFolders(item.structure).join(", ")}).`}
         </p>
       )}
+      {item.what === "source_too_wide" && (
+        <p className="mt-1">
+          This section cites a domain fewer people may read than this one.
+          Remove that source and the text drawn from it; the page stays as it is
+          until then.
+        </p>
+      )}
+      {item.what === "source_too_wide" &&
+        item.question !== null &&
+        item.basis !== null &&
+        item.section !== null && (
+          <ShareOnPurpose
+            domain={domain}
+            path={item.path}
+            section={item.section}
+            question={item.question}
+            basis={item.basis}
+          />
+        )}
       {item.count !== null && item.what === "unreflected" && (
         <p className="mt-1">{`${plural(item.count, "engram", "engrams")}${item.folder !== null && item.folder !== "" ? ` under ${item.folder}` : ""} ${item.count === 1 ? "has" : "have"} no page yet.`}</p>
       )}

@@ -533,6 +533,8 @@ describe("walking on the grid", () => {
     expect(small.scaffold.length).toBeGreaterThanOrEqual(1);
   });
 
+  // A sweep over many seeded rooms: about 4 s at load average 80 (measured
+  // 2026-10-28), close to the 5 s default, and past it under heavier load.
   it("skips a scaffold frame that would stand in the decor or the other frame", () => {
     const share = (a: Box, b: Box) =>
       a.x0 < b.x1 && b.x0 < a.x1 && a.z0 < b.z1 && b.z0 < a.z1;
@@ -565,7 +567,7 @@ describe("walking on the grid", () => {
     }
     // Sixty building sites among the shelves and tables: some frame had to go.
     expect(skipped).toBeGreaterThan(0);
-  });
+  }, 20_000);
 
   it("never ends inside a void cell, whatever it is asked", () => {
     for (const place of [

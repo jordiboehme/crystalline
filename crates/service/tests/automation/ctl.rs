@@ -163,3 +163,29 @@ async fn a_status_takes_force_as_a_boolean() {
     assert_eq!(wrong["kind"], "invalid", "{wrong}");
     assert_eq!(wrong["error"], "force must be true or false", "{wrong}");
 }
+
+/// `domain_register` takes an absolute folder only: the daemon works in a
+/// folder of its own, so a relative one would name another place there.
+#[tokio::test]
+async fn domain_register_refuses_a_relative_folder() {
+    let fx = fixture(&[("MANIFEST.md", &manifest(""))]).await;
+    let answer = ask(
+        &fx,
+        "domain_register",
+        json!({ "kind": "file", "name": "kb", "path": "kb" }),
+    )
+    .await;
+    assert_eq!(answer["ok"], false, "{answer}");
+    assert!(
+        answer["error"].as_str().unwrap().contains("absolute"),
+        "{answer}"
+    );
+}
+
+/// An unknown maintenance stamp is refused by name.
+#[tokio::test]
+async fn an_unknown_maintenance_stamp_is_refused() {
+    let fx = fixture(&[("MANIFEST.md", &manifest(""))]).await;
+    let answer = ask(&fx, "maintenance_stamp", json!({ "stamp": "bogus" })).await;
+    assert_eq!(answer["ok"], false, "{answer}");
+}

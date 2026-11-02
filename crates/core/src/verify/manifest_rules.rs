@@ -2,7 +2,7 @@
 //!
 //! `MANIFEST.md` is checked with a hardcoded shape (`## Scope` and
 //! `## When to Use`, `M001`-`M004`, `M101`-`M103`), plus the frontmatter
-//! switches it declares (`M006`, `M007`, `M008`, `M009`). Every entry under a
+//! switches it declares (`M006`, `M007`, `M008`, `M009`, `M010`, `M013`). Every entry under a
 //! domain's `.crystalline.yaml` `verify.required_files` is checked with the
 //! same rule ids against its own configured sections, so a domain can apply
 //! the identical structural checks to any other file it wants enforced (a
@@ -15,9 +15,9 @@ use indexmap::IndexMap;
 use crate::config::registration::validate_domain_name;
 use crate::engram::{Engram, Heading};
 use crate::manifest::{
-    DOMAIN_NAME_KEY, GENERATED_INDEXES_KEY, GeneratedIndexes, Manifest, ProblemKind,
-    ProvisioningSection, READ_ONLY_KEY, ReadOnly, SHARING_KEY, Sharing, TagAliasSection,
-    in_root_artifact_dirs,
+    DOMAIN_NAME_KEY, EVOLVE_HOME_KEY, GENERATED_INDEXES_KEY, GeneratedIndexes, Manifest,
+    ProblemKind, ProvisioningSection, READ_ONLY_KEY, ReadOnly, SHARING_KEY, Sharing, TEAM_KEY,
+    TagAliasSection, TeamForge, in_root_artifact_dirs, validate_evolve_home,
 };
 
 use super::scanner::Domain;
@@ -54,7 +54,7 @@ fn check_manifest(domain: &Domain, sink: &mut Sink) {
 }
 
 /// Every MANIFEST rule that reads the MANIFEST's own text, over one parsed
-/// MANIFEST: `M002`-`M009`, `M101`-`M104`, `M106`, `M107`, and `M105` when
+/// MANIFEST: `M002`-`M010`, `M013`, `M101`-`M104`, `M106`, `M107`, and `M105` when
 /// `root` names a folder to look in.
 ///
 /// The one body both callers share, so what validate reports about a
@@ -262,6 +262,52 @@ pub(crate) fn check_manifest_text(
                 ReadOnly::Off.as_str(),
                 ReadOnly::On.as_str()
             )),
+        );
+    }
+
+    // `M010`: a `team` value that names no forge Crystalline knows. An error
+    // for the reason `M006` is: the domain is not doing what its MANIFEST
+    // says. An unknown value is read as absent, so the guard that keeps a
+    // team domain's Reflection at its home does not apply to this copy, and
+    // saying so is the only way the owner finds out.
+    if let Some(declared) = manifest.declared_team()
+        && TeamForge::parse(declared).is_none()
+    {
+        sink.emit(
+            path,
+            None,
+            "M010",
+            Severity::Error,
+            format!(
+                "`{TEAM_KEY}: {declared}` is not `{}`",
+                TeamForge::GitHub.as_str()
+            ),
+            Some(format!(
+                "read as absent, so this domain is not treated as a team domain; write `{TEAM_KEY}: {}`, or remove the line and the next share from an instance connected to the domain adds it",
+                TeamForge::GitHub.as_str()
+            )),
+        );
+    }
+
+    // `M013`: an `evolve_home` that is not a server address in the spelling
+    // the server writes its own. An error for the reason `M006` is: it reads
+    // as absent, so every clone of a team domain may run a scheduled evolve,
+    // which is exactly what the key is there to stop.
+    if let Some(declared) = manifest.declared_evolve_home()
+        && let Err(why) = validate_evolve_home(declared)
+    {
+        sink.emit(
+            path,
+            None,
+            "M013",
+            Severity::Error,
+            format!(
+                "`{EVOLVE_HOME_KEY}: {declared}` cannot be the home of this domain's scheduled evolve: {why}"
+            ),
+            Some(
+                "read as absent, so every clone of this team domain may run a scheduled evolve; remove the line, and the next scheduled evolve run at the team server fills it in"
+                    .to_string(),
+            ),
         );
     }
 

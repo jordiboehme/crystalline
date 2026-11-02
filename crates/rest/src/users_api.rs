@@ -249,6 +249,7 @@ pub async fn create(
         .await?
         .map_err(|e| store_error(e, &body.name))?;
     let user = read_back(&state, &body.name).await?;
+    crate::readers_changed(&state);
     Ok((StatusCode::CREATED, Json(UserResponse { user })))
 }
 
@@ -459,6 +460,7 @@ pub async fn update(
             .await
             .map_err(|e| store_error(e, &name))?;
     }
+    crate::readers_changed(&state);
     let user = read_back(&state, &name).await?;
     Ok(Json(UserResponse { user }))
 }
@@ -608,7 +610,66 @@ pub async fn remove(
         .remove_user(&name)
         .await
         .map_err(|e| store_error(e, &name))?;
+    // A single-use GitHub link the account still holds goes with it, so an
+    // account made later under the same name cannot open it.
+    if let Ok(account) = crate::auth_store::normalize_account_name(&name) {
+        state.engine.forget_github_link_invites(&account);
+    }
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// `DELETE /users/{name}/github-link` - unlink another account from GitHub.
+///
+/// Admin only: this is how a GitHub account linked to the wrong Crystalline
+/// account is freed, so the right one can link it. The user token is revoked
+/// at GitHub, deleted here and the link removed, exactly as when the person
+/// unlinks themselves. An admin may unlink its own account here too; nothing
+/// about its session depends on the link.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/users/{name}/github-link",
+    tag = "users",
+    operation_id = "unlink_user_github_link",
+    params(("name" = String, Path, description = "The account, in any casing.")),
+    responses(
+        (status = 200, description = "Unlinked.", body = super::github_link::GithubUnlinkResponse),
+        (
+            status = 401,
+            description = "No identity.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The caller is not an admin, a cookie session did \
+                           not echo its CSRF token, this instance is \
+                           read-only, or the trusted-header identity names a \
+                           disabled account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "No such account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn unlink_github(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiPath(name): ApiPath<String>,
+) -> Result<Json<super::github_link::GithubUnlinkResponse>, ApiError> {
+    identity.require_admin()?;
+    refuse_read_only(&state)?;
+    let name = folded(&name);
+    if state.auth.user(&name).await?.is_none() {
+        return Err(ApiError::not_found(format!("no account named '{name}'")));
+    }
+    Ok(Json(super::github_link::unlink_response(
+        state.engine.unlink_github(&name).await?,
+    )))
 }
 
 /// Refuse an admin acting destructively on its own account. `verb` names what

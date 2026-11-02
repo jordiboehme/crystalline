@@ -26,7 +26,7 @@ use crystalline_remote::state::{
 };
 use crystalline_service::Scope;
 use crystalline_service::engine::{EngineError, PreviewCredential, ShareActor};
-use crystalline_service::params::{ReadParams, SearchParams};
+use crystalline_service::params::{ReadParams, Readers, SearchParams};
 use crystalline_service::rest::{AuthStore, Role};
 use crystalline_service::scope::DomainAccess;
 use crystalline_service::{Engine, EnvOverlay};
@@ -101,8 +101,20 @@ async fn engine_with_env(
     .with_env_overlay(overlay)
 }
 
+/// The team's MANIFEST, carrying the team marker as every repository does
+/// after its first share from 0.30.0 on, so a share here carries exactly the
+/// changes a scenario makes. [`manifest_unmarked`] is the repository from
+/// before.
 fn manifest() -> Vec<u8> {
-    b"---\ntype: manifest\ntitle: Team\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Team\n\n## Scope\n\n- shared knowledge\n\n## When to Use\n\n- always\n".to_vec()
+    b"---\ntype: manifest\ntitle: Team\nteam: github\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Team\n\n## Scope\n\n- shared knowledge\n\n## When to Use\n\n- always\n".to_vec()
+}
+
+/// The team's MANIFEST before 0.30.0: no team marker yet.
+fn manifest_unmarked() -> Vec<u8> {
+    String::from_utf8(manifest())
+        .unwrap()
+        .replace("team: github\n", "")
+        .into_bytes()
 }
 
 /// The same MANIFEST, declaring that this domain's generated folder listings
@@ -110,7 +122,7 @@ fn manifest() -> Vec<u8> {
 /// listing in a share has to say so, the way a real team says it once in the
 /// file all of its members hold.
 fn manifest_sharing_indexes() -> Vec<u8> {
-    b"---\ntype: manifest\ntitle: Team\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\ngenerated_indexes: shared\n---\n\n# Team\n\n## Scope\n\n- shared knowledge\n\n## When to Use\n\n- always\n".to_vec()
+    b"---\ntype: manifest\ntitle: Team\nteam: github\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\ngenerated_indexes: shared\n---\n\n# Team\n\n## Scope\n\n- shared knowledge\n\n## When to Use\n\n- always\n".to_vec()
 }
 
 /// The same MANIFEST, declaring that a share of this domain commits straight
@@ -118,7 +130,7 @@ fn manifest_sharing_indexes() -> Vec<u8> {
 /// `proposal`, so a scenario whose subject is the direct path has to say so,
 /// the way a real team says it once in the file all of its members hold.
 fn manifest_sharing_direct() -> Vec<u8> {
-    b"---\ntype: manifest\ntitle: Team\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\nsharing: direct\n---\n\n# Team\n\n## Scope\n\n- shared knowledge\n\n## When to Use\n\n- always\n".to_vec()
+    b"---\ntype: manifest\ntitle: Team\nteam: github\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\nsharing: direct\n---\n\n# Team\n\n## Scope\n\n- shared knowledge\n\n## When to Use\n\n- always\n".to_vec()
 }
 
 fn engram(title: &str, permalink: &str, body: &str) -> Vec<u8> {
@@ -158,6 +170,7 @@ async fn github_disabled_refuses_all_three_origin_operations() {
             None,
             None,
             Some(root.to_str().unwrap()),
+            None,
         )
         .await
         .unwrap_err();
@@ -206,6 +219,7 @@ async fn read_only_refuses_add_but_allows_update_and_status() {
             None,
             None,
             Some(root.to_str().unwrap()),
+            None,
         )
         .await
         .unwrap_err();
@@ -365,6 +379,7 @@ async fn origin_add_creates_folder_registers_domain_and_indexes_engrams() {
             None,
             None,
             Some(root.to_str().unwrap()),
+            None,
         )
         .await
         .unwrap();
@@ -413,6 +428,274 @@ async fn origin_add_creates_folder_registers_domain_and_indexes_engrams() {
     );
 }
 
+/// A fresh connect of the team repository at `acme/brand-knowledge`, whose
+/// MANIFEST carries no team marker yet (a repository from before 0.30.0).
+async fn connected_unmarked(tmp: &Path) -> (Engine, Arc<MockProvider>, std::path::PathBuf) {
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest_unmarked())]));
+    mock.set_branch("main", &commit);
+    let root = tmp.join("brand-knowledge");
+    let eng = engine_with(
+        &tmp.join("config.yaml"),
+        &tmp.join("origins"),
+        mock.clone(),
+        true,
+        false,
+    )
+    .await;
+    let result = eng
+        .origin_add(
+            "acme/brand-knowledge",
+            None,
+            None,
+            None,
+            Some(root.to_str().unwrap()),
+            None,
+        )
+        .await
+        .unwrap();
+    // A connect never writes into the team's MANIFEST: the folder is clean.
+    assert_eq!(result["local_changes"], 0, "{result}");
+    assert_eq!(
+        std::fs::read(root.join("MANIFEST.md")).unwrap(),
+        manifest_unmarked(),
+        "the connect leaves the MANIFEST as the team wrote it"
+    );
+    (eng, mock, root)
+}
+
+fn shared_manifest(mock: &MockProvider, result: &serde_json::Value) -> String {
+    let branch = result["branch"].as_str().expect("a proposal branch");
+    let commit = mock.branch_commit(branch).expect("the share made a branch");
+    String::from_utf8(mock.commit_file(&commit, "MANIFEST.md").unwrap()).unwrap()
+}
+
+/// The first share of everything from a connected instance carries the team
+/// marker: the MANIFEST gains `team: github` right after its title, in the
+/// folder and in the proposal, beside the change that was shared.
+#[tokio::test]
+async fn a_share_of_everything_carries_the_team_marker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (eng, mock, root) = connected_unmarked(tmp.path()).await;
+    std::fs::create_dir_all(root.join("notes")).unwrap();
+    std::fs::write(root.join("notes/new.md"), engram("New", "new", "fresh")).unwrap();
+    eng.sync(Some("brand-knowledge")).await.unwrap();
+    let preview = eng
+        .origin_share_preview(
+            "brand-knowledge",
+            None,
+            None,
+            None,
+            ShareActor::Owner,
+            PreviewCredential::ActingIdentity,
+        )
+        .await
+        .unwrap();
+    assert_eq!(preview["team_marker"], team_marker(), "{preview}");
+    assert_eq!(
+        std::fs::read(root.join("MANIFEST.md")).unwrap(),
+        manifest_unmarked(),
+        "a preview writes nothing"
+    );
+    let result = eng
+        .origin_share("brand-knowledge", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(result["outcome"], "proposed", "{result}");
+    assert_eq!(result["added"], serde_json::json!(["notes/new.md"]));
+    assert_eq!(result["updated"], serde_json::json!(["MANIFEST.md"]));
+    assert_eq!(result["team_marker"], team_marker(), "{result}");
+    let shared = shared_manifest(&mock, &result);
+    assert!(shared.contains("title: Team\nteam: github\n"), "{shared}");
+    let local = std::fs::read_to_string(root.join("MANIFEST.md")).unwrap();
+    assert_eq!(local, shared, "the folder holds what was shared");
+    let body = mock
+        .proposal_body(result["number"].as_u64().unwrap())
+        .unwrap();
+    assert!(
+        body.contains("Domain: brand-knowledge"),
+        "the generated body stays: {body}"
+    );
+    assert!(
+        body.trim_end().ends_with(MARKER_NOTE),
+        "the body says why the MANIFEST changed: {body}"
+    );
+}
+
+/// What the receipt and the preview say about the marker.
+fn team_marker() -> serde_json::Value {
+    serde_json::json!({
+        "path": "MANIFEST.md",
+        "reason": "marks this repository as a team domain; added once"
+    })
+}
+
+/// The line a pull request body or a commit message ends with when the
+/// share added the marker.
+const MARKER_NOTE: &str = "MANIFEST.md gains `team: github`. Crystalline added it: it marks this repository as a team domain, and it is added once.";
+
+/// Two members of a team whose repository has no marker yet: the first one's
+/// share carries it and is merged, and the second one, who has not pulled
+/// since, shares without a conflict. Both instances write the same bytes
+/// for the marker, so the inline pull of the second share takes the team's
+/// MANIFEST as it is.
+#[tokio::test]
+async fn a_second_member_shares_the_marker_without_a_conflict() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest_unmarked())]));
+    mock.set_branch("main", &commit);
+    let mut members = Vec::new();
+    for who in ["ann", "ben"] {
+        let dir = tmp.path().join(who);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.join("brand-knowledge");
+        let eng = engine_with(
+            &dir.join("config.yaml"),
+            &dir.join("origins"),
+            mock.clone(),
+            true,
+            false,
+        )
+        .await;
+        eng.origin_add(
+            "acme/brand-knowledge",
+            None,
+            None,
+            None,
+            Some(root.to_str().unwrap()),
+            None,
+        )
+        .await
+        .unwrap();
+        std::fs::create_dir_all(root.join("notes")).unwrap();
+        std::fs::write(
+            root.join(format!("notes/{who}.md")),
+            engram(who, who, "a change of my own"),
+        )
+        .unwrap();
+        eng.sync(Some("brand-knowledge")).await.unwrap();
+        members.push((eng, root));
+    }
+
+    let (ann, _) = &members[0];
+    let first = ann
+        .origin_share("brand-knowledge", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(first["outcome"], "proposed", "{first}");
+    let merged = mock
+        .branch_commit(first["branch"].as_str().unwrap())
+        .unwrap();
+    mock.set_branch("main", &merged);
+    mock.set_proposal_state(first["number"].as_u64().unwrap(), ProposalState::Merged);
+
+    let (ben, ben_root) = &members[1];
+    let second = ben
+        .origin_share("brand-knowledge", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(second["outcome"], "proposed", "{second}");
+    assert_eq!(
+        second["added"],
+        serde_json::json!(["notes/ben.md"]),
+        "{second}"
+    );
+    assert_eq!(
+        second["updated"],
+        serde_json::json!([]),
+        "the team's MANIFEST already says it: {second}"
+    );
+    let local = std::fs::read_to_string(ben_root.join("MANIFEST.md")).unwrap();
+    assert_eq!(
+        crystalline_core::team_of_source(&local),
+        Some(crystalline_core::TeamForge::GitHub)
+    );
+}
+
+/// Pressing share with nothing to share stays a no-op: the marker alone
+/// never opens a proposal.
+#[tokio::test]
+async fn a_share_with_nothing_to_share_writes_no_marker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (eng, _mock, root) = connected_unmarked(tmp.path()).await;
+    let result = eng
+        .origin_share("brand-knowledge", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(result["outcome"], "nothing_to_share", "{result}");
+    assert!(result.get("team_marker").is_none(), "{result}");
+    assert_eq!(
+        std::fs::read(root.join("MANIFEST.md")).unwrap(),
+        manifest_unmarked()
+    );
+}
+
+/// A narrowed share carries the marker as one more file when the MANIFEST
+/// has no other unshared change, so exactly one line rides along. A MANIFEST
+/// holding unshared edits nobody chose is left alone for a share that
+/// includes it.
+#[tokio::test]
+async fn a_narrowed_share_adds_the_marker_only_to_an_unchanged_manifest() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (eng, mock, root) = connected_unmarked(tmp.path()).await;
+    std::fs::create_dir_all(root.join("notes")).unwrap();
+    std::fs::write(root.join("notes/a.md"), engram("A", "a", "mine")).unwrap();
+    std::fs::write(root.join("notes/b.md"), engram("B", "b", "theirs")).unwrap();
+    eng.sync(Some("brand-knowledge")).await.unwrap();
+    let result = eng
+        .origin_share(
+            "brand-knowledge",
+            None,
+            None,
+            None,
+            Some(&["notes/a.md".to_string()]),
+            ShareActor::Owner,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        result["added"],
+        serde_json::json!(["notes/a.md"]),
+        "{result}"
+    );
+    assert_eq!(result["updated"], serde_json::json!(["MANIFEST.md"]));
+    assert_eq!(result["team_marker"], team_marker(), "{result}");
+    let shared = shared_manifest(&mock, &result);
+    let before = String::from_utf8(manifest_unmarked()).unwrap();
+    assert_eq!(
+        shared,
+        before.replace("title: Team\n", "title: Team\nteam: github\n"),
+        "one line and nothing else"
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (eng, _mock, root) = connected_unmarked(tmp.path()).await;
+    let edited = before.replace("- always\n", "- always\n- and on Fridays\n");
+    std::fs::write(root.join("MANIFEST.md"), &edited).unwrap();
+    std::fs::create_dir_all(root.join("notes")).unwrap();
+    std::fs::write(root.join("notes/a.md"), engram("A", "a", "mine")).unwrap();
+    eng.sync(Some("brand-knowledge")).await.unwrap();
+    let result = eng
+        .origin_share(
+            "brand-knowledge",
+            None,
+            None,
+            None,
+            Some(&["notes/a.md".to_string()]),
+            ShareActor::Owner,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["updated"], serde_json::json!([]), "{result}");
+    assert!(result.get("team_marker").is_none(), "{result}");
+    assert_eq!(
+        std::fs::read_to_string(root.join("MANIFEST.md")).unwrap(),
+        edited,
+        "the unchosen MANIFEST edit is left as it was"
+    );
+}
+
 /// A connect over a configuration file that does not parse is refused before
 /// anything is downloaded: the registration at its end would refuse to save
 /// over the broken file, after the files and the origin state were written.
@@ -444,6 +727,7 @@ async fn origin_add_over_a_config_that_does_not_parse_downloads_nothing() {
             None,
             None,
             Some(root.to_str().unwrap()),
+            None,
         )
         .await
         .unwrap_err();
@@ -463,6 +747,7 @@ async fn origin_add_over_a_config_that_does_not_parse_downloads_nothing() {
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -520,6 +805,7 @@ async fn origin_add_heals_a_pending_link_that_names_the_new_domain() {
         None,
         None,
         Some(tmp.path().join("brand").to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -558,6 +844,7 @@ async fn origin_add_reports_stage_progress() {
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
         Some(cb),
     )
     .await
@@ -626,7 +913,14 @@ async fn origin_add_connects_a_registered_domain_in_place() {
     .with_origins_dir(origins_dir);
 
     let result = eng
-        .origin_add("acme/brand-knowledge", Some("brand"), None, None, None)
+        .origin_add(
+            "acme/brand-knowledge",
+            Some("brand"),
+            None,
+            None,
+            None,
+            None,
+        )
         .await
         .expect("a registered origin-less domain connects in place");
 
@@ -685,9 +979,16 @@ async fn origin_add_adopting_a_registered_domain_keeps_its_provision_and_review(
     .with_origin_provider(mock)
     .with_origins_dir(origins_dir);
 
-    eng.origin_add("acme/brand-knowledge", Some("brand"), None, None, None)
-        .await
-        .expect("a registered origin-less domain connects in place");
+    eng.origin_add(
+        "acme/brand-knowledge",
+        Some("brand"),
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("a registered origin-less domain connects in place");
 
     let on_disk: GlobalConfig = crystalline_core::config::load_yaml(&config_path).unwrap();
     let entry = on_disk.domains.get("brand").unwrap();
@@ -726,6 +1027,7 @@ async fn origin_add_refuses_a_bad_explicit_name() {
             None,
             None,
             Some(folder.to_str().unwrap()),
+            None,
         )
         .await
         .unwrap_err();
@@ -776,6 +1078,7 @@ async fn origin_add_on_a_registered_domain_refuses_a_different_folder() {
             None,
             None,
             Some(elsewhere.to_str().unwrap()),
+            None,
         )
         .await
         .unwrap_err();
@@ -801,6 +1104,7 @@ async fn origin_add_refuses_a_domain_name_already_registered() {
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -813,6 +1117,7 @@ async fn origin_add_refuses_a_domain_name_already_registered() {
             None,
             None,
             Some(other_root.to_str().unwrap()),
+            None,
         )
         .await
         .unwrap_err();
@@ -841,12 +1146,26 @@ async fn origin_add_retry_of_the_same_connect_is_idempotent() {
 
     // connect once
     let first = eng
-        .origin_add("acme/brand-knowledge", None, None, None, Some(root_str))
+        .origin_add(
+            "acme/brand-knowledge",
+            None,
+            None,
+            None,
+            Some(root_str),
+            None,
+        )
         .await
         .unwrap();
     // retry with identical arguments
     let second = eng
-        .origin_add("acme/brand-knowledge", None, None, None, Some(root_str))
+        .origin_add(
+            "acme/brand-knowledge",
+            None,
+            None,
+            None,
+            Some(root_str),
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(second["already_connected"], serde_json::json!(true));
@@ -869,9 +1188,16 @@ async fn origin_add_retry_treats_absent_branch_as_main() {
     let root_str = root.to_str().unwrap();
 
     // connect with branch None, retry with Some("main"): both mean main
-    eng.origin_add("acme/brand-knowledge", None, None, None, Some(root_str))
-        .await
-        .unwrap();
+    eng.origin_add(
+        "acme/brand-knowledge",
+        None,
+        None,
+        None,
+        Some(root_str),
+        None,
+    )
+    .await
+    .unwrap();
     let second = eng
         .origin_add(
             "acme/brand-knowledge",
@@ -879,6 +1205,7 @@ async fn origin_add_retry_treats_absent_branch_as_main() {
             None,
             Some("main"),
             Some(root_str),
+            None,
         )
         .await
         .unwrap();
@@ -899,16 +1226,30 @@ async fn origin_add_without_a_branch_tracks_the_repository_default() {
     let eng = engine_with(&config_path, &origins_dir, mock, true, false).await;
     let root_str = root.to_str().unwrap();
 
-    eng.origin_add("acme/brand-knowledge", None, None, None, Some(root_str))
-        .await
-        .unwrap();
+    eng.origin_add(
+        "acme/brand-knowledge",
+        None,
+        None,
+        None,
+        Some(root_str),
+        None,
+    )
+    .await
+    .unwrap();
     let on_disk: GlobalConfig = crystalline_core::config::load_yaml(&config_path).unwrap();
     let origin_cfg = on_disk.domains["brand-knowledge"].origin.clone().unwrap();
     assert_eq!(origin_cfg.branch.as_deref(), Some("trunk"));
 
     // A retry without a branch is the same connect, whatever was resolved.
     let again = eng
-        .origin_add("acme/brand-knowledge", None, None, None, Some(root_str))
+        .origin_add(
+            "acme/brand-knowledge",
+            None,
+            None,
+            None,
+            Some(root_str),
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(again["already_connected"], serde_json::json!(true));
@@ -921,6 +1262,7 @@ async fn origin_add_without_a_branch_tracks_the_repository_default() {
             None,
             Some("main"),
             Some(root_str),
+            None,
         )
         .await
         .unwrap_err();
@@ -947,6 +1289,7 @@ async fn origin_add_without_a_branch_refuses_when_the_default_cannot_be_read() {
             None,
             None,
             Some(root.to_str().unwrap()),
+            None,
         )
         .await
         .unwrap_err();
@@ -976,6 +1319,7 @@ async fn origin_add_retry_with_a_different_origin_still_conflicts() {
         None,
         None,
         Some(root_str),
+        None,
     )
     .await
     .unwrap();
@@ -987,6 +1331,7 @@ async fn origin_add_retry_with_a_different_origin_still_conflicts() {
             None,
             None,
             Some(root_str),
+            None,
         )
         .await
         .unwrap_err();
@@ -1000,6 +1345,7 @@ async fn origin_add_retry_with_a_different_origin_still_conflicts() {
             None,
             Some("dev"),
             Some(root_str),
+            None,
         )
         .await
         .unwrap_err();
@@ -1012,6 +1358,7 @@ async fn origin_add_retry_with_a_different_origin_still_conflicts() {
             Some("docs"),
             None,
             Some(root_str),
+            None,
         )
         .await
         .unwrap_err();
@@ -1048,8 +1395,15 @@ async fn origin_add_racing_retry_waits_under_the_lock_and_never_redownloads() {
         let eng = eng.clone();
         let root_str = root_str.clone();
         tokio::spawn(async move {
-            eng.origin_add("acme/brand-knowledge", None, None, None, Some(&root_str))
-                .await
+            eng.origin_add(
+                "acme/brand-knowledge",
+                None,
+                None,
+                None,
+                Some(&root_str),
+                None,
+            )
+            .await
         })
     };
     // Give A a moment to reach the gate.
@@ -1061,8 +1415,15 @@ async fn origin_add_racing_retry_waits_under_the_lock_and_never_redownloads() {
         let eng = eng.clone();
         let root_str = root_str.clone();
         tokio::spawn(async move {
-            eng.origin_add("acme/brand-knowledge", None, None, None, Some(&root_str))
-                .await
+            eng.origin_add(
+                "acme/brand-knowledge",
+                None,
+                None,
+                None,
+                Some(&root_str),
+                None,
+            )
+            .await
         })
     };
     // Give B a moment to reach and block on the origin lock.
@@ -1125,6 +1486,7 @@ async fn origin_add_schedules_embedding_on_the_worker_channel() {
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -1169,6 +1531,7 @@ async fn embed_worker_runs_the_scheduled_pass() {
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -1204,6 +1567,7 @@ async fn origin_update_applies_an_upstream_edit_and_the_index_reflects_it() {
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -1269,6 +1633,7 @@ async fn origin_update_schedules_embedding_on_the_worker_channel() {
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -1421,6 +1786,7 @@ async fn origin_add_on_an_env_defined_name_names_the_variable() {
             None,
             None,
             Some(other_root.to_str().unwrap()),
+            None,
         )
         .await
         .unwrap_err();
@@ -1454,6 +1820,7 @@ async fn origin_update_one_domain_failing_does_not_abort_the_others() {
         None,
         Some("good-branch"),
         Some(good_root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -1463,6 +1830,7 @@ async fn origin_update_one_domain_failing_does_not_abort_the_others() {
         None,
         Some("bad-branch"),
         Some(bad_root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -1512,6 +1880,7 @@ async fn origin_update_reports_a_proposal_transition_with_its_url_and_title() {
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -1589,6 +1958,7 @@ async fn origin_status_reports_behind_and_connection() {
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -1654,6 +2024,7 @@ async fn origin_status_names_why_and_what_kept_a_branch() {
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -1746,6 +2117,7 @@ async fn origin_status_detail_names_the_changes_and_the_default_still_only_count
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -1837,6 +2209,7 @@ async fn origin_status_detail_survives_an_offline_probe() {
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -1877,6 +2250,7 @@ async fn origin_status_with_no_domain_reports_every_origin_domain() {
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -1907,6 +2281,7 @@ async fn origin_status_survives_a_live_offline_probe_for_a_connected_domain() {
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -1972,6 +2347,7 @@ async fn origin_status_offline_probe_on_one_domain_still_reports_both_domains() 
         None,
         Some("good-branch"),
         Some(good_root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -1981,6 +2357,7 @@ async fn origin_status_offline_probe_on_one_domain_still_reports_both_domains() 
         None,
         Some("bad-branch"),
         Some(bad_root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -2035,6 +2412,7 @@ async fn origin_status_one_domain_genuinely_failing_does_not_abort_the_others() 
         None,
         Some("good-branch"),
         Some(good_root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -2044,6 +2422,7 @@ async fn origin_status_one_domain_genuinely_failing_does_not_abort_the_others() 
         None,
         Some("bad-branch"),
         Some(bad_root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -2089,6 +2468,7 @@ async fn origin_share_happy_path_opens_a_proposal_and_records_it() {
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -2157,6 +2537,7 @@ async fn a_domain_that_declares_shared_listings_carries_its_index_too() {
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -2210,6 +2591,7 @@ async fn a_share_records_the_login_it_acted_as_on_the_proposal() {
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -2245,7 +2627,16 @@ async fn direct_team(
     tmp: &tempfile::TempDir,
     mock: Arc<MockProvider>,
 ) -> (Engine, std::path::PathBuf, std::path::PathBuf) {
-    let commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest_sharing_direct())]));
+    direct_team_with(tmp, mock, manifest_sharing_direct()).await
+}
+
+/// [`direct_team`] over a MANIFEST of the caller's own.
+async fn direct_team_with(
+    tmp: &tempfile::TempDir,
+    mock: Arc<MockProvider>,
+    manifest: Vec<u8>,
+) -> (Engine, std::path::PathBuf, std::path::PathBuf) {
+    let commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest)]));
     mock.set_branch("main", &commit);
     let config_path = tmp.path().join("config.yaml");
     let origins_dir = tmp.path().join("origins");
@@ -2259,6 +2650,7 @@ async fn direct_team(
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -2360,6 +2752,7 @@ async fn a_pulled_manifest_flips_the_policy_for_the_next_share_with_no_state_cha
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -2510,6 +2903,29 @@ async fn a_direct_preview_names_the_commit_and_an_open_proposal_refuses_it() {
         serde_json::json!(["notes/new.md"]),
         "{amended}"
     );
+}
+
+/// A share that shares nothing names no team marker and leaves none
+/// behind: a direct share the branch refuses answers `branch_protected`
+/// without `team_marker`, and the folder's MANIFEST is as it was, so the
+/// marker is not a local change nobody asked for.
+#[tokio::test]
+async fn a_refused_share_names_no_team_marker_and_leaves_none() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let unmarked = String::from_utf8(manifest_sharing_direct())
+        .unwrap()
+        .replace("team: github\n", "")
+        .into_bytes();
+    let (eng, root, _origins_dir) = direct_team_with(&tmp, mock.clone(), unmarked.clone()).await;
+    mock.protect_branch("main", "Changes must be made through a pull request.");
+    let result = eng
+        .origin_share("brand", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(result["outcome"], "branch_protected", "{result}");
+    assert!(result.get("team_marker").is_none(), "{result}");
+    assert_eq!(std::fs::read(root.join("MANIFEST.md")).unwrap(), unmarked);
 }
 
 #[tokio::test]
@@ -2744,6 +3160,7 @@ async fn origin_share_with_pending_conflicts_reports_them_without_erroring() {
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -2792,6 +3209,7 @@ async fn a_preview_and_a_share_index_what_their_pull_applied() {
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -2919,6 +3337,7 @@ async fn shared_team_engine(
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -3005,6 +3424,7 @@ async fn engine_owing_a_stack_link(
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -3198,6 +3618,7 @@ async fn a_403_on_a_personal_share_teaches_the_collaborator_requirement() {
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -3574,6 +3995,7 @@ async fn origin_withdraw_restores_files_and_syncs_the_index() {
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -3664,6 +4086,7 @@ async fn origin_withdraw_schedules_embedding_on_the_worker_channel() {
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -3732,6 +4155,7 @@ async fn origin_resolve_writes_the_resolution_and_syncs_the_index() {
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -3811,6 +4235,7 @@ async fn origin_resolve_unknown_path_errors_without_writing() {
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -4012,6 +4437,7 @@ async fn reviewing_domain(
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -4102,6 +4528,63 @@ async fn delete_file(eng: &Engine, actor: &str, path: &str) {
 /// A file the team already has, and one only an actor's draft has.
 const OLD_PNG: &[u8] = b"\x89PNG\r\n\x1a\n\x00the team's old deck";
 const DECK_PNG: &[u8] = b"\x89PNG\r\n\x1a\n\x00a deck only alice has";
+
+/// A domain that reviews changes gets the marker through its review: the
+/// next proposal carries the MANIFEST line like any other change, the
+/// preview and the receipt say so, and the folder moves only when the team
+/// merges it.
+#[tokio::test]
+async fn a_review_mode_share_carries_the_marker_through_the_proposal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let eng = reviewing_domain(
+        tmp.path(),
+        mock.clone(),
+        &[
+            ("MANIFEST.md", manifest_unmarked()),
+            ("notes/plan.md", team_plan()),
+        ],
+    )
+    .await;
+    let root = tmp.path().join("team-knowledge");
+    draft(&eng, "owner", "notes/plan.md", DRAFT_PLAN).await;
+    let preview = eng
+        .origin_share_preview(
+            "team",
+            None,
+            None,
+            None,
+            ShareActor::Owner,
+            PreviewCredential::ActingIdentity,
+        )
+        .await
+        .unwrap();
+    assert_eq!(preview["team_marker"], team_marker(), "{preview}");
+    let result = eng
+        .origin_share("team", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(result["outcome"], "proposed", "{result}");
+    assert_eq!(
+        result["updated"],
+        serde_json::json!(["MANIFEST.md", "notes/plan.md"]),
+        "{result}"
+    );
+    assert_eq!(result["team_marker"], team_marker(), "{result}");
+    let shared = shared_manifest(&mock, &result);
+    assert_eq!(
+        shared,
+        String::from_utf8(manifest_unmarked())
+            .unwrap()
+            .replace("title: Team\n", "title: Team\nteam: github\n"),
+        "the proposal carries exactly the marker line"
+    );
+    assert_eq!(
+        std::fs::read(root.join("MANIFEST.md")).unwrap(),
+        manifest_unmarked(),
+        "the folder waits for the review"
+    );
+}
 
 /// A share carries the acting actor's overlay FILES beside their rows: the
 /// bytes of a file they drafted travel as an addition, their deletion of a
@@ -4739,6 +5222,7 @@ async fn the_share_preview_lists_the_overlay_paths_without_provenance() {
             None,
             None,
             Some(direct_root.to_str().unwrap()),
+            None,
         )
         .await
         .unwrap();
@@ -4864,6 +5348,7 @@ async fn a_draft_path_is_screened_the_way_a_file_in_the_folder_is() {
             None,
             None,
             Some(direct_root.to_str().unwrap()),
+            None,
         )
         .await
         .unwrap();
@@ -5527,6 +6012,7 @@ async fn a_pull_into_a_domain_that_takes_changes_directly_converges_nothing() {
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -6257,6 +6743,7 @@ async fn unshared_team_work_puts_the_share_ask_on_a_write_receipt() {
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -6325,9 +6812,16 @@ async fn the_share_ask_names_no_team_domain_the_caller_may_not_see() {
         ("acme/brand-knowledge", "brand", &brand_root),
         ("acme/vault-knowledge", "vault", &vault_root),
     ] {
-        eng.origin_add(repo, Some(name), None, None, Some(root.to_str().unwrap()))
-            .await
-            .unwrap();
+        eng.origin_add(
+            repo,
+            Some(name),
+            None,
+            None,
+            Some(root.to_str().unwrap()),
+            None,
+        )
+        .await
+        .unwrap();
     }
     std::fs::write(
         brand_root.join("added.md"),
@@ -6409,9 +6903,16 @@ async fn a_read_only_team_domain_gets_neither_ask_on_a_write_receipt() {
         ("acme/brand-knowledge", "brand", &brand_root),
         ("acme/vault-knowledge", "vault", &vault_root),
     ] {
-        eng.origin_add(repo, Some(name), None, None, Some(root.to_str().unwrap()))
-            .await
-            .unwrap();
+        eng.origin_add(
+            repo,
+            Some(name),
+            None,
+            None,
+            Some(root.to_str().unwrap()),
+            None,
+        )
+        .await
+        .unwrap();
     }
     std::fs::write(
         brand_root.join("added.md"),
@@ -6490,6 +6991,7 @@ async fn two_receipts_inside_the_memo_window_walk_the_tree_once() {
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -6553,6 +7055,7 @@ async fn a_full_rename_rewrites_a_team_domains_link_as_a_local_change() {
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -6627,6 +7130,7 @@ async fn the_respell_on_a_team_domain_becomes_local_changes() {
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -6714,6 +7218,7 @@ async fn a_pull_still_updates_a_read_only_copy() {
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -6805,6 +7310,7 @@ async fn a_conflict_takes_the_teams_side_on_a_read_only_domain() {
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -6933,6 +7439,7 @@ async fn a_standalone_origin_update_on_postgres_indexes_what_it_pulled() {
         None,
         None,
         Some(root.to_str().unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -7061,4 +7568,669 @@ async fn a_standalone_origin_update_on_postgres_indexes_what_it_pulled() {
         );
     }
     other.drop_schema().await.unwrap();
+}
+
+// --- who may read, chosen at connect ----------------------------------------
+
+/// An engine with a GitHub App pointed at a forge serving `acme/kb` (the App
+/// installed on it unless `installed` is false) and the accounts store
+/// installed before anything connects, so a private connect has somewhere to
+/// write. `extra` is more environment beside the App's.
+async fn readers_setup(
+    tmp: &Path,
+    installed: bool,
+    extra: &[(&str, &str)],
+) -> (Arc<super::github_app::Forge>, Arc<Engine>, Arc<AuthStore>) {
+    use super::github_app::{app_env, engine, repo_with_manifest, spawn_forge};
+    let installs: &[(&str, u64)] = if installed { &[("acme/kb", 1)] } else { &[] };
+    let (forge, url) = spawn_forge(
+        &[("acme/kb", repo_with_manifest(""))],
+        installs,
+        &[(1, "ghs_test")],
+    )
+    .await;
+    let mut env = app_env();
+    env.extend_from_slice(extra);
+    let eng = Arc::new(engine(tmp, &url, &env).await);
+    let auth = Arc::new(AuthStore::open(&tmp.join("auth.db")).await.unwrap());
+    auth.add_user("ada", "Ada", None, Role::Admin, "pw12345678")
+        .await
+        .unwrap();
+    eng.set_domain_access(Arc::new(
+        DomainAccess::new(auth.clone()).with_governor(eng.knowledge_governor()),
+    ));
+    (forge, eng, auth)
+}
+
+async fn connect_kb(
+    eng: &Engine,
+    root: &Path,
+    readers: Option<Readers>,
+) -> Result<serde_json::Value, EngineError> {
+    eng.origin_add(
+        "acme/kb",
+        Some("kb"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+        readers,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn connect_private_writes_an_acl_row() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_forge, eng, auth) = readers_setup(tmp.path(), true, &[]).await;
+    let report = connect_kb(&eng, &tmp.path().join("kb"), Some(Readers::Private))
+        .await
+        .unwrap();
+    assert_eq!(report["readers"], "private", "{report}");
+    let acl = auth.domain_visibility("kb").await.unwrap();
+    assert!(acl.is_some(), "a private domain has its acl row");
+    assert_eq!(
+        acl.unwrap().owner,
+        "owner",
+        "the machine owner chose it, and a governed domain never reads the owner"
+    );
+}
+
+#[tokio::test]
+async fn connect_shared_writes_none() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_forge, eng, auth) = readers_setup(tmp.path(), true, &[]).await;
+    let report = connect_kb(&eng, &tmp.path().join("kb"), Some(Readers::Shared))
+        .await
+        .unwrap();
+    assert_eq!(report["readers"], "shared", "{report}");
+    assert!(auth.domain_visibility("kb").await.unwrap().is_none());
+
+    // A retry of the same connect answers the connected state and names who
+    // reads it.
+    let again = connect_kb(&eng, &tmp.path().join("kb"), Some(Readers::Private))
+        .await
+        .unwrap();
+    assert_eq!(again["already_connected"], true, "{again}");
+    assert_eq!(again["readers"], "shared", "{again}");
+    assert_eq!(
+        again["readers_note"],
+        "this domain is already connected and its readers are shared; change who may read on its Members card",
+        "{again}"
+    );
+    assert!(auth.domain_visibility("kb").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn an_already_connected_retry_names_private_readers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_forge, eng, _auth) = readers_setup(tmp.path(), true, &[]).await;
+    connect_kb(&eng, &tmp.path().join("kb"), Some(Readers::Private))
+        .await
+        .unwrap();
+    let again = connect_kb(&eng, &tmp.path().join("kb"), Some(Readers::Private))
+        .await
+        .unwrap();
+    assert_eq!(again["already_connected"], true, "{again}");
+    assert_eq!(again["readers"], "private", "{again}");
+    assert!(again.get("readers_note").is_none(), "{again}");
+}
+
+#[tokio::test]
+async fn connect_shared_on_a_private_domain_refuses_and_keeps_its_members() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (forge, eng, auth) = readers_setup(tmp.path(), true, &[]).await;
+    auth.add_user("bea", "Bea", None, Role::Viewer, "pw12345678")
+        .await
+        .unwrap();
+    // A record an earlier registration of the name left behind, with a
+    // member: the name is private, whether or not a domain holds it now.
+    auth.set_domain_visibility("kb", true, "ada").await.unwrap();
+    auth.upsert_domain_member(
+        "kb",
+        "bea",
+        crystalline_service::rest::MemberLevel::Viewer,
+        None,
+        "ada",
+    )
+    .await
+    .unwrap();
+
+    let err = connect_kb(&eng, &tmp.path().join("kb"), Some(Readers::Shared))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EngineError::Invalid(_)), "{err:?}");
+    assert_eq!(
+        err.to_string(),
+        "this domain is private; connect it as private, then change who may read on its Members card"
+    );
+    assert_eq!(
+        auth.domain_visibility("kb").await.unwrap().unwrap().owner,
+        "ada"
+    );
+    assert_eq!(auth.domain_members("kb").await.unwrap().len(), 1);
+    assert!(
+        !forge
+            .hits()
+            .iter()
+            .any(super::github_app::Hit::is_repo_call),
+        "nothing was asked of the repository"
+    );
+    assert!(
+        eng.config().domains.get("kb").is_none(),
+        "nothing registered"
+    );
+}
+
+#[tokio::test]
+async fn connect_without_readers_on_an_app_instance_refuses_before_anything_is_fetched() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (forge, eng, auth) = readers_setup(tmp.path(), true, &[]).await;
+    let err = connect_kb(&eng, &tmp.path().join("kb"), None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EngineError::Invalid(_)), "{err:?}");
+    assert!(
+        err.to_string()
+            .contains(crystalline_service::engine::READERS_REQUIRED),
+        "{err}"
+    );
+    assert!(
+        !forge
+            .hits()
+            .iter()
+            .any(super::github_app::Hit::is_repo_call),
+        "nothing was asked of the repository"
+    );
+    assert!(
+        eng.config().domains.get("kb").is_none(),
+        "nothing registered"
+    );
+    assert!(auth.domain_visibility("kb").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn a_failed_private_connect_leaves_no_acl_row() {
+    let tmp = tempfile::tempdir().unwrap();
+    // The App is not installed on the repository: the download is refused
+    // after the readers were chosen.
+    let (_forge, eng, auth) = readers_setup(tmp.path(), false, &[]).await;
+    connect_kb(&eng, &tmp.path().join("kb"), Some(Readers::Private))
+        .await
+        .unwrap_err();
+    assert!(eng.config().domains.get("kb").is_none());
+    assert!(
+        auth.domain_visibility("kb").await.unwrap().is_none(),
+        "no acl row for a domain that never registered"
+    );
+}
+
+#[tokio::test]
+async fn a_private_connect_without_an_accounts_store_refuses() {
+    let tmp = tempfile::tempdir().unwrap();
+    use super::github_app::{app_env, engine, repo_with_manifest, spawn_forge};
+    let (forge, url) = spawn_forge(
+        &[("acme/kb", repo_with_manifest(""))],
+        &[("acme/kb", 1)],
+        &[(1, "ghs_test")],
+    )
+    .await;
+    let eng = engine(tmp.path(), &url, &app_env()).await;
+    let err = connect_kb(&eng, &tmp.path().join("kb"), Some(Readers::Private))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("accounts"), "{err}");
+    assert!(
+        !forge
+            .hits()
+            .iter()
+            .any(super::github_app::Hit::is_repo_call),
+        "refused before anything was downloaded"
+    );
+    assert!(eng.config().domains.get("kb").is_none());
+}
+
+#[tokio::test]
+async fn without_an_app_connect_is_unchanged() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let head = mock.add_commit(commit_files(&[("MANIFEST.md", manifest())]));
+    mock.set_branch("main", &head);
+    let eng = engine_with(
+        &tmp.path().join("config.yaml"),
+        &tmp.path().join("origins"),
+        mock,
+        true,
+        false,
+    )
+    .await;
+    let auth = Arc::new(AuthStore::open(&tmp.path().join("auth.db")).await.unwrap());
+    eng.set_domain_access(Arc::new(DomainAccess::new(auth.clone())));
+
+    // No readers: connected as before.
+    let report = eng
+        .origin_add(
+            "acme/kb",
+            Some("kb"),
+            None,
+            None,
+            Some(tmp.path().join("kb").to_str().unwrap()),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(report.get("readers").is_none(), "{report}");
+    assert!(report.get("readers_note").is_none(), "{report}");
+
+    // Readers given: ignored, with a note, and nothing is written.
+    let report = eng
+        .origin_add(
+            "acme/other",
+            Some("other"),
+            None,
+            None,
+            Some(tmp.path().join("other").to_str().unwrap()),
+            Some(Readers::Private),
+        )
+        .await
+        .unwrap();
+    assert!(report.get("readers").is_none(), "{report}");
+    assert!(
+        report["readers_note"]
+            .as_str()
+            .is_some_and(|n| n.contains("no GitHub App")),
+        "{report}"
+    );
+    assert!(auth.domain_visibility("other").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn env_origin_without_readers_is_private_and_warns() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("kb");
+    let root_str = root.to_str().unwrap().to_string();
+    let (_forge, eng, auth) = readers_setup(
+        tmp.path(),
+        true,
+        &[
+            ("CRYSTALLINE_DOMAIN_KB", &root_str),
+            ("CRYSTALLINE_DOMAIN_KB_ORIGIN", "acme/kb"),
+        ],
+    )
+    .await;
+    let (logs, _guard) = crate::support::capture_logs();
+    eng.apply_env_readers().await.unwrap();
+    assert!(
+        auth.domain_visibility("kb").await.unwrap().is_some(),
+        "absent readers is private"
+    );
+    let warnings: Vec<String> = logs
+        .lines()
+        .into_iter()
+        .filter(|l| l.starts_with("WARN") && l.contains("CRYSTALLINE_DOMAIN_KB_READERS"))
+        .collect();
+    assert_eq!(
+        warnings.len(),
+        1,
+        "one warning naming the variable: {warnings:?}"
+    );
+}
+
+#[tokio::test]
+async fn env_origin_with_readers_shared_writes_none_and_says_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("kb");
+    let root_str = root.to_str().unwrap().to_string();
+    let (_forge, eng, auth) = readers_setup(
+        tmp.path(),
+        true,
+        &[
+            ("CRYSTALLINE_DOMAIN_KB", &root_str),
+            ("CRYSTALLINE_DOMAIN_KB_ORIGIN", "acme/kb"),
+            ("CRYSTALLINE_DOMAIN_KB_READERS", "shared"),
+        ],
+    )
+    .await;
+    let (logs, _guard) = crate::support::capture_logs();
+    eng.apply_env_readers().await.unwrap();
+    assert!(auth.domain_visibility("kb").await.unwrap().is_none());
+    assert!(!logs.any_contains("CRYSTALLINE_DOMAIN_KB_READERS"));
+}
+
+#[tokio::test]
+async fn env_readers_shared_never_opens_a_private_domain() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("kb");
+    let root_str = root.to_str().unwrap().to_string();
+    let (_forge, eng, auth) = readers_setup(
+        tmp.path(),
+        true,
+        &[
+            ("CRYSTALLINE_DOMAIN_KB", &root_str),
+            ("CRYSTALLINE_DOMAIN_KB_ORIGIN", "acme/kb"),
+            ("CRYSTALLINE_DOMAIN_KB_READERS", "shared"),
+        ],
+    )
+    .await;
+    auth.set_domain_visibility("kb", true, "ada").await.unwrap();
+    let (logs, _guard) = crate::support::capture_logs();
+    eng.apply_env_readers().await.unwrap();
+    assert_eq!(
+        auth.domain_visibility("kb").await.unwrap().unwrap().owner,
+        "ada",
+        "left private, exactly as it stood"
+    );
+    let warnings: Vec<String> = logs
+        .lines()
+        .into_iter()
+        .filter(|l| {
+            l.starts_with("WARN")
+                && l.contains(
+                    "CRYSTALLINE_DOMAIN_KB_READERS says shared, but domain 'kb' is private; set the variable to private, or remove the private record with: crystalline domain visibility kb default",
+                )
+        })
+        .collect();
+    assert_eq!(warnings.len(), 1, "{:?}", logs.lines());
+}
+
+#[tokio::test]
+async fn env_readers_quietly_close_without_a_word() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("kb");
+    let root_str = root.to_str().unwrap().to_string();
+    let (_forge, eng, auth) = readers_setup(
+        tmp.path(),
+        true,
+        &[
+            ("CRYSTALLINE_DOMAIN_KB", &root_str),
+            ("CRYSTALLINE_DOMAIN_KB_ORIGIN", "acme/kb"),
+        ],
+    )
+    .await;
+    let (logs, _guard) = crate::support::capture_logs();
+    eng.apply_env_readers_quietly().await.unwrap();
+    assert!(auth.domain_visibility("kb").await.unwrap().is_some());
+    assert!(
+        !logs.any_contains("CRYSTALLINE_DOMAIN_KB_READERS"),
+        "{:?}",
+        logs.lines()
+    );
+}
+
+#[tokio::test]
+async fn env_readers_without_an_accounts_store_warn_once() {
+    use super::github_app::{app_env, engine, repo_with_manifest, spawn_forge};
+    let tmp = tempfile::tempdir().unwrap();
+    let (_forge, url) = spawn_forge(
+        &[("acme/kb", repo_with_manifest(""))],
+        &[("acme/kb", 1)],
+        &[(1, "ghs_test")],
+    )
+    .await;
+    let mut env = app_env();
+    let a = tmp.path().join("a").to_str().unwrap().to_string();
+    let b = tmp.path().join("b").to_str().unwrap().to_string();
+    env.extend_from_slice(&[
+        ("CRYSTALLINE_DOMAIN_A", a.as_str()),
+        ("CRYSTALLINE_DOMAIN_A_ORIGIN", "acme/a"),
+        ("CRYSTALLINE_DOMAIN_A_READERS", "private"),
+        ("CRYSTALLINE_DOMAIN_B", b.as_str()),
+        ("CRYSTALLINE_DOMAIN_B_ORIGIN", "acme/b"),
+        ("CRYSTALLINE_DOMAIN_B_READERS", "private"),
+    ]);
+    let eng = engine(tmp.path(), &url, &env).await;
+    let (logs, _guard) = crate::support::capture_logs();
+    eng.apply_env_readers().await.unwrap();
+    let warnings: Vec<String> = logs
+        .lines()
+        .into_iter()
+        .filter(|l| l.starts_with("WARN") && l.contains("accounts"))
+        .collect();
+    assert_eq!(warnings.len(), 1, "{:?}", logs.lines());
+}
+
+#[tokio::test]
+async fn a_failed_env_private_write_stops_the_start_naming_the_domain() {
+    let tmp = tempfile::tempdir().unwrap();
+    // The accounts database refuses every private record before the store
+    // opens it: its acl table takes no row.
+    {
+        let path = tmp.path().join("auth.db");
+        let db = turso::Builder::new_local(path.to_str().unwrap())
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "CREATE TABLE domain_acl (domain TEXT PRIMARY KEY NOT NULL, visibility TEXT NOT NULL, owner TEXT NOT NULL, updated_at TEXT NOT NULL, CHECK (owner = 'nobody at all'))",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+    let root = tmp.path().join("kb");
+    let root_str = root.to_str().unwrap().to_string();
+    let (_forge, eng, _auth) = readers_setup(
+        tmp.path(),
+        true,
+        &[
+            ("CRYSTALLINE_DOMAIN_KB", &root_str),
+            ("CRYSTALLINE_DOMAIN_KB_ORIGIN", "acme/kb"),
+            ("CRYSTALLINE_DOMAIN_KB_READERS", "private"),
+        ],
+    )
+    .await;
+    let result = eng.apply_env_readers().await;
+    let err = result.unwrap_err();
+    assert!(err.to_string().contains("'kb'"), "{err}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_private_connect_whose_registration_fails_takes_the_row_back() {
+    use super::github_app::{app_env, repo_with_manifest, spawn_forge};
+    use std::os::unix::fs::PermissionsExt as _;
+    let tmp = tempfile::tempdir().unwrap();
+    let (_forge, url) = spawn_forge(
+        &[("acme/kb", repo_with_manifest(""))],
+        &[("acme/kb", 1)],
+        &[(1, "ghs_test")],
+    )
+    .await;
+    // The configuration lives in a folder nothing can write into, so the
+    // registration fails after the download and after the private record.
+    let locked = tmp.path().join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let cfg = GlobalConfig {
+        github: Some(GitHubConfig {
+            enabled: Some(true),
+            api_url: Some(url),
+            ..GitHubConfig::default()
+        }),
+        ..GlobalConfig::default()
+    };
+    let overlay = EnvOverlay::from_vars(
+        app_env()
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let eng = Engine::new(
+        Arc::new(Mutex::new(TursoStore::open_in_memory().await.unwrap())),
+        cfg,
+        None,
+        Some(locked.join("config.yaml")),
+    )
+    .with_origins_dir(tmp.path().join("origins"))
+    .with_state_dir(tmp.path().to_path_buf())
+    .with_token_store_dir(tmp.path().join("tokens"))
+    .with_env_overlay(overlay);
+    let auth = Arc::new(AuthStore::open(&tmp.path().join("auth.db")).await.unwrap());
+    eng.set_domain_access(Arc::new(DomainAccess::new(auth.clone())));
+
+    let err = connect_kb(&eng, &tmp.path().join("kb"), Some(Readers::Private))
+        .await
+        .unwrap_err();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(err.to_string().contains("config"), "{err}");
+    assert!(eng.config().domains.get("kb").is_none());
+    assert!(
+        auth.domain_visibility("kb").await.unwrap().is_none(),
+        "the private record went with the failed registration"
+    );
+}
+
+/// Calls an MCP tool on a stdio session over `eng`, answering the JSON body
+/// or the error text.
+async fn mcp_call(
+    eng: Arc<Engine>,
+    tool: &str,
+    args: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    use crystalline_service::mcp::McpServer;
+    use rmcp::model::CallToolRequestParams;
+    let (client_io, server_io) = tokio::io::duplex(1 << 16);
+    let server_task =
+        tokio::spawn(async move { rmcp::serve_server(McpServer::new(eng), server_io).await });
+    let client = rmcp::serve_client((), client_io).await.unwrap();
+    let _server = server_task.await.unwrap().unwrap();
+    let mut params = CallToolRequestParams::new(tool.to_string());
+    if let serde_json::Value::Object(map) = args {
+        params = params.with_arguments(map);
+    }
+    match client.peer().call_tool(params).await {
+        Ok(result) => {
+            let v = serde_json::to_value(&result).unwrap();
+            if v["isError"].as_bool() == Some(true) {
+                return Err(v.to_string());
+            }
+            let text = v
+                .pointer("/content/0/text")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            Ok(serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text)))
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[tokio::test]
+async fn mcp_add_domain_with_repo_without_readers_refuses() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (forge, eng, auth) = readers_setup(tmp.path(), true, &[]).await;
+    let folder = tmp.path().join("kb").to_str().unwrap().to_string();
+    let err = mcp_call(
+        eng.clone(),
+        "add_domain",
+        serde_json::json!({"repo": "acme/kb", "domain": "kb", "folder": folder}),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.contains(
+            "add_domain needs readers: shared (everyone signed in) or private (only people with access on GitHub)"
+        ),
+        "{err}"
+    );
+    assert!(
+        !forge
+            .hits()
+            .iter()
+            .any(super::github_app::Hit::is_repo_call)
+    );
+
+    let report = mcp_call(
+        eng.clone(),
+        "add_domain",
+        serde_json::json!({"repo": "acme/kb", "domain": "kb", "folder": folder, "readers": "private"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report["readers"], "private", "{report}");
+    assert!(auth.domain_visibility("kb").await.unwrap().is_some());
+
+    // Readers belong to a team domain only.
+    let err = mcp_call(
+        eng,
+        "add_domain",
+        serde_json::json!({"virtual": true, "domain": "v", "readers": "shared"}),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("readers"), "{err}");
+}
+
+#[tokio::test]
+async fn env_readers_without_an_app_change_nothing_and_say_so() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("kb");
+    let root_str = root.to_str().unwrap().to_string();
+    let eng = engine_with_env(
+        &tmp.path().join("config.yaml"),
+        &tmp.path().join("origins"),
+        Arc::new(MockProvider::new()),
+        &[
+            ("CRYSTALLINE_DOMAIN_KB", &root_str),
+            ("CRYSTALLINE_DOMAIN_KB_ORIGIN", "acme/kb"),
+            ("CRYSTALLINE_DOMAIN_KB_READERS", "private"),
+        ],
+    )
+    .await;
+    let auth = Arc::new(AuthStore::open(&tmp.path().join("auth.db")).await.unwrap());
+    eng.set_domain_access(Arc::new(DomainAccess::new(auth.clone())));
+    let (logs, _guard) = crate::support::capture_logs();
+    eng.apply_env_readers().await.unwrap();
+    assert!(auth.domain_visibility("kb").await.unwrap().is_none());
+    assert!(
+        logs.lines()
+            .iter()
+            .any(|l| l.starts_with("INFO") && l.contains("CRYSTALLINE_DOMAIN_KB_READERS")),
+        "{:?}",
+        logs.lines()
+    );
+}
+
+#[tokio::test]
+async fn env_readers_quietly_take_no_write_on_a_domain_already_private() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("kb");
+    let root_str = root.to_str().unwrap().to_string();
+    let (_forge, eng, auth) = readers_setup(
+        tmp.path(),
+        true,
+        &[
+            ("CRYSTALLINE_DOMAIN_KB", &root_str),
+            ("CRYSTALLINE_DOMAIN_KB_ORIGIN", "acme/kb"),
+        ],
+    )
+    .await;
+    eng.apply_env_readers_quietly().await.unwrap();
+    assert!(auth.domain_visibility("kb").await.unwrap().is_some());
+
+    // Another connection holds the accounts database's write lock. A second
+    // run that only reads finishes at once; one that took a write lock would
+    // wait out the busy timeout and fail. The second connection needs
+    // turso's multiprocess WAL, which its Windows IO backend does not offer;
+    // the read-before-write path it pins is the same on every OS.
+    if cfg!(windows) {
+        return;
+    }
+    let db = turso::Builder::new_local(tmp.path().join("auth.db").to_str().unwrap())
+        .experimental_multiprocess_wal(true)
+        .build()
+        .await
+        .unwrap();
+    let holder = db.connect().unwrap();
+    holder.execute("BEGIN IMMEDIATE", ()).await.unwrap();
+    let second = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        eng.apply_env_readers_quietly(),
+    )
+    .await;
+    holder.execute("ROLLBACK", ()).await.unwrap();
+    second
+        .expect("the second run waited for the write lock")
+        .unwrap();
 }

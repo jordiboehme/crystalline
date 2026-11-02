@@ -17,6 +17,11 @@ pub const RETRY_AFTER: Duration = Duration::from_secs(60);
 /// every minute.
 pub const RETRY_MAX: Duration = Duration::from_secs(3600);
 
+/// How long a backup that held a page back waits before it looks again
+/// with no new change: who may read a domain can change without anything in
+/// the Reflection being marked.
+pub const HELD_RECHECK: Duration = Duration::from_secs(600);
+
 /// How often a backup that waits for a GitHub connection says so in the log.
 const QUIET_LOG_INTERVAL: Duration = Duration::from_secs(3600);
 
@@ -56,6 +61,9 @@ pub struct BackupMarks {
     failures: Mutex<HashMap<String, u32>>,
     /// When the wait for a GitHub connection was last logged.
     quiet_logged: Mutex<Option<Instant>>,
+    /// The domains whose last backup held a page back and that wait
+    /// [`HELD_RECHECK`] to look again; a new mark ends the wait.
+    holding: Mutex<std::collections::HashSet<String>>,
 }
 
 impl BackupMarks {
@@ -69,6 +77,35 @@ impl BackupMarks {
         });
         mark.last_edit = now;
         mark.settled |= cause == BackupCause::Settled;
+        // A change after a hold is backed up as any other: the wait to look
+        // again was only for when nothing changes.
+        if self.holding.lock().expect("backup holds").remove(domain) {
+            mark.retry_after = None;
+        }
+    }
+
+    /// The backup of `domain` landed at `now` and held a page back: keep it
+    /// marked and look again after [`HELD_RECHECK`], or at once on a new
+    /// mark, so the page goes out once nothing holds it any more. A change
+    /// marked while the backup ran keeps its own mark and goes at once.
+    pub fn hold(&self, domain: &str, now: Instant) {
+        let mut marks = self.marks.lock().expect("backup marks");
+        if marks.contains_key(domain) {
+            return;
+        }
+        marks.insert(
+            domain.to_string(),
+            BackupMark {
+                last_edit: now,
+                settled: true,
+                retry_after: Some(now + HELD_RECHECK),
+            },
+        );
+        drop(marks);
+        self.holding
+            .lock()
+            .expect("backup holds")
+            .insert(domain.to_string());
     }
 
     /// The domains due at `now`, sorted.
@@ -85,6 +122,7 @@ impl BackupMarks {
 
     /// Forget `domain`'s mark: it is not a home Reflection here.
     pub fn clear(&self, domain: &str) {
+        self.holding.lock().expect("backup holds").remove(domain);
         self.marks.lock().expect("backup marks").remove(domain);
         self.failures
             .lock()
@@ -96,6 +134,7 @@ impl BackupMarks {
     /// nothing to do): forget the mark, unless a change was marked after the
     /// tick read it - that one is not in the commit and stays marked.
     pub fn clear_if_unchanged(&self, domain: &str, seen: Instant) {
+        self.holding.lock().expect("backup holds").remove(domain);
         self.failures
             .lock()
             .expect("backup failures")
@@ -133,6 +172,7 @@ impl BackupMarks {
     /// merged with any mark `new` already carries.
     pub fn rename(&self, old: &str, new: &str) {
         self.failures.lock().expect("backup failures").remove(old);
+        self.holding.lock().expect("backup holds").remove(old);
         let mut marks = self.marks.lock().expect("backup marks");
         let Some(moved) = marks.remove(old) else {
             return;

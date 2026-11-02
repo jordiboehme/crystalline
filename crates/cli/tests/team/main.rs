@@ -9,17 +9,23 @@
 #[path = "../common/mod.rs"]
 mod common;
 #[cfg(unix)]
+#[path = "../common/daemon_env.rs"]
+mod daemon_env;
+#[cfg(unix)]
 #[path = "../common/forge.rs"]
 mod forge;
 #[path = "../common/remote_server.rs"]
 mod remote_server;
 
 mod connect;
+mod connect_app;
 mod domain_members;
 mod domain_rename;
 mod domain_review;
 mod env_token;
+mod github_app;
 mod origin;
+mod reflection_reach;
 #[cfg(unix)]
 mod remote_run;
 mod sources;

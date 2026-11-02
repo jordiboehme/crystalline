@@ -10,12 +10,12 @@ use crystalline_core::threads::{self as th, SectionRef, ThreadStatus, Waiting};
 use super::reflection::{
     EngramFact, ReflectionAccess, reflection_abs, source_state, source_view, thread_view,
 };
-use super::sources::{HIDDEN_SOURCE_NOTE, unavailable_note};
+use super::sources::{HIDDEN_SOURCE_NOTE, TOO_WIDE_NOTE, unavailable_note};
 use super::*;
 use crate::scope::{ReflectionCaller, ReflectionRight, Scope};
 
 /// How an agent works the queue, returned with every page.
-pub const REFLECT_GUIDANCE: &str = "Work feedback items first: read what the person changed and decide - take it into the engrams (change them, then write_reflection the section with its sources), keep it as their text (write_reflection action=settle outcome=kept), or answer it in a thread (discuss with answers_feedback). Taking feedback into the engrams of another domain needs write access there; without it, answer in a thread or settle it as kept. Then update items: bring changed engrams into their sections and write them with sources; cover unreflected engrams with a new section or reflection; move pages the pact's structure does not fit (its ## Structure bullets are globs, one per top-level bullet); apply a changed pact to the pages it affects, and when the pages follow the pact again, settle PACT.md (write_reflection action=settle without sections settles the whole page). When a person asks you for a page or space, add a bullet to the pact's ## Pages (add the heading if the pact has none) with its path or glob, their request in their words, who asked and the date. Add a matching ## Structure glob and name each section's sources. To place new engrams read ## Pages, and to recreate a page rebuild it from its bullet. Files under reflections/assets/: link an unreferenced file from the section it belongs to, or remove it with write_reflection action=delete_asset (ask first: removing is irreversible); for a missing file, ask a person to add it or correct the link; an engram attachment cannot be embedded, so ask a person to copy the file into reflections/assets/ and point the link there. A host_moved item means this instance took the domain over on a shared database and its disk lacks files the previous host wrote: their rows are kept and counted, never written here, so do not rewrite or delete those pages and files; ask a person to copy the domain folder over (or restore it) and sync, or to run the sync with --accept-disk if the files are gone for good. Answer review threads in plain words - the people reading them may not see engrams. Answer a person's thread and leave it open. The person who opened it resolves it. A thread item carries the label of its opening comment and whether it blocks: answer blocking threads first; a praise needs no answer unless it asks something. Present every page you write with the crystalline-presentation skill (the skills tool serves it).";
+pub const REFLECT_GUIDANCE: &str = "Work feedback items first: read what the person changed and decide - take it into the engrams (change them, then write_reflection the section with its sources), keep it as their text (write_reflection action=settle outcome=kept), or answer it in a thread (discuss with answers_feedback). Taking feedback into the engrams of another domain needs write access there; without it, answer in a thread or settle it as kept. Then update items: bring changed engrams into their sections and write them with sources; for a source_too_wide item, the section cites a domain fewer people may read than the page's domain: write the section again without that source and without the text drawn from it (the check sees only named sources, so dropping the source and keeping its text still leaks it); when write_reflection refuses a source for the same reason, leave out its text as well, unless your person, asked, wants to share it on purpose (the write asks them when their client can, and Fluid's Review offers it on the item; this is a deliberate step for a person, not a guard against their own agent; an unattended run never asks, cannot read such a domain at all, and leaves the text out); cover unreflected engrams with a new section or reflection; move pages the pact's structure does not fit (its ## Structure bullets are globs, one per top-level bullet); apply a changed pact to the pages it affects, and when the pages follow the pact again, settle PACT.md (write_reflection action=settle without sections settles the whole page). When a person asks you for a page or space, add a bullet to the pact's ## Pages (add the heading if the pact has none) with its path or glob, their request in their words, who asked and the date. Add a matching ## Structure glob and name each section's sources. To place new engrams read ## Pages, and to recreate a page rebuild it from its bullet. Files under reflections/assets/: link an unreferenced file from the section it belongs to, or remove it with write_reflection action=delete_asset (ask first: removing is irreversible); for a missing file, ask a person to add it or correct the link; an engram attachment cannot be embedded, so ask a person to copy the file into reflections/assets/ and point the link there. A host_moved item means this instance took the domain over on a shared database and its disk lacks files the previous host wrote: their rows are kept and counted, never written here, so do not rewrite or delete those pages and files; ask a person to copy the domain folder over (or restore it) and sync, or to run the sync with --accept-disk if the files are gone for good. Answer review threads in plain words - the people reading them may not see engrams. Answer a person's thread and leave it open. The person who opened it resolves it. A thread item carries the label of its opening comment and whether it blocks: answer blocking threads first; a praise needs no answer unless it asks something. Present every page you write with the crystalline-presentation skill (the skills tool serves it).";
 
 /// An off-structure item's hint when no Structure glob fits any page.
 pub const STRUCTURE_HINT: &str = "The pact's ## Structure bullets are read as globs, one per top-level bullet, for example - guides/*.md. None of them matches a page.";
@@ -220,6 +220,155 @@ enum Detail {
 }
 
 impl Engine {
+    /// The files under `reflections/assets/` (by path inside
+    /// `reflections/`) that only `held` pages of `domain` link: they carry
+    /// what those pages show, so the backup holds them back with them. A
+    /// file a page that goes out links too stays.
+    ///
+    /// The links are read from `files`, the bytes the backup is about to
+    /// push (by repo path, see
+    /// [`crystalline_remote::reflections_backup::collect_backup`]), so a
+    /// page known only from its file on disk counts; a held page's links in
+    /// the index count as well.
+    pub(crate) async fn held_assets(
+        &self,
+        domain: &str,
+        held: &[String],
+        spec: &crystalline_remote::provider::OriginSpec,
+        files: &BTreeMap<String, Vec<u8>>,
+    ) -> Result<BTreeSet<String>> {
+        if held.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let rows = {
+            let store = self.store.lock().await;
+            let Some(id) = store.domain_id(domain).await? else {
+                return Ok(BTreeSet::new());
+            };
+            store.list_reflections(id).await?
+        };
+        let mut by_held = BTreeSet::new();
+        for row in &rows {
+            if held.contains(&row.path) {
+                by_held.extend(r::reflection_asset_refs(&row.content, &row.path));
+            }
+        }
+        let mut by_others = BTreeSet::new();
+        for (repo_path, bytes) in files {
+            let Some(inner) =
+                crystalline_remote::reflections_backup::reflection_path(spec, repo_path)
+            else {
+                continue;
+            };
+            let r::ReflectionFile::Page(page) = r::classify(inner) else {
+                continue;
+            };
+            let refs = r::reflection_asset_refs(&String::from_utf8_lossy(bytes), &page);
+            if held.contains(&page) {
+                by_held.extend(refs);
+            } else {
+                by_others.extend(refs);
+            }
+        }
+        Ok(by_held.difference(&by_others).cloned().collect())
+    }
+
+    /// Schedule a backup of every Reflection this instance backs up that has
+    /// a page newly citing a domain fewer people may read (or one not shared
+    /// through GitHub): a page its last backup did not hold back. Answers
+    /// the domains marked, sorted.
+    ///
+    /// Who may read a domain changes in the accounts store (a domain made
+    /// private, a member removed, a role lowered), often from another
+    /// process, and nothing in the Reflection is marked by it. Without this
+    /// look such a page would stay on the backup branch head until the next
+    /// change. The daemon's recount runs it every few minutes, and the JSON
+    /// API's accounts routes run it after each change.
+    pub async fn schedule_too_wide_backups(&self) -> Vec<String> {
+        let mut marked = Vec::new();
+        let domains: Vec<String> = self.registered_domain_entries().keys().cloned().collect();
+        for domain in domains {
+            if self.reflection_switch(&domain) == crystalline_core::ReflectionSwitch::Off
+                || !self.backs_up_reflection_here(&domain).await
+            {
+                continue;
+            }
+            let pages = match self.too_wide_pages(&domain).await {
+                Ok(pages) => pages,
+                Err(e) => {
+                    tracing::debug!(domain = %domain, "too wide pages not read: {e}");
+                    continue;
+                }
+            };
+            let held = self.reflection_backup_held_back(&domain);
+            if pages.iter().any(|page| !held.contains(page)) {
+                self.mark_reflection_dirty(&domain, crate::reflection_backup::BackupCause::Settled);
+                marked.push(domain);
+            }
+        }
+        marked.sort();
+        marked
+    }
+
+    /// The pages of `domain` (by path inside `reflections/`, sorted) with a
+    /// section that cites a domain fewer people may read than `domain`: the
+    /// pages the queue names with `source_too_wide`, for every source, seen
+    /// by whom or not. A source whose domain cannot be checked here is not
+    /// counted, as in the queue.
+    pub(crate) async fn too_wide_pages(&self, domain: &str) -> Result<Vec<String>> {
+        let (rows, id) = {
+            let store = self.store.lock().await;
+            let Some(id) = store.domain_id(domain).await? else {
+                return Ok(Vec::new());
+            };
+            (store.list_reflections(id).await?, id)
+        };
+        let mut check = TooWide::new(self, domain, id).await?;
+        let mut out = Vec::new();
+        for row in rows {
+            if check.text(&row.path, &row.content).await? {
+                out.push(row.path);
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// The pages of `domain` (by path inside `reflections/`, sorted) whose
+    /// bytes among `files` (a backup's collected files, by repo path, see
+    /// [`crystalline_remote::reflections_backup::collect_backup`]) cite a
+    /// domain fewer people may read, or may and cannot be read: bytes that
+    /// are not UTF-8, or records [`r::provenance_unreadable`] says so of.
+    /// What [`Engine::too_wide_pages`] says of the index, said of what is
+    /// about to go out, so a file edited on disk before the index read it is
+    /// held back too.
+    pub(crate) async fn too_wide_in_files(
+        &self,
+        domain: &str,
+        spec: &crystalline_remote::provider::OriginSpec,
+        files: &BTreeMap<String, Vec<u8>>,
+    ) -> Result<Vec<String>> {
+        let Some(id) = self.store.lock().await.domain_id(domain).await? else {
+            return Ok(Vec::new());
+        };
+        let mut check = TooWide::new(self, domain, id).await?;
+        let mut out = Vec::new();
+        for (inner, bytes) in reflection_files(spec, files) {
+            let r::ReflectionFile::Page(page) = r::classify(inner) else {
+                continue;
+            };
+            let wide = match std::str::from_utf8(bytes) {
+                Ok(text) => check.text(&page, text).await?,
+                Err(_) => true,
+            };
+            if wide {
+                out.push(page);
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
     /// Every open item of one domain's Reflection, unranked, as `scope`
     /// may see them: a source in a domain it may not open is counted on its
     /// item and never named. `threads` is [`Engine::all_threads`] of the
@@ -283,6 +432,10 @@ impl Engine {
                 .iter()
                 .any(|row| row.path != r::PACT_FILE && structure.fits(&row.path));
         let mut cited: HashSet<String> = HashSet::new();
+        // Whether this domain's pages may cite each other domain, asked
+        // once per domain for the whole scan.
+        let mut covers: HashMap<String, bool> = HashMap::new();
+        let disclosures = self.reflection_disclosures(access.domain_id).await?;
         let mut items = Vec::new();
         for (row, prov) in rows.iter().zip(&provenances) {
             // The baseline is read for feedback alone, and the pact's is
@@ -297,7 +450,9 @@ impl Engine {
             // baseline every section would read as a person's change, so the
             // move's one item stands in for that feedback.
             let no_feedback = baseline.is_none() && host_move.is_some();
-            let baseline = baseline.unwrap_or_default();
+            // Without a baseline file (a restore from the backup branch,
+            // which does not carry them) the page stands for its baseline.
+            let baseline = super::reflection::baseline_or_seed(baseline, Some(&row.content));
             let row_age = secs_since_rfc3339(Some(&row.modified)).unwrap_or(0);
             if row.path == r::PACT_FILE {
                 let changes = if no_feedback {
@@ -476,6 +631,89 @@ impl Engine {
                     if full {
                         entry.1.push(source_view(src, &facts));
                     }
+                }
+                // Sources in a domain fewer people may read than this one
+                // (`readers_cover`): written before the rule, edited on disk,
+                // pulled in, or left behind when that domain's readers
+                // narrowed or this one's widened. Nothing refuses a file, so
+                // the queue names the section until a curator takes the
+                // source and the text drawn from it out; deleting text is a
+                // person's decision, so the page keeps serving meanwhile.
+                // One item per section, whatever the number of sources.
+                // Only a caller who may open the source's domain is told:
+                // for anyone else the item would set a hidden source in a
+                // domain registered here apart from one in a name nothing
+                // resolves, and a hidden source tells nothing of itself.
+                let mut wide_shown: Vec<Value> = Vec::new();
+                let mut wide_stamps: Vec<String> = Vec::new();
+                let mut wide_domains: Vec<String> = Vec::new();
+                for src in record.sources.iter().filter(|src| sees(src)) {
+                    let Some(local) = facts.checked_domain(src) else {
+                        continue;
+                    };
+                    let covered = match covers.get(local) {
+                        Some(covered) => *covered,
+                        None => {
+                            let covered = self.readers_cover(domain, local).await?;
+                            covers.insert(local.to_string(), covered);
+                            covered
+                        }
+                    };
+                    if covered {
+                        continue;
+                    }
+                    // Shared on purpose by a person, for the page's readers
+                    // and repository as they still are.
+                    if let Some(stored) = src.domain.as_deref()
+                        && self
+                            .source_covered_on_page(domain, &row.path, local, stored, &disclosures)
+                            .await?
+                    {
+                        continue;
+                    }
+                    if !wide_domains.iter().any(|d| d == local) {
+                        wide_domains.push(local.to_string());
+                    }
+                    wide_stamps.push(format!(
+                        "{}:{}",
+                        src.domain.as_deref().unwrap_or_default(),
+                        src.engram
+                    ));
+                    if full {
+                        wide_shown.push(source_view(src, &facts));
+                    }
+                }
+                if !wide_stamps.is_empty() {
+                    wide_stamps.sort();
+                    wide_domains.sort();
+                    // What a person is asked to share it on purpose (Fluid's
+                    // Review asks it), and the basis their yes carries back;
+                    // it names only domains this caller may open.
+                    let ask = self
+                        .disclosure_ask_for(
+                            domain,
+                            &row.path,
+                            &wide_domains,
+                            std::slice::from_ref(&section.text),
+                        )
+                        .await?;
+                    let extra = json!({
+                        "sources": wide_shown,
+                        "note": TOO_WIDE_NOTE,
+                        "question": ask.question,
+                        "basis": ask.basis,
+                    });
+                    items.push(Item {
+                        kind: "update",
+                        what: "source_too_wide",
+                        domain: domain.to_string(),
+                        path: row.path.clone(),
+                        section: Some(id.to_string()),
+                        heading: section.heading.clone(),
+                        age_secs: row_age,
+                        extra,
+                        basis: item_basis(wide_stamps.iter().map(String::as_str)),
+                    });
                 }
                 for (what, (age, sources, hidden, mut stamps)) in by_what {
                     stamps.sort();
@@ -1206,6 +1444,9 @@ impl Engine {
     /// for `hook_status`. The daemon's count tick calls this; nothing else
     /// writes `reflect_open`.
     pub async fn record_reflect_counts(&self) -> Result<BTreeMap<String, u64>> {
+        // The same pass looks for pages a change of readers left too wide,
+        // so they drop off the backup branch without waiting for an edit.
+        self.schedule_too_wide_backups().await;
         // The unnamed scope already leaves out a hidden copy and a read-only
         // domain, so nothing is filtered here.
         let counts: BTreeMap<String, u64> = self
@@ -1219,4 +1460,80 @@ impl Engine {
         }
         Ok(counts)
     }
+}
+
+/// One domain's too-wide check, with what it reads once: the confirmations
+/// on its pages, the name table and each source domain's coverage.
+struct TooWide<'a> {
+    engine: &'a Engine,
+    domain: &'a str,
+    disclosures: super::disclosure::Disclosures,
+    table: Arc<crystalline_core::names::NameTable>,
+    covers: HashMap<String, bool>,
+}
+
+impl<'a> TooWide<'a> {
+    async fn new(engine: &'a Engine, domain: &'a str, id: DomainId) -> Result<TooWide<'a>> {
+        Ok(TooWide {
+            engine,
+            domain,
+            disclosures: engine.reflection_disclosures(id).await?,
+            table: engine.name_table_now().await,
+            covers: HashMap::new(),
+        })
+    }
+
+    /// Whether page `path` with `text` has a section citing a domain fewer
+    /// people may read than the page's own, or records that cannot be read
+    /// in full ([`r::provenance_unreadable`]), which may hide one. A source
+    /// whose domain cannot be checked here is not counted, as in the queue.
+    async fn text(&mut self, path: &str, text: &str) -> Result<bool> {
+        if r::provenance_unreadable(text) {
+            return Ok(true);
+        }
+        let (engine, domain) = (self.engine, self.domain);
+        for record in r::read_provenance(text).into_values() {
+            for src in &record.sources {
+                let Some(name) = src.domain.as_deref() else {
+                    continue;
+                };
+                let Some(local) = engine.checkable_domain(&self.table, name) else {
+                    continue;
+                };
+                if local == domain {
+                    continue;
+                }
+                let covered = match self.covers.get(&local) {
+                    Some(covered) => *covered,
+                    None => {
+                        let covered = engine.readers_cover(domain, &local).await?;
+                        self.covers.insert(local.clone(), covered);
+                        covered
+                    }
+                };
+                // A person shared it on purpose, for the readers and the
+                // repository the page has now (`source_covered`).
+                let covered = covered
+                    || engine
+                        .source_covered_on_page(domain, path, &local, name, &self.disclosures)
+                        .await?;
+                if !covered {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+}
+
+/// The files of a backup's collected `files` (by repo path) inside the
+/// Reflection folder of `spec`'s domain, by their path inside it.
+fn reflection_files<'a>(
+    spec: &'a crystalline_remote::provider::OriginSpec,
+    files: &'a BTreeMap<String, Vec<u8>>,
+) -> impl Iterator<Item = (&'a str, &'a [u8])> + 'a {
+    files.iter().filter_map(move |(repo_path, bytes)| {
+        crystalline_remote::reflections_backup::reflection_path(spec, repo_path)
+            .map(|inner| (inner, bytes.as_slice()))
+    })
 }

@@ -2101,9 +2101,10 @@ impl Store for PostgresStore {
             let Some((id,)) = id else {
                 return Ok(false);
             };
-            // `domain_lock`, the two automation tables and `tag_alias` name
-            // the row without a cascade, and `relation` and `link` carry its
-            // id with no key at all, so each is cleared before the row itself.
+            // `domain_lock`, the two automation tables, `reflection_disclosure`
+            // and `tag_alias` name the row without a cascade, and `relation`
+            // and `link` carry its id with no key at all, so each is cleared
+            // before the row itself.
             for sql in [
                 "DELETE FROM domain_spelling WHERE domain_id=$1",
                 // A chunk is not content, so it does not keep the row; it
@@ -2113,6 +2114,7 @@ impl Store for PostgresStore {
                 "DELETE FROM domain_lock WHERE domain_id=$1",
                 "DELETE FROM automation_lease WHERE domain_id=$1",
                 "DELETE FROM automation_run WHERE domain_id=$1",
+                "DELETE FROM reflection_disclosure WHERE domain_id=$1",
                 "DELETE FROM relation WHERE domain_id=$1",
                 "DELETE FROM link WHERE domain_id=$1",
                 "DELETE FROM domain WHERE id=$1",
@@ -4940,6 +4942,44 @@ impl Store for PostgresStore {
         .bind(loop_kind)
         .bind(i64::try_from(keep).unwrap_or(i64::MAX))
         .execute(&mut *c)
+        .await
+        .map_err(IndexError::from)?;
+        Ok(())
+    }
+
+    async fn reflection_disclosures(&self, domain: DomainId) -> Result<Vec<(String, String)>> {
+        let mut conn = self.acquire().await?;
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT path, records FROM reflection_disclosure WHERE domain_id=$1 \
+             ORDER BY path COLLATE \"C\"",
+        )
+        .bind(domain.0)
+        .fetch_all(conn.as_mut())
+        .await
+        .map_err(IndexError::from)?;
+        Ok(rows)
+    }
+
+    async fn set_reflection_disclosures(
+        &self,
+        domain: DomainId,
+        path: &str,
+        records: Option<&str>,
+    ) -> Result<()> {
+        let mut conn = self.acquire().await?;
+        match records {
+            Some(records) => sqlx::query(
+                "INSERT INTO reflection_disclosure (domain_id, path, records) VALUES ($1, $2, $3) \
+                 ON CONFLICT (domain_id, path) DO UPDATE SET records=excluded.records",
+            )
+            .bind(domain.0)
+            .bind(path)
+            .bind(records),
+            None => sqlx::query("DELETE FROM reflection_disclosure WHERE domain_id=$1 AND path=$2")
+                .bind(domain.0)
+                .bind(path),
+        }
+        .execute(conn.as_mut())
         .await
         .map_err(IndexError::from)?;
         Ok(())

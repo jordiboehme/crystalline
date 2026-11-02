@@ -103,6 +103,10 @@ export interface ReflectionStatus {
   engramsVisible: boolean;
   /** Whether this caller holds a membership here it may leave (G5). */
   member: boolean;
+  /** `github` when access to the domain follows the GitHub App. */
+  governance: "github" | "crystalline";
+  /** Whether the domain is private. */
+  private: boolean;
   /** While `pending`: the engram paths still under `reflections/`. */
   pendingEngrams: string[];
 }
@@ -121,6 +125,8 @@ export function readReflectionStatus(
     right: oneOf(record?.right, RIGHTS, "none"),
     engramsVisible: record?.engrams_visible === true,
     member: record?.member === true,
+    governance: record?.governance === "github" ? "github" : "crystalline",
+    private: record?.private === true,
     pendingEngrams: asStrings(record?.pending_engrams),
   };
 }

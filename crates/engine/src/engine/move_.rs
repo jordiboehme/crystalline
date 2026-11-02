@@ -36,17 +36,50 @@ pub(super) struct Relocation<'a> {
     pub(super) spellings: &'a HashSet<String>,
 }
 
-/// How a move into another domain rewrites the moved engram's own links that
-/// bind by path, worked out from the source domain before the move.
+/// How a move into another domain rewrites the moved engram's own links,
+/// worked out from the source domain before the move.
 #[derive(Debug, Default)]
 struct CrossLinks {
     /// Each relative link target, as written, and what replaces it.
     relative: HashMap<String, crystalline_core::relink::NoteLinkTo>,
-    /// Each bare wikilink spelled as a source file's path, and its address.
-    paths: HashMap<String, String>,
+    /// Each wikilink, by its domain prefix (none for a bare one) and target
+    /// as written, that resolved in the source domain and would be read in
+    /// the destination once it lands, and the address that keeps it on what
+    /// it reached. Applied before the engram's references to itself follow
+    /// it, so a self-link's new permalink is never mistaken for one of these.
+    readdressed: HashMap<(Option<String>, String), CrossTarget>,
+    /// Each prefixed wikilink whose prefix spells the destination, by that
+    /// prefix and its target: written bare once the engram lands there.
+    collapsed: HashSet<(String, String)>,
     /// The links left as written that would land on an engram in the
     /// destination, as they were written.
     stranded: Vec<String>,
+    /// The target text of every reference of the moved engram the index
+    /// could not resolve before the move, which tells a link that was dead
+    /// already from one the move broke (see [`Engine::dead_links`]).
+    unresolved: HashSet<String>,
+}
+
+/// What one wikilink of an engram moving into another domain is written as.
+#[derive(Debug)]
+struct CrossTarget {
+    /// The target part: `domain:permalink`, or a path for the engram itself.
+    to: String,
+    /// The words of a link that named its target by title, kept as the
+    /// display text when the link shows none, so the reader sees what the
+    /// author wrote while the link names the permalink.
+    words: Option<String>,
+}
+
+impl CrossTarget {
+    /// The new target part of a link, `shown` when it carries a display text
+    /// of its own.
+    fn written(&self, shown: bool) -> String {
+        match &self.words {
+            Some(words) if !shown => format!("{}|{words}", self.to),
+            _ => self.to.clone(),
+        }
+    }
 }
 
 /// The `links_failed` reason for the links of the moved engram a move into
@@ -79,6 +112,11 @@ fn cross_link_reason(
     }
     (!parts.is_empty()).then(|| parts.join("; "))
 }
+
+/// The `links_failed` reason for a linking engram in a domain the mover may
+/// see but only read: its link was left as it was.
+const LINKER_READ_ONLY: &str =
+    "you may only read this domain, so its link to the moved engram was left as it was";
 
 /// Name one linking page or engram a move could not rewrite, in the shape
 /// every move receipt's `links_failed` carries: `{ domain, path, reason }`.
@@ -135,7 +173,9 @@ impl Engine {
     /// shown. So the rewrite skips a domain this caller may not see: its link
     /// is left as it was - dangling, which its own members see as an
     /// unresolved-reference finding on the next sweep - rather than silently
-    /// edited by somebody with no access to it, and the receipt's counts
+    /// edited by somebody with no access to it. A domain the caller sees but
+    /// may only read is skipped the same way and named in `links_failed`: a
+    /// move never writes where its mover may not write. The receipt's counts
     /// (`links_rewritten`, the engrams rewritten, and `references_rewritten`,
     /// the references inside them) cover the visible rewrites only, so a
     /// receipt never counts a file its reader may not know exists.
@@ -461,6 +501,26 @@ impl Engine {
         } else {
             Vec::new()
         };
+        // A domain the mover may see but only read is left as it was, like a
+        // hidden one: a move must not write where its mover may not write
+        // (on a domain GitHub governs, that domain is later shared through
+        // the App). Unlike a hidden domain it is named in `links_failed`,
+        // since the mover may know it exists. Both ends passed the write
+        // gate at the edge.
+        let mut read_only_linkers: HashSet<String> = HashSet::new();
+        let mut asked: HashSet<&str> = HashSet::new();
+        for linker in &linkers {
+            let domain = linker.domain.as_str();
+            if domain == p.domain || domain == dest_domain || !asked.insert(domain) {
+                continue;
+            }
+            if matches!(
+                self.write_access_block(scope, domain).await?,
+                Some(WriteBlock::Role | WriteBlock::WriteList { .. })
+            ) {
+                read_only_linkers.insert(domain.to_string());
+            }
+        }
         // Every other domain the rewrite will write into is counted for the
         // rest of the move, as the source and the destination are, so a
         // rename of a linker's domain waits for the move instead of racing
@@ -476,6 +536,7 @@ impl Engine {
             let domain = linker.domain.as_str();
             if domain == p.domain
                 || domain == dest_domain
+                || read_only_linkers.contains(domain)
                 || paused.contains_key(domain)
                 || linker_tickets.iter().any(|(held, _)| held == domain)
             {
@@ -595,10 +656,18 @@ impl Engine {
         // receipt's `links_failed` names them.
         let mut failed: Vec<Value> = Vec::new();
         let cross_links = if cross && update_links {
-            Some(
-                self.cross_links(&p.domain, &src.path, &dest_domain, &dest_rel, &original)
-                    .await?,
-            )
+            let mut links = self
+                .cross_links(&p.domain, &src.path, &dest_domain, &dest_rel, &original)
+                .await?;
+            let store = self.store.lock().await;
+            links.unresolved = store
+                .outbound_refs(src.id, None)
+                .await?
+                .into_iter()
+                .filter(|r| !r.resolved)
+                .map(|r| r.to_target)
+                .collect();
+            Some(links)
         } else {
             None
         };
@@ -932,6 +1001,14 @@ impl Engine {
         let mut rewritten: Vec<Value> = Vec::new();
         let mut references = 0usize;
         for linker in &linkers {
+            if read_only_linkers.contains(&linker.domain) {
+                failed.push(json!({
+                    "domain": linker.domain,
+                    "path": linker.path,
+                    "reason": LINKER_READ_ONLY,
+                }));
+                continue;
+            }
             if let Some(e) = paused.get(&linker.domain) {
                 tracing::warn!(
                     domain = linker.domain.as_str(),
@@ -1103,6 +1180,16 @@ impl Engine {
         if !failed.is_empty() {
             receipt["links_failed"] = json!(failed);
         }
+        // A move into another domain names the moved engram's own links that
+        // do not resolve where it landed, present only when there is one.
+        if let Some(cross_links) = &cross_links {
+            let dead = self
+                .dead_links(&dest_domain, &dest_permalink, &cross_links.unresolved)
+                .await;
+            if !dead.is_empty() {
+                receipt["links_dead"] = json!(dead);
+            }
+        }
         Ok(receipt)
     }
 
@@ -1189,6 +1276,18 @@ impl Engine {
         if implied != new_permalink {
             text = set_frontmatter_field(&text, "permalink", new_permalink);
         }
+        // Before the self-references follow: a link that reached another
+        // engram of the source names it by its address from here on.
+        if let Some(cross) = cross {
+            text =
+                crystalline_core::relink::readdress_wikilinks(&text, &|domain, target, shown| {
+                    cross
+                        .readdressed
+                        .get(&(domain.map(str::to_string), target.to_string()))
+                        .map(|to| to.written(shown))
+                })
+                .0;
+        }
         if let Some(spec) = relink {
             text =
                 crystalline_core::relink::relink(&text, spec.from_domain, spec.to_domain, spec).0;
@@ -1204,10 +1303,17 @@ impl Engine {
             let whole = crystalline_core::relink::readdress_relative_links(&text, &|target| {
                 cross.relative.get(target).cloned()
             });
-            text = crystalline_core::relink::readdress_path_wikilinks(&whole.text, &|target| {
-                cross.paths.get(target).cloned()
-            })
-            .0;
+            // After the self-references followed, so a bare one can no longer
+            // be read as a self-reference of the domain it left.
+            text =
+                crystalline_core::relink::readdress_wikilinks(&whole.text, &|domain, target, _| {
+                    let domain = domain?;
+                    cross
+                        .collapsed
+                        .contains(&(domain.to_string(), target.to_string()))
+                        .then(|| target.to_string())
+                })
+                .0;
             notes = cross_link_reason(&cross.stranded, &whole.unwritable, &whole.dropped);
         }
         let text = (text != original).then(|| touch_generated(&text, mover, None, now_offset()));
@@ -1225,7 +1331,12 @@ impl Engine {
     /// (every folder has its own), and a link that climbs out of the source
     /// domain stays as written, named in `stranded` when it would land on an
     /// engram in the destination. A bare wikilink spelled as a source
-    /// engram's path gets the source's prefix the same way.
+    /// engram's path gets the source's prefix the same way, and so does every
+    /// other bare wikilink and relation that resolved in the source (issue
+    /// 152): a bare link is read in the domain it sits in, so once the engram
+    /// lands it would look for its target in the destination. One that reached
+    /// the engram itself, or nothing, stays bare. A prefix that names the
+    /// destination is dropped once the engram lands there.
     async fn cross_links(
         &self,
         src_domain: &str,
@@ -1239,6 +1350,7 @@ impl Engine {
         let Ok(engram) = parse_engram(text) else {
             return Ok(out);
         };
+        let names = self.name_table_now().await;
         let targets: Vec<&LinkTarget> = engram
             .links
             .iter()
@@ -1286,32 +1398,144 @@ impl Engine {
                     }
                 }
                 LinkForm::Wiki => {
-                    if target.domain.is_some()
-                        || !target.target.to_ascii_lowercase().ends_with(".md")
-                        || out.paths.contains_key(&target.target)
-                    {
+                    let key = (target.domain.clone(), target.target.clone());
+                    if out.readdressed.contains_key(&key) {
                         continue;
                     }
-                    // Its own path follows it, and is read in the
-                    // destination from there on.
-                    if target.target == src_path {
-                        out.paths
-                            .insert(target.target.clone(), dest_rel.to_string());
-                        continue;
-                    }
-                    // Read in the destination from now on, so it names the
-                    // source domain: by permalink where an engram stands at
-                    // the path, by the path where none does (it stays
-                    // unresolved, as it was).
-                    let address = match self.descriptor_at(src_domain, &target.target).await? {
-                        Some(found) => format!("{src_domain}:{}", found.permalink),
-                        None => format!("{src_domain}:{}", target.target),
+                    let to = match &target.domain {
+                        None if target.target.to_ascii_lowercase().ends_with(".md") => {
+                            // Its own path follows it, and is read in the
+                            // destination from there on.
+                            if target.target == src_path {
+                                Some(CrossTarget {
+                                    to: dest_rel.to_string(),
+                                    words: None,
+                                })
+                            } else {
+                                // Read in the destination from now on, so it
+                                // names the source domain: by permalink where
+                                // an engram stands at the path, by the path
+                                // where none does (it stays unresolved, as it
+                                // was).
+                                let address =
+                                    match self.descriptor_at(src_domain, &target.target).await? {
+                                        Some(found) => format!("{src_domain}:{}", found.permalink),
+                                        None => format!("{src_domain}:{}", target.target),
+                                    };
+                                Some(CrossTarget {
+                                    to: address,
+                                    words: None,
+                                })
+                            }
+                        }
+                        // A bare link resolves in the domain it is read in,
+                        // so one that reached an engram of the source names
+                        // it by its address. One that reached the engram
+                        // itself is left to the self-references, and one
+                        // that reached nothing stays as written.
+                        None => {
+                            self.cross_target(src_domain, src_path, &target.target)
+                                .await?
+                        }
+                        Some(prefix) => match names.resolve(prefix) {
+                            // A prefix that names the destination: written
+                            // bare once the engram lands there, unless the
+                            // bare text would read as a prefix itself.
+                            Some(local) if local == dest_domain => {
+                                if LinkTarget::parse(&target.target).domain.is_none() {
+                                    out.collapsed
+                                        .insert((prefix.clone(), target.target.clone()));
+                                }
+                                None
+                            }
+                            Some(_) => None,
+                            // A prefix no domain answers to is no prefix: the
+                            // resolver reads the whole text at home (a title
+                            // such as `Log: Weekly`), so it is a bare link.
+                            None => self.cross_target(src_domain, src_path, &target.raw).await?,
+                        },
                     };
-                    out.paths.insert(target.target.clone(), address);
+                    if let Some(to) = to {
+                        out.readdressed.insert(key, to);
+                    }
                 }
             }
         }
         Ok(out)
+    }
+
+    /// What a bare wikilink `target` of the engram at `src_path` reached in
+    /// `src_domain`, as the address it is written with once the engram leaves
+    /// the domain; `None` when it reached the engram itself or nothing.
+    ///
+    /// Read the way the index resolves a reference: the permalink first, then
+    /// the title in any letter case, then the domain-relative path. A link by
+    /// title names the permalink and keeps its words as the display text.
+    async fn cross_target(
+        &self,
+        src_domain: &str,
+        src_path: &str,
+        target: &str,
+    ) -> Result<Option<CrossTarget>> {
+        let found = {
+            let store = self.store.lock().await;
+            store.find_engram(src_domain, target).await?
+        };
+        let (found, by_title) = match found {
+            Some(found) => {
+                let by_title = found.permalink != target;
+                (found, by_title)
+            }
+            None => match self.descriptor_at(src_domain, target).await? {
+                Some(found) => (found, false),
+                None => return Ok(None),
+            },
+        };
+        if found.path == src_path {
+            return Ok(None);
+        }
+        Ok(Some(CrossTarget {
+            to: format!("{src_domain}:{}", found.permalink),
+            words: by_title.then(|| target.to_string()),
+        }))
+    }
+
+    /// The moved engram's references the index cannot resolve now that it
+    /// has landed at `permalink` in `domain`, as the receipt's `links_dead`
+    /// names them: `{ link, reason }`, where the reason is
+    /// `unresolved_before` for a link that resolved nowhere before the move
+    /// either and `unresolved_after` for one the move left dead (a guard: a
+    /// move is meant to keep every link it found resolving). Asked of the
+    /// index, the resolver's own verdict, after every rewrite has landed. A
+    /// failing lookup names nothing rather than failing a done move.
+    async fn dead_links(
+        &self,
+        domain: &str,
+        permalink: &str,
+        unresolved_before: &HashSet<String>,
+    ) -> Vec<Value> {
+        let store = self.store.lock().await;
+        let refs = match store.lookup_id(domain, permalink).await {
+            Ok(Some(id)) => store.outbound_refs(id, None).await.unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        let mut seen = HashSet::new();
+        refs.into_iter()
+            .filter(|r| !r.resolved)
+            .filter_map(|r| {
+                let link = match &r.to_domain {
+                    Some(prefix) => format!("[[{prefix}:{}]]", r.to_target),
+                    None => format!("[[{}]]", r.to_target),
+                };
+                let reason = if unresolved_before.contains(&r.to_target) {
+                    "unresolved_before"
+                } else {
+                    "unresolved_after"
+                };
+                seen.insert(link.clone())
+                    .then(|| json!({ "link": link, "reason": reason }))
+            })
+            .collect()
     }
 
     /// Refuse a move onto a permalink another engram in the destination domain
@@ -1749,6 +1973,9 @@ impl Engine {
                     &|domain, target| {
                         (moved.spellings.contains(domain) && target == moved.from).then(|| {
                             match moved.across {
+                                // Written in the domain it moved into, the
+                                // path needs no prefix to reach it.
+                                Some(_) if linker.domain == moved.to_domain => moved.to.to_string(),
                                 Some(_) => format!("{}:{}", moved.to_domain, moved.to),
                                 None => format!("{domain}:{}", moved.to),
                             }
@@ -1899,6 +2126,19 @@ impl Engine {
             // above (or, for a dry run, is previewed as it stands).
             let mut elsewhere: Vec<String> = Vec::new();
             if domain.is_none() {
+                // An unattended request sweeps only the domains its run works
+                // on (`crate::read_limit`); a named domain meets the same rule
+                // in `refuse_read_only_domain` above.
+                if let Some(limit) = crate::read_limit::current()
+                    && let Some(writes) = &limit.writes
+                {
+                    if writes.is_empty() {
+                        return Err(EngineError::Refused(
+                            "this run works on no domain and cannot write to any".into(),
+                        ));
+                    }
+                    found.retain(|d| writes.contains(&d.domain));
+                }
                 let mut here: HashMap<String, bool> = HashMap::new();
                 let mut kept = Vec::with_capacity(found.len());
                 for d in found {

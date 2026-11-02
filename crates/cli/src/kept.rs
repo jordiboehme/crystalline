@@ -31,30 +31,6 @@ pub fn scan_here() -> Vec<KeptText> {
     root().map(|root| kept::scan(&root)).unwrap_or_default()
 }
 
-/// Before `name` becomes a new domain's name on the direct path, set aside a
-/// `kept/<name>` folder no registered domain owns (see
-/// `Engine::set_aside_orphan_kept`, the daemon's twin of this), so the new
-/// domain never reaches texts left under the name. Best effort.
-pub fn set_aside_orphan<'a>(name: &str, registered: impl IntoIterator<Item = &'a String>) {
-    use crystalline_core::config::registration::fold_domain_name;
-    let Ok(root) = root() else {
-        return;
-    };
-    if !root.join(name).is_dir() {
-        return;
-    }
-    let folded = fold_domain_name(name);
-    if registered
-        .into_iter()
-        .any(|n| fold_domain_name(n) == folded)
-    {
-        return;
-    }
-    if let Err(err) = kept::set_aside(&root, name, chrono::Utc::now()) {
-        eprintln!("note: kept texts left under '{name}' could not be set aside: {err}");
-    }
-}
-
 /// The `crystalline status` line, only when something is kept.
 pub fn status_line(found: &[KeptText]) -> Option<String> {
     (!found.is_empty()).then(|| format!("Kept texts: {} (crystalline kept list)", found.len()))

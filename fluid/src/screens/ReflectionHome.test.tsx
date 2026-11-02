@@ -1331,3 +1331,41 @@ describe("the last reflect run", () => {
     expect(within(card).queryByText(/waiting for a person/)).toBeNull();
   });
 });
+
+const UNLINKED_HINT =
+  "Connect GitHub on your profile to contribute, and to open the private domains you can read on GitHub.";
+
+/** The link read of an account with no GitHub link, on an instance with an App. */
+const unlinked = () => ({
+  linked: false,
+  app_configured: true,
+  token_live: false,
+});
+
+describe("an account with no GitHub link", () => {
+  it("is told how to open a private GitHub domain from its Reflection", async () => {
+    asContributor({
+      "/domains/eng/reflection": () =>
+        status({
+          right: "read",
+          engrams_visible: false,
+          governance: "github",
+          private: true,
+        }),
+      "/me/github-link": unlinked,
+    });
+    renderApp("/d/eng/reflection");
+    expect(await screen.findByText(UNLINKED_HINT)).toBeVisible();
+  });
+
+  it("is told nothing where Crystalline decides", async () => {
+    asContributor({
+      "/domains/eng/reflection": () =>
+        status({ right: "read", engrams_visible: false, private: true }),
+      "/me/github-link": unlinked,
+    });
+    renderApp("/d/eng/reflection");
+    await screen.findByRole("heading", { name: "eng", level: 1 });
+    expect(screen.queryByText(UNLINKED_HINT)).toBeNull();
+  });
+});

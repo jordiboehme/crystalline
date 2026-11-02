@@ -45,6 +45,12 @@ pub const REFUSED_PENDING_SPELLINGS: &str =
     "waits until only one folder spells reflections/, in any letter case";
 /// The refusal for a GitHub-connected domain whose Reflection has no home.
 pub const REFUSED_HOMELESS: &str = "this domain is connected to GitHub and its Reflection has no home yet: switch Reflection on in the domain policies at the team server";
+/// The words every refusal for a team domain that is not connected here
+/// carries: a MANIFEST with the [`crystalline_core::TEAM_KEY`] marker and no
+/// origin on this instance, typically a plain clone of the team repository
+/// registered as a local domain. The switch-on and the gate both refuse it
+/// with one sentence that names the domain before these words.
+pub const REFUSED_UNCONNECTED_TEAM: &str = "is a team domain and is not connected here";
 /// The start of the refusal for a Reflection held by another instance; its
 /// address follows.
 pub const REFUSED_ELSEWHERE_START: &str = "this domain's Reflection lives at ";
@@ -139,6 +145,8 @@ impl ReflectionAccess {
 /// The facts the switch is screened against, gathered before any write lock.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SwitchFacts {
+    /// The domain's name, for the refusals that tell a person what to run.
+    pub domain: String,
     pub virtual_domain: bool,
     /// The folders in the domain root that spell `reflections` in any letter
     /// case, sorted. More than one cannot be one Reflection: their files
@@ -183,6 +191,30 @@ fn declared_home(source: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The whole sentence for a team domain that is not connected here, as the
+/// switch-on and the gate both answer it: what is wrong, why, and the two
+/// steps that fix it. A team domain's Reflection lives only at its home,
+/// the team server, which fills in `reflection_home` and backs it up to its
+/// own branch; a copy that is not connected has neither check, so whatever
+/// Reflection it kept would travel with a plain git push instead.
+pub(crate) fn unconnected_team_refusal(domain: &str) -> String {
+    format!(
+        "'{domain}' {REFUSED_UNCONNECTED_TEAM}. A team domain's Reflection lives only at its home, the team server. Connect the domain first (crystalline domain add {domain} --origin <owner>/<repo>, or add_domain with repo; configure turns collaboration on), then switch Reflection on in the domain policies at the team server"
+    )
+}
+
+/// Whether a team domain that is not connected here is about to keep a
+/// Reflection: one of `texts` carries the team marker, and the facts say the
+/// domain has no origin on this instance. A virtual domain is refused for
+/// its own reason first.
+fn unconnected_team(facts: &SwitchFacts, texts: &[&str]) -> bool {
+    !facts.origin
+        && !facts.virtual_domain
+        && texts
+            .iter()
+            .any(|text| crystalline_core::team_of_source(text).is_some())
+}
+
 /// The refusal of a switch-on for a virtual domain.
 pub(crate) fn virtual_refusal() -> EngineError {
     EngineError::Invalid(
@@ -199,6 +231,16 @@ pub(crate) fn screen_switch(before: &str, after: &str, facts: &SwitchFacts) -> R
     }
     if facts.virtual_domain {
         return Err(virtual_refusal());
+    }
+    // Before every other check: a team domain that is not connected here
+    // never keeps a Reflection, so moving engrams out first would be work
+    // for nothing. The text it replaces counts as much as the text it
+    // writes, so one edit that drops the marker and switches on is refused
+    // too.
+    if unconnected_team(facts, &[before, after]) {
+        return Err(EngineError::Invalid(unconnected_team_refusal(
+            &facts.domain,
+        )));
     }
     if facts.folders.len() > 1 {
         let named: Vec<String> = facts.folders.iter().map(|f| format!("{f}/")).collect();
@@ -263,6 +305,14 @@ pub(crate) fn refuse_unscreened_switch_on(before: &str, after: &str) -> Result<(
 /// this instance's `service.public_url` as its `reflection_home`. Also the
 /// whole screen of the home refill, where the switch is already on.
 pub(crate) fn screen_home(after: &str, facts: &SwitchFacts) -> Result<()> {
+    // A homeless domain is also a team domain that is not connected here
+    // and already says `on`: switching it on again must not pass as a
+    // refill, which has no home to fill in for a domain with no origin.
+    if unconnected_team(facts, &[after]) {
+        return Err(EngineError::Invalid(unconnected_team_refusal(
+            &facts.domain,
+        )));
+    }
     if facts.origin {
         let Some(own) = facts.own_url.as_deref() else {
             return Err(EngineError::Invalid(
@@ -413,7 +463,7 @@ impl Engine {
     /// slash), the spelling [`crystalline_core::validate_reflection_home`]
     /// holds the stored key to, so a home this instance writes compares
     /// equal to the one it reads back. `None` when unset or not a valid base.
-    fn own_public_url(&self) -> Option<String> {
+    pub(super) fn own_public_url(&self) -> Option<String> {
         crate::settings::public_base(&self.config.read().unwrap()).map(|base| base.to_string())
     }
 
@@ -459,6 +509,7 @@ impl Engine {
         let origin = entry.origin.is_some();
         let ContentSource::File { root } = self.read_source(domain) else {
             return Ok(SwitchFacts {
+                domain: domain.to_string(),
                 virtual_domain: true,
                 origin,
                 own_url,
@@ -488,6 +539,7 @@ impl Engine {
             }
         }
         Ok(SwitchFacts {
+            domain: domain.to_string(),
             virtual_domain: false,
             folders,
             engrams: named.engrams,
@@ -586,6 +638,15 @@ impl Engine {
         let engrams = self.pending_engrams(domain).await?;
         if !engrams.is_empty() {
             return Ok(ReflectionState::Pending { engrams });
+        }
+        // A team domain that is not connected here (its MANIFEST carries
+        // the marker) has no home here, whatever its MANIFEST names: its
+        // Reflection lives at the team server, which only a connected copy
+        // can be. Asked before the home, so a plain clone on the team
+        // server's own machine, whose MANIFEST names this very instance, is
+        // refused like every other stray copy.
+        if !origin && crystalline_core::team_at(&root).is_some() {
+            return Ok(ReflectionState::Homeless);
         }
         let declared = crystalline_core::reflection_home_at(&root);
         match (declared, origin) {
@@ -838,8 +899,11 @@ impl Engine {
                     "Reflection for '{domain}' {REFUSED_PENDING}"
                 )));
             }
-            ReflectionState::Homeless => {
+            ReflectionState::Homeless if self.domain_has_origin(domain)? => {
                 return Err(EngineError::Refused(REFUSED_HOMELESS.to_string()));
+            }
+            ReflectionState::Homeless => {
+                return Err(EngineError::Refused(unconnected_team_refusal(domain)));
             }
             ReflectionState::Elsewhere { url } => {
                 return Err(EngineError::Refused(format!(
@@ -961,10 +1025,20 @@ impl Engine {
         if self.domain_entry(domain).is_err() {
             self.require_domain(domain, &caller.scope).await?;
         }
+        // An unattended request may not read this domain at all
+        // (`crate::read_limit`): its Reflection is as unknown to it as the
+        // domain.
+        if crate::read_limit::hides(domain) {
+            let hidden = self.hidden_for(&caller.scope).await?;
+            return Err(self.unknown_domain(domain, &hidden));
+        }
         let engrams_visible = self.engrams_visible(&caller.scope, domain).await?;
         // The MCP open tier curates every domain it can see; a private
         // domain stays as invisible to it as to every anonymous caller.
-        let right = if caller.open_tier {
+        // Not on a domain GitHub governs: there it is decided like everybody
+        // else, as `github.agent_identity` when that is set
+        // (`Engine::reflection_right` asks through `Engine::scope_on`).
+        let right = if caller.open_tier && !self.github_governs(domain) {
             if engrams_visible {
                 ReflectionRight::Curate
             } else {
@@ -1044,6 +1118,14 @@ pub(super) fn rooms_to_rewrite<'a>(
 /// `reflections` in another letter case (the classifier's rule, so it is the
 /// Reflection's folder), else `reflections`. A write never puts a second
 /// spelling beside the first.
+/// A page's baseline: its file under `.reflected/`, or, when there is none,
+/// what the page itself stands for ([`r::seed_baseline`]): a Reflection
+/// restored from its backup branch has no baselines, and its pages become
+/// the baseline, so a section still as last reflected is no person's change.
+pub(super) fn baseline_or_seed(file: Option<String>, page: Option<&str>) -> String {
+    file.unwrap_or_else(|| page.map(r::seed_baseline).unwrap_or_default())
+}
+
 pub(super) fn reflection_dir(root: &Path) -> PathBuf {
     let name = r::reflection_folders(root)
         .into_iter()
@@ -1520,7 +1602,12 @@ impl Engine {
         caller: &ReflectionCaller,
     ) -> Result<Value> {
         match p.action.as_deref().unwrap_or("write") {
-            "write" => self.write_reflection_text(p, caller).await,
+            "write" => match self.write_reflection_text(p, caller, false).await? {
+                Written::Receipt(receipt) => Ok(receipt),
+                Written::Preview(_) => Err(EngineError::Internal(
+                    "a write answered with a preview".into(),
+                )),
+            },
             "move" => {
                 let to = p.to.as_deref().ok_or_else(|| {
                     EngineError::Invalid("move needs `to`, the new path inside reflections/".into())
@@ -1557,11 +1644,30 @@ impl Engine {
         }
     }
 
+    /// What `p` would leave on its page and what in it needs a person's
+    /// confirmation (`super::disclosure`), worked out by the write itself and
+    /// stopped before anything is written. `None` for an action that is no
+    /// text write.
+    pub(super) async fn preview_reflection_write(
+        &self,
+        p: &WriteReflectionParams,
+        caller: &ReflectionCaller,
+    ) -> Result<Option<super::disclosure::WritePreview>> {
+        if p.action.as_deref().unwrap_or("write") != "write" {
+            return Ok(None);
+        }
+        match self.write_reflection_text(p, caller, true).await? {
+            Written::Preview(preview) => Ok(Some(preview)),
+            Written::Receipt(_) => Ok(None),
+        }
+    }
+
     async fn write_reflection_text(
         &self,
         p: &WriteReflectionParams,
         caller: &ReflectionCaller,
-    ) -> Result<Value> {
+        preview: bool,
+    ) -> Result<Written> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
@@ -1596,8 +1702,27 @@ impl Engine {
         // Each source by permalink (this domain) or address (any domain),
         // resolved in the writer's scope, and their facts read one seek
         // each before the page lock.
+        // A person's confirmation lets a source through that the reach rule
+        // alone refuses (`super::disclosure`); nobody behind the caller, no
+        // confirmation.
+        let by = super::disclosure::confirmer(caller).filter(|_| p.disclosed.is_some());
+        // The source domains this person shared on this page already, which
+        // they may cite again without a new question.
+        let shared = match super::disclosure::confirmer(caller) {
+            Some(person) if !p.sources.is_empty() => {
+                self.shared_by(&p.domain, access.domain_id, &p.path, &person)
+                    .await?
+            }
+            _ => HashSet::new(),
+        };
         let named = self
-            .resolve_source_names(&p.domain, &caller.scope, p.sources.values().flatten())
+            .resolve_source_names(
+                &p.domain,
+                &caller.scope,
+                p.sources.values().flatten(),
+                by.is_some() || preview,
+                &shared,
+            )
             .await?;
         let wanted: Vec<r::SourceRef> = named.values().map(|n| n.source_ref("")).collect();
         let facts = self
@@ -1688,7 +1813,7 @@ impl Engine {
         // no person's change (`relink`): a section the writer left alone then
         // matches the stored one, so a respelled alias in it records nobody
         // and owes no feedback.
-        let stored_baseline = read_opt(&baseline_abs)?.unwrap_or_default();
+        let stored_baseline = baseline_or_seed(read_opt(&baseline_abs)?, current.as_deref());
         let funnel = self
             .spelling_funnel(
                 &caller.scope,
@@ -1800,6 +1925,9 @@ impl Engine {
             .collect();
         let changed_ids = changed.clone();
         let mut advanced: Vec<String> = Vec::new();
+        // Each section and source domain this write carries on a person's
+        // confirmation.
+        let mut confirmed: Vec<(String, String)> = Vec::new();
         for (key, engrams) in &p.sources {
             let key = replaced
                 .iter()
@@ -1824,6 +1952,11 @@ impl Engine {
                     })
                 })?;
                 let src = source.source_ref(&fact.checksum);
+                if let (true, Some(domain)) = (source.disclose, src.domain.as_ref())
+                    && !confirmed.iter().any(|(s, d)| *s == id && d == domain)
+                {
+                    confirmed.push((id.clone(), domain.clone()));
+                }
                 // One engram named twice (by permalink and by address) is
                 // one source.
                 if !refs
@@ -1922,6 +2055,44 @@ impl Engine {
             }
         }
         let final_text = stamp_reflected(&text, &mut prov, &advanced)?;
+        // What a person must confirm (`super::disclosure`): the sources the
+        // reach rule refuses that this person has not shared on this page.
+        let needs = confirmed;
+        if preview {
+            return Ok(Written::Preview(super::disclosure::WritePreview {
+                text: final_text,
+                needs,
+            }));
+        }
+        // The readers of the page's repository the person was asked about:
+        // what their confirmation records.
+        let mut asked_repo_readers = None;
+        if by.is_some() && !needs.is_empty() {
+            let shown = super::disclosure::WritePreview {
+                text: final_text.clone(),
+                needs: needs.clone(),
+            };
+            let asked = self.asked_for_preview(&p.domain, &p.path, &shown).await?;
+            // Nothing to record a yes for while the repository's readers are
+            // unknown, whatever the person answered.
+            self.refuse_unknown_repository_readers(&p.domain, asked.repo_readers.as_ref())?;
+            // The person said yes to these readers: still them?
+            if let Some(basis) = p.disclosed.as_deref()
+                && asked.ask.basis != basis
+            {
+                return Err(EngineError::Conflict(
+                    super::disclosure::DISCLOSURE_CHANGED.into(),
+                ));
+            }
+            asked_repo_readers = asked.repo_readers;
+        }
+        let mut confirmed: Vec<String> = if by.is_some() {
+            needs.into_iter().map(|(_, source)| source).collect()
+        } else {
+            Vec::new()
+        };
+        confirmed.sort();
+        confirmed.dedup();
         // The `##` sections this write created or changed that leave it with
         // no source in their record: provenance alone, whatever else counts
         // a section as reflected. The pact is no page.
@@ -1976,6 +2147,16 @@ impl Engine {
                 }),
                 read: false,
             },
+        )
+        .await?;
+        self.record_disclosures(
+            &p.domain,
+            access.domain_id,
+            &p.path,
+            &final_text,
+            &confirmed,
+            by.as_deref(),
+            asked_repo_readers,
         )
         .await?;
         self.mark_reflection_dirty(&p.domain, BackupCause::Settled);
@@ -2089,8 +2270,15 @@ impl Engine {
                 ),
             }
         }
-        Ok(receipt)
+        Ok(Written::Receipt(receipt))
     }
+}
+
+/// What [`Engine::write_reflection_text`] answers: the receipt of a write,
+/// or what a preview would have written.
+pub(super) enum Written {
+    Receipt(Value),
+    Preview(super::disclosure::WritePreview),
 }
 
 impl Engine {
@@ -2286,7 +2474,7 @@ impl Engine {
         // already (the session's `normalize_doc`), and the stored page and
         // its baseline get the same respelling as a link rewrite that is no
         // person's change, so a section nobody touched records nobody.
-        let stored_baseline = read_opt(&baseline_abs)?.unwrap_or_default();
+        let stored_baseline = baseline_or_seed(read_opt(&baseline_abs)?, current.as_deref());
         let funnel = self
             .spelling_funnel(
                 &crate::scope::Scope::Unrestricted,
@@ -2529,9 +2717,17 @@ impl Engine {
         };
         // A section whose only difference from what was last reflected is a
         // task box is not changed: ticking a box is not something to weigh.
-        let reflected = r::parse_baseline(
-            &read_opt(&access.abs(&r::baseline_path(inner)))?.unwrap_or_default(),
-        );
+        let reflected = r::parse_baseline(&baseline_or_seed(
+            read_opt(&access.abs(&r::baseline_path(inner)))?,
+            Some(&text),
+        ));
+        // Who shared a section's text on purpose, and when: for curators,
+        // who are the ones to settle the page (`super::disclosure`).
+        let disclosures = if access.engrams_visible && access.right >= ReflectionRight::Curate {
+            self.reflection_disclosures(access.domain_id).await?
+        } else {
+            Default::default()
+        };
         let sections: Vec<Value> = r::split_sections(&markdown)
             .iter()
             .filter(|s| s.id.as_deref() != Some(r::TOP_SECTION))
@@ -2560,6 +2756,17 @@ impl Engine {
                     if hidden > 0 {
                         row["hidden_sources"] = json!(hidden);
                     }
+                }
+                let cited: Vec<&str> = record
+                    .map(|rec| {
+                        rec.sources
+                            .iter()
+                            .filter_map(|src| src.domain.as_deref())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if let Some(disclosure) = disclosures.newest(inner, &cited) {
+                    row["disclosed"] = json!({ "by": disclosure.by, "at": disclosure.at });
                 }
                 row
             })
@@ -2884,6 +3091,7 @@ impl Engine {
             OnRefusal::put_back(domain, undo),
         )
         .await?;
+        self.move_disclosures(access.domain_id, from, to).await?;
         drop(_locks);
         // The page has moved: the room's sockets learn its new path now, and
         // the fence lifts.
@@ -3087,6 +3295,7 @@ impl Engine {
             OnRefusal::put_back(domain, undo),
         )
         .await?;
+        self.drop_disclosures(access.domain_id, inner).await?;
         self.mark_reflection_dirty(domain, BackupCause::Settled);
         self.announce_reflection(
             domain,
@@ -3128,7 +3337,7 @@ impl Engine {
         let text = read_opt(&abs)?.ok_or_else(|| {
             EngineError::NotFound(format!("no reflection '{inner}' in domain '{domain}'"))
         })?;
-        let baseline = read_opt(&baseline_abs)?.unwrap_or_default();
+        let baseline = baseline_or_seed(read_opt(&baseline_abs)?, Some(&text));
         let sections = r::split_sections(&text);
         // No ids settles the whole page: every section on it, the top
         // included, and every section its baseline holds that the page no

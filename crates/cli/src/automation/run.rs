@@ -170,6 +170,13 @@ pub(super) async fn run_one(
         }
         Err(e) => return Err(e),
     };
+    // What the take says about the domain's evolve home: that this
+    // instance claimed it, or that every clone may still run evolve.
+    if !opts.json
+        && let Some(note) = take["note"].as_str()
+    {
+        println!("{domain}: {note}");
+    }
     let token = take["token"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("the lease answer carried no token"))?
@@ -188,7 +195,7 @@ pub(super) async fn run_one(
         Err(e) => return lease.fail_and_err(&started, e, stop.clone()).await,
     };
     let config = match client
-        .mcp_config()
+        .mcp_config(domain)
         .await
         .and_then(|c| PrivateConfig::write(&c))
     {
@@ -540,6 +547,9 @@ pub(super) fn open_log(
         Some(dir) => dir.to_path_buf(),
         None => crystalline_core::config::state_dir()?.join("runs"),
     };
+    // Inside an app package a new log under AppData would land in the
+    // package's private copy: refused like every other write there.
+    crystalline_core::config::check_write(&dir)?;
     std::fs::create_dir_all(&dir)?;
     let prefix = format!("{lp}-{}-", file_safe(domain));
     let path = dir.join(format!(

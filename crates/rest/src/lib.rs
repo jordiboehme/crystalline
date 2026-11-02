@@ -40,8 +40,11 @@ mod error;
 mod events;
 mod evolve;
 mod files;
+mod github_app_create;
 mod github_identity;
+mod github_link;
 mod github_settings;
+pub mod github_webhook;
 mod graph;
 mod identity_links;
 mod kept;
@@ -51,6 +54,7 @@ mod members;
 mod oauth;
 mod oauth_grants;
 mod oidc;
+use crystalline_engine::pending;
 mod reflections;
 mod users_api;
 
@@ -160,6 +164,9 @@ use crate::scope::{DomainAccess, DomainRight};
         members::set_member,
         members::remove_member,
         members::set_owner,
+        members::list_reflection_collaborators,
+        members::set_reflection_collaborator,
+        members::remove_reflection_collaborator,
         automation::read,
         kept::list,
         kept::read,
@@ -212,6 +219,7 @@ use crate::scope::{DomainAccess, DomainRight};
         reflections::save,
         reflections::remove,
         reflections::move_to,
+        reflections::disclose,
         reflections::threads,
         reflections::open,
         reflections::step,
@@ -231,6 +239,7 @@ use crate::scope::{DomainAccess, DomainRight};
         users_api::reset_password,
         users_api::remove,
         github_settings::status,
+        github_settings::access,
         github_settings::connect,
         github_settings::token,
         github_settings::disconnect,
@@ -238,6 +247,16 @@ use crate::scope::{DomainAccess, DomainRight};
         github_identity::connect,
         github_identity::token,
         github_identity::disconnect,
+        github_app_create::manifest,
+        github_app_create::created,
+        github_app_create::setup,
+        github_link::status,
+        github_link::start,
+        github_link::callback,
+        github_link::go,
+        github_link::unlink,
+        github_webhook::receive,
+        users_api::unlink_github,
         mcp_tokens::list,
         mcp_tokens::issue,
         mcp_tokens::rotate,
@@ -277,6 +296,7 @@ use crate::scope::{DomainAccess, DomainRight};
         domains::PolicyView,
         domains::SetPoliciesBody,
         domains_admin::CreateDomainBody,
+        domains_admin::Readers,
         domains_admin::RenameBody,
         domains_admin::FoldArg,
         domains_admin::ReviewBody,
@@ -288,6 +308,13 @@ use crate::scope::{DomainAccess, DomainRight};
         members::MembersResponse,
         members::MemberBody,
         members::OwnerBody,
+        schemas::ReflectionGrant,
+        schemas::GithubPerson,
+        schemas::ClosedDomain,
+        members::ReflectionCollaboratorsResponse,
+        members::Governance,
+        members::ReflectionCollaboratorBody,
+        members::GrantLevel,
         domains_admin::ShareBody,
         domains_admin::WithdrawBody,
         domains_admin::ResolveBody,
@@ -328,8 +355,15 @@ use crate::scope::{DomainAccess, DomainRight};
         users_api::UsersResponse,
         github_settings::TokenBody,
         github_settings::GithubStatusResponse,
+        github_settings::GithubAccessResponse,
         github_settings::GithubPendingView,
+        github_settings::GithubAppView,
         github_identity::GithubIdentityResponse,
+        github_app_create::GithubAppManifestBody,
+        github_app_create::GithubAppManifestResponse,
+        github_link::GithubLinkResponse,
+        github_link::StartGithubLinkResponse,
+        github_link::GithubUnlinkResponse,
         schemas::McpTokenInfo,
         mcp_tokens::IssueBody,
         mcp_tokens::IssuedTokenResponse,
@@ -346,6 +380,7 @@ use crate::scope::{DomainAccess, DomainRight};
         oauth::TokenResponse,
         reflections::SaveReflectionBody,
         reflections::MoveReflectionBody,
+        reflections::DiscloseReflectionBody,
         reflections::OpenThreadBody,
         reflections::ThreadStepBody,
         reflections::ReflectionAssetsResponse,
@@ -413,6 +448,12 @@ pub struct RestState {
     /// collab upgrade route joins rooms in it, and every save it makes goes
     /// back through the engine above.
     pub collab: Arc<crate::collab::session::CollabSessions>,
+    /// The GitHub App web-flow links in flight, one store for this process.
+    /// See [`github_link`].
+    pub(crate) github_links: Arc<github_link::GithubLinkFlows>,
+    /// The GitHub App manifest forms handed out and not yet come back, one
+    /// store for this process. See [`github_app_create`].
+    pub(crate) github_app_manifests: Arc<github_app_create::GithubAppManifests>,
     /// The path this instance is served under, from `service.public_url`:
     /// every cookie is scoped to it, so two instances on one host keep
     /// separate sessions, and the sign-in landing and `return_to` are built
@@ -443,6 +484,9 @@ pub struct RestState {
     /// whole process: every clone of this state shares it. See
     /// [`events::STREAMS_PER_ACCOUNT`].
     streams: Arc<events::StreamSlots>,
+    /// How many GitHub webhook deliveries are read and handled at once. One
+    /// count for the whole process. See [`github_webhook::CONCURRENT`].
+    pub(crate) webhook_slots: Arc<Semaphore>,
 }
 
 impl RestState {
@@ -473,6 +517,10 @@ impl RestState {
             // [`oauth::prune_at_start`].
             oauth::prune_at_start(auth.clone());
         }
+        // The JSON API's resolver asks the engine's own governor, so it
+        // answers from the same GitHub snapshots as every other surface.
+        let access =
+            Arc::new(DomainAccess::new(auth.clone()).with_governor(engine.knowledge_governor()));
         let collab = crate::collab::session::CollabSessions::new(engine.clone());
         // The engine closes co-editing rooms itself when it unregisters a
         // domain, whichever surface asked for the removal, so it needs the
@@ -483,9 +531,11 @@ impl RestState {
             base_path: crate::settings::base_path(&config),
             collab,
             engine,
+            github_links: Arc::default(),
+            github_app_manifests: Arc::default(),
             oauth,
             oidc,
-            access: Arc::new(DomainAccess::new(auth.clone())),
+            access,
             auth,
             auth_cfg,
             setup_token: None,
@@ -493,6 +543,7 @@ impl RestState {
             login_throttle: Arc::new(LoginThrottle::new(login_free_attempts, login_max_delay)),
             shutdown: None,
             streams: Arc::new(events::StreamSlots::default()),
+            webhook_slots: Arc::new(Semaphore::new(github_webhook::CONCURRENT)),
         })
     }
 
@@ -799,6 +850,19 @@ fn routes(state: RestState) -> Router {
             put(members::set_member).delete(members::remove_member),
         )
         .route("/domains/{domain}/owner", put(members::set_owner))
+        // Who reaches one domain's Reflection beyond what engram access
+        // gives: a per-domain Reflection collaborator, on any domain kept as
+        // files. Listing and changing need `Manage`; a collaborator may always
+        // take itself off. See [`members`].
+        .route(
+            "/domains/{domain}/reflection-collaborators",
+            get(members::list_reflection_collaborators),
+        )
+        .route(
+            "/domains/{domain}/reflection-collaborators/{account}",
+            put(members::set_reflection_collaborator)
+                .delete(members::remove_reflection_collaborator),
+        )
         // When the loops last ran, for the pages that show it; read rights.
         .route("/domains/{domain}/automation", get(automation::read))
         // The texts the server kept when a room could not save. Rights are
@@ -973,6 +1037,10 @@ fn routes(state: RestState) -> Router {
             post(reflections::move_to),
         )
         .route(
+            "/domains/{domain}/reflection/disclose",
+            post(reflections::disclose),
+        )
+        .route(
             "/domains/{domain}/reflection/threads",
             get(reflections::threads).post(reflections::open),
         )
@@ -1028,6 +1096,12 @@ fn routes(state: RestState) -> Router {
             patch(users_api::update).delete(users_api::remove),
         )
         .route("/users/{name}/password", post(users_api::reset_password))
+        // Admin only, inside the handler: frees a GitHub account linked to
+        // the wrong Crystalline account. See [`github_link`].
+        .route(
+            "/users/{name}/github-link",
+            delete(users_api::unlink_github),
+        )
         // Admin only as well, and enforced the same way. The GET is a pure
         // read and is served on a read-only instance; the three mutations
         // are refused there, like every other write on this surface.
@@ -1035,8 +1109,29 @@ fn routes(state: RestState) -> Router {
             "/settings/github",
             get(github_settings::status).delete(github_settings::disconnect),
         )
+        // Admin only too, and a pure read: who may use the domains connected
+        // through the GitHub App cannot be learned from GitHub right now, or
+        // which of them are closed. The admin banner reads it on every page,
+        // so it is its own route rather than `GET /settings/github`, whose
+        // read consumes a device flow's failure.
+        .route("/github/access", get(github_settings::access))
         .route("/settings/github/connect", post(github_settings::connect))
         .route("/settings/github/token", post(github_settings::token))
+        // Creating the instance's GitHub App through GitHub's manifest flow:
+        // the form is admin only under the CSRF check; the two landings are
+        // where GitHub sends the browser back, public by path so a lost
+        // session gets a page rather than a raw 401. The created landing
+        // checks the admin and the session the form was handed to itself.
+        // See [`github_app_create`].
+        .route(
+            "/settings/github/app/manifest",
+            post(github_app_create::manifest),
+        )
+        .route(
+            github_app_create::CREATED_PATH,
+            get(github_app_create::created),
+        )
+        .route(github_app_create::SETUP_PATH, get(github_app_create::setup))
         // The same admin gate a team-domain create answers to, and a pure
         // read: a peek at a repository's MANIFEST that never registers
         // anything. See [`domains_admin::github_domain_name`].
@@ -1060,6 +1155,28 @@ fn routes(state: RestState) -> Router {
             post(github_identity::connect),
         )
         .route("/me/github-identity/token", put(github_identity::token))
+        // The same person's link through the GitHub App, made with the App's
+        // web flow. Open to every signed-in account, viewers included: the
+        // link says who the person is at GitHub. The callback is where GitHub
+        // sends the browser back; it is NOT a public path, because the
+        // session that started the link is what it is bound to. See
+        // [`github_link`].
+        .route(
+            "/me/github-link",
+            get(github_link::status).delete(github_link::unlink),
+        )
+        .route("/me/github-link/start", post(github_link::start))
+        .route(github_link::CALLBACK_PATH, get(github_link::callback))
+        .route(github_link::GO_PATH, get(github_link::go))
+        // The GitHub App's webhook, public by path: GitHub has no session
+        // and no CSRF token, and the guard hands it to the handler without
+        // looking for either. The proof is the signature over the body. The
+        // handler takes the raw body and reads it only once a secret is
+        // configured and a well-formed signature header is there, up to its
+        // own limit (larger than the mount's: GitHub sends deliveries of up
+        // to 25 MB), and checks the signature before it parses anything.
+        // See [`github_webhook`].
+        .route(github_webhook::PATH, post(github_webhook::receive))
         // The other half of the same self-service idea: the tokens this
         // account's AGENTS authenticate with when `auth.mcp` is on. Open to
         // every signed-in account, viewers included - an agent acts as the
@@ -1208,6 +1325,18 @@ async fn wrong_method() -> ApiError {
 /// asked. The `crystalline` CLI on the server that holds the data is the
 /// recovery path - there is no flag that reopens this surface, on purpose
 /// (resolved ambiguity 7 in the plan).
+/// Who may read a domain just changed (visibility, a membership, an
+/// account's role, Reflection level or state): look, off the request, for
+/// Reflection pages that now cite a domain fewer people may read and
+/// schedule their backup, so they drop off the backup branch at once
+/// instead of at the next edit (`Engine::schedule_too_wide_backups`).
+pub(crate) fn readers_changed(state: &RestState) {
+    let engine = state.engine.clone();
+    tokio::spawn(async move {
+        engine.schedule_too_wide_backups().await;
+    });
+}
+
 pub(crate) fn refuse_read_only(state: &RestState) -> Result<(), ApiError> {
     if state.engine.read_only() {
         return Err(ApiError::forbidden(
@@ -1294,7 +1423,11 @@ pub(crate) async fn refuse_off_write_list(
 ///    what a stranger writing to a domain nobody registered learns;
 /// 2. then the instance role, unchanged: a domain invitation widens what an
 ///    account may *reach*, never what its instance role lets it *do*, so a
-///    domain editor who is an instance viewer is still refused here;
+///    domain editor who is an instance viewer is still refused here. On a
+///    domain GitHub governs only a signed-in account is required instead,
+///    because there the GitHub role decides and the instance role does not
+///    cap it (an instance viewer with GitHub write writes); step 3 refuses
+///    everybody else, instance `none` included;
 /// 3. then the capped right (`DomainAccess::write_right`), which carries the
 ///    membership level, what a private domain adds, and the write list. A
 ///    caller off the write list is refused with the sentence that names the
@@ -1302,9 +1435,10 @@ pub(crate) async fn refuse_off_write_list(
 ///    the caller holds, because "forbidden" on a domain they can see and read
 ///    is otherwise indistinguishable from a bug.
 ///
-/// Step 3 can only fire on a private domain. On a shared one the right is the
-/// instance role's own (the policy in `crate::scope`), so a caller past step 2
-/// holds `Write` or better by construction.
+/// Off a governed domain, step 3 can only fire on a private domain. On a
+/// shared one the right is the instance role's own (the policy in
+/// `crate::scope`), so a caller past step 2 holds `Write` or better by
+/// construction.
 ///
 /// Saving a domain's MANIFEST, privatizing a domain and the archive import are
 /// `require_admin` and carry no membership gate, since an admin resolves to
@@ -1326,7 +1460,13 @@ pub(crate) async fn require_domain_write(
 ) -> Result<Caller, ApiError> {
     let scope = identity.scope();
     state.engine.require_domain(domain, &scope).await?;
-    let caller = identity.require_editor()?;
+    // A signed-in account is still required on a governed domain, so the
+    // anonymous visitor gets the 401 every other write gives it.
+    let caller = if state.access.governs(domain) {
+        Caller::Account(identity.require_account()?)
+    } else {
+        identity.require_editor()?
+    };
     // The capped right rather than the bare domain answer, so this gate and the
     // MCP one are one rule with one spelling (`DomainAccess::write_right`). It
     // carries the write list too, so the list is asked again only to word a

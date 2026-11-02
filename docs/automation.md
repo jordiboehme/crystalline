@@ -57,7 +57,7 @@ claude --mcp-config <config> --strict-mcp-config --setting-sources "" --tools ""
   --output-format stream-json --verbose --max-turns 60 -p "<the shipped prompt>"
 ```
 
-So the agent sees only the Crystalline MCP server, no built-in tools, no settings files and no hooks. When something is due and `claude` is on `PATH`, `crystalline reflect run --dry-run` prints the command, with placeholders for the config and the prompt. These flags were checked against Claude Code 2.1.304.
+So the agent sees only the Crystalline MCP server, no built-in tools, no settings files and no hooks. The local MCP config starts `crystalline mcp --unattended --domain <domain>`, one agent per domain. Against a server the config carries the bearer and the header `X-Crystalline-Run-Domain: <domain>`, which the server believes only while that account holds the run's lease there. Both mark the session as one nobody is behind and bind it to the domain the run works on: it is never asked to share Reflection text from a domain fewer people may read, and it reads only the domains every reader of that domain may read (see [What an unattended run may read](reflection.md#what-an-unattended-run-may-read)). You set none of this: `run` writes it into the config. Custom automation that starts its own agent marks it the same way. When something is due and `claude` is on `PATH`, `crystalline reflect run --dry-run` prints the command, with placeholders for the config and the prompt. These flags were checked against Claude Code 2.1.312.
 
 The agent gets no Crystalline credentials in its environment: every variable that starts with `CRYSTALLINE_` and holds `TOKEN`, `SECRET` or `PASSWORD` is removed. The remote bearer is in the MCP config only, and the config with its folder is removed when the run ends, also after an error or a stop. Your Anthropic credential (`ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN`) is passed on as it is.
 
@@ -72,7 +72,7 @@ A run acts as an account. For a runner job or n8n that is an agent account with 
 
 `status` without `--domain` shows only the domains the account may run the loop on.
 
-Reflect runs on one instance per domain, the domain's Reflection home (see [One home, one backup](reflection.md#one-home-one-backup)). Evolve depends on the setup. When instances share one Postgres database, evolve runs on the instance that holds the domain's host lock. Every other instance shows `runs on <name>` and is never due, and `run` refuses there. Without a shared database the host lock lives in each instance's own database, so instances cannot see each other's. Then every instance with its own copy of the domain may run evolve. On a team domain, schedule the evolve runner on one instance only, for example a runner instance that joins from the GitHub origin (see [Loop runners](deployment.md#loop-runners)).
+Reflect runs on one instance per domain, the domain's Reflection home (see [One home, one backup](reflection.md#one-home-one-backup)). Evolve on a team domain runs on the domain's evolve home: the instance whose `service.public_url` is the MANIFEST's `evolve_home`. The first scheduled evolve run at an instance with a `service.public_url` claims it, and its pull request carries the line (see [One evolve runner per team domain](teams.md#one-evolve-runner-per-team-domain)). Every other clone shows `runs on <home>` and is never due, and `run` refuses there. Until an instance claims the home, every clone may run evolve; the run says so, and `crystalline doctor` warns. When instances share one Postgres database, the home is asked first, then the host lock: evolve runs on the instance that holds the domain's host lock among the instances that are the home. Instances of one database usually serve one address, so they all are. When the home names another address than the lock holder has, nobody in the group runs, and each names the other; give the instances one `service.public_url` or move the home. A local domain has no evolve home: without a shared database every instance with its own copy of it may run evolve.
 
 Give the reflect runner and the evolve runner separate accounts when both work one domain at the same time. Crystalline cannot tell which run made an MCP write, so it notes the write in every lease the account holds on that domain, and each pull request would carry the other run's writes.
 
@@ -176,14 +176,14 @@ An n8n node cannot renew the lease while the AI Agent node works, so the renewin
 
 [`examples/kubernetes/`](../examples/kubernetes/) has a runner image and three manifests. They run in remote mode against the team server.
 
-- `Dockerfile`: Claude Code 2.1.304 on a Node base image, plus the `crystalline` binary copied from the published image. The published image is distroless, so nothing can be installed on top of it. The runner image is an example, not a published image.
+- `Dockerfile`: Claude Code 2.1.312 on a Node base image, plus the `crystalline` binary copied from the published image. The published image is distroless, so nothing can be installed on top of it. The runner image is an example, not a published image.
 - `reflect-cronjob.yaml`: `crystalline reflect run --runner k8s` every 5 minutes, with `concurrencyPolicy: Forbid` and a grace period of 30 seconds. `CRYSTALLINE_REMOTE_TOKEN` and the Anthropic credential come from a Secret by reference. Nothing due means the pod ends within seconds.
 - `evolve-cronjob.yaml`: the same shape, weekly, with its own account.
 - `watch-deployment.yaml`: one replica of `crystalline reflect watch`, for answers within a minute instead of within 5 minutes.
 
 [`examples/github/crystalline-loops.yml`](../examples/github/crystalline-loops.yml) runs the same image on a GitHub Actions schedule, for a team without a cluster. GitHub may start a scheduled job some minutes late.
 
-The evolve loop can also run on an instance of its own instead of in remote mode. The pod starts its own daemon and joins the team domain from its GitHub origin with `CRYSTALLINE_DOMAIN_<NAME>`, `CRYSTALLINE_DOMAIN_<NAME>_ORIGIN` and `CRYSTALLINE_GITHUB_TOKEN` (see [Configure through environment variables](deployment.md#configure-through-environment-variables)), runs `crystalline evolve run`, shares as a pull request and ends. The reflect loop cannot run that way, since the Reflection lives on its home.
+The evolve loop can also run on an instance of its own instead of in remote mode. The pod starts its own daemon and joins the team domain from its GitHub origin with `CRYSTALLINE_DOMAIN_<NAME>`, `CRYSTALLINE_DOMAIN_<NAME>_ORIGIN` and `CRYSTALLINE_GITHUB_TOKEN` (see [Configure through environment variables](deployment.md#configure-through-environment-variables)), runs `crystalline evolve run`, shares as a pull request and ends. Give every such pod the same `CRYSTALLINE_SERVICE_PUBLIC_URL`, so its first run claims the domain's evolve home and every later pod is that home too. Crystalline never calls that address for the home, it only compares it. A pod without one runs only while the domain has no `evolve_home`. The reflect loop cannot run that way, since the Reflection lives on its home.
 
 ## Triggers
 
@@ -199,7 +199,7 @@ Where the webhook goes is the instance's choice, never the MANIFEST's, since a M
 
 The three settings are for the operator only: `crystalline config set` or the environment, never an agent through `configure`. A URL without a secret never sends, and status says so: nothing unsigned leaves the instance.
 
-Only the instance that may run the loop sends: the Reflection home for reflect, for evolve the host lock holder on a shared database and any instance with its own copy of the domain otherwise. Nothing is sent while the lease is held.
+Only the instance that may run the loop sends: the Reflection home for reflect, for evolve the evolve home of a team domain, the host lock holder on a shared database, and any instance with its own copy of the domain otherwise. Nothing is sent while the lease is held.
 
 When it sends:
 

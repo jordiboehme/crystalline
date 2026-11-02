@@ -166,6 +166,11 @@ pub const MIGRATIONS: &[Migration] = &[
         label: "automation lease pull request and written paths",
         sql: SCHEMA_V28,
     },
+    Migration {
+        version: 29,
+        label: "reflection disclosures",
+        sql: SCHEMA_V29,
+    },
 ];
 
 // The whole current schema in one step. The temporal columns stay TEXT ISO
@@ -835,6 +840,22 @@ ALTER TABLE automation_lease ADD COLUMN IF NOT EXISTS pr_url TEXT;
 ALTER TABLE automation_lease ADD COLUMN IF NOT EXISTS written TEXT NOT NULL DEFAULT '[]';
 "#;
 
+// What a person confirmed about a Reflection page: that a section may carry
+// text from a domain fewer people may read than the page's own. One row per
+// page, its records as JSON text the engine reads (who confirmed, when, for
+// which source domains and which readers). Kept here and not in the page, so
+// a confirmation can never arrive in a file edit, a pull or a page save, and
+// the page's readers never see who else reads it. Does not cascade from
+// `domain`: `wipe()` and the empty-row drop clear it by hand. Guarded, so a replay changes nothing.
+const SCHEMA_V29: &str = r#"
+CREATE TABLE IF NOT EXISTS reflection_disclosure (
+    domain_id BIGINT NOT NULL REFERENCES domain(id),
+    path TEXT NOT NULL,
+    records TEXT NOT NULL,
+    PRIMARY KEY(domain_id, path)
+);
+"#;
+
 const SCHEMA_V8: &str = r#"
 CREATE TABLE attachment (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -864,7 +885,8 @@ CREATE TABLE attachment_blob (
 /// list. `engram_meta_value` references `engram`, so it goes before it.
 /// `reflection` and `reflection_asset` reference `domain(id)` too, and so does
 /// `reflection_chunk`, which goes before `reflection`. `automation_lease` and
-/// `automation_run` reference `domain(id)` as well.
+/// `automation_run` reference `domain(id)` as well, and so does
+/// `reflection_disclosure`.
 pub const WIPE_TABLES: &[&str] = &[
     "observation_vector",
     "contradiction",
@@ -888,6 +910,7 @@ pub const WIPE_TABLES: &[&str] = &[
     "domain_lock",
     "automation_lease",
     "automation_run",
+    "reflection_disclosure",
     "domain_spelling",
     "domain",
 ];

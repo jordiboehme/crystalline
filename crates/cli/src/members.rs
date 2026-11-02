@@ -31,9 +31,11 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
-use crystalline_service::rest::{AuthStore, DomainMember, MemberLevel, VisibilityWrite};
+use crystalline_service::rest::{
+    AuthStore, DomainMember, MemberLevel, ReflectionGrant, ReflectionLevel, VisibilityWrite,
+};
 
-use crate::{MembersCommand, VisibilityArg};
+use crate::{MembersCommand, ReflectionGrantCommand, VisibilityArg};
 
 /// Open the accounts database in the state directory, the same file
 /// `crystalline users` writes and the daemon reads.
@@ -55,6 +57,92 @@ fn require_registered(name: &str, config: Option<&Path>) -> Result<String> {
         return Ok(name.to_string());
     }
     bail!("no domain named '{name}' is registered; list them with `crystalline domain list`")
+}
+
+/// What decides access to a registered domain.
+struct AccessRule {
+    /// A GitHub App decides it: an App is configured (usable or not) and the
+    /// domain has a GitHub origin, the rule the engine's governor follows.
+    governed: bool,
+    /// The `CRYSTALLINE_DOMAIN_<NAME>_READERS` variable that sets the
+    /// domain's readers on every start while an App governs it, when the
+    /// environment defines the domain with an origin.
+    env_readers_var: Option<String>,
+}
+
+/// The one answer every membership change on a domain GitHub governs gets,
+/// the web API's sentence.
+const FOLLOWS_GITHUB: &str = "access to this domain follows GitHub; change it on GitHub";
+
+/// What decides access to the registered domain `name`: a running daemon's
+/// answer, since it may have the App or the domain from an environment this
+/// command does not share (a service manager's environment file), and this
+/// process's own read only when no daemon runs or `--config` names another
+/// file, as `crystalline github app status` decides.
+///
+/// The local read loads the file fresh, with the environment overlay on
+/// top, so the effective config holds the domains the engine counts: its
+/// start-up config and the ones registered in the file since.
+async fn access_rule(name: &str, config: Option<&Path>) -> Result<AccessRule> {
+    if config.is_none()
+        && let Some(answer) = crystalline_service::client::ctl_if_running(serde_json::json!({
+            "v": 1, "cmd": "github_governs", "domain": name,
+        }))
+        .await?
+    {
+        return Ok(AccessRule {
+            governed: answer
+                .get("governed")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            env_readers_var: answer
+                .get("env_readers_var")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+        });
+    }
+    let loaded = crate::cmd::load(config)?;
+    let has_origin = loaded
+        .effective
+        .domains
+        .get(name)
+        .is_some_and(|entry| entry.origin.is_some());
+    let env_readers_var = loaded
+        .overlay
+        .env_domains()
+        .find(|(domain, env)| domain.as_str() == name && env.entry.origin.is_some())
+        .map(|(_, env)| env.readers_var());
+    Ok(AccessRule {
+        governed: has_origin && crate::cmd::github_app_decides_access(config)?,
+        env_readers_var,
+    })
+}
+
+/// Refuse a membership or owner change on a domain GitHub governs: the rows
+/// would decide nothing now and come back into force the day the App is
+/// removed.
+async fn refuse_governed(name: &str, config: Option<&Path>) -> Result<()> {
+    if access_rule(name, config).await?.governed {
+        bail!("{FOLLOWS_GITHUB}");
+    }
+    Ok(())
+}
+
+/// [`require_registered`] for a Reflection grant, which only a domain kept
+/// as files takes: a virtual domain keeps no Reflection.
+fn require_kept_as_files(name: &str, config: Option<&Path>) -> Result<String> {
+    let loaded = crate::cmd::load(config)?;
+    let name = name.trim().to_string();
+    let Some(entry) = loaded.effective.domains.get(&name) else {
+        bail!("no domain named '{name}' is registered; list them with `crystalline domain list`")
+    };
+    if entry.is_virtual() || entry.file_path().is_none() {
+        bail!(
+            "Reflection collaborators are for domains kept as files; '{name}' is kept in \
+             the database"
+        );
+    }
+    Ok(name)
 }
 
 /// Refuse an account the store does not have, or has disabled, before any
@@ -166,6 +254,12 @@ pub async fn close_new_domain(
 
 /// `crystalline domain members <domain> ...`.
 pub async fn run(domain: String, command: MembersCommand, json: bool) -> Result<()> {
+    // The Reflection grants resolve the domain themselves: only a domain
+    // kept as files takes one.
+    let command = match command {
+        MembersCommand::Reflection { command } => return reflection(domain, command).await,
+        other => other,
+    };
     // Each subcommand carries its own `--config`, the way every other domain
     // verb does, so it can be typed after the verb rather than between the
     // domain and it.
@@ -173,8 +267,12 @@ pub async fn run(domain: String, command: MembersCommand, json: bool) -> Result<
         MembersCommand::List { config }
         | MembersCommand::Add { config, .. }
         | MembersCommand::Remove { config, .. } => config.clone(),
+        MembersCommand::Reflection { .. } => unreachable!("answered above"),
     };
     let domain = require_registered(&domain, config.as_deref())?;
+    if !matches!(command, MembersCommand::List { .. }) {
+        refuse_governed(&domain, config.as_deref()).await?;
+    }
     let store = store().await?;
     match command {
         MembersCommand::List { .. } => {
@@ -190,6 +288,9 @@ pub async fn run(domain: String, command: MembersCommand, json: bool) -> Result<
                 .as_ref()
                 .map(|acl| acl.owner.clone())
                 .filter(|owner| !owner.is_empty());
+            // Reflection collaborators live on shared and private domains
+            // alike.
+            let grants = store.reflection_grants(&domain).await?;
             if json {
                 crate::print_value(
                     &serde_json::json!({
@@ -197,11 +298,13 @@ pub async fn run(domain: String, command: MembersCommand, json: bool) -> Result<
                         "visibility": if acl.is_some() { "private" } else { "shared" },
                         "owner": owner,
                         "members": members,
+                        "reflection_collaborators": grants,
                     }),
                     true,
                 );
             } else {
                 print_members(&domain, acl.is_some(), owner.as_deref(), &members);
+                print_grants(&domain, &grants);
             }
         }
         MembersCommand::Add {
@@ -219,6 +322,7 @@ pub async fn run(domain: String, command: MembersCommand, json: bool) -> Result<
             let reflection = store.member_reflection(&domain, &user).await?;
             println!("'{user}' is a {level} on domain '{domain}' with Reflection {reflection}.");
         }
+        MembersCommand::Reflection { .. } => unreachable!("answered above"),
         MembersCommand::Remove { user, .. } => {
             let name = user.trim().to_lowercase();
             // The owner holds no membership row, so a plain "not a member"
@@ -237,7 +341,71 @@ pub async fn run(domain: String, command: MembersCommand, json: bool) -> Result<
             println!("Removed '{name}' from domain '{domain}'.");
         }
     }
+    readers_changed().await;
     Ok(())
+}
+
+/// `crystalline domain members <domain> reflection add|remove`: a per-domain
+/// Reflection collaborator, on any domain kept as files.
+async fn reflection(domain: String, command: ReflectionGrantCommand) -> Result<()> {
+    match command {
+        ReflectionGrantCommand::Add {
+            user,
+            level,
+            config,
+        } => {
+            let domain = require_kept_as_files(&domain, config.as_deref())?;
+            let store = store().await?;
+            let user = require_account(&store, &user).await?;
+            let level: ReflectionLevel = level.into();
+            store
+                .set_reflection_grant(&domain, &user, level, "cli")
+                .await?;
+            println!(
+                "'{user}' is a Reflection {level} on domain '{domain}'. It sees no engram \
+                 there it could not see before."
+            );
+        }
+        ReflectionGrantCommand::Remove { user, config } => {
+            let domain = require_kept_as_files(&domain, config.as_deref())?;
+            let store = store().await?;
+            let name = user.trim().to_lowercase();
+            if !store.remove_reflection_grant(&domain, &name).await? {
+                bail!("'{name}' holds no Reflection grant on domain '{domain}'");
+            }
+            println!("Took the Reflection grant on domain '{domain}' from '{name}'.");
+        }
+    }
+    readers_changed().await;
+    Ok(())
+}
+
+/// The Reflection collaborators below the membership table, when there are
+/// any.
+fn print_grants(domain: &str, grants: &[ReflectionGrant]) {
+    if grants.is_empty() {
+        return;
+    }
+    println!();
+    println!("Reflection collaborators of '{domain}':");
+    for grant in grants {
+        println!(
+            "  {} ({}, added by {} at {})",
+            grant.account, grant.level, grant.added_by, grant.added_at
+        );
+    }
+}
+
+/// Tell a running daemon that who may read a domain changed, so it looks
+/// for Reflection pages that now cite a domain fewer people may read and
+/// backs them up off the branch at once. Never starts a daemon, and a
+/// daemon that is not there or does not know the command changes nothing:
+/// its recount every few minutes finds the same pages.
+async fn readers_changed() {
+    let _ = crystalline_service::ctl_if_running_passive(
+        serde_json::json!({ "v": 1, "cmd": "readers_changed" }),
+    )
+    .await;
 }
 
 /// `crystalline domain visibility <domain> private|default`.
@@ -249,8 +417,54 @@ pub async fn visibility(
     json: bool,
 ) -> Result<()> {
     let domain = require_registered(&domain, config.as_deref())?;
+    let rule = access_rule(&domain, config.as_deref()).await?;
+    // A governed domain the environment defines applies its readers again
+    // on every start, so a change here would not last. Without an App the
+    // variable changes nothing, and the domain is like any other.
+    if rule.governed
+        && let Some(var) = &rule.env_readers_var
+    {
+        bail!("Set by {var}; change it there.");
+    }
     let store = store().await?;
     match visibility {
+        VisibilityArg::Private if rule.governed => {
+            // GitHub decides access here: the record names the reserved
+            // machine owner, as the connect, the env readers and the Members
+            // card record it, and no account becomes an owner.
+            let written = store
+                .set_governed_private(&domain, crystalline_service::engine::OWNER_IDENTITY_NAME)
+                .await?;
+            let changed = matches!(written, VisibilityWrite::Written);
+            let note = owner.map(|owner| {
+                format!(
+                    "--owner {} was not used: GitHub decides access to domain '{domain}'.",
+                    owner.trim().to_lowercase()
+                )
+            });
+            if json {
+                if let Some(note) = &note {
+                    eprintln!("Note: {note}");
+                }
+                crate::print_value(
+                    &serde_json::json!({
+                        "domain": domain,
+                        "visibility": "private",
+                        "owner": serde_json::Value::Null,
+                        "changed": changed,
+                    }),
+                    true,
+                );
+            } else {
+                if let Some(note) = &note {
+                    println!("Note: {note}");
+                }
+                println!(
+                    "Domain '{domain}' is private: only the people with access on GitHub \
+                     read it."
+                );
+            }
+        }
         VisibilityArg::Private => {
             // The store needs a live account to name as the owner, and there
             // is no calling account here to fall back on: the CLI is the
@@ -318,15 +532,29 @@ pub async fn visibility(
             // The owner argument is ignored on this side by the store, which
             // is why the line above refuses one rather than passing it along:
             // a caller who supplied one meant something this cannot do.
-            store.set_domain_visibility(&domain, false, "cli").await?;
+            // On a domain a GitHub App governs only the private record goes,
+            // as on the Members card: the membership rows decide nothing
+            // there and are kept for the day the App is removed.
+            let governed = rule.governed;
+            if governed {
+                store.take_back_governed_private(&domain).await?;
+            } else {
+                store.set_domain_visibility(&domain, false, "cli").await?;
+            }
             if json {
                 crate::print_value(
                     &serde_json::json!({
                         "domain": domain,
                         "visibility": "shared",
                         "owner": serde_json::Value::Null,
+                        "members_kept": governed,
                     }),
                     true,
+                );
+            } else if governed {
+                println!(
+                    "Domain '{domain}' is shared: everyone signed in reads it. A GitHub \
+                     App decides access here, so its membership rows are kept."
                 );
             } else {
                 println!(
@@ -336,6 +564,7 @@ pub async fn visibility(
             }
         }
     }
+    readers_changed().await;
     Ok(())
 }
 
@@ -347,6 +576,7 @@ pub async fn transfer(
     json: bool,
 ) -> Result<()> {
     let domain = require_registered(&domain, config.as_deref())?;
+    refuse_governed(&domain, config.as_deref()).await?;
     let store = store().await?;
     let new_owner = require_account(&store, &new_owner).await?;
     store.transfer_domain(&domain, &new_owner).await?;
@@ -366,6 +596,7 @@ pub async fn transfer(
              {domain} add <account>` if they should stay."
         );
     }
+    readers_changed().await;
     Ok(())
 }
 

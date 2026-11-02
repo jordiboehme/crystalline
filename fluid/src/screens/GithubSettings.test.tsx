@@ -69,9 +69,21 @@ function statusPayload(overrides: Record<string, unknown> = {}) {
     token_store: null,
     pending: null,
     error: null,
+    app: null,
     ...overrides,
   };
 }
+
+/** The wire shape of an App the instance runs. No secret: there is none. */
+const APP = {
+  app_id: 7,
+  slug: "crystalline-kb",
+  source: "keyring",
+  install_url: "https://github.example/apps/crystalline-kb/installations/new",
+  webhook_secret_set: true,
+  error: null,
+  loading: false,
+};
 
 /** A device flow waiting for its browser half. */
 const PENDING = {
@@ -172,6 +184,42 @@ describe("the GitHub settings screen", () => {
     );
     expect(
       screen.getByRole("button", { name: /connect with token/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("names a GitHub App plainly, even before GitHub named its bot", async () => {
+    serveAs("admin", {
+      "/settings/github": () =>
+        statusPayload({
+          enabled: true,
+          connected: true,
+          token_store: "GitHub App",
+        }),
+    });
+    renderApp("/settings/github");
+
+    expect(
+      await screen.findByText("Connected as GitHub App"),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/did not name/i)).not.toBeInTheDocument();
+  });
+
+  it("names the App's bot once GitHub said it", async () => {
+    serveAs("admin", {
+      "/settings/github": () =>
+        statusPayload({
+          enabled: true,
+          connected: true,
+          user: "crystalline-acme[bot]",
+          token_store: "GitHub App",
+        }),
+    });
+    renderApp("/settings/github");
+
+    expect(
+      await screen.findByText(
+        "Connected as crystalline-acme[bot] (GitHub App)",
+      ),
     ).toBeInTheDocument();
   });
 
@@ -358,6 +406,147 @@ describe("the GitHub settings screen", () => {
       expect(forgotten).toHaveBeenCalled();
     });
     expect(await screen.findByText(/not connected/i)).toBeInTheDocument();
+  });
+
+  it("Create GitHub App posts the manifest form", async () => {
+    const manifest = { name: "Crystalline kb", public: false };
+    serveAs("admin", {
+      "/settings/github/app/manifest": () => ({
+        post_url:
+          "https://github.example/organizations/acme/settings/apps/new?state=s1",
+        manifest,
+        state: "s1",
+      }),
+    });
+    const sent: HTMLFormElement[] = [];
+    const submit = vi
+      .spyOn(HTMLFormElement.prototype, "submit")
+      .mockImplementation(function (this: HTMLFormElement) {
+        sent.push(this);
+      });
+    renderApp("/settings/github");
+
+    await userEvent.type(await screen.findByLabelText(/organization/i), "acme");
+    await userEvent.click(
+      screen.getByRole("button", { name: "Create GitHub App" }),
+    );
+
+    await waitFor(() => {
+      expect(submit).toHaveBeenCalledTimes(1);
+    });
+    expect(sentBody("/settings/github/app/manifest", "POST")).toEqual({
+      org: "acme",
+    });
+    // A real top-level POST to GitHub's page, carrying the manifest as the
+    // one field GitHub reads.
+    const [form] = sent;
+    expect(form?.action).toBe(
+      "https://github.example/organizations/acme/settings/apps/new?state=s1",
+    );
+    expect(form?.method).toBe("post");
+    const field = form?.elements.namedItem("manifest");
+    expect(field).toBeInstanceOf(HTMLInputElement);
+    expect(JSON.parse((field as HTMLInputElement).value)).toEqual(manifest);
+    submit.mockRestore();
+  });
+
+  it("sends no organization when the field is left empty", async () => {
+    serveAs("admin", {
+      "/settings/github/app/manifest": () => {
+        throw new ApiProblem(
+          409,
+          "conflict",
+          "creating the GitHub App needs service.public_url",
+        );
+      },
+    });
+    renderApp("/settings/github");
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Create GitHub App" }),
+    );
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "creating the GitHub App needs service.public_url",
+    );
+    expect(sentBody("/settings/github/app/manifest", "POST")).toEqual({});
+  });
+
+  it("shows Install on repositories once created", async () => {
+    serveAs("admin", {
+      "/settings/github": () =>
+        statusPayload({
+          enabled: true,
+          connected: true,
+          token_store: "GitHub App",
+          app: APP,
+        }),
+    });
+    renderApp("/settings/github?app=created");
+
+    const install = await screen.findByRole("link", {
+      name: "Install on repositories",
+    });
+    expect(install).toHaveAttribute("href", APP.install_url);
+    expect(install).toHaveAttribute("target", "_blank");
+    // The landing says what is left to do on GitHub: the manifest cannot
+    // switch the device flow on, and the terminal link needs it.
+    expect(screen.getByRole("status")).toHaveTextContent(/device flow/i);
+    // One App per instance: no second one is offered.
+    expect(
+      screen.queryByRole("button", { name: "Create GitHub App" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByText(/crystalline github app remove/i),
+    ).toBeInTheDocument();
+  });
+
+  it("offers no Create while a saved App is still loading", async () => {
+    serveAs("admin", {
+      "/settings/github": () =>
+        statusPayload({
+          app: {
+            app_id: null,
+            slug: null,
+            source: null,
+            install_url: null,
+            webhook_secret_set: false,
+            error: null,
+            loading: true,
+          },
+        }),
+    });
+    renderApp("/settings/github");
+
+    // The status has arrived: the connection line says so.
+    expect(await screen.findByText(/not connected/i)).toBeInTheDocument();
+    expect(screen.getByText("Reading the App")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Create GitHub App" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("offers no Create on a read-only instance", async () => {
+    apiMock.mockImplementation(
+      answersFor({
+        "/auth/me": () =>
+          meResponse({
+            user: userFixture({ name: "root", role: "admin" }),
+            read_only: true,
+          }),
+        "/domains": domainsResponse,
+        "/settings/github": () => statusPayload(),
+      }),
+    );
+    renderApp("/settings/github");
+
+    expect(
+      await screen.findByRole("heading", { name: "GitHub App" }),
+    ).toBeInTheDocument();
+    expect(await screen.findByText(/read-only/i)).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Create GitHub App" }),
+    ).not.toBeInTheDocument();
   });
 
   it("is reachable from the command palette", async () => {

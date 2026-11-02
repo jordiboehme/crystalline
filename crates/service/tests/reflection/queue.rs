@@ -2120,3 +2120,88 @@ async fn sources_in_a_domain_not_here_are_unavailable_never_missing() {
         "{queue}"
     );
 }
+
+/// A Reflection restored from its backup branch has no `.reflected/`
+/// baselines (the backup does not carry them): the restored pages are the
+/// baseline. A section whose text is what was last reflected raises no
+/// feedback; a person's change after the restore does, once.
+#[tokio::test]
+async fn a_restore_without_baselines_takes_the_pages_as_the_baseline() {
+    let fx = curated(&[]).await;
+    std::fs::remove_dir_all(fx.root.join("reflections/.reflected")).unwrap();
+    fx.engine.sync(None).await.unwrap();
+    let queue = fx
+        .engine
+        .reflect(&ReflectParams::default(), &agent())
+        .await
+        .unwrap();
+    assert!(
+        !rows(&queue).iter().any(|(kind, _, _)| kind == "feedback"),
+        "{queue}"
+    );
+    // A person's change after the restore is feedback, the rest is not.
+    let text = edit_page(&fx, "Deploys run at night.", "Deploys run at dawn.");
+    fx.engine
+        .write_reflection(&write("guides/deploying.md", &text), &person())
+        .await
+        .unwrap();
+    let queue = fx
+        .engine
+        .reflect(&ReflectParams::default(), &agent())
+        .await
+        .unwrap();
+    let feedback: Vec<String> = rows(&queue)
+        .into_iter()
+        .filter(|(kind, _, _)| kind == "feedback")
+        .map(|(_, _, heading)| heading)
+        .collect();
+    assert_eq!(feedback, ["Night deploys"], "{queue}");
+    // An agent's write of one section keeps the others reflected.
+    let text = edit_page(
+        &fx,
+        "Roll back with the script.",
+        "Roll back with the script now.",
+    );
+    let mut p = write("guides/deploying.md", &text);
+    p.sources = BTreeMap::from([(
+        "Rollback".to_string(),
+        vec!["runbooks/rollback".to_string()],
+    )]);
+    fx.engine.write_reflection(&p, &agent()).await.unwrap();
+    let queue = fx
+        .engine
+        .reflect(&ReflectParams::default(), &agent())
+        .await
+        .unwrap();
+    let feedback: Vec<String> = rows(&queue)
+        .into_iter()
+        .filter(|(kind, _, _)| kind == "feedback")
+        .map(|(_, _, heading)| heading)
+        .collect();
+    assert_eq!(feedback, ["Night deploys"], "{queue}");
+}
+
+/// A page a person wrote and no agent ever reflected has nothing to take
+/// as its baseline: every section of it stays a person's change.
+#[tokio::test]
+async fn a_page_never_reflected_stays_feedback_without_a_baseline() {
+    let fx = curated(&[]).await;
+    fx.engine
+        .write_reflection(
+            &write("notes.md", "# Notes\n\n## Idea\n\nA person's idea.\n"),
+            &person(),
+        )
+        .await
+        .unwrap();
+    let queue = fx
+        .engine
+        .reflect(&ReflectParams::default(), &agent())
+        .await
+        .unwrap();
+    assert!(
+        rows(&queue)
+            .iter()
+            .any(|(kind, _, heading)| kind == "feedback" && heading == "Idea"),
+        "{queue}"
+    );
+}

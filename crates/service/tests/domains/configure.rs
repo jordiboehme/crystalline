@@ -642,3 +642,59 @@ async fn the_environment_overlay_reaches_the_frozen_skills_serve() {
         "the overlay is applied by a builder that runs after the constructor"
     );
 }
+
+/// The `configure` snapshot names the GitHub App this instance runs, read
+/// only: its id, client id and which secrets are set, never a secret, and
+/// without asking GitHub (agents call `configure` all the time).
+#[tokio::test]
+async fn configure_reports_the_app_block_without_secrets() {
+    const PEM: &str = include_str!("../../../remote/tests/fixtures/app-key-pkcs1.pem");
+    let tmp = tempfile::tempdir().unwrap();
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let overlay = EnvOverlay::from_vars(
+        [
+            ("CRYSTALLINE_GITHUB_ENABLED", "true"),
+            // Nothing listens here: the block must not need GitHub.
+            ("CRYSTALLINE_GITHUB_API_URL", "http://127.0.0.1:1"),
+            ("CRYSTALLINE_GITHUB_APP_ID", "7"),
+            ("CRYSTALLINE_GITHUB_APP_CLIENT_ID", "Iv23.test"),
+            ("CRYSTALLINE_GITHUB_APP_PRIVATE_KEY", PEM),
+            ("CRYSTALLINE_GITHUB_APP_CLIENT_SECRET", "CLIENTSECRETVALUE"),
+            (
+                "CRYSTALLINE_GITHUB_APP_WEBHOOK_SECRET",
+                "WEBHOOKSECRETVALUE",
+            ),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let engine = Engine::new(
+        Arc::new(Mutex::new(store)),
+        GlobalConfig::default(),
+        None,
+        Some(tmp.path().join("config.yaml")),
+    )
+    .with_env_overlay(overlay)
+    .with_origins_dir(tmp.path().join("origins"))
+    .with_token_store_dir(tmp.path().join("tokens"));
+
+    let snapshot = engine.configure_snapshot().await.unwrap();
+    let app = &snapshot["github"]["app"];
+    assert_eq!(app["configured"], serde_json::json!(true), "{snapshot}");
+    assert_eq!(app["source"], serde_json::json!("environment"));
+    assert_eq!(app["app_id"], serde_json::json!(7));
+    assert_eq!(app["client_id"], serde_json::json!("Iv23.test"));
+    assert_eq!(app["client_secret_set"], serde_json::json!(true));
+    assert_eq!(app["webhook_secret_set"], serde_json::json!(true));
+    assert_eq!(app["installations"], serde_json::Value::Null);
+    assert_eq!(app["error"], serde_json::Value::Null);
+
+    let text = snapshot.to_string();
+    for secret in ["CLIENTSECRETVALUE", "WEBHOOKSECRETVALUE", "PRIVATE KEY"] {
+        assert!(!text.contains(secret), "{secret} leaked: {text}");
+    }
+    let key_body = PEM.lines().nth(1).unwrap();
+    assert!(!text.contains(key_body), "the key leaked: {text}");
+}

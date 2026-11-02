@@ -19,6 +19,8 @@
 //! costs at most one harmless extra request, and it is the shape covered by
 //! the pagination test in `tests/it/github_client.rs`.
 
+pub mod app;
+pub mod app_store;
 pub mod auth;
 mod types;
 
@@ -32,6 +34,7 @@ use reqwest::{Method, Response, StatusCode};
 use serde::de::DeserializeOwned;
 
 use crate::error::RemoteError;
+use crate::github::app::{CommitIdentities, CommitIdentity};
 use crate::provider::{
     ChangeKind, CompareResult, Feedback, HeadProbe, OpenProposalRef, OriginSpec, ProposalHandle,
     ProposalRequest, ProposalState, Provider, StackInfo, StackMember, TreeWrite, UpstreamChange,
@@ -39,10 +42,10 @@ use crate::provider::{
 use types::{
     BlobResponse, CloseProposalRequest, CommitResponse, CompareFile, CompareResponse,
     CreateBlobRequest, CreateCommitRequest, CreateProposalRequest, CreateProposalResponse,
-    CreateRefRequest, CreateTreeRequest, CurrentUserResponse, ErrorBody, IssueCommentResponse,
-    OpenProposalListItem, ProposalStateResponse, RefResponse, RepoResponse, ReviewCommentResponse,
-    ReviewResponse, ShaResponse, StackResponse, StackWriteRequest, TreeEntryRequest,
-    UpdateProposalRequest, UpdateRefRequest,
+    CreateRefRequest, CreateTreeRequest, CurrentUserResponse, ErrorBody, GitActor,
+    IssueCommentResponse, OpenProposalListItem, ProposalStateResponse, RefResponse, RepoResponse,
+    ReviewCommentResponse, ReviewResponse, ShaResponse, StackResponse, StackWriteRequest,
+    TreeEntryRequest, UpdateProposalRequest, UpdateRefRequest,
 };
 
 /// What a single URL path segment or query value keeps unencoded: the
@@ -86,11 +89,18 @@ const STACK_WRITE_BACKOFF: [Duration; STACK_WRITE_ATTEMPTS - 1] =
 /// [`RemoteError::Offline`] rather than hanging forever.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// The HTTP client type [`GitHubProvider::with_client`] takes, named here so
+/// a caller holding one needs no direct dependency on the HTTP crate.
+pub type HttpClient = reqwest::Client;
+
 /// A [`Provider`] backed by the GitHub REST and Git Data APIs over HTTP.
 pub struct GitHubProvider {
     client: reqwest::Client,
     api_url: String,
     token: Option<String>,
+    /// Who [`Provider::create_commit`] names as author and committer; `None`
+    /// leaves both to GitHub, which records the token's own identity.
+    commit: Option<CommitIdentities>,
 }
 
 impl GitHubProvider {
@@ -98,18 +108,47 @@ impl GitHubProvider {
     /// carrying `token` as a bearer credential. `token: None` sends
     /// unauthenticated requests, which works against public repositories.
     pub fn new(api_url: Option<String>, token: Option<String>) -> GitHubProvider {
+        GitHubProvider::with_client(GitHubProvider::http_client(), api_url, token)
+    }
+
+    /// The HTTP client a provider sends through, with the per-request
+    /// timeout every GitHub call here runs under.
+    ///
+    /// Building one loads the platform trust store, which is slow, so a
+    /// caller that makes a provider per call (one per repository token)
+    /// builds this once and hands a clone to each
+    /// [`with_client`](GitHubProvider::with_client). A clone shares the
+    /// connection pool.
+    pub fn http_client() -> HttpClient {
+        reqwest::Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .build()
+            .expect("the client config here is static and always valid")
+    }
+
+    /// [`new`](GitHubProvider::new) over a client the caller already holds,
+    /// from [`http_client`](GitHubProvider::http_client).
+    pub fn with_client(
+        client: HttpClient,
+        api_url: Option<String>,
+        token: Option<String>,
+    ) -> GitHubProvider {
         let api_url = api_url
             .map(|url| url.trim_end_matches('/').to_string())
             .unwrap_or_else(|| DEFAULT_API_URL.to_string());
-        let client = reqwest::Client::builder()
-            .timeout(REQUEST_TIMEOUT)
-            .build()
-            .expect("the client config here is static and always valid");
         GitHubProvider {
             client,
             api_url,
             token,
+            commit: None,
         }
+    }
+
+    /// Names `identities` as the author and the committer of every commit
+    /// this provider creates. Nothing else it sends changes.
+    pub fn with_commit_identities(mut self, identities: CommitIdentities) -> GitHubProvider {
+        self.commit = Some(identities);
+        self
     }
 
     /// Starts a request against `path` (which must start with `/`),
@@ -151,67 +190,9 @@ impl GitHubProvider {
     }
 
     /// Checks a response's status, mapping any non-2xx answer to the
-    /// matching [`RemoteError`] variant. `repo` names the repository for
-    /// endpoints scoped to one, so a 404 there becomes
-    /// [`RemoteError::RepoNotFound`]; endpoints with no single repository in
-    /// scope (`current_user`) pass `None` and a 404 falls through to the
-    /// generic [`RemoteError::Api`].
+    /// matching [`RemoteError`] variant; see [`check_response`].
     async fn check(&self, response: Response, repo: Option<&str>) -> Result<Response, RemoteError> {
-        let status = response.status();
-        if status.is_success() {
-            return Ok(response);
-        }
-
-        if status == StatusCode::UNAUTHORIZED {
-            return Err(if self.token.is_some() {
-                RemoteError::AuthExpired
-            } else {
-                RemoteError::NotConnected
-            });
-        }
-
-        if status == StatusCode::FORBIDDEN || status == StatusCode::TOO_MANY_REQUESTS {
-            let remaining = header(&response, "x-ratelimit-remaining");
-            let retry_after = header(&response, "retry-after");
-            if remaining.as_deref() == Some("0") || retry_after.is_some() {
-                let reset_at = header(&response, "x-ratelimit-reset");
-                return Err(RemoteError::RateLimited {
-                    reset: parse_reset(reset_at.as_deref(), retry_after.as_deref()),
-                });
-            }
-        }
-
-        if status == StatusCode::NOT_FOUND
-            && let Some(repo) = repo
-        {
-            return Err(RemoteError::RepoNotFound {
-                repo: repo.to_string(),
-            });
-        }
-
-        // The body is consumed exactly once, so it is read into a string
-        // before anything decides what the answer means: the organization
-        // policy check below needs GitHub's message, and so does the plain
-        // `Api` mapping it falls through to.
-        let sso_header = header(&response, "x-github-sso");
-        let message = error_message(response).await;
-
-        if status == StatusCode::FORBIDDEN
-            && let Some(policy) =
-                organization_policy_error(&self.api_url, repo, sso_header.as_deref(), &message)
-        {
-            return Err(policy);
-        }
-
-        tracing::debug!(
-            status = status.as_u16(),
-            message = %message,
-            "GitHub answered with an error this client has no specific mapping for"
-        );
-        Err(RemoteError::Api {
-            status: status.as_u16(),
-            message,
-        })
+        check_response(response, repo, self.token.is_some(), &self.api_url).await
     }
 
     /// Walks every page of a list endpoint that takes no query parameters of
@@ -518,10 +499,16 @@ impl Provider for GitHubProvider {
     ) -> Result<String, RemoteError> {
         let (owner, name) = split_repo(&origin.repo)?;
         let path = format!("/repos/{owner}/{name}/git/commits");
+        let actor = |identity: &CommitIdentity| GitActor {
+            name: identity.name.clone(),
+            email: identity.email.clone(),
+        };
         let body = CreateCommitRequest {
             message: message.to_string(),
             tree: tree.to_string(),
             parents: parents.to_vec(),
+            author: self.commit.as_ref().map(|c| actor(&c.author)),
+            committer: self.commit.as_ref().map(|c| actor(&c.committer)),
         };
         let response = self
             .send(self.request(Method::POST, &path).json(&body))
@@ -831,6 +818,79 @@ impl Provider for GitHubProvider {
         self.check(response, None).await?;
         Ok(())
     }
+}
+
+/// Checks a response's status, mapping any non-2xx answer to the matching
+/// [`RemoteError`] variant. `repo` names the repository for endpoints scoped
+/// to one, so a 404 there becomes [`RemoteError::RepoNotFound`]; endpoints
+/// with no single repository in scope (`current_user`) pass `None` and a 404
+/// falls through to the generic [`RemoteError::Api`]. `authenticated` says
+/// whether the request carried a credential, which decides what a 401 means;
+/// `api_url` is the API base the request went to.
+///
+/// Shared by [`GitHubProvider`] and the GitHub App client
+/// ([`app::GithubApp`]), so both read GitHub's answers the same way.
+pub(crate) async fn check_response(
+    response: Response,
+    repo: Option<&str>,
+    authenticated: bool,
+    api_url: &str,
+) -> Result<Response, RemoteError> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+
+    if status == StatusCode::UNAUTHORIZED {
+        return Err(if authenticated {
+            RemoteError::AuthExpired
+        } else {
+            RemoteError::NotConnected
+        });
+    }
+
+    if status == StatusCode::FORBIDDEN || status == StatusCode::TOO_MANY_REQUESTS {
+        let remaining = header(&response, "x-ratelimit-remaining");
+        let retry_after = header(&response, "retry-after");
+        if remaining.as_deref() == Some("0") || retry_after.is_some() {
+            let reset_at = header(&response, "x-ratelimit-reset");
+            return Err(RemoteError::RateLimited {
+                reset: parse_reset(reset_at.as_deref(), retry_after.as_deref()),
+            });
+        }
+    }
+
+    if status == StatusCode::NOT_FOUND
+        && let Some(repo) = repo
+    {
+        return Err(RemoteError::RepoNotFound {
+            repo: repo.to_string(),
+        });
+    }
+
+    // The body is consumed exactly once, so it is read into a string
+    // before anything decides what the answer means: the organization
+    // policy check below needs GitHub's message, and so does the plain
+    // `Api` mapping it falls through to.
+    let sso_header = header(&response, "x-github-sso");
+    let message = error_message(response).await;
+
+    if status == StatusCode::FORBIDDEN
+        && let Some(policy) =
+            organization_policy_error(api_url, repo, sso_header.as_deref(), &message)
+    {
+        return Err(policy);
+    }
+
+    tracing::debug!(
+        status = status.as_u16(),
+        message = %message,
+        "GitHub answered with an error this client has no specific mapping for"
+    );
+    Err(RemoteError::Api {
+        status: status.as_u16(),
+        message,
+    })
 }
 
 /// Splits `repo` (`owner/name`) into its two halves. `OriginSpec.repo` is

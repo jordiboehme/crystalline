@@ -23,10 +23,12 @@ brew "cargo-audit"
 brew "cargo-deny"
 
 # The Fluid web UI builds with pnpm on node ("cd fluid && pnpm build").
-# CI bootstraps pnpm through corepack instead; locally the formulae are
-# simpler and match the same lockfile.
+# pnpm comes through corepack, locally as in CI: its shim runs the version
+# the "packageManager" pin in fluid/package.json names, so a pnpm bump never
+# waits for the pnpm formula. After installing, run "corepack enable pnpm"
+# once. The corepack formula conflicts with the pnpm formula.
 brew "node"
-brew "pnpm"
+brew "corepack"
 
 # GitHub CLI: PRs, CI watching, release publishing and editing - the whole
 # release routine runs through gh.

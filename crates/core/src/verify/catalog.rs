@@ -81,6 +81,11 @@ pub const VERIFY_RULES: &[VerifyRule] = &[
         "info",
         "A link names a domain outside the scan, so it cannot be checked.",
     ),
+    rule(
+        "L007",
+        "warning",
+        "A relative link or image to a file that is not a note points at a file the domain has.",
+    ),
     rule("M001", "error", "The MANIFEST, or a required file, exists."),
     rule(
         "M002",
@@ -98,6 +103,22 @@ pub const VERIFY_RULES: &[VerifyRule] = &[
     rule("M007", "error", "sharing is proposal or direct."),
     rule("M008", "error", "domain_name can name a domain."),
     rule("M009", "error", "read_only is off or on."),
+    rule("M010", "error", "team names a known forge (github)."),
+    rule(
+        "M011",
+        "error",
+        "In a team repository, reflection: on comes with a valid reflection_home.",
+    ),
+    rule(
+        "M012",
+        "error",
+        "In a team repository, no file lies under reflections/ while Reflection is on.",
+    ),
+    rule(
+        "M013",
+        "error",
+        "evolve_home, when present, is a server address.",
+    ),
     rule("M101", "warning", "When to Use is not empty."),
     rule("M102", "warning", "Section bullets stay short."),
     rule("M103", "warning", "No section heading appears twice."),
@@ -117,6 +138,11 @@ pub const VERIFY_RULES: &[VerifyRule] = &[
         "M108",
         "warning",
         "The .crystalline.yaml parses and every severity in it is a word.",
+    ),
+    rule(
+        "M109",
+        "warning",
+        "In a team repository, the MANIFEST carries team: github.",
     ),
     rule(
         "Q001",
@@ -248,6 +274,7 @@ mod tests {
         ("mod.rs", include_str!("mod.rs")),
         ("quality.rs", include_str!("quality.rs")),
         ("schema_rules.rs", include_str!("schema_rules.rs")),
+        ("team.rs", include_str!("team.rs")),
         ("temporal.rs", include_str!("temporal.rs")),
     ];
 
@@ -287,7 +314,7 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(ids, sorted, "id order, each id once");
-        assert_eq!(ids.len(), 63);
+        assert_eq!(ids.len(), 69);
         for rule in VERIFY_RULES {
             assert!(
                 ["error", "warning", "info"].contains(&rule.default),

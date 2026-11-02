@@ -514,6 +514,86 @@ fn asset_name_verdict(path: &str) -> Option<Screened> {
     })
 }
 
+/// Why an entry is not imported when some OS Crystalline runs on cannot
+/// hold its name as a file: see [`no_os_refuses`].
+const NOT_A_PORTABLE_NAME_REASON: &str =
+    "the name is not a valid file name on every system Crystalline runs on";
+
+/// The longest a path component may be on Windows, in UTF-16 units.
+const MAX_COMPONENT_UTF16_UNITS: usize = 255;
+
+/// Whether every OS Crystalline runs on can hold `raw` (a name that does not
+/// escape the root) as a file. Windows is the strict one, so these are its
+/// rules, judged on the name alone so the answer is the same on every OS: no
+/// component may consist of dots and spaces only, end in a dot or a space,
+/// name a device (`CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`, `LPT1`-`LPT9`,
+/// `CONIN$`, `CONOUT$`, also with an extension, as `con.md`), hold one of
+/// `<>"|?*` or a control character, or be longer than 255 UTF-16 units.
+/// `:` and `\` are not here: [`escapes_the_root`] refuses them first.
+fn no_os_refuses(raw: &str) -> bool {
+    raw.split('/').all(|component| {
+        let stem = component
+            .split('.')
+            .next()
+            .unwrap_or(component)
+            .trim_end_matches(' ');
+        !component.trim_matches(['.', ' ']).is_empty()
+            && !component.ends_with(['.', ' '])
+            && !crystalline_core::config::registration::is_windows_device_name(stem)
+            && !stem.eq_ignore_ascii_case("CONIN$")
+            && !stem.eq_ignore_ascii_case("CONOUT$")
+            && !component.contains(['<', '>', '"', '|', '?', '*'])
+            && !component.chars().any(char::is_control)
+            && component.encode_utf16().count() <= MAX_COMPONENT_UTF16_UNITS
+    })
+}
+
+/// Whether an archive entry's name leaves the extraction root: a leading
+/// `/` (which covers `//server`), an empty, `.` or `..` component, a `:`
+/// anywhere (a drive letter or an alternate data stream), a `\` anywhere
+/// (a Windows separator, a UNC prefix) or a NUL. The same rules as the
+/// remote crate's `to_platform_path`, judged on the name alone, so the
+/// answer is the same on every OS.
+fn escapes_the_root(raw: &str) -> bool {
+    raw.starts_with('/')
+        || raw.contains('\0')
+        || raw
+            .split('/')
+            .any(|c| c.is_empty() || c == "." || c == ".." || c.contains(':') || c.contains('\\'))
+}
+
+/// What an archive entry's name alone decides, before anything reads it.
+///
+/// An escape refuses the whole archive. A name some OS Crystalline runs on
+/// cannot hold ([`no_os_refuses`]) is one invalid entry, the same on every
+/// OS: an `assets/` entry is answered by the attachment gate when that gate
+/// has a reason of its own (a component over 255 UTF-16 units is always
+/// over the attachment path limit), any other with
+/// [`NOT_A_PORTABLE_NAME_REASON`]. `enclosed` is zip's own `enclosed_name`
+/// check, kept as a last line behind both: since zip 9.1 it refuses on
+/// Windows the names Windows cannot hold, which the rules above already
+/// refuse everywhere, so a refusal here is screened the same way and is
+/// never read as an escape.
+fn entry_name_verdict(raw: &str, enclosed: bool) -> Result<Option<Screened>, ApiError> {
+    if escapes_the_root(raw) {
+        return Err(ApiError::unprocessable(format!(
+            "archive entry '{raw}' escapes the extraction root; refusing the archive"
+        )));
+    }
+    if enclosed && no_os_refuses(raw) {
+        return Ok(None);
+    }
+    if crystalline_core::is_under_assets(raw)
+        && let Some(decided) = asset_name_verdict(raw)
+    {
+        return Ok(Some(decided));
+    }
+    Ok(Some(Screened::Invalid {
+        path: raw.to_string(),
+        reason: NOT_A_PORTABLE_NAME_REASON.to_string(),
+    }))
+}
+
 /// Whether the archive's root `MANIFEST.md` declares `reflection: on`.
 /// Read under the per-entry ceiling the screen applies to markdown; a
 /// missing, oversized or unparseable MANIFEST declares nothing.
@@ -626,22 +706,13 @@ fn read_archive(bytes: &[u8]) -> Result<(Vec<Screened>, LooseFiles), ApiError> {
                 )
             })?
             .into_owned();
-        // Zip-slip and Windows-hostile shapes: zip's own containment check
-        // plus the component rules the remote crate's to_platform_path
-        // enforces (no empty/'.'/'..' components, no ':' or '\\' anywhere).
-        let contained = entry.enclosed_name().is_some();
-        let clean_components = !raw.starts_with('/')
-            && raw.split('/').all(|c| {
-                !c.is_empty() && c != "." && c != ".." && !c.contains(':') && !c.contains('\\')
-            });
-        if !contained || !clean_components {
-            return Err(ApiError::unprocessable(format!(
-                "archive entry '{raw}' escapes the extraction root; refusing the archive"
-            )));
-        }
+        // An escape refuses the archive before anything else is decided.
+        let name_verdict = entry_name_verdict(&raw, entry.enclosed_name().is_some())?;
         // A Reflection's pages and files are never engrams or attachments:
-        // answered before both screens below, so a `reflections/assets/`
-        // file is named for what it is rather than as "not markdown".
+        // answered before the name screen and both screens below, so a
+        // `reflections/assets/` file is named for what it is rather than as
+        // "not markdown", and a Reflection page is never written whatever
+        // its name.
         if reflection
             && matches!(
                 layout.classify(&raw),
@@ -652,6 +723,10 @@ fn read_archive(bytes: &[u8]) -> Result<(Vec<Screened>, LooseFiles), ApiError> {
                 path: raw,
                 reason: REFLECTION_NOT_IMPORTED.to_string(),
             });
+            continue;
+        }
+        if let Some(decided) = name_verdict {
+            out.push(decided);
             continue;
         }
         // The reserved folder is answered first, and before the markdown rule
@@ -1603,6 +1678,162 @@ mod tests {
         std::io::Read::read_to_end(&mut archive.by_name("assets/shot.png").unwrap(), &mut png)
             .unwrap();
         assert_eq!(png, PNG, "the binary survives the archive byte for byte");
+    }
+
+    /// The name screen gives the same answers on every OS. A name some OS
+    /// Crystalline runs on cannot hold as a file is judged by its shape,
+    /// whatever zip says on this one: it is one invalid entry, never an
+    /// escape. An `assets/` name is answered by the attachment gate when that
+    /// gate has a reason of its own. A real escape refuses the archive
+    /// whatever zip said.
+    #[test]
+    fn a_name_some_os_cannot_hold_is_screened_the_same_everywhere() {
+        let named = |raw: &str, enclosed: bool| {
+            entry_name_verdict(raw, enclosed).unwrap().map(|v| {
+                let (status, reason) = verdict(&v);
+                (status, reason.map(str::to_string))
+            })
+        };
+        let unholdable = Some(("invalid", Some(NOT_A_PORTABLE_NAME_REASON.to_string())));
+
+        let long_asset = format!("assets/{}.png", "n".repeat(300));
+        for enclosed in [true, false] {
+            assert_eq!(
+                named(&long_asset, enclosed),
+                Some(("invalid", Some(ASSET_PATH_REASON.to_string()))),
+                "enclosed {enclosed}: the attachment gate names the long asset"
+            );
+        }
+        assert_eq!(named("assets/shot.png", true), None);
+        assert_eq!(
+            named("assets/shot.png", false),
+            unholdable,
+            "a good asset name zip refuses still gets a verdict, never an escape"
+        );
+
+        // 255 UTF-16 units is the limit, counted in UTF-16, not in bytes or
+        // characters: one astral character is two units.
+        let at_limit = format!("notes/{}", "n".repeat(255));
+        let over_limit = format!("notes/{}", "n".repeat(256));
+        let astral_over = format!("notes/{}", "\u{1F600}".repeat(128));
+        let astral_at = format!("notes/{}.md", "\u{1F600}".repeat(126));
+        for (raw, refused) in [
+            (at_limit.as_str(), false),
+            (over_limit.as_str(), true),
+            (astral_over.as_str(), true),
+            (astral_at.as_str(), false),
+        ] {
+            assert_eq!(
+                named(raw, true),
+                if refused { unholdable.clone() } else { None },
+                "{} UTF-16 units",
+                raw.encode_utf16().count() - "notes/".len()
+            );
+        }
+
+        for shape in [
+            "notes/a.md.",
+            "notes/a.md ",
+            "notes/dir./a.md",
+            "notes/dir /a.md",
+            "notes/.../a.md",
+            "notes/. ./a.md",
+            "notes/ /a.md",
+            "CON",
+            "notes/con.md",
+            "notes/Prn.md",
+            "notes/aux",
+            "notes/NUL.tar.gz",
+            "notes/COM1.md",
+            "notes/com9.md",
+            "notes/LPT1.md",
+            "notes/lpt9",
+            "notes/COM\u{b9}.md",
+            "notes/LPT\u{b3}.md",
+            "notes/CONIN$",
+            "notes/conout$.md",
+            "notes/CON .md",
+            "notes/nul/a.md",
+            "notes/a<b.md",
+            "notes/a>b.md",
+            "notes/a\"b.md",
+            "notes/a|b.md",
+            "notes/a?.md",
+            "notes/a*.md",
+            "notes/a\tb.md",
+            "notes/a\u{1}b.md",
+            "notes/a\u{1f}b.md",
+            "assets/con.png",
+            "assets/shot?.png",
+        ] {
+            for enclosed in [true, false] {
+                let expected = if shape.starts_with("assets/")
+                    && let Some(decided) = asset_name_verdict(shape)
+                {
+                    let (status, reason) = verdict(&decided);
+                    Some((status, reason.map(str::to_string)))
+                } else {
+                    unholdable.clone()
+                };
+                assert_eq!(named(shape, enclosed), expected, "{shape:?}");
+            }
+        }
+
+        // Names every OS holds: not reserved, not an escape.
+        for fine in [
+            "notes/a.md",
+            "notes/.hidden.md",
+            "notes/a b.md",
+            "notes/console.md",
+            "notes/CONIN.md",
+            "notes/COM0.md",
+            "notes/COM10.md",
+            "notes/LPT.md",
+            "notes/a.CON.md",
+            "notes/x.nul",
+            "notes/%2e%2e/a.md",
+            "notes/%2e%2e%2fa.md",
+            "notes/..%2fa.md",
+            "notes/\u{2215}a.md",
+            "notes/\u{FF0F}a.md",
+            "notes/\u{2044}a.md",
+            "notes/\u{2024}\u{2024}/a.md",
+            "notes/\u{FF0E}\u{FF0E}/a.md",
+            "notes/\u{FF3C}a.md",
+            "notes/\u{FE55}a.md",
+        ] {
+            assert_eq!(named(fine, true), None, "{fine:?}");
+        }
+
+        for escape in [
+            "../x.md",
+            "a/../../x.md",
+            "a/./x.md",
+            "a//x.md",
+            "/etc/x.md",
+            "//server/share/x.md",
+            "C:/x.md",
+            "C:x.md",
+            "a/file.md:stream",
+            r"\\server\share\x.md",
+            r"a\..\..\x.md",
+            r"assets\x.png",
+            "a/x\0.md",
+            "../CON",
+            "a/../x?.md",
+        ] {
+            for enclosed in [true, false] {
+                let Err(err) = entry_name_verdict(escape, enclosed) else {
+                    panic!("{escape:?} (enclosed {enclosed}) is an escape");
+                };
+                assert_eq!(err.status.as_u16(), 422, "{escape:?}");
+                assert!(
+                    err.detail.contains("escapes the extraction root"),
+                    "{escape:?}: {}",
+                    err.detail
+                );
+            }
+        }
     }
 
     /// An `assets/` entry is screened by the upload gates rather than by the

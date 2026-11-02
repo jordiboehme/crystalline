@@ -30,7 +30,12 @@ import { Link, useLocation, useNavigate, useParams } from "react-router";
 
 import { ApiProblem, problemDetail } from "../api/client";
 import type { AssetResolver } from "../api/files";
-import type { ReflectionDoc, SectionView, SourceView } from "../api/reflection";
+import type {
+  Disclosed,
+  ReflectionDoc,
+  SectionView,
+  SourceView,
+} from "../api/reflection";
 import {
   changedVersions,
   deleteReflection,
@@ -782,7 +787,13 @@ function PageSection({
       ? view.sources
       : [];
   const hidden = engramsVisible ? (view?.hiddenSources ?? 0) : 0;
-  const aside = useSources(domain, section.heading, sources, hidden);
+  const aside = useSources(
+    domain,
+    section.heading,
+    sources,
+    hidden,
+    view?.disclosed ?? null,
+  );
   const onSectionTick = useCallback(
     (offset: number, next: "[ ]" | "[x]") => {
       onTick(index, offset, next);
@@ -833,14 +844,16 @@ function PageSection({
  * over the text below the heading, outside it, and shuts on Escape, a press
  * elsewhere or focus leaving it. A source of another domain links into that
  * domain; `hidden` sources, in a domain the reader may not open, are counted
- * and said in one line, never named. Null for a section with no sources:
- * nothing is drawn.
+ * and said in one line, never named. A curator also reads who shared a
+ * source from a domain fewer people read on purpose, and when. Null for a
+ * section with no sources: nothing is drawn.
  */
 function useSources(
   domain: string,
   heading: string,
   sources: SourceView[],
   hidden: number,
+  disclosed: Disclosed | null,
 ): HeadingAside | null {
   const [open, setOpen] = useState(false);
   const panel = useId();
@@ -936,6 +949,11 @@ function useSources(
         {hidden > 0 && (
           <li className="px-1 py-0.5 text-muted">
             {hiddenSourcesText(hidden)}
+          </li>
+        )}
+        {disclosed !== null && (
+          <li className="px-1 py-0.5 text-muted">
+            {`Shared on purpose by ${disclosed.by} on ${disclosed.at.slice(0, 10)}`}
           </li>
         )}
       </ul>

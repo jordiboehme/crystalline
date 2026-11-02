@@ -47,11 +47,16 @@
  */
 
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { useId, useState } from "react";
+import { useEffect, useId, useState } from "react";
 import { Link, Navigate, useLocation } from "react-router";
 
-import { ApiProblem } from "../api/client";
-import { PROVIDERS_KEY, fetchProviders, ssoSignInUrl } from "../api/sso";
+import { API_BASE, ApiProblem, navigateTo } from "../api/client";
+import {
+  PROVIDERS_KEY,
+  fetchProviders,
+  ssoSignInUrl,
+  ssoSignInUrlTo,
+} from "../api/sso";
 import { GemTrio } from "../components/GemGlyph";
 import { BUTTON, FOCUS_RING } from "../components/primitives";
 import { useAuth } from "./AuthContext";
@@ -59,6 +64,21 @@ import { FirstRunSetup } from "./FirstRunSetup";
 import type { FromLocation } from "./RequireAuth";
 import { CARD_FIELD, CARD_LABEL } from "./card";
 import { LOGIN_MUTATION_KEY } from "./keys";
+
+/**
+ * The single-use GitHub link the server sent this browser here from, when it
+ * did: `GET /github/link/go` sends a browser without a session to
+ * `/login?github_link=<nonce>`, and this screen opens the link again once
+ * somebody is signed in. Only a value of the nonce's own shape (64 lowercase
+ * hex characters) is believed, and the address is built here, so the query
+ * can never send the browser anywhere but that one route of this instance.
+ */
+function githubLinkTarget(search: string): string | null {
+  const nonce = new URLSearchParams(search).get("github_link");
+  return nonce !== null && /^[0-9a-f]{64}$/.test(nonce)
+    ? `${API_BASE}/github/link/go?n=${nonce}`
+    : null;
+}
 
 export default function LoginPage() {
   const { user, capabilities, login } = useAuth();
@@ -76,6 +96,7 @@ export default function LoginPage() {
   // or the home screen for someone who came here directly.
   const from = (location.state as FromLocation | null)?.from;
   const destination = from ? `${from.pathname}${from.search}${from.hash}` : "/";
+  const linkTarget = githubLinkTarget(location.search);
 
   // Which ways in this instance offers. Read on this screen only, and never
   // retried into a wall: an instance with no provider answers the same shape
@@ -127,7 +148,24 @@ export default function LoginPage() {
   // is read from the same context `RequireAuth` reads, so by the time this
   // guard can see it as signed in, every other consumer of that context
   // already agrees - there is no earlier, staler read left to race.
-  if (user && !attempt.isPending) {
+  const signedIn = user !== null && !attempt.isPending;
+
+  // The link is an API route, not a screen of this app, so it is a whole-page
+  // navigation rather than a router one.
+  useEffect(() => {
+    if (signedIn && linkTarget !== null) {
+      navigateTo(linkTarget);
+    }
+  }, [signedIn, linkTarget]);
+
+  if (signedIn && linkTarget !== null) {
+    return (
+      <main className="flex min-h-screen items-center justify-center bg-slate-50 p-6 text-slate-700 dark:bg-slate-950 dark:text-slate-300">
+        <p>Continuing to GitHub</p>
+      </main>
+    );
+  }
+  if (signedIn) {
     return <Navigate to={destination} replace />;
   }
 
@@ -281,7 +319,11 @@ export default function LoginPage() {
               <span className="h-px flex-1 bg-slate-200 dark:bg-slate-800" />
             </div>
             <a
-              href={ssoSignInUrl(destination === "/" ? undefined : destination)}
+              href={
+                linkTarget !== null
+                  ? ssoSignInUrlTo(linkTarget)
+                  : ssoSignInUrl(destination === "/" ? undefined : destination)
+              }
               className={`py-2 text-center ${BUTTON.secondary}`}
             >
               Sign in with {sso.name}

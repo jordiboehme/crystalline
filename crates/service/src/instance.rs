@@ -278,6 +278,16 @@ pub(crate) const SKILLS_OFF_OPTION: &str = "skills=off";
 /// safe direction.
 pub(crate) const ROUTING_CONDITIONAL_OPTION: &str = "routing=conditional";
 
+/// The option token that tells the daemon this stdio session is unattended
+/// (see [`HarnessGate::unattended`]). A daemon older than the token ignores
+/// it; the loop lease check still keeps that session from confirming
+/// anything while its run holds a lease.
+pub(crate) const UNATTENDED_OPTION: &str = "unattended";
+
+/// The option token prefix that names the domain an unattended run started
+/// this session for (see [`HarnessGate::run_domain`]).
+pub(crate) const RUN_DOMAIN_OPTION: &str = "domain=";
+
 /// What the `crystalline mcp` process resolved about the harness that spawned
 /// it, from its `--harness` argument and this machine's install receipt,
 /// before the session started. Two facts, because they gate two things:
@@ -291,23 +301,34 @@ pub(crate) const ROUTING_CONDITIONAL_OPTION: &str = "routing=conditional";
 ///
 /// The default (both false) is "serve everything with the full instructions",
 /// which is what every uncertain input resolves to.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HarnessGate {
     /// The receipt lists the harness with its session hook installed.
     pub hook_installed: bool,
     /// The hook is installed and the harness's onboarding is verified.
     pub onboarding_verified: bool,
+    /// The registration that spawned this session marked it unattended
+    /// (`crystalline mcp --unattended`, which a headless loop run's MCP
+    /// config carries): nobody is behind it to answer a question, so it is
+    /// never asked to share text on purpose. It only ever takes a power
+    /// away, so believing whoever spawned the process is safe.
+    pub unattended: bool,
+    /// The domain an unattended run started this session for
+    /// (`crystalline mcp --unattended --domain <D>`): its reads are limited
+    /// to what every reader of that domain may read. Counts only while the
+    /// session's caller holds a live loop lease on it.
+    pub run_domain: Option<String>,
 }
 
 impl HarnessGate {
     /// Whether the harness is fully onboarded by its own hook and skills on
     /// disk: the hook is installed and its onboarding is verified.
-    pub fn verified(self) -> bool {
+    pub fn verified(&self) -> bool {
         self.hook_installed && self.onboarding_verified
     }
 
     /// Whether the hook is installed but its onboarding is not verified.
-    pub fn conditional(self) -> bool {
+    pub fn conditional(&self) -> bool {
         self.hook_installed && !self.onboarding_verified
     }
 }
@@ -321,13 +342,27 @@ fn mcp_mode_line(gate: HarnessGate, daemon_parses_options: bool) -> String {
     if !daemon_parses_options {
         return "mcp\n".to_string();
     }
+    let mut line = "mcp".to_string();
     if gate.verified() {
-        format!("mcp {SKILLS_OFF_OPTION}\n")
+        line.push_str(&format!(" {SKILLS_OFF_OPTION}"));
     } else if gate.conditional() {
-        format!("mcp {ROUTING_CONDITIONAL_OPTION}\n")
-    } else {
-        "mcp\n".to_string()
+        line.push_str(&format!(" {ROUTING_CONDITIONAL_OPTION}"));
     }
+    if gate.unattended {
+        line.push_str(&format!(" {UNATTENDED_OPTION}"));
+    }
+    // A name with white space cannot ride a space-separated line; leaving
+    // it out reads less, never more (the session falls back to the
+    // intersection over its leases).
+    if let Some(domain) = gate
+        .run_domain
+        .as_deref()
+        .filter(|d| !d.is_empty() && !d.contains(char::is_whitespace))
+    {
+        line.push_str(&format!(" {RUN_DOMAIN_OPTION}{domain}"));
+    }
+    line.push('\n');
+    line
 }
 
 /// A connected client stream, before the handshake line is written.
@@ -2354,6 +2389,54 @@ fn daemon_log_sink() -> Option<std::process::Stdio> {
     daemon_log_file().map(Into::into)
 }
 
+/// Keep this process's own stdin, stdout and stderr out of every child it
+/// starts from now on, apart from a child given them on purpose.
+///
+/// On Windows std starts every child with handle inheritance on, so the
+/// child gets every inheritable handle of this process, not only the three
+/// it is handed as its stdio. The standard handles this process was started
+/// with are inheritable here whenever its parent passed them in, which is
+/// how a pipe is passed in. So a daemon started by a client whose output is
+/// a pipe held that pipe open for as long as it ran, and whoever read the
+/// client's output to its end (a harness, a script, a test's `output()`)
+/// waited for the daemon instead of the client. Clearing the inherit flag
+/// ends that; a later child started with `Stdio::inherit` still gets them,
+/// because std hands it an inheritable duplicate of its own.
+///
+/// `main` calls it first thing, so a spawner added later cannot forget it;
+/// the daemon spawns call it again, which costs nothing. It is a no-op on
+/// unix: std opens its own descriptors close-on-exec, and in a child the
+/// three stdio descriptors are replaced by the ones it is given.
+///
+/// What it does not cover: a handle this process inherited from its own
+/// parent beyond its standard handles still passes to every child, because
+/// std always calls `CreateProcessW` with `bInheritHandles` set. Closing that
+/// gap needs `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`, which std offers only
+/// through an unstable API.
+pub fn keep_std_handles_from_children() {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{
+            HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
+        };
+        use windows_sys::Win32::System::Console::{
+            GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+        };
+        for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            // SAFETY: GetStdHandle only reads this process's standard handle
+            // table, and SetHandleInformation changes one flag of a handle
+            // this process owns. A missing or console handle is skipped or
+            // its refusal ignored: either way it holds no pipe.
+            unsafe {
+                let handle = GetStdHandle(which);
+                if !handle.is_null() && handle != INVALID_HANDLE_VALUE {
+                    SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+                }
+            }
+        }
+    }
+}
+
 /// Spawn `current_exe serve --daemon`, forwarding `--read-only` when this
 /// instance was asked to serve read-only.
 ///
@@ -2423,6 +2506,9 @@ fn spawn_daemon(options: &SpawnOptions) -> anyhow::Result<()> {
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(daemon_log_sink().unwrap_or_else(std::process::Stdio::null));
+    // The daemon outlives this client: it must not hold the client's own
+    // stdout or stderr, or whoever reads them waits for the daemon.
+    keep_std_handles_from_children();
     #[cfg(unix)]
     if !extension {
         use std::os::unix::process::CommandExt;
@@ -3626,6 +3712,8 @@ mod tests {
     const VERIFIED_GATE: HarnessGate = HarnessGate {
         hook_installed: true,
         onboarding_verified: true,
+        unattended: false,
+        run_domain: None,
     };
 
     /// A hook in the receipt without a verified profile asks for the short
@@ -3636,21 +3724,55 @@ mod tests {
         let unverified = HarnessGate {
             hook_installed: true,
             onboarding_verified: false,
+            unattended: false,
+            run_domain: None,
         };
-        assert_eq!(mcp_mode_line(unverified, true), "mcp routing=conditional\n");
-        assert!(!mcp_mode_line(unverified, true).contains(SKILLS_OFF_OPTION));
+        assert_eq!(
+            mcp_mode_line(unverified.clone(), true),
+            "mcp routing=conditional\n"
+        );
+        assert!(!mcp_mode_line(unverified.clone(), true).contains(SKILLS_OFF_OPTION));
         assert_eq!(
             mcp_mode_line(
                 HarnessGate {
                     hook_installed: true,
-                    onboarding_verified: true
+                    onboarding_verified: true,
+                    unattended: false,
+                    run_domain: None,
                 },
                 true
             ),
             "mcp skills=off\n"
         );
-        assert_eq!(mcp_mode_line(unverified, false), "mcp\n");
+        assert_eq!(mcp_mode_line(unverified.clone(), false), "mcp\n");
         assert_eq!(mcp_mode_line(HarnessGate::default(), true), "mcp\n");
+    }
+
+    /// An unattended session (a headless loop run's) says so on the line,
+    /// beside any harness token, and only to a daemon that parses options.
+    #[test]
+    fn an_unattended_session_says_so_on_the_line() {
+        let unattended = HarnessGate {
+            unattended: true,
+            ..HarnessGate::default()
+        };
+        assert_eq!(mcp_mode_line(unattended.clone(), true), "mcp unattended\n");
+        assert_eq!(
+            mcp_mode_line(
+                HarnessGate {
+                    unattended: true,
+                    ..VERIFIED_GATE
+                },
+                true
+            ),
+            "mcp skills=off unattended\n"
+        );
+        assert_eq!(mcp_mode_line(unattended.clone(), false), "mcp\n");
+        let bound = HarnessGate {
+            run_domain: Some("eng".into()),
+            ..unattended
+        };
+        assert_eq!(mcp_mode_line(bound, true), "mcp unattended domain=eng\n");
     }
 
     /// What a 0.22.0 daemon does with the new token: its check reads only

@@ -1,4 +1,5 @@
-import { screen, within } from "@testing-library/react";
+import { screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ApiProblem, api } from "../api/client";
@@ -411,6 +412,237 @@ describe("the review screen", () => {
         ),
       ).toBeVisible();
     });
+  });
+
+  it("names a section that cites a domain fewer people may read, with its source", async () => {
+    serve({
+      ...REVIEW,
+      queue: {
+        ...REVIEW.queue,
+        queue: [
+          {
+            n: 1,
+            kind: "update",
+            what: "source_too_wide",
+            path: "guides/deploying.md",
+            section: "7f3a9c2e",
+            heading: "Night deploys",
+            age_secs: 3600,
+            sources: [
+              {
+                permalink: "team/harbor-team",
+                title: "Harbor team",
+                state: "current",
+                domain: "harbor",
+              },
+            ],
+            note: "this section cites a domain fewer people may read than this page's domain",
+          },
+        ],
+      },
+    });
+    renderApp("/d/eng/reflection/review");
+    const queue = await screen.findByRole("region", { name: "Reflect queue" });
+    expect(
+      await within(queue).findByText("Cites a domain fewer people read"),
+    ).toBeVisible();
+    expect(
+      within(queue).getByText(
+        /This section cites a domain fewer people may read than this one\./,
+      ),
+    ).toBeVisible();
+    expect(
+      within(queue).getByRole("link", { name: "Harbor team in domain harbor" }),
+    ).toHaveAttribute("href", "/d/harbor/e/team/harbor-team");
+  });
+
+  it("asks the person before it shares a too wide section on purpose", async () => {
+    const posted: unknown[] = [];
+    const question =
+      "Share text from harbor on a page more people may read? The page guides/deploying.md in eng is read by everyone who can open this instance.";
+    apiMock.mockImplementation(
+      answersFor({
+        "/auth/me": () => meResponse({ user: userFixture() }),
+        "/domains": () => ({ behavior: [], domains: [] }),
+        "/reflection/domains": () => ({ domains: [] }),
+        "/domains/eng/reflection": () => ({
+          domain: "eng",
+          enabled: true,
+          state: "on",
+          home: "local",
+          home_url: null,
+          right: "curate",
+          engrams_visible: true,
+          pending_engrams: [],
+        }),
+        "/domains/eng/reflection/tree": () => ({
+          domain: "eng",
+          pact: {
+            path: "PACT.md",
+            title: "PACT",
+            exists: true,
+            open_threads: 0,
+          },
+          nodes: [],
+        }),
+        "/domains/eng/reflection/review": () => ({
+          ...REVIEW,
+          queue: {
+            ...REVIEW.queue,
+            queue: [
+              {
+                n: 1,
+                kind: "update",
+                what: "source_too_wide",
+                path: "guides/deploying.md",
+                section: "7f3a9c2e",
+                heading: "Night deploys",
+                age_secs: 3600,
+                sources: [],
+                question,
+                basis: "b1",
+              },
+            ],
+          },
+        }),
+        "/domains/eng/reflection/disclose": (_path, init) => {
+          posted.push(JSON.parse(init?.body as string));
+          return {
+            domain: "eng",
+            path: "guides/deploying.md",
+            section: "7f3a9c2e",
+            disclosed: { by: "jordi", at: "2026-10-28T09:00:00Z" },
+          };
+        },
+      }),
+    );
+    const user = userEvent.setup();
+    renderApp("/d/eng/reflection/review");
+    const queue = await screen.findByRole("region", { name: "Reflect queue" });
+    await user.click(
+      await within(queue).findByRole("button", { name: "Share on purpose" }),
+    );
+    const dialog = await screen.findByRole("dialog", {
+      name: "Share text from a domain fewer people read",
+    });
+    expect(within(dialog).getByText(question)).toBeVisible();
+    // Cancel shares nothing.
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    expect(posted).toEqual([]);
+    expect(screen.queryByRole("dialog")).toBeNull();
+    await user.click(
+      within(queue).getByRole("button", { name: "Share on purpose" }),
+    );
+    const again = await screen.findByRole("dialog", {
+      name: "Share text from a domain fewer people read",
+    });
+    await user.click(within(again).getByRole("button", { name: "Share it" }));
+    await waitFor(() => {
+      expect(posted).toEqual([
+        { path: "guides/deploying.md", section: "7f3a9c2e", basis: "b1" },
+      ]);
+    });
+  });
+
+  it("says so and reads the review again when the readers changed since the question", async () => {
+    let reviews = 0;
+    const changed =
+      "who may read this page, or where it is backed up, changed since the person was asked; ask them again";
+    apiMock.mockImplementation(
+      answersFor({
+        "/auth/me": () => meResponse({ user: userFixture() }),
+        "/domains": () => ({ behavior: [], domains: [] }),
+        "/reflection/domains": () => ({ domains: [] }),
+        "/domains/eng/reflection": () => ({
+          domain: "eng",
+          enabled: true,
+          state: "on",
+          home: "local",
+          home_url: null,
+          right: "curate",
+          engrams_visible: true,
+          pending_engrams: [],
+        }),
+        "/domains/eng/reflection/tree": () => ({
+          domain: "eng",
+          pact: {
+            path: "PACT.md",
+            title: "PACT",
+            exists: true,
+            open_threads: 0,
+          },
+          nodes: [],
+        }),
+        "/domains/eng/reflection/review": () => {
+          reviews += 1;
+          return {
+            ...REVIEW,
+            queue: {
+              ...REVIEW.queue,
+              queue: [
+                {
+                  n: 1,
+                  kind: "update",
+                  what: "source_too_wide",
+                  path: "guides/deploying.md",
+                  section: "7f3a9c2e",
+                  heading: "Night deploys",
+                  age_secs: 3600,
+                  sources: [],
+                  question: "Share text from harbor?",
+                  basis: "b1",
+                },
+              ],
+            },
+          };
+        },
+        "/domains/eng/reflection/disclose": () => {
+          throw new ApiProblem(409, "Conflict", changed);
+        },
+      }),
+    );
+    const user = userEvent.setup();
+    renderApp("/d/eng/reflection/review");
+    const queue = await screen.findByRole("region", { name: "Reflect queue" });
+    await user.click(
+      await within(queue).findByRole("button", { name: "Share on purpose" }),
+    );
+    const dialog = await screen.findByRole("dialog", {
+      name: "Share text from a domain fewer people read",
+    });
+    const before = reviews;
+    await user.click(within(dialog).getByRole("button", { name: "Share it" }));
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent(changed);
+    await waitFor(() => {
+      expect(reviews).toBeGreaterThan(before);
+    });
+  });
+
+  it("offers no confirmation for a too wide item without a question", async () => {
+    serve({
+      ...REVIEW,
+      queue: {
+        ...REVIEW.queue,
+        queue: [
+          {
+            n: 1,
+            kind: "update",
+            what: "source_too_wide",
+            path: "guides/deploying.md",
+            section: "7f3a9c2e",
+            heading: "Night deploys",
+            age_secs: 3600,
+            sources: [],
+          },
+        ],
+      },
+    });
+    renderApp("/d/eng/reflection/review");
+    const queue = await screen.findByRole("region", { name: "Reflect queue" });
+    await within(queue).findByText("Cites a domain fewer people read");
+    expect(
+      within(queue).queryByRole("button", { name: "Share on purpose" }),
+    ).toBeNull();
   });
 
   it("links a source of another domain into its domain and counts the ones the reader cannot open", async () => {

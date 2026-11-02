@@ -61,7 +61,6 @@
 //! it is why "an address never reaches an account" is a property of one
 //! function rather than a habit spread over a handler.
 
-use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -86,6 +85,7 @@ use tokio::sync::{Mutex, RwLock};
 
 use super::auth::Identity;
 use super::auth_store::{DEFAULT_OIDC_ROLE, RefusalKind, Role, StoreRefusal, User};
+use super::pending::{PENDING_TTL, PendingRecord, PendingStore, StateMiss};
 use super::{ApiError, ApiQuery, ProblemDetail, RestState};
 
 /// The route that starts a sign-in, relative to the `/api/v1` mount.
@@ -107,29 +107,6 @@ pub const PROVIDERS_PATH: &str = "/auth/providers";
 /// trip to the provider and back, and the callback deletes it whatever the
 /// outcome.
 pub const STATE_COOKIE: &str = "fluid_oidc_state";
-
-/// How long a started sign-in may take to come back. Long enough for a person
-/// to read a consent screen and type a second factor, short enough that an
-/// abandoned attempt is forgotten while its tab is still open.
-const PENDING_TTL: Duration = Duration::from_secs(10 * 60);
-
-/// How many sign-ins may be in flight at once.
-///
-/// [`login`] is public and unauthenticated, so the pending map is something a
-/// stranger can add to. The cap is what stops that from being a way to make
-/// this process reserve memory. A record is a few hundred bytes, so a full map
-/// is single-digit megabytes; the number is generous next to any real
-/// instance's concurrent logins and small next to what a flood would want.
-const MAX_PENDING: usize = 10_000;
-
-/// How old a record must be before a full map may drop it to make room.
-///
-/// Without this, filling the map is a way to evict every real sign-in mid
-/// consent: the cap would be reached and the oldest record - somebody who
-/// pressed the button a few seconds ago - would go. With it, a full map of
-/// records younger than this refuses the newcomer instead, which costs a
-/// flood its own next request and costs the person mid-consent nothing.
-const MIN_EVICT_AGE: Duration = Duration::from_secs(30);
 
 /// How long a failed discovery is remembered before the provider is asked
 /// again.
@@ -539,143 +516,9 @@ struct Pending {
     started: Instant,
 }
 
-/// The sign-ins in flight, keyed by state.
-#[derive(Default)]
-struct PendingStore {
-    records: HashMap<String, Pending>,
-    /// Every state inserted, oldest first. Records are only ever inserted
-    /// with a fresh `started`, so this is chronological, and expiry and
-    /// eviction both walk it from the front in O(1) per record. An entry
-    /// whose record was already taken is skipped when it is reached.
-    order: VecDeque<(Instant, String)>,
-}
-
-/// How much slack the chronological order may carry over the records it
-/// indexes before a whole-order sweep is worth its cost. Small enough that the
-/// order cannot grow by much on a quiet instance, large enough that a store
-/// holding a handful of sign-ins never sweeps at all. See
-/// [`PendingStore::compact_if_slack`].
-const COMPACT_SLACK: usize = 16;
-
-/// The map is full of sign-ins too young to evict. See [`MIN_EVICT_AGE`].
-#[derive(Debug)]
-struct PendingFull;
-
-/// Why a state had no record to take: it names none, or it named one that
-/// outlived [`PENDING_TTL`]. Both answer the same sentence; they warn
-/// differently, because an operator reading "expired" checks the provider's
-/// consent screen and one reading "unknown" checks for a replay.
-#[derive(Debug, PartialEq, Eq)]
-enum StateMiss {
-    Unknown,
-    Expired,
-}
-
-impl PendingStore {
-    /// How many sign-ins are in flight.
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.records.len()
-    }
-
-    /// How many entries the chronological order holds, live or spent.
-    #[cfg(test)]
-    fn order_len(&self) -> usize {
-        self.order.len()
-    }
-
-    /// Remember `pending` under `state`, forgetting whatever has expired and,
-    /// if the map is still full, the oldest records past [`MIN_EVICT_AGE`].
-    /// Refuses when the map is full of records younger than that: a flood
-    /// must not be able to push a real sign-in out from under someone.
-    fn insert(&mut self, state: String, pending: Pending) -> Result<(), PendingFull> {
-        let now = Instant::now();
-        self.purge_expired(now);
-        self.compact_if_slack(now);
-        while self.records.len() >= MAX_PENDING {
-            let Some((started, key)) = self.order.front() else {
-                break;
-            };
-            let already_taken = !self.records.contains_key(key);
-            if !already_taken && now.duration_since(*started) < MIN_EVICT_AGE {
-                return Err(PendingFull);
-            }
-            let (_, key) = self.order.pop_front().expect("checked just above");
-            self.records.remove(&key);
-        }
-        self.order.push_back((pending.started, state.clone()));
-        self.records.insert(state, pending);
-        Ok(())
-    }
-
-    /// Take the record for `state`, if it exists and has not expired.
-    ///
-    /// Taking rather than reading is the whole point: an authorization code
-    /// may be presented once, so the record that authorizes presenting it is
-    /// removed before the exchange runs and a replay finds nothing. Expired
-    /// records are purged here too, so an idle instance does not hold them
-    /// until the next login happens to insert.
-    fn take(&mut self, state: &str) -> Result<Pending, StateMiss> {
-        let now = Instant::now();
-        // Looked up before the purge, so an expired record is reported as
-        // expired rather than as never having existed.
-        let taken = self.records.remove(state);
-        self.purge_expired(now);
-        match taken {
-            Some(pending) if now.duration_since(pending.started) < PENDING_TTL => Ok(pending),
-            Some(_) => Err(StateMiss::Expired),
-            None => Err(StateMiss::Unknown),
-        }
-    }
-
-    /// Forget every record older than [`PENDING_TTL`], from the front of the
-    /// chronological order until the first one that is still live, and drop
-    /// the spent entries met on the way.
-    ///
-    /// The spent ones matter for the bound: a sign-in started and taken at
-    /// once (a login, then a callback whose exchange fails) never fills the
-    /// map, so the eviction loop never runs, and without this the order would
-    /// keep its entry for the full TTL at the cost of two cheap requests.
-    /// Completions are roughly first in, first out, so popping spent entries
-    /// from the front keeps the order close to the map.
-    fn purge_expired(&mut self, now: Instant) {
-        while let Some((started, key)) = self.order.front() {
-            let spent = !self.records.contains_key(key);
-            if !spent && now.duration_since(*started) < PENDING_TTL {
-                break;
-            }
-            let (_, key) = self.order.pop_front().expect("checked just above");
-            self.records.remove(&key);
-        }
-    }
-
-    /// Sweep the whole order when it has grown far past the map it indexes.
-    ///
-    /// [`PendingStore::purge_expired`] walks from the front and stops at the
-    /// first live record, which is what makes it O(1) per record - and what
-    /// leaves one abandoned consent tab pinning everything behind it: a browser
-    /// that opened a sign-in and never came back holds the front of the order
-    /// for the whole TTL, and every spent entry behind it waits there with it.
-    /// Nothing is leaked (the TTL still ends it) and no sign-in is displaced
-    /// (eviction reads the same entries), but the order can hold several times
-    /// the sign-ins actually in flight for ten minutes at a time.
-    ///
-    /// So the front walk keeps its cheap common case and this pays for the
-    /// rare one, amortized: only when the order carries more than twice the
-    /// live records plus a slack that keeps a nearly-empty store from ever
-    /// sweeping, and only on insert, which is the path that grows it.
-    fn compact_if_slack(&mut self, now: Instant) {
-        if self.order.len() <= self.records.len() * 2 + COMPACT_SLACK {
-            return;
-        }
-        let PendingStore { records, order } = self;
-        order.retain(|(started, key)| {
-            if now.duration_since(*started) >= PENDING_TTL {
-                records.remove(key);
-                return false;
-            }
-            records.contains_key(key)
-        });
+impl PendingRecord for Pending {
+    fn started(&self) -> Instant {
+        self.started
     }
 }
 
@@ -786,7 +629,7 @@ pub struct OidcClient {
     metadata: RwLock<Option<CoreProviderMetadata>>,
     /// The fetch in flight and the last failure. See [`Discovery`].
     discovery: std::sync::Mutex<Discovery>,
-    pending: Mutex<PendingStore>,
+    pending: Mutex<PendingStore<Pending>>,
 }
 
 impl OidcClient {
@@ -1972,6 +1815,13 @@ pub struct OidcClaims {
     pub display: Option<String>,
     /// `email`. Presentation only: matching an address against an existing
     /// account is exactly the silent takeover this design refuses.
+    ///
+    /// An address the provider marks `email_verified: false` is not taken
+    /// (`None`), so a sign-in never stores it and a returning one keeps the
+    /// address stored before. It becomes the author address of a share
+    /// through the GitHub App, and GitHub credits a commit to whoever holds
+    /// that address. An absent `email_verified` keeps the address, because
+    /// many providers never send the claim.
     pub email: Option<String>,
     /// The account this sign-in was started to link an identity to, from
     /// `POST /auth/oidc/login`. `None` is an ordinary sign-in.
@@ -1995,7 +1845,10 @@ impl OidcClaims {
                 // one unlocalized name writes into.
                 .and_then(|localized| localized.get(None))
                 .and_then(|value| text(value.as_str())),
-            email: claims.email().and_then(|value| text(value.as_str())),
+            email: claims
+                .email()
+                .filter(|_| claims.email_verified() != Some(false))
+                .and_then(|value| text(value.as_str())),
             link_for,
         }
     }
@@ -2036,6 +1889,7 @@ impl OidcClaims {
             filled.push("name");
         }
         if self.email.is_none()
+            && info.email_verified() != Some(false)
             && let Some(value) = info.email().and_then(|value| text(value.as_str()))
         {
             self.email = Some(value);
@@ -2882,174 +2736,59 @@ mod tests {
         assert!(claims.lacks_presentation_claims());
     }
 
-    /// Why a take missed, without asking `Pending` - which holds the PKCE
-    /// verifier and the nonce - to implement `Debug` for the sake of a test.
-    fn miss(taken: Result<Pending, StateMiss>) -> StateMiss {
-        match taken {
-            Ok(_) => panic!("expected the take to miss"),
-            Err(miss) => miss,
-        }
-    }
-
-    /// The pending map is something an unauthenticated caller can add to, so
-    /// its bounds are the ones worth pinning: a record is single use, the map
-    /// has a ceiling, and the ceiling cannot be used to push a real sign-in
-    /// out from under someone mid-consent.
+    /// An address the provider itself marks unverified is never taken, from
+    /// the ID token or from userinfo: it is the commit author address of a
+    /// share through the GitHub App, and GitHub credits a commit to whoever
+    /// holds that address. A token that says nothing about verification keeps
+    /// its address, since many providers never send the claim.
     #[test]
-    fn a_flood_of_sign_ins_cannot_evict_one_that_started_moments_ago() {
-        let mut store = PendingStore::default();
-        let record = |age: Duration| Pending {
-            nonce: Nonce::new("n".to_string()),
-            verifier: PkceCodeVerifier::new("v".repeat(43)),
-            redirect_uri: RedirectUrl::new("https://example.test/cb".to_string()).unwrap(),
-            link_for: None,
-            return_to: None,
-            started: Instant::now() - age,
-        };
-        // Single use.
-        store
-            .insert("first".to_string(), record(Duration::ZERO))
-            .unwrap();
-        assert!(store.take("first").is_ok());
-        assert_eq!(
-            miss(store.take("first")),
-            StateMiss::Unknown,
-            "a state may authorize exactly one code exchange"
-        );
-
-        // A real person started a sign-in a few seconds ago...
-        store
-            .insert("real".to_string(), record(Duration::from_secs(5)))
-            .unwrap();
-        // ...and then a stranger fills the map to the brim, all just now.
-        let mut refused = 0;
-        for i in 0..(MAX_PENDING * 2) {
-            if store
-                .insert(format!("flood-{i}"), record(Duration::ZERO))
-                .is_err()
-            {
-                refused += 1;
+    fn an_email_marked_unverified_is_dropped_and_an_unmarked_one_is_kept() {
+        let token = |verified: Option<bool>| {
+            let mut raw = serde_json::json!({
+                "iss": "https://idp.example/realm",
+                "sub": "sub-1",
+                "aud": ["crystalline"],
+                "exp": 4102444800u64,
+                "iat": 1767225600u64,
+                "email": "ada@example.test",
+            });
+            if let Some(verified) = verified {
+                raw["email_verified"] = serde_json::json!(verified);
             }
-        }
-        assert!(
-            store.len() <= MAX_PENDING,
-            "the map grew past its cap: {}",
-            store.len()
-        );
-        assert!(
-            refused > 0,
-            "past the cap, a flood is refused rather than evicting"
-        );
-        assert!(
-            store.take("real").is_ok(),
-            "the sign-in that started five seconds ago survived the flood"
-        );
-
-        // A record older than the eviction age is fair game once the map is
-        // full: it makes room instead of refusing.
-        let mut store = PendingStore::default();
-        store
-            .insert(
-                "stale".to_string(),
-                record(MIN_EVICT_AGE + Duration::from_secs(1)),
-            )
-            .unwrap();
-        for i in 0..MAX_PENDING {
-            store
-                .insert(format!("fill-{i}"), record(Duration::ZERO))
-                .unwrap_or_else(|_| panic!("insert {i} should have evicted the stale record"));
-        }
+            let claims: CoreIdTokenClaims = serde_json::from_value(raw).unwrap();
+            OidcClaims::from_id_token(&claims, None)
+        };
+        assert_eq!(token(Some(false)).email, None, "unverified is dropped");
         assert_eq!(
-            miss(store.take("stale")),
-            StateMiss::Unknown,
-            "the stale record was evicted"
+            token(None).email.as_deref(),
+            Some("ada@example.test"),
+            "an absent email_verified keeps today's behaviour"
         );
-        assert!(store.len() <= MAX_PENDING);
+        assert_eq!(token(Some(true)).email.as_deref(), Some("ada@example.test"));
 
-        // An expired record is forgotten by a take as well as by an insert,
-        // so an idle instance does not hold expired sign-ins until the next
-        // login happens to purge them.
-        let mut store = PendingStore::default();
-        store
-            .insert(
-                "expired".to_string(),
-                record(PENDING_TTL + Duration::from_secs(1)),
-            )
-            .unwrap();
-        assert_eq!(miss(store.take("nobody")), StateMiss::Unknown);
-        assert_eq!(store.len(), 0, "a take purges what has expired");
-        // And one that is asked for by name after it expired says so.
-        store
-            .insert(
-                "late".to_string(),
-                record(PENDING_TTL + Duration::from_secs(1)),
-            )
-            .unwrap();
-        assert_eq!(miss(store.take("late")), StateMiss::Expired);
-    }
-
-    /// The chronological order is bounded by the cap too, not only the map:
-    /// a caller who starts a sign-in and spends it at once (a login, then a
-    /// callback whose exchange fails) leaves the map empty and would otherwise
-    /// leave an entry in the order for the full ten minutes, growing it by
-    /// two cheap unauthenticated requests per entry.
-    #[test]
-    fn spending_sign_ins_does_not_grow_the_order_past_the_cap() {
-        let mut store = PendingStore::default();
-        let record = || Pending {
-            nonce: Nonce::new("n".to_string()),
-            verifier: PkceCodeVerifier::new("v".repeat(43)),
-            redirect_uri: RedirectUrl::new("https://example.test/cb".to_string()).unwrap(),
-            link_for: None,
-            return_to: None,
-            started: Instant::now(),
+        let userinfo = |json: &[u8]| {
+            let info =
+                CoreUserInfoClaims::from_json::<std::convert::Infallible>(json, None).unwrap();
+            let mut claims = OidcClaims {
+                issuer: "i".to_string(),
+                subject: "sub-1".to_string(),
+                preferred_username: None,
+                display: None,
+                email: None,
+                link_for: None,
+            };
+            claims.fill_missing_from_userinfo(&info);
+            claims.email
         };
-        for i in 0..(MAX_PENDING * 2) {
-            let state = format!("cycle-{i}");
-            store.insert(state.clone(), record()).unwrap();
-            assert!(store.take(&state).is_ok());
-        }
-        assert_eq!(store.len(), 0);
-        assert!(
-            store.order_len() <= MAX_PENDING,
-            "spent entries piled up in the order: {}",
-            store.order_len()
+        assert_eq!(
+            userinfo(br#"{"sub":"sub-1","email":"ada@example.test","email_verified":false}"#),
+            None,
+            "userinfo cannot bring back an unverified address"
         );
-    }
-
-    /// One abandoned consent tab must not pin the order behind it.
-    ///
-    /// The front walk stops at the first live record, so a sign-in that was
-    /// started and never finished holds the front for the whole TTL while every
-    /// spent entry behind it waits with it. The whole-order sweep is what keeps
-    /// that bounded, and it is what this test would notice the absence of: the
-    /// order would otherwise grow one entry per cycle for ten minutes.
-    #[test]
-    fn an_abandoned_sign_in_does_not_pin_the_spent_entries_behind_it() {
-        let mut store = PendingStore::default();
-        let record = || Pending {
-            nonce: Nonce::new("n".to_string()),
-            verifier: PkceCodeVerifier::new("v".repeat(43)),
-            redirect_uri: RedirectUrl::new("https://example.test/cb".to_string()).unwrap(),
-            link_for: None,
-            return_to: None,
-            started: Instant::now(),
-        };
-        // The tab somebody opened and walked away from, at the front and live.
-        store.insert("abandoned".to_string(), record()).unwrap();
-        for i in 0..200 {
-            let state = format!("cycle-{i}");
-            store.insert(state.clone(), record()).unwrap();
-            assert!(store.take(&state).is_ok());
-        }
-        assert_eq!(store.len(), 1, "the abandoned sign-in is still in flight");
-        assert!(
-            store.order_len() <= COMPACT_SLACK + 2,
-            "spent entries piled up behind the abandoned one: {}",
-            store.order_len()
+        assert_eq!(
+            userinfo(br#"{"sub":"sub-1","email":"ada@example.test"}"#).as_deref(),
+            Some("ada@example.test")
         );
-        // And it is still takeable: compaction forgets nothing that is live.
-        assert!(store.take("abandoned").is_ok());
     }
 
     /// `common`, `organizations` and `consumers` are refused where the

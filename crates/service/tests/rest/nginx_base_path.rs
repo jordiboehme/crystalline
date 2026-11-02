@@ -1,6 +1,7 @@
 //! The nginx Fluid image under a path: the template rendered with and without
 //! `CRYSTALLINE_BASE_PATH`, the way the image's envsubst renders it. Without
-//! the variable the locations are exactly the 0.23.0 ones and the optional
+//! the variable the locations are the 0.23.0 ones plus the GitHub App's
+//! webhook (0.30.0) and the optional
 //! snippets are not there; with it every location sits under the prefix, the
 //! base tag is rewritten to the same bytes the daemon writes, and the two host
 //! root OAuth documents are forwarded. `nginx -t` over both renderings runs in
@@ -51,6 +52,7 @@ fn without_a_base_path_the_locations_are_the_0_23_0_ones() {
             "location = /index.html",
             "location /api/v1/collab/",
             "location ~ ^/api/v1/domains/[^/]+/archive(/|$)",
+            "location = /api/v1/github/webhook",
             "location /api/",
             "location /",
         ]
@@ -75,6 +77,7 @@ fn with_a_base_path_every_location_sits_under_it() {
             "location = /crystalline/index.html",
             "location /crystalline/api/v1/collab/",
             "location ~ ^/crystalline/api/v1/domains/[^/]+/archive(/|$)",
+            "location = /crystalline/api/v1/github/webhook",
             "location /crystalline/api/",
             "location /crystalline/",
         ]

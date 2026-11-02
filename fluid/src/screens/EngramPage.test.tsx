@@ -249,6 +249,11 @@ beforeEach(() => {
   localStorage.clear();
 });
 
+// Above roughly load average 80 this file's slower tests come close to the
+// 5000 ms default (measured 2026-10-28); the raise keeps a loaded machine from
+// reading as a failure. Never raise the global default to hide this.
+vi.setConfig({ testTimeout: 15000 });
+
 describe("the engram page", () => {
   it("a locked domain's engram page shows the lock and its text and offers no Edit", async () => {
     serve({
@@ -1629,6 +1634,50 @@ describe("what changed on this page", () => {
       await screen.findByRole("menuitem", { name: "What changed" }),
     ).toBeVisible();
     expect(screen.queryByRole("menuitem", { name: "Discard" })).toBeNull();
+  });
+
+  describe("on a domain GitHub governs", () => {
+    /** A viewer's session, with `row` folded into the listing's one domain. */
+    function serveViewer(row: Record<string, unknown>) {
+      serve({
+        "/auth/me": () => meResponse({ user: userFixture({ role: "viewer" }) }),
+        "/domains": () => ({
+          ...domainsResponse(),
+          domains: [{ ...domainsResponse().domains[0], ...row }],
+        }),
+        "/domains/eng/engrams/alpha": () =>
+          detailResponse({ local_change: "modified" }),
+      });
+    }
+
+    it("offers an instance viewer with GitHub write Edit and Share this change", async () => {
+      serveViewer({ may_share: true });
+      renderApp("/d/eng/e/alpha");
+      expect(await screen.findByRole("link", { name: "Edit" })).toBeVisible();
+      await userEvent.click(
+        await screen.findByRole("button", { name: "Changed" }),
+      );
+      expect(
+        await screen.findByRole("menuitem", { name: "Share this change" }),
+      ).toBeVisible();
+      expect(screen.getByRole("menuitem", { name: "Discard" })).toBeVisible();
+    });
+
+    it("offers a GitHub reader neither Edit nor Share this change", async () => {
+      serveViewer({ may_share: false, read_only: true });
+      renderApp("/d/eng/e/alpha");
+      await userEvent.click(
+        await screen.findByRole("button", { name: "Changed" }),
+      );
+      expect(
+        await screen.findByRole("menuitem", { name: "What changed" }),
+      ).toBeVisible();
+      expect(
+        screen.queryByRole("menuitem", { name: "Share this change" }),
+      ).toBeNull();
+      expect(screen.queryByRole("menuitem", { name: "Discard" })).toBeNull();
+      expect(screen.queryByRole("link", { name: "Edit" })).toBeNull();
+    });
   });
 
   it("opens the diff in a dialog titled by the path", async () => {

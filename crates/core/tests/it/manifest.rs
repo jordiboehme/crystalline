@@ -2,12 +2,13 @@
 
 use crate::common::{fixtures_dir, read};
 use crystalline_core::manifest::{
-    ArtifactType, DOMAIN_NAME_KEY, GeneratedIndexes, Manifest, PolicyKey, PolicyKind, PolicyRole,
-    ProblemKind, READ_ONLY_KEY, REFLECTION_HOME_KEY, REFLECTION_KEY, ReadOnly, ReflectionSwitch,
-    SHARING_KEY, Sharing, TagAliasProblemKind, append_tag_alias, domain_name_at,
-    domain_name_of_source, generated_indexes_at, in_root_artifact_dirs, manifest_template,
-    policy_registry, read_only_at, read_only_of_source, reflection_at, reflection_home_at,
-    sharing_at, starter_stanzas, tag_alias_pairs, validate_reflection_home,
+    ArtifactType, DOMAIN_NAME_KEY, EVOLVE_HOME_KEY, GeneratedIndexes, Manifest, PolicyKey,
+    PolicyKind, PolicyRole, ProblemKind, READ_ONLY_KEY, REFLECTION_HOME_KEY, REFLECTION_KEY,
+    ReadOnly, ReflectionSwitch, SHARING_KEY, Sharing, TEAM_KEY, TagAliasProblemKind, TeamForge,
+    append_tag_alias, domain_name_at, domain_name_of_source, evolve_home_at, generated_indexes_at,
+    in_root_artifact_dirs, manifest_template, policy_registry, read_only_at, read_only_of_source,
+    reflection_at, reflection_home_at, set_team_marker, sharing_at, starter_stanzas,
+    tag_alias_pairs, team_at, team_of_source, validate_reflection_home,
 };
 use crystalline_core::manifest_view::{RoutingSection, manifest_facts, policy_rows, section_rows};
 use crystalline_core::parse_engram;
@@ -929,8 +930,8 @@ fn every_registry_key_answers_through_manifest_policy() {
     let silent = manifest_from_source(&manifest_declaring_sharing(None));
     assert_eq!(
         policy_registry().len(),
-        8,
-        "generated_indexes, sharing, domain_name, read_only, reflection, reflection_home, reflect_trigger and evolve_trigger"
+        10,
+        "generated_indexes, sharing, domain_name, read_only, reflection, reflection_home, reflect_trigger, evolve_trigger, team and evolve_home"
     );
     for spec in policy_registry() {
         if spec.kind == PolicyKind::Choice {
@@ -1015,13 +1016,63 @@ fn the_registry_rows_say_who_changes_what_and_to_which_values() {
         "appended, so the rows that were there keep their places"
     );
     assert_eq!(
-        policy_registry().last().map(|spec| spec.key),
-        Some("evolve_trigger")
+        policy_registry()[7].key,
+        "evolve_trigger",
+        "the team row is appended after it"
     );
     assert_eq!(
         policy_registry()[5].key,
         REFLECTION_HOME_KEY,
         "the trigger rows are appended after it"
+    );
+    assert_eq!(
+        policy_registry()[9].key,
+        EVOLVE_HOME_KEY,
+        "appended after the team row"
+    );
+    let evolve_home = by_key(EVOLVE_HOME_KEY);
+    assert_eq!(evolve_home.kind, PolicyKind::Text);
+    assert_eq!(evolve_home.changed_by, PolicyRole::Owner);
+    assert!(evolve_home.accepts("https://kb.example.com"));
+    assert!(!evolve_home.accepts("https://kb.example.com/"));
+    assert!(!evolve_home.accepts("somewhere"));
+}
+
+/// `evolve_home` reads like `reflection_home`: a server address in the
+/// spelling the server writes its own, else absent.
+#[test]
+fn evolve_home_is_a_url_or_nothing() {
+    let home = manifest_from_source(&manifest_declaring_reflection(
+        "evolve_home: https://kb.example.com\n",
+    ));
+    assert_eq!(home.evolve_home(), Some("https://kb.example.com"));
+    assert_eq!(
+        home.policy(EVOLVE_HOME_KEY),
+        Some((Some("https://kb.example.com"), "https://kb.example.com"))
+    );
+    let junk = manifest_from_source(&manifest_declaring_reflection(
+        "evolve_home: https://KB.example.com/\n",
+    ));
+    assert_eq!(junk.declared_evolve_home(), Some("https://KB.example.com/"));
+    assert_eq!(junk.evolve_home(), None);
+    assert_eq!(
+        junk.policy(EVOLVE_HOME_KEY),
+        Some((Some("https://KB.example.com/"), ""))
+    );
+    let silent = manifest_from_source(&manifest_declaring_reflection(""));
+    assert_eq!(silent.evolve_home(), None);
+    assert_eq!(silent.policy(EVOLVE_HOME_KEY), Some((None, "")));
+
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(evolve_home_at(dir.path()), None, "no MANIFEST");
+    std::fs::write(
+        dir.path().join("MANIFEST.md"),
+        manifest_declaring_reflection("evolve_home: http://localhost:8080\n"),
+    )
+    .unwrap();
+    assert_eq!(
+        evolve_home_at(dir.path()).as_deref(),
+        Some("http://localhost:8080")
     );
 }
 
@@ -1460,7 +1511,9 @@ fn manifest_facts_reads_every_policy_and_section() {
             "reflection",
             "reflection_home",
             "reflect_trigger",
-            "evolve_trigger"
+            "evolve_trigger",
+            "team",
+            "evolve_home"
         ]
     );
     assert_eq!(facts.policies[1].declared.as_deref(), Some("direct"));
@@ -1508,7 +1561,7 @@ fn a_manifest_that_does_not_parse_declares_nothing() {
 #[test]
 fn policy_rows_without_a_manifest_are_the_registry_defaults() {
     let rows = policy_rows(None, "eng");
-    assert_eq!(rows.len(), 8);
+    assert_eq!(rows.len(), 10);
     assert_eq!(rows[0].effective, "local");
     assert_eq!(rows[1].effective, "proposal");
     assert!(rows.iter().all(|r| r.declared.is_none()));
@@ -1518,4 +1571,66 @@ fn policy_rows_without_a_manifest_are_the_registry_defaults() {
     );
     assert_eq!(rows[3].effective, "off");
     assert_eq!(section_rows(None).len(), 4);
+}
+
+// --- The team marker ----------------------------------------------------------
+
+#[test]
+fn the_team_marker_names_its_forge_or_reads_as_absent() {
+    let silent = manifest_from_source(&manifest_declaring_reflection(""));
+    assert_eq!(silent.declared_team(), None);
+    assert_eq!(silent.team(), None);
+    assert_eq!(silent.policy(TEAM_KEY), Some((None, "")));
+    let github = manifest_from_source(&manifest_declaring_reflection("team: github\n"));
+    assert_eq!(github.team(), Some(TeamForge::GitHub));
+    assert_eq!(github.policy(TEAM_KEY), Some((Some("github"), "github")));
+    for typo in ["GitHub", "gitlab", "yes"] {
+        let other =
+            manifest_from_source(&manifest_declaring_reflection(&format!("team: {typo}\n")));
+        assert_eq!(other.declared_team(), Some(typo));
+        assert_eq!(other.team(), None, "{typo} reads as absent");
+        assert_eq!(other.policy(TEAM_KEY), Some((Some(typo), "")));
+    }
+}
+
+#[test]
+fn the_team_row_is_text_that_only_the_engine_writes() {
+    let spec = *policy_registry()
+        .iter()
+        .find(|spec| spec.key == TEAM_KEY)
+        .expect("team is registered");
+    assert_eq!(spec.kind, PolicyKind::Text);
+    assert_eq!(spec.default, "");
+    assert!(spec.accepts("github"));
+    assert!(!spec.accepts("GitHub") && !spec.accepts("gitlab") && !spec.accepts(""));
+    assert_eq!(
+        policy_registry()[8].key,
+        TEAM_KEY,
+        "appended, so the rows that were there keep their places"
+    );
+}
+
+#[test]
+fn team_at_and_team_of_source_read_the_marker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    assert_eq!(team_at(root), None, "no MANIFEST");
+    std::fs::write(root.join("MANIFEST.md"), manifest_declaring_reflection("")).unwrap();
+    assert_eq!(team_at(root), None, "silent");
+    let marked = manifest_declaring_reflection("team: github\n");
+    std::fs::write(root.join("MANIFEST.md"), &marked).unwrap();
+    assert_eq!(team_at(root), Some(TeamForge::GitHub));
+    assert_eq!(team_of_source(&marked), Some(TeamForge::GitHub));
+    assert_eq!(team_of_source("no frontmatter"), None);
+}
+
+#[test]
+fn set_team_marker_writes_one_line_after_the_title_and_is_idempotent() {
+    let source = manifest_declaring_reflection("reflection: off\n");
+    let marked = set_team_marker(&source, TeamForge::GitHub);
+    assert!(marked.contains("title: KB\nteam: github\n"), "{marked}");
+    assert_eq!(team_of_source(&marked), Some(TeamForge::GitHub));
+    assert_eq!(set_team_marker(&marked, TeamForge::GitHub), marked);
+    // The rest of the text is kept as it was.
+    assert_eq!(marked.replace("team: github\n", ""), source);
 }

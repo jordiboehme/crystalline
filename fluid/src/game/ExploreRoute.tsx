@@ -103,20 +103,21 @@
  * that follows a moved engram replaces the URL through the same
  * `navigate` as a landing.
  *
- * The station dials in when it starts (M4 C26): on a mount whose context
- * is running (a launch from the C64 screen primed it; a bare reload's
- * waits for the first click) and once per tab session (`CONNECTED_KEY` in
- * `sessionStorage`), the connecting screen (`Connecting`) shows over the
- * first room while it loads, the session is held busy and the director
- * dials the domain's number (`dialNumber`). The mixer is made first in the
- * effect and read before anything resumes the context. When the screen is
- * done or skipped the sound fades out and the session gets its keys back.
- * An opening question (`Opening`) stands before the connecting screen and
- * holds the session busy the same way; it is silent, and the dial starts
- * when the connecting screen mounts. The screen's state is kept in a ref
+ * The station dials in when it starts (M4 C26): on every mount, wherever
+ * the launch lands, the connecting screen (`Connecting`) shows over the
+ * first room while it loads and the session is held busy. When the mount's
+ * context is running (a launch from the C64 screen primed it; a bare
+ * reload's waits for the first click) the director dials the domain's
+ * number (`dialNumber`); otherwise the screens show in silence and nothing
+ * is dialled. The mixer is made first in the effect and read before
+ * anything resumes the context. When the screen is done or skipped the
+ * sound fades out and the session gets its keys back. An opening question
+ * (`Opening`) stands before the connecting screen and holds the session
+ * busy the same way; it is silent, and the dial starts when the connecting
+ * screen mounts. The screen's state and whether it sounds are kept in refs
  * across StrictMode's remount, so the second mount (whose context the
- * first one's cleanup suspended, and which finds the key already set)
- * holds its own session busy and dials on its own director. The same one
+ * first one's cleanup suspended) holds its own session busy, shows the
+ * screens once and dials on its own director. The same one
  * subscription hears the carrier (C27): a drop hangs up
  * (`director.carrier`) and flashes `NO CARRIER`, the return after it plays
  * a short handshake, and `carrierGate` lets a pair sound at most once per
@@ -134,12 +135,7 @@ import { openRoute } from "../base";
 import { subscribeToChanges } from "../events/ChangeStreamProvider";
 import { createDirector } from "./audio/director";
 import { createMixer, makeAudioContext } from "./audio/mixer";
-import {
-  CARRIER_START,
-  CONNECTED_KEY,
-  carrierGate,
-  dialNumber,
-} from "./audio/modem";
+import { CARRIER_START, carrierGate, dialNumber } from "./audio/modem";
 import { changeKeys } from "./data/changes";
 import { loadDomainRows } from "./data/source";
 import { detectEnvironment, refusalReason, type Refusal } from "./device";
@@ -176,23 +172,6 @@ interface DialIn {
 
 /** The notice over a dropped change stream (M4 C27). */
 const NO_CARRIER = "NO CARRIER";
-
-/** Whether this tab already dialled in (M4 C26); unreadable storage: no. */
-function dialledIn(): boolean {
-  try {
-    return window.sessionStorage.getItem(CONNECTED_KEY) === "1";
-  } catch {
-    return false;
-  }
-}
-
-function markDialledIn(): void {
-  try {
-    window.sessionStorage.setItem(CONNECTED_KEY, "1");
-  } catch {
-    // Unwritable storage: the next mount dials in again.
-  }
-}
 
 /** The dial-in for `address`: its domain's number and name. */
 function dialInFor(address: StationAddress): DialIn {
@@ -250,6 +229,11 @@ export default function ExploreRoute() {
   // sound.
   const [dialIn, setDialIn] = useState<DialIn | null>(null);
   const dialInRef = useRef<DialIn | null>(null);
+  // Whether the launch's context ran when the screens first showed, and
+  // whether they have shown: the dial plays only on a running context, and
+  // the screens show once per mount, not again for a rebuilt session.
+  const soundedRef = useRef(false);
+  const shownRef = useRef(false);
   const hangUpRef = useRef<(() => void) | null>(null);
   // The opening question comes first: it stands over the first room until
   // it is done, and the dial-in starts only then (`startDialRef`, made by
@@ -291,7 +275,7 @@ export default function ExploreRoute() {
     });
     const dialling =
       dialInRef.current ??
-      (mixer.running && !dialledIn() ? dialInFor(addressRef.current) : null);
+      (shownRef.current ? null : dialInFor(addressRef.current));
     const director = createDirector(mixer);
     // Quiet while the pause shows or the tab is hidden, playing otherwise.
     let paused = false;
@@ -337,13 +321,15 @@ export default function ExploreRoute() {
       // they are done. A remount keeps the phase it was in.
       if (dialInRef.current === null) {
         openingRef.current = true;
+        soundedRef.current = mixer.running;
+        shownRef.current = true;
         setOpening(true);
       }
       dialInRef.current = dialling;
-      markDialledIn();
       session.setBusy(true);
       const dial = () => {
-        hangUpRef.current = director.dial(dialling.number);
+        if (soundedRef.current)
+          hangUpRef.current = director.dial(dialling.number);
       };
       if (openingRef.current) startDialRef.current = dial;
       else dial();

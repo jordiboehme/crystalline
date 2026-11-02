@@ -68,6 +68,19 @@ pub enum RemoteError {
         reset: Option<chrono::DateTime<chrono::Utc>>,
     },
 
+    /// A repository-role lookup through the GitHub App found no such login:
+    /// the account is unknown (perhaps renamed) or the repository is not
+    /// visible to the installation. Not the same as a login with no access.
+    #[error(
+        "GitHub has no account named {login} (it may have been renamed), or {repo} is not visible to the App."
+    )]
+    UserNotFound {
+        /// The repository, `owner/name`.
+        repo: String,
+        /// The login that was looked up.
+        login: String,
+    },
+
     /// The configured repository does not exist, or is not visible with the
     /// current GitHub connection.
     #[error(
@@ -270,6 +283,50 @@ pub enum RemoteError {
         /// A short, human-readable description of what went wrong.
         detail: String,
     },
+
+    /// The GitHub App's private key or client id could not be used to sign:
+    /// the PEM is not an RSA key, or signing failed. The text names the
+    /// problem and never carries key bytes.
+    #[error(
+        "The GitHub App credential is unusable: {0}. Check the private key and client id of the App."
+    )]
+    AppCredential(String),
+
+    /// The GitHub App is configured, but not installed on the repository (or
+    /// the installation does not grant it). Never answered with the instance
+    /// credential instead: the install url is the way out.
+    #[error(
+        "the GitHub App is not installed on {repo}: install it at {install_url}, then try again"
+    )]
+    AppNotInstalled {
+        /// The repository, `owner/name`.
+        repo: String,
+        /// Where an owner of the repository installs the App.
+        install_url: String,
+    },
+
+    /// GitHub answered 404 for an endpoint that always exists on a GitHub
+    /// that supports GitHub Apps: an Enterprise Server too old for it, or a
+    /// server that is not GitHub. `ghes_version` is the
+    /// `X-GitHub-Enterprise-Version` header when the server sent one.
+    #[error(
+        "This GitHub server does not offer {endpoint}{}. The GitHub App needs a GitHub Enterprise Server version that GitHub still supports; ask the server's administrator to upgrade, or check github.api_url.",
+        ghes_version_clause(ghes_version.as_deref())
+    )]
+    EndpointMissing {
+        /// The request that found no endpoint, `METHOD /path`.
+        endpoint: String,
+        /// The Enterprise Server version, when the server named one.
+        ghes_version: Option<String>,
+    },
+}
+
+/// The ` (GitHub Enterprise Server x.y.z)` clause of
+/// [`RemoteError::EndpointMissing`], empty when no version was sent.
+fn ghes_version_clause(version: Option<&str>) -> String {
+    version
+        .map(|v| format!(" (GitHub Enterprise Server {v})"))
+        .unwrap_or_default()
 }
 
 impl RemoteError {
@@ -298,6 +355,7 @@ impl RemoteError {
             | RemoteError::SsoAuthorizationRequired { .. }
             | RemoteError::OauthAppRestricted { .. }
             | RemoteError::RepoNotFound { .. }
+            | RemoteError::UserNotFound { .. }
             | RemoteError::NotADomain { .. }
             | RemoteError::ConflictsPending { .. }
             | RemoteError::ProposalNotFound { .. }
@@ -312,7 +370,10 @@ impl RemoteError {
             | RemoteError::WorkingTree { .. }
             | RemoteError::State(_)
             | RemoteError::Credential { .. }
-            | RemoteError::ServerCredential { .. } => false,
+            | RemoteError::ServerCredential { .. }
+            | RemoteError::AppCredential(_)
+            | RemoteError::AppNotInstalled { .. }
+            | RemoteError::EndpointMissing { .. } => false,
         }
     }
 }
@@ -970,6 +1031,26 @@ mod tests {
                 detail: "boom".to_string(),
             }
             .to_string(),
+            RemoteError::AppNotInstalled {
+                repo: "acme/knowledge".to_string(),
+                install_url: "https://github.com/apps/acme/installations/new".to_string(),
+            }
+            .to_string(),
+            RemoteError::UserNotFound {
+                repo: "acme/knowledge".to_string(),
+                login: "octocat".to_string(),
+            }
+            .to_string(),
+            RemoteError::EndpointMissing {
+                endpoint: "GET /app".to_string(),
+                ghes_version: Some("3.14.2".to_string()),
+            }
+            .to_string(),
+            RemoteError::EndpointMissing {
+                endpoint: "GET /app".to_string(),
+                ghes_version: None,
+            }
+            .to_string(),
         ];
         for msg in samples {
             assert!(!msg.contains(em_dash), "{msg}");
@@ -1017,6 +1098,14 @@ mod tests {
             },
             RemoteError::Refused("no".to_string()),
             RemoteError::NotEnabled,
+            RemoteError::AppNotInstalled {
+                repo: "team/knowledge".to_string(),
+                install_url: "https://github.com/apps/acme/installations/new".to_string(),
+            },
+            RemoteError::EndpointMissing {
+                endpoint: "GET /app".to_string(),
+                ghes_version: None,
+            },
         ] {
             assert!(!permanent.is_temporary(), "{permanent:?}");
         }

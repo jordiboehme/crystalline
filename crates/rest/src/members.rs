@@ -53,6 +53,15 @@
 //! What this does mean is that an instance viewer who owns a private domain
 //! administers it - which is the personal-private-domain case working as
 //! intended.
+//!
+//! **Reflection collaborators** sit beside the membership: an account given
+//! the Reflection `reader` or `contributor` level on one domain, on any
+//! domain kept as files, shared or private, governed by GitHub or not. A
+//! grant only raises the Reflection right and opens no engram, so it is not a
+//! membership row and needs no private domain. Listing and changing them
+//! needs [`DomainRight::Manage`]; a collaborator may always take itself off.
+//! On a shared domain Crystalline decides, only an instance admin holds
+//! `Manage`, so only an admin manages its collaborators there.
 
 use axum::Json;
 use axum::extract::State;
@@ -60,7 +69,8 @@ use axum::http::StatusCode;
 
 use super::auth::Identity;
 use super::auth_store::{
-    DomainMember, MemberLevel, ReflectionLevel, RefusalKind, StoreRefusal, normalize_account_name,
+    DomainMember, MemberLevel, ReflectionGrant, ReflectionLevel, RefusalKind, Role, StoreRefusal,
+    normalize_account_name,
 };
 use super::{
     ApiError, ApiJson, ApiPath, ProblemDetail, RestState, refuse_read_only, require_domain_read,
@@ -74,23 +84,90 @@ use crate::scope::DomainRight;
 /// owned (`AuthStore::remove_user`), leaving a domain only an instance admin
 /// can administer. An empty string there would read as an account whose name
 /// is empty, so the absence is spelled as one.
+///
+/// **On a domain GitHub governs** (`governance: "github"`) the people come
+/// from GitHub: `github_people` lists them with the level their role gives,
+/// `owner` is `null` and `members` is empty, because neither decides
+/// anything there. The membership rows Crystalline still holds for the
+/// domain are listed under `overridden`: they are kept for the day the App
+/// is removed, and nothing reads them until then.
 #[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 #[schema(description = "Who may reach one domain. `visibility` is `private` \
                         or `shared`; a shared domain has no owner and no \
                         members, because membership only decides anything \
-                        while a domain is private.")]
+                        while a domain is private. On a domain GitHub \
+                        governs (`governance` is `github`), the people on \
+                        GitHub decide: `github_people` lists them, `owner` \
+                        is null, `members` is empty, and the membership rows \
+                        kept from before are listed under `overridden`.")]
 pub struct MembersResponse {
     /// The account that owns this domain, or `null`: a shared domain has no
-    /// owner, and a private one whose owner's account was removed has none
-    /// either.
+    /// owner, a private one whose owner's account was removed has none
+    /// either, and on a domain GitHub governs the owner decides nothing.
     #[schema(example = "ada")]
     pub owner: Option<String>,
     /// `private` or `shared`.
     #[schema(example = "private")]
     pub visibility: &'static str,
-    /// Everyone invited, by name. Empty for a shared domain.
+    /// Everyone invited, by name. Empty for a shared domain and for a
+    /// domain GitHub governs.
     #[schema(value_type = Vec<super::schemas::DomainMember>)]
     pub members: Vec<DomainMember>,
+    /// `github` when access to this domain follows the GitHub App, else
+    /// `crystalline`.
+    pub governance: Governance,
+    /// The people GitHub lists on the repository, with the level their role
+    /// gives here and the account linked to them, for a caller who writes
+    /// here (GitHub write, maintain or admin, or an instance admin). `null`
+    /// for everybody else and on a domain GitHub does not govern; an empty
+    /// list while GitHub's answer is not known.
+    #[schema(value_type = Option<Vec<super::schemas::GithubPerson>>)]
+    pub github_people: Option<Vec<crate::engine::GithubPerson>>,
+    /// On a domain GitHub governs, for a caller with manager access: the
+    /// membership rows set in Crystalline, which GitHub overrides. Empty
+    /// everywhere else.
+    #[schema(value_type = Vec<super::schemas::DomainMember>)]
+    pub overridden: Vec<DomainMember>,
+    /// The Reflection collaborators of a domain kept as files, for a caller
+    /// with manager access; `null` for everybody else and on a domain kept
+    /// in the database.
+    #[schema(value_type = Option<Vec<super::schemas::ReflectionGrant>>)]
+    pub reflection_collaborators: Option<Vec<ReflectionGrant>>,
+    /// On a domain GitHub governs whose readers are set in the environment,
+    /// the sentence that says where; the visibility switch is read-only
+    /// then. `null` everywhere else.
+    #[schema(example = "Set by CRYSTALLINE_DOMAIN_KB_READERS; change it there.")]
+    pub visibility_fixed_by: Option<String>,
+    /// Why this domain is closed (the GitHub App is not installed on its
+    /// repository), for an instance admin; `null` otherwise.
+    pub closed_reason: Option<String>,
+}
+
+/// Who decides access to a domain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum Governance {
+    /// Access follows the GitHub App: the repository's people decide.
+    Github,
+    /// This instance's own accounts and membership records decide.
+    Crystalline,
+}
+
+/// The one answer every membership change on a domain GitHub governs gets.
+pub(crate) const FOLLOWS_GITHUB: &str = "access to this domain follows GitHub; change it on GitHub";
+
+/// The sentence a domain whose readers are set in the environment answers a
+/// visibility change with, naming the variable.
+pub(crate) fn env_readers_sentence(var: &str) -> String {
+    format!("Set by {var}; change it there.")
+}
+
+/// The 409 every membership change answers on a domain GitHub governs.
+fn refuse_governed(state: &RestState, domain: &str) -> Result<(), ApiError> {
+    if state.engine.github_governs(domain) {
+        return Err(ApiError::conflict(FOLLOWS_GITHUB));
+    }
+    Ok(())
 }
 
 /// What `PUT /domains/{domain}/members/{principal}` takes.
@@ -200,7 +277,8 @@ fn store_error(e: anyhow::Error) -> ApiError {
             | RefusalKind::IdentityAlreadyLinked
             | RefusalKind::IssuerAlreadyHeld
             | RefusalKind::NoSuchToken
-            | RefusalKind::CapReached,
+            | RefusalKind::CapReached
+            | RefusalKind::GithubIdTaken,
         )
         | None => ApiError::internal(format!("{e:#}")),
     }
@@ -356,11 +434,81 @@ pub async fn list(
         .domain_visibility(&domain)
         .await
         .map_err(|e| ApiError::internal(format!("reading this domain's visibility: {e:#}")))?;
+    let visibility = if acl.is_some() { "private" } else { "shared" };
+    let governed = state.engine.github_governs(&domain);
+    // The caller's right, read once: what of the governed half it is shown
+    // follows from it.
+    let right = state
+        .access
+        .right(&identity.scope(), &domain)
+        .await
+        .map_err(|e| {
+            ApiError::internal(format!("this domain's membership is unreadable: {e:#}"))
+        })?;
+    let reflection_collaborators =
+        reflection_collaborators_for(&state, &identity, &domain, right).await?;
+    if governed {
+        // Who GitHub lists is shown to the people who write here (GitHub
+        // write, maintain or admin, or an instance admin), never to a
+        // reader: on a public repository every signed-in account reads the
+        // domain, and the collaborator list is not public on GitHub.
+        let github_people = if right >= DomainRight::Write {
+            Some(
+                state
+                    .engine
+                    .github_people(&domain)
+                    .await
+                    .unwrap_or_default(),
+            )
+        } else {
+            None
+        };
+        // The rows survive a share on a governed domain, so they are read
+        // whatever the visibility, and only a manager sees them.
+        let overridden =
+            if right >= DomainRight::Manage {
+                state.auth.domain_members(&domain).await.map_err(|e| {
+                    ApiError::internal(format!("listing this domain's members: {e:#}"))
+                })?
+            } else {
+                Vec::new()
+            };
+        // Only where GitHub governs does the environment fix the switch.
+        let visibility_fixed_by = state
+            .engine
+            .env_readers_var(&domain)
+            .map(|var| env_readers_sentence(&var));
+        // Only an instance admin gets into a closed domain at all, so only
+        // one is told why it is closed.
+        let closed_reason = identity
+            .user
+            .as_ref()
+            .is_some_and(|user| user.role == Role::Admin)
+            .then(|| state.engine.github_closed_reason(&domain))
+            .flatten();
+        return Ok(Json(MembersResponse {
+            owner: None,
+            visibility,
+            members: Vec::new(),
+            governance: Governance::Github,
+            github_people,
+            overridden,
+            reflection_collaborators,
+            visibility_fixed_by,
+            closed_reason,
+        }));
+    }
     let Some(acl) = acl else {
         return Ok(Json(MembersResponse {
             owner: None,
-            visibility: "shared",
+            visibility,
             members: Vec::new(),
+            governance: Governance::Crystalline,
+            github_people: None,
+            overridden: Vec::new(),
+            reflection_collaborators,
+            visibility_fixed_by: None,
+            closed_reason: None,
         }));
     };
     let members = state
@@ -373,9 +521,39 @@ pub async fn list(
         // removed, which is the one value no live account can hold. It reaches
         // a client as `null` rather than as an empty name.
         owner: (!acl.owner.is_empty()).then_some(acl.owner),
-        visibility: "private",
+        visibility,
         members,
+        governance: Governance::Crystalline,
+        github_people: None,
+        overridden: Vec::new(),
+        reflection_collaborators,
+        visibility_fixed_by: None,
+        closed_reason: None,
     }))
+}
+
+/// The Reflection collaborators of `domain` when the caller manages it and
+/// it is kept as files, else `None`: the same gate
+/// `GET /domains/{domain}/reflection-collaborators` answers behind, so
+/// carrying them here widens nothing.
+async fn reflection_collaborators_for(
+    state: &RestState,
+    identity: &Identity,
+    domain: &str,
+    right: DomainRight,
+) -> Result<Option<Vec<ReflectionGrant>>, ApiError> {
+    if identity.user.is_none() || !state.engine.kept_as_files(domain) {
+        return Ok(None);
+    }
+    if right < DomainRight::Manage {
+        return Ok(None);
+    }
+    let grants = state.auth.reflection_grants(domain).await.map_err(|e| {
+        ApiError::internal(format!(
+            "listing this domain's Reflection collaborators: {e:#}"
+        ))
+    })?;
+    Ok(Some(grants))
 }
 
 /// `PUT /domains/{domain}/members/{principal}` - invite an account, or move
@@ -428,7 +606,8 @@ pub async fn list(
         ),
         (
             status = 409,
-            description = "The domain is shared, or the principal owns it.",
+            description = "The domain is shared, the principal owns it, or \
+                           access to this domain follows GitHub.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -454,13 +633,20 @@ pub async fn set_member(
     ApiPath((domain, principal)): ApiPath<(String, String)>,
     ApiJson(body): ApiJson<MemberBody>,
 ) -> Result<StatusCode, ApiError> {
-    let actor = require_right(&state, &identity, &domain, DomainRight::Manage, "manager").await?;
+    let actor = identity.require_account()?.name;
+    require_domain_read(&state, &identity, &domain).await?;
+    refuse_read_only(&state)?;
+    // GitHub decides who is here: a row written now would come back the day
+    // the App is removed, so none is written.
+    refuse_governed(&state, &domain)?;
+    refuse_below(&state, &identity, &domain, DomainRight::Manage, "manager").await?;
     let principal = principal_key(&principal)?;
     state
         .auth
         .upsert_domain_member(&domain, &principal, body.level, body.reflection, &actor)
         .await
         .map_err(store_error)?;
+    crate::readers_changed(&state);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -517,7 +703,8 @@ pub async fn set_member(
         ),
         (
             status = 409,
-            description = "The domain is shared, or the principal owns it.",
+            description = "The domain is shared, the principal owns it, or \
+                           access to this domain follows GitHub.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -559,6 +746,8 @@ pub async fn remove_member(
         require_domain_read(&state, &identity, &domain).await?;
     }
     refuse_read_only(&state)?;
+    // A leaver too: the row is kept for the day the App is removed.
+    refuse_governed(&state, &domain)?;
     if !leaving {
         refuse_below(&state, &identity, &domain, DomainRight::Manage, "manager").await?;
     }
@@ -593,6 +782,7 @@ pub async fn remove_member(
             "that account is not a member of this domain",
         ));
     }
+    crate::readers_changed(&state);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -647,7 +837,8 @@ pub async fn remove_member(
         ),
         (
             status = 409,
-            description = "The domain is shared, so it has no owner.",
+            description = "The domain is shared, so it has no owner, or access \
+                           to this domain follows GitHub.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -671,12 +862,313 @@ pub async fn set_owner(
     ApiPath(domain): ApiPath<String>,
     ApiJson(body): ApiJson<OwnerBody>,
 ) -> Result<StatusCode, ApiError> {
-    require_right(&state, &identity, &domain, DomainRight::Own, "owner").await?;
+    identity.require_account()?;
+    require_domain_read(&state, &identity, &domain).await?;
+    refuse_read_only(&state)?;
+    // A domain GitHub governs has no owner to hand on.
+    refuse_governed(&state, &domain)?;
+    refuse_below(&state, &identity, &domain, DomainRight::Own, "owner").await?;
     require_private(&state, &domain, "owner to hand on").await?;
     state
         .auth
         .transfer_domain(&domain, &body.owner)
         .await
         .map_err(store_error)?;
+    crate::readers_changed(&state);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// What a domain kept in the database is told when a Reflection
+/// collaborator is asked for: it has no Reflection to share.
+const KEPT_AS_FILES_ONLY: &str = "Reflection collaborators are for domains kept as files";
+
+/// The level a Reflection collaborator holds. Narrower than
+/// [`ReflectionLevel`]: `default` would grant nothing, and taking a grant
+/// away is `DELETE`.
+#[derive(Clone, Copy, Debug, serde::Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum GrantLevel {
+    /// Reads the Reflection and comments on it.
+    Reader,
+    /// Also edits reflection text and creates, moves and deletes reflections.
+    Contributor,
+}
+
+impl From<GrantLevel> for ReflectionLevel {
+    fn from(level: GrantLevel) -> ReflectionLevel {
+        match level {
+            GrantLevel::Reader => ReflectionLevel::Reader,
+            GrantLevel::Contributor => ReflectionLevel::Contributor,
+        }
+    }
+}
+
+/// What `GET /domains/{domain}/reflection-collaborators` answers with.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+#[schema(description = "The accounts given the Reflection reader or \
+                        contributor level on this one domain, beside what \
+                        their engram access gives them.")]
+pub struct ReflectionCollaboratorsResponse {
+    /// Every collaborator, by account name.
+    #[schema(value_type = Vec<super::schemas::ReflectionGrant>)]
+    pub collaborators: Vec<ReflectionGrant>,
+}
+
+/// What `PUT /domains/{domain}/reflection-collaborators/{account}` takes.
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+#[schema(description = "`reader` reads the Reflection and comments, \
+                        `contributor` also edits it. A grant only raises: an \
+                        engram editor curates whatever it says.")]
+pub struct ReflectionCollaboratorBody {
+    /// reader | contributor
+    #[schema(example = "reader")]
+    pub level: GrantLevel,
+}
+
+/// The 409 a domain kept in the database answers.
+fn require_kept_as_files(state: &RestState, domain: &str) -> Result<(), ApiError> {
+    if state.engine.kept_as_files(domain) {
+        Ok(())
+    } else {
+        Err(ApiError::conflict(KEPT_AS_FILES_ONLY))
+    }
+}
+
+/// `GET /domains/{domain}/reflection-collaborators` - who holds a
+/// per-domain Reflection grant here.
+#[utoipa::path(
+    get,
+    path = "/api/v1/domains/{domain}/reflection-collaborators",
+    tag = "domains",
+    operation_id = "list_reflection_collaborators",
+    summary = "The Reflection collaborators of one domain.",
+    description = "Needs manager access on the domain: its manager, its \
+                   owner, an instance admin, or on a domain GitHub governs a \
+                   GitHub maintainer or admin. A caller who may not see the \
+                   domain is answered 404, exactly as for a domain nobody \
+                   registered. A domain kept in the database answers 409.",
+    params(("domain" = String, Path, description = "The registered domain.")),
+    responses(
+        (
+            status = 200,
+            description = "The domain's Reflection collaborators.",
+            body = ReflectionCollaboratorsResponse,
+        ),
+        (
+            status = 401,
+            description = "No identity, or an anonymous one.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The caller is not a manager here.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "No such domain, or none this caller may see.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 409,
+            description = "The domain is kept in the database, not as files.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn list_reflection_collaborators(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiPath(domain): ApiPath<String>,
+) -> Result<Json<ReflectionCollaboratorsResponse>, ApiError> {
+    identity.require_account()?;
+    require_domain_read(&state, &identity, &domain).await?;
+    refuse_below(&state, &identity, &domain, DomainRight::Manage, "manager").await?;
+    require_kept_as_files(&state, &domain)?;
+    let collaborators = state.auth.reflection_grants(&domain).await.map_err(|e| {
+        ApiError::internal(format!(
+            "listing this domain's Reflection collaborators: {e:#}"
+        ))
+    })?;
+    Ok(Json(ReflectionCollaboratorsResponse { collaborators }))
+}
+
+/// `PUT /domains/{domain}/reflection-collaborators/{account}` - give an
+/// account the Reflection reader or contributor level on this domain, or
+/// change the level it holds.
+#[utoipa::path(
+    put,
+    path = "/api/v1/domains/{domain}/reflection-collaborators/{account}",
+    tag = "domains",
+    operation_id = "set_reflection_collaborator",
+    summary = "Give an account the Reflection of one domain.",
+    description = "Needs manager access on the domain. Works on any domain \
+                   kept as files, shared or private, governed by GitHub or \
+                   not. A grant only raises the Reflection right and opens \
+                   no engram: an account that reads no engram here reaches \
+                   the Reflection and nothing else.\n\nAn account that does \
+                   not exist or is disabled, and the reserved name `owner`, \
+                   are a 422, and so is a level other than `reader` or \
+                   `contributor`. A domain kept in the database answers 409.",
+    params(
+        ("domain" = String, Path, description = "The registered domain."),
+        ("account" = String, Path, description = "The account's login name."),
+    ),
+    request_body = ReflectionCollaboratorBody,
+    responses(
+        (status = 204, description = "The account holds that level here."),
+        (
+            status = 401,
+            description = "No identity, or an anonymous one.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The caller is not a manager here, the request did \
+                           not echo its CSRF token, or this instance is \
+                           read-only.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "No such domain, or none this caller may see.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 409,
+            description = "The domain is kept in the database, not as files.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 415,
+            description = "The body is not `application/json`.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 422,
+            description = "A level other than reader or contributor, or a \
+                           name that is no enabled account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn set_reflection_collaborator(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiPath((domain, account)): ApiPath<(String, String)>,
+    ApiJson(body): ApiJson<ReflectionCollaboratorBody>,
+) -> Result<StatusCode, ApiError> {
+    let actor = require_right(&state, &identity, &domain, DomainRight::Manage, "manager").await?;
+    require_kept_as_files(&state, &domain)?;
+    let account = principal_key(&account)?;
+    state
+        .auth
+        .set_reflection_grant(&domain, &account, body.level.into(), &actor)
+        .await
+        .map_err(store_error)?;
+    crate::readers_changed(&state);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `DELETE /domains/{domain}/reflection-collaborators/{account}` - take a
+/// Reflection grant away, or give up one's own.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/domains/{domain}/reflection-collaborators/{account}",
+    tag = "domains",
+    operation_id = "remove_reflection_collaborator",
+    summary = "Take an account's Reflection grant on one domain away.",
+    description = "Needs manager access on the domain, OR that the account \
+                   is the caller itself: a collaborator may always take \
+                   itself off, also where it reads no engram. A name that \
+                   holds no grant here is a 404. A domain kept in the \
+                   database answers 409.",
+    params(
+        ("domain" = String, Path, description = "The registered domain."),
+        ("account" = String, Path, description = "The account's login name."),
+    ),
+    responses(
+        (status = 204, description = "That account holds no grant here now."),
+        (
+            status = 401,
+            description = "No identity, or an anonymous one.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The caller is neither a manager here nor the \
+                           account itself, the request did not echo its CSRF \
+                           token, or this instance is read-only.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "No such domain, none this caller may see, or an \
+                           account that holds no grant on it.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 409,
+            description = "The domain is kept in the database, not as files.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn remove_reflection_collaborator(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiPath((domain, account)): ApiPath<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    let actor = identity.require_account()?;
+    let account = principal_key(&account)?;
+    let leaving = account == actor.name;
+    // A collaborator leaving is gated on its own grant rather than on
+    // engram read, so one that reads no engram here can leave too. Only a
+    // holder takes this branch, and a holder already knows the domain
+    // exists; everybody else meets the 404 an unregistered name answers.
+    let own_grant = leaving
+        && state
+            .auth
+            .reflection_grant(&domain, &actor.name)
+            .await
+            .is_ok_and(|grant| grant.is_some());
+    if !own_grant {
+        require_domain_read(&state, &identity, &domain).await?;
+    }
+    refuse_read_only(&state)?;
+    if !leaving {
+        refuse_below(&state, &identity, &domain, DomainRight::Manage, "manager").await?;
+    }
+    // A holder giving up its own grant always gets the row deleted, also
+    // one left on a name no longer registered as a domain kept as files:
+    // refusing would keep a grant its holder asked to drop.
+    if !own_grant {
+        require_kept_as_files(&state, &domain)?;
+    }
+    let removed = state
+        .auth
+        .remove_reflection_grant(&domain, &account)
+        .await
+        .map_err(store_error)?;
+    if !removed {
+        return Err(ApiError::not_found(
+            "that account holds no Reflection grant on this domain",
+        ));
+    }
+    crate::readers_changed(&state);
     Ok(StatusCode::NO_CONTENT)
 }

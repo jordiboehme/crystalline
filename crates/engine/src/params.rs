@@ -343,8 +343,11 @@ pub struct MoveParams {
     /// The new domain-relative path (with or without the `.md` suffix). Pass
     /// the engram's own current path to change only its permalink.
     pub destination: String,
-    /// Move to a different domain. Bare links from the domain it leaves gain
-    /// the domain prefix, `[[domain:Target]]`, so they still resolve.
+    /// Move to a different domain. The moved engram's bare links and
+    /// relations that resolved in the domain it leaves gain that domain's
+    /// prefix, `[[domain:permalink]]`, so they still resolve; a prefix that
+    /// names the destination is dropped. The receipt's `links_dead` names any
+    /// of its links that does not resolve after the move.
     #[serde(default)]
     pub destination_domain: Option<String>,
     /// The permalink the engram answers to after the move. Omit it and the
@@ -361,7 +364,7 @@ pub struct MoveParams {
     pub permalink: Option<String>,
     /// Rewrite every reference to the moved engram when its address changes:
     /// `[[old]]` and `[[domain:old]]` links, relations and `crystalline://domain/old`
-    /// URLs (a #fragment is kept), in every domain you can see. A relative
+    /// URLs (a #fragment is kept), in every domain you may write. A relative
     /// Markdown link ([text](../path.md)) follows the file instead: when the
     /// path changes inside the domain, links to it and its own relative links
     /// are rewritten so they land on the same files. Defaults to true; false
@@ -690,6 +693,17 @@ pub struct WriteReflectionParams {
     /// the MCP schema does not show it (schemars honours `serde(skip)`).
     #[serde(skip)]
     pub create_only: bool,
+    /// A person confirmed this write: its sections may carry text from a
+    /// domain fewer people may read than the page's, or one not shared
+    /// through GitHub while the page is backed up there. Holds the `basis`
+    /// of the question they said yes to
+    /// (`Engine::reflection_disclosure_question`), so a write whose readers
+    /// changed since is refused rather than recorded for readers the person
+    /// never saw. Set only by the surface that asked that person (the MCP
+    /// server after its question was answered); never deserialized, so no
+    /// agent can set it in its arguments and the MCP schema does not show it.
+    #[serde(skip)]
+    pub disclosed: Option<String>,
 }
 
 /// Parameters for `discuss`.
@@ -782,7 +796,11 @@ pub struct ConfigureParams {
     /// reflect_trigger and evolve_trigger: off or webhook, to have the
     /// instance send a signed webhook when reflect or evolve work is due;
     /// reflection_home is filled in when Reflection is switched on, never
-    /// set), what each MANIFEST section does and its .crystalline.yaml rule
+    /// set; team marks a domain shared through GitHub and is added by the
+    /// next share from a connected instance, never set; evolve_home names
+    /// the one instance whose scheduled evolve runs work a team domain, is
+    /// filled in by the first scheduled evolve run there and never set, and
+    /// unset moves it), what each MANIFEST section does and its .crystalline.yaml rule
     /// overrides. set and unset then address that
     /// domain: a policy key, `rules.<rule id>` (a verify rule's severity) or
     /// token_budget. Omit it for the instance settings.
@@ -859,6 +877,46 @@ pub struct AddDomainParams {
     /// default branch, asked from GitHub when the domain is added.
     #[serde(default)]
     pub branch: Option<String>,
+    /// Who may read a team domain: `shared` (everyone signed in) or
+    /// `private` (only people with access on GitHub). Required with `repo`
+    /// on an instance with a GitHub App, because access there follows GitHub
+    /// and nobody should open a confidential repository by accident; ignored
+    /// with a note without an App. Only with `repo`.
+    #[serde(default)]
+    pub readers: Option<Readers>,
+}
+
+/// Who may read a domain connected to GitHub on an instance with a GitHub
+/// App, chosen when it is connected. Access to such a domain follows GitHub:
+/// `shared` lets everyone signed in read it, `private` only the people with
+/// access to the repository on GitHub. Without an App it is not asked and
+/// is ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum Readers {
+    /// Everyone signed in reads it.
+    Shared,
+    /// Only people with access to the repository on GitHub read it.
+    Private,
+}
+
+impl Readers {
+    /// The spelling every surface takes and reports: `shared` or `private`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Readers::Shared => "shared",
+            Readers::Private => "private",
+        }
+    }
+
+    /// Reads `shared` or `private`, ignoring case and surrounding space.
+    pub fn parse(value: &str) -> Option<Readers> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "shared" => Some(Readers::Shared),
+            "private" => Some(Readers::Private),
+            _ => None,
+        }
+    }
 }
 
 /// Parameters for `remove_domain`.

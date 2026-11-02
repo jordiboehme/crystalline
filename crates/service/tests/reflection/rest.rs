@@ -906,10 +906,17 @@ fn reflection_requests(domain: &str) -> Vec<(reqwest::Method, String, Option<Val
     let body = json!({
         "markdown": "# A\n", "path": "guides/deploying.md", "section": "Night deploys",
         "text": "Why?", "outcome": "Yes.", "from": "guides/deploying.md", "to": "x/deploying.md",
+        "basis": "b1",
     });
     let ops: Vec<_> = crate::support::MOUNTED_OPERATIONS
         .iter()
-        .filter(|op| op.contains("{domain}/reflection"))
+        // The Reflection collaborator routes administer the domain, like
+        // its membership routes: an anonymous caller is refused 401 there
+        // before the domain is looked at (`rights.rs` pins their 404 for a
+        // signed-in stranger).
+        .filter(|op| {
+            op.contains("{domain}/reflection") && !op.contains("{domain}/reflection-collaborators")
+        })
         .map(|op| {
             let (method, template) = op.split_once(' ').unwrap();
             let mut path = template
@@ -928,7 +935,7 @@ fn reflection_requests(domain: &str) -> Vec<(reqwest::Method, String, Option<Val
         .collect();
     assert_eq!(
         ops.len(),
-        18,
+        19,
         "every per-domain reflection operation: {ops:?}"
     );
     ops

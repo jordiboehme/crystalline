@@ -307,6 +307,25 @@ export type AutomationResponse = {
 export type ChangeKind = 'added' | 'modified' | 'deleted' | 'moved';
 
 /**
+ * A domain closed because the GitHub App is not installed on its
+ * repository, or GitHub does not show the repository to the App.
+ */
+export type ClosedDomain = {
+    /**
+     * The domain.
+     */
+    domain: string;
+    /**
+     * What to do about it, in one sentence.
+     */
+    reason: string;
+    /**
+     * Its repository, `owner/name`.
+     */
+    repo: string;
+};
+
+/**
  * The wire form of a 412: a problem detail carrying the version the server
  * holds now, so a client can show a merge view instead of just failing.
  */
@@ -381,6 +400,7 @@ export type CreateDomainBody = {
      * shares.
      */
     private?: boolean;
+    readers?: Readers | null;
     /**
      * owner/name; github mode only.
      */
@@ -484,6 +504,26 @@ export type DiscardTargetBody = {
 };
 
 /**
+ * What `POST /domains/{domain}/reflection/disclose` takes.
+ */
+export type DiscloseReflectionBody = {
+    /**
+     * The item's `basis`: what the person's yes is bound to. When the
+     * page's readers or its repository changed since the item was read, the
+     * confirmation is refused with 409 and the person is asked again.
+     */
+    basis: string;
+    /**
+     * The reflection's path inside reflections/.
+     */
+    path: string;
+    /**
+     * The id of the section a `source_too_wide` item names.
+     */
+    section: string;
+};
+
+/**
  * A whole domain moved: refetch everything of it.
  */
 export type DomainChanged = {
@@ -558,6 +598,92 @@ export type EngramChanged = {
 export type FoldArg = 'fold' | 'discard';
 
 /**
+ * How access to the domains connected through the GitHub App stands: since when GitHub has not said who may use them while the last known roles still serve, and which domains are closed.
+ */
+export type GithubAccessResponse = {
+    /**
+     * The closed domains, each with its repository and what to do.
+     */
+    closed: Array<ClosedDomain>;
+    /**
+     * RFC 3339: since when GitHub has not answered while the last known
+     * roles still serve, or `null` while it answers.
+     */
+    stale_since?: string | null;
+};
+
+/**
+ * What `POST /settings/github/app/manifest` takes.
+ */
+export type GithubAppManifestBody = {
+    /**
+     * The GitHub organization the App is created for. Absent: the admin's
+     * own GitHub account.
+     */
+    org?: string | null;
+};
+
+/**
+ * What `POST /settings/github/app/manifest` answers: the form to post.
+ */
+export type GithubAppManifestResponse = {
+    /**
+     * The manifest. The page posts it JSON-encoded as the form field
+     * `manifest`.
+     */
+    manifest: {
+        [key: string]: unknown;
+    };
+    /**
+     * Where to post the form: GitHub's new-App page for the account or the
+     * organization, on the GitHub Enterprise Server host on GHES. Carries
+     * the state.
+     */
+    post_url: string;
+    /**
+     * The state GitHub sends back with the code. Good for one callback,
+     * for an hour, from this session only.
+     */
+    state: string;
+};
+
+/**
+ * The instance's GitHub App: which App it is, where it comes from and where an owner installs it. No secret, ever: only whether the webhook secret is set.
+ */
+export type GithubAppView = {
+    /**
+     * The numeric App id, when the App could be read.
+     */
+    app_id?: number | null;
+    /**
+     * Why the App cannot be used, when it cannot.
+     */
+    error?: string | null;
+    /**
+     * Where an owner installs the App on repositories. Null while the App
+     * cannot be used or its slug is not known yet.
+     */
+    install_url?: string | null;
+    /**
+     * True while a saved App is still being loaded: the other fields are
+     * not known yet, but an App is there, so none is to be created.
+     */
+    loading: boolean;
+    /**
+     * The App's slug, when known.
+     */
+    slug?: string | null;
+    /**
+     * keyring | file | environment.
+     */
+    source?: string | null;
+    /**
+     * Whether a webhook secret is set, so deliveries can be verified.
+     */
+    webhook_secret_set: boolean;
+};
+
+/**
  * One account's own GitHub identity: whose it is, whether a credential is on file, the login it authenticated as, since when and where it lives. No token material, ever.
  */
 export type GithubIdentityResponse = {
@@ -588,6 +714,54 @@ export type GithubIdentityResponse = {
      * environment supplies the machine's credential and never a personal one.
      */
     token_store?: string | null;
+    /**
+     * Set only by a disconnect that unlinked through the GitHub App and
+     * could not revoke the token at GitHub: the person should revoke it in
+     * their GitHub settings.
+     */
+    warning?: string | null;
+};
+
+/**
+ * One account's link to a GitHub account through the instance's GitHub App: who it is linked to, since when, and whether the user token still works. No token material, ever.
+ */
+export type GithubLinkResponse = {
+    /**
+     * Whether this instance has a GitHub App to link through. Any account
+     * may read it, unlike the admin-only settings read, so the profile picks
+     * its GitHub card by it.
+     */
+    app_configured: boolean;
+    /**
+     * The last link device flow's failure, reported on exactly one read.
+     */
+    error?: string | null;
+    /**
+     * GitHub's numeric user id.
+     */
+    github_id?: number | null;
+    /**
+     * `github.com` or the Enterprise Server host.
+     */
+    host?: string | null;
+    /**
+     * Whether the account is linked.
+     */
+    linked: boolean;
+    /**
+     * When the link was made, RFC 3339.
+     */
+    linked_at?: string | null;
+    /**
+     * The GitHub login last seen for the linked id.
+     */
+    login?: string | null;
+    pending?: GithubPendingView | null;
+    /**
+     * False once the user token is known to be gone (revoked, or its
+     * refresh token expired). The link stays; linking again restores it.
+     */
+    token_live: boolean;
 };
 
 /**
@@ -612,9 +786,34 @@ export type GithubPendingView = {
 };
 
 /**
+ * One person GitHub lists on a governed domain's repository.
+ */
+export type GithubPerson = {
+    /**
+     * The account linked to that GitHub login here, or `null` when nobody
+     * here is linked to it.
+     */
+    account?: string | null;
+    /**
+     * Their role on the repository: `admin`, `maintain`, `write`,
+     * `triage` or `read`.
+     */
+    github_role: string;
+    /**
+     * The level that role gives on this domain.
+     */
+    level: MemberLevel;
+    /**
+     * The login GitHub lists.
+     */
+    login: string;
+};
+
+/**
  * The GitHub connection as the settings screen renders and polls it. No token material, ever: only whether the feature is on, whether a credential is on file, whose it is and where it lives.
  */
 export type GithubStatusResponse = {
+    app?: GithubAppView | null;
     /**
      * Whether a credential is on file for this instance.
      */
@@ -638,6 +837,37 @@ export type GithubStatusResponse = {
      */
     user?: string | null;
 };
+
+/**
+ * What an unlink answers.
+ */
+export type GithubUnlinkResponse = {
+    /**
+     * Always false: the account is not linked any more.
+     */
+    linked: boolean;
+    /**
+     * Set when the link is gone here but GitHub did not revoke the token:
+     * the person should revoke it in their GitHub settings.
+     */
+    warning?: string | null;
+    /**
+     * Whether there was a link to remove.
+     */
+    was_linked: boolean;
+};
+
+/**
+ * Who decides access to a domain.
+ */
+export type Governance = 'github' | 'crystalline';
+
+/**
+ * The level a Reflection collaborator holds. Narrower than
+ * [`ReflectionLevel`]: `default` would grant nothing, and taking a grant
+ * away is `DELETE`.
+ */
+export type GrantLevel = 'reader' | 'contributor';
 
 /**
  * One identity an external provider asserts, tied to one account.
@@ -1188,23 +1418,60 @@ export type MemberBody = {
 export type MemberLevel = 'none' | 'viewer' | 'editor' | 'manager';
 
 /**
- * Who may reach one domain. `visibility` is `private` or `shared`; a shared domain has no owner and no members, because membership only decides anything while a domain is private.
+ * Who may reach one domain. `visibility` is `private` or `shared`; a shared domain has no owner and no members, because membership only decides anything while a domain is private. On a domain GitHub governs (`governance` is `github`), the people on GitHub decide: `github_people` lists them, `owner` is null, `members` is empty, and the membership rows kept from before are listed under `overridden`.
  */
 export type MembersResponse = {
     /**
-     * Everyone invited, by name. Empty for a shared domain.
+     * Why this domain is closed (the GitHub App is not installed on its
+     * repository), for an instance admin; `null` otherwise.
+     */
+    closed_reason?: string | null;
+    /**
+     * The people GitHub lists on the repository, with the level their role
+     * gives here and the account linked to them, for a caller who writes
+     * here (GitHub write, maintain or admin, or an instance admin). `null`
+     * for everybody else and on a domain GitHub does not govern; an empty
+     * list while GitHub's answer is not known.
+     */
+    github_people?: Array<GithubPerson> | null;
+    /**
+     * `github` when access to this domain follows the GitHub App, else
+     * `crystalline`.
+     */
+    governance: Governance;
+    /**
+     * Everyone invited, by name. Empty for a shared domain and for a
+     * domain GitHub governs.
      */
     members: Array<DomainMember>;
     /**
+     * On a domain GitHub governs, for a caller with manager access: the
+     * membership rows set in Crystalline, which GitHub overrides. Empty
+     * everywhere else.
+     */
+    overridden: Array<DomainMember>;
+    /**
      * The account that owns this domain, or `null`: a shared domain has no
-     * owner, and a private one whose owner's account was removed has none
-     * either.
+     * owner, a private one whose owner's account was removed has none
+     * either, and on a domain GitHub governs the owner decides nothing.
      */
     owner?: string | null;
+    /**
+     * The Reflection collaborators of a domain kept as files, for a caller
+     * with manager access; `null` for everybody else and on a domain kept
+     * in the database.
+     */
+    reflection_collaborators?: Array<ReflectionGrant> | null;
     /**
      * `private` or `shared`.
      */
     visibility: string;
+    /**
+     * On a domain GitHub governs whose readers are set in the environment,
+     * the sentence that says where; the visibility switch is read-only
+     * then. `null` everywhere else.
+     */
+    visibility_fixed_by?: string | null;
 };
 
 /**
@@ -1609,6 +1876,12 @@ export type ProvisioningView = {
 };
 
 /**
+ * Who may read a team domain on an instance with a GitHub App: `shared`
+ * (everyone signed in) or `private` (only people with access on GitHub).
+ */
+export type Readers = 'shared' | 'private';
+
+/**
  * Every file of a domain's Reflection.
  */
 export type ReflectionAssetsResponse = {
@@ -1648,6 +1921,50 @@ export type ReflectionChanged = {
      * Reflection, then).
      */
     path: string;
+};
+
+/**
+ * `reader` reads the Reflection and comments, `contributor` also edits it. A grant only raises: an engram editor curates whatever it says.
+ */
+export type ReflectionCollaboratorBody = {
+    /**
+     * reader | contributor
+     */
+    level: GrantLevel;
+};
+
+/**
+ * The accounts given the Reflection reader or contributor level on this one domain, beside what their engram access gives them.
+ */
+export type ReflectionCollaboratorsResponse = {
+    /**
+     * Every collaborator, by account name.
+     */
+    collaborators: Array<ReflectionGrant>;
+};
+
+/**
+ * One per-domain Reflection collaborator: an account given the Reflection
+ * reader or contributor level on one domain. A grant only raises the
+ * Reflection right and never opens an engram.
+ */
+export type ReflectionGrant = {
+    /**
+     * The account's login name, folded.
+     */
+    account: string;
+    /**
+     * RFC 3339, when this grant was last written.
+     */
+    added_at: string;
+    /**
+     * Who added or last changed this grant.
+     */
+    added_by: string;
+    /**
+     * `reader` or `contributor`.
+     */
+    level: ReflectionLevel;
 };
 
 /**
@@ -1965,6 +2282,17 @@ export type ShareBody = {
      * The pull request title. Defaults to a generated summary.
      */
     title?: string | null;
+};
+
+/**
+ * What `POST /me/github-link/start` answers: where to send the browser.
+ */
+export type StartGithubLinkResponse = {
+    /**
+     * GitHub's authorize url for this flow. The page navigates the browser
+     * there; GitHub sends it back to the callback.
+     */
+    authorize_url: string;
 };
 
 /**
@@ -2757,7 +3085,7 @@ export type CollabJoinErrors = {
      */
     401: ProblemDetail;
     /**
-     * Viewer role, read-only instance, or a missing/foreign Origin.
+     * No write right on the domain (a viewer, or on a domain GitHub governs no GitHub write), a read-only instance, or a missing/foreign Origin.
      */
     403: ProblemDetail;
     /**
@@ -2868,6 +3196,8 @@ export type ListDomainsResponses = {
      *
      * Every domain also carries `canonical_name` (the name its content carries), `aliases` (its former local names, still accepted as input), `name_origin` (`explicit` or `derived`, `null` for a legacy entry nothing has inferred yet), `shadowed` (whether another domain's local name already holds this one's canonical name - a bool, never naming the other domain), `renaming` (whether a rename has this domain paused right now; always present, so every row keeps the same columns) and `rename_pending` (`{from, to, seen_at}` when a sync saw this domain's MANIFEST `domain_name` change and nobody has finished the rename or kept the links yet, `null` otherwise).
      *
+     * Every domain carries `may_share`: whether this session may drive the domain's share surfaces (its sync status, the preview, the share, a withdrawal and a conflict), answered by the gate those routes use. On a domain GitHub governs it follows the GitHub role, so it can be true for an instance viewer. A row's `read_only`, sent only when true, says this session cannot write into the domain; on a domain GitHub governs it follows the GitHub role too.
+     *
      * For an instance admin, `mounted` lists the domains this machine offers from connected servers (`crystalline connect`): each one's local `name`, its `source`, the server's `source_url`, its `remote_name` there and the `web_url` of its page on that server (`null` unless the address is http or https). They are not served here.
      */
     200: {
@@ -2902,7 +3232,7 @@ export type CreateDomainErrors = {
      */
     415: ProblemDetail;
     /**
-     * An unknown mode, no name for a local or virtual domain (github alone may omit it), a name that could escape the domains root, a github `repo` that is not owner/name or a `path` that is absolute or holds a `..` segment, or a field that does not belong to the mode asked for.
+     * An unknown mode, no name for a local or virtual domain (github alone may omit it), a name that could escape the domains root, a github `repo` that is not owner/name or a `path` that is absolute or holds a `..` segment, a field that does not belong to the mode asked for, a `readers` that is neither shared nor private or that contradicts `private`, or a team domain without `readers` on an instance with a GitHub App.
      */
     422: ProblemDetail;
 };
@@ -3262,7 +3592,7 @@ export type DiscardDomainChangesErrors = {
      */
     401: ProblemDetail;
     /**
-     * A viewer, a membership below editor, or a read-only instance.
+     * No write right on this domain (a viewer, a membership below editor, or on a domain GitHub governs no GitHub write), or a read-only instance.
      */
     403: ProblemDetail;
     /**
@@ -3569,7 +3899,7 @@ export type CreateEngramErrors = {
      */
     401: ProblemDetail;
     /**
-     * The caller is not an editor, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
+     * The caller may not write this domain (not an editor, or on a domain GitHub governs, no GitHub write), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
      */
     403: ProblemDetail;
     /**
@@ -3639,7 +3969,7 @@ export type DeleteEngramErrors = {
      */
     401: ProblemDetail;
     /**
-     * The caller is not an editor, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. A read-only instance answers this ahead of the precondition check, so it is never 428.
+     * The caller may not write this domain (not an editor, or on a domain GitHub governs, no GitHub write), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. A read-only instance answers this ahead of the precondition check, so it is never 428.
      */
     403: ProblemDetail;
     /**
@@ -3759,7 +4089,7 @@ export type SaveEngramErrors = {
      */
     401: ProblemDetail;
     /**
-     * The caller is not an editor, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. A read-only instance answers this ahead of the precondition check, so it is never 428. A presented `X-Crystalline-Join` that names no live join of this account's is answered here too: the draft was left, the link ran out or was taken back, or the draft was folded, discarded or renamed, and nothing of the caller's was written.
+     * The caller may not write this domain (not an editor, or on a domain GitHub governs, no GitHub write), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. A read-only instance answers this ahead of the precondition check, so it is never 428. A presented `X-Crystalline-Join` that names no live join of this account's is answered here too: the draft was left, the link ran out or was taken back, or the draft was folded, discarded or renamed, and nothing of the caller's was written.
      */
     403: ProblemDetail;
     /**
@@ -3931,7 +4261,7 @@ export type DeleteAttachmentErrors = {
      */
     401: ProblemDetail;
     /**
-     * The caller is not an editor, the CSRF token is missing or wrong, the instance is read-only, or a presented `X-Crystalline-Join` names no live join of this account's.
+     * The caller may not write this domain (not an editor, or on a domain GitHub governs, no GitHub write), the CSRF token is missing or wrong, the instance is read-only, or a presented `X-Crystalline-Join` names no live join of this account's.
      */
     403: ProblemDetail;
     /**
@@ -4050,7 +4380,7 @@ export type WriteAttachmentErrors = {
      */
     401: ProblemDetail;
     /**
-     * The caller is not an editor, the CSRF token is missing or wrong, the instance is read-only, or a presented `X-Crystalline-Join` names no live join of this account's.
+     * The caller may not write this domain (not an editor, or on a domain GitHub governs, no GitHub write), the CSRF token is missing or wrong, the instance is read-only, or a presented `X-Crystalline-Join` names no live join of this account's.
      */
     403: ProblemDetail;
     /**
@@ -4497,7 +4827,7 @@ export type RemoveDomainMemberErrors = {
      */
     404: ProblemDetail;
     /**
-     * The domain is shared, or the principal owns it.
+     * The domain is shared, the principal owns it, or access to this domain follows GitHub.
      */
     409: ProblemDetail;
 };
@@ -4543,7 +4873,7 @@ export type SetDomainMemberErrors = {
      */
     404: ProblemDetail;
     /**
-     * The domain is shared, or the principal owns it.
+     * The domain is shared, the principal owns it, or access to this domain follows GitHub.
      */
     409: ProblemDetail;
     /**
@@ -4585,7 +4915,7 @@ export type MoveEngramErrors = {
      */
     401: ProblemDetail;
     /**
-     * The caller is not an editor, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
+     * The caller may not write this domain (not an editor, or on a domain GitHub governs, no GitHub write), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
      */
     403: ProblemDetail;
     /**
@@ -4653,7 +4983,7 @@ export type SetDomainOwnerErrors = {
      */
     404: ProblemDetail;
     /**
-     * The domain is shared, so it has no owner.
+     * The domain is shared, so it has no owner, or access to this domain follows GitHub.
      */
     409: ProblemDetail;
     /**
@@ -4700,7 +5030,7 @@ export type GetReflectionStatusError = GetReflectionStatusErrors[keyof GetReflec
 
 export type GetReflectionStatusResponses = {
     /**
-     * ReflectionStatus. `state` is `off`, `pending` (then `pending_engrams` lists the engrams still under `reflections/` for a caller with `engrams_visible`, and is empty for anyone else), `homeless`, `on`, `elsewhere` (then `home_url` is set) or `hosted_elsewhere` (another instance on this shared database holds the domain's host lock and serves it; then `host_label` names that instance, or is `null` while a rename pauses a domain whose lock nobody holds, and it is `null` in every other state). `member` is true when the caller holds a membership row it may leave.
+     * ReflectionStatus. `state` is `off`, `pending` (then `pending_engrams` lists the engrams still under `reflections/` for a caller with `engrams_visible`, and is empty for anyone else), `homeless`, `on`, `elsewhere` (then `home_url` is set) or `hosted_elsewhere` (another instance on this shared database holds the domain's host lock and serves it; then `host_label` names that instance, or is `null` while a rename pauses a domain whose lock nobody holds, and it is `null` in every other state). `member` is true when the caller holds a membership row it may leave; `collaborator` is true when it holds a per-domain Reflection grant it may give up (`DELETE /domains/{domain}/reflection-collaborators/{account}`). `governance` is `github` when access to the domain follows the GitHub App (then `member` is always false), else `crystalline`; `private` says whether the domain is private.
      */
     200: {
         [key: string]: unknown;
@@ -4708,6 +5038,148 @@ export type GetReflectionStatusResponses = {
 };
 
 export type GetReflectionStatusResponse = GetReflectionStatusResponses[keyof GetReflectionStatusResponses];
+
+export type ListReflectionCollaboratorsData = {
+    body?: never;
+    path: {
+        /**
+         * The registered domain.
+         */
+        domain: string;
+    };
+    query?: never;
+    url: '/api/v1/domains/{domain}/reflection-collaborators';
+};
+
+export type ListReflectionCollaboratorsErrors = {
+    /**
+     * No identity, or an anonymous one.
+     */
+    401: ProblemDetail;
+    /**
+     * The caller is not a manager here.
+     */
+    403: ProblemDetail;
+    /**
+     * No such domain, or none this caller may see.
+     */
+    404: ProblemDetail;
+    /**
+     * The domain is kept in the database, not as files.
+     */
+    409: ProblemDetail;
+};
+
+export type ListReflectionCollaboratorsError = ListReflectionCollaboratorsErrors[keyof ListReflectionCollaboratorsErrors];
+
+export type ListReflectionCollaboratorsResponses = {
+    /**
+     * The domain's Reflection collaborators.
+     */
+    200: ReflectionCollaboratorsResponse;
+};
+
+export type ListReflectionCollaboratorsResponse = ListReflectionCollaboratorsResponses[keyof ListReflectionCollaboratorsResponses];
+
+export type RemoveReflectionCollaboratorData = {
+    body?: never;
+    path: {
+        /**
+         * The registered domain.
+         */
+        domain: string;
+        /**
+         * The account's login name.
+         */
+        account: string;
+    };
+    query?: never;
+    url: '/api/v1/domains/{domain}/reflection-collaborators/{account}';
+};
+
+export type RemoveReflectionCollaboratorErrors = {
+    /**
+     * No identity, or an anonymous one.
+     */
+    401: ProblemDetail;
+    /**
+     * The caller is neither a manager here nor the account itself, the request did not echo its CSRF token, or this instance is read-only.
+     */
+    403: ProblemDetail;
+    /**
+     * No such domain, none this caller may see, or an account that holds no grant on it.
+     */
+    404: ProblemDetail;
+    /**
+     * The domain is kept in the database, not as files.
+     */
+    409: ProblemDetail;
+};
+
+export type RemoveReflectionCollaboratorError = RemoveReflectionCollaboratorErrors[keyof RemoveReflectionCollaboratorErrors];
+
+export type RemoveReflectionCollaboratorResponses = {
+    /**
+     * That account holds no grant here now.
+     */
+    204: void;
+};
+
+export type RemoveReflectionCollaboratorResponse = RemoveReflectionCollaboratorResponses[keyof RemoveReflectionCollaboratorResponses];
+
+export type SetReflectionCollaboratorData = {
+    body: ReflectionCollaboratorBody;
+    path: {
+        /**
+         * The registered domain.
+         */
+        domain: string;
+        /**
+         * The account's login name.
+         */
+        account: string;
+    };
+    query?: never;
+    url: '/api/v1/domains/{domain}/reflection-collaborators/{account}';
+};
+
+export type SetReflectionCollaboratorErrors = {
+    /**
+     * No identity, or an anonymous one.
+     */
+    401: ProblemDetail;
+    /**
+     * The caller is not a manager here, the request did not echo its CSRF token, or this instance is read-only.
+     */
+    403: ProblemDetail;
+    /**
+     * No such domain, or none this caller may see.
+     */
+    404: ProblemDetail;
+    /**
+     * The domain is kept in the database, not as files.
+     */
+    409: ProblemDetail;
+    /**
+     * The body is not `application/json`.
+     */
+    415: ProblemDetail;
+    /**
+     * A level other than reader or contributor, or a name that is no enabled account.
+     */
+    422: ProblemDetail;
+};
+
+export type SetReflectionCollaboratorError = SetReflectionCollaboratorErrors[keyof SetReflectionCollaboratorErrors];
+
+export type SetReflectionCollaboratorResponses = {
+    /**
+     * The account holds that level here.
+     */
+    204: void;
+};
+
+export type SetReflectionCollaboratorResponse = SetReflectionCollaboratorResponses[keyof SetReflectionCollaboratorResponses];
 
 export type ListReflectionAssetsData = {
     body?: never;
@@ -4902,6 +5374,54 @@ export type WriteReflectionAssetResponses = {
 
 export type WriteReflectionAssetResponse = WriteReflectionAssetResponses[keyof WriteReflectionAssetResponses];
 
+export type DiscloseReflectionSectionData = {
+    body: DiscloseReflectionBody;
+    path: {
+        /**
+         * The domain.
+         */
+        domain: string;
+    };
+    query?: never;
+    url: '/api/v1/domains/{domain}/reflection/disclose';
+};
+
+export type DiscloseReflectionSectionErrors = {
+    /**
+     * The anonymous viewer: nobody is behind it to confirm.
+     */
+    401: ProblemDetail;
+    /**
+     * Below curate access, a source in a domain this caller may not read (not named), or this instance is read-only.
+     */
+    403: ProblemDetail;
+    /**
+     * No such domain, page or section with sources.
+     */
+    404: ProblemDetail;
+    /**
+     * Who may read the page, or where it is backed up, changed since the item was read: read the queue again and ask the person the new question.
+     */
+    409: ProblemDetail;
+    /**
+     * A bad path, or nobody here knows who reads which domain because the accounts store could not be read.
+     */
+    422: ProblemDetail;
+};
+
+export type DiscloseReflectionSectionError = DiscloseReflectionSectionErrors[keyof DiscloseReflectionSectionErrors];
+
+export type DiscloseReflectionSectionResponses = {
+    /**
+     * Confirmed: `{ domain, path, section, disclosed }`, `disclosed` `{ by, at }`, or null when nothing in the section needed a confirmation.
+     */
+    200: {
+        [key: string]: unknown;
+    };
+};
+
+export type DiscloseReflectionSectionResponse = DiscloseReflectionSectionResponses[keyof DiscloseReflectionSectionResponses];
+
 export type MoveReflectionData = {
     body: MoveReflectionBody;
     path: {
@@ -5034,7 +5554,7 @@ export type GetReflectQueueError = GetReflectQueueErrors[keyof GetReflectQueueEr
 
 export type GetReflectQueueResponses = {
     /**
-     * ReflectQueue. `kind` is `feedback` (`what`: `new`, `changed`, `removed`), `update` (`source_changed`, `source_retired`, `source_missing`, `unreflected`, `off_structure`, `pact_changed`) or `review` (`thread`, with `thread`, the thread's id, and, when its opening comment is a conventional comment, `label` and `blocking`; a blocking thread comes first among the threads of its section). `sources`, an `unreflected` item's `folder` and `engrams`, and an `engram_attachment` item's `targets` are absent for a caller who cannot read engrams. The MCP `reflect` tool answers the same shape with `scope: { domains, kinds }` in place of `domain` and a `domain` member on each row; its `scope` may carry `unreadable`, the names of the domains whose queue could not be read, and `pending`, the names of the domains whose Reflection waits for engrams to leave `reflections/`. An update item's `what` may also be `asset_missing` (per section, with `assets`), `engram_attachment` (per section, with `targets`), `asset_unreferenced` (`path` empty, with `asset`) or `host_moved` (`path` empty, one per domain, after the domain moved to this instance on a shared database and this disk lacks files the previous host wrote: `only_elsewhere` is `{ previous_host, engrams, attachments, pages, files }`, counts only, `previous_host` null when unknown) or `source_unavailable` (one per page and domain that cannot be checked here, `section` null, with `source_domain`, `count`, `sections` and `note`). A source in `sources` may carry `domain`, the local name of another domain than the page's. Sources in a domain the caller may not open are never named. A feedback item and an update item then carry `hidden_sources`, their count, and `note`, one plain sentence whatever their state. A feedback item keeps its own `what`; for update items such sources are always on the section's `source_changed` item, aged by its page. An `off_structure` item carries `structure`, the pact's globs, and `hint` when none of them fits any page; a `pact_changed` item carries `diff` and `sections`, the ids of the changed parts of the pact.
+     * ReflectQueue. `kind` is `feedback` (`what`: `new`, `changed`, `removed`), `update` (`source_changed`, `source_retired`, `source_missing`, `unreflected`, `off_structure`, `pact_changed`) or `review` (`thread`, with `thread`, the thread's id, and, when its opening comment is a conventional comment, `label` and `blocking`; a blocking thread comes first among the threads of its section). `sources`, an `unreflected` item's `folder` and `engrams`, and an `engram_attachment` item's `targets` are absent for a caller who cannot read engrams. The MCP `reflect` tool answers the same shape with `scope: { domains, kinds }` in place of `domain` and a `domain` member on each row; its `scope` may carry `unreadable`, the names of the domains whose queue could not be read, and `pending`, the names of the domains whose Reflection waits for engrams to leave `reflections/`. An update item's `what` may also be `asset_missing` (per section, with `assets`), `engram_attachment` (per section, with `targets`), `asset_unreferenced` (`path` empty, with `asset`) or `host_moved` (`path` empty, one per domain, after the domain moved to this instance on a shared database and this disk lacks files the previous host wrote: `only_elsewhere` is `{ previous_host, engrams, attachments, pages, files }`, counts only, `previous_host` null when unknown), `source_unavailable` (one per page and domain that cannot be checked here, `section` null, with `source_domain`, `count`, `sections` and `note`) or `source_too_wide` (one per section that cites a domain fewer people may read than the page's domain, with `sources`, `note`, `question`, what a person is asked before they share it on purpose through `POST /domains/{domain}/reflection/disclose`, and `basis`, what that call carries back; only sources the caller may open count). A source in `sources` may carry `domain`, the local name of another domain than the page's. Sources in a domain the caller may not open are never named. A feedback item and an update item then carry `hidden_sources`, their count, and `note`, one plain sentence whatever their state. A feedback item keeps its own `what`; for update items such sources are always on the section's `source_changed` item, aged by its page. An `off_structure` item carries `structure`, the pact's globs, and `hint` when none of them fits any page; a `pact_changed` item carries `diff` and `sections`, the ids of the changed parts of the pact.
      */
     200: {
         [key: string]: unknown;
@@ -5655,7 +6175,7 @@ export type RetireEngramErrors = {
      */
     401: ProblemDetail;
     /**
-     * The caller is not an editor, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
+     * The caller may not write this domain (not an editor, or on a domain GitHub governs, no GitHub write), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
      */
     403: ProblemDetail;
     /**
@@ -5755,7 +6275,7 @@ export type GetDomainSyncStatusErrors = {
      */
     401: ProblemDetail;
     /**
-     * The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`), or the trusted-header identity names a disabled account.
+     * The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`; on a domain GitHub governs, whoever may write it), or the trusted-header identity names a disabled account.
      */
     403: ProblemDetail;
     /**
@@ -5849,7 +6369,7 @@ export type GetDomainShareChangesErrors = {
      */
     401: ProblemDetail;
     /**
-     * The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`), this instance is read-only, or the trusted-header identity names a disabled account.
+     * The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`; on a domain GitHub governs, whoever may write it), this instance is read-only, or the trusted-header identity names a disabled account.
      */
     403: ProblemDetail;
     /**
@@ -5897,7 +6417,7 @@ export type GetDomainConflictErrors = {
      */
     401: ProblemDetail;
     /**
-     * The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`), or the trusted-header identity names a disabled account.
+     * The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`; on a domain GitHub governs, whoever may write it), or the trusted-header identity names a disabled account.
      */
     403: ProblemDetail;
     /**
@@ -5945,7 +6465,7 @@ export type ResolveDomainConflictErrors = {
      */
     401: ProblemDetail;
     /**
-     * The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
+     * The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`; on a domain GitHub governs, whoever may write it), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
      */
     403: ProblemDetail;
     /**
@@ -6001,7 +6521,7 @@ export type WithdrawDomainProposalErrors = {
      */
     401: ProblemDetail;
     /**
-     * The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
+     * The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`; on a domain GitHub governs, whoever may write it), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
      */
     403: ProblemDetail;
     /**
@@ -6049,7 +6569,7 @@ export type ShareDomainErrors = {
      */
     401: ProblemDetail;
     /**
-     * The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
+     * The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`; on a domain GitHub governs, whoever may write it), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
      */
     403: ProblemDetail;
     /**
@@ -6175,6 +6695,10 @@ export type SetDomainVisibilityErrors = {
      * No such domain, or none this caller may see.
      */
     404: ProblemDetail;
+    /**
+     * Who may read this domain is set in the environment (`CRYSTALLINE_DOMAIN_<NAME>_READERS`).
+     */
+    409: ProblemDetail;
 };
 
 export type SetDomainVisibilityError = SetDomainVisibilityErrors[keyof SetDomainVisibilityErrors];
@@ -6444,6 +6968,77 @@ export type GetEvolveQueueResponses = {
 
 export type GetEvolveQueueResponse = GetEvolveQueueResponses[keyof GetEvolveQueueResponses];
 
+export type GetGithubAccessData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/v1/github/access';
+};
+
+export type GetGithubAccessErrors = {
+    /**
+     * No identity.
+     */
+    401: ProblemDetail;
+    /**
+     * The caller is not an admin.
+     */
+    403: ProblemDetail;
+};
+
+export type GetGithubAccessError = GetGithubAccessErrors[keyof GetGithubAccessErrors];
+
+export type GetGithubAccessResponses = {
+    /**
+     * How access stands.
+     */
+    200: GithubAccessResponse;
+};
+
+export type GetGithubAccessResponse = GetGithubAccessResponses[keyof GetGithubAccessResponses];
+
+export type FinishGithubAppManifestData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * The code GitHub converts into the App's credentials, once.
+         */
+        code?: string;
+        /**
+         * The state the form was handed out with.
+         */
+        state?: string;
+    };
+    url: '/api/v1/github/app/created';
+};
+
+export type FinishGithubAppManifestErrors = {
+    /**
+     * An HTML page: no signed-in session. The state is not spent.
+     */
+    401: unknown;
+    /**
+     * An HTML page: the caller is not an admin, this instance is read-only, or the state is missing, unknown, used, expired or another session's.
+     */
+    403: unknown;
+    /**
+     * An HTML page: a GitHub App is already configured, and the code was not converted.
+     */
+    409: unknown;
+    /**
+     * An HTML page: GitHub did not convert the code, or the App it answered could not be stored. The text says why, with the GitHub Enterprise Server version when the server lacks the endpoint.
+     */
+    502: unknown;
+};
+
+export type GithubAppInstalledData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/v1/github/app/setup';
+};
+
 export type GithubDomainNameData = {
     body?: never;
     path?: never;
@@ -6502,6 +7097,122 @@ export type GithubDomainNameResponses = {
 };
 
 export type GithubDomainNameResponse = GithubDomainNameResponses[keyof GithubDomainNameResponses];
+
+export type FinishGithubLinkData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * The authorization code, exchanged once for a user token.
+         */
+        code?: string;
+        /**
+         * The state `start` minted.
+         */
+        state?: string;
+        /**
+         * GitHub's refusal, `access_denied` when the person cancelled.
+         */
+        error?: string;
+    };
+    url: '/api/v1/github/link/callback';
+};
+
+export type FinishGithubLinkErrors = {
+    /**
+     * The trusted-header identity names a disabled account.
+     */
+    403: ProblemDetail;
+};
+
+export type FinishGithubLinkError = FinishGithubLinkErrors[keyof FinishGithubLinkErrors];
+
+export type OpenGithubLinkData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * The nonce `configure` minted for one account.
+         */
+        n?: string;
+    };
+    url: '/api/v1/github/link/go';
+};
+
+export type OpenGithubLinkErrors = {
+    /**
+     * An HTML page: the link was made for another account, or this instance is read-only.
+     */
+    403: unknown;
+    /**
+     * An HTML page: the link was never made, was already used or has expired.
+     */
+    404: unknown;
+    /**
+     * An HTML page: the link cannot go on to GitHub, for example because `service.public_url` or the App's client secret is not set. The text names the fix.
+     */
+    409: unknown;
+    /**
+     * An HTML page: no GitHub App is configured on this instance any more, or it cannot be used.
+     */
+    422: unknown;
+    /**
+     * An HTML page: too many links are in flight at once.
+     */
+    503: unknown;
+};
+
+export type ReceiveGithubWebhookData = {
+    /**
+     * The event's payload, as GitHub sends it, at most 25 MiB.
+     */
+    body: {
+        [key: string]: unknown;
+    };
+    path?: never;
+    query?: never;
+    url: '/api/v1/github/webhook';
+};
+
+export type ReceiveGithubWebhookErrors = {
+    /**
+     * Signed, but without `X-GitHub-Delivery` or `X-GitHub-Event`, or a body that is not JSON.
+     */
+    400: ProblemDetail;
+    /**
+     * The App has no webhook secret, or the signature is missing, not `sha256=` and 64 lowercase hex digits, or wrong. Nothing happened, and the first three are answered before the body is read.
+     */
+    401: ProblemDetail;
+    /**
+     * This instance has no GitHub App. Answered before the body is read, and not logged.
+     */
+    404: ProblemDetail;
+    /**
+     * The body did not arrive within ten seconds.
+     */
+    408: ProblemDetail;
+    /**
+     * A body over 25 MiB, refused before the signature is checked.
+     */
+    413: ProblemDetail;
+    /**
+     * A change could not be saved. The delivery is not remembered, so GitHub's redelivery is handled. The answer is one fixed sentence; the server log says why.
+     */
+    500: ProblemDetail;
+    /**
+     * Too many deliveries at once (four are read and handled at a time). Nothing happened.
+     */
+    503: ProblemDetail;
+};
+
+export type ReceiveGithubWebhookError = ReceiveGithubWebhookErrors[keyof ReceiveGithubWebhookErrors];
+
+export type ReceiveGithubWebhookResponses = {
+    /**
+     * Handled, a replay, or an event this instance does not act on.
+     */
+    200: unknown;
+};
 
 export type GetGraphData = {
     body?: never;
@@ -6708,6 +7419,105 @@ export type ConnectMyGithubIdentityTokenResponses = {
 };
 
 export type ConnectMyGithubIdentityTokenResponse = ConnectMyGithubIdentityTokenResponses[keyof ConnectMyGithubIdentityTokenResponses];
+
+export type UnlinkMyGithubLinkData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/v1/me/github-link';
+};
+
+export type UnlinkMyGithubLinkErrors = {
+    /**
+     * No identity, or an anonymous one.
+     */
+    401: ProblemDetail;
+    /**
+     * A cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
+     */
+    403: ProblemDetail;
+};
+
+export type UnlinkMyGithubLinkError = UnlinkMyGithubLinkErrors[keyof UnlinkMyGithubLinkErrors];
+
+export type UnlinkMyGithubLinkResponses = {
+    /**
+     * Unlinked.
+     */
+    200: GithubUnlinkResponse;
+};
+
+export type UnlinkMyGithubLinkResponse = UnlinkMyGithubLinkResponses[keyof UnlinkMyGithubLinkResponses];
+
+export type GetMyGithubLinkData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/v1/me/github-link';
+};
+
+export type GetMyGithubLinkErrors = {
+    /**
+     * No identity, or an anonymous one.
+     */
+    401: ProblemDetail;
+    /**
+     * The trusted-header identity names a disabled account.
+     */
+    403: ProblemDetail;
+};
+
+export type GetMyGithubLinkError = GetMyGithubLinkErrors[keyof GetMyGithubLinkErrors];
+
+export type GetMyGithubLinkResponses = {
+    /**
+     * The link.
+     */
+    200: GithubLinkResponse;
+};
+
+export type GetMyGithubLinkResponse = GetMyGithubLinkResponses[keyof GetMyGithubLinkResponses];
+
+export type StartMyGithubLinkData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/v1/me/github-link/start';
+};
+
+export type StartMyGithubLinkErrors = {
+    /**
+     * No identity, or an anonymous one.
+     */
+    401: ProblemDetail;
+    /**
+     * A cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
+     */
+    403: ProblemDetail;
+    /**
+     * `service.public_url` is not set, so there is no callback address to give GitHub, or the GitHub App has no client secret, so a code cannot be exchanged. The detail names the fix.
+     */
+    409: ProblemDetail;
+    /**
+     * No GitHub App is configured on this instance, or it cannot be used. The detail names the fix.
+     */
+    422: ProblemDetail;
+    /**
+     * Too many links are in flight at once; try again in a moment.
+     */
+    503: ProblemDetail;
+};
+
+export type StartMyGithubLinkError = StartMyGithubLinkErrors[keyof StartMyGithubLinkErrors];
+
+export type StartMyGithubLinkResponses = {
+    /**
+     * Where to send the browser.
+     */
+    200: StartGithubLinkResponse;
+};
+
+export type StartMyGithubLinkResponse = StartMyGithubLinkResponses[keyof StartMyGithubLinkResponses];
 
 export type ListMyIdentityLinksData = {
     body?: never;
@@ -7447,6 +8257,47 @@ export type GetGithubSettingsResponses = {
 
 export type GetGithubSettingsResponse = GetGithubSettingsResponses[keyof GetGithubSettingsResponses];
 
+export type StartGithubAppManifestData = {
+    body: GithubAppManifestBody;
+    path?: never;
+    query?: never;
+    url: '/api/v1/settings/github/app/manifest';
+};
+
+export type StartGithubAppManifestErrors = {
+    /**
+     * No identity.
+     */
+    401: ProblemDetail;
+    /**
+     * The caller is not an admin, a cookie session did not echo its CSRF token, the request carries no session to bind the state to, or this instance is read-only.
+     */
+    403: ProblemDetail;
+    /**
+     * A GitHub App is already configured (remove it first with `crystalline github app remove`), or `service.public_url` is not set. The detail names the fix.
+     */
+    409: ProblemDetail;
+    /**
+     * `org` is not a GitHub organization name.
+     */
+    422: ProblemDetail;
+    /**
+     * Too many forms are in flight at once; try again in a moment.
+     */
+    503: ProblemDetail;
+};
+
+export type StartGithubAppManifestError = StartGithubAppManifestErrors[keyof StartGithubAppManifestErrors];
+
+export type StartGithubAppManifestResponses = {
+    /**
+     * The form to post.
+     */
+    200: GithubAppManifestResponse;
+};
+
+export type StartGithubAppManifestResponse = StartGithubAppManifestResponses[keyof StartGithubAppManifestResponses];
+
 export type ConnectGithubDeviceData = {
     body?: never;
     path?: never;
@@ -7732,6 +8583,44 @@ export type UpdateUserResponses = {
 
 export type UpdateUserResponse = UpdateUserResponses[keyof UpdateUserResponses];
 
+export type UnlinkUserGithubLinkData = {
+    body?: never;
+    path: {
+        /**
+         * The account, in any casing.
+         */
+        name: string;
+    };
+    query?: never;
+    url: '/api/v1/users/{name}/github-link';
+};
+
+export type UnlinkUserGithubLinkErrors = {
+    /**
+     * No identity.
+     */
+    401: ProblemDetail;
+    /**
+     * The caller is not an admin, a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
+     */
+    403: ProblemDetail;
+    /**
+     * No such account.
+     */
+    404: ProblemDetail;
+};
+
+export type UnlinkUserGithubLinkError = UnlinkUserGithubLinkErrors[keyof UnlinkUserGithubLinkErrors];
+
+export type UnlinkUserGithubLinkResponses = {
+    /**
+     * Unlinked.
+     */
+    200: GithubUnlinkResponse;
+};
+
+export type UnlinkUserGithubLinkResponse = UnlinkUserGithubLinkResponses[keyof UnlinkUserGithubLinkResponses];
+
 export type ResetUserPasswordData = {
     body: PasswordBody;
     path: {
@@ -7799,7 +8688,7 @@ export type ValidateDocumentErrors = {
      */
     401: ProblemDetail;
     /**
-     * The caller is not an editor, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
+     * The caller may not write this domain (not an editor, or on a domain GitHub governs, no GitHub write), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.
      */
     403: ProblemDetail;
     /**

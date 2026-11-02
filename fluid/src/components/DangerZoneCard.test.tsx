@@ -301,6 +301,37 @@ describe("the danger zone", () => {
     ).toBeVisible();
   });
 
+  it("leaves who may read a governed domain to the members card", async () => {
+    serve(
+      {
+        "/domains/eng/members": () =>
+          membersResponse({
+            owner: null,
+            visibility: "private",
+            governance: "github",
+            github_people: [],
+            overridden: [],
+          }),
+      },
+      "admin",
+      "boss",
+    );
+
+    renderApp("/d/eng/settings");
+    const card = await dangerZone();
+    // The admin still ends the domain here; who may read it is the members
+    // card's switch, and opening it forgets nobody there.
+    expect(
+      await within(card).findByRole("button", { name: "Unregister domain" }),
+    ).toBeVisible();
+    expect(
+      within(card).queryByRole("button", { name: "Share with everyone" }),
+    ).toBeNull();
+    expect(
+      within(card).queryByRole("button", { name: "Make private" }),
+    ).toBeNull();
+  });
+
   it("gives a manager of a private domain no visibility control", async () => {
     serve(
       {

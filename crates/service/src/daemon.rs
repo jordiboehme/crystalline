@@ -610,6 +610,20 @@ pub async fn run_serve(
         Some(addr) => setup_token_for(addr, accounts_db.as_deref(), configured_setup).await,
         None => None,
     };
+    // Who reads which domain, known before anything is served or backed up,
+    // with the HTTP surface on or off: a Reflection page this daemon writes
+    // reaches every reader of its domain and the backup branch either way.
+    // Opened after the two short-lived opens above have closed theirs, and
+    // shared with the HTTP surface below, so this process holds one handle.
+    let accounts = crate::client::install_domain_access(&engine).await;
+    // Who may read each env-defined team domain on an instance with a GitHub
+    // App, recorded before anything is served so a private one is closed
+    // from its first request on. A private record that cannot be written
+    // stops the start: serving the domain open is the one thing not to do.
+    engine
+        .apply_env_readers()
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     if !daemon_flag {
         if std::io::stderr().is_terminal() {
@@ -880,7 +894,9 @@ pub async fn run_serve(
             // actually applies: a `--http` address beats both `service.http`
             // spellings, so telling a flag user to edit the config would be
             // advice that does nothing.
-            let router = match http_service(allowed_hosts, e, sessions, token, streams_rx).await {
+            let router = match http_service(accounts, allowed_hosts, e, sessions, token, streams_rx)
+                .await
+            {
                 Ok(router) => router,
                 Err(err) => {
                     tracing::warn!(
@@ -1122,25 +1138,42 @@ async fn accept_loop(listener: interprocess::local_socket::tokio::Listener, shar
     }
 }
 
-/// The harness gate a bridge's `mcp` handshake options carry. `skills=off` is
+/// The harness gate a bridge's `mcp` handshake options carry, with the
+/// `unattended` mark beside it. `skills=off` is
 /// the verified gate and wins if both tokens ever arrive; `routing=conditional`
 /// is a hook that is installed but unverified; neither (a bare `mcp` from an
 /// older bridge, or an option this binary does not know) is the default gate,
 /// which serves everything.
 fn harness_gate_from_options(options: &[&str]) -> crate::instance::HarnessGate {
-    use crate::instance::{HarnessGate, ROUTING_CONDITIONAL_OPTION, SKILLS_OFF_OPTION};
+    use crate::instance::{
+        HarnessGate, ROUTING_CONDITIONAL_OPTION, SKILLS_OFF_OPTION, UNATTENDED_OPTION,
+    };
+    let unattended = options.contains(&UNATTENDED_OPTION);
+    let run_domain = options
+        .iter()
+        .find_map(|o| o.strip_prefix(crate::instance::RUN_DOMAIN_OPTION))
+        .filter(|d| !d.is_empty())
+        .map(str::to_string);
     if options.contains(&SKILLS_OFF_OPTION) {
         HarnessGate {
             hook_installed: true,
             onboarding_verified: true,
+            unattended,
+            run_domain,
         }
     } else if options.contains(&ROUTING_CONDITIONAL_OPTION) {
         HarnessGate {
             hook_installed: true,
             onboarding_verified: false,
+            unattended,
+            run_domain,
         }
     } else {
-        HarnessGate::default()
+        HarnessGate {
+            unattended,
+            run_domain,
+            ..HarnessGate::default()
+        }
     }
 }
 
@@ -1169,7 +1202,14 @@ async fn handle_conn(mut stream: IpcStream, shared: Arc<Shared>) {
             // the surface under a live client across a daemon restart.
             let gate = harness_gate_from_options(&options);
             let server = McpServer::new(shared.engine.clone()).with_harness_gate(gate);
-            match rmcp::serve_server(server, stream).await {
+            // The line limit rmcp applies by default, named here from the one
+            // constant the stdio bridge bounds its lines with, so the bridge
+            // never forwards a line this end would drop (see
+            // `crate::line_limit`).
+            let (read, write) = tokio::io::split(stream);
+            let transport = rmcp::transport::async_rw::AsyncRwTransport::new_server(read, write)
+                .with_max_line_length(crate::line_limit::STDIO_LINE_LIMIT);
+            match rmcp::serve_server(server, transport).await {
                 Ok(running) => {
                     let _ = running.waiting().await;
                 }
@@ -1474,12 +1514,25 @@ async fn run_watcher(
 /// else already holds, and a served endpoint that stopped. Only the middle one
 /// is about a port, and only it should ever tell an operator to free one.
 async fn http_service(
+    accounts: Option<Arc<crate::rest::AuthStore>>,
     allowed_hosts: Vec<String>,
     engine: Arc<Engine>,
     http_sessions: Arc<AtomicUsize>,
     setup_token: Option<String>,
     shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<axum::Router> {
+    // The store the daemon opened at start, so the engine's resolver and the
+    // HTTP surface read one handle.
+    if let Some(auth) = accounts {
+        return http_router_with_shutdown(
+            engine,
+            http_sessions,
+            &allowed_hosts,
+            auth,
+            setup_token,
+            shutdown,
+        );
+    }
     http_service_at(
         &crystalline_core::config::web_auth_db_path()?,
         allowed_hosts,
@@ -2370,7 +2423,9 @@ fn http_base(
     // to anybody who could reach the port. It is a no-op on a second call, so
     // an integration test that builds two routers over one engine keeps the
     // first store.
-    engine.set_domain_access(Arc::new(crate::scope::DomainAccess::new(auth.clone())));
+    engine.set_domain_access(Arc::new(
+        crate::scope::DomainAccess::new(auth.clone()).with_governor(engine.knowledge_governor()),
+    ));
 
     // And the same rule answers where this instance's pages are, for an HTTP
     // caller from its own headers and for a local one from the address this
@@ -3896,10 +3951,14 @@ mod tests {
         let verified = HarnessGate {
             hook_installed: true,
             onboarding_verified: true,
+            unattended: false,
+            run_domain: None,
         };
         let conditional = HarnessGate {
             hook_installed: true,
             onboarding_verified: false,
+            unattended: false,
+            run_domain: None,
         };
         assert_eq!(harness_gate_from_options(&["skills=off"]), verified);
         assert_eq!(
@@ -3914,6 +3973,15 @@ mod tests {
         assert_eq!(
             harness_gate_from_options(&["future=1"]),
             HarnessGate::default()
+        );
+        // The unattended mark travels beside the harness tokens.
+        let marked = harness_gate_from_options(&["skills=off", "unattended"]);
+        assert!(marked.unattended && marked.verified());
+        assert!(harness_gate_from_options(&["unattended"]).unattended);
+        assert!(!harness_gate_from_options(&["skills=off"]).unattended);
+        assert_eq!(
+            harness_gate_from_options(&["unattended", "domain=eng"]).run_domain,
+            Some("eng".to_string())
         );
     }
 

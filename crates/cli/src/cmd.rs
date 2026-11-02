@@ -11,14 +11,10 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use crystalline_core::config::{
-    self, DatabaseBackend, DomainEntry, EmbeddingsConfig, GlobalConfig, NameOrigin,
-    registration::{
-        Registration, RegistrationRequest, canonical_root, case_twin, case_twin_refusal,
-        choose_domain_name, decide_registration, derive_domain_name, needs_manifest_write_back,
-        validate_domain_name,
-    },
+    self, DatabaseBackend, DomainEntry, EmbeddingsConfig, GlobalConfig,
+    registration::validate_domain_name,
 };
-use crystalline_core::names::{NameInput, NameTable};
+use crystalline_core::names::NameTable;
 use crystalline_core::text::plural;
 use crystalline_index::{
     ChunkParams, DomainKind, HostClaim, RebuildKind, Store, apply_scan, configured_model_id,
@@ -151,9 +147,15 @@ pub(crate) async fn reach_index(
     let bypassed = !crystalline_service::use_daemon(db_override, config_override);
     if !bypassed
         && let Some(request) = request
-        && let Some(data) = crystalline_service::ctl_if_running(request).await?
+        && let Some(data) = crystalline_service::ctl_routed(request).await?
     {
         return Ok(IndexRoute::Daemon(data));
+    }
+    // Inside an app package the index is never opened here, not even for a
+    // read or with an override outside AppData: the open would create a
+    // private index and ownership record (see `ctl_routed`).
+    if crystalline_service::runs_in::PackageContext::here().is_packaged() {
+        bail!(crystalline_service::client::packaged_local_engine_refusal());
     }
     let db = db_path(db_override)?;
     let turso = backend_is_turso(cfg);
@@ -379,7 +381,7 @@ pub fn domain_init(path: &Path, name: Option<&str>, json: bool) -> Result<()> {
 /// **The MANIFEST write-back only ever happens for a genuinely new
 /// registration** (the `Register` arm of each branch above, never `Adopt`):
 /// there the entry is always fresh - no origin, no review - and the name
-/// has just been validated or derived, so [`needs_manifest_write_back`]
+/// has just been validated or derived, so [`crystalline_core::config::registration::needs_manifest_write_back`]
 /// can only ever say yes when the MANIFEST does not already declare it. An
 /// ADOPTED entry is left alone even when it declares no name and would
 /// otherwise qualify: it may be a team domain (writing there directly would
@@ -400,259 +402,96 @@ pub(crate) fn domain_add_register(
     path: Option<&Path>,
     config_override: Option<&Path>,
 ) -> Result<(String, PathBuf, bool, Option<String>)> {
-    // Mutate the file truth and save it back to the resolved path; the
-    // environment overlay is never written.
-    let loaded = load(config_override)?;
+    let kept = crate::kept::root().ok();
+    let done = crystalline_service::registration::register_file_domain(
+        name,
+        path,
+        config_override,
+        kept.as_deref(),
+    )?;
+    print_notes(&done.notes);
+    let root = done
+        .root
+        .ok_or_else(|| anyhow!("the registration of '{}' named no folder", done.name))?;
+    Ok((done.name, root, done.adopted, done.shadowed))
+}
 
-    match name {
-        Some(name) => {
-            // An env-defined domain of the same name is refused: it is
-            // managed by its variable, not the config file.
-            if let Some(env) = loaded.overlay.env_domain(name) {
-                bail!(
-                    "domain '{name}' is defined by the environment variable {}; unset it to manage this domain in the config file",
-                    env.var
-                );
-            }
-
-            // The decision comes first: a name already registered to this
-            // folder is adopted as it is, one registered elsewhere is
-            // refused naming what holds it, and only a new name is checked
-            // against the naming rules - so a name registered before the
-            // rules existed can still be re-added.
-            let existing = loaded.file.domains.get(name).cloned();
-            if existing.is_none() {
-                validate_domain_name(name)
-                    .map_err(|e| anyhow!("{e}, or point at a folder with --path <dir>"))?;
-            }
-
-            let root = match path {
-                Some(p) => p.to_path_buf(),
-                None => crystalline_service::default_domain_folder(
-                    &loaded.effective.domains_root(),
-                    name,
-                ),
-            };
-
-            let abs = domain_root_with_manifest(&root)?;
-
-            match decide_registration(
-                name,
-                existing.as_ref(),
-                &RegistrationRequest::File { root: &abs },
-            ) {
-                Registration::Adopt => Ok((name.to_string(), abs, true, None)),
-                Registration::Conflict(message) => bail!("{message}"),
-                Registration::Register => {
-                    if let Some(twin) = case_twin(name, None, loaded.file.domains.iter()) {
-                        bail!("{}", case_twin_refusal(name, &twin));
-                    }
-                    crate::kept::set_aside_orphan(name, loaded.file.domains.keys());
-                    let entry =
-                        DomainEntry::file(abs.clone()).with_name_origin(NameOrigin::Explicit);
-                    let mut cfg = loaded.file;
-                    cfg.domains.insert(name.to_string(), entry.clone());
-                    config::save_yaml(&loaded.path, &cfg).map_err(|e| {
-                        anyhow!("failed to save config {}: {e}", loaded.path.display())
-                    })?;
-                    write_back_manifest_name_if_needed(&entry, &abs, name);
-                    Ok((name.to_string(), abs, false, None))
-                }
-            }
-        }
-        None => {
-            let path =
-                path.ok_or_else(|| anyhow!("name the domain, or point at its folder with --path"))?;
-
-            let abs = domain_root_with_manifest(path)?;
-
-            match existing_file_domain_at(&abs, &loaded.file) {
-                Some(existing_name) => Ok((existing_name, abs, true, None)),
-                None => {
-                    let table = build_name_table(&loaded);
-                    let manifest_name = crystalline_core::domain_name_at(&abs);
-                    let basename = abs
-                        .file_name()
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| abs.display().to_string());
-                    // A name folding onto a registered one is taken too: the
-                    // two would share one state folder on a disk that ignores
-                    // case.
-                    let taken = |c: &str| {
-                        table.resolve(c).is_some()
-                            || case_twin(c, None, loaded.file.domains.iter()).is_some()
-                    };
-                    let choice = choose_domain_name(
-                        None,
-                        manifest_name.as_deref(),
-                        || derive_domain_name(&basename, taken),
-                        taken,
-                    );
-                    crate::kept::set_aside_orphan(&choice.name, loaded.file.domains.keys());
-                    let entry = DomainEntry::file(abs.clone()).with_name_origin(choice.origin);
-                    let mut cfg = loaded.file;
-                    cfg.domains.insert(choice.name.clone(), entry.clone());
-                    config::save_yaml(&loaded.path, &cfg).map_err(|e| {
-                        anyhow!("failed to save config {}: {e}", loaded.path.display())
-                    })?;
-                    write_back_manifest_name_if_needed(&entry, &abs, &choice.name);
-                    Ok((choice.name, abs, false, choice.shadowed_canonical))
-                }
-            }
-        }
+/// Print a registration's notes to stderr, where they always went.
+pub(crate) fn print_notes(notes: &[String]) {
+    for note in notes {
+        eprintln!("{note}");
     }
 }
 
-/// `root` in its canonical form, once it holds a `MANIFEST.md`; refused
-/// naming the command that scaffolds one otherwise.
-fn domain_root_with_manifest(root: &Path) -> Result<PathBuf> {
-    if !root.join("MANIFEST.md").exists() {
-        bail!(
-            "no MANIFEST.md at {}. Run: crystalline domain init {}",
-            root.display(),
-            root.display()
-        );
-    }
-    Ok(std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf()))
+pub(crate) use crystalline_service::registration::{build_name_table, existing_file_domain_at};
+
+/// Whether `domain add` registers through the daemon's `domain_register`
+/// ctl command instead of writing the config itself: inside an app package
+/// (Claude Desktop's on Windows), where a new file under AppData lands in
+/// the package's private copy, and only without a `--config` or `--db`
+/// override, which names an exact file the daemon does not serve. Outside
+/// a package the registration stays local, as it always was.
+pub(crate) fn registers_through_daemon(db: Option<&Path>, config: Option<&Path>) -> bool {
+    crystalline_service::runs_in::PackageContext::here().is_packaged()
+        && crystalline_service::use_daemon(db, config)
 }
 
-/// Declares `name` in `<root>/MANIFEST.md` when [`needs_manifest_write_back`]
-/// says a fresh registration should - `entry` is always a brand-new entry at
-/// this call site (never an adopted one, see [`domain_add_register`]'s own
-/// doc comment for why that split matters), so this is really only ever a
-/// no-op when the MANIFEST already declares `name`.
-///
-/// Best effort: a MANIFEST write that fails after the registration already
-/// landed is logged to stderr rather than propagated, the same trade-off the
-/// engine's own `write_back_domain_name` makes and for the same reason - the
-/// registration already saved, and answering with an error here would tell
-/// the caller their `domain add` failed when it did not.
-fn write_back_manifest_name_if_needed(entry: &DomainEntry, root: &Path, name: &str) {
-    let manifest_declares = crystalline_core::domain_name_at(root).is_some();
-    if !needs_manifest_write_back(entry, manifest_declares) {
-        return;
-    }
-    if crystalline_core::read_only_at(root).is_on() {
-        eprintln!("note: '{name}' is read-only, so the name was not written into its MANIFEST.");
-        return;
-    }
-    if let Err(e) = write_back_manifest_name(root, name) {
-        eprintln!(
-            "warning: writing the domain name back into the MANIFEST of '{name}' failed: {e}"
-        );
-    }
+/// The `domain_register` ctl request for a `kind` (`file` or `virtual`)
+/// registration. A path is made absolute against this process's folder
+/// first: the daemon works in a folder of its own.
+pub(crate) fn register_request(
+    kind: &str,
+    name: Option<&str>,
+    path: Option<&Path>,
+) -> Result<serde_json::Value> {
+    let path = path
+        .map(|p| {
+            std::path::absolute(p).map_err(|e| anyhow!("could not resolve {}: {e}", p.display()))
+        })
+        .transpose()?;
+    Ok(serde_json::json!({
+        "v": 1,
+        "cmd": "domain_register",
+        "kind": kind,
+        "name": name,
+        "path": path.map(|p| p.to_string_lossy().into_owned()),
+    }))
 }
 
-/// The name of the file domain already rooted at `canonical`, if any: the
-/// idempotency hook so pointing `domain add --path` at the same folder twice
-/// adopts the existing registration - whatever name it holds - rather than
-/// adding a second one over the same files. Never a write-back candidate
-/// (see [`domain_add_register`]'s doc comment), so only the name is needed.
-pub(crate) fn existing_file_domain_at(canonical: &Path, cfg: &GlobalConfig) -> Option<String> {
-    cfg.domains.iter().find_map(|(name, entry)| {
-        (canonical_root(entry).as_deref() == Some(canonical)).then(|| name.clone())
-    })
-}
-
-/// The name table a fresh registration must not collide with: every domain
-/// this machine's file config and its effective (env-overlaid) config
-/// currently hold, each carrying its own file domain's declared canonical
-/// name - read straight off its MANIFEST, since this path has no index to
-/// ask - and its recorded aliases. Mirrors the engine's own `build_table`
-/// (`crates/engine/src/engine/names.rs`), so a check here and one
-/// `Engine::domain_add_local` runs agree on what "taken" means: a spelling
-/// already resolving to a registered domain - as its local name, its
-/// canonical name, or an alias - is taken, not merely a name that happens
-/// to be a config key somewhere.
-///
-/// A virtual domain contributes only its local name: its canonical name
-/// lives in the database, which this path never opens - an empty
-/// `virtual_names` map into [`crystalline_core::names::config_name_inputs`],
-/// same as [`domain_list`]'s own no-index case.
-pub(crate) fn build_name_table(loaded: &crystalline_service::LoadedConfig) -> NameTable {
-    let empty = std::collections::BTreeMap::new();
-    let mut inputs: Vec<NameInput> = Vec::new();
-    for cfg in [&loaded.file, &loaded.effective] {
-        inputs.extend(crystalline_core::names::config_name_inputs(
-            &cfg.domains,
-            &empty,
-        ));
-    }
-    NameTable::build(&inputs)
-}
-
-/// Rewrite `<root>/MANIFEST.md` to declare `domain_name: <name>`; a no-op
-/// when it already reads that way.
-fn write_back_manifest_name(root: &Path, name: &str) -> Result<()> {
-    // A read-only domain keeps its MANIFEST as the team wrote it; the name
-    // stays the registration's, exactly as the engine's write-back does.
-    if crystalline_core::read_only_at(root).is_on() {
-        return Ok(());
-    }
-    let manifest = root.join("MANIFEST.md");
-    let text = std::fs::read_to_string(&manifest)
-        .map_err(|e| anyhow!("reading {}: {e}", manifest.display()))?;
-    // Written as LF, the whole file, like every write; compared in LF so a
-    // CRLF MANIFEST that already declares the name is left alone.
-    let current = crystalline_core::to_lf(&text);
-    let updated =
-        crystalline_core::to_lf(&crystalline_core::manifest::set_declared_name(&text, name))
-            .into_owned();
-    if updated != current {
-        std::fs::write(&manifest, updated)
-            .map_err(|e| anyhow!("writing {}: {e}", manifest.display()))?;
-    }
-    Ok(())
+/// Register through the daemon (see [`registers_through_daemon`]) and
+/// print the registration's notes, as the local path does.
+pub(crate) async fn register_through_daemon(
+    kind: &str,
+    name: Option<&str>,
+    path: Option<&Path>,
+) -> Result<crystalline_service::registration::Registered> {
+    let request = register_request(kind, name, path)?;
+    let data = crystalline_service::ctl_routed(request)
+        .await
+        .map_err(|e| crystalline_service::client::older_daemon_words(e, "domain_register"))?
+        .ok_or_else(|| anyhow!("no Crystalline daemon answered the registration"))?;
+    let done: crystalline_service::registration::Registered = serde_json::from_value(data)
+        .map_err(|e| anyhow!("could not read the daemon's registration answer: {e}"))?;
+    print_notes(&done.notes);
+    Ok(done)
 }
 
 /// Register a virtual domain in the global config (database-backed, no path).
 /// Returns the MANIFEST markdown to scaffold into the database and whether an
-/// existing registration of this name was adopted rather than written.
-///
-/// A virtual domain always needs a name - there is no folder or repository
-/// to derive one from - so a fresh registration is always
-/// `name_origin: explicit`.
+/// existing registration of this name was adopted rather than written. The
+/// rules are [`crystalline_service::registration::register_virtual_domain`]'s.
 pub(crate) fn domain_add_register_virtual(
     name: &str,
     config_override: Option<&Path>,
 ) -> Result<(String, bool)> {
-    let loaded = load(config_override)?;
-    if let Some(env) = loaded.overlay.env_domain(name) {
-        bail!(
-            "domain '{name}' is defined by the environment variable {}; unset it to manage this domain in the config file",
-            env.var
-        );
-    }
-    let adopted = match decide_registration(
+    let kept = crate::kept::root().ok();
+    let done = crystalline_service::registration::register_virtual_domain(
         name,
-        loaded.file.domains.get(name),
-        &RegistrationRequest::Virtual,
-    ) {
-        Registration::Adopt => true,
-        Registration::Conflict(message) => bail!("{message}"),
-        Registration::Register => {
-            validate_domain_name(name).map_err(|e| anyhow!(e))?;
-            if let Some(twin) = case_twin(name, None, loaded.file.domains.iter()) {
-                bail!("{}", case_twin_refusal(name, &twin));
-            }
-            false
-        }
-    };
-    if !adopted {
-        crate::kept::set_aside_orphan(name, loaded.file.domains.keys());
-        let mut cfg = loaded.file;
-        cfg.domains.insert(
-            name.to_string(),
-            DomainEntry::virtual_domain().with_name_origin(NameOrigin::Explicit),
-        );
-        config::save_yaml(&loaded.path, &cfg)
-            .map_err(|e| anyhow!("failed to save config {}: {e}", loaded.path.display()))?;
-    }
-    let today = chrono::Utc::now()
-        .date_naive()
-        .format("%Y-%m-%d")
-        .to_string();
-    Ok((crystalline_core::manifest_template(name, &today), adopted))
+        config_override,
+        kept.as_deref(),
+    )?;
+    print_notes(&done.notes);
+    Ok((done.manifest.unwrap_or_default(), done.adopted))
 }
 
 /// Print the `domain add --virtual` result.
@@ -1046,6 +885,15 @@ pub(crate) fn print_origin_add(repo: &str, data: &serde_json::Value, json: bool)
         data["engrams"].as_u64().unwrap_or(0),
         data["base_commit"].as_str().unwrap_or("")
     );
+    // Who may read it, on an instance with a GitHub App.
+    match data["readers"].as_str() {
+        Some("private") => println!("  readers: only people with access on GitHub"),
+        Some("shared") => println!("  readers: everyone signed in"),
+        _ => {}
+    }
+    if let Some(note) = data["readers_note"].as_str() {
+        println!("  {note}");
+    }
     if data["adopted"].as_bool().unwrap_or(false) {
         let changes = data["local_changes"].as_u64().unwrap_or(0);
         println!(
@@ -3642,7 +3490,7 @@ pub async fn connect_github(
             "this machine's GitHub identity comes from CRYSTALLINE_GITHUB_TOKEN; unset it to sign in interactively"
         );
     }
-    let cfg = loaded.effective;
+    let cfg = &loaded.effective;
     let api_url = host
         .map(|h| format!("https://{h}/api/v3"))
         .or_else(|| cfg.github.as_ref().and_then(|g| g.api_url.clone()));
@@ -3653,6 +3501,44 @@ pub async fn connect_github(
         None => config::origins_state_dir()
             .map_err(|e| anyhow!("could not resolve the state directory: {e}"))?,
     };
+
+    // On an instance with a GitHub App a person links GitHub through the
+    // App's device flow, and the OAuth ways of connecting a person do not
+    // hold. The machine's own credential is not a person's and keeps them.
+    if !instance {
+        let home = crystalline_service::engine::AppHome::new(
+            api_url.clone(),
+            state_dir.clone(),
+            token_store_dir.is_some(),
+        );
+        let app = match home.configured(&loaded.overlay) {
+            Ok(None) => None,
+            Ok(Some(credentials)) => Some(
+                crystalline_remote::GithubApp::new(api_url.clone(), credentials)
+                    .map_err(|e| e.to_string()),
+            ),
+            // An App that cannot be used refuses a connect, while a
+            // disconnect still removes the link and the token, unrevoked.
+            Err(unusable) => Some(Err(unusable.to_string())),
+        };
+        if let Some(app) = app {
+            let person = PersonalApp {
+                app,
+                identity,
+                token_host: token_host.as_deref(),
+                state_dir: &state_dir,
+                token_store_dir,
+                cfg,
+            };
+            if disconnect {
+                return person.disconnect(json).await;
+            }
+            if token.is_some() {
+                bail!("{}", crystalline_service::engine::OAUTH_IDENTITY_UNDER_APP);
+            }
+            return person.connect(json).await;
+        }
+    }
 
     if disconnect {
         match token_store_dir {
@@ -3698,8 +3584,6 @@ pub async fn connect_github(
         None => device_flow_sign_in(&auth_base, &client_id, api_url.as_deref()).await?,
     };
 
-    // One keychain write, no read: `save_resolving_for` writes straight through
-    // and lands in the file store only if the keychain write itself fails.
     let stored = crystalline_remote::StoredToken {
         access_token,
         host: token_host
@@ -3707,22 +3591,17 @@ pub async fn connect_github(
             .unwrap_or_else(|| "github.com".to_string()),
         user: login.clone(),
         created_at: chrono::Utc::now(),
+        refresh_token: None,
+        expires_at: None,
+        refresh_expires_at: None,
     };
-    let store = match token_store_dir {
-        Some(dir) => {
-            let store = crystalline_remote::TokenStore::file_fallback_for(identity, dir)
-                .map_err(|e| anyhow!("{e}"))?;
-            store.save(&stored).map_err(|e| anyhow!("{e}"))?;
-            store
-        }
-        None => crystalline_remote::TokenStore::save_resolving_for(
-            identity,
-            token_host.as_deref(),
-            &state_dir,
-            &stored,
-        )
-        .map_err(|e| anyhow!("{e}"))?,
-    };
+    let store = save_credential(
+        identity,
+        token_host.as_deref(),
+        &state_dir,
+        token_store_dir,
+        &stored,
+    )?;
 
     // A personal connect that lands on an instance-mode installation is a
     // credential nothing will use yet, so the mode is named where it is
@@ -3766,6 +3645,347 @@ pub async fn connect_github(
         }
     }
     Ok(())
+}
+
+/// Saves `stored` as `identity`'s credential: under `token_store_dir` when
+/// the test seam names one, else with one keychain write and no read
+/// (`save_resolving_for` writes straight through and lands in the file store
+/// only if the keychain write itself fails).
+fn save_credential(
+    identity: &crystalline_remote::TokenIdentity,
+    token_host: Option<&str>,
+    state_dir: &Path,
+    token_store_dir: Option<&Path>,
+    stored: &crystalline_remote::StoredToken,
+) -> Result<crystalline_remote::TokenStore> {
+    match token_store_dir {
+        Some(dir) => {
+            let store = crystalline_remote::TokenStore::file_fallback_for(identity, dir)
+                .map_err(|e| anyhow!("{e}"))?;
+            store.save(stored).map_err(|e| anyhow!("{e}"))?;
+            Ok(store)
+        }
+        None => crystalline_remote::TokenStore::save_resolving_for(
+            identity, token_host, state_dir, stored,
+        )
+        .map_err(|e| anyhow!("{e}")),
+    }
+}
+
+/// What `connect github --personal` prints when GitHub answers the App's
+/// device flow with `device_flow_disabled`.
+const APP_DEVICE_FLOW_DISABLED: &str = "GitHub refused the sign-in because Device Flow is switched off for the GitHub App: enable Device Flow in the GitHub App's settings on GitHub, then run this again.";
+
+/// A person's GitHub on an instance with a GitHub App: `connect github
+/// --personal` signs in through the App's device flow and keeps the whole
+/// grant (the refresh token too, so a share renews it), and `--as` links the
+/// account it names. The machine owner has no account to link: its token
+/// alone is what its `personal` shares go out on, and the same holds for
+/// `github.agent_identity` when it names no account.
+///
+/// The link is written to the accounts database directly, the way `users`
+/// edits it, because a connect from a terminal opens no engine. The order
+/// is the engine's (`Engine::link_github`): the row first, so a GitHub
+/// account linked to another account is refused before a token is stored,
+/// and a failed token save marks the row's token gone.
+struct PersonalApp<'a> {
+    /// The App, or why it cannot be used: a connect is then refused, and a
+    /// disconnect goes ahead without the revoke.
+    app: std::result::Result<crystalline_remote::GithubApp, String>,
+    identity: &'a crystalline_remote::TokenIdentity,
+    token_host: Option<&'a str>,
+    state_dir: &'a Path,
+    token_store_dir: Option<&'a Path>,
+    cfg: &'a crystalline_core::config::GlobalConfig,
+}
+
+impl PersonalApp<'_> {
+    /// The personal identity's name: the account, or the owner's fixed one.
+    fn name(&self) -> &str {
+        match self.identity {
+            crystalline_remote::TokenIdentity::Personal(name) => name,
+            crystalline_remote::TokenIdentity::Instance => {
+                crystalline_service::engine::OWNER_IDENTITY_NAME
+            }
+        }
+    }
+
+    /// The accounts database, when this machine has one. Never created
+    /// here: a machine without accounts has nothing to link.
+    async fn accounts(&self) -> Result<Option<crystalline_service::rest::AuthStore>> {
+        let path = config::web_auth_db_path()
+            .map_err(|e| anyhow!("could not resolve the state directory: {e}"))?;
+        if !path.exists() {
+            return Ok(None);
+        }
+        Ok(Some(
+            crystalline_service::rest::AuthStore::open(&path).await?,
+        ))
+    }
+
+    /// The accounts database when this connect links an account, `None`
+    /// when it saves the token alone (the owner, or the agent identity
+    /// without an account). An account Crystalline does not know is refused
+    /// here, before any sign-in.
+    async fn link_target(&self) -> Result<Option<crystalline_service::rest::AuthStore>> {
+        let name = self.name();
+        if name == crystalline_service::engine::OWNER_IDENTITY_NAME {
+            return Ok(None);
+        }
+        if let Some(store) = self.accounts().await?
+            && store.user(name).await?.is_some()
+        {
+            return Ok(Some(store));
+        }
+        if self.cfg.github_agent_identity() == Some(name) {
+            return Ok(None);
+        }
+        bail!(
+            "no account named '{name}' to link GitHub to; name an account Crystalline knows (crystalline users list), or leave out --as to connect this machine's owner"
+        )
+    }
+
+    async fn connect(&self, json: bool) -> Result<()> {
+        let app = self.app.as_ref().map_err(|e| anyhow!("{e}"))?;
+        let accounts = self.link_target().await?;
+        let credentials = app.credentials();
+        let auth_base = app.auth_base();
+        let grant = device_flow_grant(auth_base, &credentials.client_id, None)
+            .await
+            .map_err(|e| {
+                if crystalline_remote::github::auth::is_device_flow_disabled(&e) {
+                    anyhow!(APP_DEVICE_FLOW_DISABLED)
+                } else {
+                    device_flow_error(auth_base, e)
+                }
+            })?;
+        let user =
+            crystalline_remote::github::auth::github_user(app.api_url(), &grant.access_token)
+                .await
+                .map_err(|e| anyhow!("{e}"))?;
+        let name = self.name();
+        if let Some(store) = &accounts {
+            store
+                .link_github(name, &credentials.host, user.id, &user.login)
+                .await?;
+        }
+        let stored = crystalline_remote::StoredToken {
+            access_token: grant.access_token,
+            host: self
+                .token_host
+                .map(str::to_string)
+                .unwrap_or_else(|| "github.com".to_string()),
+            user: user.login.clone(),
+            created_at: chrono::Utc::now(),
+            refresh_token: grant.refresh_token,
+            expires_at: grant.expires_at,
+            refresh_expires_at: grant.refresh_expires_at,
+        };
+        let saved = save_credential(
+            self.identity,
+            self.token_host,
+            self.state_dir,
+            self.token_store_dir,
+            &stored,
+        );
+        let store = match saved {
+            Ok(store) => store,
+            Err(e) => {
+                if let Some(accounts) = &accounts
+                    && let Err(mark) = accounts.mark_github_token_gone(name).await
+                {
+                    tracing::warn!(
+                        "the GitHub link of {name} could not be marked after a failed token save: {mark}"
+                    );
+                }
+                return Err(e);
+            }
+        };
+        // A running daemon may hold an older token of this identity in its
+        // cache; a relink replaces it.
+        let told = notify_daemon_forgot(self.identity).await;
+        let personal_mode = matches!(
+            self.cfg.github_share_identity(),
+            crystalline_core::config::ShareIdentityMode::Personal
+        );
+        if json {
+            let mut report = serde_json::json!({
+                "connected": user.login,
+                "token_store": store.kind(),
+                "github_enabled": self.cfg.github_enabled(),
+                "identity": "personal",
+                "account": identity_label(self.identity),
+                "share_identity": self.cfg.github_share_identity().as_str(),
+                "github_app": true,
+                "linked": accounts.is_some(),
+                "daemon": told.as_str(),
+            });
+            if let DaemonNotice::Refused(e) = &told {
+                report["daemon_error"] = serde_json::json!(e);
+            }
+            println!("{report}");
+            return Ok(());
+        }
+        let how = if accounts.is_some() {
+            format!(
+                "Linked {} to GitHub as {} through the GitHub App",
+                identity_phrase(self.identity),
+                user.login
+            )
+        } else {
+            format!(
+                "Connected {} as {} through the GitHub App",
+                identity_phrase(self.identity),
+                user.login
+            )
+        };
+        println!("{how} ({} token store).", store.kind());
+        if !personal_mode {
+            println!(
+                "Run: crystalline config set github.share_identity personal to share with personal identities"
+            );
+        }
+        if let DaemonNotice::Refused(e) = &told {
+            println!(
+                "A running daemon could not be told ({e}); restart it so it shares with the new token."
+            );
+        }
+        Ok(())
+    }
+
+    /// Revokes the identity's App user token at GitHub, removes its link
+    /// and deletes the token; the owner has no link and only its token goes.
+    /// The revoke is best effort: when GitHub cannot be reached, refuses it,
+    /// the App has no client secret or cannot be used at all, the rest still
+    /// happens and the person is told to revoke it themselves. A token that
+    /// cannot be deleted fails the disconnect.
+    ///
+    /// A copy of `Engine::unlink_github` for a terminal, which opens no
+    /// engine (crates/engine/src/engine/github.rs): keep the two aligned.
+    async fn disconnect(&self, json: bool) -> Result<()> {
+        use crystalline_service::engine::GithubUnlink;
+        let name = self.name().to_string();
+        let accounts = if name == crystalline_service::engine::OWNER_IDENTITY_NAME {
+            None
+        } else {
+            self.accounts().await?
+        };
+        let linked = match &accounts {
+            Some(store) => store.github_link_of(&name).await?.is_some(),
+            None => false,
+        };
+        let (store, token) = match self.token_store_dir {
+            Some(dir) => {
+                let store = crystalline_remote::TokenStore::file_fallback_for(self.identity, dir)
+                    .map_err(|e| anyhow!("{e}"))?;
+                let token = store.load().map_err(|e| anyhow!("{e}"))?;
+                (store, token)
+            }
+            None => crystalline_remote::TokenStore::resolve_and_load_for(
+                self.identity,
+                self.token_host,
+                self.state_dir,
+            )
+            .map_err(|e| anyhow!("{e}"))?,
+        };
+        let outcome = match &token {
+            Some(token) if self.revoke(&name, &token.access_token).await => GithubUnlink::Unlinked,
+            Some(_) => GithubUnlink::NotRevoked,
+            None if linked => GithubUnlink::Unlinked,
+            None => GithubUnlink::NotLinked,
+        };
+        // The row before the token, as the engine does: a failure in between
+        // leaves a token without a link, never a link without its token.
+        if linked && let Some(store) = &accounts {
+            store.unlink_github(&name).await?;
+        }
+        if token.is_some() {
+            store.delete().map_err(|e| {
+                anyhow!("the GitHub token of {name} could not be deleted ({e}); run the disconnect again")
+            })?;
+        }
+        // The file a keychain failure at connect time left behind, which a
+        // keychain that works again would not resolve to.
+        if self.token_store_dir.is_none() {
+            crystalline_remote::TokenStore::file_fallback_for(self.identity, self.state_dir)
+                .and_then(|file| file.delete())
+                .map_err(|e| {
+                    anyhow!("the GitHub token file of {name} could not be deleted ({e}); run the disconnect again")
+                })?;
+        }
+        let told = notify_daemon_forgot(self.identity).await;
+        if json {
+            let mut report = serde_json::json!({
+                "disconnected": identity_label(self.identity),
+                "unlinked": linked,
+                "revoked": outcome != GithubUnlink::NotRevoked && token.is_some(),
+                "daemon": told.as_str(),
+            });
+            if let Some(warning) = outcome.warning() {
+                report["warning"] = serde_json::json!(warning);
+            }
+            if let DaemonNotice::Refused(e) = &told {
+                report["daemon_error"] = serde_json::json!(e);
+            }
+            println!("{report}");
+            return Ok(());
+        }
+        println!("Disconnected {}.", identity_phrase(self.identity));
+        if let Some(warning) = outcome.warning() {
+            println!("{}", upper_first(warning));
+        }
+        if let DaemonNotice::Refused(e) = &told {
+            println!(
+                "A running daemon could not be told ({e}); restart it so it stops sharing with the credential this just deleted."
+            );
+        }
+        Ok(())
+    }
+
+    /// Revokes `access_token` at GitHub through the App. True when GitHub
+    /// revoked it (or no longer knew it).
+    async fn revoke(&self, name: &str, access_token: &str) -> bool {
+        let app = match &self.app {
+            Ok(app) => app,
+            Err(e) => {
+                tracing::warn!(
+                    "the GitHub App cannot be used ({e}), so the GitHub token of {name} could not be revoked"
+                );
+                return false;
+            }
+        };
+        let credentials = app.credentials();
+        let Some(secret) = credentials.client_secret.as_deref() else {
+            tracing::warn!(
+                "the GitHub App has no client secret, so the GitHub token of {name} could not be revoked"
+            );
+            return false;
+        };
+        match crystalline_remote::github::auth::revoke_user_token(
+            app.api_url(),
+            &credentials.client_id,
+            secret,
+            access_token,
+        )
+        .await
+        {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!("the GitHub token of {name} could not be revoked at GitHub: {e}");
+                false
+            }
+        }
+    }
+}
+
+/// `text` with its first letter upper case, for a sentence the engine
+/// words to follow another.
+fn upper_first(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
 }
 
 /// Deletes `identity`'s credential wherever this machine keeps it: the backend
@@ -3919,9 +4139,28 @@ async fn device_flow_sign_in(
     client_id: &str,
     api_url: Option<&str>,
 ) -> Result<(String, String)> {
-    let start = crystalline_remote::github::auth::start_device_flow(auth_base, client_id)
+    let access_token = device_flow_grant(auth_base, client_id, Some("repo"))
+        .await
+        .map(|grant| grant.access_token)
+        .map_err(|e| device_flow_error(auth_base, e))?;
+
+    let login = crystalline_remote::github::auth::validate_token(api_url, &access_token)
         .await
         .map_err(|e| anyhow!("{e}"))?;
+    Ok((access_token, login))
+}
+
+/// The device flow itself, for the OAuth App (`scope` `repo`) and the
+/// GitHub App (no scope): prints the user code and verification url, ticks
+/// a progress indicator while waiting for it to be confirmed in the browser,
+/// and returns the grant GitHub issued.
+async fn device_flow_grant(
+    auth_base: &str,
+    client_id: &str,
+    scope: Option<&str>,
+) -> std::result::Result<crystalline_remote::UserTokenGrant, crystalline_remote::RemoteError> {
+    let start =
+        crystalline_remote::github::auth::start_device_flow(auth_base, client_id, scope).await?;
     print_device_code(&start, auth_base);
 
     let ticker = tokio::spawn(async {
@@ -3947,12 +4186,7 @@ async fn device_flow_sign_in(
         crystalline_remote::github::auth::run_device_flow(auth_base, client_id, &start).await;
     ticker.abort();
     eprintln!();
-    let access_token = poll.map_err(|e| device_flow_error(auth_base, e))?;
-
-    let login = crystalline_remote::github::auth::validate_token(api_url, &access_token)
-        .await
-        .map_err(|e| anyhow!("{e}"))?;
-    Ok((access_token, login))
+    poll
 }
 
 /// Prints the device flow's user code and verification url unmissably: this
@@ -4937,5 +5171,286 @@ mod embeddings_line_tests {
                 "{device}"
             );
         }
+    }
+}
+
+/// What `crystalline github app set` was handed: the App's ids and the files
+/// its private key and secrets are read from.
+pub(crate) struct AppFiles {
+    pub app_id: u64,
+    pub client_id: String,
+    pub private_key: PathBuf,
+    pub client_secret: Option<PathBuf>,
+    pub webhook_secret: Option<PathBuf>,
+}
+
+/// Reads one secret file, losing exactly one trailing line break the way the
+/// `_FILE` variables do. An empty file is refused, naming the flag and the
+/// path, never a value.
+fn read_secret_file(flag: &str, path: &Path) -> Result<String> {
+    let text = std::fs::read_to_string(path).map_err(|e| {
+        anyhow!(
+            "{flag} names {}, which cannot be read ({e})",
+            path.display()
+        )
+    })?;
+    let value = crystalline_core::secret_env::trim_one_line_break(&text).to_string();
+    if value.trim().is_empty() {
+        bail!("{flag} names {}, which is empty", path.display());
+    }
+    Ok(value)
+}
+
+/// Where this CLI process finds and keeps the GitHub App: the effective
+/// `github.api_url` of `loaded`, and the state directory beside the token
+/// store, or only the file under `token_store_dir` (the test seam, see
+/// [`test_token_store_dir`]).
+fn app_home(
+    loaded: &crystalline_service::LoadedConfig,
+    token_store_dir: Option<&Path>,
+) -> Result<crystalline_service::engine::AppHome> {
+    let api_url = loaded
+        .effective
+        .github
+        .as_ref()
+        .and_then(|g| g.api_url.clone());
+    Ok(match token_store_dir {
+        Some(dir) => crystalline_service::engine::AppHome::new(api_url, dir.to_path_buf(), true),
+        None => crystalline_service::engine::AppHome::new(
+            api_url,
+            config::origins_state_dir()
+                .map_err(|e| anyhow!("could not resolve the state directory: {e}"))?,
+            false,
+        ),
+    })
+}
+
+/// Tells a running daemon that the saved App changed, so it drops the one
+/// it holds. Only the notice travels; the credentials never do. Sent
+/// whatever `--config` names: the App store lives in this machine's state
+/// directory, which the one daemon reads whichever config file it serves.
+async fn notify_daemon_app_changed() -> DaemonNotice {
+    match crystalline_service::client::ctl_if_running(serde_json::json!({
+        "v": 1, "cmd": "github_app_changed",
+    }))
+    .await
+    {
+        Ok(Some(_)) => DaemonNotice::Notified,
+        Ok(None) => DaemonNotice::NotRunning,
+        Err(e) => DaemonNotice::Refused(e.to_string()),
+    }
+}
+
+/// Whether a GitHub App decides access to a team domain connected from this
+/// machine: an App configured, usable or not, read from the environment and
+/// the saved App without asking GitHub (the engine's own
+/// `github_app_configured`). An App store that cannot be read counts as
+/// configured, as the engine counts it.
+pub fn github_app_decides_access(config_override: Option<&Path>) -> Result<bool> {
+    let loaded = load(config_override)?;
+    let home = app_home(&loaded, test_token_store_dir().as_deref())?;
+    Ok(!matches!(home.configured(&loaded.overlay), Ok(None)))
+}
+
+/// `crystalline github app status`: the daemon's view when one is running
+/// and no `--config` names another file, else this process's own read of
+/// the environment and the App store. GitHub is asked for the slug and the
+/// installations either way. No secret is printed.
+pub async fn github_app_status(
+    config_override: Option<&Path>,
+    token_store_dir: Option<&Path>,
+    json: bool,
+) -> Result<()> {
+    let from_daemon = match config_override {
+        Some(_) => None,
+        None => crystalline_service::client::ctl_if_running(serde_json::json!({
+            "v": 1, "cmd": "github_app_status",
+        }))
+        .await?
+        .map(serde_json::from_value::<crystalline_service::engine::GithubAppStatus>)
+        .transpose()?,
+    };
+    let status = match from_daemon {
+        Some(status) => status,
+        None => {
+            let loaded = load(config_override)?;
+            app_home(&loaded, token_store_dir)?
+                .status(&loaded.overlay)
+                .await
+        }
+    };
+    print_github_app_status(&status, json)
+}
+
+/// `crystalline github app set`: reads the secrets from their files,
+/// validates the App against GitHub and saves it (see
+/// [`crystalline_service::engine::AppHome::save`]), then tells a running
+/// daemon to drop the App it holds.
+pub async fn github_app_set(
+    files: AppFiles,
+    config_override: Option<&Path>,
+    token_store_dir: Option<&Path>,
+    json: bool,
+) -> Result<()> {
+    let loaded = load(config_override)?;
+    if loaded.effective.read_only() {
+        bail!("{}", crystalline_service::engine::EngineError::ReadOnly);
+    }
+    let api_url = loaded
+        .effective
+        .github
+        .as_ref()
+        .and_then(|g| g.api_url.clone());
+    // Before any file is read or GitHub is asked: the environment decides.
+    if loaded.overlay.github_app(api_url.as_deref()).is_some() {
+        bail!("{}", crystalline_service::engine::APP_FROM_ENV);
+    }
+    let client_id = files.client_id.trim().to_string();
+    if client_id.is_empty() {
+        bail!("--client-id is empty");
+    }
+    let credentials = crystalline_remote::AppCredentials {
+        app_id: files.app_id,
+        client_id,
+        private_key: read_secret_file("--private-key-file", &files.private_key)?,
+        client_secret: files
+            .client_secret
+            .as_deref()
+            .map(|path| read_secret_file("--client-secret-file", path))
+            .transpose()?,
+        webhook_secret: files
+            .webhook_secret
+            .as_deref()
+            .map(|path| read_secret_file("--webhook-secret-file", path))
+            .transpose()?,
+        slug: None,
+        host: String::new(),
+    };
+    let status = app_home(&loaded, token_store_dir)?
+        .save(&loaded.overlay, credentials)
+        .await?;
+    let told = notify_daemon_app_changed().await;
+    print_github_app_status(&status, json)?;
+    if !json {
+        report_daemon_notice(&told);
+    }
+    Ok(())
+}
+
+/// `crystalline github app remove`: deletes the saved App and its keychain
+/// marker, then tells a running daemon to drop the App it holds.
+pub async fn github_app_remove(
+    config_override: Option<&Path>,
+    token_store_dir: Option<&Path>,
+    json: bool,
+) -> Result<()> {
+    let loaded = load(config_override)?;
+    if loaded.effective.read_only() {
+        bail!("{}", crystalline_service::engine::EngineError::ReadOnly);
+    }
+    let removal = app_home(&loaded, token_store_dir)?.remove(&loaded.overlay)?;
+    let told = notify_daemon_app_changed().await;
+    if json {
+        let mut report = serde_json::json!({
+            "removed": true,
+            "keychain_unreadable": removal.keychain_unreadable,
+            "daemon": told.as_str(),
+        });
+        if let DaemonNotice::Refused(e) = &told {
+            report["daemon_error"] = serde_json::json!(e);
+        }
+        println!("{report}");
+    } else {
+        println!(
+            "Removed the GitHub App. Origin operations use this instance's GitHub sign-in again."
+        );
+        if let Some(reason) = &removal.keychain_unreadable {
+            println!(
+                "The keychain could not be read ({reason}), so a GitHub App saved there may remain. Run crystalline github app remove again once the keychain is unlocked."
+            );
+        }
+        report_daemon_notice(&told);
+    }
+    Ok(())
+}
+
+/// The line a person reads when a running daemon could not be told.
+fn report_daemon_notice(told: &DaemonNotice) {
+    if let DaemonNotice::Refused(e) = told {
+        println!("A running daemon could not be told ({e}); restart it so it picks up the change.");
+    }
+}
+
+/// Prints an App status, as compact JSON or as lines a person reads.
+fn print_github_app_status(
+    status: &crystalline_service::engine::GithubAppStatus,
+    json: bool,
+) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string(status)?);
+        return Ok(());
+    }
+    if !status.configured {
+        println!("No GitHub App is configured. Run: crystalline github app set --help");
+        if let Some(error) = &status.error {
+            println!("{error}");
+        }
+        return Ok(());
+    }
+    let unknown = || "?".to_string();
+    println!(
+        "GitHub App {} (id {}, client id {}) from the {}",
+        status.slug.clone().unwrap_or_else(unknown),
+        status
+            .app_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(unknown),
+        status.client_id.clone().unwrap_or_else(unknown),
+        status.source.clone().unwrap_or_else(unknown),
+    );
+    let set = |on: bool| if on { "set" } else { "not set" };
+    println!(
+        "  client secret: {}, webhook secret: {}",
+        set(status.client_secret_set),
+        set(status.webhook_secret_set)
+    );
+    match &status.installations {
+        Some(accounts) if accounts.is_empty() => println!("  not installed on any account yet"),
+        Some(accounts) => println!("  installed on: {}", accounts.join(", ")),
+        None => {}
+    }
+    if let Some(error) = &status.error {
+        println!("  [problem] {error}");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod register_request_tests {
+    use super::*;
+
+    /// A relative `--path` goes to the daemon as an absolute one: the daemon
+    /// works in a folder of its own, so a relative one would name another
+    /// place there.
+    #[test]
+    fn a_relative_path_is_sent_absolute() {
+        let request = register_request("file", Some("kb"), Some(Path::new("kb"))).unwrap();
+        let sent = request["path"].as_str().unwrap();
+        assert!(Path::new(sent).is_absolute(), "{request}");
+        assert_eq!(
+            Path::new(sent),
+            std::env::current_dir().unwrap().join("kb"),
+            "{request}"
+        );
+        assert_eq!(request["cmd"], "domain_register");
+        assert_eq!(request["kind"], "file");
+        assert_eq!(request["name"], "kb");
+    }
+
+    #[test]
+    fn a_virtual_registration_sends_no_path() {
+        let request = register_request("virtual", Some("notes"), None).unwrap();
+        assert!(request["path"].is_null(), "{request}");
+        assert_eq!(request["kind"], "virtual");
     }
 }

@@ -20,6 +20,8 @@ Claude Desktop runs its extensions inside its own app package. So the extension 
 
 When you sign out or shut down, the daemon stops cleanly.
 
+A `crystalline` command that runs inside Claude Desktop, for example from Claude Code's shell there, also works only through that daemon: it sends its changes to the daemon, and without one it says why and asks you to run it in a terminal outside Claude Desktop. Setup steps such as `crystalline connect`, `crystalline install` and `crystalline doctor --fix` always belong in a terminal outside Claude Desktop.
+
 ## Updating
 
 You do not need to update the extension. Update Crystalline (`brew upgrade crystalline` on macOS, the newest MSI on Windows), and the extension uses the new version. If the extension itself ever needs an update, your agent tells you.
@@ -34,9 +36,9 @@ It starts with no domains: the agent creates one with the `add_domain` tool when
 
 The extension looks for Crystalline in the usual places: the two Homebrew folders and then your `PATH` on macOS, `Program Files` and then your `PATH` on Windows. When it finds none, or finds one older than 0.24.0, Claude says so in the chat. It names what is missing and the command or download that fixes it. Install or update, then restart Claude Desktop. Nothing is lost: your knowledge stays where it was.
 
-## Moving from an older extension on Windows
+## A second state inside Claude Desktop on Windows
 
-Extensions before 0.24.0 carried their own Crystalline. Restart Claude Desktop after you update the extension. Until then it can still use the old extension's Crystalline. On Windows that one could keep a second state inside Claude Desktop's package (`%LOCALAPPDATA%\Packages\Claude_...\LocalCache\Roaming\crystalline`). `crystalline doctor` tells you when there is one: how many domains it registers, how big its index is and when it last changed. To merge it into your normal state, quit Claude Desktop and run:
+Extensions before 0.24.0 carried their own Crystalline. Restart Claude Desktop after you update the extension. Until then it can still use the old extension's Crystalline. On Windows that one could keep a second state inside Claude Desktop's package (`%LOCALAPPDATA%\Packages\Claude_...\LocalCache\Roaming\crystalline`). Before 0.30.0 a `crystalline` command that ran inside Claude Desktop, such as `crystalline domain add` from Claude Code's shell there, could create or extend that state too. You notice it when searches find no domains while the list of domains at the start of a session shows them. `crystalline doctor` tells you when there is one: how many domains it registers, which of them the daemon does not serve, how big its index is and when it last changed. To merge it into your normal state, quit Claude Desktop and run:
 
     crystalline doctor --fix --merge-desktop-state
 

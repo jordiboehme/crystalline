@@ -211,7 +211,7 @@ mod tests {
     #[test]
     fn the_mcp_config_is_private_and_goes_away() {
         use std::os::unix::fs::PermissionsExt as _;
-        let config = PrivateConfig::write(&remote_mcp_config("https://x", "cmt_t")).unwrap();
+        let config = PrivateConfig::write(&remote_mcp_config("https://x", "cmt_t", "eng")).unwrap();
         let path = config.path.clone();
         let dir = path.parent().unwrap().to_path_buf();
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;

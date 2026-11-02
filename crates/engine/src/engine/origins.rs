@@ -1,4 +1,68 @@
 use super::*;
+use crate::params::Readers;
+
+/// What a connect to GitHub on an instance with a GitHub App is told when
+/// it does not say who may read the domain. Access there follows GitHub, so
+/// the choice is asked every time and never defaulted: nobody opens a
+/// confidential repository by accident. A surface that asks the question
+/// itself (the CLI prompt, the MCP refusal) matches on this text, which
+/// also travels over the control socket as a plain string.
+pub const READERS_REQUIRED: &str = "say who may read this domain: shared (everyone signed in) or private (only people with access on GitHub)";
+
+/// Why a private connect is refused on an instance with no accounts store
+/// open: the private record lives there, and without it the domain would be
+/// open to everyone signed in the moment accounts exist.
+const PRIVATE_NEEDS_ACCOUNTS: &str = "a private domain is recorded in this instance's accounts, and none are set up yet: add the first account with `crystalline users add` and restart the server, or connect it with readers shared";
+
+/// Why a shared connect is refused on a name that is already private.
+const SHARED_ON_PRIVATE: &str =
+    "this domain is private; connect it as private, then change who may read on its Members card";
+
+/// The note a connect carries when it was given readers on an instance
+/// without a GitHub App.
+const READERS_IGNORED: &str = "this instance has no GitHub App, so readers was ignored: who may read this domain follows this instance's own accounts, as for any other domain";
+
+/// What a connect does about who may read the domain; see
+/// [`Engine::connect_readers`].
+#[derive(Clone, Copy)]
+enum ConnectReaders {
+    /// No App: nothing to ask, nothing given.
+    Ungoverned,
+    /// No App, and readers were given anyway: ignored, with a note.
+    Ignored,
+    /// An App: the domain will be governed, readers as chosen.
+    Governed(Readers),
+}
+
+/// The MANIFEST's path in a domain and in every share of it.
+const MANIFEST_PATH: &str = "MANIFEST.md";
+
+/// Why the MANIFEST rides along on a share that adds the team marker, as
+/// the share receipt and the preview name it beside the path.
+pub const TEAM_MARKER_REASON: &str = "marks this repository as a team domain; added once";
+
+/// The line a share that adds the team marker ends its pull request body or
+/// commit message with, so a reviewer reads why the MANIFEST changed.
+const TEAM_MARKER_NOTE: &str = "MANIFEST.md gains `team: github`. Crystalline added it: it marks this repository as a team domain, and it is added once.";
+
+/// What the team marker does for one share: the MANIFEST text the share
+/// carries, and the file list it goes on with when the marker joined a
+/// narrowed one.
+struct TeamMarker {
+    /// The MANIFEST text before the marker, for a share that ends up
+    /// sharing nothing and takes the marker back out of the folder.
+    current: String,
+    /// Whether the marker was written into the folder (a domain that takes
+    /// changes directly) rather than into a staged tree.
+    in_folder: bool,
+    marked: String,
+    files: Option<Vec<String>>,
+}
+
+/// The receipt and preview entry for a share that carries the team marker.
+fn team_marker_json() -> Value {
+    json!({ "path": MANIFEST_PATH, "reason": TEAM_MARKER_REASON })
+}
 
 impl Engine {
     // --- origin (GitHub collaboration) ----------------------------------------
@@ -29,6 +93,20 @@ impl Engine {
     /// connected state rather than a conflict. Both also carry the name
     /// fields every registration result does: `name_origin`,
     /// `canonical_name`, `aliases`, `shadowed` and, when shadowed, a `note`.
+    ///
+    /// `readers` says who may read the domain on an instance with a GitHub
+    /// App ([`Engine::github_app_configured`]), where its access follows
+    /// GitHub. There it is required, and refused with [`READERS_REQUIRED`]
+    /// before anything is fetched when absent; `private` also needs the
+    /// accounts store installed. `private` is recorded before the domain is
+    /// registered, and only the acl row it wrote is taken back when the
+    /// registration fails. `shared` writes and deletes nothing, and is
+    /// refused before the download on a name that already carries a private
+    /// record (a private domain is made shared on its Members card, never by
+    /// a connect). A fresh connect then reports `readers` (`shared` or
+    /// `private`). Without an App the answer is ignored and the report
+    /// carries a `readers_note` saying so. An already-connected retry changes
+    /// no record and reports the readers as they stand.
     pub async fn origin_add(
         &self,
         repo: &str,
@@ -36,8 +114,9 @@ impl Engine {
         path: Option<&str>,
         branch: Option<&str>,
         folder: Option<&str>,
+        readers: Option<Readers>,
     ) -> Result<Value> {
-        self.origin_add_with_progress(repo, domain, path, branch, folder, None)
+        self.origin_add_with_progress(repo, domain, path, branch, folder, readers, None)
             .await
     }
 
@@ -46,6 +125,7 @@ impl Engine {
     /// downloading, downloaded, indexing, connected - so a client can keep
     /// its request timeout alive during a long download and index; an
     /// already-connected retry is instant and reports none.
+    #[allow(clippy::too_many_arguments)]
     pub async fn origin_add_with_progress(
         &self,
         repo: &str,
@@ -53,6 +133,7 @@ impl Engine {
         path: Option<&str>,
         branch: Option<&str>,
         folder: Option<&str>,
+        readers: Option<Readers>,
         progress: Option<OriginProgress>,
     ) -> Result<Value> {
         self.origin_add_with_progress_as(
@@ -61,6 +142,7 @@ impl Engine {
             path,
             branch,
             folder,
+            readers,
             progress,
             &crate::scope::Scope::Unrestricted,
         )
@@ -78,6 +160,7 @@ impl Engine {
         path: Option<&str>,
         branch: Option<&str>,
         folder: Option<&str>,
+        readers: Option<Readers>,
         progress: Option<OriginProgress>,
         scope: &crate::scope::Scope,
     ) -> Result<Value> {
@@ -95,6 +178,16 @@ impl Engine {
         // Before anything is downloaded or origin state written: the
         // registration at the end would refuse a file that does not parse.
         self.refuse_a_config_that_does_not_parse()?;
+        // Who may read it, asked before anything else is: on an instance
+        // with a GitHub App the answer decides whether the content is open to
+        // everyone signed in, so it is never defaulted.
+        let readers = self.connect_readers(readers)?;
+        // The answer as given, for a retry that finds the domain connected:
+        // a different answer there is named, never applied.
+        let asked = match readers {
+            ConnectReaders::Governed(chosen) => Some(chosen),
+            _ => None,
+        };
 
         // The name, in order: the caller's own; else the `domain_name` the
         // repository's MANIFEST declares, read through the forge before
@@ -115,7 +208,7 @@ impl Engine {
                 if let Some((name, entry)) =
                     self.connection_matching(repo, path, branch, folder, true)
                 {
-                    return self.origin_already_connected(&name, &entry).await;
+                    return self.origin_already_connected(&name, &entry, asked).await;
                 }
                 // The repository's own name is the fallback, and what holds it
                 // here is known without asking the forge: a domain connected
@@ -130,7 +223,9 @@ impl Engine {
                 let default_refusal =
                     match self.holder_of(&default_name, repo, path, branch, folder) {
                         Ok(Holder::Connected(entry)) => {
-                            return self.origin_already_connected(&default_name, &entry).await;
+                            return self
+                                .origin_already_connected(&default_name, &entry, asked)
+                                .await;
                         }
                         Ok(_) => None,
                         Err(e) => Some(e),
@@ -154,7 +249,7 @@ impl Engine {
                 if let Some((name, entry)) =
                     self.connection_matching(repo, path, Some(&branch_name), folder, false)
                 {
-                    return self.origin_already_connected(&name, &entry).await;
+                    return self.origin_already_connected(&name, &entry, asked).await;
                 }
                 let declared = self
                     .origin_manifest_name(provider.as_ref(), repo, path, &branch_name)
@@ -214,7 +309,9 @@ impl Engine {
             Ok(_) => match self.holder_of(&domain_name, repo, path, branch, folder)? {
                 Holder::Free => None,
                 Holder::Connected(entry) => {
-                    return self.origin_already_connected(&domain_name, &entry).await;
+                    return self
+                        .origin_already_connected(&domain_name, &entry, asked)
+                        .await;
                 }
                 Holder::Adopt(root, entry) => Some((root, entry)),
             },
@@ -237,13 +334,24 @@ impl Engine {
         {
             if Self::origin_matches_request(&entry, origin_cfg, repo, path, branch, folder) {
                 return self
-                    .origin_already_connected_locked(&domain_name, &entry)
+                    .origin_already_connected_locked(&domain_name, &entry, asked)
                     .await;
             }
             return Err(EngineError::Conflict(format!(
                 "domain '{domain_name}' is already connected to {}; pass a domain name to connect this origin under a different one",
                 origin_cfg.repo
             )));
+        }
+        // A shared answer never opens a name that is already private: a
+        // private domain being adopted, or the record an earlier
+        // registration of the name left. Asked once the name is final and
+        // before the download (a nameless connect has only read the MANIFEST
+        // by now), so nothing is fetched or registered, and nothing is
+        // written or deleted for it.
+        if matches!(readers, ConnectReaders::Governed(Readers::Shared))
+            && self.name_is_private(&domain_name).await?
+        {
+            return Err(EngineError::Invalid(SHARED_ON_PRIVATE.to_string()));
         }
 
         let adopts_registered = existing.is_some();
@@ -297,10 +405,21 @@ impl Engine {
             ),
         );
 
+        // A private domain is recorded private before it is registered, so
+        // there is no moment in which the registered domain is governed and
+        // open to everyone signed in. Should the registration below fail,
+        // the record is taken back again.
+        let closed = match readers {
+            ConnectReaders::Governed(Readers::Private) => {
+                Some(self.record_private_readers(&domain_name, scope).await?)
+            }
+            _ => None,
+        };
+
         // Register the domain and persist, mirroring `configure`'s file-then-
         // effective write-lock-first pattern so a concurrent read never observes
         // a half-applied config and no env value bakes into the saved file.
-        {
+        let registered = (|| -> Result<()> {
             let mut file_guard = self.file_config.write().unwrap();
             let mut file = self.fresh_file_config(&file_guard)?;
             // Adopting a registered domain keeps everything already decided
@@ -339,7 +458,22 @@ impl Engine {
             let effective = self.overlay.apply(&file);
             *file_guard = file;
             *self.config.write().unwrap() = effective;
+            Ok(())
+        })();
+        if let Err(e) = registered {
+            if closed == Some(crystalline_identity::auth_store::VisibilityWrite::Written) {
+                self.take_back_private_readers(&domain_name).await;
+            }
+            return Err(e);
         }
+        // Who the repository is on GitHub, so a later transfer or a reused
+        // name is told apart from a rename (still under the origin lock).
+        self.record_repository_ids_at_connect(&domain_name, repo, &state_dir)
+            .await;
+        let readers_note = match readers {
+            ConnectReaders::Ignored => Some(READERS_IGNORED),
+            _ => None,
+        };
         // Its origin may make it a copy of a mounted domain, hidden from now on.
         self.sync_sources_local();
 
@@ -380,9 +514,229 @@ impl Engine {
             "files_added": report.files_written,
             "local_changes": report.local_changes,
         });
+        if let ConnectReaders::Governed(chosen) = readers {
+            result["readers"] = json!(chosen.as_str());
+        }
+        if let Some(note) = readers_note {
+            result["readers_note"] = json!(note);
+        }
         self.append_name_fields(&mut result, &domain_name).await?;
         self.note_beside_mounts(&mut result, &wanted, &domain_name, scope);
         Ok(result)
+    }
+
+    /// What a connect does about who may read the domain, decided before
+    /// anything is fetched: on an instance with a GitHub App (usable or not,
+    /// see [`Engine::github_app_configured`]) the caller has to say, and a
+    /// private answer needs the accounts store to record it in; without an
+    /// App the answer is not asked and, when given, ignored with a note.
+    fn connect_readers(&self, readers: Option<Readers>) -> Result<ConnectReaders> {
+        if !self.github_app_configured() {
+            return Ok(match readers {
+                Some(_) => ConnectReaders::Ignored,
+                None => ConnectReaders::Ungoverned,
+            });
+        }
+        match readers {
+            None => Err(EngineError::Invalid(READERS_REQUIRED.to_string())),
+            Some(Readers::Private) if self.domain_access.get().is_none() => {
+                Err(EngineError::Invalid(PRIVATE_NEEDS_ACCOUNTS.to_string()))
+            }
+            Some(chosen) => Ok(ConnectReaders::Governed(chosen)),
+        }
+    }
+
+    /// Whether `domain` carries a private record, registered or not. `false`
+    /// without an accounts store, where no record can exist. A record that
+    /// cannot be read refuses: the answer decides whether a shared connect
+    /// would open it.
+    async fn name_is_private(&self, domain: &str) -> Result<bool> {
+        let Some(access) = self.domain_access.get() else {
+            return Ok(false);
+        };
+        access.has_private_record(domain).await.map_err(|e| {
+            EngineError::Internal(format!(
+                "whether domain '{domain}' is private could not be read, so it was not connected: {e:#}"
+            ))
+        })
+    }
+
+    /// Who reads a governed domain as it stands: `private` with a private
+    /// record, else `shared`. `None` without an App, where the question is
+    /// not asked, or when the record cannot be read.
+    async fn governed_readers_now(&self, domain: &str) -> Option<Readers> {
+        if !self.github_app_configured() {
+            return None;
+        }
+        match self.name_is_private(domain).await {
+            Ok(true) => Some(Readers::Private),
+            Ok(false) => Some(Readers::Shared),
+            Err(_) => None,
+        }
+    }
+
+    /// Records `domain` private for a governed connect, naming who chose
+    /// it: the signed-in account, else the machine owner's reserved name.
+    async fn record_private_readers(
+        &self,
+        domain: &str,
+        scope: &crate::scope::Scope,
+    ) -> Result<crystalline_identity::auth_store::VisibilityWrite> {
+        let set_by = match scope {
+            crate::scope::Scope::User { account, .. } | crate::scope::Scope::Agent { account } => {
+                account.as_str()
+            }
+            crate::scope::Scope::Unrestricted | crate::scope::Scope::Anonymous => {
+                crate::scope::OWNER_IDENTITY_NAME
+            }
+        };
+        let access = self
+            .domain_access
+            .get()
+            .ok_or_else(|| EngineError::Invalid(PRIVATE_NEEDS_ACCOUNTS.to_string()))?;
+        access
+            .set_governed_private(domain, set_by)
+            .await
+            .map_err(|e| {
+                EngineError::Internal(format!(
+                    "domain '{domain}' could not be made private, so it was not connected: {e:#}"
+                ))
+            })
+    }
+
+    /// Takes back the private record [`Engine::record_private_readers`]
+    /// wrote for a connect whose registration failed: the acl row only, never
+    /// a membership. Best effort: a record left behind keeps the name
+    /// private, which closes rather than opens.
+    async fn take_back_private_readers(&self, domain: &str) {
+        let Some(access) = self.domain_access.get() else {
+            return;
+        };
+        if let Err(e) = access.take_back_governed_private(domain).await {
+            tracing::warn!(
+                "domain '{domain}' was not connected, but its private record could not be taken back: {e:#}"
+            );
+        }
+    }
+
+    /// Whether the share of `files` (`None` is the whole unshared delta) out
+    /// of the tree at `tree` carries the team marker
+    /// ([`crystalline_core::TEAM_KEY`]), and if so the MANIFEST text it
+    /// carries and the file list it goes on with. `tree` is the folder for a
+    /// domain that takes changes directly, and the staged tree of the
+    /// actor's drafts for one that reviews changes. Reads only: the share
+    /// writes what this answers, and the preview reports it.
+    ///
+    /// The share, not the connect, is the one place every connected instance
+    /// passes through on its way to the team, existing connections included.
+    /// A connect never writes into the team's MANIFEST (a fresh connect has
+    /// no local change, and review mode needs exactly that clean folder to
+    /// start), and a write on every pull would be a local change nobody made
+    /// that comes back after every discard. At the share, the marker and the
+    /// share are one act, the receipt, the preview and the pull request body
+    /// say so, and on a domain that reviews changes it goes through the
+    /// review like any other line:
+    ///
+    /// - a share of everything carries it when there is something else to
+    ///   share, so pressing share with nothing to share stays a no-op;
+    /// - a narrowed share carries it when the list names the MANIFEST, and
+    ///   when the MANIFEST holds no other unshared change, in which case the
+    ///   MANIFEST joins the list and exactly one line rides along; a MANIFEST
+    ///   with unshared edits that were not chosen is left for a share that
+    ///   includes it.
+    ///
+    /// Nothing is carried from a read-only instance or domain, from a
+    /// MANIFEST that already declares a `team` (an unknown value is left for
+    /// its owner: verify reports it as `M010`, and a newer release may know
+    /// it) or from a frontmatter the marker cannot be cut into.
+    async fn plan_team_marker(
+        &self,
+        domain: &str,
+        tree: &Path,
+        state_dir: &Path,
+        files: Option<&[String]>,
+    ) -> Result<Option<TeamMarker>> {
+        if self.read_only || self.domain_is_read_only(domain).await {
+            return Ok(None);
+        }
+        let Ok(current) = std::fs::read_to_string(tree.join(MANIFEST_PATH)) else {
+            return Ok(None);
+        };
+        let current = crystalline_core::to_lf(&current);
+        let declares_team = crystalline_core::parse_engram(&current)
+            .map(|e| {
+                crystalline_core::Manifest::from_engram(&e, &current)
+                    .declared_team()
+                    .is_some()
+            })
+            .unwrap_or(true);
+        let marked =
+            crystalline_core::set_team_marker(&current, crystalline_core::TeamForge::GitHub);
+        if declares_team || marked == current {
+            return Ok(None);
+        }
+        let Some(state) = crystalline_remote::state::OriginState::load(state_dir)? else {
+            return Ok(None);
+        };
+        let local = crystalline_remote::changes::detect_local_changes_against(
+            tree,
+            &ops::unshared_base(&state),
+            state_dir,
+            self.reflection_mode(domain).await?,
+        )?;
+        let changed: Vec<&str> = local
+            .changes
+            .iter()
+            .filter(|change| !change.is_generated_index())
+            .map(|change| change.path())
+            .collect();
+        let files = match files {
+            None if changed.is_empty() => return Ok(None),
+            None => None,
+            Some(list) if list.iter().any(|path| path == MANIFEST_PATH) => None,
+            Some(_) if changed.contains(&MANIFEST_PATH) => return Ok(None),
+            Some(list) => {
+                let mut list = list.to_vec();
+                list.push(MANIFEST_PATH.to_string());
+                Some(list)
+            }
+        };
+        Ok(Some(TeamMarker {
+            current: current.to_string(),
+            in_folder: false,
+            marked,
+            files,
+        }))
+    }
+
+    /// Write the marker [`Engine::plan_team_marker`] planned into the folder
+    /// of a domain that takes changes directly, just before its share.
+    /// Answers whether it wrote: a MANIFEST open in a co-editing room is
+    /// left to the room, and the next share tries again.
+    ///
+    /// Written as bytes, not through the edit path, so it carries no
+    /// `generated` stamp: every instance writes exactly the same line at the
+    /// same place, and a member whose share pulls the MANIFEST another
+    /// member's share already marked meets a merge with nothing to
+    /// reconcile. A stamp of its own would differ on every instance and make
+    /// that pull a conflict nobody caused.
+    async fn write_team_marker(&self, domain: &str, root: &Path, marked: &str) -> Result<bool> {
+        // The write ticket and the read-only screen, as every write has.
+        let scope = crate::scope::Scope::Unrestricted;
+        let view = DomainView::for_write(self, domain, &scope).await?;
+        let (desc, _) = view.resolve("manifest").await?;
+        if let Some(rooms) = self.collab_rooms()
+            && rooms
+                .live_text(&desc.domain, &desc.permalink, None)
+                .await
+                .is_some()
+        {
+            return Ok(false);
+        }
+        write_file(&join_rel(root, &desc.path), marked)?;
+        drop(view);
+        self.sync(Some(domain)).await?;
+        Ok(true)
     }
 
     /// The branch a connect tracks: the one asked for, else the one the forge
@@ -616,10 +970,16 @@ impl Engine {
     /// The response for a connect retry that matches the existing
     /// connection: the same shape `origin_add` returns, marked
     /// `already_connected`, read under the domain's origin lock.
-    async fn origin_already_connected(&self, name: &str, entry: &DomainEntry) -> Result<Value> {
+    async fn origin_already_connected(
+        &self,
+        name: &str,
+        entry: &DomainEntry,
+        asked: Option<Readers>,
+    ) -> Result<Value> {
         let lock = self.origin_lock(name);
         let _guard = lock.lock().await;
-        self.origin_already_connected_locked(name, entry).await
+        self.origin_already_connected_locked(name, entry, asked)
+            .await
     }
 
     /// [`origin_already_connected`](Self::origin_already_connected)'s body,
@@ -627,10 +987,15 @@ impl Engine {
     /// inside `origin_add_with_progress` calls this directly: the origin lock
     /// is a non-reentrant tokio mutex, so re-acquiring it there would
     /// deadlock.
+    ///
+    /// `asked` is the readers answer the retry gave on an instance with a
+    /// GitHub App: one that differs from the domain's own is not applied,
+    /// and the report carries a `readers_note` saying where to change it.
     async fn origin_already_connected_locked(
         &self,
         name: &str,
         entry: &DomainEntry,
+        asked: Option<Readers>,
     ) -> Result<Value> {
         let root = entry.file_path().unwrap_or_default();
         let state_dir = self.origin_state_dir(name)?;
@@ -655,6 +1020,17 @@ impl Engine {
             "base_commit": base_commit,
             "already_connected": true,
         });
+        // Who reads it, as it stands: a retry changes no record, whatever
+        // readers it was given.
+        if let Some(readers) = self.governed_readers_now(name).await {
+            result["readers"] = json!(readers.as_str());
+            if asked.is_some_and(|asked| asked != readers) {
+                result["readers_note"] = json!(format!(
+                    "this domain is already connected and its readers are {}; change who may read on its Members card",
+                    readers.as_str()
+                ));
+            }
+        }
         self.append_name_fields(&mut result, name).await?;
         Ok(result)
     }
@@ -842,6 +1218,115 @@ impl Engine {
         }))
     }
 
+    /// Records who may read every env-defined team domain, from its
+    /// `CRYSTALLINE_DOMAIN_<NAME>_READERS` variable, on an instance with a
+    /// GitHub App. The daemon calls this once at startup, after the accounts
+    /// store is installed and before anything is served, so a domain is
+    /// closed before its first request.
+    ///
+    /// It only ever closes: `private`, or an absent variable, writes the
+    /// private record (left as it stands when there is one); `shared` writes
+    /// nothing, and on a domain that is already private it says so in one
+    /// warning and leaves it private, since who may read a private domain is
+    /// changed on its Members card. An absent variable reads as private,
+    /// with one warning naming it, since nobody should open a confidential
+    /// repository by accident. Applied whether or not `github.enabled` is on,
+    /// because closing a domain is never wrong.
+    ///
+    /// Without an App it writes nothing, and a variable set anyway is named
+    /// in an info line. Without an accounts store there is no record to
+    /// write, and one warning says so for every domain that should be
+    /// private. A private record that cannot be written stops the start,
+    /// naming the domain.
+    pub async fn apply_env_readers(&self) -> Result<()> {
+        self.apply_env_readers_with(false).await
+    }
+
+    /// [`Engine::apply_env_readers`] for the standalone stdio and one-shot
+    /// stacks: the private records are written the same way, and nothing is
+    /// said, since the daemon's start already says it once.
+    pub async fn apply_env_readers_quietly(&self) -> Result<()> {
+        self.apply_env_readers_with(true).await
+    }
+
+    async fn apply_env_readers_with(&self, quiet: bool) -> Result<()> {
+        let targets: Vec<(String, Option<Readers>, String)> = self
+            .overlay
+            .env_domains()
+            .filter(|(_, env)| env.entry.origin.is_some())
+            .map(|(name, env)| (name.clone(), env.readers, env.readers_var()))
+            .collect();
+        if targets.is_empty() {
+            return Ok(());
+        }
+        if !self.github_app_configured() {
+            if !quiet {
+                for (_, readers, var) in &targets {
+                    if readers.is_some() {
+                        tracing::info!(
+                            "{var} changes nothing on an instance without a GitHub App: who may read the domain follows this instance's own accounts"
+                        );
+                    }
+                }
+            }
+            return Ok(());
+        }
+        let access = self.domain_access.get();
+        let mut unrecorded: Vec<String> = Vec::new();
+        for (name, readers, var) in targets {
+            if readers.is_none() && !quiet {
+                tracing::warn!(
+                    "{var} is not set, so the env-defined team domain '{name}' is private: only people with access on GitHub read it. Set {var} to shared or private to say who may read it"
+                );
+            }
+            let Some(access) = access else {
+                if readers != Some(Readers::Shared) {
+                    unrecorded.push(name);
+                }
+                continue;
+            };
+            // Read first: a domain that is already private needs no write,
+            // and a start that finds it so takes no write lock on the
+            // accounts database.
+            let private = access.has_private_record(&name).await.map_err(|e| {
+                EngineError::Internal(format!(
+                    "whether the env-defined team domain '{name}' is private could not be read: {e:#}"
+                ))
+            })?;
+            if readers == Some(Readers::Shared) {
+                // Shared never opens a domain that is already private.
+                if private && !quiet {
+                    tracing::warn!(
+                        "{var} says shared, but domain '{name}' is private; set the variable to private, or remove the private record with: crystalline domain visibility {name} default"
+                    );
+                }
+                continue;
+            }
+            if private {
+                continue;
+            }
+            access
+                .set_governed_private(&name, crate::scope::OWNER_IDENTITY_NAME)
+                .await
+                .map_err(|e| {
+                    EngineError::Internal(format!(
+                        "the env-defined team domain '{name}' could not be made private: {e:#}"
+                    ))
+                })?;
+        }
+        if !unrecorded.is_empty() && !quiet {
+            tracing::warn!(
+                "the env-defined team domains {} should be private, but this instance has no accounts yet to record it in; restart the server after adding the first account",
+                unrecorded
+                    .iter()
+                    .map(|n| format!("'{n}'"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        Ok(())
+    }
+
     /// Bootstraps every env-defined team domain that carries an origin but
     /// has no local origin state yet, bringing each up through
     /// `Engine::origin_update_one` so bootstrapping and a plain background
@@ -954,7 +1439,9 @@ impl Engine {
         let share_actor = match scope {
             crate::scope::Scope::Unrestricted => ShareActor::Owner,
             crate::scope::Scope::User { account, .. } => ShareActor::Account(account.clone()),
-            crate::scope::Scope::Anonymous => ShareActor::HttpAgent,
+            crate::scope::Scope::Anonymous | crate::scope::Scope::Agent { .. } => {
+                ShareActor::HttpAgent
+            }
         };
         // A refusal is recorded per login, so the status reads it under the
         // login this caller's shares go out on. Resolved once, outside every
@@ -1143,11 +1630,17 @@ impl Engine {
                 .unwrap_or_default()
         });
         let sharing = crystalline_core::sharing_at(&root);
+        let app = self.origin_status_app(&spec.repo).await;
         let with_out_of_band = |mut value: Value| {
             if let Some(object) = value.as_object_mut() {
                 // Read off the folder like the change detail is, so every
                 // status surface says which kind of domain it is looking at.
                 object.insert("sharing".to_string(), json!(sharing.as_str()));
+                // Only with an App configured, so a status without one reads
+                // exactly as it always has.
+                if let Some(app) = &app {
+                    object.insert("app".to_string(), app.clone());
+                }
             }
             if let Some(paths) = &out_of_band
                 && let Some(object) = value.as_object_mut()
@@ -1195,7 +1688,14 @@ impl Engine {
                 change_detail(),
                 origin::viewer_refusal(&report, viewer, sharing),
             ))),
-            Err(e) if probe.is_some() && origin::is_probe_transport_error(&e) => {
+            // A repository the App is not installed on degrades the same way:
+            // the report still comes back from local state, with the refusal
+            // (and its install url) as the probe error and in `app`.
+            Err(e)
+                if probe.is_some()
+                    && (origin::is_probe_transport_error(&e)
+                        || matches!(e, RemoteError::AppNotInstalled { .. })) =>
+            {
                 // AuthExpired is one of the transport errors this arm catches
                 // (see `origin::is_probe_transport_error`), so a probe that
                 // failed because the token was revoked drops the cached
@@ -1215,6 +1715,29 @@ impl Engine {
             }
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// The `app` block of one domain's status: `{ installed, install_url }`
+    /// when a GitHub App is configured, `None` otherwise. `installed` is
+    /// `null` when GitHub could not be asked (offline, rate limited), and
+    /// `install_url` is `null` when the App's slug could not be read. Never
+    /// an error: a status survives an App that cannot be reached.
+    async fn origin_status_app(&self, repo: &str) -> Option<Value> {
+        let github_app::AppSlot::Ready(router) = self.github_app_slot() else {
+            return None;
+        };
+        let app = router.app();
+        // Asked afresh rather than read from the cache: an uninstall since the
+        // last call is exactly what this block exists to show.
+        app.evict_repo(repo);
+        let (installed, install_url) = match app.installation_for(repo).await {
+            Ok(_) => (json!(true), app.install_url().await.ok()),
+            Err(RemoteError::AppNotInstalled { install_url, .. }) => {
+                (json!(false), Some(install_url))
+            }
+            Err(_) => (Value::Null, app.install_url().await.ok()),
+        };
+        Some(json!({ "installed": installed, "install_url": install_url }))
     }
 
     /// Runs one scheduling pass of the background origin poller: checks
@@ -1258,7 +1781,12 @@ impl Engine {
             }
             self.origin_poller.set_rate_limited_until(None);
         }
-        if !self.origin_connection_offline().0 {
+        // An App is a connection of its own: an instance that runs one needs
+        // no instance token to pull. Asked only when no token is on file, so
+        // an instance without an App reads exactly what it read before.
+        if !self.origin_connection_offline().0
+            && !matches!(self.github_app_slot(), github_app::AppSlot::Ready(_))
+        {
             if self.origin_poller.should_log_no_token(now) {
                 tracing::debug!(
                     "origin poll: no GitHub connection yet; waiting for connect to resume polling"
@@ -1664,8 +2192,35 @@ impl Engine {
         if let (Some(who), true) = (drafting.as_deref(), stacks_allowed) {
             self.refuse_open_proposal_while_reviewing(domain, &state_dir, who)?;
         }
-        let (provider, login) = self.resolve_share_provider(&actor)?;
+        let (provider, login) = self.resolve_share_provider(&actor, &spec.repo).await?;
         let acting = self.personal_write_login(login.as_deref());
+        // The team marker, for a share of the folder: written into the folder
+        // before anything is detected (see `Engine::plan_team_marker`). A
+        // failure never fails the share; the marker waits for the next one.
+        let mut marker: Option<TeamMarker> = None;
+        if drafting.is_none() {
+            match self
+                .plan_team_marker(domain, &root, &state_dir, files)
+                .await
+            {
+                Ok(Some(plan)) => match self.write_team_marker(domain, &root, &plan.marked).await {
+                    Ok(true) => {
+                        marker = Some(TeamMarker {
+                            in_folder: true,
+                            ..plan
+                        })
+                    }
+                    Ok(false) => {}
+                    Err(e) => tracing::warn!(
+                        "writing the team marker of '{domain}' before a share failed: {e}"
+                    ),
+                },
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!("planning the team marker of '{domain}' failed: {e}")
+                }
+            }
+        }
         // In review mode the share is of the actor's own drafts, which are in
         // the index and on nobody's disk, so the tree `ops` detects against is
         // staged here. `None` is a domain that takes changes directly, whose
@@ -1694,6 +2249,28 @@ impl Engine {
         let detect_in = staging
             .as_ref()
             .map_or(root.as_path(), |prepared| prepared.staging.root());
+        // In review mode the marker joins the staged tree of the actor's
+        // drafts, so it goes through the review like any other line; the
+        // folder moves only when the team merges it.
+        if let Some(prepared) = staging.as_ref() {
+            let tree = prepared.staging.root();
+            match self.plan_team_marker(domain, tree, &state_dir, files).await {
+                Ok(Some(plan)) => match write_file(&tree.join(MANIFEST_PATH), &plan.marked) {
+                    Ok(()) => marker = Some(plan),
+                    Err(e) => tracing::warn!(
+                        "staging the team marker of '{domain}' for a share failed: {e}"
+                    ),
+                },
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!("planning the team marker of '{domain}' failed: {e}")
+                }
+            }
+        }
+        let files = marker
+            .as_ref()
+            .and_then(|plan| plan.files.as_deref())
+            .or(files);
         match ops::propose(
             share_provider,
             &spec,
@@ -1704,6 +2281,7 @@ impl Engine {
                 as_proposal,
                 title,
                 description,
+                note: marker.is_some().then_some(TEAM_MARKER_NOTE),
                 proposal,
                 stacks_allowed,
                 // Who the proposal record names, in either identity mode: the
@@ -1722,6 +2300,23 @@ impl Engine {
         {
             Ok(outcome) => {
                 let mut receipt = origin::propose_outcome_json(&outcome);
+                // Only an outcome that carried something to the team carried
+                // the marker; a refusal or a diverged proposal shared nothing,
+                // and the marker it wrote into the folder is taken back.
+                let shared = matches!(
+                    outcome,
+                    ops::ProposeOutcome::Proposed(_)
+                        | ops::ProposeOutcome::Updated(_)
+                        | ops::ProposeOutcome::Committed(_)
+                        | ops::ProposeOutcome::FellBack { .. }
+                );
+                if let Some(plan) = &marker {
+                    if shared {
+                        receipt["team_marker"] = team_marker_json();
+                    } else {
+                        self.take_back_team_marker(domain, &root, plan).await;
+                    }
+                }
                 // A reviewing domain's direct commit: the folder is written
                 // from the base copies the commit advanced, those paths are
                 // indexed, and the convergence pass a merged proposal's pull
@@ -1783,6 +2378,9 @@ impl Engine {
                 Ok(receipt)
             }
             Err(RemoteError::ConflictsPending { count }) => {
+                if let Some(plan) = &marker {
+                    self.take_back_team_marker(domain, &root, plan).await;
+                }
                 // The conflicts refusal is the loudest case for syncing: the
                 // pull ran, applied everything that merged cleanly and only
                 // then refused, so this shape carries the most unindexed work
@@ -1800,7 +2398,36 @@ impl Engine {
                     "conflicts": conflicts,
                 }))
             }
-            Err(e) => Err(share_write_error(e, acting.as_deref(), &spec.repo).into()),
+            Err(e) => {
+                if let Some(plan) = &marker {
+                    self.take_back_team_marker(domain, &root, plan).await;
+                }
+                Err(share_write_error(e, acting.as_deref(), &spec.repo).into())
+            }
+        }
+    }
+
+    /// Take the team marker a share wrote into the folder back out when the
+    /// share carried nothing to the team, so it never stays behind as a
+    /// local change nobody asked for. Only while the MANIFEST still holds
+    /// exactly what the marker write left: a pull or a person that changed
+    /// it since owns it now. Best effort, like the write.
+    async fn take_back_team_marker(&self, domain: &str, root: &Path, plan: &TeamMarker) {
+        if !plan.in_folder {
+            return;
+        }
+        let path = root.join(MANIFEST_PATH);
+        let unchanged = std::fs::read_to_string(&path)
+            .is_ok_and(|text| crystalline_core::to_lf(&text) == plan.marked);
+        if !unchanged {
+            return;
+        }
+        if let Err(e) = write_file(&path, &plan.current) {
+            tracing::warn!("taking the team marker of '{domain}' back failed: {e}");
+            return;
+        }
+        if let Err(e) = self.sync(Some(domain)).await {
+            tracing::warn!("indexing '{domain}' after taking the team marker back failed: {e}");
         }
     }
 
@@ -1975,7 +2602,7 @@ impl Engine {
             // confirm a share this instance would then refuse.
             self.refuse_open_proposal_while_reviewing(domain, &state_dir, who)?;
         }
-        let (provider, login) = match self.resolve_share_provider(&actor) {
+        let (provider, login) = match self.resolve_share_provider(&actor, &spec.repo).await {
             Ok(resolved) => resolved,
             Err(e)
                 if credential == PreviewCredential::ReadScopeFallback
@@ -2021,6 +2648,7 @@ impl Engine {
                 as_proposal,
                 title,
                 description: None,
+                note: None,
                 proposal,
                 stacks_allowed,
                 // Carried for the same reason the provider is: a preview
@@ -2044,6 +2672,15 @@ impl Engine {
         // it rather than with a column answering a question nobody asked.
         let provenance = drafting.is_none().then_some(root.as_path());
         let mut plan = origin::share_plan_json(&plan, provenance);
+        // The marker the share would add, named beside the plan rather than
+        // in its change list: the folder does not hold it yet, and the
+        // change list is what a person ticks and discards.
+        if let Ok(Some(_)) = self
+            .plan_team_marker(domain, detect_in, &state_dir, files)
+            .await
+        {
+            plan["team_marker"] = team_marker_json();
+        }
         // The repository beside the branch, so Fluid's share dialog can say
         // where a commit goes without a second lookup.
         plan["repo"] = json!(spec.repo);
@@ -2102,7 +2739,7 @@ impl Engine {
         } else {
             Vec::new()
         };
-        let (provider, login) = self.resolve_share_provider(&actor)?;
+        let (provider, login) = self.resolve_share_provider(&actor, &spec.repo).await?;
         let acting = self.personal_write_login(login.as_deref());
         let mut report = ops::withdraw(
             provider.as_ref(),
@@ -3221,7 +3858,7 @@ impl Engine {
 
     /// The base directory per-domain origin state lives under: the test
     /// override, or the real state directory.
-    fn origins_base_dir(&self) -> Result<PathBuf> {
+    pub(super) fn origins_base_dir(&self) -> Result<PathBuf> {
         match &self.origins_dir_override {
             Some(p) => Ok(p.clone()),
             None => crystalline_core::config::origins_state_dir()
@@ -3288,9 +3925,22 @@ impl Engine {
     /// a machine that has not connected yet is never cached, so a later
     /// connect is seen too. Errors with `RemoteError::NotConnected` when no
     /// token has been saved and no test provider is injected.
+    ///
+    /// With a GitHub App configured (see [`Engine::github_app`]) the provider
+    /// is the App's [`github_app::AppRouter`] instead, which sends each call
+    /// on the installation token of the repository it is about, and the
+    /// instance credential is not read at all. A repository the App is not
+    /// installed on is refused with `RemoteError::AppNotInstalled` naming the
+    /// install url, never served on the instance credential. An App that is
+    /// configured but unusable refuses every operation the same way.
     pub(super) fn resolve_origin_provider(&self) -> Result<Arc<dyn Provider>> {
         if let Some(p) = &self.origin_provider_override {
             return Ok(p.clone());
+        }
+        match self.github_app_slot() {
+            github_app::AppSlot::Ready(router) => return Ok(router),
+            github_app::AppSlot::Refused(detail) => return Err(github_app::app_refusal(detail)),
+            github_app::AppSlot::Absent | github_app::AppSlot::Unloaded => {}
         }
         let api_url = self
             .config
@@ -3332,14 +3982,28 @@ impl Engine {
     /// is whatever [`Engine::with_origin_provider_login`] supplied beside it -
     /// `None` unless a test asked for one, which is the same answer as a
     /// credential that names nobody.
-    pub(super) fn resolve_share_provider(
+    ///
+    /// Through a GitHub App, the share's commits name the acting account as
+    /// author and the App's bot as committer when the account has a contact
+    /// address (see [`Engine::app_share_router`]); `repo` is the repository
+    /// whose installation token reads the bot's identity.
+    pub(super) async fn resolve_share_provider(
         &self,
         actor: &ShareActor,
+        repo: &str,
     ) -> Result<(Arc<dyn Provider>, Option<String>)> {
         if let Some(p) = &self.origin_provider_override {
             return Ok((p.clone(), self.origin_provider_override_login.clone()));
         }
-        let (api_url, token) = self.resolve_share_credential(actor)?;
+        if let Some(app) = self.instance_share_app()? {
+            let app = self.app_share_router(app, actor, repo).await;
+            let login = app.bot_login();
+            return Ok((app, login));
+        }
+        let (api_url, token) = match self.personal_app_identity(actor)? {
+            Some(name) => (self.share_api_url(), self.personal_user_token(&name).await?),
+            None => self.resolve_share_credential(actor)?,
+        };
         let login = token.user_display().map(str::to_string);
         Ok((
             Arc::new(GitHubProvider::new(api_url, Some(token.access_token))),
@@ -3356,8 +4020,60 @@ impl Engine {
         if self.origin_provider_override.is_some() {
             return Some(self.origin_provider_override_login.clone());
         }
+        match self.instance_share_app() {
+            Ok(Some(app)) => return Some(app.bot_login()),
+            Ok(None) => {}
+            Err(_) => return None,
+        }
         let (_, token) = self.resolve_share_credential(actor).ok()?;
         Some(token.user_display().map(str::to_string))
+    }
+
+    /// The personal identity a share by `actor` runs under when it goes out
+    /// on a GitHub App user token: in `personal` mode with a usable App. That
+    /// token is renewed before use ([`Engine::personal_user_token`]); without
+    /// an App, or with one that cannot be used, the personal credential is
+    /// read as before ([`Engine::resolve_share_credential`]).
+    fn personal_app_identity(&self, actor: &ShareActor) -> Result<Option<String>> {
+        let (mode, agent_identity) = {
+            let config = self.config.read().unwrap();
+            (
+                config.github_share_identity(),
+                config.github_agent_identity().map(str::to_string),
+            )
+        };
+        if mode != ShareIdentityMode::Personal
+            || !matches!(self.github_app_slot(), github_app::AppSlot::Ready(_))
+        {
+            return Ok(None);
+        }
+        self.acting_identity_name(actor, agent_identity).map(Some)
+    }
+
+    /// The effective `github.api_url` a share's client is built against.
+    fn share_api_url(&self) -> Option<String> {
+        self.config
+            .read()
+            .unwrap()
+            .github
+            .as_ref()
+            .and_then(|g| g.api_url.clone())
+    }
+
+    /// The App a share goes out through, when it goes out through one: in
+    /// `instance` mode with an App configured, the same
+    /// [`github_app::AppRouter`] the read side uses, and an unusable App
+    /// refuses. `personal` mode never takes the App: a person's write runs
+    /// on that person's own credential, as before.
+    fn instance_share_app(&self) -> Result<Option<Arc<github_app::AppRouter>>> {
+        if self.config.read().unwrap().github_share_identity() != ShareIdentityMode::Instance {
+            return Ok(None);
+        }
+        match self.github_app_slot() {
+            github_app::AppSlot::Ready(router) => Ok(Some(router)),
+            github_app::AppSlot::Refused(detail) => Err(github_app::app_refusal(detail)),
+            github_app::AppSlot::Absent | github_app::AppSlot::Unloaded => Ok(None),
+        }
     }
 
     /// The credential half of [`Engine::resolve_share_provider`]: the api url
@@ -3473,8 +4189,14 @@ impl Engine {
             .and_then(|g| g.api_url.clone());
         let host = origin::token_host(api_url.as_deref());
         let (store, token) = self.github_credential(host.as_deref())?;
+        // An App is a connection of its own: an instance that runs one
+        // reads, pulls and shares without an instance token. Asked only when
+        // no token is on file, so an instance without an App reads exactly
+        // what it read before.
+        let connected =
+            token.is_some() || matches!(self.github_app_slot(), github_app::AppSlot::Ready(_));
         Ok(json!({
-            "connected": token.is_some(),
+            "connected": connected,
             "user": token.as_ref().and_then(|t| t.user_display()),
             "token_store": store.kind(),
         }))
@@ -3543,6 +4265,19 @@ impl Engine {
             )
         };
         connection["share_identity"] = json!(mode.as_str());
+        // A configured App that cannot be used refuses every origin
+        // operation; this is where the status says why.
+        if let github_app::AppSlot::Refused(detail) = self.github_app_slot() {
+            connection["app"] = json!({
+                "error": github_app::app_refusal(detail).to_string(),
+            });
+        }
+        // A keychain that could not be read is said here while the failure
+        // is remembered: an App saved in it is refused, and without one the
+        // status says the keychain was not readable all the same.
+        if let Some(reason) = self.github_app_keychain_unreadable() {
+            connection["app"]["keychain_unreadable"] = json!(reason);
+        }
         if mode == ShareIdentityMode::Personal {
             connection["owner_identity"] =
                 self.personal_slot_json(OWNER_IDENTITY_NAME, &connection);
@@ -3724,9 +4459,19 @@ impl Engine {
     /// clearing every entry (up to one per identity per host now) avoids
     /// threading the offending host through every provider-op call site and
     /// costs only one extra keychain read per host on the next touch.
+    ///
+    /// With a GitHub App, a 401 has already been retried once on a renewed
+    /// installation token inside [`github_app::AppRouter`]; one that still
+    /// reaches here means the installation itself changed, so every
+    /// installation and token the App cached is forgotten too and the next
+    /// call looks the repository up again (and says so when the App is gone).
+    /// Only an App already loaded is touched: this never loads one.
     fn drop_github_credential_on_auth(&self, e: &RemoteError) {
         if matches!(e, RemoteError::AuthExpired) {
             self.github_tokens.lock().unwrap().clear();
+            if let Some(router) = self.github_app.read().unwrap().ready() {
+                router.app().evict_all();
+            }
         }
     }
 }

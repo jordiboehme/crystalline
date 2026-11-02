@@ -27,9 +27,13 @@ import {
 import type {
   ArchiveReport as ArchiveReportWire,
   CreateDomainWireBody,
+  GithubAppManifestResponse,
   GithubIdentityResponse,
+  GithubLinkResponse,
   GithubStatusResponse,
+  GithubUnlinkResponse,
   RenameWireBody,
+  StartGithubLinkResponse,
 } from "./model";
 
 /**
@@ -72,6 +76,24 @@ export interface GithubStatus {
    * status read after the flow ends, then cleared.
    */
   error: string | null;
+  /** The instance's GitHub App, or null when none is configured. */
+  app: GithubApp | null;
+}
+
+/** The instance's GitHub App. No secret: the server sends none. */
+export interface GithubApp {
+  /** The numeric App id, when the App could be read. */
+  appId: number | null;
+  /** The App's slug, when known. */
+  slug: string | null;
+  /** `keyring`, `file` or `environment`. */
+  source: string | null;
+  /** Where an owner installs the App, when it is usable and its slug known. */
+  installUrl: string | null;
+  /** Why the App cannot be used, in the server's words. */
+  error: string | null;
+  /** A saved App is still being loaded; nothing else is known yet. */
+  loading: boolean;
 }
 
 /** The cache key of the GitHub connection. */
@@ -94,6 +116,23 @@ export function readGithubStatus(payload: unknown): GithubStatus {
     tokenStore: asString(record?.token_store),
     pending: readPending(record?.pending),
     error: asString(record?.error),
+    app: readApp(record?.app),
+  };
+}
+
+/** The App block, or null when the instance has no App. */
+function readApp(value: unknown): GithubApp | null {
+  const record = asObject(value);
+  if (record === null) {
+    return null;
+  }
+  return {
+    appId: asNumber(record.app_id),
+    slug: asString(record.slug),
+    source: asString(record.source),
+    installUrl: asString(record.install_url),
+    error: asString(record.error),
+    loading: record.loading === true,
   };
 }
 
@@ -142,6 +181,50 @@ export async function submitGithubToken(token: string): Promise<GithubStatus> {
       body: JSON.stringify({ token }),
     }),
   );
+}
+
+/** The form that creates the instance's GitHub App on GitHub. */
+export interface GithubAppManifestForm {
+  /** GitHub's new-App page, carrying the state. */
+  postUrl: string;
+  /** The manifest, posted JSON-encoded as the field `manifest`. */
+  manifest: unknown;
+}
+
+/**
+ * Ask for the manifest form. `org` names the organization the App is made
+ * for; without it the App belongs to the admin's own GitHub account.
+ */
+export async function startGithubAppManifest(
+  org: string | null,
+): Promise<GithubAppManifestForm> {
+  const answer = await api<GithubAppManifestResponse>(
+    "/settings/github/app/manifest",
+    {
+      method: "POST",
+      body: JSON.stringify(org === null ? {} : { org }),
+    },
+  );
+  return { postUrl: answer.post_url, manifest: answer.manifest };
+}
+
+/**
+ * Send the browser to GitHub with the manifest: a real form POST, the only
+ * way GitHub's new-App page takes one. The page is left for GitHub's, so
+ * nothing runs after this.
+ */
+export function postGithubAppManifest(form: GithubAppManifestForm): void {
+  const element = document.createElement("form");
+  element.method = "post";
+  element.action = form.postUrl;
+  element.hidden = true;
+  const field = document.createElement("input");
+  field.type = "hidden";
+  field.name = "manifest";
+  field.value = JSON.stringify(form.manifest);
+  element.appendChild(field);
+  document.body.appendChild(element);
+  element.submit();
 }
 
 /** Forget the stored credential. Leaves the feature itself switched on. */
@@ -233,6 +316,11 @@ export interface GithubIdentity {
    * exactly one read after the flow ends, then cleared.
    */
   error: string | null;
+  /**
+   * Only on a disconnect that unlinked through the GitHub App and could not
+   * revoke the token at GitHub, in the server's words; null otherwise.
+   */
+  warning: string | null;
 }
 
 /**
@@ -266,6 +354,7 @@ export function readMyGithubIdentity(payload: unknown): GithubIdentity {
     tokenStore: asString(record?.token_store),
     pending: readPending(record?.pending),
     error: asString(record?.error),
+    warning: asString(record?.warning),
   };
 }
 
@@ -329,6 +418,78 @@ export async function disconnectMyGithubIdentity(): Promise<GithubIdentity> {
   );
 }
 
+/**
+ * The caller's link to a GitHub account through the instance's GitHub App, as
+ * the profile card renders it. No token material, ever.
+ */
+export interface GithubLink {
+  /** Whether this instance has a GitHub App to link through at all. */
+  appConfigured: boolean;
+  /** Whether the account is linked. */
+  linked: boolean;
+  /** The GitHub login last seen for the linked account. */
+  login: string | null;
+  /** When the link was made, RFC 3339. */
+  linkedAt: string | null;
+  /** False once GitHub no longer takes the link's token; linking again fixes it. */
+  tokenLive: boolean;
+  /** A link device flow started from the command line, waiting for its browser half. */
+  pending: GithubPending | null;
+  /** That device flow's failure, in the server's words, reported once. */
+  error: string | null;
+}
+
+/**
+ * The cache key of the caller's own GitHub link. Its own key, beside the
+ * identity's: the two are read by the same card but answer different routes.
+ */
+export const MY_GITHUB_LINK_KEY = ["me-github-link"] as const;
+
+/**
+ * Read a link payload, whatever arrived. Defensive for the reason
+ * {@link readMyGithubIdentity} is: a missing field leaves the card on "no App"
+ * or "not linked" rather than throwing inside a render.
+ */
+export function readMyGithubLink(payload: unknown): GithubLink {
+  const record = asObject(payload);
+  return {
+    appConfigured: record?.app_configured === true,
+    linked: record?.linked === true,
+    login: asString(record?.login),
+    linkedAt: asString(record?.linked_at),
+    tokenLive: record?.token_live === true,
+    pending: readPending(record?.pending),
+    error: asString(record?.error),
+  };
+}
+
+/** The caller's own link, and whether there is an App to link through. */
+export async function fetchMyGithubLink(): Promise<GithubLink> {
+  return readMyGithubLink(await api<GithubLinkResponse>("/me/github-link"));
+}
+
+/**
+ * Start linking through the App's web flow: answers GitHub's authorize url,
+ * which the page navigates the whole browser to.
+ */
+export async function startMyGithubLink(): Promise<string> {
+  const started = await api<StartGithubLinkResponse>("/me/github-link/start", {
+    method: "POST",
+  });
+  return started.authorize_url;
+}
+
+/**
+ * Unlink the caller's own account. Answers the server's warning when GitHub
+ * could not revoke the token, else null.
+ */
+export async function unlinkMyGithubLink(): Promise<string | null> {
+  const answer = await api<GithubUnlinkResponse>("/me/github-link", {
+    method: "DELETE",
+  });
+  return asString(asObject(answer)?.warning);
+}
+
 /** Which of the three kinds of domain is being registered. */
 export type DomainMode = "local" | "virtual" | "github";
 
@@ -351,7 +512,16 @@ export interface CreateDomainBody {
   // variable, as opposed to an object literal, is not flagged). Indexing it
   // is what turns that removal into a compile error here too.
   private?: NonNullable<CreateDomainWireBody["private"]>;
+  /** Who may read a team domain on an instance with a GitHub App. */
+  readers?: Readers;
 }
+
+/**
+ * Who may read a team domain whose access follows GitHub: everyone signed in,
+ * or only the people with access to the repository on GitHub. The generated
+ * schema's own enum.
+ */
+export type Readers = NonNullable<CreateDomainWireBody["readers"]>;
 
 /** What a registration reports back: the name it took, and where it landed. */
 export interface CreatedDomain {
@@ -1250,6 +1420,27 @@ export interface SharePlan {
    * older server.
    */
   note: string | null;
+  /**
+   * The team marker this share adds to the MANIFEST, with the server's
+   * reason, when it adds one; null otherwise, and from an older server. It
+   * is not in `changes`: the folder does not hold it yet, and `changes` is
+   * what a person ticks and discards.
+   */
+  teamMarker: TeamMarker | null;
+}
+
+/** A file a share adds on its own, and why: the team marker in the MANIFEST. */
+export interface TeamMarker {
+  path: string;
+  reason: string;
+}
+
+/** Read a `team_marker` entry off a plan or a share receipt. */
+export function readTeamMarker(payload: unknown): TeamMarker | null {
+  const record = asObject(payload);
+  const path = asString(record?.path);
+  const reason = asString(record?.reason);
+  return path === null || reason === null ? null : { path, reason };
 }
 
 /**
@@ -1327,6 +1518,7 @@ export async function fetchShareChanges(domain: string): Promise<SharePlan> {
     title: asString(record?.title),
     own: record?.own !== false,
     note: asString(record?.note),
+    teamMarker: readTeamMarker(record?.team_marker),
   };
 }
 

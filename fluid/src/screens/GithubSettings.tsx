@@ -15,16 +15,19 @@
  */
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useId, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
+import { useSearchParams } from "react-router";
 
 import {
   GITHUB_STATUS_KEY,
   disconnectGithub,
   fetchGithubStatus,
+  postGithubAppManifest,
+  startGithubAppManifest,
   startGithubConnect,
   submitGithubToken,
 } from "../api/admin";
-import type { GithubPending } from "../api/admin";
+import type { GithubApp, GithubPending, GithubStatus } from "../api/admin";
 import { problemDetail } from "../api/client";
 import { useAuth } from "../auth/AuthContext";
 import {
@@ -50,6 +53,25 @@ const CONNECT_BUTTON = `${CONTROL_HEIGHT} ${BUTTON.primary}`;
 const SECONDARY_BUTTON = `${CONTROL_HEIGHT} ${BUTTON.secondary}`;
 
 const DANGER_BUTTON = `${CONTROL_HEIGHT} ${BUTTON.destructive}`;
+
+/**
+ * Who the instance is connected as. A GitHub App is named plainly: before
+ * GitHub has said its bot's name (an App from the environment whose slug was
+ * not read yet) it is just "GitHub App", never "an account GitHub did not
+ * name (GitHub App)".
+ */
+function connectedLine(connection: GithubStatus | null | undefined): string {
+  if (!connection?.connected) {
+    return "Not connected";
+  }
+  if (connection.tokenStore === APP_STORE && connection.user === null) {
+    return `Connected as ${APP_STORE}`;
+  }
+  return `Connected as ${connection.user ?? "an account GitHub did not name"} (${connection.tokenStore ?? "an unnamed store"})`;
+}
+
+/** The store name the server gives an instance connected through its App. */
+const APP_STORE = "GitHub App";
 
 export default function GithubSettings() {
   const { capabilities } = useAuth();
@@ -163,6 +185,11 @@ function GithubPanel() {
         </p>
       )}
 
+      <AppSection
+        app={connection?.app ?? null}
+        loading={status.isPending || connection?.app?.loading === true}
+      />
+
       {status.error && (
         <p
           role="alert"
@@ -185,11 +212,7 @@ function GithubPanel() {
             Reading the connection
           </p>
         ) : (
-          <p className="text-sm">
-            {connection?.connected
-              ? `Connected as ${connection.user ?? "an account GitHub did not name"} (${connection.tokenStore ?? "an unnamed store"})`
-              : "Not connected"}
-          </p>
+          <p className="text-sm">{connectedLine(connection)}</p>
         )}
 
         {/*
@@ -403,5 +426,180 @@ function Disconnect({
         </>
       )}
     </div>
+  );
+}
+
+/** What the App's creation landings say, by the `app` value they carry. */
+const APP_LANDINGS: Record<string, string> = {
+  created:
+    "The GitHub App is created. Install it on the repositories your team domains use. Then enable Device Flow in the App's settings on GitHub, so people can link GitHub from a terminal with crystalline connect github --personal.",
+  installed: "The GitHub App is installed.",
+};
+
+/** The landing's notice, read once from the address GitHub sent back to. */
+function appLanding(params: URLSearchParams): Notice | null {
+  const code = params.get("app");
+  // Own keys only: the value comes from the address.
+  if (code === null || !Object.hasOwn(APP_LANDINGS, code)) {
+    return null;
+  }
+  const text = APP_LANDINGS[code];
+  return text === undefined ? null : { kind: "done", text };
+}
+
+/**
+ * The instance's GitHub App: create it through GitHub's manifest flow, then
+ * install it on repositories.
+ *
+ * Creating is a POST and then a whole-page form POST to GitHub, for the
+ * reason the link card on the profile gives: the first records server side
+ * which admin session asked (under the CSRF check), and only a real form
+ * POST carries the manifest to GitHub's new-App page. GitHub sends the
+ * browser back to the server, which stores the App and lands here with
+ * `app=created`; that is read once into the notice and then taken out of the
+ * address, so a reload does not say it again.
+ */
+function AppSection({
+  app,
+  loading,
+}: {
+  app: GithubApp | null;
+  loading: boolean;
+}) {
+  const { capabilities } = useAuth();
+  const orgField = useId();
+  const [org, setOrg] = useState("");
+  const [problem, setProblem] = useState<string | null>(null);
+  const [params, setParams] = useSearchParams();
+  const [landing] = useState<Notice | null>(() => appLanding(params));
+  useEffect(() => {
+    if (params.has("app")) {
+      const rest = new URLSearchParams(params);
+      rest.delete("app");
+      setParams(rest, { replace: true });
+    }
+  }, [params, setParams]);
+
+  const create = useMutation({
+    mutationFn: () => {
+      const named = org.trim();
+      return startGithubAppManifest(named === "" ? null : named);
+    },
+    onSuccess: (form) => {
+      setProblem(null);
+      postGithubAppManifest(form);
+    },
+    onError: (error: Error) => {
+      setProblem(problemDetail(error));
+    },
+  });
+
+  return (
+    <section
+      aria-labelledby="github-app"
+      className="flex flex-col gap-4 rounded border border-slate-200 p-4 dark:border-slate-800"
+    >
+      <div>
+        <h2 id="github-app" className="text-section">
+          GitHub App
+        </h2>
+        <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">
+          An App of this instance&apos;s own reads, pulls and shares, and who
+          may use each team domain follows the repository on GitHub.
+        </p>
+      </div>
+
+      {landing && (
+        <p
+          role="status"
+          className="rounded border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-700 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-300"
+        >
+          {landing.text}
+        </p>
+      )}
+
+      {problem !== null && (
+        <p
+          role="alert"
+          className="rounded border border-red-300 bg-red-50 px-3 py-2 text-sm text-red-800 dark:border-red-900 dark:bg-red-950 dark:text-red-200"
+        >
+          {problem}
+        </p>
+      )}
+
+      {loading ? (
+        <p className="text-sm text-slate-500 dark:text-slate-400">
+          Reading the App
+        </p>
+      ) : app ? (
+        <div className="flex flex-col items-start gap-3">
+          <p className="text-sm">
+            {app.slug ??
+              (app.appId === null ? "GitHub App" : `App ${String(app.appId)}`)}
+            {app.source !== null && ` (${app.source})`}
+          </p>
+          {app.error !== null && (
+            <p
+              role="alert"
+              className="rounded border border-red-300 bg-red-50 px-3 py-2 text-sm text-red-800 dark:border-red-900 dark:bg-red-950 dark:text-red-200"
+            >
+              {app.error}
+            </p>
+          )}
+          {app.installUrl !== null && (
+            <a
+              href={app.installUrl}
+              target="_blank"
+              rel="noreferrer"
+              className={`${CONTROL_HEIGHT} ${BUTTON.secondary} ${FOCUS_RING}`}
+            >
+              Install on repositories
+            </a>
+          )}
+          <p className="text-sm text-slate-500 dark:text-slate-400">
+            To create a new App, remove this one first with{" "}
+            <code className="font-mono">crystalline github app remove</code>.
+          </p>
+        </div>
+      ) : capabilities.readOnly ? (
+        <p className="text-sm text-slate-500 dark:text-slate-400">
+          This instance is read-only, so no GitHub App can be created here.
+        </p>
+      ) : (
+        <form
+          className="flex flex-wrap items-end gap-3"
+          onSubmit={(event) => {
+            event.preventDefault();
+            create.mutate();
+          }}
+        >
+          <div className="flex flex-col gap-1">
+            <label
+              htmlFor={orgField}
+              className="text-xs text-slate-500 dark:text-slate-400"
+            >
+              Organization (empty for your own account)
+            </label>
+            <input
+              id={orgField}
+              type="text"
+              autoComplete="off"
+              value={org}
+              onChange={(event) => {
+                setOrg(event.target.value);
+              }}
+              className={`w-72 ${FIELD}`}
+            />
+          </div>
+          <button
+            type="submit"
+            disabled={create.isPending}
+            className={CONNECT_BUTTON}
+          >
+            Create GitHub App
+          </button>
+        </form>
+      )}
+    </section>
   );
 }

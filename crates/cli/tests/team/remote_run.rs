@@ -22,8 +22,10 @@ use serde_json::{Value, json};
 use crate::forge::Forge;
 use crate::remote_server::CliServer;
 
+/// Carries the team marker, as every team repository does after its first
+/// share from 0.30.0 on, so a run's share carries only the run's files.
 fn manifest() -> Vec<u8> {
-    b"---\ntype: manifest\ntitle: brand\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# brand\n\n## Scope\n\n- The brand team's knowledge\n\n## When to Use\n\n- Route here for brand questions\n".to_vec()
+    b"---\ntype: manifest\ntitle: brand\nteam: github\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# brand\n\n## Scope\n\n- The brand team's knowledge\n\n## When to Use\n\n- Route here for brand questions\n".to_vec()
 }
 
 fn engram(title: &str, permalink: &str, body: &str) -> Vec<u8> {

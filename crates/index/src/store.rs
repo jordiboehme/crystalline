@@ -4112,6 +4112,21 @@ pub trait Store: Send + Sync {
         paths: &[String],
     ) -> Result<u64>;
 
+    /// The disclosures recorded on `domain`'s Reflection, one entry per
+    /// page: its path inside `reflections/` and its records as the JSON text
+    /// [`Store::set_reflection_disclosures`] stored. Sorted by path.
+    async fn reflection_disclosures(&self, domain: DomainId) -> Result<Vec<(String, String)>>;
+
+    /// Replace the disclosures recorded on one page of `domain`'s
+    /// Reflection with `records` (JSON text the engine reads), or drop them
+    /// when `records` is `None`.
+    async fn set_reflection_disclosures(
+        &self,
+        domain: DomainId,
+        path: &str,
+        records: Option<&str>,
+    ) -> Result<()>;
+
     /// The lease of `loop_kind` on `domain` as stored, a stale one included.
     async fn automation_lease(
         &self,

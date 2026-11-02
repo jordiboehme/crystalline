@@ -17,8 +17,8 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use crystalline_remote::github::GitHubProvider;
 use crystalline_remote::{
-    ChangeKind, HeadProbe, OriginSpec, ProposalRequest, ProposalState, Provider, RemoteError,
-    TreeWrite,
+    ChangeKind, CommitIdentities, CommitIdentity, HeadProbe, OriginSpec, ProposalRequest,
+    ProposalState, Provider, RemoteError, TreeWrite,
 };
 use tokio::net::TcpListener;
 
@@ -379,6 +379,70 @@ async fn create_blob_tree_commit_and_branch_send_the_documented_bodies() {
     let branch_body = state.branch_body.lock().unwrap().clone().unwrap();
     assert_eq!(branch_body["ref"], "refs/heads/feature-x");
     assert_eq!(branch_body["sha"], "commitsha1");
+}
+
+/// A forge that answers only `POST .../git/commits` and keeps its body.
+async fn commit_capture() -> (Arc<Captured>, String) {
+    let state = Arc::new(Captured::default());
+    let app = Router::new()
+        .route(
+            "/repos/acme/brand-knowledge/git/commits",
+            post(
+                |State(state): State<Arc<Captured>>, Json(body): Json<serde_json::Value>| async move {
+                    *state.commit_body.lock().unwrap() = Some(body);
+                    Json(serde_json::json!({"sha": "commitsha1"}))
+                },
+            ),
+        )
+        .with_state(state.clone());
+    let base = spawn(app).await;
+    (state, base)
+}
+
+#[tokio::test]
+async fn create_commit_sends_author_and_committer_when_set() {
+    let (state, base) = commit_capture().await;
+    let provider = GitHubProvider::new(Some(base), None).with_commit_identities(CommitIdentities {
+        author: CommitIdentity {
+            name: "Ada Lovelace".to_string(),
+            email: "ada@example.com".to_string(),
+        },
+        committer: CommitIdentity {
+            name: "crystalline-acme[bot]".to_string(),
+            email: "41898282+crystalline-acme[bot]@users.noreply.github.com".to_string(),
+        },
+    });
+    provider
+        .create_commit(&origin(), "message", "treesha1", &["p1".to_string()])
+        .await
+        .unwrap();
+
+    let body = state.commit_body.lock().unwrap().clone().unwrap();
+    assert_eq!(body["author"]["name"], "Ada Lovelace");
+    assert_eq!(body["author"]["email"], "ada@example.com");
+    assert_eq!(body["committer"]["name"], "crystalline-acme[bot]");
+    assert_eq!(
+        body["committer"]["email"],
+        "41898282+crystalline-acme[bot]@users.noreply.github.com"
+    );
+    assert_eq!(body["message"], "message");
+}
+
+#[tokio::test]
+async fn create_commit_omits_both_by_default() {
+    let (state, base) = commit_capture().await;
+    let provider = GitHubProvider::new(Some(base), None);
+    provider
+        .create_commit(&origin(), "message", "treesha1", &["p1".to_string()])
+        .await
+        .unwrap();
+
+    let body = state.commit_body.lock().unwrap().clone().unwrap();
+    let keys: Vec<&String> = body.as_object().unwrap().keys().collect();
+    assert!(
+        !keys.iter().any(|k| *k == "author" || *k == "committer"),
+        "no identity keys without identities: {keys:?}"
+    );
 }
 
 #[tokio::test]

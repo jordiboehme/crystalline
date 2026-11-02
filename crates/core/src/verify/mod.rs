@@ -15,6 +15,10 @@
 //! is reported as `M108` (a warning) and otherwise changes nothing. `--strict`
 //! additionally promotes every rule whose default severity is `Warning` to
 //! `Error`, `M108` included.
+//!
+//! `--team-repository` adds the rules for a repository a team shares through
+//! GitHub (`M011`, `M012`, `M109`), which the domain's own settings cannot
+//! lower, and puts `M010` out of their reach too; see the `team` module.
 
 mod catalog;
 mod domain_config;
@@ -26,6 +30,7 @@ mod report;
 mod scanner;
 mod schema_rules;
 mod severity;
+mod team;
 mod temporal;
 mod util;
 
@@ -155,6 +160,11 @@ pub struct VerifyOptions {
     /// When set, applied to every scanned domain instead of discovering
     /// each domain's own `.crystalline.yaml`.
     pub config_override: Option<crate::config::DomainConfig>,
+    /// Also run the team repository rules (`M011`, `M012`, `M109`): the
+    /// checks for the repository of a domain shared through GitHub, where a
+    /// Reflection must never be kept. Off by default, so plain verify of a
+    /// local domain or a personal backup repository is unchanged.
+    pub team_repository: bool,
 }
 
 /// Verify one or more paths. Each path given directly is treated as a
@@ -294,7 +304,7 @@ pub fn check_document(domain: &str, rel_path: &Path, source: &str) -> Vec<Issue>
 }
 
 /// Run the MANIFEST rules over one MANIFEST text, without scanning a domain:
-/// `M002`-`M009`, `M101`-`M104`, `M106` and `M107`, plus `M105` when `root`
+/// `M002`-`M010`, `M013`, `M101`-`M104`, `M106` and `M107`, plus `M105` when `root`
 /// names the domain folder its provisioned folders are looked up in.
 ///
 /// Backs the edit and write receipts, which report what a change did to a
@@ -349,6 +359,10 @@ pub(crate) struct Sink<'a> {
     summary: &'a mut Summary,
     verify_cfg: Option<&'a crate::config::VerifyConfig>,
     strict: bool,
+    /// Rules the domain's own settings do not reach in this run: `M010` in a
+    /// team repository, so a pull request cannot misspell the team marker
+    /// and turn off the finding about it in the same change.
+    fixed: &'static [&'static str],
 }
 
 impl<'a> Sink<'a> {
@@ -363,7 +377,14 @@ impl<'a> Sink<'a> {
             summary,
             verify_cfg,
             strict,
+            fixed: &[],
         }
+    }
+
+    /// This sink, with `rules` out of reach of the domain's settings.
+    fn with_fixed(mut self, rules: &'static [&'static str]) -> Sink<'a> {
+        self.fixed = rules;
+        self
     }
 
     /// Emit a finding at its rule's default severity. Resolves the
@@ -386,7 +407,12 @@ impl<'a> Sink<'a> {
             message: message.into(),
             fix,
         };
-        let Some(issue) = effective_issue(raw, self.verify_cfg, self.strict) else {
+        let verify_cfg = if self.fixed.contains(&rule) {
+            None
+        } else {
+            self.verify_cfg
+        };
+        let Some(issue) = effective_issue(raw, verify_cfg, self.strict) else {
             return;
         };
         match issue.severity {
@@ -411,12 +437,24 @@ fn run_rules(domains: &[scanner::Domain], options: &VerifyOptions) -> VerifyRepo
     };
 
     for domain in domains {
+        // The team repository rules first, through a sink that reads no
+        // domain settings: a `.crystalline.yaml` in the very change they
+        // guard must not be able to turn them off.
+        if options.team_repository {
+            let mut sink = Sink::new(&mut issues, &mut summary, None, options.strict);
+            team::check(domain, &mut sink);
+        }
         let mut sink = Sink::new(
             &mut issues,
             &mut summary,
             domain.config.verify.as_ref(),
             options.strict,
-        );
+        )
+        .with_fixed(if options.team_repository {
+            &["M010"]
+        } else {
+            &[]
+        });
         // The domain's own settings first: a severity word verify does not
         // know, or a file that does not parse, silently took an override
         // away. One `M108` per problem, against the file itself.

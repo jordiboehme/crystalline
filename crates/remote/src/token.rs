@@ -116,6 +116,17 @@ pub struct StoredToken {
     pub user: String,
     /// When this token was saved.
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// The refresh token of an expiring GitHub App user token; `None` for an
+    /// OAuth App token or a personal access token, which do not expire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
+    /// When `access_token` stops working; `None` when it never does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When `refresh_token` stops working. `None` means there is no refresh
+    /// token or its expiry is unknown, not only that it never expires.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl StoredToken {
@@ -134,7 +145,7 @@ impl StoredToken {
     }
 }
 
-/// Redacts `access_token`: a `StoredToken` reaches `Debug` output in a log
+/// Redacts `access_token` and `refresh_token`: a `StoredToken` reaches `Debug` output in a log
 /// line, a panic message or a test failure far more easily than it reaches
 /// `Display` (which this type has none of), so the derive is deliberately not
 /// used here. Every other field is plain, non-secret metadata and prints as
@@ -146,6 +157,12 @@ impl std::fmt::Debug for StoredToken {
             .field("host", &self.host)
             .field("user", &self.user)
             .field("created_at", &self.created_at)
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("expires_at", &self.expires_at)
+            .field("refresh_expires_at", &self.refresh_expires_at)
             .finish()
     }
 }
@@ -435,6 +452,9 @@ impl TokenStore {
                 host: host.clone(),
                 user: String::new(),
                 created_at: chrono::Utc::now(),
+                refresh_token: None,
+                expires_at: None,
+                refresh_expires_at: None,
             })),
         }
     }
@@ -718,7 +738,11 @@ pub(crate) fn keyring_read(account: &str, timeout: Duration) -> KeyringRead {
 /// One bounded keychain write for `account`, the shape both
 /// [`TokenStore::save_resolving_for`] and [`TokenStore::save`] write
 /// through. `Err` carries the reason, a timeout included.
-fn keyring_write(account: &str, json: String, timeout: Duration) -> Result<(), RemoteError> {
+pub(crate) fn keyring_write(
+    account: &str,
+    json: String,
+    timeout: Duration,
+) -> Result<(), RemoteError> {
     refuse_real_keychain_under_test("save");
     let owned = account.to_string();
     keyring_call_with_timeout(timeout, "save", move || {
@@ -732,7 +756,7 @@ fn keyring_write(account: &str, json: String, timeout: Duration) -> Result<(), R
 
 /// One bounded keychain delete for `account`. Deleting an entry that is not
 /// there is not an error, exactly as it was before the bound.
-fn keyring_delete(account: &str, timeout: Duration) -> Result<(), RemoteError> {
+pub(crate) fn keyring_delete(account: &str, timeout: Duration) -> Result<(), RemoteError> {
     refuse_real_keychain_under_test("delete");
     let owned = account.to_string();
     keyring_call_with_timeout(timeout, "delete", move || {
@@ -779,7 +803,19 @@ fn from_json(json: &str) -> Result<StoredToken, RemoteError> {
 /// owner-only, then renamed into place, so a reader never sees a partial
 /// file and no other local account can read the token in between.
 fn save_file(path: &Path, token: &StoredToken) -> Result<(), RemoteError> {
-    let json = to_json(token)?;
+    write_secret_file(path, &to_json(token)?)
+}
+
+fn load_file(path: &Path) -> Result<Option<StoredToken>, RemoteError> {
+    match read_secret_file(path)? {
+        Some(contents) => from_json(&contents).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// The write half of [`save_file`] over already-serialized text, shared with
+/// the App credential store so both lock a secret file down the same way.
+pub(crate) fn write_secret_file(path: &Path, json: &str) -> Result<(), RemoteError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -790,15 +826,17 @@ fn save_file(path: &Path, token: &StoredToken) -> Result<(), RemoteError> {
     Ok(())
 }
 
-fn load_file(path: &Path) -> Result<Option<StoredToken>, RemoteError> {
+/// The read half of [`load_file`]: the file's text, or `None` when it does not
+/// exist.
+pub(crate) fn read_secret_file(path: &Path) -> Result<Option<String>, RemoteError> {
     match std::fs::read_to_string(path) {
-        Ok(contents) => from_json(&contents).map(Some),
+        Ok(contents) => Ok(Some(contents)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.into()),
     }
 }
 
-fn delete_file(path: &Path) -> Result<(), RemoteError> {
+pub(crate) fn delete_file(path: &Path) -> Result<(), RemoteError> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -831,7 +869,43 @@ mod tests {
             host: "github.com".to_string(),
             user: "octocat".to_string(),
             created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            refresh_token: None,
+            expires_at: None,
+            refresh_expires_at: None,
         }
+    }
+
+    #[test]
+    fn stored_token_reads_old_json_without_the_new_fields() {
+        let old = r#"{"access_token":"gho_x","host":"github.com","user":"octocat","created_at":"2023-11-14T22:13:20Z"}"#;
+        let token: StoredToken = serde_json::from_str(old).unwrap();
+        assert!(token.refresh_token.is_none());
+        assert!(token.expires_at.is_none());
+        assert!(token.refresh_expires_at.is_none());
+        // A token without the new fields serializes without them too.
+        let json = serde_json::to_string(&token).unwrap();
+        assert!(!json.contains("refresh"), "{json}");
+    }
+
+    #[test]
+    fn stored_token_round_trips_the_refresh_fields() {
+        let mut token = sample_token();
+        token.refresh_token = Some("ghr_secretrefresh".to_string());
+        token.expires_at = chrono::DateTime::from_timestamp(1_700_028_800, 0);
+        token.refresh_expires_at = chrono::DateTime::from_timestamp(1_715_897_600, 0);
+        let back: StoredToken =
+            serde_json::from_str(&serde_json::to_string(&token).unwrap()).unwrap();
+        assert_eq!(back, token);
+    }
+
+    #[test]
+    fn stored_token_debug_redacts_the_refresh_token() {
+        let mut token = sample_token();
+        token.refresh_token = Some("ghr_secretrefresh".to_string());
+        let debug = format!("{token:?}");
+        assert!(!debug.contains("ghr_secretrefresh"), "{debug}");
+        assert!(!debug.contains("gho_examplesecret"), "{debug}");
+        assert!(debug.contains("refresh_token"), "{debug}");
     }
 
     // The keyring arms of `resolve_and_load` and `save_resolving` are

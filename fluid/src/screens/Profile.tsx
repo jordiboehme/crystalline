@@ -44,15 +44,20 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Copy } from "lucide-react";
 import { Dialog } from "radix-ui";
 import { useEffect, useId, useRef, useState } from "react";
+import { Navigate, useLocation, useSearchParams } from "react-router";
 
 import {
   MY_GITHUB_IDENTITY_KEY,
+  MY_GITHUB_LINK_KEY,
   connectMyGithubIdentityToken,
   disconnectMyGithubIdentity,
   fetchMyGithubIdentity,
+  fetchMyGithubLink,
   startMyGithubIdentityDevice,
+  startMyGithubLink,
+  unlinkMyGithubLink,
 } from "../api/admin";
-import type { GithubIdentity, GithubPending } from "../api/admin";
+import type { GithubIdentity, GithubLink, GithubPending } from "../api/admin";
 import { ApiProblem, problemDetail } from "../api/client";
 import {
   MCP_TOKENS_KEY,
@@ -82,6 +87,7 @@ import {
   unlinkIdentity,
 } from "../api/sso";
 import { useAuth } from "../auth/AuthContext";
+import type { FromLocation } from "../auth/RequireAuth";
 import { navigateTo } from "../base";
 import {
   BUTTON,
@@ -113,9 +119,23 @@ const MUTED = "text-sm text-slate-500 dark:text-slate-400";
 
 export default function Profile() {
   const { user, capabilities } = useAuth();
+  const location = useLocation();
   // A profile is an account's, and an anonymous session has none. The address
-  // then says exactly as much as a mistyped one does.
+  // then says exactly as much as a mistyped one does. The one exception is a
+  // GitHub link coming back to a browser that lost its session: on an
+  // instance with anonymous viewing that browser is not sent to the sign-in
+  // by the gate, so it is sent here, and comes back to the profile after.
   if (!user) {
+    if (new URLSearchParams(location.search).has("github_error")) {
+      const state: FromLocation = {
+        from: {
+          pathname: location.pathname,
+          search: location.search,
+          hash: location.hash,
+        },
+      };
+      return <Navigate to="/login" replace state={state} />;
+    }
     return <NotFound />;
   }
 
@@ -138,17 +158,51 @@ export default function Profile() {
 /**
  * The GitHub identity this account shares as.
  *
- * Gated on the role rather than on `canWrite`, which folds in whether the
- * instance takes writes at all: a read-only instance still has an identity to
- * show, it simply refuses every verb that would change one, and those are left
- * out below instead of the whole card. A viewer is the other case and is a
- * different sentence: the server refuses them this route, so the card does not
- * go and ask - it says why there is nothing here for them.
+ * Two cards in one frame, picked by whether this instance has a GitHub App.
+ * The link read answers that for every account (the settings read that names
+ * the App is admin only), and while it is in flight nothing is drawn below the
+ * heading: offering the older ways in for a moment and then swapping them out
+ * would be a door that moves under the pointer. A read that fails, from an
+ * older server or otherwise, is taken as no App, which is the card this
+ * screen always had.
+ *
+ * With an App, {@link GithubLinkPanel}: every account may link, viewers too,
+ * because the link is who the person is at GitHub rather than a right to
+ * share. Without one, {@link IdentityPanel}, gated on the role rather than on
+ * `canWrite`, which folds in whether the instance takes writes at all: a
+ * read-only instance still has an identity to show, it simply refuses every
+ * verb that would change one, and those are left out below instead of the
+ * whole card. A viewer is the other case and is a different sentence: the
+ * server refuses them that route, so the card does not go and ask - it says
+ * why there is nothing here for them.
  */
 function GithubIdentityCard() {
   const { capabilities } = useAuth();
   const sharer =
     capabilities.role === "editor" || capabilities.role === "admin";
+
+  const link = useQuery({
+    queryKey: MY_GITHUB_LINK_KEY,
+    queryFn: fetchMyGithubLink,
+    retry: false,
+    // Only while a device flow started from the command line waits.
+    refetchInterval: (query) => (query.state.data?.pending ? POLL_MS : false),
+  });
+  const app = link.data?.appConfigured === true ? link.data : null;
+
+  // The callback's landing, read once and taken out of the address here, so
+  // it is said whichever card shows: a link read that failed still lands the
+  // person on a sentence, and a reload does not say it again.
+  const [params, setParams] = useSearchParams();
+  const [landing] = useState<Notice | null>(() => landingNotice(params));
+  useEffect(() => {
+    if (params.has("github") || params.has("github_error")) {
+      const rest = new URLSearchParams(params);
+      rest.delete("github");
+      rest.delete("github_error");
+      setParams(rest, { replace: true });
+    }
+  }, [params, setParams]);
 
   return (
     <section
@@ -160,12 +214,19 @@ function GithubIdentityCard() {
           GitHub identity
         </h2>
         <p className={`mt-1 ${MUTED}`}>
-          The account your shared work is opened under. Proposals you share from
-          this instance carry your GitHub name, so it needs write access to the
-          repositories your team domains track.
+          {app
+            ? sharer
+              ? "The GitHub account your shared work is opened under. Link it once, and what you share from this instance carries your GitHub name."
+              : "Link your GitHub account once so this instance knows who you are there."
+            : "The account your shared work is opened under. Proposals you share from this instance carry your GitHub name, so it needs write access to the repositories your team domains track."}
         </p>
       </div>
-      {sharer ? (
+      {landing && <NoticeLine notice={landing} />}
+      {link.isPending ? (
+        <p className={MUTED}>Reading your GitHub identity</p>
+      ) : app ? (
+        <GithubLinkPanel link={app} sharer={sharer} />
+      ) : sharer ? (
         <IdentityPanel />
       ) : (
         <p className={MUTED}>
@@ -174,6 +235,239 @@ function GithubIdentityCard() {
         </p>
       )}
     </section>
+  );
+}
+
+/** What the link callback's landing says, by the code it sent the browser back with. */
+const LINK_ERRORS: Record<string, string> = {
+  id_taken:
+    "This GitHub account is already linked to another Crystalline account. An admin can unlink it there.",
+  state:
+    "This GitHub link could not be matched to a link you started, or it took too long. Connect again.",
+  session:
+    "You were signed out before GitHub sent you back, so nothing was linked. Connect again.",
+  denied: "You cancelled at GitHub, so nothing was linked.",
+  failed:
+    "Your GitHub account could not be linked. Try again, or ask an admin to check the GitHub App.",
+};
+
+/** The landing's notice, read once from the address the callback sent. */
+function landingNotice(params: URLSearchParams): Notice | null {
+  const code = params.get("github_error");
+  if (code !== null) {
+    // Own keys only: the code comes from the address, and a name such as
+    // `constructor` must not reach the object's prototype.
+    const known = Object.hasOwn(LINK_ERRORS, code) ? LINK_ERRORS[code] : null;
+    return { kind: "problem", text: known ?? LINK_ERRORS.failed ?? "" };
+  }
+  if (params.get("github") === "linked") {
+    return { kind: "done", text: "Your GitHub account is linked." };
+  }
+  return null;
+}
+
+/** A notice line: an alert for bad news, a status for good. */
+function NoticeLine({ notice }: { notice: Notice }) {
+  return (
+    <p
+      role={notice.kind === "problem" ? "alert" : "status"}
+      className={
+        notice.kind === "problem"
+          ? "rounded border border-red-300 bg-red-50 px-3 py-2 text-sm text-red-800 dark:border-red-900 dark:bg-red-950 dark:text-red-200"
+          : "rounded border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-700 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-300"
+      }
+    >
+      {notice.text}
+    </p>
+  );
+}
+
+/**
+ * The link through the instance's GitHub App: connect, see who you are
+ * linked to, unlink.
+ *
+ * Connecting is a POST and then a whole-page navigation, for the reason the
+ * SSO card gives: the POST records server side that this session started the
+ * link (under the CSRF check), and only a real navigation can carry somebody
+ * to GitHub's consent page and back. GitHub sends the browser back to the
+ * callback, which lands here with `github=linked` or `github_error=<code>`;
+ * that is read once into the notice and then taken out of the address, so a
+ * reload does not say it again.
+ */
+function GithubLinkPanel({
+  link,
+  sharer,
+}: {
+  link: GithubLink;
+  sharer: boolean;
+}) {
+  const { capabilities } = useAuth();
+  const queryClient = useQueryClient();
+  const [notice, setNotice] = useState<Notice | null>(null);
+
+  /*
+    An older sign-in (an OAuth token from before the App) keeps working for
+    shares until the person links (ruling R11), so it is shown here with a
+    way to forget it. Only before a link: once linked, the personal slot
+    holds the App's own token, and forgetting it is what Unlink does.
+  */
+  const older = useQuery({
+    queryKey: MY_GITHUB_IDENTITY_KEY,
+    queryFn: fetchMyGithubIdentity,
+    enabled: sharer && !link.linked,
+    retry: false,
+  });
+  const forget = useMutation({
+    retry: false,
+    mutationFn: disconnectMyGithubIdentity,
+    onSuccess: (gone) => {
+      setNotice(
+        gone.warning === null
+          ? { kind: "done", text: "The older sign-in is forgotten." }
+          : { kind: "problem", text: gone.warning },
+      );
+      void queryClient.invalidateQueries({ queryKey: MY_GITHUB_IDENTITY_KEY });
+      void queryClient.invalidateQueries({ queryKey: MY_GITHUB_LINK_KEY });
+    },
+    onError: (error: Error) => {
+      setNotice({ kind: "problem", text: problemDetail(error) });
+    },
+  });
+  const olderSignIn = sharer && !link.linked && older.data?.connected === true;
+  const olderLogin = older.data?.login ?? null;
+
+  const connect = useMutation({
+    // Never retried: each start mints a state, and a second one would leave
+    // a link nobody finishes taking up a slot.
+    retry: false,
+    mutationFn: startMyGithubLink,
+    onSuccess: (authorizeUrl) => {
+      navigateTo(authorizeUrl);
+    },
+    onError: (error: Error) => {
+      // A 409 or 422 is the App's setup (no public url, no client secret, an
+      // App that cannot be used), and the server's sentence names the admin
+      // command that fixes it. An admin gets those words; anyone else gets
+      // who to ask.
+      const setup =
+        error instanceof ApiProblem &&
+        (error.status === 409 || error.status === 422);
+      setNotice({
+        kind: "problem",
+        text:
+          setup && capabilities.role !== "admin"
+            ? "Ask an admin to check the GitHub App."
+            : problemDetail(error),
+      });
+    },
+  });
+
+  const unlink = useMutation({
+    retry: false,
+    mutationFn: unlinkMyGithubLink,
+    onSuccess: (warning) => {
+      // The unlink happened here either way; a warning means the token may
+      // still work at GitHub, and the person is the one who can revoke it.
+      setNotice(
+        warning === null
+          ? { kind: "done", text: "Your GitHub account is unlinked." }
+          : { kind: "problem", text: warning },
+      );
+      void queryClient.invalidateQueries({ queryKey: MY_GITHUB_LINK_KEY });
+      // The share dialog reads the personal identity, and the unlink took
+      // its token away.
+      void queryClient.invalidateQueries({ queryKey: MY_GITHUB_IDENTITY_KEY });
+    },
+    onError: (error: Error) => {
+      setNotice({ kind: "problem", text: problemDetail(error) });
+    },
+  });
+
+  const failure = link.pending === null ? link.error : null;
+  const expired = link.linked && !link.tokenLive;
+
+  return (
+    <>
+      {notice && <NoticeLine notice={notice} />}
+      {failure !== null && (
+        <NoticeLine notice={{ kind: "problem", text: failure }} />
+      )}
+
+      {link.linked ? (
+        <div className="flex flex-col gap-1">
+          <p className="text-sm">
+            {link.login === null
+              ? "Linked to a GitHub account"
+              : `Linked to @${link.login}`}
+          </p>
+          {link.linkedAt !== null && (
+            <p className={MUTED}>{`Linked on ${formatDay(link.linkedAt)}`}</p>
+          )}
+        </div>
+      ) : (
+        <p className="text-sm">Not linked</p>
+      )}
+      {expired && (
+        <p className="text-sm text-amber-800 dark:text-amber-200">
+          GitHub access expired. Connect again to share as yourself.
+        </p>
+      )}
+
+      {capabilities.readOnly ? (
+        <p className={MUTED}>
+          This instance is read only, so nothing here can be linked or unlinked.
+        </p>
+      ) : (
+        <>
+          {link.pending !== null && <DeviceFlow pending={link.pending} />}
+          <div className="flex flex-wrap items-center gap-3">
+            {(!link.linked || expired) && link.pending === null && (
+              <button
+                type="button"
+                disabled={connect.isPending}
+                onClick={() => {
+                  connect.mutate();
+                }}
+                className={CONNECT_BUTTON}
+              >
+                Connect GitHub
+              </button>
+            )}
+            {link.linked && (
+              <button
+                type="button"
+                disabled={unlink.isPending}
+                onClick={() => {
+                  unlink.mutate();
+                }}
+                className={DANGER_BUTTON}
+              >
+                Unlink GitHub
+              </button>
+            )}
+          </div>
+          {olderSignIn && (
+            <div className="flex flex-wrap items-center gap-3 border-t border-slate-200 pt-4 dark:border-slate-800">
+              <span className="text-sm">
+                {olderLogin === null
+                  ? "You still have an older GitHub sign-in."
+                  : `You still have an older GitHub sign-in as @${olderLogin}.`}
+              </span>
+              <button
+                type="button"
+                disabled={forget.isPending}
+                onClick={() => {
+                  forget.mutate();
+                }}
+                className={SECONDARY_BUTTON}
+              >
+                Forget it
+              </button>
+            </div>
+          )}
+        </>
+      )}
+    </>
   );
 }
 
@@ -440,11 +734,17 @@ function IdentityPanel() {
 
   const forget = useMutation({
     mutationFn: disconnectMyGithubIdentity,
-    onSuccess: () => {
-      setNotice({
-        kind: "done",
-        text: "Your credential is gone. Sharing needs one, so connect again before you share.",
-      });
+    onSuccess: (gone) => {
+      // A warning means the disconnect unlinked through the GitHub App and
+      // GitHub could not revoke the token: the server's words say what to do.
+      setNotice(
+        gone.warning === null
+          ? {
+              kind: "done",
+              text: "Your credential is gone. Sharing needs one, so connect again before you share.",
+            }
+          : { kind: "problem", text: gone.warning },
+      );
       void invalidate();
     },
     onError: (error: Error) => {

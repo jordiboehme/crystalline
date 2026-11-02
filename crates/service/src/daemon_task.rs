@@ -162,6 +162,10 @@ impl DaemonTask for Seam {
                         cmd.env_remove(name);
                     }
                 }
+                // Task Scheduler starts the daemon from its own service, so
+                // it holds none of this process's handles; a child of this
+                // process would hold its stdout and stderr on Windows.
+                crate::instance::keep_std_handles_from_children();
                 cmd.spawn().map(|_| ()).map_err(|e| e.to_string())
             }
             other => Err(format!("unknown {TEST_DAEMON_TASK_ENV} value '{other}'")),

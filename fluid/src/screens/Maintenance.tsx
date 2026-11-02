@@ -86,6 +86,7 @@ import {
 } from "../api/evolve";
 import { deleteAttachment } from "../api/files";
 import { useAuth } from "../auth/AuthContext";
+import { mayWriteIn } from "../domainWritable";
 import { Loading } from "../components/Loading";
 import {
   BUTTON,
@@ -132,14 +133,15 @@ export default function Maintenance() {
     queryKey: DOMAINS_QUERY_KEY,
     queryFn: fetchDomains,
   });
-  // The domains this caller cannot write into, whatever the reason: the
-  // server leaves a locked domain out of the queue, and this hides the
-  // controls for one that is off the write list.
-  const blocked = new Set(
-    (listing.data?.domains ?? [])
-      .filter((d) => d.writeBlocked)
-      .map((d) => d.name),
-  );
+  // The domains this caller may write into, by the listing row: the server
+  // leaves a locked domain out of the queue, and this hides the controls for
+  // one that is off the write list, or one GitHub governs where this
+  // account only reads (and shows them where GitHub lets a viewer write).
+  const canWriteIn = (name: string) =>
+    mayWriteIn(
+      capabilities,
+      listing.data?.domains.find((d) => d.name === name),
+    );
   // Fetched on arrival, on the Refresh button, when the acknowledged rows are
   // asked for or given back, and after a write that changes what the queue
   // holds. Never on anything else: the app's default is to refetch a stale
@@ -342,7 +344,7 @@ export default function Maintenance() {
             key={group.key}
             group={group}
             actions={actions}
-            canWriteIn={(name) => capabilities.canWrite && !blocked.has(name)}
+            canWriteIn={canWriteIn}
             onChanged={resweep}
           />
         ))}

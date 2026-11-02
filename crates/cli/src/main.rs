@@ -105,6 +105,13 @@ enum Command {
         /// of each domain's own `.crystalline.yaml`.
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Also check what the repository of a team domain must never hold:
+        /// a Reflection switched on without a home (M011), files under
+        /// reflections/ while Reflection is on (M012), and a MANIFEST
+        /// without `team: github` (M109, a warning). A domain's own
+        /// .crystalline.yaml cannot turn these rules off.
+        #[arg(long)]
+        team_repository: bool,
     },
     /// Generate a session-start knowledge routing prompt. No database,
     /// service or network connection is used.
@@ -172,6 +179,11 @@ enum Command {
     Disconnect {
         /// The source's name or its URL, as crystalline status lists it.
         target: String,
+    },
+    /// Manage this instance's GitHub integration beyond the sign-in.
+    Github {
+        #[command(subcommand)]
+        command: GithubCommand,
     },
     /// Wire a coding harness up to Crystalline in one idempotent step:
     /// register the MCP server, install the SessionStart routing hook, the
@@ -473,6 +485,17 @@ enum Command {
         /// start the server.
         #[arg(long)]
         harness: Option<String>,
+        /// Mark this session unattended: nobody is behind it to answer a
+        /// question, so it is never asked to share Reflection text from a
+        /// domain fewer people may read. The MCP config of a headless loop
+        /// run (`crystalline reflect run`, `crystalline evolve run`) passes it.
+        #[arg(long, hide = true)]
+        unattended: bool,
+        /// The domain an unattended run started this session for: its reads
+        /// are limited to what every reader of that domain may read. Implies
+        /// --unattended. `crystalline reflect run` and `evolve run` pass it.
+        #[arg(long, hide = true)]
+        domain: Option<String>,
         /// Load the global config from this file instead of the default path.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -1375,6 +1398,13 @@ enum DomainCommand {
         /// exist and be enabled.
         #[arg(long, value_name = "ACCOUNT")]
         owner: Option<String>,
+        /// Who may read a team domain on an instance with a GitHub App:
+        /// shared (everyone signed in) or private (only people with access on
+        /// GitHub). Asked on a terminal when not given, and required when
+        /// nobody can be asked; --private answers private. Ignored, with a
+        /// note, on an instance without an App. Only with --origin.
+        #[arg(long, value_enum, requires = "origin", conflicts_with = "private")]
+        readers: Option<ReadersArg>,
         /// Load the global config from this file instead of the default path.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -1479,8 +1509,9 @@ enum DomainCommand {
     /// Make a domain private, owned by one account, or share it with every
     /// account again. Private is the personal domain: only its owner, the
     /// accounts invited into it and instance admins see it at all. Sharing it
-    /// again forgets who was invited. The machine operator administers every
-    /// domain.
+    /// again forgets who was invited, except on a domain a GitHub App
+    /// governs, where the membership rows are kept. The machine operator
+    /// administers every domain.
     Visibility {
         /// The registered domain.
         domain: String,
@@ -1489,7 +1520,8 @@ enum DomainCommand {
         #[arg(value_enum)]
         visibility: VisibilityArg,
         /// The account that owns the domain once it is private. Required with
-        /// `private`, and meaningless with `default`.
+        /// `private`, and meaningless with `default`. Not used on a domain a
+        /// GitHub App governs, where GitHub decides access.
         #[arg(long, value_name = "ACCOUNT")]
         owner: Option<String>,
         /// Load the global config from this file instead of the default path.
@@ -1572,6 +1604,58 @@ enum MembersCommand {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Give an account the Reflection of this one domain, or take it away:
+    /// a Reflection collaborator reads (reader) or also edits (contributor)
+    /// the Reflection, on a shared or a private domain kept as files, and
+    /// sees no engram it could not see before. A grant only raises.
+    Reflection {
+        #[command(subcommand)]
+        command: ReflectionGrantCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ReflectionGrantCommand {
+    /// Give an account the Reflection reader or contributor level on this
+    /// domain, or change the level it holds.
+    Add {
+        /// The account's login name.
+        user: String,
+        /// reader: reads the Reflection and comments. contributor: also edits
+        /// it.
+        #[arg(long, value_enum)]
+        level: GrantLevelArg,
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Take an account's Reflection grant on this domain away.
+    Remove {
+        /// The account's login name.
+        user: String,
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+}
+
+/// The two levels `domain members reflection add` accepts. `default` is not
+/// one: it would grant nothing, and `remove` takes a grant away.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum GrantLevelArg {
+    /// Reads the Reflection and comments on it.
+    Reader,
+    /// Also edits reflection text and creates, moves and deletes reflections.
+    Contributor,
+}
+
+impl From<GrantLevelArg> for crystalline_service::rest::ReflectionLevel {
+    fn from(arg: GrantLevelArg) -> crystalline_service::rest::ReflectionLevel {
+        match arg {
+            GrantLevelArg::Reader => crystalline_service::rest::ReflectionLevel::Reader,
+            GrantLevelArg::Contributor => crystalline_service::rest::ReflectionLevel::Contributor,
+        }
+    }
 }
 
 /// The two modes `domain review` accepts. `direct` rather than `off` because
@@ -1594,6 +1678,24 @@ enum VisibilityArg {
     Private,
     /// Every account sees it, which is how a domain starts out.
     Default,
+}
+
+/// Who may read a team domain, as `domain add --origin --readers` takes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum ReadersArg {
+    /// Everyone signed in reads it.
+    Shared,
+    /// Only people with access on GitHub read it.
+    Private,
+}
+
+impl From<ReadersArg> for crystalline_service::params::Readers {
+    fn from(arg: ReadersArg) -> crystalline_service::params::Readers {
+        match arg {
+            ReadersArg::Shared => crystalline_service::params::Readers::Shared,
+            ReadersArg::Private => crystalline_service::params::Readers::Private,
+        }
+    }
 }
 
 /// The membership levels `domain members add` accepts, mirroring
@@ -1672,6 +1774,63 @@ enum TagsCommand {
 }
 
 #[derive(Subcommand, Debug)]
+enum GithubCommand {
+    /// Show, set or remove the GitHub App this instance reads, pulls and
+    /// shares through. With an App, each repository is reached with the
+    /// App's installation token instead of one person's sign-in.
+    App {
+        #[command(subcommand)]
+        command: GithubAppCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum GithubAppCommand {
+    /// Show the App: where it comes from, its id, client id and slug, which
+    /// secrets are set (never the secrets) and the accounts it is installed
+    /// on.
+    Status {
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Save an App for this instance, for setups without a browser. The
+    /// private key and the secrets are read from files, never from the
+    /// command line. GitHub is asked first whether it accepts the key; the
+    /// App is saved in the keychain, or in a file only this user can read
+    /// when there is no working keychain. Refused while the
+    /// CRYSTALLINE_GITHUB_APP_* variables supply the App.
+    Set {
+        /// The numeric App id, from the App's settings page.
+        #[arg(long)]
+        app_id: u64,
+        /// The App's client id (Iv1... or Iv23...).
+        #[arg(long)]
+        client_id: String,
+        /// The PEM private key file GitHub gave for the App.
+        #[arg(long, value_name = "PATH")]
+        private_key_file: PathBuf,
+        /// A file holding the App's client secret.
+        #[arg(long, value_name = "PATH")]
+        client_secret_file: Option<PathBuf>,
+        /// A file holding the secret GitHub signs the App's webhooks with.
+        #[arg(long, value_name = "PATH")]
+        webhook_secret_file: Option<PathBuf>,
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Remove the saved App. Reading, pulling and sharing go back to the
+    /// instance's own GitHub sign-in. Refused while the
+    /// CRYSTALLINE_GITHUB_APP_* variables supply the App.
+    Remove {
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum ConnectCommand {
     /// Sign in to GitHub: paste a personal access token, or sign in with a
     /// short code in the browser. Works whether or not team domains are
@@ -1688,14 +1847,19 @@ enum ConnectCommand {
         /// Connect a personal identity for sharing, instead of this machine's
         /// own credential. Sharing runs on it wherever github.share_identity
         /// is personal; reading and pulling always stay on the machine's.
+        /// With a GitHub App configured, this signs in through the App and
+        /// a pasted --token is refused.
         #[arg(long)]
         personal: bool,
         /// Connect on behalf of another Crystalline account (admin use), for
         /// example a bot account remote agents share as. Requires --personal.
+        /// With a GitHub App configured, this links the account to GitHub.
         #[arg(long = "as", value_name = "ACCOUNT", requires = "personal")]
         as_account: Option<String>,
         /// Forget the addressed credential instead of connecting one. With
-        /// --personal it forgets that identity; on its own, this machine's.
+        /// --personal it forgets that identity (with a GitHub App it also
+        /// revokes the token and unlinks the account); on its own, this
+        /// machine's.
         #[arg(long, conflicts_with = "token")]
         disconnect: bool,
         /// Load the global config from this file instead of the default path.
@@ -1992,6 +2156,9 @@ fn main() -> std::process::ExitCode {
     // else can read or write the environment while it is written. The daemon,
     // the MCP bridge and headless runs are this same binary and pass here too.
     unsafe { crystalline_index::keep_xet_telemetry_off() };
+    // Before anything can start a child: on Windows a child would otherwise
+    // hold this process's stdout and stderr open after it exits.
+    crystalline_service::instance::keep_std_handles_from_children();
     match run() {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) if e.is::<PrintedRefusal>() => std::process::ExitCode::from(1),
@@ -2025,6 +2192,15 @@ fn run() -> anyhow::Result<()> {
     }
     let cli = Cli::parse();
     init_cli_tracing(cli.command.as_ref());
+    // Inside Claude Desktop's app package every new file under AppData lands
+    // in the package's private copy, so from here on a write there that was
+    // not sent to the daemon fails loudly instead of splitting the state.
+    crystalline_service::runs_in::fence_packaged_writes();
+    if crystalline_service::runs_in::PackageContext::here().is_packaged()
+        && let Some(step) = cli.command.as_ref().and_then(packaged_setup_step)
+    {
+        anyhow::bail!(crystalline_service::runs_in::packaged_setup_refusal(step));
+    }
     match cli.command {
         None => {
             Cli::command().print_help()?;
@@ -2036,7 +2212,8 @@ fn run() -> anyhow::Result<()> {
             strict,
             format,
             config,
-        }) => run_verify(paths, strict, format, config, cli.json),
+            team_repository,
+        }) => run_verify(paths, strict, team_repository, format, config, cli.json),
         Some(Command::Prompt { kind }) => match kind {
             PromptKind::System {
                 workspace,
@@ -2099,6 +2276,9 @@ fn run() -> anyhow::Result<()> {
         Some(Command::Connect { .. }) => anyhow::bail!(
             "name what to connect to: crystalline connect <url> for a Crystalline server, or crystalline connect github"
         ),
+        Some(Command::Github {
+            command: GithubCommand::App { command },
+        }) => on_runtime(move || run_github_app(command, cli.json)),
         Some(Command::Disconnect { target }) => {
             on_runtime(move || sources::disconnect_server(target, cli.json))
         }
@@ -2219,6 +2399,12 @@ fn run() -> anyhow::Result<()> {
             take_over,
             config,
         }) => {
+            // The daemon never runs with an app package's identity: every
+            // file it wrote under AppData would land in the package's private
+            // copy. Refused before anything else, the scratch folder included.
+            if crystalline_service::runs_in::PackageContext::here().is_packaged() {
+                anyhow::bail!(crystalline_service::runs_in::PACKAGED_SERVE_REFUSAL);
+            }
             // A task-started daemon is recorded as an autostart, like any
             // daemon a client spawned: no new start mode an old reader would
             // fail to parse.
@@ -2272,8 +2458,14 @@ fn run() -> anyhow::Result<()> {
             embedded,
             read_only,
             harness,
+            unattended,
+            domain,
             config,
-        }) => on_runtime(move || mcp_dispatch(embedded, read_only, harness, config, cli.db)),
+        }) => on_runtime(move || {
+            mcp_dispatch(
+                embedded, read_only, harness, unattended, domain, config, cli.db,
+            )
+        }),
         Some(Command::Ctl { command }) => on_runtime(move || run_ctl(command, cli.json)),
         Some(Command::Users { command }) => on_runtime(move || users::run(command, cli.json)),
         Some(Command::Kept { command }) => kept::run(command, cli.json),
@@ -2328,6 +2520,54 @@ fn run() -> anyhow::Result<()> {
                 Ok(())
             }
         },
+    }
+}
+
+/// The terminal setup step `command` is, when it is one that a process
+/// inside an app package must not run: each writes Crystalline's state on
+/// this machine itself (`sources.json`, `installs.json`, the rename
+/// journal, a repaired config, the accounts database, the kept folder, the
+/// model cache) and no daemon does it for it. The merge of
+/// Claude Desktop's state keeps its own, older refusal in `doctor`.
+fn packaged_setup_step(command: &Command) -> Option<&'static str> {
+    match command {
+        Command::Connect { .. } => Some("connect"),
+        Command::Disconnect { .. } => Some("disconnect"),
+        Command::Install { .. } => Some("install"),
+        Command::Uninstall { .. } => Some("uninstall"),
+        Command::DaemonTask {
+            action: DaemonTaskAction::Register { .. },
+        } => Some("daemon-task register"),
+        Command::Users { .. } => Some("users"),
+        Command::Github {
+            command:
+                GithubCommand::App {
+                    command: GithubAppCommand::Set { .. },
+                },
+        } => Some("github app set"),
+        Command::Github {
+            command:
+                GithubCommand::App {
+                    command: GithubAppCommand::Remove { .. },
+                },
+        } => Some("github app remove"),
+        Command::Kept {
+            command: KeptCommand::Drop { .. },
+        } => Some("kept drop"),
+        Command::Model {
+            command: ModelCommand::Download { .. },
+        } => Some("model download"),
+        Command::Doctor {
+            merge_desktop_state: false,
+            discard_rename: true,
+            ..
+        } => Some("doctor --discard-rename"),
+        Command::Doctor {
+            merge_desktop_state: false,
+            fix: true,
+            ..
+        } => Some("doctor --fix"),
+        _ => None,
     }
 }
 
@@ -2479,7 +2719,7 @@ async fn status_dispatch(
     // config names and cannot sensibly do that from a file they cannot read.
     if !bypassed
         && let Some(data) =
-            crystalline_service::ctl_if_running(json!({ "v": 1, "cmd": "status" })).await?
+            crystalline_service::ctl_routed(json!({ "v": 1, "cmd": "status" })).await?
     {
         let loaded = cmd::load(config.as_deref());
         let config_error = loaded.as_ref().err().map(|e| e.to_string());
@@ -2496,6 +2736,23 @@ async fn status_dispatch(
             _ => Vec::new(),
         };
         sources::with_daemon_failures(&mut source_rows, &data["sources"]);
+        // Claude Desktop's second state, compared with what the daemon
+        // serves: its domains the daemon does not know are the ones a
+        // routing block read inside Claude Desktop lists and searches miss.
+        let registered: Vec<String> = data["registered"]
+            .as_array()
+            .map(|names| {
+                names
+                    .iter()
+                    .filter_map(|n| n.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut desktop_states = desktop_state::scan_here();
+        for state in &mut desktop_states {
+            state.compare_with(&registered);
+        }
+        let packaged_line = crystalline_service::desktop_state::packaged_read_line();
         if json {
             let mut data = data;
             if let serde_json::Value::Object(map) = &mut data {
@@ -2507,8 +2764,11 @@ async fn status_dispatch(
                 map.insert("sources".to_string(), serde_json::to_value(&source_rows)?);
                 map.insert(
                     "desktop_states".to_string(),
-                    serde_json::to_value(desktop_state::scan_here())?,
+                    serde_json::to_value(&desktop_states)?,
                 );
+                if let Some(line) = &packaged_line {
+                    map.insert("inside_package".to_string(), json!(line));
+                }
                 insert_kept_count(map);
                 // Present only when something differs, as doctor --json does.
                 if !mismatches.is_empty() {
@@ -2534,7 +2794,16 @@ async fn status_dispatch(
                 data["version"].as_str().unwrap_or("unknown"),
                 format_uptime(data["uptime_secs"].as_u64().unwrap_or(0)),
             );
-            if let Some(line) = desktop_state::status_line(&desktop_state::scan_here()) {
+            if let Some(line) = &packaged_line {
+                println!("{line}");
+            }
+            if let Some(line) = desktop_state::status_line(&desktop_states) {
+                println!("{line}");
+            }
+            for line in desktop_states
+                .iter()
+                .filter_map(desktop_state::unserved_line)
+            {
                 println!("{line}");
             }
             if let Some(line) = kept::status_line(&kept::scan_here()) {
@@ -3086,6 +3355,43 @@ async fn run_connect(command: ConnectCommand, json: bool) -> anyhow::Result<()> 
                 json,
             )
             .await
+        }
+    }
+}
+
+/// `github app status|set|remove`: in-process, like `connect github` (the
+/// App is this machine's credential, not content); a running daemon is told
+/// when the saved App changed, and answers `status` for itself.
+async fn run_github_app(command: GithubAppCommand, json: bool) -> anyhow::Result<()> {
+    let token_store_dir = cmd::test_token_store_dir();
+    match command {
+        GithubAppCommand::Status { config } => {
+            cmd::github_app_status(config.as_deref(), token_store_dir.as_deref(), json).await
+        }
+        GithubAppCommand::Set {
+            app_id,
+            client_id,
+            private_key_file,
+            client_secret_file,
+            webhook_secret_file,
+            config,
+        } => {
+            cmd::github_app_set(
+                cmd::AppFiles {
+                    app_id,
+                    client_id,
+                    private_key: private_key_file,
+                    client_secret: client_secret_file,
+                    webhook_secret: webhook_secret_file,
+                },
+                config.as_deref(),
+                token_store_dir.as_deref(),
+                json,
+            )
+            .await
+        }
+        GithubAppCommand::Remove { config } => {
+            cmd::github_app_remove(config.as_deref(), token_store_dir.as_deref(), json).await
         }
     }
 }
@@ -4263,6 +4569,7 @@ fn run_domain(command: DomainCommand, db: Option<PathBuf>, json: bool) -> anyhow
             no_sync,
             private,
             owner,
+            readers,
             config,
         } => on_runtime(move || async move {
             // The positional path and `--path` are two spellings of the same
@@ -4274,7 +4581,13 @@ fn run_domain(command: DomainCommand, db: Option<PathBuf>, json: bool) -> anyhow
             // standing shared - which is the opposite of what was asked for.
             // `--private` requires `--owner` at the clap level, so the pair is
             // either both present or both absent.
+            // A team domain whose access a GitHub App decides drops the owner
+            // anyway (the connect records the domain private itself), so the
+            // account is not required to exist there.
+            let app_decides =
+                origin.is_some() && private && cmd::github_app_decides_access(config.as_deref())?;
             let closing = match (private, owner) {
+                (true, Some(owner)) if app_decides => Some(owner.trim().to_lowercase()),
                 (true, Some(owner)) => Some(members::check_private_owner(&owner).await?),
                 _ => None,
             };
@@ -4282,12 +4595,13 @@ fn run_domain(command: DomainCommand, db: Option<PathBuf>, json: bool) -> anyhow
             // caller's own `name`, which may be absent: a nameless add lands
             // on a name worked out from the folder, and that is the name
             // `--private` must close.
-            let (chosen_name, adopted) = domain_add_dispatch(
+            let (chosen_name, adopted, governed) = domain_add_dispatch(
                 name,
                 path,
                 is_virtual,
                 origin,
                 branch,
+                readers.map(Into::into),
                 config.clone(),
                 db,
                 no_sync,
@@ -4295,7 +4609,21 @@ fn run_domain(command: DomainCommand, db: Option<PathBuf>, json: bool) -> anyhow
                 closing.as_deref(),
             )
             .await?;
-            if let Some(owner) = closing {
+            // A domain whose access follows GitHub was made private by the
+            // connect itself; its owner record is never read, so there is
+            // nothing left to close.
+            if let Some(owner) = closing.as_deref()
+                && governed
+            {
+                // Said rather than dropped silently: the account asked for
+                // was not recorded anywhere.
+                let line = owner_dropped_note(owner);
+                if json {
+                    eprintln!("{line}");
+                } else {
+                    println!("{line}");
+                }
+            } else if let Some(owner) = closing {
                 // The dispatch refused `--private` on an adopted registration
                 // before it printed anything; a domain that reaches this
                 // point is new.
@@ -4713,6 +5041,8 @@ async fn mcp_dispatch(
     embedded: bool,
     read_only: bool,
     harness: Option<String>,
+    unattended: bool,
+    domain: Option<String>,
     config: Option<PathBuf>,
     db: Option<PathBuf>,
 ) -> anyhow::Result<()> {
@@ -4722,6 +5052,8 @@ async fn mcp_dispatch(
         config.as_deref(),
         read_only,
         harness.as_deref(),
+        unattended,
+        domain.as_deref(),
     )
     .await
 }
@@ -4740,6 +5072,10 @@ async fn mcp_dispatch(
 ///
 /// `private_owner` is `--private`'s owner: an adopted registration is refused
 /// with it before anything is printed.
+///
+/// Answers the name registered, whether it was adopted, and whether the
+/// connect recorded who may read it (a team domain on an instance with a
+/// GitHub App, whose access follows GitHub).
 #[allow(clippy::too_many_arguments)]
 async fn domain_add_dispatch(
     name: Option<String>,
@@ -4747,18 +5083,20 @@ async fn domain_add_dispatch(
     is_virtual: bool,
     origin: Option<String>,
     branch: Option<String>,
+    readers: Option<crystalline_service::params::Readers>,
     config: Option<PathBuf>,
     db: Option<PathBuf>,
     no_sync: bool,
     json: bool,
     private_owner: Option<&str>,
-) -> anyhow::Result<(String, bool)> {
+) -> anyhow::Result<(String, bool, bool)> {
     if let Some(origin_spec) = origin {
         return domain_add_origin_dispatch(
             name,
             path,
             origin_spec,
             branch,
+            readers,
             is_virtual,
             no_sync,
             config,
@@ -4770,6 +5108,17 @@ async fn domain_add_dispatch(
     }
     if branch.is_some() {
         anyhow::bail!("`domain add --branch` requires --origin");
+    }
+    // Inside an app package an override keeps the registration local, and
+    // the sync after it would need a local engine, which is never opened
+    // there: refused before anything is registered.
+    if crystalline_service::runs_in::PackageContext::here().is_packaged()
+        && !crystalline_service::use_daemon(db.as_deref(), config.as_deref())
+        && !no_sync
+    {
+        anyhow::bail!(
+            "inside Claude Desktop's app package `domain add` with --config or --db can only register the domain, not index it. Add --no-sync, or run the command in a terminal outside Claude Desktop"
+        );
     }
 
     if is_virtual {
@@ -4783,7 +5132,13 @@ async fn domain_add_dispatch(
                 "`domain add --virtual` needs a name; there is no folder to derive one from"
             )
         })?;
-        let (markdown, adopted) = cmd::domain_add_register_virtual(&name, config.as_deref())?;
+        let (markdown, adopted) = if cmd::registers_through_daemon(db.as_deref(), config.as_deref())
+        {
+            let done = cmd::register_through_daemon("virtual", Some(&name), None).await?;
+            (done.manifest.unwrap_or_default(), done.adopted)
+        } else {
+            cmd::domain_add_register_virtual(&name, config.as_deref())?
+        };
         if let Some(owner) = private_owner
             && adopted
         {
@@ -4797,7 +5152,7 @@ async fn domain_add_dispatch(
         )
         .await?;
         cmd::print_domain_add_virtual(&name, adopted, &scaffold, json);
-        return Ok((name, adopted));
+        return Ok((name, adopted, false));
     }
 
     // An absent path defaults to `<domains_root>/<name>` inside
@@ -4807,7 +5162,16 @@ async fn domain_add_dispatch(
     // given name to place it under. Either way the resolved directory still
     // needs a pre-scaffolded MANIFEST.md.
     let (chosen_name, abs, adopted, shadowed) =
-        cmd::domain_add_register(name.as_deref(), path.as_deref(), config.as_deref())?;
+        if cmd::registers_through_daemon(db.as_deref(), config.as_deref()) {
+            let done =
+                cmd::register_through_daemon("file", name.as_deref(), path.as_deref()).await?;
+            let root = done.root.ok_or_else(|| {
+                anyhow::anyhow!("the daemon registered '{}' with no folder", done.name)
+            })?;
+            (done.name, root, done.adopted, done.shadowed)
+        } else {
+            cmd::domain_add_register(name.as_deref(), path.as_deref(), config.as_deref())?
+        };
     // Before the `--no-sync` print and before the sync, so a refused
     // `--private` prints nothing and indexes nothing.
     if let Some(owner) = private_owner
@@ -4817,7 +5181,7 @@ async fn domain_add_dispatch(
     }
     if no_sync {
         cmd::print_domain_add_no_sync(&chosen_name, &abs, adopted, shadowed.as_deref(), json);
-        return Ok((chosen_name, adopted));
+        return Ok((chosen_name, adopted, false));
     }
 
     // Index over the daemon only when no explicit --config/--db override was
@@ -4827,7 +5191,7 @@ async fn domain_add_dispatch(
     use serde_json::json as j;
     let report: crystalline_index::SyncReport =
         if crystalline_service::use_daemon(db.as_deref(), config.as_deref())
-            && let Some(data) = crystalline_service::ctl_if_running(
+            && let Some(data) = crystalline_service::ctl_routed(
                 j!({ "v": 1, "cmd": "sync", "domain": chosen_name, "embed": false }),
             )
             .await?
@@ -4851,7 +5215,7 @@ async fn domain_add_dispatch(
         &report,
         json,
     );
-    Ok((chosen_name, adopted))
+    Ok((chosen_name, adopted, false))
 }
 
 /// `domain add --origin`: connects a team domain to a GitHub repository
@@ -4872,13 +5236,14 @@ async fn domain_add_origin_dispatch(
     path: Option<PathBuf>,
     origin_spec: String,
     branch: Option<String>,
+    readers: Option<crystalline_service::params::Readers>,
     is_virtual: bool,
     no_sync: bool,
     config: Option<PathBuf>,
     db: Option<PathBuf>,
     json: bool,
     private_owner: Option<&str>,
-) -> anyhow::Result<(String, bool)> {
+) -> anyhow::Result<(String, bool, bool)> {
     if is_virtual {
         anyhow::bail!("`domain add --origin` cannot be combined with --virtual");
     }
@@ -4908,16 +5273,36 @@ async fn domain_add_origin_dispatch(
     // in place).
     let snapshot = cmd::load(config.as_deref())?.file.domains;
 
-    let data = crystalline_service::origin_add(
-        &repo,
-        name.as_deref(),
-        subpath.as_deref(),
-        branch.as_deref(),
-        folder_str.as_deref(),
-        db.as_deref(),
-        config.as_deref(),
-    )
-    .await?;
+    let connect = |readers: Option<crystalline_service::params::Readers>| {
+        crystalline_service::origin_add(
+            &repo,
+            name.as_deref(),
+            subpath.as_deref(),
+            branch.as_deref(),
+            folder_str.as_deref(),
+            readers,
+            db.as_deref(),
+            config.as_deref(),
+        )
+    };
+    // On an instance with a GitHub App the connect refuses until it is told
+    // who may read the domain, before anything is fetched. `--private`
+    // answers it; a terminal is asked; nobody else can be.
+    let data = match connect(readers).await {
+        Err(e)
+            if readers.is_none()
+                && e.to_string()
+                    .contains(crystalline_service::engine::READERS_REQUIRED) =>
+        {
+            let answer = match private_owner {
+                Some(_) => crystalline_service::params::Readers::Private,
+                None => ask_readers()?,
+            };
+            connect(Some(answer)).await?
+        }
+        other => other?,
+    };
+    let governed = data.get("readers").is_some();
     let chosen_name = data["domain"].as_str().unwrap_or_default().to_string();
     let already_registered = snapshot.contains_key(&chosen_name);
     // Adopted when the name was already registered before this call (a
@@ -4927,8 +5312,10 @@ async fn domain_add_origin_dispatch(
     // now, so the refusal carries its report.
     let already_connected = data["already_connected"].as_bool().unwrap_or(false);
     let adopted = already_registered || already_connected;
+    // A governed connect recorded the domain private itself, adopted or not.
     if let Some(owner) = private_owner
         && adopted
+        && !governed
     {
         return Err(refuse_private_after_connect(
             &repo,
@@ -4939,7 +5326,46 @@ async fn domain_add_origin_dispatch(
         ));
     }
     cmd::print_origin_add(&repo, &data, json);
-    Ok((chosen_name, adopted))
+    Ok((chosen_name, adopted, governed))
+}
+
+/// The note `domain add --origin --private --owner` prints when a GitHub App
+/// decides who may read the domain: the domain is private, and the owner is
+/// not recorded, because access follows GitHub.
+fn owner_dropped_note(owner: &str) -> String {
+    format!(
+        "Note: --owner {} was not recorded. A GitHub App decides access to this domain, so it is private to the people with access on GitHub.",
+        owner.trim().to_lowercase()
+    )
+}
+
+/// The refusal a connect gets off a terminal on an instance with a GitHub
+/// App when `--readers` was not given.
+const READERS_FLAG_NEEDED: &str =
+    "say who may read this domain: --readers shared or --readers private";
+
+/// Asks on the terminal who may read a team domain being connected: the
+/// question Fluid's dialog asks, with no answer preselected. Off a terminal
+/// nobody can be asked, so it refuses naming the flag.
+fn ask_readers() -> anyhow::Result<crystalline_service::params::Readers> {
+    use crystalline_service::params::Readers;
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!(READERS_FLAG_NEEDED);
+    }
+    eprintln!("Who may read this domain?");
+    eprintln!("  shared   Everyone signed in");
+    eprintln!("  private  Only people with access on GitHub");
+    loop {
+        eprint!("Type shared or private: ");
+        std::io::stderr().flush()?;
+        let mut answer = String::new();
+        if std::io::stdin().read_line(&mut answer)? == 0 {
+            anyhow::bail!(READERS_FLAG_NEEDED);
+        }
+        if let Some(readers) = Readers::parse(&answer) {
+            return Ok(readers);
+        }
+    }
 }
 
 /// `domain remove`: the engine's own unregistration, over the daemon when one
@@ -5195,6 +5621,7 @@ fn init_cli_tracing(command: Option<&Command>) {
 fn run_verify(
     paths: Vec<PathBuf>,
     strict: bool,
+    team_repository: bool,
     format: Option<OutputFormat>,
     config_path: Option<PathBuf>,
     json_flag: bool,
@@ -5216,6 +5643,7 @@ fn run_verify(
     let options = VerifyOptions {
         strict,
         config_override,
+        team_repository,
     };
 
     let report = match verify::verify_paths(paths, &options) {
@@ -5336,21 +5764,41 @@ fn run_prompt(
     // so the routing prompt reflects env-configured settings.
     let loaded_config = crystalline_service::overlay::load(config_path.as_deref())?;
     let mut global = loaded_config.effective;
+    let mut env_domain_names: Vec<String> = loaded_config
+        .overlay
+        .env_domains()
+        .map(|(name, _)| name.clone())
+        .collect();
+    // Inside Claude Desktop's app package this read of the config file can
+    // open the package's private copy, so the daemon's configuration is
+    // asked first; the local one is used only when no daemon answers, and
+    // the block then says so.
+    let mut package_note = None;
+    if crystalline_service::runs_in::PackageContext::here().is_packaged()
+        && config_path.is_none()
+        && db.is_none()
+    {
+        match on_runtime_value(daemon_routing_config) {
+            Ok(Some((config, env))) => {
+                global = config;
+                env_domain_names = env;
+            }
+            Ok(None) | Err(_) => package_note = Some(PACKAGED_PROMPT_NOTE.to_string()),
+        }
+    }
     // Domains from connected servers: a local copy a server replaces leaves
     // the block, the server's copy joins it under its local name. A name the
     // daemon's fresher table mounts leaves it too, so no name is listed twice.
-    let (shadowed, mounted_rows, stale) =
+    let (shadowed, mounted_rows, mut stale) =
         mounted_part(&global, config_path.is_some() || db.is_some());
+    stale.extend(package_note);
     global.domains.retain(|name, _| {
         !shadowed.contains(name) && !mounted_rows.iter().any(|m| &m.name == name)
     });
     // Named so an env-defined domain never nags the pending block for a
     // decision it can never record - see `session_notices`'s doc comment.
-    let env_domains: std::collections::HashSet<&str> = loaded_config
-        .overlay
-        .env_domains()
-        .map(|(name, _)| name.as_str())
-        .collect();
+    let env_domains: std::collections::HashSet<&str> =
+        env_domain_names.iter().map(String::as_str).collect();
 
     // Session-start provisioning: reconcile opted-in domains' file artifacts
     // and surface undecided domains, joining the same notice channel as the
@@ -5511,6 +5959,36 @@ fn run_prompt(
         eprintln!("{note}");
     }
     Ok(())
+}
+
+/// The line a routing block read inside Claude Desktop's app package
+/// carries when the daemon gave no configuration (none answered, or an
+/// older one that does not know `routing_config`): it comes from the
+/// package's private
+/// copy of the configuration, which can list domains the daemon does not
+/// serve.
+const PACKAGED_PROMPT_NOTE: &str = "Note: this session runs inside Claude Desktop's app package, and the Crystalline daemon did not give its configuration, so this routing block was read from Claude Desktop's private copy of the configuration. It can list domains the daemon does not serve; `crystalline status` in a terminal outside Claude Desktop shows the daemon's view.";
+
+/// How long `prompt system` inside a package waits for the daemon the task
+/// starts: the SessionStart hook runs under a ten second limit, and a
+/// killed hook gives the session no routing block at all, which is worse
+/// than the local read with its note.
+const PACKAGED_PROMPT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The configuration and env-defined domain names the daemon builds a
+/// routing block from (the `routing_config` ctl command), for a prompt run
+/// inside an app package. `None` when no daemon answered or the answer
+/// does not read.
+async fn daemon_routing_config() -> Option<(crystalline_core::config::GlobalConfig, Vec<String>)> {
+    let data = crystalline_service::ctl_routed_waiting(
+        serde_json::json!({ "v": 1, "cmd": "routing_config" }),
+        PACKAGED_PROMPT_WAIT,
+    )
+    .await
+    .ok()??;
+    let config = serde_json::from_value(data.get("config")?.clone()).ok()?;
+    let env = serde_json::from_value(data.get("env_domains")?.clone()).unwrap_or_default();
+    Some((config, env))
 }
 
 /// The text block with each stale source's line after it.
@@ -5799,6 +6277,13 @@ fn to_core_format(f: OutputFormat) -> verify::Format {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_dropped_owner_is_named_with_the_reason() {
+        let note = owner_dropped_note(" Ada ");
+        assert!(note.contains("--owner ada was not recorded"), "{note}");
+        assert!(note.contains("A GitHub App decides access"), "{note}");
+    }
 
     /// `domain import` groups the links it did not take by why, as
     /// `crystalline import` does, instead of printing the raw answer.

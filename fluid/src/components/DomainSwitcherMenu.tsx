@@ -27,6 +27,7 @@ import {
   fetchReflectionDomains,
 } from "../api/reflectionDomains";
 import { useAuth } from "../auth/AuthContext";
+import { mayWriteIn } from "../domainWritable";
 import { domainRoute, reflectionRoute } from "../paths";
 import { Loading } from "./Loading";
 import { MENU_SEPARATOR } from "./menu";
@@ -78,6 +79,13 @@ export default function DomainSwitcherMenu({
       .filter((row) => row.state !== "off")
       .map((row) => row.domain),
   );
+  // Whether this person writes anywhere at all, by role or, on a domain
+  // GitHub governs, by their GitHub role.
+  const writesSomewhere =
+    capabilities.canWrite ||
+    (listing.data?.domains ?? []).some((entry) =>
+      mayWriteIn(capabilities, entry),
+    );
   const rows: Row[] = (listing.data?.domains ?? []).map((entry) => ({
     name: entry.name,
     to: domainRoute(entry.name),
@@ -86,7 +94,7 @@ export default function DomainSwitcherMenu({
     // only where they write elsewhere: for a viewer it would be every row.
     chip: entry.private
       ? "private"
-      : capabilities.canWrite && entry.writeBlocked
+      : writesSomewhere && entry.writeBlocked
         ? "view only"
         : reflecting.has(entry.name)
           ? "Reflection"

@@ -86,6 +86,7 @@ import {
   localChangeKey,
   localChangesKey,
   readStackPlacement,
+  readTeamMarker,
   refusalSentence,
   shareDomain,
   sharePlanKey,
@@ -133,10 +134,13 @@ export default function ShareDialogBody({
    * read-only instance refuses every content write whoever is asking, and a
    * reader who may not write is offered no control that would be refused.
    */
-  const mayDiscard = capabilities.canWrite && !capabilities.readOnly;
   // Sharing is refused on a locked domain (discard is not, decision D5), so
-  // the button says so instead of failing.
-  const { domainLocked } = useDomainWritable(domain);
+  // the button says so instead of failing. Where the listing answers per
+  // domain, a viewer with write access on GitHub may discard on a domain
+  // GitHub governs, as the route serves it.
+  const { canWrite, domainLocked } = useDomainWritable(domain);
+  const mayDiscard =
+    (capabilities.canWrite || canWrite) && !capabilities.readOnly;
   const lockedReasonId = useId();
   const titleField = useId();
   const descriptionField = useId();
@@ -526,6 +530,11 @@ export default function ShareDialogBody({
                   {outcome.note}
                 </p>
               )}
+              {outcome.marker != null && (
+                <p className="text-sm text-slate-600 dark:text-slate-300">
+                  {outcome.marker}
+                </p>
+              )}
               {problem !== null && (
                 <p role="alert" className={ALERT_CLASSES}>
                   {problem}
@@ -729,6 +738,14 @@ export default function ShareDialogBody({
                     : undefined
                 }
               />
+              {/* A file the share adds on its own is named apart from the
+                  list: the folder does not hold it yet, so there is nothing
+                  to tick or discard, only a reason to read. */}
+              {plan.data?.teamMarker != null && (
+                <p className="text-caption text-slate-500 dark:text-slate-400">
+                  {`${plan.data.teamMarker.path} also travels with this share: it ${plan.data.teamMarker.reason}.`}
+                </p>
+              )}
               {arming !== null && (
                 <DiscardConfirm
                   question={
@@ -1028,6 +1045,11 @@ interface OutcomeSentence {
   /** The server's extra line about how the share went, if it sent one. */
   note?: string | null;
   /**
+   * The line naming the file the share added on its own (the team marker
+   * in the MANIFEST) and why, when it added one.
+   */
+  marker?: string | null;
+  /**
    * Whether the refusal offers the same share as a proposal: a direct
    * commit the branch refused, answered with `fallback: "proposal"`.
    */
@@ -1101,6 +1123,18 @@ function numberSentence(
  * number, so there is nothing there to point a reader at.
  */
 function describeOutcome(result: unknown): OutcomeSentence {
+  const sentence = describeShareOutcome(result);
+  const marker = readTeamMarker(asObject(result)?.team_marker);
+  return marker === null
+    ? sentence
+    : {
+        ...sentence,
+        marker: `${marker.path} went with this share: it ${marker.reason}.`,
+      };
+}
+
+/** {@link describeOutcome} without the team marker line. */
+function describeShareOutcome(result: unknown): OutcomeSentence {
   const record = asObject(result);
   const outcome = asString(record?.outcome) ?? "";
   // A `proposed` report carries its placement and url at the top level and
