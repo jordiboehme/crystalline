@@ -754,6 +754,41 @@ fn cli_visibility_on_an_env_defined_governed_domain_names_the_variable() {
     }
 }
 
+/// Without a GitHub App the `_READERS` variable changes nothing, so an
+/// env-defined domain with an origin takes a visibility change as any
+/// other domain does.
+#[test]
+fn without_an_app_an_env_defined_domain_takes_a_visibility_change() {
+    let fx = Fixture::new();
+    let team = fx.home.path().join("team");
+    fx.run(
+        &["domain", "init"],
+        &[team.to_str().unwrap(), "--name", "team"],
+    );
+    let mut cmd = bin();
+    isolate(&mut cmd, fx.home.path());
+    cmd.env("CRYSTALLINE_DOMAIN_TEAM", &team)
+        .env("CRYSTALLINE_DOMAIN_TEAM_ORIGIN", "acme/team")
+        .args([
+            "domain",
+            "visibility",
+            "team",
+            "private",
+            "--owner",
+            "ada",
+            "--config",
+        ])
+        .arg(&fx.config);
+    let out = cmd.output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("owned by 'ada'"), "{stdout}");
+}
+
 /// Run `crystalline <args>` in `env` without the GitHub App variables,
 /// with `stdin` when given, returning (success, stdout, stderr).
 #[cfg(unix)]

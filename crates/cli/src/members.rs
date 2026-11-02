@@ -65,8 +65,8 @@ struct AccessRule {
     /// domain has a GitHub origin, the rule the engine's governor follows.
     governed: bool,
     /// The `CRYSTALLINE_DOMAIN_<NAME>_READERS` variable that sets the
-    /// domain's readers on every start, when the environment defines the
-    /// domain with an origin.
+    /// domain's readers on every start while an App governs it, when the
+    /// environment defines the domain with an origin.
     env_readers_var: Option<String>,
 }
 
@@ -418,9 +418,12 @@ pub async fn visibility(
 ) -> Result<()> {
     let domain = require_registered(&domain, config.as_deref())?;
     let rule = access_rule(&domain, config.as_deref()).await?;
-    // Such a domain applies its readers again on every start, so a change
-    // here would not last.
-    if let Some(var) = &rule.env_readers_var {
+    // A governed domain the environment defines applies its readers again
+    // on every start, so a change here would not last. Without an App the
+    // variable changes nothing, and the domain is like any other.
+    if rule.governed
+        && let Some(var) = &rule.env_readers_var
+    {
         bail!("Set by {var}; change it there.");
     }
     let store = store().await?;
