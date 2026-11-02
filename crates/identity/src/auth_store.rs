@@ -1436,6 +1436,9 @@ impl AuthStore {
     /// schema. The parent directory is created too, so a first run against a
     /// fresh state directory works.
     pub async fn open(path: &Path) -> Result<AuthStore> {
+        // Inside an app package a new database file (or its log) under
+        // AppData would land in the package's private copy: refused there.
+        crystalline_core::config::check_write(path)?;
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {

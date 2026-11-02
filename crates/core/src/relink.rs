@@ -349,7 +349,20 @@ fn relink_wikilink(
     };
     // A link that carried a prefix keeps one, now naming the new domain; a
     // bare link gains one only when it no longer resolves where it is written.
+    // One exception: when the engram changed domain into the very domain the
+    // link is written in, the prefix would name the link's own domain, so the
+    // link is written bare (`[[ops:x]]` in an engram of `ops` reads `[[x]]`),
+    // unless the bare text would itself read as a prefix (a title such as
+    // `Log: Weekly`). A move inside one domain keeps a prefix the author
+    // wrote.
     let new_domain = match &target.domain {
+        Some(_)
+            if spec.from_domain != spec.to_domain
+                && written_in == spec.to_domain
+                && LinkTarget::parse(new_target).domain.is_none() =>
+        {
+            None
+        }
         Some(_) => Some(spec.to_domain),
         None if written_in != spec.to_domain => Some(spec.to_domain),
         None => None,
@@ -522,12 +535,8 @@ pub fn readdress_path_wikilinks(
     source: &str,
     map: &dyn Fn(&str) -> Option<String>,
 ) -> (String, usize) {
-    rewrite_body_lines(source, BodyGate::Lossless, &|line| {
-        through(LinkDialect::Addressed, line, |l| {
-            path_wikilink_line(l, &|domain, target| {
-                domain.is_none().then(|| map(target)).flatten()
-            })
-        })
+    readdress_wikilinks(source, &|domain, target, _| {
+        domain.is_none().then(|| map(target)).flatten()
     })
 }
 
@@ -539,10 +548,24 @@ pub fn readdress_prefixed_path_wikilinks(
     source: &str,
     map: &dyn Fn(&str, &str) -> Option<String>,
 ) -> (String, usize) {
+    readdress_wikilinks(source, &|domain, target, _| {
+        domain.and_then(|d| map(d, target))
+    })
+}
+
+/// What [`readdress_wikilinks`] asks of each wikilink: its domain prefix
+/// (none for a bare one), its target, and whether it shows a display text;
+/// the answer is the new target part, or `None` to keep the link.
+pub type WikilinkMap<'a> = dyn Fn(Option<&str>, &str, bool) -> Option<String> + 'a;
+
+/// Rewrite every wikilink, bare or prefixed, whose domain prefix (none for a
+/// bare one) and target `map` answers, so its target part reads the answer;
+/// the third argument says whether the link shows a display text after a
+/// `|`, which stays as written. A link inside code is never handed to `map`.
+/// The one walk behind every wikilink readdress here.
+pub fn readdress_wikilinks(source: &str, map: &WikilinkMap<'_>) -> (String, usize) {
     rewrite_body_lines(source, BodyGate::Lossless, &|line| {
-        through(LinkDialect::Addressed, line, |l| {
-            path_wikilink_line(l, &|domain, target| domain.and_then(|d| map(d, target)))
-        })
+        through(LinkDialect::Addressed, line, |l| path_wikilink_line(l, map))
     })
 }
 
@@ -552,24 +575,16 @@ pub fn readdress_prefixed_path_wikilinks(
 /// the folder of the engram that holds it. A prefixed wikilink, one inside
 /// code and one naming any other text stay as written.
 pub fn respell_path_wikilinks(source: &str, from: &str, to: &str) -> (String, usize) {
-    rewrite_body_lines(source, BodyGate::Lossless, &|line| {
-        through(LinkDialect::Addressed, line, |l| {
-            path_wikilink_line(l, &|domain, target| {
-                (domain.is_none() && target == from).then(|| to.to_string())
-            })
-        })
+    readdress_wikilinks(source, &|domain, target, _| {
+        (domain.is_none() && target == from).then(|| to.to_string())
     })
 }
 
-/// One body line under [`respell_path_wikilinks`] and
-/// [`readdress_path_wikilinks`]: the wikilinks found the way [`relink_line`]
-/// finds them, over the line with inline code masked, and every bare one
-/// whose domain prefix (none for a bare one) and target `map` answers
-/// renamed to the answer.
-fn path_wikilink_line(
-    line: &str,
-    map: &dyn Fn(Option<&str>, &str) -> Option<String>,
-) -> (String, usize) {
+/// One body line under [`readdress_wikilinks`]: the wikilinks found the way
+/// [`relink_line`] finds them, over the line with inline code masked, and
+/// every one whose domain prefix (none for a bare one), target and display
+/// text flag `map` answers renamed to the answer.
+fn path_wikilink_line(line: &str, map: &WikilinkMap<'_>) -> (String, usize) {
     let original: Vec<char> = line.chars().collect();
     let code: Vec<char> = if line.contains('`') {
         mask_inline_code(line).chars().collect()
@@ -588,7 +603,7 @@ fn path_wikilink_line(
             let end = target_end(&masked, i + 2, close);
             let inner: String = masked[i + 2..end].iter().collect();
             let target = LinkTarget::parse(&inner);
-            if let Some(to) = map(target.domain.as_deref(), &target.target) {
+            if let Some(to) = map(target.domain.as_deref(), &target.target, end < close) {
                 out.push_str("[[");
                 out.push_str(&to);
                 out.extend(&original[end..close]);
@@ -626,6 +641,29 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("```\n[[pumps/b.md]]\n```"), "{out}");
+    }
+
+    #[test]
+    fn readdress_wikilinks_hands_the_map_every_link_and_whether_it_shows_a_text() {
+        let source = format!(
+            "{ENGRAM_HEAD}- relates_to [[b]]\n\nSee [[b|bee]], [[ops:x]], [[Cee]] and `[[b]]`.\n\n\
+             ```\n[[b]]\n```\n"
+        );
+        let (out, n) = readdress_wikilinks(&source, &|domain, target, shown| match (
+            domain, target, shown,
+        ) {
+            (None, "b", _) => Some("notes:b".to_string()),
+            (Some("ops"), "x", false) => Some("x".to_string()),
+            (None, "Cee", false) => Some("notes:c|Cee".to_string()),
+            _ => None,
+        });
+        assert_eq!(n, 4, "{out}");
+        assert!(out.contains("- relates_to [[notes:b]]\n"), "{out}");
+        assert!(
+            out.contains("See [[notes:b|bee]], [[x]], [[notes:c|Cee]] and `[[b]]`."),
+            "{out}"
+        );
+        assert!(out.contains("```\n[[b]]\n```"), "{out}");
     }
 
     #[test]
@@ -856,6 +894,37 @@ mod tests {
     }
 
     #[test]
+    fn a_link_written_in_the_destination_loses_the_prefix_naming_its_own_domain() {
+        let source = doc(
+            "See [[eng:alpha]], [[eng:Alpha Notes|the notes]] and [[eng:alpha|it]].\n\
+             - relates_to [[eng:alpha]]\n",
+        );
+        let (out, n) = relink(&source, "ops", "ops", &CROSS);
+        assert_eq!(n, 4, "{out}");
+        assert!(
+            out.contains(
+                "See [[alpha]], [[Alpha Notes|the notes]] and [[alpha|it]].\n\
+                 - relates_to [[alpha]]\n"
+            ),
+            "{out}"
+        );
+        // Written anywhere else, the prefix names the new domain.
+        let (out, _) = relink(&source, "dev", "dev", &CROSS);
+        assert!(
+            out.contains("See [[ops:alpha]], [[ops:Alpha Notes|the notes]]"),
+            "{out}"
+        );
+        // A title whose head would read as a prefix once bare keeps one.
+        let colon = Relink {
+            title: "Log: Weekly",
+            ..CROSS
+        };
+        let (out, n) = relink(&doc("[[eng:Log: Weekly]]\n"), "ops", "ops", &colon);
+        assert_eq!(n, 1, "{out}");
+        assert!(out.contains("[[ops:Log: Weekly]]"), "{out}");
+    }
+
+    #[test]
     fn a_permalink_change_rewrites_bare_prefixed_relation_and_url_references() {
         let source = doc("See [[velog/alpha]] and [[eng:velog/alpha]].\n\
              - relates_to [[velog/alpha]]\n\
@@ -930,11 +999,11 @@ mod tests {
     }
 
     #[test]
-    fn a_linker_in_the_destination_domain_keeps_its_prefix_form() {
+    fn a_linker_in_the_destination_domain_drops_the_prefix_form() {
         let source = doc("From ops: [[eng:alpha]]\n");
         let (out, n) = relink(&source, "ops", "ops", &CROSS);
         assert_eq!(n, 1);
-        assert!(out.contains("From ops: [[ops:alpha]]"));
+        assert!(out.contains("From ops: [[alpha]]"), "{out}");
     }
 
     #[test]
@@ -948,12 +1017,13 @@ mod tests {
     #[test]
     fn self_references_read_in_the_old_domain_and_write_for_the_new_one() {
         // Bare in the domain it leaves, bare again in the one it lands in: the
-        // link needs no prefix to find its own engram there.
+        // link needs no prefix to find its own engram there, and a prefixed
+        // one loses the prefix that would name its own domain.
         let source = doc("Back to the top: [[alpha]] and [[eng:alpha]]\n");
         let (out, n) = relink(&source, "eng", "ops", &CROSS);
         assert_eq!(n, 1, "{out}");
         assert!(
-            out.contains("Back to the top: [[alpha]] and [[ops:alpha]]"),
+            out.contains("Back to the top: [[alpha]] and [[alpha]]"),
             "{out}"
         );
         let renamed = Relink {
@@ -963,7 +1033,7 @@ mod tests {
         let (out, n) = relink(&source, "eng", "ops", &renamed);
         assert_eq!(n, 2, "{out}");
         assert!(
-            out.contains("[[guides/alpha]] and [[ops:guides/alpha]]"),
+            out.contains("[[guides/alpha]] and [[guides/alpha]]"),
             "{out}"
         );
     }

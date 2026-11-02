@@ -18,6 +18,7 @@ mod automation;
 mod bridge;
 #[cfg(unix)]
 mod mcp_stub;
+mod packaged;
 #[cfg(unix)]
 mod service;
 #[cfg(windows)]

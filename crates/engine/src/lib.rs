@@ -24,6 +24,7 @@ pub mod pending;
 #[doc(hidden)]
 pub mod poller;
 pub mod read_limit;
+pub mod registration;
 mod rename;
 #[cfg(any(test, feature = "testing"))]
 pub use rename::RenameHold;

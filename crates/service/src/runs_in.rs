@@ -222,6 +222,32 @@ fn job_and_package() -> (Option<bool>, Option<bool>, Option<String>) {
 /// never reads it.
 pub const TEST_PACKAGE_ENV: &str = "CRYSTALLINE_TEST_PACKAGE";
 
+/// Why a process inside an app package writes nothing under AppData itself,
+/// the sentence every refused write carries (see
+/// `crystalline_core::config::write_fence`).
+pub const PACKAGED_WRITE_REASON: &str = "this command runs inside Claude Desktop's app package, where Windows keeps every new file under AppData in the package's private copy, which the Crystalline daemon never sees. Run the command in a terminal outside Claude Desktop";
+
+/// Why `crystalline serve` does not run inside an app package.
+pub const PACKAGED_SERVE_REFUSAL: &str = "crystalline serve does not run inside Claude Desktop's app package: the daemon would keep its state in the package's private copy, apart from every process outside it. Start the daemon from a terminal outside Claude Desktop, or let the Crystalline sign-in task start it (crystalline doctor names it)";
+
+/// The refusal of a terminal setup step (`connect`, `install`, `doctor
+/// --fix` and the like) inside an app package: each writes Crystalline's
+/// state on this machine, which no daemon does for it.
+pub fn packaged_setup_refusal(command: &str) -> String {
+    format!(
+        "`crystalline {command}` writes Crystalline's state on this machine, and {PACKAGED_WRITE_REASON}."
+    )
+}
+
+/// Fence this process off from every write under AppData when it runs
+/// inside an app package: the CLI calls it once at start. Outside a package
+/// it does nothing, so an ordinary process writes exactly as before.
+pub fn fence_packaged_writes() {
+    if PackageContext::here().is_packaged() {
+        crystalline_core::config::refuse_appdata_writes(PACKAGED_WRITE_REASON);
+    }
+}
+
 /// Whether this process runs inside an app package (Claude Desktop's MSIX
 /// package on Windows). Read once. Inside one, `crystalline mcp` is only a
 /// bridge to the daemon outside: see `instance::ensure_daemon_in`.

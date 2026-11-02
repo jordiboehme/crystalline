@@ -2189,6 +2189,15 @@ fn run() -> anyhow::Result<()> {
     }
     let cli = Cli::parse();
     init_cli_tracing(cli.command.as_ref());
+    // Inside Claude Desktop's app package every new file under AppData lands
+    // in the package's private copy, so from here on a write there that was
+    // not sent to the daemon fails loudly instead of splitting the state.
+    crystalline_service::runs_in::fence_packaged_writes();
+    if crystalline_service::runs_in::PackageContext::here().is_packaged()
+        && let Some(step) = cli.command.as_ref().and_then(packaged_setup_step)
+    {
+        anyhow::bail!(crystalline_service::runs_in::packaged_setup_refusal(step));
+    }
     match cli.command {
         None => {
             Cli::command().print_help()?;
@@ -2387,6 +2396,12 @@ fn run() -> anyhow::Result<()> {
             take_over,
             config,
         }) => {
+            // The daemon never runs with an app package's identity: every
+            // file it wrote under AppData would land in the package's private
+            // copy. Refused before anything else, the scratch folder included.
+            if crystalline_service::runs_in::PackageContext::here().is_packaged() {
+                anyhow::bail!(crystalline_service::runs_in::PACKAGED_SERVE_REFUSAL);
+            }
             // A task-started daemon is recorded as an autostart, like any
             // daemon a client spawned: no new start mode an old reader would
             // fail to parse.
@@ -2502,6 +2517,42 @@ fn run() -> anyhow::Result<()> {
                 Ok(())
             }
         },
+    }
+}
+
+/// The terminal setup step `command` is, when it is one that a process
+/// inside an app package must not run: each writes Crystalline's state on
+/// this machine itself (`sources.json`, `installs.json`, the rename
+/// journal, a repaired config, the accounts database, the kept folder, the
+/// model cache) and no daemon does it for it. The merge of
+/// Claude Desktop's state keeps its own, older refusal in `doctor`.
+fn packaged_setup_step(command: &Command) -> Option<&'static str> {
+    match command {
+        Command::Connect { .. } => Some("connect"),
+        Command::Disconnect { .. } => Some("disconnect"),
+        Command::Install { .. } => Some("install"),
+        Command::Uninstall { .. } => Some("uninstall"),
+        Command::DaemonTask {
+            action: DaemonTaskAction::Register { .. },
+        } => Some("daemon-task register"),
+        Command::Users { .. } => Some("users"),
+        Command::Kept {
+            command: KeptCommand::Drop { .. },
+        } => Some("kept drop"),
+        Command::Model {
+            command: ModelCommand::Download { .. },
+        } => Some("model download"),
+        Command::Doctor {
+            merge_desktop_state: false,
+            discard_rename: true,
+            ..
+        } => Some("doctor --discard-rename"),
+        Command::Doctor {
+            merge_desktop_state: false,
+            fix: true,
+            ..
+        } => Some("doctor --fix"),
+        _ => None,
     }
 }
 
@@ -2653,7 +2704,7 @@ async fn status_dispatch(
     // config names and cannot sensibly do that from a file they cannot read.
     if !bypassed
         && let Some(data) =
-            crystalline_service::ctl_if_running(json!({ "v": 1, "cmd": "status" })).await?
+            crystalline_service::ctl_routed(json!({ "v": 1, "cmd": "status" })).await?
     {
         let loaded = cmd::load(config.as_deref());
         let config_error = loaded.as_ref().err().map(|e| e.to_string());
@@ -2670,6 +2721,23 @@ async fn status_dispatch(
             _ => Vec::new(),
         };
         sources::with_daemon_failures(&mut source_rows, &data["sources"]);
+        // Claude Desktop's second state, compared with what the daemon
+        // serves: its domains the daemon does not know are the ones a
+        // routing block read inside Claude Desktop lists and searches miss.
+        let registered: Vec<String> = data["registered"]
+            .as_array()
+            .map(|names| {
+                names
+                    .iter()
+                    .filter_map(|n| n.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut desktop_states = desktop_state::scan_here();
+        for state in &mut desktop_states {
+            state.compare_with(&registered);
+        }
+        let packaged_line = crystalline_service::desktop_state::packaged_read_line();
         if json {
             let mut data = data;
             if let serde_json::Value::Object(map) = &mut data {
@@ -2681,8 +2749,11 @@ async fn status_dispatch(
                 map.insert("sources".to_string(), serde_json::to_value(&source_rows)?);
                 map.insert(
                     "desktop_states".to_string(),
-                    serde_json::to_value(desktop_state::scan_here())?,
+                    serde_json::to_value(&desktop_states)?,
                 );
+                if let Some(line) = &packaged_line {
+                    map.insert("inside_package".to_string(), json!(line));
+                }
                 insert_kept_count(map);
                 // Present only when something differs, as doctor --json does.
                 if !mismatches.is_empty() {
@@ -2708,7 +2779,16 @@ async fn status_dispatch(
                 data["version"].as_str().unwrap_or("unknown"),
                 format_uptime(data["uptime_secs"].as_u64().unwrap_or(0)),
             );
-            if let Some(line) = desktop_state::status_line(&desktop_state::scan_here()) {
+            if let Some(line) = &packaged_line {
+                println!("{line}");
+            }
+            if let Some(line) = desktop_state::status_line(&desktop_states) {
+                println!("{line}");
+            }
+            for line in desktop_states
+                .iter()
+                .filter_map(desktop_state::unserved_line)
+            {
                 println!("{line}");
             }
             if let Some(line) = kept::status_line(&kept::scan_here()) {
@@ -5014,6 +5094,17 @@ async fn domain_add_dispatch(
     if branch.is_some() {
         anyhow::bail!("`domain add --branch` requires --origin");
     }
+    // Inside an app package an override keeps the registration local, and
+    // the sync after it would need a local engine, which is never opened
+    // there: refused before anything is registered.
+    if crystalline_service::runs_in::PackageContext::here().is_packaged()
+        && !crystalline_service::use_daemon(db.as_deref(), config.as_deref())
+        && !no_sync
+    {
+        anyhow::bail!(
+            "inside Claude Desktop's app package `domain add` with --config or --db can only register the domain, not index it. Add --no-sync, or run the command in a terminal outside Claude Desktop"
+        );
+    }
 
     if is_virtual {
         if path.is_some() {
@@ -5026,7 +5117,13 @@ async fn domain_add_dispatch(
                 "`domain add --virtual` needs a name; there is no folder to derive one from"
             )
         })?;
-        let (markdown, adopted) = cmd::domain_add_register_virtual(&name, config.as_deref())?;
+        let (markdown, adopted) = if cmd::registers_through_daemon(db.as_deref(), config.as_deref())
+        {
+            let done = cmd::register_through_daemon("virtual", Some(&name), None).await?;
+            (done.manifest.unwrap_or_default(), done.adopted)
+        } else {
+            cmd::domain_add_register_virtual(&name, config.as_deref())?
+        };
         if let Some(owner) = private_owner
             && adopted
         {
@@ -5050,7 +5147,16 @@ async fn domain_add_dispatch(
     // given name to place it under. Either way the resolved directory still
     // needs a pre-scaffolded MANIFEST.md.
     let (chosen_name, abs, adopted, shadowed) =
-        cmd::domain_add_register(name.as_deref(), path.as_deref(), config.as_deref())?;
+        if cmd::registers_through_daemon(db.as_deref(), config.as_deref()) {
+            let done =
+                cmd::register_through_daemon("file", name.as_deref(), path.as_deref()).await?;
+            let root = done.root.ok_or_else(|| {
+                anyhow::anyhow!("the daemon registered '{}' with no folder", done.name)
+            })?;
+            (done.name, root, done.adopted, done.shadowed)
+        } else {
+            cmd::domain_add_register(name.as_deref(), path.as_deref(), config.as_deref())?
+        };
     // Before the `--no-sync` print and before the sync, so a refused
     // `--private` prints nothing and indexes nothing.
     if let Some(owner) = private_owner
@@ -5070,7 +5176,7 @@ async fn domain_add_dispatch(
     use serde_json::json as j;
     let report: crystalline_index::SyncReport =
         if crystalline_service::use_daemon(db.as_deref(), config.as_deref())
-            && let Some(data) = crystalline_service::ctl_if_running(
+            && let Some(data) = crystalline_service::ctl_routed(
                 j!({ "v": 1, "cmd": "sync", "domain": chosen_name, "embed": false }),
             )
             .await?
@@ -5643,21 +5749,41 @@ fn run_prompt(
     // so the routing prompt reflects env-configured settings.
     let loaded_config = crystalline_service::overlay::load(config_path.as_deref())?;
     let mut global = loaded_config.effective;
+    let mut env_domain_names: Vec<String> = loaded_config
+        .overlay
+        .env_domains()
+        .map(|(name, _)| name.clone())
+        .collect();
+    // Inside Claude Desktop's app package this read of the config file can
+    // open the package's private copy, so the daemon's configuration is
+    // asked first; the local one is used only when no daemon answers, and
+    // the block then says so.
+    let mut package_note = None;
+    if crystalline_service::runs_in::PackageContext::here().is_packaged()
+        && config_path.is_none()
+        && db.is_none()
+    {
+        match on_runtime_value(daemon_routing_config) {
+            Ok(Some((config, env))) => {
+                global = config;
+                env_domain_names = env;
+            }
+            Ok(None) | Err(_) => package_note = Some(PACKAGED_PROMPT_NOTE.to_string()),
+        }
+    }
     // Domains from connected servers: a local copy a server replaces leaves
     // the block, the server's copy joins it under its local name. A name the
     // daemon's fresher table mounts leaves it too, so no name is listed twice.
-    let (shadowed, mounted_rows, stale) =
+    let (shadowed, mounted_rows, mut stale) =
         mounted_part(&global, config_path.is_some() || db.is_some());
+    stale.extend(package_note);
     global.domains.retain(|name, _| {
         !shadowed.contains(name) && !mounted_rows.iter().any(|m| &m.name == name)
     });
     // Named so an env-defined domain never nags the pending block for a
     // decision it can never record - see `session_notices`'s doc comment.
-    let env_domains: std::collections::HashSet<&str> = loaded_config
-        .overlay
-        .env_domains()
-        .map(|(name, _)| name.as_str())
-        .collect();
+    let env_domains: std::collections::HashSet<&str> =
+        env_domain_names.iter().map(String::as_str).collect();
 
     // Session-start provisioning: reconcile opted-in domains' file artifacts
     // and surface undecided domains, joining the same notice channel as the
@@ -5818,6 +5944,36 @@ fn run_prompt(
         eprintln!("{note}");
     }
     Ok(())
+}
+
+/// The line a routing block read inside Claude Desktop's app package
+/// carries when the daemon gave no configuration (none answered, or an
+/// older one that does not know `routing_config`): it comes from the
+/// package's private
+/// copy of the configuration, which can list domains the daemon does not
+/// serve.
+const PACKAGED_PROMPT_NOTE: &str = "Note: this session runs inside Claude Desktop's app package, and the Crystalline daemon did not give its configuration, so this routing block was read from Claude Desktop's private copy of the configuration. It can list domains the daemon does not serve; `crystalline status` in a terminal outside Claude Desktop shows the daemon's view.";
+
+/// How long `prompt system` inside a package waits for the daemon the task
+/// starts: the SessionStart hook runs under a ten second limit, and a
+/// killed hook gives the session no routing block at all, which is worse
+/// than the local read with its note.
+const PACKAGED_PROMPT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The configuration and env-defined domain names the daemon builds a
+/// routing block from (the `routing_config` ctl command), for a prompt run
+/// inside an app package. `None` when no daemon answered or the answer
+/// does not read.
+async fn daemon_routing_config() -> Option<(crystalline_core::config::GlobalConfig, Vec<String>)> {
+    let data = crystalline_service::ctl_routed_waiting(
+        serde_json::json!({ "v": 1, "cmd": "routing_config" }),
+        PACKAGED_PROMPT_WAIT,
+    )
+    .await
+    .ok()??;
+    let config = serde_json::from_value(data.get("config")?.clone()).ok()?;
+    let env = serde_json::from_value(data.get("env_domains")?.clone()).unwrap_or_default();
+    Some((config, env))
 }
 
 /// The text block with each stale source's line after it.

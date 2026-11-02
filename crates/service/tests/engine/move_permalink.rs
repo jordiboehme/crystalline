@@ -1416,6 +1416,16 @@ async fn a_cross_domain_move_turns_relative_links_into_addresses() {
         .unwrap();
     assert_eq!(receipt["links_rewritten"], 1, "{receipt}");
     assert_eq!(receipt["references_rewritten"], 2, "{receipt}");
+    // The link to a file the source never had was dead before the move and
+    // is named; the folder's index.md is no engram link at all.
+    assert_eq!(
+        dead(&receipt),
+        vec![(
+            "[[notes:guides/c.md]]".to_string(),
+            "unresolved_before".to_string()
+        )],
+        "{receipt}"
+    );
     let failed = receipt["links_failed"].as_array().expect("links_failed");
     assert_eq!(failed.len(), 1, "{receipt}");
     assert_eq!(failed[0]["domain"], "ops", "{receipt}");
@@ -1535,4 +1545,355 @@ async fn a_prefixed_path_wikilink_follows_a_move() {
     assert!(linker.contains("See [[vault:x/a.md|A]]."), "{linker}");
     let l = read_receipt(&f, "ops", "linker").await;
     assert!(edges(&l)[0].1, "{l}");
+}
+
+// --- issue 152: the moved engram's own bare links ------------------------------
+
+/// The `link` and `reason` of every entry in a move receipt's `links_dead`,
+/// empty when the receipt carries none.
+fn dead(receipt: &Value) -> Vec<(String, String)> {
+    receipt["links_dead"]
+        .as_array()
+        .map(|dead| {
+            dead.iter()
+                .map(|d| {
+                    (
+                        d["link"].as_str().unwrap().to_string(),
+                        d["reason"].as_str().unwrap().to_string(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The issue's repro: `a` links `[[b]]` and `[[c]]`, both in `notes`, and
+/// moves to `ops`. In `ops` a bare link resolves in `ops`, so both gain the
+/// domain they were written in and still resolve.
+#[tokio::test]
+async fn issue_152_a_moved_engrams_bare_links_keep_resolving() {
+    let f = Fixture::new().await;
+    seed(
+        f.notes(),
+        "a.md",
+        &engram("Ay", "a", "See [[b]] and [[c]]."),
+    );
+    seed(f.notes(), "b.md", &engram("Bee", "b", "B."));
+    seed(f.notes(), "c.md", &engram("Cee", "c", "C."));
+    f.sync().await;
+
+    let receipt = f.mv("a", "notes", "a.md", Some("ops"), None).await.unwrap();
+    let a = read(f.ops(), "a.md");
+    assert!(a.contains("See [[notes:b]] and [[notes:c]]."), "{a}");
+    assert!(dead(&receipt).is_empty(), "{receipt}");
+    let a = read_receipt(&f, "ops", "a").await;
+    assert!(edges(&a).iter().all(|(_, resolved, _)| *resolved), "{a}");
+    assert!(
+        f.unresolved("ops").await.is_empty(),
+        "{:?}",
+        f.unresolved("ops").await
+    );
+}
+
+/// Relation bullets are written in the same brackets and follow the same
+/// rule. A display text stays as written; a link by title names the target
+/// by its permalink, so it survives a later change of that title, and keeps
+/// the author's words as its display text.
+#[tokio::test]
+async fn a_cross_domain_move_prefixes_relations_aliases_and_title_links() {
+    let f = Fixture::new().await;
+    seed(
+        f.notes(),
+        "process/a.md",
+        &engram(
+            "Ay",
+            "process/a",
+            "- relates_to [[process/b]]\n- part_of [[process/b|the bee]]\n\n\
+             See [[process/b|B]], [[Cee Title]], [[cee title|the cee]] and `[[process/b]]`.",
+        ),
+    );
+    seed(f.notes(), "process/b.md", &engram("Bee", "process/b", "B."));
+    seed(
+        f.notes(),
+        "sources/c.md",
+        &engram("Cee Title", "sources/c", "C."),
+    );
+    f.sync().await;
+
+    let receipt = f
+        .mv("process/a", "notes", "process/a.md", Some("ops"), None)
+        .await
+        .unwrap();
+    let a = read(f.ops(), "process/a.md");
+    assert!(
+        a.contains(
+            "- relates_to [[notes:process/b]]\n- part_of [[notes:process/b|the bee]]\n\n\
+             See [[notes:process/b|B]], [[notes:sources/c|Cee Title]], \
+             [[notes:sources/c|the cee]] and `[[process/b]]`."
+        ),
+        "{a}"
+    );
+    assert!(dead(&receipt).is_empty(), "{receipt}");
+    let a = read_receipt(&f, "ops", "process/a").await;
+    assert!(edges(&a).iter().all(|(_, resolved, _)| *resolved), "{a}");
+}
+
+/// A target moved into `ops` first: its inbound rewrite gave the linker
+/// `[[ops:b]]` while the linker still sat in `notes`. When the linker
+/// follows, that prefix names its own domain and collapses to `[[b]]`, and a
+/// bare link that names an engram in the destination and nothing in the
+/// source stays bare.
+#[tokio::test]
+async fn a_target_moved_first_leaves_the_linker_bare_once_it_follows() {
+    let f = Fixture::new().await;
+    seed(
+        f.notes(),
+        "a.md",
+        &engram("Ay", "a", "See [[b]] and [[d|the dee]]."),
+    );
+    seed(f.notes(), "b.md", &engram("Bee", "b", "B."));
+    seed(f.ops(), "d.md", &engram("Dee", "d", "Already here."));
+    f.sync().await;
+
+    f.mv("b", "notes", "b.md", Some("ops"), None).await.unwrap();
+    let a = read(f.notes(), "a.md");
+    assert!(a.contains("See [[ops:b]] and [[d|the dee]]."), "{a}");
+
+    let receipt = f.mv("a", "notes", "a.md", Some("ops"), None).await.unwrap();
+    let a = read(f.ops(), "a.md");
+    assert!(a.contains("See [[b]] and [[d|the dee]]."), "{a}");
+    assert!(dead(&receipt).is_empty(), "{receipt}");
+    let a = read_receipt(&f, "ops", "a").await;
+    assert!(edges(&a).iter().all(|(_, resolved, _)| *resolved), "{a}");
+}
+
+/// A target moved into `ops` after the linker, under a new slug: the
+/// linker's `[[notes:b]]` is an inbound reference by then, so the second move
+/// rewrites it, and in an engram of `ops` the prefix collapses.
+#[tokio::test]
+async fn a_target_moved_later_with_a_new_slug_is_followed_and_collapses() {
+    let f = Fixture::new().await;
+    seed(
+        f.notes(),
+        "a.md",
+        &engram("Ay", "a", "See [[b|the bee]].\n- relates_to [[b]]"),
+    );
+    seed(f.notes(), "b.md", &engram("Bee", "b", "B."));
+    f.sync().await;
+
+    f.mv("a", "notes", "a.md", Some("ops"), None).await.unwrap();
+    let a = read(f.ops(), "a.md");
+    assert!(
+        a.contains("See [[notes:b|the bee]].\n- relates_to [[notes:b]]"),
+        "{a}"
+    );
+
+    let receipt = f
+        .mv("b", "notes", "bee.md", Some("ops"), Some("bee"))
+        .await
+        .unwrap();
+    assert_eq!(receipt["links_rewritten"], 1, "{receipt}");
+    let a = read(f.ops(), "a.md");
+    assert!(
+        a.contains("See [[bee|the bee]].\n- relates_to [[bee]]"),
+        "{a}"
+    );
+    let a = read_receipt(&f, "ops", "a").await;
+    assert!(edges(&a).iter().all(|(_, resolved, _)| *resolved), "{a}");
+}
+
+/// A link to the moved engram itself stays bare and follows its new
+/// permalink, even when that new permalink is what another engram of the
+/// source domain answers to: the other engram's link gains the prefix, the
+/// self-link does not.
+#[tokio::test]
+async fn a_link_to_the_moved_engram_itself_stays_bare() {
+    let f = Fixture::new().await;
+    seed(
+        f.notes(),
+        "a.md",
+        &engram("Ay", "a", "Me: [[a]], by title [[Ay]]; the other: [[a2]]."),
+    );
+    seed(f.notes(), "a2.md", &engram("Other", "a2", "Not the one."));
+    f.sync().await;
+
+    let receipt = f
+        .mv("a", "notes", "a2.md", Some("ops"), Some("a2"))
+        .await
+        .unwrap();
+    let a = read(f.ops(), "a2.md");
+    assert!(
+        a.contains("Me: [[a2]], by title [[Ay]]; the other: [[notes:a2]]."),
+        "{a}"
+    );
+    assert!(dead(&receipt).is_empty(), "{receipt}");
+}
+
+/// A link already carrying a prefix of a third domain is left alone, and so
+/// is one to the source domain: both resolve where they did.
+#[tokio::test]
+async fn an_already_prefixed_link_is_untouched() {
+    let f = Fixture::new().await;
+    seed(
+        f.notes(),
+        "a.md",
+        &engram("Ay", "a", "See [[vault:x]] and [[notes:b]]."),
+    );
+    seed(f.notes(), "b.md", &engram("Bee", "b", "B."));
+    f.sync().await;
+    let x: WriteParams = serde_json::from_value(serde_json::json!({
+        "domain": "vault", "title": "x", "content": "X."
+    }))
+    .unwrap();
+    f.engine.write_engram(&x).await.unwrap();
+    assert!(
+        edges(&read_receipt(&f, "notes", "a").await)
+            .iter()
+            .all(|(_, resolved, _)| *resolved)
+    );
+
+    let receipt = f.mv("a", "notes", "a.md", Some("ops"), None).await.unwrap();
+    let a = read(f.ops(), "a.md");
+    assert!(a.contains("See [[vault:x]] and [[notes:b]]."), "{a}");
+    assert!(dead(&receipt).is_empty(), "{receipt}");
+}
+
+/// A link that resolved nowhere before the move stays as written, and the
+/// receipt names it in `links_dead` so the caller sees it at once. The
+/// resolver never splits a `#fragment` off a wikilink target, so
+/// `[[b#setup]]` is one of them; `[[b]]` beside it resolves and gains its
+/// prefix.
+#[tokio::test]
+async fn a_link_that_never_resolved_stays_and_is_named_in_links_dead() {
+    let f = Fixture::new().await;
+    seed(
+        f.notes(),
+        "a.md",
+        &engram("Ay", "a", "See [[ghost]], [[b#setup]] and [[b]]."),
+    );
+    seed(f.notes(), "b.md", &engram("Bee", "b", "B."));
+    f.sync().await;
+    let before = edges(&read_receipt(&f, "notes", "a").await);
+    assert!(
+        before.contains(&("b#setup".to_string(), false, None)),
+        "the resolver reads the fragment as part of the target: {before:?}"
+    );
+
+    let receipt = f.mv("a", "notes", "a.md", Some("ops"), None).await.unwrap();
+    let a = read(f.ops(), "a.md");
+    assert!(
+        a.contains("See [[ghost]], [[b#setup]] and [[notes:b]]."),
+        "{a}"
+    );
+    let mut dead = dead(&receipt);
+    dead.sort();
+    assert_eq!(
+        dead,
+        vec![
+            ("[[b#setup]]".to_string(), "unresolved_before".to_string()),
+            ("[[ghost]]".to_string(), "unresolved_before".to_string()),
+        ],
+        "{receipt}"
+    );
+    assert!(receipt.get("links_failed").is_none(), "{receipt}");
+}
+
+/// A move inside one domain leaves bare links bare and carries no
+/// `links_dead`, and `update_links: false` skips the cross-domain rewrite
+/// of the moved engram's own links as it skips every other.
+#[tokio::test]
+async fn same_domain_moves_and_update_links_false_leave_bare_links_alone() {
+    let f = Fixture::new().await;
+    seed(
+        f.notes(),
+        "a.md",
+        &engram("Ay", "a", "See [[b]] and [[ghost]]."),
+    );
+    seed(f.notes(), "b.md", &engram("Bee", "b", "B."));
+    f.sync().await;
+
+    let receipt = f
+        .mv("a", "notes", "guides/a.md", None, Some("keep"))
+        .await
+        .unwrap();
+    let a = read(f.notes(), "guides/a.md");
+    assert!(a.contains("See [[b]] and [[ghost]]."), "{a}");
+    assert!(receipt.get("links_dead").is_none(), "{receipt}");
+
+    let receipt = f
+        .engine
+        .move_engram(
+            &MoveParams {
+                identifier: "a".to_string(),
+                domain: "notes".to_string(),
+                destination: "a.md".to_string(),
+                destination_domain: Some("ops".to_string()),
+                permalink: None,
+                update_links: Some(false),
+            },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    let a = read(f.ops(), "a.md");
+    assert!(a.contains("See [[b]] and [[ghost]]."), "{a}");
+    assert!(receipt.get("links_dead").is_none(), "{receipt}");
+}
+
+/// A title whose head reads like a domain prefix (`[[Log: Weekly]]`) is no
+/// prefix when no domain answers to it: the resolver reads the whole text at
+/// home, so the move treats it as the bare link it is.
+#[tokio::test]
+async fn a_colon_title_link_is_a_bare_link_and_gains_the_prefix() {
+    let f = Fixture::new().await;
+    seed(
+        f.notes(),
+        "a.md",
+        &engram("Ay", "a", "See [[Log: Weekly]]."),
+    );
+    seed(
+        f.notes(),
+        "weekly.md",
+        &engram("Log: Weekly", "weekly", "The log.")
+            .replace("title: Log: Weekly", "title: \"Log: Weekly\""),
+    );
+    f.sync().await;
+    let r = read_receipt(&f, "notes", "a").await;
+    assert!(edges(&r)[0].1, "{r}");
+
+    let receipt = f.mv("a", "notes", "a.md", Some("ops"), None).await.unwrap();
+    let a = read(f.ops(), "a.md");
+    assert!(a.contains("See [[notes:weekly|Log: Weekly]]."), "{a}");
+    assert!(dead(&receipt).is_empty(), "{receipt}");
+}
+
+/// An engram of the destination that names the moved engram by its path
+/// with the source's prefix (`[[notes:guides/a.md]]`) follows it, and the
+/// prefix that would name its own domain is dropped.
+#[tokio::test]
+async fn a_prefixed_path_wikilink_in_the_destination_collapses() {
+    let f = Fixture::new().await;
+    seed(
+        f.notes(),
+        "guides/a.md",
+        &engram("Ay", "guides/a", "The engram."),
+    );
+    seed(
+        f.ops(),
+        "linker.md",
+        &engram(
+            "Linker",
+            "linker",
+            "See [[notes:guides/a.md|A]] and [[notes:guides/a]].",
+        ),
+    );
+    f.sync().await;
+
+    f.mv("guides/a", "notes", "x/a.md", Some("ops"), None)
+        .await
+        .unwrap();
+    let linker = read(f.ops(), "linker.md");
+    assert!(linker.contains("See [[x/a.md|A]] and [[x/a]]."), "{linker}");
+    let l = read_receipt(&f, "ops", "linker").await;
+    assert!(edges(&l).iter().all(|(_, resolved, _)| *resolved), "{l}");
 }
