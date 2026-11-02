@@ -687,6 +687,24 @@ pub fn merge_text(
     upstream: &str,
     line_merge: LineMerge<'_>,
 ) -> MergedText {
+    merge_text_with(base, local, upstream, line_merge, line_merge)
+}
+
+/// [`merge_text`] with a merge of its own for the body: `line_merge` merges
+/// the frontmatter key blocks (and the whole text when one side's
+/// frontmatter cannot be merged by key), `body_merge` the body after the
+/// frontmatter, and the whole text when no side has a frontmatter at all.
+///
+/// A body merge may be finer than a line merge (per character, say); a
+/// frontmatter value is never merged finer than its lines, so two changes to
+/// one date never make a date nobody wrote.
+pub fn merge_text_with(
+    base: Option<&str>,
+    local: &str,
+    upstream: &str,
+    line_merge: LineMerge<'_>,
+    body_merge: LineMerge<'_>,
+) -> MergedText {
     let base = base.map(crate::to_lf);
     let local = crate::to_lf(local);
     let upstream = crate::to_lf(upstream);
@@ -698,10 +716,16 @@ pub fn merge_text(
             local_body,
             upstream_body,
         } => settle(base_body, local_body, upstream_body)
-            .or_else(|| line_merge(base_body, local_body, upstream_body))
+            .or_else(|| body_merge(base_body, local_body, upstream_body))
             .map(|body| head + &body),
         FrontmatterMerge::Conflict => None,
-        FrontmatterMerge::NotApplicable => line_merge(base.unwrap_or(""), local, upstream),
+        FrontmatterMerge::NotApplicable => {
+            let all_body = [base.unwrap_or(""), local, upstream]
+                .iter()
+                .all(|text| split_frontmatter(text).is_none());
+            let merge = if all_body { body_merge } else { line_merge };
+            merge(base.unwrap_or(""), local, upstream)
+        }
     };
     match merged {
         Some(text) if !breaks_parse(local, upstream, &text) => MergedText::Clean(text),
@@ -718,6 +742,36 @@ mod tests {
     use super::*;
 
     const DOC: &str = "---\ntype: engram\ntitle: T\npermalink: t\n---\n\n# T\n\nBody.\n";
+
+    #[test]
+    fn merge_text_with_keeps_the_body_merge_out_of_the_frontmatter() {
+        let lines: &dyn Fn(&str, &str, &str) -> Option<String> = &|_, _, _| None;
+        let body: &dyn Fn(&str, &str, &str) -> Option<String> = &|_, _, _| Some("merged\n".into());
+        let base = "---\ntype: engram\ntitle: T\ndate: 1\n---\n\nbody\n";
+        let local = base.replace("body", "local");
+        let upstream = base.replace("body", "upstream");
+        assert_eq!(
+            merge_text_with(Some(base), &local, &upstream, lines, body),
+            MergedText::Clean(base.replace("\nbody\n", "merged\n"))
+        );
+        // A key both sides changed goes to the line merge, never the body's.
+        let local = base.replace("date: 1", "date: 2");
+        let upstream = base.replace("date: 1", "date: 3");
+        assert_eq!(
+            merge_text_with(Some(base), &local, &upstream, lines, body),
+            MergedText::Conflict
+        );
+        // No frontmatter anywhere: the whole text is body.
+        assert_eq!(
+            merge_text_with(Some("a\n"), "b\n", "c\n", lines, body),
+            MergedText::Clean("merged\n".into())
+        );
+        // One side with a frontmatter that cannot be merged by key: lines.
+        assert_eq!(
+            merge_text_with(Some("a\n"), "---\ntype: x\n---\n\nb\n", "c\n", lines, body),
+            MergedText::Conflict
+        );
+    }
 
     #[test]
     fn same_content_reads_values_not_spelling() {

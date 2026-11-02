@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 
-use crystalline_core::frontmatter::{MergedText, merge_text};
+use crystalline_core::frontmatter::{MergedText, merge_text_with};
 use diffy::{ConflictStyle, MergeOptions};
 use similar::{Algorithm, DiffOp, capture_diff_slices};
 use unicode_segmentation::UnicodeSegmentation;
@@ -32,16 +32,18 @@ pub enum MergeOutcome {
 ///
 /// A line both sides changed (a person typing in one cell of a table row, an
 /// agent changing another cell of the same row) is merged once more per
-/// character (see `line_merge`); the merge is clean only when that is.
+/// character in the body (see `body_merge`); the merge is clean only when
+/// that is. Frontmatter key blocks keep the plain line merge, so two changes
+/// to one value are a conflict rather than a value nobody wrote.
 pub fn three_way(base_file: &str, mine_session: &str, theirs_file: &str) -> MergeOutcome {
     let base = to_lf(base_file);
     let theirs = to_lf(theirs_file);
     let mine_session = &*to_lf(mine_session);
     // Frontmatter by key, body by line, and never a result that stops
     // parsing where both sides parsed. diffy's marked text is discarded
-    // inside `line_merge`: conflict markers must never reach an engram file
-    // or the live document.
-    match merge_text(Some(&base), mine_session, &theirs, &line_merge) {
+    // inside `line_merge` and `body_merge`: conflict markers must never reach
+    // an engram file or the live document.
+    match merge_text_with(Some(&base), mine_session, &theirs, &line_merge, &body_merge) {
         MergedText::Clean(merged) => MergeOutcome::Clean(merged),
         MergedText::Conflict => MergeOutcome::Conflict,
     }
@@ -52,18 +54,38 @@ pub fn three_way(base_file: &str, mine_session: &str, theirs_file: &str) -> Merg
 /// input with a line that starts like a marker keeps today's conflict.
 const FALLBACK_MARKER_LEN: usize = 64;
 
-/// diffy's three-way line merge, its conflict-marked `Err` discarded.
-///
-/// When the line merge conflicts, each conflicting hunk whose three sides
-/// have the same number of lines is merged again line against line, per
-/// grapheme cluster ([`grapheme_merge`]). The result is clean only when every
-/// such line merges clean; any other hunk shape (lines added or removed on
-/// one side, or a cluster both sides changed) stays a conflict, as before.
+/// diffy's three-way line merge, its conflict-marked `Err` discarded. The
+/// frontmatter's merge.
 fn line_merge(base: &str, mine: &str, theirs: &str) -> Option<String> {
-    match diffy::merge(base, mine, theirs) {
-        Ok(merged) => Some(merged),
-        Err(_) => hunk_merge(base, mine, theirs),
-    }
+    diffy::merge(base, mine, theirs).ok()
+}
+
+/// The body's merge: [`line_merge`], and when that conflicts, each
+/// conflicting hunk in which every line pairs with its own counterpart is
+/// merged again line against line, per grapheme cluster
+/// ([`grapheme_merge`]). The result is clean only when every such line
+/// merges clean; any other hunk shape (lines added, removed or moved on one
+/// side, or a cluster both sides changed) stays a conflict, as before.
+fn body_merge(base: &str, mine: &str, theirs: &str) -> Option<String> {
+    line_merge(base, mine, theirs).or_else(|| hunk_merge(base, mine, theirs))
+}
+
+/// Whether the lines of `side` pair one to one with the lines of `base`:
+/// the line diff holds nothing but equal lines and runs replaced by as many
+/// lines, so line `i` of one is the counterpart of line `i` of the other.
+/// Equal line counts alone do not say that: a side that dropped the first
+/// line and added a last one has as many lines, each paired with the wrong
+/// one.
+fn pairs_line_for_line(base: &[&str], side: &[&str]) -> bool {
+    capture_diff_slices(Algorithm::Myers, base, side)
+        .iter()
+        .all(|op| match *op {
+            DiffOp::Equal { .. } => true,
+            DiffOp::Replace {
+                old_len, new_len, ..
+            } => old_len == new_len,
+            DiffOp::Delete { .. } | DiffOp::Insert { .. } => false,
+        })
 }
 
 /// The character fallback of [`line_merge`]: diffy's conflicting hunks, read
@@ -90,15 +112,11 @@ fn hunk_merge(base: &str, mine: &str, theirs: &str) -> Option<String> {
             t.to_string()
         }
     });
-    let open = "<".repeat(FALLBACK_MARKER_LEN);
-    let original = "|".repeat(FALLBACK_MARKER_LEN);
-    let middle = "=".repeat(FALLBACK_MARKER_LEN);
-    let close = ">".repeat(FALLBACK_MARKER_LEN);
-    let markers = [&open, &original, &middle, &close];
+    let markers = marker_lines();
     if [&base, &mine, &theirs]
         .iter()
         .flat_map(|t| t.lines())
-        .any(|line| markers.iter().any(|m| line.starts_with(m.as_str())))
+        .any(|line| starts_like_a_marker(line, &markers))
     {
         return None;
     }
@@ -107,13 +125,39 @@ fn hunk_merge(base: &str, mine: &str, theirs: &str) -> Option<String> {
         .set_conflict_marker_length(FALLBACK_MARKER_LEN)
         .merge(&base, &mine, &theirs)
         .err()?;
+    let mut merged = resolve_marked(&marked)?;
+    if added {
+        merged.pop();
+    }
+    Some(merged)
+}
 
-    let (open, original, middle, close) = (
-        format!("{open} ours\n"),
-        format!("{original} original\n"),
-        format!("{middle}\n"),
-        format!("{close} theirs\n"),
-    );
+/// The four marker lines diffy writes with [`FALLBACK_MARKER_LEN`], in the
+/// order a diff3-style hunk has them: ours, original, the middle, theirs.
+fn marker_lines() -> [String; 4] {
+    let run = |c: char| c.to_string().repeat(FALLBACK_MARKER_LEN);
+    [
+        format!("{} ours\n", run('<')),
+        format!("{} original\n", run('|')),
+        format!("{}\n", run('=')),
+        format!("{} theirs\n", run('>')),
+    ]
+}
+
+/// Whether `line` starts with one of the four marker runs.
+fn starts_like_a_marker(line: &str, markers: &[String; 4]) -> bool {
+    markers
+        .iter()
+        .any(|m| line.starts_with(&m[..FALLBACK_MARKER_LEN]))
+}
+
+/// Read diffy's diff3-style marked text and merge each hunk per character.
+/// `None` when a hunk does not pair line for line or does not merge, when
+/// the text holds no hunk at all or ends inside one, and when the result
+/// still holds a line that starts like a marker: the conflict stands.
+fn resolve_marked(marked: &str) -> Option<String> {
+    let markers = marker_lines();
+    let [open, original, middle, close] = &markers;
     enum Part {
         Outside,
         Mine,
@@ -121,6 +165,7 @@ fn hunk_merge(base: &str, mine: &str, theirs: &str) -> Option<String> {
         Theirs,
     }
     let mut part = Part::Outside;
+    let mut hunks = 0;
     let mut hunk: [Vec<&str>; 3] = Default::default();
     let mut merged = String::with_capacity(marked.len());
     for line in marked.split_inclusive('\n') {
@@ -133,22 +178,26 @@ fn hunk_merge(base: &str, mine: &str, theirs: &str) -> Option<String> {
             Part::Base => hunk[0].push(line),
             Part::Theirs if line == close => {
                 let [b, m, t] = std::mem::take(&mut hunk);
-                if b.len() != m.len() || b.len() != t.len() {
+                if !pairs_line_for_line(&b, &m) || !pairs_line_for_line(&b, &t) {
                     return None;
                 }
                 for ((b, m), t) in b.iter().zip(&m).zip(&t) {
                     merged.push_str(&grapheme_merge(b, m, t)?);
                 }
+                hunks += 1;
                 part = Part::Outside;
             }
             Part::Theirs => hunk[2].push(line),
         }
     }
-    if !matches!(part, Part::Outside) {
+    if !matches!(part, Part::Outside) || hunks == 0 {
         return None;
     }
-    if added {
-        merged.pop();
+    if merged
+        .lines()
+        .any(|line| starts_like_a_marker(line, &markers))
+    {
+        return None;
     }
     Some(merged)
 }
@@ -156,7 +205,14 @@ fn hunk_merge(base: &str, mine: &str, theirs: &str) -> Option<String> {
 /// A three-way merge of one line per extended grapheme cluster: each cluster
 /// is interned to an id, the ids are merged by diffy one per line, and a
 /// clean result is read back. Clusters are whole tokens, so a merged line is
-/// always made of clusters one of the sides holds.
+/// always made of clusters one of the sides holds. The same change made by
+/// both sides at the same place is kept once, as the line merge keeps a line
+/// both sides changed alike.
+///
+/// The merged line is cut into clusters once more and must give back the
+/// clusters it was made of: clusters set side by side can join into another
+/// one (two lone regional indicators make a flag), and a merge that changes
+/// what a cluster is stays a conflict.
 fn grapheme_merge(base: &str, mine: &str, theirs: &str) -> Option<String> {
     let mut clusters: Vec<&str> = Vec::new();
     let mut ids: HashMap<&str, usize> = HashMap::new();
@@ -173,14 +229,21 @@ fn grapheme_merge(base: &str, mine: &str, theirs: &str) -> Option<String> {
         out
     });
     let merged = diffy::merge(&base, &mine, &theirs).ok()?;
-    merged
+    let tokens: Vec<&str> = merged
         .lines()
         .map(|id| {
             id.parse::<usize>()
                 .ok()
                 .and_then(|i| clusters.get(i).copied())
         })
-        .collect()
+        .collect::<Option<_>>()?;
+    let line = tokens.concat();
+    keeps_clusters(&line, &tokens).then_some(line)
+}
+
+/// Whether `line` cuts into exactly `tokens` as extended grapheme clusters.
+fn keeps_clusters(line: &str, tokens: &[&str]) -> bool {
+    line.graphemes(true).eq(tokens.iter().copied())
 }
 
 /// Morph the live Y.Text into `target` with a minimal edit script, positions
@@ -583,6 +646,74 @@ mod tests {
         sync(&server, &person);
         assert_eq!(text.get_string(&server.transact()), "| 1x | 2Z |\n");
         assert_eq!(typed.get_string(&person.transact()), "| 1x | 2Z |\n");
+    }
+
+    #[test]
+    fn a_hunk_of_equal_line_counts_whose_lines_moved_is_a_conflict() {
+        // Theirs dropped the first row and added a last one: as many lines,
+        // but none of them pairs with its own counterpart.
+        let base = "| 1 | 2 | 3 |\n| 4 | 2 | 3 |\n";
+        let mine = "| 1 | 2 | 3x |\n| 4 | 2y | 3 |\n";
+        let theirs = "| 4 | 2 | 3 |\n| 7 | 2 | 3 |\n";
+        assert!(matches!(
+            three_way(base, mine, theirs),
+            MergeOutcome::Conflict
+        ));
+    }
+
+    #[test]
+    fn two_rows_both_sides_changed_in_place_still_merge_per_character() {
+        let base = "| 1 | 2 |\n| 3 | 4 |\n";
+        let mine = "| 1x | 2 |\n| 3x | 4 |\n";
+        let theirs = "| 1 | 2y |\n| 3 | 4y |\n";
+        let MergeOutcome::Clean(merged) = three_way(base, mine, theirs) else {
+            panic!("rows changed in place pair line for line");
+        };
+        assert_eq!(merged, "| 1x | 2y |\n| 3x | 4y |\n");
+    }
+
+    #[test]
+    fn a_marked_text_without_a_hunk_or_with_a_marker_left_is_never_taken() {
+        let [open, original, middle, close] = marker_lines();
+        assert_eq!(resolve_marked("| a | b |\n"), None, "no hunk was read");
+        let hunk = format!("{open}| aX | b |\n{original}| a | b |\n{middle}| a | bY |\n{close}");
+        assert_eq!(resolve_marked(&hunk).as_deref(), Some("| aX | bY |\n"));
+        let stray = format!("{}\n{hunk}", &close[..FALLBACK_MARKER_LEN]);
+        assert_eq!(resolve_marked(&stray), None, "a marker line is left over");
+    }
+
+    #[test]
+    fn a_date_changed_two_ways_in_the_frontmatter_is_a_conflict() {
+        let base = "---\ntype: engram\ntitle: T\npermalink: t\nstatus: stable\ndate: 2026-11-02\n---\n\n# T\n\n| 1 | 2 |\n";
+        let mine = base.replace("2026-11-02", "2026-11-05");
+        let theirs = base.replace("2026-11-02", "2026-12-02");
+        assert!(matches!(
+            three_way(base, &mine, &theirs),
+            MergeOutcome::Conflict
+        ));
+        // The body of the same page still merges per character.
+        let mine = base.replace("| 1 | 2 |", "| 1x | 2 |");
+        let theirs = base.replace("| 1 | 2 |", "| 1 | 2y |");
+        let MergeOutcome::Clean(merged) = three_way(base, &mine, &theirs) else {
+            panic!("a body cell merge is clean");
+        };
+        assert_eq!(merged, base.replace("| 1 | 2 |", "| 1x | 2y |"));
+    }
+
+    #[test]
+    fn clusters_that_would_join_after_a_merge_are_refused() {
+        // Two lone regional indicators set side by side read as one flag.
+        let (d, e) = ("\u{1F1E9}", "\u{1F1EA}");
+        assert!(!keeps_clusters(&format!("{d}{e}"), &[d, e]));
+        assert!(keeps_clusters(&format!("{d}x{e}"), &[d, "x", e]));
+        // A lone regional indicator next to an edit survives as it was.
+        let base = format!("| {d}a | b |\n");
+        let mine = format!("| {d}ax | b |\n");
+        let theirs = format!("| {d}a | by |\n");
+        let MergeOutcome::Clean(merged) = three_way(&base, &mine, &theirs) else {
+            panic!("a lone regional indicator beside the edits merges");
+        };
+        assert_eq!(merged, format!("| {d}ax | by |\n"));
     }
 
     const HARBOR: &str = "---\ntype: manifest\ntitle: Harbor\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\n---\n\n# Harbor\n\n## Scope\n\n- Engineering\n";
