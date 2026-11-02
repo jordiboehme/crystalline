@@ -25,6 +25,15 @@
 //! The state is random, kept only in this process, single use (taken, not
 //! read) and lives ten minutes ([`PENDING_TTL`]). The code is never logged
 //! and never echoed.
+//!
+//! An agent session starts the same flow another way: MCP `configure` with
+//! `connect: "github"` mints a single-use link bound to the session's
+//! account ([`crate::engine::Engine::mint_github_link`]), and the person opens
+//! `GET /github/link/go?n=<nonce>` ([`go`]). Opened by a browser signed in as
+//! that account, the link is spent and goes on into the first hop above, so
+//! everything after it is unchanged. Opened by any other account it is
+//! refused, so a forwarded link never links somebody else's GitHub account
+//! to the sender's.
 
 use std::sync::Mutex;
 use std::time::Instant;
@@ -281,20 +290,25 @@ pub async fn start(
     identity: Identity,
 ) -> Result<Response, ApiError> {
     let user = identity.require_account()?;
-    refuse_read_only(&state)?;
     // The guard's CSRF check already required a token for this POST; a
     // missing one here would mean no session to bind the flow to.
     let csrf = identity.csrf.as_deref().ok_or_else(|| {
         ApiError::forbidden("this request carries no session to bind the link to: log in again")
     })?;
+    let authorize_url = begin(&state, &user.name, csrf)?;
+    Ok((no_store(), Json(StartGithubLinkResponse { authorize_url })).into_response())
+}
+
+/// The start both ways in share: the POST from the profile and the
+/// single-use link an agent session hands out ([`go`]). Mints a state bound
+/// to `account` and to the session whose CSRF token is `csrf`, and answers
+/// GitHub's authorize url.
+fn begin(state: &RestState, account: &str, csrf: &str) -> Result<String, ApiError> {
+    refuse_read_only(state)?;
     let app = state.engine.github_link_app()?;
     let credentials = app.credentials();
     if credentials.client_secret.is_none() {
-        return Err(ApiError::conflict(
-            "the GitHub App has no client secret, so the browser link cannot exchange GitHub's \
-             code; an admin adds it with: crystalline github app set --client-secret-file <file> (or \
-             sets CRYSTALLINE_GITHUB_APP_CLIENT_SECRET when the App comes from the environment)",
-        ));
+        return Err(ApiError::conflict(crate::engine::NO_CLIENT_SECRET_TO_LINK));
     }
     let config = state.engine.config();
     let Some(public) = crate::settings::public_base(&config) else {
@@ -308,7 +322,7 @@ pub async fn start(
     let flow_state = new_state();
     let now = state.engine.link_clock_now();
     let pending = GithubLinkPending {
-        account: user.name.clone(),
+        account: account.to_string(),
         session_hash: session_hash(csrf),
         redirect_uri: redirect_uri.clone(),
         started: now,
@@ -325,13 +339,219 @@ pub async fn start(
             )
             .retry_after(30)
         })?;
-    let authorize_url = crystalline_remote::github::auth::authorize_url(
+    Ok(crystalline_remote::github::auth::authorize_url(
         app.auth_base(),
         &credentials.client_id,
         &redirect_uri,
         &flow_state,
+    ))
+}
+
+/// The query of a single-use link. Optional, so a link without a nonce is
+/// answered with this module's page rather than by the extractor.
+#[derive(serde::Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct GoQuery {
+    /// The nonce `configure` minted for one account.
+    n: Option<String>,
+}
+
+/// Whether `n` has the shape of a nonce: 64 lowercase hex characters. Only
+/// such a value is ever written into a redirect.
+fn is_nonce(n: &str) -> bool {
+    n.len() == 64 && n.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// What a link that cannot be used says, whatever the reason: never minted,
+/// already used or expired. The reason goes to the log only.
+const LINK_GONE: &str =
+    "This link to connect GitHub is not valid any more. Ask your agent for a new link.";
+
+/// What a link opened by an account other than the one it was made for says.
+/// It names nobody: the person holding it learns no account name from it.
+const LINK_OTHER_ACCOUNT: &str = "This link was made for another account, so it cannot connect \
+     GitHub for the account you are signed in as. Ask your own agent for a link, or connect \
+     GitHub from your profile.";
+
+/// A page for a person. Every text that reaches it is a constant of this
+/// module or a refusal detail written by this server, and it is escaped
+/// all the same.
+fn page(status: StatusCode, text: &str) -> Response {
+    let text = text
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;");
+    let body = format!(
+        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+         <title>Connect GitHub</title></head>\
+         <body style=\"font-family: system-ui, sans-serif; max-width: 36rem; margin: 4rem auto; \
+         padding: 0 1rem; line-height: 1.5\"><h1>Connect GitHub</h1><p>{text}</p></body></html>\n"
     );
-    Ok((no_store(), Json(StartGithubLinkResponse { authorize_url })).into_response())
+    (
+        status,
+        no_store(),
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                "default-src 'none'; style-src 'unsafe-inline'",
+            ),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+/// A 303 to `location`, not cached.
+fn see_other(location: String) -> Response {
+    (
+        StatusCode::SEE_OTHER,
+        no_store(),
+        [(header::LOCATION, location)],
+    )
+        .into_response()
+}
+
+/// Where a browser without a session goes to sign in and come back to the
+/// link `nonce`. With single sign-on it is the provider's sign-in, which
+/// lands back on the link through its checked `return_to`; without it the
+/// sign-in page, which carries the nonce and nothing else and opens the link
+/// again once somebody is signed in. The nonce is not spent: nothing proved
+/// who sent it.
+fn to_sign_in(state: &RestState, nonce: &str, sso: bool) -> Response {
+    let base = state.base_path.href();
+    if sso && state.oidc.is_some() {
+        let link = format!("{base}api/v1{GO_PATH}?n={nonce}");
+        let return_to = super::oidc::safe_return_path(&link, &state.base_path)
+            .expect("a link under the base path is a safe return path");
+        let encoded =
+            percent_encoding::utf8_percent_encode(&return_to, percent_encoding::NON_ALPHANUMERIC);
+        return see_other(format!(
+            "{base}api/v1{}?return_to={encoded}",
+            super::oidc::LOGIN_PATH
+        ));
+    }
+    see_other(format!("{base}login?github_link={nonce}"))
+}
+
+/// Where the single-use link an agent session hands out lives, under
+/// `/api/v1`.
+pub const GO_PATH: &str = "/github/link/go";
+
+/// `GET /github/link/go` - open a single-use link to connect GitHub.
+#[utoipa::path(
+    get,
+    path = "/api/v1/github/link/go",
+    tag = "settings",
+    operation_id = "open_github_link",
+    summary = "Open a single-use link an agent session handed out to connect GitHub.",
+    description = "MCP `configure` with `connect: \"github\"` on an instance \
+                   with a GitHub App answers this link, bound to the account \
+                   the agent session is signed in as. Opened in a browser \
+                   signed in as that same account, the link is spent and the \
+                   browser goes on to GitHub's authorize url, exactly as \
+                   `POST /me/github-link/start` would send it, so the \
+                   callback and its landing on the profile are the same. \
+                   Without a session the browser is sent to sign in (the \
+                   single sign-on provider when one is configured, else the \
+                   sign-in page) and back, and the link is not spent. \
+                   Opened by another account it is refused and spent, so a \
+                   forwarded link never links somebody else's GitHub account. \
+                   It lives ten minutes. It is a browser landing, so every \
+                   refusal is an HTML page, never JSON.",
+    params(GoQuery),
+    responses(
+        (
+            status = 303,
+            description = "To GitHub's authorize url, or to sign in and back.",
+        ),
+        (
+            status = 403,
+            description = "An HTML page: the link was made for another \
+                           account, or this instance is read-only.",
+            content_type = "text/html",
+        ),
+        (
+            status = 404,
+            description = "An HTML page: the link was never made, was \
+                           already used or has expired.",
+            content_type = "text/html",
+        ),
+        (
+            status = 409,
+            description = "An HTML page: the link cannot go on to GitHub, \
+                           for example because `service.public_url` or the \
+                           App's client secret is not set. The text names \
+                           the fix.",
+            content_type = "text/html",
+        ),
+        (
+            status = 422,
+            description = "An HTML page: no GitHub App is configured on this \
+                           instance any more, or it cannot be used.",
+            content_type = "text/html",
+        ),
+        (
+            status = 503,
+            description = "An HTML page: too many links are in flight at \
+                           once.",
+            content_type = "text/html",
+        ),
+    ),
+)]
+pub async fn go(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiQuery(query): ApiQuery<GoQuery>,
+) -> Response {
+    let Some(nonce) = query.n.filter(|n| is_nonce(n)) else {
+        return page(StatusCode::NOT_FOUND, LINK_GONE);
+    };
+    let Ok(user) = identity.require_account() else {
+        return to_sign_in(&state, &nonce, true);
+    };
+    // An account without a CSRF token yet is a trusted-header identity that
+    // has not loaded the app: the sign-in page loads it, which mints one,
+    // and opens the link again.
+    let Some(csrf) = identity.csrf.as_deref() else {
+        return to_sign_in(&state, &nonce, false);
+    };
+    // Taken before anything is compared: a link is spent by the first
+    // signed-in browser that opens it, whoever that is.
+    let account = match state.engine.take_github_link(&nonce) {
+        Ok(account) => account,
+        Err(miss) => {
+            let why = match miss {
+                StateMiss::Unknown => "unknown or already used",
+                StateMiss::Expired => "expired",
+            };
+            tracing::warn!(
+                "a GitHub link opened by {} was refused: the link is {why}",
+                user.name
+            );
+            return page(StatusCode::NOT_FOUND, LINK_GONE);
+        }
+    };
+    if account != user.name {
+        tracing::warn!(
+            "a GitHub link made for {account} was opened by {} and refused",
+            user.name
+        );
+        return page(StatusCode::FORBIDDEN, LINK_OTHER_ACCOUNT);
+    }
+    match begin(&state, &user.name, csrf) {
+        Ok(authorize_url) => see_other(authorize_url),
+        Err(e) => {
+            tracing::warn!(
+                "the GitHub link of {} could not start: {}",
+                user.name,
+                e.detail
+            );
+            page(e.status, &e.detail)
+        }
+    }
 }
 
 /// The query GitHub sends the browser back with. Every field optional, so a

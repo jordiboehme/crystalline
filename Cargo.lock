@@ -1444,6 +1444,7 @@ dependencies = [
  "crystalline-remote",
  "diffy",
  "futures",
+ "getrandom 0.4.3",
  "globset",
  "http",
  "indexmap 2.14.2",

@@ -7110,6 +7110,7 @@ fn every_instance_write_guard_meets_the_domain_flag() {
         ("engine.rs", "start_github_identity_device_flow"),
         // A person's GitHub link: a credential and an accounts row.
         ("engine.rs", "link_github"),
+        ("engine.rs", "mint_github_link"),
         ("engine.rs", "start_github_link_device_flow"),
         ("engine.rs", "unlink_github"),
     ];

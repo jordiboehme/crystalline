@@ -3860,7 +3860,7 @@ impl McpServer {
     #[tool(
         name = "configure",
         title = "Configure Crystalline",
-        description = "View and adjust Crystalline's settings, like an app's preferences page: call with no arguments to see them, set to change them (for example github.enabled to turn on team collaboration) and connect to link your GitHub account with a short code you confirm in the browser. With a token it accepts a personal access token instead. Connecting works before or after enabling; only team domains need github.enabled turned on. Call it with domain to see and change how one domain behaves: its domain policies (the MANIFEST keys sharing, direct or proposal, generated_indexes, local or shared, and read_only, off or on, and domain_name, the name links from other domains use, and reflection, off or on (on makes reflections/ the domain's Reflection and is refused while engrams live there; reflection_home is filled in, never set), team (marks a domain shared through GitHub; added by the next share from a connected instance, never set), evolve_home (the one instance whose scheduled evolve runs work a team domain; filled in by the first scheduled evolve run at an instance with service.public_url, never set; unset it at the instance that should run evolve to move the home), and reflect_trigger and evolve_trigger, off or webhook (webhook makes the instance send a signed webhook when reflect or evolve work is due, so an outside runner such as n8n starts without polling)), what each MANIFEST section does, and its rule overrides in .crystalline.yaml (a verify rule's severity, off, error, warning or info, and the token budget). With domain, set and unset change that domain, for example set { \"sharing\": \"direct\" } to allow direct commits or { \"rules.E007\": \"off\" } to turn a rule off. read_only: on refuses every write to the domain; switch it on when the user asks. Call it with domain whenever the user wants a domain to commit directly or open proposals, to share or keep its generated indexes, or to silence or raise a rule. With domain it refuses these: switching read_only off (only a person does that, in the domain policies), any other change on a read-only domain, a rule override in a domain that reviews changes (.crystalline.yaml is not an engram, so change the file in the domain), a rule override in a virtual domain (it has no .crystalline.yaml), and any call on a mounted domain (change it on the server it comes from). In a domain that reviews changes a policy change becomes your draft. The github block also reports this instance's GitHub App read only (github.app: whether one is configured, its source, app id, client id and slug, whether the client secret and the webhook secret are set, and an error when the App cannot be used, for example a keychain that could not be read); check it when GitHub reads, pulls or shares fail. No secret is ever shown, and the App is never set or removed here: the operator runs crystalline github app set or remove. The instance's network, database and sign-in are not listed here: the operator sets them with the crystalline CLI.",
+        description = "View and adjust Crystalline's settings, like an app's preferences page: call with no arguments to see them, set to change them (for example github.enabled to turn on team collaboration) and connect to link your GitHub account with a short code you confirm in the browser. With a token it accepts a personal access token instead. On an instance with a GitHub App, connect (without a token) links the person's own account instead and needs no admin rights: it answers a single-use link in url to relay to the person, who opens it in a browser signed in here as the same account; it works once, within ten minutes. A local stdio session is told the command to run instead (crystalline connect github --personal). Connecting works before or after enabling; only team domains need github.enabled turned on. Call it with domain to see and change how one domain behaves: its domain policies (the MANIFEST keys sharing, direct or proposal, generated_indexes, local or shared, and read_only, off or on, and domain_name, the name links from other domains use, and reflection, off or on (on makes reflections/ the domain's Reflection and is refused while engrams live there; reflection_home is filled in, never set), team (marks a domain shared through GitHub; added by the next share from a connected instance, never set), evolve_home (the one instance whose scheduled evolve runs work a team domain; filled in by the first scheduled evolve run at an instance with service.public_url, never set; unset it at the instance that should run evolve to move the home), and reflect_trigger and evolve_trigger, off or webhook (webhook makes the instance send a signed webhook when reflect or evolve work is due, so an outside runner such as n8n starts without polling)), what each MANIFEST section does, and its rule overrides in .crystalline.yaml (a verify rule's severity, off, error, warning or info, and the token budget). With domain, set and unset change that domain, for example set { \"sharing\": \"direct\" } to allow direct commits or { \"rules.E007\": \"off\" } to turn a rule off. read_only: on refuses every write to the domain; switch it on when the user asks. Call it with domain whenever the user wants a domain to commit directly or open proposals, to share or keep its generated indexes, or to silence or raise a rule. With domain it refuses these: switching read_only off (only a person does that, in the domain policies), any other change on a read-only domain, a rule override in a domain that reviews changes (.crystalline.yaml is not an engram, so change the file in the domain), a rule override in a virtual domain (it has no .crystalline.yaml), and any call on a mounted domain (change it on the server it comes from). In a domain that reviews changes a policy change becomes your draft. The github block also reports this instance's GitHub App read only (github.app: whether one is configured, its source, app id, client id and slug, whether the client secret and the webhook secret are set, and an error when the App cannot be used, for example a keychain that could not be read); check it when GitHub reads, pulls or shares fail. No secret is ever shown, and the App is never set or removed here: the operator runs crystalline github app set or remove. The instance's network, database and sign-in are not listed here: the operator sets them with the crystalline CLI.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -3891,11 +3891,19 @@ impl McpServer {
         // CHANGES this instance - a set, an unset, and the three connect
         // fields that decide which GitHub identity it acts as - is an
         // instance change and is gated as one.
+        //
+        // One exception: on an instance with a GitHub App, `connect` without
+        // a token links the caller's own account to GitHub (a single-use link
+        // the person opens), which changes nothing about the instance, so any
+        // account may ask for it. `host` has no say there: the App fixes it.
+        let app_link = p.token.is_none()
+            && p.connect.as_deref() == Some("github")
+            && self.engine.github_app_configured();
         let changes = !p.set.is_empty()
             || !p.unset.is_empty()
-            || p.connect.is_some()
+            || (p.connect.is_some() && !app_link)
             || p.token.is_some()
-            || p.host.is_some();
+            || (p.host.is_some() && !app_link);
         if changes && let Some(refusal) = self.refuse_instance_change(&self.scope_of(&ctx)) {
             return refuse(refusal);
         }
@@ -3912,6 +3920,9 @@ impl McpServer {
             return refuse(crate::settings::OPERATOR_SETTING_REFUSAL);
         }
 
+        if app_link {
+            return self.github_link_answer(&ctx).await;
+        }
         if p.token.is_some() || p.connect.is_some() {
             let result = match (p.token.as_deref(), p.connect.as_deref()) {
                 (Some(token), _) => {
@@ -3949,6 +3960,67 @@ impl McpServer {
         let mut snapshot = self.engine.configure_snapshot().await.map_err(to_error)?;
         snapshot["domain_settings"] = json!(CONFIGURE_DOMAIN_HINT);
         self.ok_list(snapshot)
+    }
+
+    /// `configure` with `connect: "github"` on an instance with a GitHub App:
+    /// a single-use link for the person behind this session to open
+    /// (`Engine::mint_github_link`), never the instance's own device flow.
+    ///
+    /// An unattended session is refused before anything else: it answers
+    /// people it has never met. A session that is not an account (the
+    /// machine owner on stdio, an agent on an instance that does not make
+    /// agents sign in) has nothing to link, so it is answered with the way
+    /// that does exist. Without `service.public_url` there is no address to
+    /// put in a link, so nothing is minted and the answer says so.
+    async fn github_link_answer(
+        &self,
+        ctx: &RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if crystalline_engine::read_limit::current().is_some() {
+            return refuse(crystalline_engine::engine::UNATTENDED_LINK);
+        }
+        let account = match self.scope_of(ctx) {
+            Scope::User { account, .. } => account,
+            Scope::Unrestricted => {
+                return ok(json!({
+                    "connected": false,
+                    "url": Value::Null,
+                    "command": GITHUB_LINK_OWNER_COMMAND,
+                    "next_steps": GITHUB_LINK_OWNER_STEPS,
+                }));
+            }
+            // The agent identity stands in for the open tier on one governed
+            // domain only; it is not the person behind this session.
+            Scope::Anonymous | Scope::Agent { .. } => {
+                return ok(json!({
+                    "connected": false,
+                    "url": Value::Null,
+                    "next_steps": GITHUB_LINK_ANONYMOUS_STEPS,
+                }));
+            }
+        };
+        let config = self.engine.config();
+        let Some(public) = crystalline_engine::settings::public_base(&config) else {
+            return ok(json!({
+                "connected": false,
+                "url": Value::Null,
+                "profile": "/profile",
+                "next_steps": GITHUB_LINK_NO_PUBLIC_URL,
+            }));
+        };
+        let nonce = self.engine.mint_github_link(&account).map_err(to_error)?;
+        ok(json!({
+            "connected": false,
+            "url": public.join(&format!("/api/v1/github/link/go?n={nonce}")),
+            "expires_in": crystalline_engine::pending::PENDING_TTL.as_secs(),
+            "single_use": true,
+            "account": account,
+            "next_steps": format!(
+                "Give this link to the person. They open it in a browser signed in to \
+                 Crystalline as {account} and confirm at GitHub. It works once, within ten \
+                 minutes, and only for that account."
+            ),
+        }))
     }
 
     #[tool(
@@ -6313,6 +6385,21 @@ fn attach_configure_hint(value: &mut Value, configure_listed: bool) {
         obj.insert("configure".to_string(), json!(CONFIGURE_MANIFEST_HINT));
     }
 }
+
+/// The command that links the machine owner's GitHub identity, which has no
+/// account here to link through the App.
+const GITHUB_LINK_OWNER_COMMAND: &str = "crystalline connect github --personal";
+
+/// What the machine owner on stdio is told instead of a link.
+const GITHUB_LINK_OWNER_STEPS: &str = "This session runs as the machine owner, which has no account here to link a GitHub account to. Run this in a terminal on this machine: crystalline connect github --personal";
+
+/// What an agent that is not signed in as an account is told instead of a
+/// link.
+const GITHUB_LINK_ANONYMOUS_STEPS: &str = "This session is not signed in as an account, so there is no account to link a GitHub account to. The person signs in to Crystalline in a browser and connects GitHub from their profile.";
+
+/// What an agent is told when there is no public address to build a link
+/// with.
+const GITHUB_LINK_NO_PUBLIC_URL: &str = "This instance has no service.public_url, so it cannot make a link to hand out. The person opens their profile on this instance (/profile) and connects GitHub there. An admin sets service.public_url to make links work.";
 
 /// Why a call naming a domain refuses a connect.
 const CONFIGURE_DOMAIN_NO_CONNECT: &str = "connect, token, host and restart are about this instance's GitHub sign-in, not about a domain; call configure without domain to connect";

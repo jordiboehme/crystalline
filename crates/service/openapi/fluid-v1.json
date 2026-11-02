@@ -9241,6 +9241,62 @@
         }
       }
     },
+    "/api/v1/github/link/go": {
+      "get": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "Open a single-use link an agent session handed out to connect GitHub.",
+        "description": "MCP `configure` with `connect: \"github\"` on an instance with a GitHub App answers this link, bound to the account the agent session is signed in as. Opened in a browser signed in as that same account, the link is spent and the browser goes on to GitHub's authorize url, exactly as `POST /me/github-link/start` would send it, so the callback and its landing on the profile are the same. Without a session the browser is sent to sign in (the single sign-on provider when one is configured, else the sign-in page) and back, and the link is not spent. Opened by another account it is refused and spent, so a forwarded link never links somebody else's GitHub account. It lives ten minutes. It is a browser landing, so every refusal is an HTML page, never JSON.",
+        "operationId": "open_github_link",
+        "parameters": [
+          {
+            "name": "n",
+            "in": "query",
+            "description": "The nonce `configure` minted for one account.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "303": {
+            "description": "To GitHub's authorize url, or to sign in and back."
+          },
+          "403": {
+            "description": "An HTML page: the link was made for another account, or this instance is read-only.",
+            "content": {
+              "text/html": {}
+            }
+          },
+          "404": {
+            "description": "An HTML page: the link was never made, was already used or has expired.",
+            "content": {
+              "text/html": {}
+            }
+          },
+          "409": {
+            "description": "An HTML page: the link cannot go on to GitHub, for example because `service.public_url` or the App's client secret is not set. The text names the fix.",
+            "content": {
+              "text/html": {}
+            }
+          },
+          "422": {
+            "description": "An HTML page: no GitHub App is configured on this instance any more, or it cannot be used.",
+            "content": {
+              "text/html": {}
+            }
+          },
+          "503": {
+            "description": "An HTML page: too many links are in flight at once.",
+            "content": {
+              "text/html": {}
+            }
+          }
+        }
+      }
+    },
     "/api/v1/github/webhook": {
       "post": {
         "tags": [

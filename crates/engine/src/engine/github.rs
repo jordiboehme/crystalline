@@ -968,6 +968,74 @@ impl Engine {
         }
     }
 
+    /// Mint a single-use link for `account`, for an agent session to relay to
+    /// its person: they open `<service.public_url>/api/v1/github/link/go?n=<nonce>`
+    /// in a browser signed in as this same account, and it continues into the
+    /// browser link flow. Answers the nonce.
+    ///
+    /// The nonce is 32 random bytes, kept only in this process, bound to the
+    /// account, single use ([`Engine::take_github_link`] takes it) and lives
+    /// [`crate::pending::PENDING_TTL`] on the link clock. It is a capability
+    /// to start a link for this account only: the route that spends it
+    /// refuses a browser signed in as anybody else, so a forwarded link can
+    /// never link someone else's GitHub account to this one.
+    ///
+    /// Refused in an unattended session (a read limit is set): that agent
+    /// answers people it has never met. Refused on a read-only instance, and
+    /// whenever the link could not work: no usable App, no accounts store, or
+    /// an App without a client secret.
+    pub fn mint_github_link(&self, account: &str) -> Result<String> {
+        if crate::read_limit::current().is_some() {
+            return Err(EngineError::Forbidden(UNATTENDED_LINK.to_string()));
+        }
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        personal_identity(account)?;
+        let app = self.github_link_app()?;
+        if app.credentials().client_secret.is_none() {
+            return Err(EngineError::Conflict(NO_CLIENT_SECRET_TO_LINK.to_string()));
+        }
+        let mut bytes = [0u8; 32];
+        getrandom::fill(&mut bytes).expect("the OS CSPRNG is available");
+        let nonce = crystalline_index::hex_lower(&bytes);
+        let now = self.link_clock_now();
+        self.github_link_invites
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert_at(
+                nonce.clone(),
+                LinkInvite {
+                    account: account.to_string(),
+                    started: now,
+                },
+                now,
+            )
+            .map_err(|_| {
+                EngineError::Conflict(
+                    "too many GitHub links are waiting to be opened; try again in a moment"
+                        .to_string(),
+                )
+            })?;
+        Ok(nonce)
+    }
+
+    /// Spend a nonce [`Engine::mint_github_link`] handed out: the account it
+    /// was minted for, or why there is none (never minted, already spent, or
+    /// older than ten minutes). Taken, not read, so whoever presents it
+    /// first spends it.
+    pub fn take_github_link(
+        &self,
+        nonce: &str,
+    ) -> std::result::Result<String, crate::pending::StateMiss> {
+        let now = self.link_clock_now();
+        self.github_link_invites
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take_at(nonce, now)
+            .map(|invite| invite.account)
+    }
+
     /// The accounts store a link is kept in. Only a process that serves
     /// accounts (the daemon with its HTTP surface) has one.
     fn link_access(&self) -> Result<Arc<crate::scope::DomainAccess>> {
@@ -1350,6 +1418,27 @@ impl Engine {
 /// refused with while a GitHub App is configured.
 pub const OAUTH_IDENTITY_UNDER_APP: &str =
     "this instance uses a GitHub App: connect GitHub from your profile";
+
+/// One single-use link waiting to be opened (see [`Engine::mint_github_link`]).
+pub(crate) struct LinkInvite {
+    /// The account it was minted for, the only one it may link.
+    account: String,
+    /// When it was minted, on the link clock.
+    started: std::time::Instant,
+}
+
+impl crate::pending::PendingRecord for LinkInvite {
+    fn started(&self) -> std::time::Instant {
+        self.started
+    }
+}
+
+/// What an unattended session is refused a link with.
+pub const UNATTENDED_LINK: &str = "an unattended session cannot hand out a link to connect GitHub; the person connects GitHub from their profile";
+
+/// What a link is refused with when the GitHub App has no client secret, so
+/// the browser flow could not exchange GitHub's code.
+pub const NO_CLIENT_SECRET_TO_LINK: &str = "the GitHub App has no client secret, so the browser link cannot exchange GitHub's code; an admin adds it with: crystalline github app set --client-secret-file <file> (or sets CRYSTALLINE_GITHUB_APP_CLIENT_SECRET when the App comes from the environment)";
 
 /// What a link is refused with when no GitHub App is configured.
 const NO_APP_TO_LINK: &str = "linking a GitHub account needs a GitHub App, and none is configured on this instance; an admin sets one up with: crystalline github app set";

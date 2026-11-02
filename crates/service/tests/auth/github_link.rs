@@ -24,12 +24,14 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use crystalline_core::config::{
-    DomainEntry, GitHubConfig, GlobalConfig, ResponseFormat, ServiceConfig,
+    AuthConfig, DomainEntry, GitHubConfig, GlobalConfig, OidcConfig, ResponseFormat, ServiceConfig,
 };
 use crystalline_index::TursoStore;
 use crystalline_service::daemon::http_router;
+use crystalline_service::mcp::McpServer;
 use crystalline_service::rest::{AuthStore, Role};
 use crystalline_service::{Engine, EnvOverlay};
+use rmcp::model::CallToolRequestParams;
 
 const CLIENT_ID: &str = "Iv23.weblink";
 const CLIENT_SECRET: &str = "shhh-the-app-client-secret";
@@ -168,6 +170,7 @@ struct Ctx {
     client: reqwest::Client,
     auth: Arc<AuthStore>,
     clock: Arc<Mutex<Instant>>,
+    engine: Arc<Engine>,
     _tmp: tempfile::TempDir,
 }
 
@@ -175,6 +178,11 @@ struct Setup {
     public_url: bool,
     client_secret: bool,
     app: bool,
+    /// `auth.mcp` on, so an agent session over HTTP is an account.
+    mcp_auth: bool,
+    /// A single sign-on provider configured (never reached: the tests only
+    /// read where the browser is sent).
+    sso: bool,
 }
 
 impl Default for Setup {
@@ -183,6 +191,8 @@ impl Default for Setup {
             public_url: true,
             client_secret: true,
             app: true,
+            mcp_auth: false,
+            sso: false,
         }
     }
 }
@@ -216,6 +226,17 @@ impl Ctx {
                 response_format: Some(ResponseFormat::Json),
                 public_url: setup.public_url.then(|| format!("http://{addr}")),
                 ..ServiceConfig::default()
+            }),
+            auth: Some(AuthConfig {
+                mcp: Some(setup.mcp_auth),
+                oauth: Some(false),
+                oidc: setup.sso.then(|| OidcConfig {
+                    issuer: Some("https://idp.example".to_string()),
+                    client_id: Some("crystalline".to_string()),
+                    client_secret: Some("idp-secret".to_string()),
+                    ..OidcConfig::default()
+                }),
+                ..AuthConfig::default()
             }),
             ..GlobalConfig::default()
         };
@@ -273,7 +294,7 @@ impl Ctx {
                 .unwrap();
         }
         let router = http_router(
-            engine,
+            engine.clone(),
             Arc::new(AtomicUsize::new(0)),
             &[],
             auth.clone(),
@@ -298,6 +319,7 @@ impl Ctx {
                 .unwrap(),
             auth,
             clock,
+            engine,
             _tmp: tmp,
         }
     }
@@ -933,4 +955,310 @@ async fn the_link_read_says_whether_an_app_is_configured() {
     let mine = without.my_link(&vic).await;
     assert_eq!(mine["app_configured"], false, "{mine}");
     assert_eq!(mine["linked"], false, "{mine}");
+}
+
+// --- the single-use link an agent session hands its person ---------------------
+
+/// Where the single-use link lives under `/api/v1`.
+const GO_PATH: &str = "/github/link/go";
+
+impl Ctx {
+    /// Opens a single-use link as the browser `cookies` holds.
+    async fn go(&self, nonce: &str, cookies: &Cookies) -> reqwest::Response {
+        self.get(&format!("{GO_PATH}?n={nonce}"), cookies).await
+    }
+}
+
+/// The nonce a link carries.
+fn nonce_of(url: &str) -> String {
+    let url = reqwest::Url::parse(url).unwrap();
+    url.query_pairs()
+        .find(|(k, _)| k == "n")
+        .map(|(_, v)| v.into_owned())
+        .expect("the link carries a nonce")
+}
+
+/// The first single-use link in a raw MCP answer.
+fn link_in(answer: &str, addr: &SocketAddr) -> String {
+    let prefix = format!("http://{addr}/api/v1{GO_PATH}?n=");
+    let at = answer
+        .find(&prefix)
+        .unwrap_or_else(|| panic!("the answer carries a link:\n{answer}"));
+    let rest = &answer[at + prefix.len()..];
+    let nonce: String = rest.chars().take_while(char::is_ascii_hexdigit).collect();
+    format!("{prefix}{nonce}")
+}
+
+/// Asserts `response` is a page for a person: HTML, never JSON, not cached.
+async fn assert_html_page(response: reqwest::Response, status: u16) -> String {
+    assert_eq!(response.status(), status);
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(content_type.starts_with("text/html"), "{content_type}");
+    assert_eq!(
+        response
+            .headers()
+            .get(reqwest::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store")
+    );
+    response.text().await.unwrap()
+}
+
+/// Asserts `response` sends the browser to GitHub's authorize url and hands
+/// back the state it carries.
+fn assert_authorize(response: &reqwest::Response, github: &FakeGithub, ctx: &Ctx) -> String {
+    assert_eq!(response.status(), 303, "{:?}", response.headers());
+    let authorize = reqwest::Url::parse(&location(response)).unwrap();
+    assert!(
+        authorize
+            .as_str()
+            .starts_with(&format!("{}/login/oauth/authorize?", github.url)),
+        "{authorize}"
+    );
+    let query: HashMap<String, String> = authorize.query_pairs().into_owned().collect();
+    assert_eq!(query["client_id"], CLIENT_ID);
+    assert_eq!(
+        query["redirect_uri"],
+        format!("http://{}/api/v1/github/link/callback", ctx.addr)
+    );
+    query["state"].clone()
+}
+
+/// An agent session over HTTP, authenticated as a person, asks `configure`
+/// to connect GitHub on an instance with an App: the answer is a single-use
+/// link to relay, not a refusal and not the instance's device flow. It needs
+/// no admin rights, because linking one's own GitHub account changes nothing
+/// about the instance. Opened in that person's browser, the link goes on to
+/// GitHub.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_connect_under_an_app_answers_a_single_use_link() {
+    let github = FakeGithub::start().await;
+    let ctx = Ctx::with(
+        &github,
+        Setup {
+            mcp_auth: true,
+            ..Setup::default()
+        },
+    )
+    .await;
+    let token = ctx
+        .auth
+        .issue_mcp_token("vic", "agent")
+        .await
+        .unwrap()
+        .token;
+    let session = crate::support::McpTestSession::open(&ctx.addr, Some(&token)).await;
+    let answer = session
+        .call_tool("configure", serde_json::json!({ "connect": "github" }))
+        .await;
+    assert!(answer.contains("expires_in"), "{answer}");
+    assert!(!answer.contains("only an instance admin"), "{answer}");
+    let url = link_in(&answer, &ctx.addr);
+    let nonce = nonce_of(&url);
+    assert_eq!(nonce.len(), 64, "{url}");
+
+    let vic = ctx.login("vic").await;
+    let response = ctx.go(&nonce, &vic).await;
+    let state = assert_authorize(&response, &github, &ctx);
+    github.grant("code-v", "ghu_vic", 503, "vic-gh");
+    let landed = ctx.callback(&vic, "code-v", &state).await;
+    assert_eq!(location(&landed), "/profile?github=linked");
+    assert_eq!(ctx.link_of("vic").await.unwrap().github_id, 503);
+}
+
+/// A link works once: the second open is refused with a page, and reaches
+/// nothing.
+#[tokio::test]
+async fn the_link_spends_once() {
+    let github = FakeGithub::start().await;
+    let ctx = Ctx::start(&github).await;
+    let ann = ctx.login("ann").await;
+    let nonce = ctx.engine.mint_github_link("ann").unwrap();
+    assert_authorize(&ctx.go(&nonce, &ann).await, &github, &ctx);
+    let page = assert_html_page(ctx.go(&nonce, &ann).await, 404).await;
+    assert!(page.contains("Ask your agent for a new link"), "{page}");
+    let page = assert_html_page(ctx.go("deadbeef", &ann).await, 404).await;
+    assert!(page.contains("Ask your agent for a new link"), "{page}");
+}
+
+/// A link lives ten minutes.
+#[tokio::test]
+async fn the_link_expires_after_ten_minutes() {
+    let github = FakeGithub::start().await;
+    let ctx = Ctx::start(&github).await;
+    let ann = ctx.login("ann").await;
+
+    let nonce = ctx.engine.mint_github_link("ann").unwrap();
+    ctx.advance(Duration::from_secs(10 * 60 + 1));
+    assert_html_page(ctx.go(&nonce, &ann).await, 404).await;
+
+    let nonce = ctx.engine.mint_github_link("ann").unwrap();
+    ctx.advance(Duration::from_secs(9 * 60 + 59));
+    assert_authorize(&ctx.go(&nonce, &ann).await, &github, &ctx);
+}
+
+/// A forwarded link cannot link somebody else's GitHub account to the
+/// sender's: opened by another account it is refused with a page that names
+/// nobody, and spent, so the sender's own browser cannot use it either.
+#[tokio::test]
+async fn a_link_opened_by_another_account_is_refused() {
+    let github = FakeGithub::start().await;
+    let ctx = Ctx::start(&github).await;
+    let ann = ctx.login("ann").await;
+    let bob = ctx.login("bob").await;
+    let nonce = ctx.engine.mint_github_link("ann").unwrap();
+
+    let page = assert_html_page(ctx.go(&nonce, &bob).await, 403).await;
+    assert!(page.contains("another account"), "{page}");
+    assert!(
+        !page
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|word| word == "ann"),
+        "the page names nobody: {page}"
+    );
+    assert_html_page(ctx.go(&nonce, &ann).await, 404).await;
+    assert_eq!(github.token_hits(), 0);
+    assert!(ctx.link_of("ann").await.is_none());
+    assert!(ctx.link_of("bob").await.is_none());
+}
+
+/// Without a session the link sends the browser to sign in and back, and is
+/// not spent by that: the sign-in page carries the nonce and nothing else,
+/// and with single sign-on the provider's sign-in comes back to this very
+/// link through the checked return address.
+#[tokio::test]
+async fn a_link_without_a_session_goes_to_sign_in_and_back() {
+    let github = FakeGithub::start().await;
+    let ctx = Ctx::start(&github).await;
+    let nonce = ctx.engine.mint_github_link("ann").unwrap();
+    let response = ctx.go(&nonce, &Vec::new()).await;
+    assert_eq!(response.status(), 303);
+    assert_eq!(location(&response), format!("/login?github_link={nonce}"));
+    let ann = ctx.login("ann").await;
+    assert_authorize(&ctx.go(&nonce, &ann).await, &github, &ctx);
+
+    // A nonce that is not one never rides into the sign-in page.
+    let response = ctx.go("%2F%2Fevil.example", &Vec::new()).await;
+    assert_html_page(response, 404).await;
+
+    let sso = Ctx::with(
+        &github,
+        Setup {
+            sso: true,
+            ..Setup::default()
+        },
+    )
+    .await;
+    let nonce = sso.engine.mint_github_link("ann").unwrap();
+    let response = sso.go(&nonce, &Vec::new()).await;
+    assert_eq!(response.status(), 303);
+    assert_eq!(
+        location(&response),
+        format!("/api/v1/auth/oidc/login?return_to=%2Fapi%2Fv1%2Fgithub%2Flink%2Fgo%3Fn%3D{nonce}")
+    );
+    let ann = sso.login("ann").await;
+    assert_authorize(&sso.go(&nonce, &ann).await, &github, &sso);
+}
+
+/// A good link goes on into the browser link flow: GitHub's authorize url
+/// with a state that the callback accepts from this session, so the link
+/// lands on the account the link was made for.
+#[tokio::test]
+async fn a_good_link_lands_on_githubs_authorize_url_with_a_state() {
+    let github = FakeGithub::start().await;
+    let ctx = Ctx::start(&github).await;
+    let ann = ctx.login("ann").await;
+    let nonce = ctx.engine.mint_github_link("ann").unwrap();
+    let response = ctx.go(&nonce, &ann).await;
+    assert_eq!(
+        response
+            .headers()
+            .get(reqwest::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store")
+    );
+    let state = assert_authorize(&response, &github, &ctx);
+    github.grant("code-1", "ghu_ann", 501, "ann-gh");
+    let landed = ctx.callback(&ann, "code-1", &state).await;
+    assert_eq!(location(&landed), "/profile?github=linked");
+    assert_eq!(ctx.link_of("ann").await.unwrap().github_id, 501);
+}
+
+/// One `configure` call over stdio, the way a local harness makes it.
+async fn stdio_configure(server: McpServer, args: serde_json::Value) -> Result<String, String> {
+    let (client_io, server_io) = tokio::io::duplex(1 << 16);
+    let served = tokio::spawn(async move { rmcp::serve_server(server, server_io).await });
+    let client = rmcp::serve_client((), client_io).await.unwrap();
+    let _server = served.await.unwrap().unwrap();
+    let mut params = CallToolRequestParams::new("configure");
+    if let serde_json::Value::Object(map) = args {
+        params = params.with_arguments(map);
+    }
+    let answer = match client.call_tool(params).await {
+        Ok(result) => {
+            let value = serde_json::to_value(&result).unwrap();
+            let text = value
+                .pointer("/content/0/text")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if value["isError"] == true {
+                Err(text)
+            } else {
+                Ok(text)
+            }
+        }
+        Err(e) => Err(e.to_string()),
+    };
+    client.cancel().await.unwrap();
+    answer
+}
+
+/// The machine owner on stdio has no account to link a GitHub account to:
+/// the answer names the CLI command that links the owner's identity, and no
+/// link is made.
+#[tokio::test]
+async fn the_owner_on_stdio_gets_the_cli_command() {
+    let github = FakeGithub::start().await;
+    let ctx = Ctx::start(&github).await;
+    let answer = stdio_configure(
+        McpServer::new(ctx.engine.clone()),
+        serde_json::json!({ "connect": "github" }),
+    )
+    .await
+    .expect("an answer, not a refusal");
+    assert!(
+        answer.contains("crystalline connect github --personal"),
+        "{answer}"
+    );
+    assert!(!answer.contains(GO_PATH), "{answer}");
+    assert!(!answer.contains("user_code"), "no device flow: {answer}");
+}
+
+/// An unattended session answers people it has never met, so it never hands
+/// out a link that would link somebody's GitHub account.
+#[tokio::test]
+async fn an_unattended_session_cannot_mint_a_link() {
+    let github = FakeGithub::start().await;
+    let ctx = Ctx::start(&github).await;
+    let refused = crystalline_service::read_limit::within(
+        Some(crystalline_service::read_limit::Limit::default()),
+        async { ctx.engine.mint_github_link("ann") },
+    )
+    .await
+    .unwrap_err();
+    assert!(refused.to_string().contains("unattended"), "{refused}");
+
+    let answer = stdio_configure(
+        McpServer::new(ctx.engine.clone()).with_unattended(true),
+        serde_json::json!({ "connect": "github" }),
+    )
+    .await
+    .expect_err("refused");
+    assert!(answer.contains("unattended"), "{answer}");
 }

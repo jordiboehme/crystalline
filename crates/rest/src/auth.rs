@@ -131,7 +131,7 @@ pub const SETUP_PATH: &str = "/auth/setup";
 /// every other `POST`. This list is a path list, so it exempts both; the guard
 /// that matters for the second one lives in the handler rather than here, and
 /// that is the first thing to check when reading this exemption.
-const PUBLIC_PATHS: [&str; 13] = [
+const PUBLIC_PATHS: [&str; 14] = [
     LOGIN_PATH,
     "/auth/logout",
     "/auth/me",
@@ -165,6 +165,13 @@ const PUBLIC_PATHS: [&str; 13] = [
     // linked without the session that started the link. See
     // `super::github_link::callback`.
     super::github_link::CALLBACK_PATH,
+    // The single-use link an agent session hands its person to connect
+    // GitHub. A browser landing too, opened from a chat where nobody can say
+    // whether the browser is signed in: without a session it is sent to sign
+    // in and back, never a raw 401. The nonce proves nothing on its own; the
+    // handler spends it only for a signed-in session of the very account it
+    // was made for. See `super::github_link::go`.
+    super::github_link::GO_PATH,
     // Where GitHub delivers the App's webhook events. The proof is the
     // signature over the body (`X-Hub-Signature-256` under the App's
     // webhook secret), never a session: GitHub has none, and a browser's

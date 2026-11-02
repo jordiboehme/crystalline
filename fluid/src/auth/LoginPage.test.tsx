@@ -10,7 +10,7 @@ import { act, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { ApiProblem, api, setCsrfToken } from "../api/client";
+import { ApiProblem, api, navigateTo, setCsrfToken } from "../api/client";
 import type { LoginResponse } from "../api/model";
 import {
   answersFor,
@@ -22,11 +22,17 @@ import {
 
 vi.mock("../api/client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../api/client")>();
-  return { ...actual, api: vi.fn(), setCsrfToken: vi.fn() };
+  return {
+    ...actual,
+    api: vi.fn(),
+    navigateTo: vi.fn(),
+    setCsrfToken: vi.fn(),
+  };
 });
 
 const apiMock = vi.mocked(api);
 const setCsrfTokenMock = vi.mocked(setCsrfToken);
+const navigateToMock = vi.mocked(navigateTo);
 
 function serve(routes: Record<string, () => unknown>) {
   apiMock.mockImplementation(answersFor(routes));
@@ -49,6 +55,73 @@ async function signIn(name = "ada", password = "hunter2") {
 beforeEach(() => {
   apiMock.mockReset();
   setCsrfTokenMock.mockReset();
+  navigateToMock.mockReset();
+});
+
+/** A nonce of the shape the server mints: 64 lowercase hex characters. */
+const NONCE = "a1".repeat(32);
+
+describe("a single-use GitHub link that sent the browser here to sign in", () => {
+  it("opens the link again once the person is signed in", async () => {
+    let signedIn = false;
+    serve({
+      "/auth/me": () =>
+        signedIn ? meResponse({ user: userFixture() }) : meResponse(),
+      "/auth/login": (): LoginResponse => {
+        signedIn = true;
+        return { csrf: "sess", user: userFixture() };
+      },
+      "/domains": domainsResponse,
+    });
+
+    renderApp(`/login?github_link=${NONCE}`);
+    await signIn();
+
+    await waitFor(() =>
+      expect(navigateToMock).toHaveBeenCalledWith(
+        `/api/v1/github/link/go?n=${NONCE}`,
+      ),
+    );
+  });
+
+  it("carries the link through single sign-on as return_to", async () => {
+    serve({
+      "/auth/me": () => meResponse(),
+      "/auth/providers": () => ({
+        local: true,
+        oidc: { enabled: true, name: "Contoso" },
+      }),
+    });
+
+    renderApp(`/login?github_link=${NONCE}`);
+
+    const button = await screen.findByRole("link", {
+      name: "Sign in with Contoso",
+    });
+    expect(button).toHaveAttribute(
+      "href",
+      `/api/v1/auth/oidc/login?return_to=%2Fapi%2Fv1%2Fgithub%2Flink%2Fgo%3Fn%3D${NONCE}`,
+    );
+  });
+
+  it("goes nowhere else for a value that is not a nonce", async () => {
+    let signedIn = false;
+    serve({
+      "/auth/me": () =>
+        signedIn ? meResponse({ user: userFixture() }) : meResponse(),
+      "/auth/login": (): LoginResponse => {
+        signedIn = true;
+        return { csrf: "sess", user: userFixture() };
+      },
+      "/domains": domainsResponse,
+    });
+
+    renderApp("/login?github_link=%2F%2Fevil.example");
+    await signIn();
+
+    expect(await screen.findByRole("heading", { name: "Home" })).toBeVisible();
+    expect(navigateToMock).not.toHaveBeenCalled();
+  });
 });
 
 describe("the login screen", () => {

@@ -249,6 +249,7 @@ use crate::scope::{DomainAccess, DomainRight};
         github_link::status,
         github_link::start,
         github_link::callback,
+        github_link::go,
         github_link::unlink,
         github_webhook::receive,
         users_api::unlink_github,
@@ -1140,6 +1141,7 @@ fn routes(state: RestState) -> Router {
         )
         .route("/me/github-link/start", post(github_link::start))
         .route(github_link::CALLBACK_PATH, get(github_link::callback))
+        .route(github_link::GO_PATH, get(github_link::go))
         // The GitHub App's webhook, public by path: GitHub has no session
         // and no CSRF token, and the guard hands it to the handler without
         // looking for either. The proof is the signature over the body. The

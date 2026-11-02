@@ -1189,6 +1189,9 @@ pub struct Engine {
     // The clock a GitHub web-flow link's pending state is aged by;
     // `Instant::now` outside tests (see `Engine::with_link_clock`).
     link_clock: github_app::AppClock,
+    // The single-use links an agent session handed its person, keyed by
+    // nonce and aged on the link clock (see `Engine::mint_github_link`).
+    github_link_invites: std::sync::Mutex<crate::pending::PendingStore<github::LinkInvite>>,
     // Test-only: answers the App store read in place of the keychain and the
     // file, so a test can stage a keychain that fails and then recovers.
     #[cfg(any(test, feature = "testing"))]
@@ -2503,6 +2506,7 @@ impl Engine {
             github_app: std::sync::RwLock::new(github_app::AppState::new()),
             app_clock: Arc::new(Instant::now),
             link_clock: Arc::new(Instant::now),
+            github_link_invites: std::sync::Mutex::new(crate::pending::PendingStore::default()),
             #[cfg(any(test, feature = "testing"))]
             app_store_lookup: None,
             backup_marks: Default::default(),
@@ -7459,7 +7463,7 @@ mod edit;
 mod evolve;
 mod fence;
 mod github;
-pub use github::OAUTH_IDENTITY_UNDER_APP;
+pub use github::{NO_CLIENT_SECRET_TO_LINK, OAUTH_IDENTITY_UNDER_APP, UNATTENDED_LINK};
 mod github_access;
 pub use github_access::{
     CLOSE_GRACE, CONFIRM_TIMEOUT, ClosedDomain, FRESH_FOR, GithubEventOutcome, GithubGovernor,

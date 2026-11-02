@@ -222,6 +222,7 @@ pub const MOUNTED_OPERATIONS: &[&str] = &[
     "DELETE /api/v1/me/github-link",
     "POST /api/v1/me/github-link/start",
     "GET /api/v1/github/link/callback",
+    "GET /api/v1/github/link/go",
     "POST /api/v1/github/webhook",
     "GET /api/v1/me/mcp-tokens",
     "POST /api/v1/me/mcp-tokens",

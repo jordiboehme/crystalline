@@ -7011,6 +7011,41 @@ export type FinishGithubLinkErrors = {
 
 export type FinishGithubLinkError = FinishGithubLinkErrors[keyof FinishGithubLinkErrors];
 
+export type OpenGithubLinkData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * The nonce `configure` minted for one account.
+         */
+        n?: string;
+    };
+    url: '/api/v1/github/link/go';
+};
+
+export type OpenGithubLinkErrors = {
+    /**
+     * An HTML page: the link was made for another account, or this instance is read-only.
+     */
+    403: unknown;
+    /**
+     * An HTML page: the link was never made, was already used or has expired.
+     */
+    404: unknown;
+    /**
+     * An HTML page: the link cannot go on to GitHub, for example because `service.public_url` or the App's client secret is not set. The text names the fix.
+     */
+    409: unknown;
+    /**
+     * An HTML page: no GitHub App is configured on this instance any more, or it cannot be used.
+     */
+    422: unknown;
+    /**
+     * An HTML page: too many links are in flight at once.
+     */
+    503: unknown;
+};
+
 export type ReceiveGithubWebhookData = {
     /**
      * The event's payload, as GitHub sends it, at most 25 MiB.
