@@ -50,8 +50,9 @@
 //!   runs a maintenance sweep on the server, which can take longer than ten
 //!   seconds on a large domain. A forwarded file upload or download has it
 //!   too (a full-size file over a slow uplink), run as [`Budget::Cut`], and
-//!   the capability question before it keeps [`ONE_DOMAIN_LIMIT`]. The token request of a refresh always has
-//!   [`ONE_DOMAIN_LIMIT`], whatever the caller's budget (see above).
+//!   the capability question before it keeps [`ONE_DOMAIN_LIMIT`]. The
+//!   token request of a refresh always has [`ONE_DOMAIN_LIMIT`], whatever
+//!   the caller's budget (see above).
 //! - **A network failure is never "sign in again".** It is
 //!   [`RemoteFailure::Unreachable`] or [`RemoteFailure::TimedOut`], and a
 //!   refresh that fails on the network leaves the stored refresh token as it

@@ -172,7 +172,8 @@ pub struct ReadParams {
     /// Also return the pictures the engram links to (png, jpeg, gif, webp) as
     /// image content, so you can look at them. At most 8 pictures and 5 MiB
     /// in all; the rest stay resource links. Pass it when a picture is marked
-    /// as needing vision. Only for a domain on this machine. For an
+    /// as needing vision. Pictures an engram links to come back only for a
+    /// domain on this machine. For an
     /// identifier under assets/ it decides how a picture comes back: left
     /// out or true, as an image block with no base64; false, as base64 in
     /// the JSON with no image block. To copy a picture, read it with false,
