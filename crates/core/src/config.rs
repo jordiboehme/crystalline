@@ -7,6 +7,9 @@
 //! here.
 
 pub mod registration;
+pub mod write_fence;
+
+pub use write_fence::{WriteFence, check_write, refuse_appdata_writes};
 
 use std::path::{Path, PathBuf};
 
@@ -36,6 +39,16 @@ pub enum ConfigError {
     /// parse time.
     #[error("invalid database configuration: {0}")]
     Database(String),
+    /// A write this process may not make: it runs inside an app package,
+    /// where a new file under AppData lands in the package's private copy
+    /// (see [`write_fence`]).
+    #[error("refused to write {path}: {reason}")]
+    PackagedWrite {
+        /// The path the write was for.
+        path: String,
+        /// Why, and what to do instead.
+        reason: String,
+    },
 }
 
 // --- global config -----------------------------------------------------------
@@ -1481,6 +1494,16 @@ pub fn save_yaml<T: Serialize>(path: &Path, value: &T) -> Result<(), ConfigError
 /// payload (JSON, for example) gets the same atomicity and directory-creation
 /// guarantees without round-tripping through YAML.
 pub fn save_bytes(path: &Path, bytes: &[u8]) -> Result<(), ConfigError> {
+    save_bytes_in(path, bytes, write_fence::fence())
+}
+
+/// [`save_bytes`] under `fence`, the process's own one in production.
+fn save_bytes_in(path: &Path, bytes: &[u8], fence: Option<&WriteFence>) -> Result<(), ConfigError> {
+    // Before the parent folder is created: a new folder under AppData is
+    // redirected inside a package just like a new file.
+    if let Some(fence) = fence {
+        fence.check(path)?;
+    }
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -1489,7 +1512,7 @@ pub fn save_bytes(path: &Path, bytes: &[u8]) -> Result<(), ConfigError> {
             source,
         })?;
     }
-    write_atomic(path, bytes).map_err(|source| ConfigError::Io {
+    write_atomic_in(path, bytes, fence).map_err(|source| ConfigError::Io {
         path: path.display().to_string(),
         source,
     })
@@ -1503,6 +1526,12 @@ pub fn save_bytes(path: &Path, bytes: &[u8]) -> Result<(), ConfigError> {
 /// `save_bytes` above. Does not create the parent directory - callers that
 /// need one (like `save_bytes`) create it first.
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_atomic_in(path, bytes, write_fence::fence())
+}
+
+/// [`write_atomic`] under `fence`.
+fn write_atomic_in(path: &Path, bytes: &[u8], fence: Option<&WriteFence>) -> std::io::Result<()> {
+    write_fence::check_io(fence, path)?;
     let tmp = temp_sibling(path);
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, path)?;
@@ -1515,6 +1544,12 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// non-markdown copy path) that has a source file to duplicate rather than an
 /// already-encoded payload in memory. Does not create the parent directory.
 pub(crate) fn copy_atomic(src: &Path, dest: &Path) -> std::io::Result<()> {
+    copy_atomic_in(src, dest, write_fence::fence())
+}
+
+/// [`copy_atomic`] under `fence`.
+fn copy_atomic_in(src: &Path, dest: &Path, fence: Option<&WriteFence>) -> std::io::Result<()> {
+    write_fence::check_io(fence, dest)?;
     let tmp = temp_sibling(dest);
     std::fs::copy(src, &tmp)?;
     std::fs::rename(&tmp, dest)?;
@@ -2308,6 +2343,73 @@ mod tests {
         // destination already exists.
         save_bytes(&path, b"{\"v\":2}").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"{\"v\":2}");
+    }
+
+    fn appdata_fence(home: &Path) -> WriteFence {
+        WriteFence::new(
+            "this command runs inside an app package",
+            vec![home.join("roaming"), home.join("local")],
+            vec![home.join("roaming").join("crystalline").join("hooks")],
+        )
+    }
+
+    #[test]
+    fn a_fenced_save_under_appdata_fails_and_creates_nothing() {
+        let home = tempfile::tempdir().unwrap();
+        let fence = appdata_fence(home.path());
+        for root in ["roaming", "local"] {
+            let path = home
+                .path()
+                .join(root)
+                .join("crystalline")
+                .join("config.yaml");
+            let err = save_bytes_in(&path, b"domains: {}", Some(&fence)).unwrap_err();
+            assert!(
+                matches!(&err, ConfigError::PackagedWrite { reason, .. } if reason.contains("app package")),
+                "{err}"
+            );
+            assert!(
+                !home.path().join(root).exists(),
+                "not even the parent folder is created"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fenced_save_to_the_hooks_folder_or_outside_appdata_goes_ahead() {
+        let home = tempfile::tempdir().unwrap();
+        let fence = appdata_fence(home.path());
+        let hook = home
+            .path()
+            .join("roaming")
+            .join("crystalline")
+            .join("hooks")
+            .join("s.json");
+        save_bytes_in(&hook, b"{}", Some(&fence)).unwrap();
+        assert_eq!(std::fs::read(&hook).unwrap(), b"{}");
+        let outside = home.path().join("data").join("index.yaml");
+        save_bytes_in(&outside, b"x", Some(&fence)).unwrap();
+        assert_eq!(std::fs::read(&outside).unwrap(), b"x");
+    }
+
+    #[test]
+    fn the_atomic_helpers_refuse_a_fenced_path() {
+        let home = tempfile::tempdir().unwrap();
+        let fence = appdata_fence(home.path());
+        let dir = home.path().join("roaming").join("crystalline");
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("sources.json");
+        let err = write_atomic_in(&target, b"{}", Some(&fence)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        let src = home.path().join("src.txt");
+        std::fs::write(&src, b"x").unwrap();
+        let err = copy_atomic_in(&src, &target, Some(&fence)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            0,
+            "no temp file and no target were written"
+        );
     }
 
     #[test]

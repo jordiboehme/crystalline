@@ -2043,6 +2043,10 @@ fn run() -> anyhow::Result<()> {
     }
     let cli = Cli::parse();
     init_cli_tracing(cli.command.as_ref());
+    // Inside Claude Desktop's app package every new file under AppData lands
+    // in the package's private copy, so from here on a write there that was
+    // not sent to the daemon fails loudly instead of splitting the state.
+    crystalline_service::runs_in::fence_packaged_writes();
     match cli.command {
         None => {
             Cli::command().print_help()?;
