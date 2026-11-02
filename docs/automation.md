@@ -65,7 +65,7 @@ The agent gets no Crystalline credentials in its environment: every variable tha
 
 ## Who may run a loop
 
-A run acts as an account. For a runner job or n8n that is an agent account with a `cmt_` token (see [An account per agent](deployment.md#an-account-per-agent)).
+A run acts as an account. For a runner job or n8n that is an agent account with a `cmt_` token (see [An account per agent](deployment.md#an-account-per-agent)). With a GitHub App, access to a team domain follows GitHub, so the agent account needs a GitHub link too. An admin runs `crystalline connect github --personal --as <agent-account>` on the server and signs in to GitHub, in the device flow, as a bot user with write on the repository. The device flow must be switched on in the App's settings on GitHub. Write gives editor and lets the account curate the Reflection, which is enough for reflect and evolve.
 
 - The reflect loop needs the right to curate the domain's Reflection.
 - The evolve loop needs the right to write the domain.
