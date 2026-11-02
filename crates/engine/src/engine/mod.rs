@@ -6508,7 +6508,7 @@ impl Engine {
     }
 
     /// This machine's `<state>/kept` folder as this engine knows it, `None`
-    /// without a state folder (see [`Engine::kept_dir`]).
+    /// without a state folder, as the co-editing rooms see it.
     pub fn kept_folder(&self) -> Option<PathBuf> {
         self.kept_dir()
     }

@@ -381,7 +381,7 @@ pub fn domain_init(path: &Path, name: Option<&str>, json: bool) -> Result<()> {
 /// **The MANIFEST write-back only ever happens for a genuinely new
 /// registration** (the `Register` arm of each branch above, never `Adopt`):
 /// there the entry is always fresh - no origin, no review - and the name
-/// has just been validated or derived, so [`needs_manifest_write_back`]
+/// has just been validated or derived, so [`crystalline_core::config::registration::needs_manifest_write_back`]
 /// can only ever say yes when the MANIFEST does not already declare it. An
 /// ADOPTED entry is left alone even when it declares no name and would
 /// otherwise qualify: it may be a team domain (writing there directly would

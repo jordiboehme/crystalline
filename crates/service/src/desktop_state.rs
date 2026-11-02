@@ -53,8 +53,8 @@ impl DesktopState {
 /// view of the real one.
 const STATE_FILES: [&str; 3] = ["config.yaml", "index.db", "service.json"];
 
-/// Every private state folder under `local_appdata` that holds state (see
-/// [`holds_state`]), sorted by path. With `real` set, a folder that is only
+/// Every private state folder under `local_appdata` that holds state (a
+/// `config.yaml` or an `index.db`), sorted by path. With `real` set, a folder that is only
 /// a view of the real state folder (one of its state files is the same
 /// file, by volume and file index on Windows, device and inode elsewhere)
 /// is left out: nothing is split there, and a merge would rename the real
@@ -84,7 +84,7 @@ pub fn scan(local_appdata: Option<&Path>, real: Option<&Path>) -> Vec<DesktopSta
 }
 
 /// Whether the private `folder` is only another name for the real state
-/// folder `real`: one of [`STATE_FILES`] exists on both sides and is the
+/// folder `real`: one of `config.yaml`, `index.db` and `service.json` exists on both sides and is the
 /// same file.
 pub fn is_view_of(folder: &Path, real: &Path) -> bool {
     STATE_FILES.iter().any(|name| {
