@@ -19,6 +19,10 @@
  * Undo: the cell view has no history of its own. Its Mod-z, Mod-Shift-z and
  * Mod-y run on the main view's stack, so CodeMirror's history or
  * Y.UndoManager stays the only one.
+ *
+ * Search: Mod-f, F3 and Mod-g (Shift for the previous hit) run the main
+ * view's search from the cell's caret. Presence: `cellPresence` draws the
+ * peers' carets in the cell and publishes the local one while it has focus.
  */
 
 import {
@@ -27,6 +31,7 @@ import {
   redo as historyRedo,
   undo as historyUndo,
 } from "@codemirror/commands";
+import { findNext, findPrevious, openSearchPanel } from "@codemirror/search";
 import type { Extension, Text, TransactionSpec } from "@codemirror/state";
 import {
   Annotation,
@@ -52,9 +57,11 @@ import { ySyncFacet, yUndoManagerKeymap } from "y-codemirror.next";
 import { documentLanguage } from "../setup";
 import { formattingKeymap } from "../toolbar";
 import { cellPreviewLayers } from "./draws";
+import { cellPresence } from "./presence";
 import type { MountedCell, OpenCell } from "./openCell";
 import {
   bumpGeneration,
+  cellMain,
   closeCell,
   closeCellAt,
   gridWritable,
@@ -433,10 +440,8 @@ export function runMainUndo(main: EditorView, which: "undo" | "redo"): boolean {
   return done;
 }
 
-/** The main view a cell view edits a cell of. */
-export const cellMain = Facet.define<EditorView, EditorView | null>({
-  combine: (values) => values[0] ?? null,
-});
+/** The main view a cell view edits a cell of (kept in `openCell.ts`). */
+export { cellMain };
 
 /**
  * Whether the cell view's caret is empty and at the visible start (`side`
@@ -455,6 +460,45 @@ export function atCellEdge(view: EditorView, side: -1 | 1): boolean {
   const first = cellUnits(view.state.doc, range)[0];
   return first?.hide === range.from && head === range.from + 1;
 }
+
+/**
+ * A search command of the main view, run from the cell view. Main's
+ * selection is stale while a cell is open (the cell sends only its caret),
+ * so it first becomes the cell's: the search starts from the cell's caret and
+ * a selected word seeds the query. The move carries `fromCell` and no select
+ * event, so it neither opens nor closes a cell.
+ */
+function onMain(command: (main: EditorView) => boolean) {
+  return (view: EditorView): boolean => {
+    const main = view.state.facet(cellMain);
+    if (!main || isDestroyed(main)) return false;
+    if (view.state.doc.eq(main.state.doc)) {
+      const { anchor, head } = view.state.selection.main;
+      main.dispatch({
+        selection: { anchor, head },
+        annotations: [fromCell.of(true)],
+      });
+    }
+    return command(main);
+  };
+}
+
+/** The main view's search keys, from inside the cell. */
+const cellSearchKeys = keymap.of([
+  { key: "Mod-f", run: onMain(openSearchPanel), preventDefault: true },
+  {
+    key: "F3",
+    run: onMain(findNext),
+    shift: onMain(findPrevious),
+    preventDefault: true,
+  },
+  {
+    key: "Mod-g",
+    run: onMain(findNext),
+    shift: onMain(findPrevious),
+    preventDefault: true,
+  },
+]);
 
 function insertLineBreakTag(view: EditorView): boolean {
   const range = view.state.selection.main;
@@ -694,7 +738,7 @@ export function mountCellEditor(
         Prec.highest([hideOutside, cellMarks]),
         clampToCell,
         forward,
-        Prec.high(
+        Prec.high([
           keymap.of([
             {
               key: "Mod-z",
@@ -712,7 +756,9 @@ export function mountCellEditor(
               preventDefault: true,
             },
           ]),
-        ),
+          cellSearchKeys,
+        ]),
+        cellPresence,
         documentLanguage,
         ...main.state.facet(cellPreviewLayers),
         formattingKeymap,

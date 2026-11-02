@@ -71,21 +71,32 @@ export function roomMain(text: string, extra: Extension[] = [cellForwarding]) {
   const undoManager = new Y.UndoManager(ytext);
   const awareness = new Awareness(local);
   const remoteAwareness = new Awareness(remote);
-  awareness.on(
-    "update",
-    ({ added, updated, removed }: Record<string, number[]>) => {
-      const changed = [
-        ...(added ?? []),
-        ...(updated ?? []),
-        ...(removed ?? []),
-      ];
-      applyAwarenessUpdate(
-        remoteAwareness,
-        encodeAwarenessUpdate(awareness, changed),
-        "remote",
-      );
-    },
-  );
+  // Awareness travels both ways, each peer sending only its own client, so
+  // a remote cursor reaches the local main view as it would from a server.
+  const relay = (from: Awareness, to: Awareness) => {
+    from.on(
+      "update",
+      (
+        { added, updated, removed }: Record<string, number[]>,
+        origin: unknown,
+      ) => {
+        if (origin === "remote") return;
+        const changed = [
+          ...(added ?? []),
+          ...(updated ?? []),
+          ...(removed ?? []),
+        ].filter((id) => id === from.clientID);
+        if (changed.length === 0) return;
+        applyAwarenessUpdate(
+          to,
+          encodeAwarenessUpdate(from, changed),
+          "remote",
+        );
+      },
+    );
+  };
+  relay(awareness, remoteAwareness);
+  relay(remoteAwareness, awareness);
   const main = new EditorView({
     state: parsedState(
       EditorState.create({

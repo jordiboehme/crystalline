@@ -21,13 +21,22 @@ import type {
   EditorState,
   TransactionSpec,
 } from "@codemirror/state";
-import { MapMode, StateEffect, StateField } from "@codemirror/state";
+import { Facet, MapMode, StateEffect, StateField } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import type { YSyncConfig } from "y-codemirror.next";
 import { ySyncFacet } from "y-codemirror.next";
 
 import type { GridCell } from "./structure";
 import { cellAt, gridTableAt } from "./structure";
+
+/**
+ * The main view a cell view edits a cell of. It lives here, below the cell
+ * editor, so the cell view's presence layer can read it without importing
+ * the cell editor back.
+ */
+export const cellMain = Facet.define<EditorView, EditorView | null>({
+  combine: (values) => values[0] ?? null,
+});
 
 /** Main-doc positions inside one cell's content. */
 export interface OpenCell {

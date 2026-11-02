@@ -277,15 +277,21 @@ describe("in a room, the added row is its own undo step (R14, R15)", () => {
       { cursor?: { anchor: unknown; head: unknown } | null } | undefined;
     const cursor = state?.cursor ?? null;
     if (cursor !== null) {
-      // Whatever is published lies outside the table.
-      for (const rel of [cursor.anchor, cursor.head]) {
-        const abs = Y.createAbsolutePositionFromRelativePosition(
-          Y.createRelativePositionFromJSON(rel),
-          local,
-        );
-        const index = abs?.index ?? -1;
-        expect(index < table.from || index > table.to).toBe(true);
-      }
+      // Whatever is published lies outside the table, or is the open
+      // cell's own caret (Task 6 publishes it), never main's.
+      const caret = cellView(main).state.selection.main;
+      const at = [cursor.anchor, cursor.head].map(
+        (rel) =>
+          Y.createAbsolutePositionFromRelativePosition(
+            Y.createRelativePositionFromJSON(rel),
+            local,
+          )?.index ?? -1,
+      );
+      const outside = at.every((i) => i < table.from || i > table.to);
+      expect(outside || (at[0] === caret.anchor && at[1] === caret.head)).toBe(
+        true,
+      );
+      expectOpen(main, 2, 0);
     }
   });
 });
