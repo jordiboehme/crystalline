@@ -727,37 +727,217 @@ fn cli_private_on_a_governed_domain_names_no_account() {
 
 /// A domain defined in the environment with an origin is governed too (the
 /// engine counts every domain with an origin it knows, whether the config
-/// file or the environment brought it), and needs no `--owner`.
+/// file or the environment brought it), and its readers come from
+/// `_READERS` on every start: with no daemon running, the CLI's own read
+/// refuses a visibility change with the variable's name.
 #[test]
-fn cli_private_on_an_env_defined_governed_domain_needs_no_owner() {
+fn cli_visibility_on_an_env_defined_governed_domain_names_the_variable() {
     let fx = Fixture::new();
     let team = fx.home.path().join("team");
     fx.run(
         &["domain", "init"],
         &[team.to_str().unwrap(), "--name", "team"],
     );
-    let mut cmd = with_app(&fx);
-    cmd.env("CRYSTALLINE_DOMAIN_TEAM", &team)
-        .env("CRYSTALLINE_DOMAIN_TEAM_ORIGIN", "acme/team")
-        .args(["domain", "visibility", "team", "private", "--config"])
-        .arg(&fx.config);
-    let out = cmd.output().unwrap();
-    assert!(
+    for side in ["private", "default"] {
+        let mut cmd = with_app(&fx);
+        cmd.env("CRYSTALLINE_DOMAIN_TEAM", &team)
+            .env("CRYSTALLINE_DOMAIN_TEAM_ORIGIN", "acme/team")
+            .args(["domain", "visibility", "team", side, "--config"])
+            .arg(&fx.config);
+        let out = cmd.output().unwrap();
+        assert!(!out.status.success(), "{side}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("Set by CRYSTALLINE_DOMAIN_TEAM_READERS; change it there."),
+            "{side}: {stderr}"
+        );
+    }
+}
+
+/// Run `crystalline <args>` in `env` without the GitHub App variables,
+/// with `stdin` when given, returning (success, stdout, stderr).
+#[cfg(unix)]
+fn in_daemon_env(
+    env: &crate::daemon_env::DaemonEnv,
+    args: &[&str],
+    stdin: Option<&str>,
+) -> (bool, String, String) {
+    in_daemon_env_with(env, &[], args, stdin)
+}
+
+/// [`in_daemon_env`] with `vars` set on the command.
+#[cfg(unix)]
+fn in_daemon_env_with(
+    env: &crate::daemon_env::DaemonEnv,
+    vars: &[(&str, &str)],
+    args: &[&str],
+    stdin: Option<&str>,
+) -> (bool, String, String) {
+    use std::io::Write as _;
+    let mut cmd = crate::common::crystalline_std();
+    env.apply(&mut cmd);
+    for (name, value) in vars {
+        cmd.env(name, value);
+    }
+    for name in [
+        "CRYSTALLINE_GITHUB_APP_ID",
+        "CRYSTALLINE_GITHUB_APP_CLIENT_ID",
+        "CRYSTALLINE_GITHUB_APP_PRIVATE_KEY",
+    ] {
+        cmd.env_remove(name);
+    }
+    let mut child = cmd
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        let mut pipe = child.stdin.take().unwrap();
+        if let Some(input) = stdin {
+            pipe.write_all(input.as_bytes()).unwrap();
+        }
+    }
+    let out = child.wait_with_output().unwrap();
+    (
         out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// An environment whose daemon has the GitHub App from its own
+/// environment (a service manager's environment file), while every command
+/// run here has none: a domain `eng` with a GitHub origin, private to `ada`
+/// with `bob` invited, set up before the daemon started. `env_team` also
+/// defines the domain `team` in the daemon's environment with an origin.
+#[cfg(unix)]
+fn governed_by_the_daemon_only(tag: &str, env_team: bool) -> crate::daemon_env::DaemonEnv {
+    let mut env = crate::daemon_env::DaemonEnv::new(tag);
+    let kb = env.dir.join("kb");
+    let team = env.dir.join("team");
+    for (dir, name) in [(&kb, "eng"), (&team, "team")] {
+        let (ok, _, err) = in_daemon_env(
+            &env,
+            &["domain", "init", dir.to_str().unwrap(), "--name", name],
+            None,
+        );
+        assert!(ok, "{err}");
+    }
+    std::fs::create_dir_all(env.config_path().parent().unwrap()).unwrap();
+    std::fs::write(
+        env.config_path(),
+        format!(
+            "github:\n  enabled: true\n  api_url: http://127.0.0.1:1\ndomains:\n  eng:\n    path: {}\n    origin:\n      repo: acme/kb\n",
+            kb.display()
+        ),
+    )
+    .unwrap();
+    for (name, role) in [("ada", "editor"), ("bob", "viewer"), ("carol", "viewer")] {
+        let (ok, _, err) = in_daemon_env(
+            &env,
+            &["users", "add", name, "--role", role, "--password-stdin"],
+            Some("s3cret\n"),
+        );
+        assert!(ok, "{err}");
+    }
+    for args in [
+        &["domain", "visibility", "eng", "private", "--owner", "ada"][..],
+        &[
+            "domain", "members", "eng", "add", "bob", "--level", "viewer",
+        ][..],
+    ] {
+        let (ok, _, err) = in_daemon_env(&env, args, None);
+        assert!(ok, "{args:?}: {err}");
+    }
+    let key = include_str!("../../../remote/tests/fixtures/app-key-pkcs1.pem");
+    let team_path = team.display().to_string();
+    let mut daemon_env = vec![
+        ("CRYSTALLINE_GITHUB_APP_ID", "7"),
+        ("CRYSTALLINE_GITHUB_APP_CLIENT_ID", "Iv23.test"),
+        ("CRYSTALLINE_GITHUB_APP_PRIVATE_KEY", key),
+    ];
+    if env_team {
+        daemon_env.push(("CRYSTALLINE_DOMAIN_TEAM", team_path.as_str()));
+        daemon_env.push(("CRYSTALLINE_DOMAIN_TEAM_ORIGIN", "acme/team"));
+    }
+    env.serve_with_env(&daemon_env);
+    env
+}
+
+/// "Governed" is the running daemon's answer, not the CLI's own read of
+/// its environment: a daemon with the App from its environment file governs
+/// `eng`, and the CLI run in a plain shell has no App at all. Shared keeps
+/// the membership rows, private records the reserved owner, and a
+/// membership change is refused the way the web API refuses it.
+#[cfg(unix)]
+#[test]
+fn the_daemon_decides_governed_when_the_cli_has_no_app() {
+    let env = governed_by_the_daemon_only("gov", false);
+    let (ok, out, err) = in_daemon_env(
+        &env,
+        &["--json", "domain", "visibility", "eng", "default"],
+        None,
     );
-    let mut list = with_app(&fx);
-    list.env("CRYSTALLINE_DOMAIN_TEAM", &team)
-        .env("CRYSTALLINE_DOMAIN_TEAM_ORIGIN", "acme/team")
-        .args(["--json", "domain", "members", "team", "list", "--config"])
-        .arg(&fx.config);
-    let out = list.output().unwrap();
+    assert!(ok, "{err}");
+    let shared: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(shared["members_kept"], true, "{shared}");
+
+    let (ok, _, err) = in_daemon_env(
+        &env,
+        &[
+            "domain", "members", "eng", "add", "carol", "--level", "viewer",
+        ],
+        None,
+    );
+    assert!(!ok);
     assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
+        err.contains("access to this domain follows GitHub; change it on GitHub"),
+        "{err}"
     );
-    let listed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let (ok, _, err) = in_daemon_env(&env, &["domain", "members", "eng", "remove", "bob"], None);
+    assert!(!ok);
+    assert!(err.contains("follows GitHub"), "{err}");
+
+    let (ok, _, err) = in_daemon_env(
+        &env,
+        &["domain", "visibility", "eng", "private", "--owner", "ada"],
+        None,
+    );
+    assert!(ok, "{err}");
+    let (ok, out, err) = in_daemon_env(&env, &["--json", "domain", "members", "eng", "list"], None);
+    assert!(ok, "{err}");
+    let listed: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(listed["owner"], "owner", "{listed}");
+    let members = listed["members"].to_string();
+    assert!(members.contains("bob"), "{listed}");
+    assert!(!members.contains("carol"), "{listed}");
+}
+
+/// A domain the daemon's environment defines with an origin applies its
+/// readers again on every start, so a visibility change from the CLI would
+/// not last: refused with the variable's name, both ways, as the web API
+/// refuses it.
+#[cfg(unix)]
+#[test]
+fn visibility_on_an_env_defined_governed_domain_names_the_variable() {
+    let env = governed_by_the_daemon_only("envr", true);
+    // The command sees the domain as the daemon does, without the App.
+    let team = env.dir.join("team").display().to_string();
+    let vars = [
+        ("CRYSTALLINE_DOMAIN_TEAM", team.as_str()),
+        ("CRYSTALLINE_DOMAIN_TEAM_ORIGIN", "acme/team"),
+    ];
+    for args in [
+        &["domain", "visibility", "team", "private"][..],
+        &["domain", "visibility", "team", "default"][..],
+    ] {
+        let (ok, _, err) = in_daemon_env_with(&env, &vars, args, None);
+        assert!(!ok, "{args:?}");
+        assert!(
+            err.contains("Set by CRYSTALLINE_DOMAIN_TEAM_READERS; change it there."),
+            "{args:?}: {err}"
+        );
+    }
 }

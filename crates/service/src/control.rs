@@ -663,6 +663,23 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
             envelope_ok(json!(shared.engine.github_app_status().await)),
             false,
         ),
+        // What decides access to one domain on this daemon: whether its
+        // GitHub App does, and the `_READERS` variable that sets the
+        // domain's readers when its environment defines the domain. The
+        // CLI's `domain visibility` and `domain members` ask this rather
+        // than read their own environment, which a daemon started by a
+        // service manager does not share.
+        "github_governs" => {
+            let domain = req.get("domain").and_then(Value::as_str).unwrap_or("");
+            (
+                envelope_ok(json!({
+                    "domain": domain,
+                    "governed": shared.engine.github_app_decides_access(domain).await,
+                    "env_readers_var": shared.engine.env_readers_var(domain),
+                })),
+                false,
+            )
+        }
         // The CLI just saved or removed the App in this machine's store, so
         // this daemon drops the App it holds and looks for it again on the
         // next origin operation. Nothing is sent but the notice: the

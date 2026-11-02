@@ -9,6 +9,9 @@
 #[path = "../common/mod.rs"]
 mod common;
 #[cfg(unix)]
+#[path = "../common/daemon_env.rs"]
+mod daemon_env;
+#[cfg(unix)]
 #[path = "../common/forge.rs"]
 mod forge;
 #[path = "../common/remote_server.rs"]

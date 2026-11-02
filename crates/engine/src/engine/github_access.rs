@@ -1683,6 +1683,26 @@ impl super::Engine {
             .is_some_and(|access| access.governs(domain))
     }
 
+    /// Whether a GitHub App decides access to `domain` on this instance,
+    /// asked of the App store and the domain's origin rather than of the
+    /// resolver: an App is configured (usable or not) and `domain` has a
+    /// GitHub origin, the rule the governor follows. Unlike
+    /// [`Engine::github_governs`] it holds on a daemon that serves no HTTP
+    /// too, where the stored records still decide the day it does. The
+    /// CLI's `domain visibility` and `domain members` ask a running daemon
+    /// this, so a daemon that has the App from its own environment decides
+    /// for a command run in a shell that has none.
+    pub async fn github_app_decides_access(self: &Arc<Self>, domain: &str) -> bool {
+        if !self.github_origins().iter().any(|(name, _)| name == domain) {
+            return false;
+        }
+        // The first read of the App may ask the keychain.
+        let engine = self.clone();
+        tokio::task::spawn_blocking(move || engine.github_app_configured())
+            .await
+            .unwrap_or(true)
+    }
+
     /// Whether `scope` is the MCP open tier: an anonymous caller on an
     /// instance with `auth.mcp` off.
     pub fn is_open_tier(&self, scope: &Scope) -> bool {

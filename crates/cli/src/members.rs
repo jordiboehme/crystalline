@@ -59,20 +59,73 @@ fn require_registered(name: &str, config: Option<&Path>) -> Result<String> {
     bail!("no domain named '{name}' is registered; list them with `crystalline domain list`")
 }
 
-/// Whether a GitHub App decides access to the registered domain `name`: an
-/// App is configured (usable or not) and the domain has a GitHub origin,
-/// the rule the engine's governor follows. The engine counts the domains
-/// in its start-up config and the ones registered in the config file since
-/// (its discovered domains); this command loads the file fresh, with the
-/// environment overlay on top, so the effective config already holds both.
-fn governed_by_app(name: &str, config: Option<&Path>) -> Result<bool> {
+/// What decides access to a registered domain.
+struct AccessRule {
+    /// A GitHub App decides it: an App is configured (usable or not) and the
+    /// domain has a GitHub origin, the rule the engine's governor follows.
+    governed: bool,
+    /// The `CRYSTALLINE_DOMAIN_<NAME>_READERS` variable that sets the
+    /// domain's readers on every start, when the environment defines the
+    /// domain with an origin.
+    env_readers_var: Option<String>,
+}
+
+/// The one answer every membership change on a domain GitHub governs gets,
+/// the web API's sentence.
+const FOLLOWS_GITHUB: &str = "access to this domain follows GitHub; change it on GitHub";
+
+/// What decides access to the registered domain `name`: a running daemon's
+/// answer, since it may have the App or the domain from an environment this
+/// command does not share (a service manager's environment file), and this
+/// process's own read only when no daemon runs or `--config` names another
+/// file, as `crystalline github app status` decides.
+///
+/// The local read loads the file fresh, with the environment overlay on
+/// top, so the effective config holds the domains the engine counts: its
+/// start-up config and the ones registered in the file since.
+async fn access_rule(name: &str, config: Option<&Path>) -> Result<AccessRule> {
+    if config.is_none()
+        && let Some(answer) = crystalline_service::client::ctl_if_running(serde_json::json!({
+            "v": 1, "cmd": "github_governs", "domain": name,
+        }))
+        .await?
+    {
+        return Ok(AccessRule {
+            governed: answer
+                .get("governed")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            env_readers_var: answer
+                .get("env_readers_var")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+        });
+    }
     let loaded = crate::cmd::load(config)?;
     let has_origin = loaded
         .effective
         .domains
         .get(name)
         .is_some_and(|entry| entry.origin.is_some());
-    Ok(has_origin && crate::cmd::github_app_decides_access(config)?)
+    let env_readers_var = loaded
+        .overlay
+        .env_domains()
+        .find(|(domain, env)| domain.as_str() == name && env.entry.origin.is_some())
+        .map(|(_, env)| env.readers_var());
+    Ok(AccessRule {
+        governed: has_origin && crate::cmd::github_app_decides_access(config)?,
+        env_readers_var,
+    })
+}
+
+/// Refuse a membership or owner change on a domain GitHub governs: the rows
+/// would decide nothing now and come back into force the day the App is
+/// removed.
+async fn refuse_governed(name: &str, config: Option<&Path>) -> Result<()> {
+    if access_rule(name, config).await?.governed {
+        bail!("{FOLLOWS_GITHUB}");
+    }
+    Ok(())
 }
 
 /// [`require_registered`] for a Reflection grant, which only a domain kept
@@ -217,6 +270,9 @@ pub async fn run(domain: String, command: MembersCommand, json: bool) -> Result<
         MembersCommand::Reflection { .. } => unreachable!("answered above"),
     };
     let domain = require_registered(&domain, config.as_deref())?;
+    if !matches!(command, MembersCommand::List { .. }) {
+        refuse_governed(&domain, config.as_deref()).await?;
+    }
     let store = store().await?;
     match command {
         MembersCommand::List { .. } => {
@@ -361,9 +417,15 @@ pub async fn visibility(
     json: bool,
 ) -> Result<()> {
     let domain = require_registered(&domain, config.as_deref())?;
+    let rule = access_rule(&domain, config.as_deref()).await?;
+    // Such a domain applies its readers again on every start, so a change
+    // here would not last.
+    if let Some(var) = &rule.env_readers_var {
+        bail!("Set by {var}; change it there.");
+    }
     let store = store().await?;
     match visibility {
-        VisibilityArg::Private if governed_by_app(&domain, config.as_deref())? => {
+        VisibilityArg::Private if rule.governed => {
             // GitHub decides access here: the record names the reserved
             // machine owner, as the connect, the env readers and the Members
             // card record it, and no account becomes an owner.
@@ -470,7 +532,7 @@ pub async fn visibility(
             // On a domain a GitHub App governs only the private record goes,
             // as on the Members card: the membership rows decide nothing
             // there and are kept for the day the App is removed.
-            let governed = governed_by_app(&domain, config.as_deref())?;
+            let governed = rule.governed;
             if governed {
                 store.take_back_governed_private(&domain).await?;
             } else {
@@ -511,6 +573,7 @@ pub async fn transfer(
     json: bool,
 ) -> Result<()> {
     let domain = require_registered(&domain, config.as_deref())?;
+    refuse_governed(&domain, config.as_deref()).await?;
     let store = store().await?;
     let new_owner = require_account(&store, &new_owner).await?;
     store.transfer_domain(&domain, &new_owner).await?;
