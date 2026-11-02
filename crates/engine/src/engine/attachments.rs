@@ -185,7 +185,7 @@ impl Engine {
             )));
         }
         if let Some(actor) = view.actor() {
-            let row = if create_only {
+            let (row, created) = if create_only {
                 view.put_file_if_absent(path, &bytes).await?
             } else {
                 view.put_file(path, &bytes).await?
@@ -199,15 +199,19 @@ impl Engine {
             self.settle_file_convergence(view.domain(), actor, path)
                 .await;
             crate::maintenance::record_pending(view.domain());
-            return Ok(WrittenAttachment { row, draft: true });
+            return Ok(WrittenAttachment {
+                row,
+                draft: true,
+                created,
+            });
         }
         let replace = if create_only {
             ReplaceRule::CreateOnly
         } else {
             ReplaceRule::Allow
         };
-        let row = self
-            .attachment_write_ruled(view.domain(), path, bytes, replace)
+        let WrittenAsset { row, created } = self
+            .asset_write_in(AssetHome::Engram, view.domain(), path, bytes, replace)
             .await?;
         self.announce_attachment(
             view.domain(),
@@ -215,7 +219,11 @@ impl Engine {
             Some(row.sha256.clone()),
             actor_label,
         );
-        Ok(WrittenAttachment { row, draft: false })
+        Ok(WrittenAttachment {
+            row,
+            draft: false,
+            created,
+        })
     }
 
     /// The view-taking write above under the acting scope, for the surfaces
@@ -1161,6 +1169,8 @@ impl Engine {
         let created = self
             .write_engram_as(
                 &WriteParams {
+                    path: None,
+                    base64: None,
                     domain: p.domain.clone(),
                     title: title.clone(),
                     content: body,

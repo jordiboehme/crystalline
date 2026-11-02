@@ -2237,7 +2237,7 @@ impl<'a> DomainView<'a> {
     /// read and would let a concurrent replace hand this caller a receipt
     /// describing the other writer's bytes - which is what the folder arm's
     /// per-file lock exists to prevent there.
-    pub(crate) async fn put_file(&self, path: &str, bytes: &[u8]) -> Result<AttachmentRow> {
+    pub(crate) async fn put_file(&self, path: &str, bytes: &[u8]) -> Result<(AttachmentRow, bool)> {
         self.put_file_ruled(path, bytes, false).await
     }
 
@@ -2249,7 +2249,7 @@ impl<'a> DomainView<'a> {
         &self,
         path: &str,
         bytes: &[u8],
-    ) -> Result<AttachmentRow> {
+    ) -> Result<(AttachmentRow, bool)> {
         self.put_file_ruled(path, bytes, true).await
     }
 
@@ -2259,19 +2259,23 @@ impl<'a> DomainView<'a> {
     /// joined owner) cannot both find it empty. The file lock is taken before
     /// the check, which may take the store lock, so the order is the one
     /// every other writer keeps.
+    ///
+    /// Answers the row and whether this actor's view showed no file at the
+    /// path before (`created`), read under the same lock.
     async fn put_file_ruled(
         &self,
         path: &str,
         bytes: &[u8],
         create_only: bool,
-    ) -> Result<AttachmentRow> {
+    ) -> Result<(AttachmentRow, bool)> {
         let actor = self.files_writer()?;
         let state_dir = self.files_state_dir()?;
         let abs = crate::overlay_files::file(&state_dir, &self.domain, actor, path)
             .map_err(|e| self.files_io(path, e))?;
         let lock = self.engine.write_lock(&abs);
         let _guard = lock.lock().await;
-        if create_only && self.shows_file(path).await? {
+        let shown = self.shows_file(path).await?;
+        if create_only && shown {
             return Err(EngineError::Conflict(format!(
                 "'{path}' {}",
                 crate::engine::ASSET_EXISTS
@@ -2279,7 +2283,8 @@ impl<'a> DomainView<'a> {
         }
         crate::overlay_files::put(&state_dir, &self.domain, actor, path, bytes)
             .map_err(|e| self.files_io(path, e))?;
-        crate::engine::attachment_row(path, bytes, crate::engine::asset_modified(&abs))
+        let row = crate::engine::attachment_row(path, bytes, crate::engine::asset_modified(&abs))?;
+        Ok((row, !shown))
     }
 
     /// Whether this actor's files overlay shows a file at `path`: its own

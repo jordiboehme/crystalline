@@ -27,6 +27,8 @@ const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\x00binary\x00bytes";
 /// A minimal `write_engram` request into `eng`, optionally filed in a folder.
 fn write_params(title: &str, folder: Option<&str>) -> WriteParams {
     WriteParams {
+        path: None,
+        base64: None,
         domain: "eng".to_string(),
         title: title.to_string(),
         content: "body".to_string(),
@@ -1846,6 +1848,8 @@ async fn an_attachment_read_in_review_mode_answers_the_reviewed_folder_for_every
     engine
         .write_engram_as(
             &WriteParams {
+                path: None,
+                base64: None,
                 domain: "team".to_string(),
                 title: "Fresh".to_string(),
                 content: "- [idea] a page only alice has #team".to_string(),

@@ -67,6 +67,8 @@ fn engram(title: &str, permalink: &str, body: &str) -> String {
 
 fn write_params(domain: &str, title: &str, content: &str) -> WriteParams {
     WriteParams {
+        path: None,
+        base64: None,
         domain: domain.to_string(),
         title: title.to_string(),
         content: content.to_string(),

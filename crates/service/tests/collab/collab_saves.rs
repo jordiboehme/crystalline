@@ -1869,6 +1869,8 @@ async fn a_full_rename_that_stops_does_not_tell_its_rooms_a_new_name() {
         tokio::spawn(async move {
             engine
                 .write_engram(&crystalline_service::params::WriteParams {
+                    path: None,
+                    base64: None,
                     domain: "eng".into(),
                     title: "Beta".into(),
                     content: "written while the rename waits".into(),
@@ -1923,6 +1925,8 @@ async fn a_refused_rename_does_not_tell_its_rooms_a_new_name() {
         tokio::spawn(async move {
             engine
                 .write_engram(&crystalline_service::params::WriteParams {
+                    path: None,
+                    base64: None,
                     domain: "eng".into(),
                     title: "Beta".into(),
                     content: "written while the rename waits".into(),

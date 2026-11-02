@@ -879,6 +879,8 @@ pub async fn create(
     // title and the body back out of it, and borrows them, so the params have
     // to outlive the write that consumed them.
     let params = WriteParams {
+        path: None,
+        base64: None,
         domain: domain.clone(),
         title: body.title,
         content: body.content,

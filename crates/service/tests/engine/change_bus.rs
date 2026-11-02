@@ -135,6 +135,8 @@ fn engram_of(change: &Change) -> &EngramChanged {
 
 fn write_params(title: &str, overwrite: bool) -> WriteParams {
     WriteParams {
+        path: None,
+        base64: None,
         domain: "notes".to_string(),
         title: title.to_string(),
         content: "the body".to_string(),

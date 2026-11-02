@@ -220,6 +220,8 @@ async fn a_retired_checkpoint_is_pruned_when_the_config_still_names_its_profile(
 
 fn write(title: &str, content: &str) -> WriteParams {
     WriteParams {
+        path: None,
+        base64: None,
         domain: "notes".to_string(),
         title: title.to_string(),
         content: content.to_string(),

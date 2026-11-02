@@ -1558,6 +1558,8 @@ fn scope_of(actor: &str) -> Scope {
 
 fn write_params(domain: &str, title: &str, content: &str) -> WriteParams {
     WriteParams {
+        path: None,
+        base64: None,
         domain: domain.to_string(),
         title: title.to_string(),
         content: content.to_string(),

@@ -8,6 +8,7 @@
 mod support;
 
 mod answers;
+mod assets;
 mod automation;
 mod client;
 mod connect;

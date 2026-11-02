@@ -37,6 +37,8 @@ chrono = { workspace = true }
 # does not inherit it automatically: plain-text merge conflict surfacing here
 # needs its own line.
 diffy = { workspace = true }
+# An agent sends an uploaded file as base64 over MCP.
+base64 = { workspace = true }
 futures = { workspace = true }
 getrandom = { workspace = true }
 globset = { workspace = true }

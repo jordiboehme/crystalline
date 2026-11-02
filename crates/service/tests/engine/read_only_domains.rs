@@ -86,6 +86,8 @@ pub(crate) fn sha256(text: &str) -> String {
 
 pub(crate) fn write_params(domain: &str, title: &str) -> WriteParams {
     WriteParams {
+        path: None,
+        base64: None,
         domain: domain.into(),
         title: title.into(),
         content: "- [fact] new #eng".into(),

@@ -35,6 +35,8 @@ async fn engine() -> Engine {
 async fn write(engine: &Engine, title: &str, status: &str, body: &str) {
     engine
         .write_engram(&WriteParams {
+            path: None,
+            base64: None,
             domain: "notes".to_string(),
             title: title.to_string(),
             content: body.to_string(),

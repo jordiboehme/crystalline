@@ -524,6 +524,8 @@ async fn instance(mcp_auth: bool) -> Fixture {
 /// columns work on.
 fn row_engram(domain: &str, account: &str) -> WriteParams {
     WriteParams {
+        path: None,
+        base64: None,
         domain: domain.to_string(),
         title: format!("Row {account}"),
         content: "- [fact] a row's own engram".to_string(),

@@ -41,6 +41,8 @@ async fn engine() -> (tempfile::TempDir, Arc<Engine>) {
 
 fn write(domain: &str, title: &str) -> WriteParams {
     WriteParams {
+        path: None,
+        base64: None,
         domain: domain.to_string(),
         title: title.to_string(),
         content: RETRY.to_string(),

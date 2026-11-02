@@ -175,6 +175,8 @@ async fn write_engram_content_with_crlf_is_stored_lf() {
     for domain in ["eng", "scratch"] {
         engine
             .write_engram(&WriteParams {
+                path: None,
+                base64: None,
                 domain: domain.to_string(),
                 title: "Captured".to_string(),
                 content: "line one\r\nline two\r\n\r\n- [fact] a fact\r\n".to_string(),

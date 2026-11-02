@@ -158,6 +158,8 @@ async fn engine_on(provider: Arc<dyn EmbeddingProvider>) -> (tempfile::TempDir, 
 
 fn write(title: &str, content: &str) -> WriteParams {
     WriteParams {
+        path: None,
+        base64: None,
         domain: "notes".to_string(),
         title: title.to_string(),
         content: content.to_string(),

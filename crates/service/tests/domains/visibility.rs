@@ -1209,6 +1209,8 @@ async fn a_capture_over_a_virtual_manifest_cannot_switch_read_only_on() {
     let (_tmp, engine) = fixture().await;
     engine.domain_add_virtual("scratch").await.unwrap();
     let p = crystalline_service::params::WriteParams {
+        path: None,
+        base64: None,
         domain: "scratch".into(),
         title: "MANIFEST".into(),
         content: "## Scope\n\n- x\n\n## When to Use\n\n- y\n".into(),
@@ -1243,6 +1245,8 @@ async fn a_capture_over_a_virtual_manifest_that_leaves_the_flag_alone_lands() {
     let (_tmp, engine) = fixture().await;
     engine.domain_add_virtual("scratch").await.unwrap();
     let p = crystalline_service::params::WriteParams {
+        path: None,
+        base64: None,
         domain: "scratch".into(),
         title: "MANIFEST".into(),
         content: "## Scope\n\n- x\n\n## When to Use\n\n- y\n".into(),
@@ -1316,6 +1320,8 @@ async fn a_reviewing_draft_move_onto_the_manifest_is_judged_by_the_draft() {
 
     // A draft-only engram of `out`'s that switches the lock on.
     let draft = crystalline_service::params::WriteParams {
+        path: None,
+        base64: None,
         domain: "open".into(),
         title: "Locker".into(),
         content: "## Scope\n\n- x\n\n## When to Use\n\n- y\n".into(),

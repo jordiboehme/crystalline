@@ -129,6 +129,8 @@ fn retry_receipt() -> serde_json::Value {
 
 fn write(domain: &str, title: &str, content: &str, status: Option<&str>) -> WriteParams {
     WriteParams {
+        path: None,
+        base64: None,
         domain: domain.to_string(),
         title: title.to_string(),
         content: content.to_string(),

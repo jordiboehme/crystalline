@@ -204,6 +204,8 @@ async fn a_manifest_edit_changes_the_table() {
 
     engine
         .write_engram(&WriteParams {
+            path: None,
+            base64: None,
             domain: "ops".to_string(),
             title: "Escalation".to_string(),
             content: "Then [[platform:runbook]].".to_string(),
@@ -374,6 +376,8 @@ async fn eng_with_alias(dir: &Path) -> Engine {
 
 fn write_params(domain: &str, title: &str, content: &str) -> WriteParams {
     WriteParams {
+        path: None,
+        base64: None,
         domain: domain.to_string(),
         title: title.to_string(),
         content: content.to_string(),
@@ -2108,6 +2112,8 @@ async fn the_startup_pass_binds_what_an_upgrade_left_pending() {
     ] {
         engine
             .write_engram(&WriteParams {
+                path: None,
+                base64: None,
                 domain: "scratch".to_string(),
                 title: title.to_string(),
                 content: body.to_string(),

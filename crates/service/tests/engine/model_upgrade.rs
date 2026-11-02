@@ -62,6 +62,8 @@ fn upgraded_engine(store: Arc<Mutex<dyn Store>>) -> Arc<Engine> {
 
 fn write(title: &str, content: &str) -> WriteParams {
     WriteParams {
+        path: None,
+        base64: None,
         domain: "notes".to_string(),
         title: title.to_string(),
         content: content.to_string(),

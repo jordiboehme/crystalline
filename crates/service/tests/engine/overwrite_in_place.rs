@@ -64,6 +64,8 @@ async fn fixture(
 
 fn capture(title: &str, folder: Option<&str>, content: &str, overwrite: bool) -> WriteParams {
     WriteParams {
+        path: None,
+        base64: None,
         domain: "notes".to_string(),
         title: title.to_string(),
         content: content.to_string(),

@@ -7862,6 +7862,8 @@ async fn a_hidden_domains_engram_is_a_neighbour_only_to_a_caller_who_may_see_it(
     h.engine.set_provider(Arc::new(support::TopicEmbedder));
     h.engine
         .write_engram(&crystalline_service::params::WriteParams {
+            path: None,
+            base64: None,
             domain: "lab".to_string(),
             title: "Retry secrets".to_string(),
             content: RETRY.to_string(),

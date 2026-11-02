@@ -4463,6 +4463,8 @@ async fn a_hidden_domains_engram_never_reaches_a_strangers_receipt() {
     // the way a search would.
     fx.engine
         .write_engram(&crystalline_service::params::WriteParams {
+            path: None,
+            base64: None,
             domain: "scrap".to_string(),
             title: "Retry secrets".to_string(),
             content: RETRY.to_string(),

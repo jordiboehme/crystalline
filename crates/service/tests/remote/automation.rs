@@ -108,6 +108,8 @@ async fn only_the_lease_accounts_mcp_writes_are_noted() {
         .engine
         .write_engram_as(
             &WriteParams {
+                path: None,
+                base64: None,
                 domain: "open".into(),
                 title: "Typed In Fluid".into(),
                 content: "- [fact] a person typed this".into(),

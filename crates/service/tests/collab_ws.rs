@@ -1230,6 +1230,8 @@ impl Review {
             .engine
             .write_engram_as(
                 &crystalline_service::params::WriteParams {
+                    path: None,
+                    base64: None,
                     domain: "team".to_string(),
                     title: title.to_string(),
                     content: body.to_string(),

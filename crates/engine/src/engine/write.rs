@@ -2405,6 +2405,8 @@ mod landing_race_tests {
             tokio::spawn(async move {
                 engine
                     .write_engram(&WriteParams {
+                        path: None,
+                        base64: None,
                         domain: "notes".to_string(),
                         title: "Code Review Standards".to_string(),
                         content: "The new rule.".to_string(),
@@ -2474,6 +2476,8 @@ mod landing_race_tests {
         );
         engine.sync(None).await.unwrap();
         let params = |content: &str| WriteParams {
+            path: None,
+            base64: None,
             domain: "notes".to_string(),
             title: "Code Review Standards".to_string(),
             content: content.to_string(),
@@ -2580,6 +2584,8 @@ mod landing_race_tests {
             tokio::spawn(async move {
                 engine
                     .write_engram(&WriteParams {
+                        path: None,
+                        base64: None,
                         domain: "notes".to_string(),
                         title: "Code Review Standards".to_string(),
                         content: "The new rule.".to_string(),
@@ -2677,6 +2683,8 @@ mod on_disk_name_tests {
 
     fn create(title: &str, folder: &str) -> WriteParams {
         WriteParams {
+            path: None,
+            base64: None,
             domain: "kb".to_string(),
             title: title.to_string(),
             content: "Mine.".to_string(),

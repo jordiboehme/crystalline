@@ -55,6 +55,8 @@ fn virtual_engine(store: Arc<Mutex<dyn Store>>) -> Engine {
 
 fn write_params(title: &str, content: &str) -> WriteParams {
     WriteParams {
+        path: None,
+        base64: None,
         domain: "notes".to_string(),
         title: title.to_string(),
         content: content.to_string(),
@@ -784,6 +786,8 @@ both_backends!(import_refuses_a_file_domain, import_refuses_file_domain);
 
 fn tagged(title: &str, content: &str, tags: Vec<&str>) -> WriteParams {
     WriteParams {
+        path: None,
+        base64: None,
         domain: "notes".to_string(),
         title: title.to_string(),
         content: content.to_string(),

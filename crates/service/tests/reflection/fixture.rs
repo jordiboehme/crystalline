@@ -44,6 +44,8 @@ pub fn page(title: &str) -> String {
 
 pub fn write_params(title: &str, folder: Option<&str>, content: &str) -> WriteParams {
     WriteParams {
+        path: None,
+        base64: None,
         domain: "eng".into(),
         title: title.into(),
         content: content.into(),

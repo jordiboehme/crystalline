@@ -1638,8 +1638,9 @@ impl Engine {
                     .await?;
                 Ok(json!({ "domain": p.domain, "path": p.path, "deleted": true }))
             }
+            "write_asset" => self.write_reflection_asset(p, caller).await,
             other => Err(EngineError::Invalid(format!(
-                "`{other}` is not a write_reflection action; use write, move, delete, settle, move_asset or delete_asset"
+                "`{other}` is not a write_reflection action; use write, move, delete, settle, write_asset, move_asset or delete_asset"
             ))),
         }
     }

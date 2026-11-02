@@ -183,6 +183,8 @@ impl Fixture {
     /// view at all, which is the state every test here starts from.
     async fn draft(&self, account: &str, title: &str, body: &str) -> String {
         let params = crystalline_service::params::WriteParams {
+            path: None,
+            base64: None,
             domain: "team".to_string(),
             title: title.to_string(),
             content: body.to_string(),
@@ -1271,6 +1273,8 @@ async fn draft_in(f: &Fixture, account: &str, folder: &str, title: &str, body: &
         .engine
         .write_engram_as(
             &crystalline_service::params::WriteParams {
+                path: None,
+                base64: None,
                 domain: "team".to_string(),
                 title: title.to_string(),
                 content: body.to_string(),
@@ -1450,6 +1454,8 @@ async fn the_join_refusal_names_the_permalink() {
         .engine
         .write_engram_as(
             &crystalline_service::params::WriteParams {
+                path: None,
+                base64: None,
                 domain: "team".to_string(),
                 title: "Plan".to_string(),
                 content: "What alice would change.".to_string(),

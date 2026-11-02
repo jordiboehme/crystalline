@@ -2431,8 +2431,48 @@ impl McpServer {
                     .await
             }
             (None, None) => self.engine.read_reflection_tree(&p.domain, caller).await,
-            (None, Some(path)) => self.engine.read_reflection(&p.domain, path, caller).await,
+            (None, Some(path)) => match crate::engine::attachment_identifier(path) {
+                // A file of the Reflection, read under the Reflection's own
+                // rights, as `resources/read` reads it.
+                Some(file) => {
+                    let (bytes, row) = self
+                        .engine
+                        .reflection_asset_read(&p.domain, &file, caller)
+                        .await?;
+                    Ok(crate::engine::file_answer(&p.domain, bytes, &row))
+                }
+                None => self.engine.read_reflection(&p.domain, path, caller).await,
+            },
         }
+    }
+
+    /// `write_reflection`'s write for both doors, after any question was
+    /// answered: the engine's write, then the run's note of the files a file
+    /// action changed, by their path in the domain (`reflections/assets/...`).
+    async fn write_reflection_core(
+        &self,
+        p: &WriteReflectionParams,
+        rc: &ReflectionCaller,
+        caller: &Caller,
+    ) -> Result<Value, EngineError> {
+        let value = self.engine.write_reflection(p, rc).await?;
+        let changed: Vec<&str> = match p.action.as_deref().unwrap_or("write") {
+            "write_asset" => vec![value["path"].as_str().unwrap_or(&p.path)],
+            "delete_asset" => vec![p.path.as_str()],
+            "move_asset" => [Some(p.path.as_str()), p.to.as_deref()]
+                .into_iter()
+                .flatten()
+                .collect(),
+            _ => Vec::new(),
+        };
+        for path in changed {
+            let note = json!({
+                "domain": p.domain,
+                "path": format!("{}/{path}", crystalline_core::reflection::REFLECTIONS_DIR),
+            });
+            self.note_run_writes(caller, &note).await;
+        }
+        Ok(value)
     }
 
     /// `p` with every domain it names spelled as a local name, for `scope`.
@@ -2465,6 +2505,42 @@ impl McpServer {
         let scope = &caller.scope;
         if let Some(refusal) = self.refuse_unwritable(&p.domain, scope).await? {
             return Ok(Verdict::Refused(refusal));
+        }
+        // **With `path` this is an upload, a person's upload.** The editor
+        // gate above is REST's `require_domain_write`; the engine runs the
+        // REST route's own write (`Engine::attachment_write_joined`), so the
+        // path rules, the allowlist, the size cap, the read-only refusals and
+        // the join screen are that route's. A share-link on the call is the
+        // join, as `X-Crystalline-Join` is there: the file follows it into
+        // the draft owner's files.
+        if p.path.is_some() {
+            let join = match p.share_link.as_deref() {
+                Some(token) => Some(
+                    self.joined_by_holder(scope, caller.holder.clone(), token)
+                        .await?,
+                ),
+                None => None,
+            };
+            let receipt = match self
+                .engine
+                .upload_attachment(&p, scope, join.as_ref())
+                .await
+            {
+                Ok(receipt) => receipt,
+                Err(e) => return overlay_refusal(e).map(Verdict::Refused),
+            };
+            self.note_run_writes(caller, &receipt).await;
+            return Ok(Verdict::Done(receipt));
+        }
+        if p.base64.is_some() {
+            return Err(to_error(EngineError::Invalid(
+                "base64 uploads a file: pass path, the file's path under assets/, with it".into(),
+            )));
+        }
+        if p.title.trim().is_empty() {
+            return Err(to_error(EngineError::Invalid(
+                "write_engram needs title for an engram (or path to upload a file)".into(),
+            )));
         }
         let actor = caller.actor();
         // A capture inside somebody's draft names that draft on the call: this
@@ -2527,8 +2603,10 @@ impl McpServer {
     /// run whose lease this caller's account holds (R4, ruling B): the run
     /// shares only what its runner wrote over MCP. Every engram write tool
     /// calls this once it succeeded (write, edit, move with both ends and
-    /// the linkers it rewrote, split, delete); a write over REST, Fluid or
-    /// the files never reaches it. A caller with no account notes nothing.
+    /// the linkers it rewrote, split, delete, and an upload with `path`), and
+    /// `write_reflection` for the files its file actions change
+    /// (`reflections/assets/...`); a write over REST, Fluid or the files
+    /// never reaches it. A caller with no account notes nothing.
     /// A failed note is logged and never fails the write.
     async fn note_run_writes(&self, caller: &Caller, receipt: &Value) {
         let Scope::User { account, .. } = &caller.scope else {
@@ -2545,6 +2623,27 @@ impl McpServer {
     async fn read_core(&self, p: ReadParams, caller: &Caller) -> Result<Value, ErrorData> {
         let p = self.localized_in(p, &caller.scope).await?;
         let scope = &caller.scope;
+        // An `assets/` identifier names an attachment, which this answers
+        // itself: its bytes as this caller sees the domain, through the same
+        // gated seam `resources/read` reads through.
+        if let Some(path) = crate::engine::attachment_identifier(&p.identifier) {
+            let Some(domain) = p.domain.as_deref() else {
+                return Err(to_error(EngineError::Invalid(format!(
+                    "reading the file '{path}' needs domain, the domain that holds it"
+                ))));
+            };
+            let (bytes, row) = self
+                .file_bytes(
+                    ContentKind::Engram,
+                    domain,
+                    &path,
+                    scope,
+                    &remote_reflection_caller(caller),
+                )
+                .await
+                .map_err(to_error)?;
+            return Ok(crate::engine::file_answer(domain, bytes, &row));
+        }
         // A link presented here binds it to this account and opens the draft
         // for this holder, so the read below answers the draft it names and a
         // later edit of that page lands in its author's copy. The read itself
@@ -3078,10 +3177,12 @@ impl McpServer {
         match tool {
             "write_engram" => remote_verdict(self.write_core(remote_args(args)?, caller).await),
             "read_engram" => {
-                let mut value = self
-                    .read_core(remote_args(args)?, caller)
-                    .await
-                    .map_err(remote_failed)?;
+                let p: ReadParams = remote_args(args)?;
+                let is_file = crate::engine::attachment_identifier(&p.identifier).is_some();
+                let mut value = self.read_core(p, caller).await.map_err(remote_failed)?;
+                if is_file {
+                    return Ok(value);
+                }
                 let domain = value["domain"].as_str().unwrap_or_default().to_string();
                 let files = self
                     .linked_files(
@@ -3159,7 +3260,7 @@ impl McpServer {
                     .read_reflection_core(&p, &reflection_caller)
                     .await
                     .map_err(remote_engine)?;
-                if p.path.is_some() {
+                if p.path.is_some() && !names_reflection_file(&p) {
                     let files = self
                         .linked_files(
                             ContentKind::Reflection,
@@ -3180,8 +3281,7 @@ impl McpServer {
                     .localized_for(&p, &caller.scope)
                     .await
                     .map_err(remote_engine)?;
-                self.engine
-                    .write_reflection(&p, &remote_reflection_caller(caller))
+                self.write_reflection_core(&p, &remote_reflection_caller(caller), caller)
                     .await
                     .map_err(remote_engine)
             }
@@ -3292,6 +3392,10 @@ impl McpServer {
         }
         let caller = self.caller(&ctx);
         let include_images = p.include_images;
+        if crate::engine::attachment_identifier(&p.identifier).is_some() {
+            let value = self.read_core(p, &caller).await?;
+            return file_result(value);
+        }
         let mut value = self.read_core(p, &caller).await?;
         attach_configure_hint(
             &mut value,
@@ -3636,6 +3740,7 @@ impl McpServer {
         let p = self.localized(p, &ctx).await?;
         let caller = self.reflection_caller(&ctx);
         match self.read_reflection_core(&p, &caller).await {
+            Ok(value) if names_reflection_file(&p) => file_result(value),
             Ok(value) if p.path.is_some() => {
                 let files = self
                     .linked_files(
@@ -3692,7 +3797,10 @@ impl McpServer {
                 return Self::reflection_refused(e).map(CallToolResponse::from);
             }
         };
-        match self.engine.write_reflection(&p, &caller).await {
+        match self
+            .write_reflection_core(&p, &caller, &self.caller(&ctx))
+            .await
+        {
             Ok(v) => ok(v).map(CallToolResponse::from),
             // Refused for reach, by a person whose client could not ask them:
             // say how they still can.
@@ -6117,6 +6225,34 @@ const MAX_INLINE_IMAGES: usize = 8;
 const MAX_INLINE_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
 
 /// A picture a model can look at: the raster formats vision reads.
+/// Whether a `read_reflection` names one of the Reflection's files rather
+/// than a page.
+fn names_reflection_file(p: &ReadReflectionParams) -> bool {
+    p.query.is_none()
+        && p.path
+            .as_deref()
+            .and_then(crate::engine::attachment_identifier)
+            .is_some()
+}
+
+/// A file a read answered ([`crate::engine::file_answer`]) as a tool result:
+/// the answer, and for a picture (png, jpeg, gif, webp, at most
+/// [`MAX_INLINE_IMAGE_BYTES`]) the same bytes as an image block too, so a
+/// model with vision sees it.
+fn file_result(answer: Value) -> Result<CallToolResult, ErrorData> {
+    let image = (|| {
+        let mime = answer["mime"].as_str()?;
+        if !inlinable_image(mime) || answer["size"].as_u64()? > MAX_INLINE_IMAGE_BYTES {
+            return None;
+        }
+        let data = answer["base64"].as_str()?;
+        Some(ContentBlock::image(data.to_string(), mime.to_string()))
+    })();
+    let mut result = ok(answer)?;
+    result.content.extend(image);
+    Ok(result)
+}
+
 fn inlinable_image(mime: &str) -> bool {
     matches!(
         mime,

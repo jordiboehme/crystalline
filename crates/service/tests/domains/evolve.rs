@@ -2303,6 +2303,8 @@ async fn an_authors_own_drafts_resolve_each_others_links() {
     engine
         .write_engram_as(
             &crystalline_service::params::WriteParams {
+                path: None,
+                base64: None,
                 domain: "team".to_string(),
                 title: "Restart Ladder".to_string(),
                 content: "The ladder the importer restart climbs.".to_string(),
@@ -2387,6 +2389,8 @@ async fn write_as(engine: &Engine, title: &str, body: &str, scope: &Scope) {
     let value = engine
         .write_engram_as(
             &crystalline_service::params::WriteParams {
+                path: None,
+                base64: None,
                 domain: "team".to_string(),
                 title: title.to_string(),
                 content: body.to_string(),
